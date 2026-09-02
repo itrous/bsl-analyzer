@@ -45,7 +45,7 @@ pub(crate) use scan::{classify_changes, file_fingerprint, FileStat, WorkspaceDif
     unused_imports,
     reason = "the stable graph facade preserves crate::graph snapshot paths while implementation stays private"
 )]
-pub(crate) use snapshot::{GraphSnapshot, PooledGraphDb};
+pub(crate) use snapshot::{BackgroundSnapshotError, GraphSnapshot, PooledGraphDb};
 pub(crate) use state::GraphState;
 #[allow(
     unused_imports,

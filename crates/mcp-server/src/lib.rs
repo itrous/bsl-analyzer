@@ -10,6 +10,8 @@ mod graph;
 mod graph_db;
 mod graph_query;
 mod http;
+#[cfg(test)]
+mod inventory;
 pub mod project;
 mod state;
 mod tasks;
@@ -1015,7 +1017,7 @@ impl McpServer {
             diag.ensure_loading();
             return Ok(tools::resident::status(
                 &diag.status_report(),
-                self.state.owns_caches(),
+                self.state.owns_caches_cached(),
                 self.state.standalone_notice().as_deref(),
             )
             .into());
@@ -1247,12 +1249,11 @@ impl McpServer {
                 // can mint form/file `graph_id`s with the same `src/cf/…` prefix the graph uses.
                 let graph_root = self.state.workspace_root().cloned();
                 let index_progress = self.state.index_progress().clone();
+                self.state.request_overlay_refresh();
                 let retry_progress = index_progress.clone();
-                let workspace_lease = self.state.workspace_lease().clone();
                 let outcome = tools::search::search_call(ct, move |cancel| {
-                    tools::search::hybrid_code_fenced(
+                    tools::search::hybrid_code_cancellable(
                         &engine,
-                        &workspace_lease,
                         cancel,
                         &semantic_runtime,
                         workspace_search_mode,
@@ -1693,9 +1694,7 @@ impl McpServer {
         // it and poll progress instead of reading a flat `loading` envelope from a data action.
         if p.action == "status" {
             graph.ensure_loading();
-            let report = tokio::task::spawn_blocking(move || graph.status_report())
-                .await
-                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?;
+            let report = graph.status_report();
             return Ok(tools::graph::status(&report));
         }
 
@@ -1801,10 +1800,9 @@ impl McpServer {
                     return Err(contract::unknown_action(McpProfile::Workspace, "graph", other))
                 }
             };
-            // Stamp freshness relative to the snapshot that served this answer: the
-            // scan may detect drift and kick a background reload, but `revision`
-            // and `stale` describe the data actually returned above.
-            let freshness = graph.freshness(&snapshot);
+            // Request reads report the publication already paired with this descriptor;
+            // background owners detect drift and schedule reloads.
+            let freshness = graph.cached_freshness(&snapshot);
             // Modules the artefact could not read are missing nodes and edges: that is
             // incompleteness of the answer, not merely drift.
             let completeness = completeness.when(
@@ -2213,7 +2211,7 @@ impl McpServer {
                 diag.ensure_loading();
                 Ok(tools::resident::status(
                     &diag.status_report(),
-                    self.state.owns_caches(),
+                    self.state.owns_caches_cached(),
                     self.state.standalone_notice().as_deref(),
                 )
                 .into())
@@ -3003,6 +3001,104 @@ mod surface_guards {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_status_requests_are_cached_under_held_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache).unwrap();
+        let lease = state.workspace_lease().clone();
+        let server = McpServer::new(McpProfile::Workspace, state);
+        let held_lease = lease.hold_file_lock_for_test();
+        let token = || tokio_util::sync::CancellationToken::new();
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            server.metadata(
+                Parameters(MetadataParams {
+                    action: "status".to_owned(),
+                    filter: None,
+                    meta_type: None,
+                    name_mask: None,
+                    max_items: None,
+                    object_type: None,
+                    object_name: None,
+                    form_name: None,
+                    max_output_tokens: None,
+                    connection: None,
+                    mode: None,
+                }),
+                token(),
+                tasks::TaskCapable(false),
+            ),
+        )
+        .await
+        .expect("metadata status must not wait for the lease lock")
+        .expect("metadata status response");
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            server.diagnostics(
+                Parameters(DiagnosticsParams {
+                    action: "status".to_owned(),
+                    path: None,
+                    root_id: None,
+                    codes: Vec::new(),
+                    locale: None,
+                    min_severity: None,
+                    range_start: None,
+                    range_end: None,
+                    detail: None,
+                    max_findings: None,
+                    max_files: None,
+                    max_output_tokens: None,
+                }),
+                token(),
+                tasks::TaskCapable(false),
+            ),
+        )
+        .await
+        .expect("diagnostics status must not wait for the lease lock")
+        .expect("diagnostics status response");
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            server.graph(
+                Parameters(GraphParams {
+                    action: "status".to_owned(),
+                    id: None,
+                    query: None,
+                    ids: Vec::new(),
+                    max_output_tokens: None,
+                    detail: None,
+                    dir: None,
+                    depth: None,
+                    max_nodes: None,
+                    provenance: Vec::new(),
+                    edge_kinds: Vec::new(),
+                    top: None,
+                    call_sites: None,
+                    max_call_sites: None,
+                }),
+                token(),
+            ),
+        )
+        .await
+        .expect("graph status must not wait for the lease lock")
+        .expect("graph status response");
+
+        drop(held_lease);
+        server.shutdown();
+    }
+}
+
+#[cfg(test)]
 mod graph_supersession_contract {
     use super::*;
     use std::time::Duration;
@@ -3047,10 +3143,31 @@ mod graph_supersession_contract {
         })
     }
 
+    fn references_params(symbol: &str) -> Parameters<ReferencesParams> {
+        Parameters(ReferencesParams {
+            symbol: Some(symbol.to_owned()),
+            anchor_root_id: None,
+            root_id: None,
+            path: None,
+            line: None,
+            column: None,
+            line_content: None,
+            area_root_id: None,
+            area_path_prefix: None,
+            kinds: Vec::new(),
+            include_declaration: None,
+            limit: None,
+            max_files: None,
+            include_preview: None,
+            max_output_tokens: None,
+        })
+    }
+
     enum BusyGraphHandler {
         Graph,
         ResolveNames,
         SymbolInfo,
+        References,
     }
 
     async fn assert_busy_graph_handler_returns_immediately(handler: BusyGraphHandler) {
@@ -3107,6 +3224,23 @@ mod graph_supersession_contract {
                     _ => panic!("a caller that declared no task extension is answered inline"),
                 }
             }
+            BusyGraphHandler::References => {
+                let response = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    server.references(
+                        references_params("Сервер.Считать"),
+                        token(),
+                        tasks::TaskCapable(false),
+                    ),
+                )
+                .await
+                .expect("references must not wait for the lease lock")
+                .expect("resident references survive unavailable graph enrichment");
+                match response {
+                    rmcp::model::CallToolResponse::Complete(result) => result,
+                    _ => panic!("a caller that declared no task extension is answered inline"),
+                }
+            }
         };
         assert!(answer.structured_content.is_some());
 
@@ -3128,6 +3262,11 @@ mod graph_supersession_contract {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn symbol_info_misses_immediately_when_preopened_handles_are_busy() {
         assert_busy_graph_handler_returns_immediately(BusyGraphHandler::SymbolInfo).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn references_misses_immediately_when_preopened_handles_are_busy() {
+        assert_busy_graph_handler_returns_immediately(BusyGraphHandler::References).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

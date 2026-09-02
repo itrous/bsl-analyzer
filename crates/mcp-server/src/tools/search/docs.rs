@@ -141,7 +141,7 @@ pub fn search_docs(
     // The same shape as the semantic code path: take what the embed needs from the engine,
     // release the lock, embed off it, take the lock again for the now-fast search. The
     // engine's embedding identity is fixed for the life of the process, so the captures
-    // cannot go stale across the unlocked window (see `semantic_code_hits_fenced`).
+    // cannot go stale across the unlocked window (see `semantic_code_hits`).
     let (embedder, model_id, dim) = {
         let guard = match engine_guard(engine, cancel, "search_docs")? {
             Ok(guard) => guard,

@@ -1,4 +1,4 @@
-use super::overlay_retry::PublishRetryWindow;
+use super::retry_window::{RetryDecision, RetryOwner, RetryWindow};
 use super::types::{OverlayWarmupState, SemanticRuntimeStatus, SharedSearchEngine};
 use super::SharedState;
 use bsl_search::{IndexProgress, SearchEngine, WorkspaceRootsTransitionOutcome};
@@ -177,6 +177,10 @@ type EmbedFenceHook = Box<dyn FnMut(EmbedFencePoint) + Send>;
 #[cfg(test)]
 static EMBED_FENCE_HOOK: Mutex<Option<EmbedFenceHook>> = Mutex::new(None);
 #[cfg(test)]
+static FORCE_EMBED_PREFLIGHT_REFUSALS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static FORCE_EMBED_PUBLICATION_REFUSALS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
 pub(super) static FORCE_OVERLAY_PUBLICATION_REFUSALS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -317,7 +321,8 @@ impl SharedState {
                     (false, false, false)
                 }
                 super::WorkspaceSearchApply::TransientRefusal
-                | super::WorkspaceSearchApply::Terminal => (false, false, false),
+                | super::WorkspaceSearchApply::Superseded
+                | super::WorkspaceSearchApply::Released => (false, false, false),
             };
         };
         // Fence the complete off-lock preparation, not only its second validation pass. Metadata
@@ -433,7 +438,8 @@ impl SharedState {
                 return (false, false, false);
             }
             super::WorkspaceSearchApply::TransientRefusal
-            | super::WorkspaceSearchApply::Terminal => return (false, false, false),
+            | super::WorkspaceSearchApply::Superseded
+            | super::WorkspaceSearchApply::Released => return (false, false, false),
         };
         match outcome {
             WorkspaceRootsTransitionOutcome::Unchanged => (true, false, false),
@@ -527,7 +533,9 @@ impl SharedState {
                             overlay_warmup,
                             OverlayWarmupState::Skipped("no embedder configured".to_owned()),
                         );
-                        return super::WorkspaceSearchApply::Terminal;
+                        return super::WorkspaceSearchApply::Applied(OverlayWarmupState::Skipped(
+                            "no embedder configured".to_owned(),
+                        ));
                     };
                     let Some(roots) = engine.workspace_roots().cloned() else {
                         tracing::debug!("overlay warmup: no workspace root; skipping");
@@ -535,7 +543,9 @@ impl SharedState {
                             overlay_warmup,
                             OverlayWarmupState::Skipped("no workspace root".to_owned()),
                         );
-                        return super::WorkspaceSearchApply::Terminal;
+                        return super::WorkspaceSearchApply::Applied(OverlayWarmupState::Skipped(
+                            "no workspace root".to_owned(),
+                        ));
                     };
                     let warm_cache = match engine.workspace_overlay_embedding_cache_snapshot() {
                         Ok(cache) => cache,
@@ -606,7 +616,7 @@ impl SharedState {
         // verdict would let a superseded daemon write for up to its TTL after a takeover),
         // and the caller's own stop signal rides along: a shutdown mid-batch must not keep
         // writing the shared table while the lease is being handed over.
-        let should_continue = || lease.owns_caches_now() && keep_going();
+        let should_continue = || keep_going();
         let planning_distrusted = dirty_before.retry_distrusted();
         let primed = SearchEngine::prime_workspace_overlay_standalone_retrying(
             &db_path,
@@ -615,7 +625,7 @@ impl SharedState {
             warm_cache,
             graph_provider,
             &should_continue,
-            |operation| Self::search_fence_outcome(lease.with_ownership_outcome(operation)),
+            |operation| Self::search_fence_outcome(lease.publish_short(&mut (), |_| operation())),
             &planning_distrusted,
             &mut *retry_transient,
         );
@@ -625,13 +635,17 @@ impl SharedState {
                 tracing::warn!("workspace overlay semantic warmup temporarily refused");
                 return super::WorkspaceSearchApply::TransientRefusal;
             }
-            Ok(bsl_search::FenceOutcome::Terminal) => {
+            Ok(bsl_search::FenceOutcome::Superseded) => {
                 tracing::warn!("workspace overlay semantic warmup stopped");
                 Self::set_overlay_warmup_state(
                     overlay_warmup,
                     OverlayWarmupState::Failed("workspace ownership lost at publish".to_owned()),
                 );
-                return super::WorkspaceSearchApply::Terminal;
+                return super::WorkspaceSearchApply::Superseded;
+            }
+            Ok(bsl_search::FenceOutcome::Released) => {
+                tracing::warn!("workspace overlay semantic warmup released");
+                return super::WorkspaceSearchApply::Released;
             }
             Err(error) => {
                 tracing::warn!("workspace overlay semantic warmup failed: {error}");
@@ -658,7 +672,7 @@ impl SharedState {
                 overlay_warmup,
                 OverlayWarmupState::Failed("workspace ownership lost at publish".to_owned()),
             );
-            return super::WorkspaceSearchApply::Terminal;
+            return super::WorkspaceSearchApply::Released;
         }
         let mut prepared = match search_engine.lock() {
             Ok(guard) => match guard.as_ref() {
@@ -690,7 +704,7 @@ impl SharedState {
         };
         let published = loop {
             if !keep_going() {
-                return super::WorkspaceSearchApply::Terminal;
+                return super::WorkspaceSearchApply::Released;
             }
             #[cfg(test)]
             if FORCE_OVERLAY_PUBLICATION_REFUSALS
@@ -716,14 +730,17 @@ impl SharedState {
                 super::WorkspaceSearchApply::TransientRefusal => {
                     return super::WorkspaceSearchApply::TransientRefusal
                 }
-                super::WorkspaceSearchApply::Terminal => {
+                super::WorkspaceSearchApply::Superseded => {
                     Self::set_overlay_warmup_state(
                         overlay_warmup,
                         OverlayWarmupState::Failed(
                             "workspace ownership lost at publish".to_owned(),
                         ),
                     );
-                    return super::WorkspaceSearchApply::Terminal;
+                    return super::WorkspaceSearchApply::Superseded;
+                }
+                super::WorkspaceSearchApply::Released => {
+                    return super::WorkspaceSearchApply::Released;
                 }
                 super::WorkspaceSearchApply::OperationError(error) => break Err(error),
             }
@@ -885,7 +902,7 @@ impl SharedState {
                         (),
                         Result<(), bsl_search::SearchError>,
                     >| {
-                        Self::search_fence_outcome(lease.with_ownership_checkpointed(operation))
+                        Self::search_fence_outcome(lease.publish_checkpointed(operation))
                     };
                     engine.refresh_dirty_contexts_fenced(
                         &provider,
@@ -927,7 +944,12 @@ impl SharedState {
         // Re-rendered chunks had their live embedding NULLed; without a re-embed they serve
         // the OLD vector in-process and vanish from semantic results after a restart until
         // the boot pass. Kick the same background embed machinery workspace init uses.
-        if stats.cleared_embeddings > 0 && !matches!(outcome, bsl_search::FenceOutcome::Terminal) {
+        if stats.cleared_embeddings > 0
+            && !matches!(
+                outcome,
+                bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released
+            )
+        {
             Self::kick_context_reembed(
                 engine,
                 semantic_runtime,
@@ -1043,7 +1065,8 @@ impl SharedState {
                 let mut status_guard = EmbedStatusGuard::new(Arc::clone(&runtime));
                 #[cfg(test)]
                 let mut apply_count = 0usize;
-                let mut publish_retry = PublishRetryWindow::default();
+                let mut publish_retry =
+                    RetryWindow::with_budget(RetryOwner::OverlayEmbedding, publish_retry_budget);
                 tracing::info!(
                     publish_retry_budget_secs = publish_retry_budget.as_secs(),
                     "background embedding pass started"
@@ -1081,15 +1104,31 @@ impl SharedState {
                                 {
                                     hook(EmbedFencePoint::Apply(apply_count));
                                 }
+                                let forced = if apply_count == 1 {
+                                    &FORCE_EMBED_PREFLIGHT_REFUSALS
+                                } else {
+                                    &FORCE_EMBED_PUBLICATION_REFUSALS
+                                };
+                                if forced
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                                        remaining.checked_sub(1)
+                                    })
+                                    .is_ok()
+                                {
+                                    return bsl_search::FenceOutcome::TransientRefusal;
+                                }
                             }
                             Self::search_fence_outcome(
-                                worker_lease.with_ownership_outcome(operation),
+                                worker_lease.publish_short(&mut (), |_| operation()),
                             )
                         },
                         || {
                             let now = Instant::now();
-                            let Some(delay) = publish_retry.refused(now, publish_retry_budget) else {
-                                return false;
+                            let bounded_delay =
+                                super::overlay_retry::retry_delay(publish_retry.streak());
+                            let delay = match publish_retry.refused(now, bounded_delay) {
+                                RetryDecision::RetryAfter(delay) => delay,
+                                RetryDecision::Stop(_) => return false,
                             };
                             std::thread::sleep(delay);
                             !publish_retry.expired(Instant::now())
@@ -1104,11 +1143,18 @@ impl SharedState {
                             {
                                 hook(EmbedFencePoint::Swap);
                             }
+                            let mut prepared_index = Some(index);
                             let swapped = match engine.lock() {
                                 Ok(mut guard) => match guard.as_mut() {
-                                    Some(engine) => worker_lease.with_ownership_outcome(|| {
-                                        engine.set_vector_index(index)
-                                    }),
+                                    Some(engine) => worker_lease.publish_short(
+                                        &mut prepared_index,
+                                        |prepared| {
+                                            engine.set_vector_index(
+                                                prepared.take().expect("prepared index exists"),
+                                            );
+                                            Ok::<_, std::convert::Infallible>(())
+                                        },
+                                    ),
                                     None => {
                                         tracing::warn!("embedding pass: engine unavailable");
                                         Self::set_semantic_runtime_status(
@@ -1134,7 +1180,7 @@ impl SharedState {
                                 }
                             };
                             match swapped {
-                                crate::workspace_lease::LeaseOutcome::Applied(()) => {
+                                crate::workspace_lease::LeaseOperationOutcome::Applied(()) => {
                                     #[cfg(test)]
                                     {
                                         let mut hook = EMBED_POST_PASS_HOOK
@@ -1145,10 +1191,11 @@ impl SharedState {
                                         }
                                     }
                                 }
-                                crate::workspace_lease::LeaseOutcome::TransientRefusal => {
+                                crate::workspace_lease::LeaseOperationOutcome::TransientRefusal => {
                                     retry_refusal = true;
                                 }
-                                crate::workspace_lease::LeaseOutcome::Terminal => {
+                                crate::workspace_lease::LeaseOperationOutcome::Superseded
+                                | crate::workspace_lease::LeaseOperationOutcome::Released => {
                                     Self::set_semantic_runtime_status(
                                         &runtime,
                                         SemanticRuntimeStatus::Failed(
@@ -1159,12 +1206,27 @@ impl SharedState {
                                     status_guard.finish();
                                     return;
                                 }
+                                crate::workspace_lease::LeaseOperationOutcome::OperationError(
+                                    error,
+                                ) => {
+                                    Self::set_semantic_runtime_status(
+                                        &runtime,
+                                        SemanticRuntimeStatus::Failed(format!(
+                                            "embedding publication failed: {error:?}"
+                                        )),
+                                    );
+                                    status_guard.finish();
+                                    return;
+                                }
                             }
                         }
                         Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                             retry_refusal = true;
                         }
-                        Ok(bsl_search::FenceOutcome::Terminal) => {
+                        Ok(
+                            bsl_search::FenceOutcome::Superseded
+                            | bsl_search::FenceOutcome::Released,
+                        ) => {
                             Self::set_semantic_runtime_status(
                                 &runtime,
                                 SemanticRuntimeStatus::Failed(
@@ -1188,12 +1250,13 @@ impl SharedState {
                         }
                     }
                     let retry_wait = if retry_refusal {
-                        match publish_retry.refused(Instant::now(), publish_retry_budget) {
-                            Some(delay) => {
+                        let delay = super::overlay_retry::retry_delay(publish_retry.streak());
+                        match publish_retry.refused(Instant::now(), delay) {
+                            RetryDecision::RetryAfter(delay) => {
                                 let _ = flight.claim();
                                 Some(delay)
                             }
-                            None => {
+                            RetryDecision::Stop(_) => {
                                 Self::set_semantic_runtime_status(
                                     &runtime,
                                     SemanticRuntimeStatus::Failed(
@@ -1205,7 +1268,7 @@ impl SharedState {
                             }
                         }
                     } else {
-                        publish_retry.reset();
+                        publish_retry.complete();
                         None
                     };
                     if !flight.finish_pass() {
@@ -1247,6 +1310,133 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::tempdir;
+
+    struct ResetEmbeddingRefusals;
+
+    impl Drop for ResetEmbeddingRefusals {
+        fn drop(&mut self) {
+            super::FORCE_EMBED_PREFLIGHT_REFUSALS.store(0, Ordering::SeqCst);
+            super::FORCE_EMBED_PUBLICATION_REFUSALS.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn seed_pending_embedding(path: &std::path::Path) {
+        use bsl_search::{Chunk, ChunkKind, Store};
+
+        Store::open(path)
+            .unwrap()
+            .reindex_file_with_context(
+                bsl_search::CONFIGURATION_ROOT_ID,
+                "A.bsl",
+                b"h",
+                &[Chunk {
+                    kind: ChunkKind::Procedure,
+                    name: "Альфа".to_owned(),
+                    is_export: true,
+                    annotations: Vec::new(),
+                    line_start: 0,
+                    line_end: 1,
+                    text: "Процедура Альфа()\nКонецПроцедуры".to_owned(),
+                }],
+                None,
+                Some(&[None]),
+            )
+            .unwrap();
+    }
+
+    fn wait_for_embed_flight(flight: &super::EmbedFlight) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while flight.is_in_flight() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!flight.is_in_flight(), "embedding pass did not finish");
+    }
+
+    fn spawn_counting_embedding_server() -> (String, Arc<AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut chunk = [0; 2048];
+                let mut header_end = None;
+                let mut content_len = 0;
+                while let Ok(read) = stream.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if header_end.is_none() {
+                        if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                            header_end = Some(end + 4);
+                            let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                            content_len = headers
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse().ok())
+                                .unwrap_or(0);
+                        }
+                    }
+                    if header_end.is_some_and(|end| request.len() >= end + content_len) {
+                        break;
+                    }
+                }
+                observed.fetch_add(1, Ordering::SeqCst);
+                let inputs = header_end
+                    .and_then(|end| {
+                        serde_json::from_slice::<serde_json::Value>(&request[end..]).ok()
+                    })
+                    .and_then(|value| value.get("input")?.as_array().map(Vec::len))
+                    .unwrap_or(1);
+                let data: Vec<_> = (0..inputs)
+                    .map(|index| serde_json::json!({"index": index, "embedding": [1.0, 0.0, 0.0]}))
+                    .collect();
+                let body = serde_json::json!({"data": data}).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    fn start_test_embed(
+        cache: &crate::cache::WorkspaceCacheLayout,
+        server: &str,
+        budget: Duration,
+    ) -> (
+        super::SharedSearchEngine,
+        Arc<Mutex<crate::state::SemanticRuntimeStatus>>,
+        Arc<super::EmbedFlight>,
+    ) {
+        cache.ensure().unwrap();
+        let db_path = cache.search_db_path();
+        seed_pending_embedding(&db_path);
+        let engine = Arc::new(Mutex::new(Some(
+            SearchEngine::new(&db_path, mock_semantic_config(server)).unwrap(),
+        )));
+        let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
+        let flight = super::EmbedFlight::new();
+        SharedState::spawn_embed_pass(
+            Arc::clone(&engine),
+            Arc::clone(&runtime),
+            bsl_search::IndexProgress::new(),
+            Arc::clone(&flight),
+            crate::workspace_lease::WorkspaceLease::claim_cache(cache),
+            db_path,
+            mock_semantic_config(server),
+            budget,
+        );
+        (engine, runtime, flight)
+    }
 
     /// The extension topology recorded in the graph database a test just built — what a real
     /// publish would put in its signal, and what the refresh checks the file against.
@@ -3130,6 +3320,67 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(both, "the rerun loop embedded the chunk created after the pass started");
+    }
+
+    #[test]
+    fn failed_typed_preflight_makes_zero_network_calls() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _reset = ResetEmbeddingRefusals;
+        let (server, calls) = spawn_counting_embedding_server();
+        let dir = tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        super::FORCE_EMBED_PREFLIGHT_REFUSALS.store(1, Ordering::SeqCst);
+
+        let (_, runtime, flight) = start_test_embed(&cache, &server, Duration::ZERO);
+        wait_for_embed_flight(&flight);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            &*runtime.lock().unwrap(),
+            crate::state::SemanticRuntimeStatus::Failed(message)
+                if message.contains("retry budget exhausted")
+        ));
+    }
+
+    #[test]
+    fn prepared_vectors_survive_transient_publish_without_second_call() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _reset = ResetEmbeddingRefusals;
+        let (server, calls) = spawn_counting_embedding_server();
+        let dir = tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        super::FORCE_EMBED_PUBLICATION_REFUSALS.store(1, Ordering::SeqCst);
+
+        let (engine, runtime, flight) = start_test_embed(&cache, &server, Duration::from_secs(1));
+        wait_for_embed_flight(&flight);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(*runtime.lock().unwrap(), crate::state::SemanticRuntimeStatus::Ready));
+        assert_eq!(engine.lock().unwrap().as_ref().unwrap().vector_count(), 1);
+        assert!(bsl_search::Store::open_existing(&cache.search_db_path())
+            .unwrap()
+            .load_pending_embedding_documents("code")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn publication_deadline_moves_runtime_to_failed() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _reset = ResetEmbeddingRefusals;
+        let (server, _) = spawn_counting_embedding_server();
+        let dir = tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        super::FORCE_EMBED_PREFLIGHT_REFUSALS.store(1, Ordering::SeqCst);
+
+        let (_, runtime, flight) = start_test_embed(&cache, &server, Duration::ZERO);
+        wait_for_embed_flight(&flight);
+
+        assert!(matches!(
+            &*runtime.lock().unwrap(),
+            crate::state::SemanticRuntimeStatus::Failed(message)
+                if message.contains("retry budget exhausted")
+        ));
     }
 
     #[test]

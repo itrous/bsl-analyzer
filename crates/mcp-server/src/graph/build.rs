@@ -7,7 +7,7 @@ use bsl_search::SearchEngine;
 #[cfg(test)]
 use crate::cache::graph_db_path;
 use crate::graph_query::GraphDb;
-use crate::workspace_lease::LeaseOutcome;
+use crate::workspace_lease::{LeaseOperationError, LeaseOperationOutcome};
 
 #[cfg(test)]
 use super::input::GRAPH_SOURCE_ROOT;
@@ -26,7 +26,8 @@ pub(super) const GRAPH_BUILD_BATCH: usize = 500;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LoadFailureReason {
     TransientRefusal,
-    Terminal,
+    Superseded,
+    Released,
     OperationError,
 }
 
@@ -55,24 +56,33 @@ impl std::fmt::Display for LoadFailure {
 impl std::error::Error for LoadFailure {}
 
 fn install_failure(
-    outcome: LeaseOutcome<Result<(), SnapshotInstallError>>,
+    outcome: LeaseOperationOutcome<(), SnapshotInstallError>,
 ) -> Result<(), LoadFailure> {
     match outcome {
-        LeaseOutcome::Applied(Ok(())) => Ok(()),
-        LeaseOutcome::Applied(Err(SnapshotInstallError::Changed)) => Err(LoadFailure::new(
-            LoadFailureReason::TransientRefusal,
+        LeaseOperationOutcome::Applied(()) => Ok(()),
+        LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+            SnapshotInstallError::Changed,
+        )) => Err(LoadFailure::new(
+            LoadFailureReason::OperationError,
             "graph path changed before the prepared snapshot pool could be installed",
         )),
-        LeaseOutcome::Applied(Err(SnapshotInstallError::Operation(message))) => {
-            Err(LoadFailure::new(LoadFailureReason::OperationError, message))
+        LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+            SnapshotInstallError::Operation(message),
+        )) => Err(LoadFailure::new(LoadFailureReason::OperationError, message)),
+        LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
+            Err(LoadFailure::operation(error))
         }
-        LeaseOutcome::TransientRefusal => Err(LoadFailure::new(
+        LeaseOperationOutcome::TransientRefusal => Err(LoadFailure::new(
             LoadFailureReason::TransientRefusal,
             "workspace cache ownership was temporarily unavailable during graph snapshot install",
         )),
-        LeaseOutcome::Terminal => Err(LoadFailure::new(
-            LoadFailureReason::Terminal,
-            "workspace cache ownership ended before graph snapshot install",
+        LeaseOperationOutcome::Superseded => Err(LoadFailure::new(
+            LoadFailureReason::Superseded,
+            "workspace cache ownership was superseded before graph snapshot install",
+        )),
+        LeaseOperationOutcome::Released => Err(LoadFailure::new(
+            LoadFailureReason::Released,
+            "workspace cache ownership was released before graph snapshot install",
         )),
     }
 }
@@ -180,7 +190,10 @@ impl GraphState {
         if self.is_superseded() {
             self.record_load_failure(
                 is_reload,
-                LoadFailure::new(LoadFailureReason::Terminal, super::types::SUPERSEDED_GRAPH_ERROR),
+                LoadFailure::new(
+                    LoadFailureReason::Superseded,
+                    super::types::SUPERSEDED_GRAPH_ERROR,
+                ),
             );
             return;
         }
@@ -230,32 +243,6 @@ impl GraphState {
                     self.record_load_failure(is_reload, failure);
                     return;
                 }
-            }
-        }
-
-        // Everything below writes the shared graph database. Transient non-ownership may re-arm
-        // later; terminal supersession was rejected before either cache-adoption path above.
-        match self.lease.with_ownership_outcome(|| ()) {
-            LeaseOutcome::Applied(()) => {}
-            LeaseOutcome::TransientRefusal => {
-                self.record_load_failure(
-                    is_reload,
-                    LoadFailure::new(
-                        LoadFailureReason::TransientRefusal,
-                        "workspace cache ownership is temporarily unavailable; graph build deferred",
-                    ),
-                );
-                return;
-            }
-            LeaseOutcome::Terminal => {
-                self.record_load_failure(
-                    is_reload,
-                    LoadFailure::new(
-                        LoadFailureReason::Terminal,
-                        "workspace cache ownership ended before the graph build started",
-                    ),
-                );
-                return;
             }
         }
 
@@ -548,9 +535,9 @@ impl GraphState {
                     None,
                 )) {
                     return match error.reason {
-                        LoadFailureReason::TransientRefusal | LoadFailureReason::Terminal => {
-                            PublishAttemptOutcome::Refused(error)
-                        }
+                        LoadFailureReason::TransientRefusal
+                        | LoadFailureReason::Superseded
+                        | LoadFailureReason::Released => PublishAttemptOutcome::Refused(error),
                         LoadFailureReason::OperationError => PublishAttemptOutcome::FallBack,
                     };
                 }
@@ -568,9 +555,9 @@ impl GraphState {
                 tracing::warn!("incremental reload failed, falling back to full rebuild: {e}");
                 let _ = std::fs::remove_file(&tmp_path);
                 match e.reason {
-                    LoadFailureReason::TransientRefusal | LoadFailureReason::Terminal => {
-                        PublishAttemptOutcome::Refused(e)
-                    }
+                    LoadFailureReason::TransientRefusal
+                    | LoadFailureReason::Superseded
+                    | LoadFailureReason::Released => PublishAttemptOutcome::Refused(e),
                     LoadFailureReason::OperationError => PublishAttemptOutcome::FallBack,
                 }
             }
@@ -591,7 +578,7 @@ impl GraphState {
     ) -> PublishAttemptOutcome {
         if self.is_superseded() {
             return PublishAttemptOutcome::Refused(LoadFailure::new(
-                LoadFailureReason::Terminal,
+                LoadFailureReason::Superseded,
                 super::types::SUPERSEDED_GRAPH_ERROR,
             ));
         }
@@ -666,7 +653,7 @@ impl GraphState {
     ) -> PublishAttemptOutcome {
         if self.is_superseded() {
             return PublishAttemptOutcome::Refused(LoadFailure::new(
-                LoadFailureReason::Terminal,
+                LoadFailureReason::Superseded,
                 super::types::SUPERSEDED_GRAPH_ERROR,
             ));
         }
@@ -752,7 +739,15 @@ impl GraphState {
     /// build failures stay terminal.
     pub(super) fn record_load_failure(&self, is_reload: bool, failure: LoadFailure) {
         if failure.reason == LoadFailureReason::TransientRefusal {
-            self.withheld_build.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut retry = lock_recover(&self.graph_retry);
+            let window = retry.get_or_insert_with(|| {
+                crate::state::retry_window::RetryWindow::new(
+                    crate::state::retry_window::RetryOwner::Graph,
+                )
+            });
+            let _ = window.refused(std::time::Instant::now(), std::time::Duration::ZERO);
+        } else {
+            *lock_recover(&self.graph_retry) = None;
         }
         let mut inner = lock_recover(&self.inner);
         if is_reload {
@@ -919,9 +914,14 @@ fn publish_or_discard(
     tmp_path: &Path,
     out_path: &Path,
 ) -> Result<(), LoadFailure> {
-    match graph.lease.with_ownership_outcome(|| std::fs::rename(tmp_path, out_path)) {
-        LeaseOutcome::Applied(renamed) => renamed.map_err(LoadFailure::operation),
-        LeaseOutcome::TransientRefusal => {
+    match graph.lease.publish_short(&mut (), |_| std::fs::rename(tmp_path, out_path)) {
+        LeaseOperationOutcome::Applied(()) => Ok(()),
+        LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(error))
+        | LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
+            let _ = std::fs::remove_file(tmp_path);
+            Err(LoadFailure::operation(error))
+        }
+        LeaseOperationOutcome::TransientRefusal => {
             let _ = std::fs::remove_file(tmp_path);
             Err(LoadFailure::new(
                 LoadFailureReason::TransientRefusal,
@@ -929,11 +929,18 @@ fn publish_or_discard(
                  when the graph build finished; the build was discarded instead of published",
             ))
         }
-        LeaseOutcome::Terminal => {
+        LeaseOperationOutcome::Superseded => {
             let _ = std::fs::remove_file(tmp_path);
             Err(LoadFailure::new(
-                LoadFailureReason::Terminal,
-                "workspace cache ownership ended before the graph build could be published",
+                LoadFailureReason::Superseded,
+                "workspace cache ownership was superseded before the graph build could be published",
+            ))
+        }
+        LeaseOperationOutcome::Released => {
+            let _ = std::fs::remove_file(tmp_path);
+            Err(LoadFailure::new(
+                LoadFailureReason::Released,
+                "workspace cache ownership was released before the graph build could be published",
             ))
         }
     }
@@ -1054,21 +1061,36 @@ impl ide::FusedChunkSink for FusedChunkWriter<'_> {
             {
                 continue;
             }
-            match self.lease.with_ownership_checkpointed(|checkpoint| {
+            match self.lease.publish_checkpointed(|checkpoint| {
                 self.engine.ingest_fused_file_checkpointed(&key, &hash, chunks, ctxs, checkpoint)
             }) {
-                LeaseOutcome::Applied(result) => result?,
-                LeaseOutcome::TransientRefusal => {
+                LeaseOperationOutcome::Applied(()) => {}
+                LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(error)) => {
+                    self.failure = Some(LoadFailure::operation(&error));
+                    return Err(error.into());
+                }
+                LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
+                    self.failure = Some(LoadFailure::operation(error));
+                    return Err(std::io::Error::other("fused ingest stopped").into());
+                }
+                LeaseOperationOutcome::TransientRefusal => {
                     self.failure = Some(LoadFailure::new(
                         LoadFailureReason::TransientRefusal,
                         "workspace cache ownership was temporarily refused during fused ingest",
                     ));
                     return Err(std::io::Error::other("fused ingest stopped").into());
                 }
-                LeaseOutcome::Terminal => {
+                LeaseOperationOutcome::Superseded => {
                     self.failure = Some(LoadFailure::new(
-                        LoadFailureReason::Terminal,
-                        "workspace cache ownership ended during fused ingest",
+                        LoadFailureReason::Superseded,
+                        "workspace cache ownership was superseded during fused ingest",
+                    ));
+                    return Err(std::io::Error::other("fused ingest stopped").into());
+                }
+                LeaseOperationOutcome::Released => {
+                    self.failure = Some(LoadFailure::new(
+                        LoadFailureReason::Released,
+                        "workspace cache ownership was released during fused ingest",
                     ));
                     return Err(std::io::Error::other("fused ingest stopped").into());
                 }
@@ -1291,7 +1313,7 @@ mod tests {
         let error = graph
             .run_fused_cold_build(&mut engine, root, 0)
             .expect_err("takeover after the first file must stop fused ingest");
-        assert!(error.to_string().contains("ownership ended"), "{error}");
+        assert!(error.to_string().contains("ownership was superseded"), "{error}");
         assert!(lease.is_superseded(), "the second file's fence observes the new owner");
         assert_eq!(
             engine.store().all_files_in_collection("code").unwrap().len(),
@@ -1348,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_publish_refusal_rearms_after_ownership_returns() {
+    fn original_transient_arms_withheld_build_until_trigger() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
@@ -1366,13 +1388,20 @@ mod tests {
 
         assert_eq!(error.reason, LoadFailureReason::TransientRefusal);
         graph.record_load_failure(false, error);
-        assert!(graph.withheld_build.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(
-            lease.with_ownership_outcome(|| "ownership returned"),
-            LeaseOutcome::Applied("ownership returned")
-        );
+        assert!(lock_recover(&graph.graph_retry).is_some());
+        assert!(matches!(
+            lease.publish_short(&mut (), |_| Ok::<_, std::convert::Infallible>(
+                "ownership returned"
+            )),
+            LeaseOperationOutcome::Applied("ownership returned")
+        ));
         assert!(!temp.exists());
         assert!(!canonical.exists());
+
+        graph.ensure_loading();
+        assert!(!matches!(graph.status(), GraphStatus::Failed(_)));
+        wait_ready(&graph);
+        assert!(lock_recover(&graph.graph_retry).is_none());
     }
 
     #[test]
@@ -1395,9 +1424,9 @@ mod tests {
             &released_cache.root().join("released.db"),
         )
         .unwrap_err();
-        assert_eq!(released_error.reason, LoadFailureReason::Terminal);
+        assert_eq!(released_error.reason, LoadFailureReason::Released);
         released_graph.record_load_failure(false, released_error);
-        assert!(!released_graph.withheld_build.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock_recover(&released_graph.graph_retry).is_none());
 
         let superseded_dir = tempfile::tempdir().unwrap();
         let superseded_cache =
@@ -1418,14 +1447,14 @@ mod tests {
             &superseded_cache.root().join("superseded.db"),
         )
         .unwrap_err();
-        assert_eq!(superseded_error.reason, LoadFailureReason::Terminal);
+        assert_eq!(superseded_error.reason, LoadFailureReason::Superseded);
         superseded_graph.record_load_failure(false, superseded_error);
-        assert!(!superseded_graph.withheld_build.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock_recover(&superseded_graph.graph_retry).is_none());
         newer.release();
     }
 
     #[test]
-    fn rename_error_stays_operational_when_a_later_probe_would_refuse() {
+    fn operation_error_is_not_reclassified_by_later_probe() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
@@ -1442,7 +1471,7 @@ mod tests {
         graph.record_load_failure(false, error);
         drop(held);
 
-        assert!(!graph.withheld_build.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock_recover(&graph.graph_retry).is_none());
     }
 
     /// Driven through the real cold-build entry point, not through the walk it happens
@@ -1500,7 +1529,12 @@ mod tests {
             GraphStatus::Ready { files: built.files },
             None,
         );
-        assert_eq!(fresh_install, LeaseOutcome::Applied(Err(SnapshotInstallError::Changed)));
+        assert!(matches!(
+            fresh_install,
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                SnapshotInstallError::Changed
+            ))
+        ));
         assert!(fresh.snapshot().is_none(), "fresh publish never becomes ready");
 
         let clean_dir = tempfile::tempdir().unwrap();
@@ -1514,7 +1548,7 @@ mod tests {
             panic!("clean adoption must preserve the final install refusal")
         };
         clean.record_load_failure(false, failure);
-        assert!(clean.withheld_build.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock_recover(&clean.graph_retry).is_none());
         assert!(clean.snapshot().is_none(), "clean adoption never becomes ready");
 
         let stale_dir = tempfile::tempdir().unwrap();
@@ -1531,7 +1565,7 @@ mod tests {
             panic!("stale adoption must preserve the final install refusal")
         };
         stale.record_load_failure(false, failure);
-        assert!(stale.withheld_build.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock_recover(&stale.graph_retry).is_none());
         assert!(stale.snapshot().is_none(), "stale adoption never becomes ready");
     }
 
@@ -1553,10 +1587,7 @@ mod tests {
 
         assert!(matches!(
             graph.try_incremental_reload(root, 2, 0),
-            PublishAttemptOutcome::Refused(LoadFailure {
-                reason: LoadFailureReason::TransientRefusal,
-                ..
-            })
+            PublishAttemptOutcome::FallBack
         ));
         assert_eq!(
             graph.snapshot().map(|snapshot| snapshot.generation),
@@ -1578,12 +1609,12 @@ mod tests {
         graph.run_load(false);
 
         assert!(matches!(graph.status(), GraphStatus::Ready { .. }));
-        assert!(!graph.withheld_build.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock_recover(&graph.graph_retry).is_none());
         assert!(graph.snapshot().is_some(), "the invalid cache fell back to a real build");
     }
 
     #[test]
-    fn full_reload_install_refusal_keeps_the_old_snapshot_and_rearms() {
+    fn full_reload_install_failure_keeps_the_old_snapshot_without_transient_retry() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
@@ -1596,7 +1627,7 @@ mod tests {
         graph.run_load(true);
 
         assert_eq!(graph.snapshot().map(|snapshot| snapshot.generation), Some(1));
-        assert!(graph.withheld_build.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock_recover(&graph.graph_retry).is_none());
         assert!(matches!(
             lock_recover(&graph.inner).published.as_ref().unwrap().reload,
             ReloadState::Failed(_)
@@ -2085,7 +2116,7 @@ mod tests {
         };
         assert_eq!(failure.reason, LoadFailureReason::TransientRefusal);
         graph.record_load_failure(true, failure);
-        assert!(graph.withheld_build.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock_recover(&graph.graph_retry).is_some());
     }
 
     /// A cached build whose fingerprint no longer matches the workspace (it moved

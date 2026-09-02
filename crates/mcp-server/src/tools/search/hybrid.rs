@@ -1,6 +1,6 @@
-use super::lexical::lexical_code_hits_fenced;
+use super::lexical::lexical_code_hits;
 use super::render::{format_code_hits, hits_response, no_hits_response, Envelope};
-use super::semantic::semantic_code_hits_fenced;
+use super::semantic::semantic_code_hits;
 use super::status::search_not_ready;
 use super::types::{CodeHits, SearchFailure, HYBRID_FETCH_MULTIPLIER};
 use crate::baseline::{ConfiguredBaselineStatus, ExternalBaselineService};
@@ -49,9 +49,8 @@ pub fn hybrid_code(
     limit: usize,
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
-    hybrid_code_fenced(
+    hybrid_code_cancellable(
         engine,
-        &crate::workspace_lease::WorkspaceLease::unmanaged(),
         &CancellationToken::new(),
         semantic_runtime,
         workspace_search_mode,
@@ -70,9 +69,8 @@ pub fn hybrid_code(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn hybrid_code_fenced(
+pub fn hybrid_code_cancellable(
     engine: &Arc<Mutex<Option<SearchEngine>>>,
-    lease: &crate::workspace_lease::WorkspaceLease,
     cancel: &CancellationToken,
     semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
     workspace_search_mode: WorkspaceSearchMode,
@@ -88,9 +86,8 @@ pub fn hybrid_code_fenced(
     // other can still surface after fusion.
     let fetch = limit.saturating_mul(HYBRID_FETCH_MULTIPLIER).max(limit);
 
-    let lexical = lexical_code_hits_fenced(
+    let lexical = lexical_code_hits(
         engine,
-        lease,
         cancel,
         workspace_search_mode.clone(),
         configured_baseline,
@@ -122,9 +119,8 @@ pub fn hybrid_code_fenced(
     if cancel.is_cancelled() {
         return Err(SearchFailure::Cancelled);
     }
-    let semantic = semantic_code_hits_fenced(
+    let semantic = semantic_code_hits(
         engine,
-        lease,
         cancel,
         semantic_runtime,
         workspace_search_mode,
@@ -194,45 +190,24 @@ fn assemble_code_response(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::lexical::lexical_code_hits_fenced;
-    use super::super::semantic::semantic_code_hits_fenced;
+pub(super) mod tests {
+    use super::super::lexical::lexical_code_hits;
+    use super::super::semantic::semantic_code_hits;
     use super::super::test_support::{code_hit, retryable_postgres_source};
-    use super::{assemble_code_response, hybrid_code, hybrid_code_fenced};
+    use super::{assemble_code_response, hybrid_code};
     use crate::baseline::ConfiguredBaselineStatus;
     use crate::state::{SemanticRuntimeStatus, WorkspaceSearchMode};
-    use bsl_search::{
-        FileKey, FusedHit, IndexProgress, Modality, ModuleSnapshot, ModuleSnapshotSource,
-        SearchEngine, SnapshotFetch,
-    };
+    use bsl_search::{FileKey, FusedHit, IndexProgress, Modality, ModuleSnapshot, SearchEngine};
     use project_model::{ResolvedWorkspaceBaselineSupport, SearchBaselineSupportState};
     use rmcp::model::ErrorCode;
     use std::fs;
-    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
-    #[test]
-    fn search_code_does_not_write_after_supersession() {
-        struct TakeoverSource {
-            workspace: PathBuf,
-            newer: Mutex<Option<crate::workspace_lease::WorkspaceLease>>,
-        }
-
-        impl ModuleSnapshotSource for TakeoverSource {
-            fn text_and_parse(&self, path: &str) -> SnapshotFetch {
-                let text = fs::read_to_string(path).unwrap();
-                *self.newer.lock().unwrap() =
-                    Some(crate::workspace_lease::WorkspaceLease::claim(&self.workspace));
-                SnapshotFetch::Fetched(ModuleSnapshot {
-                    root: parser::parse(&text).syntax_node(),
-                    text: text.into(),
-                })
-            }
-        }
-
+    pub(in crate::tools::search) fn assert_all_search_modes_are_resident_only_under_held_lease() {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
         let file = workspace.join("CommonModule.bsl");
@@ -257,35 +232,17 @@ mod tests {
             .unwrap();
         let before_hash = engine.store().file_hash(&key.root_id, &key.path).unwrap();
 
-        let old = crate::workspace_lease::WorkspaceLease::claim(workspace);
-        engine.set_module_snapshot_source(Arc::new(TakeoverSource {
-            workspace: workspace.to_path_buf(),
-            newer: Mutex::new(None),
-        }));
+        let lease = crate::workspace_lease::WorkspaceLease::claim(workspace);
         let shared = Arc::new(Mutex::new(Some(engine)));
         let failed = Arc::new(Mutex::new(SemanticRuntimeStatus::Failed("test".to_owned())));
 
-        fs::remove_file(cache.lease_path()).unwrap();
-        let clean = lexical_code_hits_fenced(
-            &shared,
-            &old,
-            &CancellationToken::new(),
-            WorkspaceSearchMode::SqliteLocal,
-            None,
-            None,
-            "Предыдущая",
-            10,
-        )
-        .unwrap();
-        assert!(matches!(clean, super::super::types::CodeHits::Ready { .. }));
-        assert!(!cache.lease_path().exists(), "a clean snapshot read never opens the lease file");
-
         fs::write(&file, "Процедура Новая()\nКонецПроцедуры").unwrap();
         shared.lock().unwrap().as_ref().unwrap().mark_workspace_path_dirty(&file).unwrap();
+        let held_lease = lease.hold_file_lock_for_test();
+        let started = Instant::now();
 
-        let lexical = lexical_code_hits_fenced(
+        let lexical = lexical_code_hits(
             &shared,
-            &old,
             &CancellationToken::new(),
             WorkspaceSearchMode::SqliteLocal,
             None,
@@ -294,9 +251,8 @@ mod tests {
             10,
         )
         .unwrap();
-        let semantic = semantic_code_hits_fenced(
+        let semantic = semantic_code_hits(
             &shared,
-            &old,
             &CancellationToken::new(),
             &failed,
             WorkspaceSearchMode::SqliteLocal,
@@ -306,10 +262,10 @@ mod tests {
             10,
         )
         .unwrap();
-        let hybrid = hybrid_code_fenced(
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(held_lease);
+        let hybrid = hybrid_code(
             &shared,
-            &old,
-            &CancellationToken::new(),
             &failed,
             WorkspaceSearchMode::SqliteLocal,
             None,
@@ -330,7 +286,7 @@ mod tests {
         let hybrid_text = hybrid.content[0].as_text().unwrap().text.as_str();
         assert!(hybrid_text.contains("Предыдущая"), "{hybrid_text}");
         assert!(!hybrid_text.contains("Новая"), "{hybrid_text}");
-        assert!(old.is_superseded());
+        assert!(!lease.is_superseded());
 
         let guard = shared.lock().unwrap();
         let engine = guard.as_ref().unwrap();

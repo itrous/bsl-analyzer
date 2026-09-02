@@ -8,6 +8,7 @@
 //! bounded deadline; an operation failure waits for a new signal, while an incomplete scan or
 //! internally superseded overlay plan keeps the obligation alive.
 
+use super::retry_window::{RetryDecision, RetryOwner, RetryWindow};
 use super::types::{OverlayWarmupState, SemanticRuntimeStatus, SharedSearchEngine};
 use crate::workspace_lease::WorkspaceLease;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,32 +33,6 @@ pub(super) fn retry_delay(streak: u32) -> Duration {
         return Duration::ZERO;
     }
     TICK.checked_mul(1u32 << streak.min(6).saturating_sub(1)).map(|d| d.min(CAP)).unwrap_or(CAP)
-}
-
-#[derive(Default)]
-pub(super) struct PublishRetryWindow {
-    deadline: Option<Instant>,
-    streak: u32,
-}
-
-impl PublishRetryWindow {
-    pub(super) fn expired(&self, now: Instant) -> bool {
-        self.deadline.is_some_and(|deadline| now >= deadline)
-    }
-
-    pub(super) fn refused(&mut self, now: Instant, budget: Duration) -> Option<Duration> {
-        let deadline = *self.deadline.get_or_insert_with(|| now.checked_add(budget).unwrap_or(now));
-        if now >= deadline {
-            return None;
-        }
-        let delay = retry_delay(self.streak).min(deadline - now);
-        self.streak = self.streak.saturating_add(1);
-        Some(delay)
-    }
-
-    pub(super) fn reset(&mut self) {
-        *self = Self::default();
-    }
 }
 
 struct RetryState {
@@ -252,9 +227,7 @@ impl OverlayRetry {
     /// signal. An unpublished engine reads as "due" — the pass classifies it (a transient
     /// `Skipped` before the async init publishes, a backoff-paced retry after).
     fn should_run(&self, obligation: bool) -> bool {
-        if !self.lease.owns_caches_now() {
-            // A transient UNCLAIMED/lock refusal retries; the caller separately disarms only
-            // when this fresh check latched an irreversible foreign-owner observation.
+        if self.lease.is_superseded() {
             return false;
         }
         if obligation {
@@ -290,7 +263,8 @@ impl OverlayRetry {
             );
         }
         let stop = &self.stop;
-        let mut publish_retry = PublishRetryWindow::default();
+        let mut publish_retry =
+            RetryWindow::with_budget(RetryOwner::OverlayEmbedding, self.publish_retry_budget);
         let mut budget_exhausted = false;
         let mut outcome = super::SharedState::run_overlay_warmup(
             &self.engine,
@@ -299,9 +273,13 @@ impl OverlayRetry {
             &|| !stop.load(Ordering::SeqCst),
             &mut || {
                 let now = Instant::now();
-                let Some(delay) = publish_retry.refused(now, self.publish_retry_budget) else {
-                    budget_exhausted = true;
-                    return false;
+                let bounded_delay = retry_delay(publish_retry.streak());
+                let delay = match publish_retry.refused(now, bounded_delay) {
+                    RetryDecision::RetryAfter(delay) => delay,
+                    RetryDecision::Stop(_) => {
+                        budget_exhausted = true;
+                        return false;
+                    }
                 };
                 std::thread::sleep(delay);
                 if publish_retry.expired(Instant::now()) {
@@ -345,7 +323,7 @@ impl OverlayRetry {
                         )),
                     );
                 }
-                super::WorkspaceSearchApply::Terminal => {
+                super::WorkspaceSearchApply::Superseded => {
                     super::SharedState::set_semantic_runtime_status(
                         &self.semantic_runtime,
                         SemanticRuntimeStatus::Failed(
@@ -354,6 +332,7 @@ impl OverlayRetry {
                         ),
                     );
                 }
+                super::WorkspaceSearchApply::Released => {}
             }
         }
         outcome
@@ -409,7 +388,8 @@ impl OverlayRetry {
                     )),
                 );
             }
-            super::WorkspaceSearchApply::Terminal
+            super::WorkspaceSearchApply::Superseded
+            | super::WorkspaceSearchApply::Released
             | super::WorkspaceSearchApply::Applied(
                 OverlayWarmupState::Pending
                 | OverlayWarmupState::Skipped(_)
@@ -466,19 +446,22 @@ mod tests {
     #[test]
     fn publish_retry_window_keeps_one_deadline() {
         let start = Instant::now();
-        let mut retry = PublishRetryWindow::default();
-        assert_eq!(retry.refused(start, Duration::from_secs(10)), Some(Duration::ZERO));
-        let deadline = retry.deadline;
+        let mut retry =
+            RetryWindow::with_budget(RetryOwner::OverlayEmbedding, Duration::from_secs(10));
+        let delay = retry_delay(retry.streak());
+        assert_eq!(retry.refused(start, delay), RetryDecision::RetryAfter(Duration::ZERO));
+        let delay = retry_delay(retry.streak());
         assert_eq!(
-            retry.refused(start + Duration::from_secs(9), Duration::from_secs(10)),
-            Some(Duration::from_secs(1))
+            retry.refused(start + Duration::from_secs(9), delay),
+            RetryDecision::RetryAfter(Duration::from_secs(1))
         );
-        assert_eq!(retry.deadline, deadline, "later refusals cannot extend the obligation");
         assert!(retry.expired(start + Duration::from_secs(10)));
-        assert_eq!(retry.refused(start + Duration::from_secs(10), Duration::from_secs(10)), None);
+        assert!(matches!(
+            retry.refused(start + Duration::from_secs(10), Duration::ZERO),
+            RetryDecision::Stop(_)
+        ));
 
-        retry.reset();
-        assert_eq!(retry.deadline, None, "a later external pass gets a fresh budget");
+        assert!(retry.observe_external_work(true), "a later external pass gets a fresh budget");
     }
 
     fn state() -> RetryState {
@@ -577,7 +560,7 @@ mod tests {
         assert_eq!((s.streak, s.obligation, s.disarmed), (1, true, false), "transient skip");
 
         let mut s = state();
-        dummy.settle_outcome(&mut s, super::super::WorkspaceSearchApply::Terminal, 0);
+        dummy.settle_outcome(&mut s, super::super::WorkspaceSearchApply::Released, 0);
         assert!(s.disarmed, "terminal skip disarms");
     }
 
@@ -814,7 +797,7 @@ mod tests {
                 let retry = driver_over(Arc::new(Mutex::new(None)), lease.clone());
                 retry.kick_fresh();
                 std::thread::sleep(Duration::from_millis(100));
-                assert_eq!(retry.pass_count(), 0, "no pass starts while ownership is unavailable");
+                assert!(retry.pass_count() >= 1, "the workflow owns its admission attempt");
                 assert!(!lease.is_superseded(), "lock contention is not terminal");
                 (retry, lease)
             });
@@ -865,13 +848,22 @@ mod tests {
         let before = retry.pass_count();
         retry.kick_fresh();
         assert!(wait_for(5_000, || mine.is_superseded()), "the fresh check observes takeover");
-        assert_eq!(retry.pass_count(), before, "a superseded daemon runs no pass");
+        assert_eq!(
+            retry.pass_count(),
+            before + 1,
+            "one typed admission attempt observes the supersession"
+        );
+        let terminal_passes = retry.pass_count();
 
         // The newer daemon exits cleanly; the old process remains terminally read-only.
         newer.release();
         retry.kick_fresh();
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(retry.pass_count(), before, "owner release cannot re-arm a terminal driver");
+        assert_eq!(
+            retry.pass_count(),
+            terminal_passes,
+            "owner release cannot re-arm a terminal driver"
+        );
         assert!(matches!(*runtime.lock().unwrap(), SemanticRuntimeStatus::Failed(_)));
         retry.stop();
     }

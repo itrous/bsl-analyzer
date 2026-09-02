@@ -7,7 +7,8 @@ use crate::ports::{ModuleSnapshot, ModuleSnapshotSource, SnapshotCatalog, Snapsh
 use crate::publish::EmbeddingExecutionPolicy;
 use crate::resolver::{InMemoryResolvedViewResolver, ResolvedView};
 use crate::store::{
-    ContextRefreshMutation, Store, WorkspaceStoreTransition, WorkspaceTransitionFile,
+    ContextRefreshMutation, Store, WorkspaceDriftStoreOutcome, WorkspaceStoreTransition,
+    WorkspaceTransitionFile,
 };
 use crate::workspace_overlay::{
     lexical_hits, normalized_file_hash_for_indexed_documents, semantic_hits, BaselineHashMode,
@@ -102,7 +103,8 @@ pub struct ReferenceCollectionReplaceOutcome {
 pub enum FenceOutcome<T> {
     Applied(T),
     TransientRefusal,
-    Terminal,
+    Superseded,
+    Released,
 }
 
 #[doc(hidden)]
@@ -521,7 +523,7 @@ impl SearchEngine {
     pub fn new(db_path: &Path, config: SearchConfig) -> Result<Self, SearchError> {
         match Self::new_fenced(db_path, config, Self::permit_checkpointed_apply)? {
             FenceOutcome::Applied(engine) => Ok(engine),
-            FenceOutcome::TransientRefusal | FenceOutcome::Terminal => {
+            FenceOutcome::TransientRefusal | FenceOutcome::Superseded | FenceOutcome::Released => {
                 unreachable!("the permit-all constructor fence cannot refuse")
             }
         }
@@ -547,7 +549,8 @@ impl SearchEngine {
         let store = match Self::open_store_fenced(db_path, &mut apply)? {
             FenceOutcome::Applied(store) => store,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => return Ok(FenceOutcome::Released),
         };
         let dim = embedder_config.dim.unwrap_or(1024);
         let embedder = Embedder::new(embedder_config);
@@ -567,7 +570,8 @@ impl SearchEngine {
                 match persisted {
                     FenceOutcome::Applied(()) => prepared.finish(),
                     FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-                    FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+                    FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+                    FenceOutcome::Released => return Ok(FenceOutcome::Released),
                 }
             }
         }
@@ -577,7 +581,8 @@ impl SearchEngine {
         })? {
             FenceOutcome::Applied(()) => {}
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => return Ok(FenceOutcome::Released),
         }
 
         Ok(FenceOutcome::Applied(Self {
@@ -674,7 +679,8 @@ impl SearchEngine {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-                FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+                FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+                FenceOutcome::Released => return Ok(FenceOutcome::Released),
             }
         }
     }
@@ -699,7 +705,8 @@ impl SearchEngine {
         };
         match apply(&mut erased) {
             FenceOutcome::TransientRefusal => Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => Ok(FenceOutcome::Released),
             FenceOutcome::Applied(Err(error)) => Err(error),
             FenceOutcome::Applied(Ok(())) => value.map(FenceOutcome::Applied).ok_or_else(|| {
                 SearchError::Index(
@@ -769,7 +776,8 @@ impl SearchEngine {
         };
         match apply(&mut erased) {
             FenceOutcome::TransientRefusal => Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => Ok(FenceOutcome::Released),
             FenceOutcome::Applied(Err(error)) => Err(error),
             FenceOutcome::Applied(Ok(())) => value.map(FenceOutcome::Applied).ok_or_else(|| {
                 SearchError::Index(
@@ -894,7 +902,7 @@ impl SearchEngine {
     pub fn fts_only(db_path: &Path) -> Result<Self, SearchError> {
         match Self::fts_only_fenced(db_path, Self::permit_checkpointed_apply)? {
             FenceOutcome::Applied(engine) => Ok(engine),
-            FenceOutcome::TransientRefusal | FenceOutcome::Terminal => {
+            FenceOutcome::TransientRefusal | FenceOutcome::Superseded | FenceOutcome::Released => {
                 unreachable!("the permit-all constructor fence cannot refuse")
             }
         }
@@ -915,7 +923,8 @@ impl SearchEngine {
         let store = match Self::open_store_fenced(db_path, &mut apply)? {
             FenceOutcome::Applied(store) => store,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => return Ok(FenceOutcome::Released),
         };
         let dim = 1024;
         let index = VectorIndex::new(dim)?;
@@ -926,7 +935,8 @@ impl SearchEngine {
         })? {
             FenceOutcome::Applied(()) => {}
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => return Ok(FenceOutcome::Released),
         }
 
         Ok(FenceOutcome::Applied(Self {
@@ -955,7 +965,7 @@ impl SearchEngine {
             Self::permit_checkpointed_apply(apply)
         })? {
             FenceOutcome::Applied(engine) => Ok(engine),
-            FenceOutcome::TransientRefusal | FenceOutcome::Terminal => {
+            FenceOutcome::TransientRefusal | FenceOutcome::Superseded | FenceOutcome::Released => {
                 unreachable!("the permit-all constructor fence cannot refuse")
             }
         }
@@ -978,7 +988,8 @@ impl SearchEngine {
         let store = match Self::open_store_fenced(db_path, &mut apply)? {
             FenceOutcome::Applied(store) => store,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => return Ok(FenceOutcome::Released),
         };
         let dim = embedder_config.dim.unwrap_or(1024);
         let embedder = Embedder::new(embedder_config);
@@ -990,7 +1001,8 @@ impl SearchEngine {
         })? {
             FenceOutcome::Applied(()) => {}
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => return Ok(FenceOutcome::Released),
         }
 
         Ok(FenceOutcome::Applied(Self {
@@ -1441,7 +1453,8 @@ impl SearchEngine {
         Ok(match completed {
             FenceOutcome::Applied(()) => FenceOutcome::Applied(index),
             FenceOutcome::TransientRefusal => FenceOutcome::TransientRefusal,
-            FenceOutcome::Terminal => FenceOutcome::Terminal,
+            FenceOutcome::Superseded => FenceOutcome::Superseded,
+            FenceOutcome::Released => FenceOutcome::Released,
         })
     }
 
@@ -1502,7 +1515,7 @@ impl SearchEngine {
         for batch in items.chunks(batch_size) {
             if should_continue.is_some_and(|keep_going| !keep_going()) {
                 let (_, data) = store.load_all_embeddings_with_generation(dim)?;
-                return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Terminal));
+                return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Released));
             }
             match Self::fenced_value_retrying(apply, || Ok(()), retry_transient)? {
                 FenceOutcome::Applied(()) => {}
@@ -1510,9 +1523,13 @@ impl SearchEngine {
                     let (_, data) = store.load_all_embeddings_with_generation(dim)?;
                     return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::TransientRefusal));
                 }
-                FenceOutcome::Terminal => {
+                FenceOutcome::Superseded => {
                     let (_, data) = store.load_all_embeddings_with_generation(dim)?;
-                    return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Terminal));
+                    return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Superseded));
+                }
+                FenceOutcome::Released => {
+                    let (_, data) = store.load_all_embeddings_with_generation(dim)?;
+                    return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Released));
                 }
             }
 
@@ -1541,9 +1558,13 @@ impl SearchEngine {
                     let (_, data) = store.load_all_embeddings_with_generation(dim)?;
                     return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::TransientRefusal));
                 }
-                FenceOutcome::Terminal => {
+                FenceOutcome::Superseded => {
                     let (_, data) = store.load_all_embeddings_with_generation(dim)?;
-                    return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Terminal));
+                    return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Superseded));
+                }
+                FenceOutcome::Released => {
+                    let (_, data) = store.load_all_embeddings_with_generation(dim)?;
+                    return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Released));
                 }
             }
         }
@@ -1602,7 +1623,7 @@ impl SearchEngine {
             // The sidecar is a shared artifact like any other; a caller that may no longer
             // write leaves it to whoever may.
             if should_continue.is_some_and(|keep_going| !keep_going()) {
-                return Ok((index, FenceOutcome::Terminal));
+                return Ok((index, FenceOutcome::Released));
             }
             let persisted = if let Some(mut prepared) =
                 Self::prepare_built(store, dim, Some(embedder), &index, generation)
@@ -1713,7 +1734,7 @@ impl SearchEngine {
             // Asked between batches, never inside one: a pass over a large configuration runs
             // for hours, and the caller's right to write may not outlive it.
             if should_continue.is_some_and(|keep_going| !keep_going()) {
-                stopped = Some(FenceOutcome::Terminal);
+                stopped = Some(FenceOutcome::Released);
                 break;
             }
             match result {
@@ -1725,8 +1746,12 @@ impl SearchEngine {
                             stopped = Some(FenceOutcome::TransientRefusal);
                             break;
                         }
-                        FenceOutcome::Terminal => {
-                            stopped = Some(FenceOutcome::Terminal);
+                        FenceOutcome::Superseded => {
+                            stopped = Some(FenceOutcome::Superseded);
+                            break;
+                        }
+                        FenceOutcome::Released => {
+                            stopped = Some(FenceOutcome::Released);
                             break;
                         }
                     }
@@ -1757,7 +1782,7 @@ impl SearchEngine {
         let stopped = stopped.or_else(|| {
             should_continue
                 .is_some_and(|keep_going| !keep_going())
-                .then_some(FenceOutcome::Terminal)
+                .then_some(FenceOutcome::Released)
         });
         if let Some(outcome) = stopped {
             // The vectors already written stay — they were written while the caller still had
@@ -1783,7 +1808,8 @@ impl SearchEngine {
         match persisted {
             FenceOutcome::Applied(()) => {}
             FenceOutcome::TransientRefusal => return Ok((index, FenceOutcome::TransientRefusal)),
-            FenceOutcome::Terminal => return Ok((index, FenceOutcome::Terminal)),
+            FenceOutcome::Superseded => return Ok((index, FenceOutcome::Superseded)),
+            FenceOutcome::Released => return Ok((index, FenceOutcome::Released)),
         }
 
         info!(embedded, errors, total_vectors = index.len(), "fused embedding complete");
@@ -2012,7 +2038,8 @@ impl SearchEngine {
                         FenceOutcome::TransientRefusal => {
                             return Ok(FenceOutcome::TransientRefusal)
                         }
-                        FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+                        FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+                        FenceOutcome::Released => return Ok(FenceOutcome::Released),
                     }
                     result.indexed += 1;
                 }
@@ -2032,7 +2059,7 @@ impl SearchEngine {
     pub fn index_directory_deferred(&mut self, root: &Path) -> Result<usize, SearchError> {
         match self.index_directory_deferred_fenced(root, Self::permit_checkpointed_apply)? {
             FenceOutcome::Applied(indexed) => Ok(indexed),
-            FenceOutcome::TransientRefusal | FenceOutcome::Terminal => {
+            FenceOutcome::TransientRefusal | FenceOutcome::Superseded | FenceOutcome::Released => {
                 unreachable!("the permit-all ingest fence cannot refuse")
             }
         }
@@ -2055,7 +2082,8 @@ impl SearchEngine {
         let result = match self.ingest_boot_files_fenced(&bsl_files, true, &mut apply)? {
             FenceOutcome::Applied(result) => result,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => return Ok(FenceOutcome::Released),
         };
         info!(
             indexed = result.indexed,
@@ -2068,7 +2096,7 @@ impl SearchEngine {
     pub fn index_directory_fts(&mut self, root: &Path) -> Result<usize, SearchError> {
         match self.index_directory_fts_fenced(root, Self::permit_checkpointed_apply)? {
             FenceOutcome::Applied(indexed) => Ok(indexed),
-            FenceOutcome::TransientRefusal | FenceOutcome::Terminal => {
+            FenceOutcome::TransientRefusal | FenceOutcome::Superseded | FenceOutcome::Released => {
                 unreachable!("the permit-all ingest fence cannot refuse")
             }
         }
@@ -2090,7 +2118,8 @@ impl SearchEngine {
         Ok(match self.ingest_boot_files_fenced(&bsl_files, false, &mut apply)? {
             FenceOutcome::Applied(result) => FenceOutcome::Applied(result.indexed),
             FenceOutcome::TransientRefusal => FenceOutcome::TransientRefusal,
-            FenceOutcome::Terminal => FenceOutcome::Terminal,
+            FenceOutcome::Superseded => FenceOutcome::Superseded,
+            FenceOutcome::Released => FenceOutcome::Released,
         })
     }
 
@@ -2103,7 +2132,7 @@ impl SearchEngine {
     pub fn index_unindexed_roots_fts(&mut self) -> Result<usize, SearchError> {
         match self.index_unindexed_roots_fts_fenced(Self::permit_checkpointed_apply)? {
             FenceOutcome::Applied(indexed) => Ok(indexed),
-            FenceOutcome::TransientRefusal | FenceOutcome::Terminal => {
+            FenceOutcome::TransientRefusal | FenceOutcome::Superseded | FenceOutcome::Released => {
                 unreachable!("the permit-all ingest fence cannot refuse")
             }
         }
@@ -2150,7 +2179,8 @@ impl SearchEngine {
         Ok(match self.ingest_boot_files_fenced(&files, false, &mut apply)? {
             FenceOutcome::Applied(result) => FenceOutcome::Applied(result.indexed),
             FenceOutcome::TransientRefusal => FenceOutcome::TransientRefusal,
-            FenceOutcome::Terminal => FenceOutcome::Terminal,
+            FenceOutcome::Superseded => FenceOutcome::Superseded,
+            FenceOutcome::Released => FenceOutcome::Released,
         })
     }
 
@@ -2872,6 +2902,57 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// Apply one already-materialized drift slice. The host advances its cursors only after this
+    /// returns `Continue(Ok(_))`; cancellation rolls back every Store mutation in the slice.
+    pub fn apply_prepared_workspace_drift_batch(
+        &mut self,
+        dirty_keys: &[FileKey],
+        removed_keys: &[FileKey],
+        context_keys: &[FileKey],
+        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
+    ) -> ControlFlow<(), Result<usize, SearchError>> {
+        let rows = dirty_keys.len() + removed_keys.len() + context_keys.len();
+        if rows > WORKSPACE_APPLY_BATCH_ROWS {
+            return ControlFlow::Continue(Err(SearchError::Index(format!(
+                "workspace drift batch has {rows} rows; maximum is {WORKSPACE_APPLY_BATCH_ROWS}"
+            ))));
+        }
+        let mut cache = match self.workspace_overlay_cache.lock() {
+            Ok(cache) => cache,
+            Err(error) => {
+                return ControlFlow::Continue(Err(SearchError::Index(format!(
+                    "workspace overlay cache lock error: {error}"
+                ))));
+            }
+        };
+        let outcome =
+            match self.store.apply_workspace_drift_batch(removed_keys, context_keys, checkpoint) {
+                Ok(ControlFlow::Continue(outcome)) => outcome,
+                Ok(ControlFlow::Break(())) => return ControlFlow::Break(()),
+                Err(error) => return ControlFlow::Continue(Err(error)),
+            };
+        let WorkspaceDriftStoreOutcome { removed_chunk_ids, context_mark_seq } = outcome;
+        if let Some(seq) = context_mark_seq {
+            self.store.observe_committed_mark_seq(seq);
+        }
+        for chunk_id in removed_chunk_ids {
+            if let Err(error) = self.index.remove(chunk_id) {
+                tracing::warn!(chunk_id, "failed to evict a committed drift removal: {error}");
+            }
+        }
+        cache.enable_watcher_mode();
+        for key in dirty_keys {
+            cache.mark_dirty_path(key.clone());
+        }
+        for key in removed_keys {
+            cache.mark_dirty_path(key.clone());
+            // Local mode serves no baseline hits, so conservatively hiding a possible remote copy
+            // is correct without loading the workspace-sized manifest inside the publication.
+            cache.remove_known_deleted(key, true);
+        }
+        ControlFlow::Continue(Ok(removed_keys.len()))
+    }
+
     /// The store key of a workspace `.bsl` file, or `None` when it is not a
     /// `.bsl` or lies outside every registered root. Shared by the workspace
     /// point-update entry points.
@@ -3226,7 +3307,7 @@ impl SearchEngine {
             .reconcile_workspace_files_fenced(present_abs, |apply| FenceOutcome::Applied(apply()))?
         {
             FenceOutcome::Applied(removed) => Ok(removed),
-            FenceOutcome::TransientRefusal | FenceOutcome::Terminal => {
+            FenceOutcome::TransientRefusal | FenceOutcome::Superseded | FenceOutcome::Released => {
                 unreachable!("the permit-all reconcile fence cannot refuse")
             }
         }
@@ -3279,7 +3360,8 @@ impl SearchEngine {
             match admitted {
                 FenceOutcome::Applied(()) => {}
                 FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-                FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+                FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+                FenceOutcome::Released => return Ok(FenceOutcome::Released),
             }
             match removal.expect("an admitted reconcile operation runs once") {
                 Ok(()) => batch.removed += 1,
@@ -3377,7 +3459,7 @@ impl SearchEngine {
             -> ControlFlow<(), Result<(), SearchError>>| {
             let mut checkpoint = || ControlFlow::Continue(());
             match operation(&mut checkpoint) {
-                ControlFlow::Break(()) => FenceOutcome::Terminal,
+                ControlFlow::Break(()) => FenceOutcome::Released,
                 ControlFlow::Continue(result) => FenceOutcome::Applied(result),
             }
         };
@@ -3385,7 +3467,7 @@ impl SearchEngine {
             self.refresh_dirty_contexts_fenced(provider, seq_bound, false, &mut apply)?;
         match outcome {
             FenceOutcome::Applied(()) => Ok(stats),
-            FenceOutcome::TransientRefusal | FenceOutcome::Terminal => {
+            FenceOutcome::TransientRefusal | FenceOutcome::Superseded | FenceOutcome::Released => {
                 unreachable!("the permit-all context refresh fence cannot refuse")
             }
         }
@@ -3483,7 +3565,8 @@ impl SearchEngine {
                 FenceOutcome::TransientRefusal => {
                     return Ok((stats, FenceOutcome::TransientRefusal));
                 }
-                FenceOutcome::Terminal => return Ok((stats, FenceOutcome::Terminal)),
+                FenceOutcome::Superseded => return Ok((stats, FenceOutcome::Superseded)),
+                FenceOutcome::Released => return Ok((stats, FenceOutcome::Released)),
             }
         }
         Ok((stats, FenceOutcome::Applied(())))
@@ -3495,11 +3578,32 @@ impl SearchEngine {
     /// claim — a file changed at the same stat during the local period would be suppressed by
     /// the inherited row after a switch back. Rows live only under the mode that wrote them.
     pub fn set_serves_external_baseline(&mut self, serves: bool) -> Result<(), SearchError> {
-        self.serves_external_baseline = serves;
-        if !serves {
-            self.store.clear_overlay_fingerprint_cache()?;
+        let mut checkpoint = || ControlFlow::Continue(());
+        match self.set_serves_external_baseline_checkpointed(serves, &mut checkpoint) {
+            ControlFlow::Continue(result) => result,
+            ControlFlow::Break(()) => unreachable!("permit-all checkpoint cannot cancel"),
         }
-        Ok(())
+    }
+
+    pub fn set_serves_external_baseline_checkpointed(
+        &mut self,
+        serves: bool,
+        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
+    ) -> ControlFlow<(), Result<(), SearchError>> {
+        if serves && self.serves_external_baseline {
+            return ControlFlow::Continue(Ok(()));
+        }
+        if !serves {
+            match self.store.clear_overlay_fingerprint_cache_checkpointed(checkpoint) {
+                Ok(ControlFlow::Continue(())) => {}
+                Ok(ControlFlow::Break(())) => return ControlFlow::Break(()),
+                Err(error) => return ControlFlow::Continue(Err(error)),
+            }
+        } else if checkpoint().is_break() {
+            return ControlFlow::Break(());
+        }
+        self.serves_external_baseline = serves;
+        ControlFlow::Continue(Ok(()))
     }
 
     /// The manifest fingerprints IF this engine serves an external baseline, `None` otherwise.
@@ -3802,7 +3906,8 @@ impl SearchEngine {
         )? {
             FenceOutcome::Applied(embeddings) => embeddings,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-            FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+            FenceOutcome::Released => return Ok(FenceOutcome::Released),
         };
 
         // Include the warm-reused vectors for the plan's chunks in the published set so Phase C
@@ -3851,12 +3956,13 @@ impl SearchEngine {
             // vectors to the shared store, and a caller that lost the workspace lease must
             // stop writing over the new owner's rows.
             if !should_continue() {
-                return Ok(FenceOutcome::Terminal);
+                return Ok(FenceOutcome::Released);
             }
             match Self::fenced_value_retrying(apply, || Ok(()), retry_transient)? {
                 FenceOutcome::Applied(()) => {}
                 FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-                FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+                FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+                FenceOutcome::Released => return Ok(FenceOutcome::Released),
             }
             let inputs: Vec<&str> = batch.iter().map(|(_, input)| input.as_str()).collect();
             let embeddings = embedder.embed_batch_interactive(&inputs)?;
@@ -3869,7 +3975,7 @@ impl SearchEngine {
             // Re-checked AFTER the embed round-trip too: the stop signal may have changed while
             // the request was in flight. The actual SQLite save is separately fenced below.
             if !should_continue() {
-                return Ok(FenceOutcome::Terminal);
+                return Ok(FenceOutcome::Released);
             }
             // Persist to the standalone store (NOT the live engine) so partial progress survives
             // a mid-pass failure. The callback holds the host ownership barrier for this one
@@ -3889,7 +3995,8 @@ impl SearchEngine {
             match admitted {
                 FenceOutcome::Applied(()) => {}
                 FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-                FenceOutcome::Terminal => return Ok(FenceOutcome::Terminal),
+                FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+                FenceOutcome::Released => return Ok(FenceOutcome::Released),
             }
         }
 
@@ -4746,6 +4853,128 @@ mod tests {
     use std::ops::ControlFlow;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    fn baseline_manifest(snapshot: &str, rows: usize) -> crate::WorkspaceBaselineManifest {
+        crate::WorkspaceBaselineManifest {
+            snapshot_id: snapshot.to_owned(),
+            snapshot_fingerprint: Some(format!("{snapshot}-fingerprint")),
+            files: (0..rows)
+                .map(|index| crate::BaselineManifestFile {
+                    collection: "code".to_owned(),
+                    root_id: CONFIGURATION_ROOT_ID.to_owned(),
+                    path: format!("File{index}.bsl"),
+                    file_fingerprint: format!("fingerprint-{index}"),
+                    document_count: 1,
+                    file_object_id: format!("object-{index}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn manifest_and_fingerprint_transitions_checkpoint_and_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("search.db");
+        let mut engine = SearchEngine::fts_only(&db_path).unwrap();
+        let original = baseline_manifest("original", 1);
+        engine.store().save_baseline_manifest(&original).unwrap();
+
+        let replacement = baseline_manifest("replacement", WORKSPACE_APPLY_BATCH_ROWS + 1);
+        let mut checkpoints = 0;
+        let interrupted = engine
+            .store()
+            .save_baseline_manifest_checkpointed(&replacement, &mut || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .unwrap();
+        assert!(interrupted.is_break());
+        assert_eq!(
+            engine.store().load_baseline_manifest().unwrap().unwrap().snapshot_id,
+            "original"
+        );
+
+        engine.store().save_baseline_manifest(&replacement).unwrap();
+        checkpoints = 0;
+        let interrupted = engine
+            .store()
+            .clear_baseline_manifest_checkpointed(&mut || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .unwrap();
+        assert!(interrupted.is_break());
+        assert_eq!(
+            engine.store().load_coherent_baseline_manifest().unwrap().unwrap().snapshot_id,
+            "replacement"
+        );
+
+        engine.set_serves_external_baseline(true).unwrap();
+        let fingerprints = (0..=WORKSPACE_APPLY_BATCH_ROWS)
+            .map(|index| {
+                (
+                    FileKey::configuration(format!("File{index}.bsl")),
+                    crate::store::PersistedFingerprint {
+                        file_size: index as u64,
+                        file_mtime_secs: index as i64,
+                        file_mtime_nanos: 0,
+                        content_fingerprint: format!("content-{index}"),
+                        canonical: format!("canonical-{index}"),
+                    },
+                )
+            })
+            .collect();
+        engine.store().save_overlay_fingerprint_cache("replacement", &fingerprints).unwrap();
+        checkpoints = 0;
+        let interrupted = engine.set_serves_external_baseline_checkpointed(false, &mut || {
+            checkpoints += 1;
+            if checkpoints == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        assert!(interrupted.is_break());
+        assert!(engine.serves_external_baseline);
+        assert_eq!(engine.store().overlay_fingerprint_keys().unwrap().len(), fingerprints.len());
+    }
+
+    #[test]
+    fn prepared_drift_batch_rolls_back_owner_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let removed = FileKey::configuration("Removed.bsl");
+        let context = FileKey::configuration("Context.bsl");
+        let chunks = code_chunk::Chunker::chunk("Процедура Тест()\nКонецПроцедуры");
+        engine.ingest_fused_file(&removed, b"hash", &chunks, &vec![None; chunks.len()]).unwrap();
+        let mut checkpoints = 0;
+        let outcome = engine.apply_prepared_workspace_drift_batch(
+            &[],
+            std::slice::from_ref(&removed),
+            std::slice::from_ref(&context),
+            &mut || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        );
+        assert!(outcome.is_break());
+        assert!(engine.store().file_hash(&removed.root_id, &removed.path).unwrap().is_some());
+        assert!(!engine.store().overlay_tombstone_paths("code").unwrap().contains(&removed));
+        assert!(!engine.context_dirty_paths("code").unwrap().contains(&context));
+        assert!(engine.workspace_overlay_dirty_paths().unwrap().is_empty());
+    }
     use tempfile::tempdir;
 
     #[test]
@@ -4801,7 +5030,7 @@ mod tests {
                 ControlFlow::Break(())
             };
             match operation(&mut checkpoint) {
-                ControlFlow::Break(()) => FenceOutcome::Terminal,
+                ControlFlow::Break(()) => FenceOutcome::Released,
                 ControlFlow::Continue(result) => FenceOutcome::Applied(result),
             }
         };
@@ -4824,7 +5053,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(matches!(outcome, FenceOutcome::Terminal));
+        assert!(matches!(outcome, FenceOutcome::Released));
         assert_eq!(admissions, 1);
         assert_eq!(checkpoints, 1);
         assert_eq!(
@@ -5026,11 +5255,11 @@ mod tests {
                 if calls.get() == 1 {
                     run_apply(apply)
                 } else {
-                    FenceOutcome::Terminal
+                    FenceOutcome::Superseded
                 }
             })
             .unwrap();
-        assert!(matches!(overlay, FenceOutcome::Terminal));
+        assert!(matches!(overlay, FenceOutcome::Superseded));
         assert_eq!(calls.get(), 2);
         assert_eq!(Store::open_existing(&refused_fts).unwrap().fts_count().unwrap(), 0);
 
@@ -5312,7 +5541,7 @@ mod tests {
                 |operation| FenceOutcome::Applied(operation()),
             )
             .unwrap(),
-            FenceOutcome::Terminal
+            FenceOutcome::Released
         ));
         assert_eq!(
             SearchEngine::embed_pending_chunks_standalone(&wrapper, &config, None, Some(&stop),)
@@ -5458,13 +5687,13 @@ mod tests {
                 if calls < 5 {
                     FenceOutcome::Applied(operation())
                 } else {
-                    FenceOutcome::Terminal
+                    FenceOutcome::Superseded
                 }
             },
         )
         .unwrap();
         #[cfg(not(windows))]
-        assert!(matches!(result, FenceOutcome::Terminal));
+        assert!(matches!(result, FenceOutcome::Superseded));
         #[cfg(windows)]
         assert!(matches!(result, FenceOutcome::Applied(_)));
         assert_eq!(calls, if cfg!(windows) { 4 } else { 5 });
@@ -6261,7 +6490,7 @@ mod tests {
                     "the refreshed heartbeat keeps the live owner admissible"
                 );
                 if admissions == 2 {
-                    return FenceOutcome::Terminal;
+                    return FenceOutcome::Released;
                 }
                 let mut checkpoint = || {
                     checkpoints += 1;
@@ -6270,14 +6499,14 @@ mod tests {
                     ControlFlow::Continue(())
                 };
                 match operation(&mut checkpoint) {
-                    ControlFlow::Break(()) => FenceOutcome::Terminal,
+                    ControlFlow::Break(()) => FenceOutcome::Released,
                     ControlFlow::Continue(result) => FenceOutcome::Applied(result),
                 }
             };
         let (partial, outcome) = engine
             .refresh_dirty_contexts_fenced(&NewContext, i64::MAX, false, &mut stop_before_second)
             .unwrap();
-        assert!(matches!(outcome, FenceOutcome::Terminal));
+        assert!(matches!(outcome, FenceOutcome::Released));
         assert_eq!(admissions, 2, "65 chunk writes require a second fence");
         assert_eq!(checkpoints, 2, "the committed batch heartbeats before and after its write");
         assert!(virtual_now > VIRTUAL_STALE_AFTER, "the virtual refresh exceeds stale interval");
@@ -6304,7 +6533,7 @@ mod tests {
             retry_admissions += 1;
             let mut checkpoint = || ControlFlow::Continue(());
             match operation(&mut checkpoint) {
-                ControlFlow::Break(()) => FenceOutcome::Terminal,
+                ControlFlow::Break(()) => FenceOutcome::Released,
                 ControlFlow::Continue(result) => FenceOutcome::Applied(result),
             }
         };
@@ -8836,7 +9065,7 @@ mod tests {
                 let mut checkpoint = || ControlFlow::Continue(());
                 match operation(&mut checkpoint) {
                     ControlFlow::Continue(value) => FenceOutcome::Applied(value),
-                    ControlFlow::Break(()) => FenceOutcome::Terminal,
+                    ControlFlow::Break(()) => FenceOutcome::Released,
                 }
             };
             SearchEngine::open_store_fenced(&db_path, &mut apply).unwrap()
@@ -8873,7 +9102,7 @@ mod tests {
                     let mut checkpoint = || ControlFlow::Continue(());
                     match operation(&mut checkpoint) {
                         ControlFlow::Continue(result) => FenceOutcome::Applied(result),
-                        ControlFlow::Break(()) => FenceOutcome::Terminal,
+                        ControlFlow::Break(()) => FenceOutcome::Released,
                     }
                 };
                 SearchEngine::open_store_fenced(db_path, &mut apply).unwrap()

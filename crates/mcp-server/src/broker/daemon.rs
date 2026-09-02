@@ -141,7 +141,7 @@ async fn serve(
     // fraction of the *shorter* grace so the exit lands close to the intended window, not
     // up to 2× late, even when a test drives a tiny TTL.
     let poll =
-        (orphan_grace.min(idle_ttl) / 4).clamp(Duration::from_millis(100), Duration::from_secs(15));
+        (orphan_grace.min(idle_ttl) / 4).clamp(Duration::from_millis(100), Duration::from_secs(1));
     let mut idle_since = Some(Instant::now());
     let mut ticker = interval(poll);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -166,12 +166,13 @@ async fn serve(
             }
             _ = ticker.tick() => {
                 sessions.retain(|h| !h.is_finished());
+                let superseded = server.superseded();
                 // Reset the idle clock while any session is connected; otherwise count down
                 // against the grace that fits the backend's history — the long `idle_ttl`
                 // once it has served real traffic, the short `orphan_grace` before then.
                 if active.load(Ordering::SeqCst) != 0 {
                     idle_since = None;
-                } else if server.superseded() {
+                } else if superseded {
                     // A newer generation owns this workspace's derived caches, so this backend
                     // is terminally unable to maintain them — a transient ownership refusal is
                     // not enough. The warm hold buys a reconnecting client nothing, and holding

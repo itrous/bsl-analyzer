@@ -7,8 +7,12 @@ use std::time::{Instant, UNIX_EPOCH};
 use crate::change_hub::{ChangeEntry, ChangeKind};
 use crate::graph_query::GraphDb;
 
-use super::state::{lock_recover, GraphState, Published, ReloadState};
-use super::types::{Freshness, GraphStatus};
+#[cfg(test)]
+use super::state::ReloadState;
+use super::state::{lock_recover, GraphState, Published};
+#[cfg(test)]
+use super::types::Freshness;
+use super::types::GraphStatus;
 
 /// How often the query-path freshness fold must come from a real walk instead of the
 /// event-maintained map. Bounds how long a change the hub cannot observe can keep
@@ -43,6 +47,12 @@ pub(super) struct ScanCache {
 
 /// Every publication prepares this many independent read handles before becoming ready.
 pub(crate) const SNAPSHOT_POOL_CAP: usize = 4;
+
+#[derive(Debug)]
+pub(crate) enum BackgroundSnapshotError {
+    Changed,
+    Operation(anyhow::Error),
+}
 
 #[cfg(test)]
 type SnapshotOpenHook = Box<dyn FnOnce()>;
@@ -80,8 +90,8 @@ fn set_snapshot_checkout_hook(hook: SnapshotOpenHook) {
 /// A pooled idle read handle plus the freshness token it was opened under.
 pub(super) struct PooledSnapshotEntry {
     pub(super) generation: u64,
-    fingerprint: crate::graph_db::GraphFp,
-    force_stale: bool,
+    pub(super) fingerprint: crate::graph_db::GraphFp,
+    pub(super) force_stale: bool,
     db: GraphDb,
 }
 
@@ -231,8 +241,8 @@ fn classify_prepare_identity_error(error: std::io::Error) -> SnapshotPrepareErro
 pub(crate) struct GraphSnapshot {
     pub graph: PooledGraphDb,
     pub(super) generation: u64,
-    fingerprint: crate::graph_db::GraphFp,
-    force_stale: bool,
+    pub(super) fingerprint: crate::graph_db::GraphFp,
+    pub(super) force_stale: bool,
     /// Modules this artefact was built without being able to read. Makes `stale`
     /// true — the graph is missing their nodes and edges — WITHOUT making
     /// `wants_reload` true, since rebuilding cannot read them either.
@@ -358,18 +368,18 @@ impl GraphState {
     /// retried rather than silently dropped.
     pub(super) fn install_prepared_snapshot(
         &self,
-        prepared: PreparedSnapshotPool,
+        mut prepared: PreparedSnapshotPool,
         published: Published,
         status: GraphStatus,
         reload_obligation: Option<usize>,
-    ) -> crate::workspace_lease::LeaseOutcome<Result<(), SnapshotInstallError>> {
+    ) -> crate::workspace_lease::LeaseOperationOutcome<(), SnapshotInstallError> {
         #[cfg(test)]
         SNAPSHOT_OPEN_HOOK.with(|slot| {
             if let Some(hook) = slot.borrow_mut().take() {
                 hook();
             }
         });
-        self.lease.with_ownership_outcome(|| {
+        let outcome = self.lease.publish_short(&mut prepared, |prepared| {
             #[cfg(test)]
             if REFUSE_SNAPSHOT_INSTALL.with(|refuse| refuse.replace(false)) {
                 return Err(SnapshotInstallError::Changed);
@@ -405,14 +415,18 @@ impl GraphState {
             let mut inner = lock_recover(&self.inner);
             let mut pool = lock_recover(&self.snapshot_pool);
             pool.generation = published.generation;
-            pool.entries = prepared.entries;
+            pool.entries = std::mem::take(&mut prepared.entries);
             inner.published = Some(published);
             inner.status = status;
             if let Some(epoch) = reload_obligation {
                 self.complete_project_reload_through(epoch);
             }
             Ok(())
-        })
+        });
+        if matches!(&outcome, crate::workspace_lease::LeaseOperationOutcome::Applied(())) {
+            *lock_recover(&self.graph_retry) = None;
+        }
+        outcome
     }
 
     /// Snapshot the graph for a blocking query, if built. The returned
@@ -458,16 +472,17 @@ impl GraphState {
     /// Requests use [`Self::snapshot`] and never reach this fallback.
     pub(crate) fn snapshot_blocking(
         &self,
-    ) -> crate::workspace_lease::LeaseOutcome<anyhow::Result<Option<GraphSnapshot>>> {
-        use crate::workspace_lease::LeaseOutcome;
+    ) -> crate::workspace_lease::LeaseOperationOutcome<Option<GraphSnapshot>, BackgroundSnapshotError>
+    {
+        use crate::workspace_lease::{LeaseOperationError, LeaseOperationOutcome};
 
         if let Some(snapshot) = self.snapshot() {
-            return LeaseOutcome::Applied(Ok(Some(snapshot)));
+            return LeaseOperationOutcome::Applied(Some(snapshot));
         }
         let (generation, fingerprint, force_stale, workspace_roots) = {
             let inner = lock_recover(&self.inner);
             let Some(published) = inner.published.as_ref() else {
-                return LeaseOutcome::Applied(Ok(None));
+                return LeaseOperationOutcome::Applied(None);
             };
             (
                 published.generation,
@@ -476,12 +491,6 @@ impl GraphState {
                 published.search_roots.clone(),
             )
         };
-        match self.lease.with_ownership_outcome(|| ()) {
-            LeaseOutcome::Applied(()) => {}
-            LeaseOutcome::TransientRefusal => return LeaseOutcome::TransientRefusal,
-            LeaseOutcome::Terminal => return LeaseOutcome::Terminal,
-        }
-
         let opened = (|| -> anyhow::Result<(PooledSnapshotEntry, GraphPathIdentity)> {
             #[cfg(test)]
             if self.background_snapshot_failure.load(std::sync::atomic::Ordering::SeqCst) == 2 {
@@ -502,7 +511,11 @@ impl GraphState {
         })();
         let (entry, identity) = match opened {
             Ok(opened) => opened,
-            Err(error) => return LeaseOutcome::Applied(Err(error)),
+            Err(error) => {
+                return LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                    BackgroundSnapshotError::Operation(error),
+                ))
+            }
         };
 
         #[cfg(test)]
@@ -511,7 +524,11 @@ impl GraphState {
                 hook();
             }
         });
-        match self.lease.with_ownership_outcome(|| {
+        let mut prepared = Some((entry, identity));
+        match self.lease.publish_short(&mut prepared, |prepared| {
+            let (_, identity) = prepared
+                .as_ref()
+                .expect("background snapshot publication keeps its prepared value until commit");
             #[cfg(test)]
             if self.background_snapshot_failure.load(std::sync::atomic::Ordering::SeqCst) == 1 {
                 return Err(SnapshotInstallError::Changed);
@@ -520,7 +537,7 @@ impl GraphState {
                 SnapshotInstallError::Operation("graph path unavailable".to_owned())
             })?;
             match GraphPathIdentity::read(&path) {
-                Ok(current) if current == identity => {}
+                Ok(current) if current == *identity => {}
                 Ok(_) => return Err(SnapshotInstallError::Changed),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Err(SnapshotInstallError::Changed)
@@ -536,9 +553,10 @@ impl GraphState {
             }
             Ok(())
         }) {
-            LeaseOutcome::Applied(Ok(())) => {
+            LeaseOperationOutcome::Applied(()) => {
+                let (entry, _) = prepared.take().expect("successful publication retains entry");
                 let unread_files = entry.db.unread_files();
-                LeaseOutcome::Applied(Ok(Some(GraphSnapshot {
+                LeaseOperationOutcome::Applied(Some(GraphSnapshot {
                     graph: PooledGraphDb {
                         entry: Some(entry),
                         pool: Arc::clone(&self.snapshot_pool),
@@ -548,32 +566,35 @@ impl GraphState {
                     force_stale,
                     unread_files,
                     workspace_roots,
-                })))
+                }))
             }
-            LeaseOutcome::Applied(Err(SnapshotInstallError::Changed)) => LeaseOutcome::Applied(
-                Err(anyhow::anyhow!("graph changed before background snapshot admission")),
-            ),
-            LeaseOutcome::Applied(Err(SnapshotInstallError::Operation(message))) => {
-                LeaseOutcome::Applied(Err(anyhow::anyhow!(message)))
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                SnapshotInstallError::Changed,
+            )) => LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                BackgroundSnapshotError::Changed,
+            )),
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                SnapshotInstallError::Operation(message),
+            )) => LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                BackgroundSnapshotError::Operation(anyhow::anyhow!(message)),
+            )),
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
+                LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error))
             }
-            LeaseOutcome::TransientRefusal => LeaseOutcome::TransientRefusal,
-            LeaseOutcome::Terminal => LeaseOutcome::Terminal,
+            LeaseOperationOutcome::TransientRefusal => LeaseOperationOutcome::TransientRefusal,
+            LeaseOperationOutcome::Superseded => LeaseOperationOutcome::Superseded,
+            LeaseOperationOutcome::Released => LeaseOperationOutcome::Released,
         }
     }
 
-    /// Report the freshness of `snapshot` relative to disk, and on drift kick an
-    /// async reload (at most one in flight). `stale`/`revision` are relative to the
-    /// snapshot that served the response; the reload decision is relative to the
-    /// latest published snapshot. Walks the filesystem, so call from a blocking
-    /// context.
+    /// Test-only legacy freshness path. Production request handlers use
+    /// `cached_freshness` and never walk disk or start a reload.
+    #[cfg(test)]
     pub(crate) fn freshness(&self, snapshot: &GraphSnapshot) -> Freshness {
         let disk = self.current_disk_fp();
         let stale = snapshot.force_stale
             || snapshot.unread_files > 0
             || disk.map(|(fp, _)| fp != snapshot.fingerprint).unwrap_or(false);
-        // Read before the lock: the lease may go to disk, and the inner mutex serializes every
-        // graph query. Drift is still reported (the response says `stale`), but only the daemon
-        // that owns the workspace's derived caches acts on it — see [`crate::workspace_lease`].
         let may_build = self.may_build();
 
         let mut inner = lock_recover(&self.inner);
@@ -936,10 +957,14 @@ mod tests {
             GraphStatus::Ready { files: 0 },
             None,
         );
-        assert_eq!(
+        assert!(matches!(
             outcome,
-            crate::workspace_lease::LeaseOutcome::Applied(Err(SnapshotInstallError::Changed))
-        );
+            crate::workspace_lease::LeaseOperationOutcome::OperationError(
+                crate::workspace_lease::LeaseOperationError::Operation(
+                    SnapshotInstallError::Changed
+                )
+            )
+        ));
     }
 
     #[test]
@@ -1094,8 +1119,8 @@ mod tests {
     }
 
     #[test]
-    fn blocking_snapshot_classifies_preflight_identity_and_open_failures() {
-        use crate::workspace_lease::LeaseOutcome;
+    fn background_snapshot_preserves_all_typed_outcomes() {
+        use crate::workspace_lease::{LeaseOperationError, LeaseOperationOutcome};
 
         let ready_graph = || {
             let dir = tempfile::tempdir().unwrap();
@@ -1119,13 +1144,13 @@ mod tests {
         let (_dir, graph, lease) = ready_graph();
         let held_lock = lease.hold_file_lock_for_test();
         let started = Instant::now();
-        assert!(matches!(graph.snapshot_blocking(), LeaseOutcome::Applied(Ok(Some(_)))));
+        assert!(matches!(graph.snapshot_blocking(), LeaseOperationOutcome::Applied(Some(_))));
         assert!(started.elapsed() < Duration::from_millis(100), "pool checkout skips preflight");
         drop(held_lock);
 
         let _occupied = occupy(&graph);
         let held_lock = lease.hold_file_lock_for_test();
-        assert!(matches!(graph.snapshot_blocking(), LeaseOutcome::TransientRefusal));
+        assert!(matches!(graph.snapshot_blocking(), LeaseOperationOutcome::TransientRefusal));
         drop(held_lock);
 
         let (_dir, graph, _lease) = ready_graph();
@@ -1134,14 +1159,36 @@ mod tests {
         set_snapshot_install_hook(Box::new(move || {
             lock_recover(&changed.inner).published.as_mut().unwrap().generation += 1;
         }));
-        assert!(matches!(graph.snapshot_blocking(), LeaseOutcome::Applied(Err(_))));
+        assert!(matches!(
+            graph.snapshot_blocking(),
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(_))
+        ));
 
         let (_dir, graph, _lease) = ready_graph();
         let _occupied = occupy(&graph);
         graph.set_background_snapshot_failure_for_test(Some(BackgroundSnapshotFailure::Open));
         let result = graph.snapshot_blocking();
         graph.set_background_snapshot_failure_for_test(None);
-        assert!(matches!(result, LeaseOutcome::Applied(Err(_))));
+        assert!(matches!(
+            result,
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(_))
+        ));
+
+        let missing = GraphState::for_workspace(tempfile::tempdir().unwrap().path().to_path_buf());
+        assert!(matches!(missing.snapshot_blocking(), LeaseOperationOutcome::Applied(None)));
+
+        let (_dir, graph, lease) = ready_graph();
+        let _occupied = occupy(&graph);
+        lease.release();
+        assert!(matches!(graph.snapshot_blocking(), LeaseOperationOutcome::Released));
+
+        let (_dir, graph, old) = ready_graph();
+        let _occupied = occupy(&graph);
+        let cache = graph.cache().unwrap().clone();
+        let newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        assert!(matches!(graph.snapshot_blocking(), LeaseOperationOutcome::Superseded));
+        old.release();
+        newer.release();
     }
 
     #[test]

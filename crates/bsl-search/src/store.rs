@@ -46,6 +46,11 @@ pub(crate) enum ContextRefreshMutation {
     Clear { key: FileKey, seq_bound: i64 },
 }
 
+pub(crate) struct WorkspaceDriftStoreOutcome {
+    pub(crate) removed_chunk_ids: Vec<i64>,
+    pub(crate) context_mark_seq: Option<i64>,
+}
+
 /// The embeddings the vector index is built from (`(chunk_id, vector)` rows) paired with the
 /// `embedding_generation` they were read at, as one consistent snapshot.
 pub type EmbeddingsSnapshot = (i64, Vec<(i64, Vec<f32>)>);
@@ -1025,6 +1030,10 @@ impl Store {
         self.mark_seq.fetch_max(seq, Ordering::SeqCst);
     }
 
+    pub(crate) fn observe_committed_mark_seq(&self, seq: i64) {
+        self.observe_mark_seq(seq);
+    }
+
     /// The highest mark seq the database at `path` has issued to ANYONE.
     ///
     /// A store's own high-water only tracks the stamps it allocated, so it sits below anything
@@ -1269,6 +1278,81 @@ impl Store {
             Ok(()) => ControlFlow::Continue(Ok((marked, updated, cleared))),
             Err(error) => ControlFlow::Continue(Err(error.into())),
         }
+    }
+
+    pub(crate) fn apply_workspace_drift_batch(
+        &self,
+        removed: &[FileKey],
+        context: &[FileKey],
+        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
+    ) -> Result<ControlFlow<(), WorkspaceDriftStoreOutcome>, SearchError> {
+        if checkpoint().is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut removed_chunk_ids = Vec::new();
+        let deleted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+        for key in removed {
+            let mut stmt = tx.prepare(
+                "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id
+                 WHERE f.collection = 'code' AND f.root_id = ?1 AND f.path = ?2",
+            )?;
+            removed_chunk_ids.extend(
+                stmt.query_map(params![key.root_id, key.path], |row| row.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            tx.execute(
+                "INSERT INTO overlay_tombstones (root_id, path, collection, deleted_at)
+                 VALUES (?1, ?2, 'code', ?3)
+                 ON CONFLICT(root_id, path) DO UPDATE SET collection = 'code', deleted_at = ?3",
+                params![key.root_id, key.path, deleted_at],
+            )?;
+            tx.execute(
+                "DELETE FROM overlay_fingerprint_cache WHERE root_id = ?1 AND path = ?2",
+                params![key.root_id, key.path],
+            )?;
+            tx.execute(
+                "DELETE FROM chunks_fts WHERE rowid IN (
+                     SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id
+                     WHERE f.collection = 'code' AND f.root_id = ?1 AND f.path = ?2
+                 )",
+                params![key.root_id, key.path],
+            )?;
+            tx.execute(
+                "DELETE FROM files WHERE collection = 'code' AND root_id = ?1 AND path = ?2",
+                params![key.root_id, key.path],
+            )?;
+        }
+        let context_mark_seq = if context.is_empty() {
+            None
+        } else {
+            let seq = Self::next_mark_seq(&tx)?;
+            let marked_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0);
+            let mut stmt = tx.prepare(
+                "INSERT INTO context_dirty (root_id, path, collection, marked_at, seq)
+                 VALUES (?1, ?2, 'code', ?3, ?4)
+                 ON CONFLICT(root_id, path, collection) DO UPDATE SET marked_at = ?3, seq = ?4",
+            )?;
+            for key in context {
+                stmt.execute(params![key.root_id, key.path, marked_at, seq])?;
+            }
+            Some(seq)
+        };
+        if checkpoint().is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        tx.commit()?;
+        Ok(ControlFlow::Continue(WorkspaceDriftStoreOutcome {
+            removed_chunk_ids,
+            context_mark_seq,
+        }))
     }
 
     pub fn insert_chunk(
@@ -2402,6 +2486,21 @@ impl Store {
         &self,
         manifest: &crate::WorkspaceBaselineManifest,
     ) -> Result<(), SearchError> {
+        let mut checkpoint = || ControlFlow::Continue(());
+        match self.save_baseline_manifest_checkpointed(manifest, &mut checkpoint)? {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(()) => unreachable!("permit-all checkpoint cannot cancel"),
+        }
+    }
+
+    pub fn save_baseline_manifest_checkpointed(
+        &self,
+        manifest: &crate::WorkspaceBaselineManifest,
+        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>, SearchError> {
+        if checkpoint().is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
         let fetched_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2422,24 +2521,45 @@ impl Store {
                 fetched_at.to_string()
             ],
         )?;
-        tx.execute("DELETE FROM baseline_manifest_files", [])?;
+        loop {
+            let deleted = tx.execute(
+                "DELETE FROM baseline_manifest_files WHERE rowid IN (
+                     SELECT rowid FROM baseline_manifest_files LIMIT ?1
+                 )",
+                params![crate::engine::WORKSPACE_APPLY_BATCH_ROWS as i64],
+            )?;
+            if deleted == crate::engine::WORKSPACE_APPLY_BATCH_ROWS && checkpoint().is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+            if deleted < crate::engine::WORKSPACE_APPLY_BATCH_ROWS {
+                break;
+            }
+        }
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO baseline_manifest_files
                  (root_id, collection, path, file_fingerprint)
                  VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for file in &manifest.files {
+            for (index, file) in manifest.files.iter().enumerate() {
                 stmt.execute(params![
                     file.root_id,
                     file.collection,
                     file.path,
                     file.file_fingerprint
                 ])?;
+                if (index + 1).is_multiple_of(crate::engine::WORKSPACE_APPLY_BATCH_ROWS)
+                    && checkpoint().is_break()
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
             }
         }
+        if checkpoint().is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
         tx.commit()?;
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     }
 
     pub fn load_baseline_manifest(&self) -> Result<Option<BaselineManifestRecord>, SearchError> {
@@ -2496,11 +2616,41 @@ impl Store {
     /// never be observable half-deleted: a surviving header over an emptied files table
     /// would read back as a valid-but-empty manifest. One transaction removes both.
     pub fn clear_baseline_manifest(&self) -> Result<(), SearchError> {
+        let mut checkpoint = || ControlFlow::Continue(());
+        match self.clear_baseline_manifest_checkpointed(&mut checkpoint)? {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(()) => unreachable!("permit-all checkpoint cannot cancel"),
+        }
+    }
+
+    pub fn clear_baseline_manifest_checkpointed(
+        &self,
+        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>, SearchError> {
+        if checkpoint().is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM baseline_manifest_files", [])?;
+        loop {
+            let deleted = tx.execute(
+                "DELETE FROM baseline_manifest_files WHERE rowid IN (
+                     SELECT rowid FROM baseline_manifest_files LIMIT ?1
+                 )",
+                params![crate::engine::WORKSPACE_APPLY_BATCH_ROWS as i64],
+            )?;
+            if deleted == crate::engine::WORKSPACE_APPLY_BATCH_ROWS && checkpoint().is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+            if deleted < crate::engine::WORKSPACE_APPLY_BATCH_ROWS {
+                break;
+            }
+        }
         tx.execute("DELETE FROM baseline_manifest WHERE id = 1", [])?;
+        if checkpoint().is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
         tx.commit()?;
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     }
 
     /// The persisted manifest header, but only when the `baseline_manifest_files` rows
@@ -2942,8 +3092,40 @@ impl Store {
     }
 
     pub fn clear_overlay_fingerprint_cache(&self) -> Result<(), SearchError> {
-        self.conn.execute("DELETE FROM overlay_fingerprint_cache", [])?;
-        Ok(())
+        let mut checkpoint = || ControlFlow::Continue(());
+        match self.clear_overlay_fingerprint_cache_checkpointed(&mut checkpoint)? {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(()) => unreachable!("permit-all checkpoint cannot cancel"),
+        }
+    }
+
+    pub fn clear_overlay_fingerprint_cache_checkpointed(
+        &self,
+        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>, SearchError> {
+        if checkpoint().is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        loop {
+            let deleted = tx.execute(
+                "DELETE FROM overlay_fingerprint_cache WHERE rowid IN (
+                     SELECT rowid FROM overlay_fingerprint_cache LIMIT ?1
+                 )",
+                params![crate::engine::WORKSPACE_APPLY_BATCH_ROWS as i64],
+            )?;
+            if deleted == crate::engine::WORKSPACE_APPLY_BATCH_ROWS && checkpoint().is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+            if deleted < crate::engine::WORKSPACE_APPLY_BATCH_ROWS {
+                break;
+            }
+        }
+        if checkpoint().is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        tx.commit()?;
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Drop exactly these keys' fingerprint rows, leaving every other row alone. A row asserts

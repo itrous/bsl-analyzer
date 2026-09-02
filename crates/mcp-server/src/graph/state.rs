@@ -5,17 +5,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bsl_search::SearchEngine;
 
 use crate::change_hub::{SinkCursor, WorkspaceChangeHub};
+use crate::state::retry_window::{RetryDecision, RetryWindow};
 
 use super::build::PublishAttemptOutcome;
 use super::snapshot::{FpMapState, ScanCache, SnapshotPool};
 use super::types::{
-    FusedStartup, GraphPublishOutcome, GraphPublishSignal, GraphStatus, GraphStatusReport,
-    NudgeOutcome, SUPERSEDED_GRAPH_ERROR,
+    Freshness, FusedStartup, GraphPublishOutcome, GraphPublishSignal, GraphStatus,
+    GraphStatusReport, NudgeOutcome, SUPERSEDED_GRAPH_ERROR,
 };
 
 /// Minimum time between on-disk drift scans. A scan stats every `.bsl`/`.xml`
@@ -192,9 +193,8 @@ pub(crate) struct GraphState {
     /// builds and publishes nothing — it serves what it already holds and lets the owner
     /// maintain the file. Unmanaged (always owning) for a disabled graph and in tests.
     pub(super) lease: crate::workspace_lease::WorkspaceLease,
-    /// The last load stopped on a transient ownership refusal rather than a build failure.
-    /// Terminal supersession never re-arms; an unobserved lock/stale-record transition may.
-    pub(super) withheld_build: Arc<AtomicBool>,
+    /// Trigger-driven retry obligation created only by a transient publication refusal.
+    pub(super) graph_retry: Arc<Mutex<Option<RetryWindow>>>,
 }
 
 impl GraphState {
@@ -247,7 +247,7 @@ impl GraphState {
             #[cfg(test)]
             publish_passes: Arc::new(AtomicUsize::new(0)),
             lease: crate::workspace_lease::WorkspaceLease::unmanaged(),
-            withheld_build: Arc::new(AtomicBool::new(false)),
+            graph_retry: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -261,6 +261,7 @@ impl GraphState {
     /// Whether this daemon may write the shared graph database. A superseded one keeps
     /// serving its published snapshot but schedules no builds: the owner maintains the file,
     /// and two processes rebuilding it only race renames and flicker generations.
+    #[cfg(test)]
     pub(super) fn may_build(&self) -> bool {
         self.lease.owns_caches()
     }
@@ -625,15 +626,31 @@ impl GraphState {
         lock_recover(&self.inner).status.clone()
     }
 
-    /// Lifecycle snapshot for the `status` action. For a ready graph it also reports the
-    /// served revision and on-disk freshness (and, like every freshness check, kicks an async
-    /// reload on drift) — so this walks the filesystem and must be called from a blocking
-    /// context. A `Ready` status whose snapshot momentarily cannot be opened is reported as
-    /// `loading` (a reload is renaming the file into place), never as a torn read. A
-    /// superseded graph reports ready only while one of its own descriptors is idle in the
-    /// pool; it never reopens the shared path.
+    /// Request-safe freshness from the publication paired with this pre-opened snapshot.
+    pub(crate) fn cached_freshness(&self, snapshot: &super::GraphSnapshot) -> Freshness {
+        let (stale, reload, topology) = lock_recover(&self.inner)
+            .published
+            .as_ref()
+            .filter(|published| published.generation == snapshot.generation)
+            .map(|published| {
+                (
+                    published.stale || published.force_stale,
+                    published.reload.label(),
+                    published.fingerprint.topology,
+                )
+            })
+            .unwrap_or((snapshot.force_stale, "none", snapshot.fingerprint.topology));
+        Freshness {
+            revision: snapshot.generation,
+            stale: stale || snapshot.unread_files() > 0,
+            reload,
+            topology,
+        }
+    }
+
+    /// Cached lifecycle snapshot for the `status` action. It uses only process-local state and
+    /// the pre-opened descriptor pool; drift detection belongs to background graph owners.
     pub(crate) fn status_report(&self) -> GraphStatusReport {
-        let _ = self.may_build();
         let superseded = self.lease.is_superseded();
         let report = |state: &'static str, superseded: Option<bool>| GraphStatusReport {
             state,
@@ -646,10 +663,15 @@ impl GraphState {
             superseded,
         };
 
+        let status = {
+            let inner = lock_recover(&self.inner);
+            inner.status.clone()
+        };
+
         if superseded {
-            if let GraphStatus::Ready { files } = self.status() {
+            if let GraphStatus::Ready { files } = status {
                 if let Some(snapshot) = self.snapshot() {
-                    let freshness = self.freshness(&snapshot);
+                    let freshness = self.cached_freshness(&snapshot);
                     return GraphStatusReport {
                         files: Some(files),
                         unread_files: Some(snapshot.unread_files()),
@@ -666,7 +688,7 @@ impl GraphState {
             };
         }
 
-        match self.status() {
+        match status {
             GraphStatus::Disabled => report("disabled", None),
             GraphStatus::Idle | GraphStatus::Loading => report("loading", None),
             GraphStatus::Failed(msg) => {
@@ -674,7 +696,7 @@ impl GraphState {
             }
             GraphStatus::Ready { files } => match self.snapshot() {
                 Some(snapshot) => {
-                    let freshness = self.freshness(&snapshot);
+                    let freshness = self.cached_freshness(&snapshot);
                     GraphStatusReport {
                         files: Some(files),
                         unread_files: Some(snapshot.unread_files()),
@@ -692,19 +714,21 @@ impl GraphState {
     /// Trigger the background load if this is the first call. Transitions
     /// `Idle → Loading` and spawns exactly one loader thread; later calls return
     /// immediately. No-op for disabled / already-loading / ready / failed / terminally
-    /// superseded graphs. A transient fence refusal may re-arm through [`Self::withheld_build`].
+    /// superseded graphs. A transient fence refusal may re-arm through `graph_retry`.
     pub(crate) fn ensure_loading(&self) {
         if self.workspace_root.is_none() || self.superseded_latched() {
             return;
         }
+        let retry_allowed = lock_recover(&self.graph_retry).as_mut().is_some_and(|retry| {
+            matches!(retry.refused(Instant::now(), Duration::ZERO), RetryDecision::RetryAfter(_))
+        });
         {
             let mut inner = lock_recover(&self.inner);
-            let retry_withheld = self.withheld_build.load(Ordering::SeqCst)
-                && matches!(inner.status, GraphStatus::Failed(_));
-            if inner.status != GraphStatus::Idle && !retry_withheld {
+            if inner.status != GraphStatus::Idle
+                && !(retry_allowed && matches!(inner.status, GraphStatus::Failed(_)))
+            {
                 return;
             }
-            self.withheld_build.store(false, Ordering::SeqCst);
             inner.status = GraphStatus::Loading;
         }
 
@@ -758,7 +782,7 @@ impl GraphState {
             GraphStatus::Ready { files },
             None,
         );
-        assert!(matches!(outcome, crate::workspace_lease::LeaseOutcome::Applied(Ok(()))));
+        assert!(matches!(outcome, crate::workspace_lease::LeaseOperationOutcome::Applied(())));
     }
 
     /// Abandon a claimed external build that did not produce a usable database, so the
@@ -798,6 +822,11 @@ impl GraphState {
     fn nudge_after_recording(&self, force_project: bool) -> NudgeOutcome {
         if self.is_superseded() {
             return NudgeOutcome::NoOp;
+        }
+        if matches!(self.status(), GraphStatus::Failed(_)) {
+            if let Some(retry) = lock_recover(&self.graph_retry).as_mut() {
+                retry.observe_external_work(true);
+            }
         }
         match self.status() {
             GraphStatus::Idle => {
@@ -1193,7 +1222,7 @@ mod tests {
         assert!(matches!(
             graph.try_publish_cached(root, 0),
             PublishAttemptOutcome::Refused(super::super::build::LoadFailure {
-                reason: super::super::build::LoadFailureReason::Terminal,
+                reason: super::super::build::LoadFailureReason::Superseded,
                 ..
             })
         ));
@@ -1260,8 +1289,9 @@ mod tests {
             *newer_in_hook.lock().unwrap() =
                 Some(crate::workspace_lease::WorkspaceLease::claim(&root_in_hook));
             assert!(matches!(
-                refusal_lease_in_hook.with_ownership_outcome(|| ()),
-                crate::workspace_lease::LeaseOutcome::Terminal
+                refusal_lease_in_hook
+                    .publish_short(&mut (), |_| { Ok::<_, std::convert::Infallible>(()) }),
+                crate::workspace_lease::LeaseOperationOutcome::Superseded
             ));
             GraphPublishOutcome { topology_handled: false, roots_handled: true }
         });

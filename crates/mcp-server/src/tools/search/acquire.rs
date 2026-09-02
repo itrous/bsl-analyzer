@@ -34,9 +34,8 @@ pub(crate) const ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_m
 /// and it is also what lets the wait observe the request's cancellation between polls: a
 /// parked `lock()` cannot be woken by anything but the holder.
 ///
-/// This is the only way a request path takes the engine lock — the search tools and the
-/// resident prefetch they run first. Background writers have no request to be cancelled by
-/// and keep their plain `lock()`.
+/// This is the only way a request path takes the engine lock. Background writers have no
+/// request to be cancelled by and keep their plain `lock()`.
 pub(crate) fn try_acquire_engine<'a>(
     engine: &'a Arc<Mutex<Option<SearchEngine>>>,
     cancel: &CancellationToken,

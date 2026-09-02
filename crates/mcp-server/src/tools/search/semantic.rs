@@ -27,9 +27,8 @@ use tracing::warn;
     clippy::too_many_arguments,
     reason = "semantic search has the lexical inputs plus its runtime status; a one-use context struct would only rename them"
 )]
-pub(super) fn semantic_code_hits_fenced(
+pub(super) fn semantic_code_hits(
     engine: &Arc<Mutex<Option<SearchEngine>>>,
-    lease: &crate::workspace_lease::WorkspaceLease,
     cancel: &CancellationToken,
     semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
     workspace_search_mode: WorkspaceSearchMode,
@@ -48,9 +47,6 @@ pub(super) fn semantic_code_hits_fenced(
         .lock()
         .map_err(|e| McpError::internal_error(format!("semantic runtime lock error: {e}"), None))?
         .clone();
-    // Reindex dirty overlay paths from the shared resident parse before serving. Runs OFF the
-    // engine lock and no-ops when the resident is unavailable.
-    crate::state::SharedState::prefetch_resident_overlay_fenced(engine, lease, cancel)?;
     let guard = match try_acquire_engine(engine, cancel) {
         Ok(g) => g,
         Err(AcquireFailure::Poisoned) => return Err(engine_lock_poisoned_error().into()),
@@ -418,7 +414,7 @@ where
 mod tests {
     use super::super::test_support::semantic_hit;
     use super::super::types::{CodeHits, DirectResult, SemanticUnavailable};
-    use super::{merge_direct_semantic_with_refill, semantic_code_hits_fenced};
+    use super::{merge_direct_semantic_with_refill, semantic_code_hits};
     use crate::state::{SemanticRuntimeStatus, WorkspaceSearchMode};
     use bsl_search::{EmbedderConfig, SearchConfig, SearchEngine};
     use std::collections::HashSet;
@@ -481,9 +477,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("workspace-search.db");
         let engine = Arc::new(Mutex::new(Some(SearchEngine::fts_only(&db_path).unwrap())));
-        let outcome = semantic_code_hits_fenced(
+        let outcome = semantic_code_hits(
             &engine,
-            &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &tokio_util::sync::CancellationToken::new(),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Failed("overlay sync failed".to_owned()))),
             WorkspaceSearchMode::SqliteLocal,
@@ -502,9 +497,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("workspace-search.db");
         let engine = Arc::new(Mutex::new(Some(SearchEngine::fts_only(&db_path).unwrap())));
-        let outcome = semantic_code_hits_fenced(
+        let outcome = semantic_code_hits(
             &engine,
-            &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &tokio_util::sync::CancellationToken::new(),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Indexing)),
             WorkspaceSearchMode::SqliteLocal,
@@ -533,9 +527,8 @@ mod tests {
             ..SearchConfig::default()
         };
         let engine = Arc::new(Mutex::new(Some(SearchEngine::new(&db_path, config).unwrap())));
-        let outcome = semantic_code_hits_fenced(
+        let outcome = semantic_code_hits(
             &engine,
-            &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &tokio_util::sync::CancellationToken::new(),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Ready)),
             WorkspaceSearchMode::SqliteLocal,
