@@ -1,6 +1,6 @@
 ## Context
 
-PR #54 (`75b8a978`) repaired the confirmed takeover races and is already contained by the exact implementation base `upstream/develop` / `f8bf4da5831840070aa19477be68e74d78014fa6`. Issue #71 remains open because current APIs still allow arbitrary work inside `with_ownership_outcome`, collapse terminal causes, and leave several transient-retry obligations unbounded.
+PR #54 (`75b8a978`) repaired the confirmed takeover races and is already contained by the exact v0.2.77 integration base `upstream/develop` / `edc78e22f3efbfe51ffd8e6dfd05b457976195ca`. Issue #71 remains open because current APIs still allow arbitrary work inside `with_ownership_outcome`, collapse terminal causes, and leave several transient-retry obligations unbounded.
 
 The production audit also found request-time ownership work outside the originally named graph handlers: lexical, semantic, and hybrid search can run fenced prefetch; metadata, diagnostics, and graph status can refresh ownership. Those paths are part of this change. This is a planning-only architecture gate; it does not restore the historical stacked change removed during PR #54 integration.
 
@@ -12,7 +12,7 @@ GO requires all requirement scenarios to have an exact task and planned test map
 
 ## Positive Prerequisites
 
-- Implementation branch starts from exact SHA `f8bf4da5831840070aa19477be68e74d78014fa6`, which contains PR #54 merge `75b8a978`.
+- Implementation branch is rebased onto exact SHA `edc78e22f3efbfe51ffd8e6dfd05b457976195ca`, which contains v0.2.77 and PR #54 merge `75b8a978`.
 - `openspec validate enforce-workspace-lease-operation-profiles --strict --no-interactive` passes before implementation.
 - Baseline production inventory covers `workspace_lease`, bootstrap, sync, embedding, overlay retry, graph build/state/snapshot, `bsl-search` transaction helpers, all search modes, and metadata/diagnostics/graph status.
 - Existing Linux tests and Windows MCP workflow are the verification surfaces; no clean secondary worktree, published PR, live CI result, or maintainer response is a planning prerequisite.
@@ -50,6 +50,7 @@ GO requires all requirement scenarios to have an exact task and planned test map
 11. Independent search/database mutation batches and fused per-file SQLite ingest use `WORKSPACE_APPLY_BATCH_ROWS = 64`. `GRAPH_BUILD_BATCH = 500` applies only to temporary graph construction outside the fence. Atomic manifest/fingerprint transitions use checkpointed helpers at the existing 64-row boundary.
 12. A heartbeat is periodic liveness maintenance, not a retry obligation. A transient heartbeat miss waits for the next normal tick and does not create an inner retry loop.
 13. No new dependency, runtime thread, scheduler, persistent schema, lease record, or MCP configuration/wire field is introduced.
+14. Integration with v0.2.77 preserves request cancellation and withdrawal, but cancellation plumbing does not regain authority to acquire or inspect `WorkspaceLease`, synchronously prefetch resident state, or wait for refresh; search requests cancel resident reads while refresh remains a coalesced background signal.
 
 ## Operation Contract
 

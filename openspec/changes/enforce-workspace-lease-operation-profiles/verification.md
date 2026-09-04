@@ -47,7 +47,7 @@ Every spec scenario has exactly one row. Identifiers are planned until implement
 ## Required Commands
 
 - Run each Rust identifier above with an exact or fully qualified filter and confirm a non-zero test count.
-- Run all `inventory::*` identifiers above and fail on any match outside the documented allow-list. The compatibility inventory executes `git diff --exit-code f8bf4da5831840070aa19477be68e74d78014fa6 -- Cargo.lock` and audits the exact added diff for thread/spawn APIs, schema/version DDL, lease-record fields, environment/config reads, and MCP serialization types.
+- Run all `inventory::*` identifiers above and fail on any match outside the documented allow-list. The compatibility inventory executes `git diff --exit-code edc78e22f3efbfe51ffd8e6dfd05b457976195ca -- Cargo.lock` and audits the exact added diff for thread/spawn APIs, schema/version DDL, lease-record fields, environment/config reads, and MCP serialization types.
 - In Linux `Check` and Windows `MCP transports + secure broker`, run each of the six portable identifiers in row 32 as `cargo test -p mcp-server <identifier> -- --exact` and require a non-zero test count.
 - `cargo fmt --all -- --check`
 - `cargo clippy -p bsl-search -p mcp-server --all-targets --all-features -- -D warnings`
@@ -63,12 +63,12 @@ After a later explicit publication request, match the PR head SHA to the locally
 
 ## Current Status
 
-Implementation, local verification, and both independent reviews are complete. Publication
-remains out of scope.
+Implementation, v0.2.77 rebase integration, local verification, and both independent reviews are
+complete. Republishing the rebased PR branch remains pending.
 
 ## Evidence Collected
 
-- Baseline: `git fetch upstream develop`; both `HEAD` and `upstream/develop` are `f8bf4da5831840070aa19477be68e74d78014fa6`; `git merge-base --is-ancestor 75b8a978 HEAD` passed; initial dirty state contained only this untracked `openspec/` tree.
+- Baseline: initial implementation started from `f8bf4da5831840070aa19477be68e74d78014fa6`; on 2026-09-04 the branch was rebased onto v0.2.77 integration base `edc78e22f3efbfe51ffd8e6dfd05b457976195ca`; `git merge-base --is-ancestor 75b8a978 HEAD` passed.
 - Caller inventory: seven production files referenced the legacy ownership APIs and ten files referenced `LeaseOutcome` or `FenceOutcome` before implementation.
 - Traceability: an exact requirement/scenario-to-matrix comparison passed with 32 scenarios, 32 unique rows, no duplicate scenario, and every row linked to an existing task.
 - Pre-implementation strict validation: `openspec validate enforce-workspace-lease-operation-profiles --strict --no-interactive` passed.
@@ -93,12 +93,17 @@ remains out of scope.
   batch creates the next enable budget.
 - Request paths: the exact graph pool-only, all-search resident-only, and all-status cached-only
   tests each executed once and passed. The four busy descriptor-pool tests also passed; status
-  uses cached lease/standalone-extension state and search only coalesces a background refresh.
+  uses cached lease/standalone extension/external-object state and search only coalesces a
+  background refresh.
+- v0.2.77 cancellation integration: six search cancellation gates and both workspace/reference
+  handler-matrix tests passed. `search_call` and `CancellationToken` remain on the request path,
+  while source inventory and the held-lease regression confirm that cancellation adds no lease
+  access, synchronous resident prefetch, or refresh wait.
 - Embedding: all three paid-work exact tests passed, proving zero network calls after failed
   preflight, one paid call across transient publication refusal, and `Failed` on deadline.
 - Exact matrix: every listed scenario, handler, and supplemental-inventory identifier executed at
   least one test and passed after the final integration changes.
-- Full gates: `bsl-search` passed 405 tests with 29 ignored; `mcp-server` passed 974 library tests
+- Full gates: `bsl-search` passed 405 tests with 29 ignored; `mcp-server` passed 994 library tests
   with 1 ignored plus 155 integration tests. Strict Clippy, rustfmt check, `git diff --check`,
   `actionlint`, all three inventory gates, and strict non-interactive OpenSpec validation passed.
 - Full local CI follow-up: workspace-wide `RUSTFLAGS='-D warnings' cargo clippy

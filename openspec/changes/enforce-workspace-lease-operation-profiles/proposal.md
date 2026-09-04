@@ -27,4 +27,4 @@ None. The current repository contains no promoted OpenSpec capability covering w
 - Supporting code where transaction boundaries are owned: `crates/bsl-search/src/{engine,store,workspace_overlay,vector_persist}.rs`.
 - Tests and existing Windows MCP CI filters will be extended. Request refresh is routed through the existing search sink; no new runtime dependency, worker, scheduler, cache/SQLite format, lease record format, configuration knob, or MCP wire change is introduced.
 - Internal Rust APIs change; there is no public compatibility or data migration.
-- Source: https://github.com/itrous/bsl-analyzer/issues/71. PR #54 merge `75b8a978` is contained by the exact implementation base `f8bf4da5831840070aa19477be68e74d78014fa6`; it is a behavioral baseline, not a dependency branch.
+- Source: https://github.com/itrous/bsl-analyzer/issues/71. PR #54 merge `75b8a978` is contained by the exact v0.2.77 integration base `edc78e22f3efbfe51ffd8e6dfd05b457976195ca`; it is a behavioral baseline, not a dependency branch.

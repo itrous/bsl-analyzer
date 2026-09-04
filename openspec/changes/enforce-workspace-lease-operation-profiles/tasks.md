@@ -1,6 +1,6 @@
 ## 0. Baseline and traceability
 
-- [x] 0.1 Fetch `upstream/develop`; require exact base `f8bf4da5831840070aa19477be68e74d78014fa6`, confirm PR #54 merge `75b8a978` is an ancestor, record dirty state, and capture the production caller inventory before editing.
+- [x] 0.1 Fetch `upstream/develop`; require exact v0.2.77 integration base `edc78e22f3efbfe51ffd8e6dfd05b457976195ca`, confirm PR #54 merge `75b8a978` is an ancestor, record dirty state, and capture the production caller inventory before editing.
 - [x] 0.2 Map every requirement scenario to one exact task and planned test/inventory identifier in `verification.md`; reject duplicate or unmapped rows.
 - [x] 0.3 Run the focused lease, graph, bootstrap, sync, embed, and overlay baseline plus formatting and strict Clippy; record pre-existing failures separately.
 

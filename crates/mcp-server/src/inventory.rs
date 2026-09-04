@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-const BASE: &str = "f8bf4da5831840070aa19477be68e74d78014fa6";
+const BASE: &str = "edc78e22f3efbfe51ffd8e6dfd05b457976195ca";
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("source directory is readable") {
