@@ -22,9 +22,8 @@ use tracing::warn;
     clippy::too_many_arguments,
     reason = "the lexical modality takes the tool-dispatch inputs plus the request's cancellation; a one-use context struct would only rename them"
 )]
-pub(super) fn lexical_code_hits_fenced(
+pub(super) fn lexical_code_hits(
     engine: &Arc<Mutex<Option<SearchEngine>>>,
-    lease: &crate::workspace_lease::WorkspaceLease,
     cancel: &CancellationToken,
     workspace_search_mode: WorkspaceSearchMode,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
@@ -38,9 +37,6 @@ pub(super) fn lexical_code_hits_fenced(
         configured_baseline,
         external_baseline.as_ref(),
     )?;
-    // Reindex dirty overlay paths from the shared resident parse before serving. Runs OFF the
-    // engine lock and no-ops when the resident is unavailable.
-    crate::state::SharedState::prefetch_resident_overlay_fenced(engine, lease, cancel)?;
     let guard = match try_acquire_engine(engine, cancel) {
         Ok(g) => g,
         Err(AcquireFailure::Poisoned) => return Err(engine_lock_poisoned_error().into()),

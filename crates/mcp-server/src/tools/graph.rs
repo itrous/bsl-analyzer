@@ -498,6 +498,39 @@ fn redact_opt(source: &mut Option<String>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn graph_data_requests_are_pool_only_under_held_lease() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        cache.ensure().unwrap();
+        let lease_path = cache.lease_path();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let graph = crate::graph::GraphState::for_workspace_with_cache(root.to_path_buf(), cache)
+            .with_lease(lease.clone());
+        graph.ensure_loading();
+        crate::graph::test_support::wait_ready(&graph);
+        let held_lease = lease.hold_file_lock_for_test();
+        std::fs::remove_file(lease_path).unwrap();
+        lease.invalidate_verdict_for_test();
+
+        let started = Instant::now();
+        let first = graph.snapshot().expect("a resident descriptor needs no lease refresh");
+        let descriptors: Vec<_> = (1..crate::graph::SNAPSHOT_POOL_CAP)
+            .map(|_| graph.snapshot().expect("published descriptor"))
+            .collect();
+        assert!(graph.snapshot().is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        drop(held_lease);
+        drop(first);
+        drop(descriptors);
+        lease.release();
+    }
+
     /// `graph schema` is the only machine-readable place this tool names the reasons a node
     /// may carry instead of a location, and a consumer writes its own closed match from it.
     /// A list short by one code makes that consumer meet a value it was told cannot occur.

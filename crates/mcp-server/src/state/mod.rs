@@ -2,6 +2,7 @@ mod bootstrap;
 pub use bootstrap::WorkspaceInitError;
 mod embed;
 mod overlay_retry;
+pub(crate) mod retry_window;
 mod sync;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -47,13 +48,15 @@ pub(crate) struct ReferenceSearchState {
 /// dirty and are served by the query's own lazy disk refresh and by subsequent queries' prefetch
 /// passes, so nothing is lost — the cap is purely a per-query budget. 64 keeps the pre-pass cheap
 /// while covering the common "edit a handful of files, then search" case in one shot.
+#[cfg(test)]
 const MAX_RESIDENT_PREFETCH_PATHS_PER_QUERY: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum WorkspaceSearchApply<T, E> {
     Applied(T),
     TransientRefusal,
-    Terminal,
+    Superseded,
+    Released,
     OperationError(E),
 }
 
@@ -64,6 +67,7 @@ pub struct SharedState {
     /// which may be nested under `workspace_root`. File-tree lookups such as
     /// `metadata(form)` resolve object directories relative to THIS root, not the repo root.
     source_root: Option<PathBuf>,
+    standalone_notice: Option<String>,
     onec_client: Option<OnecClient>,
     onec_connections: BTreeMap<String, OnecConnection>,
     debug_session: Arc<Mutex<Option<bsl_debug::session::DebugSession>>>,
@@ -129,16 +133,28 @@ impl OnecConnection {
 
 impl SharedState {
     pub(super) fn search_fence_outcome<T>(
-        outcome: crate::workspace_lease::LeaseOutcome<T>,
-    ) -> bsl_search::FenceOutcome<T> {
+        outcome: crate::workspace_lease::LeaseOperationOutcome<T, bsl_search::SearchError>,
+    ) -> bsl_search::FenceOutcome<Result<T, bsl_search::SearchError>> {
         match outcome {
-            crate::workspace_lease::LeaseOutcome::Applied(value) => {
-                bsl_search::FenceOutcome::Applied(value)
+            crate::workspace_lease::LeaseOperationOutcome::Applied(value) => {
+                bsl_search::FenceOutcome::Applied(Ok(value))
             }
-            crate::workspace_lease::LeaseOutcome::TransientRefusal => {
+            crate::workspace_lease::LeaseOperationOutcome::OperationError(error) => {
+                let error = match error {
+                    crate::workspace_lease::LeaseOperationError::Lease(error) => error.into(),
+                    crate::workspace_lease::LeaseOperationError::Operation(error) => error,
+                };
+                bsl_search::FenceOutcome::Applied(Err(error))
+            }
+            crate::workspace_lease::LeaseOperationOutcome::TransientRefusal => {
                 bsl_search::FenceOutcome::TransientRefusal
             }
-            crate::workspace_lease::LeaseOutcome::Terminal => bsl_search::FenceOutcome::Terminal,
+            crate::workspace_lease::LeaseOperationOutcome::Superseded => {
+                bsl_search::FenceOutcome::Superseded
+            }
+            crate::workspace_lease::LeaseOperationOutcome::Released => {
+                bsl_search::FenceOutcome::Released
+            }
         }
     }
 
@@ -147,9 +163,39 @@ impl SharedState {
         lease: &crate::workspace_lease::WorkspaceLease,
         apply: impl FnOnce(&mut bsl_search::SearchEngine) -> Result<T, bsl_search::SearchError>,
     ) -> WorkspaceSearchApply<T, bsl_search::SearchError> {
-        Self::apply_workspace_search_checkpointed(shared, lease, |engine, _checkpoint| {
-            std::ops::ControlFlow::Continue(apply(engine))
-        })
+        let mut guard = match shared.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return WorkspaceSearchApply::OperationError(bsl_search::SearchError::Index(
+                    format!("workspace search engine lock poisoned: {error}"),
+                ));
+            }
+        };
+        let Some(engine) = guard.as_mut() else {
+            return WorkspaceSearchApply::OperationError(bsl_search::SearchError::Index(
+                "workspace search engine is not published".to_owned(),
+            ));
+        };
+        match lease.publish_short(&mut (), |_| apply(engine)) {
+            crate::workspace_lease::LeaseOperationOutcome::Applied(result) => {
+                WorkspaceSearchApply::Applied(result)
+            }
+            crate::workspace_lease::LeaseOperationOutcome::OperationError(error) => {
+                WorkspaceSearchApply::OperationError(match error {
+                    crate::workspace_lease::LeaseOperationError::Lease(error) => error.into(),
+                    crate::workspace_lease::LeaseOperationError::Operation(error) => error,
+                })
+            }
+            crate::workspace_lease::LeaseOperationOutcome::TransientRefusal => {
+                WorkspaceSearchApply::TransientRefusal
+            }
+            crate::workspace_lease::LeaseOperationOutcome::Superseded => {
+                WorkspaceSearchApply::Superseded
+            }
+            crate::workspace_lease::LeaseOperationOutcome::Released => {
+                WorkspaceSearchApply::Released
+            }
+        }
     }
 
     pub(super) fn apply_workspace_search_checkpointed<T>(
@@ -187,17 +233,25 @@ impl SharedState {
                 "workspace search engine is not published".to_owned(),
             ));
         };
-        match lease.with_ownership_checkpointed(|checkpoint| apply(engine, checkpoint)) {
-            crate::workspace_lease::LeaseOutcome::Applied(Ok(result)) => {
+        match lease.publish_checkpointed(|checkpoint| apply(engine, checkpoint)) {
+            crate::workspace_lease::LeaseOperationOutcome::Applied(result) => {
                 WorkspaceSearchApply::Applied(result)
             }
-            crate::workspace_lease::LeaseOutcome::Applied(Err(error)) => {
-                WorkspaceSearchApply::OperationError(error)
+            crate::workspace_lease::LeaseOperationOutcome::OperationError(error) => {
+                WorkspaceSearchApply::OperationError(match error {
+                    crate::workspace_lease::LeaseOperationError::Lease(error) => error.into(),
+                    crate::workspace_lease::LeaseOperationError::Operation(error) => error,
+                })
             }
-            crate::workspace_lease::LeaseOutcome::TransientRefusal => {
+            crate::workspace_lease::LeaseOperationOutcome::TransientRefusal => {
                 WorkspaceSearchApply::TransientRefusal
             }
-            crate::workspace_lease::LeaseOutcome::Terminal => WorkspaceSearchApply::Terminal,
+            crate::workspace_lease::LeaseOperationOutcome::Superseded => {
+                WorkspaceSearchApply::Superseded
+            }
+            crate::workspace_lease::LeaseOperationOutcome::Released => {
+                WorkspaceSearchApply::Released
+            }
         }
     }
 
@@ -213,26 +267,16 @@ impl SharedState {
     /// carries, joined for one status line — the state in which valid calls into
     /// that configuration are reported as unresolved. An extension's and an
     /// external object's are distinct conditions and both can hold at once.
-    /// Derived from the project as it is now, not from the root captured at
-    /// bootstrap: a config edit can move the resolved root between a main
-    /// configuration and an extension, and everything else — diagnostics, graph,
-    /// drift — already rebuilds through `crate::project::at` when it does.
+    /// Captured at bootstrap and refreshed by rebuilding the workspace state.
     pub(crate) fn standalone_notice(&self) -> Option<String> {
-        let root = self.workspace_root.as_deref()?;
-        let project = crate::project::at(root).ok()?;
-        let notices: Vec<String> =
-            [project.standalone_extension_notice(), project.standalone_external_notice()]
-                .into_iter()
-                .flatten()
-                .collect();
-        (!notices.is_empty()).then(|| notices.join("\n"))
+        self.standalone_notice.clone()
     }
 
     pub(crate) fn superseded(&self) -> bool {
-        let _ = self.workspace_lease.owns_caches();
         self.workspace_lease.is_superseded()
     }
 
+    #[cfg(test)]
     pub(crate) fn owns_caches(&self) -> bool {
         self.workspace_lease.owns_caches()
     }
@@ -247,6 +291,11 @@ impl SharedState {
                     SemanticRuntimeStatus::Indexing | SemanticRuntimeStatus::OverlaySyncing
                 )
             })
+    }
+
+    /// Cached request-path view backed only by lease atomics.
+    pub(crate) fn owns_caches_cached(&self) -> bool {
+        self.workspace_lease.owns_caches_cached()
     }
 
     /// Start building the diagnostics resident now instead of on the first tool call.
@@ -356,10 +405,18 @@ impl SharedState {
         Arc::clone(&self.overlay_warmup)
     }
 
+    /// Coalesce a request-observed stale resident into the existing background owner.
+    pub(crate) fn request_overlay_refresh(&self) {
+        if let Some(retry) = &self.overlay_retry {
+            retry.kick_fresh();
+        }
+    }
+
     pub(crate) fn workspace_search_mode(&self) -> WorkspaceSearchMode {
         self.workspace_search_mode.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn workspace_lease(&self) -> &crate::workspace_lease::WorkspaceLease {
         &self.workspace_lease
     }
@@ -420,10 +477,7 @@ impl SharedState {
     /// lock that only touches the overlay cache (never the resident). A resident that is
     /// absent/loading, or a path it cannot serve, is simply missing from the map and the
     /// reindex disk-reads it — so search never regresses when the resident is unavailable.
-    ///
-    /// Runs on behalf of one request: both engine-lock acquisitions and the per-path
-    /// resident reads observe `cancel`, and a cancelled request withdraws with whatever
-    /// remains left dirty, exactly as the per-query cap leaves it.
+    #[cfg(test)]
     pub(crate) fn prefetch_resident_overlay_fenced(
         engine: &SharedSearchEngine,
         lease: &crate::workspace_lease::WorkspaceLease,
@@ -530,10 +584,27 @@ mod tests {
         state.workspace_lease = old.clone();
         let newer = crate::workspace_lease::WorkspaceLease::claim(terminal_dir.path());
         old.invalidate_verdict_for_test();
+        assert!(!state.superseded(), "the cached view performs no ownership refresh");
+        assert!(!old.owns_caches(), "the heartbeat-owned refresh observes takeover");
         assert!(state.superseded(), "the refreshed live foreign token is terminal");
         newer.release();
         assert!(state.superseded(), "owner release cannot clear the terminal flag");
         assert!(!state.owns_caches());
+    }
+
+    #[test]
+    fn superseded_check_never_waits_for_the_lease_lifecycle_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
+        let mut state = SharedState::shared();
+        state.workspace_lease = lease.clone();
+        let held = lease.hold_lifecycle_lock_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || tx.send(state.superseded()).unwrap());
+
+        assert!(!rx.recv_timeout(std::time::Duration::from_millis(100)).unwrap());
+        drop(held);
     }
 }
 
@@ -597,7 +668,7 @@ mod standalone_extension_tests {
     }
 
     #[test]
-    fn the_notice_follows_a_config_edit_that_moves_the_root() {
+    fn the_notice_is_cached_for_request_status() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         configuration(root, "cf", false);
@@ -608,17 +679,11 @@ mod standalone_extension_tests {
         let state = SharedState::workspace(root.to_path_buf()).unwrap();
         assert!(state.standalone_notice().is_none(), "a main configuration stays silent");
 
-        // Everything else — diagnostics, graph, drift — rebuilds through
-        // `crate::project::at` after a config edit, so a notice read from the
-        // root captured at bootstrap would describe a project no longer in use.
         std::fs::write(&config, "[source]\nroot = \"ext\"\nextensions = []\n").unwrap();
-        assert!(
-            state.standalone_notice().is_some(),
-            "the root is now an extension and the notice must follow"
-        );
+        assert!(state.standalone_notice().is_none(), "request status does not reparse the project");
 
-        std::fs::write(&config, "[source]\nroot = \"cf\"\nextensions = []\n").unwrap();
-        assert!(state.standalone_notice().is_none(), "and must go away again");
+        let extension = SharedState::workspace(root.to_path_buf()).unwrap();
+        assert!(extension.standalone_notice().is_some());
     }
 }
 

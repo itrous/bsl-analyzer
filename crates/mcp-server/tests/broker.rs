@@ -163,13 +163,20 @@ async fn superseded_backend_lifecycle() {
     let client = ().serve(stream).await.expect("active client initializes");
 
     let newer = SharedState::workspace_with_cache(root.clone(), cache.clone()).unwrap();
-    tokio::time::sleep(Duration::from_millis(2_200)).await;
     let mut status = serde_json::Map::new();
     status.insert("action".to_owned(), serde_json::Value::String("status".to_owned()));
-    client
-        .call_tool(CallToolRequestParams::new("metadata").with_arguments(status))
-        .await
-        .expect("the active session survives takeover and observes it");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        let answer = client
+            .call_tool(CallToolRequestParams::new("metadata").with_arguments(status.clone()))
+            .await
+            .expect("the active session survives takeover and observes it");
+        if answer.structured_content.as_ref().is_some_and(|body| body["owns_caches"] == false) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "backend never observed takeover");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     newer.shutdown();
 
     let mut schema = serde_json::Map::new();

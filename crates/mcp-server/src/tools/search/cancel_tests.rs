@@ -7,18 +7,14 @@
 //! answered once the wait ends, so the early return is the cancellation's doing.
 
 use super::docs::{find_docs, search_docs};
-use super::hybrid::hybrid_code_fenced;
-use super::lexical::lexical_code_hits_fenced;
-use super::semantic::semantic_code_hits_fenced;
+use super::hybrid::hybrid_code_cancellable;
+use super::lexical::lexical_code_hits;
+use super::semantic::semantic_code_hits;
 use super::test_support::latched_service;
 use super::try_acquire_engine;
 use super::types::{CodeHits, SearchFailure};
-use crate::state::{SemanticRuntimeStatus, SharedState, WorkspaceSearchMode};
-use crate::workspace_lease::WorkspaceLease;
-use bsl_search::{
-    EmbedderConfig, IndexProgress, ModuleSnapshot, ModuleSnapshotSource, SearchConfig,
-    SearchEngine, SnapshotFetch,
-};
+use crate::state::{SemanticRuntimeStatus, WorkspaceSearchMode};
+use bsl_search::{EmbedderConfig, IndexProgress, SearchConfig, SearchEngine};
 use rmcp::model::CallToolResult;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -84,9 +80,8 @@ fn actions() -> Vec<(&'static str, SearchCall)> {
         (
             "search_code",
             Box::new(|engine, cancel| {
-                hybrid_code_fenced(
+                hybrid_code_cancellable(
                     engine,
-                    &WorkspaceLease::unmanaged(),
                     cancel,
                     &ready_runtime(),
                     WorkspaceSearchMode::SqliteLocal,
@@ -176,9 +171,8 @@ fn a_cancelled_search_waiting_on_the_actor_releases_the_engine_lock() {
         let cancel = cancel.clone();
         let service = Arc::clone(&service);
         move || {
-            lexical_code_hits_fenced(
+            lexical_code_hits(
                 &engine,
-                &WorkspaceLease::unmanaged(),
                 &cancel,
                 WorkspaceSearchMode::SqliteLocal,
                 None,
@@ -223,9 +217,8 @@ fn a_cancelled_identity_gate_releases_the_engine_lock() {
         let cancel = cancel.clone();
         let service = Arc::clone(&service);
         move || {
-            semantic_code_hits_fenced(
+            semantic_code_hits(
                 &engine,
-                &WorkspaceLease::unmanaged(),
                 &cancel,
                 &ready_runtime(),
                 WorkspaceSearchMode::SqliteLocal,
@@ -346,9 +339,8 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
             let service = service.as_ref().map(|(service, _)| Arc::clone(service));
             move || -> Result<(), SearchFailure> {
                 if name == "search_code" {
-                    semantic_code_hits_fenced(
+                    semantic_code_hits(
                         &engine,
-                        &WorkspaceLease::unmanaged(),
                         &cancel,
                         &ready_runtime(),
                         WorkspaceSearchMode::SqliteLocal,
@@ -389,87 +381,6 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
     }
 }
 
-/// A resident that answers the first fetch only when the test lets it.
-struct LatchedResident {
-    fetches: AtomicUsize,
-    gate: Mutex<mpsc::Receiver<()>>,
-}
-
-impl ModuleSnapshotSource for LatchedResident {
-    fn text_and_parse(&self, path: &str) -> SnapshotFetch {
-        if self.fetches.fetch_add(1, Ordering::SeqCst) == 0 {
-            self.gate.lock().unwrap().recv().ok();
-        }
-        let text = std::fs::read_to_string(path).unwrap();
-        SnapshotFetch::Fetched(ModuleSnapshot {
-            root: parser::parse(&text).syntax_node(),
-            text: text.into(),
-        })
-    }
-}
-
-/// I8 — the resident prefetch withdraws at the cancellation: the paths after the one in
-/// flight are not fetched, and nothing fetched so far is applied to the overlay.
-#[test]
-fn a_cancelled_prefetch_stops_at_the_path_in_flight_and_applies_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path();
-    let names = ["Первый", "Второй", "Третий"];
-    for name in names {
-        std::fs::write(
-            workspace.join(format!("{name}.bsl")),
-            format!("Процедура {name}()\nКонецПроцедуры"),
-        )
-        .unwrap();
-    }
-    let mut engine = SearchEngine::fts_only(&workspace.join("search.db")).unwrap();
-    engine.index_directory_fts(workspace).unwrap();
-    engine.set_workspace_root(workspace);
-    engine.initialize_workspace_overlay_clean().unwrap();
-    engine.enable_workspace_watcher_mode();
-    for name in names {
-        let file = workspace.join(format!("{name}.bsl"));
-        std::fs::write(&file, format!("Процедура {name}Новая()\nКонецПроцедуры")).unwrap();
-        assert!(engine.mark_workspace_path_dirty(&file).unwrap());
-    }
-    let dirty_before = engine.workspace_overlay_dirty_paths().unwrap();
-    assert_eq!(dirty_before.len(), 3, "sanity: three dirty paths to prefetch");
-
-    let (release_tx, release_rx) = mpsc::channel::<()>();
-    let resident =
-        Arc::new(LatchedResident { fetches: AtomicUsize::new(0), gate: Mutex::new(release_rx) });
-    engine.set_module_snapshot_source(Arc::clone(&resident) as Arc<dyn ModuleSnapshotSource>);
-    let engine: SharedEngine = Arc::new(Mutex::new(Some(engine)));
-
-    let cancel = CancellationToken::new();
-    let outcome = on_thread({
-        let engine = Arc::clone(&engine);
-        let cancel = cancel.clone();
-        move || {
-            SharedState::prefetch_resident_overlay_fenced(
-                &engine,
-                &WorkspaceLease::unmanaged(),
-                &cancel,
-            )
-        }
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while resident.fetches.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < deadline, "the prefetch never reached the resident");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    cancel.cancel();
-    release_tx.send(()).unwrap();
-    let (out, _) = outcome.recv_timeout(Duration::from_secs(5)).expect("the prefetch returns");
-    assert!(out.is_err(), "a cancelled prefetch withdraws");
-    assert_eq!(resident.fetches.load(Ordering::SeqCst), 1, "only the fetch in flight ran");
-
-    let guard = engine.lock().unwrap();
-    let dirty_after = guard.as_ref().unwrap().workspace_overlay_dirty_paths().unwrap();
-    assert_eq!(dirty_after, dirty_before, "nothing fetched before the cancellation was applied");
-}
-
 /// The lexical modality answers a cancellation the same way whether it reaches the actor
 /// or not: the value, not a pending envelope. (Type-level: `CodeHits` has no cancelled
 /// variant, so a cancellation cannot be rendered as a body from here.)
@@ -479,9 +390,8 @@ fn a_cancelled_lexical_modality_is_a_failure_not_a_pending_body() {
     let engine = fts_engine(&dir);
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let out = lexical_code_hits_fenced(
+    let out = lexical_code_hits(
         &engine,
-        &WorkspaceLease::unmanaged(),
         &cancel,
         WorkspaceSearchMode::SqliteLocal,
         None,

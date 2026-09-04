@@ -1,4 +1,7 @@
-use super::{SharedSearchEngine, SharedState, MAX_RESIDENT_PREFETCH_PATHS_PER_QUERY};
+use super::retry_window::{RetryDecision, RetryOwner, RetryWindow};
+#[cfg(test)]
+use super::MAX_RESIDENT_PREFETCH_PATHS_PER_QUERY;
+use super::{SharedSearchEngine, SharedState};
 use crate::change_hub::WorkspaceChangeHub;
 use crate::graph::GraphState;
 use bsl_search::SearchEngine;
@@ -22,11 +25,28 @@ struct SearchDriftPlan {
     full_rescan: bool,
     roots_epoch: u64,
     preparation_error: Option<String>,
+    snapshot_outcome: Option<SnapshotPreparationOutcome>,
+    snapshot_paths: Vec<PathBuf>,
     nudge_rebuild: bool,
     nudge_project_reload: bool,
     dirty_cursor: usize,
     removed_cursor: usize,
     context_cursor: usize,
+}
+
+enum SnapshotPreparationOutcome {
+    OperationError(String),
+    TransientRefusal,
+    Superseded,
+    Released,
+}
+
+enum ReferencingFilesOutcome {
+    Applied(std::collections::HashSet<PathBuf>),
+    OperationError(String),
+    TransientRefusal,
+    Superseded,
+    Released,
 }
 
 #[derive(Default)]
@@ -181,6 +201,10 @@ impl SharedState {
         std::thread::Builder::new()
             .name("bsl-search-overlay-watch".to_owned())
             .spawn(move || {
+                let mut cursor = cursor;
+                let mut generation = 0u64;
+                let mut enable_retry = RetryWindow::new(RetryOwner::ChangeHub);
+                let mut enable_rescan_debt = false;
                 // Watcher mode is one-way in the store and doubles as "skip the full
                 // rescan", so the only place it can be asked for safely is inside the
                 // consumer that feeds it: a running thread is a feeder that exists.
@@ -191,25 +215,53 @@ impl SharedState {
                     }) {
                         super::WorkspaceSearchApply::Applied(()) => break,
                         super::WorkspaceSearchApply::TransientRefusal => {
-                            std::thread::sleep(crate::workspace_lease::VERDICT_TTL)
+                            match enable_retry
+                                .refused(std::time::Instant::now(), Duration::from_secs(2))
+                            {
+                                RetryDecision::RetryAfter(delay) => std::thread::sleep(delay),
+                                RetryDecision::Stop(_) => loop {
+                                    generation =
+                                        hub.wait_for_change(generation, Duration::from_secs(30));
+                                    let batch = hub.materialize(cursor);
+                                    if !batch.entries.is_empty() || batch.rescan_required {
+                                        enable_retry.observe_external_work(true);
+                                        break;
+                                    }
+                                },
+                            }
                         }
-                        super::WorkspaceSearchApply::Terminal => {
+                        super::WorkspaceSearchApply::Superseded
+                        | super::WorkspaceSearchApply::Released => {
+                            enable_retry.terminal();
                             hub.unsubscribe(cursor);
                             return;
                         }
                         super::WorkspaceSearchApply::OperationError(error) => {
-                            tracing::warn!("could not enable workspace watcher mode: {error}");
-                            hub.unsubscribe(cursor);
-                            return;
+                            enable_retry.operation_error();
+                            enable_rescan_debt = true;
+                            tracing::warn!(
+                                "could not enable workspace watcher mode; sink stays dormant until fresh work: {error}"
+                            );
+                            loop {
+                                generation =
+                                    hub.wait_for_change(generation, Duration::from_secs(30));
+                                let batch = hub.materialize(cursor);
+                                if !batch.entries.is_empty() || batch.rescan_required {
+                                    enable_retry = RetryWindow::new(RetryOwner::ChangeHub);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
                 tracing::info!("search overlay sink subscribed to workspace change hub");
 
-                let mut cursor = cursor;
-                let mut generation = 0u64;
                 let mut pending = None;
+                let mut drift_retry = None;
                 let mut rescan_debt = RescanDebt::default();
+                if enable_rescan_debt {
+                    rescan_debt.record_failure(std::time::Instant::now());
+                }
                 loop {
                     if pending.is_none() {
                         generation = hub.wait_for_change(
@@ -252,6 +304,7 @@ impl SharedState {
                             &graph,
                         );
                         pending = Some((batch, plan, fresh, root_relevant));
+                        drift_retry = Some(RetryWindow::new(RetryOwner::Drift));
                     }
                     let (batch, plan, fresh, root_relevant) = pending.as_mut().unwrap();
                     if *root_relevant {
@@ -273,21 +326,41 @@ impl SharedState {
                     }
                     match applied {
                         super::WorkspaceSearchApply::Applied(true) => {
+                            if let Some(retry) = drift_retry.as_mut() {
+                                retry.complete();
+                            }
                             if plan.full_rescan {
                                 rescan_debt.clear();
                             }
                         }
                         super::WorkspaceSearchApply::TransientRefusal => {
-                            std::thread::sleep(crate::workspace_lease::VERDICT_TTL);
-                            continue;
+                            let retry = drift_retry.as_mut().expect("pending drift owns a budget");
+                            let delay = super::overlay_retry::retry_delay(retry.streak());
+                            if let RetryDecision::RetryAfter(delay) =
+                                retry.refused(std::time::Instant::now(), delay)
+                            {
+                                std::thread::sleep(delay);
+                                continue;
+                            }
+                            tracing::warn!(
+                                "search drift lease retry budget exhausted; advancing the hub cursor"
+                            );
+                            rescan_debt.record_failure(std::time::Instant::now());
                         }
                         super::WorkspaceSearchApply::OperationError(error) => {
+                            if let Some(retry) = drift_retry.as_mut() {
+                                retry.operation_error();
+                            }
                             tracing::warn!(
                                 "search drift apply failed; advancing the hub cursor: {error}"
                             );
                             rescan_debt.record_failure(std::time::Instant::now());
                         }
-                        super::WorkspaceSearchApply::Terminal => {
+                        super::WorkspaceSearchApply::Superseded
+                        | super::WorkspaceSearchApply::Released => {
+                            if let Some(retry) = drift_retry.as_mut() {
+                                retry.terminal();
+                            }
                             hub.unsubscribe(cursor);
                             return;
                         }
@@ -307,6 +380,7 @@ impl SharedState {
                         }
                     }
                     pending = None;
+                    drift_retry = None;
                 }
             })
             .is_ok()
@@ -415,11 +489,23 @@ impl SharedState {
                     plan.context_paths.extend(walk_bsl_files(&subtree));
                 }
             }
-            match Self::resolve_referencing_module_files(graph, &class.xml_paths) {
-                Ok(paths) => plan.context_paths.extend(paths),
-                Err(error) => {
-                    plan.preparation_error = Some(error);
+            let snapshot_paths: Vec<_> =
+                class.xml_paths.iter().map(|path| path.raw.clone()).collect();
+            match Self::resolve_referencing_module_files(graph, &snapshot_paths) {
+                ReferencingFilesOutcome::Applied(paths) => plan.context_paths.extend(paths),
+                ReferencingFilesOutcome::OperationError(error) => {
+                    plan.snapshot_outcome = Some(SnapshotPreparationOutcome::OperationError(error));
                     plan.full_rescan = true;
+                }
+                ReferencingFilesOutcome::TransientRefusal => {
+                    plan.snapshot_outcome = Some(SnapshotPreparationOutcome::TransientRefusal);
+                    plan.snapshot_paths = snapshot_paths;
+                }
+                ReferencingFilesOutcome::Superseded => {
+                    plan.snapshot_outcome = Some(SnapshotPreparationOutcome::Superseded)
+                }
+                ReferencingFilesOutcome::Released => {
+                    plan.snapshot_outcome = Some(SnapshotPreparationOutcome::Released)
                 }
             }
             plan.mark_all_context |= mark_whole;
@@ -516,6 +602,40 @@ impl SharedState {
         plan: &mut SearchDriftPlan,
         _graph: &GraphState,
     ) -> super::WorkspaceSearchApply<bool, bsl_search::SearchError> {
+        if matches!(plan.snapshot_outcome, Some(SnapshotPreparationOutcome::TransientRefusal)) {
+            match Self::resolve_referencing_module_files(_graph, &plan.snapshot_paths) {
+                ReferencingFilesOutcome::Applied(paths) => {
+                    plan.context_paths.extend(paths);
+                    plan.snapshot_outcome = None;
+                    plan.snapshot_paths.clear();
+                    Self::materialize_search_drift(shared, plan);
+                }
+                ReferencingFilesOutcome::OperationError(error) => {
+                    plan.snapshot_outcome = Some(SnapshotPreparationOutcome::OperationError(error));
+                }
+                ReferencingFilesOutcome::TransientRefusal => {}
+                ReferencingFilesOutcome::Superseded => {
+                    plan.snapshot_outcome = Some(SnapshotPreparationOutcome::Superseded)
+                }
+                ReferencingFilesOutcome::Released => {
+                    plan.snapshot_outcome = Some(SnapshotPreparationOutcome::Released)
+                }
+            }
+        }
+        if let Some(outcome) = plan.snapshot_outcome.as_ref() {
+            return match outcome {
+                SnapshotPreparationOutcome::OperationError(error) => {
+                    super::WorkspaceSearchApply::OperationError(bsl_search::SearchError::Index(
+                        error.clone(),
+                    ))
+                }
+                SnapshotPreparationOutcome::TransientRefusal => {
+                    super::WorkspaceSearchApply::TransientRefusal
+                }
+                SnapshotPreparationOutcome::Superseded => super::WorkspaceSearchApply::Superseded,
+                SnapshotPreparationOutcome::Released => super::WorkspaceSearchApply::Released,
+            };
+        }
         #[cfg(test)]
         let force_apply_error =
             FORCE_DRIFT_APPLY_ERROR_ENGINE.load(Ordering::SeqCst) == Arc::as_ptr(shared) as usize;
@@ -543,55 +663,60 @@ impl SharedState {
                 return super::WorkspaceSearchApply::Applied(true);
             }
         }
-        Self::apply_workspace_search_checkpointed(shared, lease, |engine, checkpoint| {
+        let dirty_start = plan.dirty_cursor;
+        let dirty_end =
+            (dirty_start + bsl_search::WORKSPACE_APPLY_BATCH_ROWS).min(plan.dirty_keys.len());
+        let mut remaining = bsl_search::WORKSPACE_APPLY_BATCH_ROWS - (dirty_end - dirty_start);
+        let removed_start = plan.removed_cursor;
+        let removed_end = (removed_start + remaining).min(plan.removed_keys.len());
+        remaining -= removed_end - removed_start;
+        let context_start = plan.context_cursor;
+        let context_end = (context_start + remaining).min(plan.context_keys.len());
+
+        let outcome = Self::apply_workspace_search(shared, lease, |engine| {
             if engine.workspace_roots_epoch() != plan.roots_epoch {
-                return std::ops::ControlFlow::Continue(Err(bsl_search::SearchError::Index(
+                return Err(bsl_search::SearchError::Index(
                     "workspace roots changed after search drift preparation".to_owned(),
-                )));
+                ));
             }
             if let Some(error) = &plan.preparation_error {
-                return std::ops::ControlFlow::Continue(Err(bsl_search::SearchError::Index(
-                    error.clone(),
-                )));
+                return Err(bsl_search::SearchError::Index(error.clone()));
             }
             #[cfg(test)]
             if force_apply_error {
-                return std::ops::ControlFlow::Continue(Err(bsl_search::SearchError::Index(
+                return Err(bsl_search::SearchError::Index(
                     "forced drift apply failure".to_owned(),
-                )));
+                ));
             }
-            let result = (|| -> Result<(), bsl_search::SearchError> {
-                let mut remaining = bsl_search::WORKSPACE_APPLY_BATCH_ROWS;
-                while remaining > 0 && plan.dirty_cursor < plan.dirty_keys.len() {
-                    engine.mark_workspace_key_dirty(plan.dirty_keys[plan.dirty_cursor].clone())?;
-                    plan.dirty_cursor += 1;
-                    remaining -= 1;
+            let mut checkpoint = || std::ops::ControlFlow::Continue(());
+            match engine.apply_prepared_workspace_drift_batch(
+                &plan.dirty_keys[dirty_start..dirty_end],
+                &plan.removed_keys[removed_start..removed_end],
+                &plan.context_keys[context_start..context_end],
+                &mut checkpoint,
+            ) {
+                std::ops::ControlFlow::Continue(result) => result,
+                std::ops::ControlFlow::Break(()) => {
+                    unreachable!("short publication checkpoint always continues")
                 }
-                if remaining > 0 && plan.removed_cursor < plan.removed_keys.len() {
-                    let end = (plan.removed_cursor + remaining).min(plan.removed_keys.len());
-                    engine.remove_workspace_keys(
-                        plan.removed_keys[plan.removed_cursor..end].to_vec(),
-                    )?;
-                    remaining -= end - plan.removed_cursor;
-                    plan.removed_cursor = end;
-                }
-                while remaining > 0 && plan.context_cursor < plan.context_keys.len() {
-                    engine.mark_workspace_key_context_dirty(
-                        &plan.context_keys[plan.context_cursor],
-                    )?;
-                    plan.context_cursor += 1;
-                    remaining -= 1;
-                }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                return std::ops::ControlFlow::Continue(Err(error));
             }
-            if checkpoint().is_break() {
-                return std::ops::ControlFlow::Break(());
+        });
+        match outcome {
+            super::WorkspaceSearchApply::Applied(_) => {
+                plan.dirty_cursor = dirty_end;
+                plan.removed_cursor = removed_end;
+                plan.context_cursor = context_end;
+                super::WorkspaceSearchApply::Applied(plan.complete())
             }
-            std::ops::ControlFlow::Continue(Ok(plan.complete()))
-        })
+            super::WorkspaceSearchApply::TransientRefusal => {
+                super::WorkspaceSearchApply::TransientRefusal
+            }
+            super::WorkspaceSearchApply::Superseded => super::WorkspaceSearchApply::Superseded,
+            super::WorkspaceSearchApply::Released => super::WorkspaceSearchApply::Released,
+            super::WorkspaceSearchApply::OperationError(error) => {
+                super::WorkspaceSearchApply::OperationError(error)
+            }
+        }
     }
 
     /// Reverse-look-up the workspace modules that READ any changed MDO, returning the graph's
@@ -625,38 +750,55 @@ impl SharedState {
     /// queries, never a table scan.
     fn resolve_referencing_module_files(
         graph: &GraphState,
-        xml_paths: &[crate::drift_classify::DriftPath],
-    ) -> Result<std::collections::HashSet<PathBuf>, String> {
-        use crate::workspace_lease::LeaseOutcome;
+        xml_paths: &[PathBuf],
+    ) -> ReferencingFilesOutcome {
+        use crate::workspace_lease::{LeaseOperationError, LeaseOperationOutcome};
 
         let mut files = std::collections::HashSet::new();
         let mdo_ids: Vec<String> =
-            xml_paths.iter().filter_map(|dp| xml_to_mdo_id(&dp.raw)).collect();
+            xml_paths.iter().filter_map(|path| xml_to_mdo_id(path)).collect();
         if mdo_ids.is_empty() {
-            return Ok(files);
+            return ReferencingFilesOutcome::Applied(files);
         }
         let snapshot = match graph.snapshot_blocking() {
-            LeaseOutcome::Applied(Ok(Some(snapshot))) => snapshot,
-            LeaseOutcome::Applied(Ok(None)) => return Ok(files),
-            LeaseOutcome::Applied(Err(error)) => {
-                return Err(format!("background graph snapshot failed: {error}"))
+            LeaseOperationOutcome::Applied(Some(snapshot)) => snapshot,
+            LeaseOperationOutcome::Applied(None) => return ReferencingFilesOutcome::Applied(files),
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                crate::graph::BackgroundSnapshotError::Changed,
+            )) => {
+                return ReferencingFilesOutcome::OperationError(
+                    "background graph snapshot changed during preparation".to_owned(),
+                );
             }
-            LeaseOutcome::TransientRefusal => {
-                return Err("background graph snapshot lease was temporarily unavailable".to_owned())
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                crate::graph::BackgroundSnapshotError::Operation(error),
+            )) => {
+                return ReferencingFilesOutcome::OperationError(format!(
+                    "background graph snapshot failed: {error}"
+                ));
             }
-            LeaseOutcome::Terminal => {
-                return Err("background graph snapshot lease ended".to_owned())
+            LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
+                return ReferencingFilesOutcome::OperationError(format!(
+                    "background graph snapshot lease failed: {error}"
+                ));
             }
+            LeaseOperationOutcome::TransientRefusal => {
+                return ReferencingFilesOutcome::TransientRefusal
+            }
+            LeaseOperationOutcome::Superseded => return ReferencingFilesOutcome::Superseded,
+            LeaseOperationOutcome::Released => return ReferencingFilesOutcome::Released,
         };
         for mdo_id in mdo_ids {
             match snapshot.graph.referencing_files(&mdo_id) {
                 Ok(found) => files.extend(found.into_iter().map(PathBuf::from)),
                 Err(error) => {
-                    return Err(format!("referencing-files lookup failed for {mdo_id}: {error}"))
+                    return ReferencingFilesOutcome::OperationError(format!(
+                        "referencing-files lookup failed for {mdo_id}: {error}"
+                    ))
                 }
             }
         }
-        Ok(files)
+        ReferencingFilesOutcome::Applied(files)
     }
 
     /// Re-mark every workspace `.bsl` dirty for the search overlay, then reconcile the
@@ -796,7 +938,7 @@ impl SharedState {
                 }
                 Some(true)
             }
-            Ok(bsl_search::FenceOutcome::Terminal) => None,
+            Ok(bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released) => None,
             Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                 unreachable!("startup_apply retries transient refusals")
             }
@@ -836,6 +978,7 @@ impl SharedState {
 /// lock that only touches the overlay cache (never the resident). A resident that is
 /// absent/loading, or a path it cannot serve, is simply missing from the map and the
 /// reindex disk-reads it — so search never regresses when the resident is unavailable.
+#[cfg(test)]
 pub(super) fn prefetch_resident_overlay(
     engine: &SharedSearchEngine,
     lease: &crate::workspace_lease::WorkspaceLease,
@@ -1026,7 +1169,7 @@ mod tests {
         write_common_module, write_common_module_tree, EnvVarGuard, ENV_LOCK,
     };
     use super::{
-        SearchDriftPlan, SharedState, FORCE_REWALK_WALK_ERROR,
+        SearchDriftPlan, SharedState, SnapshotPreparationOutcome, FORCE_REWALK_WALK_ERROR,
         MAX_RESIDENT_PREFETCH_PATHS_PER_QUERY,
     };
     use crate::state::types::OverlayInit;
@@ -1186,7 +1329,10 @@ mod tests {
                 }
                 Ok::<_, bsl_search::SearchError>(())
             });
-            assert!(matches!(outcome, crate::state::WorkspaceSearchApply::Terminal), "{family:?}");
+            assert!(
+                matches!(outcome, crate::state::WorkspaceSearchApply::Superseded),
+                "{family:?}"
+            );
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "{family:?}");
             let guard = shared.lock().unwrap();
             let engine = guard.as_ref().unwrap();
@@ -1235,7 +1381,7 @@ mod tests {
                 &mut plan,
                 &crate::graph::GraphState::disabled(),
             ),
-            crate::state::WorkspaceSearchApply::Terminal
+            crate::state::WorkspaceSearchApply::Superseded
         ));
 
         let retry_lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
@@ -1316,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_drift_errors_advance_changes_and_coalesce_one_rescan_debt() {
+    fn durable_drift_error_advances_cursor_and_coalesces_debt() {
         use crate::change_hub::{test_support::eventually, WorkspaceChangeHub};
         use std::time::Duration;
 
@@ -2529,7 +2675,10 @@ mod tests {
                 &graph,
             );
             assert!(plan.full_rescan, "snapshot failure must request recovery rescan");
-            assert!(plan.preparation_error.is_some(), "snapshot failure must not look applied");
+            assert!(matches!(
+                plan.snapshot_outcome,
+                Some(SnapshotPreparationOutcome::OperationError(_))
+            ));
             assert!(matches!(
                 SharedState::apply_prepared_search_drift(&engine, &lease, &mut plan, &graph),
                 crate::state::WorkspaceSearchApply::OperationError(_)
@@ -2550,14 +2699,10 @@ mod tests {
                 false,
                 &graph,
             );
-            assert!(
-                contended.full_rescan,
-                "a lease refused under an empty pool must request recovery rescan"
-            );
-            assert!(
-                contended.preparation_error.is_some(),
-                "a refused lease must not pass for an XML drift that resolved to nothing"
-            );
+            assert!(matches!(
+                contended.snapshot_outcome,
+                Some(SnapshotPreparationOutcome::TransientRefusal)
+            ));
         }
 
         drop(occupied);
