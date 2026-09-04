@@ -174,6 +174,8 @@ struct Inner {
     fail_managed_read: AtomicBool,
     #[cfg(test)]
     fail_managed_restamp: AtomicBool,
+    #[cfg(test)]
+    fail_checkpoint_lock: AtomicBool,
 }
 
 impl WorkspaceLease {
@@ -249,6 +251,8 @@ impl WorkspaceLease {
                 fail_managed_read: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_managed_restamp: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_checkpoint_lock: AtomicBool::new(false),
             }),
         }
     }
@@ -274,6 +278,8 @@ impl WorkspaceLease {
             fail_managed_read: AtomicBool::new(false),
             #[cfg(test)]
             fail_managed_restamp: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_checkpoint_lock: AtomicBool::new(false),
         });
         let lease = Self { inner };
         // A starting daemon outbids whatever it finds — newest wins is the whole rule.
@@ -538,6 +544,11 @@ impl WorkspaceLease {
                     hook();
                 }
             });
+            #[cfg(test)]
+            if self.inner.fail_checkpoint_lock.swap(false, Ordering::SeqCst) {
+                stopped = Some(LeaseOperationOutcome::TransientRefusal);
+                return ControlFlow::Break(());
+            }
             guard = match LockGuard::acquire(&lock_path, LOCK_WAIT) {
                 Ok(guard) => Some(guard),
                 Err(error) if is_lock_contention(&error) => {
@@ -642,6 +653,23 @@ impl WorkspaceLease {
     #[cfg(test)]
     pub(crate) fn invalidate_verdict_for_test(&self) {
         *lock_recover(&self.inner.checked_at) = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_lifecycle_lock_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        lock_recover(&self.inner.checked_at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_checkpoint_lock_for_test(&self) {
+        self.inner.fail_checkpoint_lock.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_restamp_for_test(&self) {
+        self.inner.fail_managed_restamp.store(true, Ordering::SeqCst);
     }
 
     /// Release this process's record on a clean exit.
@@ -765,6 +793,15 @@ fn spawn_heartbeat(inner: Weak<Inner>) {
                 std::thread::sleep(Duration::from_secs(1));
                 waited += Duration::from_secs(1);
                 if inner.upgrade().is_none() {
+                    return;
+                }
+                let Some(inner) = inner.upgrade() else { return };
+                if inner.released.load(Ordering::SeqCst) {
+                    return;
+                }
+                let lease = WorkspaceLease { inner };
+                let _ = lease.owns_caches();
+                if lease.is_superseded() {
                     return;
                 }
             }
@@ -966,6 +1003,7 @@ mod tests {
                 fail_managed_lock: AtomicBool::new(false),
                 fail_managed_read: AtomicBool::new(false),
                 fail_managed_restamp: AtomicBool::new(false),
+                fail_checkpoint_lock: AtomicBool::new(false),
             }),
         }
     }
@@ -1134,11 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpointed_release_rolls_back_as_released() {
-        checkpointed_atomic_publish_rolls_back_at_boundary();
-    }
-
-    #[test]
     fn checkpoint_restamp_error_rolls_back_as_operation_error() {
         let dir = tempfile::tempdir().unwrap();
         let lease = WorkspaceLease::claim(dir.path());
@@ -1221,16 +1254,6 @@ mod tests {
         assert!(!is_stale(&record_at(&lease_path(dir.path()))));
     }
 
-    #[test]
-    fn release_waits_only_for_current_short_publish() {
-        release_waits_for_only_the_admitted_batch_and_refuses_the_next();
-    }
-
-    #[test]
-    fn release_signal_precedes_lifecycle_wait() {
-        checkpointed_atomic_publish_rolls_back_at_boundary();
-    }
-
     /// The newest claim owns the workspace: the daemon that started first stops writing derived
     /// caches, the one that started last keeps writing. Reverse the comparison in `recheck` and
     /// the draining generation would keep ownership while the client-facing one goes read-only.
@@ -1308,6 +1331,7 @@ mod tests {
                 fail_managed_lock: AtomicBool::new(false),
                 fail_managed_read: AtomicBool::new(false),
                 fail_managed_restamp: AtomicBool::new(false),
+                fail_checkpoint_lock: AtomicBool::new(false),
             }),
         };
         assert!(matches!(
@@ -1540,6 +1564,8 @@ mod tests {
         let third = WorkspaceLease::claim(dir.path()); // generation 3
         assert_eq!(first.generation(), Some(1), "the numbering this scenario turns on");
 
+        let first_heartbeat = first.hold_lifecycle_lock_for_test();
+        let third_heartbeat = third.hold_lifecycle_lock_for_test();
         std::fs::remove_file(lease_path(dir.path())).unwrap();
         std::thread::sleep(VERDICT_TTL);
 
@@ -1548,6 +1574,8 @@ mod tests {
         assert!(second.owns_caches());
         assert_eq!(second.generation(), Some(1), "the wipe restarted the numbering");
 
+        drop(first_heartbeat);
+        drop(third_heartbeat);
         assert!(!first.owns_caches(), "the generation it shares is not its claim");
         assert!(!third.owns_caches(), "and the newest daemon gave the workspace up too");
         assert!(

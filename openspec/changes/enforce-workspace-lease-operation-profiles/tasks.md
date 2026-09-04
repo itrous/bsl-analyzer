@@ -54,5 +54,10 @@
 - [x] 5.4 Run the exact `inventory::no_new_runtime_or_compatibility_surface` audit against the recorded base; confirm no new dependency, runtime thread/scheduler, persistent format, lease record, configuration knob, or MCP wire change.
 - [x] 5.5 Fill actual evidence in `verification.md` and run `openspec validate enforce-workspace-lease-operation-profiles --strict --no-interactive`.
 
+## 6. Maintainer review closure
+
+- [x] 6.1 Close the five blocking review findings: keep broker accept cached-only, require non-zero CI filters, preserve retryable startup transactions, re-arm graph recovery only on fresh work, and remove alias tests.
+- [x] 6.2 Strengthen the held-lock and caller-inventory gates without restoring request-time lease work.
+
 <!-- GOAL_CURSOR -->
 All implementation tasks are complete. Publication, live CI, maintainer acceptance, and issue closure are later delivery actions, not gates for completing this local implementation change.

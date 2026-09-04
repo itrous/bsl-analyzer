@@ -267,16 +267,12 @@ impl SharedState {
     /// carries, joined for one status line — the state in which valid calls into
     /// that configuration are reported as unresolved. An extension's and an
     /// external object's are distinct conditions and both can hold at once.
-    /// Derived from the project as it is now, not from the root captured at
-    /// bootstrap: a config edit can move the resolved root between a main
-    /// configuration and an extension, and everything else — diagnostics, graph,
-    /// drift — already rebuilds through `crate::project::at` when it does.
+    /// Captured at bootstrap and refreshed by rebuilding the workspace state.
     pub(crate) fn standalone_notice(&self) -> Option<String> {
         self.standalone_notice.clone()
     }
 
     pub(crate) fn superseded(&self) -> bool {
-        let _ = self.workspace_lease.owns_caches();
         self.workspace_lease.is_superseded()
     }
 
@@ -588,10 +584,27 @@ mod tests {
         state.workspace_lease = old.clone();
         let newer = crate::workspace_lease::WorkspaceLease::claim(terminal_dir.path());
         old.invalidate_verdict_for_test();
+        assert!(!state.superseded(), "the cached view performs no ownership refresh");
+        assert!(!old.owns_caches(), "the heartbeat-owned refresh observes takeover");
         assert!(state.superseded(), "the refreshed live foreign token is terminal");
         newer.release();
         assert!(state.superseded(), "owner release cannot clear the terminal flag");
         assert!(!state.owns_caches());
+    }
+
+    #[test]
+    fn superseded_check_never_waits_for_the_lease_lifecycle_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
+        let mut state = SharedState::shared();
+        state.workspace_lease = lease.clone();
+        let held = lease.hold_lifecycle_lock_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || tx.send(state.superseded()).unwrap());
+
+        assert!(!rx.recv_timeout(std::time::Duration::from_millis(100)).unwrap());
+        drop(held);
     }
 }
 

@@ -25,12 +25,18 @@ jobs:
       - run: cargo clippy --all-targets --all-features
       - name: Portable workspace lease profiles
         run: |
-          cargo test -p mcp-server workspace_lease::tests::contention_unclaimed_and_missing_are_transient -- --exact
-          cargo test -p mcp-server workspace_lease::tests::release_signal_precedes_lifecycle_wait -- --exact
-          cargo test -p mcp-server graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement -- --exact
-          cargo test -p mcp-server tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease -- --exact
-          cargo test -p mcp-server tools::search::tests::all_search_modes_are_resident_only_under_held_lease -- --exact
-          cargo test -p mcp-server tests::all_status_requests_are_cached_under_held_lease -- --exact
+          set -euo pipefail
+          run_exact() {
+            output=$(cargo test -p mcp-server --lib "$1" -- --exact 2>&1)
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_exact workspace_lease::tests::contention_unclaimed_and_missing_are_transient
+          run_exact workspace_lease::tests::a_throttled_checkpoint_still_reports_a_release
+          run_exact graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement
+          run_exact tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease
+          run_exact tools::search::tests::all_search_modes_are_resident_only_under_held_lease
+          run_exact tests::all_status_requests_are_cached_under_held_lease
       - run: cargo test --all --no-fail-fast
 
   windows-mcp:
@@ -72,8 +78,7 @@ jobs:
           cargo test -p mcp-server state::bootstrap::tests::startup_metadata_fence_stops_after_takeover &&
           cargo test -p mcp-server state::bootstrap::tests::startup_ingest_fence_does_not_repeat_preparation &&
           cargo test -p mcp-server state::bootstrap::tests::superseded_bootstrap_stops_mutating &&
-          cargo test -p mcp-server state::sync::tests::superseded_daemon_cannot_mutate_shared_search &&
-          cargo test -p mcp-server search_code_does_not_write_after_supersession
+          cargo test -p mcp-server state::sync::tests::superseded_daemon_cannot_mutate_shared_search
       - name: Terminal graph snapshot lifecycle
         run: >-
           cargo test -p mcp-server graph::state::tests::superseded_graph_never_adopts_or_reloads &&
@@ -108,13 +113,20 @@ jobs:
           cargo test -p mcp-server graph_supersession_contract::resolve_names_misses_immediately_when_preopened_handles_are_busy -- --exact &&
           cargo test -p mcp-server graph_supersession_contract::symbol_info_misses_immediately_when_preopened_handles_are_busy -- --exact
       - name: Portable workspace lease profiles
-        run: >-
-          cargo test -p mcp-server workspace_lease::tests::contention_unclaimed_and_missing_are_transient -- --exact &&
-          cargo test -p mcp-server workspace_lease::tests::release_signal_precedes_lifecycle_wait -- --exact &&
-          cargo test -p mcp-server graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement -- --exact &&
-          cargo test -p mcp-server tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease -- --exact &&
-          cargo test -p mcp-server tools::search::tests::all_search_modes_are_resident_only_under_held_lease -- --exact &&
-          cargo test -p mcp-server tests::all_status_requests_are_cached_under_held_lease -- --exact
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_exact() {
+            output=$(cargo test -p mcp-server --lib "$1" -- --exact 2>&1)
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_exact workspace_lease::tests::contention_unclaimed_and_missing_are_transient
+          run_exact workspace_lease::tests::a_throttled_checkpoint_still_reports_a_release
+          run_exact graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement
+          run_exact tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease
+          run_exact tools::search::tests::all_search_modes_are_resident_only_under_held_lease
+          run_exact tests::all_status_requests_are_cached_under_held_lease
 
   partitioned-baseline-scale:
     name: Partitioned baseline 1.6M release gate

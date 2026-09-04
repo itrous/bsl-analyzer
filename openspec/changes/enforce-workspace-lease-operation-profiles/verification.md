@@ -14,11 +14,11 @@ Every spec scenario has exactly one row. Identifiers are planned until implement
 | 8 | Fenced outcomes preserve their origin / Managed lease I/O fails | 1.1 | `workspace_lease::tests::managed_lease_io_error_is_not_transient` | Linux, Windows |
 | 9 | Fenced outcomes preserve their origin / A live foreign token is observed | 1.4 | `workspace_lease::tests::checkpoint_observes_live_foreign_token_and_rolls_back` | Linux, Windows |
 | 10 | Fenced outcomes preserve their origin / Shutdown prevents admission | 1.4 | `workspace_lease::tests::pre_admission_release_skips_callback` | Linux, Windows |
-| 11 | Fenced outcomes preserve their origin / Release interrupts checkpointed work | 1.4 | `workspace_lease::tests::checkpointed_release_rolls_back_as_released` | Linux, Windows |
+| 11 | Fenced outcomes preserve their origin / Release interrupts checkpointed work | 1.4 | `workspace_lease::tests::release_during_checkpointed_callback_rolls_back_as_terminal` | Linux, Windows |
 | 12 | Fenced outcomes preserve their origin / Supersession precedes release | 1.4 | `workspace_lease::tests::first_terminal_cause_survives_release` | Linux, Windows |
 | 13 | Lock holding and shutdown latency are bounded / Long refresh exceeds the stale interval | 1.4 | `workspace_lease::tests::checkpointed_operation_outlives_stale_after_without_self_supersession` | Linux |
-| 14 | Lock holding and shutdown latency are bounded / Release arrives during a bounded batch | 1.3 | `workspace_lease::tests::release_waits_only_for_current_short_publish` | Linux, Windows |
-| 15 | Lock holding and shutdown latency are bounded / Release arrives during an indivisible transaction | 1.4 | `workspace_lease::tests::release_signal_precedes_lifecycle_wait` | Linux, Windows |
+| 14 | Lock holding and shutdown latency are bounded / Release arrives during a bounded batch | 1.3 | `workspace_lease::tests::release_waits_for_only_the_admitted_batch_and_refuses_the_next` | Linux, Windows |
+| 15 | Lock holding and shutdown latency are bounded / Release arrives during an indivisible transaction | 1.4 | `workspace_lease::tests::a_throttled_checkpoint_still_reports_a_release` | Linux, Windows |
 | 16 | Lock holding and shutdown latency are bounded / Manifest and fingerprint transitions span many rows | 2.5 | `engine::tests::manifest_and_fingerprint_transitions_checkpoint_and_rollback` | Linux, Windows |
 | 17 | Every retrying obligation has a fixed deadline / Startup lock remains contended | 3.2 | `state::bootstrap::tests::startup_lease_retry_stops_at_600_seconds` | Linux |
 | 18 | Every retrying obligation has a fixed deadline / Fresh work coalesces during retry | 3.1 | `state::retry_window::tests::all_retry_owners_preserve_deadline_and_streak_when_coalescing` | Linux |
@@ -26,22 +26,22 @@ Every spec scenario has exactly one row. Identifiers are planned until implement
 | 20 | Every retrying obligation has a fixed deadline / Permanent operation error occurs | 3.1 | `state::retry_window::tests::all_retry_owners_stop_on_operation_error` | Linux |
 | 21 | Every retrying obligation has a fixed deadline / Heartbeat is transiently refused | 2.1 | `workspace_lease::tests::heartbeat_refusal_waits_for_normal_tick` | Linux, Windows |
 | 22 | Drift and snapshot failures preserve progress and recovery debt / A second change follows a durable failure | 4.5 | `state::sync::tests::durable_drift_error_advances_cursor_and_coalesces_debt` | Linux, Windows |
-| 23 | Drift and snapshot failures preserve progress and recovery debt / Topology marking fails | 4.5 | `state::sync::tests::failed_search_marking_still_sends_topology_nudges` | Linux |
-| 24 | Drift and snapshot failures preserve progress and recovery debt / A removed path is recreated before recovery | 4.5 | `state::sync::tests::rescan_debt_uses_current_disk_after_recreate` | Linux, Windows |
+| 23 | Drift and snapshot failures preserve progress and recovery debt / Topology marking fails | 4.5 | `state::sync::tests::durable_drift_error_advances_cursor_and_coalesces_debt` (combined end-to-end scenario) | Linux |
+| 24 | Drift and snapshot failures preserve progress and recovery debt / A removed path is recreated before recovery | 4.5 | `state::sync::tests::durable_drift_error_advances_cursor_and_coalesces_debt` (combined end-to-end scenario) | Linux, Windows |
 | 25 | Drift and snapshot failures preserve progress and recovery debt / Background snapshot preparation has a classified outcome | 4.4 | `graph::snapshot::tests::background_snapshot_preserves_all_typed_outcomes` | Linux, Windows |
 | 26 | Local contention does not repeat paid embedding work / Ownership is refused before network work | 4.6 | `state::embed::tests::failed_typed_preflight_makes_zero_network_calls` | Linux |
 | 27 | Local contention does not repeat paid embedding work / Publication is refused after vectors are returned | 4.6 | `state::embed::tests::prepared_vectors_survive_transient_publish_without_second_call` | Linux |
 | 28 | Local contention does not repeat paid embedding work / Embedding deadline is exhausted | 4.6 | `state::embed::tests::publication_deadline_moves_runtime_to_failed` | Linux |
 | 29 | Graph build retry follows the original failure / Ownership returns after transient refusal | 4.7 | `graph::build::tests::original_transient_arms_withheld_build_until_trigger` | Linux |
-| 30 | Graph build retry follows the original failure / Build operation fails while ownership probe is negative | 4.7 | `graph::build::tests::operation_error_is_not_reclassified_by_later_probe` | Linux |
+| 30 | Graph build retry follows the original failure / Build operation fails while ownership probe is negative | 4.7 | `graph::build::tests::operation_error_waits_for_fresh_work_without_losing_its_origin` | Linux |
 | 31 | The complete caller set is regression-protected / Removed generic API remains referenced | 1.6 | `inventory::no_generic_or_unclassified_production_lease_callers` | Linux |
-| 32 | The complete caller set is regression-protected / Portable exact filters run in CI | 5.3 | `workspace_lease::tests::contention_unclaimed_and_missing_are_transient`; `workspace_lease::tests::release_signal_precedes_lifecycle_wait`; `graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement`; `tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease`; `tools::search::tests::all_search_modes_are_resident_only_under_held_lease`; `tests::all_status_requests_are_cached_under_held_lease` | Linux `Check`, Windows `MCP transports + secure broker` |
+| 32 | The complete caller set is regression-protected / Portable exact filters run in CI | 5.3 | `workspace_lease::tests::contention_unclaimed_and_missing_are_transient`; `workspace_lease::tests::a_throttled_checkpoint_still_reports_a_release`; `graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement`; `tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease`; `tools::search::tests::all_search_modes_are_resident_only_under_held_lease`; `tests::all_status_requests_are_cached_under_held_lease` | Linux `Check`, Windows `MCP transports + secure broker` |
 
 ## Supplemental Inventory Gates
 
 | Gate | Task | Exact planned evidence |
 |---|---:|---|
-| Heavy work remains outside lease fences | 2.11 | `inventory::prepared_work_stays_outside_lease_fences` |
+| Fence callers remain exact and request paths remain lease-free | 2.11 | `inventory::fence_callers_are_exactly_classified`; `inventory::request_paths_do_not_call_lease_or_mutation_helpers` |
 | Runtime and compatibility surface is unchanged | 5.4 | `inventory::no_new_runtime_or_compatibility_surface` |
 
 ## Required Commands
@@ -63,8 +63,8 @@ After a later explicit publication request, match the PR head SHA to the locally
 
 ## Current Status
 
-Implementation, v0.2.77 rebase integration, local verification, and both independent reviews are
-complete. Republishing the rebased PR branch remains pending.
+Implementation, v0.2.77 cancellation integration, maintainer-review repairs, and local verification
+are complete. Republishing the PR branch and live CI remain pending.
 
 ## Evidence Collected
 
@@ -73,11 +73,11 @@ complete. Republishing the rebased PR branch remains pending.
 - Traceability: an exact requirement/scenario-to-matrix comparison passed with 32 scenarios, 32 unique rows, no duplicate scenario, and every row linked to an existing task.
 - Pre-implementation strict validation: `openspec validate enforce-workspace-lease-operation-profiles --strict --no-interactive` passed.
 - Pre-implementation code baseline: `workspace_lease` 24 tests, graph snapshot 19, graph build 85, bootstrap 35, sync 52, embed 25, and overlay retry 16 all passed; `cargo fmt --all -- --check` and strict Clippy for `bsl-search` plus `mcp-server` passed with no pre-existing failure.
-- Lease core: the final `workspace_lease` suite passed 39/39, including exact five-way classification, callback/lease error provenance, pre-commit restamp with zero commit calls on failure, checkpoint rollback, first-terminal precedence, same-token liveness, real foreign-token takeover, and release latency filters. The existing cross-fence restamp throttle regression also passed after separating forced short restamp from checkpointed throttling.
+- Lease core: the final `workspace_lease` suite passed, including exact five-way classification, callback/lease error provenance, pre-commit restamp with zero commit calls on failure, checkpoint rollback, first-terminal precedence, same-token liveness, real foreign-token takeover, and release latency filters. The existing cross-fence restamp throttle regression also passed after separating forced short restamp from checkpointed throttling.
 - Post-review lease correction: checkpointed work now yields and reacquires the OS lock at every
   cooperative boundary, revalidates the real lease record, and retains the reacquired guard through
   the next batch/commit. The deterministic real-record takeover test passed and the final lease
-  module suite passed 39/39.
+  module suite passed.
 - Outcome adapters: `bsl-search` has no `FenceOutcome::Terminal`; its full suite passed with 403 tests and 29 ignored. `mcp-server --all-features` compiled both production and all test targets after exhaustive host migration to distinct `Superseded` and `Released` variants.
 - Legacy surface and heartbeat: the exact `inventory::no_generic_or_unclassified_production_lease_callers` filter executed one passing test and `rg` found no legacy ownership API or `LeaseOutcome` reference under `mcp-server/src`; the exact heartbeat refusal filter passed and proves one transient miss is retried only by the next explicit tick.
 - Graph profiles: snapshot, build, and state module suites passed (19, 85, and 28 tests). Exact typed snapshot/path identity and original transient/operation provenance filters each executed one passing test; temporary graph work is off-fence, prepared installs use short publication, and fused ingest uses checkpointed 64-row boundaries.
@@ -103,8 +103,8 @@ complete. Republishing the rebased PR branch remains pending.
   preflight, one paid call across transient publication refusal, and `Failed` on deadline.
 - Exact matrix: every listed scenario, handler, and supplemental-inventory identifier executed at
   least one test and passed after the final integration changes.
-- Full gates: `bsl-search` passed 405 tests with 29 ignored; `mcp-server` passed 994 library tests
-  with 1 ignored plus 155 integration tests. Strict Clippy, rustfmt check, `git diff --check`,
+- Full gates: `bsl-search` passed 405 tests with 29 ignored; the final `mcp-server` rerun passed
+  992 library tests with 1 ignored plus every integration target. Strict Clippy, rustfmt check, `git diff --check`,
   `actionlint`, all three inventory gates, and strict non-interactive OpenSpec validation passed.
 - Full local CI follow-up: workspace-wide `RUSTFLAGS='-D warnings' cargo clippy
   --all-targets --all-features` and `RUSTFLAGS='-D warnings' cargo test --all --no-fail-fast`
@@ -120,3 +120,7 @@ complete. Republishing the rebased PR branch remains pending.
   reacquisition, record validation, and rollback; its degraded-state observation and real-handler
   evidence gaps were closed with the existing polling status, rescan debt, and four exact busy-pool
   handler tests.
+- Maintainer review: all five blocking findings were closed. Broker accept reads only the cached
+  terminal bit; CI exact filters reject zero executed tests; startup retries rerun the transaction;
+  graph operation/changed failures wait for genuinely fresh work; alias tests were deleted. The
+  held-lock status/graph tests and exact fence/request-path inventories close MID-1, MID-2, and MID-4.

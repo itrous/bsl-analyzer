@@ -1017,24 +1017,16 @@ impl SharedState {
         }
     }
 
-    fn startup_apply_checkpointed_once<T>(
+    fn startup_apply_checkpointed_value<T>(
         lease: &crate::workspace_lease::WorkspaceLease,
-        operation: impl FnOnce(
+        mut operation: impl FnMut(
             &mut dyn FnMut() -> std::ops::ControlFlow<()>,
-        ) -> std::ops::ControlFlow<(), Result<T, bsl_search::SearchError>>,
+        )
+            -> std::ops::ControlFlow<(), Result<T, bsl_search::SearchError>>,
     ) -> Result<Option<T>, bsl_search::SearchError> {
-        let mut operation = Some(operation);
         let mut value = None;
-        let outcome = Self::startup_apply_checkpointed(lease, |checkpoint| {
-            let operation = match operation.take() {
-                Some(operation) => operation,
-                None => {
-                    return std::ops::ControlFlow::Continue(Err(bsl_search::SearchError::Index(
-                        "checkpointed startup operation invoked more than once".to_owned(),
-                    )));
-                }
-            };
-            match operation(checkpoint) {
+        let outcome =
+            Self::startup_apply_checkpointed(lease, |checkpoint| match operation(checkpoint) {
                 std::ops::ControlFlow::Break(()) => std::ops::ControlFlow::Break(()),
                 std::ops::ControlFlow::Continue(Err(error)) => {
                     std::ops::ControlFlow::Continue(Err(error))
@@ -1043,8 +1035,7 @@ impl SharedState {
                     value = Some(result);
                     std::ops::ControlFlow::Continue(Ok(()))
                 }
-            }
-        });
+            });
         match outcome {
             bsl_search::FenceOutcome::Applied(Ok(())) => Ok(value),
             bsl_search::FenceOutcome::Applied(Err(error)) => Err(error),
@@ -1147,7 +1138,7 @@ impl SharedState {
         store: &bsl_search::Store,
         lease: &crate::workspace_lease::WorkspaceLease,
     ) {
-        let cleared = Self::startup_apply_checkpointed_once(lease, |checkpoint| {
+        let cleared = Self::startup_apply_checkpointed_value(lease, |checkpoint| {
             match store.clear_baseline_manifest_checkpointed(checkpoint) {
                 Ok(std::ops::ControlFlow::Continue(())) => std::ops::ControlFlow::Continue(Ok(())),
                 Ok(std::ops::ControlFlow::Break(())) => std::ops::ControlFlow::Break(()),
@@ -1226,10 +1217,10 @@ impl SharedState {
                 return Ok(None);
             };
             let roots = Self::roots_of(&project, &excluded);
-            let Some(()) = Self::startup_apply_checkpointed_once(lease, |checkpoint| {
+            let Some(()) = Self::startup_apply_checkpointed_value(lease, |checkpoint| {
                 if let Err(error) = Self::configure_workspace_engine(
                     &mut engine,
-                    roots,
+                    roots.clone(),
                     BaselineHashMode::NormalizedChunks,
                 ) {
                     return std::ops::ControlFlow::Continue(Err(error));
@@ -1241,7 +1232,7 @@ impl SharedState {
             };
 
             let store = engine.store();
-            let Some(()) = Self::startup_apply_checkpointed_once(lease, |checkpoint| match store
+            let Some(()) = Self::startup_apply_checkpointed_value(lease, |checkpoint| match store
                 .clear_workspace_overlay_checkpointed("code", checkpoint)
             {
                 Ok(std::ops::ControlFlow::Continue(())) => std::ops::ControlFlow::Continue(Ok(())),
@@ -1290,7 +1281,7 @@ impl SharedState {
                         {
                             Ok(manifest) => {
                                 let manifest_files = manifest.files.len();
-                                match Self::startup_apply_checkpointed_once(lease, |checkpoint| {
+                                match Self::startup_apply_checkpointed_value(lease, |checkpoint| {
                                     match store
                                         .save_baseline_manifest_checkpointed(&manifest, checkpoint)
                                     {
@@ -1378,10 +1369,12 @@ impl SharedState {
         // a row surviving the local period would suppress a same-stat edit after a switch
         // back to the same snapshot. A failed clear leaves that lie standing, so the boot
         // fails closed, exactly like the Postgres branch does on its own failed clears.
-        let Some(()) = Self::startup_apply_checkpointed_once(lease, |checkpoint| {
-            if let Err(error) =
-                Self::configure_workspace_engine(&mut engine, roots, BaselineHashMode::RawFileBytes)
-            {
+        let Some(()) = Self::startup_apply_checkpointed_value(lease, |checkpoint| {
+            if let Err(error) = Self::configure_workspace_engine(
+                &mut engine,
+                roots.clone(),
+                BaselineHashMode::RawFileBytes,
+            ) {
                 return std::ops::ControlFlow::Continue(Err(error));
             }
             engine.set_serves_external_baseline_checkpointed(false, checkpoint)
@@ -1907,6 +1900,26 @@ mod tests {
         ));
         assert_eq!(clock.get().duration_since(started), std::time::Duration::from_secs(600));
         assert_eq!(attempts.get(), 301);
+    }
+
+    #[test]
+    fn checkpoint_refusal_retries_the_startup_transaction() {
+        let dir = tempdir().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
+        lease.fail_next_checkpoint_lock_for_test();
+        let mut attempts = 0_u8;
+
+        let result = SharedState::startup_apply_checkpointed_value(&lease, |checkpoint| {
+            attempts += 1;
+            if checkpoint().is_break() {
+                return std::ops::ControlFlow::Break(());
+            }
+            std::ops::ControlFlow::Continue(Ok(attempts))
+        })
+        .unwrap();
+
+        assert_eq!(result, Some(2));
+        assert_eq!(attempts, 2);
     }
 
     #[test]

@@ -856,8 +856,8 @@ impl GraphState {
                     NudgeOutcome::NoOp
                 }
             }
-            // Only a transient fence refusal is retryable here. Terminal supersession returned
-            // above and never resumes after the foreign owner exits.
+            // Fresh external work may start a new epoch after a transient refusal or operation
+            // failure. Terminal supersession returned above never resumes.
             GraphStatus::Failed(_) => {
                 self.ensure_loading();
                 match self.status() {

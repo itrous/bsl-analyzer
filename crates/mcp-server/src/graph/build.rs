@@ -63,7 +63,7 @@ fn install_failure(
         LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
             SnapshotInstallError::Changed,
         )) => Err(LoadFailure::new(
-            LoadFailureReason::OperationError,
+            LoadFailureReason::TransientRefusal,
             "graph path changed before the prepared snapshot pool could be installed",
         )),
         LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
@@ -735,19 +735,26 @@ impl GraphState {
     /// previous snapshot but flags `reload="failed"` so the agent sees it. A
     /// later drift check retries the reload (the throttle bounds the retry rate).
     ///
-    /// A transient ownership refusal is flagged for retry. Terminal supersession and genuine
-    /// build failures stay terminal.
+    /// A transient refusal keeps its retry budget. An operation error stops that obligation,
+    /// but fresh external work may start a new graph epoch; terminal lease outcomes never do.
     pub(super) fn record_load_failure(&self, is_reload: bool, failure: LoadFailure) {
-        if failure.reason == LoadFailureReason::TransientRefusal {
-            let mut retry = lock_recover(&self.graph_retry);
-            let window = retry.get_or_insert_with(|| {
-                crate::state::retry_window::RetryWindow::new(
-                    crate::state::retry_window::RetryOwner::Graph,
-                )
-            });
-            let _ = window.refused(std::time::Instant::now(), std::time::Duration::ZERO);
-        } else {
-            *lock_recover(&self.graph_retry) = None;
+        match failure.reason {
+            LoadFailureReason::TransientRefusal | LoadFailureReason::OperationError => {
+                let mut retry = lock_recover(&self.graph_retry);
+                let window = retry.get_or_insert_with(|| {
+                    crate::state::retry_window::RetryWindow::new(
+                        crate::state::retry_window::RetryOwner::Graph,
+                    )
+                });
+                if failure.reason == LoadFailureReason::TransientRefusal {
+                    let _ = window.refused(std::time::Instant::now(), std::time::Duration::ZERO);
+                } else {
+                    window.operation_error();
+                }
+            }
+            LoadFailureReason::Superseded | LoadFailureReason::Released => {
+                *lock_recover(&self.graph_retry) = None;
+            }
         }
         let mut inner = lock_recover(&self.inner);
         if is_reload {
@@ -1454,24 +1461,31 @@ mod tests {
     }
 
     #[test]
-    fn operation_error_is_not_reclassified_by_later_probe() {
+    fn operation_error_waits_for_fresh_work_without_losing_its_origin() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        sample_workspace(root);
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
         cache.ensure().unwrap();
         let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
         let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
             .with_lease(lease.clone());
-        let missing = cache.root().join("missing.building");
-        let error = publish_or_discard(&graph, &missing, &cache.root().join("output.db"))
-            .expect_err("an admitted rename of a missing file is a real operation error");
+        let prepared = cache.root().join("prepared.building");
+        fs::write(&prepared, b"candidate").unwrap();
+        lease.fail_next_restamp_for_test();
+        let error = publish_or_discard(&graph, &prepared, &cache.root().join("output.db"))
+            .expect_err("a lease restamp failure is a real operation error");
         assert_eq!(error.reason, LoadFailureReason::OperationError);
 
         let held = lease.hold_file_lock_for_test();
         graph.record_load_failure(false, error);
         drop(held);
 
-        assert!(lock_recover(&graph.graph_retry).is_none());
+        assert!(lock_recover(&graph.graph_retry).is_some());
+        graph.ensure_loading();
+        assert!(matches!(graph.status(), GraphStatus::Failed(_)));
+        assert_eq!(graph.nudge_rebuild(), crate::graph::NudgeOutcome::LoadStarted);
+        wait_ready(&graph);
     }
 
     /// Driven through the real cold-build entry point, not through the walk it happens
@@ -1548,7 +1562,7 @@ mod tests {
             panic!("clean adoption must preserve the final install refusal")
         };
         clean.record_load_failure(false, failure);
-        assert!(lock_recover(&clean.graph_retry).is_none());
+        assert!(lock_recover(&clean.graph_retry).is_some());
         assert!(clean.snapshot().is_none(), "clean adoption never becomes ready");
 
         let stale_dir = tempfile::tempdir().unwrap();
@@ -1565,13 +1579,13 @@ mod tests {
             panic!("stale adoption must preserve the final install refusal")
         };
         stale.record_load_failure(false, failure);
-        assert!(lock_recover(&stale.graph_retry).is_none());
+        assert!(lock_recover(&stale.graph_retry).is_some());
         assert!(stale.snapshot().is_none(), "stale adoption never becomes ready");
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn incremental_publication_propagates_final_install_refusal() {
+    fn incremental_publication_retries_changed_snapshot_install() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
@@ -1587,7 +1601,10 @@ mod tests {
 
         assert!(matches!(
             graph.try_incremental_reload(root, 2, 0),
-            PublishAttemptOutcome::FallBack
+            PublishAttemptOutcome::Refused(LoadFailure {
+                reason: LoadFailureReason::TransientRefusal,
+                ..
+            })
         ));
         assert_eq!(
             graph.snapshot().map(|snapshot| snapshot.generation),
@@ -1614,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn full_reload_install_failure_keeps_the_old_snapshot_without_transient_retry() {
+    fn full_reload_changed_install_keeps_the_old_snapshot_and_retries() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
@@ -1627,7 +1644,7 @@ mod tests {
         graph.run_load(true);
 
         assert_eq!(graph.snapshot().map(|snapshot| snapshot.generation), Some(1));
-        assert!(lock_recover(&graph.graph_retry).is_none());
+        assert!(lock_recover(&graph.graph_retry).is_some());
         assert!(matches!(
             lock_recover(&graph.inner).published.as_ref().unwrap().reload,
             ReloadState::Failed(_)

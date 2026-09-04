@@ -1604,16 +1604,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_search_marking_still_sends_topology_nudges() {
-        durable_drift_error_advances_cursor_and_coalesces_debt();
-    }
-
-    #[test]
-    fn rescan_debt_uses_current_disk_after_recreate() {
-        durable_drift_error_advances_cursor_and_coalesces_debt();
-    }
-
-    #[test]
     fn root_transition_epoch_ignores_unrelated_files_and_tracks_keyspace_drift() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();

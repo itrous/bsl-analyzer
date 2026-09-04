@@ -37,22 +37,52 @@ fn no_generic_or_unclassified_production_lease_callers() {
 }
 
 #[test]
-fn prepared_work_stays_outside_lease_fences() {
-    let allowed = [
-        "graph/build.rs",
-        "graph/snapshot.rs",
-        "graph/state.rs",
-        "state/bootstrap.rs",
-        "state/embed.rs",
-        "state/mod.rs",
-        "workspace_lease.rs",
+fn fence_callers_are_exactly_classified() {
+    let expected = [
+        ("graph/build.rs", 2),
+        ("graph/snapshot.rs", 2),
+        ("state/bootstrap.rs", 2),
+        ("state/embed.rs", 4),
+        ("state/mod.rs", 2),
+        ("workspace_lease.rs", 1),
     ];
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     for path in production_sources() {
         let source = std::fs::read_to_string(&path).expect("Rust source is readable");
-        if source.contains(".publish_short(") || source.contains(".publish_checkpointed(") {
-            let relative = path.strip_prefix(&root).unwrap().to_string_lossy();
-            assert!(allowed.contains(&relative.as_ref()), "unclassified fence caller: {relative}");
+        let source = production_prefix(&source);
+        let actual = source.matches(".publish_short(").count()
+            + source.matches(".publish_checkpointed(").count();
+        let relative = path.strip_prefix(&root).unwrap().to_string_lossy();
+        let classified = expected
+            .iter()
+            .find_map(|(path, count)| (*path == relative).then_some(*count))
+            .unwrap_or(0);
+        assert_eq!(actual, classified, "unclassified fence caller count in {relative}");
+    }
+}
+
+#[test]
+fn request_paths_do_not_call_lease_or_mutation_helpers() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib = root.join("lib.rs");
+    let tools = root.join("tools");
+    let forbidden = [
+        ".publish_short(",
+        ".publish_checkpointed(",
+        ".owns_caches(",
+        ".owns_caches_now(",
+        "apply_workspace_search(",
+        "apply_workspace_search_checkpointed(",
+        "prefetch_resident_overlay",
+        "snapshot_blocking(",
+    ];
+    for path in
+        production_sources().into_iter().filter(|path| path == &lib || path.starts_with(&tools))
+    {
+        let source = std::fs::read_to_string(&path).expect("Rust source is readable");
+        let source = production_prefix(&source);
+        for token in forbidden {
+            assert!(!source.contains(token), "{} contains request-time {token}", path.display());
         }
     }
 }
@@ -105,7 +135,12 @@ fn no_new_runtime_or_compatibility_surface() {
             .output()
             .expect("git is available");
         let previous = String::from_utf8(previous.stdout).expect("base source is UTF-8");
-        for token in ["tokio::spawn", "std::thread::spawn", "thread::Builder::new"] {
+        for token in [
+            "tokio::spawn",
+            "tokio::task::spawn_blocking",
+            "std::thread::spawn",
+            "thread::Builder::new",
+        ] {
             assert!(
                 production_prefix(&current).matches(token).count()
                     <= production_prefix(&previous).matches(token).count(),

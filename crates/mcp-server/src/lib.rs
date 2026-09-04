@@ -3012,10 +3012,13 @@ mod tests {
         crate::graph::test_support::sample_workspace(root);
         std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let lease_path = cache.lease_path();
         let state = SharedState::workspace_with_cache(root.to_path_buf(), cache).unwrap();
         let lease = state.workspace_lease().clone();
         let server = McpServer::new(McpProfile::Workspace, state);
         let held_lease = lease.hold_file_lock_for_test();
+        std::fs::remove_file(lease_path).unwrap();
+        lease.invalidate_verdict_for_test();
         let token = || tokio_util::sync::CancellationToken::new();
 
         tokio::time::timeout(

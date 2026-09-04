@@ -12,7 +12,7 @@ pub(crate) enum RetryOwner {
 }
 
 impl RetryOwner {
-    fn may_rearm_after_exhaustion(self) -> bool {
+    fn may_rearm_on_fresh_work(self) -> bool {
         !matches!(self, Self::Startup)
     }
 }
@@ -95,8 +95,8 @@ impl RetryWindow {
     /// Returns true only when fresh external work starts a new obligation.
     pub(crate) fn observe_external_work(&mut self, genuinely_fresh: bool) -> bool {
         if genuinely_fresh
-            && self.stopped == Some(RetryStop::Exhausted)
-            && self.owner.may_rearm_after_exhaustion()
+            && matches!(self.stopped, Some(RetryStop::Exhausted | RetryStop::OperationError))
+            && self.owner.may_rearm_on_fresh_work()
         {
             self.deadline = None;
             self.streak = 0;
@@ -193,7 +193,7 @@ mod tests {
                 RetryDecision::Stop(RetryStop::OperationError),
                 "{owner:?}"
             );
-            assert!(!window.observe_external_work(true), "{owner:?}");
+            assert_eq!(window.observe_external_work(true), owner.may_rearm_on_fresh_work());
 
             let mut terminal = RetryWindow::new(owner);
             assert_eq!(terminal.terminal(), RetryDecision::Stop(RetryStop::Terminal));
