@@ -15,6 +15,7 @@ mod indexing;
 mod indexing_runtime_tests;
 #[cfg(test)]
 mod inventory;
+pub mod native_check;
 pub mod project;
 #[cfg(test)]
 mod serve_stream_tests;
@@ -599,6 +600,12 @@ struct ExecuteParams {
     /// Output budget in tokens (~4 chars each); over-budget output (a `run` context block, an
     /// evaluated value, a long syntax-error listing) is truncated with a note (default 6000).
     max_output_tokens: Option<usize>,
+    /// `check`: snippet (default) or complete module.
+    input_kind: Option<crate::native_check::types::InputKind>,
+    /// `check` module kind; required with `input_kind=module`.
+    module_type: Option<crate::native_check::types::ModuleType>,
+    /// `check` module owner and origin, or an explicitly synthetic context.
+    context: Option<crate::native_check::types::CheckContext>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1670,22 +1677,32 @@ impl McpServer {
         }
     }
 
-    /// Run or syntax-check BSL code in an embedded interpreter. Use to confirm a snippet
-    /// compiles, run a small script, or evaluate a single expression. Not for querying the
-    /// database (use `query` for SDBL) and not for analyzer findings (use `diagnostics`).
-    /// Actions: `check` — syntax-check `code`; `run` — execute `code`; `eval` — evaluate the
-    /// single expression in `code`. `run`/`eval` execute code, so this tool is not read-only.
-    /// Output is bounded by `max_output_tokens` and appends a truncation note.
+    /// Check BSL syntax with the selected connection's native compiler, run a script, or
+    /// evaluate one expression. A native compiler profile is required for `check`; without it,
+    /// the result is `unsupported`. `check` defaults to `input_kind=snippet`; module checks need
+    /// `module_type` and a metadata or explicit synthetic `context`. `run`/`eval` execute code,
+    /// so this tool is not read-only. Output is bounded by `max_output_tokens`.
     #[tool(name = "execute")]
-    async fn execute(&self, params: Parameters<ExecuteParams>) -> Result<CallToolResult, McpError> {
+    async fn execute(
+        &self,
+        params: Parameters<ExecuteParams>,
+        ct: tokio_util::sync::CancellationToken,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let budget = p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
         match p.action.as_str() {
             "check" => {
+                let request = crate::native_check::types::CheckRequest {
+                    input_kind: p.input_kind.unwrap_or_default(),
+                    module_type: p.module_type,
+                    context: p.context,
+                };
                 tools::execution::check_syntax(
                     &self.state,
+                    &request,
                     &p.code,
                     p.connection.as_deref(),
+                    ct,
                     budget,
                 )
                 .await
@@ -4660,17 +4677,19 @@ mod tool_descriptions {
               - user: Infobase user name (deleted users can only be matched by name).
 
             ## execute
-            Run or syntax-check BSL code in an embedded interpreter. Use to confirm a snippet
-            compiles, run a small script, or evaluate a single expression. Not for querying the
-            database (use `query` for SDBL) and not for analyzer findings (use `diagnostics`).
-            Actions: `check` — syntax-check `code`; `run` — execute `code`; `eval` — evaluate the
-            single expression in `code`. `run`/`eval` execute code, so this tool is not read-only.
-            Output is bounded by `max_output_tokens` and appends a truncation note.
+            Check BSL syntax with the selected connection's native compiler, run a script, or
+            evaluate one expression. A native compiler profile is required for `check`; without it,
+            the result is `unsupported`. `check` defaults to `input_kind=snippet`; module checks need
+            `module_type` and a metadata or explicit synthetic `context`. `run`/`eval` execute code,
+            so this tool is not read-only. Output is bounded by `max_output_tokens`.
               - action: check | run | eval.
               - code: BSL source to `check`/`run`, or the single expression to `eval`.
               - connection: Named live 1C connection (optional when only one/default connection exists).
+              - context: `check` module owner and origin, or an explicitly synthetic context.
+              - input_kind: `check`: snippet (default) or complete module.
               - max_output_tokens: Output budget in tokens (~4 chars each); over-budget output (a `run` context block, an
             evaluated value, a long syntax-error listing) is truncated with a note (default 6000).
+              - module_type: `check` module kind; required with `input_kind=module`.
 
             ## graph
             Whole-config semantic call graph: traverse who-calls-whom and object/metadata usage by

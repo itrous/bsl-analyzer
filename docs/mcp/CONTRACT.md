@@ -30,7 +30,7 @@ uri: bsl-analyzer://contract
 
 ```jsonc
 {
-  "contract_version": "3.3",
+  "contract_version": "4.0",
   "build_version": "0.2.80",
   "mcp": {
     "profiles": {
@@ -111,6 +111,14 @@ uri: bsl-analyzer://contract
   действия `search(action=find_docs|search_docs|list_platform|status)` доступны
   не только в `reference`, но и в `workspace`; отдельный профиль `reference`
   остаётся совместимым, но больше не обязателен для справки платформы.
+- Контракт `4.0` меняет смысл `execute(action=check)`: он использует нативный профиль
+  выбранного именованного подключения и возвращает структурированный `schema_version="1"`.
+  `compiler.compatibility` — сериализованный токен режима из XML применённой конфигурации;
+  на платформе 8.3.27.1989 runtime-значение `НеИспользовать` представлено токеном
+  `Version8_3_27`, а не отдельным режимом runtime.
+  Без профиля результат `unsupported`; прежний HTTP `/check-syntax` не вызывается.
+  `run`/`eval` сохраняют прежние HTTP DTO и разрешения. `execute` намеренно не публикует
+  единый `outputSchema`, поскольку эти действия возвращают разные формы.
 
 - `tools` — то, что сервер отдаёт в `tools/list` при обычном запуске;
   `opt_in_tools` — то, что эта же сборка умеет, но отдаёт только по явному
@@ -210,13 +218,15 @@ uri: bsl-analyzer://contract
 
 ```python
 major, minor = contract["contract_version"].split(".")
-assert major == "3" and int(minor) >= 2
+assert major == "4" and int(minor) >= 0
 ```
 
 `build_version` остаётся в документе, но для feature-detection он не нужен —
 именно ради этого и введена отдельная версия.
 
-В контракте `3.3` инструмент `search` публикует `outputSchema` версии `9` в workspace и `7` в reference:
+Контракт `3.3` ввёл текущие на тот момент схемы `search`; контракт `4.0` сохраняет их
+без изменений и отдельно меняет `execute(action=check)`. Инструмент `search` публикует
+`outputSchema` версии `9` в workspace и `7` в reference:
 hits и `not_ready` используют `schema_version="8"` для `search_code` и `"6"` для справки, `status` обоих профилей —
 `"4"`, `list_platform` сохраняет `"1"`. Добавлены необязательное поле статуса `embedding_profile`
 и необязательный закрытый объект

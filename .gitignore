@@ -27,6 +27,7 @@ Thumbs.db
 
 # Build artifacts
 .build/
+.artifacts/
 *.so
 *.dylib
 *.dll

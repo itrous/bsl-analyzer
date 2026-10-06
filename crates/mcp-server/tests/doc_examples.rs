@@ -1,4 +1,4 @@
-//! Every JSON example in the tool document is a body the tool could actually serve.
+//! Every JSON example names whether it is a tool input or a result the tool could serve.
 //!
 //! A document example is the first thing a client reads and the last thing anyone reruns.
 //! Two of them here were older than the location contract and showed a shape no build had
@@ -31,20 +31,25 @@ const DOC: &str = "../../docs/mcp/TOOLS_AND_EXTENSION.md";
 /// instead of quietly keeping it forever.
 const WITHOUT_SCHEMA: &[&str] = &["outline"];
 
-/// One fenced block: the tool it claims to be an answer of, and its parsed body.
+/// One fenced block: the tool and direction its parsed body documents.
 struct Example {
     line: usize,
     tool: String,
+    direction: ExampleDirection,
     body: Value,
 }
 
-/// Read the fenced JSON blocks and the tool each one names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExampleDirection {
+    Input,
+    Output,
+}
+
+/// Read fenced JSON blocks with explicit tool and optional direction metadata.
 ///
-/// The marker is part of the fence info string (```json tool=references), so a block cannot
-/// be added without answering the question "whose answer is this?". `tool=none` is the
-/// answer for a payload that is not an MCP tool body at all — the 1C HTTP service's version
-/// reply — and it is spelled out rather than left to a missing marker, which would make
-/// "forgot to mark it" and "deliberately not a tool body" the same thing.
+/// `tool=references` identifies the tool; `direction=input` selects its request schema. Output
+/// is the default. `tool=none` marks a payload that is not an MCP tool body at all — the 1C
+/// HTTP service's version reply — rather than treating a missing marker as intentional.
 fn examples(document: &str) -> Vec<Example> {
     let mut found = Vec::new();
     let mut lines = document.lines().enumerate();
@@ -64,6 +69,18 @@ fn examples(document: &str) -> Vec<Example> {
                 )
             })
             .to_owned();
+        let direction = match info
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("direction="))
+            .unwrap_or("output")
+        {
+            "input" => ExampleDirection::Input,
+            "output" => ExampleDirection::Output,
+            other => panic!(
+                "docs/mcp/TOOLS_AND_EXTENSION.md:{}: unknown example direction `{other}`",
+                index + 1
+            ),
+        };
         let mut text = String::new();
         for (_, line) in lines.by_ref() {
             if line.starts_with("```") {
@@ -75,7 +92,7 @@ fn examples(document: &str) -> Vec<Example> {
         let body = serde_json::from_str(&text).unwrap_or_else(|error| {
             panic!("docs/mcp/TOOLS_AND_EXTENSION.md:{}: not JSON: {error}", index + 1)
         });
-        found.push(Example { line: index + 1, tool, body });
+        found.push(Example { line: index + 1, tool, direction, body });
     }
     found
 }
@@ -111,27 +128,31 @@ async fn session(server: McpServer) -> Client {
 /// Both profiles, because the surface is split between them — `syntax_help` is served by the
 /// reference profile and `references` only by a workspace launch that opted in — and a
 /// document example does not say which launch it came from.
-async fn published_schemas() -> BTreeMap<String, Value> {
+async fn published_schemas() -> (BTreeMap<String, Value>, BTreeMap<String, Value>) {
     let ws = stage_fixture();
     let state = SharedState::workspace(ws.path().to_path_buf()).expect("valid workspace project");
     let gate = ToolGate::for_launch(McpProfile::Workspace, &["references".to_owned()]);
     let workspace = McpServer::with_gate(McpProfile::Workspace, state, &gate);
     let reference = McpServer::new(McpProfile::Reference, SharedState::reference(None));
 
-    let mut schemas = BTreeMap::new();
+    let mut input_schemas = BTreeMap::new();
+    let mut output_schemas = BTreeMap::new();
     for server in [workspace, reference] {
         let client = session(server).await;
         let listed = client.list_tools(Default::default()).await.expect("tools/list");
         for tool in listed.tools {
+            input_schemas
+                .entry(tool.name.to_string())
+                .or_insert_with(|| Value::Object((*tool.input_schema).clone()));
             if let Some(schema) = tool.output_schema.as_ref() {
-                schemas
+                output_schemas
                     .entry(tool.name.to_string())
                     .or_insert_with(|| Value::Object((**schema).clone()));
             }
         }
         client.cancel().await.ok();
     }
-    schemas
+    (input_schemas, output_schemas)
 }
 
 /// RPC errors have no successful outputSchema; reuse only its closed failure definition.
@@ -156,23 +177,27 @@ fn embedding_error_schema(search_schema: &Value) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_documented_example_validates_against_the_schema_its_tool_publishes() {
+async fn every_documented_example_validates_against_the_published_schema_for_its_direction() {
     let document = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(DOC))
         .expect("the tool document is checked in beside the crate");
     let examples = examples(&document);
     assert!(!examples.is_empty(), "a gate over no examples is green whatever the examples say");
-    let schemas = published_schemas().await;
-    let error_schema = embedding_error_schema(schemas.get("search").expect("search outputSchema"));
+    let (input_schemas, output_schemas) = published_schemas().await;
+    let error_schema =
+        embedding_error_schema(output_schemas.get("search").expect("search outputSchema"));
     assert!(examples.iter().any(|example| example.tool == "search:error"));
 
     let mut unchecked = Vec::new();
     for example in &examples {
         if example.tool == "none" {
+            assert_eq!(example.direction, ExampleDirection::Output);
             continue;
         }
-        if WITHOUT_SCHEMA.contains(&example.tool.as_str()) {
+        if example.direction == ExampleDirection::Output
+            && WITHOUT_SCHEMA.contains(&example.tool.as_str())
+        {
             assert!(
-                !schemas.contains_key(&example.tool),
+                !output_schemas.contains_key(&example.tool),
                 "`{}` publishes an output schema now, so its example at \
                  docs/mcp/TOOLS_AND_EXTENSION.md:{} can be validated — drop it from \
                  WITHOUT_SCHEMA",
@@ -182,16 +207,25 @@ async fn every_documented_example_validates_against_the_schema_its_tool_publishe
             unchecked.push(format!("{} (line {})", example.tool, example.line));
             continue;
         }
-        let schema = if example.tool == "search:error" {
-            &error_schema
-        } else {
-            schemas.get(&example.tool).unwrap_or_else(|| {
-                panic!(
-                    "docs/mcp/TOOLS_AND_EXTENSION.md:{}: no tool named `{}` publishes a schema; \
-                 either the name is wrong or it belongs in WITHOUT_SCHEMA",
-                    example.line, example.tool,
-                )
-            })
+        let schema = match (example.direction, example.tool.as_str()) {
+            (ExampleDirection::Input, _) => {
+                input_schemas.get(&example.tool).unwrap_or_else(|| {
+                    panic!(
+                        "docs/mcp/TOOLS_AND_EXTENSION.md:{}: no tool named `{}` publishes an input schema",
+                        example.line, example.tool,
+                    )
+                })
+            }
+            (ExampleDirection::Output, "search:error") => &error_schema,
+            (ExampleDirection::Output, _) => {
+                output_schemas.get(&example.tool).unwrap_or_else(|| {
+                    panic!(
+                        "docs/mcp/TOOLS_AND_EXTENSION.md:{}: no tool named `{}` publishes an output schema; \
+                     either the name is wrong or it belongs in WITHOUT_SCHEMA",
+                        example.line, example.tool,
+                    )
+                })
+            }
         };
         let validator = jsonschema::validator_for(schema).unwrap_or_else(|error| {
             panic!("`{}` publishes an unusable schema: {error}", example.tool)
@@ -205,7 +239,7 @@ async fn every_documented_example_validates_against_the_schema_its_tool_publishe
                 serde_json::to_string_pretty(&example.body).unwrap_or_default(),
             );
         }
-        if example.tool == "search:error" {
+        if example.direction == ExampleDirection::Output && example.tool == "search:error" {
             let mut unsafe_example = example.body.clone();
             unsafe_example["data"]["semantic_failure"]["provider_body"] = json!("private");
             assert!(!validator.is_valid(&unsafe_example), "RPC diagnostics must stay closed");

@@ -79,3 +79,8 @@ crates/mcp-server/src/lib.rs	module	2	вне-класса: вид узла гр�
 crates/mcp-server/src/tools/graph.rs	module	2	вне-класса: вид узла графа
 crates/mcp-server/src/tools/location.rs	module	1	вне-класса: вид узла графа
 crates/mcp-server/src/tools/symbol_info.rs	module	2	вне-класса: вид символа
+crates/mcp-server/src/native_check/profile.rs	fixtures/catalog.xml	1	вне-класса: имя локального встроенного XML-шаблона
+crates/mcp-server/src/native_check/profile.rs	fixtures/common_module.xml	1	вне-класса: имя локального встроенного XML-шаблона
+crates/mcp-server/src/native_check/profile.rs	fixtures/managed_form.xml	1	вне-класса: имя локального встроенного XML-шаблона
+crates/mcp-server/src/native_check/profile.rs	fixtures/managed_form_body.xml	1	вне-класса: имя локального встроенного XML-шаблона
+crates/mcp-server/src/native_check/profile.rs	fixtures/ordinary_form.xml	1	вне-класса: имя локального встроенного XML-шаблона

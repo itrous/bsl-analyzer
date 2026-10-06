@@ -28,6 +28,8 @@ struct OnecConnectionConfig {
     password_env: String,
     #[serde(default)]
     allow_execute: bool,
+    #[serde(default)]
+    native_check: Option<mcp_server::native_check::NativeProfile>,
 }
 
 #[derive(Subcommand)]
@@ -1491,13 +1493,21 @@ fn configure_named_onec_connections(
                 )
             })?
         };
-        state.add_onec_connection(
-            name,
-            mcp_server::OnecConnection::new(
-                onec_client::Client::new(&connection.url, &user, &password),
-                connection.allow_execute,
-            ),
-        );
+        let client = onec_client::Client::new(&connection.url, &user, &password);
+        let onec_connection = match connection.native_check {
+            Some(native_check) => {
+                mcp_server::native_check::startup(&native_check).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                })?;
+                mcp_server::OnecConnection::new_with_native_check(
+                    client,
+                    connection.allow_execute,
+                    native_check,
+                )
+            }
+            None => mcp_server::OnecConnection::new(client, connection.allow_execute),
+        };
+        state.add_onec_connection(name, onec_connection);
     }
     Ok(())
 }
@@ -1641,6 +1651,46 @@ mod tests {
         );
         assert_eq!(frozen.query, "frozen query");
         assert_eq!(frozen.document, "frozen document");
+    }
+
+    #[test]
+    fn named_connection_example_parses_native_check_profile_without_exposing_values() {
+        let file: super::OnecConnectionsFile = serde_json::from_str(include_str!(
+            "../../../../../docs/mcp/onec-connections.example.json"
+        ))
+        .unwrap();
+        let connection = &file.connections["test-base"];
+        let profile = connection.native_check.as_ref().expect("native_check profile");
+        assert_eq!(profile.source_kind, mcp_server::native_check::SourceKind::File);
+        assert_eq!(profile.designer_path, PathBuf::from("/opt/1cv8/x86_64/8.3.27.1989/1cv8"));
+        assert_eq!(profile.python_path, PathBuf::from("/usr/bin/python3.14"));
+        assert_eq!(profile.xvfb_run_path, Some(PathBuf::from("/usr/bin/xvfb-run")));
+        assert_eq!(profile.expected_build, "8.3.27.1989");
+        assert_eq!(profile.work_root, PathBuf::from("/var/lib/bsl-analyzer/native-check"));
+        assert_eq!(profile.source_connection_env, "BSL_NATIVE_FILE_SOURCE");
+        assert!(profile.user_env.is_none());
+        assert_eq!(profile.max_input_bytes, 2 * 1024 * 1024);
+        assert_eq!(profile.deadline_ms, 120_000);
+        assert_eq!(profile.max_log_bytes, 256 * 1024);
+        let debug = format!("{profile:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("BSL_NATIVE_FILE_SOURCE"));
+        assert!(!debug.contains("8.3.27.1989"));
+        assert!(!connection.allow_execute);
+    }
+
+    #[test]
+    fn named_connection_server_profile_parses_without_rac_settings() {
+        let file: super::OnecConnectionsFile = serde_json::from_str(
+            r#"{"connections":{"server-base":{"url":"http://127.0.0.1/test-base/hs/bsl-analyzer","native_check":{"designer_path":"/opt/1cv8/x86_64/8.3.27.1989/1cv8","python_path":"/usr/bin/python3.14","expected_build":"8.3.27.1989","work_root":"/var/lib/bsl-analyzer/native-check","source_connection_env":"BSL_NATIVE_SERVER_SOURCE","user_env":"BSL_NATIVE_SERVER_USER"}}}}"#,
+        )
+        .unwrap();
+        let profile =
+            file.connections["server-base"].native_check.as_ref().expect("native_check profile");
+        assert_eq!(profile.source_kind, mcp_server::native_check::SourceKind::Server);
+        assert_eq!(profile.python_path, PathBuf::from("/usr/bin/python3.14"));
+        assert_eq!(profile.user_env.as_deref(), Some("BSL_NATIVE_SERVER_USER"));
+        assert!(profile.password_env.is_none());
     }
 
     #[test]

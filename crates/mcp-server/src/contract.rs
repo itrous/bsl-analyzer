@@ -36,7 +36,7 @@ use crate::{McpProfile, McpServer};
 /// Consumers should require an exact major and a minimum minor. Bump this by hand in the
 /// same commit that changes the surface; the snapshot test over [`document`] puts the
 /// version field next to the change in the diff.
-pub const CONTRACT_VERSION: &str = "3.3";
+pub const CONTRACT_VERSION: &str = "4.0";
 
 /// URI of the MCP resource carrying [`document`].
 pub const CONTRACT_URI: &str = "bsl-analyzer://contract";
@@ -99,8 +99,21 @@ const WORKSPACE_SEARCH_ACTIONS: &[ActionDecl] = &[
 const QUERY_ACTIONS: &[ActionDecl] =
     &[action("validate", &["query"]), action("execute", &["query"]), action("schema", &[])];
 
-const EXECUTE_ACTIONS: &[ActionDecl] =
-    &[action("check", &[]), action("run", &[]), action("eval", &[])];
+const EXECUTE_ACTIONS: &[ActionDecl] = &[
+    ActionDecl {
+        name: "check",
+        required: &[],
+        note: Some(
+            "defaults to `input_kind=snippet`; `module` requires `module_type` and `context`; \
+             requires a selected connection with `native_check` profile (`--onec-url` alone \
+             is unsupported); structured result has \
+             `schema_version=\"1\"`; this action has no tool-wide `outputSchema` because \
+             `run` and `eval` retain text responses",
+        ),
+    },
+    action("run", &[]),
+    action("eval", &[]),
+];
 
 const DEBUG_ACTIONS: &[ActionDecl] = &[
     action("attach", &["host", "infobase"]),
@@ -398,12 +411,12 @@ fn params_surface(schema: &Map<String, Value>) -> Value {
             .map(|name| {
                 let mut param = Map::new();
                 param.insert("name".into(), json!(name));
-                param.insert("type".into(), json!(type_of(&props[name])));
+                param.insert("type".into(), json!(type_of(schema, &props[name], 0)));
                 param.insert("required".into(), json!(required.contains(name.as_str())));
                 // Absent and explicitly `null` are different inputs: an optional parameter
                 // may be omitted, and a nullable one additionally accepts `null` in place
                 // of a value. `required: false` alone would under-declare the second.
-                if accepts_null(&props[name]) {
+                if accepts_null(schema, &props[name], 0) {
                     param.insert("nullable".into(), json!(true));
                 }
                 Value::Object(param)
@@ -491,17 +504,67 @@ fn shape_from_value(root: &Map<String, Value>, schema: &Value, depth: usize) -> 
     shape
 }
 
-fn accepts_null(schema: &Value) -> bool {
+fn accepts_null(root: &Map<String, Value>, schema: &Value, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("null")
+        || schema
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|names| names.iter().any(|name| name == "null"))
+        || schema.get("const").is_some_and(Value::is_null)
+        || schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(Value::is_null))
+    {
+        return true;
+    }
+
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        if let Some(name) = reference.strip_prefix("#/$defs/") {
+            if let Some(definition) =
+                root.get("$defs").and_then(Value::as_object).and_then(|defs| defs.get(name))
+            {
+                if accepts_null(root, definition, depth + 1) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    for keyword in ["anyOf", "oneOf"] {
+        if schema.get(keyword).and_then(Value::as_array).is_some_and(|branches| {
+            branches.iter().any(|branch| accepts_null(root, branch, depth + 1))
+        }) {
+            return true;
+        }
+    }
+
     schema
-        .get("type")
+        .get("allOf")
         .and_then(Value::as_array)
-        .is_some_and(|names| names.iter().any(|name| name == "null"))
+        .is_some_and(|branches| branches.iter().all(|branch| accepts_null(root, branch, depth + 1)))
 }
 
-/// Collapse a property schema to one type name. `Option<T>` widens the schema to
-/// `["T", "null"]`; the null arm is reported separately by `nullable`, so it is dropped
-/// here rather than turning every optional parameter's type into a union.
-fn type_of(schema: &Value) -> String {
+/// Collapse a property schema to one type name. A nullable schema may use either a union
+/// type or `anyOf`/`oneOf` with a null branch; the null arm is reported separately by
+/// `nullable`, so it is dropped here rather than turning the parameter type into a union.
+fn type_of(root: &Map<String, Value>, schema: &Value, depth: usize) -> String {
+    if depth > 16 {
+        return "any".to_owned();
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        if let Some(name) = reference.strip_prefix("#/$defs/") {
+            if let Some(definition) =
+                root.get("$defs").and_then(Value::as_object).and_then(|defs| defs.get(name))
+            {
+                return type_of(root, definition, depth + 1);
+            }
+        }
+    }
+
     let base = match schema.get("type") {
         Some(Value::String(name)) => name.clone(),
         Some(Value::Array(names)) => names
@@ -510,11 +573,43 @@ fn type_of(schema: &Value) -> String {
             .find(|name| *name != "null")
             .unwrap_or("any")
             .to_string(),
-        _ => "any".to_string(),
+        _ => {
+            // Schemars represents `Option<T>` over a referenced type as `anyOf([$ref, null])`.
+            // Ignore null and resolve the remaining branch for this compact surface; the full
+            // JSON schema remains authoritative for the accepted values and structure.
+            let union =
+                schema.get("oneOf").or_else(|| schema.get("anyOf")).and_then(Value::as_array);
+            if let Some(branches) = union {
+                let types: Vec<_> = branches
+                    .iter()
+                    .map(|branch| type_of(root, branch, depth + 1))
+                    .filter(|kind| kind != "null")
+                    .collect();
+                if let Some(first) = types.first() {
+                    if types.iter().all(|kind| kind == first) {
+                        first.clone()
+                    } else {
+                        "any".to_owned()
+                    }
+                } else if branches.iter().all(|branch| accepts_null(root, branch, depth + 1)) {
+                    "null".to_owned()
+                } else {
+                    "any".to_owned()
+                }
+            } else if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
+                all_of
+                    .iter()
+                    .map(|branch| type_of(root, branch, depth + 1))
+                    .find(|kind| kind != "any")
+                    .unwrap_or_else(|| "any".to_owned())
+            } else {
+                "any".to_owned()
+            }
+        }
     };
     if base == "array" {
         if let Some(item) = schema.get("items") {
-            return format!("array<{}>", type_of(item));
+            return format!("array<{}>", type_of(root, item, depth + 1));
         }
     }
     base
@@ -539,9 +634,49 @@ mod tests {
     use expect_test::expect;
 
     #[test]
+    fn nullable_referenced_schemas_keep_their_compact_type() {
+        // Schemars 1.2 emits Option<enum/struct> as anyOf([$ref, {type: null}]).
+        // Keep this regression at that JSON Schema boundary: the compact declaration must
+        // report the non-null branch's type and preserve the nullable marker.
+        let schema = json!({
+            "$defs": {
+                "InputKind": {"type": "string", "enum": ["snippet", "module"]},
+                "ModuleType": {
+                    "type": "string",
+                    "enum": ["object", "managed_form", "ordinary_form", "common", "manager"]
+                },
+                "CheckContext": {
+                    "oneOf": [
+                        {"type": "object", "properties": {"kind": {"const": "metadata"}}},
+                        {"type": "object", "properties": {"kind": {"const": "synthetic"}}}
+                    ]
+                }
+            },
+            "type": "object",
+            "properties": {
+                "input_kind": {"anyOf": [{"$ref": "#/$defs/InputKind"}, {"type": "null"}]},
+                "module_type": {"anyOf": [{"$ref": "#/$defs/ModuleType"}, {"type": "null"}]},
+                "context": {"anyOf": [{"$ref": "#/$defs/CheckContext"}, {"type": "null"}]}
+            }
+        });
+        let schema = schema.as_object().unwrap();
+        let compact = params_surface(schema);
+        let params = compact.as_array().unwrap();
+        fn parameter<'a>(params: &'a [Value], name: &str) -> &'a Value {
+            params.iter().find(|parameter| parameter["name"] == name).unwrap()
+        }
+        assert_eq!(parameter(params, "input_kind")["type"], "string");
+        assert_eq!(parameter(params, "input_kind")["nullable"], true);
+        assert_eq!(parameter(params, "module_type")["type"], "string");
+        assert_eq!(parameter(params, "module_type")["nullable"], true);
+        assert_eq!(parameter(params, "context")["type"], "object");
+        assert_eq!(parameter(params, "context")["nullable"], true);
+    }
+
+    #[test]
     fn indexing_discovery_contract() {
         use crate::indexing::{Indexing, Kind, State, Target};
-        assert_eq!(CONTRACT_VERSION, "3.3");
+        assert_eq!(CONTRACT_VERSION, "4.0");
         let indexing = serde_json::to_value(Indexing::single(Target::new(
             Kind::Reference,
             State::Ready,
@@ -810,6 +945,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn execute_keeps_output_schema_absent_for_mixed_response_actions() {
+        let router = McpServer::profile_router(McpProfile::Workspace);
+        let execute = router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "execute")
+            .expect("execute tool");
+        assert!(execute.output_schema.is_none());
+        assert!(tools_of(McpProfile::Workspace)
+            .iter()
+            .find(|tool| tool.name == "execute")
+            .unwrap()
+            .output_schema_version
+            .is_none());
+    }
+
     /// Every served tool's inputSchema says its root is an object.
     ///
     /// The output side is gated above; the input side is the half a client reads FIRST, and a
@@ -926,7 +1078,7 @@ mod tests {
         doc.insert("mcp".into(), mcp_surface());
         expect![[r#"
             {
-              "contract_version": "3.3",
+              "contract_version": "4.0",
               "mcp": {
                 "profiles": {
                   "reference": {
@@ -966,8 +1118,9 @@ mod tests {
                           },
                           {
                             "name": "kind",
+                            "nullable": true,
                             "required": false,
-                            "type": "any"
+                            "type": "string"
                           },
                           {
                             "name": "limit",
@@ -1284,8 +1437,9 @@ mod tests {
                           },
                           {
                             "name": "kind",
+                            "nullable": true,
                             "required": false,
-                            "type": "any"
+                            "type": "string"
                           },
                           {
                             "name": "limit",
@@ -1380,6 +1534,7 @@ mod tests {
                         "actions": [
                           {
                             "name": "check",
+                            "note": "defaults to `input_kind=snippet`; `module` requires `module_type` and `context`; requires a selected connection with `native_check` profile (`--onec-url` alone is unsupported); structured result has `schema_version=\"1\"`; this action has no tool-wide `outputSchema` because `run` and `eval` retain text responses",
                             "required": []
                           },
                           {
@@ -1410,10 +1565,28 @@ mod tests {
                             "type": "string"
                           },
                           {
+                            "name": "context",
+                            "nullable": true,
+                            "required": false,
+                            "type": "object"
+                          },
+                          {
+                            "name": "input_kind",
+                            "nullable": true,
+                            "required": false,
+                            "type": "string"
+                          },
+                          {
                             "name": "max_output_tokens",
                             "nullable": true,
                             "required": false,
                             "type": "integer"
+                          },
+                          {
+                            "name": "module_type",
+                            "nullable": true,
+                            "required": false,
+                            "type": "string"
                           }
                         ]
                       },
@@ -1805,8 +1978,9 @@ mod tests {
                           },
                           {
                             "name": "member_kind",
+                            "nullable": true,
                             "required": false,
-                            "type": "any"
+                            "type": "string"
                           },
                           {
                             "name": "member_name",

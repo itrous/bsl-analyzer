@@ -744,6 +744,28 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("tools/search/acquire.rs", "acquire_for_owner", "thread::sleep", Waiting::Owner),
     ("tools/search/acquire.rs", "wait_turn", ".wait_timeout(", Waiting::Owner),
     ("tools/search/acquire.rs", "take_for_shutdown", "take_for_shutdown(", Waiting::OwnProtocol),
+    // Compiler child completion is bounded by the caller's deadline/cancellation select.
+    ("native_check/compiler.rs", "run_bounded_with_log", ".wait(", Waiting::Bounded),
+    // Recovery polls stop after 100 bounded 20 ms checks of the private process group.
+    (
+        "native_check/profile.rs",
+        "recover_leaderless_owned_group",
+        "thread::sleep",
+        Waiting::Bounded,
+    ),
+    (
+        "native_check/profile.rs",
+        "recover_leaderless_owned_group",
+        "thread::sleep",
+        Waiting::Bounded,
+    ),
+    (
+        "native_check/profile.rs",
+        "recover_leaderless_owned_group",
+        "thread::sleep",
+        Waiting::Bounded,
+    ),
+    ("native_check/profile.rs", "recover_process_group", "thread::sleep", Waiting::Bounded),
     // The lease: a lock wait bounded by `LOCK_WAIT`, and the heartbeat's own slice.
     ("workspace_lease.rs", "acquire", "thread::sleep", Waiting::Bounded),
     ("workspace_lease.rs", "spawn_heartbeat", "thread::sleep", Waiting::OwnProtocol),
@@ -846,6 +868,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
             "graph/portable_workspace_graph_tests.rs",
             "graph/test_support.rs",
             "indexing_runtime_tests.rs",
+            "native_check/tests.rs",
             "payload_smoke_tests.rs",
             "serve_stream_tests.rs",
             "state/indexing_tests.rs",

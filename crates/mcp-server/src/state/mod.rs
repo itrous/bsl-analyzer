@@ -331,11 +331,20 @@ pub struct SharedState {
 pub struct OnecConnection {
     client: OnecClient,
     allow_execute: bool,
+    native_check: Option<Arc<crate::native_check::NativeProfile>>,
 }
 
 impl OnecConnection {
     pub fn new(client: OnecClient, allow_execute: bool) -> Self {
-        Self { client, allow_execute }
+        Self { client, allow_execute, native_check: None }
+    }
+
+    pub fn new_with_native_check(
+        client: OnecClient,
+        allow_execute: bool,
+        profile: crate::native_check::NativeProfile,
+    ) -> Self {
+        Self { client, allow_execute, native_check: Some(Arc::new(profile)) }
     }
 
     pub fn client(&self) -> &OnecClient {
@@ -344,6 +353,10 @@ impl OnecConnection {
 
     pub fn allow_execute(&self) -> bool {
         self.allow_execute
+    }
+
+    pub fn native_check_profile(&self) -> Option<Arc<crate::native_check::NativeProfile>> {
+        self.native_check.clone()
     }
 }
 

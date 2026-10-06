@@ -41,6 +41,7 @@
 
 ## Архитектурные заметки
 
+- [BA-023: платформенная проверка полного BSL-модуля](architecture/BA-023-MODULE-SYNTAX-CHECK.md) — контексты компиляции, нативный worker, ограничения и результаты приёмки `execute(check)`
 - `architecture/SEARCH_BASELINE_OVERLAY.md` — описание модели `baseline + overlay`
 - `central-postgres-search/README.md` — набор документов по централизованному поиску в PostgreSQL
 

@@ -4,7 +4,19 @@
       "url": "http://127.0.0.1/test-base/hs/bsl-analyzer",
       "user_env": "BSL_TEST_BASE_USER",
       "password_env": "BSL_TEST_BASE_PASSWORD",
-      "allow_execute": false
+      "allow_execute": false,
+      "native_check": {
+        "source_kind": "file",
+        "designer_path": "/opt/1cv8/x86_64/8.3.27.1989/1cv8",
+        "python_path": "/usr/bin/python3.14",
+        "xvfb_run_path": "/usr/bin/xvfb-run",
+        "expected_build": "8.3.27.1989",
+        "work_root": "/var/lib/bsl-analyzer/native-check",
+        "source_connection_env": "BSL_NATIVE_FILE_SOURCE",
+        "max_input_bytes": 2097152,
+        "deadline_ms": 120000,
+        "max_log_bytes": 262144
+      }
     }
   }
 }
