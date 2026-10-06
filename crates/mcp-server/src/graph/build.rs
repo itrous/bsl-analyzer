@@ -4036,7 +4036,9 @@ mod tests {
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
         wait_ready(&graph);
-        assert_eq!(graph.status_report().stale, Some(false));
+        wait_until(&graph, "the initial graph status to report fresh", || {
+            graph.status_report().stale == Some(false)
+        });
         write(
             root,
             "CommonModules/Сервер/Ext/Module.bsl",
@@ -4049,11 +4051,9 @@ mod tests {
         graph.record_load_failure(true, refused());
         graph.record_load_failure(true, refused());
 
-        assert_eq!(
-            graph.status_report().stale,
-            Some(true),
-            "a graph whose reload failed read fresh"
-        );
+        wait_until(&graph, "a graph whose reload failed to report stale", || {
+            graph.status_report().stale == Some(true)
+        });
         graph.nudge_rebuild();
         assert!(
             graph.owes_change().is_some(),
