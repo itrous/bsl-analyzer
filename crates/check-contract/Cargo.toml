@@ -1,0 +1,14 @@
+[package]
+name = "check-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+schemars = "1.2"
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+jsonschema = { version = "0.51.0", default-features = false }

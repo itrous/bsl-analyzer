@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "request_id": "check-001",
+  "connection": "demo",
+  "backend": "native-designer/0.1.0",
+  "status": "error",
+  "valid": null,
+  "issues": [],
+  "contexts_required": ["server"],
+  "contexts_checked": [],
+  "truncated": false,
+  "failure": {"code": "cleanup_failed", "message": "owned temporary resources remain"},
+  "compilation_status": "valid",
+  "compiler": {"build": "8.3.27.1989", "compatibility": "Version8_3_27", "fingerprint": "fixture"},
+  "cleanup_status": "incomplete",
+  "module_type": null,
+  "context": null,
+  "backend_info": null
+}

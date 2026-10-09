@@ -1,0 +1,13 @@
+{
+  "schema_version": "1",
+  "request_id": "check-001",
+  "connection": "demo",
+  "code": "Процедура Проверка()\nКонецПроцедуры",
+  "limits": {
+    "timeout_ms": 120000,
+    "max_code_bytes": 2097152,
+    "max_response_bytes": 262144,
+    "max_stderr_bytes": 65536,
+    "stop_grace_ms": 2000
+  }
+}

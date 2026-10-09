@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "request_id": "check-001",
+  "connection": "demo",
+  "backend": "native-designer/0.1.0",
+  "status": "invalid",
+  "valid": false,
+  "issues": [{"message": "syntax error", "line": 1, "column": 1}],
+  "contexts_required": ["server"],
+  "contexts_checked": ["server"],
+  "truncated": false,
+  "failure": null,
+  "compilation_status": "invalid",
+  "compiler": {"build": "8.3.27.1989", "compatibility": "Version8_3_27", "fingerprint": "fixture"},
+  "cleanup_status": "complete",
+  "module_type": null,
+  "context": null,
+  "backend_info": null
+}

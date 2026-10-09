@@ -704,6 +704,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "check-contract"
+version = "0.2.86"
+dependencies = [
+ "jsonschema",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,240 @@
+{
+  "$defs": {
+    "InputKind": {
+      "description": "Kind of source supplied to the checker.",
+      "oneOf": [
+        {
+          "const": "snippet",
+          "description": "Procedure or function text without module metadata.",
+          "type": "string"
+        },
+        {
+          "const": "module",
+          "description": "Complete module text.",
+          "type": "string"
+        }
+      ]
+    },
+    "ModuleContext": {
+      "description": "Real or synthetic module context.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Real owner and origin from configuration or an extension.",
+          "properties": {
+            "kind": {
+              "const": "metadata",
+              "type": "string"
+            },
+            "origin": {
+              "$ref": "#/$defs/Origin",
+              "description": "Configuration or extension where the owner is defined."
+            },
+            "owner": {
+              "description": "Full metadata owner name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "owner",
+            "origin"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Synthetic context that makes no claim about a real owner.",
+          "properties": {
+            "kind": {
+              "const": "synthetic",
+              "type": "string"
+            },
+            "module_type": {
+              "$ref": "#/$defs/ModuleType",
+              "description": "Module type represented by the synthetic request."
+            }
+          },
+          "required": [
+            "kind",
+            "module_type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ModuleType": {
+      "description": "Supported module kinds.",
+      "oneOf": [
+        {
+          "const": "object",
+          "description": "Object module.",
+          "type": "string"
+        },
+        {
+          "const": "managed_form",
+          "description": "Managed form module.",
+          "type": "string"
+        },
+        {
+          "const": "ordinary_form",
+          "description": "Ordinary form module.",
+          "type": "string"
+        },
+        {
+          "const": "common",
+          "description": "Common module.",
+          "type": "string"
+        },
+        {
+          "const": "manager",
+          "description": "Manager module.",
+          "type": "string"
+        }
+      ]
+    },
+    "Origin": {
+      "description": "Origin of a metadata owner.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Owner belongs to the base configuration.",
+          "properties": {
+            "kind": {
+              "const": "configuration",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Owner belongs to the named extension.",
+          "properties": {
+            "kind": {
+              "const": "extension",
+              "type": "string"
+            },
+            "name": {
+              "description": "Extension name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WireLimits": {
+      "additionalProperties": false,
+      "description": "Required positive wire bounds supplied by the caller.\nNormalized response shared by callers and backends.",
+      "properties": {
+        "max_code_bytes": {
+          "description": "Maximum source size in UTF-8 bytes.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_response_bytes": {
+          "description": "Maximum response size in bytes.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_stderr_bytes": {
+          "description": "Maximum captured stderr size in bytes.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "stop_grace_ms": {
+          "description": "Soft-stop grace period in milliseconds.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "description": "Operation deadline in milliseconds.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "timeout_ms",
+        "max_code_bytes",
+        "max_response_bytes",
+        "max_stderr_bytes",
+        "stop_grace_ms"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Request sent to a check backend.",
+  "properties": {
+    "code": {
+      "description": "UTF-8 source text limited by `limits.max_code_bytes`.",
+      "type": "string"
+    },
+    "connection": {
+      "description": "Profile name echoed unchanged in the response.",
+      "type": "string"
+    },
+    "context": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModuleContext"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Metadata owner or explicit synthetic context."
+    },
+    "input_kind": {
+      "$ref": "#/$defs/InputKind",
+      "default": "snippet",
+      "description": "Source shape; an omitted value means `snippet`."
+    },
+    "limits": {
+      "$ref": "#/$defs/WireLimits",
+      "description": "Five positive bounds supplied by the caller."
+    },
+    "module_type": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModuleType"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Expected module type, forbidden for snippets."
+    },
+    "request_id": {
+      "description": "Non-empty ASCII caller identifier, at most 64 bytes.",
+      "type": "string"
+    },
+    "schema_version": {
+      "description": "Wire schema version.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "request_id",
+    "connection",
+    "code",
+    "limits"
+  ],
+  "title": "CheckRequest",
+  "type": "object"
+}
