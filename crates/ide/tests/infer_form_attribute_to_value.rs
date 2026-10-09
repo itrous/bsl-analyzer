@@ -126,8 +126,8 @@ fn report_catalog_and_document_forms_follow_their_main_attribute() {
     assert_metadata_ref(&db, ty, MetadataKind::DocumentObject, "Документ1");
 }
 
-/// The form XML parser keeps a record-manager attribute type as an unresolved name,
-/// so there is nothing to convert it to yet.
+/// A record-manager attribute is typed as form data over its register, but the value
+/// `РеквизитФормыВЗначение` turns it into is not modelled yet, so it stays unknown.
 #[test]
 fn a_record_manager_attribute_stays_unknown() {
     let (db, ty) =

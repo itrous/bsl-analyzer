@@ -1,4 +1,4 @@
-use bsl_metadata::{AttributeType, FormAttribute, MetadataResolver};
+use bsl_metadata::{AttributeType, FormAttribute, MdoType, MetadataResolver};
 use bsl_types::builders::Builders;
 use bsl_types::facet::{FormDataFacet, MdoRefFacet};
 use bsl_types::intern::TypeKernelDb;
@@ -16,6 +16,16 @@ pub fn lower_form_attribute_to_typeid(
     resolver: &dyn MetadataResolver,
 ) -> TypeId {
     let has_columns = !attr.columns.is_empty();
+
+    // The form module never holds the record manager itself, main attribute or not:
+    // the platform hands it over as a form-data structure over the register's
+    // columns, so `Запись.<Измерение>` is a field and `Запись.Записать()` is no method.
+    if let AttributeType::InformationRegisterRecordManager { name } = &attr.attr_type {
+        return db.mk_form_data(
+            FormDataFacet::Structure,
+            Some(MdoRefFacet::new(MdoType::InformationRegister, name.clone())),
+        );
+    }
 
     if attr.is_main {
         let kind = if has_columns {
@@ -234,6 +244,29 @@ mod tests {
         match db.lookup_type(ty) {
             TypeKind::FormData { kind, .. } => assert_eq!(*kind, FormDataFacet::Tree),
             other => panic!("expected FormData(Tree), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_manager_attribute_is_form_data_over_its_register_main_or_not() {
+        let db = InMemoryDb::new();
+        for attr in [
+            main_attr(
+                "Запись",
+                AttributeType::InformationRegisterRecordManager { name: "Курсы".to_string() },
+            ),
+            plain(
+                "ПредыдущаяЗапись",
+                AttributeType::InformationRegisterRecordManager { name: "Курсы".to_string() },
+            ),
+        ] {
+            let id = lower_form_attribute_to_typeid(&db, &attr, &ConfigsObjectResolver(&[]));
+            assert_form_data(
+                &db,
+                id,
+                FormDataFacet::Structure,
+                Some((MdoType::InformationRegister, "Курсы")),
+            );
         }
     }
 

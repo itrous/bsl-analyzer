@@ -275,19 +275,27 @@ fn a_list_form_has_the_dynamic_list_extension_not_the_object_one() {
     assert_eq!(absent_bare_calls(&db, file_id), vec!["Записать".to_string()]);
 }
 
-/// A record form's `Запись` is an information register record manager, a type the
-/// metadata parser leaves unread: the form may carry any extension, so the methods
-/// of every one of them stay silent, while a name owned by nothing is still reported.
+/// A record form's `Запись` is an information register record manager, and its type
+/// names the form's extension exactly: the record extension's methods stay silent,
+/// while the object and list extensions' methods and a name owned by nothing are
+/// reported.
 #[test]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
-fn a_record_form_widens_to_every_extension() {
+fn a_record_form_has_the_record_extension_not_the_object_or_list_one() {
     let text = "&НаКлиенте\nПроцедура Тест()\n    Записать();\n    Прочитать();\n    \
                 Ссылка = ПолучитьНавигационнуюСсылкуЗаписи();\n    \
                 Ссылка = ПолучитьНавигационнуюСсылкуОбъекта();\n    \
                 Ссылка = ПолучитьНавигационнуюСсылкуСписка();\n    \
                 СовсемНеизвестныйВызов();\nКонецПроцедуры\n";
     let (db, file_id) = setup_at(RECORD_FORM_MODULE, text);
-    assert_eq!(absent_bare_calls(&db, file_id), vec!["СовсемНеизвестныйВызов".to_string()]);
+    assert_eq!(
+        absent_bare_calls(&db, file_id),
+        vec![
+            "ПолучитьНавигационнуюСсылкуОбъекта".to_string(),
+            "ПолучитьНавигационнуюСсылкуСписка".to_string(),
+            "СовсемНеизвестныйВызов".to_string()
+        ]
+    );
 }
 
 #[test]
