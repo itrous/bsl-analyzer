@@ -84,7 +84,8 @@ impl HbkContainer {
                 descriptors.len()
             )));
         }
-        for descriptor in descriptors.chunks_exact(DESCRIPTOR_SIZE) {
+        let (descriptors, _) = descriptors.as_chunks::<DESCRIPTOR_SIZE>();
+        for descriptor in descriptors {
             let header_offset = u32_le(descriptor, 0) as usize;
             let body_offset = u32_le(descriptor, 4);
             if u32_le(descriptor, 8) != SPLITTER {
@@ -121,10 +122,8 @@ impl HbkContainer {
         if header.len() < 24 || (header.len() - 24) % 2 != 0 {
             return Err(self.error(format!("entity header at {offset} is malformed")));
         }
-        let units: Vec<u16> = header[20..header.len() - 4]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+        let (pairs, _) = header[20..header.len() - 4].as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         String::from_utf16(&units)
             .map_err(|_| self.error(format!("entity name at {offset} is not UTF-16")))
     }
