@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "request_id": "check-001",
+  "connection": "demo",
+  "backend": "native-designer/0.1.0",
+  "status": "context_required",
+  "valid": null,
+  "issues": [],
+  "contexts_required": [],
+  "contexts_checked": [],
+  "truncated": false,
+  "failure": {"code": "context_required", "message": "module context is required"},
+  "compilation_status": null,
+  "compiler": null,
+  "cleanup_status": null,
+  "module_type": null,
+  "context": null,
+  "backend_info": null
+}

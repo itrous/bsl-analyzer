@@ -1,0 +1,468 @@
+{
+  "$defs": {
+    "CleanupStatus": {
+      "description": "Whether owned temporary resources were cleaned up.",
+      "oneOf": [
+        {
+          "const": "complete",
+          "description": "Cleanup completed.",
+          "type": "string"
+        },
+        {
+          "const": "incomplete",
+          "description": "Some owned resources remain.",
+          "type": "string"
+        }
+      ]
+    },
+    "CompilationStatus": {
+      "description": "Result of the compiler step, independent of later cleanup.",
+      "oneOf": [
+        {
+          "const": "valid",
+          "description": "Compilation found no source issue.",
+          "type": "string"
+        },
+        {
+          "const": "invalid",
+          "description": "Compilation found a source issue.",
+          "type": "string"
+        }
+      ]
+    },
+    "CompilerContext": {
+      "description": "1C compiler contexts used to report required and checked coverage.",
+      "oneOf": [
+        {
+          "const": "server",
+          "description": "Server.",
+          "type": "string"
+        },
+        {
+          "const": "thin_client",
+          "description": "Thin client.",
+          "type": "string"
+        },
+        {
+          "const": "web_client",
+          "description": "Web client.",
+          "type": "string"
+        },
+        {
+          "const": "thick_client_managed",
+          "description": "Managed thick client.",
+          "type": "string"
+        },
+        {
+          "const": "thick_client_ordinary",
+          "description": "Ordinary thick client.",
+          "type": "string"
+        },
+        {
+          "const": "external_connection",
+          "description": "External connection.",
+          "type": "string"
+        },
+        {
+          "const": "mobile_client",
+          "description": "Mobile client.",
+          "type": "string"
+        },
+        {
+          "const": "mobile_app_client",
+          "description": "Mobile application client.",
+          "type": "string"
+        },
+        {
+          "const": "mobile_app_server",
+          "description": "Mobile application server.",
+          "type": "string"
+        }
+      ]
+    },
+    "CompilerInfo": {
+      "additionalProperties": false,
+      "description": "Compiler build and source identity values.",
+      "properties": {
+        "build": {
+          "description": "Build string, or required explicit `null` when unknown.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "compatibility": {
+          "description": "Compatibility mode, or required explicit `null` when unknown.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fingerprint": {
+          "description": "Compiler/source fingerprint, or required explicit `null` when unknown.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "build",
+        "compatibility",
+        "fingerprint"
+      ],
+      "type": "object"
+    },
+    "Failure": {
+      "additionalProperties": false,
+      "description": "Domain failure returned by the backend.",
+      "properties": {
+        "code": {
+          "description": "Lower snake-case domain code; caller transport codes are reserved.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable explanation.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "Issue": {
+      "additionalProperties": false,
+      "description": "Compiler finding with a positive 1-based line and UTF-16 column pair, or two nulls.",
+      "properties": {
+        "column": {
+          "description": "1-based UTF-16 code-unit column, or required explicit `null` when unknown.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "1-based source line, or required explicit `null` when unknown.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Diagnostic text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "line",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ModuleContext": {
+      "description": "Real or synthetic module context.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Real owner and origin from configuration or an extension.",
+          "properties": {
+            "kind": {
+              "const": "metadata",
+              "type": "string"
+            },
+            "origin": {
+              "$ref": "#/$defs/Origin",
+              "description": "Configuration or extension where the owner is defined."
+            },
+            "owner": {
+              "description": "Full metadata owner name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "origin",
+            "owner"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Synthetic context that makes no claim about a real owner.",
+          "properties": {
+            "kind": {
+              "const": "synthetic",
+              "type": "string"
+            },
+            "module_type": {
+              "$ref": "#/$defs/ModuleType",
+              "description": "Module type represented by the synthetic request."
+            }
+          },
+          "required": [
+            "kind",
+            "module_type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ModuleType": {
+      "description": "Supported module kinds.",
+      "oneOf": [
+        {
+          "const": "object",
+          "description": "Object module.",
+          "type": "string"
+        },
+        {
+          "const": "managed_form",
+          "description": "Managed form module.",
+          "type": "string"
+        },
+        {
+          "const": "ordinary_form",
+          "description": "Ordinary form module.",
+          "type": "string"
+        },
+        {
+          "const": "common",
+          "description": "Common module.",
+          "type": "string"
+        },
+        {
+          "const": "manager",
+          "description": "Manager module.",
+          "type": "string"
+        }
+      ]
+    },
+    "Origin": {
+      "description": "Origin of a metadata owner.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Owner belongs to the base configuration.",
+          "properties": {
+            "kind": {
+              "const": "configuration",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Owner belongs to the named extension.",
+          "properties": {
+            "kind": {
+              "const": "extension",
+              "type": "string"
+            },
+            "name": {
+              "description": "Extension name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Status": {
+      "description": "Result category for the complete check request.",
+      "oneOf": [
+        {
+          "const": "valid",
+          "description": "The check succeeded.",
+          "type": "string"
+        },
+        {
+          "const": "invalid",
+          "description": "A proven issue exists in the supplied source.",
+          "type": "string"
+        },
+        {
+          "const": "context_required",
+          "description": "More module context is needed.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "description": "The selected backend cannot handle the request.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "The backend could not complete a trustworthy result.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Normalized response shared by callers and backends.",
+  "properties": {
+    "backend": {
+      "description": "Backend name and a non-empty version suffix separated by `/`.",
+      "type": "string"
+    },
+    "backend_info": {
+      "additionalProperties": true,
+      "description": "Open backend-specific object, or required explicit `null` if unused.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "cleanup_status": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CleanupStatus"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Cleanup result, or required explicit `null` if unknown."
+    },
+    "compilation_status": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CompilationStatus"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Compilation result, or required explicit `null` if unknown."
+    },
+    "compiler": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CompilerInfo"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Compiler identity; each unknown member is explicit `null`."
+    },
+    "connection": {
+      "description": "Connection name echoed from the request.",
+      "type": "string"
+    },
+    "context": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModuleContext"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Checked owner and origin, or required explicit `null` if unavailable."
+    },
+    "contexts_checked": {
+      "description": "Compiler contexts actually checked.",
+      "items": {
+        "$ref": "#/$defs/CompilerContext"
+      },
+      "type": "array"
+    },
+    "contexts_required": {
+      "description": "Compiler contexts required for a valid result.",
+      "items": {
+        "$ref": "#/$defs/CompilerContext"
+      },
+      "type": "array"
+    },
+    "failure": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Failure"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Domain failure, or required explicit `null` if absent."
+    },
+    "issues": {
+      "description": "Findings and their original-source positions.",
+      "items": {
+        "$ref": "#/$defs/Issue"
+      },
+      "type": "array"
+    },
+    "module_type": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModuleType"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Resolved module type, or required explicit `null` if unavailable."
+    },
+    "request_id": {
+      "description": "Caller identifier echoed from the request.",
+      "type": "string"
+    },
+    "schema_version": {
+      "description": "Wire schema version.",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/Status",
+      "description": "Overall result category."
+    },
+    "truncated": {
+      "description": "Whether some findings were omitted while the JSON stayed whole.",
+      "type": "boolean"
+    },
+    "valid": {
+      "description": "`true` for valid, `false` for invalid, or required explicit `null` otherwise.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "backend",
+    "backend_info",
+    "cleanup_status",
+    "compilation_status",
+    "compiler",
+    "connection",
+    "context",
+    "contexts_checked",
+    "contexts_required",
+    "failure",
+    "issues",
+    "module_type",
+    "request_id",
+    "schema_version",
+    "status",
+    "truncated",
+    "valid"
+  ],
+  "title": "CheckResponse",
+  "type": "object"
+}
