@@ -390,7 +390,7 @@ impl WorkspaceDiff {
 }
 
 /// Computes a semantic structure hash of an XML document, ignoring elements
-/// like `<Version>` and `<Comment>`, XML comments, and non-significant whitespace.
+/// like `<Version>` and `<Comment>`, XML comments, and indentation between elements.
 pub(crate) fn xml_semantic_hash(xml_text: &str) -> [u8; 32] {
     let Ok(doc) = bsl_metadata::roxmltree::Document::parse(xml_text) else {
         return *blake3::hash(xml_text.as_bytes()).as_bytes();
@@ -433,11 +433,14 @@ fn hash_xml_node(node: bsl_metadata::roxmltree::Node<'_, '_>, hasher: &mut blake
             hash_xml_part(attr.value(), hasher);
         }
     } else if node.is_text() {
+        // Only indentation between sibling elements is formatting: the metadata parser
+        // reads a leaf's text verbatim, so its surrounding whitespace is part of the value.
         if let Some(text) = node.text() {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
+            let indentation = text.trim().is_empty()
+                && node.parent().is_some_and(|parent| parent.children().any(|c| c.is_element()));
+            if !indentation {
                 hasher.update(b"T");
-                hash_xml_part(trimmed, hasher);
+                hash_xml_part(text, hasher);
             }
         }
     }
@@ -545,12 +548,28 @@ mod diff_tests {
         let xml2 = r#"<Configuration>
     <!-- some XML comment -->
     <Properties>
-        <Name>
-            Config1
-        </Name>
+        <Name>Config1</Name>
     </Properties>
 </Configuration>"#;
         assert_eq!(xml_semantic_hash(xml1), xml_semantic_hash(xml2));
+    }
+
+    /// The metadata parser reads element text verbatim, so whitespace inside a leaf
+    /// value is a different name, code or data path, not formatting.
+    #[test]
+    fn xml_semantic_hash_keeps_whitespace_inside_leaf_text() {
+        let base = r#"<Catalog><Properties><Name>Товары</Name></Properties></Catalog>"#;
+        for edited in [
+            r#"<Catalog><Properties><Name>Товары </Name></Properties></Catalog>"#,
+            r#"<Catalog><Properties><Name> Товары</Name></Properties></Catalog>"#,
+            "<Catalog><Properties><Name>\n    Товары\n</Name></Properties></Catalog>",
+        ] {
+            assert_ne!(xml_semantic_hash(base), xml_semantic_hash(edited), "{edited}");
+        }
+        assert_ne!(
+            xml_semantic_hash(r#"<Catalog><Properties><Name/></Properties></Catalog>"#),
+            xml_semantic_hash(r#"<Catalog><Properties><Name> </Name></Properties></Catalog>"#),
+        );
     }
 
     #[test]

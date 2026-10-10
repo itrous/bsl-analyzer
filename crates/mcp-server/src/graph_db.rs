@@ -1473,6 +1473,26 @@ pub(crate) struct BodyPatch {
     modules: usize,
 }
 
+/// The `Form.xml` descriptor beside a managed form's `Ext/Form/Module.bsl`, spelled with
+/// `/` separators like the descriptor paths it is compared with.
+fn form_xml_for_module(module: &Path) -> Option<String> {
+    use bsl_conventions::{conventional_of, ConventionalName};
+    let form_dir = module.parent()?;
+    let is_module = module
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| conventional_of(name) == Some(ConventionalName::Module));
+    let is_form_dir = form_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| conventional_of(name) == Some(ConventionalName::Form));
+    if !is_module || !is_form_dir {
+        return None;
+    }
+    let xml = form_dir.parent()?.join(ConventionalName::FormXml.canonical());
+    Some(xml.to_string_lossy().replace('\\', "/"))
+}
+
 #[cfg(test)]
 impl BodyPatch {
     pub(crate) fn rows_for_test(&self) -> &ide::ReprojectedRows {
@@ -1561,13 +1581,11 @@ pub(crate) fn local_metadata_delta(
             found_owner = true;
         }
         for (_file_id, module_path) in &universe.files {
-            let text = module_path.to_string_lossy().replace('\\', "/");
-            let marker_at = text.to_ascii_lowercase().rfind("/form/module.bsl");
-            let Some(marker_at) = marker_at else { continue };
-            let xml_candidate = format!("{}/Form.xml", &text[..marker_at]);
+            let Some(xml_candidate) = form_xml_for_module(module_path) else { continue };
             if !xml.eq_ignore_ascii_case(&xml_candidate) {
                 continue;
             }
+            let text = module_path.to_string_lossy().replace('\\', "/");
             let Some((owner, form_name)) = ide::form_key_for_path(&text) else { continue };
             let scope = owner.as_ref().map_or_else(
                 || "common".to_owned(),
@@ -1824,8 +1842,7 @@ pub(crate) fn compute_body_patch_with_metadata(
             |(kind, name)| format!("{}/{}", kind.english_name(), name),
         );
         metadata_owner_ids.push(format!("form/{scope}/{form}"));
-        if let Some(marker) = text.to_ascii_lowercase().rfind("/form/module.bsl") {
-            let xml = PathBuf::from(format!("{}/Form.xml", &text[..marker]));
+        if let Some(xml) = form_xml_for_module(path).map(PathBuf::from) {
             if !metadata_form_paths.contains(&xml) {
                 metadata_form_paths.push(xml);
             }

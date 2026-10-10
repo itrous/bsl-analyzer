@@ -2247,11 +2247,9 @@ impl GraphState {
     /// answerable. Readers use this to label cross-cache results consistently.
     pub(crate) fn is_reloading(&self) -> bool {
         let inner = lock_recover(&self.inner);
-        matches!(inner.status, GraphStatus::Loading)
-            || inner
-                .published
-                .as_ref()
-                .is_some_and(|published| published.reload == ReloadState::Running)
+        inner.published.as_ref().is_some_and(|published| {
+            inner.status == GraphStatus::Loading || published.reload == ReloadState::Running
+        })
     }
 
     #[cfg(test)]
@@ -3122,6 +3120,26 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A cold build has no publication to be stale against: answers from other caches
+    /// stay fresh until a graph is installed and then rebuilt.
+    #[test]
+    fn only_a_published_graph_reports_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let cold = GraphState::for_workspace(root.to_path_buf());
+        cold.set_loading_for_test();
+        assert_eq!(cold.status(), GraphStatus::Loading);
+        assert!(!cold.is_reloading(), "a cold build is not a reload");
+
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        assert!(!graph.is_reloading());
+        graph.set_loading_for_test();
+        assert!(graph.is_reloading(), "loading over an installed publication is a reload");
+    }
 
     /// A delivery is listed when the LEDGER has it, not when the consumer set out to make it.
     ///
