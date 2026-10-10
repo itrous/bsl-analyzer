@@ -99,12 +99,6 @@ pub(crate) fn standalone_notice_of(project: &project_model::Project) -> Option<S
     (!notices.is_empty()).then(|| notices.join("\n"))
 }
 
-/// [`standalone_notice_of`] for the project at `root`, read from disk — for the watcher,
-/// never for a request.
-pub(crate) fn derive_standalone_notice(root: &std::path::Path) -> Option<String> {
-    standalone_notice_of(&crate::project::at(root).ok()?)
-}
-
 /// The daemon's stop request to every background owner, and the count of owners still running.
 ///
 /// One object for both, because a stop that cannot be observed is a stop nobody can prove: the
