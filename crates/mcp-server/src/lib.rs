@@ -4698,10 +4698,31 @@ mod graph_supersession_contract {
                 [..shifted_resident.find("Функция Считать").unwrap()]
                 .matches('\n')
                 .count();
-            let search_line = search_body["hits"][0]["line_start"].as_u64().unwrap() as usize;
+            let method_chunk_start = |source: &str| {
+                bsl_search::Chunker::source_chunks(source)
+                    .into_iter()
+                    .find(|chunk| {
+                        chunk.chunk.name == "Считать"
+                            && chunk.chunk.kind == bsl_search::ChunkKind::Function
+                    })
+                    .expect("search target function chunk")
+                    .chunk
+                    .line_start as usize
+                    + 1
+            };
+            let old_chunk_line = method_chunk_start(&old_text);
+            let shifted_chunk_line = method_chunk_start(&shifted_resident);
+            let first_hit = &search_body["hits"][0];
+            assert_eq!(first_hit["symbol"], "Считать");
+            assert_eq!(first_hit["kind"], "function");
+            assert_eq!(
+                std::path::Path::new(first_hit["path"].as_str().unwrap()),
+                std::path::Path::new("CommonModules/Сервер/Ext/Module.bsl")
+            );
+            let search_line = first_hit["line_start"].as_u64().unwrap() as usize;
             assert!(
-                search_line == old_method_line || search_line == old_method_line + 1,
-                "search location must belong to the old or shifted published text: {search_line}"
+                search_line == old_chunk_line || search_line == shifted_chunk_line,
+                "search location must match the old or shifted function chunk: {search_line} not in [{old_chunk_line}, {shifted_chunk_line}]"
             );
             let function_diagnostic = diag_body["result"]["findings"]
                 .as_array()
