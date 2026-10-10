@@ -109,7 +109,10 @@ impl BackendKey {
     /// long runtime/temp directory surfaces here as `InvalidInput` rather than a
     /// confusing `EINVAL` when the daemon later `bind`s.
     pub fn socket_path(&self) -> io::Result<PathBuf> {
-        let path = runtime_socket_dir()?.join(format!("{}.sock", self.digest()));
+        let layout = runtime_socket_layout()?;
+        let path = layout.dir.join(format!("{}.sock", self.digest()));
+        self.validate_runtime_output(&path)?;
+        prepare_runtime_socket_dir(&layout)?;
         #[cfg(unix)]
         {
             let len = path.as_os_str().as_encoded_bytes().len();
@@ -126,6 +129,40 @@ impl BackendKey {
         }
         Ok(path)
     }
+
+    /// Runtime log path, gated against selected workspace inputs before creating the
+    /// runtime directory. Windows also writes this file even though its rendezvous
+    /// endpoint is a named pipe.
+    pub fn runtime_log_path(&self) -> io::Result<PathBuf> {
+        let layout = runtime_socket_layout()?;
+        let path = layout.dir.join(format!("{}.log", self.digest()));
+        self.validate_runtime_output(&path)?;
+        prepare_runtime_socket_dir(&layout)?;
+        Ok(path)
+    }
+
+    fn validate_runtime_output(&self, path: &Path) -> io::Result<()> {
+        if matches!(self.profile, McpProfile::Workspace) {
+            let project = crate::project::at(&self.source_dir)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            validate_runtime_endpoint(&project, path)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_runtime_endpoint(project: &project_model::Project, path: &Path) -> io::Result<()> {
+    if let Some(root) = crate::WorkspaceCacheLayout::overlapping_source_root(project, path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "broker runtime endpoint {} overlaps workspace input root {}",
+                path.display(),
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `sun_path` capacity (including the trailing NUL) the kernel accepts for a
@@ -244,11 +281,9 @@ fn canonical_run_user_dir() -> Option<PathBuf> {
     ours.then_some(base)
 }
 
-/// Per-user directory that holds broker sockets. Prefers `$XDG_RUNTIME_DIR`, then the canonical
-/// `/run/user/<euid>` (so a dropped env var doesn't split the rendezvous), then the system temp
-/// dir — directly when that is already uid-private, otherwise under a user-scoped subdir of it.
-/// Created `0700` on unix so a co-tenant cannot enumerate or connect to another user's backend.
-pub fn runtime_socket_dir() -> io::Result<PathBuf> {
+/// Select the existing runtime location without creating it. Workspace callers
+/// can validate the derived endpoint against project inputs before any mkdir.
+fn runtime_socket_layout() -> io::Result<SocketDirLayout> {
     #[cfg(unix)]
     let (canonical, temp_is_uid_private) = (canonical_run_user_dir(), temp_dir_is_uid_private());
     #[cfg(not(unix))]
@@ -260,7 +295,10 @@ pub fn runtime_socket_dir() -> io::Result<PathBuf> {
         std::env::temp_dir(),
         temp_is_uid_private,
     );
-    let layout = socket_dir_layout(source, &user_tag());
+    Ok(socket_dir_layout(source, &user_tag()))
+}
+
+fn prepare_runtime_socket_dir(layout: &SocketDirLayout) -> io::Result<()> {
     // Every level we create must be ours — otherwise an attacker who owns an ancestor could
     // swap our socket dir after it is validated. So validate the tagged base (rejecting an
     // attacker-pre-created one) before creating the leaf, never descending recursively through
@@ -270,7 +308,7 @@ pub fn runtime_socket_dir() -> io::Result<PathBuf> {
         create_private_dir(base)?;
     }
     create_private_dir(&layout.dir)?;
-    Ok(layout.dir)
+    Ok(())
 }
 
 /// The path with any trailing separators removed.
@@ -465,7 +503,10 @@ pub fn backend_name(key: &BackendKey) -> io::Result<interprocess::local_socket::
     #[cfg(windows)]
     {
         use interprocess::local_socket::{GenericNamespaced, ToNsName};
-        let _ = runtime_socket_dir();
+        // Windows rendezvous does not use a filesystem socket, but the detached child
+        // still writes its runtime log there. Validate that automatic output before the
+        // directory is created, just as the Unix socket path does.
+        let _ = key.runtime_log_path()?;
         format!("bsl-mcp-{}.sock", key.digest()).to_ns_name::<GenericNamespaced>()
     }
 }
@@ -582,13 +623,35 @@ mod tests {
 
     #[test]
     fn socket_path_sits_under_runtime_dir_and_is_named_by_digest() {
-        let k = key("/srv/erp", McpProfile::Workspace, 7);
+        let k = key("/srv/erp", McpProfile::Reference, 7);
         let path = k.socket_path().expect("runtime dir resolvable");
-        assert_eq!(path.parent(), Some(runtime_socket_dir().unwrap().as_path()));
+        let runtime_dir = runtime_socket_layout().unwrap().dir;
+        assert_eq!(path.parent(), Some(runtime_dir.as_path()));
         assert_eq!(
             path.file_name().and_then(|s| s.to_str()),
             Some(format!("{}.sock", k.digest()).as_str())
         );
+    }
+
+    #[test]
+    fn workspace_cache_scope_runtime_endpoint_and_log_overlap_fails_before_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let key = BackendKey::new(
+            root.path(),
+            root.path().join("cache"),
+            McpProfile::Workspace,
+            0,
+            0,
+            BTreeSet::new(),
+        );
+        let runtime = root.path().join("runtime").join(SOCKET_DIR_LEAF);
+        for endpoint in [runtime.join("derived.sock"), runtime.join("derived.log")] {
+            let error = key
+                .validate_runtime_output(&endpoint)
+                .expect_err("runtime endpoint under project input is refused");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert!(!runtime.exists(), "the preflight must not create the overlapping path");
     }
 
     #[test]

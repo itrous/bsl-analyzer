@@ -15,7 +15,7 @@ use interprocess::local_socket::tokio::Stream as TokioStream;
 #[cfg(any(unix, windows))]
 use mcp_server::broker::{self, BackendKey};
 use mcp_server::{serve_stream, McpProfile, McpServer, SharedState};
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, PingRequest};
 use rmcp::ServiceExt;
 use tempfile::TempDir;
 
@@ -26,14 +26,41 @@ fn reference_server() -> McpServer {
 #[cfg(any(unix, windows))]
 fn key_for(src: &TempDir) -> BackendKey {
     // Profile here only names the socket; the served profile is the passed server.
+    let workspace = src.path().canonicalize().unwrap();
+    let project = mcp_server::project::at(&workspace).unwrap();
+    let cache_base = src
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("{}-cache", src.path().file_name().unwrap().to_string_lossy()));
+    let cache = mcp_server::WorkspaceCacheLayout::for_project(
+        &project,
+        Some(&cache_base),
+        &workspace,
+        None,
+    )
+    .unwrap();
     BackendKey::new(
-        src.path(),
-        mcp_server::WorkspaceCacheLayout::for_workspace(src.path()).root(),
+        &workspace,
+        cache.root(),
         McpProfile::Workspace,
         0,
         0,
         std::collections::BTreeSet::new(),
     )
+}
+
+#[cfg(any(unix, windows))]
+fn cache_for(src: &TempDir) -> mcp_server::WorkspaceCacheLayout {
+    let workspace = src.path().canonicalize().unwrap();
+    let project = mcp_server::project::at(&workspace).unwrap();
+    let cache_base = src
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("{}-cache", src.path().file_name().unwrap().to_string_lossy()));
+    mcp_server::WorkspaceCacheLayout::for_project(&project, Some(&cache_base), &workspace, None)
+        .unwrap()
 }
 
 #[cfg(any(unix, windows))]
@@ -52,6 +79,76 @@ async fn connect_within(key: &BackendKey, budget: Duration) -> TokioStream {
         assert!(tokio::time::Instant::now() < deadline, "backend never became reachable");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(any(unix, windows))]
+async fn workspace_cache_scope_drift_retires_broker_and_reconnects_on_new_key() {
+    let src = TempDir::new().unwrap();
+    std::fs::write(
+        src.path().join("Configuration.xml"),
+        "<Configuration><Name>Main</Name></Configuration>",
+    )
+    .unwrap();
+    std::fs::write(src.path().join("Module.bsl"), "Процедура A() КонецПроцедуры").unwrap();
+    let old_key = key_for(&src);
+    let initial_root = src.path().to_path_buf();
+    let initial_cache = cache_for(&src);
+    let old_backend = tokio::spawn(broker::daemon::run(
+        move || {
+            let state = SharedState::workspace_with_cache(initial_root, initial_cache)?;
+            Ok(McpServer::new(McpProfile::Workspace, state))
+        },
+        old_key.clone(),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    ));
+    let old_client =
+        ().serve(connect_within(&old_key, Duration::from_secs(10)).await).await.unwrap();
+
+    let nested = src.path().join("src/cf");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        nested.join("Configuration.xml"),
+        "<Configuration><Name>Main</Name></Configuration>",
+    )
+    .unwrap();
+    std::fs::write(src.path().join("bsl-analyzer.toml"), "[source]\nroot = \"src/cf\"\n").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), old_backend)
+        .await
+        .expect("scope drift closes the old broker daemon")
+        .expect("old daemon task joins")
+        .expect("old daemon exits cleanly");
+    assert!(old_key != key_for(&src), "the changed topology selects a new broker key");
+    assert!(connect(&old_key).await.is_err(), "the old backend endpoint is gone");
+    assert!(
+        old_client
+            .send_request(rmcp::model::ClientRequest::PingRequest(PingRequest::default()))
+            .await
+            .is_err(),
+        "the old transport was closed with its backend"
+    );
+
+    let new_key = key_for(&src);
+    let new_root = src.path().to_path_buf();
+    let new_cache = cache_for(&src);
+    let new_backend = tokio::spawn(broker::daemon::run(
+        move || {
+            let state = SharedState::workspace_with_cache(new_root, new_cache)?;
+            Ok(McpServer::new(McpProfile::Workspace, state))
+        },
+        new_key.clone(),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    ));
+    let new_client =
+        ().serve(connect_within(&new_key, Duration::from_secs(10)).await).await.unwrap();
+    new_client.cancel().await.ok();
+    tokio::time::timeout(Duration::from_secs(5), new_backend)
+        .await
+        .expect("new scope backend can serve and exit")
+        .expect("new daemon task joins")
+        .expect("new daemon exits cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -145,7 +242,15 @@ fn hold_lease_lock(cache: &mcp_server::WorkspaceCacheLayout) -> std::fs::File {
 async fn superseded_backend_lifecycle() {
     let src = TempDir::new().unwrap();
     let root = src.path().to_path_buf();
-    let cache = mcp_server::WorkspaceCacheLayout::for_workspace(&root);
+    let project = mcp_server::project::at(&root).unwrap();
+    let cache_base = src
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("{}-cache", src.path().file_name().unwrap().to_string_lossy()));
+    let cache =
+        mcp_server::WorkspaceCacheLayout::for_project(&project, Some(&cache_base), &root, None)
+            .unwrap();
     let backend_root = root.clone();
     let backend_cache = cache.clone();
     let backend = tokio::spawn(broker::daemon::run(
@@ -194,7 +299,19 @@ async fn superseded_backend_lifecycle() {
 
     let transient_src = TempDir::new().unwrap();
     let transient_root = transient_src.path().to_path_buf();
-    let transient_cache = mcp_server::WorkspaceCacheLayout::for_workspace(&transient_root);
+    let transient_project = mcp_server::project::at(&transient_root).unwrap();
+    let transient_base = transient_src
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("{}-cache", transient_src.path().file_name().unwrap().to_string_lossy()));
+    let transient_cache = mcp_server::WorkspaceCacheLayout::for_project(
+        &transient_project,
+        Some(&transient_base),
+        &transient_root,
+        None,
+    )
+    .unwrap();
     let lock = hold_lease_lock(&transient_cache);
     let build_root = transient_root.clone();
     let build_cache = transient_cache.clone();

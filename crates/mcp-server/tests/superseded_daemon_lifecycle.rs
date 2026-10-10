@@ -102,8 +102,10 @@ async fn superseded_daemon_lifecycle() {
     let workspace = tempfile::tempdir().unwrap();
     let cache_dir = tempfile::tempdir().unwrap();
     let root = workspace.path().to_path_buf();
-    let cache = WorkspaceCacheLayout::from_root(cache_dir.path().to_path_buf());
     write_workspace(&root, 1);
+    let project = mcp_server::project::at(&root).unwrap();
+    let cache =
+        WorkspaceCacheLayout::for_project(&project, Some(cache_dir.path()), &root, None).unwrap();
 
     let old_server = McpServer::new(
         McpProfile::Workspace,

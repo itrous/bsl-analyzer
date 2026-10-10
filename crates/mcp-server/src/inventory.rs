@@ -721,6 +721,7 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("state/mod.rs", "apply_workspace_search_checkpointed", "acquire_for_owner(", Waiting::Owner),
     // `OwnerStop::sleep` itself: the primitive every retry pause is built on.
     ("state/mod.rs", "sleep", ".wait_timeout(", Waiting::Owner),
+    ("state/mod.rs", "wait_empty", ".wait_timeout(", Waiting::Owner),
     ("state/overlay_backlog.rs", "backlog", "acquire_for_owner(", Waiting::Owner),
     ("state/overlay_backlog.rs", "round", "acquire_for_owner(", Waiting::Owner),
     ("state/overlay_backlog.rs", "run", ".wait(", Waiting::Owner),

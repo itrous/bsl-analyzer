@@ -1,6 +1,6 @@
 //! Which daemon owns a workspace's derived caches.
 //!
-//! A workspace's `.build` directory holds caches derived from the same sources — the call
+//! One workspace-scoped cache leaf holds caches derived from the same sources — the call
 //! graph and the code-search index — but the daemon that maintains them is not unique.
 //! [`BackendKey`](crate::broker::BackendKey) forks a fresh backend on a binary upgrade, an
 //! embedding-config change, or an extension-topology edit, and the superseded daemon lives on
@@ -230,6 +230,9 @@ struct Inner {
     /// caller named no workspace: the claim check then has nothing to compare and is decided
     /// by the old rules.
     workspace: Option<String>,
+    /// Immutable cache scope admitted by the launcher. Background writers use
+    /// it for fresh Project checks before paid work and publication.
+    cache: Option<crate::cache::WorkspaceCacheLayout>,
     owns: AtomicBool,
     /// Set permanently after this lease, having owned the workspace, observes a live foreign
     /// token. All clones share the verdict and never attempt to reclaim after it is set.
@@ -294,9 +297,8 @@ struct Inner {
 
 impl WorkspaceLease {
     /// Claim `workspace_root`'s derived caches for this process, taking the generation above
-    /// whatever the last owner recorded. An unwritable or locked-out `.build` yields an
-    /// unmanaged lease (see [`Inner::path`]) rather than an error: the daemon still works, it
-    /// just cannot coordinate with a peer.
+    /// whatever the last owner recorded. A fixture whose lease directory cannot be prepared
+    /// yields a coordination-failed lease that refuses every derived-cache write.
     #[cfg(test)]
     pub(crate) fn claim(workspace_root: &Path) -> Self {
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(workspace_root);
@@ -377,6 +379,7 @@ impl WorkspaceLease {
         Self {
             inner: Arc::new(Inner {
                 path: None,
+                cache: None,
                 generation: AtomicU64::new(0),
                 token: AtomicU64::new(0),
                 workspace: None,
@@ -414,6 +417,7 @@ impl WorkspaceLease {
         let path = cache.lease_path();
         let inner = Arc::new(Inner {
             path: Some(path),
+            cache: Some(cache.clone()),
             generation: AtomicU64::new(UNCLAIMED),
             token: AtomicU64::new(0),
             workspace: cache.workspace().map(workspace_identity),
@@ -585,7 +589,8 @@ impl WorkspaceLease {
     /// Whether this daemon may write the workspace's derived caches. The verdict is cached for
     /// [`VERDICT_TTL`], so gating a write path on it costs an atomic load in the common case.
     pub(crate) fn owns_caches(&self) -> bool {
-        if self.inner.released.load(Ordering::SeqCst)
+        if self.inner.coordination_failed
+            || self.inner.released.load(Ordering::SeqCst)
             || self.inner.superseded.load(Ordering::SeqCst)
         {
             return false;
@@ -702,7 +707,8 @@ impl WorkspaceLease {
 
     /// Last process-local ownership verdict, without lock-file or lease-record I/O.
     pub(crate) fn owns_caches_cached(&self) -> bool {
-        !self.inner.released.load(Ordering::SeqCst)
+        !self.inner.coordination_failed
+            && !self.inner.released.load(Ordering::SeqCst)
             && !self.inner.superseded.load(Ordering::SeqCst)
             && (self.inner.path.is_none() || self.inner.owns.load(Ordering::SeqCst))
     }
@@ -716,7 +722,8 @@ impl WorkspaceLease {
     /// [`Self::with_ownership`] does), which is the right trade where the write is a vector
     /// that a re-embed can replace rather than a rename that destroys another daemon's build.
     pub(crate) fn owns_caches_now(&self) -> bool {
-        if self.inner.released.load(Ordering::SeqCst)
+        if self.inner.coordination_failed
+            || self.inner.released.load(Ordering::SeqCst)
             || self.inner.superseded.load(Ordering::SeqCst)
         {
             return false;
@@ -935,7 +942,9 @@ impl WorkspaceLease {
     }
 
     fn terminal_outcome<T, E>(&self) -> Option<LeaseOperationOutcome<T, E>> {
-        if self.inner.superseded.load(Ordering::SeqCst) {
+        if self.inner.coordination_failed {
+            Some(LeaseOperationOutcome::Released)
+        } else if self.inner.superseded.load(Ordering::SeqCst) {
             Some(LeaseOperationOutcome::Superseded)
         } else if self.inner.released.load(Ordering::SeqCst) {
             Some(LeaseOperationOutcome::Released)
@@ -986,6 +995,14 @@ impl WorkspaceLease {
     /// Whether this lease stands in for a managed claim that could not be made.
     pub(crate) fn coordination_failed(&self) -> bool {
         self.inner.coordination_failed
+    }
+
+    /// Re-read the declared Project against this lease's frozen cache scope.
+    /// Unmanaged/reference leases preserve their existing no-scope behavior.
+    pub(crate) fn scope_matches_project(&self) -> bool {
+        let Some(cache) = self.inner.cache.as_ref() else { return true };
+        let Some(root) = cache.workspace() else { return true };
+        crate::project::at(root).is_ok_and(|project| cache.verify_project(&project).is_ok())
     }
 
     pub(crate) fn is_superseded(&self) -> bool {
@@ -1353,6 +1370,30 @@ fn is_lock_contention(error: &io::Error) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn workspace_cache_scope_lease_admission_detects_project_drift() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cache_parent = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Configuration.xml"), "<Configuration/>").unwrap();
+        let project = crate::project::at(workspace.path()).unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&cache_parent.path().join("cache")),
+            cache_parent.path(),
+            None,
+        )
+        .unwrap();
+        let lease = WorkspaceLease::claim_cache(&cache);
+        assert!(lease.scope_matches_project());
+
+        std::fs::write(
+            workspace.path().join("bsl-analyzer.toml"),
+            "[source]\nexclude = [\"generated\"]\n",
+        )
+        .unwrap();
+        assert!(!lease.scope_matches_project());
+    }
+
     fn publish_test<T>(
         lease: &WorkspaceLease,
         write: impl FnOnce() -> T,
@@ -1544,8 +1585,7 @@ mod tests {
         cache_dir: &std::path::Path,
         workspace: &std::path::Path,
     ) -> crate::cache::WorkspaceCacheLayout {
-        crate::cache::WorkspaceCacheLayout::prepare_explicit(cache_dir, std::path::Path::new(""))
-            .expect("an explicit cache root is creatable")
+        crate::cache::WorkspaceCacheLayout::from_root(cache_dir.to_path_buf())
             .with_workspace(workspace.to_path_buf())
     }
 
@@ -1720,6 +1760,7 @@ mod tests {
         WorkspaceLease {
             inner: Arc::new(Inner {
                 path: Some(cache.lease_path()),
+                cache: Some(cache.clone()),
                 generation: AtomicU64::new(UNCLAIMED),
                 token: AtomicU64::new(0),
                 workspace: None,
@@ -2064,6 +2105,7 @@ mod tests {
         let unclaimed = WorkspaceLease {
             inner: Arc::new(Inner {
                 path: Some(cache.lease_path()),
+                cache: Some(cache.clone()),
                 generation: AtomicU64::new(UNCLAIMED),
                 token: AtomicU64::new(0),
                 workspace: None,
@@ -2496,17 +2538,30 @@ mod tests {
         assert_eq!(record_at(&path).generation, newer.generation, "the newer owner still holds it");
     }
 
-    /// A lease over a directory that cannot host a record governs nothing and never blocks its
-    /// daemon from maintaining caches — coordination is best-effort, never a kill switch.
+    /// A cache whose lease directory cannot be prepared refuses derived-cache writes, while an
+    /// intentionally unmanaged lease still allows unrelated reference-profile work.
     #[test]
-    fn an_unclaimable_lease_still_lets_its_daemon_write() {
+    fn workspace_cache_coordination_failed_blocks_derived_writes() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("not-a-directory");
         std::fs::write(&file, "").unwrap();
 
         let lease = WorkspaceLease::claim(&file);
         assert_eq!(lease.generation(), None, "nothing was claimed");
-        assert!(lease.owns_caches(), "an unmanaged lease never withholds ownership");
+        assert!(lease.coordination_failed());
+        assert!(!lease.owns_caches());
+        assert!(!lease.owns_caches_cached());
+        assert!(!lease.owns_caches_now());
+        let mut wrote = false;
+        assert!(matches!(
+            lease.publish_short(&mut wrote, |value| {
+                *value = true;
+                Ok::<_, std::io::Error>(())
+            }),
+            LeaseOperationOutcome::Released
+        ));
+        assert!(!wrote, "publication fence must refuse writes after claim failure");
+        assert!(WorkspaceLease::unmanaged().owns_caches(), "reference work remains unmanaged");
     }
 
     /// A stale record that was never observed while live is not evidence of supersession. The

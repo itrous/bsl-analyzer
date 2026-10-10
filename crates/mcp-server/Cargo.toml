@@ -78,6 +78,7 @@ libc = "0.2"
 tempfile.workspace = true
 widestring = "1.0"
 win-security-identifier = "0.1.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 # Safe introspection of a connected named-pipe server: lets us read the
 # server PID's image path and owner SID without project-local unsafe or
 # handwritten Win32 FFI. `system` feature is Process/System/Users only —

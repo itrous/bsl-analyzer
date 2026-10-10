@@ -1,6 +1,8 @@
 mod baseline;
 pub mod broker;
 mod cache;
+#[cfg(windows)]
+pub mod cache_windows;
 mod cancel;
 mod change_hub;
 pub mod contract;
@@ -179,7 +181,10 @@ static MEASURED_ALLOC: measured_alloc::Measuring = measured_alloc::Measuring;
 pub use baseline::{
     resolve_project_baseline_diagnostics, BaselineConfigDiagnostics, BaselineResolutionSummary,
 };
-pub use cache::WorkspaceCacheLayout;
+pub use cache::{
+    expected_scope_from_env, CacheOrigin, WorkspaceCacheLayout, WORKSPACE_CACHE_BASE_ENV,
+    WORKSPACE_CACHE_SCOPE_ENV,
+};
 pub use graph_db::{
     read_source_root_scoped_sqlite_method_call_digest, read_sqlite_method_call_digest,
 };
@@ -271,15 +276,30 @@ where
     T: rmcp::transport::IntoTransport<rmcp::RoleServer, std::io::Error, A>,
 {
     use rmcp::ServiceExt;
+    let session_shutdown = tokio_util::sync::CancellationToken::new();
+    let relay_shutdown = session_shutdown.clone();
+    let scope_shutdown = server.scope_transport_stop();
+    let relay = tokio::spawn(async move {
+        tokio::select! {
+            () = shutdown.cancelled() => {},
+            () = scope_shutdown.cancelled() => {},
+        }
+        relay_shutdown.cancel();
+    });
     // RMCP cancels its token when a session ends. A child keeps one client's disconnect
     // from stopping the broker's other sessions while still observing broker shutdown.
-    let session = match server.serve_with_ct(transport, shutdown.child_token()).await {
-        Ok(session) => session,
-        Err(rmcp::service::ServerInitializeError::Cancelled) => return Ok(()),
-        Err(error) => return Err(anyhow::anyhow!("{error}")),
-    };
-    session.waiting().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(())
+    let result = async {
+        let session = match server.serve_with_ct(transport, session_shutdown.child_token()).await {
+            Ok(session) => session,
+            Err(rmcp::service::ServerInitializeError::Cancelled) => return Ok(()),
+            Err(error) => return Err(anyhow::anyhow!("{error}")),
+        };
+        session.waiting().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
+    }
+    .await;
+    relay.abort();
+    result
 }
 
 use crate::graph::GraphStatus;
@@ -1220,6 +1240,10 @@ impl McpServer {
 
     pub fn shutdown(&self) {
         self.state.shutdown();
+    }
+
+    pub(crate) fn scope_transport_stop(&self) -> tokio_util::sync::CancellationToken {
+        self.state.scope_transport_stop()
     }
 
     /// Whether a newer daemon generation owns this workspace's derived caches. The broker

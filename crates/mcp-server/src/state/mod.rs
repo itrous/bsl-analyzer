@@ -131,6 +131,10 @@ struct OwnerStopInner {
     /// only its own condvar leaves an owner asleep on someone else's, and the order of the
     /// shutdown steps then decides whether that owner leaves in a second or in thirty.
     wakers: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+    /// Scope invalidation has a stronger terminal action than ordinary shutdown or
+    /// supersession. Keep its transport cancellation separate so a normal owner stop still
+    /// observes the daemon's existing drain ordering.
+    scope_transport_stop: Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
 /// Taken by whoever spawns an owner, before the thread starts, and moved into it: an owner
@@ -141,6 +145,7 @@ pub(crate) struct OwnerLive(OwnerStop);
 impl Drop for OwnerLive {
     fn drop(&mut self) {
         self.0 .0.live.fetch_sub(1, Ordering::SeqCst);
+        self.0 .0.wake.notify_all();
     }
 }
 
@@ -151,6 +156,31 @@ impl crate::tools::search::OwnerWait for OwnerStop {
 }
 
 impl OwnerStop {
+    pub(crate) fn set_scope_transport_stop(
+        &self,
+        transport_stop: tokio_util::sync::CancellationToken,
+    ) {
+        *self.0.scope_transport_stop.lock().unwrap_or_else(|poison| poison.into_inner()) =
+            Some(transport_stop);
+    }
+
+    /// Scope mismatch is terminal: cancel its transport before stopping owners. Ordinary
+    /// `stop()` deliberately leaves the transport alone for supersession/drain callers.
+    pub(crate) fn stop_for_scope_change(&self) {
+        {
+            let transport_stop =
+                self.0.scope_transport_stop.lock().unwrap_or_else(|poison| poison.into_inner());
+            match transport_stop.as_ref() {
+                Some(transport_stop) if !transport_stop.is_cancelled() => {
+                    tracing::warn!("workspace source composition changed; restart/reconnect MCP");
+                    transport_stop.cancel();
+                }
+                _ => {}
+            }
+        }
+        self.stop();
+    }
+
     /// Ask every owner to leave, and release every wait they could be in — this call, not the
     /// steps around it. What "release" means is the waiter's own business: a condvar notify, a
     /// hub that starts closing, a queue that stops admitting.
@@ -213,6 +243,27 @@ impl OwnerStop {
     pub(crate) fn enter(&self) -> OwnerLive {
         self.0.live.fetch_add(1, Ordering::SeqCst);
         OwnerLive(self.clone())
+    }
+
+    /// Wait for every admitted owner to leave before releasing shared derived files.
+    pub(crate) fn wait_empty(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut stopped = self.0.stopped.lock().unwrap_or_else(|poison| poison.into_inner());
+        while self.0.live.load(Ordering::SeqCst) != 0 {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let (guard, result) = self
+                .0
+                .wake
+                .wait_timeout(stopped, remaining)
+                .unwrap_or_else(|poison| poison.into_inner());
+            stopped = guard;
+            if result.timed_out() && self.0.live.load(Ordering::SeqCst) != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     #[cfg(test)]
@@ -321,6 +372,9 @@ pub struct SharedState {
     tasks: rmcp::task_manager::TaskManager,
     /// The stop every background owner of this backend waits on.
     owners: OwnerStop,
+    /// Scope drift is terminal for this backend's transports. Kept separate from ordinary
+    /// owner stop so supersession can finish its existing graph drain before closing sessions.
+    scope_transport_stop: tokio_util::sync::CancellationToken,
     /// The owner of the overlay's point backlog; started once an engine is published.
     overlay_backlog: overlay_backlog::OverlayBacklog,
     /// Where the workspace search consumer is (see [`ConsumerPhase`]).
@@ -1079,7 +1133,15 @@ impl SharedState {
         // stdio session, a broker fallback) from demoting a long-running daemon for the whole
         // staleness window just by having started later. LAST, so nothing this daemon still
         // has in flight can publish over the next owner's caches.
-        self.workspace_lease.release();
+        if self.owners.wait_empty(std::time::Duration::from_secs(5)) {
+            self.workspace_lease.release();
+        } else {
+            tracing::error!("workspace owners did not stop; retaining the workspace lease");
+        }
+    }
+
+    pub(crate) fn scope_transport_stop(&self) -> tokio_util::sync::CancellationToken {
+        self.scope_transport_stop.clone()
     }
 }
 
@@ -1088,6 +1150,97 @@ mod tests {
     use super::{SharedSearchEngine, SharedState, WorkspaceSearchApply};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn workspace_cache_scope_change_logs_restart_once() {
+        use tracing_subscriber::prelude::*;
+
+        struct Capture(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor<'a>(&'a mut Vec<String>);
+                impl tracing::field::Visit for Visitor<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0.push(format!("{value:?}"));
+                        }
+                    }
+
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "message" {
+                            self.0.push(value.to_owned());
+                        }
+                    }
+                }
+                event.record(&mut Visitor(&mut self.0.lock().unwrap()));
+            }
+        }
+
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let owners = super::OwnerStop::default();
+        let scope_stop = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(scope_stop.clone());
+        test_utils::with_subscriber(
+            tracing_subscriber::registry().with(Capture(messages.clone())),
+            || {
+                owners.stop_for_scope_change();
+                owners.stop_for_scope_change();
+            },
+        );
+
+        assert!(scope_stop.is_cancelled());
+        assert_eq!(
+            messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message.contains("workspace source composition changed; restart/reconnect MCP")
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_cache_scope_shutdown_waits_for_owners_before_releasing_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SharedState::shared();
+        let lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
+        state.workspace_lease = lease.clone();
+        let owners = state.owners.clone();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        owners.wakes(move || {
+            let _ = stop_tx.send(());
+        });
+        let owner = std::thread::spawn(move || {
+            let _live = owners.enter();
+            stop_rx.recv().unwrap();
+            finish_rx.recv().unwrap();
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            state.shutdown();
+            done_tx.send(()).unwrap();
+        });
+
+        done_rx.recv_timeout(Duration::from_secs(1)).expect_err("shutdown must await its owner");
+        assert!(lease.owns_caches(), "the lease remains held while the owner may still write");
+        finish_tx.send(()).unwrap();
+        owner.join().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(1)).expect("shutdown completes after owner exit");
+        shutdown.join().unwrap();
+        assert!(!lease.owns_caches(), "lease release follows the last owner exit");
+    }
 
     #[test]
     fn workspace_search_missing_engine_is_an_operation_error() {
@@ -1309,18 +1462,9 @@ mod standalone_extension_tests {
         .unwrap();
     }
 
-    fn wait_for_notice(state: &SharedState, want: impl Fn(Option<&str>) -> bool) -> bool {
-        crate::change_hub::test_support::eventually(std::time::Duration::from_secs(20), || {
-            want(state.standalone_notice().as_deref())
-        })
-    }
-
-    /// The advisory comes from the project the boot parsed, and then from the graph's drift
-    /// watcher, which sees a config edit arrive. A config edit can move the resolved root
-    /// between a main configuration and an extension, and a status line that kept the boot-time
-    /// answer would describe a project that is no longer being analyzed.
+    /// Scope drift retires the session; its advisory stays bound to the boot Project.
     #[test]
-    fn the_advisory_is_seeded_at_boot_and_follows_config_edits() {
+    fn the_advisory_is_seeded_at_boot_and_scope_drift_stops_the_session() {
         let _env = super::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1337,12 +1481,15 @@ mod standalone_extension_tests {
 
         std::fs::write(&config, "[source]\nroot = \"cf\"\nextensions = []\n").unwrap();
         assert!(
-            wait_for_notice(&state, |notice| notice.is_none()),
-            "the root is a main configuration again and the watcher did not follow"
+            crate::change_hub::test_support::eventually(std::time::Duration::from_secs(20), || {
+                state.scope_transport_stop().is_cancelled()
+            },),
+            "changing the selected root retires the session bound to the old scope"
         );
-
-        std::fs::write(&config, "[source]\nroot = \"ext\"\nextensions = []\n").unwrap();
-        assert!(wait_for_notice(&state, |notice| notice.is_some()), "and back to an extension");
+        assert!(
+            state.standalone_notice().is_some(),
+            "the old Project remains the only analyzed one"
+        );
         state.shutdown();
     }
 

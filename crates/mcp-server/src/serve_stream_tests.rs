@@ -69,3 +69,45 @@ async fn stream_shutdown_closes_uninitialized_transport() {
         .expect("read observes transport closure");
     assert_eq!(read, 0, "the silent peer receives EOF");
 }
+
+/// A cache-scope failure closes every session of that backend without relying on the daemon's
+/// ordinary shutdown token (which remains available for the supersession drain protocol).
+#[tokio::test]
+async fn workspace_cache_scope_stops_all_session_transports() {
+    let daemon_shutdown = CancellationToken::new();
+    let state = SharedState::shared();
+    let server = McpServer::new(McpProfile::Reference, state.clone());
+    let first = server.clone();
+    let second = server;
+    let (first_client, first_task) = {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let task =
+            tokio::spawn(serve_stream_with_shutdown(first, server_io, daemon_shutdown.clone()));
+        (().serve(client_io).await.expect("first client initializes"), task)
+    };
+    let (second_client, second_task) = {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let task =
+            tokio::spawn(serve_stream_with_shutdown(second, server_io, daemon_shutdown.clone()));
+        (().serve(client_io).await.expect("second client initializes"), task)
+    };
+
+    state.scope_transport_stop().cancel();
+    session_finished(first_task).await;
+    session_finished(second_task).await;
+    assert!(
+        first_client
+            .send_request(ClientRequest::PingRequest(PingRequest::default()))
+            .await
+            .is_err(),
+        "scope retirement closes the first session"
+    );
+    assert!(
+        second_client
+            .send_request(ClientRequest::PingRequest(PingRequest::default()))
+            .await
+            .is_err(),
+        "scope retirement closes the second session"
+    );
+    assert!(!daemon_shutdown.is_cancelled(), "scope retirement leaves broker shutdown distinct");
+}

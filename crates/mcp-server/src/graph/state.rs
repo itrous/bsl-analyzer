@@ -493,6 +493,7 @@ pub(crate) struct GraphState {
     /// other locks are held. Never-stopped by default, which is what a disabled graph and a
     /// test without a daemon want.
     pub(super) stop: crate::state::OwnerStop,
+    pub(super) scope_transport_stop: Option<tokio_util::sync::CancellationToken>,
     /// Makes the next reload claim answer `Held`, the way a lease that cannot be confirmed
     /// between the decision and the claim does. That window is one instruction wide in
     /// production, and what happens in it — whether a budget is spent for a build nobody
@@ -584,6 +585,7 @@ impl GraphState {
             refused_installs: Arc::new(AtomicUsize::new(0)),
             lease: crate::workspace_lease::WorkspaceLease::unmanaged(),
             stop: crate::state::OwnerStop::default(),
+            scope_transport_stop: None,
             watch: Arc::new(Mutex::new((super::watcher::WatchPhase::Unwatched, None))),
             alarms: Arc::new(AtomicUsize::new(0)),
             first_build_asked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1512,6 +1514,36 @@ impl GraphState {
     pub(crate) fn with_owner_stop(mut self, stop: crate::state::OwnerStop) -> Self {
         self.stop = stop;
         self
+    }
+
+    pub(crate) fn with_scope_transport_stop(
+        mut self,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        self.scope_transport_stop = Some(stop);
+        self
+    }
+
+    /// Revalidate the immutable namespace before an on-disk graph preparation or publication.
+    pub(crate) fn validate_workspace_scope(&self) -> bool {
+        let (Some(root), Some(cache)) = (self.workspace_root.as_deref(), self.cache.as_ref())
+        else {
+            return true;
+        };
+        let validation = crate::project::at(root)
+            .map_err(|error| error.to_string())
+            .and_then(|project| cache.verify_project(&project).map_err(|error| error.to_string()));
+        match validation {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(%error, "workspace cache scope changed before graph publication");
+                self.stop.stop_for_scope_change();
+                if let Some(stop) = &self.scope_transport_stop {
+                    stop.cancel();
+                }
+                false
+            }
+        }
     }
 
     /// Whether this daemon may write the shared graph database. A superseded one keeps
@@ -3120,6 +3152,55 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn workspace_cache_scope_graph_prepare_rejects_a_drifted_project_before_opening_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let project = crate::project::at(root).expect("initial project parses");
+        let base = root.join("external-cache");
+        let cache =
+            crate::cache::WorkspaceCacheLayout::for_project(&project, Some(&base), root, None)
+                .expect("initial cache scope resolves");
+        let owners = crate::state::OwnerStop::default();
+        let transport = tokio_util::sync::CancellationToken::new();
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache)
+            .with_owner_stop(owners.clone())
+            .with_scope_transport_stop(transport.clone());
+
+        let nested = root.join("src").join("cf");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \"src/cf\"\n").unwrap();
+
+        assert!(matches!(
+            graph.prepare_snapshot_pool(1, crate::graph_db::GraphFp::default(), false),
+            Err(super::super::snapshot::SnapshotPrepareError::Changed)
+        ));
+        assert!(owners.is_stopped(), "scope drift stops graph owners before cache preparation");
+        assert!(transport.is_cancelled(), "scope drift retires serving transports");
+    }
+
+    #[test]
+    fn workspace_cache_scope_graph_validation_without_transport_token_still_stops_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let project = crate::project::at(root).expect("initial project parses");
+        let base = root.join("external-cache");
+        let cache =
+            crate::cache::WorkspaceCacheLayout::for_project(&project, Some(&base), root, None)
+                .expect("initial cache scope resolves");
+        let owners = crate::state::OwnerStop::default();
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache)
+            .with_owner_stop(owners.clone());
+
+        fs::write(root.join("bsl-analyzer.toml"), "[source]\nexclude = [\"generated\"]\n").unwrap();
+
+        assert!(!graph.validate_workspace_scope());
+        assert!(owners.is_stopped(), "direct graph entrypoints stop on scope drift");
+    }
 
     /// A cold build has no publication to be stale against: answers from other caches
     /// stay fresh until a graph is installed and then rebuilt.

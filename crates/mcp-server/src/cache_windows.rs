@@ -30,8 +30,12 @@ impl Drop for Descriptor {
     }
 }
 
+fn invalid() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "unsafe private directory")
+}
+
 fn descriptor() -> io::Result<Descriptor> {
-    let sid = SecurityIdentifier::get_current_user_sid().map_err(|_| super::invalid())?.to_string();
+    let sid = SecurityIdentifier::get_current_user_sid().map_err(|_| invalid())?.to_string();
     let sddl: Vec<u16> =
         format!("O:{sid}D:P(A;OICI;FA;;;{sid})").encode_utf16().chain(Some(0)).collect();
     let mut descriptor = ptr::null_mut();
@@ -50,14 +54,14 @@ fn descriptor() -> io::Result<Descriptor> {
     Ok(Descriptor(descriptor))
 }
 
-pub(super) fn reject_reparse(metadata: &fs::Metadata) -> io::Result<()> {
+pub fn reject_reparse(metadata: &fs::Metadata) -> io::Result<()> {
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(super::invalid());
+        return Err(invalid());
     }
     Ok(())
 }
 
-pub(super) fn private_directory(path: &Path) -> io::Result<()> {
+pub fn private_directory(path: &Path) -> io::Result<()> {
     let descriptor = descriptor()?;
     let security = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -74,16 +78,16 @@ pub(super) fn private_directory(path: &Path) -> io::Result<()> {
     }
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
-        return Err(super::invalid());
+        return Err(invalid());
     }
     reject_reparse(&metadata)?;
     verify_private(path)
 }
 
-pub(super) fn verify_private(path: &Path) -> io::Result<()> {
+pub fn verify_private(path: &Path) -> io::Result<()> {
     verify_access(path, true)
 }
-pub(super) fn verify_shared(path: &Path) -> io::Result<()> {
+pub fn verify_shared(path: &Path) -> io::Result<()> {
     verify_access(path, false)
 }
 
@@ -120,7 +124,7 @@ fn verify_access(path: &Path, protected: bool) -> io::Result<()> {
             || acl.is_null()
             || (*acl).AceCount == 0
         {
-            return Err(super::invalid());
+            return Err(invalid());
         }
         if protected && fs::symlink_metadata(path)?.is_dir() {
             let mut control = 0;
@@ -128,7 +132,7 @@ fn verify_access(path: &Path, protected: bool) -> io::Result<()> {
             if GetSecurityDescriptorControl(actual.0, &mut control, &mut revision) == 0
                 || control & SE_DACL_PROTECTED == 0
             {
-                return Err(super::invalid());
+                return Err(invalid());
             }
         }
         let mut system = [0u32; SECURITY_MAX_SID_SIZE as usize / 4];
@@ -156,7 +160,7 @@ fn verify_access(path: &Path, protected: bool) -> io::Result<()> {
                     && EqualSid(sid, system.as_mut_ptr().cast()) == 0
                     && EqualSid(sid, admin.as_mut_ptr().cast()) == 0)
             {
-                return Err(super::invalid());
+                return Err(invalid());
             }
         }
     }
@@ -173,7 +177,7 @@ mod tests {
     };
 
     #[test]
-    fn private_dacl_and_unprivileged_junction_rejection() {
+    fn workspace_cache_scope_private_dacl_and_unprivileged_junction_rejection() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target");
         private_directory(&target).unwrap();

@@ -17,7 +17,7 @@ use tracing::{
 use tracing_subscriber::{filter::Targets, layer::Context, Layer};
 
 #[cfg(windows)]
-mod windows;
+use mcp_server::cache_windows as windows;
 
 const TARGET: &str = "bsl_vector_lifecycle";
 const RECORD_BYTES: usize = 8192;
@@ -230,6 +230,12 @@ fn journal_directory(source: Option<&Path>) -> io::Result<PathBuf> {
         }
         None => blake3::hash(b"reference-only").to_hex().to_string(),
     };
+    let target = journal_target(&state, &key);
+    if let Some(source) = source {
+        let project = mcp_server::project::at(source)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        validate_journal_target(&project, &target)?;
+    }
     // Validate the existing ancestry before creating anything below it.
     if let Some(existing) = state.ancestors().find(|path| path.exists()) {
         validate_ancestors(existing)?;
@@ -244,6 +250,25 @@ fn journal_directory(source: Option<&Path>) -> io::Result<PathBuf> {
     builder.create(&state)?;
     validate_ancestors(&state)?;
     prepare_directory(&state, &key)
+}
+
+fn journal_target(state: &Path, key: &str) -> PathBuf {
+    state.join("bsl-analyzer").join("vector-journal").join(key)
+}
+
+fn validate_journal_target(project: &project_model::Project, target: &Path) -> io::Result<()> {
+    if let Some(root) = mcp_server::WorkspaceCacheLayout::overlapping_source_root(project, target)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "optional vector journal {} overlaps source root {}",
+                target.display(),
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_directory(state: &Path, key: &str) -> io::Result<PathBuf> {
@@ -497,6 +522,17 @@ mod tests {
         let path = temp.path().join("private");
         private_directory(&path).unwrap();
         TestDirectory { _temp: temp, path }
+    }
+
+    #[test]
+    fn workspace_cache_scope_journal_gate_checks_the_created_leaf_before_mkdir() {
+        let workspace = tempfile::tempdir().unwrap();
+        let project = mcp_server::project::at(workspace.path()).unwrap();
+        let state = workspace.path().join("state");
+        let target = journal_target(&state, "scope-key");
+
+        assert!(validate_journal_target(&project, &target).is_err());
+        assert!(!state.exists(), "journal refusal must precede state-directory creation");
     }
 
     fn records(path: &Path) -> Vec<serde_json::Value> {

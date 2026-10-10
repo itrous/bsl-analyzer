@@ -512,11 +512,8 @@ fn moved_external_cache_reuses_graph_without_a_full_build() {
         "bsl-analyzer.toml",
         "[source]\nroot = \".\"\nextensions = []\n",
     );
-    let old_cache = WorkspaceCacheLayout::prepare_explicit(
-        &old_dir.path().join("old-external-cache"),
-        old_dir.path(),
-    )
-    .expect("prepare old external cache");
+    let old_cache = WorkspaceCacheLayout::from_root(old_dir.path().join("old-external-cache"));
+    old_cache.ensure().expect("prepare old external cache");
     let old_excluded = old_cache.exclusions(&old_root);
     let old_project = super::input::ProjectSnapshot::load_excluding(&old_root, &old_excluded);
     let old_universe = super::universe::ScannedUniverse::scan_excluding(
@@ -529,11 +526,8 @@ fn moved_external_cache_reuses_graph_without_a_full_build() {
 
     let new_dir = tempfile::tempdir().expect("new workspace tempdir");
     let new_root = new_dir.path().join("new-workspace");
-    let new_cache = WorkspaceCacheLayout::prepare_explicit(
-        &new_dir.path().join("new-external-cache"),
-        new_dir.path(),
-    )
-    .expect("prepare new external cache");
+    let new_cache = WorkspaceCacheLayout::from_root(new_dir.path().join("new-external-cache"));
+    new_cache.ensure().expect("prepare new external cache");
     copy_tree(&old_root, &new_root);
     copy_tree(old_cache.root(), new_cache.root());
     assert_ne!(old_cache.root(), new_cache.root(), "the external cache location moved");

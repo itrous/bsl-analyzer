@@ -150,6 +150,7 @@ async fn serve(
     // up to 2× late, even when a test drives a tiny TTL.
     let poll =
         (orphan_grace.min(idle_ttl) / 4).clamp(Duration::from_millis(100), Duration::from_secs(15));
+    let scope_shutdown = server.scope_transport_stop();
     let mut idle_since = Some(Instant::now());
     let mut superseded = false;
     let mut ticker = interval(poll);
@@ -165,6 +166,10 @@ async fn serve(
             // connect as non-retryable. This cannot starve the idle check: accept is only
             // continuously ready while connections are actively arriving, which is not idle.
             biased;
+            _ = scope_shutdown.cancelled() => {
+                tracing::info!("workspace cache scope retired; closing the broker endpoint");
+                break Ok(());
+            }
             accepted = listener.accept() => {
                 let conn = match accepted {
                     Ok(conn) => conn,

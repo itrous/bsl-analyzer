@@ -244,7 +244,17 @@ impl Drop for LoadingVerdict {
 
 impl ReferenceSearchState {
     fn new(project_root: Option<&Path>) -> Self {
-        let (project_config, lifecycle) = match project_root {
+        Self::new_with_reference_cache(
+            project_root,
+            SharedState::reference_search_db_path().as_deref(),
+        )
+    }
+
+    fn new_with_reference_cache(
+        project_root: Option<&Path>,
+        reference_cache: Option<&Path>,
+    ) -> Self {
+        let (project_config, mut lifecycle) = match project_root {
             Some(root) => match project_model::ProjectConfig::load(root) {
                 Ok(config) => (config, ReferenceSearchLifecycle::Uninitialized),
                 Err(error) => {
@@ -260,6 +270,17 @@ impl ReferenceSearchState {
             },
             None => (None, ReferenceSearchLifecycle::Uninitialized),
         };
+        if matches!(lifecycle, ReferenceSearchLifecycle::Uninitialized) {
+            if let Some(root) = project_root {
+                if let Some(message) = reference_storage_overlap(root, reference_cache) {
+                    tracing::warn!(error = %message, "reference search cache is unavailable; MCP startup continues");
+                    lifecycle = ReferenceSearchLifecycle::Failed {
+                        message,
+                        reason_code: "baseline_unavailable".to_owned(),
+                    };
+                }
+            }
+        }
         let token_profile = token_profile_for_bootstrap(project_config.as_ref(), project_root);
         let embedding_prefixes = project_config.as_ref().map_or_else(
             || super::types::EmbeddingPrefixes {
@@ -504,25 +525,54 @@ impl ReferenceSearchState {
     }
 }
 
+fn reference_storage_overlap(project_root: &Path, path: Option<&Path>) -> Option<String> {
+    let project = match crate::project::at(project_root) {
+        Ok(project) => project,
+        Err(error) => {
+            return Some(format!("cannot validate project for reference storage: {error}"));
+        }
+    };
+    let Some(path) = path else {
+        return Some("reference cache path is unavailable".to_owned());
+    };
+    match crate::cache::WorkspaceCacheLayout::overlapping_source_root(&project, path) {
+        Ok(Some(root)) => Some(format!(
+            "reference cache {} overlaps source root {}",
+            path.display(),
+            root.display()
+        )),
+        Ok(None) => None,
+        Err(error) => Some(format!("cannot validate reference cache path: {error}")),
+    }
+}
+
 /// Why a workspace could not be brought up.
 #[derive(Debug)]
 pub enum WorkspaceInitError {
     /// The project config or its extension topology is invalid: a daemon must not come
     /// up analyzing a differently-shaped project than the one configured.
     Project(project_model::ProjectError),
+    Cache(std::io::Error),
     /// The derived-cache root contains a scan root, so following that root and treating
     /// the cache as the server's own output are mutually exclusive.
-    CacheCoversScanRoot { cache: std::path::PathBuf, root: std::path::PathBuf },
+    CacheCoversScanRoot {
+        cache: std::path::PathBuf,
+        root: std::path::PathBuf,
+    },
     /// A scan root lies inside a service directory (`.git`, `target`, `node_modules`): the
     /// exclusion that keeps the directory out of the graph would swallow the root's sources,
     /// exactly as a cache above a root would.
-    ScanRootInsideServiceDirectory { service: std::path::PathBuf, root: std::path::PathBuf },
+    ScanRootInsideServiceDirectory {
+        service: std::path::PathBuf,
+        root: std::path::PathBuf,
+    },
 }
 
 impl std::fmt::Display for WorkspaceInitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WorkspaceInitError::Project(error) => error.fmt(f),
+            WorkspaceInitError::Cache(error) => error.fmt(f),
             WorkspaceInitError::CacheCoversScanRoot { cache, root } => write!(
                 f,
                 "cache directory {} contains the scanned source root {}; \
@@ -545,6 +595,7 @@ impl std::error::Error for WorkspaceInitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             WorkspaceInitError::Project(error) => Some(error),
+            WorkspaceInitError::Cache(error) => Some(error),
             WorkspaceInitError::CacheCoversScanRoot { .. }
             | WorkspaceInitError::ScanRootInsideServiceDirectory { .. } => None,
         }
@@ -584,8 +635,17 @@ impl SharedState {
     /// daemon must not come up analyzing a differently-shaped project than the
     /// one configured.
     pub fn workspace(source_dir: PathBuf) -> Result<Self, WorkspaceInitError> {
-        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(&source_dir);
-        Self::workspace_with_cache(source_dir, cache)
+        let root = source_dir.canonicalize().map_err(WorkspaceInitError::Cache)?;
+        let project = crate::project::at(&root)?;
+        let cwd = env::current_dir().map_err(WorkspaceInitError::Cache)?;
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            None,
+            &cwd,
+            crate::cache::expected_scope_from_env().map_err(WorkspaceInitError::Cache)?.as_deref(),
+        )
+        .map_err(WorkspaceInitError::Cache)?;
+        Self::workspace_with_cache(root, cache)
     }
 
     /// Construct workspace state with all rebuildable derived files rooted in `cache`.
@@ -603,6 +663,14 @@ impl SharedState {
         frozen_prefixes: Option<super::types::EmbeddingPrefixes>,
     ) -> Result<Self, WorkspaceInitError> {
         let project = crate::project::at(&source_dir)?;
+        cache.verify_project(&project).map_err(WorkspaceInitError::Cache)?;
+        if cache.origin() == crate::cache::CacheOrigin::Explicit {
+            cache.ensure().map_err(WorkspaceInitError::Cache)?;
+        }
+        // Explicit preparation may take long enough for the project declaration to change.
+        // Re-read it at the last point before any workspace owner or derived store is started.
+        let project = crate::project::at(&source_dir)?;
+        cache.verify_project(&project).map_err(WorkspaceInitError::Cache)?;
         let embedding_prefixes = match frozen_prefixes {
             Some(prefixes) => prefixes,
             None => {
@@ -651,8 +719,9 @@ impl SharedState {
                 .into_iter()
                 .map(|target| target.path)
                 .collect();
+        let placement_exclusions = cache.placement_exclusions(&project.root);
         if let Some((hole, root)) =
-            project_model::PathScope::new(&watched, &source_exclusions).hole_covering_a_root()
+            project_model::PathScope::new(&watched, &placement_exclusions).hole_covering_a_root()
         {
             // The list holds two kinds of hole, and the advice differs: a cache above a root
             // is moved by pointing --cache-dir elsewhere, while a service directory above a
@@ -725,7 +794,7 @@ impl SharedState {
         // session: a serving daemon calls `warm_start` right after this constructor, and the
         // resident's publish re-declares the roots too.
         // The hub takes the same exclusion list every walk takes: the derived cache — the
-        // server's own output, which by default lives at `<workspace>/.build` inside the
+        // server's own output, whose owned `<base>/workspaces/v1` family may sit inside the
         // recursive watch, where every index write would otherwise come back as an event
         // about the tree being analyzed — and the service directories of the workspace root.
         // The user's `[source].exclude` is kept apart from that list: it follows the
@@ -756,6 +825,8 @@ impl SharedState {
         // driver, the publish hook, the consumer and the backlog owner all take it, and every
         // wait any of them makes is released by the one call that raises it.
         let owners = super::OwnerStop::default();
+        let scope_transport_stop = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(scope_transport_stop.clone());
         {
             // The hub's wait returns on a new generation, on `closing`, or on its caller's own
             // predicate — never on a bare wake. So the stop sets `closing`: without it an owner
@@ -763,43 +834,51 @@ impl SharedState {
             let hub = change_hub.clone();
             owners.wakes(move || hub.interrupt_waiters());
         }
+        SharedState::start_scope_guard(
+            change_hub.clone(),
+            source_dir.clone(),
+            cache.clone(),
+            owners.clone(),
+            scope_transport_stop.clone(),
+        );
 
         // The overlay retry driver exists only where an Embed pass exists: Postgres mode
         // with an embedder. It is created before the graph hook so a root transition can kick
         // the SAME owner; no second warmup worker is introduced.
-        let overlay_retry =
-            if matches!(workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay) {
-                match Self::embedding_config_with_prefixes(Some(&embedding_prefixes)) {
-                    Ok(Some(_)) => Some(super::overlay_retry::OverlayRetry::spawn(
-                        Arc::clone(&search_engine),
-                        owners.clone(),
-                        Arc::clone(&overlay_warmup),
-                        Arc::clone(&semantic_runtime),
-                        workspace_lease.clone(),
-                        embedding_publish_retry_budget,
-                    )),
-                    Ok(None) => {
-                        Self::set_overlay_warmup_state(
-                            &overlay_warmup,
-                            OverlayWarmupState::Skipped("no embedder configured".to_owned()),
-                        );
-                        None
-                    }
-                    Err(error) => {
-                        Self::set_semantic_runtime_status(
-                            &semantic_runtime,
-                            SemanticRuntimeStatus::from_search_error(&error),
-                        );
-                        Self::set_overlay_warmup_state(
-                            &overlay_warmup,
-                            OverlayWarmupState::from_search_error(&error),
-                        );
-                        None
-                    }
+        let overlay_retry = if !workspace_lease.coordination_failed()
+            && matches!(workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay)
+        {
+            match Self::embedding_config_with_prefixes(Some(&embedding_prefixes)) {
+                Ok(Some(_)) => Some(super::overlay_retry::OverlayRetry::spawn(
+                    Arc::clone(&search_engine),
+                    owners.clone(),
+                    Arc::clone(&overlay_warmup),
+                    Arc::clone(&semantic_runtime),
+                    workspace_lease.clone(),
+                    embedding_publish_retry_budget,
+                )),
+                Ok(None) => {
+                    Self::set_overlay_warmup_state(
+                        &overlay_warmup,
+                        OverlayWarmupState::Skipped("no embedder configured".to_owned()),
+                    );
+                    None
                 }
-            } else {
-                None
-            };
+                Err(error) => {
+                    Self::set_semantic_runtime_status(
+                        &semantic_runtime,
+                        SemanticRuntimeStatus::from_search_error(&error),
+                    );
+                    Self::set_overlay_warmup_state(
+                        &overlay_warmup,
+                        OverlayWarmupState::from_search_error(&error),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // ONE embed single-flight shared by the boot pass and the post-context/root refresh kick,
         // so overlapping passes collapse into one and the installed index is always built from
@@ -827,7 +906,8 @@ impl SharedState {
         let graph = graph
             .with_publish_hook(publish_hook)
             .with_lease(workspace_lease.clone())
-            .with_owner_stop(owners.clone());
+            .with_owner_stop(owners.clone())
+            .with_scope_transport_stop(scope_transport_stop.clone());
         // A test that has to ask a handler what it answers while the graph is genuinely
         // unconsulted takes the first build here, where the graph exists and no thread this
         // boot starts has run yet. It then holds production's own single flight, and every
@@ -918,9 +998,74 @@ impl SharedState {
             overlay_retry,
             tasks: rmcp::task_manager::TaskManager::new(),
             owners,
+            scope_transport_stop,
             overlay_backlog,
             search_consumer,
         })
+    }
+
+    /// Retire this immutable workspace scope on a project-declaration event. Ordinary source
+    /// body changes stay on the existing hot-reload path; only project inputs or a lost event
+    /// batch trigger the inexpensive canonical project validation.
+    fn start_scope_guard(
+        hub: WorkspaceChangeHub,
+        root: PathBuf,
+        cache: crate::cache::WorkspaceCacheLayout,
+        owners: super::OwnerStop,
+        transport_stop: tokio_util::sync::CancellationToken,
+    ) {
+        let thread_owners = owners.clone();
+        let spawn = std::thread::Builder::new()
+            .name("workspace-cache-scope".to_owned())
+            .spawn(move || {
+                let _live = thread_owners.enter();
+                let cursor = hub.subscribe();
+                loop {
+                    if thread_owners.is_stopped() {
+                        break;
+                    }
+                    // Sample before draining: a delivery before this sample is
+                    // included in the batch, and one after it makes the wait
+                    // return. Sampling after drain would lose the window between
+                    // the drain and the sample.
+                    let generation = hub.generation();
+                    let batch = hub.drain(cursor);
+                    let project_input_changed = batch.rescan_required
+                        || batch.entries.iter().any(|entry| {
+                            entry
+                                .canonical
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(project_model::is_project_input_file_name)
+                        });
+                    if project_input_changed {
+                        let still_same_scope = crate::project::at(&root)
+                            .map_err(|error| error.to_string())
+                            .and_then(|project| {
+                                cache.verify_project(&project).map_err(|error| error.to_string())
+                            });
+                        if let Err(error) = still_same_scope {
+                            tracing::error!(%error, "workspace cache scope changed; stopping this backend");
+                            thread_owners.stop_for_scope_change();
+                            break;
+                        }
+                    }
+                    hub.wait_for_change_or(
+                        generation,
+                        std::time::Duration::from_secs(24 * 60 * 60),
+                        || thread_owners.is_stopped(),
+                    );
+                    if thread_owners.is_stopped() {
+                        break;
+                    }
+                }
+                hub.unsubscribe(cursor);
+            });
+        if let Err(error) = spawn {
+            tracing::error!(%error, "workspace cache scope guard failed to start");
+            owners.stop();
+            transport_stop.cancel();
+        }
     }
 
     // Each argument is a distinct shared handle the spawned init thread must own (engine,
@@ -1293,6 +1438,7 @@ impl SharedState {
             overlay_retry: None,
             tasks: rmcp::task_manager::TaskManager::new(),
             owners: super::OwnerStop::default(),
+            scope_transport_stop: tokio_util::sync::CancellationToken::new(),
             overlay_backlog: Default::default(),
             search_consumer: Arc::new(Mutex::new(super::ConsumerPhase::Stopped)),
         }
@@ -1323,6 +1469,7 @@ impl SharedState {
             overlay_retry: None,
             tasks: rmcp::task_manager::TaskManager::new(),
             owners: super::OwnerStop::default(),
+            scope_transport_stop: tokio_util::sync::CancellationToken::new(),
             overlay_backlog: Default::default(),
             search_consumer: Arc::new(Mutex::new(super::ConsumerPhase::Stopped)),
         }
@@ -1903,13 +2050,6 @@ impl SharedState {
         if stop.is_stopped() {
             return Ok(None);
         }
-        let cache = graph
-            .cache()
-            .cloned()
-            .unwrap_or_else(|| crate::cache::WorkspaceCacheLayout::for_workspace(workspace_root));
-        cache.ensure().ok();
-        let db_path = cache.search_db_path();
-
         // The daemon only reaches this after `workspace()` validated the project;
         // a config broken by a mid-session edit keeps search down, loudly.
         let project = match crate::project::at(workspace_root) {
@@ -1919,6 +2059,42 @@ impl SharedState {
                 return Err(bsl_search::SearchError::Index(format!("invalid project: {e}")));
             }
         };
+        if !graph.validate_workspace_scope() {
+            return Err(bsl_search::SearchError::Index(
+                "workspace cache scope changed before search preparation".to_owned(),
+            ));
+        }
+        if lease.coordination_failed() {
+            tracing::warn!("workspace cache lease unavailable; workspace search stays offline");
+            return Err(bsl_search::SearchError::Index(
+                "workspace cache lease unavailable".to_owned(),
+            ));
+        }
+        let cache = if let Some(cache) = graph.cache().cloned() {
+            cache
+        } else {
+            let cwd = env::current_dir()
+                .map_err(|error| bsl_search::SearchError::Index(error.to_string()))?;
+            crate::cache::WorkspaceCacheLayout::for_project(
+                &project,
+                None,
+                &cwd,
+                crate::cache::expected_scope_from_env()
+                    .map_err(|error| bsl_search::SearchError::Index(error.to_string()))?
+                    .as_deref(),
+            )
+            .map_err(|error| bsl_search::SearchError::Index(error.to_string()))?
+        };
+        cache
+            .verify_project(&project)
+            .map_err(|error| bsl_search::SearchError::Index(error.to_string()))?;
+        if !graph.validate_workspace_scope() {
+            return Err(bsl_search::SearchError::Index(
+                "workspace cache scope changed before search store preparation".to_owned(),
+            ));
+        }
+        cache.ensure().map_err(|error| bsl_search::SearchError::Index(error.to_string()))?;
+        let db_path = cache.search_db_path();
         let source_path = project.source_path().to_path_buf();
 
         // Branch by the configured MODE, never by baseline presence: in Postgres mode a
@@ -2086,6 +2262,11 @@ impl SharedState {
                 "workspace overlay-only baseline initialized; baseline search served from Postgres"
             );
 
+            if !graph.validate_workspace_scope() {
+                return Err(bsl_search::SearchError::Index(
+                    "workspace cache scope changed before search publication".to_owned(),
+                ));
+            }
             return Ok(Some(WorkspaceSearchInit {
                 engine,
                 mode: WorkspaceSearchMode::PostgresRemoteOverlay,
@@ -2156,6 +2337,11 @@ impl SharedState {
                 return Ok(None);
             };
             let overlay_init = if reconciled { OverlayInit::Clean } else { OverlayInit::Prime };
+            if !graph.validate_workspace_scope() {
+                return Err(bsl_search::SearchError::Index(
+                    "workspace cache scope changed before search publication".to_owned(),
+                ));
+            }
             return Ok(Some(WorkspaceSearchInit {
                 engine,
                 mode: WorkspaceSearchMode::SqliteLocal,
@@ -2228,7 +2414,7 @@ impl SharedState {
                     }
                 }
                 Ok(bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released) => {
-                    return Ok(None)
+                    return Ok(None);
                 }
                 Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                     unreachable!("startup_apply retries transient refusals")
@@ -2262,6 +2448,11 @@ impl SharedState {
                 return Ok(None);
             };
             let overlay_init = if reconciled { OverlayInit::Clean } else { OverlayInit::Prime };
+            if !graph.validate_workspace_scope() {
+                return Err(bsl_search::SearchError::Index(
+                    "workspace cache scope changed before search publication".to_owned(),
+                ));
+            }
             return Ok(Some(WorkspaceSearchInit {
                 engine,
                 mode: WorkspaceSearchMode::SqliteLocal,
@@ -2286,7 +2477,7 @@ impl SharedState {
                     tracing::info!(indexed, "FTS index built")
                 }
                 Ok(bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released) => {
-                    return Ok(None)
+                    return Ok(None);
                 }
                 Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                     unreachable!("startup_apply retries transient refusals")
@@ -2319,7 +2510,7 @@ impl SharedState {
                 }
                 Ok(bsl_search::FenceOutcome::Applied(_)) => {}
                 Ok(bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released) => {
-                    return Ok(None)
+                    return Ok(None);
                 }
                 Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                     unreachable!("startup_apply retries transient refusals")
@@ -2332,6 +2523,11 @@ impl SharedState {
             OverlayInit::Prime
         };
 
+        if !graph.validate_workspace_scope() {
+            return Err(bsl_search::SearchError::Index(
+                "workspace cache scope changed before search publication".to_owned(),
+            ));
+        }
         Ok(Some(WorkspaceSearchInit {
             engine,
             mode: WorkspaceSearchMode::SqliteLocal,
@@ -3788,6 +3984,123 @@ mod tests {
         state.shutdown();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn workspace_cache_scope_ignores_current_and_sibling_leaf_writes() {
+        use std::time::{Duration, Instant};
+
+        let _env_lock = env_lock();
+        let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
+        let _embedding_model = EnvVarGuard::unset("EMBEDDING_MODEL");
+
+        let workspace_dir = tempdir().unwrap();
+        let workspace = workspace_dir.path();
+        let main = workspace.join("src/cf");
+        let neighbor = workspace.join(".derived/workspaces/v1-neighbor");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&neighbor).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            workspace.join(".derived/workspaces"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(main.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(
+            neighbor.join("Configuration.xml"),
+            "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+        )
+        .unwrap();
+        write_common_module_tree(&main, "Main", "Процедура Основная() КонецПроцедуры\n");
+        write_common_module_tree(&neighbor, "Neighbor", "Процедура Соседняя() КонецПроцедуры\n");
+        let legitimate_build = main.join(".build/Legit.bsl");
+        fs::create_dir_all(legitimate_build.parent().unwrap()).unwrap();
+        fs::write(&legitimate_build, "Процедура ИзBuild() КонецПроцедуры\n").unwrap();
+        fs::write(
+            workspace.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"Neighbor\", path = \".derived/workspaces/v1-neighbor\" }]\n",
+        )
+        .unwrap();
+
+        let project = crate::project::at(workspace).unwrap();
+        let base = workspace.join(".derived");
+        let cache =
+            crate::cache::WorkspaceCacheLayout::for_project(&project, Some(&base), workspace, None)
+                .unwrap();
+        let state = SharedState::workspace_with_cache(workspace.to_path_buf(), cache.clone())
+            .expect("a sibling source tree beside the owned namespace is valid");
+        state.graph().ensure_loading();
+        let hub = state.change_hub().expect("workspace installs its watcher");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while (state.search_engine().lock().unwrap().is_none()
+            || state.graph().status_report().state != "ready")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(state.search_engine().lock().unwrap().is_some(), "search startup completed");
+        let before_revision = state.graph().status_report().revision.expect("graph is ready");
+        let inventory = || {
+            state
+                .search_engine()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .store()
+                .all_files_in_collection("code")
+                .unwrap()
+                .into_iter()
+                .map(|(key, _)| key.path)
+                .collect::<Vec<_>>()
+        };
+        let before_keys = inventory();
+        for source in [".build/Legit.bsl", "CommonModules/Neighbor/Ext/Module.bsl"] {
+            assert!(
+                before_keys.iter().any(|path| path == source),
+                "legitimate source path was not indexed: {source}; inventory={before_keys:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let cursor = hub.subscribe();
+        let before_generation = hub.generation();
+
+        let family = cache.root().parent().unwrap();
+        let sibling = family.join("0".repeat(64));
+        fs::write(cache.root().join("Ignored.bsl"), "Процедура Cache() КонецПроцедуры\n").unwrap();
+        fs::write(cache.root().join("writer.lease"), "lease\n").unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("Ignored.bsl"), "Процедура Sibling() КонецПроцедуры\n").unwrap();
+        fs::write(sibling.join("writer.lease.lock"), "lock\n").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert_eq!(
+            hub.generation(),
+            before_generation,
+            "owned current and sibling leaves are not watched"
+        );
+        assert!(
+            hub.materialize(cursor).entries.is_empty(),
+            "cache leaf writes produced watcher events"
+        );
+        assert_eq!(inventory(), before_keys, "cache writes do not enter search key inventory");
+        assert_eq!(
+            state.graph().status_report().revision,
+            Some(before_revision),
+            "cache writes do not publish a graph rebuild"
+        );
+
+        // The adjacent extension is a positive control: its source remains watched.
+        let adjacent = neighbor.join("New.bsl");
+        fs::write(&adjacent, "Процедура СоседняяНовая() КонецПроцедуры\n").unwrap();
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            hub.generation() > before_generation
+        }));
+        state.shutdown();
+    }
+
     /// The Postgres branch of the search init returns before it ever reaches the fused cold
     /// build's graph claim, which used to leave the graph idle until the first
     /// `graph`/`symbol_info` call — billing a whole-config build to a mid-session request.
@@ -3888,6 +4201,16 @@ mod tests {
         (workspace, baseline)
     }
 
+    /// Failure fixtures must seed the same leaf that production startup opens.
+    fn resolved_workspace_cache(workspace: &std::path::Path) -> crate::cache::WorkspaceCacheLayout {
+        let project = crate::project::at(workspace).expect("fixture project parses");
+        let cwd = std::env::current_dir().expect("test process has a current directory");
+        let scope =
+            crate::cache::expected_scope_from_env().expect("fixture cache scope stamp is valid");
+        crate::cache::WorkspaceCacheLayout::for_project(&project, None, &cwd, scope.as_deref())
+            .expect("fixture cache namespace resolves")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn spawn_local_boot(
         workspace: PathBuf,
@@ -3961,7 +4284,10 @@ mod tests {
         }
         fs::write(workspace.join("bsl-analyzer.toml"), "[source]\nroot = \"src/cf\"\n").unwrap();
 
-        let db_path = crate::cache::search_db_path(&workspace);
+        let old_cache = resolved_workspace_cache(&workspace);
+        let old_db_path = old_cache.search_db_path();
+        let old_leaf = old_cache.root().to_path_buf();
+        assert!(!old_leaf.exists(), "the boot has not created the old topology's leaf");
         let (hub, hold) = WorkspaceChangeHub::start_targets_held(vec![
             crate::change_hub::WatchTarget::recursive(workspace.clone()),
         ]);
@@ -3991,9 +4317,9 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
-            !db_path.exists(),
+            !old_db_path.exists(),
             "the boot opened its store before the watch was up: {}",
-            db_path.display(),
+            old_db_path.display(),
         );
 
         // Only now is the extension part of the project.
@@ -4002,6 +4328,10 @@ mod tests {
             "[source]\nroot = \"src/cf\"\nextensions = [{ name = \"e\", path = \"ext\" }]\n",
         )
         .unwrap();
+        let new_cache = resolved_workspace_cache(&workspace);
+        let new_db_path = new_cache.search_db_path();
+        assert_ne!(old_cache.root(), new_cache.root(), "the extension changes the frozen scope");
+        assert!(!new_cache.root().exists(), "no storage opens before the held watch is released");
         hold.release();
 
         let roots = init.join().unwrap().expect("the init runs to completion once the watch is up");
@@ -4009,7 +4339,12 @@ mod tests {
             roots, 2,
             "the project was read after the watch, so the extension declared meanwhile is registered",
         );
-        assert!(db_path.exists(), "and the store the init opened is on disk");
+        assert!(
+            new_db_path.exists(),
+            "the init opened the store for the Project read after the watch"
+        );
+        assert!(!old_leaf.exists(), "the old scope was not opened after the Project changed");
+        assert!(!old_db_path.exists());
     }
 
     /// A cursor is subscribed before the thread that will read it exists, so every way out
@@ -4026,10 +4361,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let (workspace, baseline) = local_workspace_for_boot(dir.path());
         // A store that cannot be opened: the init fails and publishes nothing.
-        fs::create_dir_all(
-            crate::cache::WorkspaceCacheLayout::for_workspace(&workspace).search_db_path(),
-        )
-        .unwrap();
+        let cache = resolved_workspace_cache(&workspace);
+        cache.ensure().unwrap();
+        fs::create_dir(cache.search_db_path()).unwrap();
         let hub = WorkspaceChangeHub::start_with_unstartable_thread(vec![
             crate::change_hub::WatchTarget::recursive(workspace.clone()),
         ]);
@@ -4120,9 +4454,9 @@ mod tests {
             "Процедура ЛокальнаяПроцедура()\nКонецПроцедуры",
         )
         .unwrap();
-        crate::cache::ensure_workspace_cache_dir(workspace).unwrap();
-
-        let db_path = crate::cache::search_db_path(workspace);
+        let cache = resolved_workspace_cache(workspace);
+        cache.ensure().unwrap();
+        let db_path = cache.search_db_path();
         let mut stale_engine = SearchEngine::fts_only(&db_path).unwrap();
         stale_engine
             .sync_indexed_documents_in_collection(
@@ -4228,8 +4562,9 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let workspace = dir.path();
-        crate::cache::ensure_workspace_cache_dir(workspace).unwrap();
-        let db_path = crate::cache::search_db_path(workspace);
+        let cache = resolved_workspace_cache(workspace);
+        cache.ensure().unwrap();
+        let db_path = cache.search_db_path();
         let mut stale_engine = SearchEngine::fts_only(&db_path).unwrap();
         stale_engine
             .sync_indexed_documents_in_collection(
@@ -4583,6 +4918,124 @@ mod tests {
                 if reason_code == "project_config_error"
         ));
         assert!(state.engine.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn workspace_cache_reference_overlap_disables_optional_owner_without_creating_output() {
+        let dir = tempdir().unwrap();
+        let reference_cache = dir.path().join("reference-search.db");
+        let state = super::ReferenceSearchState::new_with_reference_cache(
+            Some(dir.path()),
+            Some(&reference_cache),
+        );
+
+        assert!(matches!(
+            state.lifecycle(),
+            super::ReferenceSearchLifecycle::Failed { ref reason_code, ref message }
+                if reason_code == "baseline_unavailable"
+                    && message.contains("overlaps source root")
+        ));
+        state.ensure_loading();
+        assert!(state.worker.lock().unwrap().is_none(), "disabled optional owner must not start");
+        assert!(!reference_cache.exists(), "overlap validation precedes creating the output");
+    }
+
+    #[test]
+    fn workspace_cache_scope_config_change_stops_owner_transport_but_body_drift_stays_hot() {
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(root.join("Module.bsl"), "Процедура До() КонецПроцедуры").unwrap();
+        let project = crate::project::at(&root).expect("fixture project parses");
+        let base = dir.path().join("cache");
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&base),
+            dir.path(),
+            None,
+        )
+        .expect("cache scope resolves");
+        let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.clone()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let owners = super::super::OwnerStop::default();
+        let transport_stop = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(transport_stop.clone());
+        SharedState::start_scope_guard(
+            hub.clone(),
+            root.clone(),
+            cache,
+            owners.clone(),
+            transport_stop.clone(),
+        );
+
+        let before = hub.generation();
+        fs::write(root.join("Module.bsl"), "Процедура После() КонецПроцедуры").unwrap();
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            hub.generation() > before
+        }));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!owners.is_stopped(), "a BSL body edit remains a hot update");
+        assert!(!transport_stop.is_cancelled());
+
+        let before_xml = hub.generation();
+        fs::write(
+            root.join("Configuration.xml"),
+            "<Configuration><Name>Updated</Name></Configuration>",
+        )
+        .unwrap();
+        assert!(crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+            hub.generation() > before_xml
+        }));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !owners.is_stopped(),
+            "ordinary configuration XML data changes do not retire the scope"
+        );
+        assert!(!transport_stop.is_cancelled());
+
+        let configuration = root.join("src").join("cf");
+        fs::create_dir_all(&configuration).unwrap();
+        fs::write(configuration.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(root.join("bsl-analyzer.toml"), "[source]\nroot = \"src/cf\"\n").unwrap();
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+                owners.is_stopped() && transport_stop.is_cancelled()
+            }),
+            "a topology change retires owners and the serving transport"
+        );
+        hub.shutdown();
+        assert!(
+            owners.wait_empty(Duration::from_secs(1)),
+            "scope guard leaves before shutdown completes"
+        );
+    }
+
+    #[test]
+    fn workspace_cache_scope_supplied_layout_rejects_project_drift_before_cache_creation() {
+        let workspace = tempdir().unwrap();
+        let cache_parent = tempdir().unwrap();
+        let root = workspace.path();
+        fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let project = crate::project::at(root).expect("initial Project parses");
+        let base = cache_parent.path().join("cache");
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&base),
+            cache_parent.path(),
+            None,
+        )
+        .expect("initial scope resolves");
+        let leaf = cache.root().to_path_buf();
+        assert!(!leaf.exists());
+
+        fs::write(root.join("bsl-analyzer.toml"), "[source]\nexclude = [\"generated\"]\n").unwrap();
+        let error = SharedState::workspace_with_cache(root.to_path_buf(), cache)
+            .err()
+            .expect("a stale parent layout must fail in the child before writes");
+        assert!(error.to_string().contains("cache scope no longer matches"));
+        assert!(!leaf.exists(), "old namespace was touched after Project drift");
     }
 
     #[test]
@@ -5201,8 +5654,9 @@ mod tests {
         fs::create_dir_all(&cf).unwrap();
         fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
         crate::graph::test_support::sample_workspace(&cf);
-        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(&workspace);
-        fs::create_dir_all(cache.search_db_path()).unwrap();
+        let cache = resolved_workspace_cache(&workspace);
+        cache.ensure().unwrap();
+        fs::create_dir(cache.search_db_path()).unwrap();
 
         let state = SharedState::workspace(workspace.clone()).expect("valid workspace project");
         wait_until_graph_ready(state.graph());
@@ -5383,8 +5837,10 @@ mod tests {
     }
 
     /// A newer daemon takes the workspace while edits keep arriving: the search consumer and
-    /// the graph watcher of this one leave on their own — no shutdown — releasing their
-    /// cursors, and the edits after the takeover change nothing this daemon owns.
+    /// graph watcher leave on their own, and the edits after takeover change nothing this
+    /// daemon owns. Its scope guard remains subscribed while this session can still serve, so
+    /// a project-input change can retire the immutable cache scope; ordinary supersession must
+    /// not cancel that transport ahead of the daemon's established drain path.
     #[test]
     fn a_superseded_daemon_applies_nothing_more_and_releases_its_cursors() {
         use crate::tools::location::DriftWatch;
@@ -5414,7 +5870,7 @@ mod tests {
         let revision = sampled.get();
         let cursors = hub.active_cursor_count();
 
-        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(&workspace);
+        let cache = resolved_workspace_cache(&workspace);
         let _newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
         fs::write(
             cf.join("CommonModules/Сервер/Ext/Module.bsl"),
@@ -5432,16 +5888,7 @@ mod tests {
                 && state.graph().status_report().drift_watch == Some("unobserved")),
             "an owner stayed on a workspace it no longer owns"
         );
-        // None left at all: the search consumer, the graph's watcher, and the cursor the
-        // graph's own comparison keeps for its scan cache — which is subscribed lazily, so it
-        // need not have existed when `cursors` was sampled. A cursor nobody drains keeps the
-        // hub holding entries for a consumer that has left.
         assert!(cursors >= 2, "control: the consumers were subscribed, got {cursors}");
-        assert!(
-            eventually(&|| hub.active_cursor_count() == 0),
-            "the owners left their cursors behind: {} of {cursors}",
-            hub.active_cursor_count()
-        );
         {
             let guard = state.search_engine().lock().unwrap();
             let engine = guard.as_ref().expect("the local index is published");
@@ -5462,6 +5909,31 @@ mod tests {
         assert_eq!((report.state, report.superseded), ("failed", Some(true)), "it serves nothing");
         let on_disk = crate::graph::test_support::meta_string(&cache.graph_db_path(), "revision");
         assert_eq!(Some(on_disk.parse::<u64>().unwrap()), revision, "the graph was rebuilt");
+        assert!(
+            !state.scope_transport_stop().is_cancelled(),
+            "ordinary supersession leaves scope transport shutdown to the existing drain path"
+        );
+        assert!(
+            eventually(&|| hub.active_cursor_count() == 1),
+            "only the live session's scope guard remains after search and graph owners leave; got {}",
+            hub.active_cursor_count()
+        );
+        let extension = workspace.join("extra-extension");
+        fs::create_dir_all(&extension).unwrap();
+        fs::write(extension.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(
+            workspace.join("bsl-analyzer.toml"),
+            "[source]\nroot = \"cf\"\nextensions = [{ name = \"extra\", path = \"extra-extension\" }]\n",
+        )
+        .unwrap();
+        assert!(
+            eventually(&|| state.scope_transport_stop().is_cancelled()),
+            "a changed Project retires the still-live scope guard after ordinary supersession"
+        );
+        assert!(
+            eventually(&|| hub.active_cursor_count() == 0),
+            "the terminal scope guard releases its cursor"
+        );
         state.shutdown();
     }
 
@@ -5477,8 +5949,9 @@ mod tests {
         fs::create_dir_all(&cf).unwrap();
         fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
         crate::graph::test_support::sample_workspace(&cf);
-        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(&workspace);
-        fs::create_dir_all(cache.search_db_path()).unwrap();
+        let cache = resolved_workspace_cache(&workspace);
+        cache.ensure().unwrap();
+        fs::create_dir(cache.search_db_path()).unwrap();
         let state = SharedState::workspace(workspace).expect("valid workspace project");
         let abandoned =
             crate::change_hub::test_support::eventually(std::time::Duration::from_secs(30), || {
@@ -5545,7 +6018,7 @@ mod tests {
 
         let _env_lock = env_lock();
         let (_dir, workspace) = workspace_with_two_extensions();
-        let graph_db = crate::cache::graph_db_path(&workspace);
+        let graph_db = resolved_workspace_cache(&workspace).graph_db_path();
 
         let first = SharedState::workspace(workspace.clone()).expect("valid workspace project");
         wait_until_graph_ready(first.graph());

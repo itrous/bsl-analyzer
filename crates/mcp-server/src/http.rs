@@ -243,6 +243,12 @@ pub async fn serve_http(
     cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
     let allowed_hosts = effective_allowed_hosts(address, allowed_hosts);
+    let scope_shutdown = server.scope_transport_stop();
+    let relay_cancellation = cancellation.clone();
+    let scope_relay = tokio::spawn(async move {
+        scope_shutdown.cancelled().await;
+        relay_cancellation.cancel();
+    });
     let released = server.clone();
     let config = StreamableHttpServerConfig::default()
         .with_cancellation_token(cancellation.clone())
@@ -286,15 +292,18 @@ pub async fn serve_http(
     );
     tokio::pin!(serve);
 
-    tokio::select! {
-        result = &mut serve => result?,
+    let result = tokio::select! {
+        result = &mut serve => result,
         () = grace_after_cancel(&cancellation) => {
             tracing::warn!(
                 grace_seconds = SHUTDOWN_GRACE.as_secs(),
                 "MCP HTTP shutdown grace elapsed with requests still in flight; dropping them"
             );
+            Ok(())
         }
-    }
+    };
+    scope_relay.abort();
+    result?;
     Ok(())
 }
 
@@ -307,7 +316,34 @@ async fn grace_after_cancel(cancellation: &CancellationToken) {
 mod tests {
     use std::net::{IpAddr, SocketAddr};
 
-    use super::{effective_allowed_hosts, host_is_allowed, wildcard_allowed_hosts};
+    use super::{
+        effective_allowed_hosts, host_is_allowed, wildcard_allowed_hosts, CancellationToken,
+    };
+
+    #[tokio::test]
+    async fn workspace_cache_scope_stops_the_http_listener() {
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = crate::SharedState::shared();
+        let server = crate::McpServer::new(crate::McpProfile::Reference, state.clone());
+        let task = tokio::spawn(super::serve_http(
+            listener,
+            server,
+            crate::McpProfile::Reference,
+            address,
+            Vec::new(),
+            CancellationToken::new(),
+        ));
+
+        state.scope_transport_stop().cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("scope retirement closes HTTP within a finite grace")
+            .expect("HTTP task joins")
+            .expect("HTTP shutdown succeeds");
+    }
 
     fn address(ip: &str, port: u16) -> SocketAddr {
         SocketAddr::new(ip.parse::<IpAddr>().expect("test address should parse"), port)
