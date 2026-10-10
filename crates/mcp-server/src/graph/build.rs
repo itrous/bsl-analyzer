@@ -1,6 +1,7 @@
 //! Background graph build, cache adoption, and SQLite publication work.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::sync::atomic::Ordering;
@@ -80,6 +81,21 @@ impl std::fmt::Display for LoadFailure {
 }
 
 impl std::error::Error for LoadFailure {}
+
+fn relative_event_path(
+    path: &Path,
+    workspace_root: &Path,
+    roots: Option<&bsl_search::WorkspaceRoots>,
+) -> String {
+    if let Ok(relative) = path.strip_prefix(workspace_root) {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+    let Some(key) = roots.and_then(|roots| roots.key_of_path(path)) else {
+        return "<unregistered>".to_owned();
+    };
+    let root_id = if key.root_id.is_empty() { "configuration" } else { &key.root_id };
+    format!("{root_id}/{}", key.path.replace('\\', "/"))
+}
 
 fn install_failure(
     outcome: LeaseOperationOutcome<(), SnapshotInstallError>,
@@ -168,6 +184,7 @@ impl GraphState {
         observed_through: u64,
         ticket: Option<super::debt::BuildTicket>,
     ) -> Result<(), LoadFailure> {
+        self.clear_cold_build_ticker();
         let Some(workspace_root) = self.workspace_root.clone() else {
             return Err(LoadFailure::operation("fused build on a non-workspace graph"));
         };
@@ -196,6 +213,9 @@ impl GraphState {
             Ok(Err(failure)) => return Err(sink.failure.take().unwrap_or(failure)),
             Err(_) => return Err(LoadFailure::operation("fused graph build panicked")),
         };
+        let publication_id = built.prepared.publication_id();
+        let files = built.files;
+        let xml_files = built.xml_files;
         if built.force_stale {
             tracing::warn!("fused graph build straddled a disk write; snapshot marked stale");
         }
@@ -218,11 +238,24 @@ impl GraphState {
             recovery_through,
             built.recovery,
         ))?;
+        self.finish_cold_build_ticker();
         *lock_recover(&self.scan) = None;
         self.ensure_hub_roots(&built.scan_roots, built.physical_topology, built.declaration_epoch);
         // The fused sink just wrote every indexed document's context from THIS
         // build — nothing persisted predates it, so no whole-collection re-render.
         self.notify_published(false);
+        tracing::info!(
+            files,
+            xml_files,
+            parsed_xml = xml_files,
+            reprojected = files,
+            affected_callers = 0,
+            generation,
+            fact_seq = observed_through,
+            publication_id = publication_id.as_deref(),
+            sponsors = ?ticket.map(|ticket| ticket.sponsors),
+            "graph database build complete"
+        );
         Ok(())
     }
 
@@ -271,6 +304,7 @@ impl GraphState {
     /// from a drift-triggered reload (bumps the generation, keeps the old snapshot
     /// served on failure).
     pub(super) fn run_load(&self, is_reload: bool) {
+        self.clear_cold_build_ticker();
         if self.is_superseded() {
             self.record_load_failure(
                 is_reload,
@@ -401,7 +435,14 @@ impl GraphState {
             }
         }
 
-        tracing::info!(?workspace_root, is_reload, generation, "graph database build started");
+        tracing::info!(
+            ?workspace_root,
+            is_reload,
+            generation,
+            fact_seq = observed_through,
+            forced = force_project_reload,
+            "graph database build started"
+        );
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build_and_publish_graph_file(&workspace_root, generation, self, None)
         }));
@@ -411,6 +452,7 @@ impl GraphState {
                 let PublishedBuild {
                     generation,
                     files,
+                    xml_files,
                     fp_pre,
                     force_stale,
                     scan_roots,
@@ -420,6 +462,7 @@ impl GraphState {
                     prepared,
                     recovery,
                 } = built;
+                let publication_id = prepared.publication_id();
                 if force_stale {
                     tracing::warn!(
                         is_reload,
@@ -467,13 +510,25 @@ impl GraphState {
                     self.record_load_failure(is_reload, error);
                     return;
                 }
+                self.finish_cold_build_ticker();
                 #[cfg(test)]
                 if let Some(hook) = &self.publish_window_hook {
                     hook();
                 }
                 self.ensure_hub_roots(&scan_roots, physical_topology, declaration_epoch);
                 self.notify_published(topology_changed);
-                tracing::info!(files, generation, is_reload, "graph database build complete");
+                tracing::info!(
+                    files,
+                    xml_files,
+                    parsed_xml = xml_files,
+                    reprojected = files,
+                    affected_callers = 0,
+                    generation,
+                    is_reload,
+                    fact_seq = observed_through,
+                    publication_id = publication_id.as_deref(),
+                    "graph database build complete"
+                );
             }
             Ok(Err(e)) => {
                 tracing::warn!("graph database build failed: {}", e.message);
@@ -501,14 +556,10 @@ impl GraphState {
     /// Observation only: it records the decision the production gates already made, and no
     /// gate consults it. A test asserting a point rewrite must be able to tell a patch from a
     /// full rebuild that quietly replaced it, or it is asserting about the wrong path.
-    #[cfg(test)]
     fn note_incremental(&self, outcome: &'static str) -> PublishAttemptOutcome {
+        tracing::info!(reason_code = outcome, "incremental reload fell back to a full build");
+        #[cfg(test)]
         lock_recover(&self.incremental_decisions).push(outcome);
-        PublishAttemptOutcome::FallBack
-    }
-
-    #[cfg(not(test))]
-    fn note_incremental(&self, _outcome: &'static str) -> PublishAttemptOutcome {
         PublishAttemptOutcome::FallBack
     }
 
@@ -518,17 +569,28 @@ impl GraphState {
         generation: u64,
         observed_through: u64,
     ) -> PublishAttemptOutcome {
+        tracing::info!(generation, fact_seq = observed_through, "graph incremental reload started");
         let db_path = self.graph_db_path().expect("workspace graph has cache layout");
         // Every read of the published build below names the generation this first one saw,
         // and none holds a handle across the scans and analysis between them.
         let wait = super::BACKGROUND_READ_WAIT;
-        let Ok((base, stored_fp)) = self.store.read(None, wait, |snapshot| {
-            (snapshot.generation, snapshot.graph.stored_fingerprints())
+        let Ok((base, stored_fp, stored_module_total)) = self.store.read(None, wait, |snapshot| {
+            (
+                snapshot.generation,
+                snapshot.graph.stored_fingerprints(),
+                snapshot.graph.file_count_strict(),
+            )
         }) else {
-            return self.note_incremental("published graph unavailable");
+            return self.note_incremental("published_graph_unavailable");
         };
-        if stored_fp.is_empty() {
-            return self.note_incremental("no stored fingerprints"); // older build → full rebuild
+        let Ok(stored_module_total) = stored_module_total else {
+            return self.note_incremental("missing_published_module_total");
+        };
+        // Empty fingerprints are valid only for a current-schema publication that
+        // explicitly records zero modules. GraphDb::open has already rejected older
+        // schemas; nonempty published module totals retain the legacy-cache fallback.
+        if stored_fp.is_empty() && stored_module_total != 0 {
+            return self.note_incremental("no_stored_fingerprints"); // older build → full rebuild
         }
         // ONE project snapshot and ONE scanned universe serve the eligibility diff,
         // the profile recompute, the pre-fingerprint and the patch, so neither a
@@ -540,8 +602,8 @@ impl GraphState {
         // `.bsl` bodies drifted on disk — never body-patch across it.
         match self.store.read(Some(base), wait, |snapshot| snapshot.graph.freshness_token()) {
             Ok(Ok((_, stored_token, _))) if stored_token.topology == project.portable_topology => {}
-            Err(_) => return self.note_incremental("published graph moved"),
-            _ => return self.note_incremental("topology moved"),
+            Err(_) => return self.note_incremental("published_graph_moved"),
+            _ => return self.note_incremental("topology_moved"),
         }
         let pre = crate::graph::universe::ScannedUniverse::scan_project(&project);
         // Before the diff, not inside the bracket: a diff against a short scan reads
@@ -549,7 +611,7 @@ impl GraphState {
         // stats at all — the diff cannot see incompleteness, only the verdict can.
         if !pre.clean() {
             tracing::info!("incremental reload: incomplete workspace scan; full rebuild");
-            return self.note_incremental("incomplete scan");
+            return self.note_incremental("incomplete_scan");
         }
         // The ticket cutoff is the fact frontier this publication may discharge, not the
         // coherence window. Events that arrived before this authoritative pre-scan are already
@@ -563,63 +625,176 @@ impl GraphState {
             pre.stats.iter().any(|stat| roots.key_of_path(&stat.canonical).is_none())
         }) {
             tracing::info!("incremental reload: external symlink target needs a full rebuild");
-            return self.note_incremental("external symlink target");
+            return self.note_incremental("external_symlink_target");
         }
         let diff = super::scan::classify_changes_with_roots(
             &stored_fp,
             &pre.stats,
             project.search_roots.as_ref(),
         );
+        let bsl_added = diff
+            .added
+            .iter()
+            .filter(|p| !bsl_conventions::str_has_extension(p, bsl_conventions::XML_EXTENSION))
+            .count();
+        let bsl_removed = diff
+            .removed
+            .iter()
+            .filter(|p| !bsl_conventions::str_has_extension(p, bsl_conventions::XML_EXTENSION))
+            .count();
+        let bsl_modified = diff
+            .modified
+            .iter()
+            .filter(|p| !bsl_conventions::str_has_extension(p, bsl_conventions::XML_EXTENSION))
+            .count();
+        let trigger = match (bsl_added, bsl_removed, bsl_modified, diff.modified.len()) {
+            (0, 0, 0, 0) if diff.added.is_empty() && diff.removed.is_empty() => {
+                "touch_or_empty_diff"
+            }
+            (added, 0, 0, _) if added > 0 => "bsl_added",
+            (0, removed, 0, _) if removed > 0 => "bsl_removed",
+            (0, 0, modified, _) if modified > 0 => "bsl_modified",
+            _ => "mixed_source_delta",
+        };
+        let relative_paths = |paths: &[String]| {
+            paths
+                .iter()
+                .map(|path| {
+                    relative_event_path(
+                        Path::new(path),
+                        workspace_root,
+                        project.search_roots.as_ref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        tracing::info!(
+            generation,
+            fact_seq = observed_through,
+            trigger,
+            added_paths = ?relative_paths(&diff.added),
+            removed_paths = ?relative_paths(&diff.removed),
+            modified_paths = ?relative_paths(&diff.modified),
+            "graph workspace changes classified"
+        );
 
-        // Body-only shape: at least one `.bsl` modified, nothing added/removed, no
-        // metadata drift (an `.xml` change can flip visibility for any module).
-        if diff.is_empty()
-            || !diff.added.is_empty()
-            || !diff.removed.is_empty()
-            || diff.touches_metadata()
-        {
-            return self.note_incremental("not a body-only shape");
-        }
-        let modified_paths: Vec<PathBuf> = diff.modified.iter().map(PathBuf::from).collect();
-
-        // Recompute each modified module's profile and partition into body-only
-        // (signature unchanged) and signature-changed.
-        let profiles =
-            match crate::graph_db::recompute_module_profiles(&project, &pre.files, &modified_paths)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("incremental reload: profile recompute failed: {e}");
-                    return self.note_incremental("profile recompute failed");
-                }
-            };
         let Ok(stored_sig) =
             self.store.read(Some(base), wait, |snapshot| snapshot.graph.stored_sig_hashes())
         else {
-            return self.note_incremental("published graph moved");
+            return self.note_incremental("published_graph_moved");
+        };
+
+        // Filter out XML modifications whose semantic structure is unchanged (<Version>, <Comment>, etc.)
+        let mut changed_bsl = Vec::new();
+        let mut added_or_removed_bsl = Vec::new();
+        let mut metadata_paths = Vec::new();
+        let mut xml_observations = Vec::new();
+        for path_str in &diff.modified {
+            if bsl_conventions::str_has_extension(path_str, bsl_conventions::XML_EXTENSION) {
+                let path = PathBuf::from(path_str);
+                let key =
+                    project.search_roots.as_ref().and_then(|roots| pre.key_for_path(roots, &path));
+                let current_sig = super::scan::xml_semantic_hash_file(&path).map(|h| {
+                    u64::from_le_bytes(h[..8].try_into().expect("blake3 hash >= 8 bytes"))
+                });
+                xml_observations.push((path.clone(), current_sig));
+                let stored_s = key.as_ref().and_then(|k| stored_sig.get(k)).copied().flatten();
+                if current_sig.is_some() && current_sig == stored_s {
+                    // Semantic no-op: version/comment/formatting edit in XML
+                } else {
+                    metadata_paths.push(path);
+                }
+            } else {
+                changed_bsl.push(path_str.clone());
+            }
+        }
+        for path in &diff.added {
+            if bsl_conventions::str_has_extension(path, bsl_conventions::XML_EXTENSION) {
+                let path = PathBuf::from(path);
+                let hash = super::scan::xml_semantic_hash_file(&path).map(|h| {
+                    u64::from_le_bytes(h[..8].try_into().expect("blake3 hash >= 8 bytes"))
+                });
+                xml_observations.push((path.clone(), hash));
+                metadata_paths.push(path);
+            } else {
+                added_or_removed_bsl.push(path.clone());
+            }
+        }
+        for path in &diff.removed {
+            if bsl_conventions::str_has_extension(path, bsl_conventions::XML_EXTENSION) {
+                let path = PathBuf::from(path);
+                xml_observations.push((path.clone(), None));
+                metadata_paths.push(path);
+            } else {
+                added_or_removed_bsl.push(path.clone());
+            }
+        }
+        let (owner_ids, form_paths) = if metadata_paths.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            match crate::graph_db::local_metadata_delta(&project, &pre, &db_path, &metadata_paths) {
+                Ok(Some(delta)) => delta,
+                Ok(None) => return self.note_incremental("global_or_unsupported_xml_delta"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "incremental metadata owner lookup failed");
+                    return self.note_incremental("metadata_owner_lookup_failed");
+                }
+            }
+        };
+        changed_bsl.extend(added_or_removed_bsl);
+        changed_bsl.sort();
+        let drifted_bsl_paths: Vec<PathBuf> = changed_bsl.iter().map(PathBuf::from).collect();
+        let current_changed_paths: Vec<PathBuf> = drifted_bsl_paths
+            .iter()
+            .filter(|path| pre.files.iter().any(|(_, current)| current == *path))
+            .cloned()
+            .collect();
+
+        // Recompute each modified module's profile and partition into body-only
+        // (signature unchanged) and signature-changed.
+        let profiles = if current_changed_paths.is_empty() {
+            rustc_hash::FxHashMap::default()
+        } else {
+            match crate::graph_db::recompute_module_profiles(
+                &project,
+                &pre.files,
+                &current_changed_paths,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("incremental reload: profile recompute failed: {e}");
+                    return self.note_incremental("profile_recompute_failed");
+                }
+            }
         };
         let mut sig_changed: Vec<(String, &crate::graph_db::ModuleProfile)> = Vec::new();
-        for p in &modified_paths {
+        let mut removed_profiles = Vec::new();
+        for p in &drifted_bsl_paths {
             let key = p.to_string_lossy().into_owned();
+            if !current_changed_paths.contains(p) {
+                removed_profiles.push((key, crate::graph_db::ModuleProfile::removed()));
+                continue;
+            }
             let Some(profile) = profiles.get(&key) else {
-                return self.note_incremental("no recomputed profile");
+                return self.note_incremental("no_recomputed_profile");
             };
             // The diff and this lookup use the same scan's walked alias and durable key.
             let stored_key =
                 project.search_roots.as_ref().and_then(|roots| pre.key_for_path(roots, p));
             match stored_key.as_ref().and_then(|key| stored_sig.get(key)) {
                 Some(Some(stored)) if *stored == profile.sig_hash => {} // body-only
-                Some(Some(_)) => sig_changed.push((key, profile)),      // signature changed
+                Some(Some(_)) | None => sig_changed.push((key, profile)),
                 // A module the last full build could not READ has no stored signature, so a
                 // modification to it can never be a body-only patch.
-                _ => return self.note_incremental("no stored signature"),
+                Some(None) => return self.note_incremental("no_stored_signature"),
             }
         }
+        sig_changed.extend(removed_profiles.iter().map(|(path, profile)| (path.clone(), profile)));
 
         // A signature change is handled by the caller-delta path: reproject the changed
         // module PLUS its resolved callers, when caller-delta-safe (no new resolvable
         // name). Otherwise fall back to a full rebuild.
-        let mut changed_paths = modified_paths.clone();
+        let mut changed_paths = drifted_bsl_paths.clone();
         if !sig_changed.is_empty() {
             let refs: Vec<(&str, &crate::graph_db::ModuleProfile)> =
                 sig_changed.iter().map(|(f, p)| (f.as_str(), *p)).collect();
@@ -642,25 +817,12 @@ impl GraphState {
                     tracing::info!(
                         "incremental reload: signature change not caller-delta-safe; full rebuild"
                     );
-                    return self.note_incremental("caller delta not safe");
+                    return self.note_incremental("caller_delta_not_safe");
                 }
                 Err(e) => {
                     tracing::warn!("incremental reload: caller-delta plan failed: {e}");
-                    return self.note_incremental("caller delta failed");
+                    return self.note_incremental("caller_delta_failed");
                 }
-            }
-            // If the caller fan-out approaches the whole config, a full rebuild (no
-            // 2.6 GB copy) is cheaper than reprojecting most modules. Compare against
-            // the `.bsl` module count only — `changed_paths` are modules, while
-            // `stored_fp` also counts `.xml`, which would skew the threshold.
-            let module_total = bsl_module_total_filekeys(&stored_fp);
-            if changed_paths.len() * 2 > module_total {
-                tracing::info!(
-                    changed = changed_paths.len(),
-                    modules = module_total,
-                    "incremental reload: caller-delta too broad; full rebuild"
-                );
-                return self.note_incremental("caller delta too broad");
             }
         }
 
@@ -671,7 +833,7 @@ impl GraphState {
             tracing::info!(
                 "incremental reload: portable file key or content hash unavailable; full rebuild"
             );
-            return self.note_incremental("incomplete portable fingerprint");
+            return self.note_incremental("incomplete_portable_fingerprint");
         };
         // The patch is written into the database on disk — not necessarily the one served, when
         // an earlier install was refused after its write — so its base is read off the file.
@@ -699,11 +861,15 @@ impl GraphState {
         };
         let built_at = chrono::Utc::now().to_rfc3339();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let patch = crate::graph_db::compute_body_patch(
+            let patch = crate::graph_db::compute_body_patch_with_metadata(
                 &project,
                 &pre,
                 &db_path,
                 &changed_paths,
+                &metadata_paths,
+                &owner_ids,
+                &form_paths,
+                &xml_observations,
                 GRAPH_BUILD_BATCH,
             )
             .map_err(LoadFailure::operation)?;
@@ -762,6 +928,7 @@ impl GraphState {
                 &plan,
                 pause,
             )?;
+            let reprojected = patch.reprojected_modules();
             let prepared =
                 open_installed_replacement(self, generation, fp_pre, force_stale, &db_path, pause)?;
             // A point patch re-projected exactly what it was given. It proves nothing about
@@ -779,11 +946,13 @@ impl GraphState {
                 crate::graph::snapshot::RecoveryCoverage::PatchedKeys { rewritten: &rewritten },
                 project.search_roots.as_ref(),
             );
-            Ok::<_, LoadFailure>((modules, fp_pre, force_stale, prepared, recovery))
+            Ok::<_, LoadFailure>((modules, reprojected, fp_pre, force_stale, prepared, recovery))
         }));
 
         match outcome {
-            Ok(Ok((files, fp, force_stale, prepared, recovery))) => {
+            Ok(Ok((files, reprojected, fp, force_stale, prepared, recovery))) => {
+                let publication_id = prepared.publication_id();
+                let removed = bsl_removed;
                 if force_stale {
                     tracing::warn!(
                         "incremental reload straddled a disk write; marking snapshot stale"
@@ -822,23 +991,54 @@ impl GraphState {
                 tracing::info!(
                     files,
                     generation,
-                    modified = changed_paths.len(),
+                    xml_files = pre
+                        .stats
+                        .iter()
+                        .filter(|stat| bsl_conventions::str_has_extension(
+                            &stat.path,
+                            bsl_conventions::XML_EXTENSION
+                        ))
+                        .count(),
+                    parsed_xml = xml_observations.iter().filter(|(_, hash)| hash.is_some()).count(),
+                    trigger,
+                    reprojected,
+                    added = bsl_added,
+                    modified = bsl_modified,
+                    affected_callers = reprojected.saturating_sub(current_changed_paths.len()),
+                    removed,
+                    fact_seq = observed_through,
+                    publication_id = publication_id.as_deref(),
                     "graph incremental reload complete"
                 );
                 PublishAttemptOutcome::Published
             }
             Ok(Err(e)) => {
-                tracing::warn!("incremental reload failed, falling back to full rebuild: {e}");
+                tracing::warn!(
+                    reason_code = "patch_operation_failed",
+                    error = %e.message,
+                    "incremental reload failed, falling back to full rebuild"
+                );
                 match e.reason {
                     LoadFailureReason::TransientRefusal
                     | LoadFailureReason::Superseded
                     | LoadFailureReason::Released => PublishAttemptOutcome::Refused(e),
-                    LoadFailureReason::OperationError => PublishAttemptOutcome::FallBack,
+                    LoadFailureReason::OperationError => {
+                        self.note_incremental("patch_operation_failed")
+                    }
                 }
             }
-            Err(_) => {
-                tracing::error!("incremental reload panicked, falling back to full rebuild");
-                PublishAttemptOutcome::FallBack
+            Err(payload) => {
+                let panic_message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic");
+                tracing::error!(
+                    reason_code = "patch_panicked",
+                    panic = panic_message,
+                    "incremental reload panicked, falling back to full rebuild"
+                );
+                self.note_incremental("patch_panicked")
             }
         }
     }
@@ -1044,8 +1244,11 @@ impl GraphState {
                 "cached graph database was built for another extension topology; \
                  rebuilding instead of serving it stale, and re-rendering search contexts"
             );
-            super::state::lock_recover(&self.debt)
-                .record_hook(super::debt::HookDebt { topology: true, roots: false });
+            super::state::lock_recover(&self.debt).record_hook(super::debt::HookDebt {
+                topology: true,
+                roots: false,
+                marks: false,
+            });
             return PublishAttemptOutcome::FallBack;
         }
         let files = files.unwrap_or(0);
@@ -1130,6 +1333,7 @@ impl GraphState {
         // special: it is recorded against its own fact and is still owed, because no
         // publication observed it.
         let rearmed = self.record_admission_failure(kind, |inner| {
+            inner.build_ticker = None;
             if is_reload {
                 if let Some(p) = inner.published.as_mut() {
                     p.reload = ReloadState::Failed(failure.message);
@@ -1311,6 +1515,13 @@ fn build_and_publish_scanned_inner(
     Ok(PublishedBuild {
         generation,
         files: summary.modules,
+        xml_files: pre
+            .stats
+            .iter()
+            .filter(|stat| {
+                bsl_conventions::str_has_extension(&stat.path, bsl_conventions::XML_EXTENSION)
+            })
+            .count(),
         fp_pre,
         force_stale,
         scan_roots: project.scan_roots.clone(),
@@ -1510,22 +1721,22 @@ fn build_candidate(
     let coherence_cutoff = graph.observation();
     #[cfg(test)]
     graph.full_builds_started.fetch_add(1, Ordering::SeqCst);
-    let summary = match match chunk_sink {
-        Some(sink) => crate::graph_db::build_graph_database_fused(
-            project,
-            pre,
-            candidate,
-            GRAPH_BUILD_BATCH,
-            &meta,
-            sink,
-        ),
-        None => {
-            crate::graph_db::build_graph_database(project, pre, candidate, GRAPH_BUILD_BATCH, &meta)
-        }
-    } {
+    let ticker = Arc::new(ide::GraphBuildTicker::default());
+    graph.start_cold_build_ticker(Arc::clone(&ticker));
+    let summary = match crate::graph_db::build_graph_database_inner(
+        project,
+        pre,
+        candidate,
+        GRAPH_BUILD_BATCH,
+        &meta,
+        chunk_sink,
+        Some(ticker),
+    ) {
         Ok(summary) => summary,
         Err(error) => return Err(LoadFailure::operation(error)),
     };
+    #[cfg(test)]
+    graph.enter_build_candidate_hook();
     // The post-scan derives a FRESH project snapshot AND a fresh walk: the straddle
     // check must see the world as it is now, or a topology/root change landing
     // mid-build would compare the frozen snapshot against itself and publish clean.
@@ -2050,6 +2261,7 @@ struct PublishedBuild {
     /// replacement prepared earlier and installed as it was built.
     generation: u64,
     files: usize,
+    xml_files: usize,
     fp_pre: crate::graph_db::GraphFp,
     force_stale: bool,
     scan_roots: Vec<PathBuf>,
@@ -2279,6 +2491,7 @@ impl ide::FusedChunkSink for FusedChunkWriter<'_> {
     }
 }
 
+#[cfg(test)]
 fn bsl_module_total_filekeys(
     stored_fp: &std::collections::HashMap<bsl_search::FileKey, [u8; 32]>,
 ) -> usize {
@@ -2390,6 +2603,7 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
         wait_ready(&graph);
+
         let path = graph_db_path(root);
         let (candidate, fingerprint) = next_publication_beside(&path);
 
@@ -2733,6 +2947,34 @@ mod tests {
         assert_eq!(error.reason, LoadFailureReason::OperationError);
         assert!(!temp.exists(), "the refused build is discarded");
         assert_eq!(fs::read(&path).unwrap(), before, "and nothing is renamed over it");
+    }
+
+    /// A warm cache produced by the previous projection rules cannot be adopted even
+    /// when file fingerprints match: the graph is rebuilt through the existing schema gate.
+    #[test]
+    fn previous_projection_format_is_rebuilt_before_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        seed_cache(root, crate::graph::scan::workspace_fingerprint(root));
+        let path = graph_db_path(root);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [(crate::graph_db::SCHEMA_VERSION - 1).to_string()],
+            )
+            .unwrap();
+
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.ensure_loading();
+        wait_ready(&graph);
+
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            meta_string(&path, "schema_version"),
+            crate::graph_db::SCHEMA_VERSION.to_string()
+        );
     }
 
     /// A build replaces exactly the publication it was prepared from. Another one standing at
@@ -3387,6 +3629,11 @@ mod tests {
             "Чужой",
             true,
             "&НаСервере\nФункция Чуж() Экспорт КонецФункции",
+        );
+        write(
+            root,
+            "CommonModules/Клиент/Ext/Module.bsl",
+            "&НаКлиенте\nПроцедура Главная() Экспорт\nСервер.Считать();\nДополнительный.Extra();\nКонецПроцедуры",
         );
         let with_vendored = build_and_publish_graph_file(root, 2, &graph, None).unwrap();
 
@@ -6446,7 +6693,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bsl_sigs, 2, "both module bodies get a signature hash");
-        assert_eq!(xml_sigs, 0, ".xml descriptors have no signature hash");
+        assert_eq!(xml_sigs, 2, "both XML descriptors carry semantic hashes");
     }
 
     /// The persisted signature hash is stable across a body-only edit (same method
@@ -6457,6 +6704,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере\nФункция Считать(Знач А) Экспорт КонецФункции",
+        );
         let out = graph_db_path(root);
         fs::create_dir_all(out.parent().unwrap()).unwrap();
 
@@ -6481,20 +6733,33 @@ mod tests {
         build_whole_graph(root, &out, 1, &meta()).expect("builds");
         let base = server_sig(&out);
 
-        // Body-only edit: same signature `Функция Считать() Экспорт`, new body.
+        // Body-only edit: same signature including its parameter list, new body.
         write(
             root,
             "CommonModules/Сервер/Ext/Module.bsl",
-            "&НаСервере\nФункция Считать() Экспорт\nА = 1; Возврат А;\nКонецФункции",
+            "&НаСервере\nФункция Считать(Знач А) Экспорт\nБ = А + 1; Возврат Б;\nКонецФункции",
         );
         build_whole_graph(root, &out, 1, &meta()).expect("rebuilds");
         assert_eq!(server_sig(&out), base, "a body-only edit leaves the signature hash unchanged");
+
+        // Parameter composition changes resolution semantics even when name/export stay fixed.
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере\nФункция Считать(Знач А, Б) Экспорт КонецФункции",
+        );
+        build_whole_graph(root, &out, 1, &meta()).expect("rebuilds");
+        assert_ne!(
+            server_sig(&out),
+            base,
+            "changing the exported parameter list reopens caller resolution"
+        );
 
         // Signature edit: rename the function. The hash must move.
         write(
             root,
             "CommonModules/Сервер/Ext/Module.bsl",
-            "&НаСервере\nФункция Считать2() Экспорт КонецФункции",
+            "&НаСервере\nФункция Считать2(Знач А) Экспорт КонецФункции",
         );
         build_whole_graph(root, &out, 1, &meta()).expect("rebuilds");
         assert_ne!(server_sig(&out), base, "renaming a method changes the signature hash");
@@ -8655,6 +8920,63 @@ mod tests {
         assert!(!body_only.touches_metadata(), "a body-only change does not touch metadata");
     }
 
+    #[test]
+    fn external_change_paths_log_with_root_identity_and_relative_file_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let configuration = workspace.path().join("src/cf");
+        fs::create_dir_all(&configuration).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_file = external.path().join("CommonModules/Ext/Ext/Module.bsl");
+        fs::create_dir_all(external_file.parent().unwrap()).unwrap();
+        fs::write(&external_file, "&НаСервере\nПроцедура Внешняя() КонецПроцедуры").unwrap();
+        let (roots, rejected) = bsl_search::WorkspaceRoots::build(
+            workspace.path(),
+            &configuration,
+            &[external.path().to_path_buf()],
+        );
+        assert!(rejected.is_empty());
+
+        let external_path = external_file.to_string_lossy().into_owned();
+        let before = FileStat::for_test(&external_path, 1, 1);
+        let key = before.key(&roots).expect("registered external root key");
+        let stored =
+            std::collections::HashMap::from([(key.clone(), before.persisted_content_hash())]);
+        let changed = FileStat::for_test(&external_path, 2, 1);
+        let modified = classify_changes_with_roots(&stored, &[changed], Some(&roots));
+        let removed = classify_changes_with_roots(&stored, &[], Some(&roots));
+        assert_eq!(modified.modified.as_slice(), std::slice::from_ref(&external_path));
+        assert_eq!(removed.removed, [external_path]);
+
+        let expected = format!("{}/{}", key.root_id, key.path);
+        assert_eq!(
+            relative_event_path(Path::new(&modified.modified[0]), workspace.path(), Some(&roots)),
+            expected
+        );
+        assert_eq!(
+            relative_event_path(Path::new(&removed.removed[0]), workspace.path(), Some(&roots)),
+            expected
+        );
+        assert_eq!(
+            relative_event_path(
+                &configuration.join("Catalogs/Товары.xml"),
+                workspace.path(),
+                Some(&roots)
+            ),
+            "src/cf/Catalogs/Товары.xml",
+            "paths under the workspace keep their existing relative spelling"
+        );
+        let unregistered = tempfile::tempdir().unwrap();
+        assert_eq!(
+            relative_event_path(
+                &unregistered.path().join("secret/Module.bsl"),
+                workspace.path(),
+                Some(&roots)
+            ),
+            "<unregistered>",
+            "unknown event paths never fall back to their absolute spelling"
+        );
+    }
+
     /// End-to-end: a signature change (method removal) drifts the workspace, and the
     /// reload takes the caller-delta path — bumping the generation and serving a graph
     /// where the removed method (and its caller's edge) is gone.
@@ -8836,11 +9158,24 @@ mod tests {
 
 #[cfg(test)]
 mod form_twin_tests {
-    use super::super::test_support::{sample_workspace, write};
+    use super::super::state::lock_recover;
+    use super::super::test_support::{
+        sample_workspace, wait_ready, write, write_extension_workspace,
+    };
+    use super::super::GraphState;
+    use super::PublishAttemptOutcome;
     use super::GRAPH_BUILD_BATCH;
     use crate::graph_db::build_graph_database;
     use rusqlite::Connection;
     use std::path::Path;
+
+    fn wait_for_build_to_settle(graph: &GraphState) {
+        let deadline = std::time::Instant::now() + super::super::test_support::WAIT_CEILING;
+        while graph.build_in_flight() {
+            assert!(std::time::Instant::now() < deadline, "initial graph build did not settle");
+            std::thread::yield_now();
+        }
+    }
 
     fn build(root: &Path, out: &Path) {
         let project = crate::graph::ProjectSnapshot::load(root);
@@ -8877,6 +9212,46 @@ mod form_twin_tests {
         (nodes, edges, form_nodes)
     }
 
+    fn full_projection(out: &Path) -> (Vec<String>, Vec<String>) {
+        let conn = Connection::open(out).unwrap();
+        let collect = |sql: &str, columns: usize| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.query_map([], |row| {
+                (0..columns)
+                    .map(|index| {
+                        row.get::<_, rusqlite::types::Value>(index)
+                            .map(|value| format!("{value:?}"))
+                    })
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map(|parts| parts.join("|"))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        };
+        (
+            collect(
+                "SELECT id,kind,name,qualified,module,file_root_id,file_path,name_offset,sig_end,src_start,src_end,dispatch,is_export,addressable FROM nodes ORDER BY id",
+                14,
+            ),
+            collect(
+                "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses",
+                8,
+            ),
+        )
+    }
+
+    fn write_catalog_attribute(root: &Path, name: &str, attribute: &str) {
+        let id = if name == "Контрагенты" { 2 } else { 1 };
+        write(
+            root,
+            &format!("Catalogs/{name}.xml"),
+            &format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Catalog uuid="00000000-0000-0000-0000-0000000000{id:02}"><Properties><Name>{name}</Name><CodeLength>9</CodeLength></Properties><ChildObjects><Attribute uuid="00000000-0000-0000-0000-0000000010{id:02}"><Properties><Name>{attribute}</Name><Type><Type>xs:string</Type></Type></Properties></Attribute></ChildObjects></Catalog></MetaDataObject>"#
+            ),
+        );
+    }
+
     /// Дерево с форменным модулем `Module.BSL` собирается в тот же граф, что его
     /// нижнерегистровый близнец: узлы, рёбра и квалифицированное имя форменного
     /// обработчика совпадают.
@@ -8909,5 +9284,698 @@ mod form_twin_tests {
             v.into_iter().map(|(n, q)| (n, q.to_ascii_lowercase())).collect()
         };
         assert_eq!(fold(lower_form), fold(upper_form), "квалификация форменного обработчика");
+    }
+
+    #[test]
+    fn local_mdo_attribute_and_form_xml_delta_matches_cold_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        write_catalog_attribute(root, "Товары", "ИНН");
+        write_catalog_attribute(root, "Контрагенты", "Код");
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере\nФункция Считать() Экспорт\nЗапрос = \"ВЫБРАТЬ КПП ИЗ Справочник.Товары\";\nСправочники.Товары.СоздатьЭлемент();\nВозврат 1;\nКонецФункции",
+        );
+        write(
+            root,
+            "Catalogs/Товары/Forms/Карточка/Ext/Form.xml",
+            r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10"><ChildItems><InputField name="ПолеКПП" id="1"><DataPath>Объект.КПП</DataPath><Events><Event name="OnChange">ПриИзменении</Event></Events></InputField></ChildItems><Attributes><Attribute name="Объект"><Type><v8:Type>cfg:CatalogObject.Товары</v8:Type></Type><MainAttribute>true</MainAttribute></Attribute></Attributes></Form>"#,
+        );
+        write(
+            root,
+            "Catalogs/Товары/Forms/Карточка/Ext/Form/Module.bsl",
+            "&НаКлиенте\nПроцедура ПриИзменении(Элемент)\nКонецПроцедуры",
+        );
+        write(
+            root,
+            "Catalogs/Контрагенты/Forms/Связь/Ext/Form.xml",
+            r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10"><ChildItems><InputField name="ПолеКПП" id="1"><DataPath>Товар.КПП</DataPath></InputField></ChildItems><Attributes><Attribute name="Товар"><Type><v8:Type>cfg:CatalogObject.Товары</v8:Type></Type></Attribute></Attributes></Form>"#,
+        );
+        write(
+            root,
+            "Catalogs/Контрагенты/Forms/Связь/Ext/Form/Module.bsl",
+            "&НаКлиенте\nПроцедура ПриОткрытии(Элемент)\nКонецПроцедуры",
+        );
+
+        let graph = GraphState::for_workspace_with_cache(
+            root.to_path_buf(),
+            crate::cache::WorkspaceCacheLayout::for_workspace(root),
+        );
+        graph.ensure_loading();
+        wait_ready(&graph);
+        wait_for_build_to_settle(&graph);
+
+        // First prove the fixture itself represents both owners and their structural
+        // form edges before the metadata-only patch is allowed to touch either row.
+        let cold = root.join("cold-owner.db");
+        build(root, &cold);
+        let initial = full_projection(&crate::cache::graph_db_path(root));
+        assert_eq!(initial, full_projection(&cold), "initial owner graph equals cold build");
+        assert!(initial.0.iter().any(|row| row.contains("mdo/Catalog/Контрагенты")));
+        assert!(initial.0.iter().any(|row| row.contains("form/Catalog/Контрагенты/Связь")));
+        assert!(initial.1.iter().any(|row| {
+            row.contains("mdo/Catalog/Контрагенты")
+                && row.contains("form/Catalog/Контрагенты/Связь")
+                && row.contains("contains")
+        }));
+
+        write_catalog_attribute(root, "Товары", "КПП");
+        build(root, &cold);
+        let post_edit_cold = full_projection(&cold);
+        assert!(post_edit_cold.0.iter().any(|row| row.contains("mdo/Catalog/Контрагенты")));
+        assert!(post_edit_cold.0.iter().any(|row| row.contains("form/Catalog/Контрагенты/Связь")));
+        assert!(post_edit_cold.1.iter().any(|row| {
+            row.contains("mdo/Catalog/Контрагенты")
+                && row.contains("form/Catalog/Контрагенты/Связь")
+                && row.contains("contains")
+        }));
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let project = crate::graph::ProjectSnapshot::load_excluding(root, &cache.exclusions(root));
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        let metadata_path = root.join("Catalogs/Товары.xml");
+        let (owners, forms) = crate::graph_db::local_metadata_delta(
+            &project,
+            &universe,
+            &crate::cache::graph_db_path(root),
+            std::slice::from_ref(&metadata_path),
+        )
+        .unwrap()
+        .expect("existing catalog attribute edit is a local owner delta");
+        let semantic_hash = crate::graph::scan::xml_semantic_hash_file(&metadata_path)
+            .map(|hash| u64::from_le_bytes(hash[..8].try_into().expect("blake3 hash >= 8 bytes")));
+        let patch = crate::graph_db::compute_body_patch_with_metadata(
+            &project,
+            &universe,
+            &crate::cache::graph_db_path(root),
+            &[],
+            std::slice::from_ref(&metadata_path),
+            &owners,
+            &forms,
+            &[(metadata_path.clone(), semantic_hash)],
+            GRAPH_BUILD_BATCH,
+        )
+        .unwrap();
+        assert!(
+            patch.reprojected_modules() > 0,
+            "an XML-only owner delta also reprojects its unchanged BSL consumers"
+        );
+        let projected = patch.rows_for_test();
+        assert!(projected.nodes.iter().any(|node| node.id == "mdo/Catalog/Контрагенты"));
+        assert!(projected.nodes.iter().any(|node| node.id == "form/Catalog/Контрагенты/Связь"));
+        assert!(projected.edges.iter().any(|edge| {
+            edge.from_id == "mdo/Catalog/Контрагенты"
+                && edge.to_id == "form/Catalog/Контрагенты/Связь"
+                && edge.kind == "contains"
+        }));
+        assert!(!graph.build_in_flight(), "metadata patch starts after the initial build settles");
+        assert!(matches!(
+            graph.try_incremental_reload(root, 2, 0),
+            PublishAttemptOutcome::Published
+        ));
+        assert_eq!(
+            full_projection(&cold),
+            post_edit_cold,
+            "incremental publish leaves cold baseline untouched"
+        );
+
+        let compare_projection = |message: &str| {
+            let actual = full_projection(&crate::cache::graph_db_path(root));
+            let expected = full_projection(&cold);
+            let difference = |actual: &[String], expected: &[String]| {
+                let mut missing = expected.to_vec();
+                let mut extra = Vec::new();
+                for row in actual {
+                    if let Some(position) = missing.iter().position(|candidate| candidate == row) {
+                        missing.remove(position);
+                    } else {
+                        extra.push(row.clone());
+                    }
+                }
+                (missing, extra)
+            };
+            let (missing_nodes, extra_nodes) = difference(&actual.0, &expected.0);
+            let (missing_edges, extra_edges) = difference(&actual.1, &expected.1);
+            assert!(
+                missing_nodes.is_empty()
+                    && extra_nodes.is_empty()
+                    && missing_edges.is_empty()
+                    && extra_edges.is_empty(),
+                "{message}; missing nodes={missing_nodes:?}; extra nodes={extra_nodes:?}; missing edges={missing_edges:?}; extra edges={extra_edges:?}"
+            );
+        };
+        compare_projection("metadata-only patch preserves incoming query, manager and form edges");
+        let query_and_manager: i64 = Connection::open(crate::cache::graph_db_path(root))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE kind IN ('query_ref','manager_creates') AND from_id = 'method/common/Сервер/Считать' AND to_id = 'mdo/Catalog/Товары'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            query_and_manager >= 2,
+            "unchanged BSL's incoming owner edges were retained: {query_and_manager}"
+        );
+        let incoming_edges: i64 = Connection::open(crate::cache::graph_db_path(root))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE (kind = 'query_ref' AND from_id = 'method/common/Сервер/Считать' AND to_id = 'attribute/Catalog/Товары/КПП') OR (kind = 'data_binding' AND to_id = 'attribute/Catalog/Товары/КПП')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            incoming_edges, 3,
+            "new query and both owner-local and foreign form consumers resolve the new attribute"
+        );
+
+        write(
+            root,
+            "Catalogs/Товары/Forms/Карточка/Ext/Form.xml",
+            r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"><ChildItems><InputField name="ПолеКПП" id="1"><DataPath>Объект.КПП</DataPath><Events><Event name="OnChange">ПриИзменении</Event></Events></InputField></ChildItems></Form>"#,
+        );
+        assert!(matches!(
+            graph.try_incremental_reload(root, 3, 0),
+            PublishAttemptOutcome::Published
+        ));
+
+        build(root, &cold);
+        compare_projection("local form replacement keeps the neighboring owner and graph edges");
+        assert!(full_projection(&cold).0.iter().any(|row| row.contains("mdo/Catalog/Контрагенты")));
+        assert!(full_projection(&cold).0.iter().any(|row| row.contains("ПолеКПП")));
+    }
+
+    #[test]
+    fn adding_and_removing_form_module_with_existing_xml_matches_cold_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        write(
+            root,
+            "Catalogs/Товары/Forms/Карточка/Ext/Form.xml",
+            r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"><ChildItems><InputField name="ПолеИНН" id="1"><DataPath>Объект.Код</DataPath></InputField></ChildItems></Form>"#,
+        );
+        let graph = GraphState::for_workspace_with_cache(
+            root.to_path_buf(),
+            crate::cache::WorkspaceCacheLayout::for_workspace(root),
+        );
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let cold = root.join("cold-form-membership.db");
+        let compare_cold = || {
+            build(root, &cold);
+            assert_eq!(
+                full_projection(&crate::cache::graph_db_path(root)),
+                full_projection(&cold),
+                "form owner membership must match a cold graph"
+            );
+        };
+
+        let module = root.join("Catalogs/Товары/Forms/Карточка/Ext/Form/Module.bsl");
+        write(
+            root,
+            "Catalogs/Товары/Forms/Карточка/Ext/Form/Module.bsl",
+            "&НаКлиенте\nПроцедура ПриОткрытии(Элемент)\nКонецПроцедуры",
+        );
+        assert!(matches!(
+            graph.try_incremental_reload(root, 2, 0),
+            PublishAttemptOutcome::Published
+        ));
+        compare_cold();
+        assert!(full_projection(&crate::cache::graph_db_path(root))
+            .0
+            .iter()
+            .any(|row| row.contains("form/Catalog/Товары/Карточка")));
+
+        std::fs::remove_file(module).unwrap();
+        assert!(matches!(
+            graph.try_incremental_reload(root, 3, 0),
+            PublishAttemptOutcome::Published
+        ));
+        compare_cold();
+        assert!(!full_projection(&crate::cache::graph_db_path(root))
+            .0
+            .iter()
+            .any(|row| row.contains("form/Catalog/Товары/Карточка")));
+    }
+
+    fn apply_one_module_patch(root: &Path, source_db: &Path, changed_path: &Path, serial: u64) {
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let project = crate::graph::ProjectSnapshot::load_excluding(root, &cache.exclusions(root));
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        let patched = root.join(format!("patched-{serial}.db"));
+        crate::graph_db::update_graph_database_bodies(
+            &project,
+            &universe,
+            source_db,
+            &patched,
+            &[changed_path.to_path_buf()],
+            GRAPH_BUILD_BATCH,
+            &crate::graph_db::GraphMeta {
+                revision: serial,
+                fingerprint: crate::graph_db::GraphFp::default(),
+                files: universe.files.len(),
+                built_at: "test".to_owned(),
+                publication_id: format!("patch-{serial}"),
+            },
+        )
+        .unwrap();
+        std::fs::copy(patched, source_db).unwrap();
+    }
+
+    fn assert_last_module_roundtrip(root: &Path, module_rel: &str, body: &str) {
+        let module = root.join(module_rel);
+        let canonical_module = module.canonicalize().unwrap();
+        let graph_db = crate::cache::graph_db_path(root);
+        build(root, &graph_db);
+        let cold = root.join("cold-last-module.db");
+        let compare_cold = |step: &str| {
+            build(root, &cold);
+            assert_eq!(
+                full_projection(&graph_db),
+                full_projection(&cold),
+                "{step}: zero/one module graph must match a cold build"
+            );
+        };
+        compare_cold("initial module");
+        let initial = full_projection(&graph_db);
+        let mdo = "mdo/Catalog/Товары";
+        let attribute = "attribute/Catalog/Товары/ИНН";
+        assert!(initial.0.iter().any(|row| row.contains(mdo)), "custom MDO row present");
+        assert!(
+            initial.0.iter().any(|row| row.contains(attribute)),
+            "custom attribute row present"
+        );
+        assert!(
+            initial.1.iter().any(|row| row.contains(mdo)
+                && row.contains(attribute)
+                && row.contains("contains")),
+            "custom catalog containment edge present"
+        );
+
+        std::fs::remove_file(&module).unwrap();
+        apply_one_module_patch(root, &graph_db, &canonical_module, 2);
+        compare_cold("after deleting the only module");
+        assert!(
+            full_projection(&graph_db).0.is_empty(),
+            "zero-module cold projection has no nodes"
+        );
+        assert!(
+            full_projection(&graph_db).1.is_empty(),
+            "zero-module cold projection has no edges"
+        );
+
+        write(root, module_rel, body);
+        let restored_path = module.canonicalize().unwrap();
+        apply_one_module_patch(root, &graph_db, &restored_path, 3);
+        compare_cold("after restoring the first module");
+        let restored = full_projection(&graph_db);
+        assert!(restored.0.iter().any(|row| row.contains(attribute)));
+        assert!(restored.1.iter().any(|row| row.contains(mdo) && row.contains(attribute)));
+    }
+
+    fn assert_public_last_module_roundtrip(root: &Path, module_rel: &str, body: &str) {
+        let module = root.join(module_rel);
+        let graph = GraphState::for_workspace_with_cache(
+            root.to_path_buf(),
+            crate::cache::WorkspaceCacheLayout::for_workspace(root),
+        );
+        graph.ensure_loading();
+        wait_ready(&graph);
+        wait_for_build_to_settle(&graph);
+        let graph_db = crate::cache::graph_db_path(root);
+        let cold = root.join("cold-public-last-module.db");
+        let compare_cold = |step: &str| {
+            build(root, &cold);
+            assert_eq!(
+                full_projection(&graph_db),
+                full_projection(&cold),
+                "{step}: public reload must match a cold build"
+            );
+        };
+        compare_cold("initial module");
+        let initial = full_projection(&graph_db);
+        let mdo = "mdo/Catalog/Товары";
+        let attribute = "attribute/Catalog/Товары/ИНН";
+        assert!(initial.0.iter().any(|row| row.contains(attribute)));
+        assert!(initial.1.iter().any(|row| {
+            row.contains(mdo) && row.contains(attribute) && row.contains("contains")
+        }));
+        let full_builds = graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst);
+
+        std::fs::remove_file(&module).unwrap();
+        assert!(matches!(
+            graph.try_incremental_reload(root, 2, 0),
+            PublishAttemptOutcome::Published
+        ));
+        compare_cold("after deleting the only module");
+        assert!(full_projection(&graph_db).0.is_empty());
+        assert!(full_projection(&graph_db).1.is_empty());
+        assert_eq!(
+            graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst),
+            full_builds,
+            "deleting the sole module used the public incremental path"
+        );
+
+        write(root, module_rel, body);
+        assert!(matches!(
+            graph.try_incremental_reload(root, 3, 0),
+            PublishAttemptOutcome::Published
+        ));
+        compare_cold("after restoring the first module");
+        let restored = full_projection(&graph_db);
+        assert!(restored.0.iter().any(|row| row.contains(attribute)));
+        assert!(restored.1.iter().any(|row| {
+            row.contains(mdo) && row.contains(attribute) && row.contains("contains")
+        }));
+        assert_eq!(
+            graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst),
+            full_builds,
+            "restoring the first module used the public incremental path"
+        );
+    }
+
+    fn setup_custom_catalog_workspace(root: &Path) {
+        sample_workspace(root);
+        std::fs::remove_file(root.join("CommonModules/Клиент/Ext/Module.bsl")).unwrap();
+        std::fs::remove_file(root.join("CommonModules/Сервер/Ext/Module.bsl")).unwrap();
+        write_catalog_attribute(root, "Товары", "ИНН");
+        write(
+            root,
+            "Catalogs/Товары/Forms/Карточка/Ext/Form.xml",
+            r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"><ChildItems><InputField name="ПолеИНН" id="1"><DataPath>Объект.ИНН</DataPath></InputField></ChildItems></Form>"#,
+        );
+    }
+
+    #[test]
+    fn removing_and_restoring_the_sole_form_module_matches_cold_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        std::fs::remove_file(root.join("CommonModules/Клиент/Ext/Module.bsl")).unwrap();
+        std::fs::remove_file(root.join("CommonModules/Сервер/Ext/Module.bsl")).unwrap();
+        write_catalog_attribute(root, "Товары", "ИНН");
+        write(
+            root,
+            "Catalogs/Товары/Forms/Карточка/Ext/Form.xml",
+            r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"><ChildItems><InputField name="ПолеИНН" id="1"><DataPath>Объект.ИНН</DataPath></InputField></ChildItems></Form>"#,
+        );
+        let module_rel = "Catalogs/Товары/Forms/Карточка/Ext/Form/Module.bsl";
+        let body = "&НаКлиенте\nПроцедура ПриОткрытии(Элемент)\nКонецПроцедуры";
+        write(root, module_rel, body);
+        assert_last_module_roundtrip(root, module_rel, body);
+    }
+
+    #[test]
+    fn removing_and_restoring_the_sole_ordinary_module_matches_cold_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        std::fs::remove_file(root.join("CommonModules/Клиент/Ext/Module.bsl")).unwrap();
+        std::fs::remove_file(root.join("CommonModules/Сервер/Ext/Module.bsl")).unwrap();
+        write_catalog_attribute(root, "Товары", "ИНН");
+        let module_rel = "CommonModules/Единственный/Ext/Module.bsl";
+        let body = "&НаСервере\nФункция M() Экспорт\nВозврат 1;\nКонецФункции";
+        crate::graph::test_support::write_common_module(root, "Единственный", true, body);
+        assert_last_module_roundtrip(root, module_rel, body);
+    }
+
+    #[test]
+    fn public_reload_roundtrips_the_sole_form_module_with_custom_catalog_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        setup_custom_catalog_workspace(root);
+        let module_rel = "Catalogs/Товары/Forms/Карточка/Ext/Form/Module.bsl";
+        let body = "&НаКлиенте\nПроцедура ПриОткрытии(Элемент)\nКонецПроцедуры";
+        write(root, module_rel, body);
+        assert_public_last_module_roundtrip(root, module_rel, body);
+    }
+
+    #[test]
+    fn public_reload_roundtrips_the_sole_ordinary_module_with_custom_catalog_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        setup_custom_catalog_workspace(root);
+        let module_rel = "CommonModules/Единственный/Ext/Module.bsl";
+        let body = "&НаСервере\nФункция M() Экспорт\nВозврат 1;\nКонецФункции";
+        crate::graph::test_support::write_common_module(root, "Единственный", true, body);
+        assert_public_last_module_roundtrip(root, module_rel, body);
+    }
+
+    #[test]
+    fn public_reload_accepts_empty_fingerprints_for_current_schema_zero_module_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        std::fs::remove_file(root.join("CommonModules/Клиент/Ext/Module.bsl")).unwrap();
+        std::fs::remove_file(root.join("CommonModules/Клиент.xml")).unwrap();
+        std::fs::remove_file(root.join("CommonModules/Сервер/Ext/Module.bsl")).unwrap();
+        std::fs::remove_file(root.join("CommonModules/Сервер.xml")).unwrap();
+        let module_rel = "CommonModules/Единственный/Ext/Module.bsl";
+        let body = "Процедура M()\nКонецПроцедуры";
+        write(root, module_rel, body);
+        let module = root.join(module_rel);
+        let graph = GraphState::for_workspace_with_cache(
+            root.to_path_buf(),
+            crate::cache::WorkspaceCacheLayout::for_workspace(root),
+        );
+        graph.ensure_loading();
+        wait_ready(&graph);
+        wait_for_build_to_settle(&graph);
+        let graph_db = crate::cache::graph_db_path(root);
+        let full_builds = graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst);
+
+        std::fs::remove_file(&module).unwrap();
+        assert!(matches!(
+            graph.try_incremental_reload(root, 2, 0),
+            PublishAttemptOutcome::Published
+        ));
+        assert_eq!(full_projection(&graph_db), (Vec::new(), Vec::new()));
+        let stored_empty =
+            crate::graph_db::stored_fingerprints_in(&Connection::open(&graph_db).unwrap());
+        assert!(stored_empty.is_empty(), "plain-BSL zero graph has no fingerprint rows");
+
+        write(root, module_rel, body);
+        assert!(matches!(
+            graph.try_incremental_reload(root, 3, 0),
+            PublishAttemptOutcome::Published
+        ));
+        let cold = root.join("cold-no-xml-first-module.db");
+        build(root, &cold);
+        assert_eq!(full_projection(&graph_db), full_projection(&cold));
+        assert_eq!(
+            graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst),
+            full_builds,
+            "current-schema empty publications remain eligible for incremental reload"
+        );
+    }
+
+    #[test]
+    fn adding_and_removing_a_bsl_module_matches_a_cold_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        crate::graph::test_support::write_common_module(
+            root,
+            "Дополнительный",
+            true,
+            "&НаСервере\nФункция Extra() Экспорт\nВозврат 1;\nКонецФункции",
+        );
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере\nФункция Считать() Экспорт\nВозврат Дополнительный.Extra();\nКонецФункции",
+        );
+        let extra = root.join("CommonModules/Дополнительный/Ext/Module.bsl");
+        std::fs::remove_file(&extra).unwrap();
+
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache);
+        graph.ensure_loading();
+        wait_ready(&graph);
+
+        let initial = Connection::open(crate::cache::graph_db_path(root)).unwrap();
+        let unresolved_rows: Vec<(String, String, String)> = initial
+            .prepare("SELECT target_scope, method_lower, caller_path FROM unresolved_calls ORDER BY target_scope, method_lower")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            unresolved_rows.iter().any(|(_, method, path)| method == "extra"
+                && path.ends_with("CommonModules/Сервер/Ext/Module.bsl")),
+            "cold graph must record the unresolved caller reverse index: {unresolved_rows:?}"
+        );
+
+        let cold = root.join("cold.db");
+        let projection = |path: &Path| {
+            let conn = Connection::open(path).unwrap();
+            let read = |sql: &str, count: usize| {
+                let mut stmt = conn.prepare(sql).unwrap();
+                stmt.query_map([], |row| {
+                    (0..count)
+                        .map(|i| row.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|parts| parts.join("|"))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+            };
+            (
+                read("SELECT id,kind,name,qualified,module,file_root_id,file_path,name_offset,sig_end,src_start,src_end,dispatch,is_export,addressable FROM nodes ORDER BY id", 14),
+                read("SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses", 8),
+            )
+        };
+        let compare_cold = || {
+            build(root, &cold);
+            assert_eq!(projection(&crate::cache::graph_db_path(root)), projection(&cold));
+        };
+
+        std::fs::create_dir_all(extra.parent().unwrap()).unwrap();
+        std::fs::write(&extra, "&НаСервере\nФункция Extra() Экспорт\nВозврат 1;\nКонецФункции")
+            .unwrap();
+        let project = crate::graph::ProjectSnapshot::load(root);
+        let universe = crate::graph::universe::ScannedUniverse::scan(&project.scan_roots);
+        let current_modules = universe
+            .files
+            .iter()
+            .filter(|(_, path)| {
+                bsl_conventions::str_has_extension(
+                    path.to_string_lossy().as_ref(),
+                    bsl_conventions::BSL_EXTENSION,
+                )
+            })
+            .count();
+        let profile = crate::graph_db::recompute_module_profiles(
+            &project,
+            &universe.files,
+            std::slice::from_ref(&extra),
+        )
+        .unwrap();
+        let profile = profile.get(&extra.to_string_lossy().to_string()).unwrap();
+        let roots = project.search_roots.as_ref().unwrap();
+        let planned = crate::graph_db::caller_delta_plan(
+            &crate::cache::graph_db_path(root),
+            &[(&extra.to_string_lossy(), profile)],
+            Some(roots),
+        )
+        .unwrap();
+        assert!(
+            planned.as_ref().is_some_and(|callers| callers
+                .iter()
+                .any(|path| path.ends_with("CommonModules/Сервер/Ext/Module.bsl"))),
+            "caller delta must select the unresolved caller; sig={}, exports={:?}, refs={unresolved_rows:?}, plan={planned:?}",
+            profile.sig_hash,
+            profile.exported_lower
+        );
+        assert_eq!(planned.as_ref().unwrap().len(), 1, "fixture has one dependent caller");
+        let affected_modules = 1 + planned.as_ref().unwrap().len();
+        assert_eq!(
+            current_modules, 3,
+            "fixture currently has the new module and two existing modules"
+        );
+        assert_eq!(affected_modules, 2, "the delta is the new module plus its proven caller");
+        assert!(
+            affected_modules * 2 > current_modules,
+            "affected/current modules = {affected_modules}/{current_modules}; safe caller closure exceeds half"
+        );
+        assert!(matches!(
+            graph.try_incremental_reload(root, 2, 0),
+            PublishAttemptOutcome::Published
+        ));
+        compare_cold();
+
+        std::fs::remove_file(&extra).unwrap();
+        let removed = graph.try_incremental_reload(root, 3, 0);
+        let (was_published, outcome) = match removed {
+            PublishAttemptOutcome::Published => (true, "published".to_owned()),
+            PublishAttemptOutcome::FallBack => (false, "full-build fallback".to_owned()),
+            PublishAttemptOutcome::Refused(failure) => (false, failure.message),
+        };
+        assert!(
+            was_published,
+            "delete should publish incrementally ({outcome}); status={:?}; decisions={:?}",
+            graph.status(),
+            lock_recover(&graph.incremental_decisions)
+        );
+        compare_cold();
+    }
+
+    #[test]
+    fn metadata_version_bump_and_touch_publish_without_bsl_reprojection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_extension_workspace(root, false);
+        let config_xml_v1 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties>
+            <Name>Тестовая</Name>
+            <Version>1.0.0.1</Version>
+            <Comment>Базовая версия</Comment>
+        </Properties>
+    </Configuration>
+</MetaDataObject>"#;
+        write(root, "ext/a/Configuration.xml", config_xml_v1);
+        let module_xml = root.join("CommonModules/Сервер.xml");
+        let module_v1 = std::fs::read_to_string(&module_xml).unwrap().replace(
+            "<Name>Сервер</Name>",
+            "<Name>Сервер</Name><Comment>Исходный комментарий</Comment>",
+        );
+        std::fs::write(&module_xml, module_v1).unwrap();
+
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache);
+        graph.ensure_loading();
+        wait_ready(&graph);
+
+        // Edit extension Configuration.xml and a module comment only: BSL bytes stay unchanged.
+        let config_xml_v2 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties>
+            <Name>Тестовая</Name>
+            <Version>1.0.0.2</Version>
+            <Comment>Обновленная версия</Comment>
+        </Properties>
+    </Configuration>
+</MetaDataObject>"#;
+        write(root, "ext/a/Configuration.xml", config_xml_v2);
+        let module_v2 = std::fs::read_to_string(&module_xml)
+            .unwrap()
+            .replace("Исходный комментарий", "Обновленный комментарий");
+        std::fs::write(&module_xml, module_v2).unwrap();
+        let full_builds_before =
+            graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = graph.try_incremental_reload(root, 2, 0);
+        assert!(
+            matches!(outcome, PublishAttemptOutcome::Published),
+            "version bump and comment edit must not fall back to full rebuild; decisions: {:?}",
+            lock_recover(&graph.incremental_decisions)
+        );
+
+        // Rewriting identical metadata bytes models a touch-only event: the scan diff is empty.
+        write(root, "ext/a/Configuration.xml", config_xml_v2);
+        let outcome = graph.try_incremental_reload(root, 3, 0);
+        assert!(
+            matches!(outcome, PublishAttemptOutcome::Published),
+            "an empty content diff must acknowledge the event without a full rebuild; decisions: {:?}",
+            lock_recover(&graph.incremental_decisions)
+        );
+        assert_eq!(
+            lock_recover(&graph.incremental_decisions).as_slice(),
+            ["published", "published"],
+            "both no-op publications must avoid the full-build fallback"
+        );
+        assert_eq!(
+            graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst),
+            full_builds_before,
+            "extension version/comment changes publish without a full graph build"
+        );
     }
 }

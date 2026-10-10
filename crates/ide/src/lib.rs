@@ -44,8 +44,9 @@ pub use folding::{FoldingRange, FoldingRangeKind};
 pub use formatting::{FormattingConfig, FormattingResult};
 pub use graph::{
     build_workspace_graph_rows, call_site_absence_reason, classify_graph_id, confidence_label,
-    method_graph_id, method_id_for_path, module_id_of_method, rank_resolve_candidates,
-    reproject_changed_modules, resolve_name_segment, scope_for_path, warm_batch_config_roots,
+    folded_common_scope_for_path, form_key_for_path, method_graph_id, method_id_for_path,
+    module_id_of_method, rank_resolve_candidates, reproject_changed_modules,
+    reproject_metadata_owners, resolve_name_segment, scope_for_path, warm_batch_config_roots,
     BatchDbOpener, ChunkRow, Direction, EdgeRef, FusedChunkSink, GraphBuildSummary,
     GraphBuildTicker, GraphContext, GraphDetail, GraphError, GraphIdKind, GraphOverview,
     GraphRowSink, ModuleMethod, NeighborsParams, NeighborsResult, NodeRef, NodeResult,

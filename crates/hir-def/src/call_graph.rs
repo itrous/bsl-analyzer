@@ -118,6 +118,9 @@ pub struct GraphMethodEntry {
     pub name: Name,
     pub is_export: bool,
     pub dispatch: MethodDispatch,
+    /// Hash of the declaration header, including its parameter list and export marker.
+    /// Filled by the graph index from the same file text used to parse this item tree.
+    pub signature_hash: u64,
     /// Range of the declaration's name token — anchors the start of the signature.
     pub name_range: TextRange,
     /// End of the declaration header (closing `)` or export keyword) — anchors the
@@ -673,6 +676,7 @@ pub fn extract_graph_methods(item_tree: &ItemTree) -> Vec<GraphMethodEntry> {
             dispatch: MethodDispatch::from_annotation(
                 method.annotations().first().map(|a| &a.kind),
             ),
+            signature_hash: 0,
             name_range: method.name_range(),
             sig_end: method.sig_end(),
             source_range: method.source_range(),

@@ -791,7 +791,7 @@ fn indexing_workspace_responses_defensive_retry() {
     )
     .unwrap();
     let response =
-        crate::finish_indexed_search(retry, state.workspace_indexing(), Some(6000)).unwrap();
+        crate::finish_indexed_search(retry, state.workspace_indexing(), Some(6000), false).unwrap();
     let body = response.structured_content.unwrap();
     assert_scope(&body, &["lexical", "semantic"]);
     assert_eq!(body["status"], "not_ready");

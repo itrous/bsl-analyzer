@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU8;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -68,9 +68,11 @@ pub(super) struct Published {
     /// Search roots paired with this publication: from the build snapshot for a fresh
     /// artifact, or from the fingerprint-verified live project for cached adoption.
     pub(super) search_roots: Option<bsl_search::WorkspaceRoots>,
-    /// The hub position read before this publication's build scanned disk (see
-    /// [`GraphState::observation`]). `None` for a publication that scanned nothing — the
-    /// boot's stale cache — which therefore consumes no marks.
+    /// The highest hub position known to be reflected by this publication. A successful
+    /// build initializes it from the position read before its disk scan; a complete clean
+    /// comparison against the same fingerprint may advance it under `publication_gate`.
+    /// `None` for a publication that scanned nothing — the boot's stale cache — which
+    /// therefore consumes no marks.
     pub(super) observed_through: Option<u64>,
 }
 
@@ -95,6 +97,7 @@ pub(super) struct Inner {
     pub(super) status: GraphStatus,
     pub(super) published: Option<Published>,
     pub(super) indexing_unread_files: Option<usize>,
+    pub(super) build_ticker: Option<Arc<ide::GraphBuildTicker>>,
     /// The ticket of the build holding the slot. Written with the grant and cleared with the
     /// outcome, so a slot that reads as taken always names what it was taken for.
     pub(super) claimed: Option<super::debt::BuildTicket>,
@@ -138,6 +141,9 @@ impl Drop for CarriedTicket<'_> {
 /// pre-scan that follows it.
 #[cfg(test)]
 pub(super) type PostClaimHook = Arc<dyn Fn(&GraphState) + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) type BuildCandidateHook = Arc<dyn Fn(&GraphState) + Send + Sync>;
 
 /// The barrier a test runs on the watcher's own thread, between taking the continuation latch
 /// and sampling the alarm counter.
@@ -242,7 +248,9 @@ enum Executor {
 enum ReloadClaim {
     Claimed,
     /// Disk matches the published build and no project reload is outstanding.
-    NotOwed,
+    NotOwed {
+        comparison: Option<ComparisonProof>,
+    },
     /// A difference WAS measured, and every account that could have paid for the attempt has
     /// run out. Nothing is answered by this: the debts stand, their explanation stands, and
     /// only fresh work opens a budget that can act on them.
@@ -254,6 +262,15 @@ enum ReloadClaim {
     /// The daemon has asked its owners to leave. Not a refusal and not a failure: nothing is
     /// dropped, nothing is retried, and no debt is recorded — this generation is going.
     Stopping,
+}
+
+/// A clean disk comparison of the exact published generation and fingerprint. The proof is
+/// revalidated under `publication_gate` before it advances that publication's fact frontier.
+#[derive(Clone, Copy)]
+struct ComparisonProof {
+    generation: u64,
+    fingerprint: crate::graph_db::GraphFp,
+    through: u64,
 }
 
 /// Handle to the workspace call graph. Cheap to clone (shared `Arc`s).
@@ -301,6 +318,8 @@ pub(crate) struct GraphState {
     /// A barrier, not a sleep: it runs once, on the building thread, at one named point.
     #[cfg(test)]
     pub(super) post_claim_hook: Option<PostClaimHook>,
+    #[cfg(test)]
+    pub(super) build_candidate_hook: Option<BuildCandidateHook>,
     /// Runs on the thread handing a stale publication's catch-up over, after the successor has
     /// been spawned and before the hand-over returns — the window in which two builds hold one
     /// mandate between them.
@@ -433,6 +452,10 @@ pub(crate) struct GraphState {
     /// The highest context-dirty mark the search engine placed for a render this graph could
     /// not serve, not yet registered. See [`OwedContextMarks`].
     pub(super) owed_context_marks: Arc<std::sync::atomic::AtomicI64>,
+    /// Highest hub fact observed while those marks were reported. Written before the mark
+    /// high-water and never reset, so a concurrent registration can only pair marks with an
+    /// equal or later fact.
+    pub(super) owed_context_fact: Arc<AtomicU64>,
     /// This process's hold on the graph file, shared with the lease observer that lets it go.
     pub(super) access: Arc<Mutex<GraphAccess>>,
     /// Who publishes through this graph, in every `publication_id` it writes.
@@ -511,6 +534,7 @@ impl GraphState {
                 carrier: 0,
                 carries: 0,
                 indexing_unread_files: None,
+                build_ticker: None,
             })),
             scan: Arc::new(Mutex::new(None)),
             workspace_root,
@@ -528,6 +552,8 @@ impl GraphState {
             background_snapshot_failure: Arc::new(AtomicU8::new(0)),
             #[cfg(test)]
             post_claim_hook: None,
+            #[cfg(test)]
+            build_candidate_hook: None,
             #[cfg(test)]
             handover_hook: None,
             #[cfg(test)]
@@ -566,6 +592,7 @@ impl GraphState {
             first_build_kicks: Arc::new(AtomicUsize::new(0)),
             claims: Arc::new(AtomicUsize::new(0)),
             owed_context_marks: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            owed_context_fact: Arc::new(AtomicU64::new(0)),
             access: Arc::new(Mutex::new(GraphAccess::NotHeld)),
             publication_owner: crate::workspace_lease::new_token(),
             publications: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -594,6 +621,7 @@ impl GraphState {
     pub(crate) fn owed_context_marks(&self) -> OwedContextMarks {
         OwedContextMarks {
             high: Arc::clone(&self.owed_context_marks),
+            fact: Arc::clone(&self.owed_context_fact),
             alarms: Arc::clone(&self.alarms),
             hub: self.change_hub.clone(),
         }
@@ -601,13 +629,15 @@ impl GraphState {
 
     /// Register the marks reported through [`OwedContextMarks`] as marks this graph consumes.
     ///
-    /// Under the fact the hub stands at NOW, not fact `0`: a consumption clears every mark up to
-    /// its bound, and a mark an `.xml` change placed before these, for a fact no publication has
-    /// observed yet, must not be cleared against a graph that predates that change.
+    /// Use the hub frontier captured by the provider report, not the later fact at registration:
+    /// a deferred duplicate mark must not become fresh merely because another event arrived.
+    /// The provider stores the fact before the mark high-water; swapping the high-water before
+    /// loading the monotone fact can over-cover a concurrent report, but cannot under-cover it.
     pub(super) fn register_owed_context_marks(&self) {
         let high = self.owed_context_marks.swap(0, Ordering::SeqCst);
         if high > 0 {
-            self.marks_placed(high, self.observation());
+            let fact = self.owed_context_fact.load(Ordering::SeqCst);
+            self.marks_placed(high, fact);
         }
     }
 
@@ -946,6 +976,43 @@ impl GraphState {
                 return;
             }
             let decision = lock_recover(&self.debt).decide(Instant::now(), facts);
+            if let Some(start) = decision.start {
+                tracing::info!(
+                    action = "build",
+                    trigger = start.trigger,
+                    executor = ?executor,
+                    "graph debt decision"
+                );
+            }
+            if decision.check {
+                tracing::info!(
+                    action = "compare_disk",
+                    trigger = "disk_event",
+                    executor = ?executor,
+                    "graph debt decision"
+                );
+            }
+            if decision.probe {
+                tracing::info!(
+                    action = "probe_recovery",
+                    trigger = "recovery",
+                    executor = ?executor,
+                    "graph debt decision"
+                );
+            }
+            if decision.flush_hook.any() {
+                let trigger = if decision.flush_hook.marks {
+                    "owed_context_marks"
+                } else {
+                    "published_context_refresh"
+                };
+                tracing::info!(
+                    action = "refresh_contexts",
+                    trigger,
+                    executor = ?executor,
+                    "graph debt decision"
+                );
+            }
             let mut acted = false;
             if let Some(start) = decision.start {
                 // The first build of an idle graph is not this executor's to take. Nothing is
@@ -1064,7 +1131,7 @@ impl GraphState {
                 }
                 // A forced claim is never refused for want of drift, so this is the ordinary
                 // comparison answering the change: disk still matches the published build.
-                ReloadClaim::NotOwed => {
+                ReloadClaim::NotOwed { comparison } => {
                     let mut debt = lock_recover(&self.debt);
                     debt.change_answered(read_before_claim.min(self.scan_watermark()));
                     // The retry this start was owed has now run: it compared and found the
@@ -1072,6 +1139,7 @@ impl GraphState {
                     debt.failure_answered();
                     drop(debt);
                     self.clear_failed_reload_slot();
+                    self.record_comparison_and_consume_marks(comparison, read_before_claim);
                     StartOutcome::AnsweredWithoutBuilding
                 }
                 // Measured, unpayable. Nothing is answered and nothing is retried: the debt
@@ -1098,12 +1166,13 @@ impl GraphState {
         match self.try_claim_reload(false) {
             ReloadClaim::Stopping => {}
             ReloadClaim::Claimed => self.spawn_reload(),
-            ReloadClaim::NotOwed => {
+            ReloadClaim::NotOwed { comparison } => {
                 let mut debt = lock_recover(&self.debt);
                 debt.change_answered(read_before_claim.min(self.scan_watermark()));
                 debt.failure_answered();
                 drop(debt);
                 self.clear_failed_reload_slot();
+                self.record_comparison_and_consume_marks(comparison, read_before_claim);
             }
             // See the same arm in `start_build`: a refusal for want of a sponsor answers
             // nothing about disk.
@@ -1239,16 +1308,24 @@ impl GraphState {
         // reply carrying the old number clears nothing: otherwise an offer made before that
         // publication would report ITS bits as taken.
         let (revision, owed) = lock_recover(&self.debt).claim_hook();
-        if !owed.any() {
+        let observed = self.consuming_observation();
+        let bound = observed.and_then(|observed| lock_recover(&self.debt).marks.bound(observed));
+        if !owed.any() && bound.is_none() {
             return false;
         }
-        let outcome = self.fire_hook(0, owed.topology, owed.roots);
+        let outcome = self.fire_hook(bound.unwrap_or(0), owed.topology, owed.roots);
         let handled = HookDebt {
             topology: owed.topology && outcome.topology_handled,
             roots: owed.roots && outcome.roots_handled,
+            marks: bound.is_some() && outcome.topology_handled,
         };
         let mut debt = lock_recover(&self.debt);
         debt.hook_handled(revision, handled);
+        if let (Some(observed), Some(bound)) = (observed, bound) {
+            if outcome.topology_handled {
+                debt.marks.consumed(observed, bound);
+            }
+        }
         if !handled.any() {
             // Offered and took nothing. That is not an action, and asking again this turn is
             // how a consumer that refuses for as long as it lives — a search engine that never
@@ -1563,6 +1640,19 @@ impl GraphState {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_build_candidate_hook_for_test(mut self, hook: BuildCandidateHook) -> Self {
+        self.build_candidate_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn enter_build_candidate_hook(&self) {
+        if let Some(hook) = self.build_candidate_hook.clone() {
+            hook(self);
+        }
+    }
+
     /// Attach the barrier described by [`Self::handover_hook`].
     #[cfg(test)]
     pub(super) fn with_handover_hook(mut self, hook: PostClaimHook) -> Self {
@@ -1771,7 +1861,7 @@ impl GraphState {
     }
 
     /// The observation of the current publication, if marks may be consumed against it: a
-    /// ready graph whose publication scanned disk (`observed_through` is set) and is neither
+    /// ready graph with a proven coverage frontier (`observed_through` is set) and is neither
     /// the boot's stale cache nor a build that straddled a write.
     pub(super) fn consuming_observation(&self) -> Option<u64> {
         let inner = lock_recover(&self.inner);
@@ -1824,9 +1914,70 @@ impl GraphState {
     fn consume_observed_marks(&self) {
         let _gate = lock_recover(&self.publication_gate);
         let Some(observed) = self.consuming_observation() else { return };
-        let Some(bound) = lock_recover(&self.debt).marks.bound(observed) else { return };
-        if self.fire_hook(bound, false, false).topology_handled {
-            lock_recover(&self.debt).marks.consumed(observed, bound);
+        self.consume_marks_through_while_published(observed);
+    }
+
+    /// An unchanged, complete disk comparison can extend the installed graph's fact coverage
+    /// without publishing or projecting it again. Persist that proof on the exact publication
+    /// it compared so marks placed later can use it too; failed context refreshes retain the
+    /// frontier and are retried by the ordinary hook-debt path.
+    fn record_comparison_and_consume_marks(&self, proof: Option<ComparisonProof>, cutoff: u64) {
+        let Some(proof) = proof else { return };
+        let _gate = lock_recover(&self.publication_gate);
+        let through = {
+            let mut inner = lock_recover(&self.inner);
+            if !matches!(inner.status, GraphStatus::Ready { .. }) {
+                return;
+            }
+            let Some(published) = inner.published.as_mut() else { return };
+            if published.generation != proof.generation
+                || published.fingerprint != proof.fingerprint
+                || published.stale
+                || published.force_stale
+            {
+                return;
+            }
+            let debt = lock_recover(&self.debt);
+            if debt.owes_recovery() {
+                return;
+            }
+            let compared_through = proof.through.min(cutoff);
+            let observed_through = published.observed_through.get_or_insert(compared_through);
+            *observed_through = (*observed_through).max(compared_through);
+            let through = *observed_through;
+            drop(debt);
+            through
+        };
+        // A recovery obligation or a stale transition may have appeared while the comparison
+        // was finishing. Recheck the existing consumption guards before calling the hook.
+        if self.consuming_observation().is_none() {
+            return;
+        }
+        self.consume_marks_through_while_published(through);
+        // This comparison can make every placed mark covered; clear its build schedule even
+        // when the context hook refuses, leaving only the independent hook retry debt.
+        self.settle_mark_obligation();
+    }
+
+    /// The publication gate is held by the caller; the caller has verified the current
+    /// publication is suitable for refreshing these contexts.
+    fn consume_marks_through_while_published(&self, through: u64) {
+        let Some(bound) = lock_recover(&self.debt).marks.bound(through) else { return };
+        let (revision, _) = lock_recover(&self.debt).claim_hook();
+        let outcome = self.fire_hook(bound, false, false);
+        if outcome.topology_handled {
+            let mut debt = lock_recover(&self.debt);
+            debt.marks.consumed(through, bound);
+            // A prior publication may have refused these already-covered marks and left
+            // hook debt behind. This successful render consumed those same placements;
+            // clear only that mark bit, and only if the offer revision did not change
+            // while the consumer ran. Topology/root refresh debt is independent.
+            debt.hook_handled(revision, HookDebt { topology: false, roots: false, marks: true });
+        } else {
+            let now = Instant::now();
+            let mut debt = lock_recover(&self.debt);
+            debt.record_hook(HookDebt { topology: false, roots: false, marks: true });
+            debt.pace_hook_refusal(now);
         }
     }
 
@@ -1835,7 +1986,8 @@ impl GraphState {
     /// while one runs.
     pub(super) fn settle_mark_obligation(&self) {
         let in_flight = self.drift_pending();
-        if lock_recover(&self.debt).settle_marks(Instant::now(), in_flight) {
+        let observed = self.consuming_observation();
+        if lock_recover(&self.debt).settle_marks_through(Instant::now(), in_flight, observed) {
             self.wake_watcher();
         }
     }
@@ -1885,13 +2037,21 @@ impl GraphState {
             let mut debt = lock_recover(&self.debt);
             debt.hook_handled(
                 revision,
-                HookDebt { topology: outcome.topology_handled, roots: outcome.roots_handled },
+                HookDebt {
+                    topology: outcome.topology_handled,
+                    roots: outcome.roots_handled,
+                    marks: bound.is_some() && outcome.topology_handled,
+                },
             );
             debt.record_hook(HookDebt {
                 topology: topology && !outcome.topology_handled,
                 roots: !outcome.roots_handled,
+                marks: bound.is_some() && !outcome.topology_handled,
             });
-            if !outcome.topology_handled && !outcome.roots_handled {
+            if topology && !outcome.topology_handled
+                || !outcome.roots_handled
+                || bound.is_some() && !outcome.topology_handled
+            {
                 // Offered this publication's refreshes and took none of them. A refusal earns
                 // the same finite pause here as on an executor's turn: without one the pass
                 // records what was refused, the executor it drives at the end finds that debt
@@ -1899,9 +2059,10 @@ impl GraphState {
                 // breath. Paced after the record, so it is the debt now standing that waits.
                 debt.pace_hook_refusal(Instant::now());
             }
-            if let (Some(observed), Some(bound), true) = (observed, bound, outcome.topology_handled)
-            {
-                debt.marks.consumed(observed, bound);
+            if let (Some(observed), Some(bound)) = (observed, bound) {
+                if outcome.topology_handled {
+                    debt.marks.consumed(observed, bound);
+                }
             }
         }
         self.settle_mark_obligation();
@@ -2049,6 +2210,64 @@ impl GraphState {
         lock_recover(&self.inner).status.clone()
     }
 
+    /// A bounded read for the cold-loading response. A ready snapshot that is reloading never
+    /// exposes a build estimate, and a busy lifecycle lock simply leaves it unknown.
+    pub(crate) fn cold_build_eta_seconds(&self) -> Option<u64> {
+        let inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        if inner.status != GraphStatus::Loading || inner.published.is_some() {
+            return None;
+        }
+        inner.build_ticker.as_ref()?.eta_seconds()
+    }
+
+    pub(super) fn start_cold_build_ticker(&self, ticker: Arc<ide::GraphBuildTicker>) {
+        let mut inner = lock_recover(&self.inner);
+        if inner.status == GraphStatus::Loading && inner.published.is_none() {
+            inner.build_ticker = Some(ticker);
+        }
+    }
+
+    /// Finish the final measured interval only after the publication is installed.
+    pub(super) fn finish_cold_build_ticker(&self) {
+        let ticker = { lock_recover(&self.inner).build_ticker.take() };
+        if let Some(ticker) = ticker {
+            ticker.note("published", 0, 0, "");
+        }
+    }
+
+    pub(super) fn clear_cold_build_ticker(&self) {
+        lock_recover(&self.inner).build_ticker = None;
+    }
+
+    /// Whether a generation is being rebuilt while the installed snapshot remains
+    /// answerable. Readers use this to label cross-cache results consistently.
+    pub(crate) fn is_reloading(&self) -> bool {
+        let inner = lock_recover(&self.inner);
+        matches!(inner.status, GraphStatus::Loading)
+            || inner
+                .published
+                .as_ref()
+                .is_some_and(|published| published.reload == ReloadState::Running)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reload_running_for_test(&self) {
+        if let Some(published) = lock_recover(&self.inner).published.as_mut() {
+            published.reload = ReloadState::Running;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_loading_for_test(&self) {
+        let mut inner = lock_recover(&self.inner);
+        inner.status = GraphStatus::Loading;
+        inner.build_ticker = None;
+    }
+
     /// Who watches this graph's drift, and how. A graph whose watcher never started or has
     /// left is unobserved: nothing would notice it falling behind.
     pub(crate) fn drift_watch(&self) -> crate::tools::location::DriftWatch {
@@ -2079,22 +2298,35 @@ impl GraphState {
 
     /// Request-safe freshness from the publication paired with this pre-opened snapshot.
     pub(crate) fn cached_freshness(&self, snapshot: &super::GraphSnapshot) -> Freshness {
-        let (stale, reload, topology) = lock_recover(&self.inner)
-            .published
-            .as_ref()
-            .filter(|published| published.generation == snapshot.generation)
-            .map(|published| {
-                (
-                    published.stale || published.force_stale,
-                    published.reload.label(),
-                    published.fingerprint.topology,
-                )
-            })
-            // No publication carries this snapshot's generation any more: a newer revision
-            // replaced it while this request was in flight, so the data being returned is by
-            // construction behind. Reporting the snapshot's own `force_stale` here would call
-            // an obsolete revision fresh.
-            .unwrap_or((true, "none", snapshot.fingerprint.topology));
+        let (stale, reload, topology, building) = {
+            let inner = lock_recover(&self.inner);
+            let publication = inner
+                .published
+                .as_ref()
+                .filter(|published| published.generation == snapshot.generation)
+                .map(|published| {
+                    (
+                        published.stale || published.force_stale,
+                        published.reload.label(),
+                        published.fingerprint.topology,
+                    )
+                })
+                // No publication carries this snapshot's generation any more: a newer revision
+                // replaced it while this request was in flight, so the data being returned is by
+                // construction behind. Reporting the snapshot's own `force_stale` here would call
+                // an obsolete revision fresh.
+                .unwrap_or((true, "none", snapshot.fingerprint.topology));
+            (
+                publication.0,
+                publication.1,
+                publication.2,
+                matches!(&inner.status, GraphStatus::Loading)
+                    || inner.published.as_ref().is_some_and(|published| {
+                        published.generation == snapshot.generation
+                            && published.reload == ReloadState::Running
+                    }),
+            )
+        };
         let drift_watch = self.drift_watch();
         Freshness {
             revision: snapshot.generation,
@@ -2103,6 +2335,7 @@ impl GraphState {
             // is known to be behind as fresh — the request path no longer walks disk, so this
             // is the only place the fact can still surface.
             stale: stale
+                || building
                 || snapshot.force_stale
                 || snapshot.unread_files() > 0
                 || self.drift_pending()
@@ -2446,6 +2679,7 @@ impl GraphState {
             if !matches!(inner.status, GraphStatus::Idle | GraphStatus::Failed(_)) {
                 return false;
             }
+            inner.build_ticker = None;
             inner.status = GraphStatus::Loading;
             let mut debt = lock_recover(&self.debt);
             let forced_through = debt.forced_fact();
@@ -2512,6 +2746,7 @@ impl GraphState {
         if inner.status != GraphStatus::Idle {
             return false;
         }
+        inner.build_ticker = None;
         inner.status = GraphStatus::Loading;
         let mut debt = lock_recover(&self.debt);
         let forced_through = debt.forced_fact();
@@ -2569,6 +2804,7 @@ impl GraphState {
         if inner.status == GraphStatus::Loading {
             inner.status = GraphStatus::Idle;
             inner.claimed = None;
+            inner.build_ticker = None;
         }
     }
 
@@ -2608,7 +2844,8 @@ impl GraphState {
         if !self.lease.owns_caches_now() {
             return ReloadClaim::Held;
         }
-        let disk = (!force).then(|| self.current_disk_fp()).flatten();
+        let disk_receipt = (!force).then(|| self.current_disk_fp_with_watermark()).flatten();
+        let disk = disk_receipt.map(|(fingerprint, clean, _)| (fingerprint, clean));
         // Read BEFORE the slot is granted, never after: this is the cutoff the build's proof
         // may cover, and reading it early can only under-claim. `observation` takes the hub's
         // own lock, which is why it is not taken under `inner`.
@@ -2621,8 +2858,9 @@ impl GraphState {
         if self.stop.is_stopped() {
             return ReloadClaim::Stopping;
         }
+        let ready = matches!(inner.status, GraphStatus::Ready { .. });
         let Some(published) = inner.published.as_mut() else {
-            return ReloadClaim::NotOwed;
+            return ReloadClaim::NotOwed { comparison: None };
         };
         if published.reload == ReloadState::Running {
             return ReloadClaim::Running;
@@ -2663,7 +2901,22 @@ impl GraphState {
             inner.claimed = Some(ticket);
             ReloadClaim::Claimed
         } else {
-            ReloadClaim::NotOwed
+            let comparison = if !force
+                && ready
+                && !published.stale
+                && !published.force_stale
+                && disk_receipt.is_some_and(|(_, clean, _)| clean)
+                && !lock_recover(&self.debt).owes_recovery()
+            {
+                disk_receipt.map(|(_, _, through)| ComparisonProof {
+                    generation: published.generation,
+                    fingerprint: published.fingerprint,
+                    through,
+                })
+            } else {
+                None
+            };
+            ReloadClaim::NotOwed { comparison }
         }
     }
 
@@ -2830,12 +3083,18 @@ pub(super) enum GraphAccess {
 #[derive(Clone)]
 pub(crate) struct OwedContextMarks {
     high: Arc<std::sync::atomic::AtomicI64>,
+    fact: Arc<AtomicU64>,
     alarms: Arc<AtomicUsize>,
     hub: Option<WorkspaceChangeHub>,
 }
 
 impl OwedContextMarks {
     pub(crate) fn record(&self, mark_high: i64) {
+        // The search engine calls this while holding its own lock. Reading the hub's short-lived
+        // accumulator mutex follows the same engine -> hub order as the existing wake below; it
+        // never waits for graph publication or search-engine work.
+        let fact = self.hub.as_ref().map_or(u64::MAX, WorkspaceChangeHub::seq);
+        self.fact.fetch_max(fact, Ordering::SeqCst);
         self.high.fetch_max(mark_high, Ordering::SeqCst);
         self.alarms.fetch_add(1, Ordering::SeqCst);
         if let Some(hub) = &self.hub {
@@ -3232,10 +3491,17 @@ mod tests {
             armed.store(true, Ordering::SeqCst);
 
             let observed = hub.seq();
+            // A body-only BSL edit would be accepted by the incremental path, which
+            // deliberately has no full-build post-claim barrier. Change the module's
+            // XML execution context instead: this is a real unsupported local topology
+            // delta and must enter the full-build admission this test observes.
+            let descriptor = root.join("CommonModules/Сервер.xml");
+            let xml = std::fs::read_to_string(&descriptor).unwrap();
+            assert!(xml.contains("<Global>false</Global>"), "fixture starts non-global");
             super::super::test_support::write(
                 root,
-                "CommonModules/Сервер/Ext/Module.bsl",
-                "Функция Считать() Экспорт Возврат 2; КонецФункции",
+                "CommonModules/Сервер.xml",
+                &xml.replace("<Global>false</Global>", "<Global>true</Global>"),
             );
             let admitted_fact = crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
             match lane {
@@ -3346,7 +3612,7 @@ mod tests {
         // A comparison that will answer without building — disk matches what is published —
         // standing beside a hook revision nobody has taken.
         graph.record_change(graph.observation());
-        graph.record_hook_debt(HookDebt { topology: true, roots: false });
+        graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
         graph.drive();
 
         assert_eq!(
@@ -3400,7 +3666,7 @@ mod tests {
         wait_ready(&graph);
         armed.store(true, Ordering::SeqCst);
 
-        graph.record_hook_debt(HookDebt { topology: true, roots: false });
+        graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
         let first = {
             let graph = graph.clone();
             std::thread::spawn(move || graph.drive())
@@ -3462,7 +3728,7 @@ mod tests {
         assert_eq!(fires.load(Ordering::SeqCst), 0, "an offer was made for a debt nobody owes",);
 
         // The control, so the assertion is not about a hook that never fires at all.
-        graph.record_hook_debt(HookDebt { topology: true, roots: false });
+        graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
         graph.flush_hook_obligations();
         assert_eq!(fires.load(Ordering::SeqCst), 1, "the offer that IS owed was never made");
     }
@@ -3508,7 +3774,7 @@ mod tests {
         wait_ready(&graph);
         armed.store(true, Ordering::SeqCst);
 
-        graph.record_hook_debt(HookDebt { topology: true, roots: false });
+        graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
         let flushing = {
             let graph = graph.clone();
             std::thread::spawn(move || graph.drive())
@@ -3520,7 +3786,7 @@ mod tests {
         );
 
         // A SECOND topology change, while the first offer is still out with the hook.
-        graph.record_hook_debt(HookDebt { topology: true, roots: false });
+        graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
         release.store(true, Ordering::SeqCst);
         flushing.join().expect("the parked flush finished");
 
@@ -3572,7 +3838,7 @@ mod tests {
         *lock_recover(&slot) = Some(graph.clone());
         armed.store(true, Ordering::SeqCst);
 
-        graph.record_hook_debt(HookDebt { topology: true, roots: false });
+        graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
         graph.drive();
 
         assert_eq!(
@@ -3612,7 +3878,7 @@ mod tests {
         wait_ready(&graph);
         armed.store(true, Ordering::SeqCst);
 
-        graph.record_hook_debt(HookDebt { topology: true, roots: false });
+        graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
         graph.drive();
         graph.drive();
         assert_eq!(
@@ -4306,7 +4572,7 @@ mod tests {
         );
         let before = offers.load(Ordering::SeqCst);
 
-        graph.record_hook_debt(HookDebt { topology: true, roots: true });
+        graph.record_hook_debt(HookDebt { topology: true, roots: true, marks: false });
         graph.drive();
 
         let asked = offers.load(Ordering::SeqCst) - before;
@@ -4853,7 +5119,7 @@ mod tests {
         let after_publish = refreshes.load(Ordering::SeqCst);
 
         // What the boot's topology mismatch leaves behind, with no publish left to carry it.
-        graph.record_hook_debt(HookDebt { topology: true, roots: false });
+        graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
         graph.flush_hook_obligations();
 
         assert_eq!(refreshes.load(Ordering::SeqCst), after_publish + 1, "the request is honoured");
@@ -4927,8 +5193,8 @@ mod tests {
             });
         }
         graph.record_change_quietly(graph.observation());
-        graph.record_hook_debt(HookDebt { topology: true, roots: false });
-        graph.record_hook_debt(HookDebt { topology: false, roots: true });
+        graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
+        graph.record_hook_debt(HookDebt { topology: false, roots: true, marks: false });
         lock_recover(&graph.debt).place_marks(Instant::now(), 41, 0);
 
         let _newer = crate::workspace_lease::WorkspaceLease::claim(root);
@@ -6007,7 +6273,11 @@ mod tests {
         release_tx.send(()).expect("the parked pass is still running");
         publisher.join().expect("the publish pass completed");
         assert!(graph.marks_pending(), "an unhandled consume dropped the marks");
-        assert!(graph.owes_marks(), "nothing is on its way to consume them, so a build is owed");
+        assert!(graph.hook_debt().marks, "the refused covered refresh remains owed to the hook");
+        assert!(
+            !graph.owes_marks(),
+            "the publication already observed these facts; a refused refresh does not need a graph build"
+        );
     }
 
     /// Consuming marks against a publication and installing the next one are one critical
@@ -8903,7 +9173,7 @@ mod tests {
                     "the publish pass never reached its hook",
                 );
                 // Raised while the pass owns the offer, and taken by nobody until it returns.
-                graph.record_hook_debt(HookDebt { topology: true, roots: false });
+                graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
                 let before = fires.load(Ordering::SeqCst);
                 graph.drive();
                 during_turn.store(fires.load(Ordering::SeqCst) - before, Ordering::SeqCst);
@@ -9818,6 +10088,280 @@ mod tests {
         assert!(!graph.marks_pending(), "the next publication did not consume them");
     }
 
+    #[test]
+    fn an_unchanged_disk_comparison_consumes_marks_without_republishing() {
+        use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let hub = super::super::test_support::workspace_hub(root);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        let mark_attempts = Arc::new(AtomicUsize::new(0));
+        let graph = GraphState::for_workspace(root.to_path_buf())
+            .with_change_hub(hub.clone())
+            .with_publish_hook({
+                let offered = Arc::clone(&offered);
+                let mark_attempts = Arc::clone(&mark_attempts);
+                Arc::new(move |signal: GraphPublishSignal| {
+                    lock_recover(&offered).push(signal.mark_bound);
+                    let handled =
+                        signal.mark_bound == 0 || mark_attempts.fetch_add(1, Ordering::SeqCst) > 0;
+                    GraphPublishOutcome { topology_handled: handled, roots_handled: true }
+                })
+            });
+        graph.set_watch(super::super::watcher::WatchPhase::Running, None);
+        graph.ensure_loading();
+        wait_ready(&graph);
+        wait_publish_pass_within(&graph, WAIT_CEILING, 1);
+        lock_recover(&offered).clear();
+
+        let revision = graph.status_report().revision.expect("published graph revision");
+        let full_builds = graph.full_builds_started.load(Ordering::SeqCst);
+        let publication = graph.consuming_observation().expect("clean publication observation");
+        let metadata_path = root.join("Configuration.xml");
+        let same_bytes = fs::read(&metadata_path).unwrap();
+
+        // Order one: the complete comparison proves the same graph covers this new fact,
+        // before any context mark exists. That proof must survive for a later consumer.
+        let before = hub.seq().max(publication);
+        fs::write(&metadata_path, &same_bytes).unwrap();
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+                hub.seq() > before
+            }),
+            "the same-byte XML write did not reach the workspace hub"
+        );
+        let first_fact = hub.seq();
+        assert!(first_fact > publication, "the comparison must postdate the installed publication");
+        graph.record_change_quietly(first_fact);
+        graph.check_against_disk();
+
+        // The first context refresh refuses. The persisted comparison still proves this
+        // mark is covered, so retrying the hook must not schedule a graph build.
+        graph.marks_placed(7, first_fact);
+        assert!(graph.marks_pending(), "a refused hook must retain its mark");
+        graph.flush_hook_obligations();
+        assert!(!graph.marks_pending(), "the successful hook retry did not consume the mark");
+        assert_eq!(mark_attempts.load(Ordering::SeqCst), 2, "one refusal and one retry ran");
+
+        // Order two: a later fact is marked before its same-byte comparison. The prior
+        // comparison frontier must not claim it; the new exact scan may then advance it.
+        let before = hub.seq();
+        fs::write(&metadata_path, &same_bytes).unwrap();
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+                hub.seq() > before
+            }),
+            "the second same-byte XML write did not reach the workspace hub"
+        );
+        let second_fact = hub.seq();
+        assert!(second_fact > first_fact, "the second mark needs a newer fact");
+        graph.marks_placed(8, second_fact);
+        assert!(graph.marks_pending(), "the prior comparison cannot cover a newer fact");
+        graph.record_change_quietly(second_fact);
+        graph.check_against_disk();
+
+        let offered = lock_recover(&offered).clone();
+        assert!(
+            offered.contains(&7) && offered.contains(&8),
+            "the comparisons did not offer both proven mark bounds"
+        );
+        assert!(!graph.marks_pending(), "the successful hook did not consume the mark");
+        assert!(!graph.owes_marks(), "the comparison left a covered marks schedule armed");
+        assert!(!graph.drift_pending(), "the comparison left a graph reload in flight");
+        std::thread::sleep(super::super::debt::OWED_MARKS_GRACE + Duration::from_millis(100));
+        graph.drive();
+        assert!(!graph.owes_marks(), "the grace period re-armed a covered marks schedule");
+        assert!(!graph.drift_pending(), "the grace period started a covered graph reload");
+        assert_eq!(graph.status_report().revision, Some(revision));
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), full_builds);
+        hub.shutdown();
+    }
+
+    #[test]
+    fn deferred_context_mark_keeps_its_reported_fact() {
+        use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let hub = super::super::test_support::workspace_hub(root);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let graph = GraphState::for_workspace(root.to_path_buf())
+            .with_change_hub(hub.clone())
+            .with_publish_hook(Arc::new(|_| GraphPublishOutcome::HANDLED));
+        graph.set_watch(super::super::watcher::WatchPhase::Running, None);
+        graph.ensure_loading();
+        wait_ready(&graph);
+        wait_publish_pass_within(&graph, WAIT_CEILING, 1);
+
+        let revision = graph.status_report().revision.expect("published graph revision");
+        let full_builds = graph.full_builds_started.load(Ordering::SeqCst);
+        let observed = graph.consuming_observation().expect("clean publication observation");
+        let path = root.join("Configuration.xml");
+        let same_bytes = fs::read(&path).unwrap();
+        let before = hub.seq().max(observed);
+        fs::write(&path, &same_bytes).unwrap();
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+                hub.seq() > before
+            }),
+            "the first same-byte touch did not reach the hub"
+        );
+        let reported_fact = hub.seq();
+        let owed = graph.owed_context_marks();
+        owed.record(7);
+        graph.marks_placed(7, reported_fact);
+        graph.record_change_quietly(reported_fact);
+        graph.check_against_disk();
+        assert!(!graph.marks_pending(), "the no-op comparison did not consume the direct mark");
+
+        // The provider's report remains deferred while another hub event arrives. Registration
+        // must retain the fact at which it reported the mark, not rebind it to this later seq.
+        fs::write(&path, &same_bytes).unwrap();
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+                hub.seq() > reported_fact
+            }),
+            "the later same-byte touch did not advance the hub"
+        );
+        graph.register_owed_context_marks();
+        assert!(
+            !graph.marks_pending(),
+            "deferred registration rebound the already-consumed high mark to a newer hub fact"
+        );
+
+        let newer_fact = hub.seq();
+        owed.record(8);
+        graph.register_owed_context_marks();
+        assert!(graph.marks_pending(), "a new provider mark must keep its captured fact");
+        assert!(
+            lock_recover(&graph.debt).marks.placements() > 0,
+            "the prior no-op comparison cannot claim a later provider mark"
+        );
+
+        fs::write(&path, &same_bytes).unwrap();
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(5), || {
+                hub.seq() > newer_fact
+            }),
+            "the comparison touch for the newer provider mark did not reach the hub"
+        );
+        let comparison_fact = hub.seq();
+        graph.record_change_quietly(comparison_fact);
+        graph.check_against_disk();
+        assert!(!graph.marks_pending(), "a complete later comparison should consume the mark");
+
+        std::thread::sleep(super::super::debt::OWED_MARKS_GRACE + Duration::from_millis(100));
+        graph.drive();
+        assert_eq!(graph.status_report().revision, Some(revision));
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), full_builds);
+        hub.shutdown();
+    }
+
+    #[test]
+    fn refused_covered_mark_refresh_retries_without_a_graph_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook = {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move |signal: GraphPublishSignal| {
+                let handled = if signal.mark_bound > 0 {
+                    attempts.fetch_add(1, Ordering::SeqCst) > 1
+                } else {
+                    true
+                };
+                GraphPublishOutcome { topology_handled: handled, roots_handled: true }
+            }) as Arc<dyn Fn(GraphPublishSignal) -> GraphPublishOutcome + Send + Sync>
+        };
+        let graph = GraphState::for_workspace(dir.path().to_path_buf()).with_publish_hook(hook);
+        publish(&graph, Some(10), false, false);
+        let published_passes = graph.publish_passes.load(Ordering::SeqCst);
+        graph.marks_placed(5, 8);
+        assert!(graph.marks_pending(), "a refused hook left covered marks pending");
+
+        graph.flush_hook_obligations();
+        assert!(graph.marks_pending(), "two refusals must keep the covered mark pending");
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0);
+
+        graph.flush_hook_obligations();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "two refusals and one retry ran");
+        assert!(!graph.marks_pending(), "the successful hook consumed its covered mark");
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0);
+        assert_eq!(graph.publish_passes.load(Ordering::SeqCst), published_passes);
+    }
+
+    #[test]
+    fn a_later_covered_mark_success_clears_prior_hook_debt_without_an_extra_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move |signal: GraphPublishSignal| {
+                let handled = if signal.mark_bound > 0 {
+                    attempts.fetch_add(1, Ordering::SeqCst) > 0
+                } else {
+                    true
+                };
+                GraphPublishOutcome { topology_handled: handled, roots_handled: true }
+            }) as Arc<dyn Fn(GraphPublishSignal) -> GraphPublishOutcome + Send + Sync>
+        };
+        let graph = GraphState::for_workspace(dir.path().to_path_buf()).with_publish_hook(hook);
+        publish(&graph, Some(10), false, false);
+        let publish_passes = graph.publish_passes.load(Ordering::SeqCst);
+
+        graph.marks_placed(5, 8);
+        assert!(graph.marks_pending(), "first hook refusal keeps the mark placed");
+        assert!(graph.hook_debt().marks, "first hook refusal records mark refresh debt");
+        assert!(!graph.owes_marks(), "fact 8 is already covered by generation 10");
+
+        graph.marks_placed(6, 9);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "the second placement retries the hook");
+        assert!(!graph.marks_pending(), "the successful refresh consumed both covered placements");
+        assert!(!graph.hook_debt().marks, "successful consume clears the previous hook debt");
+        graph.flush_hook_obligations();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "cleared hook debt offers no duplicate retry"
+        );
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0);
+        assert_eq!(graph.publish_passes.load(Ordering::SeqCst), publish_passes);
+    }
+
+    #[test]
+    fn a_covered_mark_retry_does_not_hide_a_new_unobserved_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphState::for_workspace(dir.path().to_path_buf()).with_publish_hook(
+            Arc::new(|signal: GraphPublishSignal| GraphPublishOutcome {
+                topology_handled: signal.mark_bound == 0,
+                roots_handled: true,
+            }),
+        );
+        publish(&graph, Some(10), false, false);
+
+        graph.marks_placed(5, 8);
+        assert!(!lock_recover(&graph.debt).owes_marks(), "fact 8 is already covered by 10");
+
+        graph.marks_placed(6, 11);
+        assert!(graph.marks_pending(), "both refused covered work and fact 11 remain placed");
+        assert!(
+            lock_recover(&graph.debt).owes_marks(),
+            "fact 11 is beyond the publication and still requires a graph build"
+        );
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0);
+
+        let now = Instant::now() + super::super::debt::OWED_MARKS_GRACE + Duration::from_secs(1);
+        let decision = lock_recover(&graph.debt)
+            .decide(now, Facts { ready: true, owns: true, ..Facts::default() });
+        assert!(decision.start.is_some_and(|start| start.forced));
+    }
+
     /// A lazy first build that serves a stale cache hands its catch-up the admission it was
     /// granted — not a second one.
     ///
@@ -9904,11 +10448,15 @@ mod tests {
             root,
             super::super::scan::workspace_fingerprint(root),
         );
-        // Drift only a full rebuild answers: a module the cached build never had.
+        // A global-context change is deliberately outside the incremental projection. The
+        // successor must therefore reach the full-build publication window this test parks.
+        let descriptor = root.join("CommonModules/Сервер.xml");
+        let xml = std::fs::read_to_string(&descriptor).unwrap();
+        assert!(xml.contains("<Global>false</Global>"), "fixture starts non-global");
         super::super::test_support::write(
             root,
-            "CommonModules/Добавленный/Ext/Module.bsl",
-            "Процедура П() Экспорт КонецПроцедуры",
+            "CommonModules/Сервер.xml",
+            &xml.replace("<Global>false</Global>", "<Global>true</Global>"),
         );
 
         let successor_carried = Arc::new(AtomicBool::new(false));
