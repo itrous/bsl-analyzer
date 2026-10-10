@@ -1224,6 +1224,10 @@ fn handle_vfs_msg(
         if outcome.diagnostics_baseline_changed {
             state.request_workspace_diagnostic_refresh();
         }
+        // Semantic-tokens requests issued during the reindex were declined or
+        // cancelled; ask the client to pull them again, as the initial-load
+        // finalize does.
+        state.request_semantic_tokens_refresh();
     }
 
     Ok(())
