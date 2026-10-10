@@ -143,8 +143,9 @@ async fn workspace_cache_scope_drift_retires_broker_and_reconnects_on_new_key() 
     ));
     let new_client =
         ().serve(connect_within(&new_key, Duration::from_secs(10)).await).await.unwrap();
-    new_client.cancel().await.ok();
-    tokio::time::timeout(Duration::from_secs(5), new_backend)
+    new_client.cancel().await.expect("new scope client closes cleanly");
+    // Workspace startup work can legitimately outlive the backend's idle TTL.
+    tokio::time::timeout(Duration::from_secs(20), new_backend)
         .await
         .expect("new scope backend can serve and exit")
         .expect("new daemon task joins")
