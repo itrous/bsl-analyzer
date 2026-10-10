@@ -171,6 +171,7 @@ jobs:
           run_exact mcp-server graph::state::tests::the_boots_own_call_respects_a_spent_retry_budget
           run_exact mcp-server graph::watcher::the_watcher_records_and_does_not_decide::the_watcher_never_calls_a_recording_that_decides
           run_exact mcp-server graph::watcher::tests::an_advisory_nobody_keeps_current_says_so
+          run_exact mcp-server graph::watcher::tests::advisory_refresh_before_scope_guard_preserves_the_boot_project_on_drift
           run_exact mcp-server state::overlay_retry::every_wait_reads_the_stop::no_branch_of_the_loop_sleeps_without_reading_the_stop
           run_exact mcp-server state::overlay_retry::tests::a_stop_while_the_driver_is_asking_the_engine_is_not_slept_off
           run_exact mcp-server state::embed::embed_exit_status::every_exit_of_the_pass_says_how_it_ended
@@ -698,6 +699,7 @@ jobs:
           run_exact mcp-server graph::state::tests::the_boots_own_call_respects_a_spent_retry_budget
           run_exact mcp-server graph::watcher::the_watcher_records_and_does_not_decide::the_watcher_never_calls_a_recording_that_decides
           run_exact mcp-server graph::watcher::tests::an_advisory_nobody_keeps_current_says_so
+          run_exact mcp-server graph::watcher::tests::advisory_refresh_before_scope_guard_preserves_the_boot_project_on_drift
           run_exact mcp-server state::overlay_retry::every_wait_reads_the_stop::no_branch_of_the_loop_sleeps_without_reading_the_stop
           run_exact mcp-server state::overlay_retry::tests::a_stop_while_the_driver_is_asking_the_engine_is_not_slept_off
           run_exact mcp-server state::embed::embed_exit_status::every_exit_of_the_pass_says_how_it_ended
