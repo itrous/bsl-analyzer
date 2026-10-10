@@ -57,11 +57,15 @@ pub fn parse_common_attribute_xml(xml: &str) -> Result<CommonAttribute> {
                 // An unreadable setting on a known object: it may be the only thing that puts
                 // the object into the composition.
                 (ContentTarget::Object(..), None) => unattributed_members = true,
-                (ContentTarget::Unknown, usage) => {
-                    if usage != Some(CommonAttributeUse::DontUse) {
-                        unattributed_members = true;
-                    }
+                // `DontUse` keeps an object out and `Auto` defers to `AutoUse`, so only an
+                // explicit or unreadable `Use` could have put the unknown object in.
+                (ContentTarget::Unknown, Some(CommonAttributeUse::Use) | None) => {
+                    unattributed_members = true
                 }
+                (
+                    ContentTarget::Unknown,
+                    Some(CommonAttributeUse::DontUse | CommonAttributeUse::Auto),
+                ) => {}
             }
         }
     }
@@ -140,6 +144,30 @@ mod tests {
         let attr = parse_common_attribute_xml(xml).expect("parses");
         assert!(attr.unattributed_members);
         assert_eq!(attr.includes(MdoType::Catalog, "Любой"), None);
+    }
+
+    #[test]
+    fn unknown_reference_with_auto_follows_auto_use() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+    <CommonAttribute uuid="2dfd1ee1-6abb-4b03-b03e-08354ff0f6fc">
+        <Properties>
+            <Name>Странный</Name>
+            <Type><v8:Type>xs:boolean</v8:Type></Type>
+            <Content>
+                <xr:Item>
+                    <xr:Metadata>НовыйВидОбъекта.Х</xr:Metadata>
+                    <xr:Use>Auto</xr:Use>
+                </xr:Item>
+            </Content>
+            <AutoUse>DontUse</AutoUse>
+            <DataSeparation>DontUse</DataSeparation>
+        </Properties>
+    </CommonAttribute>
+</MetaDataObject>"#;
+        let attr = parse_common_attribute_xml(xml).expect("parses");
+        assert!(!attr.unattributed_members);
+        assert_eq!(attr.includes(MdoType::Catalog, "Любой"), Some(false));
     }
 
     #[test]
