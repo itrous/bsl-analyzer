@@ -598,6 +598,13 @@ pub struct InferenceContext<'db> {
 
     var_types: FxHashMap<NormName, TypeId>,
 
+    /// Locals whose latest write in walk order carried no type (an unknown value, or
+    /// `Для Каждого` over a collection whose element is unknown) while `var_types` still
+    /// holds an older one. A read answers `Unknown` for them: the older type no longer
+    /// describes the value, and checks made against it accused valid code. `var_types`
+    /// itself keeps the older type so the exported per-body summary does not change.
+    reset_vars: rustc_hash::FxHashSet<NormName>,
+
     implicit_locals: FxHashMap<String, ImplicitLocalInfo>,
 
     assigned_var_names: rustc_hash::FxHashSet<NormName>,
@@ -922,6 +929,7 @@ impl<'db> InferenceContext<'db> {
             owner,
             body: Arc::clone(body),
             var_types: FxHashMap::default(),
+            reset_vars: rustc_hash::FxHashSet::default(),
             implicit_locals: FxHashMap::default(),
             assigned_var_names: rustc_hash::FxHashSet::default(),
             assignment_target_names,
@@ -1289,6 +1297,20 @@ impl<'db> InferenceContext<'db> {
 
     fn is_unknown(&self, id: TypeId) -> bool {
         id == self.db.unknown()
+    }
+
+    /// A write that gives the local `ty` from here on in walk order.
+    fn record_local_type(&mut self, name: NormName, ty: TypeId) {
+        self.reset_vars.remove(&name);
+        self.var_types.insert(name, ty);
+    }
+
+    /// A write whose value has no type. The local stops reading as whatever an earlier
+    /// write made it; a local never typed before is left to bare-name resolution as it was.
+    fn reset_local_type(&mut self, name: NormName) {
+        if self.var_types.contains_key(&name) {
+            self.reset_vars.insert(name);
+        }
     }
 
     fn is_undefined(&self, id: TypeId) -> bool {
@@ -2255,6 +2277,7 @@ impl<'db> InferenceContext<'db> {
                 let value_ty = self.infer_expr(ExprId::from_idx(*value));
                 let target_id = ExprId::from_idx(*target);
                 let mut infer_target = true;
+                let mut reset_after_target = None;
 
                 let target_expr = self.body.expr_idx(*target).clone();
                 match &target_expr {
@@ -2338,8 +2361,10 @@ impl<'db> InferenceContext<'db> {
                                             ty: value_ty,
                                         }],
                                     });
-                                if !self.is_unknown(value_ty) {
-                                    self.var_types.insert(norm_key, value_ty);
+                                if self.is_unknown(value_ty) {
+                                    reset_after_target = Some(norm_key);
+                                } else {
+                                    self.record_local_type(norm_key, value_ty);
                                 }
                             }
                         }
@@ -2410,6 +2435,13 @@ impl<'db> InferenceContext<'db> {
                     }
                     self.infer_expr(target_id);
                 }
+                // The target itself keeps the type the local had before this write: it is
+                // the slot being written, and completion takes the expected type of the
+                // right-hand side from it (`Сумма = <incomplete>`). Reads after the write
+                // see the reset.
+                if let Some(name) = reset_after_target {
+                    self.reset_local_type(name);
+                }
             }
 
             Stmt::Expr(expr_idx) => {
@@ -2471,19 +2503,24 @@ impl<'db> InferenceContext<'db> {
                 self.infer_expr(ExprId::from_idx(*to));
                 let var_name = NormName::intern(self.body.binding_idx(*var).name.as_str());
                 let number = self.db.number(None, None);
-                self.var_types.insert(var_name, number);
+                self.record_local_type(var_name, number);
                 self.binding_types.insert(BindingId::from_idx(*var), number);
                 self.infer_stmts(body);
             }
 
             Stmt::ForEach { var, collection, body } => {
                 let coll_ty = self.infer_expr(ExprId::from_idx(*collection));
-                if let Some(elem_ty) =
-                    crate::iteration_lookup::resolve_iter_element_ty(self.db, coll_ty)
+                let var_name = NormName::intern(self.body.binding_idx(*var).name.as_str());
+                match crate::iteration_lookup::resolve_iter_element_ty(self.db, coll_ty)
+                    .filter(|elem_ty| !self.is_unknown(*elem_ty))
                 {
-                    let var_name = NormName::intern(self.body.binding_idx(*var).name.as_str());
-                    self.var_types.insert(var_name, elem_ty);
-                    self.binding_types.insert(BindingId::from_idx(*var), elem_ty);
+                    Some(elem_ty) => {
+                        self.record_local_type(var_name, elem_ty);
+                        self.binding_types.insert(BindingId::from_idx(*var), elem_ty);
+                    }
+                    // The loop rebinds the name even when the element is unknown, so a type
+                    // left by an earlier loop or assignment of the same name is stale here.
+                    None => self.reset_local_type(var_name),
                 }
                 self.infer_stmts(body);
             }
@@ -2886,7 +2923,12 @@ impl<'db> InferenceContext<'db> {
 
         let resolved = resolver.resolve_name(self.db, name);
 
-        if let Some(ty) = self.var_types.get(&NormName::intern(name.as_str())) {
+        let flow_key = NormName::intern(name.as_str());
+        if self.reset_vars.contains(&flow_key) {
+            trace!("resolved {} as a local reset by an untyped write", name);
+            return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
+        }
+        if let Some(ty) = self.var_types.get(&flow_key) {
             trace!("resolved {} via var_types = {:?}", name, ty);
             let ty_id = *ty;
             // Structure-literal key enrichment: a local typed as a `Структура` gets its collected
