@@ -1276,13 +1276,13 @@ fn handle_request(state: &mut GlobalState, req: Request) -> Result<()> {
         .on_latency::<CallHierarchyOutgoingCalls>(crate::handlers::handle_call_hierarchy_outgoing)
         .on_latency::<InlayHintRequest>(crate::handlers::handle_inlay_hint)
         .on_latency::<WorkspaceSymbolRequest>(crate::handlers::handle_workspace_symbol)
-        .on_latency::<SelectionRangeRequest>(crate::handlers::handle_selection_range)
+        .on_syntax_latency::<SelectionRangeRequest>(crate::handlers::handle_selection_range)
         .on_latency::<DocumentHighlightRequest>(crate::handlers::handle_document_highlight)
-        .on_latency::<FoldingRangeRequest>(crate::handlers::handle_folding_range)
+        .on_syntax_latency::<FoldingRangeRequest>(crate::handlers::handle_folding_range)
         .on_latency::<HoverRequest>(crate::handlers::handle_hover)
         .on_latency::<Completion>(crate::handlers::handle_completion)
         .on_latency::<SemanticTokensFullRequest>(crate::handlers::handle_semantic_tokens_full)
-        .on_latency::<DocumentSymbolRequest>(crate::handlers::handle_document_symbol)
+        .on_syntax_latency::<DocumentSymbolRequest>(crate::handlers::handle_document_symbol)
         .on_latency::<CodeActionRequest>(crate::handlers::handle_code_action)
         .on_latency::<DocumentDiagnosticRequest>(crate::handlers::handle_document_diagnostic)
         .on_latency::<WorkspaceDiagnosticRequest>(crate::handlers::handle_workspace_diagnostic)
@@ -1604,6 +1604,125 @@ mod tests {
         );
         assert_eq!(state.diagnostics_generation.get(&uri).copied(), Some(1));
         assert!(state.diagnostics_tokens.contains_key(&uri));
+    }
+
+    /// An editor asks for the outline, folds and selection ranges the moment a file opens —
+    /// on a large configuration, long before the initial load finishes. Those requests read
+    /// only the file's own parse, so they are answered right away; requests that need the
+    /// rest of the workspace are still declined until the load completes.
+    #[test]
+    fn syntax_requests_are_answered_while_the_workspace_loads() {
+        use lsp_types::request::{
+            DocumentSymbolRequest, FoldingRangeRequest, HoverRequest, Request as _,
+            SelectionRangeRequest,
+        };
+
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        state.init_empty_source_root();
+        state.analysis_host.raw_database_mut().set_workspace_load_complete(false);
+        assert!(!state.vfs_done);
+
+        let text = [
+            "#Область Интерфейс",
+            "",
+            "Процедура Тест() Экспорт",
+            "\tА = 1;",
+            "КонецПроцедуры",
+            "",
+            "#КонецОбласти",
+            "",
+            "Функция Ф()",
+            "\tВозврат 1;",
+            "КонецФункции",
+        ]
+        .join("\n");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("mod.bsl");
+        std::fs::write(&path, &text).expect("write");
+        let uri = lsp_types::Url::from_file_path(&path).unwrap();
+        crate::handlers::notification::handle_did_open(
+            &mut state,
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".to_string(),
+                    version: 1,
+                    text,
+                },
+            },
+        )
+        .unwrap();
+        while receiver.try_recv().is_ok() {}
+
+        let doc = || serde_json::json!({ "textDocument": { "uri": uri } });
+        let requests = [
+            (1, DocumentSymbolRequest::METHOD, doc()),
+            (2, FoldingRangeRequest::METHOD, doc()),
+            (
+                3,
+                SelectionRangeRequest::METHOD,
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "positions": [{ "line": 3, "character": 1 }],
+                }),
+            ),
+            (
+                4,
+                HoverRequest::METHOD,
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 2, "character": 11 },
+                }),
+            ),
+        ];
+        for (id, method, params) in requests {
+            handle_request(&mut state, Request::new(id.into(), method.to_string(), params))
+                .unwrap();
+        }
+
+        // Every answer is already on the client channel: nothing was handed to the pool,
+        // where the next streamed VFS batch would have cancelled it.
+        assert!(state.task_pool.receiver.try_recv().is_err(), "no pool job while loading");
+        assert!(state.request_tokens.is_empty(), "no in-flight request left behind");
+        let mut responses = std::collections::HashMap::new();
+        while let Ok(message) = receiver.try_recv() {
+            if let Message::Response(response) = message {
+                responses.insert(response.id.clone(), response);
+            }
+        }
+        let answer = |id: i32| {
+            let response = &responses[&lsp_server::RequestId::from(id)];
+            assert!(response.error.is_none(), "request {id} declined: {:?}", response.error);
+            response.result.clone().expect("a result")
+        };
+
+        let symbols: lsp_types::DocumentSymbolResponse = serde_json::from_value(answer(1)).unwrap();
+        let lsp_types::DocumentSymbolResponse::Nested(symbols) = symbols else {
+            panic!("expected a hierarchical outline, got {symbols:?}");
+        };
+        let outline: Vec<(String, Vec<String>)> = symbols
+            .iter()
+            .map(|s| {
+                let children = s.children.iter().flatten().map(|c| c.name.clone()).collect();
+                (s.name.clone(), children)
+            })
+            .collect();
+        assert_eq!(
+            outline,
+            vec![("Интерфейс".to_string(), vec!["Тест".to_string()]), ("Ф".to_string(), vec![]),]
+        );
+        let folds: Vec<lsp_types::FoldingRange> = serde_json::from_value(answer(2)).unwrap();
+        assert!(folds.iter().any(|f| f.start_line == 0 && f.end_line == 6), "{folds:?}");
+        let selections: Vec<lsp_types::SelectionRange> = serde_json::from_value(answer(3)).unwrap();
+        assert_eq!(selections.len(), 1);
+
+        let hover = &responses[&lsp_server::RequestId::from(4)];
+        assert_eq!(
+            hover.error.as_ref().map(|e| e.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32),
+            "a request that needs the workspace must still wait for the load"
+        );
     }
 
     #[test]
