@@ -48,6 +48,7 @@ fn extract_cursor(fixture_text: &str) -> (String, String, u32) {
 
 /// Positive control: the manager chain resolves when nobody holds the root.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn unheld_manager_chain_resolves_signature() {
     let (analysis, file_id, offset) = setup(
         r#"//- /test.bsl
@@ -61,6 +62,7 @@ fn unheld_manager_chain_resolves_signature() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn assignment_to_the_root_still_resolves_the_manager_signature() {
     let (analysis, file_id, offset) = setup(
         r#"//- /test.bsl

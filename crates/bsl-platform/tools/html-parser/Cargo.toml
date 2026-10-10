@@ -2,8 +2,13 @@
 name = "html-parser"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+description = "Extracts the 1C syntax-helper corpus from HBK help archives, in-process"
 
-[workspace]
+[lib]
+name = "html_parser"
+path = "src/lib.rs"
+doctest = false
 
 [[bin]]
 name = "html-parser"
@@ -14,3 +19,15 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 scraper = "0.25.0"
+tracing.workspace = true
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[features]
+# Help archive writer and a self-written archive pair for other crates' tests.
+test-support = []
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -2252,6 +2252,11 @@ pub struct ProjectConfig {
     #[serde(default, alias = "target_platform_version")]
     pub target_platform_version: Option<String>,
 
+    /// `[platform_help]`: where the platform help corpus comes from. `None`
+    /// (unset) leaves the choice to the build's default source.
+    #[serde(default, alias = "platform_help")]
+    pub platform_help: Option<PlatformHelpConfig>,
+
     /// Oldest 1C platform release the code must still compile on (production may
     /// run an older platform than the one development happens on). Unset keeps
     /// `PlatformMemberNewerThanMinVersion` silent; it never changes what
@@ -2294,6 +2299,46 @@ pub struct ProjectConfig {
 
     #[serde(default)]
     pub analysis: AnalysisConfig,
+}
+
+/// `[platform_help]` — the source of the platform help corpus. The process loads
+/// it once at startup; a changed value takes effect after a restart. Field-less
+/// sources are empty struct variants so that a stray field is refused rather
+/// than ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "source", rename_all = "lowercase", deny_unknown_fields)]
+pub enum PlatformHelpConfig {
+    /// The interface facts compiled into this build, without 1C's texts.
+    Bundled {},
+    /// HBK archives of an installed platform. Without `path`, the
+    /// `BSL_PLATFORM_PATH` directory, then the conventional install locations.
+    Installed {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// A prepared corpus: exactly one of a package/JSON `path` or a manifest `url`.
+    External {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+    },
+    /// The snapshot saved for `auto`, else an installed platform, else the
+    /// pinned corpus download, else no help.
+    Auto {},
+    /// No platform help; nothing is searched, extracted or downloaded.
+    None {},
+}
+
+/// [`PlatformHelpConfig`] with its paths resolved against the config directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlatformHelpSelection {
+    Bundled,
+    Installed { path: Option<PathBuf> },
+    ExternalPath(PathBuf),
+    ExternalUrl(String),
+    Auto,
+    None,
 }
 
 /// `[analysis]` — restricting the set of files/lines diagnostics are reported
@@ -2419,6 +2464,7 @@ impl ProjectConfig {
 
     fn validate_configuration_source(&self) -> Result<(), ConfigLoadError> {
         self.validate_source_exclude()?;
+        self.validate_platform_help()?;
         if self.configuration_root.is_some() && self.configuration_dependency.is_some() {
             return Err(
                 self.config_error("[source] cannot define both root and configuration".to_owned())
@@ -2435,6 +2481,64 @@ impl ProjectConfig {
             }
         }
         Ok(())
+    }
+
+    fn validate_platform_help(&self) -> Result<(), ConfigLoadError> {
+        let empty = |value: &Option<String>| value.as_deref().is_some_and(|v| v.trim().is_empty());
+        match &self.platform_help {
+            Some(PlatformHelpConfig::Installed { path }) if empty(path) => {
+                Err(self.config_error("platform_help.path must not be empty".to_owned()))
+            }
+            Some(PlatformHelpConfig::External { path, url }) => {
+                if empty(path) || empty(url) {
+                    return Err(self.config_error(
+                        "platform_help.path and platform_help.url must not be empty".to_owned(),
+                    ));
+                }
+                match (path, url) {
+                    (Some(_), None) | (None, Some(_)) => Ok(()),
+                    _ => Err(self.config_error(
+                        "platform_help source \"external\" needs exactly one of path or url"
+                            .to_owned(),
+                    )),
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The configured help source with paths resolved against the directory of the
+    /// config file (or `project_root` for a config not read from a file); `None`
+    /// when the configuration leaves the choice to the build default.
+    pub fn platform_help_selection(
+        &self,
+        project_root: &Path,
+    ) -> Result<Option<PlatformHelpSelection>, ConfigLoadError> {
+        self.validate_platform_help()?;
+        let Some(config) = &self.platform_help else {
+            return Ok(None);
+        };
+        let resolve = |value: &str| {
+            let path = self.resolve_config_path(project_root, value);
+            std::path::absolute(&path).unwrap_or(path)
+        };
+        Ok(Some(match config {
+            PlatformHelpConfig::Bundled {} => PlatformHelpSelection::Bundled,
+            PlatformHelpConfig::Installed { path } => {
+                PlatformHelpSelection::Installed { path: path.as_deref().map(resolve) }
+            }
+            PlatformHelpConfig::External { path: Some(path), .. } => {
+                PlatformHelpSelection::ExternalPath(resolve(path))
+            }
+            PlatformHelpConfig::External { url: Some(url), .. } => {
+                PlatformHelpSelection::ExternalUrl(url.clone())
+            }
+            PlatformHelpConfig::External { path: None, url: None } => {
+                unreachable!("validated: external has a path or a url")
+            }
+            PlatformHelpConfig::Auto {} => PlatformHelpSelection::Auto,
+            PlatformHelpConfig::None {} => PlatformHelpSelection::None,
+        }))
     }
 
     /// Each `[source].exclude` value must name a directory relative to the config file.
@@ -3202,6 +3306,8 @@ struct TomlConfig {
     #[serde(default)]
     target_platform_version: Option<String>,
     #[serde(default)]
+    platform_help: Option<PlatformHelpConfig>,
+    #[serde(default)]
     min_platform_version: Option<String>,
     #[serde(default)]
     compatibility_mode: Option<String>,
@@ -3293,6 +3399,7 @@ impl From<TomlConfig> for ProjectConfig {
             configuration_dependency: toml.source.configuration,
             source_exclude: toml.source.exclude,
             target_platform_version: toml.target_platform_version,
+            platform_help: toml.platform_help,
             min_platform_version: toml.min_platform_version,
             compatibility_mode: toml.compatibility_mode,
             language: None,
@@ -3754,16 +3861,16 @@ mod tests {
     use super::{
         branch_pattern_matches, current_git_branch, current_git_commit,
         evaluate_workspace_baseline_support, is_publish_branch_allowed, parse_timestamp_utc,
-        resolve_postgres_url, resolve_workspace_branch_policy, wildcard_matches,
+        resolve_postgres_url, resolve_workspace_branch_policy, wildcard_matches, ConfigLoadError,
         DiagnosticsBaselineConfig, DiagnosticsBaselineGroupConfig,
         DiagnosticsBaselinePartitionIdentity, DiagnosticsBaselinePartitionPolicy,
         DiagnosticsBaselineProjectError, DiagnosticsBaselineProjectMode,
         DiagnosticsBaselineProjectScope, DiagnosticsBaselineSelection, ExtensionDecl,
-        FeaturesConfig, PostgresAccessMode, Project, ProjectConfig, ProjectDiagnosticsConfig,
-        ProjectError, ResolvePostgresUrlError, SearchBaselineBackend, SearchBaselinePolicyConfig,
-        SearchBaselineSupportState, SearchPostgresConfig, SearchPostgresCredentialHelperConfig,
-        SourceSet, SourceSetOverride, StructuredExtensionDecl, TopologyError,
-        WorkspaceDiagnosticsScope,
+        FeaturesConfig, PlatformHelpSelection, PostgresAccessMode, Project, ProjectConfig,
+        ProjectDiagnosticsConfig, ProjectError, ResolvePostgresUrlError, SearchBaselineBackend,
+        SearchBaselinePolicyConfig, SearchBaselineSupportState, SearchPostgresConfig,
+        SearchPostgresCredentialHelperConfig, SourceSet, SourceSetOverride,
+        StructuredExtensionDecl, TopologyError, WorkspaceDiagnosticsScope,
     };
     use super::{
         compatibility_mode_in, configuration_kind, CompatibilityModeSource, ConfigurationKind,
@@ -3773,6 +3880,7 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use std::env;
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -3817,6 +3925,114 @@ mod tests {
         fs::write(&path, "target_platform_version = \"8.3.27.1644\"\n").unwrap();
         let config = ProjectConfig::load_from_file(&path).unwrap();
         assert_eq!(config.target_platform_version.as_deref(), Some("8.3.27.1644"));
+    }
+
+    fn load_toml(dir: &Path, body: &str) -> Result<ProjectConfig, ConfigLoadError> {
+        let path = dir.join("bsl-analyzer.toml");
+        fs::write(&path, body).unwrap();
+        ProjectConfig::load_from_file(&path)
+    }
+
+    #[test]
+    fn platform_help_reads_toml_and_resolves_paths_from_config_dir() {
+        let dir = tempdir().unwrap();
+        let config =
+            load_toml(dir.path(), "[platform_help]\nsource = \"installed\"\npath = \"hbk\"\n")
+                .unwrap();
+        let elsewhere = Path::new("/somewhere/else");
+        let config_dir = std::path::absolute(dir.path()).unwrap();
+        assert_eq!(
+            config.platform_help_selection(elsewhere).unwrap(),
+            Some(PlatformHelpSelection::Installed { path: Some(config_dir.join("hbk")) })
+        );
+
+        let config =
+            load_toml(dir.path(), "[platform_help]\nsource = \"external\"\npath = \"c.json\"\n")
+                .unwrap();
+        assert_eq!(
+            config.platform_help_selection(elsewhere).unwrap(),
+            Some(PlatformHelpSelection::ExternalPath(config_dir.join("c.json")))
+        );
+        for (source, expected) in [
+            ("none", PlatformHelpSelection::None),
+            ("auto", PlatformHelpSelection::Auto),
+            ("bundled", PlatformHelpSelection::Bundled),
+        ] {
+            let config =
+                load_toml(dir.path(), &format!("[platform_help]\nsource = \"{source}\"\n"))
+                    .unwrap();
+            assert_eq!(config.platform_help_selection(elsewhere).unwrap(), Some(expected));
+        }
+        let unset = load_toml(dir.path(), "").unwrap();
+        assert_eq!(unset.platform_help_selection(elsewhere).unwrap(), None);
+    }
+
+    #[test]
+    fn platform_help_and_compatibility_settings_coexist() {
+        let dir = tempdir().unwrap();
+        let toml = load_toml(
+            dir.path(),
+            "target_platform_version = \"8.3.27\"\nmin_platform_version = \"8.3.17\"\ncompatibility_mode = \"8.3.15\"\n[platform_help]\nsource = \"auto\"\n",
+        )
+        .unwrap();
+        let json: ProjectConfig = serde_json::from_str(
+            r#"{"targetPlatformVersion":"8.3.27","minPlatformVersion":"8.3.17","compatibilityMode":"8.3.15","platformHelp":{"source":"auto"}}"#,
+        )
+        .unwrap();
+        for config in [toml, json] {
+            assert_eq!(config.target_platform_version.as_deref(), Some("8.3.27"));
+            assert_eq!(config.min_platform_version.as_deref(), Some("8.3.17"));
+            assert_eq!(config.compatibility_mode.as_deref(), Some("8.3.15"));
+            assert_eq!(
+                config.platform_help_selection(dir.path()).unwrap(),
+                Some(PlatformHelpSelection::Auto)
+            );
+        }
+    }
+
+    #[test]
+    fn platform_help_reads_json_camel_and_snake_case() {
+        let camel: ProjectConfig = serde_json::from_str(
+            r#"{"platformHelp":{"source":"external","url":"https://example.invalid/m.json"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            camel.platform_help_selection(Path::new("/root")).unwrap(),
+            Some(PlatformHelpSelection::ExternalUrl("https://example.invalid/m.json".to_owned()))
+        );
+        let snake: ProjectConfig = serde_json::from_str(
+            r#"{"platform_help":{"source":"installed","path":"/opt/1cv8/x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            snake.platform_help_selection(Path::new("/root")).unwrap(),
+            Some(PlatformHelpSelection::Installed { path: Some(PathBuf::from("/opt/1cv8/x")) })
+        );
+        // No config file: relative paths resolve against the project root.
+        let relative: ProjectConfig =
+            serde_json::from_str(r#"{"platformHelp":{"source":"external","path":"c.json"}}"#)
+                .unwrap();
+        assert_eq!(
+            relative.platform_help_selection(Path::new("/root")).unwrap(),
+            Some(PlatformHelpSelection::ExternalPath(PathBuf::from("/root/c.json")))
+        );
+    }
+
+    #[test]
+    fn platform_help_rejects_malformed_values_as_config_errors() {
+        let dir = tempdir().unwrap();
+        for body in [
+            "[platform_help]\nsource = \"process\"\n",
+            "[platform_help]\nsource = \"Installed\"\n",
+            "[platform_help]\npath = \"x\"\n",
+            "[platform_help]\nsource = \"none\"\npath = \"x\"\n",
+            "[platform_help]\nsource = \"installed\"\nurl = \"http://x\"\n",
+            "[platform_help]\nsource = \"external\"\n",
+            "[platform_help]\nsource = \"external\"\npath = \"a\"\nurl = \"http://x\"\n",
+            "[platform_help]\nsource = \"installed\"\npath = \"\"\n",
+        ] {
+            assert!(load_toml(dir.path(), body).is_err(), "must be refused: {body}");
+        }
     }
 
     #[test]

@@ -171,6 +171,7 @@ mod tests {
     /// The union stands in for an unread main attribute only while it holds every
     /// extension the catalog knows; a new platform extension must join it.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn the_extension_union_is_the_catalog_extension_set() {
         let data = PlatformDataInner::instance();
         let mut catalog: Vec<String> = data
@@ -209,6 +210,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn is_form_self_property_name_recognizes_known_russian_props() {
         for name in &["Элементы", "Команды", "Параметры", "ТекущийЭлемент", "Заголовок"]
         {
@@ -220,6 +222,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn is_form_self_property_name_is_bilingual() {
         for name in &["Items", "Commands", "Title"] {
             assert!(is_form_self_property_name(name), "expected English alias {name:?} to resolve");
@@ -227,6 +230,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn is_form_self_property_name_is_case_insensitive() {
         assert!(is_form_self_property_name("элементы"));
         assert!(is_form_self_property_name("ЭЛЕМЕНТЫ"));

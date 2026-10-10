@@ -533,6 +533,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn platform_name_entries_cover_every_kind_and_localize_owners() {
         let entries = platform_name_entries();
         for kind in [
@@ -742,6 +743,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_return_type_on_array_is_known() {
         let (db, file_id) = empty_db();
         let arr = t(&db, file_id, db.array(None));
@@ -758,6 +760,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn methods_lists_platform_methods_for_array() {
         let (db, file_id) = empty_db();
         let arr = t(&db, file_id, db.array(None));
@@ -771,6 +774,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn methods_list_prefixed_platform_methods_for_metadata_refs() {
         let (db, file_id) = empty_db();
         let cat = t(&db, file_id, metadata_ref(&db, MetadataKind::CatalogRef, "X"));

@@ -460,7 +460,7 @@ mod tests {
         lsp_types::HoverParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier {
-                    uri: lsp_types::Url::parse("file:///test.bsl").unwrap(),
+                    uri: crate::test_uri::file_uri("test.bsl"),
                 },
                 position: lsp_types::Position { line: 0, character: 0 },
             },

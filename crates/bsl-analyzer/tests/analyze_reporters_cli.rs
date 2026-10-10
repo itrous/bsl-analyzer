@@ -38,6 +38,7 @@ fn analyze_writes_sarif_report() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn issue80_dom_sarif_accepts_valid_and_rejects_invalid_controls() {
     let temp = TempDir::new().expect("tempdir");
     let source_dir =

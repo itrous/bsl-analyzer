@@ -459,6 +459,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn platform_global_method_call_resolves_silently() {
         let code = r#"
 Процедура Тест()
@@ -613,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn form_self_call_to_platform_form_method_is_silent() {
         let umc = form_umc(
             "&НаКлиенте\nПроцедура Сохранить()\n    ЭтотОбъект.Закрыть();\nКонецПроцедуры\n",

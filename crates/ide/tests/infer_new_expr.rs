@@ -116,6 +116,7 @@ fn new_query_with_literal_text_types_as_query_with_projection() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn new_query_chain_propagates_projection_through_execute_select() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -149,6 +150,7 @@ fn new_query_with_parse_error_literal_falls_back_to_no_projection() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn execute_batch_literal_zero_index_yields_first_subquery_projection() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -170,6 +172,7 @@ fn execute_batch_literal_zero_index_yields_first_subquery_projection() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn execute_batch_literal_one_index_yields_second_subquery_projection() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -190,6 +193,7 @@ fn execute_batch_literal_one_index_yields_second_subquery_projection() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn execute_batch_out_of_range_index_yields_no_projection() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -208,6 +212,7 @@ fn execute_batch_out_of_range_index_yields_no_projection() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn execute_batch_dynamic_index_yields_no_projection() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -227,6 +232,7 @@ fn execute_batch_dynamic_index_yields_no_projection() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn execute_batch_chain_propagates_through_select() {
     let fixture = r#"//- /test.bsl
 Функция Тест()

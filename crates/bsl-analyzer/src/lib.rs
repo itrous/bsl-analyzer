@@ -17,6 +17,7 @@ pub mod features_state;
 pub mod frozen_context;
 pub mod global_state;
 pub mod handlers;
+pub mod help_bootstrap;
 pub mod locale;
 pub mod lsp;
 pub mod mcp_install;
@@ -27,6 +28,8 @@ pub mod reporters;
 pub mod server;
 pub mod smoke;
 pub mod task_pool;
+#[cfg(test)]
+pub(crate) mod test_uri;
 pub mod workspace;
 
 pub use server::main_loop;

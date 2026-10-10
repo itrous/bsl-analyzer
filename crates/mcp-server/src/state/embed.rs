@@ -4087,7 +4087,11 @@ mod tests {
         wait_for_embed_flight(&flight);
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(matches!(*runtime.lock().unwrap(), crate::state::SemanticRuntimeStatus::Ready));
+        let status = runtime.lock().unwrap().clone();
+        assert!(
+            matches!(status, crate::state::SemanticRuntimeStatus::Ready),
+            "the pass must end ready after the one transient refusal, got {status:?}",
+        );
         assert_eq!(engine.lock().unwrap().as_ref().unwrap().vector_count(), 1);
         assert!(bsl_search::Store::open_existing(&cache.search_db_path())
             .unwrap()

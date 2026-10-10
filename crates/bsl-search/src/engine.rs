@@ -6,7 +6,7 @@ use crate::lifecycle::{self, Batch, Outcome, Reason};
 use crate::local_baseline::LocalStoreBaselineAdapter;
 use crate::ports::{ModuleSnapshotSource, SnapshotCatalog, SnapshotContentStore};
 use crate::publish::EmbeddingExecutionPolicy;
-use crate::resolver::{InMemoryResolvedViewResolver, ResolvedView};
+use crate::resolver::{InMemoryResolvedViewResolver, ResolvedView, ResolvedViewCounts};
 use crate::store::{
     ContextRefreshMutation, Store, WorkspaceDriftStoreOutcome, WorkspaceStoreTransition,
     WorkspaceTransitionFile,
@@ -5584,6 +5584,26 @@ impl SearchEngine {
         .resolve_view(baseline, overlay)
     }
 
+    /// The counts [`Self::resolve_workspace_code_view`] would report, without the view:
+    /// the status line that asks for them needs two numbers, and the view behind them
+    /// is the whole indexed corpus loaded into memory.
+    pub fn resolve_workspace_code_view_counts(
+        &self,
+    ) -> Result<Option<ResolvedViewCounts>, SearchError> {
+        if self.workspace_roots.is_none() {
+            return Ok(None);
+        }
+        let baseline =
+            BaselineRef::for_snapshot(CorpusId::WorkspaceCode, "local-workspace-baseline");
+        let mut overlay = self.workspace_overlay_snapshot()?.overlay;
+        overlay.baseline = baseline.clone();
+        let per_file = self.store.count_indexed_documents_by_file(
+            "code",
+            self.embedder.as_ref().and_then(Embedder::token_layout_claim),
+        )?;
+        InMemoryResolvedViewResolver.resolve_counts(baseline, per_file, overlay).map(Some)
+    }
+
     pub fn resolve_workspace_code_view_with<C, S>(
         &self,
         baseline: BaselineRef,
@@ -6217,6 +6237,20 @@ impl SearchEngine {
         collection: &str,
     ) -> Result<usize, SearchError> {
         self.store.clear_file_hashes_without_embeddings(collection)
+    }
+
+    /// [`Self::remove_file`] when the file is indexed; `false` (and no index
+    /// rebuild) when there is nothing to remove.
+    pub fn remove_file_if_present(
+        &mut self,
+        rel_path: &str,
+        collection: &str,
+    ) -> Result<bool, SearchError> {
+        if self.store.file_hash(CONFIGURATION_ROOT_ID, rel_path)?.is_none() {
+            return Ok(false);
+        }
+        self.remove_file(rel_path, collection)?;
+        Ok(true)
     }
 
     pub fn remove_file(&mut self, rel_path: &str, collection: &str) -> Result<(), SearchError> {

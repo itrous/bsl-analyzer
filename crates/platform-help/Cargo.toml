@@ -1,0 +1,29 @@
+[package]
+name = "platform-help"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Selects, loads and publishes the platform help corpus at application startup"
+
+[lib]
+doctest = false
+
+[dependencies]
+bsl-platform.workspace = true
+dirs = "6"
+html-parser.workspace = true
+project-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+ureq = "3.2"
+url.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+html-parser = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

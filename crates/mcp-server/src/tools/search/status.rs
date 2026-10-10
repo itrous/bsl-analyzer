@@ -10,7 +10,6 @@ use bsl_search::{IndexProgress, SearchEngine};
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData as McpError;
 use serde_json::json;
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
@@ -525,22 +524,22 @@ pub(super) fn search_status_with_cap(
         }
 
         if let Some(overlay) = workspace_overlay {
+            // Counts only — the view itself is every indexed document in memory, and the
+            // two numbers below are all this report takes from it.
             let resolve_local_start = std::time::Instant::now();
-            let local_view = engine.resolve_workspace_code_view().map_err(|e| {
+            let local_view = engine.resolve_workspace_code_view_counts().map_err(|e| {
                 McpError::internal_error(format!("resolved workspace view error: {e}"), None)
             })?;
             tracing::debug!(
                 elapsed_ms = resolve_local_start.elapsed().as_millis() as u64,
-                "search.status: resolve_workspace_code_view (local store)"
+                "search.status: resolve_workspace_code_view_counts (local store)"
             );
             if let Some(view) = local_view {
-                let files: HashSet<&str> =
-                    view.documents().iter().map(|document| document.path.as_str()).collect();
                 let _ = writeln!(out);
                 let _ = writeln!(out, "Resolved workspace view: ready");
                 let _ = writeln!(out, "  Baseline: {}", format_baseline_ref(view.baseline()));
-                let _ = writeln!(out, "  Files:    {}", files.len());
-                let _ = writeln!(out, "  Chunks:   {}", view.documents().len());
+                let _ = writeln!(out, "  Files:    {}", view.files());
+                let _ = writeln!(out, "  Chunks:   {}", view.chunks());
             }
 
             let _ = writeln!(out);

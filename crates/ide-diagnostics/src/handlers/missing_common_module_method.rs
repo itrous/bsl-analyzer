@@ -108,6 +108,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_platform_global_member_call_suppresses_diagnostic() {
         let code = r#"
 Процедура Тест()
@@ -169,6 +170,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_platform_global_unknown_member_keeps_falling_through() {
         let code = r#"
 Процедура Тест()

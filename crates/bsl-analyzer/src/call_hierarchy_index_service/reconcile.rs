@@ -4,7 +4,7 @@ use std::time::Instant;
 use hir::{graph_index::GraphIndex, CallHierarchyReverseIndex};
 
 use super::worker::{superseded, BuildContext};
-use super::{BATCH_SIZE, CATCH_UP_LIMIT, CATCH_UP_PASSES};
+use super::{CatchUpBudget, BATCH_SIZE};
 use crate::call_hierarchy_index_state::CallHierarchyIndexState;
 use crate::global_state::Task;
 
@@ -13,7 +13,7 @@ pub(super) fn reconcile(
     mut index: CallHierarchyReverseIndex,
     target_index: GraphIndex,
 ) -> Task {
-    let BuildContext { lifecycle, mem_docs, frozen } = context;
+    let BuildContext { lifecycle, mem_docs, frozen, budget } = context;
     let source_root = frozen.source_root_id;
     let generation = frozen.creation_generation;
     let started = Instant::now();
@@ -30,15 +30,15 @@ pub(super) fn reconcile(
 
     loop {
         let Some(edited_files) = lifecycle.drain_journal(source_root, generation) else {
-            tracing::debug!(
-                phase = "supersession",
-                supersession_reason = "generation_not_building_during_catch_up",
-                "call hierarchy compact index build superseded"
+            return superseded(
+                &lifecycle,
+                source_root,
+                generation,
+                "generation_not_building_during_catch_up",
             );
-            return superseded(&lifecycle, source_root, generation);
         };
         if edited_files.is_empty() {
-            if passes != 0 && catch_up_exhausted(passes, started) {
+            if passes != 0 && catch_up_exhausted(passes, started, budget) {
                 return catch_up_superseded(&lifecycle, source_root, generation, passes);
             }
             tracing::debug!(
@@ -61,17 +61,17 @@ pub(super) fn reconcile(
             index = match Arc::try_unwrap(candidate) {
                 Ok(index) if lifecycle.is_building(source_root, generation) => index,
                 Ok(_) | Err(_) => {
-                    tracing::debug!(
-                        phase = "supersession",
-                        supersession_reason = "publication_lifecycle_changed",
-                        "call hierarchy compact index build superseded"
+                    return superseded(
+                        &lifecycle,
+                        source_root,
+                        generation,
+                        "publication_lifecycle_changed",
                     );
-                    return superseded(&lifecycle, source_root, generation);
                 }
             };
             continue;
         }
-        if catch_up_exhausted(passes, started) {
+        if catch_up_exhausted(passes, started, budget) {
             return catch_up_superseded(&lifecycle, source_root, generation, passes);
         }
         passes += 1;
@@ -92,12 +92,16 @@ pub(super) fn reconcile(
         if changed_modules.len() != changed_count {
             tracing::debug!(
                 phase = "supersession",
-                supersession_reason = "edited_file_left_frozen_snapshot",
                 edited_file_count = changed_count,
                 changed_module_count = changed_modules.len(),
-                "call hierarchy compact index build superseded"
+                "an edited file left the frozen snapshot"
             );
-            return superseded(&lifecycle, source_root, generation);
+            return superseded(
+                &lifecycle,
+                source_root,
+                generation,
+                "edited_file_left_frozen_snapshot",
+            );
         }
         let mut open_batch = |batch: &[ide::ModuleId]| refreshed.open_batch(batch);
         let projections = ide::reproject_call_hierarchy_index_modules(
@@ -111,11 +115,15 @@ pub(super) fn reconcile(
             Err(error) => {
                 tracing::debug!(
                     phase = "supersession",
-                    supersession_reason = "catch_up_projection_failed",
                     failure_reason = %error,
-                    "call hierarchy compact index build superseded"
+                    "call hierarchy compact index catch-up projection failed"
                 );
-                return superseded(&lifecycle, source_root, generation);
+                return superseded(
+                    &lifecycle,
+                    source_root,
+                    generation,
+                    "catch_up_projection_failed",
+                );
             }
         };
         let projection_pair_count =
@@ -131,15 +139,14 @@ pub(super) fn reconcile(
             if index.layout_hash(projection.module) != Some(projection.layout_hash) {
                 tracing::debug!(
                     phase = "supersession",
-                    supersession_reason = "module_layout_changed",
                     ?projection.module,
-                    "call hierarchy compact index build superseded"
+                    "a caught-up module changed its layout"
                 );
-                return superseded(&lifecycle, source_root, generation);
+                return superseded(&lifecycle, source_root, generation, "module_layout_changed");
             }
             index.replace_module(projection.module, projection.pairs, projection.layout_hash);
         }
-        if catch_up_exhausted(passes, started) {
+        if catch_up_exhausted(passes, started, budget) {
             return catch_up_superseded(&lifecycle, source_root, generation, passes);
         }
     }
@@ -151,15 +158,10 @@ fn catch_up_superseded(
     generation: u64,
     passes: usize,
 ) -> Task {
-    tracing::debug!(
-        phase = "supersession",
-        supersession_reason = "catch_up_budget_exhausted",
-        catch_up_passes = passes,
-        "call hierarchy compact index build superseded"
-    );
-    superseded(lifecycle, source_root, generation)
+    tracing::debug!(phase = "supersession", catch_up_passes = passes, "catch-up budget exhausted");
+    superseded(lifecycle, source_root, generation, "catch_up_budget_exhausted")
 }
 
-pub(super) fn catch_up_exhausted(passes: usize, started: Instant) -> bool {
-    passes >= CATCH_UP_PASSES || started.elapsed() >= CATCH_UP_LIMIT
+pub(super) fn catch_up_exhausted(passes: usize, started: Instant, budget: CatchUpBudget) -> bool {
+    passes >= budget.passes || started.elapsed() >= budget.limit
 }

@@ -183,6 +183,7 @@ const RUSSIAN_ONLY_ENTRIES: &[&str] = &[
 ];
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn deprecation_registry_english_names_match_platform_data() {
     let mut mismatched = Vec::new();
     let mut checked = 0usize;
@@ -251,6 +252,7 @@ fn deprecation_registry_english_names_match_platform_data() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn deprecation_registry_replacements_name_a_reachable_receiver() {
     let mut unreachable = Vec::new();
     let mut unrecognized = Vec::new();

@@ -25,6 +25,10 @@ const WAIT_SLICE: Duration = Duration::from_secs(30);
 /// How long one readiness wait lasts before the watcher comes up to check its stop.
 const READINESS_SLICE: Duration = Duration::from_secs(1);
 
+/// Disk events are coalesced after this quiet interval, with a hard cap per burst.
+const DEBOUNCE_QUIET: Duration = Duration::from_millis(150);
+const DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(1);
+
 /// Where the watcher is in its life, for the freshness a graph answer reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WatchPhase {
@@ -82,12 +86,15 @@ pub(crate) fn start(
         return false;
     };
     graph.set_watch(WatchPhase::Starting, Some(cursor));
+    let initial_roots = project_roots(graph);
+    let initial_hashes = initial_descriptor_hashes(&initial_roots);
     let watcher = Watcher {
         graph: graph.clone(),
         hub: hub.clone(),
         cursor,
         advisory: AdvisoryOwner(advisory),
-        project_roots: std::cell::RefCell::new(project_roots(graph)),
+        project_roots: std::cell::RefCell::new(initial_roots),
+        descriptor_hashes: std::cell::RefCell::new(initial_hashes),
         _live: stop.enter(),
         stop,
     };
@@ -114,6 +121,8 @@ struct Watcher {
     /// The roots the project had when a descriptor was last looked at: what a delivered
     /// `Configuration.xml` is measured against.
     project_roots: std::cell::RefCell<Vec<PathBuf>>,
+    /// Semantic structure hashes of known root descriptors.
+    descriptor_hashes: std::cell::RefCell<std::collections::HashMap<PathBuf, [u8; 32]>>,
     stop: OwnerStop,
     /// Last, so the owner counts as gone only after its advisory is handed back.
     _live: OwnerLive,
@@ -214,7 +223,7 @@ impl Watcher {
             self.graph.enter_latch_window();
             let alarms = self.graph.alarms.load(std::sync::atomic::Ordering::SeqCst);
             let wait = if continuing { Duration::ZERO } else { self.alarm_wait(Instant::now()) };
-            generation = self.hub.wait_for_change_or(generation, wait, || {
+            let next_generation = self.hub.wait_for_change_or(generation, wait, || {
                 self.graph.alarms.load(std::sync::atomic::Ordering::SeqCst) != alarms
                     // Read here too, not only above. The latch can be raised in the window
                     // between taking it and sampling the counter, and then the counter this
@@ -226,11 +235,43 @@ impl Watcher {
             if self.must_leave() {
                 return;
             }
+            if next_generation != generation {
+                // Disk events arrived: debounce to collapse batches of file writes (150ms quiet, up to 1000ms max)
+                self.debounce_quiet(next_generation);
+                generation = self.hub.generation();
+            } else {
+                generation = next_generation;
+            }
+            if self.must_leave() {
+                return;
+            }
             self.drain();
             // Asked again between the two: a drain records, and the alarms at the top of the
             // next turn decide — which can walk the whole tree or run a probe, taking seconds.
             // A stop that lands in there is answered by leaving, or a build would start after
             // the daemon asked every owner to go and before the workspace is handed back.
+        }
+    }
+
+    /// Wait for a period of silence (quiescence) after change events arrive, to coalesce
+    /// rapid series of filesystem modifications (e.g. from editor saves or git checkouts).
+    fn debounce_quiet(&self, mut current_gen: u64) {
+        let started = Instant::now();
+        while started.elapsed() < DEBOUNCE_MAX_WAIT {
+            if self.must_leave() {
+                return;
+            }
+            let remaining = DEBOUNCE_MAX_WAIT.saturating_sub(started.elapsed());
+            let wait = DEBOUNCE_QUIET.min(remaining);
+            // `wait_for_change_or` runs this predicate while holding the hub accumulator lock;
+            // do not call `must_leave`, which asks the hub whether it is closing and deadlocks.
+            let next_gen = self
+                .hub
+                .wait_for_change_or(current_gen, wait, || self.leaves_without_asking_the_hub());
+            if next_gen == current_gen {
+                break;
+            }
+            current_gen = next_gen;
         }
     }
 
@@ -330,16 +371,57 @@ impl Watcher {
         // of the project model itself, so no discovery rule is restated here.
         let fresh = project_roots(&self.graph);
         let known = self.project_roots.replace(fresh.clone());
+        if known != fresh {
+            // The structural root change itself still forces a rebuild. Seed descriptor
+            // observations for the new root set now so a later Version/Comment-only save
+            // on a newly-added extension can be recognized as a semantic no-op.
+            *self.descriptor_hashes.borrow_mut() = initial_descriptor_hashes(&fresh);
+            return true;
+        }
         let parent = |path: &std::path::Path| {
             path.parent()
                 .map(|dir| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
         };
-        known != fresh
-            || [parent(&entry.canonical), parent(&entry.raw)]
-                .into_iter()
-                .flatten()
-                .any(|dir| known.contains(&dir) || fresh.contains(&dir))
+        let touches_known_root = [parent(&entry.canonical), parent(&entry.raw)]
+            .into_iter()
+            .flatten()
+            .any(|dir| known.contains(&dir) || fresh.contains(&dir));
+        if !touches_known_root {
+            return false;
+        }
+
+        // It touches a known Configuration.xml descriptor while roots composition remains the same.
+        // Check if the semantic structure of the XML changed (ignoring <Version>, <Comment>, whitespace).
+        let target_path = if entry.canonical.exists() { &entry.canonical } else { &entry.raw };
+        if let Some(hash) = super::scan::xml_semantic_hash_file(target_path) {
+            let mut hashes = self.descriptor_hashes.borrow_mut();
+            if let Some(&old_hash) = hashes.get(target_path) {
+                if old_hash == hash {
+                    // Semantic no-op: version/comment edit did not change root descriptor structure.
+                    return false;
+                }
+            }
+            hashes.insert(target_path.clone(), hash);
+            if let Ok(canon) = std::fs::canonicalize(target_path) {
+                hashes.insert(canon, hash);
+            }
+        }
+        true
     }
+}
+
+fn initial_descriptor_hashes(roots: &[PathBuf]) -> std::collections::HashMap<PathBuf, [u8; 32]> {
+    let mut map = std::collections::HashMap::new();
+    for root in roots {
+        let desc = root.join(bsl_conventions::ConventionalName::ConfigurationXml.canonical());
+        if let Some(hash) = super::scan::xml_semantic_hash_file(&desc) {
+            if let Ok(canon) = std::fs::canonicalize(&desc) {
+                map.insert(canon, hash);
+            }
+            map.insert(desc, hash);
+        }
+    }
+    map
 }
 
 /// The roots the project at the graph's workspace declares right now, canonical and sorted.
@@ -473,8 +555,14 @@ mod tests {
             "a real delivery above the frontier must reopen the budget",
         );
     }
-    use super::super::test_support::{sample_workspace, wait_ready, wait_until};
+    use super::super::test_support::{published_report, sample_workspace, wait_ready, wait_until};
     use super::*;
+
+    #[test]
+    fn debounce_window_matches_the_disk_event_contract() {
+        assert_eq!(DEBOUNCE_QUIET, Duration::from_millis(150));
+        assert_eq!(DEBOUNCE_MAX_WAIT, Duration::from_secs(1));
+    }
     use crate::change_hub::test_support::eventually;
     use std::sync::{Arc, Mutex};
 
@@ -533,6 +621,7 @@ mod tests {
                 cursor,
                 advisory: AdvisoryOwner(None),
                 project_roots: std::cell::RefCell::new(super::project_roots(graph)),
+                descriptor_hashes: std::cell::RefCell::new(std::collections::HashMap::new()),
                 _live: stop.enter(),
                 stop: stop.clone(),
             }
@@ -842,6 +931,7 @@ mod tests {
                 cursor: hub.subscribe(),
                 advisory: AdvisoryOwner(None),
                 project_roots: std::cell::RefCell::new(super::project_roots(&graph)),
+                descriptor_hashes: std::cell::RefCell::new(std::collections::HashMap::new()),
                 _live: stop.enter(),
                 stop: stop.clone(),
             };
@@ -864,7 +954,7 @@ mod tests {
         let (graph, hub, stop) = super::super::test_support::watched_graph(root);
         graph.ensure_loading();
         wait_ready(&graph);
-        let before = graph.status_report().revision.unwrap();
+        let before = published_report(&graph).revision.unwrap();
         graph.refused_installs.store(1, std::sync::atomic::Ordering::SeqCst);
         super::super::test_support::write(
             root,
@@ -889,7 +979,8 @@ mod tests {
         assert!(start(&graph, &hub, None, stop.clone()));
         graph.ensure_loading();
         wait_ready(&graph);
-        let before = graph.status_report().revision.unwrap();
+        let before = published_report(&graph).revision.unwrap();
+        let builds_before = graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst);
         super::super::test_support::write(
             root,
             "CommonModules/Сервер/Ext/Module.bsl",
@@ -898,6 +989,20 @@ mod tests {
         wait_until(&graph, "the edit to reach the graph", || {
             graph.status_report().revision.is_some_and(|revision| revision > before)
         });
+        wait_until(&graph, "the event's build to settle", || {
+            !graph.drift_pending() && !graph.build_in_flight()
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            graph.status_report().revision,
+            Some(before + 1),
+            "one save should coalesce filesystem notifications into one graph publication"
+        );
+        assert_eq!(
+            graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst),
+            builds_before,
+            "body-only save stays incremental"
+        );
         stop.stop();
         hub.interrupt_waiters();
     }
@@ -938,7 +1043,7 @@ mod tests {
         assert!(start(&graph, &hub, None, stop.clone()));
         graph.ensure_loading();
         wait_ready(&graph);
-        let before = graph.status_report().revision.unwrap();
+        let before = published_report(&graph).revision.unwrap();
 
         // Every reload this edit causes starts after the edit's first fact reached the hub.
         let first_fact = hub.seq() + 1;
@@ -975,7 +1080,7 @@ mod tests {
         graph.ensure_loading();
         wait_ready(&graph);
         wait_until(&graph, "the boot nudge to settle", || !graph.drift_pending());
-        let before = graph.status_report().revision.unwrap();
+        let before = published_report(&graph).revision.unwrap();
 
         // A fact the published build did not observe, which changes no fingerprint input.
         let seq_before = hub.seq();
@@ -989,7 +1094,7 @@ mod tests {
             !graph.marks_pending()
         });
         assert!(bounds.lock().unwrap().contains(&42));
-        assert!(graph.status_report().revision.unwrap() > before, "no rebuild ran");
+        assert!(published_report(&graph).revision.unwrap() > before, "no rebuild ran");
         stop.stop();
         hub.interrupt_waiters();
     }
@@ -1014,6 +1119,7 @@ mod tests {
             cursor: hub.subscribe(),
             advisory: AdvisoryOwner(None),
             project_roots: std::cell::RefCell::new(super::project_roots(&graph)),
+            descriptor_hashes: std::cell::RefCell::new(std::collections::HashMap::new()),
             _live: stop.enter(),
             stop: stop.clone(),
         };
@@ -1078,6 +1184,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_new_extension_descriptor_is_seeded_before_its_version_only_edit() {
+        use crate::graph::test_support::{sample_workspace, write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        write(root, "Configuration.xml", "<Configuration/>");
+        let hub = super::super::test_support::workspace_hub(root);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
+        let stop = OwnerStop::default();
+        let cursor = hub.subscribe();
+        let roots = project_roots(&graph);
+        let watcher = Watcher {
+            graph: graph.clone(),
+            hub: hub.clone(),
+            cursor,
+            advisory: AdvisoryOwner(None),
+            project_roots: std::cell::RefCell::new(roots.clone()),
+            descriptor_hashes: std::cell::RefCell::new(initial_descriptor_hashes(&roots)),
+            _live: stop.enter(),
+            stop: stop.clone(),
+        };
+
+        let descriptor = root.join("cfe/New/Configuration.xml");
+        write(
+            root,
+            "cfe/New/Configuration.xml",
+            "<Configuration><Properties><Version>1.0</Version></Properties></Configuration>",
+        );
+        let event = |path: &std::path::Path| ChangeEntry {
+            canonical: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+            raw: path.to_path_buf(),
+            kind: crate::change_hub::ChangeKind::MaybeChanged,
+            seq: hub.seq().saturating_add(1),
+        };
+        assert!(
+            watcher.is_project_input(&event(&descriptor)),
+            "new extension root forces topology reload"
+        );
+
+        write(
+            root,
+            "cfe/New/Configuration.xml",
+            "<Configuration><Properties><Version>2.0</Version></Properties></Configuration>",
+        );
+        assert!(
+            !watcher.is_project_input(&event(&descriptor)),
+            "the new root descriptor hash was seeded by the structural event"
+        );
+
+        hub.unsubscribe(cursor);
+        hub.shutdown();
+        stop.stop();
+    }
+
     /// The two consumers that feed ONE graph ledger from one hub: the search sink's cursor,
     /// whose dispatch the stand performs through the graph's own loss entry, and the graph
     /// watcher, drained through its production `drain`. Cap 2, so three distinct paths cut a
@@ -1123,6 +1286,7 @@ mod tests {
                 cursor: hub.subscribe(),
                 advisory: AdvisoryOwner(None),
                 project_roots: std::cell::RefCell::new(super::project_roots(&graph)),
+                descriptor_hashes: std::cell::RefCell::new(std::collections::HashMap::new()),
                 _live: stop.enter(),
                 stop: stop.clone(),
             };

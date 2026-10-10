@@ -387,6 +387,7 @@ fn three_level_invalidates_on_config_change() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn three_level_candidate_invalidation() {
     const FIXTURE: &str = r#"
 //- /valid.bsl

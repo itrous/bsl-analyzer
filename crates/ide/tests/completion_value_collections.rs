@@ -61,6 +61,7 @@ fn labels(items: &[CompletionItem]) -> Vec<&str> {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_new_value_table() {
     let items = complete(
         r#"//- /test.bsl
@@ -83,6 +84,7 @@ fn completion_after_dot_on_new_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_new_structure() {
     let items = complete(
         r#"//- /test.bsl
@@ -105,6 +107,7 @@ fn completion_after_dot_on_new_structure() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_new_value_tree() {
     let items = complete(
         r#"//- /test.bsl
@@ -126,6 +129,7 @@ fn completion_after_dot_on_new_value_tree() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_new_value_table_with_prefix() {
     let items = complete(
         r#"//- /test.bsl
@@ -152,6 +156,7 @@ fn completion_after_dot_on_new_value_table_with_prefix() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_local_from_same_module_fn_returning_value_table() {
     let items = complete(
         r#"//- /test.bsl
@@ -180,6 +185,7 @@ fn completion_after_dot_on_local_from_same_module_fn_returning_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_local_from_same_module_fn_returning_structure() {
     let items = complete(
         r#"//- /test.bsl
@@ -208,6 +214,7 @@ fn completion_after_dot_on_local_from_same_module_fn_returning_structure() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_two_hop_same_module_cascade_value_table() {
     let items = complete(
         r#"//- /test.bsl
@@ -240,6 +247,7 @@ fn completion_two_hop_same_module_cascade_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_two_hop_same_module_cascade_structure() {
     let items = complete(
         r#"//- /test.bsl
@@ -269,6 +277,7 @@ fn completion_two_hop_same_module_cascade_structure() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_qualified_call_cross_module_value_table() {
     let items = complete(
         r#"//- /CommonModules/Util/Ext/Module.bsl
@@ -298,6 +307,7 @@ fn completion_qualified_call_cross_module_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_two_hop_cross_module_cascade_structure() {
     let items = complete(
         r#"//- /CommonModules/Util/Ext/Module.bsl
@@ -331,6 +341,7 @@ fn completion_two_hop_cross_module_cascade_structure() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_method_graph_hop_then_property_hop_value_table_columns() {
     let items = complete(
         r#"//- /test.bsl
@@ -360,6 +371,7 @@ fn completion_method_graph_hop_then_property_hop_value_table_columns() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_local_from_same_module_fn_returning_array_callee_below() {
     let items = complete(
         r#"//- /test.bsl
@@ -388,6 +400,7 @@ fn completion_after_dot_on_local_from_same_module_fn_returning_array_callee_belo
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_local_from_same_module_fn_value_table_callee_below() {
     let items = complete(
         r#"//- /test.bsl
@@ -413,6 +426,7 @@ fn completion_after_dot_on_local_from_same_module_fn_value_table_callee_below() 
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_local_from_same_module_fn_array_callee_above() {
     let items = complete(
         r#"//- /test.bsl
@@ -441,6 +455,7 @@ fn completion_after_dot_on_local_from_same_module_fn_array_callee_above() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_local_from_self_recursive_value_table() {
     let items = complete(
         r#"//- /test.bsl
@@ -472,6 +487,7 @@ fn completion_after_dot_on_local_from_self_recursive_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_local_from_mutual_recursion_structure() {
     let items = complete(
         r#"//- /test.bsl
@@ -536,6 +552,7 @@ fn completion_after_dot_on_local_from_pure_self_recursion_yields_no_items() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_structure_returned_from_fn_lists_keys_and_methods() {
     let items = complete(
         r#"//- /test.bsl
@@ -569,6 +586,7 @@ fn completion_after_dot_on_structure_returned_from_fn_lists_keys_and_methods() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_same_body_structure_lists_constructor_and_insert_keys() {
     let items = complete(
         r#"//- /test.bsl
@@ -643,6 +661,7 @@ fn completion_after_dot_on_nested_structure_value_lists_inner_keys() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_non_literal_key_does_not_break_known_keys() {
     let items = complete(
         r#"//- /test.bsl
@@ -765,6 +784,7 @@ fn completion_for_each_row_from_chained_structure_key_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_chained_dot_on_value_table_columns() {
     let items = complete(
         r#"//- /test.bsl
@@ -791,6 +811,7 @@ fn completion_after_chained_dot_on_value_table_columns() {
 // ---- Stage 2: interprocedural keys (helpers / child methods) ----
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_keys_from_same_module_helper() {
     let items = complete(
         r#"//- /test.bsl

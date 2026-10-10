@@ -1137,6 +1137,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_builtins_scope_resolves_platform_global() {
         let file_id = FileId(0);
         let module_id = ModuleId::new(file_id);

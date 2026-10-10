@@ -666,6 +666,7 @@ fn every_identifier_aware_code_has_a_fixture() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn bilingual_identifier_fixtures_have_parity() {
     for (code, ru_source, en_source) in BILINGUAL_FIXTURES {
         assert!(

@@ -218,6 +218,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn platform_candidate_with_spaces_has_only_an_accepted_symbol_address() {
         let db = ide::RootDatabaseImpl::new();
         let candidate = ide::NameCandidate::new(

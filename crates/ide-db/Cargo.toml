@@ -42,3 +42,6 @@ test-fixture.workspace = true
 [[bench]]
 name = "salsa_incremental"
 harness = false
+
+[lints]
+workspace = true

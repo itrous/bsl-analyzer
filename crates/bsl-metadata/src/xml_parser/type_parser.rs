@@ -395,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn namespaced_platform_tokens_resolve_via_catalogue() {
         for (token, expected_ru) in [
             ("d5p1:TextDocument", "ТекстовыйДокумент"),
@@ -411,6 +412,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn xdto_named_token_resolves_to_class_type() {
         // `FlowchartContextType` is the XDTO type name of `ГрафическаяСхема`;
         // the token must resolve to the class type via the catalogue's XDTO alias.
@@ -421,6 +423,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn platform_token_resolution_is_namespace_prefix_agnostic() {
         // 1C emits the same logical type under version-namespaced prefixes;
         // both must resolve to the same Russian type name.
@@ -472,6 +475,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn fill_checking_is_not_a_value_type_but_resolves_via_catalogue() {
         // Not one of the hand-modelled kernel value types...
         assert_eq!(parse_platform_value_type("v8:FillChecking"), None);

@@ -95,6 +95,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn query_text_resolves_to_string_writable() {
         let db = InMemoryDb::new();
         let receiver = db.platform_object("Запрос".to_string());
@@ -105,6 +106,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn query_parameters_resolves_to_structure_readonly() {
         let db = InMemoryDb::new();
         let receiver = db.platform_object("Запрос".to_string());
@@ -115,6 +117,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn query_temp_tables_manager_resolves_to_union() {
         let db = InMemoryDb::new();
         let receiver = db.platform_object("Запрос".to_string());
@@ -130,6 +133,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn bilingual_english_property_name_resolves() {
         let db = InMemoryDb::new();
         let receiver = db.platform_object("Query".to_string());
@@ -179,6 +183,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn form_control_pages_resolves_extension_only_property() {
         use bsl_metadata::FormElementKind;
         let db = InMemoryDb::new();
@@ -189,6 +194,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn form_control_pages_falls_through_to_base_for_shared_property() {
         use bsl_metadata::FormElementKind;
         let db = InMemoryDb::new();
@@ -210,6 +216,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn form_control_input_field_still_resolves_base_only() {
         use bsl_metadata::FormElementKind;
         let db = InMemoryDb::new();

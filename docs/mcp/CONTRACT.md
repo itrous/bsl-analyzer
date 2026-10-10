@@ -30,7 +30,7 @@ uri: bsl-analyzer://contract
 
 ```jsonc
 {
-  "contract_version": "3.3",
+  "contract_version": "3.4",
   "build_version": "0.2.80",
   "mcp": {
     "profiles": {
@@ -111,6 +111,8 @@ uri: bsl-analyzer://contract
   действия `search(action=find_docs|search_docs|list_platform|status)` доступны
   не только в `reference`, но и в `workspace`; отдельный профиль `reference`
   остаётся совместимым, но больше не обязателен для справки платформы.
+- В контракте `3.4` CLI добавляет команду `platform-help package` (подготовка
+  пакета справки платформы); поверхность MCP не изменилась.
 
 - `tools` — то, что сервер отдаёт в `tools/list` при обычном запуске;
   `opt_in_tools` — то, что эта же сборка умеет, но отдаёт только по явному

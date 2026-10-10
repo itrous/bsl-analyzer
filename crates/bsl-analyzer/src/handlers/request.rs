@@ -58,7 +58,15 @@ pub fn handle_goto_definition(
     let line_index = source_doc.line_index();
 
     let offset =
-        crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding)?;
+        match crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding) {
+            Ok(o) => o,
+            Err(_) => {
+                tracing::debug!(
+                    "Position out of bounds, likely race with didChange - returning empty"
+                );
+                return Ok(None);
+            }
+        };
 
     let target = ctx.analysis.goto_definition(file_id, offset.into());
 
@@ -127,7 +135,15 @@ pub fn handle_type_definition(
     let line_index = source_doc.line_index();
 
     let offset =
-        crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding)?;
+        match crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding) {
+            Ok(o) => o,
+            Err(_) => {
+                tracing::debug!(
+                    "Position out of bounds, likely race with didChange - returning empty"
+                );
+                return Ok(None);
+            }
+        };
 
     let Some(nav_target) = ctx.analysis.type_definition(file_id, offset.into()) else {
         return Ok(None);
@@ -176,7 +192,15 @@ pub fn handle_find_references(
     let line_index = doc.line_index();
 
     let offset =
-        crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding)?;
+        match crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding) {
+            Ok(o) => o,
+            Err(_) => {
+                tracing::debug!(
+                    "Position out of bounds, likely race with didChange - returning empty"
+                );
+                return Ok(None);
+            }
+        };
 
     let locations = ctx.analysis.find_references(file_id, offset.into());
 
@@ -215,7 +239,15 @@ pub fn handle_prepare_rename(
     let line_index = doc.line_index();
 
     let offset =
-        crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding)?;
+        match crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding) {
+            Ok(o) => o,
+            Err(_) => {
+                tracing::debug!(
+                    "Position out of bounds, likely race with didChange - returning empty"
+                );
+                return Ok(None);
+            }
+        };
 
     let Some(target) = ctx.analysis.prepare_rename(file_id, offset.into()) else {
         return Ok(None);
@@ -255,7 +287,15 @@ pub fn handle_rename(
     let line_index = doc.line_index();
 
     let offset =
-        crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding)?;
+        match crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding) {
+            Ok(o) => o,
+            Err(_) => {
+                tracing::debug!(
+                    "Position out of bounds, likely race with didChange - returning empty"
+                );
+                return Ok(None);
+            }
+        };
 
     let locations = match ctx.analysis.rename(file_id, offset.into(), &new_name) {
         Ok(locations) => locations,
@@ -324,7 +364,15 @@ pub fn handle_prepare_call_hierarchy(
     let line_index = doc.line_index();
 
     let offset =
-        crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding)?;
+        match crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding) {
+            Ok(o) => o,
+            Err(_) => {
+                tracing::debug!(
+                    "Position out of bounds, likely race with didChange - returning empty"
+                );
+                return Ok(None);
+            }
+        };
 
     let Some(ide_item) = ctx.analysis.prepare_call_hierarchy(file_id, offset.into()) else {
         return Ok(None);
@@ -755,7 +803,15 @@ pub fn handle_document_highlight(
     let line_index = doc.line_index();
 
     let offset =
-        crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding)?;
+        match crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding) {
+            Ok(o) => o,
+            Err(_) => {
+                tracing::debug!(
+                    "Position out of bounds, likely race with didChange - returning empty"
+                );
+                return Ok(None);
+            }
+        };
 
     let highlights = ctx.analysis.document_highlights(file_id, offset.into());
     if highlights.is_empty() {
@@ -905,7 +961,15 @@ pub fn handle_hover(ctx: &LatencyRequestContext, params: HoverParams) -> Result<
     let line_index = doc.line_index();
 
     let offset =
-        crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding)?;
+        match crate::lsp::offset_with_encoding(line_index, text, position, ctx.position_encoding) {
+            Ok(o) => o,
+            Err(_) => {
+                tracing::debug!(
+                    "Position out of bounds, likely race with didChange - returning empty"
+                );
+                return Ok(None);
+            }
+        };
 
     let hover_result = ctx.analysis.hover(file_id, offset.into(), ctx.diagnostics_config.locale);
 
@@ -2235,8 +2299,18 @@ pub fn handle_on_type_formatting(
 
     let line_index = LineIndex::new(&text);
 
-    let offset =
-        crate::lsp::offset_with_encoding(&line_index, &text, position, snap.position_encoding)?;
+    let offset = match crate::lsp::offset_with_encoding(
+        &line_index,
+        &text,
+        position,
+        snap.position_encoding,
+    ) {
+        Ok(o) => o,
+        Err(_) => {
+            tracing::debug!("Position out of bounds, likely race with didChange - returning empty");
+            return Ok(None);
+        }
+    };
 
     let char_typed = params.ch.chars().next().unwrap_or('\0');
 
@@ -2299,6 +2373,12 @@ mod tests {
 
     mod call_hierarchy_trace_tests;
     mod inlay_hint_tests;
+    mod position_race_tests;
+
+    /// How long a stand waits for a thread to reach a parked or published state before
+    /// calling the test hung. Scheduling latency on a loaded machine is the only thing
+    /// it absorbs, so it is generous and nothing is measured against it.
+    const PARK_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// A symbol whose range does not project onto the open buffer is the one case where a
     /// map can lie without looking wrong: the answer stays well-formed while a method — or
@@ -2336,7 +2416,7 @@ mod tests {
             symbols: Vec<DocumentSymbol>,
         ) -> anyhow::Result<Option<lsp_types::DocumentSymbolResponse>> {
             let line_index = LineIndex::new(SOURCE);
-            let uri = lsp_types::Url::parse("file:///ws/Module.bsl").expect("uri");
+            let uri = crate::test_uri::file_uri("ws/Module.bsl");
             document_symbol_response(&line_index, SOURCE, symbols, PositionEncoding::Utf16, &uri)
         }
 
@@ -2543,7 +2623,7 @@ mod tests {
     fn test_goto_definition_not_found() {
         let mut state = create_test_state();
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         state.mem_docs.insert(uri.clone(), "Процедура Тест() КонецПроцедуры".to_string(), 1);
 
@@ -2566,7 +2646,7 @@ mod tests {
     fn goto_definition_context_frozen_against_main_thread_mutation() {
         let mut state = create_test_state();
 
-        let uri = lsp_types::Url::parse("file:///frozen.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("frozen.bsl");
         state.mem_docs.insert(uri.clone(), "original".to_string(), 1);
 
         let ctx = latency_ctx(&state);
@@ -2591,7 +2671,7 @@ mod tests {
     fn test_find_references_empty() {
         let mut state = create_test_state();
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         state.mem_docs.insert(uri.clone(), "Процедура Тест() КонецПроцедуры".to_string(), 1);
 
@@ -2695,7 +2775,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///rename.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("rename.bsl");
         let source =
             "Процедура Тест()\n    Перем МояПеременная;\n    МояПеременная = 10;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
@@ -2720,7 +2800,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///rename.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("rename.bsl");
         let source = "Процедура Тест()\n    Перем МояПеременная;\n    МояПеременная = 10;\n    Результат = МояПеременная;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -2747,7 +2827,7 @@ mod tests {
         state.init_empty_source_root();
         state.supports_workspace_edit_document_changes = true;
 
-        let uri = lsp_types::Url::parse("file:///rename.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("rename.bsl");
         let source =
             "Процедура Тест()\n    Перем МояПеременная;\n    МояПеременная = 10;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
@@ -2780,7 +2860,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///rename.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("rename.bsl");
         let source =
             "Процедура Тест()\n    Перем МояПеременная;\n    МояПеременная = 10;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
@@ -2829,7 +2909,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -2844,7 +2924,7 @@ mod tests {
         // Given: a call-hierarchy anchor in a loaded source root.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-prepare.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-prepare.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let receiver = state.task_pool.receiver.clone();
@@ -2878,7 +2958,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -2905,7 +2985,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n\nПроцедура Второй()\n    Помощник();\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -2929,7 +3009,7 @@ mod tests {
         // Given: a resident compact index for one target and its caller.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-warm.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-warm.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -2966,7 +3046,7 @@ mod tests {
         state.init_empty_source_root();
         // The dispatcher rejects requests until VFS loading has completed in production.
         state.vfs_done = true;
-        let uri = lsp_types::Url::parse("file:///ch-single-worker.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-single-worker.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3030,7 +3110,7 @@ mod tests {
         // Given: a prepared target whose compact index is still building.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-wait.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-wait.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3043,7 +3123,9 @@ mod tests {
         ));
         let lifecycle = state.call_hierarchy_index.clone();
         let publisher = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            // A hang guard, not a measurement: the request parks as soon as it is
+            // scheduled, which a loaded machine may put off for a long time.
+            let deadline = std::time::Instant::now() + PARK_HANG_GUARD;
             while !lifecycle.has_waiter(source_root, 1) {
                 assert!(std::time::Instant::now() < deadline, "incoming request did not park");
                 std::thread::yield_now();
@@ -3051,7 +3133,9 @@ mod tests {
             assert!(lifecycle.publish(source_root, 1, index));
         });
         let mut ctx = latency_ctx(&state);
-        ctx.call_hierarchy_wait_policy.timeout = std::time::Duration::from_millis(100);
+        // The wait only has to outlast the publisher's scheduling; a waiter that gives
+        // up first answers `None` and fails below, so the bound stays a bound.
+        ctx.call_hierarchy_wait_policy.timeout = PARK_HANG_GUARD;
 
         // When: incoming calls arrive before the build publishes.
         let result = handle_call_hierarchy_incoming(
@@ -3075,7 +3159,7 @@ mod tests {
         // Given: an otherwise valid call-hierarchy item without retained prepare state.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-unprepared.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-unprepared.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let item = call_hierarchy_item_at(&state, &uri, Position { line: 0, character: 10 });
@@ -3097,7 +3181,7 @@ mod tests {
         // Given: a prepared build that will outlive a short incoming-call deadline.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-timeout.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-timeout.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3132,7 +3216,7 @@ mod tests {
         // Given: an incoming request parked on a prepared build.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-cancel.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-cancel.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3182,7 +3266,7 @@ mod tests {
         // Given: a prepared index build that has not yet published.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-followers.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-followers.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3193,12 +3277,16 @@ mod tests {
             1,
             crate::call_hierarchy_index_state::CallHierarchyIndexSnapshotId(1),
         ));
+        // One bound for every request: a follower that parked would answer no sooner
+        // than this, so "answered sooner" below is what tells a follower that did not
+        // park from one that did — whatever the machine's speed.
+        let wait_bound = PARK_HANG_GUARD;
         let mut waiting_ctx = latency_ctx(&state);
-        waiting_ctx.call_hierarchy_wait_policy.timeout = std::time::Duration::from_millis(200);
+        waiting_ctx.call_hierarchy_wait_policy.timeout = wait_bound;
         let follower_contexts: Vec<_> = (0..4)
             .map(|_| {
                 let mut ctx = latency_ctx(&state);
-                ctx.call_hierarchy_wait_policy.timeout = std::time::Duration::from_millis(200);
+                ctx.call_hierarchy_wait_policy.timeout = wait_bound;
                 ctx
             })
             .collect();
@@ -3209,7 +3297,7 @@ mod tests {
             let waiting_request = scope.spawn(move || {
                 handle_call_hierarchy_incoming(&waiting_ctx, incoming_params(waiting_item))
             });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            let deadline = std::time::Instant::now() + PARK_HANG_GUARD;
             while !state.call_hierarchy_index.has_waiter(source_root, 1) {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -3246,7 +3334,11 @@ mod tests {
                     "only the first Building request may wait"
                 );
             }
-            assert!(followers_started.elapsed() < std::time::Duration::from_millis(100));
+            let followers_took = followers_started.elapsed();
+            assert!(
+                followers_took < wait_bound,
+                "a follower waited out the bound instead of answering at once: {followers_took:?}",
+            );
             assert!(hover.join().expect("hover request must finish").unwrap().is_some());
             assert!(state.call_hierarchy_index.publish(source_root, 1, index));
 
@@ -3263,7 +3355,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch-superseded.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-superseded.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3289,7 +3381,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch-ready-edit.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-ready-edit.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3317,7 +3409,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ws.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ws.bsl");
         let source =
             "Функция ОбщийРасчёт() Экспорт\nКонецФункции\n\nФункция Приватный()\nКонецФункции\n";
         open_source(&mut state, &uri, source);
@@ -3348,7 +3440,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///td.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("td.bsl");
         let source = "Процедура Тест()\n    Счётчик = 1;\n    Сообщить(Счётчик);\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -3373,7 +3465,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///sel.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("sel.bsl");
         let source = "Процедура Тест()\n    Итог = Первое + Второе;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -3409,7 +3501,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///hints.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("hints.bsl");
         let source = "Функция Сложить(Первое, Второе)\n    Возврат Первое;\nКонецФункции\n\nПроцедура Тест()\n    Сложить(10, 20);\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -3441,7 +3533,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///highlight.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("highlight.bsl");
         let source = r#"
 Процедура Тест()
     Перем МояПеременная;
@@ -3489,7 +3581,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///folding.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("folding.bsl");
         let source = "#Область Public\nПроцедура Тест()\n    Если Истина Тогда\n        Сообщить(1);\n    КонецЕсли;\nКонецПроцедуры\n#КонецОбласти";
 
         state.mem_docs.insert(uri.clone(), source.to_string(), 1);
@@ -3543,7 +3635,7 @@ mod tests {
         state.init_empty_source_root();
         state.folding_range_limit = limit;
 
-        let uri = lsp_types::Url::parse(&format!("file:///{file_name}")).unwrap();
+        let uri = crate::test_uri::file_uri(file_name);
         state.mem_docs.insert(uri.clone(), source.to_string(), 1);
         let open_file_id = state.vfs_file_for_url(&uri).unwrap();
         state.open_files.insert(open_file_id);
@@ -3707,7 +3799,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///fixall.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("fixall.bsl");
         state.mem_docs.insert(uri.clone(), source.to_string(), 1);
         let open_file_id = state.vfs_file_for_url(&uri).unwrap();
         state.open_files.insert(open_file_id);
@@ -3836,6 +3928,10 @@ mod tests {
     /// answer that is simply empty.
     #[test]
     fn workspace_symbol_skips_a_candidate_whose_file_is_gone() {
+        // The panic below is real and runs under an attached database, so it stamps the
+        // process-wide panic watch like any other: a test asserting the watch is clean
+        // must not run beside it.
+        let _guard = crate::panic_watch::panic_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let module_path = tmp.path().join("Ровный.bsl");
         let module_text = "Процедура ДрейфТестМетод() Экспорт\nКонецПроцедуры\n";
@@ -3915,8 +4011,8 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let source_uri = lsp_types::Url::parse("file:///source.bsl").unwrap();
-        let target_uri = lsp_types::Url::parse("file:///target.bsl").unwrap();
+        let source_uri = crate::test_uri::file_uri("source.bsl");
+        let target_uri = crate::test_uri::file_uri("target.bsl");
         let source_text = "Процедура Источник()\nКонецПроцедуры";
         let target_text = "ПерваяСтрока\n    Цель();\n";
 
@@ -3963,7 +4059,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///short.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("short.bsl");
         let source = "short";
 
         state.mem_docs.insert(uri.clone(), source.to_string(), 1);
@@ -4057,13 +4153,13 @@ mod tests {
         /// long enough for a cancel sent on its first file to land mid-walk; the
         /// positive control below reports the count the walk really visits.
         const CALLERS: usize = 1000;
-        const ROOT: &str = "/cancel-walk/CommonModules";
+        const ROOT: &str = "cancel-walk/CommonModules";
         const ANCHOR_SOURCE: &str = "Процедура ПриИзмененииПоля() Экспорт\nКонецПроцедуры\n";
         const CALLER_SOURCE: &str =
             "Процедура Тело() Экспорт\n    Объявление.ПриИзмененииПоля();\nКонецПроцедуры\n";
 
         fn anchor_uri() -> lsp_types::Url {
-            lsp_types::Url::from_file_path(format!("{ROOT}/Объявление/Ext/Module.bsl")).unwrap()
+            crate::test_uri::file_uri(&format!("{ROOT}/Объявление/Ext/Module.bsl"))
         }
 
         /// The callers are registered as open buffers: the walk takes its candidates
@@ -4082,7 +4178,9 @@ mod tests {
             {
                 let mut vfs = state.vfs.write();
                 for i in 0..CALLERS {
-                    let path = VfsPath::new(format!("{ROOT}/Вызов{i:04}/Ext/Module.bsl"));
+                    let path = VfsPath::new(crate::test_uri::file_path(&format!(
+                        "{ROOT}/Вызов{i:04}/Ext/Module.bsl"
+                    )));
                     vfs.set_file_contents(path.clone(), Some(Arc::from(CALLER_SOURCE)));
                     let file_id = vfs.file_id(&path).expect("just registered");
                     state.open_files.insert(file_id);

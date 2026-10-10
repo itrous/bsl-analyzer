@@ -377,9 +377,10 @@ pub(crate) fn item_tree_heap(v: &Arc<ItemTree>) -> usize {
 }
 
 // Condensed module item index (no green-tree pin): feeds symbol/name resolution
-// across modules. High cap keeps it across chunk-boundary LRU trims so a later
-// chunk doesn't re-lower it from a re-parse.
-#[salsa::tracked(lru = 2048, heap_size = crate::item_tree::item_tree_heap, returns(ref))]
+// across modules. The cap holds a whole workspace: a resident that trims after every
+// request, or a sweep that trims between chunks, must not re-lower a callee's index
+// from a re-parse each time a request reaches into it.
+#[salsa::tracked(lru = 65536, heap_size = crate::item_tree::item_tree_heap, returns(ref))]
 pub fn item_tree_query<'db>(
     db: &'db dyn base_db::RootQueryDb,
     file_id_input: base_db::FileIdInput<'db>,

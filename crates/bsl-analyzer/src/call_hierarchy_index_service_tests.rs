@@ -55,11 +55,24 @@ fn call_hierarchy_index_edit_journal_catches_up_body_only_buffer_edit() {
     assert!(lifecycle.record_body_edit_or_supersede_ready(fixture.source_root, 1, fixture.file_id,));
 
     // When: the base index completes and drains the journal against the latest buffer.
-    let task = run_build(lifecycle.clone(), fixture.mem_docs.clone(), snapshot);
+    // The budget is unbounded on purpose: this is a test of what catching up does,
+    // and a build superseded for running past a wall-clock limit on a loaded machine
+    // would say nothing about that.
+    let task = run_build_within(
+        lifecycle.clone(),
+        fixture.mem_docs.clone(),
+        snapshot,
+        CatchUpBudget::UNBOUNDED,
+    );
 
     // Then: the caught-up index publishes without the stale call pair.
     let Task::CallHierarchyIndexBuilt { index, .. } = task else {
-        panic!("body-only edit must publish a caught-up index");
+        panic!(
+            "body-only edit must publish a caught-up index, got {task:?}; \
+             building = {}, ready = {}",
+            lifecycle.is_building(fixture.source_root, 1),
+            lifecycle.is_ready_generation(fixture.source_root, 1),
+        );
     };
     assert!(index.is_empty());
     assert!(lifecycle.is_ready_generation(fixture.source_root, 1));
@@ -89,10 +102,18 @@ fn call_hierarchy_index_layout_edit_supersedes_instead_of_publishing() {
     assert!(lifecycle.record_body_edit_or_supersede_ready(fixture.source_root, 1, fixture.file_id,));
 
     // When: reconciliation compares the old layout with the latest module layout.
-    let task = run_build(lifecycle.clone(), fixture.mem_docs.clone(), snapshot);
+    let task = run_build_within(
+        lifecycle.clone(),
+        fixture.mem_docs.clone(),
+        snapshot,
+        CatchUpBudget::UNBOUNDED,
+    );
 
     // Then: the changed layout is superseded and cannot publish the frozen generation.
-    assert!(matches!(task, Task::CallHierarchyIndexSuperseded { .. }));
+    assert!(
+        matches!(task, Task::CallHierarchyIndexSuperseded { reason: "module_layout_changed", .. }),
+        "the layout change must be the reason, got {task:?}",
+    );
     assert!(lifecycle.finish_superseded(fixture.source_root, 1));
     assert!(!lifecycle.is_ready_generation(fixture.source_root, 1));
 }
@@ -101,12 +122,51 @@ fn call_hierarchy_index_layout_edit_supersedes_instead_of_publishing() {
 fn call_hierarchy_index_catch_up_budget_supersedes_after_pass_or_time_limit() {
     // Given: catch-up at its pass and time boundaries.
     let now = Instant::now();
+    let budget = CatchUpBudget::PRODUCTION;
 
     // When: either limit is exhausted.
-    let pass_exhausted = catch_up_exhausted(CATCH_UP_PASSES, now);
-    let time_exhausted = catch_up_exhausted(0, now - CATCH_UP_LIMIT);
+    let pass_exhausted = catch_up_exhausted(budget.passes, now, budget);
+    let time_exhausted = catch_up_exhausted(0, now - budget.limit, budget);
 
     // Then: the worker must supersede instead of entering another catch-up loop.
     assert!(pass_exhausted);
     assert!(time_exhausted);
+    assert!(!catch_up_exhausted(0, now, budget), "a fresh catch-up is within budget");
+}
+
+/// The budget is a wall-clock policy, so a build that runs past it is superseded for
+/// that reason and says so — the one outcome a loaded machine can produce on its own,
+/// which is why the tests above do not run under it.
+#[test]
+fn call_hierarchy_index_exhausted_catch_up_budget_names_itself() {
+    let initial = "Процедура А()\nБ();\nКонецПроцедуры\n\nПроцедура Б()\nКонецПроцедуры";
+    let mut fixture = fixture(initial);
+    let snapshot = CallHierarchyIndexFrozenSnapshot::capture(
+        &fixture.db,
+        fixture.source_root,
+        &fixture.mem_docs.freeze(),
+        1,
+    );
+    let lifecycle = CallHierarchyIndexState::default();
+    assert!(lifecycle.start_build(fixture.source_root, 1, CallHierarchyIndexSnapshotId(1)));
+    let uri = Url::from_file_path(fixture._directory.path().join("Module.bsl")).expect("file URL");
+    fixture.mem_docs.insert(
+        uri,
+        "Процедура А()\nКонецПроцедуры\n\nПроцедура Б()\nКонецПроцедуры".to_owned(),
+        2,
+    );
+    assert!(lifecycle.record_body_edit_or_supersede_ready(fixture.source_root, 1, fixture.file_id,));
+
+    // A budget that is already spent: one pass of catching up is one too many.
+    let spent = CatchUpBudget { passes: 0, limit: std::time::Duration::MAX };
+    let task = run_build_within(lifecycle.clone(), fixture.mem_docs.clone(), snapshot, spent);
+
+    assert!(
+        matches!(
+            task,
+            Task::CallHierarchyIndexSuperseded { reason: "catch_up_budget_exhausted", .. }
+        ),
+        "got {task:?}",
+    );
+    assert!(lifecycle.finish_superseded(fixture.source_root, 1));
 }

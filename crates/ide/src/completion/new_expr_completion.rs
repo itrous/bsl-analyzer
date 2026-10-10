@@ -119,6 +119,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn offers_only_constructors_in_new_position_empty_prefix() {
         let code = "Процедура Тест()
     Х = Новый $0
@@ -137,6 +138,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn filters_by_prefix_russian() {
         let code = "Процедура Тест()
     Х = Новый Масс$0

@@ -86,7 +86,7 @@ pub use publish::{
     SharedEmbeddingPublishStats, SharedEmbeddingPublisher,
 };
 pub use resolved_view_search::lexical_hits as lexical_hits_for_resolved_view;
-pub use resolver::{InMemoryResolvedViewResolver, ResolvedView};
+pub use resolver::{InMemoryResolvedViewResolver, ResolvedView, ResolvedViewCounts};
 pub use store::{BaselineManifestRecord, ChunkInfo, Store, TextSearchResult};
 pub use token_policy::{TokenPolicy, SEGMENTATION_VERSION};
 pub use workspace_overlay::{

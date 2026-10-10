@@ -1532,15 +1532,7 @@ impl<'db> InferenceContext<'db> {
         };
         let type_param = self.db.type_descriptor();
         let position = signature.params.iter().position(|param| param.ty == type_param)?;
-        let arg = *args.get(position)?;
-        let (callee, text) = crate::type_literal::type_ctor_literal(body, arg)?;
-        if self.is_call_name_shadowed(callee) {
-            return None;
-        }
-        let named = crate::lower::type_string::lower_constructed_type_name_typeid(self.db, text);
-        if named == self.db.unknown() {
-            return None;
-        }
+        let named = self.literal_type_argument(body, *args.get(position)?)?;
         members
             .iter()
             .any(|member| crate::subtype::is_assignable(self.db, named, *member))
@@ -1560,6 +1552,49 @@ impl<'db> InferenceContext<'db> {
                 signature.return_ty = selected;
             }
         }
+    }
+
+    /// The type a literal `Тип("X")` argument names, when `Тип` is the platform
+    /// function and X lowers to a known type.
+    fn literal_type_argument(&mut self, body: &Body, arg: ExprIdx) -> Option<TypeId> {
+        let (callee, text) = crate::type_literal::type_ctor_literal(body, arg)?;
+        if self.is_call_name_shadowed(callee) {
+            return None;
+        }
+        let named = crate::lower::type_string::lower_constructed_type_name_typeid(self.db, text);
+        (named != self.db.unknown()).then_some(named)
+    }
+
+    /// The result of the managed form's own `РеквизитФормыВЗначение(Имя[, Тип])`:
+    /// the platform documents it as `Произвольный`, while the value is fixed by the
+    /// call — by a literal `Тип` argument when one is given, otherwise by the
+    /// declared type of the attribute the literal name points at.
+    ///
+    /// A second argument that is not a recognisable literal decides the type at
+    /// run time, so it leaves the result unknown rather than falling back to the
+    /// attribute: the two may legitimately differ.
+    fn form_attribute_to_value_return(
+        &mut self,
+        name: &hir_def::Name,
+        args: &[ExprId],
+    ) -> Option<TypeId> {
+        let method = bsl_platform::PlatformData::instance()
+            .get_method(crate::form_self::FORM_TYPE_NAME, name.as_str())?;
+        if method.english_name != "FormAttributeToValue" {
+            return None;
+        }
+        let resolver = self.get_resolver();
+        if !crate::this_object::is_managed_form_module(self.db, &resolver) {
+            return None;
+        }
+        let body = Arc::clone(&self.body);
+        if let Some(type_arg) = args.get(1) {
+            if !matches!(body.expr(*type_arg), Expr::Missing) {
+                return self.literal_type_argument(&body, type_arg.to_idx());
+            }
+        }
+        let attribute = crate::type_literal::bare_string_literal(&body, args.first()?.to_idx())?;
+        crate::form_attr::resolve_form_attribute_value(self.db, &resolver, attribute)
     }
 
     fn is_call_name_shadowed(&mut self, name: &Name) -> bool {
@@ -3474,6 +3509,15 @@ impl<'db> InferenceContext<'db> {
                     let mut candidates = info.candidates;
                     let arg_idxs: Vec<ExprIdx> = args.iter().map(|arg| arg.to_idx()).collect();
                     self.select_returns_by_type_argument(&mut candidates, &arg_idxs);
+                    if self.form_self_receiver_name(base_id).is_some() {
+                        if let Some(value_ty) =
+                            self.form_attribute_to_value_return(&method_name, args)
+                        {
+                            for signature in candidates.signatures_mut() {
+                                signature.return_ty = value_ty;
+                            }
+                        }
+                    }
                     // Same coercion the user cascade dispatched on: the manager
                     // receiver and the workspace receiver are one value.
                     if let TypeKind::ObjectManager(facet) = &workspace_receiver_kind {
@@ -3773,6 +3817,9 @@ impl<'db> InferenceContext<'db> {
                     .unwrap_or(BareNameVerdict::Indeterminate)
             };
             self.report_absent_bare_call(name, callee, verdict);
+            if let Some(value_ty) = self.form_attribute_to_value_return(name, args) {
+                return value_ty;
+            }
         }
         self.db.unknown()
     }
@@ -5178,6 +5225,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_builtin_function_lookup() {
         let db = bsl_types::testing::InMemoryDb::new();
         let builtins = builtin::builtin_functions();
@@ -5195,6 +5243,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_builtin_date_function() {
         let db = bsl_types::testing::InMemoryDb::new();
         let builtins = builtin::builtin_functions();
@@ -5210,6 +5259,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_builtin_type_function() {
         let db = bsl_types::testing::InMemoryDb::new();
         let builtins = builtin::builtin_functions();

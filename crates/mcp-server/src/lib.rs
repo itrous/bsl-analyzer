@@ -208,15 +208,42 @@ fn finish_indexed_search(
     mut response: CallToolResult,
     indexing: indexing::Indexing,
     budget: Option<usize>,
+    stale: bool,
 ) -> Result<CallToolResult, McpError> {
     if response.structured_content.as_ref().is_some_and(|body| body["action"] == "list_platform") {
         return Ok(response);
     }
     indexing.attach(&mut response);
+    let response = mark_graph_stale(response, stale);
     match budget {
         Some(budget) => tools::search::finalize_indexed_response(response, budget),
         None => Ok(response),
     }
+}
+
+fn mark_graph_stale(mut response: CallToolResult, stale: bool) -> CallToolResult {
+    if stale {
+        if let Some(body) = response.structured_content.as_mut() {
+            let old_mirror = serde_json::to_string(body).expect("JSON serializes");
+            // Only fields the tool's schema already declares: a top-level `stale` is part of
+            // some envelopes but not of others, and must not appear unannounced.
+            if body.get("stale").is_some() {
+                body["stale"] = serde_json::Value::Bool(true);
+            }
+            if body.get("freshness").is_some() {
+                body["freshness"]["stale"] = serde_json::Value::Bool(true);
+            }
+            let mirror = serde_json::to_string(body).expect("JSON serializes");
+            for content in &mut response.content {
+                if let rmcp::model::ContentBlock::Text(text) = content {
+                    if text.text == old_mirror {
+                        text.text.clone_from(&mirror);
+                    }
+                }
+            }
+        }
+    }
+    response
 }
 
 pub async fn serve_stdio(server: McpServer) -> anyhow::Result<()> {
@@ -947,7 +974,9 @@ fn require<T>(val: Option<T>, field: &str, action: &str) -> Result<T, McpError> 
 /// conclusions about whether waiting helps.
 fn graph_provider_state(status: &GraphStatus, has_snapshot: bool) -> ide::ProviderState {
     match status {
-        GraphStatus::Ready { .. } if has_snapshot => ide::ProviderState::Answered,
+        GraphStatus::Ready { .. } | GraphStatus::Loading if has_snapshot => {
+            ide::ProviderState::Answered
+        }
         // Ready with no snapshot is a race, not a build failure: the answer is the
         // same as still-building — ask again.
         GraphStatus::Ready { .. } | GraphStatus::Idle | GraphStatus::Loading => {
@@ -1513,6 +1542,7 @@ impl McpServer {
                         ),
                         self.state.workspace_indexing(),
                         budget,
+                        self.state.graph().is_reloading(),
                     );
                 }
                 let configured_baseline = baseline.configured;
@@ -1621,7 +1651,7 @@ impl McpServer {
         } else {
             self.state.workspace_indexing()
         };
-        finish_indexed_search(response, indexing, budget)
+        finish_indexed_search(response, indexing, budget, self.state.graph().is_reloading())
     }
 
     /// Validate or execute SDBL (the 1C query language) against the configuration schema. Use
@@ -1979,6 +2009,7 @@ impl McpServer {
                 response,
                 indexing::Indexing::single(graph.indexing_snapshot()),
                 loading_budget,
+                graph.is_reloading(),
             )
         };
 
@@ -1996,6 +2027,7 @@ impl McpServer {
                 tools::graph::status(&report),
                 indexing::Indexing::single(target),
                 None,
+                false,
             );
         }
 
@@ -2060,9 +2092,12 @@ impl McpServer {
                 ))
             }
             GraphStatus::Idle | GraphStatus::Loading => {
-                return finish_loading(tools::graph::loading(Some(
-                    "call graph is still indexing; retry shortly",
-                )))
+                if !graph.has_installed_snapshot() {
+                    return finish_loading(tools::graph::loading(
+                        Some("call graph is still indexing; retry shortly"),
+                        graph.cold_build_eta_seconds(),
+                    ));
+                }
             }
             GraphStatus::Failed(msg) => {
                 return Err(McpError::internal_error(format!("graph load failed: {msg}"), None))
@@ -2162,7 +2197,7 @@ impl McpServer {
                 "graph_busy",
                 "the graph's ownership is being confirmed; retry shortly",
             )),
-            Err(_) => finish_loading(tools::graph::loading(None)),
+            Err(_) => finish_loading(tools::graph::loading(None, graph.cold_build_eta_seconds())),
         }
     }
 
@@ -2298,12 +2333,17 @@ impl McpServer {
 
                 graph.read_optional(|snapshot| {
                     let gdb = snapshot.map(|s| &*s.graph);
+                    // The resident card and the graph snapshot are independently
+                    // published caches. A graph rebuild in flight therefore makes
+                    // this cross-source answer stale even if the resident has not
+                    // started its own reload yet.
+                    let graph_reloading = graph.is_reloading();
 
                     let stamp = tools::symbol_info::ResidentStamp {
                         roots: Some(&roots),
                         revision: freshness.revision,
                         topology: freshness.topology,
-                        stale: freshness.stale,
+                        stale: freshness.stale || graph_reloading,
                         unread_files,
                     };
 
@@ -2430,6 +2470,11 @@ impl McpServer {
             "references",
             ct,
             move |session| {
+                // Before the read that folds them: the name indexes' per-file halves,
+                // warmed in chunks with a trim between, so a cold index is built from
+                // memos instead of holding every workspace file's syntax tree at once.
+                let warm_cancel = std::sync::Arc::clone(session.cancel());
+                let _ = session.read_fanout(|resident, _| resident.warm_name_indexes(&warm_cancel));
                 graph.read_optional(|snapshot| {
                     let graph_source = graph_name_source(&graph, snapshot);
 
@@ -2576,6 +2621,7 @@ impl McpServer {
         use tools::diagnostics::{parse_detail, parse_min_severity, FileFilters};
 
         let diag = self.state.diagnostics().clone();
+        let graph = self.state.graph().clone();
         let path = require(p.path, "path", "file")?;
         let path = std::path::PathBuf::from(path);
         let root_id = p.root_id;
@@ -2604,6 +2650,7 @@ impl McpServer {
         };
 
         let retry_diag = diag.clone();
+        let response_graph = graph.clone();
         let heal_diag = diag.clone();
         tasks::resident_response(
             self,
@@ -2632,7 +2679,10 @@ impl McpServer {
                 use crate::diagnostics_state::ResidentOutcome;
                 match outcome {
                     ResidentOutcome::Ready((result, completeness), freshness) => {
-                        Ok(tools::diagnostics::envelope(freshness, completeness, result))
+                        Ok(mark_graph_stale(
+                            tools::diagnostics::envelope(freshness, completeness, result),
+                            response_graph.is_reloading(),
+                        ))
                     }
                     ResidentOutcome::Loading => {
                         Ok(tools::diagnostics::loading(&session.status_report()))
@@ -2672,6 +2722,7 @@ impl McpServer {
         };
 
         let diag = self.state.diagnostics().clone();
+        let graph = self.state.graph().clone();
         // Kicks the lazy build only: branching on the lifecycle here would answer before
         // the cancellation token is consulted, and a cancelled call would be handed a
         // `loading` body. The read renders every outcome, `loading` included.
@@ -2696,6 +2747,7 @@ impl McpServer {
         // concurrent calls stay untouched.
         let started = std::time::Instant::now();
         let retry_diag = diag.clone();
+        let response_graph = graph.clone();
         tasks::resident_response(
             self,
             caller,
@@ -2704,8 +2756,10 @@ impl McpServer {
             move |session| {
                 let sweep_cancel = std::sync::Arc::clone(session.cancel());
                 let outcome = session.read_fanout(|resident, generation| {
-                    let sweep =
-                        resident.workspace_aggregates(resident.config(), &opts, &sweep_cancel);
+                    // Cloned, not borrowed: the sweep trims the resident's caches as it
+                    // goes, so it needs the resident mutably for its whole duration.
+                    let config = resident.config().clone();
+                    let sweep = resident.workspace_aggregates(&config, &opts, &sweep_cancel);
                     if sweep.cancelled {
                         tracing::info!(
                             tool = "diagnostics",
@@ -2720,7 +2774,10 @@ impl McpServer {
                 });
                 match outcome {
                     ResidentOutcome::Ready((result, completeness), freshness) => {
-                        Ok(tools::diagnostics::envelope(freshness, completeness, result))
+                        Ok(mark_graph_stale(
+                            tools::diagnostics::envelope(freshness, completeness, result),
+                            response_graph.is_reloading(),
+                        ))
                     }
                     ResidentOutcome::Loading => {
                         Ok(tools::diagnostics::loading(&session.status_report()))
@@ -2941,7 +2998,7 @@ impl McpServer {
             SearchCommand::SearchCode(_) => unreachable!("reference schema excludes search_code"),
         }?;
         let indexing = self.state.reference_indexing();
-        finish_indexed_search(response, indexing, budget)
+        finish_indexed_search(response, indexing, budget, self.state.graph().is_reloading())
     }
 
     /// Ask the ITS expert-help knowledge base a natural-language question about the 1C platform
@@ -4343,6 +4400,20 @@ mod graph_supersession_contract {
                 assert!(!validator.is_valid(&missing));
             }
         }
+        let ready = server
+            .graph(params("status", None), token())
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let mut loading = serde_json::json!({"status":"loading", "indexing":ready["indexing"]});
+        assert!(validator.is_valid(&loading), "optional ETA omitted: {loading}");
+        loading["eta_seconds"] = serde_json::json!(3);
+        assert!(validator.is_valid(&loading), "positive ETA accepted: {loading}");
+        for invalid_eta in [serde_json::json!(0), serde_json::json!(-1), serde_json::json!("3")] {
+            loading["eta_seconds"] = invalid_eta;
+            assert!(!validator.is_valid(&loading), "invalid ETA accepted: {loading}");
+        }
         let held = crate::graph::test_support::hold_every_handle(&graph);
         for action in ["overview", "node", "source", "neighbors", "callers", "callees"] {
             let request = params(action, Some("method/common/Сервер/Считать"));
@@ -4377,6 +4448,7 @@ mod graph_supersession_contract {
             retry,
             indexing::Indexing::single(graph.indexing_snapshot()),
             None,
+            false,
         )
         .unwrap();
         let body = retry.structured_content.unwrap();
@@ -4385,6 +4457,253 @@ mod graph_supersession_contract {
         assert!(validator.is_valid(&body));
         let response = server.graph(resolve_params("Массив"), token()).await.unwrap();
         assert!(response.structured_content.unwrap().get("indexing").is_none());
+        server.shutdown();
+        drop(env);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize environment-dependent fixture across its async calls"
+    )]
+    async fn stale_snapshot_served_during_loading() {
+        let env = crate::state::test_support::env_lock();
+        let _model = crate::state::test_support::EnvVarGuard::unset("EMBEDDING_MODEL");
+        let dir = tempfile::tempdir().unwrap();
+        crate::graph::test_support::sample_workspace(dir.path());
+        std::fs::write(dir.path().join("Configuration.xml"), "<Configuration/>").unwrap();
+        let state = SharedState::workspace(dir.path().to_path_buf()).unwrap();
+        let graph = state.graph().clone();
+        let diagnostics = state.diagnostics().clone();
+        graph.ensure_loading();
+        crate::graph::test_support::wait_ready(&graph);
+        state.diagnostics().ensure_loading();
+        crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
+
+        assert!(graph.has_installed_snapshot());
+
+        let server = McpServer::new(McpProfile::Workspace, state);
+        let token = tokio_util::sync::CancellationToken::new;
+        let search_status = server
+            .workspace_search(
+                Parameters(
+                    serde_json::from_value::<WorkspaceSearchParams>(
+                        serde_json::json!({"action":"status"}),
+                    )
+                    .unwrap(),
+                ),
+                token(),
+            )
+            .await
+            .expect("search status before stale snapshot test");
+        let status_body = search_status.structured_content.expect("search status body");
+        assert_eq!(status_body["state"], "ready", "precondition: search resident is ready");
+        let search_params = || {
+            Parameters(
+                serde_json::from_value::<WorkspaceSearchParams>(
+                    serde_json::json!({"action":"search_code","query":"Считать","limit":5}),
+                )
+                .unwrap(),
+            )
+        };
+        let warmed_search = server
+            .workspace_search(search_params(), token())
+            .await
+            .expect("warm lexical/hybrid search before graph reload");
+        assert!(
+            warmed_search.structured_content.as_ref().unwrap().to_string().contains("Считать"),
+            "precondition: warmed search has a positive hit"
+        );
+
+        let resident_symbol = server
+            .symbol_info(symbol_params("Сервер.Считать"), token(), tasks::TaskCapable(false))
+            .await
+            .expect("warm the target symbol in the installed resident before disk drift");
+        let rmcp::model::CallToolResponse::Complete(resident_symbol) = resident_symbol else {
+            panic!("the preloaded symbol response was incomplete");
+        };
+        let resident_symbol = resident_symbol.structured_content.unwrap();
+        assert_eq!(resident_symbol["status"], "ok");
+        assert!(resident_symbol["definition"]["line"].is_number());
+        assert!(resident_symbol["signature"].is_string());
+
+        // Hold the graph in its reload state before delivering disk drift, so this test
+        // exercises stale serving without racing the real watcher into ownership handoff.
+        graph.set_reload_running_for_test();
+        assert!(matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }));
+        assert!(graph.is_reloading(), "published Ready graph reports its active reload");
+        let changed_path = dir.path().join("CommonModules/Сервер/Ext/Module.bsl");
+        let old_text = std::fs::read_to_string(&changed_path).unwrap();
+        std::fs::write(&changed_path, format!("// сдвиг координат\n{old_text}")).unwrap();
+        // `file_text` is revision-guarded: an un-applied disk edit must be refused rather
+        // than combined with the resident's old ranges. Let the normal diagnostics drift
+        // path consume the real workspace event first, while the graph publication remains
+        // installed. The subsequent tool assertions then compare each service to its own
+        // coherent resident snapshot during graph reload.
+        let resident_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let shifted_resident = loop {
+            let observed = diagnostics.read(|resident, _| {
+                let file_id = resident.file_id_for(&changed_path).expect("resident module");
+                resident.analysis().file_text(file_id).to_string()
+            });
+            if let crate::diagnostics_state::ResidentOutcome::Ready(text, _) = observed {
+                if text.starts_with("// сдвиг координат\n") {
+                    break text;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < resident_deadline,
+                "the normal diagnostics drift path did not apply the delivered disk edit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(shifted_resident, format!("// сдвиг координат\n{old_text}"));
+        let graph_snapshot = graph.snapshot().expect("published graph handle");
+        assert!(
+            graph.cached_freshness(&graph_snapshot).stale,
+            "Ready+Running publication was reported fresh before serving: {}",
+            crate::graph::test_support::graph_state_summary(&graph)
+        );
+
+        let mut published_bodies = None;
+        for phase in 0..2 {
+            if phase == 1 {
+                graph.set_loading_for_test();
+                assert_eq!(graph.status(), crate::graph::GraphStatus::Loading);
+                assert!(graph.is_reloading());
+            }
+
+            // Each tool must keep serving the installed generation with a stale marker
+            // for both Ready+Running and Loading. The disk edit above moves every old
+            // range, so equality across phases proves each answer stays on its resident.
+            let mut request = params("overview", None);
+            request.0.max_output_tokens = Some(1000);
+            let graph_body =
+                server.graph(request, token()).await.unwrap().structured_content.unwrap();
+            assert_ne!(graph_body.get("status"), Some(&serde_json::json!("loading")));
+            assert_eq!(graph_body["freshness"]["stale"], true);
+            assert!(graph_body.get("eta_seconds").is_none(), "stale snapshot: {graph_body}");
+
+            let sym_response = server
+                .symbol_info(symbol_params("Сервер.Считать"), token(), tasks::TaskCapable(false))
+                .await
+                .expect("symbol_info must serve the installed resident during reload");
+            let rmcp::model::CallToolResponse::Complete(sym_response) = sym_response else {
+                panic!("symbol_info returned an incomplete response during reload");
+            };
+            let sym_body = sym_response.structured_content.expect("symbol_info response body");
+            assert_eq!(sym_body["status"], "ok");
+            assert_eq!(sym_body["freshness"]["stale"], true);
+            assert_eq!(sym_body["doc"], "сдвиг координат");
+            assert_eq!(
+                sym_body["definition"]["line"], 2,
+                "directive and declaration moved together"
+            );
+            assert_eq!(sym_body["definition"]["snippet"], "&НаСервере");
+            assert_eq!(sym_body["definitions"][0]["location"]["range"]["start_line"], 2);
+            assert_eq!(sym_body["definitions"][0]["location"]["enclosing_range"]["start_line"], 1);
+
+            let unchanged = server
+                .symbol_info(symbol_params("Клиент.Главная"), token(), tasks::TaskCapable(false))
+                .await
+                .expect("unchanged symbol remains available during reload");
+            let rmcp::model::CallToolResponse::Complete(unchanged) = unchanged else {
+                panic!("unchanged symbol unexpectedly became incomplete during reload");
+            };
+            let unchanged_body = unchanged.structured_content.unwrap();
+            assert_eq!(unchanged_body["freshness"]["stale"], true);
+            assert!(unchanged_body.get("signature").is_some());
+            assert!(unchanged_body["definition"]["line"].is_number());
+            assert!(unchanged_body["definitions"][0]["location"].is_object());
+
+            let search_response = server
+                .workspace_search(search_params(), token())
+                .await
+                .expect("search must serve the warmed lexical snapshot during reload");
+            let search_body = search_response.structured_content.expect("search response body");
+            assert!(
+                search_body.to_string().contains("Считать"),
+                "search must return a positive hit"
+            );
+            assert_eq!(search_body["freshness"]["stale"], true);
+            assert!(search_body.get("stale").is_none(), "undeclared search field: {search_body}");
+
+            let diag_response = server
+                .diagnostics(
+                    Parameters(DiagnosticsParams {
+                        action: "file".to_owned(),
+                        path: Some(changed_path.to_string_lossy().into_owned()),
+                        root_id: None,
+                        codes: Vec::new(),
+                        locale: None,
+                        min_severity: None,
+                        range_start: None,
+                        range_end: None,
+                        detail: None,
+                        max_findings: None,
+                        max_files: None,
+                        max_output_tokens: Some(4096),
+                    }),
+                    token(),
+                    tasks::TaskCapable(false),
+                )
+                .await
+                .expect("diagnostics file response");
+            let rmcp::model::CallToolResponse::Complete(diag_response) = diag_response else {
+                panic!("diagnostics returned an incomplete response during reload");
+            };
+            let diag_body = diag_response.structured_content.expect("diagnostics response body");
+            assert_ne!(diag_body["status"], "loading");
+            assert_eq!(diag_body["freshness"]["stale"], true);
+            let mirror = diag_response
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    rmcp::model::ContentBlock::Text(text) => {
+                        serde_json::from_str::<serde_json::Value>(&text.text).ok()
+                    }
+                    _ => None,
+                })
+                .expect("diagnostics JSON text mirror");
+            assert_eq!(
+                mirror["freshness"]["stale"], true,
+                "JSON mirror matches structured stale flag"
+            );
+
+            let old_method_line = shifted_resident
+                [..shifted_resident.find("Функция Считать").unwrap()]
+                .matches('\n')
+                .count();
+            let search_line = search_body["hits"][0]["line_start"].as_u64().unwrap() as usize;
+            assert!(
+                search_line == old_method_line || search_line == old_method_line + 1,
+                "search location must belong to the old or shifted published text: {search_line}"
+            );
+            let function_diagnostic = diag_body["result"]["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|finding| finding["code"] == "FunctionShouldHaveReturn")
+                .expect("function diagnostic uses a source range");
+            assert_eq!(
+                function_diagnostic["range"]["start_line"], old_method_line,
+                "diagnostic source range follows the resident's shifted text"
+            );
+            let bodies = (
+                graph_body["result"].clone(),
+                sym_body["definition"].clone(),
+                diag_body["result"]["findings"].clone(),
+            );
+            if let Some(published) = &published_bodies {
+                assert_eq!(
+                    &bodies, published,
+                    "each tool keeps its published payload across reload states"
+                );
+            } else {
+                published_bodies = Some(bodies);
+            }
+        }
+
         server.shutdown();
         drop(env);
     }
@@ -5033,12 +5352,79 @@ mod resolve_envelope {
         crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
         let server = ServerUnderTest(McpServer::new(McpProfile::Workspace, state));
 
+        let mut overview_request = resolve_params("ignored");
+        overview_request.0.action = "overview".to_owned();
+        overview_request.0.query = None;
+        assert!(!server.0.state.graph().has_installed_snapshot());
+        let overview = server
+            .graph(overview_request, tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("cold overview answers with a retry envelope");
+        let overview_body = overview.structured_content.expect("structured loading body");
+        assert_eq!(overview_body["status"], "loading");
+        assert!(overview_body.get("eta_seconds").is_none());
+        assert!(!server.0.state.graph().has_installed_snapshot());
+        assert!(held.holds_unconsulted(), "overview released the first-build hold");
+
         let body = resolve_nothing(&server).await;
 
         // The whole answer was assembled with the build still held, so what it says about the
         // graph is what the graph was, not what it became.
         assert!(held.holds_unconsulted(), "the graph was built out from under the answer: {body}",);
         assert_partial_while_the_graph_is_unconsulted(&body);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize environment-dependent fixture across its async calls"
+    )]
+    async fn cold_loading_estimates_remaining_time_after_a_completed_build_interval() {
+        let _env_lock = crate::state::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let graph =
+            crate::graph::GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+                .with_build_candidate_hook_for_test(std::sync::Arc::new(move |_| {
+                    entered_tx.send(()).expect("test is waiting for the producer boundary");
+                    release_rx.lock().unwrap().recv().expect("test releases the producer boundary");
+                }));
+
+        let (state, _old_graph_hold) = crate::graph::test_support::holding_the_first_build(|| {
+            SharedState::workspace_with_cache(root.to_path_buf(), cache)
+                .expect("valid workspace project")
+        });
+        let state = state.with_graph_for_test(graph.clone());
+        let server = ServerUnderTest(McpServer::new(McpProfile::Workspace, state));
+        let mut overview_request = resolve_params("ignored");
+        overview_request.0.action = "overview".to_owned();
+        overview_request.0.query = None;
+        graph.ensure_loading();
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("real graph producer reached the post-persistence boundary");
+        assert_eq!(graph.status(), crate::graph::GraphStatus::Loading);
+        assert!(!graph.has_installed_snapshot());
+        let response = server
+            .graph(overview_request, tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("cold overview remains a loading response before publication");
+        let body = response.structured_content.expect("structured loading response");
+        assert_eq!(body["status"], "loading");
+        assert!(body["eta_seconds"].as_u64().is_some_and(|seconds| seconds > 0), "{body}");
+        assert!(!graph.has_installed_snapshot());
+
+        release_tx.send(()).expect("release the producer after observing its ETA");
+        crate::graph::test_support::wait_ready(&graph);
+        assert!(graph.cold_build_eta_seconds().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

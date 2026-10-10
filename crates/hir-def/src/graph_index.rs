@@ -71,6 +71,13 @@ pub struct GraphIndex {
     node_dispatch: FxHashMap<MethodId, MethodDispatch>,
 }
 
+fn signature_hash(header: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    header.hash(&mut hasher);
+    hasher.finish()
+}
+
 impl GraphIndex {
     /// An empty index; populate with [`Self::add_module`] (e.g. one batch's modules
     /// at a time in a fresh database) to build the whole-config index without ever
@@ -163,7 +170,13 @@ impl GraphIndex {
         module: ModuleId,
     ) -> (Vec<GraphMethodEntry>, Option<MethodDispatch>, bool) {
         let item_tree = db.item_tree(module.file_id);
-        let all = crate::call_graph::extract_graph_methods(&item_tree);
+        let text = db.file_text(module.file_id);
+        let mut all = crate::call_graph::extract_graph_methods(&item_tree);
+        for entry in &mut all {
+            let start = u32::from(entry.name_range.start()) as usize;
+            let end = u32::from(entry.sig_end) as usize;
+            entry.signature_hash = text.get(start..end).map_or(0, signature_hash);
+        }
         let module_dispatch = db
             .module_metadata(module)
             .execution_context
@@ -201,8 +214,8 @@ impl GraphIndex {
         self.methods.get(&method.module)?.all.iter().find(|e| e.local_id == method.local_id)
     }
 
-    /// A body-free signature hash of one module's methods: the ordered
-    /// (original-spelling name, `is_export`, effective dispatch) of every method in
+    /// A body-free signature hash of one module's methods: the ordered declaration
+    /// headers (including parameters), export flags, and effective dispatch of every method in
     /// declaration order. This is exactly the cross-module resolution + identity
     /// surface — `find_method` resolves on the name, callers' edges/boundary flags
     /// depend on `is_export` + effective dispatch, and the durable method id embeds
@@ -228,6 +241,7 @@ impl GraphIndex {
         methods.unread.hash(&mut hasher);
         for entry in &methods.all {
             entry.name.as_str().hash(&mut hasher);
+            entry.signature_hash.hash(&mut hasher);
             entry.is_export.hash(&mut hasher);
             // The effective dispatch (module execution context wins, else annotation)
             // is what the stored node row and the client→server edge flag carry, so it
@@ -893,6 +907,10 @@ fn reference_targets(
 pub struct BatchCallProjection {
     pub edges: Vec<WorkspaceCallEdge>,
     pub unresolved: Vec<(ModuleId, ModuleId, String)>,
+    /// Calls to a metadata-declared common module whose body file is not present in
+    /// the current graph. The module name is retained so adding its BSL body can
+    /// find and reproject callers without rescanning source text.
+    pub unresolved_declared_common: Vec<(ModuleId, String, String)>,
 }
 
 /// Workspace-wide state threaded across batches: MDO spelling canonicalization and
@@ -1006,13 +1024,15 @@ pub fn project_batch_call_edges<DB: ConfigsDatabase + Clone + Send>(
     let results: Vec<_> = parallel_per_module(pool, db, batch, |db, module| {
         let summary = resolve_module_summary_via_index(db, module, index);
         let unresolved = extract_unresolved_refs(db, module, index);
-        (summary, unresolved)
+        let unresolved_declared_common = extract_missing_common_module_refs(db, module);
+        (summary, unresolved, unresolved_declared_common)
     });
 
     let mut edges = Vec::new();
     let mut unresolved = Vec::new();
+    let mut unresolved_declared_common = Vec::new();
     let dispatch = |node: &GraphNode| index.dispatch(node);
-    for (summary, unres) in &results {
+    for (summary, unres, declared) in &results {
         edges.extend(crate::queries::project_module_call_edges(
             summary,
             &dispatch,
@@ -1021,8 +1041,47 @@ pub fn project_batch_call_edges<DB: ConfigsDatabase + Clone + Send>(
         for (target, method_lower) in unres {
             unresolved.push((summary.module, *target, method_lower.clone()));
         }
+        unresolved_declared_common.extend(declared.iter().cloned());
     }
-    BatchCallProjection { edges, unresolved }
+    BatchCallProjection { edges, unresolved, unresolved_declared_common }
+}
+
+/// Keep a reverse reference for a qualified call only when its common-module
+/// receiver is declared by metadata but currently has no usable source body.
+/// `CallTarget::QualifiedModule` is produced by semantic call lowering, so this
+/// does not infer receivers from arbitrary field chains or source text.
+fn extract_missing_common_module_refs(
+    db: &dyn ConfigsDatabase,
+    module: ModuleId,
+) -> Vec<(ModuleId, String, String)> {
+    use crate::call_graph::CallTarget;
+
+    let Some(module_name_owner) = db.has_config_root(module.file_id).then_some(module.file_id)
+    else {
+        return Vec::new();
+    };
+    let resolver = Resolver::with_workspace_scope(module);
+    let mut refs = Vec::new();
+    for edge in &db.module_call_summary(module).call_edges {
+        let CallTarget::QualifiedModule { module_name, method_name } = &edge.target else {
+            continue;
+        };
+        if resolver.locate_common_module_candidates(db, module_name).is_ok()
+            || db.resolve_common_module(module_name_owner, module_name.as_str()).is_none()
+        {
+            continue;
+        }
+        // Match the durable `common/<name>` scope used by `encode_scope`; folding
+        // here allows source spelling to differ from metadata's casing.
+        refs.push((
+            module,
+            format!("common/{}", module_name.as_str().fold_lower()),
+            method_name.as_str().fold_lower(),
+        ));
+    }
+    refs.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+    refs.dedup();
+    refs
 }
 
 /// Run `f` for every module in `batch` in parallel on `pool`, returning the results
@@ -2609,8 +2668,13 @@ mod module_layout_hash_tests {
     fn hashes_marked(source: &str, unread: bool) -> (u64, u64) {
         let module = ModuleId::new(FileId(0));
         let parse = parser::parse(source);
-        let methods =
+        let mut methods =
             crate::call_graph::extract_graph_methods(&crate::ItemTree::from_parse(&parse));
+        for entry in &mut methods {
+            let start = u32::from(entry.name_range.start()) as usize;
+            let end = u32::from(entry.sig_end) as usize;
+            entry.signature_hash = source.get(start..end).map_or(0, signature_hash);
+        }
         let mut index = GraphIndex::new();
         index.insert_module_data(module, methods, None, unread);
 
@@ -2728,6 +2792,14 @@ mod module_layout_hash_tests {
 
         assert_ne!(before.0, after.0, "durable signature identity");
         assert_ne!(before.1, after.1, "resident layout identity");
+    }
+
+    #[test]
+    fn exported_parameter_composition_moves_signature_hash() {
+        let before = hashes("Процедура Выполнить(Знач А) Экспорт\nКонецПроцедуры");
+        let after = hashes("Процедура Выполнить(Знач А, Б) Экспорт\nКонецПроцедуры");
+
+        assert_ne!(before.0, after.0, "callers must be reconsidered when parameters change");
     }
 
     #[test]

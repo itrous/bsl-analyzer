@@ -101,6 +101,7 @@ fn arg_count_mismatches(db: &RootDatabaseImpl, file_id: FileId) -> usize {
 const LOCAL_KINDS: [&str; 3] = ["черезпараметр", "черезперем", "черезлокальную"];
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_local_variable_leaves_the_call_to_the_module_function() {
     let (db, file_id) = setup(
         r#"
@@ -132,6 +133,7 @@ fn a_local_variable_leaves_the_call_to_the_module_function() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_module_variable_leaves_the_call_to_the_module_function() {
     // The write types the module variable as a Число, so the callee read as a value is
     // neither unknown nor a function; the call still reaches the function.
@@ -216,6 +218,7 @@ fn a_module_variable_leaves_the_call_to_the_global_export() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_variable_leaves_the_call_to_the_platform_function() {
     let (db, file_id) = setup(
         r#"
@@ -284,6 +287,7 @@ fn a_variable_leaves_the_call_to_a_catalog_only_platform_function() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_value_held_in_the_name_and_the_call_of_the_name_coexist() {
     let (db, file_id) = setup(
         r#"

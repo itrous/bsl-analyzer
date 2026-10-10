@@ -1133,6 +1133,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn platform_object_fields_include_form_extension_properties() {
         let fields = enumerate_fields(
             &[],
@@ -1332,6 +1333,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn enumerate_tabular_section_row_yields_columns_and_line_number() {
         let mut ts = TabularSection::new(Uuid::new_v4(), "Услуги");
         ts.set_attributes(vec![TabularSectionAttribute::new(
@@ -1833,6 +1835,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn point_in_time_present_on_three_record_flavours_absent_on_calc() {
         let pd = PlatformData::instance();
         let has_pit = |prefix: &str| {

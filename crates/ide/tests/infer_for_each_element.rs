@@ -30,6 +30,7 @@ fn var_ty(db: &RootDatabaseImpl, file_id: FileId, var_lower: &str) -> Option<Typ
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn for_each_over_map_yields_kluch_i_znachenie() {
     let (db, file_id) = setup(
         r#"
@@ -53,6 +54,7 @@ fn for_each_over_map_yields_kluch_i_znachenie() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn for_each_over_value_table_yields_row() {
     let (db, file_id) = setup(
         r#"
@@ -76,6 +78,7 @@ fn for_each_over_value_table_yields_row() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn for_each_over_value_list_yields_list_item() {
     let (db, file_id) = setup(
         r#"
@@ -99,6 +102,7 @@ fn for_each_over_value_list_yields_list_item() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn for_each_over_array_overwrites_prior_binding_with_any() {
     let (db, file_id) = setup(
         r#"

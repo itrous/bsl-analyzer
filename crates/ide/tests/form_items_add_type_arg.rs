@@ -72,6 +72,7 @@ fn fixture(body: &str) -> String {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn literal_group_type_narrows_and_serves_as_parent() {
     let (db, file_id) = setup(&fixture(
         "    Группа = Элементы.Добавить(\"Группа\", Тип(\"ГруппаФормы\"));
@@ -84,6 +85,7 @@ fn literal_group_type_narrows_and_serves_as_parent() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn literal_field_type_used_as_parent_is_still_a_mismatch() {
     let (db, file_id) = setup(&fixture(
         "    Поле = Элементы.Добавить(\"Поле\", Тип(\"ПолеФормы\"));
@@ -96,6 +98,7 @@ fn literal_field_type_used_as_parent_is_still_a_mismatch() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn english_type_name_narrows_to_the_same_kind() {
     let (db, file_id) = setup(&fixture(
         "    Группа = Элементы.Вставить(\"Группа\", Type(\"FormGroup\"));
@@ -108,6 +111,7 @@ fn english_type_name_narrows_to_the_same_kind() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn non_literal_type_keeps_the_union_and_is_accepted_as_parent() {
     let (db, file_id) = setup(&fixture(
         "    Родитель = Элементы.Добавить(\"Родитель\", ТипЭлемента);
@@ -119,6 +123,7 @@ fn non_literal_type_keeps_the_union_and_is_accepted_as_parent() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn type_outside_the_documented_kinds_keeps_the_union() {
     let (db, file_id) = setup(&fixture(
         "    Элемент = Элементы.Добавить(\"Элемент\", Тип(\"Массив\"));
@@ -128,6 +133,7 @@ fn type_outside_the_documented_kinds_keeps_the_union() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn shadowed_type_function_does_not_narrow() {
     let text = "&НаСервере
 Функция Тип(Имя)
@@ -144,6 +150,7 @@ fn shadowed_type_function_does_not_narrow() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn members_resolve_on_the_narrowed_kind() {
     let (db, file_id) = setup(&fixture(
         "    Поле = Элементы.Добавить(\"Поле\", Тип(\"ПолеФормы\"));
@@ -154,6 +161,7 @@ fn members_resolve_on_the_narrowed_kind() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn data_composition_collections_follow_the_type_argument_too() {
     let (db, file_id) = setup(
         "&НаСервере
@@ -169,6 +177,7 @@ fn data_composition_collections_follow_the_type_argument_too() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn an_item_of_unknown_kind_is_still_no_number() {
     // The latitude is for a slot that admits some item kinds; a slot that admits
     // none of them still reports the item.

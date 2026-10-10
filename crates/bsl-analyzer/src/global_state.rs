@@ -27,6 +27,15 @@ use crate::task_pool;
 /// appears. Fast per-file opens finish within this window and show nothing.
 const ANALYSIS_PROGRESS_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How long a baseline error read off an empty input is held before it is announced.
+///
+/// Long enough for a truncating write to land its bytes even on a loaded machine, so
+/// the look that follows sees what the author saved; short enough that a file which is
+/// really empty is still reported promptly. The hold is paid off the loop, as a task,
+/// so a loop answering keystrokes never waits it out.
+pub(crate) const DIAGNOSTICS_BASELINE_HOLD: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
 /// Bound on the one incoming-call request allowed to await a compact-index build.
 #[derive(Debug, Clone, Copy)]
 pub struct CallHierarchyWaitPolicy {
@@ -127,14 +136,25 @@ pub enum Task {
         generation: u64,
         reason: String,
     },
+    /// A compact reverse call index build gave its generation back without publishing.
+    /// `reason` says why — a panic, a lost generation, an exhausted catch-up budget —
+    /// because the loop's answer is the same for all of them and nothing else would
+    /// tell them apart.
     CallHierarchyIndexSuperseded {
         source_root: base_db::SourceRootId,
         generation: u64,
+        reason: &'static str,
     },
     /// A successful `callHierarchy/prepare` authorized this generation to build.
     CallHierarchyIndexBuildRequested {
         source_root: base_db::SourceRootId,
         generation: u64,
+    },
+    /// The hold on a baseline error read off an empty input ran out: look at the
+    /// baseline again and announce the error if the input still reads the same.
+    /// `hold` says which hold the look belongs to.
+    DiagnosticsBaselineRecheck {
+        hold: u64,
     },
 }
 
@@ -246,6 +266,20 @@ pub struct GlobalState {
     pub(crate) source_exclusions: stdx::path_exclusion::ExcludedPaths,
     pub diagnostics_baseline: Arc<ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot>,
     pub(crate) diagnostics_baseline_notification_ledger: BTreeSet<String>,
+    /// Baseline errors seen once on an input read as empty and not yet announced.
+    ///
+    /// A truncating write is empty between its `open` and its `write`, and a load that
+    /// lands there reads content nobody saved. The ledger keys errors by their content,
+    /// so announcing that reading and then the bytes the author meant would report one
+    /// save twice. Such an error is held here instead, and a look scheduled
+    /// [`DIAGNOSTICS_BASELINE_HOLD`] later announces it only if the input still reads
+    /// the same: a file that is really empty is reported once, late by the hold; a
+    /// write caught halfway is reported once, for the bytes it ended with.
+    pub(crate) diagnostics_baseline_held: BTreeSet<String>,
+    /// Which hold is current. A look carries the hold it was scheduled for, and a look
+    /// that arrives for an earlier hold is dropped: a hold that ended and a new one that
+    /// started in the meantime is owed its whole wait, not the remainder of the old one.
+    pub(crate) diagnostics_baseline_hold: u64,
     pub shutdown_requested: bool,
 
     pub loader_receiver: Receiver<loader::Message>,
@@ -466,6 +500,8 @@ impl GlobalState {
                 ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::Disabled,
             ),
             diagnostics_baseline_notification_ledger: BTreeSet::new(),
+            diagnostics_baseline_held: BTreeSet::new(),
+            diagnostics_baseline_hold: 0,
             shutdown_requested: false,
             loader,
             loader_receiver,
@@ -1513,7 +1549,7 @@ mod vfs_race_tests {
 
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///user.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("user.bsl");
         let file_id = state.vfs_file_for_url(&uri).unwrap();
         // Open document: text lives in the resident overlay, not on disk (this
         // synthetic file has no disk path for the disk-backed path to read).
@@ -2711,14 +2747,14 @@ mod vfs_race_tests {
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
 
-        let inside_a = "/proj/Catalogs/X/Ext/ObjectModule.bsl";
-        let inside_b = "/proj/Catalogs/X/Forms/F/Ext/Form/Module.bsl";
-        let outside = "/proj/Catalogs/Y/Ext/ObjectModule.bsl";
+        let inside_a = "proj/Catalogs/X/Ext/ObjectModule.bsl";
+        let inside_b = "proj/Catalogs/X/Forms/F/Ext/Form/Module.bsl";
+        let outside = "proj/Catalogs/Y/Ext/ObjectModule.bsl";
         {
             let mut vfs = state.vfs.write();
             for p in [inside_a, inside_b, outside] {
                 vfs.set_file_contents(
-                    vfs::VfsPath::new(p),
+                    vfs::VfsPath::new(crate::test_uri::file_path(p)),
                     Some(Arc::from("Процедура А() КонецПроцедуры")),
                 );
             }
@@ -2728,13 +2764,13 @@ mod vfs_race_tests {
         let in_file_set = |state: &GlobalState, p: &str| {
             let db = state.analysis_host.raw_database();
             let sr = db.source_root_input(SourceRootId(0)).root(db);
-            sr.file_set().file_for_path(&vfs::VfsPath::new(p)).is_some()
+            sr.file_set().file_for_path(&vfs::VfsPath::new(crate::test_uri::file_path(p))).is_some()
         };
         assert!(in_file_set(&state, inside_a) && in_file_set(&state, outside), "baseline loaded");
 
         // Remove the directory subtree "Catalogs/X".
         let removed =
-            vec![paths::AbsPathBuf::assert_utf8(std::path::PathBuf::from("/proj/Catalogs/X"))];
+            vec![paths::AbsPathBuf::assert_utf8(crate::test_uri::file_path("proj/Catalogs/X"))];
         let refreshed = state.remove_directories(&removed);
 
         assert!(refreshed, "a subtree removal should request an open-document refresh");

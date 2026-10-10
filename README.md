@@ -42,8 +42,12 @@ dataflow.
 ## Поддерживаемая версия платформы
 
 Проект разрабатывается и тестируется только на **1С:Предприятие 8.3.27**.
-Факты платформы — типы, методы, глобальный контекст — берутся из справки этой
-версии (см. [`crates/bsl-platform/data/PROVENANCE.md`](crates/bsl-platform/data/PROVENANCE.md)).
+Полнота глобального контекста аттестована по каталогу EDT этой версии, а
+справка платформы — типы, методы, описания — читается при запуске из
+установленной платформы или пакета справки, а без них по умолчанию скачивается
+закреплённый корпус из `itrous/bsl-platform-help` (`[platform_help]`, см.
+[`docs/configuration/PROJECT_CONFIGURATION.md`](docs/configuration/PROJECT_CONFIGURATION.md)
+и [`crates/bsl-platform/data/PROVENANCE.md`](crates/bsl-platform/data/PROVENANCE.md)).
 
 Более ранние версии и режимы совместимости не проверяются: анализ и
 рекомендации диагностик исходят из того, что доступен весь API 8.3.27.

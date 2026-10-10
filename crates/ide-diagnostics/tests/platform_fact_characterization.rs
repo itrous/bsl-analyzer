@@ -7,6 +7,7 @@ use test_fixture::Fixture;
 const PLATFORM_DEPRECATED_CODES: &[DiagnosticCode] = &[DiagnosticCode::DeprecatedPlatformApi];
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn deprecated_platform_diagnostic_families_match_current_replacements() {
     let source = r#"Процедура DeprecatedPlatformFacts()
     Дата = ТекущаяДата();

@@ -284,7 +284,9 @@ pub(crate) fn symbol_tree_heap(v: &Arc<SymbolTree>) -> usize {
 // Navigation view; its ranges move on every edit, so nothing on the inference
 // path reads it (that path reads `module_interface`). High cap keeps it across
 // chunk-boundary LRU trims for the IDE surfaces that do.
-#[salsa::tracked(lru = 2048, heap_size = crate::symbol_tree::symbol_tree_heap, returns(ref))]
+// The cap holds a whole workspace: `module_members` folds every file's tree, and a
+// resident that warms them in chunks with trims between must find them still memoised.
+#[salsa::tracked(lru = 65536, heap_size = crate::symbol_tree::symbol_tree_heap, returns(ref))]
 pub fn symbol_tree_query<'db>(
     db: &'db dyn crate::DefDatabase,
     file_id_input: base_db::FileIdInput<'db>,

@@ -215,6 +215,9 @@ pub(super) enum HoleOrigin {
 /// a reload mutates `db` in place.
 pub(crate) struct DiagnosticsResident {
     pub(super) db: RootDatabaseImpl,
+    /// Trims [`Self::trim_after_read`] has run, for a test that every read trims.
+    #[cfg(test)]
+    pub(super) read_trims: u32,
     /// This resident's OWN pool for the diagnostics fan-out. Dedicated because salsa
     /// attaches at most one database per thread while every job carries its own db
     /// clone: a worker shared with another resident's sweep would be asked to attach a
@@ -549,6 +552,116 @@ pub(crate) fn build_scope(root: &Path, base: &str) -> ScopeBuild {
     }
 }
 
+/// Files and source bytes one sweep chunk hands to the pool before the memo caches
+/// are trimmed. The in-chunk working set is the sweep's peak memory and scales with
+/// the chunk's bytes, so both are capped (the CLI `analyze` discipline); the sweep
+/// answers the same union whatever the chunking.
+const SWEEP_CHUNK: stdx::batch::BatchBudget =
+    stdx::batch::BatchBudget::files(500).with_bytes(32 << 20);
+
+impl DiagnosticsResident {
+    /// Evict memos beyond their interactive caps and drop the parser's thread-local
+    /// green-node caches on the sweep pool. The freed pages are left to the allocator:
+    /// the next chunk reuses them, and an explicit purge here would only make it fault
+    /// them back in. Needs `&mut`: salsa's trim takes the exclusive handle and waits
+    /// for the chunk's worker clones, which the pool has already dropped by the time
+    /// this runs.
+    fn trim_between_chunks(&mut self) {
+        self.db.enforce_lru();
+        self.clear_pool_node_caches();
+    }
+
+    /// The sweep's final trim: the swept files are batch working set nothing will read
+    /// again, so the heavy per-file chains go down to the small sweep caps instead of
+    /// pinning a full interactive window of them until the next request.
+    fn trim_after_sweep(&mut self) {
+        ide::sweep_lru_deep(&mut self.db);
+        self.clear_pool_node_caches();
+        profile::purge_allocator();
+    }
+
+    /// Warm the per-file halves of the name indexes the `references` tool reads, in
+    /// chunks with a trim between them. The indexes are one query each over every
+    /// workspace file, so a cold one would otherwise parse the whole workspace inside
+    /// the request and keep every syntax tree until it answers; warmed this way, the
+    /// trees of a chunk go at its end and only the small per-file memos stay. The pool
+    /// discipline is the sweep's: each job on its own db clone, registered with the
+    /// request's cancellation, nested parallelism refused.
+    pub(crate) fn warm_name_indexes(&mut self, cancel: &RequestCancel) {
+        use rayon::prelude::*;
+        use std::panic::AssertUnwindSafe;
+
+        // Owned paths, not borrows of the table: the trim between chunks takes the
+        // resident mutably.
+        let mut files: Vec<(FileId, String)> =
+            self.by_path.iter().map(|(path, id)| (*id, path.clone())).collect();
+        files.sort_by_key(|(id, _)| id.0);
+        let chunks = stdx::batch::chunks_by_budget(
+            &files,
+            |(_, path)| std::fs::metadata(path).map_or(0, |meta| meta.len()),
+            SWEEP_CHUNK,
+        );
+        for &chunk in &chunks {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let seed = SweepWorker::new(self.db.clone());
+            let outcome = self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
+                chunk.par_iter().try_for_each_with(seed, |worker, (file_id, _)| {
+                    let file_id = *file_id;
+                    let _no_nesting = stdx::par_guard::enter_no_nested_parallelism();
+                    if !worker.registered {
+                        cancel.register(salsa::Database::cancellation_token(
+                            worker.analysis.database(),
+                        ));
+                        worker.registered = true;
+                    }
+                    if cancel.is_cancelled() {
+                        return Err(salsa::Cancelled::Local);
+                    }
+                    salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                        worker.analysis.warm_name_indexes(&[file_id]);
+                    }))
+                })
+            });
+            match outcome {
+                Ok(()) => {}
+                Err(salsa::Cancelled::Local) => return,
+                Err(other) => std::panic::resume_unwind(Box::new(other)),
+            }
+            self.trim_between_chunks();
+        }
+    }
+
+    fn clear_pool_node_caches(&self) {
+        syntax::clear_shared_node_cache();
+        if let Some(pool) = self.sweep_pool.get() {
+            pool.broadcast(|_| syntax::clear_shared_node_cache());
+        }
+    }
+
+    /// Trim the memo caches to their interactive caps after one served read. A
+    /// request leaves its file's syntax tree, lowered bodies and inference memoised,
+    /// and nothing else moves the revision, so without this every file an agent ever
+    /// asked about would stay resident; with it the resident holds at most the caps'
+    /// worth of recent files, and a repeat request on one of them is still a cache
+    /// hit. Evicting nothing costs nothing, and the freed pages go back to the OS on
+    /// the allocator's own decay rather than by a purge here, whose walk of every
+    /// arena grows with the heap and would be paid on every request. Called by the
+    /// lifecycle after the read's closure returned and its database clone was dropped,
+    /// under the resident lock. The parser cache cleared here is the calling thread's:
+    /// a request's parse runs on the thread that serves it, and a blocking-pool thread
+    /// that falls idle takes its cache with it.
+    pub(super) fn trim_after_read(&mut self) {
+        self.db.enforce_lru();
+        syntax::clear_shared_node_cache();
+        #[cfg(test)]
+        {
+            self.read_trims += 1;
+        }
+    }
+}
+
 impl DiagnosticsResident {
     /// Workspace-wide diagnostics aggregated per code (the `workspace` action). Runs
     /// rayon over per-worker db clones (shared Salsa storage, the CLI `analyze`
@@ -562,7 +675,7 @@ impl DiagnosticsResident {
     /// worker-clone tokens are ever cancelled — the master db handle stays untouched,
     /// so concurrent `diagnostics` calls and later sweeps are unaffected.
     pub(crate) fn workspace_aggregates(
-        &self,
+        &mut self,
         config: &ide::DiagnosticsConfig,
         opts: &SweepOptions,
         cancel: &RequestCancel,
@@ -655,67 +768,83 @@ impl DiagnosticsResident {
             ide::diagnostics_baseline::BaselineDiagnosticCandidate<(FileId, ide::Diagnostic)>;
         // The pool takes an owned db clone: `&self` is not `Sync` (the resident holds a
         // `RefCell` VFS), and each worker clones its own handle from this seed anyway.
-        let mut seed = SweepWorker::new(self.db.clone());
-        // Warm the configuration inventory HERE, before the pool opens: a job that
-        // first-loads a config root fans out over the loader's own rayon scope, parks,
-        // and can steal a sibling job carrying a different db clone onto this thread.
-        //
-        // Only when there is something to sweep, and only while the request still wants
-        // an answer: the inventory loads EVERY root, so warming it for an empty sweep
-        // (`max_files: 0`, a scope that admitted nothing) turns a request that asked for
-        // no work into a full configuration parse under the resident lock. Registered
-        // like any worker, so a cancellation arriving mid-warm unwinds it too.
-        if !swept.is_empty() && !cancel.is_cancelled() {
+        // Borrow what the jobs read, so `move` takes the references and leaves the values
+        // to the code after the sweep.
+        let path_of = &path_of;
+        let workspace_root = &workspace_root;
+        // The files go through the pool in chunks, and the resident's memo caches are
+        // trimmed between chunks: salsa evicts beyond a query's `lru` cap only at a
+        // revision boundary or on an explicit trim, and a sweep never moves the
+        // revision, so one pass over thousands of files would otherwise keep every
+        // file's syntax tree, lowered bodies and inference resident at once (the CLI
+        // `analyze` chunk discipline). Chunking changes nothing in the answer — the
+        // aggregates are a union over files — only how many files' working set is
+        // live at a time. Nothing to sweep makes no chunk and so raises no pool:
+        // building one costs a thread per core, and a request that asked for no files
+        // must not pay for it under the resident lock.
+        let mut prepared: Vec<Option<Vec<Candidate>>> = Vec::with_capacity(swept.len());
+        let chunks = stdx::batch::chunks_by_budget(
+            swept,
+            |file_id| {
+                path_of
+                    .get(file_id)
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .map_or(0, |meta| meta.len())
+            },
+            SWEEP_CHUNK,
+        );
+        for &chunk in &chunks {
+            if cancel.is_cancelled() {
+                prepared.extend(chunk.iter().map(|_| None));
+                continue;
+            }
+            let mut seed = SweepWorker::new(self.db.clone());
+            // Warm the configuration inventory HERE, before the pool opens: a job that
+            // first-loads a config root fans out over the loader's own rayon scope, parks,
+            // and can steal a sibling job carrying a different db clone onto this thread.
+            // Per chunk, not once per sweep: the trim between chunks can leave it cold.
+            // Registered like any worker, so a cancellation arriving mid-warm unwinds it too.
             #[cfg(test)]
             sweep_probe::record_warm();
             cancel.register(salsa::Database::cancellation_token(seed.analysis.database()));
             seed.registered = true;
             seed.analysis.warm_configuration_inventory();
-        }
-        // Borrow what the jobs read, so `move` takes the references and leaves the values
-        // to the code after the sweep.
-        let path_of = &path_of;
-        let workspace_root = &workspace_root;
-        // Nothing to sweep: no pool either. Building one costs a thread per core, and a
-        // request that asked for no files must not pay for it under the resident lock.
-        let prepared: Vec<Option<Vec<Candidate>>> = if swept.is_empty() {
-            Vec::new()
-        } else {
-            self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
-                swept
-                    .par_iter()
-                    .map_with(seed, |worker, &file_id| {
-                        // Belt-and-suspenders behind the warm-up: should a query still reach an
-                        // internally parallel path, it runs serially instead of stealing a
-                        // sibling job and attaching a second database to this thread.
-                        let _no_nesting = stdx::par_guard::enter_no_nested_parallelism();
-                        #[cfg(test)]
-                        sweep_probe::record_job(worker.origin);
-                        if !worker.registered {
-                            cancel.register(salsa::Database::cancellation_token(
-                                worker.analysis.database(),
-                            ));
-                            worker.registered = true;
-                        }
-                        if cancel.is_cancelled() {
-                            return None;
-                        }
-                        let caught = salsa::Cancelled::catch(AssertUnwindSafe(|| {
-                            let diagnostics = worker.analysis.diagnostics(file_id, config);
-                            let text = worker.analysis.file_text(file_id);
-                            let path =
-                                path_of.get(&file_id).expect("swept file has a resident path");
-                            let relative = Path::new(path)
-                                .strip_prefix(workspace_root)
-                                .unwrap_or(Path::new(path))
-                                .to_string_lossy()
-                                .replace(std::path::MAIN_SEPARATOR, "/");
-                            let source_lines: Vec<_> = text.lines().collect();
-                            diagnostics
-                                .into_iter()
-                                .map(|d| {
-                                    let output = d.to_output(&text);
-                                    ide::diagnostics_baseline::BaselineDiagnosticCandidate {
+            let chunk_results: Vec<Option<Vec<Candidate>>> =
+                self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
+                    chunk
+                        .par_iter()
+                        .map_with(seed, |worker, &file_id| {
+                            // Belt-and-suspenders behind the warm-up: should a query still reach an
+                            // internally parallel path, it runs serially instead of stealing a
+                            // sibling job and attaching a second database to this thread.
+                            let _no_nesting = stdx::par_guard::enter_no_nested_parallelism();
+                            #[cfg(test)]
+                            sweep_probe::record_job(worker.origin);
+                            if !worker.registered {
+                                cancel.register(salsa::Database::cancellation_token(
+                                    worker.analysis.database(),
+                                ));
+                                worker.registered = true;
+                            }
+                            if cancel.is_cancelled() {
+                                return None;
+                            }
+                            let caught = salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                                let diagnostics = worker.analysis.diagnostics(file_id, config);
+                                let text = worker.analysis.file_text(file_id);
+                                let path =
+                                    path_of.get(&file_id).expect("swept file has a resident path");
+                                let relative = Path::new(path)
+                                    .strip_prefix(workspace_root)
+                                    .unwrap_or(Path::new(path))
+                                    .to_string_lossy()
+                                    .replace(std::path::MAIN_SEPARATOR, "/");
+                                let source_lines: Vec<_> = text.lines().collect();
+                                diagnostics
+                                    .into_iter()
+                                    .map(|d| {
+                                        let output = d.to_output(&text);
+                                        ide::diagnostics_baseline::BaselineDiagnosticCandidate {
                                         diagnostic: (file_id, d),
                                         path: relative.clone(),
                                         code: output.code,
@@ -735,22 +864,24 @@ impl DiagnosticsResident {
                                                 end_column: output.end_column as u32,
                                             },
                                     }
-                                })
-                                .collect()
-                        }));
-                        match caught {
-                            Ok(diags) => Some(diags),
-                            // Only the request's own cancellation may degrade to a skipped
-                            // file. A pending write cannot exist under the resident mutex
-                            // and a propagated panic is a real defect in a sibling worker —
-                            // re-raise both instead of hiding them behind valid aggregates.
-                            Err(salsa::Cancelled::Local) => None,
-                            Err(other) => std::panic::resume_unwind(Box::new(other)),
-                        }
-                    })
-                    .collect()
-            })
-        };
+                                    })
+                                    .collect()
+                            }));
+                            match caught {
+                                Ok(diags) => Some(diags),
+                                // Only the request's own cancellation may degrade to a skipped
+                                // file. A pending write cannot exist under the resident mutex
+                                // and a propagated panic is a real defect in a sibling worker —
+                                // re-raise both instead of hiding them behind valid aggregates.
+                                Err(salsa::Cancelled::Local) => None,
+                                Err(other) => std::panic::resume_unwind(Box::new(other)),
+                            }
+                        })
+                        .collect()
+                });
+            prepared.extend(chunk_results);
+            self.trim_between_chunks();
+        }
 
         let cancelled = cancel.is_cancelled();
         let files_swept = prepared.iter().filter(|result| result.is_some()).count();
@@ -887,14 +1018,20 @@ impl DiagnosticsResident {
         // clone's token, stop between files, and keep an unwind inside the worker.
         // Without that this pass is unstoppable, and a cancellation unwind would
         // cross rayon into the state lock as a panic.
-        let author_filter = self.author_filter.as_ref();
+        // An owned handle, not a borrow of the resident: the deep trim after the pass
+        // below needs the resident mutably.
+        let author_filter = self.author_filter.clone();
+        let author_filter = author_filter.as_ref();
         let author_ignored = std::sync::atomic::AtomicUsize::new(0);
-        let seed = SweepWorker::new(self.db.clone());
         let author_ignored = &author_ignored;
         let active_by_file = &active_by_file;
+        // The seed clone is made only where the pool consumes it: left in this frame by
+        // a sweep with nothing to sweep, it would be a live handle the deep trim below
+        // waits on forever.
         let per_file: Vec<Vec<(String, ide::SeverityBucket)>> = if swept.is_empty() {
             Vec::new()
         } else {
+            let seed = SweepWorker::new(self.db.clone());
             self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
                 swept
                     .par_iter()
@@ -976,6 +1113,9 @@ impl DiagnosticsResident {
         aggregates.sort_by(|a, b| {
             b.severity.cmp(&a.severity).then(b.count.cmp(&a.count)).then(a.code.cmp(&b.code))
         });
+        // The author pass above ran on clones of its own, so the deep trim here sees
+        // the whole sweep's working set and no live handle.
+        self.trim_after_sweep();
 
         WorkspaceSweep {
             aggregates,
@@ -1415,9 +1555,9 @@ mod tests {
         wait_ready(&state);
 
         let watch = super::sweep_probe::watch();
-        let out = state.read(|resident, _| {
+        let out = state.read_mut(|resident, _| {
             resident.workspace_aggregates(
-                resident.config(),
+                &resident.config().clone(),
                 &sweep_opts(),
                 &RequestCancel::default(),
             )
@@ -1457,8 +1597,12 @@ mod tests {
 
         let mut empty = sweep_opts();
         empty.max_files = 0;
-        let pooled = state.read(|resident, _| {
-            resident.workspace_aggregates(resident.config(), &empty, &RequestCancel::default());
+        let pooled = state.read_mut(|resident, _| {
+            resident.workspace_aggregates(
+                &resident.config().clone(),
+                &empty,
+                &RequestCancel::default(),
+            );
             resident.sweep_pool.get().is_some()
         });
         assert_eq!(watch.warms(), 0, "a zero-file sweep loads no configuration");
@@ -1469,16 +1613,16 @@ mod tests {
 
         let cancelled = RequestCancel::default();
         cancelled.cancel_all();
-        let _ = state.read(|resident, _| {
-            resident.workspace_aggregates(resident.config(), &sweep_opts(), &cancelled)
+        let _ = state.read_mut(|resident, _| {
+            resident.workspace_aggregates(&resident.config().clone(), &sweep_opts(), &cancelled)
         });
         assert_eq!(watch.warms(), 0, "an already-cancelled sweep loads no configuration");
 
         // The positive control: with files to sweep and a live request, the warm-up DOES
         // run — otherwise the two zeroes above would hold for a sweep that never warms.
-        let _ = state.read(|resident, _| {
+        let _ = state.read_mut(|resident, _| {
             resident.workspace_aggregates(
-                resident.config(),
+                &resident.config().clone(),
                 &sweep_opts(),
                 &RequestCancel::default(),
             )
@@ -1982,7 +2126,7 @@ mod tests {
 
         let cancelled = RequestCancel::default();
         cancelled.cancel_all();
-        let out = state.read(|resident, _| {
+        let out = state.read_mut(|resident, _| {
             let workdir =
                 resident.workspace_root().canonicalize().expect("workspace root canonicalizes");
             let module = module_path(root, "Сервер").canonicalize().expect("module exists");
@@ -2039,7 +2183,7 @@ mod tests {
         state.ensure_loading();
         wait_ready(&state);
 
-        let out = state.read(|resident, _| {
+        let out = state.read_mut(|resident, _| {
             let workdir =
                 resident.workspace_root().canonicalize().expect("workspace root canonicalizes");
             let module = module_path(root, "Сервер").canonicalize().expect("module exists");
@@ -2090,8 +2234,12 @@ mod tests {
 
         let cancelled_sweep = RequestCancel::default();
         cancelled_sweep.cancel_all();
-        let out = state.read(|resident, _| {
-            resident.workspace_aggregates(resident.config(), &sweep_opts(), &cancelled_sweep)
+        let out = state.read_mut(|resident, _| {
+            resident.workspace_aggregates(
+                &resident.config().clone(),
+                &sweep_opts(),
+                &cancelled_sweep,
+            )
         });
         match out {
             ResidentOutcome::Ready(sweep, _) => {
@@ -2103,9 +2251,9 @@ mod tests {
             _ => panic!("expected Ready outcome"),
         }
 
-        let out = state.read(|resident, _| {
+        let out = state.read_mut(|resident, _| {
             resident.workspace_aggregates(
-                resident.config(),
+                &resident.config().clone(),
                 &sweep_opts(),
                 &RequestCancel::default(),
             )
@@ -2178,8 +2326,8 @@ mod tests {
         wait_ready(&state);
 
         let cancel = RequestCancel::default();
-        let out = state.read(|resident, _| {
-            resident.workspace_aggregates(resident.config(), &sweep_opts(), &cancel)
+        let out = state.read_mut(|resident, _| {
+            resident.workspace_aggregates(&resident.config().clone(), &sweep_opts(), &cancel)
         });
         let sweep = match out {
             ResidentOutcome::Ready(sweep, _) => sweep,
@@ -2233,6 +2381,188 @@ mod tests {
                 "back-link must resolve through a symlinked config subtree via the canonicalising fallback"
             ),
             _ => panic!("expected Ready outcome from a loaded db"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use std::path::Path;
+
+    use super::super::test_support::{module_path, wait_ready, write_common_module};
+    use super::super::{DiagnosticsState, ResidentOutcome, SweepOptions};
+    use super::DiagnosticsResident;
+    use crate::cancel::RequestCancel;
+
+    /// More modules than the sweep window of syntax trees (`parse_query`'s sweep cap is
+    /// 64), so a sweep that does not trim leaves a count the assertion can see.
+    const MODULES: usize = 100;
+
+    fn workspace_with_modules(root: &Path) {
+        for i in 0..MODULES {
+            write_common_module(
+                root,
+                &format!("Модуль{i}"),
+                true,
+                "&НаСервере\nФункция Считать() Экспорт Возврат 1; КонецФункции",
+            );
+        }
+    }
+
+    fn ready_state(root: &Path) -> DiagnosticsState {
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.ensure_loading();
+        wait_ready(&state);
+        state
+    }
+
+    /// Live memos of the ingredient whose output type name contains `output`: salsa
+    /// names an ingredient's row by its output type, not by the query.
+    fn memos(resident: &DiagnosticsResident, output: &str) -> usize {
+        resident
+            .db()
+            .memory_report()
+            .into_iter()
+            .filter(|(name, ..)| name.contains(output))
+            .map(|(_, count, ..)| count)
+            .sum()
+    }
+
+    /// Heap bytes the resident's syntax trees hold. Eviction drops a memo's value and
+    /// keeps its slot, so the live count never moves; the trees' heap does.
+    fn syntax_tree_bytes(resident: &DiagnosticsResident) -> usize {
+        resident
+            .db()
+            .memory_report()
+            .into_iter()
+            .filter(|(name, ..)| name.contains("syntax::Parse<"))
+            .map(|(.., heap)| heap.unwrap_or(0))
+            .sum()
+    }
+
+    fn ready<T>(outcome: ResidentOutcome<T>) -> T {
+        match outcome {
+            ResidentOutcome::Ready(value, _) => value,
+            _ => panic!("the resident is ready"),
+        }
+    }
+
+    fn sweep_all() -> SweepOptions {
+        SweepOptions { min_severity: ide::SeverityBucket::Hint, codes: Vec::new(), max_files: 1000 }
+    }
+
+    /// A workspace sweep leaves at most the sweep window of syntax trees resident:
+    /// every swept module was parsed, and without the final deep trim all of them
+    /// would still be memoised (the count would equal the module count).
+    #[test]
+    fn a_sweep_trims_the_swept_syntax_trees_down_to_the_sweep_window() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = ready_state(dir.path());
+
+        // The positive control: served one by one, every module's tree stays within
+        // the interactive window, so all of them are resident before the sweep.
+        for i in 0..MODULES {
+            let config = ready(state.read(|resident, _| resident.config().clone()));
+            let _ = state.read(|resident, _| {
+                let file_id = resident.file_id_for(&module_path(dir.path(), &format!("Модуль{i}")));
+                let analysis = resident.analysis();
+                file_id.map(|file_id| analysis.diagnostics(file_id, &config).len())
+            });
+        }
+        let before =
+            ready(state.read(|resident, _| {
+                (memos(resident, "syntax::Parse<"), syntax_tree_bytes(resident))
+            }));
+        assert_eq!(before.0, MODULES, "the control: every module was parsed");
+        assert!(before.1 > 0, "the control: the trees hold heap");
+
+        let (swept, after) = ready(state.read_mut(|resident, _| {
+            let config = resident.config().clone();
+            let sweep =
+                resident.workspace_aggregates(&config, &sweep_all(), &RequestCancel::default());
+            (sweep.files_swept, syntax_tree_bytes(resident))
+        }));
+        assert_eq!(swept, MODULES, "every module was swept");
+        // The modules are identical, so the trees weigh the same: at most the sweep
+        // window of 64 out of 100 trees is still held, within one tree of slack.
+        assert!(
+            after > 0 && after <= before.1 * 65 / 100,
+            "a sweep keeps at most the sweep window of syntax trees: {after} of {} bytes",
+            before.1
+        );
+    }
+
+    /// The warm-up memoises both halves of the name indexes for every resident file,
+    /// from a resident that held none of them.
+    #[test]
+    fn warm_name_indexes_memoises_both_halves_for_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = ready_state(dir.path());
+
+        let before = ready(state.read(|resident, _| {
+            (memos(resident, "SymbolTree>"), memos(resident, "FileNameUsage>"))
+        }));
+        assert_eq!(before, (0, 0), "the control: a fresh resident holds neither index");
+
+        let after = ready(state.read_mut(|resident, _| {
+            resident.warm_name_indexes(&RequestCancel::default());
+            (memos(resident, "SymbolTree>"), memos(resident, "FileNameUsage>"))
+        }));
+        assert_eq!(after, (MODULES, MODULES), "every file's symbol tree and name set");
+    }
+
+    /// Every served read trims: the syntax trees of files read earlier fall out once
+    /// more than the interactive window of them has been read.
+    #[test]
+    fn every_read_trims_the_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = ready_state(dir.path());
+
+        // The probe is a read of its own: it sees the trims of the reads BEFORE it,
+        // and its own trim runs only after it returned.
+        let trims = ready(state.read(|resident, _| resident.read_trims));
+        assert_eq!(trims, 0, "a fresh resident has trimmed nothing before its first read");
+        for _ in 0..3 {
+            let _ = state.read(|_, _| ());
+        }
+        let trims = ready(state.read(|resident, _| resident.read_trims));
+        assert_eq!(trims, 4, "one trim per read, after the read: the first probe and three more");
+    }
+
+    /// A sweep with nothing to sweep still returns: the author pass makes its db
+    /// clone only where the pool consumes it, so the deep trim at the end finds no
+    /// live handle. Run on its own thread so a regression fails the test instead of
+    /// hanging the suite.
+    #[test]
+    fn an_empty_sweep_returns_through_its_final_trim() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = std::sync::Arc::new(ready_state(dir.path()));
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let sweeping = std::sync::Arc::clone(&state);
+        std::thread::spawn(move || {
+            let empty = SweepOptions {
+                min_severity: ide::SeverityBucket::Hint,
+                codes: Vec::new(),
+                max_files: 0,
+            };
+            let out = sweeping.read_mut(|resident, _| {
+                let config = resident.config().clone();
+                resident
+                    .workspace_aggregates(&config, &empty, &RequestCancel::default())
+                    .files_swept
+            });
+            let _ = done.send(matches!(out, ResidentOutcome::Ready(0, _)));
+        });
+        match finished.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(returned) => assert!(returned, "the empty sweep reports zero files swept"),
+            Err(_) => {
+                panic!("the empty sweep did not return: its final trim waits on a live db handle")
+            }
         }
     }
 }

@@ -25,6 +25,7 @@ use ide::{GraphBuildSummary, GraphBuildTicker, MethodCallDigest, ModuleId, RootD
 use rusqlite::{params, Connection, OptionalExtension};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use stdx::batch::BatchBudget;
 use vfs::FileId;
 
 #[cfg(test)]
@@ -81,7 +82,10 @@ use crate::graph::input::{build_source_root, db_for_files};
 // later process reuses the hash of an unchanged file instead of reading it again.
 // 23: every publication records a `publication_id`, so the result of a write is established
 // from the database itself; an older database has none and is rebuilt, never stamped.
-pub(crate) const SCHEMA_VERSION: u32 = 23;
+// 24: XML semantic fingerprints now preserve tree boundaries/namespaces and exported method
+// signatures include parameter composition. Existing version-23 rows cannot prove either
+// property, so they are invalidated through the normal cache-format gate.
+pub(crate) const SCHEMA_VERSION: u32 = 24;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
@@ -842,32 +846,58 @@ pub(crate) fn read_unread_paths(conn: &rusqlite::Connection) -> Vec<bsl_search::
 /// never another batch's database. Peak memory is therefore bounded by the batch
 /// size plus that index, not by the whole config.
 ///
+/// Cut `modules` into the batches one streaming pass loads together, weighing each
+/// module by the byte length the universe's scan recorded for it (a module the scan
+/// did not stat weighs nothing and is bounded by the file cap alone).
+fn plan_batches<'a>(
+    universe: &crate::graph::universe::ScannedUniverse,
+    modules: &'a [ModuleId],
+    file_paths: &FxHashMap<FileId, PathBuf>,
+    budget: BatchBudget,
+) -> Vec<&'a [ModuleId]> {
+    let bytes_of: FxHashMap<&Path, u64> =
+        universe.stats.iter().map(|stat| (stat.canonical.as_path(), stat.len)).collect();
+    stdx::batch::chunks_by_budget(
+        modules,
+        |module| {
+            file_paths
+                .get(&module.file_id)
+                .and_then(|path| bytes_of.get(path.as_path()))
+                .copied()
+                .unwrap_or(0)
+        },
+        budget,
+    )
+}
+
 /// Returns the build tally; node/edge counts in the database are recorded in its
 /// `meta` table by [`GraphDbWriter::finalize`], and the paths whose bytes could not be
 /// read go beside them under `unread_paths` — the artefact carries its own gaps, so no
 /// caller has to thread them through.
+#[cfg(test)]
 pub(crate) fn build_graph_database(
     project: &crate::graph::ProjectSnapshot,
     universe: &crate::graph::universe::ScannedUniverse,
     out_path: &Path,
-    batch_size: usize,
+    budget: BatchBudget,
     meta: &GraphMeta,
 ) -> anyhow::Result<GraphBuildSummary> {
-    build_graph_database_inner(project, universe, out_path, batch_size, meta, None)
+    build_graph_database_inner(project, universe, out_path, budget, meta, None, None)
 }
 
 /// As [`build_graph_database`], but also streams the search index's code chunks (with
 /// graph context) from the same parse pass into `chunk_sink` — the compute half of the
 /// graph/search fusion. The graph rows written are byte-identical to the plain build.
+#[cfg(test)]
 pub(crate) fn build_graph_database_fused(
     project: &crate::graph::ProjectSnapshot,
     universe: &crate::graph::universe::ScannedUniverse,
     out_path: &Path,
-    batch_size: usize,
+    budget: BatchBudget,
     meta: &GraphMeta,
     chunk_sink: &mut dyn ide::FusedChunkSink,
 ) -> anyhow::Result<GraphBuildSummary> {
-    build_graph_database_inner(project, universe, out_path, batch_size, meta, Some(chunk_sink))
+    build_graph_database_inner(project, universe, out_path, budget, meta, Some(chunk_sink), None)
 }
 
 /// Default seconds without build progress before the watchdog reports a stall.
@@ -1050,13 +1080,14 @@ fn thread_state_summary() -> String {
     "unavailable on this platform".to_owned()
 }
 
-fn build_graph_database_inner(
+pub(crate) fn build_graph_database_inner(
     project: &crate::graph::ProjectSnapshot,
     universe: &crate::graph::universe::ScannedUniverse,
     out_path: &Path,
-    batch_size: usize,
+    budget: BatchBudget,
     meta: &GraphMeta,
     chunk_sink: Option<&mut dyn ide::FusedChunkSink>,
+    ticker: Option<Arc<GraphBuildTicker>>,
 ) -> anyhow::Result<GraphBuildSummary> {
     if !project.validated || project.search_roots.is_none() {
         anyhow::bail!("cannot persist a portable graph without validated workspace roots");
@@ -1072,6 +1103,7 @@ fn build_graph_database_inner(
         .collect();
     let file_paths: FxHashMap<FileId, PathBuf> =
         files.iter().map(|(f, p)| (*f, p.clone())).collect();
+    let batches = plan_batches(universe, &modules, &file_paths, budget);
 
     // Where each metadata object is defined, read off the universe this build
     // already scanned rather than a fresh walk of the disk.
@@ -1104,7 +1136,12 @@ fn build_graph_database_inner(
     // Heartbeat + stall watchdog for the whole build (index, edge passes, fused
     // chunking): kept alive until after `finalize`, so a wedge anywhere in the
     // pipeline gets reported rather than freezing silently.
-    let ticker = Arc::new(GraphBuildTicker::default());
+    let ticker = ticker.unwrap_or_else(|| Arc::new(GraphBuildTicker::default()));
+    ticker.set_eta_total_intervals(if batches.is_empty() {
+        0
+    } else {
+        batches.len().saturating_mul(4).saturating_add(8)
+    });
     let _watchdog =
         spawn_build_watchdog(Arc::clone(&ticker), out_path.parent().map(Path::to_path_buf));
 
@@ -1137,7 +1174,7 @@ fn build_graph_database_inner(
             &paths,
             Some(&project.workspace_root),
             &mdo_files,
-            batch_size,
+            &batches,
             &mut open_batch,
             &mut sink,
             chunk_sink,
@@ -1172,12 +1209,20 @@ fn build_graph_database_inner(
                 ));
             };
             let content_hash = s.persisted_content_hash();
+            let sig_hash =
+                if bsl_conventions::str_has_extension(&s.path, bsl_conventions::XML_EXTENSION) {
+                    crate::graph::scan::xml_semantic_hash_file(&s.canonical).map(|h| {
+                        u64::from_le_bytes(h[..8].try_into().expect("blake3 hash >= 8 bytes"))
+                    })
+                } else {
+                    sig_by_path.get(&s.path).copied()
+                };
             Ok(FileFingerprint {
                 root_id: key.root_id,
                 path: key.path,
                 content_hash,
                 fingerprint: s.fingerprint(),
-                sig_hash: sig_by_path.get(&s.path).copied(),
+                sig_hash,
                 observation: s.persisted_observation(),
             })
         })
@@ -1200,6 +1245,7 @@ fn build_graph_database_inner(
             unread_keys_from_paths(&unread, project.search_roots.as_ref(), Some(universe))?;
         write_unread_keys(&conn, &unread_keys)?;
     }
+    ticker.note("validation", 0, 0, "");
     Ok(summary)
 }
 
@@ -1419,15 +1465,155 @@ pub(crate) struct BodyPatch {
     rows: ide::ReprojectedRows,
     changed_modules: Vec<ModuleId>,
     changed_paths: Vec<PathBuf>,
+    metadata_node_prefixes: Vec<String>,
+    clear_graph: bool,
+    xml_sig_hashes: FxHashMap<String, Option<u64>>,
     file_paths: FxHashMap<FileId, PathBuf>,
     unread: BTreeSet<PathBuf>,
     modules: usize,
+}
+
+/// The `Form.xml` descriptor beside a managed form's `Ext/Form/Module.bsl`, spelled with
+/// `/` separators like the descriptor paths it is compared with.
+fn form_xml_for_module(module: &Path) -> Option<String> {
+    use bsl_conventions::{conventional_of, ConventionalName};
+    let form_dir = module.parent()?;
+    let is_module = module
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| conventional_of(name) == Some(ConventionalName::Module));
+    let is_form_dir = form_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| conventional_of(name) == Some(ConventionalName::Form));
+    if !is_module || !is_form_dir {
+        return None;
+    }
+    let xml = form_dir.parent()?.join(ConventionalName::FormXml.canonical());
+    Some(xml.to_string_lossy().replace('\\', "/"))
+}
+
+#[cfg(test)]
+impl BodyPatch {
+    pub(crate) fn rows_for_test(&self) -> &ide::ReprojectedRows {
+        &self.rows
+    }
+}
+
+/// Identify only metadata XML files whose projection is local to one persisted MDO owner
+/// or one form. `None` is the deliberately narrow fallback for global/unsupported XML.
+pub(crate) fn local_metadata_delta(
+    project: &crate::graph::ProjectSnapshot,
+    universe: &crate::graph::universe::ScannedUniverse,
+    db_path: &Path,
+    xml_paths: &[PathBuf],
+) -> anyhow::Result<Option<(Vec<String>, Vec<PathBuf>)>> {
+    if xml_paths.is_empty() {
+        return Ok(Some((Vec::new(), Vec::new())));
+    }
+    let roots = project.search_roots.as_ref();
+    let mdo_files = crate::graph::mdo_files::mdo_files(
+        &project.configs,
+        &bsl_conventions::PathSetTree::from_files(
+            universe.stats.iter().map(|stat| PathBuf::from(&stat.path)),
+        ),
+    );
+    let current_mdos: std::collections::HashMap<String, String> = mdo_files
+        .iter()
+        .map(|((kind, folded_name), path)| {
+            let object_name =
+                Path::new(path).file_stem().and_then(|stem| stem.to_str()).unwrap_or(folded_name);
+            (path.clone(), format!("mdo/{}/{}", kind.english_name(), object_name))
+        })
+        .collect();
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut owners = Vec::new();
+    let mut forms = Vec::new();
+
+    for xml_path in xml_paths {
+        let xml = xml_path.to_string_lossy().replace('\\', "/");
+        let mut found_owner = false;
+        let current_owner = current_mdos.get(&xml);
+        let mut previous_mdo_owners = Vec::new();
+        if let Some(owner) = current_owner {
+            owners.push(owner.clone());
+            found_owner = true;
+        }
+        if let (Some(root_id), Some(path)) = durable_file_key(roots, Some(&xml)) {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM nodes WHERE kind = 'mdo' AND file_root_id = ?1 AND file_path = ?2",
+            )?;
+            let rows = stmt.query_map(params![root_id, path], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let owner = row?;
+                previous_mdo_owners.push(owner.clone());
+                owners.push(owner);
+                found_owner = true;
+            }
+        }
+        if current_owner.is_some() || !previous_mdo_owners.is_empty() {
+            // The local MDO path proves a stable owner identity. Adding, deleting,
+            // or renaming the object can introduce consumers that have no persisted
+            // incoming edge yet, so keep those topology edits on the full-build path.
+            if previous_mdo_owners.len() != 1
+                || current_owner
+                    .is_none_or(|current| !previous_mdo_owners[0].eq_ignore_ascii_case(current))
+            {
+                return Ok(None);
+            }
+        }
+        // An MDO's forms can bind directly to its attributes. Reproject every form
+        // module owned by that object together with the catalog rows so data_binding
+        // edges are rebuilt from the same metadata generation.
+        let mdo_owners: Vec<_> =
+            owners.iter().filter(|owner| owner.starts_with("mdo/")).cloned().collect();
+        for (_file_id, module_path) in &universe.files {
+            let text = module_path.to_string_lossy().replace('\\', "/");
+            let Some((Some((kind, object)), form_name)) = ide::form_key_for_path(&text) else {
+                continue;
+            };
+            let owner_id = format!("mdo/{}/{}", kind.english_name(), object);
+            if !mdo_owners.iter().any(|owner| owner.eq_ignore_ascii_case(&owner_id)) {
+                continue;
+            }
+            owners.push(format!("form/{}/{form_name}", owner_id.trim_start_matches("mdo/")));
+            forms.push(module_path.clone());
+            found_owner = true;
+        }
+        for (_file_id, module_path) in &universe.files {
+            let Some(xml_candidate) = form_xml_for_module(module_path) else { continue };
+            if !xml.eq_ignore_ascii_case(&xml_candidate) {
+                continue;
+            }
+            let text = module_path.to_string_lossy().replace('\\', "/");
+            let Some((owner, form_name)) = ide::form_key_for_path(&text) else { continue };
+            let scope = owner.as_ref().map_or_else(
+                || "common".to_owned(),
+                |(kind, object)| format!("{}/{}", kind.english_name(), object),
+            );
+            owners.push(format!("form/{scope}/{form_name}"));
+            forms.push(module_path.clone());
+            found_owner = true;
+        }
+        if !found_owner {
+            return Ok(None);
+        }
+    }
+    owners.sort();
+    owners.dedup();
+    forms.sort();
+    forms.dedup();
+    Ok(Some((owners, forms)))
 }
 
 impl BodyPatch {
     /// How many modules the graph holds once the patch is applied.
     pub(crate) fn modules(&self) -> usize {
         self.modules
+    }
+
+    pub(crate) fn reprojected_modules(&self) -> usize {
+        self.changed_modules.len()
     }
 }
 
@@ -1437,12 +1623,43 @@ impl BodyPatch {
 /// their resolved callers (the caller-delta set). Once [`begin_body_patch`] applies it, the
 /// database holds what a full rebuild of the edited tree would. Eligibility is not re-validated
 /// here: the caller (`try_incremental_reload`) owns the sig/caller-delta-safety gates.
+#[cfg(test)]
 pub(crate) fn compute_body_patch(
     project: &crate::graph::ProjectSnapshot,
     universe: &crate::graph::universe::ScannedUniverse,
     src_path: &Path,
     changed_paths: &[PathBuf],
-    batch_size: usize,
+    budget: BatchBudget,
+) -> anyhow::Result<BodyPatch> {
+    compute_body_patch_with_metadata(
+        project,
+        universe,
+        src_path,
+        changed_paths,
+        &[],
+        &[],
+        &[],
+        &[],
+        budget,
+    )
+}
+
+/// As [`compute_body_patch`], with a proved local XML owner delta. Metadata rows and
+/// their old owner prefixes are carried to the same SQL transaction as BSL rows.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the production caller passes distinct inputs for one atomic BSL and metadata projection"
+)]
+pub(crate) fn compute_body_patch_with_metadata(
+    project: &crate::graph::ProjectSnapshot,
+    universe: &crate::graph::universe::ScannedUniverse,
+    src_path: &Path,
+    changed_paths: &[PathBuf],
+    metadata_paths: &[PathBuf],
+    owner_ids: &[String],
+    form_paths: &[PathBuf],
+    xml_observations: &[(PathBuf, Option<u64>)],
+    budget: BatchBudget,
 ) -> anyhow::Result<BodyPatch> {
     if !project.validated || project.search_roots.is_none() {
         anyhow::bail!("cannot patch a portable graph without validated workspace roots");
@@ -1453,6 +1670,7 @@ pub(crate) fn compute_body_patch(
         files.iter().map(|(f, p)| (*f, p.to_string_lossy().replace('\\', "/"))).collect();
     let file_paths: FxHashMap<FileId, PathBuf> =
         files.iter().map(|(f, p)| (*f, p.clone())).collect();
+    let batches = plan_batches(universe, &all_modules, &file_paths, budget);
 
     // Where each metadata object is defined, read off the universe this build
     // already scanned rather than a fresh walk of the disk.
@@ -1465,19 +1683,69 @@ pub(crate) fn compute_body_patch(
 
     // Map changed canonical paths → ModuleIds, preserving file-id order so a new aux
     // object's first-seen spelling matches a full build's.
+    let mut effective_changed_paths = changed_paths.to_vec();
+    let changed_mdo_owners: Vec<_> =
+        owner_ids.iter().filter(|owner| owner.starts_with("mdo/")).collect();
+    if !changed_mdo_owners.is_empty() {
+        let conn =
+            Connection::open_with_flags(src_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT n.file_root_id, n.file_path FROM edges e \
+             JOIN nodes n ON n.id = e.from_id WHERE n.kind IN ('method','module') \
+             AND (e.to_id = ?1 OR substr(e.to_id, 1, length(?1) + 1) = ?1 || '/')",
+        )?;
+        for owner in changed_mdo_owners {
+            let rows = stmt.query_map(params![owner], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (Some(root_id), Some(path)) = row? else { continue };
+                let Some(roots) = project.search_roots.as_ref() else { continue };
+                let Some(path) = roots.resolve_walked(&bsl_search::FileKey::new(root_id, path))
+                else {
+                    continue;
+                };
+                if files.iter().any(|(_, scanned)| scanned == &path)
+                    && !effective_changed_paths.contains(&path)
+                {
+                    effective_changed_paths.push(path);
+                }
+            }
+        }
+    }
     let changed_set: std::collections::HashSet<&Path> =
-        changed_paths.iter().map(|p| p.as_path()).collect();
+        effective_changed_paths.iter().map(|p| p.as_path()).collect();
     let changed_modules: Vec<ModuleId> = files
         .iter()
         .filter(|(_, p)| changed_set.contains(p.as_path()))
         .map(|(f, _)| ModuleId::new(*f))
         .collect();
-    if changed_modules.len() != changed_paths.len() {
-        anyhow::bail!(
-            "incremental update: {} changed paths, {} matched modules (a path is not an indexed .bsl module)",
-            changed_paths.len(),
-            changed_modules.len()
-        );
+    let scanned_changed = effective_changed_paths
+        .iter()
+        .filter(|path| files.iter().any(|(_, scanned)| scanned == *path))
+        .count();
+    if changed_modules.len() != scanned_changed {
+        anyhow::bail!("incremental update: changed paths do not match scanned BSL modules");
+    }
+
+    if changed_paths.is_empty() && metadata_paths.is_empty() && xml_observations.is_empty() {
+        return Ok(BodyPatch {
+            rows: ide::ReprojectedRows {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                sig_hashes: FxHashMap::default(),
+                casing_variant_objects: Vec::new(),
+                unresolved_calls: Vec::new(),
+            },
+            changed_modules: Vec::new(),
+            changed_paths: Vec::new(),
+            metadata_node_prefixes: Vec::new(),
+            clear_graph: false,
+            xml_sig_hashes: FxHashMap::default(),
+            file_paths,
+            unread: BTreeSet::new(),
+            modules: all_modules.len(),
+        });
     }
 
     let source_root = build_source_root(files);
@@ -1500,17 +1768,182 @@ pub(crate) fn compute_body_patch(
     let _watchdog =
         spawn_build_watchdog(Arc::clone(&ticker), src_path.parent().map(Path::to_path_buf));
 
-    let rows = ide::reproject_changed_modules(
-        &all_modules,
-        &changed_modules,
-        &paths,
-        Some(&project.workspace_root),
-        &mdo_files,
-        batch_size,
-        &mut open_batch,
-        Some(&ticker),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let source_projection_empty = if all_modules.len() == 1 && changed_modules.len() == 1 {
+        let conn =
+            Connection::open_with_flags(src_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get::<_, i64>(0))? == 0
+    } else {
+        false
+    };
+
+    let mut rows = if source_projection_empty {
+        // With no prior graph rows and exactly one current module there are no
+        // unchanged BSL consumers. Reuse the canonical whole-workspace projector to
+        // restore that module plus all metadata owners in one ordinary patch.
+        let mut projected_nodes = Vec::new();
+        let mut projected_edges = Vec::new();
+        let mut sink = |nodes: &[ide::graph_index::NodeRow],
+                        edges: &[ide::graph_index::EdgeRow]| {
+            projected_nodes.extend_from_slice(nodes);
+            projected_edges.extend_from_slice(edges);
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        };
+        let summary = ide::build_workspace_graph_rows(
+            &all_modules,
+            &paths,
+            Some(&project.workspace_root),
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            &mut sink,
+            None,
+            Some(&ticker),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        ide::ReprojectedRows {
+            nodes: projected_nodes,
+            edges: projected_edges,
+            sig_hashes: summary.module_sig_hashes,
+            casing_variant_objects: summary.casing_variant_objects,
+            unresolved_calls: summary.unresolved_calls,
+        }
+    } else if changed_modules.is_empty() {
+        ide::ReprojectedRows {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            sig_hashes: FxHashMap::default(),
+            casing_variant_objects: Vec::new(),
+            unresolved_calls: Vec::new(),
+        }
+    } else {
+        ide::reproject_changed_modules(
+            &all_modules,
+            &changed_modules,
+            &paths,
+            Some(&project.workspace_root),
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            Some(&ticker),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    };
+
+    // A form-module BSL add/remove changes whether the cold graph projects that
+    // form's XML structure. Treat it as an owner delta too: additions reproject
+    // the existing Form.xml owner; deletions clear the prior owner prefix.
+    let mut metadata_owner_ids = owner_ids.to_vec();
+    let mut metadata_form_paths = form_paths.to_vec();
+    for path in &effective_changed_paths {
+        let text = path.to_string_lossy().replace('\\', "/");
+        let Some((owner, form)) = ide::form_key_for_path(&text) else { continue };
+        let scope = owner.map_or_else(
+            || "common".to_owned(),
+            |(kind, name)| format!("{}/{}", kind.english_name(), name),
+        );
+        metadata_owner_ids.push(format!("form/{scope}/{form}"));
+        if let Some(xml) = form_xml_for_module(path).map(PathBuf::from) {
+            if !metadata_form_paths.contains(&xml) {
+                metadata_form_paths.push(xml);
+            }
+        }
+    }
+    if owner_ids.iter().any(|owner| owner.starts_with("mdo/")) {
+        // Newly-added attributes have no old binding edge to use as a reverse index.
+        // Reproject every form module so unresolved data paths and Ref fields can
+        // become bindings in this same metadata publication. Their structural owner
+        // prefixes join the same transaction, replacing rather than duplicating the
+        // existing form→item/attribute and mdo→form rows.
+        for (_, path) in files {
+            let Some((owner, form)) = ide::form_key_for_path(&path.to_string_lossy()) else {
+                continue;
+            };
+            let scope = owner.map_or_else(
+                || "common".to_owned(),
+                |(kind, name)| format!("{}/{}", kind.english_name(), name),
+            );
+            metadata_owner_ids.push(format!("form/{scope}/{form}"));
+            metadata_form_paths.push(path.clone());
+        }
+    }
+    metadata_owner_ids.sort();
+    metadata_owner_ids.dedup();
+
+    let mut form_modules: Vec<ModuleId> = metadata_form_paths
+        .iter()
+        .filter_map(|path| {
+            files.iter().find(|(_, scanned)| scanned == path).map(|(file, _)| ModuleId::new(*file))
+        })
+        .collect();
+    // The changed Form/Module.bsl path itself is already a proof of the owner even
+    // when path normalization differs from the accompanying Form.xml path.
+    // Include it directly so adding the module projects the existing form owner.
+    form_modules.extend(effective_changed_paths.iter().filter_map(|changed| {
+        let text = changed.to_string_lossy();
+        ide::form_key_for_path(&text).and_then(|_| {
+            files
+                .iter()
+                .find(|(_, scanned)| scanned == changed)
+                .map(|(file, _)| ModuleId::new(*file))
+        })
+    }));
+    form_modules.sort_by_key(|module| module.file_id);
+    form_modules.dedup();
+    if !source_projection_empty && (!metadata_owner_ids.is_empty() || !form_modules.is_empty()) {
+        if let Some(representative) = all_modules.first().copied() {
+            let mut projection_ids = vec![representative];
+            projection_ids.extend(form_modules.iter().copied().filter(|m| *m != representative));
+            let projection_files: Vec<_> = projection_ids
+                .iter()
+                .map(|module| (module.file_id, file_paths[&module.file_id].clone()))
+                .collect();
+            let loaded = db_for_files(
+                &source_root,
+                &projection_files,
+                &project.configs,
+                Some(&config_cache),
+            );
+            unread.extend(loaded.unread);
+            let (nodes, edges) = ide::reproject_metadata_owners(
+                &loaded.db,
+                representative.file_id,
+                &form_modules,
+                &paths,
+                Some(&project.workspace_root),
+                &mdo_files,
+                &metadata_owner_ids.iter().cloned().collect(),
+            );
+            rows.nodes.extend(nodes);
+            rows.edges.extend(edges);
+        } else {
+            // A cold graph with no BSL modules has no derived nodes or edges, no
+            // matter which metadata owner changed. `clear_graph` below writes that
+            // exact empty projection in the same transaction.
+        }
+    }
+
+    let mut metadata_node_prefixes = Vec::new();
+    for owner in metadata_owner_ids {
+        if let Some(rest) = owner.strip_prefix("mdo/") {
+            metadata_node_prefixes.extend([
+                owner.clone(),
+                format!("attribute/{rest}"),
+                format!("tabular_section/{rest}"),
+                format!("ts_attr/{rest}"),
+                format!("form/{rest}"),
+                format!("form_item/{rest}"),
+                format!("form_attr/{rest}"),
+            ]);
+        } else if let Some(rest) = owner.strip_prefix("form/") {
+            metadata_node_prefixes.extend([
+                owner.clone(),
+                format!("form_item/{rest}"),
+                format!("form_attr/{rest}"),
+            ]);
+        }
+    }
+    metadata_node_prefixes.sort();
+    metadata_node_prefixes.dedup();
 
     // Normalised `(file_root_id, file_path)` keys for the changed modules — used both to gate the
     // fast path and to scope the per-module deletes below.
@@ -1525,10 +1958,22 @@ pub(crate) fn compute_body_patch(
         incremental_safety_check(&src, &changed_files, &rows, project.search_roots.as_ref())?;
     }
 
+    let mut all_changed_paths = changed_paths.to_vec();
+    all_changed_paths.extend(metadata_paths.iter().cloned());
+    all_changed_paths.extend(xml_observations.iter().map(|(path, _)| path.clone()));
+    all_changed_paths.extend(effective_changed_paths.iter().cloned());
+    all_changed_paths.sort();
+    all_changed_paths.dedup();
     Ok(BodyPatch {
         rows,
         changed_modules,
-        changed_paths: changed_paths.to_vec(),
+        changed_paths: all_changed_paths,
+        metadata_node_prefixes,
+        clear_graph: all_modules.is_empty(),
+        xml_sig_hashes: xml_observations
+            .iter()
+            .map(|(path, hash)| (path.to_string_lossy().into_owned(), *hash))
+            .collect(),
         file_paths,
         unread,
         modules: all_modules.len(),
@@ -1663,10 +2108,10 @@ pub(crate) fn update_graph_database_bodies(
     src_path: &Path,
     out_path: &Path,
     changed_paths: &[PathBuf],
-    batch_size: usize,
+    budget: BatchBudget,
     meta: &GraphMeta,
 ) -> anyhow::Result<GraphBuildSummary> {
-    let patch = compute_body_patch(project, universe, src_path, changed_paths, batch_size)?;
+    let patch = compute_body_patch(project, universe, src_path, changed_paths, budget)?;
     std::fs::copy(src_path, out_path)?;
     let transaction =
         begin_body_patch(out_path, project, universe, &patch, meta, false, PATCH_SQL_BUDGET)
@@ -1682,7 +2127,17 @@ fn write_body_patch(
     meta: &GraphMeta,
     force_stale: bool,
 ) -> anyhow::Result<GraphBuildSummary> {
-    let BodyPatch { rows, changed_modules, changed_paths, file_paths, unread, modules } = patch;
+    let BodyPatch {
+        rows,
+        changed_modules,
+        changed_paths,
+        metadata_node_prefixes,
+        clear_graph,
+        xml_sig_hashes,
+        file_paths,
+        unread,
+        modules,
+    } = patch;
     let stat_by_path: FxHashMap<String, &crate::graph::scan::FileStat> =
         universe.stats.iter().map(|s| (s.path.clone(), s)).collect();
 
@@ -1724,6 +2179,68 @@ fn write_body_patch(
               WHERE n.kind IN ('method', 'module'))",
             [],
         )?;
+
+        // A cold workspace with no BSL modules emits no graph projection at all.
+        // Dropping all derived rows here makes the last-module transition exact and
+        // lets a later first-module patch repopulate the complete projection.
+        if *clear_graph {
+            tx.execute_batch("DELETE FROM edges; DELETE FROM nodes;")?;
+        }
+
+        if !metadata_node_prefixes.is_empty() {
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS temp.metadata_node_prefixes;
+                 CREATE TEMP TABLE metadata_node_prefixes (prefix TEXT PRIMARY KEY) WITHOUT ROWID;
+                 DROP TABLE IF EXISTS temp.metadata_current_nodes;
+                 CREATE TEMP TABLE metadata_current_nodes (id TEXT PRIMARY KEY) WITHOUT ROWID;",
+            )?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR IGNORE INTO metadata_node_prefixes (prefix) VALUES (?1)",
+                )?;
+                for prefix in metadata_node_prefixes {
+                    stmt.execute(params![prefix])?;
+                }
+            }
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR IGNORE INTO metadata_current_nodes (id) VALUES (?1)",
+                )?;
+                for row in &rows.nodes {
+                    let id = match row.kind {
+                        "mdo" | "attribute" => canonicalize_aux_id(&existing_mdo, &row.id),
+                        _ => row.id.clone(),
+                    };
+                    stmt.execute(params![id])?;
+                }
+            }
+            // Replacing an owner must replace its own outgoing structural edges. Keep
+            // references from unchanged BSL and neighboring forms when their target node
+            // still exists in the new projection; those consumers are outside this patch
+            // and cannot be reconstructed by the metadata-only projector. Drop incoming
+            // edges only when the referenced owner node disappeared.
+            tx.execute(
+                "DELETE FROM edges WHERE EXISTS (
+                    SELECT 1 FROM metadata_node_prefixes p
+                    WHERE edges.from_id = p.prefix OR substr(edges.from_id, 1, length(p.prefix) + 1) = p.prefix || '/'
+                 ) OR EXISTS (
+                    SELECT 1 FROM metadata_node_prefixes p
+                    WHERE (edges.to_id = p.prefix OR substr(edges.to_id, 1, length(p.prefix) + 1) = p.prefix || '/')
+                      AND (
+                        NOT EXISTS (SELECT 1 FROM metadata_current_nodes n WHERE n.id = edges.to_id)
+                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding')
+                      )
+                 )",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM nodes WHERE EXISTS (
+                    SELECT 1 FROM metadata_node_prefixes p
+                    WHERE nodes.id = p.prefix OR substr(nodes.id, 1, length(p.prefix) + 1) = p.prefix || '/'
+                 )",
+                [],
+            )?;
+        }
 
         // Re-insert the reprojected nodes, canonicalising aux ids against the store.
         for row in &rows.nodes {
@@ -1829,6 +2346,64 @@ fn write_body_patch(
                     observed,
                 ],
             )?;
+        }
+
+        for changed_path in changed_paths {
+            let canonical = changed_path.to_string_lossy().into_owned();
+            if stat_by_path.contains_key(&canonical) {
+                continue;
+            }
+            let (Some(root_id), Some(path)) =
+                durable_file_key(project.search_roots.as_ref(), Some(&canonical))
+            else {
+                anyhow::bail!(
+                    "incremental update: removed file is outside registered roots: {canonical}"
+                );
+            };
+            tx.execute(
+                "DELETE FROM files WHERE root_id = ?1 AND path = ?2",
+                params![root_id, path],
+            )?;
+        }
+
+        // Refresh only XML files whose bytes changed. The watcher already hashed each
+        // diff XML once for semantic classification; unchanged XML reuses its persisted
+        // signature without a second workspace-wide parse.
+        if let Some(roots) = project.search_roots.as_ref() {
+            for changed_path in changed_paths.iter().filter(|path| {
+                bsl_conventions::str_has_extension(
+                    &path.to_string_lossy(),
+                    bsl_conventions::XML_EXTENSION,
+                )
+            }) {
+                let canonical = changed_path.to_string_lossy().into_owned();
+                let Some(stat) = stat_by_path.get(&canonical).copied() else { continue };
+                let Some(key) = stat.key(roots) else { continue };
+                let content_hash = stat.persisted_content_hash();
+                let sig = xml_sig_hashes.get(&canonical).copied().flatten().or_else(|| {
+                    crate::graph::scan::xml_semantic_hash_file(&stat.canonical).map(|h| {
+                        u64::from_le_bytes(h[..8].try_into().expect("blake3 hash >= 8 bytes"))
+                    })
+                });
+                let [len, mtime, ctime, ino, dev, observed] =
+                    observation_columns(stat.persisted_observation());
+                tx.execute(
+                    FILES_INSERT_SQL,
+                    params![
+                        key.root_id,
+                        key.path,
+                        content_hash.as_slice(),
+                        stat.fingerprint() as i64,
+                        sig.map(|h| h as i64),
+                        len,
+                        mtime,
+                        ctime,
+                        ino,
+                        dev,
+                        observed,
+                    ],
+                )?;
+            }
         }
 
         // The artefact's hole set changes ONLY for the modules this patch rewrote —
@@ -1947,6 +2522,17 @@ pub struct ModuleProfile {
     pub unread: bool,
 }
 
+impl ModuleProfile {
+    pub(crate) fn removed() -> Self {
+        Self {
+            sig_hash: 0,
+            exported_lower: std::collections::BTreeSet::new(),
+            has_collision: false,
+            unread: false,
+        }
+    }
+}
+
 /// Recompute each module at `changed_paths`'s profile, for the incremental
 /// eligibility checks (sig drift, and the caller-delta resolvable-name surface).
 /// Builds a tiny resident index over only those modules — these reads are a module's
@@ -2001,6 +2587,7 @@ pub fn recompute_module_profiles(
             },
         );
     }
+
     Ok(out)
 }
 
@@ -2089,10 +2676,13 @@ fn plan_caller_delta(
             let Some(scope) = ide::scope_for_path(file) else {
                 return Ok(None); // not name-keyed → its callers aren't indexable
             };
+            let folded_scope =
+                ide::folded_common_scope_for_path(file).unwrap_or_else(|| scope.clone());
             let mut stmt = conn.prepare(
-                "SELECT caller_root_id, caller_path FROM unresolved_calls WHERE target_scope = ?1",
+                "SELECT caller_root_id, caller_path FROM unresolved_calls \
+                 WHERE target_scope = ?1 OR target_scope = ?2",
             )?;
-            let rows = stmt.query_map(params![scope], |r| {
+            let rows = stmt.query_map(params![scope, folded_scope], |r| {
                 Ok(bsl_search::FileKey::new(r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?;
             for row in rows {
@@ -2135,12 +2725,14 @@ fn plan_caller_delta(
             let Some(scope) = ide::scope_for_path(file) else {
                 return Ok(None); // not name-keyed → its callers aren't indexable
             };
+            let folded_scope =
+                ide::folded_common_scope_for_path(file).unwrap_or_else(|| scope.clone());
             let mut stmt = conn.prepare(
                 "SELECT caller_root_id, caller_path FROM unresolved_calls \
-                 WHERE target_scope = ?1 AND method_lower = ?2",
+                     WHERE (target_scope = ?1 OR target_scope = ?2) AND method_lower = ?3",
             )?;
             for name in added {
-                let rows = stmt.query_map(params![scope, name], |r| {
+                let rows = stmt.query_map(params![scope, folded_scope, name], |r| {
                     Ok(bsl_search::FileKey::new(r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                 })?;
                 for row in rows {
@@ -2644,7 +3236,14 @@ mod tests {
         let db = root.join(".build/graph.db");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let (project, universe) = scanned_project(root);
-        build_graph_database(&project, &universe, &db, 1, &build_meta()).unwrap();
+        build_graph_database(
+            &project,
+            &universe,
+            &db,
+            stdx::batch::BatchBudget::files(1),
+            &build_meta(),
+        )
+        .unwrap();
 
         assert_eq!(
             stored_file(&db, "mdo/Catalog/Товары"),
@@ -2666,7 +3265,14 @@ mod tests {
         let db_pre = root.join(".build/pre.db");
         std::fs::create_dir_all(db_pre.parent().unwrap()).unwrap();
         let (project, universe) = scanned_project(root);
-        build_graph_database(&project, &universe, &db_pre, 1, &build_meta()).unwrap();
+        build_graph_database(
+            &project,
+            &universe,
+            &db_pre,
+            stdx::batch::BatchBudget::files(1),
+            &build_meta(),
+        )
+        .unwrap();
         assert_eq!(
             stored_file(&db_pre, "mdo/Catalog/Товары"),
             None,
@@ -2689,7 +3295,7 @@ mod tests {
             &db_pre,
             &db_incremental,
             &[module.canonicalize().unwrap()],
-            1,
+            stdx::batch::BatchBudget::files(1),
             &build_meta(),
         )
         .unwrap();
@@ -2745,8 +3351,14 @@ mod tests {
         let db_pre = root.join(".build/pre.db");
         std::fs::create_dir_all(db_pre.parent().expect("database path has a parent")).unwrap();
         let (project, universe) = scanned(root);
-        build_graph_database(&project, &universe, &db_pre, 1, &meta())
-            .expect("initial build succeeds");
+        build_graph_database(
+            &project,
+            &universe,
+            &db_pre,
+            stdx::batch::BatchBudget::files(1),
+            &meta(),
+        )
+        .expect("initial build succeeds");
 
         let changed = vec![module_path.canonicalize().expect("module file exists")];
         let path_key = changed[0].to_string_lossy().into_owned();
@@ -2780,14 +3392,20 @@ mod tests {
             &db_pre,
             &db_incremental,
             &changed,
-            1,
+            stdx::batch::BatchBudget::files(1),
             &meta(),
         )
         .expect("body-only incremental update succeeds");
         let db_full = root.join(".build/full.db");
         let (project, universe) = scanned(root);
-        build_graph_database(&project, &universe, &db_full, 1, &meta())
-            .expect("full rebuild succeeds");
+        build_graph_database(
+            &project,
+            &universe,
+            &db_full,
+            stdx::batch::BatchBudget::files(1),
+            &meta(),
+        )
+        .expect("full rebuild succeeds");
 
         let dump = |path: &Path| {
             let conn = Connection::open(path).unwrap();
@@ -2899,7 +3517,7 @@ mod tests {
             &project,
             &universe,
             &path,
-            1,
+            stdx::batch::BatchBudget::files(1),
             &GraphMeta {
                 revision: 1,
                 fingerprint: GraphFp::default(),

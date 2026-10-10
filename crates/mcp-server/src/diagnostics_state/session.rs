@@ -107,12 +107,12 @@ impl ResidentSession {
     /// handle itself, so it needs the registry, not the attach.
     pub(crate) fn read_fanout<T>(
         &self,
-        f: impl FnOnce(&DiagnosticsResident, u64) -> T,
+        f: impl FnOnce(&mut DiagnosticsResident, u64) -> T,
     ) -> ResidentOutcome<T> {
         if self.cancel.is_cancelled() {
             std::panic::resume_unwind(Box::new(salsa::Cancelled::Local));
         }
-        self.diag.read(|resident, generation| f(resident, generation))
+        self.diag.read_mut(|resident, generation| f(resident, generation))
     }
 
     /// A read on an EMPTY database this request owns, for the answer a tool still

@@ -191,6 +191,7 @@ EndProcedure
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn query_required_data_relevance_needs_mode_8_3_14() {
         let source = r#"
 Процедура Тест()

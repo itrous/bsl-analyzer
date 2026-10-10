@@ -38,6 +38,7 @@ fn query_no_projection(db: &RootDatabaseImpl, ty: TypeId) -> bool {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn straight_line_text_assign_refines_projection_through_execute_select() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -97,6 +98,7 @@ fn divergent_branch_literals_collapse_refinement_to_none() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn unrelated_field_writes_do_not_block_refinement() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -116,6 +118,7 @@ fn unrelated_field_writes_do_not_block_refinement() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn no_text_assignment_keeps_receiver_unrefined() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -137,6 +140,7 @@ fn no_text_assignment_keeps_receiver_unrefined() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn loop_carried_text_write_collapses_refinement_to_none() {
     let fixture = r#"//- /test.bsl
 Функция Тест()

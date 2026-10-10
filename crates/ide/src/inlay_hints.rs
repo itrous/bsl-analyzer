@@ -287,6 +287,7 @@ mod tests {
 
     /// Global aliases share the platform signature and its numbered argument group.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn parameter_hints_expand_global_parameter_series() {
         for name in ["Мин", "Макс", "ПродолжитьВызов", "Min", "Max", "ProceedWithCall"]
         {
@@ -324,6 +325,7 @@ mod tests {
 
     /// A bounded group must stop naming arguments beyond its documented endpoint.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn parameter_hints_respect_bounded_series() {
         let source = "Процедура Тест()\n    СтрШаблон(\"%10\", 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);\nКонецПроцедуры\n";
         let (db, file_id) = single_file(source);
@@ -336,6 +338,7 @@ mod tests {
 
     /// Empty slots retain their index, and expanded names still suppress redundant hints.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn parameter_series_preserve_empty_slots_and_name_suppression() {
         let source = "Процедура Тест(Значение1, зНАЧЕНИЕ2)\n    СтрШаблон(\"%3\", , , 30);\n    СтрШаблон(\"%1 %2 %3\", Значение1, зНАЧЕНИЕ2, 40);\nКонецПроцедуры\n";
         let (db, file_id) = single_file(source);
@@ -359,6 +362,7 @@ mod tests {
 
     /// Constructors use both numbered groups and explicit variadic flags from the reference.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn parameter_hints_expand_constructor_parameter_series() {
         let cases = [
             (

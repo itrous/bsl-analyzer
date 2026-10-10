@@ -73,6 +73,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_deprecated_type_russian() {
         let code = r#"Функция ЭтоФормаПриложения(Окно)
 	ИмяТипа = "ФормаКлиентскогоПриложения";
@@ -88,6 +89,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_deprecated_type_english() {
         let code = r#"Function IsAppForm(Window)
 	Return TypeOf(Window) = Type("ManagedForm");
@@ -101,6 +103,7 @@ EndFunction
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_case_insensitive() {
         let code = r#"Процедура СобратьТипы(Типы)
 	Типы.Добавить(тип("управляемаяФОРМА"));

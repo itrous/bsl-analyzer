@@ -11,3 +11,6 @@ base-db.workspace = true
 syntax.workspace = true
 vfs.workspace = true
 rustc-hash.workspace = true
+
+[lints]
+workspace = true

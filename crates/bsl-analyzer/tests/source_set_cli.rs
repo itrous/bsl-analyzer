@@ -252,6 +252,7 @@ fn assert_extension_metadata_fields(run: &Run, tail: &str, extension_visible: bo
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_cli_covers_document_fields_common_module_and_external() {
     let root = extension_metadata_fixture();
     let run = analyze(
@@ -349,6 +350,7 @@ fn extension_metadata_cli_covers_document_fields_common_module_and_external() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_cli_no_extensions_keeps_base_and_rejects_extension_fields() {
     let root = extension_metadata_fixture();
     let run = analyze(
@@ -407,6 +409,7 @@ fn extension_metadata_cli_no_extensions_keeps_base_and_rejects_extension_fields(
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_cli_external_depends_on_empty_excludes_only_extension_metadata() {
     let root = extension_metadata_fixture();
     let run = analyze(
@@ -428,6 +431,7 @@ fn extension_metadata_cli_external_depends_on_empty_excludes_only_extension_meta
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_cli_external_dependency_excludes_other_selected_extension() {
     let root = extension_metadata_fixture();
     let run = analyze(

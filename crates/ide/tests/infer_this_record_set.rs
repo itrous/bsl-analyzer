@@ -185,6 +185,7 @@ fn infer_this_record_set_english_spelling() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn for_each_yields_information_register_record_kind() {
     let text = r#"
 Процедура Тест()
@@ -203,6 +204,7 @@ fn for_each_yields_information_register_record_kind() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn record_dimension_resolves() {
     let text = r#"
 Процедура Тест()
@@ -216,6 +218,7 @@ fn record_dimension_resolves() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn record_standard_period_resolves() {
     let config_path = temp_designer_config_with_register_recorders();
     let text = r#"
@@ -236,6 +239,7 @@ fn record_standard_period_resolves() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn record_standard_active_resolves() {
     let text = r#"
 Процедура Тест()
@@ -249,6 +253,7 @@ fn record_standard_active_resolves() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn record_recorder_resolves_to_union_of_recorders() {
     let config_path = temp_designer_config_with_register_recorders();
     let text = r#"
@@ -320,6 +325,7 @@ fn filter_period_resolves_for_periodic_inforeg() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn additional_properties_implicit_bare_resolves() {
     let text = r#"
 Функция Тест()

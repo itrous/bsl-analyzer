@@ -3380,6 +3380,41 @@ impl Store {
         self.load_indexed_documents_with_token_layout_claim(collection, None)
     }
 
+    /// Documents per file of `collection`, counted where
+    /// [`Self::load_indexed_documents_with_token_layout_claim`] would load them: the
+    /// same chunk–file–span join, so a chunk with several source spans counts once per
+    /// span exactly as it would load, and the same token-layout verification.
+    pub fn count_indexed_documents_by_file(
+        &self,
+        collection: &str,
+        token_layout_claim: Option<&str>,
+    ) -> Result<Vec<(crate::DocumentPath, usize)>, SearchError> {
+        if let Some(claim) = token_layout_claim {
+            Self::verify_token_layout_claim(&self.conn, Some(claim))?;
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT f.collection, f.root_id, f.path, COUNT(*)
+             FROM chunks c
+             JOIN files f ON f.id = c.file_id
+             LEFT JOIN chunk_source_spans s ON s.chunk_id = c.id
+             WHERE f.collection = ?1
+             GROUP BY f.collection, f.root_id, f.path",
+        )?;
+        let rows = stmt
+            .query_map(params![collection], |row| {
+                Ok((
+                    crate::DocumentPath::new(
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ),
+                    row.get::<_, i64>(3)? as usize,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn load_indexed_documents_with_token_layout_claim(
         &self,
         collection: Option<&str>,
@@ -6887,6 +6922,48 @@ mod tests {
 
         store.remove_file(CONFIGURATION_ROOT_ID, "test.bsl", "code").unwrap();
         assert_eq!(store.text_search("Удаляемая", 10, None).unwrap().len(), 0);
+    }
+
+    /// The per-file counts are the loaded rows counted: two code files with different
+    /// chunk counts and a platform document the collection filter leaves out.
+    #[test]
+    fn count_indexed_documents_by_file_matches_the_loaded_rows() {
+        let mut store = Store::in_memory().unwrap();
+        let one = crate::Chunker::chunk("Процедура Код()\nКонецПроцедуры");
+        let two = crate::Chunker::chunk(
+            "Процедура Первая()\nКонецПроцедуры\n\nПроцедура Вторая()\nКонецПроцедуры",
+        );
+        store.reindex_file(CONFIGURATION_ROOT_ID, "A.bsl", b"hash-a", &one, None).unwrap();
+        store.reindex_file(CONFIGURATION_ROOT_ID, "B.bsl", b"hash-b", &two, None).unwrap();
+        store
+            .reindex_documents(
+                "platform",
+                "platform://docs",
+                b"hash-docs",
+                &[crate::Document {
+                    title: "Строка".to_owned(),
+                    body: "Описание".to_owned(),
+                    kind: "type".to_owned(),
+                }],
+                None,
+            )
+            .unwrap();
+
+        let loaded = store.load_indexed_documents(Some("code")).unwrap();
+        let mut expected: std::collections::HashMap<crate::DocumentPath, usize> =
+            Default::default();
+        for document in &loaded {
+            *expected.entry(document.document_path()).or_default() += 1;
+        }
+        let counted: std::collections::HashMap<crate::DocumentPath, usize> =
+            store.count_indexed_documents_by_file("code", None).unwrap().into_iter().collect();
+
+        assert_eq!(counted, expected);
+        assert_eq!(counted.len(), 2, "two code files, no platform row");
+        assert!(
+            counted.values().any(|count| *count > 1),
+            "the control: at least one file holds more than one document"
+        );
     }
 
     #[test]

@@ -9,3 +9,6 @@ rust-version.workspace = true
 expect-test.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

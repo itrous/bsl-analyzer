@@ -2,12 +2,13 @@ pub mod capability;
 mod db;
 pub mod deprecation;
 mod global_catalog;
+pub mod help;
 mod parameter_series;
 pub mod security;
+mod snapshot;
 pub mod standard_mdo_attributes;
 mod types;
 
-#[cfg(test)]
 mod overlays;
 
 #[allow(warnings)]
@@ -35,7 +36,13 @@ pub use global_catalog::{
     PlatformGlobalKind, PlatformGlobalSymbol, PlatformSymbolCapabilities, PlatformVersion,
     PlatformVersionParseError,
 };
+pub use help::{
+    active_platform_help_request, install_platform_help, InstallOutcome, PlatformHelp,
+    PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind, PlatformHelpStatus,
+    RestartRequired, BUNDLED_PLATFORM_VERSION, CORPUS_ENV,
+};
 pub use parameter_series::ParameterSeries;
+pub use snapshot::{PlatformSnapshot, SnapshotDecodeError};
 pub use types::*;
 
 pub fn split_type_alternatives(raw: &str) -> Vec<&str> {

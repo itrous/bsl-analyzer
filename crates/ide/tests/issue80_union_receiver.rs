@@ -67,6 +67,7 @@ fn type_mismatch_silent_on_union_receiver_when_one_arm_accepts() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn issue80_union_receiver_rejects_cross_product_arguments() {
     let fixture = r#"
 //- /CommonModules/ФабрикаКриптографии/Ext/Module.bsl

@@ -40,3 +40,6 @@ tempfile.workspace = true
 expect-test.workspace = true
 test-fixture.workspace = true
 uuid = { version = "1.0", features = ["v4"] }
+
+[lints]
+workspace = true

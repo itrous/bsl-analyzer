@@ -77,6 +77,7 @@ fn infer_register_dimension_resolves_to_catalog_ref() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn infer_for_each_over_record_set_yields_record_kind() {
     let fixture = r#"
 //- /CommonModules/ПервыйОбщийМодуль/Ext/Module.bsl
@@ -104,6 +105,7 @@ fn infer_for_each_over_record_set_yields_record_kind() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn infer_register_record_dimension_resolves_through_field_lookup() {
     let fixture = r#"
 //- /CommonModules/ПервыйОбщийМодуль/Ext/Module.bsl

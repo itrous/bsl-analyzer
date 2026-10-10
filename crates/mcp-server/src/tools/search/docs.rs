@@ -314,6 +314,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn find_docs_hits_carry_the_structured_listing_beside_the_text() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("reference-search.db");
@@ -355,6 +356,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn find_docs_returns_a_real_property_identity() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("reference-search.db");
@@ -396,6 +398,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn search_docs_returns_a_real_constructor_identity_from_semantic_corpus() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("reference-search.db");

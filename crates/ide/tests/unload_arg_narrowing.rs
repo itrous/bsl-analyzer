@@ -48,6 +48,7 @@ fn union_has(
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn no_arg_narrows_to_value_table() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -65,6 +66,7 @@ fn no_arg_narrows_to_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn direct_iteration_narrows_to_value_table() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -82,6 +84,7 @@ fn direct_iteration_narrows_to_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn by_groups_narrows_to_value_tree() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -99,6 +102,7 @@ fn by_groups_narrows_to_value_tree() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn by_groups_with_hierarchy_narrows_to_value_tree() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -116,6 +120,7 @@ fn by_groups_with_hierarchy_narrows_to_value_tree() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn english_linear_narrows_to_value_table() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -133,6 +138,7 @@ fn english_linear_narrows_to_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn english_by_groups_with_hierarchy_narrows_to_value_tree() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -150,6 +156,7 @@ fn english_by_groups_with_hierarchy_narrows_to_value_tree() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn dynamic_arg_keeps_union() {
     let fixture = r#"//- /test.bsl
 Функция Тест(ТипОбхода)
@@ -167,6 +174,7 @@ fn dynamic_arg_keeps_union() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn projection_carries_into_narrowed_value_table() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -191,6 +199,7 @@ fn projection_carries_into_narrowed_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn projection_carries_through_direct_iteration_arg() {
     let fixture = r#"//- /test.bsl
 Функция Тест()

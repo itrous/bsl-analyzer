@@ -474,6 +474,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_platform_method_variable_shadows_platform_type_name() {
         let code = "Процедура Тест()
     Массив = Новый СписокЗначений;
@@ -497,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_platform_method_signature_on_keyword_method_name() {
         let code = "Процедура Тест()
     Запрос = Новый Запрос;
@@ -520,6 +522,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_platform_method_on_instance_variable() {
         let code = "Процедура Тест()
     МойМассив = Новый Массив;
@@ -540,6 +543,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_platform_method_signature_on_chained_call_return_type() {
         let code = "Процедура Тест()
     Запрос = Новый Запрос;
@@ -577,6 +581,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_platform_method_signature_on_chained_union_first_arm_wins() {
         let code = "Процедура Тест()
     Запрос = Новый Запрос;
@@ -610,6 +615,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_constructor_signature_on_array() {
         let code = "Процедура Тест()
     Х = Новый Массив($0);
@@ -667,6 +673,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn platform_overloads_unique_selection() {
         let code = "Процедура Тест()
     Дата(2024, 1, 1$0)
@@ -695,6 +702,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn platform_overloads_ambiguous_selection() {
         let code = "Процедура Тест()
     ДокументЗащищенПаролем(Неизвестно$0)
@@ -712,6 +720,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn constructor_signature_help_selects_unique_candidate() {
         let code = "Процедура Тест()
     Массив = Новый Массив($0)
@@ -738,6 +747,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn signature_help_does_not_rank_candidates() {
         let code = "Процедура Тест()
     Результат = ДокументЗащищенПаролем($0)
@@ -772,6 +782,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn signature_help_maps_all_overloads() {
         let code = "Процедура Тест()
     Результат = ДокументЗащищенПаролем($0)

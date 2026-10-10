@@ -70,3 +70,33 @@ fn partial_document() {
         }
     }
 }
+
+/// The control for the harness's own judgement: a wait on a server that is idle and
+/// will never meet the condition fails on the FIRST silent window, and says why. A
+/// wait that could only ever report "Timeout" after a minute could not tell this case
+/// from a server still working, which is what every timeout in this family looked like.
+#[test]
+fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
+    let dir = project();
+    let lsp = Lsp::start(dir.path());
+    let silence = Duration::from_secs(2);
+
+    let started = std::time::Instant::now();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lsp.wait_for_judging(silence, |_| false);
+    }));
+    let waited = started.elapsed();
+
+    let payload = outcome.expect_err("a condition no message meets must fail the wait");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+    assert!(message.contains("used no CPU"), "the verdict names idleness: {message}");
+    assert!(message.contains(file!()), "the verdict names the waiting line: {message}");
+    assert!(
+        waited < SILENCE,
+        "an idle server is judged on its own silence window, not the default: {waited:?}",
+    );
+}

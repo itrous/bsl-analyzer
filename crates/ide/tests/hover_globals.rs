@@ -372,6 +372,7 @@ fn hover_implicit_local_of_unknown_type_shadows_hbk_property() {
 /// complete set of such readings; each was verified to leak before the guard
 /// moved to the caller.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn assigned_collection_name_still_shows_the_collection_card() {
     let markup = hover_markup(
         r#"//- /test.bsl
@@ -443,6 +444,7 @@ fn held_name_suppresses_global_function_card() {
 /// Positive control for the whole class: with nobody holding the names, all four
 /// readings still render.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn unheld_names_still_render_all_four_readings() {
     let plural = hover_markup(
         r#"//- /test.bsl

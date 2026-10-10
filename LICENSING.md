@@ -270,7 +270,8 @@ inherits the obligations of the original sources.
 | `crates/bsl-metadata/fixtures/designer/WebServices/WebСервис1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
 | `crates/ide-diagnostics/test_data/metadata/designer/` (51 files, whole directory) | bsl-language-server (Java), by the message of `8591e553`; content identical to the `4601ffcb` fixtures | removed test fixture, added by `8591e553`, not referenced by any test; present in history only — see below |
 | `crates/ide-diagnostics/test_data/set_permissions_for_new_objects/Roles/` (6 XML files) | not named by its commit; content identical to the `designer/Roles/` files above | test fixture, first added by `0629d987`, moved by `4527ea15` — see below |
-| `crates/bsl-platform/data/platform_data.json` | ООО «1С-Софт» | 1C copyright, see `crates/bsl-platform/data/PROVENANCE.md` — not covered by MIT / Apache-2.0 / LGPL-3.0 |
+| `crates/bsl-platform/data/platform_data.json` (removed by #312; history only), platform help packages and the pinned corpus `auto` downloads | ООО «1С-Софт» | 1C copyright, see `crates/bsl-platform/data/PROVENANCE.md` — not covered by MIT / Apache-2.0 / LGPL-3.0; packages carry their own `NOTICE.md` |
+| `crates/bsl-platform/data/platform_facts.json` (compiled into the binary) | structured interface facts of the 1C:Enterprise platform, derived from the corpus above with every text removed | factual information about the platform's API, treated as not protectable expression — see `PROVENANCE.md`; contains no description, parameter documentation, example or note; a test fails if any such field appears |
 
 The preprocessor symbol list, formerly in
 `crates/ide-diagnostics/src/utils/preprocessor_symbols.rs` and now in

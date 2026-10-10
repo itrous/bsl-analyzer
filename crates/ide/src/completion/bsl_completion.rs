@@ -1263,6 +1263,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_complete_mdo_plural_forms() {
         use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
         use ide_db::RootDatabaseImpl;
@@ -1301,6 +1302,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_complete_mdo_symbols_bilingual() {
         use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
         use ide_db::RootDatabaseImpl;

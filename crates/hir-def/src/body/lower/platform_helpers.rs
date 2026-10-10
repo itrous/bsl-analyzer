@@ -12,6 +12,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_is_global_function_bilingual() {
         assert!(is_global_function("НачатьТранзакцию", "BeginTransaction"));
         assert!(is_global_function("BeginTransaction", "BeginTransaction"));

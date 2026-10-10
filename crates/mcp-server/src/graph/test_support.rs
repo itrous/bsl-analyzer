@@ -158,6 +158,36 @@ pub(crate) fn wait_until_within(
     }
 }
 
+/// [`wait_until`] for a stand that has no watcher: `drive` plays it, before every look.
+///
+/// One decision is about one moment, and the moment a stand usually picks — right after
+/// a publication it just waited for — is a busy one: the builder still holds its slot
+/// while it arms the hub and runs the publish pass, and the lease may be re-read from
+/// disk. A decision taken then is "not now", which in the daemon the watcher comes back
+/// to revisit. Here nobody would, and the owed work would stand until the ceiling for
+/// want of a second look — the slower the machine, the wider that window.
+#[track_caller]
+pub(crate) fn wait_until_driving(
+    graph: &GraphState,
+    what: &str,
+    mut drive: impl FnMut(),
+    mut condition: impl FnMut() -> bool,
+) {
+    wait_until(graph, what, || {
+        if condition() {
+            return true;
+        }
+        drive();
+        false
+    });
+}
+
+/// [`wait_until_driving`] with the graph's own [`GraphState::drive`] as the watcher.
+#[track_caller]
+pub(crate) fn drive_until(graph: &GraphState, what: &str, condition: impl FnMut() -> bool) {
+    wait_until_driving(graph, what, || graph.drive(), condition);
+}
+
 /// Wait for the graph's STATUS to reach `Ready`.
 ///
 /// This is a status barrier and nothing more. It is NOT a barrier for the publish pass
@@ -182,6 +212,24 @@ pub(crate) fn wait_ready(graph: &GraphState) {
         }
         _ => false,
     });
+}
+
+/// The status report of a published graph, with its published fields present.
+///
+/// The report samples its locks without blocking and, while any owner holds one — the
+/// watcher, the publish pass, the hub's poll — leaves the published fields out. A single
+/// read right after a publication is therefore a race; the wait keeps the sample that
+/// carries them.
+#[track_caller]
+pub(crate) fn published_report(graph: &GraphState) -> super::GraphStatusReport {
+    let mut sample = None;
+    wait_until(graph, "a status report carrying the published revision", || {
+        let report = graph.status_report();
+        let published = report.revision.is_some();
+        sample = Some(report);
+        published
+    });
+    sample.expect("the wait captured a published report")
 }
 
 /// Wait until at least `passes` completed publish passes have been counted.

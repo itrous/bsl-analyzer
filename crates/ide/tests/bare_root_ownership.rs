@@ -59,6 +59,7 @@ fn hover_names_platform_manager(owner: Owner) -> bool {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn signature_help_respects_every_owner() {
     for owner in Owner::UNHELD {
         assert!(
@@ -75,6 +76,7 @@ fn signature_help_respects_every_owner() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn inlay_hints_respect_every_owner() {
     for owner in Owner::UNHELD {
         assert!(
@@ -107,6 +109,7 @@ fn completion_respects_every_owner() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_respects_every_owner() {
     for owner in Owner::UNHELD {
         assert!(

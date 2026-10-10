@@ -175,7 +175,10 @@ pub fn method_line_diagnostics_query<'db>(
     Arc::new(slab::check_block_all(&analysis, &block))
 }
 
-#[salsa::tracked(lru = 256, heap_size = diagnostics_heap, returns(clone))]
+// Sized for a whole workspace of answers: a file's list is small next to the chains
+// it was computed from, and a sweep that trims those chains away keeps its answers,
+// so a repeated sweep over the same files is a lookup, not a recomputation.
+#[salsa::tracked(lru = 32768, heap_size = diagnostics_heap, returns(clone))]
 pub fn file_diagnostics_query<'db>(
     db: &'db dyn RootDatabase,
     file_id_input: FileIdInput<'db>,

@@ -32,6 +32,7 @@ fn var_type(db: &RootDatabaseImpl, file_id: FileId, var_lower: &str) -> Option<T
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn path_resolves_platform_builtin_via_resolver() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -128,6 +129,7 @@ fn implicit_local_of_unknown_type_claims_platform_global_property_name() {
 /// Positive control for the two tests above: without a claiming local the very
 /// same reads still resolve to the globals.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn unclaimed_bare_global_names_still_resolve() {
     let fixture = r#"//- /test.bsl
 Функция Тест()

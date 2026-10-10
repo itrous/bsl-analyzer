@@ -13,3 +13,6 @@ rowan.workspace = true
 [dev-dependencies]
 expect-test.workspace = true
 parser = { path = "../parser" }
+
+[lints]
+workspace = true

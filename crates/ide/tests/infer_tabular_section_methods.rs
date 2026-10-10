@@ -68,6 +68,7 @@ const OBJECT_RETURNING_MODULE: &str = r#"
 "#;
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn infer_full_tabular_section_chain() {
     let fixture = format!(
         r#"{OBJECT_RETURNING_MODULE}
@@ -115,6 +116,7 @@ fn infer_full_tabular_section_chain() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn infer_tabular_section_count_returns_number() {
     let fixture = format!(
         r#"{OBJECT_RETURNING_MODULE}
@@ -131,6 +133,7 @@ fn infer_tabular_section_count_returns_number() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn infer_tabular_section_unload_returns_value_table() {
     let fixture = format!(
         r#"{OBJECT_RETURNING_MODULE}
@@ -190,6 +193,7 @@ fn unresolved_method_call_fires_on_tabular_section_typo() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn no_unresolved_method_call_on_valid_tabular_section_method() {
     let fixture = format!(
         r#"{OBJECT_RETURNING_MODULE}

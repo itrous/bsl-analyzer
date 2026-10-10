@@ -57,6 +57,7 @@ fn labels(items: &[CompletionItem]) -> Vec<String> {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_module_method_call_returning_structure() {
     let items = complete(
         r#"//- /CommonModules/КоннекторHTTP/Ext/Module.bsl

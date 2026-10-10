@@ -46,10 +46,22 @@ pub enum DiagnosticsBaselineSnapshot {
         epoch: String,
         errors: Vec<DiagnosticsBaselineErrorSummary>,
         ground: BaselineGround,
+        /// An input read as zero bytes. A truncating write passes through exactly
+        /// that state between its `open` and its `write`, and nothing in the bytes
+        /// tells a file caught there from one that is really empty — only a later
+        /// look does. A host announcing errors can hold this one back until then.
+        read_empty: bool,
     },
 }
 
 impl DiagnosticsBaselineSnapshot {
+    /// Whether an input of this snapshot was read as zero bytes — the state a
+    /// truncating write passes through, so the error may describe content nobody
+    /// saved. Never true of a healthy snapshot.
+    pub fn read_empty(&self) -> bool {
+        matches!(self, Self::Error { read_empty: true, .. })
+    }
+
     /// Load a baseline, reusing the previous snapshot's objects where they have not moved.
     pub fn load_reusing(project: &project_model::Project, previous: &Self) -> Self {
         settle(project, || Self::load_once_reusing(project, previous))
@@ -290,7 +302,7 @@ impl DiagnosticsBaselineSnapshot {
                 }
                 Err(error) => {
                     let detail = error.to_string();
-                    let (observation_paths, observed_bytes) = partitioned_error_observation(
+                    let observed = partitioned_error_observation(
                         &project.root,
                         &resolved.project_path,
                         &plan.enabled_partition_ids,
@@ -299,14 +311,18 @@ impl DiagnosticsBaselineSnapshot {
                     let mut snapshot = Self::error_observed_many(
                         Some(resolved.path),
                         Some(resolved.project_path.clone()),
-                        observation_paths,
+                        observed.paths,
                         error.info().code,
-                        &observed_bytes,
+                        &observed.fingerprint,
                         detail,
                         ground,
                     );
                     let Self::Error {
-                        selection, partitions_enabled, partitions_unsuppressed, ..
+                        selection,
+                        partitions_enabled,
+                        partitions_unsuppressed,
+                        read_empty,
+                        ..
                     } = &mut snapshot
                     else {
                         unreachable!()
@@ -315,6 +331,7 @@ impl DiagnosticsBaselineSnapshot {
                     *partitions_enabled = Some(plan.enabled_partition_ids.len());
                     *partitions_unsuppressed =
                         Some(plan.partitions.len() - plan.enabled_partition_ids.len());
+                    *read_empty = observed.read_empty;
                     Self::with_partition_errors(snapshot, &error)
                 }
             };
@@ -361,14 +378,17 @@ impl DiagnosticsBaselineSnapshot {
                     _ => "invalid_file",
                 };
                 let detail = error.to_string();
-                Self::error(
+                let mut snapshot = Self::error(
                     Some(resolved.path),
                     Some(resolved.project_path.clone()),
                     code,
                     &bytes,
                     detail,
                     ground,
-                )
+                );
+                let Self::Error { read_empty, .. } = &mut snapshot else { unreachable!() };
+                *read_empty = bytes.is_empty();
+                snapshot
             }
         }
     }
@@ -440,6 +460,7 @@ impl DiagnosticsBaselineSnapshot {
                 epoch,
             }],
             ground,
+            read_empty: false,
         }
     }
 
@@ -917,27 +938,44 @@ fn partitioned_epoch(
     hasher.finalize().to_hex().to_string()
 }
 
+/// What a failed partitioned load saw of its inputs: the names to watch for a repair,
+/// a fingerprint of their bytes for the error's epoch, and whether any of them read as
+/// zero bytes. One flag for the whole set is enough because a host only HOLDS an
+/// announcement on it and looks again: an object caught inside a write beside a really
+/// broken one costs that look's delay, never the broken one's announcement.
+struct ErrorObservation {
+    paths: Vec<PathBuf>,
+    fingerprint: [u8; 32],
+    read_empty: bool,
+}
+
 fn partitioned_error_observation(
     project_root: &Path,
     project_path: &str,
     enabled_partition_ids: &[String],
-) -> (Vec<PathBuf>, [u8; 32]) {
+) -> ErrorObservation {
     let directory = project_root.join(project_path);
     let manifest_path = directory.join("manifest.json");
     let mut hasher = blake3::Hasher::new();
+    let mut read_empty = false;
     let Ok(managed) =
         project_model::ManagedBaselineDirectory::open(project_root, project_path, false)
     else {
-        return (vec![], *hasher.finalize().as_bytes());
+        return ErrorObservation {
+            paths: vec![],
+            fingerprint: *hasher.finalize().as_bytes(),
+            read_empty,
+        };
     };
     let mut paths = vec![manifest_path];
     let Ok(mut manifest_file) = managed.open_file("manifest.json") else {
-        return (paths, *hasher.finalize().as_bytes());
+        return ErrorObservation { paths, fingerprint: *hasher.finalize().as_bytes(), read_empty };
     };
     let mut bytes = Vec::new();
     if manifest_file.read_to_end(&mut bytes).is_err() {
-        return (paths, *hasher.finalize().as_bytes());
+        return ErrorObservation { paths, fingerprint: *hasher.finalize().as_bytes(), read_empty };
     }
+    read_empty |= bytes.is_empty();
     hasher.update(&bytes);
     if let Ok(manifest) = serde_json::from_slice::<
         ide::partitioned_diagnostics_baseline::DiagnosticsBaselineManifest,
@@ -953,17 +991,20 @@ fn partitioned_error_observation(
             paths.push(project_root.join(relative));
             let Ok(mut file) = managed.open_file(&entry.file) else { continue };
             hasher.update(entry.file.as_bytes());
+            let mut total = 0usize;
             loop {
                 match file.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
+                        total += read;
                         hasher.update(&buffer[..read]);
                     }
                 }
             }
+            read_empty |= total == 0;
         }
     }
-    (paths, *hasher.finalize().as_bytes())
+    ErrorObservation { paths, fingerprint: *hasher.finalize().as_bytes(), read_empty }
 }
 
 #[cfg(all(test, unix))]
@@ -1600,7 +1641,7 @@ include = ["main"]
         )
         .unwrap();
         assert_eq!(
-            partitioned_error_observation(dir.path(), "baselines", &[]).0,
+            partitioned_error_observation(dir.path(), "baselines", &[]).paths,
             vec![dir.path().join("baselines/manifest.json")]
         );
     }
@@ -1611,7 +1652,7 @@ include = ["main"]
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("manifest.json"), b"secret").unwrap();
         symlink(outside.path(), dir.path().join("baselines")).unwrap();
-        assert!(partitioned_error_observation(dir.path(), "baselines", &[]).0.is_empty());
+        assert!(partitioned_error_observation(dir.path(), "baselines", &[]).paths.is_empty());
     }
 
     #[test]
@@ -1620,9 +1661,9 @@ include = ["main"]
         std::fs::create_dir(dir.path().join("baselines")).unwrap();
         let manifest = dir.path().join("baselines/manifest.json");
         std::fs::write(&manifest, b"broken-a").unwrap();
-        let first = partitioned_error_observation(dir.path(), "baselines", &[]).1;
+        let first = partitioned_error_observation(dir.path(), "baselines", &[]).fingerprint;
         std::fs::write(&manifest, b"broken-b").unwrap();
-        assert_ne!(partitioned_error_observation(dir.path(), "baselines", &[]).1, first);
+        assert_ne!(partitioned_error_observation(dir.path(), "baselines", &[]).fingerprint, first);
     }
 
     #[test]

@@ -337,6 +337,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn copy_form_data_signature_admits_form_data_tree_argument() {
         let db = InMemoryDb::new();
         let sigs = builtin_functions()
@@ -357,6 +358,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn lookup_is_case_insensitive_and_bilingual() {
         let builtins = builtin_functions();
         assert!(builtins.get("СтрДлина").is_some());
@@ -373,6 +375,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn nstr_has_optional_second_parameter() {
         let db = InMemoryDb::new();
         let builtins = builtin_functions();
@@ -384,6 +387,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn strtemplate_is_capped_variadic() {
         let db = InMemoryDb::new();
         let builtins = builtin_functions();
@@ -397,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn strlen_returns_number() {
         let db = InMemoryDb::new();
         let builtins = builtin_functions();
@@ -408,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn currentdate_takes_no_args() {
         let db = InMemoryDb::new();
         let builtins = builtin_functions();
@@ -550,6 +556,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn registry_has_many_signatures() {
         let builtins = builtin_functions();
         assert!(builtins.signatures.len() > 500);

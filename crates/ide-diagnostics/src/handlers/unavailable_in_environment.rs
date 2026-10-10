@@ -54,6 +54,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn server_only_type_method_flagged_in_client_form_method() {
         // ЧтениеТекста is unavailable in the web client; a form method behind
         // &НаКлиенте runs in every configured client environment.
@@ -101,6 +102,7 @@ mod tests {
     /// Имя типа, записанное строкой, ограничено контекстом ровно так же, как
     /// записанное синтаксисом.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn server_only_type_flagged_when_named_by_string() {
         for ctor in [r#"Новый("ЧтениеТекста")"#, r#"Новый(Тип("ЧтениеТекста"))"#]
         {
@@ -153,6 +155,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn preprocessor_branch_still_checks_matching_environments() {
         // Unlike a blanket skip, narrowing keeps checking the environments
         // the branch IS compiled for.
@@ -177,6 +180,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn preprocessor_else_gets_complement() {
         let fixture = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -271,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn server_only_global_function_flagged_on_client() {
         let fixture = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -330,6 +335,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn module_level_guard_still_checks_matching_environments() {
         let fixture = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -350,6 +356,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn type_constructor_unavailable_in_web_client() {
         let fixture = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -389,6 +396,7 @@ mod tests {
     /// Глобальные коллекции менеджеров (`Перечисления`, `Справочники`, …) —
     /// серверная поверхность: тонкий и веб-клиент их не компилируют.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn manager_collection_flagged_on_client() {
         let fixture_server = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -435,6 +443,7 @@ mod tests {
     /// переменную. Поэтому обращение остаётся обращением к коллекции и
     /// ограничение по средам к нему применяется — до присваивания и после.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn assignment_does_not_silence_collection_env() {
         for (label, fixture) in [
             (
@@ -504,6 +513,7 @@ mod tests {
     /// Диагностика вызывной формы стоит на корневом имени коллекции,
     /// а не на всём вызове.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn three_level_diagnostic_anchors_on_collection_root() {
         let source = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -557,6 +567,7 @@ mod tests {
     /// потому что присваивание коллекции не объявляет локаль вовсе, так что
     /// вопрос о ветках не возникает. Прежний осознанный FN закрылся сам.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn cross_branch_assignment_does_not_silence_the_client_branch() {
         let fixture = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -580,6 +591,7 @@ mod tests {
     /// Корень, обёрнутый в скобки, — по-прежнему трёхуровневый вызов;
     /// диагностика стоит на имени, а не на всём выражении.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn parenthesized_three_level_root_anchors_on_name() {
         let source = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -617,6 +629,7 @@ mod tests {
 
     /// Английское имя коллекции ограничено так же, как русское.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn english_manager_collection_flagged_on_client() {
         let fixture = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -637,6 +650,7 @@ mod tests {
     /// Корень цепочки проверяется и в вызывной форме
     /// `Справочники.Товары.НайтиПоКоду()`, а не только в форме чтения.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn three_level_manager_call_flagged_on_client() {
         let fixture_server = r#"
 //- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl

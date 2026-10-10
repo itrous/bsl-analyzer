@@ -12,12 +12,23 @@ smol_str = { workspace = true }
 rustc-hash = { workspace = true }
 once_cell = { workspace = true }
 salsa = { workspace = true }
+serde_json = { workspace = true }
 
 [build-dependencies]
 serde_json = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+html-parser = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+blake3 = "1.8"
+sha2 = "0.11"
 
 [features]
+# No-op: once marked a build that compiled the help corpus in. The corpus is
+# loaded at runtime now; the feature stays so existing build commands that name
+# it keep working.
 platform_docs = []
+
+[lints]
+workspace = true

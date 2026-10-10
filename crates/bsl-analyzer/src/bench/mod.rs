@@ -112,6 +112,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn hover_point_measures_non_empty_result() {
         let r = run_one(FeatureSpec::Hover { offset: off("Сообщить") }, Expect::NonEmpty).unwrap();
         assert_measured(&r);
@@ -301,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn edit_point_reports_all_phases() {
         let end = FIXTURE.len() as u32;
         let r = run_one(
@@ -396,6 +398,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn recompute_mode_reports_churn_for_every_edit_kind() {
         // The event callback is installed at database construction; the flag
         // must be visible before boot. Process-global and never unset — other

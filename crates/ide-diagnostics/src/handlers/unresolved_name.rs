@@ -134,6 +134,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn same_named_module_method_is_not_a_value_of_platform_function() {
         use crate::test_utils::check_with_cfe;
 

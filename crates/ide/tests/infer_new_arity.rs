@@ -168,6 +168,7 @@ fn formatted_string_strings_accepts_variadic() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn fixed_array_required_floor_fires() {
     let fixture = r#"
 //- /test.bsl
@@ -183,6 +184,7 @@ fn fixed_array_required_floor_fires() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn query_upper_bound_fires() {
     let fixture = r#"
 //- /test.bsl

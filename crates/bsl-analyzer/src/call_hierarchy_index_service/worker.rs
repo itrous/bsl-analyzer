@@ -4,12 +4,13 @@ use crate::global_state::Task;
 use crate::mem_docs::MemDocs;
 
 use super::reconcile::reconcile;
-use super::BATCH_SIZE;
+use super::{CatchUpBudget, BATCH_SIZE};
 
 pub(super) struct BuildContext {
     pub(super) lifecycle: CallHierarchyIndexState,
     pub(super) mem_docs: MemDocs,
     pub(super) frozen: CallHierarchyIndexFrozenSnapshot,
+    pub(super) budget: CatchUpBudget,
 }
 
 pub(super) fn run_build(
@@ -17,7 +18,16 @@ pub(super) fn run_build(
     mem_docs: MemDocs,
     frozen: CallHierarchyIndexFrozenSnapshot,
 ) -> Task {
-    let context = BuildContext { lifecycle, mem_docs, frozen };
+    run_build_within(lifecycle, mem_docs, frozen, CatchUpBudget::PRODUCTION)
+}
+
+pub(super) fn run_build_within(
+    lifecycle: CallHierarchyIndexState,
+    mem_docs: MemDocs,
+    frozen: CallHierarchyIndexFrozenSnapshot,
+    budget: CatchUpBudget,
+) -> Task {
+    let context = BuildContext { lifecycle, mem_docs, frozen, budget };
     let source_root = context.frozen.source_root_id;
     let generation = context.frozen.creation_generation;
     let _worker_span = tracing::info_span!(
@@ -43,7 +53,7 @@ pub(super) fn run_build(
                 failure_reason = "panic",
                 "call hierarchy compact index worker panicked"
             );
-            superseded(&recovery_lifecycle, source_root, generation)
+            superseded(&recovery_lifecycle, source_root, generation, "worker_panicked")
         }
     }
 }
@@ -52,14 +62,9 @@ fn build(context: BuildContext) -> Task {
     let source_root = context.frozen.source_root_id;
     let generation = context.frozen.creation_generation;
     if !context.lifecycle.is_building(source_root, generation) {
-        tracing::debug!(
-            phase = "supersession",
-            supersession_reason = "generation_not_building",
-            "call hierarchy compact index build superseded"
-        );
-        return superseded(&context.lifecycle, source_root, generation);
+        return superseded(&context.lifecycle, source_root, generation, "generation_not_building");
     }
-    let BuildContext { lifecycle, mem_docs, frozen } = context;
+    let BuildContext { lifecycle, mem_docs, frozen, budget } = context;
     let frozen = frozen.materialize();
     let _freeze_span = tracing::info_span!(
         "call_hierarchy_index_build_phase",
@@ -102,20 +107,25 @@ fn build(context: BuildContext) -> Task {
         estimated_heap_bytes = built.estimated_heap_bytes,
         "call hierarchy compact index base build completed"
     );
-    reconcile(BuildContext { lifecycle, mem_docs, frozen }, built.index, built.target_index)
+    reconcile(BuildContext { lifecycle, mem_docs, frozen, budget }, built.index, built.target_index)
 }
 
+/// Give the generation back, saying why: the task carries the reason so that a build
+/// that panicked, one that lost its generation and one that ran out of budget are three
+/// different outcomes to whoever receives it, not one.
 pub(super) fn superseded(
     lifecycle: &CallHierarchyIndexState,
     source_root: base_db::SourceRootId,
     generation: u64,
+    reason: &'static str,
 ) -> Task {
     tracing::debug!(
         ?source_root,
         generation,
         phase = "supersession",
-        "call hierarchy compact index lifecycle marked superseded"
+        supersession_reason = reason,
+        "call hierarchy compact index build superseded"
     );
     lifecycle.supersede(source_root);
-    Task::CallHierarchyIndexSuperseded { source_root, generation }
+    Task::CallHierarchyIndexSuperseded { source_root, generation, reason }
 }

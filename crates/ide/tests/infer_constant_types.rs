@@ -68,6 +68,7 @@ fn type_mismatches(db: &RootDatabaseImpl, file_id: FileId) -> Vec<(TypeId, TypeI
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn three_level_get_resolves_string_constant() {
     let fixture = r#"
 //- /test.bsl
@@ -81,6 +82,7 @@ fn three_level_get_resolves_string_constant() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn three_level_get_resolves_number_constant() {
     let fixture = r#"
 //- /test.bsl
@@ -94,6 +96,7 @@ fn three_level_get_resolves_number_constant() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn three_level_get_resolves_catalog_ref_constant() {
     let fixture = r#"
 //- /test.bsl
@@ -117,6 +120,7 @@ fn three_level_get_resolves_catalog_ref_constant() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn three_level_get_resolves_composite_constant() {
     let fixture = r#"
 //- /test.bsl
@@ -166,6 +170,7 @@ fn three_level_get_on_untyped_constant_stays_unknown() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn three_level_set_typechecks_first_argument() {
     let fixture = r#"
 //- /test.bsl
@@ -214,6 +219,7 @@ fn typed_sink_silent_on_number_into_string_via_coercion() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn two_level_alias_get_resolves_string_constant() {
     let fixture = r#"
 //- /test.bsl

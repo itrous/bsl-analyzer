@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn frozen_file_paths_roundtrip() {
         let mut vfs = Vfs::new();
-        let path = PathBuf::from("/tmp/test.bsl");
+        let path = crate::test_uri::file_path("tmp/test.bsl");
         vfs.set_file_contents(VfsPath::new(path.clone()), Some(Arc::from("content")));
         let file_id = vfs.file_id(&VfsPath::new(path.clone())).unwrap();
 
@@ -158,11 +158,11 @@ mod tests {
     #[test]
     fn frozen_file_paths_survive_later_mutation() {
         let mut vfs = Vfs::new();
-        let path_a = PathBuf::from("/tmp/a.bsl");
+        let path_a = crate::test_uri::file_path("tmp/a.bsl");
         vfs.set_file_contents(VfsPath::new(path_a.clone()), Some(Arc::from("a")));
         let frozen = FrozenFilePaths::freeze(&vfs);
 
-        let path_b = PathBuf::from("/tmp/b.bsl");
+        let path_b = crate::test_uri::file_path("tmp/b.bsl");
         vfs.set_file_contents(VfsPath::new(path_b.clone()), Some(Arc::from("b")));
 
         let url_b = Url::from_file_path(&path_b).unwrap();
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn frozen_file_paths_excludes_deleted() {
         let mut vfs = Vfs::new();
-        let path = PathBuf::from("/tmp/gone.bsl");
+        let path = crate::test_uri::file_path("tmp/gone.bsl");
         vfs.set_file_contents(VfsPath::new(path.clone()), Some(Arc::from("x")));
         vfs.set_file_contents(VfsPath::new(path.clone()), None);
 

@@ -1,0 +1,521 @@
+{
+ "keywords": [],
+ "types": [
+  {
+   "name": "СоставХранимыхДанныхХранилищаДвоичныхДанных",
+   "english_name": "BinaryDataStorageDataContent",
+   "min_version": "8.3.26"
+  },
+  {
+   "name": "ФормаКлиентскогоПриложения",
+   "english_name": "ClientApplicationForm",
+   "min_version": "8.2"
+  },
+  {
+   "name": "ДокументDOM",
+   "english_name": "DOMDocument",
+   "min_version": "8.1"
+  },
+  {
+   "name": "СоставКопииБазыДанных",
+   "english_name": "DatabaseCopyContent",
+   "min_version": "8.3.14 (в режиме совместимости с версией 8.3.14 и последующими)"
+  },
+  {
+   "name": "СоставТабличногоПространстваБазыДанных",
+   "english_name": "DatabaseTablespaceContent",
+   "min_version": "8.3.23"
+  },
+  {
+   "name": "ПланыОбменаМенеджер",
+   "english_name": "ExchangePlansManager",
+   "min_version": "8.0"
+  },
+  {
+   "name": "СоставФункциональнойОпции",
+   "english_name": "FunctionalOptionContent",
+   "min_version": "8.2"
+  },
+  {
+   "name": "ПолеHTMLДокумента",
+   "english_name": "HTMLDocumentField",
+   "min_version": "8.0"
+  },
+  {
+   "name": "КоллекцияОбъектовМетаданных",
+   "english_name": "MetadataObjectCollection",
+   "min_version": "8.0"
+  },
+  {
+   "name": "КоллекцияЗначенийСвойстваОбъектаМетаданных",
+   "english_name": "MetadataObjectPropertyValueCollection",
+   "min_version": "8.0"
+  },
+  {
+   "name": "ОбъектМетаданных: WebСервис",
+   "english_name": "MetadataObject: WebService",
+   "min_version": "8.1"
+  },
+  {
+   "name": "ОбъектМетаданных: WSСсылка",
+   "english_name": "MetadataObject: WSReference",
+   "min_version": "8.1"
+  },
+  {
+   "name": "Массив",
+   "english_name": "Array",
+   "min_version": "8.0",
+   "context": {
+    "thick_client": true,
+    "thin_client": true,
+    "web_client": true,
+    "server": true,
+    "mobile_client": true,
+    "external_connection": true
+   },
+   "iter_element_types": [
+    "Произвольный"
+   ]
+  }
+ ],
+ "methods": [
+  {
+   "id": 0,
+   "type_name": "DOMDocument",
+   "name": "ДобавитьДочерний",
+   "english_name": "AppendChild",
+   "min_version": "8.1",
+   "return_type": "АтрибутDOM, ДокументDOM, ЭлементDOM, ОпределениеТипаДокументаDOM, НотацияDOM, СущностьDOM, ФрагментДокументаDOM, ТекстDOM, КомментарийDOM, СекцияCDATADOM, ИнструкцияОбработкиDOM, СсылкаНаСущностьDOM, ПространствоИменXPath",
+   "parameters": [
+    {
+     "name": "НовыйУзел",
+     "is_optional": false,
+     "param_type": "АтрибутDOM, ДокументDOM, ЭлементDOM, ОпределениеТипаДокументаDOM, НотацияDOM"
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "type_name": "MetadataObjectCollection",
+   "name": "Содержит",
+   "english_name": "Contains",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {
+     "name": "ОбъектМетаданных",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 2,
+   "type_name": "MetadataObjectCollection",
+   "name": "Индекс",
+   "english_name": "IndexOf",
+   "min_version": "8.0",
+   "return_type": "Число",
+   "parameters": [
+    {
+     "name": "ОписаниеМетаданного",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "type_name": "MetadataObjectPropertyValueCollection",
+   "name": "Содержит",
+   "english_name": "Contains",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {
+     "name": "ОбъектОписанияМетаданного",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type_name": "FunctionalOptionContent",
+   "name": "Содержит",
+   "english_name": "Contains",
+   "min_version": "8.2",
+   "return_type": "Булево",
+   "parameters": [
+    {
+     "name": "Объект",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type_name": "FunctionalOptionContent",
+   "name": "Найти",
+   "english_name": "Find",
+   "min_version": "8.2",
+   "return_type": "ЭлементСоставаФункциональнойОпции, Неопределено",
+   "parameters": [
+    {
+     "name": "Объект",
+     "is_optional": false,
+     "param_type": "Строка, ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица"
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "type_name": "ExchangePlansManager",
+   "name": "ВыбратьИзменения",
+   "english_name": "SelectChanges",
+   "min_version": "8.0",
+   "return_type": "ВыборкаДанных",
+   "parameters": [
+    {
+     "name": "Узел",
+     "is_optional": false,
+     "param_type": "ПланОбменаСсылка"
+    },
+    {
+     "name": "НомерСообщения",
+     "is_optional": false,
+     "param_type": "Число"
+    },
+    {
+     "name": "ФильтрВыборки",
+     "is_optional": true,
+     "param_type": "Неопределено, ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица"
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "type_name": "HTMLDocumentField",
+   "name": "ПолучитьURL",
+   "english_name": "GetURL",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {
+     "name": "ОбъектМетаданных",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "type_name": "DatabaseCopyContent",
+   "name": "Найти",
+   "english_name": "Find",
+   "min_version": "8.3.14 (в режиме совместимости с версией 8.3.14 и последующими)",
+   "return_type": "ЭлементСоставаКопииБазыДанных",
+   "parameters": [
+    {
+     "name": "Объект",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "type_name": "DatabaseCopyContent",
+   "name": "Вставить",
+   "english_name": "Insert",
+   "min_version": "8.3.14 (в режиме совместимости с версией 8.3.14 и последующими)",
+   "return_type": "ЭлементСоставаКопииБазыДанных",
+   "parameters": [
+    {
+     "name": "Индекс",
+     "is_optional": false,
+     "param_type": "Число"
+    },
+    {
+     "name": "Элемент",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "type_name": "BinaryDataStorageDataContent",
+   "name": "Найти",
+   "english_name": "Find",
+   "min_version": "8.3.26",
+   "return_type": "ЭлементСоставаХранимыхДанныхХранилищаДвоичныхДанных",
+   "parameters": [
+    {
+     "name": "Объект",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type_name": "DatabaseTablespaceContent",
+   "name": "Найти",
+   "english_name": "Find",
+   "min_version": "8.3.23",
+   "return_type": "ЭлементСоставаТабличногоПространстваБазыДанных",
+   "parameters": [
+    {
+     "name": "Объект",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "type_name": "Array",
+   "name": "Добавить",
+   "english_name": "Add",
+   "min_version": "8.0",
+   "parameters": [
+    {
+     "name": "Значение",
+     "param_type": "Произвольный",
+     "is_optional": true
+    }
+   ],
+   "context": {
+    "thick_client": true,
+    "thin_client": true,
+    "web_client": true,
+    "server": true,
+    "mobile_client": true,
+    "external_connection": true
+   },
+   "documentation": {
+    "syntax": "Добавить(<Значение>)",
+    "description": "Fixture text: appends one element to the end of the fixture array.",
+    "param_descriptions": [
+     {
+      "name": "Значение",
+      "description": "Fixture text: the element to append."
+     }
+    ],
+    "examples": [
+     {
+      "code": "Список.Добавить(1);",
+      "description": "Fixture example."
+     }
+    ],
+    "see_also": [
+     "Массив.Вставить"
+    ]
+   }
+  },
+  {
+   "id": 13,
+   "type_name": "Array",
+   "name": "Количество",
+   "english_name": "Count",
+   "min_version": "8.0",
+   "return_type": "Число",
+   "parameters": [],
+   "documentation": {
+    "syntax": "Количество()",
+    "description": "Fixture text: number of elements.",
+    "param_descriptions": [],
+    "examples": []
+   }
+  }
+ ],
+ "global_functions": [
+  {
+   "id": 0,
+   "name": "ПравоДоступа",
+   "english_name": "AccessRight",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {
+     "name": "Право",
+     "is_optional": false,
+     "param_type": "Строка"
+    },
+    {
+     "name": "ОбъектМетаданных",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    },
+    {
+     "name": "Пользователь/Роль",
+     "is_optional": true,
+     "param_type": "ПользовательИнформационнойБазы, ОбъектМетаданных: Роль"
+    },
+    {
+     "name": "СтандартныйРеквизитСтандартнаяТабличнаяЧасть",
+     "is_optional": true,
+     "param_type": "Строка"
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "name": "ВыполнитьПроверкуПравДоступа",
+   "english_name": "VerifyAccessRights",
+   "min_version": "8.2",
+   "parameters": [
+    {
+     "name": "Право",
+     "is_optional": false,
+     "param_type": "Строка"
+    },
+    {
+     "name": "ОбъектМетаданных",
+     "is_optional": false,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    },
+    {
+     "name": "СтандартныйРеквизитСтандартнаяТабличнаяЧасть",
+     "is_optional": true,
+     "param_type": "Строка"
+    }
+   ]
+  },
+  {
+   "id": 2,
+   "name": "ЗаписьЖурналаРегистрации",
+   "english_name": "WriteLogEvent",
+   "min_version": "8.0",
+   "parameters": [
+    {
+     "name": "ИмяСобытия",
+     "is_optional": false,
+     "param_type": "Строка"
+    },
+    {
+     "name": "Уровень",
+     "is_optional": true,
+     "param_type": "УровеньЖурналаРегистрации"
+    },
+    {
+     "name": "ОбъектМетаданных",
+     "is_optional": true,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    },
+    {
+     "name": "Данные",
+     "is_optional": true,
+     "param_type": "Любая ссылка, Число, Строка, Дата, Булево, Неопределено"
+    },
+    {
+     "name": "Комментарий",
+     "is_optional": true,
+     "param_type": "Строка"
+    },
+    {
+     "name": "РежимТранзакции",
+     "is_optional": true,
+     "param_type": "РежимТранзакцииЗаписиЖурналаРегистрации"
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "name": "ОткрытьСправку",
+   "english_name": "OpenHelp",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {
+     "name": "Раздел",
+     "is_optional": true,
+     "param_type": "ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "name": "ОбновитьНумерациюОбъектов",
+   "english_name": "RefreshObjectsNumbering",
+   "min_version": "8.1",
+   "parameters": [
+    {
+     "name": "Метаданные",
+     "is_optional": true,
+     "param_type": "Массив, ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "name": "СтрДлина",
+   "english_name": "StrLen",
+   "min_version": "8.0",
+   "return_type": "Число",
+   "parameters": [
+    {
+     "name": "Строка",
+     "param_type": "Строка",
+     "is_optional": false
+    }
+   ],
+   "documentation": {
+    "syntax": "СтрДлина(<Строка>)",
+    "description": "Fixture text: length of a string.",
+    "param_descriptions": [
+     {
+      "name": "Строка",
+      "description": "Fixture text: the measured string."
+     }
+    ],
+    "examples": [],
+    "notes": "Fixture note."
+   }
+  }
+ ],
+ "constructors": [
+  {
+   "id": 0,
+   "type_name": "Array",
+   "variant_name": "По количеству элементов",
+   "min_version": "8.0",
+   "parameters": [
+    {
+     "name": "КоличествоЭлементов",
+     "param_type": "Число",
+     "is_optional": true
+    }
+   ],
+   "documentation": {
+    "syntax": "Новый Массив(<КоличествоЭлементов>)",
+    "description": "Fixture text: creates an array.",
+    "param_descriptions": [
+     {
+      "name": "КоличествоЭлементов",
+      "description": "Fixture text: initial size."
+     }
+    ],
+    "examples": []
+   }
+  }
+ ],
+ "properties": [
+  {
+   "id": 0,
+   "type_name": "Global context",
+   "name": "ФикстурныйГлобал",
+   "english_name": "FixtureGlobal",
+   "property_types": [
+    "Массив"
+   ],
+   "is_readonly": true,
+   "documentation": {
+    "description": "Fixture text: a global property of the fixture corpus.",
+    "see_also": []
+   }
+  }
+ ]
+}

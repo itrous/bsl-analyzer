@@ -12,3 +12,6 @@ stdx.workspace = true
 tracing.workspace = true
 crossbeam-channel.workspace = true
 paths.workspace = true
+
+[lints]
+workspace = true

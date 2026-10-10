@@ -547,10 +547,10 @@ pub fn interface_variable_named(
     interface_variable_named_query(db, crate::ModuleNameInput::new(db, module_id.file_id, name))
 }
 
-// Position-free declarations on the per-method inference path. High cap for
-// the same reason as `symbol_tree`: a chunk resolving a call into this module
-// must not re-derive it from a re-parse.
-#[salsa::tracked(lru = 2048, heap_size = module_interface_heap, returns(ref))]
+// Position-free declarations on the per-method inference path. The cap holds a
+// whole workspace for the same reason as `item_tree`: a request resolving a call into
+// this module must not re-derive it from a re-parse after a trim.
+#[salsa::tracked(lru = 65536, heap_size = module_interface_heap, returns(ref))]
 pub fn module_interface_query<'db>(
     db: &'db dyn crate::DefDatabase,
     file_id_input: base_db::FileIdInput<'db>,

@@ -234,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn multi_overload_attach_addin_zero_args_fires() {
         let fixture = r#"
 //- /test.bsl
@@ -285,6 +286,7 @@ mod tests {
     /// declare its own `СтрДлина`, and measuring against the platform's is a guess
     /// charged to the caller.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn an_unread_global_body_bars_the_platform_signature_from_answering() {
         use crate::test_utils::check_with_cfe_unreadable;
         use test_fixture::CfeFixtureBuilder;

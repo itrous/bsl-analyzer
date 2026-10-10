@@ -31,6 +31,7 @@ fn var_ty(db: &RootDatabaseImpl, file_id: FileId, var_lower: &str) -> Option<Typ
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn for_each_over_projected_value_table_yields_projected_row() {
     let fixture = r#"//- /test.bsl
 Процедура Тест()
@@ -57,6 +58,7 @@ fn for_each_over_projected_value_table_yields_projected_row() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn projected_row_column_resolves_via_projection() {
     let fixture = r#"//- /test.bsl
 Процедура Тест()
@@ -76,6 +78,7 @@ fn projected_row_column_resolves_via_projection() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn helper_function_propagates_projection_through_unload_and_iteration() {
     let fixture = r#"//- /test.bsl
 Функция ПолучитьТЗ()
@@ -99,6 +102,7 @@ fn helper_function_propagates_projection_through_unload_and_iteration() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn projection_less_value_table_keeps_platform_row() {
     let fixture = r#"//- /test.bsl
 Процедура Тест()

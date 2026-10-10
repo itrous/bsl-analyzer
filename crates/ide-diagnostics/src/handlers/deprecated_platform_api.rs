@@ -140,6 +140,7 @@ mod tests {
     use expect_test::expect;
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn effective_tags_include_lsp_deprecated() {
         let diagnostics = check_hir_diagnostic(
             r#"Процедура Тест()
@@ -156,6 +157,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn flags_deprecated_http_connection_get_ru_and_en() {
         check_diagnostics_snapshot_for(
             r#"Процедура Тест()
@@ -179,6 +181,7 @@ EndProcedure"#,
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn flags_deprecated_internet_proxy_password_read_and_assignment() {
         check_diagnostics_snapshot_for(
             r#"Процедура Тест()
@@ -198,6 +201,7 @@ EndProcedure"#,
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn flags_deprecated_internet_proxy_user_ru_and_en() {
         check_diagnostics_snapshot_for(
             r#"Процедура Тест()

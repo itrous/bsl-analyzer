@@ -608,6 +608,7 @@ async fn the_resolution_hint_names_an_axis_that_can_separate_these_declarations(
 /// not pretend to. An envelope that names `name-dictionary` and shows none of what it could
 /// consult is an identity without its evidence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 async fn an_unsupported_answer_carries_the_sources_that_composed_it() {
     let ws = stage_workspace();
     let client = client_with_references(ws.path()).await;

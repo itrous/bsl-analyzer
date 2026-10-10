@@ -55,6 +55,7 @@ fn global_param(function: &str, index: usize) -> String {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn metadata_collection_membership_takes_any_metadata_object() {
     assert_eq!(method_param("MetadataObjectCollection", "Содержит", 0), family());
     assert_eq!(method_param("MetadataObjectCollection", "Индекс", 0), family());
@@ -62,6 +63,7 @@ fn metadata_collection_membership_takes_any_metadata_object() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn global_functions_take_any_metadata_object() {
     assert_eq!(global_param("ПравоДоступа", 1), family());
     assert_eq!(global_param("AccessRight", 1), family());
@@ -71,6 +73,7 @@ fn global_functions_take_any_metadata_object() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn types_outside_the_family_keep_their_place() {
     assert_eq!(
         method_param("FunctionalOptionContent", "Найти", 0),
@@ -84,6 +87,7 @@ fn types_outside_the_family_keep_their_place() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_genuine_narrowing_is_left_as_extracted() {
     assert_eq!(
         global_param("ПравоДоступа", 2),

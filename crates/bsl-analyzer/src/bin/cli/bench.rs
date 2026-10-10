@@ -76,6 +76,7 @@ pub enum BenchCommands {
 pub fn run_bench(command: BenchCommands) -> ! {
     match command {
         BenchCommands::Discover { source_dir, output, boot_budget_ms, skip_features } => {
+            bsl_analyzer::help_bootstrap::bootstrap_for_root(&source_dir, None);
             let args = bsl_analyzer::bench::discover::DiscoverArgs {
                 source_dir,
                 boot_budget_ms,
@@ -122,6 +123,7 @@ pub fn run_bench(command: BenchCommands) -> ! {
             json,
             boot_budget_ms,
         } => {
+            bsl_analyzer::help_bootstrap::bootstrap_for_root(&source_dir, None);
             let mode = match mode {
                 BenchMode::Latency => bsl_analyzer::bench::runner::RunMode::Latency,
                 BenchMode::Recompute => {

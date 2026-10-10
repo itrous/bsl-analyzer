@@ -840,6 +840,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_goto_definition_platform_method_does_not_leak_to_workspace_module() {
         let bogus = r#"
 Функция Выполнить() Экспорт

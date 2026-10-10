@@ -117,6 +117,7 @@ fn unresolved_global_names_are_semantic_and_do_not_reject_local_names() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn form_function_conflicts_with_platform_global_function() {
     let form_module = PathBuf::from(DESIGNER_FIXTURE)
         .join("Catalogs/Справочник1/Forms/ФормаСписка/Ext/Form/Module.bsl");

@@ -44,8 +44,9 @@ pub use folding::{FoldingRange, FoldingRangeKind};
 pub use formatting::{FormattingConfig, FormattingResult};
 pub use graph::{
     build_workspace_graph_rows, call_site_absence_reason, classify_graph_id, confidence_label,
-    method_graph_id, method_id_for_path, module_id_of_method, rank_resolve_candidates,
-    reproject_changed_modules, resolve_name_segment, scope_for_path, warm_batch_config_roots,
+    folded_common_scope_for_path, form_key_for_path, method_graph_id, method_id_for_path,
+    module_id_of_method, rank_resolve_candidates, reproject_changed_modules,
+    reproject_metadata_owners, resolve_name_segment, scope_for_path, warm_batch_config_roots,
     BatchDbOpener, ChunkRow, Direction, EdgeRef, FusedChunkSink, GraphBuildSummary,
     GraphBuildTicker, GraphContext, GraphDetail, GraphError, GraphIdKind, GraphOverview,
     GraphRowSink, ModuleMethod, NeighborsParams, NeighborsResult, NodeRef, NodeResult,
@@ -357,6 +358,21 @@ impl Analysis {
     pub fn warm_configuration_inventory(&self) {
         use hir::ConfigsDatabase;
         let _ = self.db.configurations_inventory();
+    }
+
+    /// Memoise the per-file halves of the workspace-wide name indexes for `files`:
+    /// the symbol tree `module_members` folds and the name set `name_usage_index`
+    /// folds. Each aggregate is one query over every file, so a cold one builds with
+    /// every file's syntax tree live until it answers; warmed in chunks with a trim
+    /// between them, the aggregates assemble from memos and no tree outlives its
+    /// chunk. The accessors are the ones the aggregates read, so the memos are theirs.
+    pub fn warm_name_indexes(&self, files: &[FileId]) {
+        use hir::{DefDatabase, ModuleId};
+        use ide_db::base_db::FileIdInput;
+        for &file_id in files {
+            let _ = self.db.symbol_tree_ref(ModuleId::new(file_id));
+            let _ = hir::file_name_usage_query(&self.db, FileIdInput::new(&self.db, file_id));
+        }
     }
 
     /// Parallel variant of [`Self::workspace_diagnostics`] for the deferred whole-project

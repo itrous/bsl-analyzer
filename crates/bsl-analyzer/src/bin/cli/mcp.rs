@@ -916,7 +916,7 @@ fn run_mcp_broker(
         &source_dir,
         workspace_cache.root(),
         profile,
-        mcp_server::broker::embedding_config_fingerprint_with_prefixes(&embedding_prefixes),
+        backend_config_fingerprint(&embedding_prefixes, &source_dir),
         topology_fp,
         mcp_server::contract::effective_opt_in(profile, &args.enable_tools),
     );
@@ -986,7 +986,7 @@ fn run_mcp_broker_required(
         &source_dir,
         workspace_cache.root(),
         profile,
-        mcp_server::broker::embedding_config_fingerprint_with_prefixes(&embedding_prefixes),
+        backend_config_fingerprint(&embedding_prefixes, &source_dir),
         mcp_server::broker::workspace_topology_fingerprint(&source_dir),
         mcp_server::contract::effective_opt_in(profile, &args.enable_tools),
     );
@@ -1021,7 +1021,7 @@ fn run_mcp_daemon(
         &source_dir,
         workspace_cache.root(),
         profile,
-        mcp_server::broker::embedding_config_fingerprint_with_prefixes(&embedding_prefixes),
+        backend_config_fingerprint(&embedding_prefixes, &source_dir),
         topology_fp,
         mcp_server::contract::effective_opt_in(profile, &inputs.enable_tools),
     );
@@ -1405,6 +1405,28 @@ struct ServerInputs {
     enable_tools: Vec<String>,
 }
 
+/// What a backend must agree on beyond its paths: the embedding setup and the
+/// platform help source. A backend fixes its help snapshot for life, so a client
+/// configured for another source must reach a fresh backend, not the old one.
+fn backend_config_fingerprint(
+    embedding_prefixes: &mcp_server::EmbeddingPrefixes,
+    source_dir: &Path,
+) -> u64 {
+    let embedding =
+        mcp_server::broker::embedding_config_fingerprint_with_prefixes(embedding_prefixes);
+    let config = project_model::ProjectConfig::load(source_dir).ok().flatten();
+    let help = platform_help::requested_source(config.as_ref(), source_dir)
+        // `Debug` names the variant: a path and a URL with the same text are
+        // different sources.
+        .map(|request| format!("{request:?}"))
+        .unwrap_or_else(|reason| format!("invalid: {reason}"));
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&embedding.to_le_bytes());
+    hasher.update(help.as_bytes());
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("8 bytes"))
+}
+
 fn build_server(
     profile: mcp_server::McpProfile,
     inputs: ServerInputs,
@@ -1418,6 +1440,15 @@ fn build_server(
         enable_tools,
     } = inputs;
     super::logging::activate_vector_journal(source_dir.as_deref());
+    // Every process that serves MCP builds its server here — stdio, daemon, HTTP and
+    // the broker's direct fallback — so the help source is fixed here, before the
+    // server indexes or answers anything.
+    match source_dir.as_deref() {
+        Some(root) => bsl_analyzer::help_bootstrap::bootstrap_for_root(root, None),
+        None => {
+            platform_help::bootstrap(None, &env::current_dir().unwrap_or_default());
+        }
+    }
     let state = match profile {
         mcp_server::McpProfile::Workspace => {
             let source_dir = source_dir.ok_or_else(|| {
@@ -1600,7 +1631,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        daemon_command, decode_password, frozen_embedding_prefixes,
+        backend_config_fingerprint, daemon_command, decode_password, frozen_embedding_prefixes,
         resolve_embedding_prefix_values, resolve_onec_password, resolve_serve_mode_with_override,
         resolve_token_profile_values, resolve_workspace_cache, validate_backend_pid,
         validate_onec_settings, validate_serve_args, warn_on_wildcard_allowlist, HttpServeOptions,
@@ -1617,6 +1648,34 @@ mod tests {
         args: McpServeArgs,
     }
 
+    #[test]
+    fn backend_key_follows_the_configured_platform_help_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefixes = mcp_server::EmbeddingPrefixes {
+            query: String::new(),
+            document: String::new(),
+            token_profile: None,
+        };
+        let config =
+            |body: &str| std::fs::write(dir.path().join("bsl-analyzer.toml"), body).unwrap();
+
+        config("");
+        let default = backend_config_fingerprint(&prefixes, dir.path());
+        config("[platform_help]\nsource = \"external\"\npath = \"a.json\"\n");
+        let corpus_a = backend_config_fingerprint(&prefixes, dir.path());
+        config("[platform_help]\nsource = \"external\"\npath = \"b.json\"\n");
+        let corpus_b = backend_config_fingerprint(&prefixes, dir.path());
+        assert_ne!(default, corpus_a);
+        assert_ne!(corpus_a, corpus_b, "another help source must reach another backend");
+        config("[platform_help]\nsource = \"external\"\npath = \"a.json\"\n");
+        assert_eq!(backend_config_fingerprint(&prefixes, dir.path()), corpus_a);
+
+        // A path and a URL spelled with the same text are different sources.
+        config("[platform_help]\nsource = \"external\"\npath = \"/srv/help\"\n");
+        let as_path = backend_config_fingerprint(&prefixes, dir.path());
+        config("[platform_help]\nsource = \"external\"\nurl = \"/srv/help\"\n");
+        assert_ne!(backend_config_fingerprint(&prefixes, dir.path()), as_path, "path is not url");
+    }
     #[test]
     fn embedding_prefix_resolution_honors_project_empty_and_frozen_pair() {
         let config = project_model::SearchEmbeddingConfig {

@@ -1375,6 +1375,7 @@ mod tests {
     /// regression И16 was written for: `symbol_info` used to answer a resident miss from the
     /// graph alone and returned an empty list for a platform member the graph never held.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn a_resident_miss_is_answered_by_the_platform_while_the_graph_is_not_ready() {
         let roots = stand_roots();
         // A real workspace behind a real database: the dictionary runs its module and

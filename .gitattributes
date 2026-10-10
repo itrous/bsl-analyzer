@@ -1,0 +1,6 @@
+# The platform help corpus left the tree (#312); its 25 MB deletion is shown as
+# one line rather than as text.
+crates/bsl-platform/data/platform_data.json -diff
+# The built-in interface facts are regenerated as a whole by
+# scripts/strip-help-corpus-texts.py; an 11 MB line-by-line diff says nothing.
+crates/bsl-platform/data/platform_facts.json -diff

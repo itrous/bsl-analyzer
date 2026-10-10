@@ -190,7 +190,10 @@ pub struct SearchBaselineAdminMigrateArgs {
 pub fn run(command: SearchCommand) -> Result<(), Box<dyn Error + Send + Sync>> {
     match command {
         SearchCommand::Baseline { command } => match command {
-            SearchBaselineCommand::Publish(args) => publish::run(args),
+            SearchBaselineCommand::Publish(args) => {
+                bsl_analyzer::help_bootstrap::bootstrap_for_root(&args.source_dir, None);
+                publish::run(args)
+            }
             SearchBaselineCommand::Inspect { command } => match command {
                 SearchBaselineInspectCommand::ListSnapshots(args) => inspect::list_snapshots(args),
                 SearchBaselineInspectCommand::ShowSnapshot(args) => inspect::show_snapshot(args),

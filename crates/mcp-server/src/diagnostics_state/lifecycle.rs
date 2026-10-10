@@ -418,6 +418,23 @@ impl DiagnosticsState {
     where
         F: FnOnce(&DiagnosticsResident, u64) -> R,
     {
+        self.read_mut_impl(|resident, generation| f(&*resident, generation))
+    }
+
+    /// [`Self::read`] for a reader that trims the resident's own memo caches as it
+    /// goes (the workspace sweep): the same lock, the same drift reconciliation and
+    /// the same freshness verdict, with the resident borrowed mutably.
+    pub(crate) fn read_mut<F, R>(&self, f: F) -> ResidentOutcome<R>
+    where
+        F: FnOnce(&mut DiagnosticsResident, u64) -> R,
+    {
+        self.read_mut_impl(f)
+    }
+
+    fn read_mut_impl<F, R>(&self, f: F) -> ResidentOutcome<R>
+    where
+        F: FnOnce(&mut DiagnosticsResident, u64) -> R,
+    {
         *lock_recover(&self.last_access) = Instant::now();
         // Freshness is handled before taking the lock: an incremental apply needs the
         // same mutex and it is non-reentrant. A full rebuild runs off-thread and this
@@ -449,17 +466,23 @@ impl DiagnosticsState {
             None
         };
 
-        let inner = lock_recover(&self.inner);
+        let mut inner = lock_recover(&self.inner);
+        let inner: &mut Inner = &mut inner;
         let generation = inner.generation;
         match &inner.status {
-            DiagnosticsStatus::Ready { .. } => match inner.resident.as_ref() {
-                Some(resident) => {
-                    let freshness = compute_freshness(&inner, scan.as_ref());
-                    let result = f(resident, generation);
-                    ResidentOutcome::Ready(result, freshness)
+            DiagnosticsStatus::Ready { .. } => {
+                let freshness = compute_freshness(inner, scan.as_ref());
+                match inner.resident.as_mut() {
+                    Some(resident) => {
+                        let result = f(resident, generation);
+                        // After the read: its database clone is gone, so the trim never
+                        // waits on this request's own handle.
+                        resident.trim_after_read();
+                        ResidentOutcome::Ready(result, freshness)
+                    }
+                    None => ResidentOutcome::Loading,
                 }
-                None => ResidentOutcome::Loading,
-            },
+            }
             DiagnosticsStatus::Idle | DiagnosticsStatus::Loading => ResidentOutcome::Loading,
             DiagnosticsStatus::Disabled => ResidentOutcome::Disabled,
             DiagnosticsStatus::Failed(msg) => ResidentOutcome::Failed(msg.clone()),
@@ -830,6 +853,8 @@ impl DiagnosticsState {
         Ok(ResidentBuild {
             resident: DiagnosticsResident {
                 db,
+                #[cfg(test)]
+                read_trims: 0,
                 sweep_pool: std::sync::OnceLock::new(),
                 vfs,
                 by_path,

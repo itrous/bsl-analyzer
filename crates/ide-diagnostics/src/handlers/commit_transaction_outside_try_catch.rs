@@ -55,6 +55,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_outside_try() {
         let code = r#"Процедура Пример2()
     НачатьТранзакцию();
@@ -73,6 +74,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_in_exception_handler() {
         let code = r#"Процедура Пример3()
     НачатьТранзакцию();
@@ -98,6 +100,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_code_after_commit() {
         let code = r#"Процедура Пример6()
     НачатьТранзакцию();
@@ -135,6 +138,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_english_keyword() {
         let code = r#"Procedure Test()
     BeginTransaction();
@@ -153,6 +157,7 @@ EndProcedure"#;
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_case_insensitive() {
         let code = r#"Процедура Тест()
     НачатьТранзакцию();
@@ -171,6 +176,7 @@ EndProcedure"#;
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_multiple_procedures_seven_errors() {
         let code = r#"Процедура Пример1()
     НачатьТранзакцию();
@@ -276,6 +282,7 @@ EndProcedure"#;
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_commit_in_loop_after_code() {
         let code = r#"Процедура Тест()
     Для каждого Элемент Из Коллекция Цикл
@@ -302,6 +309,7 @@ EndProcedure"#;
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_single_sub_outside_try() {
         let code = r#"Процедура Тестовая()
     НачатьТранзакцию();

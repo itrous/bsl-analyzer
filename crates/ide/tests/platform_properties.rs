@@ -40,6 +40,7 @@ fn completions_at(code: &str) -> Vec<CompletionItem> {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn new_query_text_field_infers_to_string() {
     let code = "\
 Процедура Тест()
@@ -56,6 +57,7 @@ fn new_query_text_field_infers_to_string() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn new_query_parameters_field_infers_to_structure() {
     let code = "\
 Процедура Тест()
@@ -98,6 +100,7 @@ fn chained_property_method_resolves() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn read_only_property_assignment_emits_diagnostic() {
     let code = "\
 Процедура Тест()
@@ -137,6 +140,7 @@ fn writable_property_assignment_no_diagnostic() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_on_new_query_lists_text_and_parameters() {
     let code = "\
 Процедура Тест()
@@ -177,6 +181,7 @@ fn completion_on_new_query_lists_text_and_parameters() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_query_parameters_renders_readonly_structure_block() {
     let code = "\
 Процедура Тест()
@@ -205,6 +210,7 @@ fn hover_on_query_parameters_renders_readonly_structure_block() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn query_execute_unload_chain_infers_value_table() {
     let code = "\
 Процедура Тест()
@@ -232,6 +238,7 @@ fn query_execute_unload_chain_infers_value_table() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_query_execute_unload_lists_value_table_members() {
     let code = "\
 Процедура Тест()
@@ -250,6 +257,7 @@ fn completion_after_query_execute_unload_lists_value_table_members() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_on_query_parameters_lists_structure_methods() {
     let code = "\
 Процедура Тест()
@@ -269,6 +277,7 @@ fn completion_on_query_parameters_lists_structure_methods() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_chained_method_resolves_platform_method() {
     let code = "\
 Процедура Тест()
@@ -326,6 +335,7 @@ fn hover_on_chained_method_does_not_match_workspace_free_function() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_chained_method_ignores_local_var_with_same_name() {
     let code = "\
 Процедура Тест()
@@ -384,6 +394,7 @@ fn unload_column_string_arg_does_not_emit_type_mismatch() {
 /// Columns of a row taken from an unloaded query result are ordinary value-table columns: the
 /// platform accepts `Стр.Код = ...` there, so only the query-result cursor is read-only.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn value_table_row_column_assignment_no_diagnostic() {
     let code = "\
 Функция ДанныеСчетов()
@@ -415,6 +426,7 @@ fn value_table_row_column_assignment_no_diagnostic() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn query_selection_field_assignment_still_emits_diagnostic() {
     let code = "\
 Процедура Тест()

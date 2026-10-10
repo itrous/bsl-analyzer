@@ -73,6 +73,7 @@ fn nstr_one_arg_is_accepted() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn nstr_zero_args_fires_mismatch() {
     let fixture = r#"
 //- /test.bsl
@@ -89,6 +90,7 @@ fn nstr_zero_args_fires_mismatch() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn nstr_three_args_fires_mismatch() {
     let fixture = r#"
 //- /test.bsl
@@ -124,6 +126,7 @@ fn strtemplate_variadic_accepts_many_args() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn strtemplate_zero_args_fires_mismatch() {
     let fixture = r#"
 //- /test.bsl
@@ -175,6 +178,7 @@ fn min_max_accept_many_args() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn min_max_zero_args_fires_mismatch() {
     let fixture = r#"
 //- /test.bsl

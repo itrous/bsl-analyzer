@@ -490,6 +490,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn into_method_info_preserves_candidates_and_drops_handle() {
         let salsa_db = db();
         let db = InMemoryDb::new();

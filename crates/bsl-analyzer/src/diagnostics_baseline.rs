@@ -436,6 +436,7 @@ directory = "baselines"
                     epoch: "error".to_owned(),
                 }],
                 ground: Default::default(),
+                read_empty: false,
             },
             root,
             &root.join(relative),

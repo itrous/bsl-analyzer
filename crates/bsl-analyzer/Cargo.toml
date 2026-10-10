@@ -21,6 +21,7 @@ salsa-detailed-trace = ["salsa/detailed-trace"]
 
 [dependencies]
 bsl-conventions.workspace = true
+platform-help.workspace = true
 ide.workspace = true
 ide-host-core.workspace = true
 parser.workspace = true
@@ -100,3 +101,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 test-utils.workspace = true
 expect-test.workspace = true
 rmcp = { version = "3.1", features = ["client"] }
+
+[lints]
+workspace = true

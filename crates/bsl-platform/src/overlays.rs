@@ -1,9 +1,10 @@
 #[path = "overlay_schema.rs"]
 mod overlay_schema;
 
+pub(crate) use overlay_schema::OverlayError;
 use overlay_schema::{
     parse_global_function_overrides, parse_overrides, parse_property_additions,
-    validate_version_bounds, MethodParameterOverride, OverlayError, TypePropertyAddition,
+    validate_version_bounds, MethodParameterOverride, TypePropertyAddition,
 };
 use serde_json::{Map, Value};
 use std::collections::HashSet;

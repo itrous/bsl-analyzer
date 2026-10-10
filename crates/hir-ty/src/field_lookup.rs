@@ -520,6 +520,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn form_data_projection_neutralizes_platform_property_env() {
         let config = {
             let mut c = Configuration::new("Test");
@@ -555,6 +556,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn form_data_union_arm_also_neutralizes_platform_property_env() {
         let config = {
             let mut c = Configuration::new("Test");
@@ -739,6 +741,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_tabular_row_line_number_resolves_via_platform() {
         let ts = TabularSection::new(Uuid::new_v4(), "Услуги");
         let mut cat = catalog("Номенклатура", vec![]);
@@ -1189,6 +1192,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_information_register_record_set_pulls_platform_properties() {
         let mut config = Configuration::new("Test");
         config.add_register(register_with(
@@ -1220,6 +1224,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_accounting_register_record_set_has_lock_for_update() {
         let mut config = Configuration::new("Test");
         config.add_register(register_with(
@@ -1412,6 +1417,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn lookup_field_on_union_intersection_readonly_merges_via_or() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(catalog("A", vec![]));
@@ -1434,6 +1440,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_document_object_pulls_platform_properties() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(document("ПКО", vec![]));
@@ -1467,6 +1474,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_this_object_is_typed_metadata_ref_not_generic_platform_object() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(document("ПКО", vec![]));
@@ -1501,6 +1509,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_this_object_specializes_across_yo_spelling_difference() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(mdo_of(MdoType::Report, "ОстаткиТоваров", vec![]));
@@ -1527,6 +1536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_catalog_object_pulls_platform_properties() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(catalog("Номенклатура", vec![]));
@@ -1587,6 +1597,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_document_ref_caveats_and_cascade() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(document_with_standard_attrs("ПКО"));
@@ -1621,6 +1632,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_cascade_respects_presence_conditional_standard_attrs() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(document("ПКО", vec![]));
@@ -1804,6 +1816,7 @@ mod tests {
     /// `ЭтотОбъект` to itself; its platform properties come from the bare type
     /// `ВнешняяОбработка`, which has no manager prefix in the corpus.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn field_lookup_external_object_has_its_attributes_self_and_platform_properties() {
         let mut config = Configuration::new("Test");
         config.add_metadata_object(mdo_of(

@@ -246,48 +246,135 @@ cargo test --all
 
 ---
 
-## Обновление справки платформы 1С
+## Справка платформы 1С
 
-Справка платформы хранится в `crates/bsl-platform/data/platform_data.json` и содержит информацию о типах, методах и глобальных функциях 1С.
+Полный корпус справки платформы (типы, методы, свойства, конструкторы,
+глобальные функции **с описаниями**) в репозитории **не хранится** и в сборку
+не входит (#312). Анализатор читает его при запуске из источника
+`[platform_help]` (`docs/configuration/PROJECT_CONFIGURATION.md`):
+установленная платформа (HBK читаются собственным кодом, без 7z и внешних
+программ), пакет справки, `auto` (умолчание; скачивает закреплённый корпус)
+или `none`. `build.rs` генерирует только каталог EDT; `BSL_PLATFORM_PATH`
+задаёт каталог HBK для `installed`/`auto` при запуске.
 
-### Когда обновлять
+В сборку входят **встроенные факты интерфейса** —
+`crates/bsl-platform/data/platform_facts.json` (#326): тот же корпус без
+единого текстового поля (нет `description`, `param_descriptions`, `examples`,
+`notes`, `see_also`, `keywords`), с именами, сигнатурами, параметрами, типами,
+версиями и контекстами. Их отдают `source = "bundled"`, библиотечное
+использование без `BSL_PLATFORM_HELP_CORPUS` и последняя ступень `auto`, когда
+полный корпус недоступен; `none` по-прежнему пуст. Генерация —
+`scripts/strip-help-corpus-texts.py`, структурная проверка —
+`crates/bsl-platform/tests/bundled_facts.rs`; обе работают по allow-list ключей,
+так что текстовое поле под любым именем не пройдёт. Происхождение и правовой
+статус — `crates/bsl-platform/data/PROVENANCE.md`.
 
-- При выходе новой версии платформы 1С с новыми методами/типами
-- При обнаружении ошибок в справке
+`.cargo/config.toml` задаёт для всех команд cargo (`cargo test`, `cargo run`)
+пустой `BSL_PLATFORM_HELP_PINNED_URL`: тесты и запущенные ими бинарники не
+скачивают закреплённый корпус и не зависят от сети. Тест скачивания указывает
+переменную на свой локальный HTTP-сервер. Чтобы проверить скачивание вручную
+через `cargo run`, задайте переменную явно (адрес — `PINNED_URL` в
+`crates/platform-help/src/pinned.rs`).
 
-### Требования
+### Тесты и корпус
 
-- Установленная платформа 1С:Предприятие (Linux: `/opt/1cv8/x86_64/*/`)
-- Утилита `7z` для распаковки .hbk файлов
+Тесты, проверяющие факты справки, помечены
+`#[cfg_attr(not(corpus_contract), ignore = "corpus contract: …")]`:
 
-### Процедура обновления
+- **автономный профиль** (обычный `cargo test --workspace`, pre-commit hook,
+  CI без 1С) их не запускает — в отчёте они видны как `ignored`, остальные
+  тесты работают на встроенных фактах интерфейса и собственных фикстурах;
+- **corpus-contract профиль** запускает их на закреплённом корпусе — прежнем
+  `platform_data.json` (SHA-256
+  `3c759994cbd82a1522b1c497d9f2ef68c77b776d5c6723ba5a72623b570cacce`, последний
+  коммит с файлом — `af94692c`). Без входа профиль падает, а не пропускает:
 
 ```bash
-# 1. Удалить текущий файл (чтобы build.rs извлёк заново)
-rm crates/bsl-platform/data/platform_data.json
+corpus="$HOME/.cache/bsl-analyzer/platform-help-corpus/platform_data.json"
+mkdir -p "$(dirname "$corpus")"
+git show af94692c:crates/bsl-platform/data/platform_data.json > "$corpus"
+sha256sum "$corpus"   # 3c759994…cacce
 
-# 2. Собрать html-parser (если ещё не собран)
-cargo build --release -p html-parser \
-  --manifest-path crates/bsl-platform/tools/html-parser/Cargo.toml
-
-# 3. Пересобрать bsl-platform (извлечёт данные из 1С)
-cargo clean -p bsl-platform
-cargo build -p bsl-platform
-
-# 4. Скопировать сгенерированный JSON в репозиторий
-cp target/debug/build/bsl-platform-*/out/platform_data.json \
-   crates/bsl-platform/data/platform_data.json
-
-# 5. Проверить тесты
-cargo test -p hir-def --lib -- platform_helpers
-
-# 6. Закоммитить
-git add crates/bsl-platform/data/platform_data.json
-git commit -m "chore: update platform data to version X.X.X"
+CARGO_TARGET_DIR=target-corpus RUSTFLAGS="--cfg corpus_contract" \
+  BSL_PLATFORM_HELP_CORPUS="$corpus" cargo test --workspace
 ```
 
-### Приоритет источников данных (build.rs)
+В CI корпус не скачивается, и профиль там не запускается: тесты с
+`corpus_contract` остаются `ignored`, а запускать их нужно на машине, где корпус
+есть. Job `corpus-contract` проверяет другое — текстовый путь загрузчика справки
+на синтетической фикстуре `crates/bsl-platform/tests/fixtures/help/corpus.json`
+(выдуманные описания, описания параметров и примеры) и встроенные факты.
+Каждый вызов `cargo test` в нём обязан выполнить хотя бы один тест, поэтому
+набор из одних `ignored` валит job.
 
-1. `data/platform_data.json` — из репозитория (предпочтительный)
-2. Извлечение из 1С — требует установленную платформу и 7z
-3. Пустые структуры — fallback, тесты platform_helpers упадут
+`BSL_PLATFORM_HELP_CORPUS` указывает corpus JSON для процесса, которому
+никто не выбрал источник: библиотечный код в тестах и приложение без
+`[platform_help]`. Отдельный `CARGO_TARGET_DIR` нужен, потому что
+`RUSTFLAGS` пересобирает всё.
+
+### Обновление корпуса справки
+
+При выходе новой версии платформы или исправлении извлечения готовится новый
+пакет справки (см. «Пакет справки для публикации» ниже) и публикуется
+владельцем хранилища; закреплённый вход corpus-contract меняется осознанно —
+вместе с `PINNED_CORPUS_SHA256` и дайджестом наблюдаемой поверхности в
+`crates/bsl-platform/tests/help_corpus_equivalence.rs`.
+
+### Входы из Docker-платформы и реальный smoke
+
+На машине без установленной 1С неизменённые HBK берутся из контейнера
+платформы; Docker нужен только для копирования входов:
+
+```bash
+container=rtools-1c-itrous
+platform_dir=/opt/1cv8/x86_64/8.3.27.2214
+hbk_dir="$HOME/.cache/bsl-analyzer/platform-help-smoke/8.3.27.2214"
+mkdir -p "$hbk_dir"
+docker cp "$container:$platform_dir/shcntx_ru.hbk" "$hbk_dir/shcntx_ru.hbk"
+docker cp "$container:$platform_dir/shlang_ru.hbk" "$hbk_dir/shlang_ru.hbk"
+docker exec "$container" sha256sum "$platform_dir/shcntx_ru.hbk" "$platform_dir/shlang_ru.hbk"
+sha256sum "$hbk_dir/shcntx_ru.hbk" "$hbk_dir/shlang_ru.hbk"
+
+BSL_PLATFORM_HELP_SMOKE_DIR="$hbk_dir" \
+  cargo test --release -p platform-help --test real_hbk_smoke -- --ignored --nocapture
+```
+
+Smoke читает оба реальных HBK собственным reader'ом, проверяет режим
+`installed` на чистом кэше (`Массив.Добавить` по RU/EN и непустое описание),
+повторное использование кэша и отказ на испорченной копии каждого файла. Без
+входа он падает, а не пропускается; в обычном прогоне тестов он `ignored`.
+
+### Пакет справки для публикации
+
+Пакет — каталог из `platform_data.json` (корпус без оверлеев: оверлеи
+накладывает анализатор при загрузке), `manifest.json` (`schema_version`,
+`corpus_id`, версия платформы, версия экстрактора, SHA-256 корпуса) и
+`NOTICE.md` о принадлежности текстов ООО «1С-Софт». Готовит его та же
+библиотека, без внешних утилит:
+
+```bash
+# из HBK установленной платформы (или копий из Docker-платформы)
+bsl-analyzer-app platform-help package --hbk-dir "$hbk_dir" \
+  --corpus-id platform-help-8.3.27.2214 -o "$HOME/platform-help-8.3.27.2214"
+
+# из уже имеющегося корпуса JSON (как есть)
+bsl-analyzer-app platform-help package --corpus platform_data.json \
+  --corpus-id <имя> [--platform-version <версия>] -o "$HOME/<имя>"
+```
+
+Каталог назначения не должен существовать; корпус, который анализатор
+отверг бы, пакетом не становится. Публикация — отдельное действие владельца
+хранилища (рекомендовано: отдельный репозиторий `itrous/bsl-platform-help`,
+release на версию корпуса): три файла пакета загружаются как assets одного
+release, и пользователи указывают
+`url = "https://github.com/itrous/bsl-platform-help/releases/download/<tag>/manifest.json"`
+— корпус берётся из того же каталога, что и манифест. Анализатор сам ничего не
+публикует.
+
+`auto` скачивает закреплённый корпус — `PINNED_URL`/`PINNED_SHA256` в
+`crates/platform-help/src/pinned.rs`, сейчас
+`https://github.com/itrous/bsl-platform-help/releases/download/corpus-3c759994/platform_data.json`
+с SHA-256 корпуса corpus-contract профиля. Release-asset `platform_data.json`
+под тегом `corpus-3c759994` (рядом — `NOTICE.md` пакета) публикует владелец
+хранилища; содержимое после публикации не меняется. Новый корпус — новый тег и
+новые константы в релизе анализатора.

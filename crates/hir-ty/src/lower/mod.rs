@@ -788,6 +788,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn lower_type_ref_id_covers_resolver_free_branches() {
         let db = InMemoryDb::new();
         let lowering = ctx();

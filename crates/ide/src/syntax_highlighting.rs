@@ -1027,6 +1027,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_builtin_function_highlighting() {
         let code = r#"
 Функция Тест()
@@ -1075,6 +1076,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_builtin_vs_user_function() {
         let code = r#"
 Функция МояФункция()
@@ -1324,6 +1326,7 @@ EndFunction
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_highlight_record_set_chain_uses_inferred_receiver_types() {
         let code = r#"
 Процедура Тест(Значение)

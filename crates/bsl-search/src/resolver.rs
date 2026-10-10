@@ -1,7 +1,7 @@
 use crate::domain::{BaselineRef, DocumentPath, IndexedDocument, OverlayChange, SearchOverlay};
 use crate::error::SearchError;
 use crate::ports::ResolvedViewService;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedView {
@@ -27,6 +27,34 @@ impl ResolvedView {
         collection: &'a str,
     ) -> impl Iterator<Item = &'a IndexedDocument> + 'a {
         self.documents.iter().filter(move |doc| doc.collection == collection)
+    }
+}
+
+/// What [`ResolvedView`] holds, counted: how many documents the view would carry and
+/// how many distinct file paths they span, with no document loaded. A status line
+/// reports these two numbers and nothing else of the view, and the view itself is
+/// the whole indexed corpus in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedViewCounts {
+    baseline: BaselineRef,
+    files: usize,
+    chunks: usize,
+}
+
+impl ResolvedViewCounts {
+    pub fn baseline(&self) -> &BaselineRef {
+        &self.baseline
+    }
+
+    /// Distinct `path` spellings among the view's documents, as a reader counting
+    /// [`ResolvedView::documents`] by path would see them.
+    pub fn files(&self) -> usize {
+        self.files
+    }
+
+    /// The view's document count.
+    pub fn chunks(&self) -> usize {
+        self.chunks
     }
 }
 
@@ -85,6 +113,50 @@ impl InMemoryResolvedViewResolver {
         });
 
         Ok(ResolvedView::new(baseline, documents))
+    }
+}
+
+impl InMemoryResolvedViewResolver {
+    /// The counts [`Self::resolve`] would report for the same baseline and overlay,
+    /// computed from the baseline's documents-per-file instead of the documents: the
+    /// overlay's replace/delete of a file applies to a per-file count exactly as it
+    /// applies to a per-file group of documents.
+    pub fn resolve_counts(
+        &self,
+        baseline: BaselineRef,
+        baseline_documents_per_file: Vec<(DocumentPath, usize)>,
+        overlay: SearchOverlay,
+    ) -> Result<ResolvedViewCounts, SearchError> {
+        if baseline != overlay.baseline {
+            return Err(SearchError::Index(
+                "overlay baseline does not match requested baseline".to_owned(),
+            ));
+        }
+
+        let mut grouped: HashMap<DocumentPath, usize> = HashMap::new();
+        for (path, count) in baseline_documents_per_file {
+            *grouped.entry(path).or_default() += count;
+        }
+
+        for change in overlay.changes {
+            match change {
+                OverlayChange::ReplaceFile(file) => {
+                    grouped.insert(file.target, file.items.len());
+                }
+                OverlayChange::DeleteFile(target) => {
+                    grouped.remove(&target);
+                }
+            }
+        }
+
+        let chunks = grouped.values().sum();
+        let files = grouped
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(path, _)| path.path.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        Ok(ResolvedViewCounts { baseline, files, chunks })
     }
 }
 
@@ -310,5 +382,133 @@ mod tests {
 
         assert_eq!(code_symbols, vec!["ProcedureA", "ProcedureB"]);
         assert_eq!(platform_symbols, vec!["Trim"]);
+    }
+
+    /// The counted view agrees with the resolved one under an overlay that replaces
+    /// one file, empties another and deletes a third — and differs from the bare
+    /// baseline's counts, so the overlay is what the test exercises.
+    #[test]
+    fn resolve_counts_matches_resolve_under_an_overlay() {
+        let docs = vec![
+            doc(DocFixture {
+                collection: "code",
+                path: "A.bsl",
+                symbol_name: "a1",
+                kind: "procedure",
+                line_start: 1,
+                line_end: 2,
+                text: "a1",
+                content_hash: "h1",
+            }),
+            doc(DocFixture {
+                collection: "code",
+                path: "A.bsl",
+                symbol_name: "a2",
+                kind: "procedure",
+                line_start: 3,
+                line_end: 4,
+                text: "a2",
+                content_hash: "h2",
+            }),
+            doc(DocFixture {
+                collection: "code",
+                path: "B.bsl",
+                symbol_name: "b1",
+                kind: "procedure",
+                line_start: 1,
+                line_end: 2,
+                text: "b1",
+                content_hash: "h3",
+            }),
+            doc(DocFixture {
+                collection: "code",
+                path: "C.bsl",
+                symbol_name: "c1",
+                kind: "procedure",
+                line_start: 1,
+                line_end: 2,
+                text: "c1",
+                content_hash: "h4",
+            }),
+            doc(DocFixture {
+                collection: "code",
+                path: "D.bsl",
+                symbol_name: "d1",
+                kind: "procedure",
+                line_start: 1,
+                line_end: 2,
+                text: "d1",
+                content_hash: "h5",
+            }),
+        ];
+        let per_file: Vec<(DocumentPath, usize)> = {
+            let mut grouped: std::collections::HashMap<DocumentPath, usize> = Default::default();
+            for document in &docs {
+                *grouped.entry(document.document_path()).or_default() += 1;
+            }
+            grouped.into_iter().collect()
+        };
+        let mut overlay = SearchOverlay::new(baseline());
+        overlay.replace_file(
+            DocumentPath::new("code", crate::CONFIGURATION_ROOT_ID, "A.bsl"),
+            vec![
+                doc(DocFixture {
+                    collection: "code",
+                    path: "A.bsl",
+                    symbol_name: "a1",
+                    kind: "procedure",
+                    line_start: 1,
+                    line_end: 2,
+                    text: "a1'",
+                    content_hash: "h6",
+                }),
+                doc(DocFixture {
+                    collection: "code",
+                    path: "A.bsl",
+                    symbol_name: "a2",
+                    kind: "procedure",
+                    line_start: 3,
+                    line_end: 4,
+                    text: "a2'",
+                    content_hash: "h7",
+                }),
+                doc(DocFixture {
+                    collection: "code",
+                    path: "A.bsl",
+                    symbol_name: "a3",
+                    kind: "procedure",
+                    line_start: 5,
+                    line_end: 6,
+                    text: "a3",
+                    content_hash: "h8",
+                }),
+            ],
+        );
+        overlay.replace_file(
+            DocumentPath::new("code", crate::CONFIGURATION_ROOT_ID, "B.bsl"),
+            Vec::new(),
+        );
+        overlay.delete_file(DocumentPath::new("code", crate::CONFIGURATION_ROOT_ID, "C.bsl"));
+
+        let resolver = InMemoryResolvedViewResolver;
+        let view = resolver.resolve(baseline(), docs.clone(), overlay.clone()).unwrap();
+        let view_files: std::collections::HashSet<&str> =
+            view.documents().iter().map(|document| document.path.as_str()).collect();
+        let counts = resolver.resolve_counts(baseline(), per_file.clone(), overlay).unwrap();
+
+        assert_eq!(counts.chunks(), view.documents().len());
+        assert_eq!(counts.files(), view_files.len());
+        assert_eq!(
+            (counts.files(), counts.chunks()),
+            (2, 4),
+            "A replaced by 3, B emptied, C deleted, D kept"
+        );
+        let bare =
+            resolver.resolve_counts(baseline(), per_file, SearchOverlay::new(baseline())).unwrap();
+        assert_eq!(
+            (bare.files(), bare.chunks()),
+            (4, 5),
+            "the control: the overlay moved both counts"
+        );
     }
 }

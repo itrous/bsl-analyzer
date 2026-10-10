@@ -557,6 +557,7 @@ fn hover_on_constructor_name_does_not_leak_enclosing_new_type() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_keyword_method_after_dot_resolves_to_platform_method() {
     let fixture = r#"//- /test.bsl
 Процедура Тест()
@@ -582,6 +583,7 @@ fn hover_keyword_method_after_dot_resolves_to_platform_method() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_chained_keyword_method() {
     let fixture = r#"//- /test.bsl
 Процедура Тест()
@@ -603,6 +605,7 @@ fn hover_chained_keyword_method() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_platform_method_renders_unique_semantic_candidate() {
     let fixture = r#"//- /test.bsl
 Процедура Тест()
@@ -619,6 +622,7 @@ fn hover_platform_method_renders_unique_semantic_candidate() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_platform_method_renders_ambiguous_semantic_candidates() {
     let fixture = r#"//- /CommonModules/ФабрикаКриптографии/Ext/Module.bsl
 // Возвращаемое значение:
@@ -661,6 +665,7 @@ fn hover_global_execute_statement_does_not_render_query_method() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_for_each_loop_var_at_declaration_shows_element_type() {
     let fixture = r#"//- /test.bsl
 Процедура Тест()
@@ -702,6 +707,7 @@ fn hover_classic_for_counter_at_declaration_shows_number() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_for_each_loop_var_same_body_shadowing() {
     let fixture = r#"//- /test.bsl
 Процедура Тест()
@@ -726,6 +732,7 @@ fn hover_for_each_loop_var_same_body_shadowing() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_for_each_loop_var_per_body_isolation() {
     let fixture = r#"//- /test.bsl
 Процедура ПерваяПроцедура()

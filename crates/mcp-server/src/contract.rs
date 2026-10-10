@@ -36,7 +36,7 @@ use crate::{McpProfile, McpServer};
 /// Consumers should require an exact major and a minimum minor. Bump this by hand in the
 /// same commit that changes the surface; the snapshot test over [`document`] puts the
 /// version field next to the change in the diff.
-pub const CONTRACT_VERSION: &str = "3.3";
+pub const CONTRACT_VERSION: &str = "3.4";
 
 /// URI of the MCP resource carrying [`document`].
 pub const CONTRACT_URI: &str = "bsl-analyzer://contract";
@@ -167,7 +167,7 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
         name: "graph",
         actions: GRAPH_ACTIONS,
         note: None,
-        output_schema_version: Some("35"),
+        output_schema_version: Some("36"),
         default_enabled: true,
     },
     ToolDecl {
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn indexing_discovery_contract() {
         use crate::indexing::{Indexing, Kind, State, Target};
-        assert_eq!(CONTRACT_VERSION, "3.3");
+        assert_eq!(CONTRACT_VERSION, "3.4");
         let indexing = serde_json::to_value(Indexing::single(Target::new(
             Kind::Reference,
             State::Ready,
@@ -615,7 +615,7 @@ mod tests {
             assert!(!validator.is_valid(&body), "alternative branch must not bypass indexing");
         }
         let graph_schema = crate::tools::graph::schema().structured_content.unwrap();
-        assert_eq!(graph_schema["schema_version"], "35");
+        assert_eq!(graph_schema["schema_version"], "36");
         assert!(validator.is_valid(&graph_schema));
     }
 
@@ -835,6 +835,7 @@ mod tests {
     /// requires and the card omits is not an edge case: it fails every ordinary response of that
     /// shape. Each of the four card kinds is checked, root fields and the kind's own branch.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn syntax_help_cards_carry_every_field_the_schema_requires() {
         let schema = output_schema(McpProfile::Reference, "syntax_help").expect("outputSchema");
         let platform = bsl_platform::PlatformDataInner::instance();
@@ -926,7 +927,7 @@ mod tests {
         doc.insert("mcp".into(), mcp_surface());
         expect![[r#"
             {
-              "contract_version": "3.3",
+              "contract_version": "3.4",
               "mcp": {
                 "profiles": {
                   "reference": {
@@ -1682,8 +1683,8 @@ mod tests {
                           }
                         ],
                         "name": "graph",
-                        "output_schema_fingerprint": "blake3:e08616298c69ac894887fc6d775157a384557828cab4a93f010a001724f5d359",
-                        "output_schema_version": "35",
+                        "output_schema_fingerprint": "blake3:4d966d91520f2b5fc5b52b7a030dc11f6b0796bca427688d904199b098fa1184",
+                        "output_schema_version": "36",
                         "params": [
                           {
                             "name": "action",

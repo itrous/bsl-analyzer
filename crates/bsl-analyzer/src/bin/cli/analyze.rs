@@ -66,6 +66,11 @@ impl ProfilingStats {
     }
 }
 
+/// Source bytes one analysis chunk may hold beside its file cap. The chunk's
+/// working set (syntax trees, lowered bodies, inference) scales with its bytes,
+/// so this is what bounds the peak when a run of giant modules shares a chunk.
+const CHUNK_BYTES: u64 = 32 << 20;
+
 /// Best-effort human-readable message from a caught panic payload.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -411,6 +416,7 @@ fn analyze_salsa(
     // `load_metadata` below run on this value, and the path the first produces
     // becomes the interned configuration input the diagnostics resolve through.
     source_set.resolve(&source_dir)?.apply_to(&mut proj_config);
+    bsl_analyzer::help_bootstrap::bootstrap_for_config(&proj_config, &source_dir);
 
     let scope = build_scope(&source_dir, &scope_args, proj_config.analysis.diff_base.as_deref())?;
     let author_filter =
@@ -587,11 +593,20 @@ fn analyze_salsa(
     // is the peak, bounded only by this). On ERP 500 trims peak RSS ~25% vs 1000
     // (~6.0 GB vs ~8.1 GB) for ~+5% wall, so it is the default; override via
     // `BSL_SALSA_CHUNK` (larger = faster + more RSS, smaller = leaner + slower).
+    // The count cap alone leaves the peak to chance: the working set scales with
+    // the chunk's source bytes, and 500 files of a large configuration run from
+    // under a megabyte to over a hundred, so a byte cap closes the chunks that a
+    // run of giant modules would otherwise fill.
     let chunk_size = std::env::var("BSL_SALSA_CHUNK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(500);
+    let chunks = stdx::batch::chunks_by_budget(
+        &file_ids,
+        |(_, path)| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        stdx::batch::BatchBudget::files(chunk_size).with_bytes(CHUNK_BYTES),
+    );
     // Only read complexity into the JSONL `metrics` field when BOTH complexity
     // diagnostics are enabled: then both queries are warm during the chunk and
     // reading them is a salsa cache hit (free). Requiring both (not either) is
@@ -617,7 +632,7 @@ fn analyze_salsa(
         Ok(value) => value.parse::<usize>().ok().filter(|n| *n > 0),
         Err(_) => Some(700),
     };
-    let num_chunks = file_ids.len().div_ceil(chunk_size);
+    let num_chunks = chunks.len();
 
     // The JSONL contract opens with a `start` event before any analysis. Salsa
     // emits the `file`/`done` events as a batch once the chunked run finishes
@@ -629,7 +644,7 @@ fn analyze_salsa(
         println!("{}", serde_json::to_string(&StartEvent::new(file_ids.len()))?);
     }
 
-    for (chunk_idx, chunk) in file_ids.chunks(chunk_size).enumerate() {
+    for (chunk_idx, &chunk) in chunks.iter().enumerate() {
         // Per-chunk timing to separate the parallel phase from the serial tail
         // (the slowest single file's straggler wait) and the single-threaded
         // `enforce_lru` trim — the two work-starvation sources between chunks.

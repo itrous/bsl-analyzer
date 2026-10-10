@@ -131,6 +131,7 @@ fn a_variable_named_like_a_method_leaves_the_call_resolved() {
 /// with the receiver left out — the platform surface behind the implicit
 /// receiver has to be cleared before a name is called absent.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn implicit_object_methods_are_not_absent() {
     let text = "Процедура Тест()\n    Если ЭтоНовый() Тогда\n        Записать();\n    \
                 КонецЕсли;\nКонецПроцедуры\n";
@@ -150,6 +151,7 @@ fn an_object_module_still_reports_a_name_owned_by_nothing() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn implicit_record_set_methods_are_not_absent() {
     let text = "Процедура Тест()\n    Загрузить(Неопределено);\n    Записать();\nКонецПроцедуры\n";
     let (db, file_id) = setup_at(REGISTER_RECORD_SET_MODULE, text);
@@ -161,6 +163,7 @@ fn implicit_record_set_methods_are_not_absent() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn implicit_manager_methods_are_not_absent() {
     let text = "Процедура Тест()\n    Результат = СоздатьЭлемент();\nКонецПроцедуры\n";
     let (db, file_id) = setup_at(CATALOG_MANAGER_MODULE, text);
@@ -190,6 +193,7 @@ fn a_managed_form_module_reports_a_name_owned_by_nothing() {
 /// The managed form is the implicit receiver: its own platform methods are written
 /// without `ЭтаФорма`, next to the module's methods and the global context.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn managed_form_methods_siblings_and_globals_are_silent() {
     let text = "&НаКлиенте\nПроцедура Сосед()\nКонецПроцедуры\n\n\
                 &НаКлиенте\nПроцедура Тест()\n    Сосед();\n    Закрыть();\n    \
@@ -213,6 +217,7 @@ fn managed_form_methods_siblings_and_globals_are_silent() {
 /// local that holds a sibling function's name leave the form surface as it was: the
 /// form's own methods stay silent, a name owned by nothing is still reported.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn form_methods_stay_silent_past_reset_and_same_named_locals() {
     let text = "&НаКлиенте
 Функция Сосед()
@@ -238,6 +243,7 @@ fn form_methods_stay_silent_past_reset_and_same_named_locals() {
 /// The main attribute mixes its own extension into the form: a document form can
 /// `Записать()`, a form without a main attribute only has the form itself.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn the_main_attribute_extension_is_part_of_the_receiver() {
     let text = "&НаКлиенте\nПроцедура Тест()\n    Записать();\n    Прочитать();\n    \
                 Ссылка = ПолучитьНавигационнуюСсылкуОбъекта();\nКонецПроцедуры\n";
@@ -261,6 +267,7 @@ fn the_main_attribute_extension_is_part_of_the_receiver() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_list_form_has_the_dynamic_list_extension_not_the_object_one() {
     let text = "&НаКлиенте\nПроцедура Тест()\n    \
                 Ссылка = ПолучитьНавигационнуюСсылкуСписка();\n    Записать();\nКонецПроцедуры\n";
@@ -272,6 +279,7 @@ fn a_list_form_has_the_dynamic_list_extension_not_the_object_one() {
 /// metadata parser leaves unread: the form may carry any extension, so the methods
 /// of every one of them stay silent, while a name owned by nothing is still reported.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_record_form_widens_to_every_extension() {
     let text = "&НаКлиенте\nПроцедура Тест()\n    Записать();\n    Прочитать();\n    \
                 Ссылка = ПолучитьНавигационнуюСсылкуЗаписи();\n    \
@@ -323,6 +331,7 @@ fn an_ordinary_form_module_stays_silent() {
 /// A constant's value-manager module hangs off `КонстантаМенеджерЗначения`:
 /// `Записать()` / `Прочитать()` are its methods written without the receiver.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_constant_value_manager_module_resolves_its_receiver() {
     let text = "Процедура Тест()\n    Прочитать();\n    Записать();\n    \
                 СовсемНеизвестныйВызов();\nКонецПроцедуры\n";

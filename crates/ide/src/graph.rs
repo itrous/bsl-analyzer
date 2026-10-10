@@ -825,6 +825,10 @@ pub struct GraphBuildTicker {
     /// Milliseconds from `started` at the last `note`, atomically readable.
     last_progress_ms: std::sync::atomic::AtomicU64,
     position: std::sync::Mutex<String>,
+    eta_started: std::sync::OnceLock<std::time::Instant>,
+    eta_total_intervals: std::sync::atomic::AtomicU64,
+    eta_completed_intervals: std::sync::atomic::AtomicU64,
+    eta_sampled_elapsed_ns: std::sync::atomic::AtomicU64,
 }
 
 impl Default for GraphBuildTicker {
@@ -833,16 +837,54 @@ impl Default for GraphBuildTicker {
             started: std::time::Instant::now(),
             last_progress_ms: std::sync::atomic::AtomicU64::new(0),
             position: std::sync::Mutex::new("created".to_owned()),
+            eta_started: std::sync::OnceLock::new(),
+            eta_total_intervals: std::sync::atomic::AtomicU64::new(0),
+            eta_completed_intervals: std::sync::atomic::AtomicU64::new(0),
+            eta_sampled_elapsed_ns: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
 
 impl GraphBuildTicker {
+    /// Configure a cold full build's equal-weight interval estimate before its first note.
+    pub fn set_eta_total_intervals(&self, total: usize) {
+        debug_assert!(self.eta_started.get().is_none());
+        self.eta_total_intervals.store(total as u64, std::sync::atomic::Ordering::Release);
+    }
+
+    /// A remaining-time estimate from the latest completed interval sample.
+    pub fn eta_seconds(&self) -> Option<u64> {
+        estimate_graph_build_eta_seconds(
+            self.eta_total_intervals.load(std::sync::atomic::Ordering::Acquire) as usize,
+            self.eta_completed_intervals.load(std::sync::atomic::Ordering::Acquire) as usize,
+            std::time::Duration::from_nanos(
+                self.eta_sampled_elapsed_ns.load(std::sync::atomic::Ordering::Acquire),
+            ),
+        )
+    }
+
     /// Record forward progress: the build is entering `batch` (0-based) of
     /// `total` in `phase`, whose first module is `first_path` (empty when the
     /// phase has no per-batch granularity). Also emits the heartbeat trace line
     /// (target `bsl_graph`), so the on-disk log reconstructs the build timeline.
     pub fn note(&self, phase: &str, batch: usize, total: usize, first_path: &str) {
+        let now = std::time::Instant::now();
+        if phase != "method_nodes" {
+            if let Some(started) = self.eta_started.get() {
+                let elapsed_ns =
+                    now.duration_since(*started).as_nanos().min(u64::MAX as u128) as u64;
+                let completed =
+                    self.eta_completed_intervals.load(std::sync::atomic::Ordering::Relaxed);
+                let total = self.eta_total_intervals.load(std::sync::atomic::Ordering::Relaxed);
+                if total > 0 && completed < total {
+                    self.eta_sampled_elapsed_ns
+                        .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+                    self.eta_completed_intervals.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+            } else {
+                let _ = self.eta_started.set(now);
+            }
+        }
         let elapsed = self.started.elapsed().as_millis() as u64;
         self.last_progress_ms.store(elapsed, std::sync::atomic::Ordering::Relaxed);
         let label = if total > 0 {
@@ -867,6 +909,29 @@ impl GraphBuildTicker {
     }
 }
 
+// shortcut: Equal interval weights are a heuristic, not phase-calibrated; collect phase costs
+// before replacing it if production evidence shows material bias.
+fn estimate_graph_build_eta_seconds(
+    total_intervals: usize,
+    completed_intervals: usize,
+    sampled_elapsed: std::time::Duration,
+) -> Option<u64> {
+    let remaining = total_intervals.checked_sub(completed_intervals)?;
+    if total_intervals == 0
+        || completed_intervals == 0
+        || remaining == 0
+        || sampled_elapsed.is_zero()
+    {
+        return None;
+    }
+    let estimate_ns = sampled_elapsed
+        .as_nanos()
+        .checked_mul(remaining as u128)?
+        .div_ceil(completed_intervals as u128);
+    let seconds = estimate_ns.div_ceil(1_000_000_000);
+    u64::try_from(seconds).ok().map(|seconds| seconds.max(1))
+}
+
 /// Project the whole-workspace call graph into durable node/edge rows in bounded
 /// batches, streaming each batch to `sink` rather than materialising the full
 /// graph in memory. The compact [`GraphIndex`] (a per-module method table) is
@@ -879,8 +944,9 @@ impl GraphBuildTicker {
 /// graph's: every method node (including call-free ones) plus every edge endpoint.
 ///
 /// `modules` is every module in the workspace, in a stable order; `paths` maps
-/// every file id to its path for id encoding. `batch_size` modules are loaded and
-/// projected per batch; a value of 0 is treated as 1.
+/// every file id to its path for id encoding. `batches` are the contiguous runs of
+/// `modules` loaded and projected together (see [`stdx::batch::chunks_by_budget`]);
+/// their union must be `modules` in order.
 #[allow(
     clippy::too_many_arguments,
     reason = "each argument is a distinct borrowed channel of the streaming build \
@@ -892,14 +958,20 @@ pub fn build_workspace_graph_rows(
     paths: &FxHashMap<FileId, String>,
     workspace_root: Option<&Path>,
     mdo_files: &hir::graph_index::MdoFiles,
-    batch_size: usize,
+    batches: &[&[ModuleId]],
     open_batch: &mut BatchDbOpener<'_>,
     sink: &mut GraphRowSink<'_>,
     mut fused: Option<&mut dyn FusedChunkSink>,
     ticker: Option<&GraphBuildTicker>,
 ) -> Result<GraphBuildSummary, Box<dyn std::error::Error + Send + Sync>> {
-    let batch_size = batch_size.max(1);
-    let batches_total = modules.len().div_ceil(batch_size);
+    debug_assert_eq!(
+        batches.iter().map(|batch| batch.len()).sum::<usize>(),
+        modules.len(),
+        "the batches must cover every module exactly once"
+    );
+    let batches_total = batches.len();
+    // Node rows are flushed to the sink in runs of the largest batch's size.
+    let flush_rows = batches.iter().map(|batch| batch.len()).max().unwrap_or(1).max(1);
     // Heartbeat at every phase/batch boundary: which batch is entered and its first
     // module's path. Enough to localise a stalled build to one batch of modules.
     let note = |phase: &str, batch_idx: usize, batch: &[ModuleId]| {
@@ -926,7 +998,7 @@ pub fn build_workspace_graph_rows(
     // Build the index batch-by-batch: it must cover every resolution target, but
     // only one batch's item trees are resident while it is assembled.
     let mut index = GraphIndex::new();
-    for (i, batch) in modules.chunks(batch_size).enumerate() {
+    for (i, &batch) in batches.iter().enumerate() {
         note("index", i, batch);
         let db = open_batch(batch);
         index.add_batch(&pool, &db, batch);
@@ -956,10 +1028,10 @@ pub fn build_workspace_graph_rows(
     // isolated methods that no edge references. No database needed: the index and
     // path map carry every fact. Flushed in batches of node rows.
     mark("method_nodes");
-    let mut node_batch: Vec<NodeRow> = Vec::with_capacity(batch_size);
+    let mut node_batch: Vec<NodeRow> = Vec::with_capacity(flush_rows);
     for method in index.method_nodes() {
         node_batch.push(encoder.node_row(&GraphNode::Method(method)));
-        if node_batch.len() >= batch_size {
+        if node_batch.len() >= flush_rows {
             summary.node_rows += node_batch.len();
             sink(&node_batch, &[])?;
             node_batch.clear();
@@ -1020,7 +1092,7 @@ pub fn build_workspace_graph_rows(
     let mut method_edge_facts: FxHashMap<MethodId, MethodEdgeFacts> = FxHashMap::default();
 
     let mut unresolved_calls: Vec<(String, String, String)> = Vec::new();
-    for (i, batch) in modules.chunks(batch_size).enumerate() {
+    for (i, &batch) in batches.iter().enumerate() {
         note("call_edges", i, batch);
         let db = open_batch(batch);
         let proj = project_batch_call_edges(&pool, &db, batch, &index, &mut state);
@@ -1033,9 +1105,14 @@ pub fn build_workspace_graph_rows(
                 unresolved_calls.push((scope, method_lower, file));
             }
         }
+        for (caller, scope, method_lower) in proj.unresolved_declared_common {
+            if let Some(file) = file_of(caller) {
+                unresolved_calls.push((scope, method_lower, file));
+            }
+        }
         clear_node_caches(&pool);
     }
-    for (i, batch) in modules.chunks(batch_size).enumerate() {
+    for (i, &batch) in batches.iter().enumerate() {
         note("query_edges", i, batch);
         let db = open_batch(batch);
         let edges = project_batch_query_edges(&pool, &db, batch, &mut state);
@@ -1064,7 +1141,7 @@ pub fn build_workspace_graph_rows(
     // materialised by `emit`. Full-build only — the incremental reprojection never
     // runs it (form structure lives in form XML, so any form-structure change is a
     // metadata drift that already forces a full rebuild).
-    for (i, batch) in modules.chunks(batch_size).enumerate() {
+    for (i, &batch) in batches.iter().enumerate() {
         note("form_edges", i, batch);
         let db = open_batch(batch);
         let edges = project_batch_form_edges(&pool, &db, batch, paths, &mut state);
@@ -1080,7 +1157,7 @@ pub fn build_workspace_graph_rows(
     // attaches one database per thread; the config loader fans out over its own
     // scope), reusing one batch database for its config access. Full-build only — the
     // catalog is stable under body edits, so the incremental path never re-derives it.
-    if let Some(first) = modules.chunks(batch_size).next() {
+    if let Some(&first) = batches.first() {
         mark("catalog_edges");
         let db = open_batch(first);
         let edges = project_workspace_catalog_edges(&db, first[0].file_id, &mut state);
@@ -1103,7 +1180,7 @@ pub fn build_workspace_graph_rows(
     // never collides with the data objects above). Full-build only: a handler change that
     // could invalidate the edge moves the handler module's signature hash, forcing a full
     // rebuild rather than a body-only reproject.
-    if let Some(first) = modules.chunks(batch_size).next() {
+    if let Some(&first) = batches.first() {
         mark("subscription_edges");
         let db = open_batch(first);
         let edges = project_workspace_subscription_edges(&db, first[0].file_id, &index, &mut state);
@@ -1114,7 +1191,7 @@ pub fn build_workspace_graph_rows(
     // child subsystems. Config-level, pure metadata, sharing `state` so member names
     // canonicalize to the same spelling as their own nodes from the catalog pass.
     // Full-build only, like the metadata passes above.
-    if let Some(first) = modules.chunks(batch_size).next() {
+    if let Some(&first) = batches.first() {
         mark("subsystem_edges");
         let db = open_batch(first);
         let edges = project_workspace_subsystem_edges(&db, first[0].file_id, &mut state);
@@ -1125,7 +1202,7 @@ pub fn build_workspace_graph_rows(
     // (direct object-rights `resolved`, plus objects named inside an RLS restriction condition
     // `inferred`). Config-level, pure metadata, sharing `state` so object names canonicalize to
     // the same spelling as their own nodes. Full-build only, like the metadata passes above.
-    if let Some(first) = modules.chunks(batch_size).next() {
+    if let Some(&first) = batches.first() {
         mark("role_edges");
         let db = open_batch(first);
         let edges = project_workspace_role_edges(&db, first[0].file_id, &mut state);
@@ -1136,7 +1213,7 @@ pub fn build_workspace_graph_rows(
     // (its `RegisterRecords` metadata). Config-level, pure metadata, sharing `state` so register
     // names canonicalize to the same spelling as their own nodes. Full-build only, like the
     // metadata passes above.
-    if let Some(first) = modules.chunks(batch_size).next() {
+    if let Some(&first) = batches.first() {
         mark("register_records_edges");
         let db = open_batch(first);
         let edges = project_workspace_register_records_edges(&db, first[0].file_id, &mut state);
@@ -1165,6 +1242,16 @@ pub fn build_workspace_graph_rows(
 /// reverse-index lookup key by the same scope the build recorded.
 pub fn scope_for_path(path: &str) -> Option<String> {
     module_key_for_path(path).map(|k| encode_scope(&k))
+}
+
+/// Folded durable scope for a common module path. Used for reverse references
+/// captured from semantic qualified calls when the declared module has no body
+/// path yet; Unicode case folding must happen in Rust rather than SQLite `lower()`.
+pub fn folded_common_scope_for_path(path: &str) -> Option<String> {
+    match module_key_for_path(path)? {
+        hir::ModuleKey::Common { name } => Some(format!("common/{}", name.fold_lower())),
+        _ => None,
+    }
 }
 
 /// Rows for a body-only incremental update: only the `changed` modules' method nodes
@@ -1214,13 +1301,17 @@ pub fn reproject_changed_modules(
     paths: &FxHashMap<FileId, String>,
     workspace_root: Option<&Path>,
     mdo_files: &hir::graph_index::MdoFiles,
-    batch_size: usize,
+    batches: &[&[ModuleId]],
     open_batch: &mut BatchDbOpener<'_>,
     ticker: Option<&GraphBuildTicker>,
 ) -> Result<ReprojectedRows, Box<dyn std::error::Error + Send + Sync>> {
-    let batch_size = batch_size.max(1);
+    debug_assert_eq!(
+        batches.iter().map(|batch| batch.len()).sum::<usize>(),
+        all_modules.len(),
+        "the batches must cover every module exactly once"
+    );
     let pool = rayon::ThreadPoolBuilder::new().build()?;
-    let batches_total = all_modules.len().div_ceil(batch_size);
+    let batches_total = batches.len();
     let note = |phase: &str, batch_idx: usize, batch: &[ModuleId]| {
         if let Some(ticker) = ticker {
             let first =
@@ -1234,7 +1325,7 @@ pub fn reproject_changed_modules(
     // The same batch runners as the full build → the same stall class; hence the
     // same heartbeat.
     let mut index = GraphIndex::new();
-    for (i, batch) in all_modules.chunks(batch_size).enumerate() {
+    for (i, &batch) in batches.iter().enumerate() {
         note("reproject_index", i, batch);
         let db = open_batch(batch);
         index.add_batch(&pool, &db, batch);
@@ -1303,15 +1394,144 @@ pub fn reproject_changed_modules(
     let scope_of = |m: ModuleId| -> Option<String> {
         paths.get(&m.file_id).and_then(|p| module_key_for_path(p)).map(|k| encode_scope(&k))
     };
-    let unresolved_calls: Vec<(String, String, String)> = call_proj
+    let mut unresolved_calls: Vec<(String, String, String)> = call_proj
         .unresolved
         .into_iter()
         .filter_map(|(caller, target, method_lower)| {
             Some((scope_of(target)?, method_lower, paths.get(&caller.file_id)?.clone()))
         })
         .collect();
+    unresolved_calls.extend(call_proj.unresolved_declared_common.into_iter().filter_map(
+        |(caller, scope, method_lower)| {
+            Some((scope, method_lower, paths.get(&caller.file_id)?.clone()))
+        },
+    ));
 
     Ok(ReprojectedRows { nodes, edges, sig_hashes, casing_variant_objects, unresolved_calls })
+}
+
+/// Project only graph rows owned by the changed metadata objects and form modules.
+/// The caller supplies the owner MDO ids from both the installed and current snapshot,
+/// so removals and renames clear their previous rows in the same SQLite transaction.
+pub fn reproject_metadata_owners<DB: ConfigsDatabase + Clone + Send>(
+    db: &DB,
+    representative: FileId,
+    form_modules: &[ModuleId],
+    paths: &FxHashMap<FileId, String>,
+    workspace_root: Option<&Path>,
+    mdo_files: &hir::graph_index::MdoFiles,
+    owner_ids: &FxHashSet<String>,
+) -> (Vec<NodeRow>, Vec<EdgeRow>) {
+    let mut state = GraphBuildState::default();
+    let mut projected = project_workspace_catalog_edges(db, representative, &mut state);
+    if !form_modules.is_empty() {
+        let pool =
+            rayon::ThreadPoolBuilder::new().build().expect("metadata form projection thread pool");
+        projected.extend(project_batch_form_edges(&pool, db, form_modules, paths, &mut state));
+        projected.extend(project_form_binding_edges(&state));
+    }
+    projected.extend(project_workspace_subsystem_edges(db, representative, &mut state));
+    projected.extend(project_workspace_role_edges(db, representative, &mut state));
+    projected.extend(project_workspace_register_records_edges(db, representative, &mut state));
+
+    let empty_index = GraphIndex::new();
+    let strip_root = workspace_root.map(StripRoot::resolve);
+    let encoder = GraphRowEncoder::new(
+        &empty_index,
+        paths,
+        strip_root.as_ref().map(StripRoot::resolved),
+        mdo_files,
+    );
+    let form_key = |owner: &Option<(MdoType, String)>, form_name: &str| {
+        (owner.as_ref().map(|(kind, name)| (*kind, name.fold_lower())), form_name.fold_lower())
+    };
+    let form_keys: FxHashSet<(Option<(MdoType, String)>, String)> = form_modules
+        .iter()
+        .filter_map(|module| {
+            let path = paths.get(&module.file_id)?;
+            let (owner, form_name) = form_key_for_path(path)?;
+            Some(form_key(&owner, &form_name))
+        })
+        .collect();
+    let owner_affected = |node: &GraphNode| {
+        let direct_id = owner_ids.contains(&encoder.encode(node).0);
+        let owner = match node {
+            GraphNode::Mdo { mdo_type, object_name }
+            | GraphNode::Attribute { mdo_type, object_name, .. }
+            | GraphNode::TabularSection { mdo_type, object_name, .. }
+            | GraphNode::TabularSectionAttribute { mdo_type, object_name, .. } => {
+                encoder
+                    .encode(&GraphNode::Mdo {
+                        mdo_type: *mdo_type,
+                        object_name: object_name.clone(),
+                    })
+                    .0
+            }
+            GraphNode::Form { owner, .. }
+            | GraphNode::FormItem { owner, .. }
+            | GraphNode::FormAttribute { owner, .. } => owner
+                .as_ref()
+                .map(|(mdo_type, name)| {
+                    encoder
+                        .encode(&GraphNode::Mdo { mdo_type: *mdo_type, object_name: name.clone() })
+                        .0
+                })
+                .unwrap_or_default(),
+            GraphNode::Method(_) | GraphNode::ModuleCode(_) => String::new(),
+        };
+        direct_id || owner_ids.contains(&owner)
+    };
+    let form_affected =
+        |node: &GraphNode, keys: &FxHashSet<(Option<(MdoType, String)>, String)>| match node {
+            GraphNode::Form { owner, form_name }
+            | GraphNode::FormItem { owner, form_name, .. }
+            | GraphNode::FormAttribute { owner, form_name, .. } => {
+                let owner = owner.as_ref().map(|(kind, name)| (*kind, name.as_str().to_owned()));
+                keys.contains(&form_key(&owner, form_name.as_str()))
+            }
+            _ => false,
+        };
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut seen_nodes = FxHashSet::default();
+    let mut seen_edges = FxHashSet::default();
+    for edge in projected {
+        let owner_delta = owner_affected(&edge.from)
+            || owner_affected(&edge.to)
+            || form_affected(&edge.from, &form_keys)
+            || form_affected(&edge.to, &form_keys);
+        if !owner_delta {
+            continue;
+        }
+        for node in [&edge.from, &edge.to] {
+            let row = encoder.node_row(node);
+            if seen_nodes.insert(row.id.clone()) {
+                nodes.push(row);
+            }
+        }
+        let row = encoder.edge_row(&edge);
+        if seen_edges.insert((
+            row.from_id.clone(),
+            row.to_id.clone(),
+            row.kind,
+            row.provenance,
+            row.call_start,
+            row.call_end,
+            row.call_site_absent,
+            row.crosses,
+        )) {
+            edges.push(row);
+        }
+    }
+    (nodes, edges)
+}
+
+/// Parsed owner and form name for a form module path, exposed to the MCP adapter without
+/// making it depend on HIR's module-path parser.
+pub fn form_key_for_path(path: &str) -> Option<(Option<(MdoType, String)>, String)> {
+    let key = hir::parse_form_module_path(path)?;
+    Some((key.owner.map(|(kind, name)| (kind, name.as_str().to_owned())), key.form_name))
 }
 
 struct GraphCtx<'a> {
@@ -2938,7 +3158,18 @@ fn clamp_source(src: String, max_chars: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod ticker_tests {
-    use super::GraphBuildTicker;
+    use super::{estimate_graph_build_eta_seconds, GraphBuildTicker};
+    use std::time::Duration;
+
+    #[test]
+    fn eta_requires_completed_measured_intervals_and_never_rounds_to_zero() {
+        assert_eq!(estimate_graph_build_eta_seconds(10, 0, Duration::from_secs(4)), None);
+        assert_eq!(estimate_graph_build_eta_seconds(10, 1, Duration::ZERO), None);
+        assert_eq!(estimate_graph_build_eta_seconds(0, 0, Duration::from_secs(4)), None);
+        assert_eq!(estimate_graph_build_eta_seconds(10, 10, Duration::from_secs(4)), None);
+        assert_eq!(estimate_graph_build_eta_seconds(10, 3, Duration::from_millis(2500)), Some(6));
+        assert_eq!(estimate_graph_build_eta_seconds(2, 1, Duration::from_nanos(1)), Some(1));
+    }
 
     #[test]
     fn note_stamps_position_and_resets_stall_clock() {

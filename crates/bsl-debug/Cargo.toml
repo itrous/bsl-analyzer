@@ -24,3 +24,6 @@ dap = "0.4.1-alpha1"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

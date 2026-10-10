@@ -187,6 +187,7 @@ fn type_mismatch_fires_on_three_level_manager_call() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn type_mismatch_fires_on_fluent_method_call() {
     let fixture = r#"
 //- /test.bsl
@@ -220,6 +221,7 @@ fn type_mismatch_silent_on_fluent_method_call_matching_arg() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn type_mismatch_fires_on_array_insert_string_index() {
     // Guard against over-suppression: a non-union Массив receiver must still
     // flag a String passed where a numeric index is required.
@@ -408,6 +410,7 @@ fn issue80_dom_valid_child_is_accepted() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn issue80_dom_invalid_scalar_child_is_rejected() {
     let (db, file_id) = setup_impl(ISSUE80_DOM_FIXTURE, false, "/invalid.bsl");
 
@@ -668,6 +671,7 @@ fn type_mismatch_silent_on_concrete_manager_into_generic_manager_param() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn type_mismatch_fires_on_area_value_into_spreadsheet_param() {
     // The spreadsheet-area bridge is one-way: a value documented as
     // ОбластьЯчеекТабличногоДокумента must NOT be admitted where a full

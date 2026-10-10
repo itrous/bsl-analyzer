@@ -14,6 +14,7 @@ fn reference_server() -> McpServer {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 async fn contract_is_discoverable_and_readable_over_a_session() {
     let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
     tokio::spawn(serve_stream(reference_server(), server_io));
@@ -369,6 +370,7 @@ async fn budgeted_platform_list(server: McpServer) -> (Value, String) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 async fn shared_platform_listing_is_identical_in_workspace_and_reference_profiles() {
     let ws = TempDir::new().unwrap();
     let workspace = budgeted_platform_list(workspace_server(&ws)).await;

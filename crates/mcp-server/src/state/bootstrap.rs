@@ -2507,13 +2507,29 @@ impl SharedState {
         engine: &mut SearchEngine,
         progress: &Arc<IndexProgress>,
     ) -> Result<Option<EmbeddingFailure>, SearchError> {
-        let platform = PlatformDataInner::instance();
-        if platform.all_types().is_empty() {
-            tracing::debug!("no platform data available, skipping docs indexing");
+        Self::index_platform_docs_from(engine, progress, PlatformDataInner::instance())
+    }
+
+    /// Keeps the local `platform://docs` document in step with `platform`: the
+    /// served corpus replaces it, and no corpus removes it.
+    fn index_platform_docs_from(
+        engine: &mut SearchEngine,
+        progress: &Arc<IndexProgress>,
+        platform: &PlatformDataInner,
+    ) -> Result<Option<EmbeddingFailure>, SearchError> {
+        if platform.help_origin().is_none() {
+            // Only the local help document goes: the same collection may hold an
+            // external reference snapshot, which stays.
+            if engine.remove_file_if_present("platform://docs", "platform")? {
+                tracing::info!(
+                    reason = platform.help_missing_reason().unwrap_or("empty corpus"),
+                    "no platform help; local platform docs removed from the search index"
+                );
+            }
             return Ok(None);
         }
 
-        let documents = crate::build_reference_documents();
+        let documents = crate::tools::platform::build_reference_documents_from(platform);
 
         let fingerprint = crate::reference_documents_fingerprint(&documents);
 
@@ -4299,6 +4315,137 @@ mod tests {
         // ...and the embedding work is handed to the background pass.
         assert!(init.pending_embed.is_some());
     }
+    fn fixture_platform(type_name: &str) -> bsl_platform::PlatformDataInner {
+        use bsl_platform::{
+            PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
+            PlatformSnapshot,
+        };
+        let mut corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bsl-platform/tests/fixtures/help/corpus.json"
+        ))
+        .unwrap();
+        for ty in corpus["types"].as_array_mut().unwrap() {
+            if ty["english_name"] == "Array" {
+                ty["name"] = serde_json::Value::String(type_name.to_owned());
+            }
+        }
+        let snapshot =
+            PlatformSnapshot::from_corpus_json(&serde_json::to_vec(&corpus).unwrap()).unwrap();
+        bsl_platform::PlatformDataInner::from_help(PlatformHelp::loaded(
+            PlatformHelpRequest::ExternalPath(type_name.into()),
+            snapshot,
+            PlatformHelpOrigin {
+                source: PlatformHelpSourceKind::External,
+                location: None,
+                platform_version: None,
+                digest: None,
+            },
+        ))
+    }
+
+    #[test]
+    fn a_served_corpus_without_types_is_still_indexed() {
+        use bsl_platform::{
+            GlobalFunction, PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest,
+            PlatformHelpSourceKind, PlatformSnapshot,
+        };
+        let dir = tempdir().unwrap();
+        let mut engine = SearchEngine::fts_only(&dir.path().join("reference-search.db")).unwrap();
+        let snapshot = PlatformSnapshot {
+            global_functions: vec![GlobalFunction {
+                id: 0,
+                name: "ФункцияБезТипов".into(),
+                english_name: "FunctionWithoutTypes".into(),
+                return_type: None,
+                parameters: vec![],
+                variants: vec![],
+                min_version: None,
+                context: None,
+            }],
+            ..PlatformSnapshot::default()
+        };
+        let platform = bsl_platform::PlatformDataInner::from_help(PlatformHelp::loaded(
+            PlatformHelpRequest::ExternalPath("functions.json".into()),
+            snapshot,
+            PlatformHelpOrigin {
+                source: PlatformHelpSourceKind::External,
+                location: None,
+                platform_version: None,
+                digest: None,
+            },
+        ));
+        SharedState::index_platform_docs_from(&mut engine, &IndexProgress::new(), &platform)
+            .unwrap();
+        assert!(!engine.text_search("ФункцияБезТипов", 10, Some("platform")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_platform_docs_follow_the_served_corpus_and_spare_other_documents() {
+        let dir = tempdir().unwrap();
+        let mut engine = SearchEngine::fts_only(&dir.path().join("reference-search.db")).unwrap();
+        engine
+            .index_documents(
+                "platform",
+                "platform://legacy/external",
+                b"external-docs",
+                &[Document {
+                    title: "ВнешнийСнимокДокумент".to_owned(),
+                    body: "Описание ВнешнийСнимокДокумент".to_owned(),
+                    kind: "type".to_owned(),
+                }],
+                None,
+            )
+            .unwrap();
+        let progress = IndexProgress::new();
+        let found = |engine: &SearchEngine, text: &str| {
+            !engine.text_search(text, 10, Some("platform")).unwrap().is_empty()
+        };
+
+        SharedState::index_platform_docs_from(
+            &mut engine,
+            &progress,
+            &fixture_platform("КорпусАльфа"),
+        )
+        .unwrap();
+        assert!(found(&engine, "КорпусАльфа"));
+
+        SharedState::index_platform_docs_from(
+            &mut engine,
+            &progress,
+            &fixture_platform("КорпусБета"),
+        )
+        .unwrap();
+        assert!(!found(&engine, "КорпусАльфа"), "the previous corpus document must go");
+        assert!(found(&engine, "КорпусБета"));
+
+        // A configured external snapshot shares the collection; no help must not
+        // remove it. Re-add it, since a local corpus replaces the whole collection.
+        engine
+            .index_documents(
+                "platform",
+                "platform://legacy/external",
+                b"external-docs",
+                &[Document {
+                    title: "ВнешнийСнимокДокумент".to_owned(),
+                    body: "Описание ВнешнийСнимокДокумент".to_owned(),
+                    kind: "type".to_owned(),
+                }],
+                None,
+            )
+            .unwrap();
+        let missing =
+            bsl_platform::PlatformDataInner::from_help(bsl_platform::PlatformHelp::missing(
+                bsl_platform::PlatformHelpRequest::None,
+                "disabled",
+            ));
+        SharedState::index_platform_docs_from(&mut engine, &progress, &missing).unwrap();
+        assert!(!found(&engine, "КорпусБета"), "no corpus, no local platform docs");
+        assert!(found(&engine, "ВнешнийСнимокДокумент"), "other documents stay");
+        // Idempotent with nothing left to remove.
+        SharedState::index_platform_docs_from(&mut engine, &progress, &missing).unwrap();
+        assert!(found(&engine, "ВнешнийСнимокДокумент"));
+    }
+
     #[test]
     fn clear_reference_docs_cache_removes_stale_local_and_external_docs() {
         let dir = tempdir().unwrap();
@@ -4401,11 +4548,21 @@ mod tests {
         })
         .join();
         state.ensure_loading();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while state.loading() {
-            assert!(std::time::Instant::now() < deadline, "reference publication deadline");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // The worker builds the whole reference index before it reaches the lock that
+        // refuses it, so the wait is for the worker to END, not for a deadline: the index
+        // takes seconds on an idle machine and however long a loaded one gives it. The
+        // verdict is written by the guard the worker drops on its way out, so a worker
+        // that is gone and a lifecycle still loading cannot coexist once the join returns.
+        let worker = state
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("ensure_loading registers its worker");
+        // However the worker ends — unwound by the poisoned lock, or returned after a
+        // refused publication — it ends without a verdict of its own, and that is the case.
+        let _ = worker.join();
+        assert!(!state.loading(), "the worker's exit guard writes the verdict before the join");
         assert!(
             matches!(state.lifecycle(), super::ReferenceSearchLifecycle::Failed { reason_code, .. } if reason_code == "worker_gone")
         );
@@ -5206,7 +5363,7 @@ mod tests {
         assert!(eventually(&|| state.search_watch().drift_watch == Some(DriftWatch::Watching)));
         wait_until_graph_ready(state.graph());
         assert!(eventually(&|| state.graph().status_report().drift_watch == Some("watching")));
-        let revision = state.graph().status_report().revision;
+        let revision = wait_until_graph_revision(state.graph());
 
         let hub = state.change_hub().expect("a workspace boot owns a hub").clone();
         for _ in 0..3 {
@@ -5214,7 +5371,7 @@ mod tests {
         }
         assert_eq!(hub.rescan_request_count(), 0, "a healthy hub was asked to reconcile");
         assert_eq!(state.graph().owes_forced(), None, "a quiet boot reloaded the project");
-        assert_eq!(state.graph().status_report().revision, revision, "a quiet boot rebuilt");
+        assert_eq!(wait_until_graph_revision(state.graph()), revision, "a quiet boot rebuilt");
         assert!(!state.graph().marks_pending(), "a quiet boot placed marks");
         {
             let guard = state.search_engine().lock().unwrap();

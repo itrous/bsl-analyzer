@@ -229,6 +229,7 @@ fn assert_row_type(fixture: &Fixture, file: FileId, variable: &str, section: &st
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_inference_keeps_rows_typed_for_iteration_and_add() {
     let fixture = setup(true);
 
@@ -242,6 +243,7 @@ fn extension_metadata_inference_keeps_rows_typed_for_iteration_and_add() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_diagnostics_cover_base_extension_and_external_visibility() {
     let fixture = setup(true);
 
@@ -260,6 +262,7 @@ fn extension_metadata_diagnostics_cover_base_extension_and_external_visibility()
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_external_without_dependency_keeps_only_base_fields() {
     let fixture = setup(false);
 
@@ -267,6 +270,7 @@ fn extension_metadata_external_without_dependency_keeps_only_base_fields() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_external_dependency_selects_only_named_extension_metadata() {
     let root = fixture_root();
     let base = root.join("base");
@@ -406,6 +410,7 @@ fn diagnostic_count(db: &RootDatabaseImpl, file: FileId, code: DiagnosticCode) -
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_substrate_invalidates_module_diagnostics_and_added_columns() {
     use ide_db::metadata::{CommonModuleEntry, MdoEntry, MetadataListingData};
 
@@ -534,6 +539,7 @@ fn extension_metadata_substrate_invalidates_module_diagnostics_and_added_columns
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn extension_metadata_filesystem_fallback_rereads_after_revision_bump() {
     let root = tempfile::tempdir().unwrap();
     let base = root.path().join("base");

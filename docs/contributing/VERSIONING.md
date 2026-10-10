@@ -2,14 +2,16 @@
 
 ## Схема версий
 
-bsl-analyzer использует [SemVer](https://semver.org/) в формате `0.1.XX`:
+bsl-analyzer использует [SemVer](https://semver.org/) в формате `0.MINOR.PATCH`:
 
 ```
-0.1.x    — текущий релиз
-0.1.x+1  — следующий релиз
+0.3.0  — релиз с ломающим изменением (minor растёт)
+0.3.1  — следующий релиз без ломающих изменений (patch растёт)
 ```
 
-Пока проект в фазе `0.x`, breaking changes возможны в любом релизе.
+Пока проект в фазе `0.x`, breaking changes возможны в любом релизе; релиз с
+ломающим изменением повышает minor и помечается в `CHANGELOG.md` разделом
+`BREAKING`.
 
 ### Внутренние крейты
 
@@ -19,12 +21,12 @@ bsl-analyzer использует [SemVer](https://semver.org/) в формат�
 
 ## Теги Git
 
-Формат: `v0.1.XX`
+Формат: `v0.MINOR.PATCH`
 
 ```bash
 # Создание тега
-git tag v0.1.<next>
-git push origin v0.1.<next>
+git tag v0.<minor>.<patch>
+git push origin v0.<minor>.<patch>
 ```
 
 Версии только идут вперёд. Нельзя переиспользовать или перемещать тег на другой коммит.
@@ -40,8 +42,8 @@ git push origin v0.1.<next>
 # Пример
 cargo build --release  # проверить сборку
 git add Cargo.toml Cargo.lock
-git commit -m "chore: bump version to 0.1.<next>"
-git tag v0.1.<next>
+git commit -m "chore: bump version to 0.<minor>.<patch>"
+git tag v0.<minor>.<patch>
 git push origin develop --tags
 ```
 

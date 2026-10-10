@@ -100,7 +100,9 @@ fn file_name_usage_heap(v: &Arc<FileNameUsage>) -> usize {
     bytes
 }
 
-#[salsa::tracked(lru = 4096, heap_size = file_name_usage_heap, returns(ref))]
+// The cap holds a whole workspace: the aggregated index folds every file's set, and a
+// resident that warms them in chunks with trims between must find them still memoised.
+#[salsa::tracked(lru = 65536, heap_size = file_name_usage_heap, returns(ref))]
 pub fn file_name_usage_query<'db>(
     db: &'db dyn DefDatabase,
     file_id_input: FileIdInput<'db>,

@@ -1,4 +1,5 @@
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn applicability_is_stable_across_aliases_and_recomputation() {
     use super::evaluate_applicability;
 

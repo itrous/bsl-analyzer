@@ -31,6 +31,7 @@ fn var_ty(db: &RootDatabaseImpl, file_id: FileId, var_lower: &str) -> Option<Typ
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn helper_returning_refined_query_propagates_projection_to_caller() {
     let fixture = r#"//- /test.bsl
 Функция СоздатьЗапрос() Экспорт
@@ -53,6 +54,7 @@ fn helper_returning_refined_query_propagates_projection_to_caller() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn helper_with_constructor_literal_propagates_projection() {
     let fixture = r#"//- /test.bsl
 Функция СоздатьЗапрос() Экспорт
@@ -228,6 +230,7 @@ fn cfe_shadowed_binding_refines_through_local_only() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn batched_text_assignment_picks_last_query_projection() {
     let fixture = r#"//- /test.bsl
 Функция ПолучитьТЗ() Экспорт

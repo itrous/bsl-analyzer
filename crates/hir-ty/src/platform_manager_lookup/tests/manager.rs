@@ -22,6 +22,7 @@ fn platform_manager_typeid_round_trips_via_ty() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn manager_create_item_on_catalog_returns_catalog_object() {
     let db = InMemoryDb::new();
     let res = resolve_platform_manager_method(
@@ -43,6 +44,7 @@ fn manager_create_item_on_catalog_returns_catalog_object() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn manager_find_by_code_on_catalog_returns_catalog_ref() {
     let db = InMemoryDb::new();
     let res = resolve_platform_manager_method(
@@ -60,6 +62,7 @@ fn manager_find_by_code_on_catalog_returns_catalog_ref() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn manager_find_by_code_param_lowers_to_union() {
     let db = InMemoryDb::new();
     let res = resolve_platform_manager_method(
@@ -91,6 +94,7 @@ fn manager_unknown_method_returns_none() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn manager_english_method_name_resolves() {
     let db = InMemoryDb::new();
     let res = resolve_platform_manager_method(
@@ -107,6 +111,7 @@ fn manager_english_method_name_resolves() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn manager_plural_lookup_exposes_all_platform_records_and_variants() {
     let db = InMemoryDb::new();
     let expected = bsl_platform::find_prefixed_methods("InformationRegisterManager", "Select");
@@ -145,6 +150,7 @@ fn manager_mdo_without_prefix_returns_none() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn manager_create_record_set_on_information_register_returns_record_set() {
     let db = InMemoryDb::new();
     let res = resolve_platform_manager_method(
@@ -165,6 +171,7 @@ fn manager_create_record_set_on_information_register_returns_record_set() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn manager_create_record_set_on_accumulation_register_returns_record_set() {
     let db = InMemoryDb::new();
     let res = resolve_platform_manager_method(
@@ -185,6 +192,7 @@ fn manager_create_record_set_on_accumulation_register_returns_record_set() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn manager_create_record_set_on_accounting_register_returns_record_set() {
     let db = InMemoryDb::new();
     let res = resolve_platform_manager_method(
@@ -205,6 +213,7 @@ fn manager_create_record_set_on_accounting_register_returns_record_set() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn manager_create_record_set_on_calculation_register_returns_record_set() {
     let db = InMemoryDb::new();
     let res = resolve_platform_manager_method(

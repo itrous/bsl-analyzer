@@ -20,3 +20,6 @@ expect-test.workspace = true
 rowan.workspace = true
 la-arena.workspace = true
 ordered-float.workspace = true
+
+[lints]
+workspace = true

@@ -99,6 +99,7 @@ fn jsdoc_and_three_level_share_signature_materialisation() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn single_method_lookup_path_agrees_across_infer_and_facade() {
     let fixture = r#"//- /test.bsl
 Функция Тест()

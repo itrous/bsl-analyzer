@@ -1,6 +1,7 @@
 use super::*;
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn union_lookup_merges_all_arm_signatures() {
     let db = InMemoryDb::new();
     let recv = db.union(vec![db.array(None), db.structure(None)]);
@@ -32,6 +33,7 @@ fn union_lookup_merges_all_arm_signatures() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn union_lookup_preserves_distinct_arm_candidate_ids_and_parameters() {
     let db = InMemoryDb::new();
     let receiver = db.union(vec![db.array(None), db.structure(None)]);
@@ -62,6 +64,7 @@ fn union_lookup_preserves_distinct_arm_candidate_ids_and_parameters() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn union_lookup_deduplicates_candidates_by_stable_id() {
     let db = InMemoryDb::new();
     let untyped = db.array(None);
@@ -79,6 +82,7 @@ fn union_lookup_deduplicates_candidates_by_stable_id() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn union_lookup_preserves_complete_signatures_without_cross_product() {
     let db = InMemoryDb::new();
     let receiver = db.union(vec![
@@ -143,6 +147,7 @@ fn method_lookup_returns_none_for_union_without_live_method() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn method_lookup_union_narrows_past_undefined_sentinel() {
     let db = InMemoryDb::new();
     let receiver = db.union(vec![platform_id(&db, "РезультатЗапроса"), db.undefined()]);
@@ -163,6 +168,7 @@ fn method_lookup_union_narrows_past_undefined_sentinel() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn method_lookup_union_resolution_has_no_first_arm_winner() {
     let db = InMemoryDb::new();
     let receiver = db.union(vec![platform_id(&db, "ValueTable"), platform_id(&db, "ValueTree")]);

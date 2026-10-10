@@ -3,11 +3,39 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING.md).
+and this project adheres to [Semantic Versioning](https://semver.org/) in the `0.x` phase, see [VERSIONING.md](docs/contributing/VERSIONING.md).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-09
+
+### BREAKING
+
+- bsl-analyzer больше не поставляет справку по платформе 1С: корпус справки
+  исключён из сборки и читается только во время работы. Без установленной
+  платформы и без настроенного пакета справки hover и completion по
+  платформенным типам не содержат описаний (имена, сигнатуры и типы отдают
+  встроенные факты интерфейса); проверки, опирающиеся на каталог EDT, не
+  затронуты. Источник справки по умолчанию — `auto`. Значение
+  `source = "bundled"` по-прежнему принимается и отдаёт только встроенные
+  факты интерфейса без описаний. Фича `platform_docs` осталась пустой, чтобы не ломать существующие
+  команды сборки. Подробности и подключение справки — в README и
+  `docs/contributing/DEVELOPMENT_RULES.md`.
+
 ### Added
+
+- Встроенные факты интерфейса платформы (#326):
+  `crates/bsl-platform/data/platform_facts.json` — корпус справки 8.3.27.2214
+  без единого текстового поля (имена, сигнатуры, параметры, типы, версии,
+  контексты; описаний, документации параметров, примеров и заметок нет). Их
+  отдают `source = "bundled"`, библиотечное использование без явного корпуса и
+  последняя ступень `auto`: без установленной платформы, сохранённого снимка и
+  закреплённого корпуса hover и completion по платформенным типам работают по
+  фактам, описания пусты, причина недоступности полного корпуса — в журнале.
+  `none` по-прежнему без справки. Генератор `scripts/strip-help-corpus-texts.py`
+  и тест `bundled_facts` проверяют файл по allow-list ключей. Правовые записи
+  (`PROVENANCE.md`, `NOTICE`, `LICENSING.md`) зафиксировали: встроенные данные
+  текстов 1С не содержат.
 
 - Настройка проекта `min_platform_version` и диагностика
   `PlatformMemberNewerThanMinVersion` (Major, включена по умолчанию, работает
@@ -144,6 +172,21 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
   `structuredContent` получил вид `property`.
 
 ### Fixed
+
+- LSP: порча базовой линии диагностик больше не объявляется дважды за одно
+  сохранение (github#87). `std::fs::write` — это `open(O_TRUNC)` и `write`, и
+  загрузка, попавшая между ними, читала пустой файл; ledger уведомлений
+  ключуется отпечатком содержимого, так что пустое чтение и настоящие байты
+  объявлялись как два разных отказа. Снимок ошибки теперь помнит, что вход был
+  прочитан пустым, и такой отказ не объявляется сразу: через 250 мс сервер
+  смотрит ещё раз задачей цикла, а не паузой на нём, и объявляет его только если
+  файл читается так же. Файл, который пуст по-настоящему, объявляется один раз с
+  этой задержкой; запись, пойманная на середине, — один раз, за байты, которыми
+  она кончилась.
+- Сборка индекса иерархии вызовов, которая исчерпала бюджет догона, сообщает об
+  этом в задаче (`CallHierarchyIndexSuperseded { reason }`) — как и паника
+  воркера и потеря поколения, которые раньше были неразличимы снаружи
+  (github#107).
 
 - Подсветка синтаксиса больше не теряет инструкции препроцессора расширений
   (github#47). `SyntaxKind::is_preprocessor` перечислял шесть инструкций из
@@ -493,7 +536,7 @@ and this project adheres to [Date-based Versioning](docs/contributing/VERSIONING
 
 ## Future Releases
 
-Releases will follow the `YYYY.MM.DD` format as defined in [VERSIONING.md](docs/contributing/VERSIONING.md).
+Releases follow `0.MINOR.PATCH` as defined in [VERSIONING.md](docs/contributing/VERSIONING.md).
 
 ### Planned Phases
 

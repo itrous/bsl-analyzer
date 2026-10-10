@@ -26,3 +26,6 @@ expect-test.workspace = true
 ide-db.workspace = true
 base-db.workspace = true
 parser.workspace = true
+
+[lints]
+workspace = true

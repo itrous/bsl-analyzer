@@ -110,6 +110,7 @@ const CATALOG_ENTRY: (bsl_metadata::MdoType, &str, usize) =
 /// walk that answers nothing for every route would satisfy the object assertion
 /// by accident.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn an_object_module_method_called_through_a_typed_receiver_is_counted() {
     let caller = "\
 Процедура Прогон() Экспорт
@@ -158,6 +159,7 @@ fn an_object_module_method_called_through_a_typed_receiver_is_counted() {
 /// reached through an inferred receiver, so a walk fixed for one and not the
 /// other is visible.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_record_set_module_method_called_through_a_typed_receiver_is_counted() {
     let caller = "\
 Процедура Прогон() Экспорт
@@ -196,6 +198,7 @@ fn a_record_set_module_method_called_through_a_typed_receiver_is_counted() {
 /// stay green whichever of the two surfaces is consulted first. Here the order is
 /// the whole subject.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn an_object_method_shadowing_a_platform_name_is_still_the_one_called() {
     let caller = "\
 Процедура Прогон() Экспорт
@@ -317,6 +320,7 @@ fn a_call_through_this_object_is_counted() {
 /// goes red while the inference half stays green — which is precisely the drift a
 /// gate on one surface alone would miss.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn inference_and_navigation_name_the_same_method() {
     let caller = "\
 Процедура Прогон() Экспорт
@@ -394,6 +398,7 @@ fn db_without_config(files: &[(&str, &str)]) -> (RootDatabaseImpl, Vec<FileId>) 
 /// (`infer_three_level::three_level_invalidates_on_config_change`); these two routes
 /// had none.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn without_configured_visibility_the_walk_degrades_to_the_path_index() {
     let object_caller = "\
 Процедура Прогон() Экспорт

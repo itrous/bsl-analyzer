@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 
 pub const BROKEN: &str = "Процедура Тест(\n";
 
+/// Silence a server at rest is allowed before a wait is judged lost.
+pub const SILENCE: Duration = Duration::from_secs(60);
+
 pub fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -64,6 +67,9 @@ pub struct Lsp {
     pub child: Child,
     pub stdin: ChildStdin,
     pub messages: Receiver<Value>,
+    /// The methods of the last few messages a wait took in, for the failure message of a
+    /// wait that ran out: what the server was saying is the context of what it did not.
+    recent: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
 
 impl Lsp {
@@ -114,7 +120,7 @@ impl Lsp {
                 }
             }
         });
-        let mut lsp = Self { child, stdin, messages };
+        let mut lsp = Self { child, stdin, messages, recent: Default::default() };
         let root_uri = lsp_types::Url::from_directory_path(root).unwrap();
         lsp.send(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -131,19 +137,101 @@ impl Lsp {
         self.stdin.flush().unwrap();
     }
 
-    /// Wait for a message, allowing the server sixty seconds to produce EACH one.
+    /// Wait for a message, telling a server that is busy from one that is done.
     ///
-    /// Per message, not per wait: a server that is working says so — progress, logs —
-    /// and a stand behind a cold build on a loaded machine can spend longer than a
-    /// minute reaching what it is waiting for without ever having gone quiet.
+    /// Silence is judged per message, not per wait: a server that is working says so —
+    /// progress, logs — and a stand behind a cold build on a loaded machine can spend
+    /// longer than [`SILENCE`] reaching what it is waiting for without ever going quiet.
+    /// Silence alone decides nothing, though: a server deep in an analysis and a server
+    /// idle because the awaited condition can never hold are equally quiet. What tells
+    /// them apart is whether the server did any work in the meantime, so a silent window
+    /// in which it used CPU is extended, up to [`BUSY_CEILING`], and a silent window in
+    /// which it used none fails at once — with where the wait stood and what it last saw,
+    /// so the failure names the condition instead of "Timeout".
+    #[track_caller]
     pub fn wait_for(&self, predicate: impl Fn(&Value) -> bool) -> Value {
+        self.wait_for_judging(SILENCE, predicate)
+    }
+
+    /// [`Self::wait_for`] with the silence window spelled out — for the control that
+    /// shows the judgement can fail, without sitting through the real window.
+    #[track_caller]
+    pub fn wait_for_judging(&self, silence: Duration, predicate: impl Fn(&Value) -> bool) -> Value {
+        /// How long a server may stay busy and silent before the wait gives up anyway:
+        /// a bound on a runaway, not a measure of anything the tests expect.
+        const BUSY_CEILING: Duration = Duration::from_secs(10 * 60);
+
+        let caller = std::panic::Location::caller();
+        let started = std::time::Instant::now();
         loop {
-            let message = self
-                .wait_for_within(Duration::from_secs(60), |_| true)
-                .expect("the server answered nothing for a minute");
-            if predicate(&message) {
-                return message;
+            let cpu_before = self.server_cpu_ticks();
+            if let Some(message) = self.wait_for_within(silence, |_| true) {
+                if predicate(&message) {
+                    return message;
+                }
+                continue;
             }
+            let waited = started.elapsed();
+            let cpu_after = self.server_cpu_ticks();
+            let worked = match (cpu_before, cpu_after) {
+                (Some(before), Some(after)) => after > before,
+                // Without a reading the server gets the benefit of the doubt, once.
+                _ => waited < silence * 2,
+            };
+            assert!(
+                worked,
+                "waiting at {caller} for {waited:?}: the server answered nothing for \
+                 {silence:?} and used no CPU in that time, so it is not working towards \
+                 an answer — the awaited condition is one it will not meet. Last messages \
+                 seen: {}",
+                self.recent_methods(),
+            );
+            assert!(
+                waited < BUSY_CEILING,
+                "waiting at {caller} for {waited:?}: the server stayed busy but answered \
+                 nothing for {silence:?} at a stretch, past the {BUSY_CEILING:?} ceiling. \
+                 Last messages seen: {}",
+                self.recent_methods(),
+            );
+        }
+    }
+
+    /// CPU time the server process has used so far, in scheduler ticks: whether it is
+    /// working, not how hard. Linux only; elsewhere there is no reading.
+    fn server_cpu_ticks(&self) -> Option<u64> {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.child.id())).ok()?;
+        // Fields after the parenthesised command name: state is the first, utime and
+        // stime are the twelfth and thirteenth.
+        let after_name = &stat[stat.rfind(')')? + 2..];
+        let mut fields = after_name.split_whitespace();
+        let utime: u64 = fields.nth(11)?.parse().ok()?;
+        let stime: u64 = fields.next()?.parse().ok()?;
+        Some(utime + stime)
+    }
+
+    fn note_seen(&self, message: &Value) {
+        const KEPT: usize = 8;
+        let label = match (message["method"].as_str(), message["id"].as_u64()) {
+            (Some(method), _) => method.to_owned(),
+            (None, Some(id)) => format!("response #{id}"),
+            (None, None) => "message".to_owned(),
+        };
+        let mut recent = self.recent.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if recent.len() == KEPT {
+            recent.pop_front();
+        }
+        recent.push_back(label);
+    }
+
+    fn recent_methods(&self) -> String {
+        let recent = self.recent.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if recent.is_empty() {
+            "none".to_owned()
+        } else {
+            recent.iter().cloned().collect::<Vec<_>>().join(", ")
         }
     }
 
@@ -167,8 +255,12 @@ impl Lsp {
         loop {
             let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
             match self.messages.recv_timeout(remaining) {
-                Ok(message) if predicate(&message) => return Some(message),
-                Ok(_) => {}
+                Ok(message) => {
+                    self.note_seen(&message);
+                    if predicate(&message) {
+                        return Some(message);
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => return None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     panic!("the server exited instead of answering")

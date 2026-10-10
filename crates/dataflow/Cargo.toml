@@ -27,3 +27,6 @@ syntax.workspace = true
 base-db.workspace = true
 vfs.workspace = true
 ide-db.workspace = true
+
+[lints]
+workspace = true

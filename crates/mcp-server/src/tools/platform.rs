@@ -226,7 +226,11 @@ pub(crate) fn platform_reference_for_document(
 }
 
 pub fn build_reference_documents() -> Vec<bsl_search::Document> {
-    let platform = PlatformDataInner::instance();
+    build_reference_documents_from(PlatformDataInner::instance())
+}
+
+/// Reference documents of `platform`, which need not be the process snapshot.
+pub fn build_reference_documents_from(platform: &PlatformDataInner) -> Vec<bsl_search::Document> {
     let mut documents = Vec::new();
 
     for item in platform.all_types() {
@@ -1721,6 +1725,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn every_catalog_kind_round_trips_by_exact_reference_id() {
         let references = platform_references();
         for (kind, expected) in [
@@ -1744,6 +1749,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn homonymous_type_ids_open_distinct_exact_cards() {
         let references: Vec<_> = platform_references()
             .into_iter()
@@ -1756,6 +1762,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_property_collisions_and_constructor_overloads_open_exact_cards() {
         let references = platform_references();
         let property = references
@@ -1802,6 +1809,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn reference_document_builder_is_deterministic_and_complete() {
         let documents = build_reference_documents();
         let fields = |items: Vec<bsl_search::Document>| {
@@ -1821,6 +1829,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn reference_fingerprint_ignores_order_but_tracks_content() {
         let documents = build_reference_documents();
         let fingerprint = reference_documents_fingerprint(&documents);
@@ -2027,6 +2036,7 @@ mod tests {
     /// is the input that shows it: charging the text alone shipped 76 KB against a declared
     /// budget of 6000 tokens, of which 60 KB was the card nobody bounded.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn the_card_and_the_markdown_share_one_budget() {
         for name in ["ЧтениеДанных", "COMSafeArray", "Массив"] {
             let result = bsl_syntax_help(name, None, 6000).unwrap();
@@ -2046,6 +2056,7 @@ mod tests {
     /// card. Without it the assertions below pass on an implementation that lets the Markdown
     /// spend the whole ceiling and then replaces every answer with the minimal envelope.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn a_budget_below_the_cards_identity_overshoots_by_that_much_and_says_so() {
         let tiny = bsl_syntax_help("Массив", None, 1).unwrap();
         let minimal = structured(&tiny);
@@ -2066,6 +2077,7 @@ mod tests {
     /// A budget below one exact match returns the minimal envelope rather than an empty `matches`
     /// array that could be mistaken for not-found.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn a_matched_lookup_keeps_one_entry_at_any_budget() {
         let platform = PlatformDataInner::instance();
         let method = &platform.all_methods()[0];
@@ -2081,6 +2093,7 @@ mod tests {
     /// entry is available everywhere. Not hypothetical: every constructor in the data is
     /// unmarked, and an empty list would tell a machine consumer the exact opposite.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn an_unmarked_availability_reads_as_every_context() {
         let card = structured(&bsl_syntax_help("Граница", None, 6000).unwrap()).clone();
 

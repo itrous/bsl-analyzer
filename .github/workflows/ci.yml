@@ -298,6 +298,39 @@ jobs:
           run_nonempty -p bsl-analyzer --test vector_journal_cli
       - run: cargo test --all --no-fail-fast
 
+  corpus-contract:
+    # The platform help corpus is not in the repository (#312) and CI does not
+    # fetch it. The built-in interface facts serve every run, so the tests marked
+    # `corpus_contract` (which assert on the texts of the pinned corpus and refuse
+    # to run on the facts) stay ignored here; they run on a machine that holds the
+    # corpus. What this job pins is the text path of the help loader, on synthetic
+    # fixtures (`tests/fixtures/help/corpus.json`, invented descriptions,
+    # parameter descriptions and examples) and the built-in facts: each call must
+    # execute at least one test, so an ignored or filtered-out suite fails the job.
+    name: Corpus contract
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Help loader text path and built-in facts
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-platform --test help_snapshot_decoder
+          run_nonempty -p bsl-platform --test help_library_default
+          run_nonempty -p bsl-platform --test bundled_facts
+          run_nonempty -p platform-help
+          run_nonempty -p ide --test platform_help_fixture
+          run_nonempty -p bsl-analyzer --test platform_help_process
+
   windows-mcp:
     name: Windows MCP transports + secure broker
     runs-on: windows-latest

@@ -54,6 +54,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_not_first_in_except() {
         let code = r#"Процедура Тест()
     НачатьТранзакцию();
@@ -76,6 +77,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_outside_try_catch() {
         let code = r#"Процедура Тест()
     НачатьТранзакцию();
@@ -93,6 +95,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_in_try_body() {
         let code = r#"Процедура Тест()
     НачатьТранзакцию();
@@ -128,6 +131,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_english_keyword() {
         let code = r#"Procedure Test()
     BeginTransaction();
@@ -145,6 +149,7 @@ EndProcedure"#;
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_comprehensive() {
         let code = r#"Функция Тест()
     НачатьТранзакцию();
@@ -214,6 +219,7 @@ EndFunction
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_nested_try_body_rollback_snapshot() {
         check_diagnostics_snapshot_for(
             r#"Процедура Тест()

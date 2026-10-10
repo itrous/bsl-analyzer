@@ -55,6 +55,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_code_between() {
         let code = r#"Процедура Тест()
     НачатьТранзакцию();
@@ -77,6 +78,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_inside_try() {
         let code = r#"Процедура Тест()
     Попытка
@@ -99,6 +101,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_no_try_after() {
         let code = r#"Процедура Тест()
     НачатьТранзакцию();
@@ -131,6 +134,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_english_keyword() {
         let code = r#"Procedure Test()
     BeginTransaction();
@@ -148,6 +152,7 @@ EndProcedure"#;
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_case_insensitive() {
         let code = r#"Процедура Тест()
     НАЧАТЬТРАНЗАКЦИЮ();
@@ -202,6 +207,7 @@ EndProcedure"#;
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn begin_in_preproc_asymmetric_then_try_else_missing() {
         let code = r#"Процедура Тест()
     НачатьТранзакцию();
@@ -249,6 +255,7 @@ EndProcedure"#;
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn begin_in_preproc_no_else_branch_still_flagged() {
         let code = r#"Процедура Тест()
     НачатьТранзакцию();
@@ -274,6 +281,7 @@ EndProcedure"#;
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_multiple_violations_in_one_module() {
         let code = r#"Процедура ПровестиДокумент()
     НачатьТранзакцию();

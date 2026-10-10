@@ -11,6 +11,14 @@ impl GlobalState {
         let db = self.analysis_host.raw_database_mut();
         apply_project_config_to_db(db, &config);
         apply_compatibility_mode_to_db(db, self.project.as_ref());
+        if let Some(project) = self.project.as_ref() {
+            if let Some(warning) =
+                platform_help::source_change_warning(Some(&project.config), &project.root)
+            {
+                tracing::warn!("{warning}");
+                self.show_warning_message(warning);
+            }
+        }
     }
 }
 

@@ -69,6 +69,7 @@ fn mismatch_count(db: &RootDatabaseImpl, file_id: FileId) -> usize {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn max_of_numbers_is_a_number_for_format() {
     let fixture = r#"
 //- /test.bsl
@@ -92,6 +93,7 @@ fn max_of_numbers_is_a_number_for_format() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn min_of_dates_is_a_date_for_format() {
     let fixture = r#"
 //- /test.bsl
@@ -111,6 +113,7 @@ fn min_of_dates_is_a_date_for_format() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn english_max_follows_first_argument_too() {
     let fixture = r#"
 //- /test.bsl
@@ -130,6 +133,7 @@ EndProcedure
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn max_of_strings_is_still_rejected_by_format() {
     let fixture = r#"
 //- /test.bsl
@@ -149,6 +153,7 @@ fn max_of_strings_is_still_rejected_by_format() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn max_of_a_comparable_union_keeps_that_union() {
     let fixture = r#"
 //- /test.bsl
@@ -196,6 +201,7 @@ fn max_of_an_unknown_first_argument_is_unknown() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn max_of_a_foreign_first_argument_is_not_narrowed_to_it() {
     let fixture = r#"
 //- /test.bsl
@@ -225,6 +231,7 @@ fn max_of_a_foreign_first_argument_is_not_narrowed_to_it() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_module_method_named_max_is_not_narrowed() {
     let fixture = r#"
 //- /test.bsl
@@ -254,6 +261,7 @@ fn a_module_method_named_max_is_not_narrowed() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_global_export_named_max_is_not_narrowed() {
     // The inline fixture format cannot carry the `<Global>` flag, so the global module
     // and the caller live at their paths in the on-disk `designer` configuration.
@@ -291,6 +299,7 @@ fn a_global_export_named_max_is_not_narrowed() {
 /// named `Макс` leaves the call to the platform function and the result is still the
 /// first argument's type.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_module_variable_named_max_leaves_the_narrowing_in_place() {
     let fixture = r#"
 //- /test.bsl
@@ -316,6 +325,7 @@ fn a_module_variable_named_max_leaves_the_narrowing_in_place() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_local_variable_named_max_leaves_the_narrowing_in_place() {
     let fixture = r#"
 //- /test.bsl

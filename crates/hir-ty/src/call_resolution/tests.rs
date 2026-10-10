@@ -29,6 +29,7 @@ fn select_candidates(
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn candidate_shape() {
     let db = InMemoryDb::new();
     let russian = select_candidates(&db, "Выбрать");
@@ -82,6 +83,7 @@ fn candidate_shape() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn candidate_identity_rejects_duplicates() {
     let db = InMemoryDb::new();
     let resolution = select_candidates(&db, "Select");
@@ -108,6 +110,7 @@ fn candidate_identity_rejects_duplicates() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn checked_candidate_set_rejects_duplicates_in_release() {
     let db = InMemoryDb::new();
     let resolution = select_candidates(&db, "Select");

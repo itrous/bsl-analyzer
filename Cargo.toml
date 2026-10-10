@@ -2,16 +2,22 @@
 resolver = "2"
 members = [
     "crates/*",
+    "crates/bsl-platform/tools/html-parser",
     "xtask",
 ]
 
 [workspace.package]
-version = "0.2.86"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["BSL Analyzer Contributors"]
 repository = "https://github.com/itrous/bsl-analyzer"
 rust-version = "1.95"
+
+[workspace.lints.rust]
+# `--cfg corpus_contract` selects the tests that need the platform help corpus;
+# see docs/contributing/DEVELOPMENT_RULES.md.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(corpus_contract)'] }
 
 [workspace.dependencies]
 bsl-analyzer = { path = "crates/bsl-analyzer" }
@@ -24,6 +30,8 @@ bsl-config = { path = "crates/bsl-config" }
 bsl-conventions = { path = "crates/bsl-conventions" }
 bsl-metadata = { path = "crates/bsl-metadata" }
 bsl-platform = { path = "crates/bsl-platform" }
+platform-help = { path = "crates/platform-help" }
+html-parser = { path = "crates/bsl-platform/tools/html-parser" }
 bsl-types = { path = "crates/bsl-types" }
 cfg = { path = "crates/cfg" }
 cfg-types = { path = "crates/cfg-types" }

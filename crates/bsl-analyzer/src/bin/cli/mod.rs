@@ -10,6 +10,7 @@ pub mod format;
 pub mod logging;
 pub mod lsp;
 pub mod mcp;
+pub mod platform_help;
 pub mod rules;
 pub mod search_baseline;
 pub mod smoke;

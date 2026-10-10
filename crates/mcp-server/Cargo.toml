@@ -21,6 +21,7 @@ parser.workspace = true
 project-model.workspace = true
 sdbl-hir.workspace = true
 syntax.workspace = true
+profile.workspace = true
 line-index.workspace = true
 ide.workspace = true
 base-db.workspace = true
@@ -107,3 +108,6 @@ jsonschema = { version = "0.51.0", default-features = false }
 # The one-implementation gate parses Rust sources: a text scan would count the word
 # inside comments and doc examples, and this gate exists to be believed.
 syn.workspace = true
+
+[lints]
+workspace = true

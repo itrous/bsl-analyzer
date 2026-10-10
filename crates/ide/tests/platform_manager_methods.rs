@@ -155,6 +155,7 @@ fn rendered_arg_mismatches(db: &RootDatabaseImpl, file_id: FileId) -> Vec<(Strin
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn catalog_create_item_returns_catalog_object_metadata_ref() {
     let fixture = r#"
 //- /test.bsl
@@ -177,6 +178,7 @@ fn catalog_create_item_returns_catalog_object_metadata_ref() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn aliased_manager_create_item_resolves_through_lookup_method() {
     let fixture = r#"
 //- /test.bsl
@@ -194,6 +196,7 @@ fn aliased_manager_create_item_resolves_through_lookup_method() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn catalog_find_by_code_returns_catalog_ref() {
     let fixture = r#"
 //- /test.bsl
@@ -313,6 +316,7 @@ fn catalog_object_chained_write_resolves_through_metadata_ref_lookup() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_create_item_offers_catalog_object_methods() {
     let source = "\
 Процедура Тест()
@@ -338,6 +342,7 @@ fn completion_after_create_item_offers_catalog_object_methods() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn catalog_object_chained_unknown_method_still_emits_diagnostic() {
     let fixture = r#"
 //- /test.bsl
@@ -389,6 +394,7 @@ fn document_object_chained_write_resolves_through_metadata_ref_lookup() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn document_object_chained_unknown_method_emits_unresolved_method_call() {
     let fixture = r#"
 //- /test.bsl
@@ -565,6 +571,7 @@ fn issue80_select_filter_uses_structure_overload() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn issue80_select_rejects_argument_incompatible_with_all_overloads() {
     let (db, file_id) = setup_with_target_path(ISSUE80_REGISTER_FIXTURE, "/invalid.bsl");
     let mismatches = rendered_arg_mismatches(&db, file_id);
@@ -581,6 +588,7 @@ fn issue80_select_rejects_argument_incompatible_with_all_overloads() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn register_recordset_typo_emits_method_not_found() {
     let fixture = r#"
 //- /test.bsl
@@ -709,6 +717,7 @@ fn record_set_filter_method_resolves_through_scalar_key() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn aliased_record_set_workspace_method_unresolved_keeps_strict_diagnostic() {
     let fixture = r#"
 //- /test.bsl
@@ -768,6 +777,7 @@ fn metadata_ref_object_module_workspace_method_resolves() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn metadata_ref_object_module_non_exported_emits_method_not_export() {
     let fixture = r#"
 //- /Catalogs/Справочник1/Ext/ObjectModule.bsl
@@ -823,6 +833,7 @@ fn metadata_ref_workspace_then_platform_fallback() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn metadata_ref_total_miss_emits_method_not_found() {
     let fixture = r#"
 //- /Catalogs/Справочник1/Ext/ObjectModule.bsl
@@ -857,6 +868,7 @@ fn metadata_ref_total_miss_emits_method_not_found() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn catalog_ref_does_not_consult_object_module() {
     let fixture = r#"
 //- /Catalogs/Справочник1/Ext/ObjectModule.bsl
@@ -974,6 +986,7 @@ fn this_object_direct_non_exported_call_resolves() {
 /// `ManagerModule.bsl`. Refusing to resolve it would trade a false finding for a
 /// silently lost type — and with it every check downstream of that type.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn an_unread_manager_module_still_resolves_the_platform_manager_method() {
     let fixture = r#"
 //- /Catalogs/Справочник1/Ext/ManagerModule.bsl

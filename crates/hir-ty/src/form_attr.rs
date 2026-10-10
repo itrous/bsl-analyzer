@@ -3,6 +3,7 @@ use bsl_types::builders::Builders;
 use bsl_types::facet::{FormDataFacet, MdoRefFacet};
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::{MetadataKind, TypeId};
+use bsl_types::testing::RootConfigCtx;
 use hir_def::resolver::Resolver;
 use hir_def::Name;
 
@@ -50,6 +51,52 @@ pub fn lower_form_attribute_to_typeid(
     }
 
     attribute_type_to_typeid(db, &attr.attr_type, resolver)
+}
+
+/// The application value `РеквизитФормыВЗначение` turns a form attribute into, where
+/// the attribute's declared type names it unambiguously.
+///
+/// The parser keeps one `Ref` shape for both `cfg:CatalogObject.X` and
+/// `cfg:CatalogRef.X`, so a plain attribute of a kind that has references is not
+/// trusted: a reference converts to itself, an object to an object, and the two
+/// spellings are indistinguishable here. The main attribute is always the object,
+/// and a data processor or report has no reference to be confused with.
+pub(crate) fn form_attribute_value_typeid(
+    db: &dyn TypeKernelDb,
+    attr: &FormAttribute,
+    resolver: &dyn MetadataResolver,
+) -> Option<TypeId> {
+    match &attr.attr_type {
+        AttributeType::Ref { mdo_type, name }
+            if attr.is_main || MetadataKind::ref_kind_for(*mdo_type).is_none() =>
+        {
+            let kind = MetadataKind::object_kind_for(*mdo_type)?;
+            Some(db.metadata_ref(kind, name.clone(), &RootConfigCtx))
+        }
+        AttributeType::Platform(
+            bsl_metadata::PlatformValueType::ValueTable
+            | bsl_metadata::PlatformValueType::ValueTree,
+        ) => Some(attribute_type_to_typeid(db, &attr.attr_type, resolver))
+            .filter(|ty| *ty != db.unknown()),
+        _ => None,
+    }
+}
+
+/// [`form_attribute_value_typeid`] of the attribute `name` of the managed form this
+/// module belongs to.
+pub(crate) fn resolve_form_attribute_value(
+    db: &dyn HirDatabase,
+    resolver: &Resolver,
+    name: &str,
+) -> Option<TypeId> {
+    if !crate::this_object::is_managed_form_module(db, resolver) {
+        return None;
+    }
+    let module_id = resolver.module_id()?;
+    let metadata = db.module_metadata(module_id);
+    let attr = metadata.form.as_ref()?.find_attribute(name)?;
+    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
+    form_attribute_value_typeid(db, attr, &obj_resolver)
 }
 
 pub(crate) fn resolve_form_attribute(
@@ -191,6 +238,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn platform_object_fallback_attribute_lowers_to_platform_object() {
         use bsl_metadata::PlatformValueType;
         let db = InMemoryDb::new();
@@ -442,5 +490,84 @@ mod tests {
             &Name::new("Дата")
         )
         .is_none());
+    }
+
+    fn value_of(db: &InMemoryDb, attr: &FormAttribute) -> Option<TypeId> {
+        form_attribute_value_typeid(db, attr, &ConfigsObjectResolver(&[]))
+    }
+
+    #[test]
+    fn the_main_attribute_converts_to_its_object() {
+        let db = InMemoryDb::new();
+        for (mdo_type, kind) in [
+            (MdoType::DataProcessor, MetadataKind::DataProcessorObject),
+            (MdoType::Report, MetadataKind::ReportObject),
+            (MdoType::Catalog, MetadataKind::CatalogObject),
+            (MdoType::Document, MetadataKind::DocumentObject),
+            (MdoType::ExternalDataProcessor, MetadataKind::ExternalDataProcessorObject),
+        ] {
+            let attr =
+                main_attr("Объект", AttributeType::Ref { mdo_type, name: "Имя".to_string() });
+            let value = value_of(&db, &attr).expect("main attribute value");
+            assert_metadata_ref(&db, value, kind, "Имя");
+        }
+    }
+
+    #[test]
+    fn a_plain_object_attribute_converts_only_where_no_reference_exists() {
+        let db = InMemoryDb::new();
+        let processor = plain(
+            "Помощник",
+            AttributeType::Ref {
+                mdo_type: MdoType::DataProcessor, name: "Помощник".to_string()
+            },
+        );
+        let value = value_of(&db, &processor).expect("a data processor has no reference");
+        assert_metadata_ref(&db, value, MetadataKind::DataProcessorObject, "Помощник");
+
+        let catalog = plain(
+            "Контрагент",
+            AttributeType::Ref {
+                mdo_type: MdoType::Catalog, name: "Контрагенты".to_string()
+            },
+        );
+        assert_eq!(value_of(&db, &catalog), None);
+    }
+
+    #[test]
+    fn value_table_and_tree_attributes_convert_to_the_collections() {
+        use bsl_metadata::PlatformValueType;
+        let db = InMemoryDb::new();
+        let mut table = plain("Таблица", AttributeType::Platform(PlatformValueType::ValueTable));
+        table.columns = vec![FormAttributeColumn {
+            name: "Колонка".to_string(),
+            attr_type: AttributeType::Unknown,
+        }];
+        let value = value_of(&db, &table).expect("value table");
+        assert!(matches!(db.lookup_type(value), TypeKind::ValueTable(_)), "{value:?}");
+
+        let tree = plain("Дерево", AttributeType::Platform(PlatformValueType::ValueTree));
+        let tree_value = value_of(&db, &tree).expect("value tree");
+        assert_eq!(
+            tree_value,
+            attribute_type_to_typeid(&db, &tree.attr_type, &ConfigsObjectResolver(&[]))
+        );
+        assert_ne!(tree_value, db.unknown());
+    }
+
+    #[test]
+    fn other_attributes_stay_unconverted() {
+        use bsl_metadata::PlatformValueType;
+        let db = InMemoryDb::new();
+        for attr_type in [
+            AttributeType::Platform(PlatformValueType::ValueList),
+            AttributeType::Platform(PlatformValueType::DynamicList),
+            AttributeType::String { length: None },
+            AttributeType::AnyObjectRef { mdo_type: MdoType::Catalog },
+            AttributeType::Unknown,
+        ] {
+            let attr = main_attr("Объект", attr_type.clone());
+            assert_eq!(value_of(&db, &attr), None, "{attr_type:?}");
+        }
     }
 }

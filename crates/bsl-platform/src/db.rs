@@ -1,6 +1,11 @@
+use crate::help::{
+    InstallOutcome, PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpStatus,
+    RestartRequired,
+};
+use crate::snapshot::PlatformSnapshot;
 use crate::types::{
-    ConstructorDocs, GlobalFunction, PlatformConstructor, PlatformMethod, PlatformProperty,
-    PlatformType, PropertyDocs,
+    ConstructorDocs, GlobalFunction, MethodDocs, PlatformConstructor, PlatformMethod,
+    PlatformProperty, PlatformType, PropertyDocs,
 };
 use once_cell::sync::OnceCell;
 use rustc_hash::FxHashMap;
@@ -12,7 +17,44 @@ static PLATFORM_DATA_SINGLETON: OnceCell<PlatformDataInner> = OnceCell::new();
 
 pub const GLOBAL_CONTEXT_OWNER: &str = "Global context";
 
+/// Fixes the process snapshot to `help` unless one is already fixed.
+pub(crate) fn install(help: PlatformHelp) -> Result<InstallOutcome, RestartRequired> {
+    if let Some(active) = PLATFORM_DATA_SINGLETON.get() {
+        return compare_active(active, help.request);
+    }
+    let requested = help.request.clone();
+    match PLATFORM_DATA_SINGLETON.set(PlatformDataInner::from_help(help)) {
+        Ok(()) => Ok(InstallOutcome::Installed),
+        Err(_) => compare_active(
+            PLATFORM_DATA_SINGLETON.get().expect("a failed set means a value is present"),
+            requested,
+        ),
+    }
+}
+
+fn compare_active(
+    active: &PlatformDataInner,
+    requested: PlatformHelpRequest,
+) -> Result<InstallOutcome, RestartRequired> {
+    if active.request == requested {
+        Ok(InstallOutcome::AlreadyActive)
+    } else {
+        Err(RestartRequired { active: active.request.clone(), requested })
+    }
+}
+
+pub(crate) fn installed_request() -> Option<&'static PlatformHelpRequest> {
+    PLATFORM_DATA_SINGLETON.get().map(|data| &data.request)
+}
+
 pub struct PlatformDataInner {
+    request: PlatformHelpRequest,
+    origin: Option<PlatformHelpOrigin>,
+    missing_reason: Option<String>,
+    method_docs: Vec<MethodDocs>,
+    global_function_docs: Vec<MethodDocs>,
+    constructor_docs: Vec<ConstructorDocs>,
+    property_docs: Vec<PropertyDocs>,
     types: Vec<PlatformType>,
     types_by_name: FxHashMap<SmolStr, usize>,
     /// Case-folded English name per type, parallel to `types`, so resolving a
@@ -62,13 +104,46 @@ pub struct PlatformDataInner {
 }
 
 impl PlatformDataInner {
+    /// The process snapshot. Without a prior [`crate::install_platform_help`] the
+    /// first access fixes [`PlatformHelp::unselected`].
     pub fn instance() -> &'static Self {
-        PLATFORM_DATA_SINGLETON.get_or_init(Self::new)
+        PLATFORM_DATA_SINGLETON.get_or_init(|| {
+            let help = PlatformHelp::unselected();
+            // The corpus-contract suite asserts on the texts of its pinned
+            // corpus: running it on the built-in facts or on nothing is an
+            // error, never a silent skip.
+            #[cfg(corpus_contract)]
+            if help
+                .origin
+                .as_ref()
+                .is_none_or(|origin| origin.source != crate::help::PlatformHelpSourceKind::External)
+            {
+                panic!(
+                    "corpus contract run without a usable corpus: {}",
+                    help.missing_reason.as_deref().unwrap_or(
+                        "the built-in interface facts are served; set BSL_PLATFORM_HELP_CORPUS"
+                    )
+                );
+            }
+            Self::from_help(help)
+        })
     }
 
-    fn new() -> Self {
-        let mut types: Vec<PlatformType> =
-            crate::generated::PLATFORM_TYPES.iter().map(PlatformType::from).collect();
+    /// A standalone instance over `help`, outside the process snapshot. Lets tests
+    /// and tools compare sources side by side.
+    pub fn from_help(help: PlatformHelp) -> Self {
+        let PlatformHelp { request, snapshot, origin, missing_reason } = help;
+        let PlatformSnapshot {
+            mut types,
+            mut methods,
+            mut global_functions,
+            mut constructors,
+            properties,
+            method_docs,
+            global_function_docs,
+            constructor_docs,
+            property_docs,
+        } = snapshot;
 
         apply_docs_gap_iter_types_overlay(&mut types);
         apply_docs_gap_type_context_overlay(&mut types);
@@ -110,12 +185,6 @@ impl PlatformDataInner {
                 }
             }
         }
-
-        let mut global_functions: Vec<GlobalFunction> =
-            crate::generated::PLATFORM_GLOBAL_FUNCTIONS.iter().map(GlobalFunction::from).collect();
-
-        let mut methods: Vec<PlatformMethod> =
-            crate::generated::PLATFORM_METHODS.iter().map(PlatformMethod::from).collect();
 
         apply_docs_gap_method_overlay(&mut methods, &global_functions);
         apply_docs_gap_member_context_overlay(&mut methods, &mut global_functions, &types);
@@ -168,17 +237,14 @@ impl PlatformDataInner {
         }
 
         let mut method_docs_by_id = FxHashMap::default();
-        for (idx, docs) in crate::generated::METHOD_DOCS.iter().enumerate() {
+        for (idx, docs) in method_docs.iter().enumerate() {
             method_docs_by_id.insert(docs.method_id, idx);
         }
 
         let mut global_function_docs_by_id = FxHashMap::default();
-        for (idx, docs) in crate::generated::GLOBAL_FUNCTION_DOCS.iter().enumerate() {
+        for (idx, docs) in global_function_docs.iter().enumerate() {
             global_function_docs_by_id.insert(docs.method_id, idx);
         }
-
-        let mut constructors: Vec<PlatformConstructor> =
-            crate::generated::PLATFORM_CONSTRUCTORS.iter().map(PlatformConstructor::from).collect();
 
         apply_docs_only_variadic_overlay(&mut constructors);
 
@@ -192,12 +258,9 @@ impl PlatformDataInner {
         }
 
         let mut constructor_docs_by_id = FxHashMap::default();
-        for (idx, docs) in crate::generated::CONSTRUCTOR_DOCS.iter().enumerate() {
+        for (idx, docs) in constructor_docs.iter().enumerate() {
             constructor_docs_by_id.insert(docs.constructor_id, idx);
         }
-
-        let properties: Vec<PlatformProperty> =
-            crate::generated::PLATFORM_PROPERTIES.iter().map(PlatformProperty::from).collect();
 
         let mut properties_by_name = FxHashMap::default();
         let mut properties_by_type: FxHashMap<SmolStr, Vec<usize>> = FxHashMap::default();
@@ -221,7 +284,7 @@ impl PlatformDataInner {
         }
 
         let mut property_docs_by_id = FxHashMap::default();
-        for (idx, docs) in crate::generated::PROPERTY_DOCS.iter().enumerate() {
+        for (idx, docs) in property_docs.iter().enumerate() {
             property_docs_by_id.insert(docs.property_id, idx);
         }
 
@@ -256,6 +319,13 @@ impl PlatformDataInner {
         }
 
         Self {
+            request,
+            origin,
+            missing_reason,
+            method_docs,
+            global_function_docs,
+            constructor_docs,
+            property_docs,
             types,
             types_by_name,
             type_en_folded,
@@ -279,6 +349,29 @@ impl PlatformDataInner {
             ambiguous_type_names,
             form_extension_property_names,
         }
+    }
+
+    /// The source this instance serves.
+    pub fn help_request(&self) -> &PlatformHelpRequest {
+        &self.request
+    }
+
+    /// Where the served snapshot came from; `None` when no snapshot is served.
+    pub fn help_origin(&self) -> Option<&PlatformHelpOrigin> {
+        self.origin.as_ref()
+    }
+
+    /// Why the requested source serves no corpus of its own: the whole story
+    /// when [`Self::help_origin`] is `None`, and why `auto` degraded to the
+    /// built-in facts when it serves them.
+    pub fn help_missing_reason(&self) -> Option<&str> {
+        self.missing_reason.as_deref()
+    }
+
+    /// Trust in the served help for a project target. Informational: it never
+    /// proves that an API is absent.
+    pub fn help_status_for_target(&self, target: Option<&str>) -> PlatformHelpStatus {
+        crate::help::status_for_target(self.origin.as_ref(), target)
     }
 
     /// Whether `name` (any case, RU or EN) names more than one platform type,
@@ -353,10 +446,9 @@ impl PlatformDataInner {
         &self.global_functions
     }
 
-    pub fn get_method_docs(&self, method_id: u32) -> Option<crate::types::MethodDocs> {
+    pub fn get_method_docs(&self, method_id: u32) -> Option<MethodDocs> {
         let idx = *self.method_docs_by_id.get(&method_id)?;
-        let raw_docs = crate::generated::METHOD_DOCS.get(idx)?;
-        Some(crate::types::MethodDocs::from(raw_docs))
+        self.method_docs.get(idx).cloned()
     }
 
     pub fn get_constructors(&self, type_name: &str) -> Vec<&PlatformConstructor> {
@@ -373,14 +465,12 @@ impl PlatformDataInner {
 
     pub fn get_constructor_docs(&self, constructor_id: u32) -> Option<ConstructorDocs> {
         let idx = *self.constructor_docs_by_id.get(&constructor_id)?;
-        let raw = crate::generated::CONSTRUCTOR_DOCS.get(idx)?;
-        Some(ConstructorDocs::from(raw))
+        self.constructor_docs.get(idx).cloned()
     }
 
-    pub fn get_global_function_docs(&self, function_id: u32) -> Option<crate::types::MethodDocs> {
+    pub fn get_global_function_docs(&self, function_id: u32) -> Option<MethodDocs> {
         let idx = *self.global_function_docs_by_id.get(&function_id)?;
-        let raw_docs = crate::generated::GLOBAL_FUNCTION_DOCS.get(idx)?;
-        Some(crate::types::MethodDocs::from(raw_docs))
+        self.global_function_docs.get(idx).cloned()
     }
 
     pub fn get_property(&self, type_name: &str, prop_name: &str) -> Option<&PlatformProperty> {
@@ -462,8 +552,7 @@ impl PlatformDataInner {
 
     pub fn get_property_docs(&self, property_id: u32) -> Option<PropertyDocs> {
         let idx = *self.property_docs_by_id.get(&property_id)?;
-        let raw = crate::generated::PROPERTY_DOCS.get(idx)?;
-        Some(PropertyDocs::from(raw))
+        self.property_docs.get(idx).cloned()
     }
 
     pub fn get_keyword_docs(&self, keyword: &str) -> Option<crate::types::KeywordDocs> {
@@ -622,7 +711,11 @@ fn apply_docs_gap_method_overlay(
             continue;
         };
 
-        let next_id = methods.iter().map(|m| m.id).max().unwrap_or(0) + 1;
+        // A corpus whose ids already reach the top of the range leaves no id for
+        // the synthesized method; it then stays without it rather than alias one.
+        let Some(next_id) = methods.iter().map(|m| m.id).max().unwrap_or(0).checked_add(1) else {
+            continue;
+        };
         methods.push(PlatformMethod {
             id: next_id,
             type_name: SmolStr::new(*type_name),
@@ -925,6 +1018,7 @@ mod display_name_tests {
     /// до `&lt;Имя`, а настоящее имя лежит в синтаксисе документации. Проверка требует,
     /// чтобы такие записи в каталоге БЫЛИ, иначе она зелена вхолостую.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn template_manager_methods_display_their_real_name() {
         let data = PlatformDataInner::instance();
         let templated: Vec<_> =
@@ -1210,6 +1304,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn curated_overlay_corrects_dom_append_child_in_both_languages() {
         let data = PlatformDataInner::instance();
         let via_ru = data
@@ -1721,6 +1816,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn prefixed_methods_resolve_bilingual_case_insensitively_in_stable_id_order() {
         let ru = find_prefixed_methods("InformationRegisterManager", "Выбрать");
         let en = find_prefixed_methods("InformationRegisterManager", "Select");
@@ -1737,6 +1833,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn prefixed_methods_deduplicate_ids_and_sort_stably() {
         let information = find_prefixed_methods("InformationRegisterManager", "Select");
         let accumulation = find_prefixed_methods("AccumulationRegisterManager", "Select");
@@ -1759,6 +1856,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn prefixed_methods_do_not_cross_manager_families() {
         assert_eq!(
             find_prefixed_methods("InformationRegisterManager", "Select")

@@ -12,3 +12,6 @@ doctest = false
 syntax.workspace = true
 parser.workspace = true
 lexer.workspace = true
+
+[lints]
+workspace = true

@@ -63,6 +63,7 @@ const MODULE: &str = r#"
 "#;
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn documented_structure_fields_complete_after_dot() {
     let items = complete(&format!(
         "{MODULE}\n\
@@ -85,6 +86,7 @@ fn documented_structure_fields_complete_after_dot() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn undocumented_structure_offers_only_platform_methods() {
     let items = complete(
         "\n//- /test.bsl\n\
@@ -150,6 +152,7 @@ fn documented_structure_beside_undefined_completes_inside_its_own_body() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn structure_of_a_value_type_completes_its_documented_fields() {
     // `Структура из <Тип>` names the type of the values, not of the structure: the fields still
     // come from the bullets, and the slot is still a structure.
@@ -198,6 +201,7 @@ fn structure_of_a_value_type_completes_on_a_parameter() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn fields_documented_under_an_array_stay_off_the_bare_structure_beside_it() {
     // Two untyped structures in one slot, one set of bullets: they describe the array element, and
     // the alternative that is just `Структура` must not inherit them.
@@ -293,6 +297,7 @@ fn the_collection_marker_is_read_in_either_language() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn an_optional_structure_documented_without_fields_keeps_the_keys_the_body_proves() {
     // `Неопределено, Структура` is how an optional result is written. The untyped structure then
     // stands in a union arm, and filling only a bare one leaves the common case documented into

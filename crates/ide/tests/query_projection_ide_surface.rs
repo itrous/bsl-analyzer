@@ -33,6 +33,7 @@ fn var_ty(db: &RootDatabaseImpl, file_id: FileId, var_lower: &str) -> Option<Typ
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn projection_fields_visible_via_hir_type_accessors() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -53,6 +54,7 @@ fn projection_fields_visible_via_hir_type_accessors() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn projection_fields_surface_in_enumerate_fields() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -221,6 +223,7 @@ fn hover_on_literal_structure_lists_keys_as_typed_fields() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_on_projection_selection_lists_columns_and_platform_members() {
     let items = complete(
         r#"//- /test.bsl
@@ -247,6 +250,7 @@ fn completion_on_projection_selection_lists_columns_and_platform_members() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_on_inline_query_union_receiver_lists_projection_columns() {
     let items = complete(
         r#"//- /test.bsl
@@ -268,6 +272,7 @@ fn completion_on_inline_query_union_receiver_lists_projection_columns() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_inline_query_union_receiver_field_renders_type() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -287,6 +292,7 @@ fn hover_on_inline_query_union_receiver_field_renders_type() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_projection_none_omits_fields_block() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -308,6 +314,7 @@ fn hover_on_projection_none_omits_fields_block() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_projection_selection_lists_field_names() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -320,6 +327,7 @@ fn hover_on_projection_selection_lists_field_names() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_projection_selection_renders_cast_precision_and_scale() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -332,6 +340,7 @@ fn hover_on_projection_selection_renders_cast_precision_and_scale() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_projection_selection_renders_cast_string_length() {
     let fixture = r#"//- /test.bsl
 Функция Тест()
@@ -344,6 +353,7 @@ fn hover_on_projection_selection_renders_cast_string_length() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_iteration_row_from_batched_helper_renders_cast_precision() {
     let fixture = r#"//- /test.bsl
 Функция ПолучитьТЗ() Экспорт
@@ -362,6 +372,7 @@ fn hover_on_iteration_row_from_batched_helper_renders_cast_precision() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_on_projection_selection_renders_cast_precision_only_number() {
     let fixture = r#"//- /test.bsl
 Функция Тест()

@@ -120,6 +120,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn query_relevance_is_the_one_hidden_member() {
         assert_eq!(hidden_type_member("Запрос", "ТребуемаяАктуальностьДанных"), Some(v(3, 14)));
         assert_eq!(hidden_type_member("Query", "RequiredDataRelevance"), Some(v(3, 14)));

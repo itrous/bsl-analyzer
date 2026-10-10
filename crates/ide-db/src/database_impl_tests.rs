@@ -4272,6 +4272,7 @@ fn common_module_body_lookup_marks_declared_but_unmapped_body() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn platform_global_read_does_not_force_reaching_definitions() {
     use hir::HirDatabase;
 
@@ -5043,6 +5044,7 @@ fn infer_weaving_resolves_base_sibling() {
 /// method's return, so the assigned variable types as Число. Without the `&Вместо` proceed
 /// wiring `ПродолжитьВызов` would carry only the platform global's generic (non-Число) return.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn infer_weaving_types_proceed_with_call_return() {
     use crate::weaving_target;
 
@@ -7900,6 +7902,7 @@ fn an_external_root_matches_its_canonical_spelling_and_keys_by_the_configured_on
 /// object's methods live under its bare platform type, and that path must find
 /// them too, or the same call is typed but not navigable.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn navigation_resolves_a_platform_method_on_an_external_object() {
     use bsl_types::builders::Builders;
     use bsl_types::kind::MetadataKind;

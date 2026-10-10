@@ -198,6 +198,7 @@ fn completion_english_prefix_ranks_metadata_plural_in_top_tier() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_context_type_boost_floats_matching_local() {
     // `Цел` expects a `Число` argument. The Number-typed local must float above the
     // String-typed one even though it sorts later alphabetically — only the
@@ -320,6 +321,7 @@ fn completion_unresolved_call_arg_does_not_leak_outer_context() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_constructor_arg_uses_constructor_type_not_outer_context() {
     // Cursor is in a constructor argument (`Новый Тип(…)`). The constructor's own
     // parameter type is used, and the outer assignment type must NOT leak in.
@@ -382,6 +384,7 @@ fn completion_empty_prefix_does_not_type_functions() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_new_array_type() {
     let items = complete(
         r#"//- /test.bsl
@@ -412,6 +415,7 @@ fn completion_after_dot_on_new_array_type() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_array_variable_with_prefix() {
     let items = complete(
         r#"//- /test.bsl
@@ -433,6 +437,7 @@ fn completion_after_dot_on_array_variable_with_prefix() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_array_variable_typed_prefix_full_ident() {
     let items = complete(
         r#"//- /test.bsl
@@ -482,6 +487,7 @@ fn completion_after_dot_inside_preproc_branch_has_no_local_to_offer() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_member_substring_is_offered_below_prefix() {
     // `чест` is an interior substring of `Количество`, not a prefix — member
     // matching is now fuzzy, so it is offered, but ranked below the prefix tier.
@@ -545,6 +551,7 @@ fn completion_after_dot_on_common_module_typed_prefix_is_ranked() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_chained_dot_on_array_variable() {
     let items = complete(
         r#"//- /test.bsl
@@ -587,6 +594,7 @@ fn completion_after_dot_on_number_variable_does_not_offer_array_methods() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_with_cursor_on_keyword_method_name_after_dot() {
     let items = complete(
         r#"//- /test.bsl

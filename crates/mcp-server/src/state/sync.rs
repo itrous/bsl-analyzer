@@ -3849,7 +3849,7 @@ mod tests {
             &sync_project,
             &sync_universe,
             &out,
-            100,
+            stdx::batch::BatchBudget::files(100),
             &crate::graph_db::GraphMeta {
                 revision: 1,
                 fingerprint: crate::graph_db::GraphFp::default(),
@@ -3922,7 +3922,7 @@ mod tests {
             &project,
             &universe,
             &cache.graph_db_path(),
-            100,
+            stdx::batch::BatchBudget::files(100),
             &crate::graph_db::GraphMeta {
                 revision: 1,
                 fingerprint: crate::graph_db::GraphFp::default(),
@@ -4610,7 +4610,7 @@ mod tests {
                 &project,
                 &universe,
                 &out,
-                100,
+                stdx::batch::BatchBudget::files(100),
                 &crate::graph_db::GraphMeta {
                     revision: 1,
                     fingerprint: crate::graph_db::GraphFp::default(),

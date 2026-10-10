@@ -74,6 +74,7 @@ fn spellings(ru: &'static str, en: &'static str) -> impl Iterator<Item = &'stati
 
 /// A guarded name is worth guarding only where the platform actually has it.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn security_entries_match_platform_surface() {
     let mut wrong = Vec::new();
 
@@ -148,6 +149,7 @@ fn known_deviations_are_still_deviating() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn capability_entries_match_platform_surface() {
     let mut wrong = Vec::new();
 

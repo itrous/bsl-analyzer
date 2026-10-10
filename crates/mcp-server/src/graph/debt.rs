@@ -82,6 +82,9 @@ pub(super) enum BuildKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct BuildStart {
     pub(super) kind: BuildKind,
+    /// The debt branch that selected this attempt. Kept with the decision so
+    /// observability reports the scheduler's choice without re-deriving it.
+    pub(super) trigger: &'static str,
     /// Forced builds ignore an equal fingerprint and re-read the project: a config change or
     /// marks nobody consumed cannot be answered by a fingerprint comparison.
     pub(super) forced: bool,
@@ -140,16 +143,20 @@ impl Sponsors {
 pub(crate) struct HookDebt {
     pub(crate) topology: bool,
     pub(crate) roots: bool,
+    /// A bounded context refresh for covered marks was refused. Kept separate
+    /// from topology so retrying marks never promotes a body edit to full refresh.
+    pub(crate) marks: bool,
 }
 
 impl HookDebt {
     pub(crate) fn any(self) -> bool {
-        self.topology || self.roots
+        self.topology || self.roots || self.marks
     }
 
     fn merge(&mut self, other: HookDebt) {
         self.topology |= other.topology;
         self.roots |= other.roots;
+        self.marks |= other.marks;
     }
 }
 
@@ -841,6 +848,10 @@ impl MarkLedger {
         !self.placed.is_empty()
     }
 
+    fn has_uncovered(&self, observed: Option<u64>) -> bool {
+        self.placed.iter().any(|&(_, fact)| observed.is_none_or(|observed| fact > observed))
+    }
+
     /// How many placements the ledger is holding, for a test that has to see the cap hold.
     #[cfg(test)]
     pub(super) fn placements(&self) -> usize {
@@ -1467,8 +1478,22 @@ impl GraphDebt {
     /// Decide what the ledger is owed now that a publication (or a placement) has settled:
     /// marks whose fact no publication has observed need a build, and marks nobody is waiting
     /// on need nothing. Says whether a new obligation was armed.
+    #[cfg(test)]
     pub(super) fn settle_marks(&mut self, now: Instant, in_flight: bool) -> bool {
+        self.settle_marks_through(now, in_flight, None)
+    }
+
+    pub(super) fn settle_marks_through(
+        &mut self,
+        now: Instant,
+        in_flight: bool,
+        observed: Option<u64>,
+    ) -> bool {
         if !self.marks.has_placed() {
+            self.marks.owed = None;
+            return false;
+        }
+        if !self.marks.has_uncovered(observed) {
             self.marks.owed = None;
             return false;
         }
@@ -1504,6 +1529,7 @@ impl GraphDebt {
         }
         self.hook.topology &= !handled.topology;
         self.hook.roots &= !handled.roots;
+        self.hook.marks &= !handled.marks;
         if !self.hook.any() {
             self.hook_revisit = None;
         }
@@ -1522,7 +1548,8 @@ impl GraphDebt {
     /// what raised it.
     pub(super) fn pace_hook_refusal(&mut self, now: Instant) {
         if self.hook.any() {
-            self.hook_revisit = Some(now + HOOK_REVISIT);
+            let delay = if self.hook.marks { OWED_MARKS_GRACE } else { HOOK_REVISIT };
+            self.hook_revisit = Some(now + delay);
         }
     }
 
@@ -2044,24 +2071,26 @@ impl GraphDebt {
             // after their budget was spent.
             decision.start = Some(BuildStart {
                 kind,
+                trigger: "failed_retry",
                 // Attached sponsors, not bystanders: a marks demand joins this retry's mode
                 // only while its OWN budget is open, because joining costs it an attempt.
                 forced: self.forced_demanded() || self.marks_eligible(now),
             });
         } else if ripe(standing.forced) {
-            decision.start = Some(BuildStart { kind, forced: true });
+            decision.start =
+                Some(BuildStart { kind, trigger: "forced_project_reload", forced: true });
         } else if ripe(standing.marks) {
             // Marks nobody consumed: forced, because the fingerprint may be equal — a same-stat
             // edit, or a change the published build straddled — and an ordinary comparison
             // would then answer "nothing to do" for ever.
-            decision.start = Some(BuildStart { kind, forced: true });
+            decision.start = Some(BuildStart { kind, trigger: "owed_context_marks", forced: true });
         } else if ripe(standing.change) {
             if facts.ready {
                 // A delivered change is answered by a comparison, not by a build: an equal
                 // fingerprint IS the answer.
                 decision.check = true;
             } else {
-                decision.start = Some(BuildStart { kind, forced: false });
+                decision.start = Some(BuildStart { kind, trigger: "disk_event", forced: false });
             }
         }
         if decision.start.is_none() && !decision.check && ripe(standing.recovery) {
@@ -2978,7 +3007,9 @@ mod tests {
             }
             out.push(v(
                 "INV-LIVENESS",
-                format!("never settled in {budget} alarm-driven turns, settling builds with {outcome:?}"),
+                format!(
+                    "never settled in {budget} alarm-driven turns, settling builds with {outcome:?}"
+                ),
             ));
         }
     }
@@ -3057,7 +3088,7 @@ mod tests {
 
     /// One hook obligation, for the event that arms it.
     fn a_hook() -> HookDebt {
-        HookDebt { topology: true, roots: false }
+        HookDebt { topology: true, roots: false, marks: false }
     }
 
     /// A reconcile reaches the watcher and the search consumer alike, and both record it. One

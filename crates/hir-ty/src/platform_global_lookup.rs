@@ -236,6 +236,7 @@ mod tests {
     use crate::object_resolver::ConfigsObjectResolver;
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn resolve_platform_global_property_type_returns_declared_ty_for_known_global() {
         let db = bsl_types::testing::InMemoryDb::default();
         let id = resolve_platform_global_property_type(&db, &Name::new("Метаданные"))
@@ -285,6 +286,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn system_enum_member_resolves_end_to_end() {
         let db = bsl_types::testing::InMemoryDb::default();
         let receiver = resolve_platform_system_enum_type(&db, &Name::new("ВидДвиженияБухгалтерии"))

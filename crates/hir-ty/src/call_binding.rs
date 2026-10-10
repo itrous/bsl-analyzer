@@ -43,6 +43,7 @@ mod tests {
     use crate::builtin::builtin_functions;
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn capped_builtin_uses_declared_params_for_compatibility_arity() {
         let db = InMemoryDb::new();
         let builtins = builtin_functions();

@@ -145,6 +145,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn global_function_newer_than_the_minimum_is_reported() {
         let source = r#"
 Процедура Тест()
@@ -174,6 +175,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn the_range_covers_the_called_name() {
         let source = r#"
 Процедура Тест()
@@ -188,6 +190,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_of_a_platform_typed_value_is_dated_by_member_and_owner() {
         let source = r#"
 Процедура Тест()
@@ -211,6 +214,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn constructed_type_newer_than_the_minimum_is_reported() {
         let source = r#"
 Процедура Тест()
@@ -295,6 +299,7 @@ mod tests {
     /// date must never read as "new". The lookup layer returns `None` for it, which
     /// is what the inference check needs to stay silent.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn a_member_without_a_version_is_silent() {
         let data = bsl_platform::PlatformDataInner::instance();
         let undated = data
@@ -345,6 +350,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn an_uncompiled_branch_stays_silent() {
         const CALL: &str =
             "    Результат = СтрЗаменитьПоРегулярномуВыражению(\"abc\", \"b\", \"x\");\n";

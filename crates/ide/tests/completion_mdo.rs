@@ -332,6 +332,7 @@ fn completion_after_dot_on_catalog_ref_includes_tabular_section_with_detail() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_dot_on_tabular_section_shows_platform_methods_regression() {
     let items = complete(&format!(
         r#"{CATALOG_OBJECT_MODULE}
@@ -357,6 +358,7 @@ fn completion_after_dot_on_tabular_section_shows_platform_methods_regression() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_after_add_returns_row_shows_columns_and_line_number() {
     let items = complete(&format!(
         r#"{CATALOG_OBJECT_MODULE}
@@ -456,6 +458,7 @@ fn completion_after_dot_on_unknown_receiver_returns_no_mdo_fields() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_object_manager_fast_path_does_not_show_mdo_fields() {
     let items = complete(
         r#"//- /test.bsl
@@ -509,6 +512,7 @@ fn completion_after_dot_on_information_register_ref_shows_dimensions() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_filter_recorder_detail_contains_wrapper_and_recorder_type() {
     let temp_dir = tempfile::tempdir().expect("create synthetic register config tempdir");
     write_accumulation_register_with_recorder_fixture(temp_dir.path());
@@ -570,6 +574,7 @@ fn completion_bare_ident_in_form_marks_regular_form_attribute() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hover_filter_dimension_price_shows_wrapper_and_value_type() {
     let temp_dir = tempfile::tempdir().expect("create synthetic register config tempdir");
     write_accumulation_register_with_recorder_fixture(temp_dir.path());
@@ -592,6 +597,7 @@ fn hover_filter_dimension_price_shows_wrapper_and_value_type() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_document_object_offers_additional_properties_and_movements() {
     let items = complete(
         r#"//- /test.bsl
@@ -616,6 +622,7 @@ fn completion_document_object_offers_additional_properties_and_movements() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_chain_through_additional_properties_offers_structure_methods() {
     let items = complete(
         r#"//- /test.bsl
@@ -634,6 +641,7 @@ fn completion_chain_through_additional_properties_offers_structure_methods() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_catalog_object_offers_additional_properties() {
     let items = complete(
         r#"//- /test.bsl
@@ -772,6 +780,7 @@ fn completion_object_module_attribute_shadows_hbk_global() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn collection_objects_hidden_in_client_form_method() {
     let items = complete(
         r#"//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -825,6 +834,7 @@ fn collection_objects_restored_under_server_conditional() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn english_collection_root_hidden_in_client_form_method() {
     let items = complete(
         r#"//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -885,6 +895,7 @@ fn assigned_collection_root_still_offers_its_objects() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn typed_collection_local_keeps_object_suggestions_in_client() {
     let items = complete(
         r#"//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -929,6 +940,7 @@ fn assigned_root_in_server_conditional_still_offers_objects() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn shadowed_root_before_assignment_offers_no_objects() {
     let items = complete(
         r#"//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -970,6 +982,7 @@ fn metadata_collection_hidden_behind_typed_local_in_client() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn metadata_collection_objects_offered_in_server_method() {
     let items = complete(
         r#"//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -987,6 +1000,7 @@ fn metadata_collection_objects_offered_in_server_method() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn optional_typed_collection_local_keeps_objects() {
     let items = complete(
         r#"//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -1040,6 +1054,7 @@ fn optional_metadata_local_hides_server_collection() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn shadowed_root_before_assignment_with_prefix_offers_no_objects() {
     let items = complete(
         r#"//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -1076,6 +1091,7 @@ fn metadata_read_before_assignment_stays_root_gated() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn collection_rhs_before_first_assignment_stays_root_gated() {
     let items = complete(
         r#"//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
@@ -1195,6 +1211,7 @@ fn assigned_collection_shadows_same_named_method() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn assigned_local_over_method_beats_same_named_object_member() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     write_catalog_with_metadata_attribute(temp_dir.path());

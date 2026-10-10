@@ -118,6 +118,7 @@ fn assert_any_kind(db: &RootDatabaseImpl, file_id: FileId, local: &str) -> bool 
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn collection_contains_a_description_found_by_full_name() {
     let fixture = r#"
 //- /test.bsl
@@ -132,6 +133,7 @@ fn collection_contains_a_description_found_by_full_name() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn collection_index_of_a_description_found_by_full_name() {
     let fixture = r#"
 //- /test.bsl
@@ -146,6 +148,7 @@ fn collection_index_of_a_description_found_by_full_name() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn global_functions_take_a_description_of_any_kind() {
     let fixture = r#"
 //- /test.bsl
@@ -163,6 +166,7 @@ fn global_functions_take_a_description_of_any_kind() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_single_kind_outside_the_cut_five_is_accepted() {
     let fixture = r#"
 //- /test.bsl
@@ -184,6 +188,7 @@ fn a_single_kind_outside_the_cut_five_is_accepted() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_value_that_is_no_metadata_object_is_still_rejected() {
     // The platform answers each of these with "Несоответствие типов (параметр номер ...)".
     let fixture = r#"
@@ -208,6 +213,7 @@ fn a_value_that_is_no_metadata_object_is_still_rejected() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_documented_narrowing_still_rejects_other_kinds() {
     // The user/role parameter of `ПравоДоступа` admits a role description only; a
     // description of any kind may be something else.
@@ -229,6 +235,7 @@ fn a_documented_narrowing_still_rejects_other_kinds() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_description_that_may_be_absent_is_reported_for_the_absence_only() {
     // `НайтиПоТипу` answers `Неопределено` for a type no metadata object stands
     // behind, and the platform rejects `Содержит(Неопределено)` with

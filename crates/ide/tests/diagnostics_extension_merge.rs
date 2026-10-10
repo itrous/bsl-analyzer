@@ -189,6 +189,7 @@ fn weaving_before_after_on_function_is_not_applicable() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn proceed_with_call_wrong_arg_count_is_reported() {
     let fx = setup_with(PROCEED_BASE, PROCEED_EXT_BAD);
     let diags = fx.analysis.diagnostics(fx.ext_file, &DiagnosticsConfig::all_enabled());

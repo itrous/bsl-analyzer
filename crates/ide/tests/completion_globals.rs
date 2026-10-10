@@ -156,6 +156,7 @@ fn completion_russian_english_collision_emits_once() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn completion_mdo_plural_not_duplicated() {
     let items = complete(
         r#"//- /test.bsl
@@ -424,6 +425,7 @@ fn implicit_local_holding_metadata_name_offers_no_metadata_members() {
 /// Positive control for the three tests above: with nobody holding the name the
 /// very same receivers still complete against the platform globals.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn unheld_global_names_still_offer_platform_members() {
     let error_items = complete(
         r#"//- /test.bsl

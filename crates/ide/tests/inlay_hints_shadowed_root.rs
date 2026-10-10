@@ -45,6 +45,7 @@ fn hint_labels(source: &str) -> Vec<String> {
 /// Positive control: with nobody holding `Справочники`, the chain resolves and
 /// its argument is labelled. Without this the two tests below pass vacuously.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn unheld_manager_chain_labels_its_argument() {
     let labels = hint_labels(
         "Функция Тест()\n    Справочники.Справочник1.НайтиПоКоду(\"К\");\nКонецФункции\n",
@@ -53,6 +54,7 @@ fn unheld_manager_chain_labels_its_argument() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn assignment_to_the_root_still_labels_the_argument() {
     let labels = hint_labels(
         "Функция Тест()\n    Справочники = НеизвестнаяФункция();\n    \
@@ -80,6 +82,7 @@ fn receiver_named_like_a_platform_type_gets_no_hint() {
 /// Hints and signature help read the same resolution: where signature help
 /// declines to name a call, hints must not name its arguments either.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn hints_agree_with_signature_help_on_a_held_root() {
     let source = "Функция Тест()\n    Справочники = НеизвестнаяФункция();\n    \
                   Справочники.Справочник1.НайтиПоКоду(\"К\");\nКонецФункции\n";

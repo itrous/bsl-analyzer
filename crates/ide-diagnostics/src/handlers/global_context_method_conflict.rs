@@ -120,6 +120,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn reports_server_context_collision_and_allows_client_only_global_in_managed_form() {
         let server =
             "&НаСервере\nФункция ПолучитьОбщуюФорму()\n    Возврат Неопределено;\nКонецФункции";
@@ -131,6 +132,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn preserves_unannotated_ba029_collision() {
         let source =
             "Функция ПредставлениеПериода(Начало, Конец)\n    Возврат Начало;\nКонецФункции";
@@ -141,6 +143,7 @@ mod tests {
     /// у проверок независимые тумблеры. Пока 8312 включена, её точный отчёт
     /// выигрывает и дубля нет; выключили — конфликт обязан ответить (github#170).
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn disabling_the_8312_collision_does_not_silence_the_conflict() {
         // `ПроверитьБит` лежит и в списке коллизий 8312, и в глобальных
         // функциях платформы — пересечение, на котором связка и была видна.

@@ -1799,6 +1799,7 @@ mod tests {
 
     /// Russian, English and shouted — one member, one answer, one `symbol`.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn three_spellings_of_one_platform_member_are_one_candidate() {
         let db = build(&[]);
         let ask = |text: &str| {
@@ -2180,6 +2181,7 @@ mod tests {
     /// `not_ready` and skipped — the input has to be a name the platform DOES
     /// hold.
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn the_platform_answers_on_a_host_that_has_built_nothing() {
         let db = build(&[]);
 

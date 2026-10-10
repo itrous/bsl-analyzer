@@ -10,6 +10,7 @@ fn setup(fixture_text: &str) -> (RootDatabaseImpl, FileId) {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn constructor_call_attaches_candidate_resolution() {
     let (db, file_id) = setup(
         r#"
@@ -52,6 +53,7 @@ fn setup_for(fixture_text: &str, target_path: &str) -> (RootDatabaseImpl, FileId
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn builtin_call_attaches_candidate_resolution() {
     let (db, file_id) = setup(
         r#"
@@ -180,6 +182,7 @@ fn user_method_candidate_preserves_client_preprocessor_environment() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn platform_manager_call_attaches_complete_candidate_resolution() {
     let (mut db, file_id) = setup(
         r#"
@@ -215,6 +218,7 @@ fn platform_manager_call_attaches_complete_candidate_resolution() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn constant_refinement_updates_candidate_truth_before_resolution() {
     let (mut db, file_id) = setup(
         r#"

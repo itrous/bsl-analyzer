@@ -133,10 +133,11 @@ mod heap_estimate {
 }
 
 // Condensed per-module data (built from item_tree, no green-tree pin): on the
-// cross-module resolution path. High cap keeps it across chunk-boundary LRU trims
-// so a later chunk doesn't re-derive it. (`module_bodies` below stays low — it is
-// the heavy lowered HIR, needed only while a module's own file is analyzed.)
-#[salsa::tracked(lru = 2048, heap_size = heap_estimate::module_data_heap, returns(ref))]
+// cross-module resolution path. The cap holds a whole workspace, like `item_tree`'s,
+// so a trim never costs a later request a re-derivation. (`module_bodies` below
+// stays low — it is the heavy lowered HIR, needed only while a module's own file is
+// analyzed.)
+#[salsa::tracked(lru = 65536, heap_size = heap_estimate::module_data_heap, returns(ref))]
 pub fn module_data_query<'db>(
     db: &'db dyn DefDatabase,
     file_id_input: FileIdInput<'db>,

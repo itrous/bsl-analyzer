@@ -456,19 +456,85 @@ impl GlobalState {
         &mut self,
         snapshot: ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot,
     ) {
+        self.install_diagnostics_baseline_confirming(snapshot, None);
+    }
+
+    /// `confirming` names the hold whose look this install is, if it is one. Only that
+    /// look may turn a held error into an announcement: any other reload of the same
+    /// empty input — a second watcher event for one truncation, a look an earlier hold
+    /// scheduled — holds it again, so no hold is ever shorter than
+    /// [`crate::global_state::DIAGNOSTICS_BASELINE_HOLD`].
+    fn install_diagnostics_baseline_confirming(
+        &mut self,
+        snapshot: ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot,
+        confirming: Option<u64>,
+    ) {
         if snapshot.errors().is_empty() {
             self.diagnostics_baseline_notification_ledger.clear();
         }
+        // An error read off an empty input is announced only when the hold's own look
+        // finds it unchanged: the first sighting may be a truncating write caught between
+        // its `open` and its `write`, whose bytes are still to come. Holds that the new
+        // snapshot no longer carries are dropped with it.
+        let held = std::mem::take(&mut self.diagnostics_baseline_held);
+        let confirming = confirming.is_some_and(|hold| hold == self.diagnostics_baseline_hold);
         for error in snapshot.errors() {
             let key = format!("{}:{}", error.partition_id.as_deref().unwrap_or("set"), error.epoch);
-            if self.diagnostics_baseline_notification_ledger.insert(key) {
-                self.show_error_message(format!(
-                    "bsl-analyzer: diagnostics baseline {}: {}",
-                    error.code, error.detail
-                ));
+            if self.diagnostics_baseline_notification_ledger.contains(&key) {
+                continue;
             }
+            if snapshot.read_empty() && !(confirming && held.contains(&key)) {
+                self.diagnostics_baseline_held.insert(key);
+                continue;
+            }
+            self.diagnostics_baseline_notification_ledger.insert(key);
+            self.show_error_message(format!(
+                "bsl-analyzer: diagnostics baseline {}: {}",
+                error.code, error.detail
+            ));
         }
         self.diagnostics_baseline = std::sync::Arc::new(snapshot);
+        // A hold that starts now — nothing was held, or something is held that was not
+        // before — gets a look of its own; a hold carried over keeps the one it has.
+        let starts_now = !self.diagnostics_baseline_held.is_empty()
+            && (held.is_empty() || !self.diagnostics_baseline_held.is_subset(&held));
+        if starts_now {
+            self.schedule_diagnostics_baseline_recheck();
+        }
+    }
+
+    /// Open a new hold and put its look, a [`Task::DiagnosticsBaselineRecheck`], on the
+    /// loop once [`crate::global_state::DIAGNOSTICS_BASELINE_HOLD`] has run out.
+    fn schedule_diagnostics_baseline_recheck(&mut self) {
+        self.diagnostics_baseline_hold = self.diagnostics_baseline_hold.wrapping_add(1);
+        let hold = self.diagnostics_baseline_hold;
+        let sender = self.task_pool.pool.sender.clone();
+        if let Err(err) =
+            std::thread::Builder::new().name("bsl-baseline-recheck".to_owned()).spawn(move || {
+                std::thread::sleep(crate::global_state::DIAGNOSTICS_BASELINE_HOLD);
+                let _ = sender.send(crate::global_state::Task::DiagnosticsBaselineRecheck { hold });
+            })
+        {
+            // Without the look, a held error would wait for the next change to the
+            // baseline, which a file that is really empty never makes. Looking right
+            // away risks the double report the hold exists to prevent, but never
+            // silence, which is the worse of the two.
+            tracing::warn!(?err, "could not spawn the diagnostics baseline recheck thread");
+            self.recheck_diagnostics_baseline(hold);
+        }
+    }
+
+    /// The look of hold `hold`: load the baseline again and announce whatever that hold
+    /// still holds. A look belonging to an earlier hold is dropped — the hold it was
+    /// scheduled for is over, and taken for the current one it would cut that short.
+    ///
+    /// Not gated on the ground having moved — an input that is really empty moves
+    /// nothing, and the look exists precisely to tell it from one caught mid-write.
+    pub(crate) fn recheck_diagnostics_baseline(&mut self, hold: u64) -> bool {
+        if hold != self.diagnostics_baseline_hold || self.diagnostics_baseline_held.is_empty() {
+            return false;
+        }
+        self.reload_diagnostics_baseline_confirming(Some(hold))
     }
 
     /// Reload the baseline when the ground moved under the snapshot in hand.
@@ -506,6 +572,10 @@ impl GlobalState {
     }
 
     pub(crate) fn reload_diagnostics_baseline(&mut self) -> bool {
+        self.reload_diagnostics_baseline_confirming(None)
+    }
+
+    fn reload_diagnostics_baseline_confirming(&mut self, confirming: Option<u64>) -> bool {
         let Some(project) = self.project.as_ref() else { return false };
         let old_epoch = self.diagnostics_baseline.epoch().to_owned();
         let old_paths = self.diagnostics_baseline.observation_paths();
@@ -516,7 +586,7 @@ impl GlobalState {
             );
         let changed = snapshot.epoch() != old_epoch;
         let reconfigure = snapshot.observation_paths() != old_paths;
-        self.install_diagnostics_baseline(snapshot);
+        self.install_diagnostics_baseline_confirming(snapshot, confirming);
         if reconfigure {
             self.configure_loader();
         }
@@ -1183,6 +1253,7 @@ mod metadata_warmup_tests {
 #[cfg(test)]
 mod diagnostics_baseline_tests {
     use super::*;
+    use crate::global_state::Task;
     use ide::diagnostics_baseline::{
         diagnostics_baseline_json, DiagnosticsBaseline, DiagnosticsBaselineScope,
         DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
@@ -1430,6 +1501,166 @@ directory = "baselines"
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::Ready { .. }
         ));
         assert!(receiver.try_recv().is_err(), "recovery is silent");
+    }
+
+    /// A stand with a healthy legacy baseline, so the first error the test writes is
+    /// the first the ledger sees.
+    fn healthy_baseline_stand(
+    ) -> (tempfile::TempDir, PathBuf, GlobalState, crossbeam_channel::Receiver<lsp_server::Message>)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let baseline_path = root.join("baseline.json");
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[diagnostics.baseline]\npath = \"baseline.json\"\n",
+        )
+        .unwrap();
+        let valid = diagnostics_baseline_json(&DiagnosticsBaseline {
+            schema_version: DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+            scope: DiagnosticsBaselineScope { source_root: None, extensions: vec![] },
+            diagnostics: vec![],
+        })
+        .unwrap();
+        std::fs::write(&baseline_path, valid).unwrap();
+
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+        state.set_workspace_root(root).unwrap();
+        assert!(matches!(
+            &*state.diagnostics_baseline,
+            ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::Ready { .. }
+        ));
+        assert!(receiver.try_recv().is_err(), "a healthy baseline announces nothing");
+        (dir, baseline_path, state, receiver)
+    }
+
+    fn shown_message(receiver: &crossbeam_channel::Receiver<lsp_server::Message>) -> String {
+        let lsp_server::Message::Notification(notification) = receiver.recv().unwrap() else {
+            panic!("a window/showMessage notification");
+        };
+        assert_eq!(notification.method, "window/showMessage");
+        notification.params["message"].as_str().unwrap().to_owned()
+    }
+
+    /// The look the hold put on the loop, by the hold it belongs to.
+    fn the_recheck_is_scheduled(state: &GlobalState) -> u64 {
+        let task = state
+            .task_pool
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the hold puts a recheck on the loop");
+        let Task::DiagnosticsBaselineRecheck { hold } = task else { panic!("got {task:?}") };
+        hold
+    }
+
+    fn no_recheck_is_scheduled(state: &GlobalState) {
+        assert!(
+            state.task_pool.receiver.try_recv().is_err(),
+            "a hold carried over keeps the look it has; nothing new goes on the loop",
+        );
+    }
+
+    /// `std::fs::write` is `open(O_TRUNC)` then `write`, and a load between the two
+    /// reads an empty file. The bytes that follow are the same save, and the user is
+    /// told about that save once — for the bytes, not for the empty reading.
+    #[test]
+    fn an_empty_reading_inside_a_write_is_not_announced_before_the_bytes_that_follow() {
+        let (_dir, baseline_path, mut state, receiver) = healthy_baseline_stand();
+
+        // The load lands between `open` and `write`.
+        std::fs::write(&baseline_path, b"").unwrap();
+        state.reload_diagnostics_baseline();
+        assert!(
+            receiver.try_recv().is_err(),
+            "an error read off an empty file is held, not announced"
+        );
+        let hold = the_recheck_is_scheduled(&state);
+
+        // The bytes land before the hold runs out, and the watcher reports them.
+        std::fs::write(&baseline_path, b"{broken").unwrap();
+        state.reload_diagnostics_baseline();
+        let message = shown_message(&receiver);
+        assert!(message.contains("invalid_file"), "{message}");
+        assert!(receiver.try_recv().is_err(), "one save, one announcement");
+
+        // The look finds nothing held and says nothing.
+        assert!(!state.recheck_diagnostics_baseline(hold));
+        assert!(receiver.try_recv().is_err(), "the empty reading is never announced");
+    }
+
+    /// The other side of the hold: a file that is really empty is still reported, once,
+    /// when the second look finds it unchanged — never left silent for the life of the
+    /// process because its content never moves again.
+    #[test]
+    fn a_baseline_that_stays_empty_is_announced_once_after_the_hold() {
+        let (_dir, baseline_path, mut state, receiver) = healthy_baseline_stand();
+
+        std::fs::write(&baseline_path, b"").unwrap();
+        state.reload_diagnostics_baseline();
+        assert!(receiver.try_recv().is_err(), "held");
+        let hold = the_recheck_is_scheduled(&state);
+
+        state.recheck_diagnostics_baseline(hold);
+        let message = shown_message(&receiver);
+        assert!(message.contains("invalid_file"), "{message}");
+
+        state.reload_diagnostics_baseline();
+        assert!(!state.recheck_diagnostics_baseline(hold));
+        assert!(receiver.try_recv().is_err(), "an announced error is not announced again");
+    }
+
+    /// Only the hold's own look confirms it. A second reading of the same empty input
+    /// before the hold has run out — a watcher that reports one truncation twice — is
+    /// not evidence that the file stays empty, only that it still is.
+    #[test]
+    fn a_second_reading_of_the_same_empty_input_does_not_confirm_it() {
+        let (_dir, baseline_path, mut state, receiver) = healthy_baseline_stand();
+
+        std::fs::write(&baseline_path, b"").unwrap();
+        state.reload_diagnostics_baseline();
+        let hold = the_recheck_is_scheduled(&state);
+        state.reload_diagnostics_baseline();
+        assert!(receiver.try_recv().is_err(), "a reading inside the hold confirms nothing");
+        no_recheck_is_scheduled(&state);
+
+        state.recheck_diagnostics_baseline(hold);
+        let message = shown_message(&receiver);
+        assert!(message.contains("invalid_file"), "{message}");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// A look belongs to the hold that scheduled it. A hold that ended and a new one
+    /// that started before that look arrived must not be confirmed by it: the new hold
+    /// is owed the whole wait, not the remainder of the old one.
+    #[test]
+    fn a_new_hold_is_not_cut_short_by_the_look_an_earlier_one_scheduled() {
+        let (_dir, baseline_path, mut state, receiver) = healthy_baseline_stand();
+        let valid = std::fs::read(&baseline_path).unwrap();
+
+        std::fs::write(&baseline_path, b"").unwrap();
+        state.reload_diagnostics_baseline();
+        let earlier = the_recheck_is_scheduled(&state);
+
+        // The baseline is repaired, and the hold is over — its look is still on its way.
+        std::fs::write(&baseline_path, &valid).unwrap();
+        state.reload_diagnostics_baseline();
+        assert!(receiver.try_recv().is_err(), "a repaired baseline announces nothing");
+
+        // A new truncation, a new hold, a look of its own.
+        std::fs::write(&baseline_path, b"").unwrap();
+        state.reload_diagnostics_baseline();
+        let later = the_recheck_is_scheduled(&state);
+        assert_ne!(earlier, later, "a hold that starts now is not the one that ended");
+
+        assert!(!state.recheck_diagnostics_baseline(earlier), "the earlier look is dropped");
+        assert!(receiver.try_recv().is_err(), "the new hold is not cut short");
+
+        state.recheck_diagnostics_baseline(later);
+        let message = shown_message(&receiver);
+        assert!(message.contains("invalid_file"), "{message}");
+        assert!(receiver.try_recv().is_err());
     }
 }
 

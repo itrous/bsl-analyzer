@@ -2459,9 +2459,9 @@ mod tests {
             let id = body["result_id"].as_str().unwrap();
             assert_eq!(id.rsplitn(4, '@').count(), 4, "result_id carries both epochs: {id}");
 
-            let sweep = match state.read(|resident, _| {
+            let sweep = match state.read_mut(|resident, _| {
                 resident.workspace_aggregates(
-                    resident.config(),
+                    &resident.config().clone(),
                     &SweepOptions {
                         min_severity: SeverityBucket::Hint,
                         codes: Vec::new(),
@@ -2583,9 +2583,9 @@ mod tests {
             assert_eq!(state.generation(), generation, "baseline reload must not rebuild Salsa");
             assert_ne!(second["result_id"], first["result_id"]);
 
-            let sweep = match state.read(|resident, _| {
+            let sweep = match state.read_mut(|resident, _| {
                 resident.workspace_aggregates(
-                    resident.config(),
+                    &resident.config().clone(),
                     &SweepOptions {
                         min_severity: SeverityBucket::Hint,
                         codes: Vec::new(),
@@ -2830,9 +2830,9 @@ mod tests {
         }
 
         fn run_workspace(state: &DiagnosticsState, opts: &SweepOptions) -> Value {
-            let outcome = state.read(|resident, gen| {
+            let outcome = state.read_mut(|resident, gen| {
                 let sweep = resident.workspace_aggregates(
-                    resident.config(),
+                    &resident.config().clone(),
                     opts,
                     &RequestCancel::default(),
                 );

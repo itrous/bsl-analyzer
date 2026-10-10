@@ -56,6 +56,19 @@ Official references:
   * 1C query language: https://its.1c.ru/db/pubqlang
   * 1C code standards: https://its.1c.ru/db/v8std
 
+Platform help
+-------------
+The analyzer binary carries crates/bsl-platform/data/platform_facts.json:
+the interface facts of the 1C:Enterprise platform help — type, method,
+function, constructor and property names, parameter lists, types,
+versions, execution contexts and signature lines — and no descriptive
+text. It contains none of 1C's descriptions, parameter documentation,
+examples or notes; a test fails if any such field appears. The full help
+corpus, whose texts are the copyright of ООО «1С-Софт», never enters this
+repository or the binary: it is read at run time from the user's own
+platform installation, from a help package, or as a pinned download,
+each carrying its own NOTICE.md. See crates/bsl-platform/data/PROVENANCE.md.
+
 Diagnostic rules
 ----------------
 Code-quality diagnostics in crates/ide-diagnostics encode the 1C
@@ -346,19 +359,27 @@ This is a statement about observable behaviour, not about source code:
 implementing the same interface independently is intended, and copying
 implementation text is not.
 
-Bundled 1C platform data
-------------------------
-The file crates/bsl-platform/data/platform_data.json is a structured
-extract of the 1C:Enterprise context-help archives (shcntx_ru.hbk,
-shlang_ru.hbk). The contents — in particular method descriptions,
-parameter documentation and code examples — are © ООО «1С-Софт» and
-are NOT covered by this workspace's MIT, Apache-2.0 or LGPL-3.0
-licensing. The file is bundled to allow reproducible builds of
-bsl-analyzer without requiring every contributor to install
-1C:Enterprise locally, and on the practical assumption that its use is
+1C platform help data
+---------------------
+bsl-analyzer no longer bundles 1C platform help. Until issue #312 the file
+crates/bsl-platform/data/platform_data.json — a structured extract of the
+1C:Enterprise context-help archives (shcntx_ru.hbk, shlang_ru.hbk) — was
+bundled; it is removed from the tree and from builds, and remains only in
+the history. The help is now read at runtime from the user's installed
+platform or from a separately distributed help package
+(docs/configuration/PROJECT_CONFIGURATION.md, [platform_help]); with no
+platform installed, the default `auto` source downloads one pinned corpus
+file, verified by its SHA-256, from the separate repository
+itrous/bsl-platform-help and caches it next to the package NOTICE.md.
+
+The contents of that corpus, of the pinned download and of every help package — in particular
+method descriptions, parameter documentation and code examples — are
+© ООО «1С-Софт» and are NOT covered by this workspace's MIT, Apache-2.0
+or LGPL-3.0 licensing. A help package carries its own NOTICE.md with that
+statement; its use is on the practical assumption that it serves
 interoperability with the 1C platform rather than a standalone
-documentation product. See crates/bsl-platform/data/PROVENANCE.md for
-the full statement.
+documentation product. See crates/bsl-platform/data/PROVENANCE.md for the
+history and the full statement.
 
 Upstream acknowledgements
 -------------------------
@@ -377,6 +398,34 @@ Upstream acknowledgements
   * mdclasses — object-model reference used when crates/bsl-metadata
     was first written — LGPL-3.0
   * v8std.ru — public catalogue of 1C coding standards — CC0
+  * v8-context-hbk (https://github.com/alkoleft/v8-context-hbk), by
+    alkoleft — the block layout of the help-archive container followed by
+    crates/bsl-platform/tools/html-parser/src/hbk.rs was taken from its
+    crates/hbk-container at commit
+    832a5bff810e368f34d005c471481c2091395455. The project owner states
+    that its use under the MIT license was permitted; the upstream
+    repository carries no license file at that commit. The permission
+    covers that code only, not 1C's help texts. MIT license text:
+
+      Permission is hereby granted, free of charge, to any person
+      obtaining a copy of this software and associated documentation
+      files (the "Software"), to deal in the Software without
+      restriction, including without limitation the rights to use, copy,
+      modify, merge, publish, distribute, sublicense, and/or sell copies
+      of the Software, and to permit persons to whom the Software is
+      furnished to do so, subject to the following conditions:
+
+      The above copyright notice and this permission notice shall be
+      included in all copies or substantial portions of the Software.
+
+      THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+      EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+      MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+      NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+      BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+      ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+      CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+      SOFTWARE.
   * crates/parser/tests/fixtures/Module.bsl — © ООО «1С-Софт»,
     CC BY 4.0, redistributed with its own license header intact. The
     copy was taken from the test resources of bsl-parser, which had
@@ -404,8 +453,9 @@ Upstream acknowledgements
     and remains only in history. Likewise
     crates/ide-diagnostics/test_data/set_permissions_for_new_objects/Roles —
     6 XML files identical in content, with no source named by their commit.
-  * crates/bsl-platform/data/platform_data.json — © ООО «1С-Софт»,
-    1C copyright, bundled for interoperability; see
+  * crates/bsl-platform/data/platform_data.json (removed by #312, present
+    in history only) and platform help packages — © ООО «1С-Софт»,
+    1C copyright, for interoperability; see
     crates/bsl-platform/data/PROVENANCE.md
 
 See LICENSING.md for the per-crate license map and the conditions

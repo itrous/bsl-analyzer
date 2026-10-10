@@ -86,6 +86,7 @@ fn check_token_stream_with_config(code: &str, expect: Expect) {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn module_shape_token_stream() {
     // Module-level variables and code, preprocessor regions and branches,
     // annotations, comments, explicit and implicit locals, parameters with
@@ -174,6 +175,7 @@ fn module_shape_token_stream() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn mdo_and_typed_member_token_stream() {
     // Configuration-backed manager chains: MDO plural, metadata object name,
     // typed properties and methods resolved through inferred receiver types.

@@ -28,6 +28,7 @@ const REPEATED_RECEIVER_FIXTURE_HASH: &str =
     "4941d3be7120c2e7c313288855d7515396f0a89d9158d31d1a58a012b00e18ec";
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn inlay_hints_point_exercises_repeated_receiver_owner_lookup() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("Module.bsl"), REPEATED_RECEIVER_FIXTURE).unwrap();

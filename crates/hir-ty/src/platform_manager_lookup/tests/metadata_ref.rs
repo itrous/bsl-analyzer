@@ -1,4 +1,5 @@
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn metadata_ref_catalog_object_resolves_write_as_procedure() {
     let db = InMemoryDb::new();
     let res = resolve_platform_metadata_ref_method(
@@ -12,6 +13,7 @@ fn metadata_ref_catalog_object_resolves_write_as_procedure() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn any_metadata_ref_resolves_common_method_without_name() {
     let db = InMemoryDb::new();
     let res = resolve_platform_any_metadata_ref_method(
@@ -23,6 +25,7 @@ fn any_metadata_ref_resolves_common_method_without_name() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn any_metadata_ref_object_return_degrades_to_unknown() {
     let db = InMemoryDb::new();
     let res = resolve_platform_any_metadata_ref_method(
@@ -57,6 +60,7 @@ fn any_metadata_ref_register_flavour_has_no_ref_surface() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn metadata_ref_register_record_manager_resolves_write() {
     let db = InMemoryDb::new();
     let res = resolve_platform_metadata_ref_method(
@@ -70,6 +74,7 @@ fn metadata_ref_register_record_manager_resolves_write() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn metadata_ref_information_register_record_set_resolves_load() {
     let db = InMemoryDb::new();
     let res = resolve_platform_metadata_ref_method(
@@ -87,6 +92,7 @@ fn metadata_ref_information_register_record_set_resolves_load() {
 /// The control asserts that emptiness explicitly: were the prefix route ever to
 /// start answering, the bare-type route would be a duplicate, not a fix.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn external_object_methods_come_from_the_bare_platform_type_not_the_prefix_index() {
     assert!(
         bsl_platform::find_prefixed_methods("ExternalDataProcessorObject", "ПолучитьФорму")

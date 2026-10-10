@@ -647,6 +647,7 @@ fn symbol_info_whole_object_form_card_lists_attributes_items_and_handlers() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn managed_form_full_and_exact_queries_share_candidates_and_keep_private_fallback() {
     let mut db = setup_forms();
     db.set_file_text(
@@ -681,6 +682,7 @@ fn managed_form_full_and_exact_queries_share_candidates_and_keep_private_fallbac
 /// them. The fallback that answers by the module's own method must not be shadowed by the
 /// platform member that merely shares the name.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn managed_form_local_method_survives_a_platform_name_collision() {
     let mut db = setup_forms();
     db.set_file_text(FileId(0), "Процедура Закрыть()\nКонецПроцедуры\n");
@@ -767,6 +769,7 @@ fn managed_form_position_resolves_only_a_visible_form_module() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn managed_form_platform_extensions_follow_main_attribute_type() {
     let db = setup_forms();
     let document = by_name(&db, "Документ.Документ1.Форма.ФормаДокумента").unwrap();
@@ -1081,6 +1084,7 @@ fn applied_facet_exact_lookup_uses_the_same_member_collection() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn object_facets_merge_effective_metadata_module_exports_and_platform_surface() {
     let db = setup_catalog();
     let catalog = by_name(&db, "СправочникОбъект.Справочник1").unwrap();
@@ -1127,6 +1131,7 @@ fn an_unread_object_module_does_not_hide_metadata_or_platform_members() {
 }
 
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn reference_and_manager_facets_keep_their_own_surfaces() {
     let db = setup_catalog();
 

@@ -280,6 +280,7 @@ fn a_position_that_names_nothing_is_not_found() {
 /// Gate O (second input) — a platform member has no reference walk, and the
 /// positional path says so instead of returning an empty list.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_position_on_a_platform_member_is_unsupported() {
     let source = "Процедура Тест()\n    Сообщить(1);\nКонецПроцедуры\n";
     let (db, files) = db_with(&[("/ws/src/cf/CommonModules/Продажи/Ext/Module.bsl", source)]);
@@ -495,6 +496,7 @@ fn db_with_catalog() -> RootDatabaseImpl {
 /// Regression gate: green before and after the identity change, red under a mutant that
 /// freezes the symbol type to the first write's.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn the_type_of_an_implicit_local_follows_the_occurrence() {
     let module = FileId(0);
     let catalog_xml = FileId(1);
@@ -625,6 +627,7 @@ fn a_metadata_attribute_is_unsupported_not_missing() {
 /// Gate Q1 (platform half) — a platform type member is found and is not
 /// referenceable either.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_platform_member_is_unsupported_not_missing() {
     let (db, _) = two_common_modules();
 
@@ -642,6 +645,7 @@ fn a_platform_member_is_unsupported_not_missing() {
 /// would turn `unsupported_symbol` into `not_found` — "no such name" said about a name the
 /// search did find. The control is the same call without the narrowing.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn narrowing_the_anchor_does_not_turn_unsupported_into_missing() {
     let (db, files) = two_common_modules();
 
@@ -931,6 +935,7 @@ fn manager_module_references_follow_the_declared_dependency_matrix() {
 
 /// The same rule on an OBJECT module — the third of the four classes with a reference walk.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn object_module_references_follow_the_declared_dependency_matrix() {
     let mut db = RootDatabaseImpl::new();
     let unit = FileId(0);
@@ -1022,6 +1027,7 @@ fn object_module_references_follow_the_declared_dependency_matrix() {
 /// held no registers. The control is the same as the other three: the extension that
 /// DECLARES the dependency must contribute its call, or an always-empty walk passes.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn record_set_module_references_follow_the_declared_dependency_matrix() {
     let mut db = RootDatabaseImpl::new();
     let unit = FileId(0);
@@ -1520,6 +1526,7 @@ fn an_adopted_form_is_ambiguous_and_not_first_wins() {
 /// checked, because they reach the walk by different paths, and `symbol_info` is the
 /// control: the card and the walk must agree on what the string is.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn a_method_named_like_a_platform_global_is_walkable() {
     let (db, files) = db_with(&[(
         "/ws/src/cf/CommonModules/Продажи/Ext/Module.bsl",
@@ -2071,6 +2078,7 @@ const DEFINITION_MEMBER_TWICE: &str = "\
 /// symbol on several lines is one answer, and against a hint (`narrow line_content`) that
 /// cannot help, since any narrowing still holds the member.
 #[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn two_mentions_of_one_typed_member_are_not_an_ambiguity() {
     let (db, files) =
         db_with(&[("/ws/src/cf/CommonModules/Первый/Ext/Module.bsl", TYPED_MEMBER_TWICE)]);

@@ -152,6 +152,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn catalog_dates_reach_each_member_kind() {
         assert_eq!(global_function("СтрЗаменитьПоРегулярномуВыражению"), Some(v("8.3.23")));
         assert_eq!(global_function("StrReplaceByRegularExpression"), Some(v("8.3.23")));
@@ -170,6 +171,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn a_misdated_member_reads_as_undated() {
         assert_eq!(type_member("ХешированиеДанных", "ХешСумма", true), None);
         assert_eq!(type_member("DataHashing", "HashSum", true), None);
