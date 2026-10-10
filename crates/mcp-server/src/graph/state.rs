@@ -2853,9 +2853,10 @@ pub(super) fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::test_support::wait_until_driving;
     use super::super::test_support::{
-        drive_until, published_report, sample_workspace, wait_ready, wait_until,
-        wait_until_driving, wait_until_within,
+        drive_until, published_report, sample_workspace, wait_ready, wait_until, wait_until_within,
     };
     use super::*;
     use std::fs;
