@@ -825,6 +825,10 @@ pub struct GraphBuildTicker {
     /// Milliseconds from `started` at the last `note`, atomically readable.
     last_progress_ms: std::sync::atomic::AtomicU64,
     position: std::sync::Mutex<String>,
+    eta_started: std::sync::OnceLock<std::time::Instant>,
+    eta_total_intervals: std::sync::atomic::AtomicU64,
+    eta_completed_intervals: std::sync::atomic::AtomicU64,
+    eta_sampled_elapsed_ns: std::sync::atomic::AtomicU64,
 }
 
 impl Default for GraphBuildTicker {
@@ -833,16 +837,54 @@ impl Default for GraphBuildTicker {
             started: std::time::Instant::now(),
             last_progress_ms: std::sync::atomic::AtomicU64::new(0),
             position: std::sync::Mutex::new("created".to_owned()),
+            eta_started: std::sync::OnceLock::new(),
+            eta_total_intervals: std::sync::atomic::AtomicU64::new(0),
+            eta_completed_intervals: std::sync::atomic::AtomicU64::new(0),
+            eta_sampled_elapsed_ns: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
 
 impl GraphBuildTicker {
+    /// Configure a cold full build's equal-weight interval estimate before its first note.
+    pub fn set_eta_total_intervals(&self, total: usize) {
+        debug_assert!(self.eta_started.get().is_none());
+        self.eta_total_intervals.store(total as u64, std::sync::atomic::Ordering::Release);
+    }
+
+    /// A remaining-time estimate from the latest completed interval sample.
+    pub fn eta_seconds(&self) -> Option<u64> {
+        estimate_graph_build_eta_seconds(
+            self.eta_total_intervals.load(std::sync::atomic::Ordering::Acquire) as usize,
+            self.eta_completed_intervals.load(std::sync::atomic::Ordering::Acquire) as usize,
+            std::time::Duration::from_nanos(
+                self.eta_sampled_elapsed_ns.load(std::sync::atomic::Ordering::Acquire),
+            ),
+        )
+    }
+
     /// Record forward progress: the build is entering `batch` (0-based) of
     /// `total` in `phase`, whose first module is `first_path` (empty when the
     /// phase has no per-batch granularity). Also emits the heartbeat trace line
     /// (target `bsl_graph`), so the on-disk log reconstructs the build timeline.
     pub fn note(&self, phase: &str, batch: usize, total: usize, first_path: &str) {
+        let now = std::time::Instant::now();
+        if phase != "method_nodes" {
+            if let Some(started) = self.eta_started.get() {
+                let elapsed_ns =
+                    now.duration_since(*started).as_nanos().min(u64::MAX as u128) as u64;
+                let completed =
+                    self.eta_completed_intervals.load(std::sync::atomic::Ordering::Relaxed);
+                let total = self.eta_total_intervals.load(std::sync::atomic::Ordering::Relaxed);
+                if total > 0 && completed < total {
+                    self.eta_sampled_elapsed_ns
+                        .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+                    self.eta_completed_intervals.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+            } else {
+                let _ = self.eta_started.set(now);
+            }
+        }
         let elapsed = self.started.elapsed().as_millis() as u64;
         self.last_progress_ms.store(elapsed, std::sync::atomic::Ordering::Relaxed);
         let label = if total > 0 {
@@ -865,6 +907,29 @@ impl GraphBuildTicker {
     pub fn position(&self) -> String {
         self.position.lock().unwrap().clone()
     }
+}
+
+// shortcut: Equal interval weights are a heuristic, not phase-calibrated; collect phase costs
+// before replacing it if production evidence shows material bias.
+fn estimate_graph_build_eta_seconds(
+    total_intervals: usize,
+    completed_intervals: usize,
+    sampled_elapsed: std::time::Duration,
+) -> Option<u64> {
+    let remaining = total_intervals.checked_sub(completed_intervals)?;
+    if total_intervals == 0
+        || completed_intervals == 0
+        || remaining == 0
+        || sampled_elapsed.is_zero()
+    {
+        return None;
+    }
+    let estimate_ns = sampled_elapsed
+        .as_nanos()
+        .checked_mul(remaining as u128)?
+        .div_ceil(completed_intervals as u128);
+    let seconds = estimate_ns.div_ceil(1_000_000_000);
+    u64::try_from(seconds).ok().map(|seconds| seconds.max(1))
 }
 
 /// Project the whole-workspace call graph into durable node/edge rows in bounded
@@ -1040,6 +1105,11 @@ pub fn build_workspace_graph_rows(
                 unresolved_calls.push((scope, method_lower, file));
             }
         }
+        for (caller, scope, method_lower) in proj.unresolved_declared_common {
+            if let Some(file) = file_of(caller) {
+                unresolved_calls.push((scope, method_lower, file));
+            }
+        }
         clear_node_caches(&pool);
     }
     for (i, &batch) in batches.iter().enumerate() {
@@ -1172,6 +1242,16 @@ pub fn build_workspace_graph_rows(
 /// reverse-index lookup key by the same scope the build recorded.
 pub fn scope_for_path(path: &str) -> Option<String> {
     module_key_for_path(path).map(|k| encode_scope(&k))
+}
+
+/// Folded durable scope for a common module path. Used for reverse references
+/// captured from semantic qualified calls when the declared module has no body
+/// path yet; Unicode case folding must happen in Rust rather than SQLite `lower()`.
+pub fn folded_common_scope_for_path(path: &str) -> Option<String> {
+    match module_key_for_path(path)? {
+        hir::ModuleKey::Common { name } => Some(format!("common/{}", name.fold_lower())),
+        _ => None,
+    }
 }
 
 /// Rows for a body-only incremental update: only the `changed` modules' method nodes
@@ -1314,15 +1394,144 @@ pub fn reproject_changed_modules(
     let scope_of = |m: ModuleId| -> Option<String> {
         paths.get(&m.file_id).and_then(|p| module_key_for_path(p)).map(|k| encode_scope(&k))
     };
-    let unresolved_calls: Vec<(String, String, String)> = call_proj
+    let mut unresolved_calls: Vec<(String, String, String)> = call_proj
         .unresolved
         .into_iter()
         .filter_map(|(caller, target, method_lower)| {
             Some((scope_of(target)?, method_lower, paths.get(&caller.file_id)?.clone()))
         })
         .collect();
+    unresolved_calls.extend(call_proj.unresolved_declared_common.into_iter().filter_map(
+        |(caller, scope, method_lower)| {
+            Some((scope, method_lower, paths.get(&caller.file_id)?.clone()))
+        },
+    ));
 
     Ok(ReprojectedRows { nodes, edges, sig_hashes, casing_variant_objects, unresolved_calls })
+}
+
+/// Project only graph rows owned by the changed metadata objects and form modules.
+/// The caller supplies the owner MDO ids from both the installed and current snapshot,
+/// so removals and renames clear their previous rows in the same SQLite transaction.
+pub fn reproject_metadata_owners<DB: ConfigsDatabase + Clone + Send>(
+    db: &DB,
+    representative: FileId,
+    form_modules: &[ModuleId],
+    paths: &FxHashMap<FileId, String>,
+    workspace_root: Option<&Path>,
+    mdo_files: &hir::graph_index::MdoFiles,
+    owner_ids: &FxHashSet<String>,
+) -> (Vec<NodeRow>, Vec<EdgeRow>) {
+    let mut state = GraphBuildState::default();
+    let mut projected = project_workspace_catalog_edges(db, representative, &mut state);
+    if !form_modules.is_empty() {
+        let pool =
+            rayon::ThreadPoolBuilder::new().build().expect("metadata form projection thread pool");
+        projected.extend(project_batch_form_edges(&pool, db, form_modules, paths, &mut state));
+        projected.extend(project_form_binding_edges(&state));
+    }
+    projected.extend(project_workspace_subsystem_edges(db, representative, &mut state));
+    projected.extend(project_workspace_role_edges(db, representative, &mut state));
+    projected.extend(project_workspace_register_records_edges(db, representative, &mut state));
+
+    let empty_index = GraphIndex::new();
+    let strip_root = workspace_root.map(StripRoot::resolve);
+    let encoder = GraphRowEncoder::new(
+        &empty_index,
+        paths,
+        strip_root.as_ref().map(StripRoot::resolved),
+        mdo_files,
+    );
+    let form_key = |owner: &Option<(MdoType, String)>, form_name: &str| {
+        (owner.as_ref().map(|(kind, name)| (*kind, name.fold_lower())), form_name.fold_lower())
+    };
+    let form_keys: FxHashSet<(Option<(MdoType, String)>, String)> = form_modules
+        .iter()
+        .filter_map(|module| {
+            let path = paths.get(&module.file_id)?;
+            let (owner, form_name) = form_key_for_path(path)?;
+            Some(form_key(&owner, &form_name))
+        })
+        .collect();
+    let owner_affected = |node: &GraphNode| {
+        let direct_id = owner_ids.contains(&encoder.encode(node).0);
+        let owner = match node {
+            GraphNode::Mdo { mdo_type, object_name }
+            | GraphNode::Attribute { mdo_type, object_name, .. }
+            | GraphNode::TabularSection { mdo_type, object_name, .. }
+            | GraphNode::TabularSectionAttribute { mdo_type, object_name, .. } => {
+                encoder
+                    .encode(&GraphNode::Mdo {
+                        mdo_type: *mdo_type,
+                        object_name: object_name.clone(),
+                    })
+                    .0
+            }
+            GraphNode::Form { owner, .. }
+            | GraphNode::FormItem { owner, .. }
+            | GraphNode::FormAttribute { owner, .. } => owner
+                .as_ref()
+                .map(|(mdo_type, name)| {
+                    encoder
+                        .encode(&GraphNode::Mdo { mdo_type: *mdo_type, object_name: name.clone() })
+                        .0
+                })
+                .unwrap_or_default(),
+            GraphNode::Method(_) | GraphNode::ModuleCode(_) => String::new(),
+        };
+        direct_id || owner_ids.contains(&owner)
+    };
+    let form_affected =
+        |node: &GraphNode, keys: &FxHashSet<(Option<(MdoType, String)>, String)>| match node {
+            GraphNode::Form { owner, form_name }
+            | GraphNode::FormItem { owner, form_name, .. }
+            | GraphNode::FormAttribute { owner, form_name, .. } => {
+                let owner = owner.as_ref().map(|(kind, name)| (*kind, name.as_str().to_owned()));
+                keys.contains(&form_key(&owner, form_name.as_str()))
+            }
+            _ => false,
+        };
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut seen_nodes = FxHashSet::default();
+    let mut seen_edges = FxHashSet::default();
+    for edge in projected {
+        let owner_delta = owner_affected(&edge.from)
+            || owner_affected(&edge.to)
+            || form_affected(&edge.from, &form_keys)
+            || form_affected(&edge.to, &form_keys);
+        if !owner_delta {
+            continue;
+        }
+        for node in [&edge.from, &edge.to] {
+            let row = encoder.node_row(node);
+            if seen_nodes.insert(row.id.clone()) {
+                nodes.push(row);
+            }
+        }
+        let row = encoder.edge_row(&edge);
+        if seen_edges.insert((
+            row.from_id.clone(),
+            row.to_id.clone(),
+            row.kind,
+            row.provenance,
+            row.call_start,
+            row.call_end,
+            row.call_site_absent,
+            row.crosses,
+        )) {
+            edges.push(row);
+        }
+    }
+    (nodes, edges)
+}
+
+/// Parsed owner and form name for a form module path, exposed to the MCP adapter without
+/// making it depend on HIR's module-path parser.
+pub fn form_key_for_path(path: &str) -> Option<(Option<(MdoType, String)>, String)> {
+    let key = hir::parse_form_module_path(path)?;
+    Some((key.owner.map(|(kind, name)| (kind, name.as_str().to_owned())), key.form_name))
 }
 
 struct GraphCtx<'a> {
@@ -2949,7 +3158,18 @@ fn clamp_source(src: String, max_chars: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod ticker_tests {
-    use super::GraphBuildTicker;
+    use super::{estimate_graph_build_eta_seconds, GraphBuildTicker};
+    use std::time::Duration;
+
+    #[test]
+    fn eta_requires_completed_measured_intervals_and_never_rounds_to_zero() {
+        assert_eq!(estimate_graph_build_eta_seconds(10, 0, Duration::from_secs(4)), None);
+        assert_eq!(estimate_graph_build_eta_seconds(10, 1, Duration::ZERO), None);
+        assert_eq!(estimate_graph_build_eta_seconds(0, 0, Duration::from_secs(4)), None);
+        assert_eq!(estimate_graph_build_eta_seconds(10, 10, Duration::from_secs(4)), None);
+        assert_eq!(estimate_graph_build_eta_seconds(10, 3, Duration::from_millis(2500)), Some(6));
+        assert_eq!(estimate_graph_build_eta_seconds(2, 1, Duration::from_nanos(1)), Some(1));
+    }
 
     #[test]
     fn note_stamps_position_and_resets_stall_clock() {

@@ -379,6 +379,7 @@ impl WorkspaceDiff {
     /// Whether any changed file is `.xml` metadata. Metadata drift can change
     /// configuration visibility for *any* module, so it forces a full rebuild — no
     /// fast path is sound for it.
+    #[cfg(test)]
     pub(crate) fn touches_metadata(&self) -> bool {
         self.added
             .iter()
@@ -386,6 +387,78 @@ impl WorkspaceDiff {
             .chain(&self.modified)
             .any(|p| bsl_conventions::str_has_extension(p, bsl_conventions::XML_EXTENSION))
     }
+}
+
+/// Computes a semantic structure hash of an XML document, ignoring elements
+/// like `<Version>` and `<Comment>`, XML comments, and indentation between elements.
+pub(crate) fn xml_semantic_hash(xml_text: &str) -> [u8; 32] {
+    let Ok(doc) = bsl_metadata::roxmltree::Document::parse(xml_text) else {
+        return *blake3::hash(xml_text.as_bytes()).as_bytes();
+    };
+    let mut hasher = blake3::Hasher::new();
+    hash_xml_node(doc.root(), &mut hasher);
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(test)]
+pub(crate) fn xml_semantic_hash_u64(xml_text: &str) -> u64 {
+    let hash = xml_semantic_hash(xml_text);
+    u64::from_le_bytes(hash[..8].try_into().expect("blake3 hash >= 8 bytes"))
+}
+
+pub(crate) fn xml_semantic_hash_file(path: &Path) -> Option<[u8; 32]> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(xml_semantic_hash(&content))
+}
+
+fn hash_xml_node(node: bsl_metadata::roxmltree::Node<'_, '_>, hasher: &mut blake3::Hasher) {
+    if node.is_element() {
+        let tag = node.tag_name().name();
+        if node.parent().is_some_and(|parent| {
+            parent.is_element()
+                && parent.tag_name().name().eq_ignore_ascii_case("Properties")
+                && (tag.eq_ignore_ascii_case("Version") || tag.eq_ignore_ascii_case("Comment"))
+        }) {
+            return;
+        }
+        hasher.update(b"E+");
+        hash_xml_part(node.tag_name().namespace().unwrap_or(""), hasher);
+        hash_xml_part(tag, hasher);
+        let mut attrs: Vec<_> = node.attributes().collect();
+        attrs.sort_by_key(|a| (a.namespace().unwrap_or(""), a.name()));
+        for attr in attrs {
+            hasher.update(b"A");
+            hash_xml_part(attr.namespace().unwrap_or(""), hasher);
+            hash_xml_part(attr.name(), hasher);
+            hash_xml_part(attr.value(), hasher);
+        }
+    } else if node.is_text() {
+        // Only indentation between sibling elements is formatting: the metadata parser
+        // reads a leaf's text verbatim, so its surrounding whitespace is part of the value.
+        if let Some(text) = node.text() {
+            let indentation = text.trim().is_empty()
+                && node.parent().is_some_and(|parent| parent.children().any(|c| c.is_element()));
+            if !indentation {
+                hasher.update(b"T");
+                hash_xml_part(text, hasher);
+            }
+        }
+    }
+
+    for child in node.children() {
+        if child.is_comment() {
+            continue;
+        }
+        hash_xml_node(child, hasher);
+    }
+    if node.is_element() {
+        hasher.update(b"E-");
+    }
+}
+
+fn hash_xml_part(value: &str, hasher: &mut blake3::Hasher) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 /// Classify per-file drift between the stored fingerprint map (read from a built
@@ -429,5 +502,82 @@ mod diff_tests {
             modified: Vec::new(),
         };
         assert!(diff.touches_metadata(), "верхнерегистровый .XML — тоже дрейф метаданных");
+    }
+
+    #[test]
+    fn xml_semantic_hash_ignores_version_and_comment() {
+        let xml1 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject>
+    <Configuration>
+        <Properties>
+            <Name>TestConfig</Name>
+            <Version>1.0.0.1</Version>
+            <Comment>Initial release</Comment>
+        </Properties>
+    </Configuration>
+</MetaDataObject>"#;
+
+        let xml2 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject>
+    <Configuration>
+        <Properties>
+            <Name>TestConfig</Name>
+            <Version>1.0.0.2</Version>
+            <Comment>Hotfix release with updated comment</Comment>
+        </Properties>
+    </Configuration>
+</MetaDataObject>"#;
+
+        assert_eq!(xml_semantic_hash(xml1), xml_semantic_hash(xml2));
+        assert_eq!(xml_semantic_hash_u64(xml1), xml_semantic_hash_u64(xml2));
+    }
+
+    #[test]
+    fn xml_semantic_hash_detects_structural_changes() {
+        let xml1 =
+            r#"<Configuration><Properties><Name>Config1</Name></Properties></Configuration>"#;
+        let xml2 =
+            r#"<Configuration><Properties><Name>Config2</Name></Properties></Configuration>"#;
+        assert_ne!(xml_semantic_hash(xml1), xml_semantic_hash(xml2));
+    }
+
+    #[test]
+    fn xml_semantic_hash_ignores_comments_and_formatting() {
+        let xml1 =
+            r#"<Configuration><Properties><Name>Config1</Name></Properties></Configuration>"#;
+        let xml2 = r#"<Configuration>
+    <!-- some XML comment -->
+    <Properties>
+        <Name>Config1</Name>
+    </Properties>
+</Configuration>"#;
+        assert_eq!(xml_semantic_hash(xml1), xml_semantic_hash(xml2));
+    }
+
+    /// The metadata parser reads element text verbatim, so whitespace inside a leaf
+    /// value is a different name, code or data path, not formatting.
+    #[test]
+    fn xml_semantic_hash_keeps_whitespace_inside_leaf_text() {
+        let base = r#"<Catalog><Properties><Name>Товары</Name></Properties></Catalog>"#;
+        for edited in [
+            r#"<Catalog><Properties><Name>Товары </Name></Properties></Catalog>"#,
+            r#"<Catalog><Properties><Name> Товары</Name></Properties></Catalog>"#,
+            "<Catalog><Properties><Name>\n    Товары\n</Name></Properties></Catalog>",
+        ] {
+            assert_ne!(xml_semantic_hash(base), xml_semantic_hash(edited), "{edited}");
+        }
+        assert_ne!(
+            xml_semantic_hash(r#"<Catalog><Properties><Name/></Properties></Catalog>"#),
+            xml_semantic_hash(r#"<Catalog><Properties><Name> </Name></Properties></Catalog>"#),
+        );
+    }
+
+    #[test]
+    fn xml_semantic_hash_keeps_tree_boundaries_and_namespaces() {
+        assert_ne!(xml_semantic_hash("<A><B/></A>"), xml_semantic_hash("<A/><B/>"));
+        assert_ne!(
+            xml_semantic_hash("<A xmlns='urn:one'/>"),
+            xml_semantic_hash("<A xmlns='urn:two'/>")
+        );
     }
 }

@@ -467,7 +467,6 @@ impl GraphDb {
     }
 
     /// The identity of the publication this database holds.
-    #[cfg(test)]
     pub(crate) fn publication_id(&self) -> anyhow::Result<String> {
         self.meta("publication_id")?.context("graph database has no publication_id")
     }
@@ -476,6 +475,14 @@ impl GraphDb {
     /// Defaults to 0 when absent (an older build without the row).
     pub fn files(&self) -> anyhow::Result<usize> {
         Ok(self.meta("files")?.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    /// The strict module total used to distinguish a valid published empty graph
+    /// from an older/incomplete artefact with no fingerprint rows.
+    pub(crate) fn file_count_strict(&self) -> anyhow::Result<usize> {
+        self.meta("files")?
+            .and_then(|v| v.parse().ok())
+            .context("graph database meta.files missing or unparsable")
     }
 
     /// How many modules this artefact was built (or last patched) without being able

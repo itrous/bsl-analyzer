@@ -74,6 +74,7 @@ pub use register::{
     RegisterResource,
 };
 pub use role::{Role, RoleData, RoleObjectRef};
+pub use roxmltree;
 pub use scheduled_job::{ScheduledJob, ScheduledJobHandler};
 pub use scoped_fs::ScopedFs;
 pub use subsystem::Subsystem;

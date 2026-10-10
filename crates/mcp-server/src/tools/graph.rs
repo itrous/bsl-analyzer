@@ -391,10 +391,13 @@ pub fn status(report: &crate::graph::GraphStatusReport) -> CallToolResult {
 
 /// A transient "still indexing" result, emitted while the background load runs.
 /// Not an error — the agent should retry shortly.
-pub fn loading(detail: Option<&str>) -> CallToolResult {
+pub fn loading(detail: Option<&str>, eta_seconds: Option<u64>) -> CallToolResult {
     let mut body = json!({ "status": "loading" });
     if let Some(detail) = detail {
         body["detail"] = json!(detail);
+    }
+    if let Some(eta_seconds) = eta_seconds {
+        body["eta_seconds"] = json!(eta_seconds);
     }
     structured(body)
 }
@@ -405,10 +408,11 @@ pub fn loading(detail: Option<&str>) -> CallToolResult {
 /// independent of the on-disk SQLite cache layout in [`crate::graph_db`]).
 fn schema_json() -> Value {
     json!({
-        "schema_version": "35",
+        "schema_version": "36",
         "indexing_contract": "Lifecycle status and loading responses include indexing schema_version 1 with a graph target; data/schema responses do not require indexing. States: waiting|running|ready|disabled|failed|cancelled|superseded|unknown. Phase, progress and pass_id are null for graph targets.",
         "actions": ["overview", "schema", "status", "node", "source", "neighbors", "callers", "callees", "resolve"],
         "status": "`status` returns the graph lifecycle ({state: disabled|loading|ready|failed, and when ready: files, unread_files, revision, stale, reload}; for a workspace graph always `drift_watch`, see the envelope) and kicks the lazy build — poll it instead of reading a flat `loading` envelope from a data action (mirrors `diagnostics status`). `unread_files` counts modules whose bytes could not be read when the artefact was built or last patched: they contributed no nodes and no edges, so the graph is missing them, `stale` is true, and no fingerprint comparison reveals it (stat needs no read permission). A patch never clears an inherited one — only a full rebuild restores the missing rows. `files` here is the module count the artefact COVERS, unread ones included, so `unread_files` is a subset of it — unlike `diagnostics status`, whose `files` counts only what it serves and excludes them; do not apply one arithmetic to both. `superseded: true` (emitted only when it holds) means another daemon generation owns this workspace's derived caches: this server finishes the graph reads already running, closes the graph and serves no more of it — status is `failed + superseded` and every data action returns the reconnect error with `reason: owner_changed`, never `loading`. Open a new session to reach the current daemon. Other refusals carry their own `reason`: `graph_busy` (the graph is being handed over from a previous owner or its ownership confirmed; retry shortly — `status` then reads `loading` with the wait in `error`) and `graph_unavailable` (this process will not open the graph — e.g. another live process of the same version holds its cache directory; the message names the directory and asks for a separate `--cache-dir`). The static `schema` action remains available without a snapshot.",
+        "loading": "A cold graph build returns status=loading. `eta_seconds` is omitted until a completed build interval has a positive measured duration; then it is a positive remaining-time heuristic from completed work intervals. Ready snapshots served during reload do not receive an ETA.",
         "node_kinds": ["method", "module", "mdo", "attribute", "tabular_section", "form", "form_item", "form_attribute"],
         "node_shape": "`qualified` (russified display path) is emitted only for metadata nodes — for code nodes it would restate `module` + `name`; `addressable` is emitted only when false (absent = the id round-trips); `truncated: true` is emitted on a node whose `detail=bodies` source was cut short — or, when `source` is absent, dropped — to fit the output budget (so a short body is not mistaken for a complete one, nor a budget-dropped body for a method with no body)",
         "notes": "`node(module/<scope>)` resolves for any code module and returns a `methods` array ({id, name, is_export}) of the module's members; module membership is served on demand and is not a graph edge, so `neighbors(module/…)` stays empty",
@@ -526,6 +530,9 @@ pub(crate) fn graph_output_schema() -> std::sync::Arc<serde_json::Map<String, se
         {"allOf":[condition.clone(), {"required":["indexing"], "properties":{"indexing":indexing}}]},
         {"not":condition}
     ]});
+    schema["properties"] = serde_json::json!({
+        "eta_seconds": {"type":"integer", "minimum":1}
+    });
     if let Some(definitions) = definitions {
         schema["$defs"] = definitions;
     }
@@ -815,7 +822,13 @@ mod tests {
         // The contract version must be bumped in lockstep with any response-shape change
         // (a new action, node/edge kind, or result field). The history of what each bump
         // added lives in git, not here.
-        assert_eq!(schema["schema_version"], "35");
+        assert_eq!(schema["schema_version"], "36");
+        assert!(schema["loading"].as_str().unwrap().contains("eta_seconds"));
+        let output_schema = graph_output_schema();
+        assert_eq!(
+            output_schema["properties"]["eta_seconds"],
+            json!({"type":"integer", "minimum":1})
+        );
         // A bumped number over unchanged text would certify a contract the server no longer
         // honours, so the new keys are asserted by description, not by version alone.
         assert!(schema["envelope"]["freshness"].is_string(), "the freshness envelope advertised");
@@ -924,13 +937,16 @@ mod tests {
     #[test]
     fn schema_and_loading_populate_structured_content() {
         assert_structured_mirrors_text(&schema());
-        assert_eq!(schema().structured_content.unwrap()["schema_version"], "35");
+        assert_eq!(schema().structured_content.unwrap()["schema_version"], "36");
 
-        assert_structured_mirrors_text(&loading(Some("indexing")));
-        let body = loading(Some("indexing")).structured_content.unwrap();
+        assert_structured_mirrors_text(&loading(Some("indexing"), None));
+        let body = loading(Some("indexing"), None).structured_content.unwrap();
         assert_eq!(body["status"], "loading");
         assert_eq!(body["detail"], "indexing");
+        assert!(body.get("eta_seconds").is_none());
 
-        assert_eq!(loading(None).structured_content.unwrap().get("detail"), None);
+        let body = loading(None, Some(9)).structured_content.unwrap();
+        assert_eq!(body.get("detail"), None);
+        assert_eq!(body["eta_seconds"], 9);
     }
 }
