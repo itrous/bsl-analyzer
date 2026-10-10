@@ -592,7 +592,7 @@ mod tests {
 
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
-                uri: lsp_types::Url::parse("file:///test.bsl").unwrap(),
+                uri: crate::test_uri::file_uri("test.bsl"),
                 language_id: "bsl".to_string(),
                 version: 1,
                 text: "Процедура Тест() КонецПроцедуры".to_string(),
@@ -713,7 +713,7 @@ mod tests {
         let (mut state, _receiver) = create_test_state();
         state.pull_diagnostics_active = true;
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
         handle_did_open(
             &mut state,
             DidOpenTextDocumentParams {
@@ -746,7 +746,7 @@ mod tests {
         let (mut state, _receiver) = create_test_state();
         state.vfs_done = false;
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
         handle_did_open(
             &mut state,
             DidOpenTextDocumentParams {
@@ -778,7 +778,7 @@ mod tests {
     fn did_change_enqueues_pending_diagnostics_deduplicated() {
         let (mut state, _receiver) = create_test_state();
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
         handle_did_open(
             &mut state,
             DidOpenTextDocumentParams {
@@ -815,8 +815,8 @@ mod tests {
     fn diagnostics_generation_is_tracked_per_uri() {
         let (mut state, _receiver) = create_test_state();
 
-        let a = lsp_types::Url::parse("file:///a.bsl").unwrap();
-        let b = lsp_types::Url::parse("file:///b.bsl").unwrap();
+        let a = crate::test_uri::file_uri("a.bsl");
+        let b = crate::test_uri::file_uri("b.bsl");
         for (uri, text) in
             [(&a, "Процедура А() КонецПроцедуры"), (&b, "Процедура Б() КонецПроцедуры")]
         {
@@ -1023,7 +1023,7 @@ mod tests {
     fn test_did_change() {
         let (mut state, _receiver) = create_test_state();
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
         handle_did_open(
             &mut state,
             DidOpenTextDocumentParams {
@@ -1057,7 +1057,7 @@ mod tests {
         let (mut state, _receiver) = create_test_state();
         state.position_encoding = crate::lsp::PositionEncoding::Utf8;
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
         handle_did_open(
             &mut state,
             DidOpenTextDocumentParams {
@@ -1140,7 +1140,7 @@ mod tests {
     #[test]
     fn did_open_hands_file_off_from_batch_push() {
         let (mut state, _receiver) = create_test_state();
-        let uri = lsp_types::Url::parse("file:///mod.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("mod.bsl");
 
         // The deferred batch had pushed diagnostics for this (then closed) file.
         state.batch_pushed.insert(uri.clone(), "h1".to_string());
@@ -1170,7 +1170,7 @@ mod tests {
     fn test_did_close() {
         let (mut state, _receiver) = create_test_state();
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         handle_did_open(
             &mut state,

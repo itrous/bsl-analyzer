@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn test_insert_and_get() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
         let text = "Процедура Тест()\nКонецПроцедуры".to_string();
 
         mem_docs.insert(uri.clone(), text.clone(), 1);
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn test_update_full() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         mem_docs.insert(uri.clone(), "old text".to_string(), 1);
 
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn test_update_incremental() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         mem_docs.insert(uri.clone(), "hello world".to_string(), 1);
 
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn test_remove() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         mem_docs.insert(uri.clone(), "test".to_string(), 1);
         assert!(mem_docs.contains(&uri));
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn test_line_index() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
         let text = "line1\nline2\nline3".to_string();
 
         mem_docs.insert(uri.clone(), text, 1);
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn test_update_incremental_cyrillic() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         mem_docs.insert(uri.clone(), "Процедура Тест()\nКонецПроцедуры".to_string(), 1);
 
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn test_update_incremental_replace_cyrillic() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         mem_docs.insert(uri.clone(), "Функция Старый()\nКонецФункции".to_string(), 1);
 
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn test_update_incremental_cyrillic_utf8_encoding() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         mem_docs.insert(uri.clone(), "Процедура Тест()\nКонецПроцедуры".to_string(), 1);
 
@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn test_update_incremental_utf8_rejects_non_char_boundary() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         mem_docs.insert(uri.clone(), "Функция Старый()\nКонецФункции".to_string(), 1);
 
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn freeze_is_independent_of_mutation() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
         mem_docs.insert(uri.clone(), "original".to_string(), 1);
 
         let frozen = mem_docs.freeze();
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn test_update_incremental_multiline_cyrillic() {
         let mut mem_docs = MemDocs::new();
-        let uri = Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         mem_docs.insert(uri.clone(), "Процедура\nТест()\nКонецПроцедуры".to_string(), 1);
 

@@ -2416,7 +2416,7 @@ mod tests {
             symbols: Vec<DocumentSymbol>,
         ) -> anyhow::Result<Option<lsp_types::DocumentSymbolResponse>> {
             let line_index = LineIndex::new(SOURCE);
-            let uri = lsp_types::Url::parse("file:///ws/Module.bsl").expect("uri");
+            let uri = crate::test_uri::file_uri("ws/Module.bsl");
             document_symbol_response(&line_index, SOURCE, symbols, PositionEncoding::Utf16, &uri)
         }
 
@@ -2623,7 +2623,7 @@ mod tests {
     fn test_goto_definition_not_found() {
         let mut state = create_test_state();
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         state.mem_docs.insert(uri.clone(), "Процедура Тест() КонецПроцедуры".to_string(), 1);
 
@@ -2646,7 +2646,7 @@ mod tests {
     fn goto_definition_context_frozen_against_main_thread_mutation() {
         let mut state = create_test_state();
 
-        let uri = lsp_types::Url::parse("file:///frozen.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("frozen.bsl");
         state.mem_docs.insert(uri.clone(), "original".to_string(), 1);
 
         let ctx = latency_ctx(&state);
@@ -2671,7 +2671,7 @@ mod tests {
     fn test_find_references_empty() {
         let mut state = create_test_state();
 
-        let uri = lsp_types::Url::parse("file:///test.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("test.bsl");
 
         state.mem_docs.insert(uri.clone(), "Процедура Тест() КонецПроцедуры".to_string(), 1);
 
@@ -2775,7 +2775,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///rename.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("rename.bsl");
         let source =
             "Процедура Тест()\n    Перем МояПеременная;\n    МояПеременная = 10;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
@@ -2800,7 +2800,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///rename.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("rename.bsl");
         let source = "Процедура Тест()\n    Перем МояПеременная;\n    МояПеременная = 10;\n    Результат = МояПеременная;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -2827,7 +2827,7 @@ mod tests {
         state.init_empty_source_root();
         state.supports_workspace_edit_document_changes = true;
 
-        let uri = lsp_types::Url::parse("file:///rename.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("rename.bsl");
         let source =
             "Процедура Тест()\n    Перем МояПеременная;\n    МояПеременная = 10;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
@@ -2860,7 +2860,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///rename.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("rename.bsl");
         let source =
             "Процедура Тест()\n    Перем МояПеременная;\n    МояПеременная = 10;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
@@ -2909,7 +2909,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -2924,7 +2924,7 @@ mod tests {
         // Given: a call-hierarchy anchor in a loaded source root.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-prepare.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-prepare.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let receiver = state.task_pool.receiver.clone();
@@ -2958,7 +2958,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -2985,7 +2985,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n\nПроцедура Второй()\n    Помощник();\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3009,7 +3009,7 @@ mod tests {
         // Given: a resident compact index for one target and its caller.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-warm.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-warm.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3046,7 +3046,7 @@ mod tests {
         state.init_empty_source_root();
         // The dispatcher rejects requests until VFS loading has completed in production.
         state.vfs_done = true;
-        let uri = lsp_types::Url::parse("file:///ch-single-worker.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-single-worker.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3110,7 +3110,7 @@ mod tests {
         // Given: a prepared target whose compact index is still building.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-wait.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-wait.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3159,7 +3159,7 @@ mod tests {
         // Given: an otherwise valid call-hierarchy item without retained prepare state.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-unprepared.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-unprepared.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let item = call_hierarchy_item_at(&state, &uri, Position { line: 0, character: 10 });
@@ -3181,7 +3181,7 @@ mod tests {
         // Given: a prepared build that will outlive a short incoming-call deadline.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-timeout.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-timeout.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3216,7 +3216,7 @@ mod tests {
         // Given: an incoming request parked on a prepared build.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-cancel.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-cancel.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3266,7 +3266,7 @@ mod tests {
         // Given: a prepared index build that has not yet published.
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-followers.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-followers.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3355,7 +3355,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch-superseded.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-superseded.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3381,7 +3381,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ch-ready-edit.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ch-ready-edit.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
@@ -3409,7 +3409,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///ws.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("ws.bsl");
         let source =
             "Функция ОбщийРасчёт() Экспорт\nКонецФункции\n\nФункция Приватный()\nКонецФункции\n";
         open_source(&mut state, &uri, source);
@@ -3440,7 +3440,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///td.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("td.bsl");
         let source = "Процедура Тест()\n    Счётчик = 1;\n    Сообщить(Счётчик);\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -3465,7 +3465,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///sel.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("sel.bsl");
         let source = "Процедура Тест()\n    Итог = Первое + Второе;\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -3501,7 +3501,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///hints.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("hints.bsl");
         let source = "Функция Сложить(Первое, Второе)\n    Возврат Первое;\nКонецФункции\n\nПроцедура Тест()\n    Сложить(10, 20);\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
 
@@ -3533,7 +3533,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///highlight.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("highlight.bsl");
         let source = r#"
 Процедура Тест()
     Перем МояПеременная;
@@ -3581,7 +3581,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///folding.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("folding.bsl");
         let source = "#Область Public\nПроцедура Тест()\n    Если Истина Тогда\n        Сообщить(1);\n    КонецЕсли;\nКонецПроцедуры\n#КонецОбласти";
 
         state.mem_docs.insert(uri.clone(), source.to_string(), 1);
@@ -3635,7 +3635,7 @@ mod tests {
         state.init_empty_source_root();
         state.folding_range_limit = limit;
 
-        let uri = lsp_types::Url::parse(&format!("file:///{file_name}")).unwrap();
+        let uri = crate::test_uri::file_uri(file_name);
         state.mem_docs.insert(uri.clone(), source.to_string(), 1);
         let open_file_id = state.vfs_file_for_url(&uri).unwrap();
         state.open_files.insert(open_file_id);
@@ -3799,7 +3799,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///fixall.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("fixall.bsl");
         state.mem_docs.insert(uri.clone(), source.to_string(), 1);
         let open_file_id = state.vfs_file_for_url(&uri).unwrap();
         state.open_files.insert(open_file_id);
@@ -4011,8 +4011,8 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let source_uri = lsp_types::Url::parse("file:///source.bsl").unwrap();
-        let target_uri = lsp_types::Url::parse("file:///target.bsl").unwrap();
+        let source_uri = crate::test_uri::file_uri("source.bsl");
+        let target_uri = crate::test_uri::file_uri("target.bsl");
         let source_text = "Процедура Источник()\nКонецПроцедуры";
         let target_text = "ПерваяСтрока\n    Цель();\n";
 
@@ -4059,7 +4059,7 @@ mod tests {
         let mut state = create_test_state();
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///short.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("short.bsl");
         let source = "short";
 
         state.mem_docs.insert(uri.clone(), source.to_string(), 1);
@@ -4153,13 +4153,13 @@ mod tests {
         /// long enough for a cancel sent on its first file to land mid-walk; the
         /// positive control below reports the count the walk really visits.
         const CALLERS: usize = 1000;
-        const ROOT: &str = "/cancel-walk/CommonModules";
+        const ROOT: &str = "cancel-walk/CommonModules";
         const ANCHOR_SOURCE: &str = "Процедура ПриИзмененииПоля() Экспорт\nКонецПроцедуры\n";
         const CALLER_SOURCE: &str =
             "Процедура Тело() Экспорт\n    Объявление.ПриИзмененииПоля();\nКонецПроцедуры\n";
 
         fn anchor_uri() -> lsp_types::Url {
-            lsp_types::Url::from_file_path(format!("{ROOT}/Объявление/Ext/Module.bsl")).unwrap()
+            crate::test_uri::file_uri(&format!("{ROOT}/Объявление/Ext/Module.bsl"))
         }
 
         /// The callers are registered as open buffers: the walk takes its candidates
@@ -4178,7 +4178,9 @@ mod tests {
             {
                 let mut vfs = state.vfs.write();
                 for i in 0..CALLERS {
-                    let path = VfsPath::new(format!("{ROOT}/Вызов{i:04}/Ext/Module.bsl"));
+                    let path = VfsPath::new(crate::test_uri::file_path(&format!(
+                        "{ROOT}/Вызов{i:04}/Ext/Module.bsl"
+                    )));
                     vfs.set_file_contents(path.clone(), Some(Arc::from(CALLER_SOURCE)));
                     let file_id = vfs.file_id(&path).expect("just registered");
                     state.open_files.insert(file_id);

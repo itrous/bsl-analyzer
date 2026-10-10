@@ -1442,7 +1442,7 @@ mod tests {
     fn baseline_reload_invalidates_diagnostics_before_pool_scheduling() {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
-        let uri = lsp_types::Url::parse("file:///workspace/module.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("workspace/module.bsl");
         state.diagnostics_generation.insert(uri.clone(), 7);
         invalidate_diagnostics(&mut state, std::slice::from_ref(&uri));
         assert_eq!(state.diagnostics_generation[&uri], 8);
@@ -1695,7 +1695,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
 
-        let uri = lsp_types::Url::parse("file:///gone.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("gone.bsl");
         // A diagnostics task that finished with the current generation, but for a
         // document that is NOT open (closed before the result arrived).
         state.diagnostics_generation.insert(uri.clone(), 1);
@@ -1875,7 +1875,7 @@ mod tests {
         let mut state = crate::global_state::GlobalState::new(sender);
         // A many-chunk sweep so applying several chunks never trips the finalize.
         install_test_plan(&mut state, 100);
-        let uri = lsp_types::Url::parse("file:///a.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("a.bsl");
 
         // First report for a closed file with diagnostics: published and recorded.
         let chunk = current_chunk(&state, vec![batch_item(&uri, "h1", vec![dummy_diagnostic()])]);
@@ -1903,7 +1903,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
         state.workspace_batch_generation = 5;
-        let uri = lsp_types::Url::parse("file:///a.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("a.bsl");
 
         // A chunk tagged with an older generation (its sweep was superseded by a
         // config reset) must never publish or record anything.
@@ -1929,8 +1929,8 @@ mod tests {
         let mut state = crate::global_state::GlobalState::new(sender);
         // A single-chunk sweep: the one chunk both reports and finalizes.
         install_test_plan(&mut state, 1);
-        let gone = lsp_types::Url::parse("file:///gone.bsl").unwrap();
-        let kept = lsp_types::Url::parse("file:///kept.bsl").unwrap();
+        let gone = crate::test_uri::file_uri("gone.bsl");
+        let kept = crate::test_uri::file_uri("kept.bsl");
 
         // Two files were pushed by an earlier sweep.
         state.batch_pushed.insert(gone.clone(), "h1".to_string());
@@ -1952,7 +1952,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
         install_test_plan(&mut state, 5);
-        let uri = lsp_types::Url::parse("file:///a.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("a.bsl");
         state.batch_pushed.insert(uri.clone(), "h1".to_string());
 
         // A cancelled chunk (a concurrent edit cancelled it) reported nothing: it must
@@ -1980,7 +1980,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
         install_test_plan(&mut state, 100);
-        let uri = lsp_types::Url::parse("file:///a.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("a.bsl");
 
         // Prime a pushed file, then re-report it clean: one empty publish clears it.
         state.batch_pushed.insert(uri.clone(), "h1".to_string());
@@ -2004,7 +2004,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mut state = crate::global_state::GlobalState::new(sender);
         install_test_plan(&mut state, 100);
-        let uri = lsp_types::Url::parse("file:///open.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("open.bsl");
 
         // The file was opened while the batch was computing: the interactive stream
         // owns it, so the batch result is dropped and never recorded.

@@ -362,7 +362,7 @@ mod tests {
     fn save_clears_the_dirty_mark() {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
-        let uri = lsp_types::Url::parse("file:///repo/Module.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("repo/Module.bsl");
         state.scope_dirty_docs.insert(uri.clone());
 
         crate::handlers::handle_did_save(

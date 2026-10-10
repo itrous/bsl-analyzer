@@ -1549,7 +1549,7 @@ mod vfs_race_tests {
 
         state.init_empty_source_root();
 
-        let uri = lsp_types::Url::parse("file:///user.bsl").unwrap();
+        let uri = crate::test_uri::file_uri("user.bsl");
         let file_id = state.vfs_file_for_url(&uri).unwrap();
         // Open document: text lives in the resident overlay, not on disk (this
         // synthetic file has no disk path for the disk-backed path to read).
@@ -2747,14 +2747,14 @@ mod vfs_race_tests {
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
 
-        let inside_a = "/proj/Catalogs/X/Ext/ObjectModule.bsl";
-        let inside_b = "/proj/Catalogs/X/Forms/F/Ext/Form/Module.bsl";
-        let outside = "/proj/Catalogs/Y/Ext/ObjectModule.bsl";
+        let inside_a = "proj/Catalogs/X/Ext/ObjectModule.bsl";
+        let inside_b = "proj/Catalogs/X/Forms/F/Ext/Form/Module.bsl";
+        let outside = "proj/Catalogs/Y/Ext/ObjectModule.bsl";
         {
             let mut vfs = state.vfs.write();
             for p in [inside_a, inside_b, outside] {
                 vfs.set_file_contents(
-                    vfs::VfsPath::new(p),
+                    vfs::VfsPath::new(crate::test_uri::file_path(p)),
                     Some(Arc::from("Процедура А() КонецПроцедуры")),
                 );
             }
@@ -2764,13 +2764,13 @@ mod vfs_race_tests {
         let in_file_set = |state: &GlobalState, p: &str| {
             let db = state.analysis_host.raw_database();
             let sr = db.source_root_input(SourceRootId(0)).root(db);
-            sr.file_set().file_for_path(&vfs::VfsPath::new(p)).is_some()
+            sr.file_set().file_for_path(&vfs::VfsPath::new(crate::test_uri::file_path(p))).is_some()
         };
         assert!(in_file_set(&state, inside_a) && in_file_set(&state, outside), "baseline loaded");
 
         // Remove the directory subtree "Catalogs/X".
         let removed =
-            vec![paths::AbsPathBuf::assert_utf8(std::path::PathBuf::from("/proj/Catalogs/X"))];
+            vec![paths::AbsPathBuf::assert_utf8(crate::test_uri::file_path("proj/Catalogs/X"))];
         let refreshed = state.remove_directories(&removed);
 
         assert!(refreshed, "a subtree removal should request an open-document refresh");

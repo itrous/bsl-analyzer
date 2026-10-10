@@ -28,6 +28,8 @@ pub mod reporters;
 pub mod server;
 pub mod smoke;
 pub mod task_pool;
+#[cfg(test)]
+pub(crate) mod test_uri;
 pub mod workspace;
 
 pub use server::main_loop;

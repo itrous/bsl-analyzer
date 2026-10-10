@@ -122,7 +122,7 @@ fn call_hierarchy_prepare_then_incoming_traces_index_only_serving() {
     tracing::subscriber::with_default(subscriber, || {
         let mut state = create_test_state();
         state.init_empty_source_root();
-        let uri = lsp_types::Url::parse("file:///ch-trace.bsl").expect("fixture URI");
+        let uri = crate::test_uri::file_uri("ch-trace.bsl");
         let source = "Процедура Помощник()\nКонецПроцедуры\n\nПроцедура Первый()\n    Помощник();\nКонецПроцедуры\n";
         open_source(&mut state, &uri, source);
         let fixture = CallHierarchyFixture { uri: &uri, source };
