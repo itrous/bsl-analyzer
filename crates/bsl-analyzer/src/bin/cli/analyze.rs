@@ -552,9 +552,10 @@ fn analyze_salsa(
     };
 
     let diagnostics = proj_config.diagnostics.rules_json();
-    let mut config = DiagnosticsConfig::from_project_json(
+    let mut config = DiagnosticsConfig::from_project_file(
         &diagnostics,
         proj_config.output.resolve_locale().unwrap_or_default(),
+        proj_config.config_file_path(),
     );
 
     if let Some(ref diag_name) = only_diagnostic {

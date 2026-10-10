@@ -3,6 +3,7 @@ use crate::metadata::{DiagnosticSeverityLevel, DiagnosticType, MetadataTag};
 use crate::{DiagnosticCode, Severity};
 use base_db::{DiagnosticsConfigInput, Locale};
 use std::collections::HashMap;
+use std::path::Path;
 use stdx::case::CaseExt;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -109,6 +110,22 @@ impl DiagnosticsConfig {
         config
     }
 
+    /// [`Self::from_project_json`] for the loaders that know which file the
+    /// `[diagnostics]` section came from: a code in `[diagnostics.parameters]` that
+    /// is not a diagnostic of this analyzer is reported (key and file) instead of
+    /// being dropped without a trace. The effective config is the same.
+    ///
+    /// Not used by per-request readers (a `query` call re-reads the section each
+    /// time): they would repeat the warning on every call.
+    pub fn from_project_file(
+        diagnostics: &serde_json::Value,
+        locale: Locale,
+        source: Option<&Path>,
+    ) -> Self {
+        warn_unknown_parameter_codes(diagnostics, source);
+        Self::from_project_json(diagnostics, locale)
+    }
+
     pub fn all_enabled() -> Self {
         let mut enabled = Vec::new();
         for code in [
@@ -184,6 +201,64 @@ impl DiagnosticsConfig {
             tags_override: override_data.and_then(|o| o.tags.clone()),
             lsp_severity_override: override_data.and_then(|o| o.lsp_severity.clone()),
         })
+    }
+}
+
+/// Codes this analyzer used to have, with the code that took over their checks.
+/// All of them were merged into `DeprecatedPlatformApi` in v0.2.50.
+const REMOVED_CODES: &[(&str, &str, &str)] = &[
+    ("DeprecatedCurrentDate", "DeprecatedPlatformApi", "v0.2.50"),
+    ("DeprecatedFind", "DeprecatedPlatformApi", "v0.2.50"),
+    ("DeprecatedMessage", "DeprecatedPlatformApi", "v0.2.50"),
+    ("DeprecatedTypeManagedForm", "DeprecatedPlatformApi", "v0.2.50"),
+    ("DeprecatedMethods8310", "DeprecatedPlatformApi", "v0.2.50"),
+    ("DeprecatedMethods8317", "DeprecatedPlatformApi", "v0.2.50"),
+    ("DeprecatedAttributes8312", "DeprecatedPlatformApi", "v0.2.50"),
+];
+
+/// The names under `[diagnostics.parameters]` that are not a [`DiagnosticCode`].
+/// The deserializer skips them, so a typo or a code removed in a newer release
+/// leaves the rule on while the author believes it is off.
+pub fn unknown_parameter_codes(diagnostics: &serde_json::Value) -> Vec<&str> {
+    diagnostics
+        .get("parameters")
+        .and_then(|parameters| parameters.as_object())
+        .map(|parameters| {
+            parameters
+                .keys()
+                .map(String::as_str)
+                .filter(|name| name.parse::<DiagnosticCode>().is_err())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Why a name is not a code, worded for the person who wrote it. A removed code
+/// names its successor but is deliberately not mapped to it: the successor covers
+/// a whole group of checks, so switching it off would silence more than the
+/// removed key ever did.
+fn unknown_code_hint(name: &str) -> String {
+    match REMOVED_CODES.iter().find(|(removed, _, _)| *removed == name) {
+        Some((_, successor, release)) => format!(
+            "the code was removed in {release}; its check is now part of `{successor}` \
+             (not mapped automatically: `{successor} = false` would switch off every \
+             deprecated-API finding, not only this one)"
+        ),
+        None => "no diagnostic has this name (typo, or a code of another analyzer)".to_owned(),
+    }
+}
+
+fn warn_unknown_parameter_codes(diagnostics: &serde_json::Value, source: Option<&Path>) {
+    for name in unknown_parameter_codes(diagnostics) {
+        let file =
+            source.map_or_else(|| "<project config>".to_owned(), |p| p.display().to_string());
+        tracing::warn!(
+            key = name,
+            config_file = %file,
+            "unknown diagnostic code `{name}` in [diagnostics.parameters] of {file}: \
+             the key is ignored and the rule keeps its default; {}",
+            unknown_code_hint(name)
+        );
     }
 }
 
@@ -396,6 +471,9 @@ impl DiagnosticsConfig {
     }
 
     pub fn apply_cli_filters(&mut self, only_diagnostic: &[String], disable_diagnostic: &[String]) {
+        warn_unknown_cli_codes(only_diagnostic, "--only-diagnostic");
+        warn_unknown_cli_codes(disable_diagnostic, "--disable-diagnostic");
+
         if !only_diagnostic.is_empty() {
             let codes: Vec<DiagnosticCode> =
                 only_diagnostic.iter().filter_map(|s| s.parse().ok()).collect();
@@ -411,6 +489,16 @@ impl DiagnosticsConfig {
                 }
             }
         }
+    }
+}
+
+fn warn_unknown_cli_codes(names: &[String], flag: &str) {
+    for name in names.iter().filter(|name| name.parse::<DiagnosticCode>().is_err()) {
+        tracing::warn!(
+            key = name.as_str(),
+            "unknown diagnostic code `{name}` in {flag}: the name is ignored; {}",
+            unknown_code_hint(name)
+        );
     }
 }
 
@@ -448,6 +536,136 @@ mod tests {
         fn enter(&self, _: &Id) {}
 
         fn exit(&self, _: &Id) {}
+    }
+
+    /// Collects every WARN event as one line: the message and its structured fields.
+    struct WarningTexts(Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct FieldText(String);
+
+    impl tracing::field::Visit for FieldText {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            } else {
+                self.0.push_str(&format!(" [{}={value:?}]", field.name()));
+            }
+        }
+    }
+
+    impl Subscriber for WarningTexts {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &span::Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut text = FieldText(String::new());
+                event.record(&mut text);
+                self.0.lock().unwrap().push(text.0);
+            }
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    fn warnings_of(run: impl FnOnce()) -> Vec<String> {
+        let texts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(WarningTexts(texts.clone()), run);
+        let texts = texts.lock().unwrap().clone();
+        texts
+    }
+
+    /// The shape of a real project config: rules switched off by name, among them
+    /// two that this analyzer no longer has (one removed in v0.2.50, one it never had).
+    fn project_with_stale_codes() -> serde_json::Value {
+        json!({
+            "parameters": {
+                "LineLength": false,
+                "DeprecatedCurrentDate": false,
+                "DeprecatedErrorProcessing": false,
+                "MethodSize": { "maxMethodSize": 80 },
+            }
+        })
+    }
+
+    #[test]
+    fn an_unknown_code_in_parameters_is_reported_with_key_and_file() {
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let mut config = None;
+        let warnings = warnings_of(|| {
+            config = Some(DiagnosticsConfig::from_project_file(
+                &project_with_stale_codes(),
+                Locale::En,
+                Some(file),
+            ));
+        });
+
+        assert_eq!(warnings.len(), 2, "one warning per unknown key: {warnings:#?}");
+        let removed = warnings.iter().find(|w| w.contains("`DeprecatedCurrentDate`")).unwrap();
+        assert!(removed.contains("bsl-analyzer.toml"), "names the file: {removed}");
+        assert!(removed.contains("[diagnostics.parameters]"), "names the section: {removed}");
+        assert!(removed.contains("removed in v0.2.50"), "{removed}");
+        assert!(removed.contains("`DeprecatedPlatformApi`"), "names the successor: {removed}");
+        let never_existed =
+            warnings.iter().find(|w| w.contains("`DeprecatedErrorProcessing`")).unwrap();
+        assert!(never_existed.contains("no diagnostic has this name"), "{never_existed}");
+        assert!(!never_existed.contains("DeprecatedPlatformApi"), "{never_existed}");
+
+        // Behaviour is unchanged: the stale keys are still ignored and are NOT
+        // mapped to the successor, which would silence the whole group.
+        let config = config.unwrap();
+        assert!(config.is_disabled(DiagnosticCode::LineLength));
+        assert!(!config.is_disabled(DiagnosticCode::DeprecatedPlatformApi));
+        assert_eq!(config.get_int(DiagnosticCode::MethodSize, "maxMethodSize"), Some(80));
+        assert_eq!(config.disabled, vec![DiagnosticCode::LineLength]);
+    }
+
+    #[test]
+    fn a_parameter_table_with_an_unknown_name_is_reported_too() {
+        let raw = json!({ "parameters": { "LineLenght": { "maxLineLength": 150 } } });
+        let warnings = warnings_of(|| {
+            DiagnosticsConfig::from_project_file(&raw, Locale::En, None);
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("`LineLenght`"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn known_codes_and_a_missing_section_stay_silent() {
+        let raw =
+            json!({ "parameters": { "LineLength": false, "MethodSize": { "maxMethodSize": 1 } } });
+        let warnings = warnings_of(|| {
+            DiagnosticsConfig::from_project_file(&raw, Locale::En, None);
+            DiagnosticsConfig::from_project_file(&serde_json::Value::Null, Locale::En, None);
+            DiagnosticsConfig::from_project_file(&json!({}), Locale::En, None);
+        });
+        assert!(warnings.is_empty(), "{warnings:#?}");
+    }
+
+    #[test]
+    fn an_unknown_code_on_the_command_line_is_reported() {
+        let mut config = DiagnosticsConfig::default();
+        let warnings = warnings_of(|| {
+            config.apply_cli_filters(&["DeprecatedCurrentDate".to_owned()], &["Nope".to_owned()]);
+        });
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        assert!(
+            warnings[0].contains("`DeprecatedCurrentDate`")
+                && warnings[0].contains("--only-diagnostic")
+        );
+        assert!(warnings[1].contains("`Nope`") && warnings[1].contains("--disable-diagnostic"));
+        assert!(config.only_enabled.is_none(), "an unknown name selects nothing");
     }
 
     fn parse_with_warning_count(

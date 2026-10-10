@@ -61,7 +61,11 @@ impl GlobalState {
         locale: Locale,
     ) -> DiagnosticsConfigInput {
         let diagnostics = project.config.diagnostics.rules_json();
-        let config = ide::DiagnosticsConfig::from_project_json(&diagnostics, locale);
+        let config = ide::DiagnosticsConfig::from_project_file(
+            &diagnostics,
+            locale,
+            project.config.config_file_path(),
+        );
 
         let disabled: Vec<String> = config.disabled.iter().map(|code| code.to_string()).collect();
         let enabled: Vec<String> = config.enabled.iter().map(|code| code.to_string()).collect();
@@ -83,5 +87,85 @@ impl GlobalState {
             locale,
             config.bslls_suppression_compat,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::{span, Event, Id, Metadata, Subscriber};
+
+    struct WarningTexts(Arc<Mutex<Vec<String>>>);
+
+    struct MessageText(String);
+
+    impl tracing::field::Visit for MessageText {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+    }
+
+    impl Subscriber for WarningTexts {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut text = MessageText(String::new());
+                event.record(&mut text);
+                self.0.lock().unwrap().push(text.0);
+            }
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    /// The loader path of the LSP: a project config that switches rules off by name,
+    /// two of them names this analyzer does not have, must say so - otherwise the
+    /// author believes the warnings are off while they keep coming.
+    #[test]
+    fn stale_codes_in_the_project_config_are_reported_by_the_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bsl-analyzer.toml"),
+            r#"
+min_platform_version = "8.3.17"
+
+[diagnostics.parameters]
+LineLength = false
+DeprecatedCurrentDate = false  # removed in v0.2.50
+DeprecatedErrorProcessing = false  # never existed
+MagicNumber = false
+"#,
+        )
+        .unwrap();
+        let project = project_model::Project::new(dir.path()).expect("valid test project");
+
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let input = tracing::subscriber::with_default(WarningTexts(texts.clone()), || {
+            GlobalState::config_from_project(&project, Locale::default())
+        });
+        let warnings = texts.lock().unwrap().clone();
+
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        assert!(warnings.iter().any(|w| w.contains("`DeprecatedCurrentDate`")), "{warnings:#?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("`DeprecatedErrorProcessing`")),
+            "{warnings:#?}"
+        );
+        assert!(warnings.iter().all(|w| w.contains("bsl-analyzer.toml")), "{warnings:#?}");
+
+        // The valid keys still take effect; the stale ones add nothing.
+        let mut disabled = input.disabled.clone();
+        disabled.sort();
+        assert_eq!(disabled, ["LineLength", "MagicNumber"]);
     }
 }
