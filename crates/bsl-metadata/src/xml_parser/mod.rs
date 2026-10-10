@@ -1,4 +1,5 @@
 mod catalog;
+mod common_attribute;
 mod common_module;
 mod constant;
 mod defined_type;
@@ -23,6 +24,7 @@ pub use catalog::{
     parse_data_processor_xml, parse_document_xml, parse_exchange_plan_xml,
     parse_external_data_processor_xml, parse_external_report_xml, parse_report_xml, parse_task_xml,
 };
+pub use common_attribute::parse_common_attribute_xml;
 pub use common_module::parse_common_module_xml;
 pub use constant::parse_constant_xml;
 pub use defined_type::parse_defined_type_xml;

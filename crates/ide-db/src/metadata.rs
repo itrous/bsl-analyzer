@@ -113,6 +113,7 @@ pub(crate) mod heap_estimate {
             Arc<Vec<super::WebServiceEntry>>,
             Arc<Vec<super::IntegrationServiceEntry>>,
             Arc<Vec<super::SubsystemEntry>>,
+            Arc<Vec<super::CommonAttributeEntry>>,
         ),
     ) -> usize {
         let (
@@ -126,6 +127,7 @@ pub(crate) mod heap_estimate {
             web_services,
             integration_services,
             subsystems,
+            common_attributes,
         ) = fields;
 
         stdx::heap::vec_bytes::<super::MdoEntry>(entries.len())
@@ -148,6 +150,8 @@ pub(crate) mod heap_estimate {
             + integration_services.iter().map(|e| e.name.capacity()).sum::<usize>()
             + stdx::heap::vec_bytes::<super::SubsystemEntry>(subsystems.len())
             + subsystems.iter().map(|e| e.name.capacity()).sum::<usize>()
+            + stdx::heap::vec_bytes::<super::CommonAttributeEntry>(common_attributes.len())
+            + common_attributes.iter().map(|e| e.name.capacity()).sum::<usize>()
     }
 
     /// A `resolve_metadata_object` result is a clone of an `Arc` owned by
@@ -160,6 +164,22 @@ pub(crate) mod heap_estimate {
     /// `Arc` owned by `parse_register_query`; the payload is counted there once.
     pub(crate) fn shared_register_heap(_v: &Option<Arc<bsl_metadata::Register>>) -> usize {
         0
+    }
+
+    pub(crate) fn common_attribute_set_heap(v: &Arc<bsl_metadata::CommonAttributeSet>) -> usize {
+        stdx::heap::vec_bytes::<bsl_metadata::CommonAttribute>(v.attributes.len())
+            + v.attributes
+                .iter()
+                .map(|a| {
+                    a.name.capacity()
+                        + a.attr_type.estimated_heap_size()
+                        + stdx::heap::map_table_bytes::<
+                            (bsl_metadata::MdoType, String),
+                            bsl_metadata::CommonAttributeUse,
+                        >(a.content.len())
+                        + a.content.keys().map(|(_, name)| name.capacity()).sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     /// A `resolve_common_module`/`resolve_common_module_by_file` result is a
@@ -718,6 +738,9 @@ pub fn chain_configuration<'db>(
 /// optional `Ext/Predefined.xml`, plus the kind that selects the parser. Interned
 /// so [`parse_mdo_query`] keys on the file identities; the per-file content
 /// revisions drive invalidation, so editing one MDO's XML re-parses only it.
+///
+/// `listing` is the config root the object belongs to: its common attributes add fields to
+/// the object, so the parse attaches them and the object is held once, already complete.
 #[salsa::interned(debug, heap_size = stdx::heap::zero)]
 pub struct MdoFiles<'db> {
     #[returns(copy)]
@@ -726,6 +749,8 @@ pub struct MdoFiles<'db> {
     pub main: vfs::FileId,
     #[returns(copy)]
     pub predefined: Option<vfs::FileId>,
+    #[returns(copy)]
+    pub listing: MetadataListingInput,
 }
 
 /// Whether a loose-XML metadata object's discovery key (its file stem) disagrees
@@ -769,12 +794,17 @@ pub fn parse_mdo_query<'db>(
     let main_text = db.file_text_ref(files.main(db));
     let predefined_text = files.predefined(db).map(|fid| db.file_text_ref(fid));
 
-    bsl_metadata::parse_metadata_object_from_texts(
+    let mut object = bsl_metadata::parse_metadata_object_from_texts(
         files.mdo_type(db),
         main_text,
         predefined_text.map(|t| &**t),
-    )
-    .map(Arc::new)
+    )?;
+    let applied =
+        common_attribute_set(db, files.listing(db)).for_object(object.mdo_type, &object.name);
+    if !applied.is_empty() {
+        object.set_common_attributes(applied);
+    }
+    Some(Arc::new(object))
 }
 
 /// One discovered metadata object in a config root's *structure* listing: which
@@ -885,6 +915,15 @@ pub struct SubsystemEntry {
     pub main: vfs::FileId,
 }
 
+/// One discovered common attribute in a config root's *structure* listing: its name and the
+/// [`vfs::FileId`] of its XML (`CommonAttributes/<Name>.xml`). Common attributes are read as a
+/// set per root ([`common_attribute_set`]) because each one may add a field to any object.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CommonAttributeEntry {
+    pub name: String,
+    pub main: vfs::FileId,
+}
+
 /// One config root's discovered metadata listing, grouped for the database setter
 /// while keeping each metadata family typed separately.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -899,6 +938,7 @@ pub struct MetadataListingData {
     pub web_services: Vec<WebServiceEntry>,
     pub integration_services: Vec<IntegrationServiceEntry>,
     pub subsystems: Vec<SubsystemEntry>,
+    pub common_attributes: Vec<CommonAttributeEntry>,
 }
 
 /// The per-config-root *structure* input: the MDOs and defined types that exist in
@@ -921,6 +961,7 @@ pub struct MetadataListingInput {
     pub web_services: Arc<Vec<WebServiceEntry>>,
     pub integration_services: Arc<Vec<IntegrationServiceEntry>>,
     pub subsystems: Arc<Vec<SubsystemEntry>>,
+    pub common_attributes: Arc<Vec<CommonAttributeEntry>>,
 }
 
 /// The composing-file identities for one MDO, as held in a [`ConfigIndex`].
@@ -987,6 +1028,24 @@ pub fn config_index(
     Arc::new(ConfigIndex { by_name, register_by_name })
 }
 
+/// Every common attribute of one config root, read through the versioned VFS. Depends on the
+/// listing's `common_attributes` family and on the content of those files only, so editing an
+/// object's XML leaves it memoised. A file that does not parse marks the set unreadable.
+#[salsa::tracked(heap_size = heap_estimate::common_attribute_set_heap, returns(clone))]
+pub fn common_attribute_set(
+    db: &dyn base_db::SourceDatabase,
+    listing: MetadataListingInput,
+) -> Arc<bsl_metadata::CommonAttributeSet> {
+    let _span = tracing::info_span!("common_attribute_set").entered();
+
+    let mut set = bsl_metadata::CommonAttributeSet::default();
+    for entry in listing.common_attributes(db).iter() {
+        let text = db.file_text_ref(entry.main);
+        set.push_parsed(bsl_metadata::parse_common_attribute_from_text(text));
+    }
+    Arc::new(set)
+}
+
 /// Resolve a single metadata object within one config root, at per-MDO Salsa
 /// granularity. Depends on [`config_index`] (structure) to map the name to its
 /// files, then on [`parse_mdo_query`] (content) for that one MDO. A content edit
@@ -1005,7 +1064,7 @@ pub fn resolve_metadata_object(
 
     let index = config_index(db, listing);
     let ids = index.lookup(mdo_type, &name)?;
-    let files = MdoFiles::new(db, mdo_type, ids.main, ids.predefined);
+    let files = MdoFiles::new(db, mdo_type, ids.main, ids.predefined, listing);
     let object = parse_mdo_query(db, files)?;
     warn_on_stem_name_divergence(mdo_type.english_name(), &name, &object.name);
     Some(object)
@@ -1024,7 +1083,13 @@ pub fn parse_register_query(
     let _span = tracing::info_span!("parse_register").entered();
 
     let main_text = db.file_text_ref(files.main(db));
-    bsl_metadata::parse_register_from_text(files.mdo_type(db), main_text).map(Arc::new)
+    let mut register = bsl_metadata::parse_register_from_text(files.mdo_type(db), main_text)?;
+    let common = common_attribute_set(db, files.listing(db));
+    let applied = common.for_object(register.mdo_type(), register.name());
+    if !applied.is_empty() {
+        register.set_common_attributes(applied);
+    }
+    Some(Arc::new(register))
 }
 
 /// Resolve a single register within one config root, the register counterpart of
@@ -1042,7 +1107,7 @@ pub fn resolve_register(
 
     let index = config_index(db, listing);
     let ids = index.lookup(mdo_type, &name)?;
-    let files = MdoFiles::new(db, mdo_type, ids.main, ids.predefined);
+    let files = MdoFiles::new(db, mdo_type, ids.main, ids.predefined, listing);
     let register = parse_register_query(db, files)?;
     warn_on_stem_name_divergence(mdo_type.english_name(), &name, register.name());
     Some(register)
@@ -1064,7 +1129,7 @@ pub fn resolve_register_by_name(
 
     let index = config_index(db, listing);
     let (kind, ids) = index.lookup_register_by_name(&name)?;
-    let files = MdoFiles::new(db, kind, ids.main, ids.predefined);
+    let files = MdoFiles::new(db, kind, ids.main, ids.predefined, listing);
     let register = parse_register_query(db, files)?;
     warn_on_stem_name_divergence(kind.english_name(), &name, register.name());
     Some(register)

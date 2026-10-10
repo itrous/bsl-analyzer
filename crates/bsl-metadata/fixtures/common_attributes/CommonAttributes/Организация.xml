@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.10">
+	<CommonAttribute uuid="0ca00000-0000-0000-0000-0000000002a2">
+		<Properties>
+			<Name>Организация</Name>
+			<Synonym>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Организация</v8:content>
+				</v8:item>
+			</Synonym>
+			<Comment/>
+			<Type>
+				<v8:Type>cfg:CatalogRef.СправочникБезРазделения</v8:Type>
+			</Type>
+			<Content>
+				<xr:Item>
+					<xr:Metadata>Document.Документ1</xr:Metadata>
+					<xr:Use>Use</xr:Use>
+					<xr:ConditionalSeparation/>
+				</xr:Item>
+				<xr:Item>
+					<xr:Metadata>Catalog.Справочник1</xr:Metadata>
+					<xr:Use>Use</xr:Use>
+					<xr:ConditionalSeparation/>
+				</xr:Item>
+				<xr:Item>
+					<xr:Metadata>Catalog.СправочникБезРазделения</xr:Metadata>
+					<xr:Use>DontUse</xr:Use>
+					<xr:ConditionalSeparation/>
+				</xr:Item>
+				<xr:Item>
+					<xr:Metadata>InformationRegister.РегистрСведений1</xr:Metadata>
+					<xr:Use>Use</xr:Use>
+					<xr:ConditionalSeparation/>
+				</xr:Item>
+			</Content>
+			<AutoUse>DontUse</AutoUse>
+			<DataSeparation>DontUse</DataSeparation>
+			<SeparatedDataUse>Independently</SeparatedDataUse>
+			<DataSeparationValue/>
+			<DataSeparationUse/>
+			<ConditionalSeparation/>
+			<UsersSeparation>DontUse</UsersSeparation>
+			<AuthenticationSeparation>DontUse</AuthenticationSeparation>
+			<ConfigurationExtensionsSeparation>DontUse</ConfigurationExtensionsSeparation>
+			<Indexing>DontIndex</Indexing>
+			<FullTextSearch>Use</FullTextSearch>
+			<DataHistory>Use</DataHistory>
+		</Properties>
+	</CommonAttribute>
+</MetaDataObject>

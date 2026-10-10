@@ -237,6 +237,7 @@ fn bench_metadata_revalidation_after_bsl_edit(c: &mut Criterion) {
     db.set_metadata_listing(
         "/cfg",
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries,
             defined_types: Vec::new(),
             common_modules: Vec::new(),

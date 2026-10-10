@@ -475,6 +475,16 @@ pub struct MetadataObject {
     pub object_belonging: crate::ObjectBelonging,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extended_configuration_object: Option<Uuid>,
+    /// Fields contributed by common attributes whose composition includes this object. Kept
+    /// apart from `attributes` because they are not declared by the object: checks of the
+    /// object's own structure must not report them as its members.
+    #[serde(default)]
+    pub common_attributes: Vec<crate::common_attribute::CommonAttributeField>,
+    /// Whether a common attribute may apply to this object without being listed in
+    /// `common_attributes` (an unreadable `CommonAttributes/*.xml` or `Content` entry). The
+    /// object's field set is then not known to be exhaustive.
+    #[serde(default)]
+    pub common_attributes_open: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -823,6 +833,8 @@ impl MetadataObject {
             uuid: None,
             object_belonging: crate::ObjectBelonging::Own,
             extended_configuration_object: None,
+            common_attributes: Vec::new(),
+            common_attributes_open: false,
         }
     }
 
@@ -848,6 +860,8 @@ impl MetadataObject {
             uuid: None,
             object_belonging: crate::ObjectBelonging::Own,
             extended_configuration_object: None,
+            common_attributes: Vec::new(),
+            common_attributes_open: false,
         }
     }
 
@@ -916,6 +930,21 @@ impl MetadataObject {
         if !overlay.register_records().is_empty() {
             self.set_register_records(overlay.register_records().to_vec());
         }
+
+        crate::common_attribute::merge_common_attribute_fields(
+            &mut self.common_attributes,
+            &overlay.common_attributes,
+        );
+        self.common_attributes_open |= overlay.common_attributes_open;
+    }
+
+    /// Record which common attributes apply to this object.
+    pub fn set_common_attributes(
+        &mut self,
+        applied: crate::common_attribute::ObjectCommonAttributes,
+    ) {
+        self.common_attributes = applied.fields;
+        self.common_attributes_open = applied.open;
     }
 
     pub fn uuid(&self) -> Option<&Uuid> {
@@ -1043,6 +1072,13 @@ impl MetadataObject {
         bytes += self.constant_type.as_ref().map_or(0, AttributeType::estimated_heap_size);
         bytes += stdx::heap::vec_bytes::<(MdoType, Name)>(self.register_records.len())
             + self.register_records.iter().map(|(_, name)| name.capacity()).sum::<usize>();
+        bytes += stdx::heap::vec_bytes::<crate::common_attribute::CommonAttributeField>(
+            self.common_attributes.len(),
+        ) + self
+            .common_attributes
+            .iter()
+            .map(crate::common_attribute::CommonAttributeField::estimated_heap_size)
+            .sum::<usize>();
         bytes
     }
 }

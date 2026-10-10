@@ -504,6 +504,15 @@ impl<'a> Scope<'a> {
             ));
         }
 
+        for common in &mdo_object.common_attributes {
+            fields.push(FieldDef::new_with_names(
+                common.name.clone(),
+                None,
+                SdblType::from_attribute_type(&common.attr_type),
+                false,
+            ));
+        }
+
         for ts in &mdo_object.tabular_sections {
             fields.push(FieldDef::new_with_names(
                 ts.name().to_string(),

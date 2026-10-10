@@ -137,6 +137,7 @@ struct LoadedMetadata {
     data_processors: Vec<MetadataObject>,
     reports: Vec<MetadataObject>,
     subsystems: Vec<crate::subsystem::Subsystem>,
+    common_attributes: crate::common_attribute::CommonAttributeSet,
 }
 
 fn load_all_metadata_parallel(path: &Path, scope: &ScopedFs<'_>) -> LoadedMetadata {
@@ -167,6 +168,7 @@ fn load_all_metadata_parallel(path: &Path, scope: &ScopedFs<'_>) -> LoadedMetada
     let data_processors = Mutex::new(Vec::new());
     let reports = Mutex::new(Vec::new());
     let subsystems = Mutex::new(Vec::new());
+    let common_attributes = Mutex::new(crate::common_attribute::CommonAttributeSet::default());
 
     rayon::scope(|s| {
         s.spawn(|_| {
@@ -296,6 +298,10 @@ fn load_all_metadata_parallel(path: &Path, scope: &ScopedFs<'_>) -> LoadedMetada
             *subsystems.lock().unwrap() =
                 load_subsystems(scope, &collection_dir(scope, path, "Subsystems"))
         });
+        s.spawn(|_| {
+            *common_attributes.lock().unwrap() =
+                load_common_attributes(scope, &collection_dir(scope, path, "CommonAttributes"))
+        });
     });
 
     let result = LoadedMetadata {
@@ -325,6 +331,7 @@ fn load_all_metadata_parallel(path: &Path, scope: &ScopedFs<'_>) -> LoadedMetada
         data_processors: data_processors.into_inner().unwrap(),
         reports: reports.into_inner().unwrap(),
         subsystems: subsystems.into_inner().unwrap(),
+        common_attributes: common_attributes.into_inner().unwrap(),
     };
 
     tracing::info!(
@@ -422,8 +429,29 @@ fn build_configuration(loaded: LoadedMetadata) -> Configuration {
     for subsystem in loaded.subsystems {
         config.add_subsystem(subsystem);
     }
+    config.apply_common_attributes(&loaded.common_attributes);
 
     config
+}
+
+/// Read every `CommonAttributes/<Name>.xml` of one root. A file that exists but does not
+/// parse is remembered rather than dropped: the field it would add is unknown, so the field
+/// sets of the objects it could reach are no longer exhaustive.
+fn load_common_attributes(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+) -> crate::common_attribute::CommonAttributeSet {
+    let mut set = crate::common_attribute::CommonAttributeSet::default();
+    for (_, path) in loose_xml_children(scope, dir) {
+        match fs::read_to_string(&path) {
+            Ok(xml) => set.push_parsed(parse_common_attribute_from_text(&xml)),
+            Err(error) => {
+                tracing::warn!(?path, %error, "common attribute XML is unreadable");
+                set.unreadable = true;
+            }
+        }
+    }
+    set
 }
 
 /// Load every subsystem `.xml` under `Subsystems/`, recursing into nested
@@ -1107,6 +1135,43 @@ pub fn discover_integration_service_structure(
 /// [`parse_defined_type_from_text`]; the per-common-module Salsa query calls it after
 /// reading the text through the versioned VFS. Only metadata (flags + name) is read;
 /// the module body is resolved separately through the symbol tree.
+/// Parse one common attribute from its main XML text. `None` when the text is not a readable
+/// common attribute; callers treat that as an attribute of unknown name and composition.
+pub fn parse_common_attribute_from_text(
+    main_xml: &str,
+) -> Option<crate::common_attribute::CommonAttribute> {
+    match xml_parser::parse_common_attribute_xml(main_xml) {
+        Ok(attribute) => Some(attribute),
+        Err(error) => {
+            tracing::warn!(%error, "common attribute XML does not parse");
+            None
+        }
+    }
+}
+
+/// One discovered common attribute in a config root's *structure* listing: its name (file
+/// stem) and main XML path. Common attributes are flat loose XML under `CommonAttributes/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredCommonAttribute {
+    pub name: String,
+    pub main: PathBuf,
+}
+
+/// Walk one config root and list its common attributes by structure only, the
+/// common-attribute counterpart of [`discover_event_subscription_structure`].
+pub fn discover_common_attribute_structure(
+    root: &Path,
+    tree: &dyn DirTree,
+) -> Vec<DiscoveredCommonAttribute> {
+    let dir = collection_dir(tree, root, "CommonAttributes");
+    let mut out: Vec<DiscoveredCommonAttribute> = loose_xml_children(tree, &dir)
+        .into_iter()
+        .map(|(name, main)| DiscoveredCommonAttribute { name, main })
+        .collect();
+    out.sort_by(|a, b| (a.name.fold_lower(), &a.main).cmp(&(b.name.fold_lower(), &b.main)));
+    out
+}
+
 pub fn parse_common_module_from_text(main_xml: &str) -> Option<crate::common_module::CommonModule> {
     xml_parser::parse_common_module_xml(main_xml).ok()
 }
@@ -1882,6 +1947,42 @@ mod tests {
         assert!(
             !scoped.common_modules().is_empty(),
             "positive control: unrelated metadata must still be loaded"
+        );
+    }
+
+    #[test]
+    fn scoped_directory_load_omits_excluded_common_attributes() {
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/common_attributes"));
+        let names = |config: &Configuration| {
+            let catalog = config.find_metadata_object(MdoType::Catalog, "Справочник1").unwrap();
+            let mut names: Vec<_> =
+                catalog.common_attributes.iter().map(|f| f.name.clone()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&load_from_directory(path).unwrap()),
+            ["ОбластьДанныхОсновныеДанные", "ОбщийКомментарий", "Организация"],
+            "fixture sanity: every common attribute reaches the catalog before any exclusion"
+        );
+
+        let without_family =
+            load_from_directory_scoped(path, &ExcludedPaths::new([path.join("CommonAttributes")]))
+                .unwrap();
+        assert!(
+            names(&without_family).is_empty(),
+            "a common attribute was read through an excluded family directory"
+        );
+
+        let without_file = load_from_directory_scoped(
+            path,
+            &ExcludedPaths::new([path.join("CommonAttributes").join("Организация.xml")]),
+        )
+        .unwrap();
+        assert_eq!(
+            names(&without_file),
+            ["ОбластьДанныхОсновныеДанные", "ОбщийКомментарий"],
+            "an excluded common attribute file was read, or its siblings were lost"
         );
     }
 

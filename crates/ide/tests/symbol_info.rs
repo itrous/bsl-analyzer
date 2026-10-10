@@ -69,6 +69,7 @@ const REPORT_FORM_MODULE: &str = include_str!(concat!(
 
 fn empty_listing_data() -> MetadataListingData {
     MetadataListingData {
+        common_attributes: Vec::new(),
         entries: Vec::new(),
         defined_types: Vec::new(),
         common_modules: Vec::new(),

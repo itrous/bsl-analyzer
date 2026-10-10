@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" version="2.10">
+  <Configuration uuid="0cb00000-0000-0000-0000-000000000001">
+    <Properties><Name>РазделениеДанных</Name></Properties>
+  </Configuration>
+</MetaDataObject>

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.10">
+	<CommonAttribute uuid="0ca00000-0000-0000-0000-0000000002a1">
+		<Properties>
+			<Name>ОбластьДанныхОсновныеДанные</Name>
+			<Synonym>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>ОбластьДанныхОсновныеДанные</v8:content>
+				</v8:item>
+			</Synonym>
+			<Comment/>
+			<Type>
+				<v8:Type>xs:decimal</v8:Type>
+				<v8:NumberQualifiers>
+					<v8:Digits>7</v8:Digits>
+					<v8:FractionDigits>0</v8:FractionDigits>
+					<v8:AllowedSign>Nonnegative</v8:AllowedSign>
+				</v8:NumberQualifiers>
+			</Type>
+			<Content>
+				<xr:Item>
+					<xr:Metadata>Catalog.СправочникБезРазделения</xr:Metadata>
+					<xr:Use>DontUse</xr:Use>
+					<xr:ConditionalSeparation/>
+				</xr:Item>
+				<xr:Item>
+					<xr:Metadata>Constant.ИспользоватьРазделение</xr:Metadata>
+					<xr:Use>Use</xr:Use>
+					<xr:ConditionalSeparation/>
+				</xr:Item>
+				<xr:Item>
+					<xr:Metadata>ScheduledJob.Обмен</xr:Metadata>
+					<xr:Use>DontUse</xr:Use>
+					<xr:ConditionalSeparation/>
+				</xr:Item>
+				<xr:Item>
+					<xr:Metadata>CalculationRegister.Начисления.Recalculation.Перерасчет</xr:Metadata>
+					<xr:Use>DontUse</xr:Use>
+					<xr:ConditionalSeparation/>
+				</xr:Item>
+			</Content>
+			<AutoUse>Use</AutoUse>
+			<DataSeparation>Separate</DataSeparation>
+			<SeparatedDataUse>Independently</SeparatedDataUse>
+			<DataSeparationValue/>
+			<DataSeparationUse/>
+			<ConditionalSeparation/>
+			<UsersSeparation>DontUse</UsersSeparation>
+			<AuthenticationSeparation>DontUse</AuthenticationSeparation>
+			<ConfigurationExtensionsSeparation>DontUse</ConfigurationExtensionsSeparation>
+			<Indexing>DontIndex</Indexing>
+			<FullTextSearch>Use</FullTextSearch>
+			<DataHistory>Use</DataHistory>
+		</Properties>
+	</CommonAttribute>
+</MetaDataObject>

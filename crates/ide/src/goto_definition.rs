@@ -999,6 +999,7 @@ mod tests {
         db.set_metadata_listing(
             &root.to_string_lossy(),
             MetadataListingData {
+                common_attributes: Vec::new(),
                 entries: Vec::new(),
                 defined_types: Vec::new(),
                 common_modules: Vec::new(),
