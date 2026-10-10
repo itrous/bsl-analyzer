@@ -172,6 +172,9 @@ fn render(kind: &TypeKind, ctx: &dyn DisplayCtx, db: &dyn TypeKernelDb, buf: &mu
         TypeKind::MetadataReferenceCollection(kind) => {
             buf.push_str(metadata_reference_collection_label(*kind, ctx.locale()));
         }
+        TypeKind::MetadataObjectCollection(_) => {
+            buf.push_str(platform_object_label("КоллекцияОбъектовМетаданных", ctx.locale()));
+        }
         TypeKind::MetadataReference { kind, name } => {
             let kind_label = match ctx.locale() {
                 Locale::Ru => kind.russian_singular(),

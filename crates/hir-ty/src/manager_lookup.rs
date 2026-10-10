@@ -68,14 +68,23 @@ fn promote_collection_member(
     kind: MdoType,
     mdo_name: &Name,
 ) -> Option<ManagerMemberInfo> {
-    let needle = mdo_name.as_str();
-    let exists = resolver.resolve_metadata_object(kind, needle).is_some()
-        || resolver.resolve_register(kind, needle).is_some()
-        || resolver.manager_module_without_config(kind, needle);
-
-    exists.then(|| ManagerMemberInfo {
+    collection_member_exists(resolver, kind, mdo_name.as_str()).then(|| ManagerMemberInfo {
         ty: db.object_manager(kind, mdo_name.as_str().to_string(), &RootConfigCtx),
     })
+}
+
+/// Whether the configuration holds an object of `kind` named `name` — the one
+/// membership test shared by a manager collection (`Справочники.X`) and the
+/// metadata collection of the same kind (`Метаданные.Справочники.X`), so the two
+/// cannot disagree about what exists.
+pub(crate) fn collection_member_exists(
+    resolver: &dyn ObjectResolver,
+    kind: MdoType,
+    name: &str,
+) -> bool {
+    resolver.resolve_metadata_object(kind, name).is_some()
+        || resolver.resolve_register(kind, name).is_some()
+        || resolver.manager_module_without_config(kind, name)
 }
 
 pub(crate) fn lookup_predefined(

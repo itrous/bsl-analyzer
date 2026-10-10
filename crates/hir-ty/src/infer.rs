@@ -2651,13 +2651,21 @@ impl<'db> InferenceContext<'db> {
                     // A name the author has not finished writing (`Справочники.`) is not a
                     // miss: lowering keeps the incomplete field as the missing placeholder,
                     // and accusing the configuration on every keystroke would be noise.
+                    //
+                    // `Метаданные.Справочники` is closed on the same grounds, but only
+                    // where the configuration is visible: an external processor or a
+                    // loose module names objects of a configuration this file cannot
+                    // see, and there a miss proves nothing.
                     let closed_receiver = matches!(
                         base_kind,
                         TypeKind::MetadataRef(_)
                             | TypeKind::ThisObject { .. }
                             | TypeKind::ManagerCollection(_)
                     ) || matches!(base_kind, TypeKind::Structure(facet) if facet.closed);
-                    if !field.is_missing() && closed_receiver {
+                    let closed_metadata_collection =
+                        matches!(base_kind, TypeKind::MetadataObjectCollection(_))
+                            && self.db.file_has_visible_config(self.context_file_id);
+                    if !field.is_missing() && (closed_receiver || closed_metadata_collection) {
                         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedField {
                             expr: expr_id,
                             receiver_ty: base_ty,

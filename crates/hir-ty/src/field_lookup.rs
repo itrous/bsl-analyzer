@@ -117,6 +117,10 @@ fn lookup_field_raw(
         return lookup_metadata_reference_member(db, resolver, *kind, field_name);
     }
 
+    if let TypeKind::MetadataObjectCollection(kind) = db.lookup_type(effective_ty) {
+        return lookup_metadata_object_collection_member(db, resolver, *kind, field_name);
+    }
+
     if let TypeKind::Structure(facet) = db.lookup_type(effective_ty) {
         // A known literal key resolves here. A miss is classified by inference from the facet's
         // explicit completeness proof; lookup itself stays unchanged for completion/hover callers.
@@ -167,15 +171,55 @@ fn lookup_configuration_metadata_field(
         return None;
     }
 
-    // Cold (non-manager) kinds only. Manager plurals (`Метаданные.Справочники`) name a
-    // collection of metadata-DESCRIPTION objects (`ОбъектМетаданных`), not the
-    // `СправочникМенеджер`, so they must keep falling through to platform-property
-    // resolution rather than being typed as a manager collection here.
+    // Manager plurals (`Метаданные.Справочники`) name a collection of metadata-DESCRIPTION
+    // objects (`ОбъектМетаданных`), not the `СправочникМенеджер`: the property itself —
+    // its availability, its read-only flag — stays the platform's, only the collection
+    // type learns which kind it holds, so `Метаданные.Справочники.X` can be checked
+    // against the configuration.
+    if let Some(kind) = MdoType::from_plural(field_name.as_str()) {
+        if is_checked_metadata_collection(kind) {
+            let info = lookup_field_via_platform_property(db, receiver, field_name)?;
+            return Some(FieldInfo { ty: db.metadata_object_collection(kind), ..info });
+        }
+        return None;
+    }
+
     let kind = MetadataReferenceKind::from_plural(field_name.as_str())?;
     Some(FieldInfo {
         name: Name::new(kind.russian_plural()),
         name_en: Some(Name::new(kind.english_plural())),
         ty: db.metadata_reference_collection(kind),
+        value_ty: None,
+        is_readonly: true,
+        origin: crate::field_enum::FieldOrigin::MetadataReference,
+    })
+}
+
+/// Whether `Метаданные.<plural of kind>` is checked against the configuration: the
+/// manager-backed kinds, the same set whose manager collection (`Справочники.X`) is
+/// already checked. `ВнешнийИсточникДанных` is left out because the object resolver
+/// does not see external data sources, so its collection could not tell a typo from
+/// a real member.
+fn is_checked_metadata_collection(kind: MdoType) -> bool {
+    kind.manager_type_prefix().is_some() && kind != MdoType::ExternalDataSource
+}
+
+/// A member of `Метаданные.Справочники`: present when the configuration holds a
+/// catalog of that name. Its type stays unknown, as before the collection learned
+/// its kind — typing the description itself is a separate change.
+fn lookup_metadata_object_collection_member(
+    db: &dyn TypeKernelDb,
+    resolver: &dyn MetadataResolution,
+    kind: MdoType,
+    field_name: &Name,
+) -> Option<FieldInfo> {
+    if !crate::manager_lookup::collection_member_exists(resolver, kind, field_name.as_str()) {
+        return None;
+    }
+    Some(FieldInfo {
+        name: field_name.clone(),
+        name_en: None,
+        ty: db.unknown(),
         value_ty: None,
         is_readonly: true,
         origin: crate::field_enum::FieldOrigin::MetadataReference,

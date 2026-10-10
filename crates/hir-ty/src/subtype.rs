@@ -39,12 +39,19 @@ pub fn is_assignable(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool {
     // `РегламентныеЗадания.НайтиПредопределенное(Метаданные.РегламентныеЗадания.X)`) never
     // manufactures a TypeMismatch. They ARE metadata objects; a precise per-kind lattice for the
     // non-manager kinds is deliberately out of scope for this soft surface.
+    // A kind-aware metadata collection (`Метаданные.Справочники`) gets the same latitude: it
+    // was a plain platform object before it learned its element kind, and learning it must not
+    // turn into a mismatch wherever a `КоллекцияОбъектовМетаданных` is passed around.
     if matches!(
         from_kind,
-        TypeKind::MetadataReference { .. } | TypeKind::MetadataReferenceCollection(_)
+        TypeKind::MetadataReference { .. }
+            | TypeKind::MetadataReferenceCollection(_)
+            | TypeKind::MetadataObjectCollection(_)
     ) || matches!(
         to_kind,
-        TypeKind::MetadataReference { .. } | TypeKind::MetadataReferenceCollection(_)
+        TypeKind::MetadataReference { .. }
+            | TypeKind::MetadataReferenceCollection(_)
+            | TypeKind::MetadataObjectCollection(_)
     ) {
         return true;
     }

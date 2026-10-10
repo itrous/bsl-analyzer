@@ -504,6 +504,11 @@ pub enum TypeKind {
         kind: MetadataReferenceKind,
         name: Name,
     },
+    /// A manager-backed collection of the configuration metadata root
+    /// (`Метаданные.Справочники`): the platform's `КоллекцияОбъектовМетаданных`,
+    /// remembering which kind its elements are. The bare platform type forgets it,
+    /// and with it every check below `Метаданные.Справочники.X`.
+    MetadataObjectCollection(MdoType),
     AnyRef,
     MetadataObject(MetaObjFacet),
     TabularSection {

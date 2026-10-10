@@ -473,4 +473,62 @@ mod tests {
 КонецПроцедуры"#;
         assert_eq!(unresolved_fields(untouched).len(), 1, "{:?}", unresolved_fields(untouched));
     }
+
+    fn unresolved_in_fixture(fixture: &str) -> Vec<crate::Diagnostic> {
+        check_hir_diagnostic_with_fixtures(fixture)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnresolvedField)
+            .collect()
+    }
+
+    #[test]
+    fn loop_variable_over_a_metadata_collection_stays_soft() {
+        // The second loop iterates an unknown collection, and the variable would keep the
+        // first loop's kind if the element were typed by it: `Регистр.ТабличныеЧасти` below
+        // is valid code on a catalog.
+        let fixture = r#"
+//- /test.bsl
+Процедура Тест(Вид)
+    Для Каждого Описание Из Метаданные.РегистрыСведений Цикл
+        Нет = Описание.НетТакогоСвойства;
+    КонецЦикла;
+    Для Каждого Описание Из Метаданные[Вид] Цикл
+        Есть = Описание.ТабличныеЧасти;
+    КонецЦикла;
+КонецПроцедуры
+"#;
+        let unresolved = unresolved_in_fixture(fixture);
+        assert!(unresolved.is_empty(), "loop variables must stay soft: {unresolved:?}");
+    }
+
+    #[test]
+    fn metadata_shapes_without_a_trusted_member_list_stay_silent() {
+        // Nested collections, generic descriptions, the configuration root and the kinds
+        // whose platform member lists are not trusted as complete must not accuse anything.
+        let fixture = r#"
+//- /test.bsl
+Процедура Тест()
+    А = Метаданные.Справочники.Справочник1.Реквизиты.НетТакогоРеквизита;
+    Б = Метаданные.НайтиПоПолномуИмени("Справочник.Справочник1").НетТакогоСвойства;
+    В = Метаданные.ОсновнаяРоль;
+    Г = Метаданные.ОбщиеМодули.НетТакогоМодуля;
+    Д = Метаданные.Справочники.Справочник1.ОсновнаяФормаОбъекта.НетТакогоСвойства;
+    Для Каждого Описание Из Метаданные.Справочники.Справочник1.Реквизиты Цикл
+        Е = Описание.НетТакогоСвойства;
+    КонецЦикла;
+КонецПроцедуры
+"#;
+        let unresolved = unresolved_in_fixture(fixture);
+        assert!(unresolved.is_empty(), "untrusted metadata shapes must stay soft: {unresolved:?}");
+    }
+
+    #[test]
+    fn metadata_collection_miss_is_silent_without_a_visible_configuration() {
+        // An external processor or a loose module may name objects of a configuration it
+        // cannot see; the miss proves nothing there.
+        let code = r#"Процедура Тест()
+    Нет = Метаданные.Справочники.НетТакогоСправочника;
+КонецПроцедуры"#;
+        assert!(unresolved_fields(code).is_empty(), "{:?}", unresolved_fields(code));
+    }
 }

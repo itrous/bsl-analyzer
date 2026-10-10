@@ -541,6 +541,7 @@ pub fn platform_type_key_id(db: &dyn TypeKernelDb, id: TypeId) -> Option<String>
         | TypeKind::Null
         | TypeKind::Undefined => None,
         TypeKind::Uuid => Some("УникальныйИдентификатор".to_string()),
+        TypeKind::MetadataObjectCollection(_) => Some("КоллекцияОбъектовМетаданных".to_string()),
         TypeKind::ValueStorage => Some("ХранилищеЗначения".to_string()),
         TypeKind::MetadataRef(_)
         | TypeKind::AnyMetadataRef { .. }

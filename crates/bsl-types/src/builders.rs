@@ -155,6 +155,10 @@ pub trait Builders: TypeKernelDb {
         self.intern_type(TypeKind::MetadataReference { kind, name })
     }
 
+    fn metadata_object_collection(&self, mdo_type: bsl_metadata::MdoType) -> TypeId {
+        self.intern_type(TypeKind::MetadataObjectCollection(mdo_type))
+    }
+
     fn any_ref(&self) -> TypeId {
         self.intern_type(TypeKind::AnyRef)
     }

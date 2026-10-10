@@ -13,6 +13,10 @@ This usually means one of the following:
 
 The current implementation is conservative. It reports only cases where type inference has a confident metadata reference type and the field lookup fails for that type.
 
+Metadata collections are checked the same way:
+
+- `Метаданные.Справочники.NoSuchObject` — the configuration has no object of that name. The platform compiles the module and fails at run time with "Поле объекта не обнаружено" (object field not found). Only the collections of manager-backed kinds are checked (catalogs, documents, registers, charts, enumerations, exchange plans, constants, data processors, reports, business processes, tasks) — the same kinds whose manager collection (`Справочники.NoSuchObject`) is already checked — and only when the configuration is visible to the analyzer; in an external data processor the access stays silent.
+
 ## Examples
 
 Incorrect:
