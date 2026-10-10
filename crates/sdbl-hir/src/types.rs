@@ -113,6 +113,8 @@ impl SdblType {
             AttributeType::Platform(_) => Self::Unknown,
             AttributeType::PlatformNamed(_) => Self::Unknown,
             AttributeType::UnknownNamed(_) => Self::Unknown,
+            // A record manager is a form-side object, never a value a query yields.
+            AttributeType::InformationRegisterRecordManager { .. } => Self::Unknown,
             AttributeType::Unknown => Self::Unknown,
         }
     }

@@ -319,6 +319,10 @@ fn parse_reference_type(type_str: &str) -> Result<AttributeType> {
         return Ok(AttributeType::Ref { mdo_type: *mdo_type, name });
     }
 
+    if ref_type == "cfg:InformationRegisterRecordManager" {
+        return Ok(AttributeType::InformationRegisterRecordManager { name });
+    }
+
     if ref_type.ends_with("RecordManager") {
         tracing::debug!(type_str = %type_str, "record-manager type not modelled yet; treated as Unknown");
         return Ok(AttributeType::UnknownNamed(type_str.to_string()));
@@ -456,10 +460,23 @@ mod tests {
     }
 
     #[test]
-    fn record_manager_token_keeps_its_presentation() {
+    fn record_manager_token_names_its_register() {
         assert_eq!(
             parse_single_type("cfg:InformationRegisterRecordManager.Курсы", &qualifiers()).unwrap(),
-            AttributeType::UnknownNamed("cfg:InformationRegisterRecordManager.Курсы".to_string()),
+            AttributeType::InformationRegisterRecordManager { name: "Курсы".to_string() },
+        );
+    }
+
+    /// A record set is a collection, not a record: it must not be read as the
+    /// record manager of the same register.
+    #[test]
+    fn record_set_token_stays_a_register_reference() {
+        assert_eq!(
+            parse_single_type("cfg:InformationRegisterRecordSet.Курсы", &qualifiers()).unwrap(),
+            AttributeType::Ref {
+                mdo_type: MdoType::InformationRegister,
+                name: "Курсы".to_string(),
+            },
         );
     }
 

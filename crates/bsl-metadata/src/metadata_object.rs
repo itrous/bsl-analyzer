@@ -704,6 +704,12 @@ pub enum AttributeType {
         mdo_type: MdoType,
         name: String,
     },
+    /// `cfg:InformationRegisterRecordManager.<Имя>` — the type of the main attribute
+    /// `Запись` of an information register record form. Only information registers
+    /// have a record manager, so the register kind is implied.
+    InformationRegisterRecordManager {
+        name: String,
+    },
     AnyRef,
     AnyObjectRef {
         mdo_type: MdoType,
@@ -733,9 +739,10 @@ impl AttributeType {
     /// discriminant (plus `Copy` payloads) and owns no heap.
     pub fn estimated_heap_size(&self) -> usize {
         match self {
-            Self::Ref { name, .. } | Self::DefinedType { name } | Self::PlatformNamed(name) => {
-                name.capacity()
-            }
+            Self::Ref { name, .. }
+            | Self::InformationRegisterRecordManager { name }
+            | Self::DefinedType { name }
+            | Self::PlatformNamed(name) => name.capacity(),
             Self::Composite { types } => {
                 stdx::heap::vec_bytes::<AttributeType>(types.len())
                     + types.iter().map(AttributeType::estimated_heap_size).sum::<usize>()
@@ -1101,6 +1108,9 @@ impl std::fmt::Display for AttributeType {
             Self::DateTime => write!(f, "ДатаВремя"),
             Self::Ref { mdo_type, name } => {
                 write!(f, "{}.{}", mdo_type.russian_name(), name)
+            }
+            Self::InformationRegisterRecordManager { name } => {
+                write!(f, "РегистрСведенийМенеджерЗаписи.{}", name)
             }
             Self::AnyRef => write!(f, "ЛюбаяСсылка"),
             Self::AnyObjectRef { mdo_type } => {

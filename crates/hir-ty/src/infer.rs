@@ -2663,7 +2663,16 @@ impl<'db> InferenceContext<'db> {
                         self.db,
                         &obj_resolver,
                         base_ty,
-                    )) || matches!(base_kind, TypeKind::Structure(facet) if facet.closed);
+                    )) || matches!(base_kind, TypeKind::Structure(facet) if facet.closed)
+                        || (crate::field_lookup::is_record_manager_form_data(self.db, base_ty)
+                            && !crate::field_enum::metadata_fields_open(
+                                self.db,
+                                &obj_resolver,
+                                crate::field_lookup::project_form_data_for_fields_id(
+                                    self.db, base_ty,
+                                )
+                                .unwrap_or(base_ty),
+                            ));
                     if !field.is_missing() && closed_receiver {
                         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedField {
                             expr: expr_id,
