@@ -299,11 +299,8 @@ fn load_all_metadata_parallel(path: &Path, scope: &ScopedFs<'_>) -> LoadedMetada
                 load_subsystems(scope, &collection_dir(scope, path, "Subsystems"))
         });
         s.spawn(|_| {
-            *common_attributes.lock().unwrap() = load_common_attributes(&collection_dir(
-                &bsl_conventions::RealFs,
-                path,
-                "CommonAttributes",
-            ))
+            *common_attributes.lock().unwrap() =
+                load_common_attributes(scope, &collection_dir(scope, path, "CommonAttributes"))
         });
     });
 
@@ -440,9 +437,12 @@ fn build_configuration(loaded: LoadedMetadata) -> Configuration {
 /// Read every `CommonAttributes/<Name>.xml` of one root. A file that exists but does not
 /// parse is remembered rather than dropped: the field it would add is unknown, so the field
 /// sets of the objects it could reach are no longer exhaustive.
-fn load_common_attributes(dir: &Path) -> crate::common_attribute::CommonAttributeSet {
+fn load_common_attributes(
+    scope: &ScopedFs<'_>,
+    dir: &Path,
+) -> crate::common_attribute::CommonAttributeSet {
     let mut set = crate::common_attribute::CommonAttributeSet::default();
-    for (_, path) in loose_xml_children(&bsl_conventions::RealFs, dir) {
+    for (_, path) in loose_xml_children(scope, dir) {
         match fs::read_to_string(&path) {
             Ok(xml) => set.push_parsed(parse_common_attribute_from_text(&xml)),
             Err(error) => {
@@ -1947,6 +1947,42 @@ mod tests {
         assert!(
             !scoped.common_modules().is_empty(),
             "positive control: unrelated metadata must still be loaded"
+        );
+    }
+
+    #[test]
+    fn scoped_directory_load_omits_excluded_common_attributes() {
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/common_attributes"));
+        let names = |config: &Configuration| {
+            let catalog = config.find_metadata_object(MdoType::Catalog, "Справочник1").unwrap();
+            let mut names: Vec<_> =
+                catalog.common_attributes.iter().map(|f| f.name.clone()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&load_from_directory(path).unwrap()),
+            ["ОбластьДанныхОсновныеДанные", "ОбщийКомментарий", "Организация"],
+            "fixture sanity: every common attribute reaches the catalog before any exclusion"
+        );
+
+        let without_family =
+            load_from_directory_scoped(path, &ExcludedPaths::new([path.join("CommonAttributes")]))
+                .unwrap();
+        assert!(
+            names(&without_family).is_empty(),
+            "a common attribute was read through an excluded family directory"
+        );
+
+        let without_file = load_from_directory_scoped(
+            path,
+            &ExcludedPaths::new([path.join("CommonAttributes").join("Организация.xml")]),
+        )
+        .unwrap();
+        assert_eq!(
+            names(&without_file),
+            ["ОбластьДанныхОсновныеДанные", "ОбщийКомментарий"],
+            "an excluded common attribute file was read, or its siblings were lost"
         );
     }
 
