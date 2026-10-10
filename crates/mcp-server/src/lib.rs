@@ -225,7 +225,11 @@ fn mark_graph_stale(mut response: CallToolResult, stale: bool) -> CallToolResult
     if stale {
         if let Some(body) = response.structured_content.as_mut() {
             let old_mirror = serde_json::to_string(body).expect("JSON serializes");
-            body["stale"] = serde_json::Value::Bool(true);
+            // Only fields the tool's schema already declares: a top-level `stale` is part of
+            // some envelopes but not of others, and must not appear unannounced.
+            if body.get("stale").is_some() {
+                body["stale"] = serde_json::Value::Bool(true);
+            }
             if body.get("freshness").is_some() {
                 body["freshness"]["stale"] = serde_json::Value::Bool(true);
             }
@@ -4622,6 +4626,7 @@ mod graph_supersession_contract {
                 "search must return a positive hit"
             );
             assert_eq!(search_body["freshness"]["stale"], true);
+            assert!(search_body.get("stale").is_none(), "undeclared search field: {search_body}");
 
             let diag_response = server
                 .diagnostics(

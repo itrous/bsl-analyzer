@@ -654,6 +654,7 @@ impl GraphState {
             (added, 0, 0, _) if added > 0 => "bsl_added",
             (0, removed, 0, _) if removed > 0 => "bsl_removed",
             (0, 0, modified, _) if modified > 0 => "bsl_modified",
+            (0, 0, 0, _) => "xml_only_delta",
             _ => "mixed_source_delta",
         };
         let relative_paths = |paths: &[String]| {
