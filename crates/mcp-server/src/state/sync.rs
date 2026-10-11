@@ -691,6 +691,9 @@ impl SharedState {
         rescan_required: bool,
         graph: &GraphState,
     ) -> SearchDriftPlan {
+        if !graph.validate_workspace_scope() {
+            return SearchDriftPlan { preparation_stopping: true, ..SearchDriftPlan::default() };
+        }
         let class =
             crate::drift_classify::classify_drift(entries, &std::collections::HashSet::new(), None);
         let mut plan = SearchDriftPlan::default();
@@ -934,8 +937,11 @@ impl SharedState {
         stop: &super::OwnerStop,
         lease: &crate::workspace_lease::WorkspaceLease,
         plan: &mut SearchDriftPlan,
-        _graph: &GraphState,
+        graph: &GraphState,
     ) -> super::WorkspaceSearchApply<bool, bsl_search::SearchError> {
+        if !graph.validate_workspace_scope() {
+            return super::WorkspaceSearchApply::Stopping;
+        }
         if matches!(plan.snapshot_outcome, Some(SnapshotPreparationOutcome::TransientRefusal)) {
             let roots = match shared.acquire_for_owner(stop) {
                 Ok(guard) => guard.as_ref().and_then(|engine| engine.workspace_roots().cloned()),
@@ -949,7 +955,7 @@ impl SharedState {
                 }
             };
             match Self::resolve_referencing_module_files(
-                _graph,
+                graph,
                 &plan.snapshot_paths,
                 roots.as_ref(),
             ) {
@@ -1006,6 +1012,9 @@ impl SharedState {
         // right place for it: a pass with nothing to write has nothing to publish over a
         // new owner, and it goes straight back to sleep.
         if plan.preparation_error.is_none() && plan.complete() {
+            if !graph.validate_workspace_scope() {
+                return super::WorkspaceSearchApply::Stopping;
+            }
             // Still epoch-checked, because "empty" is itself a verdict of the roots the
             // plan was prepared against: a file under a root registered since then maps
             // to no key yet, so the plan comes out empty and must be replanned, not
@@ -1029,6 +1038,12 @@ impl SharedState {
         remaining -= removed_end - removed_start;
         let context_start = plan.context_cursor;
         let context_end = (context_start + remaining).min(plan.context_keys.len());
+
+        // The final Project check happens before taking the shared engine or lease
+        // fence: a prepared batch may be delayed while the immutable scope changes.
+        if !graph.validate_workspace_scope() {
+            return super::WorkspaceSearchApply::Stopping;
+        }
 
         let outcome = Self::apply_workspace_search(shared, stop, lease, |engine| {
             if engine.workspace_roots_epoch() != plan.roots_epoch {
@@ -1130,7 +1145,7 @@ impl SharedState {
                     Err(error) => {
                         return ReferencingFilesOutcome::OperationError(format!(
                             "referencing-files lookup failed for {mdo_id}: {error}"
-                        ))
+                        ));
                     }
                 }
             }
@@ -1682,6 +1697,64 @@ mod tests {
             &crate::graph::GraphState::disabled(),
         );
         assert!(lock.exists(), "a plan with work skipped the lease fence");
+    }
+
+    #[test]
+    fn workspace_cache_scope_search_drift_refuses_prepared_batch_before_engine_or_lease() {
+        let workspace = tempdir().unwrap();
+        let cache_parent = tempdir().unwrap();
+        fs::write(workspace.path().join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::write(workspace.path().join("Module.bsl"), "Процедура П() КонецПроцедуры").unwrap();
+        let project = crate::project::at(workspace.path()).unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&cache_parent.path().join("cache")),
+            cache_parent.path(),
+            None,
+        )
+        .unwrap();
+        cache.ensure().unwrap();
+        let mut engine = SearchEngine::fts_only(&cache.search_db_path()).unwrap();
+        engine.set_workspace_root(workspace.path().to_path_buf());
+        let shared: super::super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let owners = crate::state::OwnerStop::default();
+        let transport = tokio_util::sync::CancellationToken::new();
+        let graph = crate::graph::GraphState::for_workspace_with_cache(
+            workspace.path().to_path_buf(),
+            cache.clone(),
+        )
+        .with_owner_stop(owners.clone())
+        .with_scope_transport_stop(transport.clone());
+        let mut plan = SearchDriftPlan {
+            dirty_keys: vec![bsl_search::FileKey::configuration("Module.bsl")],
+            ..Default::default()
+        };
+        fs::write(
+            workspace.path().join("bsl-analyzer.toml"),
+            "[source]\nexclude = [\"generated\"]\n",
+        )
+        .unwrap();
+        fs::remove_file(cache.lease_lock_path()).unwrap();
+
+        assert!(matches!(
+            SharedState::apply_prepared_search_drift(&shared, &owners, &lease, &mut plan, &graph,),
+            crate::state::WorkspaceSearchApply::Stopping
+        ));
+        assert!(
+            !cache.lease_lock_path().exists(),
+            "scope drift was rejected before the lease fence"
+        );
+        assert!(owners.is_stopped());
+        assert!(transport.is_cancelled());
+        assert!(
+            bsl_search::Store::open_existing(&cache.search_db_path())
+                .unwrap()
+                .all_files()
+                .unwrap()
+                .is_empty(),
+            "the prepared batch was not published into the old search store"
+        );
     }
 
     #[test]
@@ -2440,8 +2513,12 @@ mod tests {
             if !done {
                 eprintln!(
                     "DIAG {what}: status={:?} forced={:?} change={:?} failed={} marks={} in_flight={} branch={}",
-                    graph.status(), graph.owes_forced(), graph.owes_change(), graph.owes_failed(),
-                    graph.owes_marks(), graph.build_in_flight(),
+                    graph.status(),
+                    graph.owes_forced(),
+                    graph.owes_change(),
+                    graph.owes_failed(),
+                    graph.owes_marks(),
+                    graph.build_in_flight(),
                     super::RESCAN_DEBT_WAIT_BRANCH.load(std::sync::atomic::Ordering::SeqCst),
                 );
             }
@@ -2477,9 +2554,16 @@ mod tests {
         if !acted_on_it {
             eprintln!(
                 "DIAG plain: status={:?} forced={:?} answered_forced={} below={} change={:?} failed={} marks={} in_flight={} branch={} seq={}",
-                graph.status(), graph.owes_forced(), graph.answered_forced(), below_the_fact,
-                graph.owes_change(), graph.owes_failed(), graph.owes_marks(),
-                graph.build_in_flight(), branch(), hub.seq(),
+                graph.status(),
+                graph.owes_forced(),
+                graph.answered_forced(),
+                below_the_fact,
+                graph.owes_change(),
+                graph.owes_failed(),
+                graph.owes_marks(),
+                graph.build_in_flight(),
+                branch(),
+                hub.seq(),
             );
         }
         assert!(acted_on_it, "a fact taken by the wait told the graph nothing");

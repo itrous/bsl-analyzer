@@ -53,7 +53,12 @@ async fn workspace_client(root: &Path, warm: bool) -> Client {
 
 async fn client_without_graph(root: &Path) -> (Client, std::fs::File) {
     // Hold before construction: startup may otherwise publish before the first request.
-    let cache = WorkspaceCacheLayout::for_workspace(root);
+    let project = mcp_server::project::at(root).unwrap();
+    let cache_base = root
+        .parent()
+        .unwrap()
+        .join(format!("{}-cache", root.file_name().unwrap().to_string_lossy()));
+    let cache = WorkspaceCacheLayout::for_project(&project, Some(&cache_base), root, None).unwrap();
     cache.ensure().unwrap();
     let lock = std::fs::OpenOptions::new()
         .create(true)

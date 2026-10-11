@@ -276,6 +276,9 @@ impl GraphState {
         built_topology: u64,
         declaration_epoch: u64,
     ) {
+        if !self.validate_workspace_scope() {
+            return;
+        }
         let (Some(hub), Some(root)) = (&self.change_hub, self.workspace_root.as_deref()) else {
             return;
         };
@@ -318,6 +321,13 @@ impl GraphState {
         let Some(workspace_root) = self.workspace_root.clone() else {
             return;
         };
+        if !self.validate_workspace_scope() {
+            self.record_load_failure(
+                is_reload,
+                LoadFailure::operation("workspace cache scope changed before graph preparation"),
+            );
+            return;
+        }
         if let Some(reason) = self.ownership_refusal() {
             self.record_load_failure(
                 is_reload,
@@ -914,7 +924,7 @@ impl GraphState {
                         LoadFailureReason::TransientRefusal,
                         "a graph read outlasted the installation wait; the patch is prepared \
                          again on the next reload",
-                    ))
+                    ));
                 }
                 super::snapshot::Pausing::Retired => return Err(lost_workspace_failure(self)),
             };
@@ -1416,6 +1426,11 @@ fn build_and_publish_scanned_inner(
     graph: &GraphState,
     chunk_sink: Option<&mut dyn ide::FusedChunkSink>,
 ) -> Result<PublishedBuild, LoadFailure> {
+    if !graph.validate_workspace_scope() {
+        return Err(LoadFailure::operation(
+            "workspace cache scope changed before graph candidate preparation",
+        ));
+    }
     let fp_pre = super::scan::fingerprint_of_project(&pre.stats, project)
         .ok_or_else(|| LoadFailure::operation("incomplete portable pre-scan fingerprint"))?;
     let out_path = graph.graph_db_path().expect("workspace graph has cache layout");
@@ -1701,6 +1716,11 @@ fn build_candidate(
     base: Option<&str>,
     fp_pre: crate::graph_db::GraphFp,
 ) -> Result<(usize, bool), LoadFailure> {
+    if !graph.validate_workspace_scope() {
+        return Err(LoadFailure::operation(
+            "workspace cache scope changed before graph candidate write",
+        ));
+    }
     let mut marker = CandidateMarker {
         format: crate::graph_db::SCHEMA_VERSION,
         base: base.map(str::to_owned),
@@ -1736,6 +1756,13 @@ fn build_candidate(
         Ok(summary) => summary,
         Err(error) => return Err(LoadFailure::operation(error)),
     };
+    if !graph.validate_workspace_scope() {
+        let _ = std::fs::remove_file(candidate);
+        let _ = std::fs::remove_file(candidate_marker_path(candidate));
+        return Err(LoadFailure::operation(
+            "workspace cache scope changed during graph candidate build",
+        ));
+    }
     #[cfg(test)]
     graph.enter_build_candidate_hook();
     // The post-scan derives a FRESH project snapshot AND a fresh walk: the straddle
@@ -1746,6 +1773,13 @@ fn build_candidate(
     let post = crate::graph::universe::ScannedUniverse::scan_project(&post_project);
     let fp_post = super::scan::fingerprint_of_project(&post.stats, &post_project)
         .ok_or_else(|| LoadFailure::operation("incomplete portable post-scan fingerprint"))?;
+    if !graph.validate_workspace_scope() {
+        let _ = std::fs::remove_file(candidate);
+        let _ = std::fs::remove_file(candidate_marker_path(candidate));
+        return Err(LoadFailure::operation(
+            "workspace cache scope changed during graph candidate build",
+        ));
+    }
     // A delivery after the analyzer started lowering may have landed and then been reverted
     // before the post-scan (the ABA case), leaving equal fingerprints that do not describe the
     // bytes the analyzer consumed. A delivery before this boundary is represented by `pre`.
@@ -1925,6 +1959,11 @@ fn write_patch_in_place(
     plan: &PatchPlan,
     pause: super::snapshot::ReplacementPause,
 ) -> Result<(usize, super::snapshot::ReplacementPause), LoadFailure> {
+    if !graph.validate_workspace_scope() {
+        return Err(LoadFailure::operation(
+            "workspace cache scope changed before graph patch preparation",
+        ));
+    }
     let base = plan.base.as_deref();
     let Ok(_file_use) = graph.store.use_file() else {
         return Err(lost_workspace_failure(graph));
@@ -1981,6 +2020,13 @@ fn write_patch_in_place(
             });
         }
     };
+    if !graph.validate_workspace_scope() {
+        drop(transaction);
+        settle_after_rollback(graph, db_path, base, &pause);
+        return Err(LoadFailure::operation(
+            "workspace cache scope changed before graph patch publication",
+        ));
+    }
     let mut held = Some(transaction);
     let outcome = graph.lease.publish_short(&mut held, |held| {
         held.take().expect("the transaction is committed once").commit()
@@ -2082,6 +2128,12 @@ fn publish_or_discard(
             let _ = std::fs::remove_file(tmp_path);
         }
     };
+    if !graph.validate_workspace_scope() {
+        discard();
+        return Err(LoadFailure::operation(
+            "workspace cache scope changed before graph replacement publication",
+        ));
+    }
     if graph.lease.is_superseded() || graph.lease.is_released() {
         discard();
         return Err(lost_workspace_failure(graph));
@@ -2539,6 +2591,47 @@ mod vector_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn workspace_cache_scope_graph_candidate_drift_rolls_back_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let project = crate::project::at(root).unwrap();
+        let cache_parent = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&cache_parent.path().join("cache")),
+            cache_parent.path(),
+            None,
+        )
+        .unwrap();
+        cache.ensure().unwrap();
+        let owners = crate::state::OwnerStop::default();
+        let transport = tokio_util::sync::CancellationToken::new();
+        let root_for_hook = root.to_path_buf();
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_owner_stop(owners.clone())
+            .with_scope_transport_stop(transport.clone())
+            .with_build_candidate_hook_for_test(Arc::new(move |_| {
+                fs::write(
+                    root_for_hook.join("bsl-analyzer.toml"),
+                    "[source]\nexclude = [\"generated\"]\n",
+                )
+                .unwrap();
+            }));
+        let snapshot = crate::graph::ProjectSnapshot::load_excluding(root, &cache.exclusions(root));
+        let pre = crate::graph::universe::ScannedUniverse::scan_project(&snapshot);
+
+        let error = build_and_publish_scanned_inner(root, &snapshot, &pre, 1, &graph, None)
+            .err()
+            .expect("scope drift during candidate build is terminal");
+        assert!(!matches!(error.reason, LoadFailureReason::TransientRefusal));
+        assert!(!cache.graph_db_path().exists(), "the candidate was not renamed into the old leaf");
+        assert!(!cache.graph_candidate_path().exists(), "the drifted candidate was rolled back");
+        assert!(owners.is_stopped());
+        assert!(transport.is_cancelled());
+    }
 
     /// A panic in the builder unwinds past the temp database into the loader's `catch_unwind`,
     /// which logs and gives up. Nothing after that knows the name — each build takes a fresh
@@ -8339,7 +8432,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
-        write_common_module(root, "Ядро", true, "&НаСервере\nПроцедура М() Экспорт КонецПроцедуры\nПроцедура Н() Экспорт КонецПроцедуры");
+        write_common_module(
+            root,
+            "Ядро",
+            true,
+            "&НаСервере\nПроцедура М() Экспорт КонецПроцедуры\nПроцедура Н() Экспорт КонецПроцедуры",
+        );
         write_common_module(
             root,
             "Алиса",
@@ -8447,7 +8545,11 @@ mod tests {
         );
 
         // Add Ядро.Новый exported.
-        write(root, "CommonModules/Ядро/Ext/Module.bsl", "&НаСервере\nПроцедура М() Экспорт КонецПроцедуры\nПроцедура Новый() Экспорт КонецПроцедуры");
+        write(
+            root,
+            "CommonModules/Ядро/Ext/Module.bsl",
+            "&НаСервере\nПроцедура М() Экспорт КонецПроцедуры\nПроцедура Новый() Экспорт КонецПроцедуры",
+        );
         let core_path = root.join("CommonModules/Ядро/Ext/Module.bsl").canonicalize().unwrap();
         let core_key = core_path.to_string_lossy().into_owned();
         let profiles = recompute_profiles_for_test(root, std::slice::from_ref(&core_path)).unwrap();
@@ -8986,7 +9088,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
-        write_common_module(root, "Ядро", true, "&НаСервере\nФункция Цель() Экспорт КонецФункции\nФункция Прочее() Экспорт КонецФункции");
+        write_common_module(
+            root,
+            "Ядро",
+            true,
+            "&НаСервере\nФункция Цель() Экспорт КонецФункции\nФункция Прочее() Экспорт КонецФункции",
+        );
         write_common_module(
             root,
             "Вызов",
@@ -9827,8 +9934,14 @@ mod form_twin_tests {
                 .collect::<Vec<_>>()
             };
             (
-                read("SELECT id,kind,name,qualified,module,file_root_id,file_path,name_offset,sig_end,src_start,src_end,dispatch,is_export,addressable FROM nodes ORDER BY id", 14),
-                read("SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses", 8),
+                read(
+                    "SELECT id,kind,name,qualified,module,file_root_id,file_path,name_offset,sig_end,src_start,src_end,dispatch,is_export,addressable FROM nodes ORDER BY id",
+                    14,
+                ),
+                read(
+                    "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses",
+                    8,
+                ),
             )
         };
         let compare_cold = || {

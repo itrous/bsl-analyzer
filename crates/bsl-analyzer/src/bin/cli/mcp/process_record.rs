@@ -51,6 +51,18 @@ impl ProcessRecordGuard {
         requested_address: SocketAddr,
     ) -> io::Result<Self> {
         let path = record_path(profile, source_dir.as_deref())?;
+        if let Some(source) = source_dir.as_deref() {
+            let project = mcp_server::project::at(source)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if let Some(root) =
+                mcp_server::WorkspaceCacheLayout::overlapping_source_root(&project, &path)?
+            {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!(
+                    "automatic MCP process record {} overlaps source root {}; choose another source/cache layout",
+                    path.display(), root.display()
+                )));
+            }
+        }
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "process record has no parent directory")
         })?;

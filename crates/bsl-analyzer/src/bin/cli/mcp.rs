@@ -54,8 +54,9 @@ pub struct McpServeArgs {
     #[arg(long = "enable-tool")]
     enable_tools: Vec<String>,
 
-    /// Directory for workspace-derived graph, search and lease files. Relative
-    /// paths are resolved from the process working directory.
+    /// Base directory for workspace-derived files. CLI > BSL_CACHE_DIR > OS cache;
+    /// the final leaf is workspaces/v1/<scope digest>. Children receive the absolute base and
+    /// frozen scope stamp. Relative paths use the process cwd.
     #[arg(long = "cache-dir")]
     cache_dir: Option<PathBuf>,
 
@@ -127,7 +128,7 @@ pub struct McpServeArgs {
 impl McpCommand {
     /// Opt-in on-disk log destination for a daemon backend, enabled by
     /// `BSL_MCP_DAEMON_LOG` (`1`/`true`/`yes`/`on` → `bsl-analyzer-daemon.log`
-    /// in the effective workspace cache, `.build` by default; any other non-empty value is taken
+    /// in the effective workspace cache; any other non-empty value is taken
     /// as an explicit path). A daemon is spawned by a broker proxy with no
     /// terminal, so without a file its diagnostics (build heartbeat, stall
     /// watchdog reports) vanish into a closed stderr — set the variable when
@@ -152,6 +153,17 @@ impl McpCommand {
     }
 
     fn daemon_log_file_for(&self, opt_in: Option<&str>) -> Option<PathBuf> {
+        self.daemon_log_file_for_scope(
+            opt_in,
+            mcp_server::expected_scope_from_env().ok()?.as_deref(),
+        )
+    }
+
+    fn daemon_log_file_for_scope(
+        &self,
+        opt_in: Option<&str>,
+        expected_scope: Option<&str>,
+    ) -> Option<PathBuf> {
         const ROTATE_BYTES: u64 = 50 * 1024 * 1024;
 
         let McpCommand::Serve(args) = self else { return None };
@@ -167,34 +179,34 @@ impl McpCommand {
         if validate_serve_args(args).is_err() {
             return None;
         }
-        let log_path = match opt_in.map(str::trim) {
+        let opt_in = match opt_in.map(str::trim) {
             None | Some("" | "0" | "false" | "no" | "off") => return None,
-            Some("1" | "true" | "yes" | "on") => {
-                let source_dir = args.source_dir.as_deref().unwrap_or_else(|| Path::new("."));
-                let layout = match args.cache_dir.as_deref() {
-                    Some(path) => mcp_server::WorkspaceCacheLayout::prepare_explicit(
-                        path,
-                        &std::env::current_dir().ok()?,
-                    )
-                    .ok()?,
-                    None => {
-                        let source_dir =
-                            source_dir.canonicalize().unwrap_or_else(|_| source_dir.to_path_buf());
-                        mcp_server::WorkspaceCacheLayout::for_workspace(&source_dir)
-                    }
-                };
-                layout.ensure().ok()?;
-                layout.daemon_log_path()
+            Some("1" | "true" | "yes" | "on") => None,
+            Some(path) => Some(PathBuf::from(path)),
+        };
+        // Both the cache log and a caller-selected log are prepared only after
+        // the same frozen Project/scope gate. Install source selection first so
+        // Project parsing and cache resolution cannot disagree with the later
+        // server launch.
+        let source_dir = args.source_dir.as_deref()?.canonicalize().ok()?;
+        install_source_set(args, &source_dir).ok()?;
+        let project = mcp_server::project::at(&source_dir).ok()?;
+        let layout = mcp_server::WorkspaceCacheLayout::for_project_in_current_dir(
+            &project,
+            args.cache_dir.as_deref(),
+            expected_scope,
+        )
+        .ok()?;
+        let log_path = if let Some(path) = opt_in {
+            // An unpreparable explicit path degrades to stderr like every other
+            // opt-in logging failure, but only after the launch gate above.
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).ok()?;
             }
-            Some(path) => {
-                // An unpreparable explicit path degrades to stderr like every
-                // other failure here — opt-in logging must never fail startup.
-                let path = PathBuf::from(path);
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(parent).ok()?;
-                }
-                path
-            }
+            path
+        } else {
+            layout.ensure().ok()?;
+            layout.daemon_log_path()
         };
         if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
             // Append `.prev` to the whole file name (`with_extension` would
@@ -322,19 +334,21 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<(), Box<dyn Error + Send + Sync>>
         resolve_onec_password(&args.onec_password, env::var("BSL_ONEC_PASSWORD").ok());
     let password = decode_password(&raw_password);
     let profile = profile_of(args.runtime_profile);
+    if matches!(profile, mcp_server::McpProfile::Workspace) {
+        let source = args
+            .source_dir
+            .as_deref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "workspace profile requires --source-dir",
+                )
+            })?
+            .canonicalize()?;
+        install_source_set(&args, &source)?;
+    }
     let (source_dir, workspace_cache) =
         resolve_workspace_inputs(profile, args.source_dir.clone(), args.cache_dir.as_deref())?;
-
-    // Installed before any mode runs, because the broker computes its backend key
-    // from the project *before* a server exists — a source set installed later
-    // would leave that key derived from the on-disk config alone, and two
-    // clients with different sets would rendezvous on one daemon.
-    if let Some(ref source_dir) = args.source_dir {
-        let root = source_dir.canonicalize().unwrap_or_else(|_| source_dir.clone());
-        let installed =
-            mcp_server::project::set_source_set_override(args.source_set.resolve(&root)?);
-        debug_assert!(installed, "the source set must be installed exactly once per process");
-    }
 
     match resolve_serve_mode(args.mode, profile)? {
         McpServeMode::Stdio => run_mcp_server(
@@ -382,6 +396,34 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<(), Box<dyn Error + Send + Sync>>
             )
         }
     }
+}
+
+fn install_source_set(args: &McpServeArgs, root: &Path) -> io::Result<()> {
+    let source_set = args
+        .source_set
+        .resolve(root)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if let Some(installed) = mcp_server::project::source_set_override() {
+        return if installed == &source_set {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a different source set override is already installed",
+            ))
+        };
+    }
+    if !mcp_server::project::set_source_set_override(source_set.clone()) {
+        let installed = mcp_server::project::source_set_override();
+        if installed.is_some_and(|installed| installed == &source_set) {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a different source set override was installed concurrently",
+        ));
+    }
+    Ok(())
 }
 
 /// The 1C credential this process will use. The broker passes it to the detached daemon through
@@ -627,24 +669,6 @@ fn validate_serve_args(args: &McpServeArgs) -> Result<Option<HttpServeOptions>, 
     })?))
 }
 
-fn resolve_workspace_cache(
-    canonical_source_dir: &Path,
-    cache_dir: Option<&Path>,
-) -> io::Result<mcp_server::WorkspaceCacheLayout> {
-    let Some(path) = cache_dir else {
-        // The default root is a function of the workspace, so it needs no current directory —
-        // and it stays lazy: a read-only source tree must still bring the daemon up with
-        // search disabled rather than fail at startup.
-        return Ok(mcp_server::WorkspaceCacheLayout::for_workspace(canonical_source_dir));
-    };
-    // Read the working directory only when it is what an absolute path never needs: a base to
-    // resolve against. A daemon started from a directory that has since been deleted must not
-    // fail over a value it would not have used.
-    let base = if path.is_absolute() { PathBuf::new() } else { env::current_dir()? };
-    mcp_server::WorkspaceCacheLayout::prepare_explicit(path, &base)
-        .map(|layout| layout.with_workspace(canonical_source_dir.to_path_buf()))
-}
-
 fn resolve_workspace_inputs(
     profile: mcp_server::McpProfile,
     source_dir: Option<PathBuf>,
@@ -662,7 +686,13 @@ fn resolve_workspace_inputs(
             format!("failed to canonicalize --source-dir {}: {error}", source_dir.display()),
         )
     })?;
-    let cache = resolve_workspace_cache(&canonical_source, cache_dir)?;
+    let project = mcp_server::project::at(&canonical_source)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let cache = mcp_server::WorkspaceCacheLayout::for_project_in_current_dir(
+        &project,
+        cache_dir,
+        mcp_server::expected_scope_from_env()?.as_deref(),
+    )?;
     Ok((Some(canonical_source), Some(cache)))
 }
 
@@ -753,13 +783,10 @@ fn daemon_command(
         .arg(source_dir)
         .arg("--mode")
         .arg("daemon");
-    // Only an explicitly requested root travels to the child. Passing the default one would
-    // turn it into an explicit `--cache-dir`, which the daemon must create at startup or
-    // fail — the default is deliberately lazy, and a read-only source tree has to keep
-    // bringing the daemon up with search disabled instead of looping through respawns.
-    if args.cache_dir.is_some() {
-        cmd.arg("--cache-dir").arg(workspace_cache.root());
-    }
+    // The scope stamp preserves default laziness even though the resolved base is forwarded.
+    cmd.arg("--cache-dir").arg(workspace_cache.declared_base());
+    cmd.env(mcp_server::WORKSPACE_CACHE_SCOPE_ENV, workspace_cache.scope_stamp());
+    cmd.env_remove(mcp_server::WORKSPACE_CACHE_BASE_ENV);
     // The daemon must resolve the same project this proxy keyed on, and its own
     // config file cannot tell it about a source set that came from argv.
     cmd.args(args.source_set.to_args());
@@ -935,7 +962,8 @@ fn run_mcp_broker(
     tracing::info!(?source_dir, "Starting MCP broker proxy");
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = rt.block_on(mcp_server::broker::proxy::connect_or_launch(key, cmd));
-    drop(rt);
+    // A completed relay can leave Tokio's uncancellable stdin read blocking runtime drop.
+    rt.shutdown_timeout(Duration::from_secs(2));
 
     use mcp_server::broker::proxy::ProxyOutcome;
     match result? {
@@ -994,7 +1022,7 @@ fn run_mcp_broker_required(
     tracing::info!(?source_dir, expected_pid, "Starting required MCP broker proxy");
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = rt.block_on(mcp_server::broker::proxy::connect_required(key, expected_pid));
-    drop(rt);
+    rt.shutdown_timeout(Duration::from_secs(2));
     result?;
     Ok(())
 }
@@ -1258,9 +1286,11 @@ fn run_mcp_server(
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let serve_result = rt.block_on(mcp_server::serve_stdio(server));
 
-    drop(rt);
     shutdown_guard.shutdown();
     drop(shutdown_guard);
+    // Tokio stdin uses an uncancellable blocking read, so an open MCP client's stdin
+    // must not hold the process in Runtime::drop after the transport has closed.
+    rt.shutdown_timeout(Duration::from_secs(2));
 
     serve_result?;
     Ok(())
@@ -1458,8 +1488,18 @@ fn build_server(
                 )
             })?;
             let source_dir = source_dir.canonicalize().unwrap_or(source_dir);
-            let workspace_cache = workspace_cache
-                .unwrap_or_else(|| mcp_server::WorkspaceCacheLayout::for_workspace(&source_dir));
+            let workspace_cache = match workspace_cache {
+                Some(cache) => cache,
+                None => {
+                    let project = mcp_server::project::at(&source_dir)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    mcp_server::WorkspaceCacheLayout::for_project_in_current_dir(
+                        &project,
+                        None,
+                        env::var(mcp_server::WORKSPACE_CACHE_SCOPE_ENV).ok().as_deref(),
+                    )?
+                }
+            };
             let embedding_prefixes = resolve_embedding_prefixes(Some(&source_dir))?;
             let mut state = mcp_server::SharedState::workspace_with_cache_and_prefixes(
                 source_dir,
@@ -1633,14 +1673,28 @@ mod tests {
     use super::{
         backend_config_fingerprint, daemon_command, decode_password, frozen_embedding_prefixes,
         resolve_embedding_prefix_values, resolve_onec_password, resolve_serve_mode_with_override,
-        resolve_token_profile_values, resolve_workspace_cache, validate_backend_pid,
-        validate_onec_settings, validate_serve_args, warn_on_wildcard_allowlist, HttpServeOptions,
-        McpCommand, McpProfileCli, McpServeArgs, McpServeMode, ServeModeContext,
+        resolve_token_profile_values, validate_backend_pid, validate_onec_settings,
+        validate_serve_args, warn_on_wildcard_allowlist, HttpServeOptions, McpCommand,
+        McpProfileCli, McpServeArgs, McpServeMode, ServeModeContext,
     };
     use clap::Parser;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
+
+    fn test_cache_layout(
+        workspace: &std::path::Path,
+        base: Option<&std::path::Path>,
+    ) -> mcp_server::WorkspaceCacheLayout {
+        let project = mcp_server::project::at(workspace).unwrap();
+        mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            base,
+            &std::env::current_dir().unwrap(),
+            None,
+        )
+        .unwrap()
+    }
 
     #[derive(Debug, Parser)]
     struct ServeCli {
@@ -1831,7 +1885,7 @@ mod tests {
         };
         assert!(broker.token_profile.is_some(), "the fixture must configure a token profile");
         let source = dir.path().canonicalize().unwrap();
-        let cache = mcp_server::WorkspaceCacheLayout::for_workspace(&source);
+        let cache = test_cache_layout(&source, None);
         let command = daemon_command(
             PathBuf::from("bsl-analyzer").as_path(),
             &source,
@@ -2587,30 +2641,26 @@ mod tests {
     }
 
     #[test]
-    fn explicit_default_cache_matches_implicit_default_after_resolution() {
+    fn workspace_cache_scope_explicit_default_base_keeps_leaf_but_stamps_origin() {
         let parent = tempfile::tempdir().unwrap();
         let source = parent.path().join("исходники");
         std::fs::create_dir(&source).unwrap();
         let canonical_source = source.canonicalize().unwrap();
-        let default_cache = canonical_source.join(".build");
-
-        let implicit = resolve_workspace_cache(&canonical_source, None).unwrap();
-        let explicit = resolve_workspace_cache(&canonical_source, Some(&default_cache)).unwrap();
-
+        let implicit = test_cache_layout(&canonical_source, None);
+        let explicit = test_cache_layout(&canonical_source, Some(implicit.declared_base()));
         assert_eq!(implicit.root(), explicit.root());
+        assert!(implicit.scope_stamp().starts_with("default:"));
+        assert!(explicit.scope_stamp().starts_with("explicit:"));
     }
 
     #[test]
-    fn broker_child_receives_absolute_cache_dir() {
+    fn workspace_cache_scope_broker_child_receives_absolute_base_and_stamp() {
         let source = tempfile::tempdir().unwrap();
         let cache_parent = tempfile::tempdir().unwrap();
-        let cache = mcp_server::WorkspaceCacheLayout::prepare_explicit(
-            PathBuf::from("кеш с пробелом").as_path(),
-            cache_parent.path(),
-        )
-        .unwrap();
+        let cache_base = cache_parent.path().join("кеш с пробелом");
+        let cache = test_cache_layout(source.path(), Some(&cache_base));
         let mut args = serve_args(McpServeMode::Broker, None);
-        args.cache_dir = Some(PathBuf::from("кеш с пробелом"));
+        args.cache_dir = Some(cache_base.clone());
         let embedding_prefixes = mcp_server::EmbeddingPrefixes {
             query: "query: ".to_owned(),
             document: "document: ".to_owned(),
@@ -2634,7 +2684,11 @@ mod tests {
         let flag = argv.iter().position(|arg| arg == "--cache-dir").unwrap();
 
         assert!(argv[flag + 1].is_absolute());
-        assert_eq!(argv[flag + 1], cache.root());
+        assert_eq!(argv[flag + 1], cache.declared_base());
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(mcp_server::WORKSPACE_CACHE_SCOPE_ENV)
+                && value == Some(cache.scope_stamp().as_ref())
+        }));
         assert!(command.get_envs().any(|(key, value)| {
             key == std::ffi::OsStr::new(mcp_server::broker::EMBEDDING_QUERY_PREFIX_ENV)
                 && value == Some(std::ffi::OsStr::new("query: "))
@@ -2657,14 +2711,13 @@ mod tests {
         }));
     }
 
-    /// Without the flag the child must derive the default itself. Handing it the resolved
-    /// default would make the daemon create `<source>/.build` at startup or die trying,
-    /// where it used to come up with search disabled.
+    /// Without the flag the child receives the resolved OS base with a default-origin stamp,
+    /// preserving the lazy creation policy.
     #[test]
-    fn broker_child_receives_no_cache_dir_when_none_was_requested() {
+    fn workspace_cache_scope_broker_child_receives_default_base_and_stamp() {
         let source = tempfile::tempdir().unwrap();
         let canonical_source = source.path().canonicalize().unwrap();
-        let cache = mcp_server::WorkspaceCacheLayout::for_workspace(&canonical_source);
+        let cache = test_cache_layout(&canonical_source, None);
         let args = serve_args(McpServeMode::Broker, None);
 
         let command = daemon_command(
@@ -2677,7 +2730,12 @@ mod tests {
         );
         let argv = command.get_args().map(PathBuf::from).collect::<Vec<_>>();
 
-        assert!(argv.iter().all(|arg| arg != "--cache-dir"), "argv: {argv:?}");
+        let flag = argv.iter().position(|arg| arg == "--cache-dir").unwrap();
+        assert_eq!(argv[flag + 1], cache.declared_base());
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(mcp_server::WORKSPACE_CACHE_SCOPE_ENV)
+                && value == Some(cache.scope_stamp().as_ref())
+        }));
         assert!(!canonical_source.join(".build").exists(), "the default stays lazy");
     }
 
@@ -2689,7 +2747,7 @@ mod tests {
     fn broker_child_receives_every_enable_tool() {
         let source = tempfile::tempdir().unwrap();
         let canonical_source = source.path().canonicalize().unwrap();
-        let cache = mcp_server::WorkspaceCacheLayout::for_workspace(&canonical_source);
+        let cache = test_cache_layout(&canonical_source, None);
         let mut args = serve_args(McpServeMode::Broker, None);
         args.enable_tools = vec!["graph".to_owned(), "outline".to_owned()];
 
@@ -2777,8 +2835,16 @@ mod tests {
         let path = serve_command(McpServeMode::Daemon, dir.path())
             .daemon_log_file_for(Some("1"))
             .expect("opt-in enables the default log file");
-        assert_eq!(path, dir.path().canonicalize().unwrap().join(".build/bsl-analyzer-daemon.log"));
-        assert!(path.parent().unwrap().is_dir(), "`.build` is created eagerly");
+        let project = mcp_server::project::at(&dir.path().canonicalize().unwrap()).unwrap();
+        let layout = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            None,
+            &std::env::current_dir().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(path, layout.daemon_log_path());
+        assert!(path.parent().unwrap().is_dir(), "the selected cache namespace is created eagerly");
 
         // A small live log is left in place: a concurrent daemon candidate must
         // not rename the winner's file out from under it.
@@ -2811,7 +2877,15 @@ mod tests {
             .daemon_log_file_for(Some("1"))
             .expect("external daemon log path must be prepared");
 
-        assert_eq!(path, cache.canonicalize().unwrap().join("bsl-analyzer-daemon.log"));
+        let project = mcp_server::project::at(&source.path().canonicalize().unwrap()).unwrap();
+        let layout = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&cache),
+            &std::env::current_dir().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(path, layout.daemon_log_path());
         assert!(!source.path().join(".build").exists());
     }
 
@@ -2874,6 +2948,35 @@ mod tests {
             .expect("missing parent directories are created, not fatal");
         assert_eq!(path, custom);
         assert!(path.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn daemon_log_scope_failure_does_not_create_or_rotate_custom_log() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("bsl-analyzer.toml"), "[source\n").unwrap();
+        let log_parent = source.path().join("must-not-exist");
+        let custom = log_parent.join("daemon.log");
+        let path = custom.to_string_lossy().into_owned();
+
+        assert!(serve_command(McpServeMode::Daemon, source.path())
+            .daemon_log_file_for(Some(&path))
+            .is_none());
+        assert!(!log_parent.exists(), "invalid Project created the custom log parent");
+    }
+
+    #[test]
+    fn daemon_log_scope_stamp_failure_does_not_rotate_existing_custom_log() {
+        let source = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let custom = logs.path().join("daemon.log");
+        std::fs::File::create(&custom).unwrap().set_len(51 * 1024 * 1024).unwrap();
+        let wrong_scope = format!("explicit:{}", "a".repeat(64));
+
+        assert!(serve_command(McpServeMode::Daemon, source.path())
+            .daemon_log_file_for_scope(Some(custom.to_str().unwrap()), Some(&wrong_scope))
+            .is_none());
+        assert_eq!(std::fs::metadata(&custom).unwrap().len(), 51 * 1024 * 1024);
+        assert!(!logs.path().join("daemon.log.prev").exists());
     }
 
     #[test]

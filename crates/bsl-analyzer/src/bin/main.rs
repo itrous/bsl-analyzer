@@ -276,17 +276,25 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let json_profile_filter =
         cli.profile_json.clone().or_else(|| env::var("BSL_PROFILE_JSON").ok());
 
-    let _journal_guard =
-        match setup_logging(log_file.clone(), append_log, profile_filter, json_profile_filter) {
-            Ok(guard) => guard,
-            Err(e) => {
-                eprintln!("Failed to setup logging: {}", e);
+    let _journal_guard = match setup_logging(
+        log_file.clone(),
+        append_log,
+        profile_filter.clone(),
+        json_profile_filter.clone(),
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("Failed to setup logging: {}", e);
+            if append_log {
+                setup_logging(None, false, profile_filter, json_profile_filter)?
+            } else {
                 if let Some(ref path) = log_file {
                     let _ = fs::write(path, format!("ERROR: Failed to setup logging: {}\n", e));
                 }
                 return Err(e.into());
             }
-        };
+        }
+    };
 
     // A panic inside a Salsa query leaves no useful trace of *which* query blew
     // up once `catch_unwind` has unwound past the query stack: Salsa attaches the

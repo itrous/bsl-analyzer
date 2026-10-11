@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -108,22 +108,30 @@ impl Drop for McpChild {
 }
 
 fn mcp_add_docs(root: &Path, profile: &str) -> String {
+    let cache_root = tempfile::tempdir().unwrap();
     let mut child = McpChild(
         Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
             .args(["mcp", "serve", "--mode", "stdio", "--profile", profile, "--source-dir"])
             .arg(root)
             .current_dir(root)
             .env("BSL_MCP_BROKER", "0")
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .env("XDG_STATE_HOME", root.join("state"))
-            .env("BSL_PLATFORM_HELP_CACHE_DIR", root.join("help-cache"))
+            .env("XDG_CACHE_HOME", cache_root.path().join("cache"))
+            .env("XDG_STATE_HOME", cache_root.path().join("state"))
+            .env("BSL_PLATFORM_HELP_CACHE_DIR", cache_root.path().join("help-cache"))
             .env_remove("BSL_ONEC_CONNECTIONS_FILE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
+    let mut stderr = child.0.stderr.take().unwrap();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.by_ref().take(16 * 1024).read_to_end(&mut bytes);
+        let _ = stderr_tx.send(String::from_utf8_lossy(&bytes).into_owned());
+    });
     let mut stdin = child.0.stdin.take().unwrap();
     let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -143,11 +151,19 @@ fn mcp_add_docs(root: &Path, profile: &str) -> String {
         "protocolVersion":"2025-06-18", "capabilities":{},
         "clientInfo":{"name":"help-fixture", "version":"1"}
     }}));
-    let receive = |id: u64| {
+    let mut receive = |id: u64| {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let message = rx.recv_timeout(remaining).expect("MCP response");
+            let message = rx.recv_timeout(remaining).unwrap_or_else(|error| {
+                let status = child.0.try_wait().ok().flatten();
+                let stderr = stderr_rx
+                    .recv_timeout(Duration::from_millis(250))
+                    .unwrap_or_else(|_| "<stderr still open or unavailable>".to_owned());
+                panic!(
+                    "MCP response channel ended ({error}); child status: {status:?}; stderr (first 16 KiB): {stderr}"
+                );
+            });
             if message["id"] == id {
                 return message;
             }

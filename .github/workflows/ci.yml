@@ -22,6 +22,18 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: python3 scripts/test-ci-test-output.py
       - run: cargo clippy --all-targets --all-features
+      - name: Workspace cache paths and scopes
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p mcp-server --lib workspace_cache_
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app workspace_cache_scope_
+          run_nonempty -p bsl-analyzer --test source_set_cli workspace_cache_scope_
       - name: Portable workspace lease profiles
         run: |
           set -euo pipefail
@@ -159,6 +171,7 @@ jobs:
           run_exact mcp-server graph::state::tests::the_boots_own_call_respects_a_spent_retry_budget
           run_exact mcp-server graph::watcher::the_watcher_records_and_does_not_decide::the_watcher_never_calls_a_recording_that_decides
           run_exact mcp-server graph::watcher::tests::an_advisory_nobody_keeps_current_says_so
+          run_exact mcp-server graph::watcher::tests::advisory_refresh_before_scope_guard_preserves_the_boot_project_on_drift
           run_exact mcp-server state::overlay_retry::every_wait_reads_the_stop::no_branch_of_the_loop_sleeps_without_reading_the_stop
           run_exact mcp-server state::overlay_retry::tests::a_stop_while_the_driver_is_asking_the_engine_is_not_slept_off
           run_exact mcp-server state::embed::embed_exit_status::every_exit_of_the_pass_says_how_it_ended
@@ -340,6 +353,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build binary
         run: cargo build -p bsl-analyzer --bin bsl-analyzer-app
+      - name: Workspace cache paths and scopes
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p mcp-server --lib workspace_cache_
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app workspace_cache_scope_
+          run_nonempty -p bsl-analyzer --test source_set_cli workspace_cache_scope_
       - name: CLI MCP mode and lifecycle tests
         shell: bash
         run: |
@@ -364,7 +389,6 @@ jobs:
           run_nonempty -p mcp-server --lib graph::snapshot::tests::drift_marks_stale_and_async_reload_bumps_generation -- --exact
           run_nonempty -p mcp-server --lib state::bootstrap::tests::a_workspace_without_a_watch_follows_edits_through_the_poll -- --exact
           run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging
-          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging::journal::windows::tests::private_dacl_and_unprivileged_junction_rejection -- --exact
       - name: Diagnostics baseline atomic create
         shell: bash
         run: |
@@ -675,6 +699,7 @@ jobs:
           run_exact mcp-server graph::state::tests::the_boots_own_call_respects_a_spent_retry_budget
           run_exact mcp-server graph::watcher::the_watcher_records_and_does_not_decide::the_watcher_never_calls_a_recording_that_decides
           run_exact mcp-server graph::watcher::tests::an_advisory_nobody_keeps_current_says_so
+          run_exact mcp-server graph::watcher::tests::advisory_refresh_before_scope_guard_preserves_the_boot_project_on_drift
           run_exact mcp-server state::overlay_retry::every_wait_reads_the_stop::no_branch_of_the_loop_sleeps_without_reading_the_stop
           run_exact mcp-server state::overlay_retry::tests::a_stop_while_the_driver_is_asking_the_engine_is_not_slept_off
           run_exact mcp-server state::embed::embed_exit_status::every_exit_of_the_pass_says_how_it_ended

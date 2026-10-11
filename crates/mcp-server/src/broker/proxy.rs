@@ -16,7 +16,7 @@ use interprocess::local_socket::tokio::Stream as TokioStream;
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
-use crate::broker::name::{backend_name, runtime_socket_dir, BackendKey};
+use crate::broker::name::{backend_name, BackendKey};
 
 /// Upper bound on waiting for a backend to become reachable. The backend binds
 /// before its heavy build, so this only needs to cover process startup — but we
@@ -300,7 +300,7 @@ where
 /// redirected to a per-backend log file in the runtime dir. Returns the child
 /// handle so a fast-exiting race loser can be reaped.
 fn spawn_detached(key: &BackendKey, cmd: &mut Command) -> anyhow::Result<Child> {
-    let log_path = runtime_socket_dir()?.join(format!("{}.log", key.digest()));
+    let log_path = key.runtime_log_path()?;
     // Bound the per-backend log instead of appending forever: roll it over when it
     // passes the cap. A concurrent race-loser's truncate is harmless — losers exit
     // immediately and write next to nothing.

@@ -142,7 +142,9 @@ fn portable_topology(
             .declared()
             .map(|path| portable_user_exclusion_key(&project.root, path)),
     );
+    // Cache aliases must identify one exclusion even when its directory appears.
     exclusions.sort();
+    exclusions.dedup();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bsl-analyzer-portable-topology-v1\0");
     hasher.update(topology.as_bytes());
@@ -450,6 +452,22 @@ mod tests {
                 .iter()
                 .any(|(_, path)| path.ends_with("CommonModules/Сервер/Ext/Module.bsl")),
             "the allowed sibling disappeared"
+        );
+    }
+
+    #[test]
+    fn an_owned_cache_directory_created_during_the_first_build_keeps_topology() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::graph::test_support::sample_workspace(dir.path());
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+
+        let before = ProjectSnapshot::load_excluding(dir.path(), &cache.exclusions(dir.path()));
+        cache.ensure().unwrap();
+        let after = ProjectSnapshot::load_excluding(dir.path(), &cache.exclusions(dir.path()));
+
+        assert_eq!(
+            before.portable_topology, after.portable_topology,
+            "cache aliases identify one owned hole whether or not its directory exists",
         );
     }
 }

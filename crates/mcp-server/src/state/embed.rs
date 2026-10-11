@@ -493,8 +493,8 @@ impl SharedState {
             |engine, checkpoint| {
                 if root_drift_epoch.load(Ordering::SeqCst) != validation_epoch {
                     tracing::debug!(
-                    "root-relevant drift was processed across validation; keeping retry obligation"
-                );
+                        "root-relevant drift was processed across validation; keeping retry obligation"
+                    );
                     return std::ops::ControlFlow::Continue(Ok(
                         WorkspaceRootsTransitionOutcome::Superseded,
                     ));
@@ -518,8 +518,8 @@ impl SharedState {
                             engine.replace_published_graph_context_provider(provider)
                         {
                             tracing::warn!(
-                            "root transition applied but published graph provider was not installed: {error}"
-                        );
+                                "root transition applied but published graph provider was not installed: {error}"
+                            );
                         }
                         std::ops::ControlFlow::Continue(Ok(outcome))
                     }
@@ -869,11 +869,11 @@ impl SharedState {
                 // Told to leave: not a refusal, so no pause and no retry. Nothing of this pass
                 // is lost that a later one cannot redo.
                 super::WorkspaceSearchApply::Stopping => {
-                    return super::WorkspaceSearchApply::Stopping
+                    return super::WorkspaceSearchApply::Stopping;
                 }
                 super::WorkspaceSearchApply::TransientRefusal if retry_transient() => {}
                 super::WorkspaceSearchApply::TransientRefusal => {
-                    return super::WorkspaceSearchApply::TransientRefusal
+                    return super::WorkspaceSearchApply::TransientRefusal;
                 }
                 super::WorkspaceSearchApply::Superseded => {
                     Self::set_overlay_warmup_state(
@@ -1222,7 +1222,10 @@ impl SharedState {
         let mut record =
             LifecycleRecord::new(&db_path, "embedding_orchestration", LifecycleReason::Embedding);
         let _ = lease.owns_caches();
-        if lease.is_superseded() || lease.is_released() {
+        if !Self::scope_matches_project_or_stop(&lease, &stop)
+            || lease.is_superseded()
+            || lease.is_released()
+        {
             record.outcome = LifecycleOutcome::Skipped;
             record.emit(false);
             tracing::debug!(
@@ -1250,13 +1253,20 @@ impl SharedState {
         // index. Uncached, because a batch is seconds and the cached verdict's two-second
         // "yes" is most of one.
         let worker_lease = lease.clone();
+        let worker_scope_stop = stop.clone();
         let keep_running = {
             let lease = lease.clone();
             // The daemon's stop belongs in the same predicate as the lease: after it, an
             // owner takes no new resources, and a batch is a network call plus a fenced
             // write. What has already been paid for finishes; nothing new begins.
             let stop = stop.clone();
-            move || !stop.is_stopped() && !lease.is_superseded() && !lease.is_released()
+            let scope_stop = stop.clone();
+            move || {
+                !stop.is_stopped()
+                    && Self::scope_matches_project_or_stop(&lease, &scope_stop)
+                    && !lease.is_superseded()
+                    && !lease.is_released()
+            }
         };
         // Counted before the thread starts, and dropped on every way out: a pass about to run
         // is an owner a shutdown must still see leave. Without it `owners.live()` could read
@@ -1335,6 +1345,15 @@ impl SharedState {
                                     return bsl_search::FenceOutcome::TransientRefusal;
                                 }
                             }
+                            // Re-read Project before entering the lease fence. A
+                            // config/topology change during paid embedding releases
+                            // the batch without persisting vectors into the old leaf.
+                            if !Self::scope_matches_project_or_stop(
+                                &worker_lease,
+                                &worker_scope_stop,
+                            ) {
+                                return bsl_search::FenceOutcome::Released;
+                            }
                             Self::search_fence_outcome(
                                 worker_lease.publish_short(&mut (), |_| operation()),
                             )
@@ -1371,6 +1390,23 @@ impl SharedState {
                                     .as_mut()
                                 {
                                     hook(EmbedFencePoint::Swap);
+                                }
+                                // Do this before taking the engine mutex: Project IO
+                                // must stay outside both engine and lease critical
+                                // sections. The asynchronous scope owner closes the
+                                // transport; this check prevents publishing its stale
+                                // prepared vector index in the meantime.
+                                if !Self::scope_matches_project_or_stop(
+                                    &worker_lease,
+                                    &worker_scope_stop,
+                                ) {
+                                    Self::set_semantic_runtime_status(
+                                        &runtime,
+                                        SemanticRuntimeStatus::Stopped,
+                                    );
+                                    progress_pass.finish(bsl_search::IndexPassState::Cancelled);
+                                    status_guard.finish(LifecycleOutcome::Interrupted);
+                                    return;
                                 }
                                 let swapped = match engine.acquire_for_owner(&stop) {
                                     Ok(mut guard) => match guard.as_mut() {
@@ -1633,6 +1669,21 @@ impl SharedState {
                 &semantic_runtime,
                 SemanticRuntimeStatus::Failed(format!("could not spawn embedding thread: {e}")),
             );
+        }
+    }
+
+    fn scope_matches_project_or_stop(
+        lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
+    ) -> bool {
+        if lease.scope_matches_project() {
+            true
+        } else {
+            // A scope mismatch is terminal even if the configuration is repaired later.
+            // Keep the existing owner stop as the admission signal; do not release the
+            // lease here, since the embedding worker may still be unwinding its claim.
+            stop.stop_for_scope_change();
+            false
         }
     }
 }
@@ -2020,7 +2071,8 @@ mod tests {
                 let body = serde_json::json!({"data": data}).to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body
+                    body.len(),
+                    body
                 );
                 let _ = stream.write_all(response.as_bytes());
             }
@@ -4098,6 +4150,207 @@ mod tests {
             .load_pending_embedding_documents("code")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn workspace_cache_scope_vector_pass_discards_batch_after_project_drift() {
+        use super::EmbedFencePoint;
+
+        let _lock = env_lock();
+        let (server, calls) = spawn_counting_embedding_server();
+        let workspace = tempdir().unwrap();
+        let cache_parent = tempdir().unwrap();
+        std::fs::write(workspace.path().join("Configuration.xml"), "<Configuration/>").unwrap();
+        let project = crate::project::at(workspace.path()).unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&cache_parent.path().join("cache")),
+            cache_parent.path(),
+            None,
+        )
+        .unwrap();
+        cache.ensure().unwrap();
+        let db_path = cache.search_db_path();
+        seed_pending_embedding(&db_path);
+        let engine = crate::state::shared_engine(Some(
+            SearchEngine::new(&db_path, mock_semantic_config(&server)).unwrap(),
+        ));
+        let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
+        let flight = super::EmbedFlight::new();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let owners = crate::state::OwnerStop::default();
+        let transport = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(transport.clone());
+        let root = workspace.path().to_path_buf();
+        let hook_root = root.clone();
+        *super::EMBED_FENCE_HOOK.lock().unwrap() = Some(Box::new(move |point| {
+            if point == EmbedFencePoint::Apply(1) {
+                std::fs::write(
+                    hook_root.join("bsl-analyzer.toml"),
+                    "[source]\nexclude = [\"generated\"]\n",
+                )
+                .unwrap();
+            }
+        }));
+
+        SharedState::spawn_embed_pass(
+            Arc::clone(&engine),
+            owners.clone(),
+            Arc::clone(&runtime),
+            bsl_search::IndexProgress::new(),
+            Arc::clone(&flight),
+            lease.clone(),
+            db_path.clone(),
+            mock_semantic_config(&server),
+            Duration::from_secs(2),
+        );
+        wait_for_embed_flight(&flight);
+        *super::EMBED_FENCE_HOOK.lock().unwrap() = None;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "scope drift was caught before the paid request"
+        );
+        assert_eq!(engine.lock().unwrap().as_ref().unwrap().vector_count(), 0);
+        assert_eq!(
+            bsl_search::Store::open_existing(&db_path)
+                .unwrap()
+                .load_pending_embedding_documents("code")
+                .unwrap()
+                .len(),
+            1,
+            "scope drift refused vector persistence before the lease fence"
+        );
+        assert!(!matches!(*runtime.lock().unwrap(), crate::state::SemanticRuntimeStatus::Ready));
+
+        assert!(owners.is_stopped(), "observed scope drift is terminal for all owners");
+        assert!(transport.is_cancelled(), "scope drift closes the serving transport");
+        std::fs::remove_file(root.join("bsl-analyzer.toml")).unwrap();
+        SharedState::spawn_embed_pass(
+            Arc::clone(&engine),
+            owners.clone(),
+            Arc::clone(&runtime),
+            bsl_search::IndexProgress::new(),
+            Arc::clone(&flight),
+            lease.clone(),
+            db_path.clone(),
+            mock_semantic_config(&server),
+            Duration::from_secs(2),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "repair cannot readmit a stopped scope");
+        assert_eq!(engine.lock().unwrap().as_ref().unwrap().vector_count(), 0);
+        lease.release();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_cache_scope_default_lease_denial_blocks_search_and_paid_vector_work() {
+        use crate::state::test_support::EnvVarGuard;
+        use bsl_search::Store;
+
+        let _lock = env_lock();
+        let (server, calls) = spawn_counting_embedding_server();
+        let workspace = tempdir().unwrap();
+        let cache_parent = tempdir().unwrap();
+        std::fs::write(workspace.path().join("Configuration.xml"), "<Configuration/>").unwrap();
+        std::fs::write(workspace.path().join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n")
+            .unwrap();
+        let project = crate::project::at(workspace.path()).unwrap();
+        let selected_base = cache_parent.path().join("default-base");
+        let explicit = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&selected_base),
+            cache_parent.path(),
+            None,
+        )
+        .unwrap();
+        let default_stamp = explicit.scope_stamp().replacen("explicit:", "default:", 1);
+        let _base = EnvVarGuard::set(
+            crate::cache::WORKSPACE_CACHE_BASE_ENV,
+            selected_base.to_str().unwrap(),
+        );
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            None,
+            cache_parent.path(),
+            Some(&default_stamp),
+        )
+        .unwrap();
+        assert_eq!(cache.origin(), crate::cache::CacheOrigin::Default);
+        cache.ensure().unwrap();
+        let db_path = cache.search_db_path();
+        seed_pending_embedding(&db_path);
+        let engine = SearchEngine::new(&db_path, mock_semantic_config(&server)).unwrap();
+        let shared = crate::state::shared_engine(Some(engine));
+        let before_files = Store::open_existing(&db_path).unwrap().all_files().unwrap();
+        let before_pending = Store::open_existing(&db_path)
+            .unwrap()
+            .load_pending_embedding_documents("code")
+            .unwrap();
+
+        // The directory and search DB are writable, but an un-writable lease lock leaves
+        // this managed default cache unclaimed. The worker must not treat that as unmanaged.
+        std::os::unix::fs::symlink("/proc/self/status", cache.lease_lock_path()).unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        assert!(lease.is_managed());
+        assert!(!lease.owns_caches(), "the denied claim owns no cache");
+        assert!(Store::open_existing(&db_path).is_ok(), "search DB remains writable");
+        let graph = crate::graph::GraphState::for_workspace_with_cache(
+            workspace.path().to_path_buf(),
+            cache.clone(),
+        );
+        let owners = crate::state::OwnerStop::default();
+        let init = SharedState::init_workspace_search_engine(
+            workspace.path(),
+            None,
+            crate::state::WorkspaceSearchMode::SqliteLocal,
+            None,
+            &graph,
+            &lease,
+            &owners,
+            &crate::state::EmbeddingPrefixes::default(),
+        );
+        assert!(init.is_err(), "a managed but unclaimed lease keeps search offline");
+        assert!(!workspace.path().join(".build").exists(), "no source fallback was created");
+        assert_eq!(Store::open_existing(&db_path).unwrap().all_files().unwrap(), before_files);
+        assert_eq!(
+            Store::open_existing(&db_path)
+                .unwrap()
+                .load_pending_embedding_documents("code")
+                .unwrap(),
+            before_pending,
+            "denied search preparation leaves the writable DB unchanged"
+        );
+
+        SharedState::spawn_embed_pass(
+            Arc::clone(&shared),
+            owners.clone(),
+            Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing)),
+            bsl_search::IndexProgress::new(),
+            super::EmbedFlight::new(),
+            lease.clone(),
+            db_path.clone(),
+            mock_semantic_config(&server),
+            Duration::from_secs(2),
+        );
+        assert!(owners.wait_empty(Duration::from_secs(2)), "vector owner exits on denied lease");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "lease denial is checked before paid embedding"
+        );
+        assert_eq!(Store::open_existing(&db_path).unwrap().all_files().unwrap(), before_files);
+        assert_eq!(
+            Store::open_existing(&db_path)
+                .unwrap()
+                .load_pending_embedding_documents("code")
+                .unwrap(),
+            before_pending,
+            "a denied owner leaves pending vectors untouched"
+        );
+        assert_eq!(shared.lock().unwrap().as_ref().unwrap().vector_count(), 0);
+        lease.release();
     }
 
     #[test]

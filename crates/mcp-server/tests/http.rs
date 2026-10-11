@@ -398,45 +398,14 @@ async fn oversized_request_body_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_chunked_body_is_rejected_with_the_same_status() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let server = TestServer::start(loopback_allowed_hosts()).await;
-    let oversized = MAX_HTTP_REQUEST_BODY_BYTES + 1;
-    let mut stream =
-        tokio::net::TcpStream::connect(server.address).await.expect("test client should connect");
-    stream
-        .write_all(
-            format!(
-                "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: {MCP_ACCEPT}\r\n\
-                 Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{oversized:x}\r\n",
-                server.address
-            )
-            .as_bytes(),
-        )
-        .await
-        .expect("headers should be written");
-    // The body is written concurrently with reading the reply: the server refuses
-    // mid-body without draining the rest, so waiting for the write to finish would
-    // block on a peer that has stopped reading.
-    let (mut reader, mut writer) = stream.into_split();
-    let body = tokio::spawn(async move {
-        let _ = writer.write_all(&vec![b'x'; oversized]).await;
-        let _ = writer.write_all(b"\r\n0\r\n\r\n").await;
-    });
-
-    let mut response = [0u8; 64];
-    let read = tokio::time::timeout(TEST_TIMEOUT, reader.read(&mut response))
-        .await
-        .expect("server should answer the oversized chunked body")
-        .expect("response should be readable");
-    let status = String::from_utf8_lossy(&response[..read]);
+    let status = chunked_oversize_response_head(server.address).await;
     assert!(
         status.starts_with("HTTP/1.1 413"),
         "the limit must not depend on request framing, got: {}",
         status.lines().next().unwrap_or_default()
     );
 
-    body.abort();
     server.stop().await;
 }
 

@@ -168,10 +168,10 @@ mod fixtures {
                     .collect();
                 let resp_body = serde_json::json!({ "data": data }).to_string();
                 let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                resp_body.len(),
-                resp_body,
-            );
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body,
+                );
                 let _ = stream.write_all(resp.as_bytes());
                 let _ = stream.flush();
             }

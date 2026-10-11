@@ -49,9 +49,22 @@ pub(crate) type AdvisorySlot = (PathBuf, Arc<Mutex<StandaloneNotice>>);
 struct AdvisoryOwner(Option<AdvisorySlot>);
 
 impl AdvisoryOwner {
-    fn refresh(&self) {
+    fn refresh(&self, graph: &GraphState, stop: &OwnerStop) {
         let Some((root, slot)) = self.0.as_ref() else { return };
-        let notice = crate::state::derive_standalone_notice(root);
+        let project = match crate::project::at(root) {
+            Ok(project) => project,
+            Err(error) => {
+                tracing::error!(%error, "workspace cache scope changed before advisory refresh");
+                stop.stop_for_scope_change();
+                return;
+            }
+        };
+        if let Some(error) = graph.cache().and_then(|cache| cache.verify_project(&project).err()) {
+            tracing::error!(%error, "workspace cache scope changed before advisory refresh");
+            stop.stop_for_scope_change();
+            return;
+        }
+        let notice = crate::state::standalone_notice_of(&project);
         *slot.lock().unwrap_or_else(|poison| poison.into_inner()) =
             StandaloneNotice::tracked(notice);
     }
@@ -189,7 +202,7 @@ impl Watcher {
             // handed a graph whose build had already failed a free new budget at startup.
             self.graph.observe_current_level(self.hub.seq());
         }
-        self.advisory.refresh();
+        self.advisory.refresh(&self.graph, &self.stop);
         !self.must_leave()
     }
 
@@ -329,7 +342,7 @@ impl Watcher {
     /// what discharges the debt, whether this watcher, the search consumer or both recorded it.
     fn apply_rescan(&self, token: Option<u64>, fact: u64) {
         self.graph.record_loss_quietly(token, fact);
-        self.advisory.refresh();
+        self.advisory.refresh(&self.graph, &self.stop);
     }
 
     fn apply(&self, entries: &[ChangeEntry], fact: u64) {
@@ -342,7 +355,7 @@ impl Watcher {
             // Root aliases and declared spellings move search ownership without moving the
             // canonical topology, so no fingerprint comparison can answer this one.
             self.graph.record_forced_quietly(fact);
-            self.advisory.refresh();
+            self.advisory.refresh(&self.graph, &self.stop);
         }
     }
 
@@ -593,6 +606,73 @@ mod tests {
 
         let after = slot.lock().unwrap().clone();
         assert_ne!(after, before, "the slot still claims someone keeps it current");
+    }
+
+    #[test]
+    fn advisory_refresh_before_scope_guard_preserves_the_boot_project_on_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (name, purpose) in [
+            ("cf", ""),
+            ("ext", "<ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>"),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("Configuration.xml"),
+                format!("<MetaDataObject><Configuration><Properties>{purpose}</Properties></Configuration></MetaDataObject>"),
+            )
+            .unwrap();
+        }
+        let config = root.join("bsl-analyzer.toml");
+        std::fs::write(&config, "[source]\nroot = \"ext\"\nextensions = []\n").unwrap();
+        let boot_project = crate::project::at(root).unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &boot_project,
+            Some(&root.join("cache")),
+            root,
+            None,
+        )
+        .unwrap();
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone());
+        let owners = OwnerStop::default();
+        let transport_stop = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(transport_stop.clone());
+        let boot_notice = crate::state::StandaloneNotice::tracked(
+            crate::state::standalone_notice_of(&boot_project),
+        );
+        assert!(crate::state::standalone_notice_of(&boot_project).is_some());
+        let slot = Arc::new(Mutex::new(boot_notice.clone()));
+        let advisory = AdvisoryOwner(Some((root.to_path_buf(), Arc::clone(&slot))));
+
+        std::fs::write(&config, "[source]\nroot = \"cf\"\nextensions = []\n").unwrap();
+        // This simulates the graph watcher handling the event before the independent scope guard.
+        advisory.refresh(&graph, &owners);
+
+        assert_eq!(*slot.lock().unwrap(), boot_notice, "new-scope advisory is not published");
+        assert!(owners.is_stopped(), "the mismatching Project stops background owners");
+        assert!(transport_stop.is_cancelled(), "the serving transport is retired");
+        assert!(!cache.root().exists(), "advisory validation does not create cache storage");
+    }
+
+    #[test]
+    fn advisory_project_error_stops_owners_without_cache_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphState::disabled();
+        assert!(graph.cache().is_none());
+        let owners = OwnerStop::default();
+        let transport_stop = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(transport_stop.clone());
+        let boot_notice = StandaloneNotice::tracked(Some("boot notice".to_owned()));
+        let slot = Arc::new(Mutex::new(boot_notice.clone()));
+        let advisory = AdvisoryOwner(Some((dir.path().to_path_buf(), Arc::clone(&slot))));
+        std::fs::write(dir.path().join("bsl-analyzer.toml"), "[source\n").unwrap();
+
+        advisory.refresh(&graph, &owners);
+
+        assert_eq!(*slot.lock().unwrap(), boot_notice);
+        assert!(owners.is_stopped());
+        assert!(transport_stop.is_cancelled());
     }
 
     /// The watcher RECORDS an idle graph's debt and never takes its first build.

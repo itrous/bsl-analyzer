@@ -3175,6 +3175,7 @@ dependencies = [
  "walkdir",
  "widestring",
  "win-security-identifier",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

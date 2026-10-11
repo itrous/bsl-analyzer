@@ -1018,6 +1018,9 @@ impl GraphState {
         expected_fingerprint: crate::graph_db::GraphFp,
         expected_force_stale: bool,
     ) -> Result<PreparedSnapshotPool, SnapshotPrepareError> {
+        if !self.validate_workspace_scope() {
+            return Err(SnapshotPrepareError::Changed);
+        }
         let path = self
             .graph_db_path()
             .ok_or_else(|| SnapshotPrepareError::Open(anyhow::anyhow!("graph path unavailable")))?;
@@ -1093,6 +1096,9 @@ impl GraphState {
         recovery_through: Option<u64>,
         recovery: super::debt::RecoveryPublicationProof,
     ) -> crate::workspace_lease::LeaseOperationOutcome<(), SnapshotInstallError> {
+        if !self.validate_workspace_scope() {
+            return crate::workspace_lease::LeaseOperationOutcome::Released;
+        }
         #[cfg(test)]
         SNAPSHOT_OPEN_HOOK.with(|slot| {
             if let Some(hook) = slot.borrow_mut().take() {
@@ -1139,7 +1145,7 @@ impl GraphState {
                 Ok(identity) if identity == prepared.path_identity => {}
                 Ok(_) => return Err(SnapshotInstallError::Changed),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(SnapshotInstallError::Changed)
+                    return Err(SnapshotInstallError::Changed);
                 }
                 Err(error) => return Err(SnapshotInstallError::Operation(error.to_string())),
             }
@@ -1394,7 +1400,7 @@ impl GraphState {
             LeaseOperationOutcome::Applied(Some(generation))
                 if generation != plan.basis.generation() =>
             {
-                return ProbeOutcome::CouldNotLook
+                return ProbeOutcome::CouldNotLook;
             }
             LeaseOperationOutcome::Applied(_) => {}
             // A failure to LOOK, not a look that found nothing.
