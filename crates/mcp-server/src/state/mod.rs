@@ -138,6 +138,8 @@ pub(crate) struct OwnerLive(OwnerStop);
 
 impl Drop for OwnerLive {
     fn drop(&mut self) {
+        // Pair the last-owner notification with wait_empty's predicate-to-wait transition.
+        let _stopped = self.0 .0.stopped.lock().unwrap_or_else(|poison| poison.into_inner());
         self.0 .0.live.fetch_sub(1, Ordering::SeqCst);
         self.0 .0.wake.notify_all();
     }
@@ -1202,6 +1204,43 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn last_owner_exit_cannot_notify_between_empty_check_and_wait() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let owners = super::OwnerStop::default();
+        let live = owners.enter();
+        let held = owners.0.stopped.lock().unwrap();
+        assert_eq!(owners.live(), 1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            drop(live);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(owners.live(), 1, "the exit cannot overtake a waiter holding its mutex");
+        let (held, result) = owners
+            .0
+            .wake
+            .wait_timeout_while(held, Duration::from_secs(5), |_| owners.live() != 0)
+            .unwrap();
+        assert!(
+            !result.timed_out(),
+            "the last owner wakes the waiter without losing its notification"
+        );
+        drop(held);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        owner.join().unwrap();
+        assert!(owners.wait_empty(Duration::ZERO));
     }
 
     #[test]

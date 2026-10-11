@@ -49,11 +49,34 @@ pub struct WorkspaceCacheLayout {
 }
 
 impl WorkspaceCacheLayout {
+    /// Resolve a namespace using the process cwd only if the selected base is relative.
+    pub fn for_project_in_current_dir(
+        project: &project_model::Project,
+        cli_base: Option<&Path>,
+        expected_scope: Option<&str>,
+    ) -> std::io::Result<Self> {
+        Self::for_project_with_cwd(project, cli_base, std::env::current_dir, expected_scope)
+    }
+
     /// Resolve a lazy namespace from the validated project, applying CLI > env > OS defaults.
     pub fn for_project(
         project: &project_model::Project,
         cli_base: Option<&Path>,
         current_dir: &Path,
+        expected_scope: Option<&str>,
+    ) -> std::io::Result<Self> {
+        Self::for_project_with_cwd(
+            project,
+            cli_base,
+            || Ok(current_dir.to_path_buf()),
+            expected_scope,
+        )
+    }
+
+    fn for_project_with_cwd(
+        project: &project_model::Project,
+        cli_base: Option<&Path>,
+        current_dir: impl FnOnce() -> std::io::Result<PathBuf>,
         expected_scope: Option<&str>,
     ) -> std::io::Result<Self> {
         if let Some(stamp) = expected_scope {
@@ -67,7 +90,8 @@ impl WorkspaceCacheLayout {
             inherited_origin,
         )?;
         let base_declared = match selected {
-            Some(path) => absolute_lexical(&path, current_dir),
+            Some(path) if path.is_absolute() => path,
+            Some(path) => current_dir()?.join(path),
             None => dirs::cache_dir()
                 .ok_or_else(|| {
                     invalid("OS cache directory is unavailable; set --cache-dir or BSL_CACHE_DIR")
@@ -381,11 +405,6 @@ fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn absolute_lexical(path: &Path, current_dir: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() { path.to_path_buf() } else { current_dir.join(path) };
-    lexical_normalize(&absolute)
-}
-
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
@@ -404,12 +423,16 @@ fn canonicalize_nearest(path: &Path) -> std::io::Result<PathBuf> {
     let mut ancestor = path;
     let mut suffix = Vec::new();
     while !ancestor.exists() {
-        let name =
-            ancestor.file_name().ok_or_else(|| invalid("cache path has no existing ancestor"))?;
-        suffix.push(name.to_os_string());
+        let component = ancestor
+            .components()
+            .next_back()
+            .filter(|component| matches!(component, Component::Normal(_) | Component::ParentDir))
+            .ok_or_else(|| invalid("cache path has no existing ancestor"))?;
+        suffix.push(component.as_os_str().to_os_string());
         ancestor =
             ancestor.parent().ok_or_else(|| invalid("cache path has no existing ancestor"))?;
     }
+    // Resolve existing symlinks before folding parents in a not-yet-created suffix.
     let mut resolved = ancestor.canonicalize()?;
     for component in suffix.iter().rev() {
         resolved.push(component);
@@ -518,6 +541,57 @@ mod tests {
 
     fn project(root: &Path) -> project_model::Project {
         crate::project::at(root).unwrap()
+    }
+
+    #[test]
+    fn workspace_cache_absolute_base_does_not_require_cwd() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cache_parent = tempfile::tempdir().unwrap();
+        let project = project(workspace.path());
+        let base = cache_parent.path().join("cache");
+        let missing_cwd = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let layout =
+            WorkspaceCacheLayout::for_project_with_cwd(&project, Some(&base), missing_cwd, None)
+                .unwrap();
+        layout.ensure().unwrap();
+        assert_eq!(layout.base(), base.canonicalize().unwrap());
+        let error = WorkspaceCacheLayout::for_project_with_cwd(
+            &project,
+            Some(Path::new("relative-cache")),
+            missing_cwd,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_cache_resolves_symlink_before_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let cache_parent = tempfile::tempdir().unwrap();
+        let target = cache_parent.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = workspace.path().join("link");
+        symlink(&target, &link).unwrap();
+        let project = project(workspace.path());
+        for suffix in ["link/../cache", "link/missing/../../cache"] {
+            let declared = workspace.path().join(suffix);
+            let layout = WorkspaceCacheLayout::for_project(
+                &project,
+                Some(&declared),
+                workspace.path(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(layout.base(), cache_parent.path().canonicalize().unwrap().join("cache"));
+            layout.ensure().unwrap();
+            assert!(layout.root().is_dir());
+            assert!(!workspace.path().join("cache").exists());
+            assert!(!target.join("missing").exists(), "resolution must remain lazy");
+        }
     }
 
     #[test]
@@ -887,10 +961,8 @@ mod tests {
         assert!(!output.exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn workspace_cache_default_base_inside_nested_workspace_is_rejected_before_creation() {
-        let _env_lock = crate::state::test_support::env_lock();
         let workspace = tempfile::tempdir().unwrap();
         let configuration = workspace.path().join("src/cf");
         std::fs::create_dir_all(&configuration).unwrap();
@@ -899,15 +971,16 @@ mod tests {
             .unwrap();
         let project = project(workspace.path());
         let scope = format!("default:{}", hex(&project_scope(&project).unwrap()));
-        let _base = crate::state::test_support::EnvVarGuard::unset(WORKSPACE_CACHE_BASE_ENV);
-        let _xdg = crate::state::test_support::EnvVarGuard::set(
-            "XDG_CACHE_HOME",
-            workspace.path().join("os-cache").to_str().unwrap(),
-        );
-
-        let error =
-            WorkspaceCacheLayout::for_project(&project, None, workspace.path(), Some(&scope))
-                .expect_err("forwarded default base inside a nested workspace must be refused");
+        // Pass the resolved default as a launcher does, rather than redirecting unrelated
+        // background cache writers through a process-wide XDG_CACHE_HOME change.
+        let default_base = workspace.path().join("os-cache");
+        let error = WorkspaceCacheLayout::for_project(
+            &project,
+            Some(&default_base),
+            workspace.path(),
+            Some(&scope),
+        )
+        .expect_err("forwarded default base inside a nested workspace must be refused");
         assert!(error.to_string().contains("inside workspace"));
         assert!(!workspace.path().join("os-cache").exists(), "rejection precedes mkdir");
 

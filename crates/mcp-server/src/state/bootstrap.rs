@@ -637,11 +637,9 @@ impl SharedState {
     pub fn workspace(source_dir: PathBuf) -> Result<Self, WorkspaceInitError> {
         let root = source_dir.canonicalize().map_err(WorkspaceInitError::Cache)?;
         let project = crate::project::at(&root)?;
-        let cwd = env::current_dir().map_err(WorkspaceInitError::Cache)?;
-        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+        let cache = crate::cache::WorkspaceCacheLayout::for_project_in_current_dir(
             &project,
             None,
-            &cwd,
             crate::cache::expected_scope_from_env().map_err(WorkspaceInitError::Cache)?.as_deref(),
         )
         .map_err(WorkspaceInitError::Cache)?;
@@ -2073,12 +2071,9 @@ impl SharedState {
         let cache = if let Some(cache) = graph.cache().cloned() {
             cache
         } else {
-            let cwd = env::current_dir()
-                .map_err(|error| bsl_search::SearchError::Index(error.to_string()))?;
-            crate::cache::WorkspaceCacheLayout::for_project(
+            crate::cache::WorkspaceCacheLayout::for_project_in_current_dir(
                 &project,
                 None,
-                &cwd,
                 crate::cache::expected_scope_from_env()
                     .map_err(|error| bsl_search::SearchError::Index(error.to_string()))?
                     .as_deref(),

@@ -191,10 +191,9 @@ impl McpCommand {
         let source_dir = args.source_dir.as_deref()?.canonicalize().ok()?;
         install_source_set(args, &source_dir).ok()?;
         let project = mcp_server::project::at(&source_dir).ok()?;
-        let layout = mcp_server::WorkspaceCacheLayout::for_project(
+        let layout = mcp_server::WorkspaceCacheLayout::for_project_in_current_dir(
             &project,
             args.cache_dir.as_deref(),
-            &std::env::current_dir().ok()?,
             expected_scope,
         )
         .ok()?;
@@ -689,11 +688,9 @@ fn resolve_workspace_inputs(
     })?;
     let project = mcp_server::project::at(&canonical_source)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let cwd = env::current_dir()?;
-    let cache = mcp_server::WorkspaceCacheLayout::for_project(
+    let cache = mcp_server::WorkspaceCacheLayout::for_project_in_current_dir(
         &project,
         cache_dir,
-        &cwd,
         mcp_server::expected_scope_from_env()?.as_deref(),
     )?;
     Ok((Some(canonical_source), Some(cache)))
@@ -1496,10 +1493,9 @@ fn build_server(
                 None => {
                     let project = mcp_server::project::at(&source_dir)
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                    mcp_server::WorkspaceCacheLayout::for_project(
+                    mcp_server::WorkspaceCacheLayout::for_project_in_current_dir(
                         &project,
                         None,
-                        &env::current_dir()?,
                         env::var(mcp_server::WORKSPACE_CACHE_SCOPE_ENV).ok().as_deref(),
                     )?
                 }

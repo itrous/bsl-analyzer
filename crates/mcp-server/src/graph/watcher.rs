@@ -655,6 +655,26 @@ mod tests {
         assert!(!cache.root().exists(), "advisory validation does not create cache storage");
     }
 
+    #[test]
+    fn advisory_project_error_stops_owners_without_cache_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphState::disabled();
+        assert!(graph.cache().is_none());
+        let owners = OwnerStop::default();
+        let transport_stop = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(transport_stop.clone());
+        let boot_notice = StandaloneNotice::tracked(Some("boot notice".to_owned()));
+        let slot = Arc::new(Mutex::new(boot_notice.clone()));
+        let advisory = AdvisoryOwner(Some((dir.path().to_path_buf(), Arc::clone(&slot))));
+        std::fs::write(dir.path().join("bsl-analyzer.toml"), "[source\n").unwrap();
+
+        advisory.refresh(&graph, &owners);
+
+        assert_eq!(*slot.lock().unwrap(), boot_notice);
+        assert!(owners.is_stopped());
+        assert!(transport_stop.is_cancelled());
+    }
+
     /// The watcher RECORDS an idle graph's debt and never takes its first build.
     ///
     /// The watcher's cursor is subscribed before anything builds the graph, so it is draining
