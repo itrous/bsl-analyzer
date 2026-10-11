@@ -2651,12 +2651,28 @@ impl<'db> InferenceContext<'db> {
                     // A name the author has not finished writing (`Справочники.`) is not a
                     // miss: lowering keeps the incomplete field as the missing placeholder,
                     // and accusing the configuration on every keystroke would be noise.
-                    let closed_receiver = matches!(
+                    //
+                    // An object a common attribute may reach without the reader being able
+                    // to say so has an open field set, and a miss on it proves nothing.
+                    let closed_receiver = (matches!(
                         base_kind,
                         TypeKind::MetadataRef(_)
                             | TypeKind::ThisObject { .. }
                             | TypeKind::ManagerCollection(_)
-                    ) || matches!(base_kind, TypeKind::Structure(facet) if facet.closed);
+                    ) && !crate::field_enum::metadata_fields_open(
+                        self.db,
+                        &obj_resolver,
+                        base_ty,
+                    )) || matches!(base_kind, TypeKind::Structure(facet) if facet.closed)
+                        || (crate::field_lookup::is_record_manager_form_data(self.db, base_ty)
+                            && !crate::field_enum::metadata_fields_open(
+                                self.db,
+                                &obj_resolver,
+                                crate::field_lookup::project_form_data_for_fields_id(
+                                    self.db, base_ty,
+                                )
+                                .unwrap_or(base_ty),
+                            ));
                     if !field.is_missing() && closed_receiver {
                         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedField {
                             expr: expr_id,

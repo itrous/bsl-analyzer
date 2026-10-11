@@ -83,6 +83,12 @@ impl TypeRef {
                 ])),
                 None => TypeRef::Unknown,
             },
+            AttributeType::InformationRegisterRecordManager { name } => {
+                TypeRef::Name(QualifiedName::from_segments([
+                    Name::new("InformationRegisterRecordManager"),
+                    Name::new(name),
+                ]))
+            }
             AttributeType::AnyRef => TypeRef::AnyRef,
             AttributeType::AnyObjectRef { mdo_type } => TypeRef::AnyRefOf(*mdo_type),
             AttributeType::Uuid => {

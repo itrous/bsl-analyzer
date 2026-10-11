@@ -133,6 +133,7 @@ fn setup_with_role_substrate(fixture_text: &str) -> (Analysis, FileId, u32) {
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -231,6 +232,7 @@ fn setup_with_http_service_substrate(fixture_text: &str) -> (Analysis, FileId, u
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -293,6 +295,7 @@ fn setup_with_web_service_substrate(fixture_text: &str) -> (Analysis, FileId, u3
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -359,6 +362,7 @@ fn setup_with_integration_service_substrate(fixture_text: &str) -> (Analysis, Fi
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -415,6 +419,7 @@ fn setup_with_scheduled_job_xml(
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),

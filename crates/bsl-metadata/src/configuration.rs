@@ -446,6 +446,26 @@ impl Configuration {
         merged
     }
 
+    /// Attach to every object and register the common attributes whose composition includes
+    /// it. Runs once over a freshly loaded root, before any extension overlay is folded in.
+    pub fn apply_common_attributes(&mut self, set: &crate::common_attribute::CommonAttributeSet) {
+        if set.is_empty() {
+            return;
+        }
+        for object in &mut self.metadata_objects {
+            let applied = set.for_object(object.mdo_type, &object.name);
+            if !applied.is_empty() {
+                object.set_common_attributes(applied);
+            }
+        }
+        for register in &mut self.registers {
+            let applied = set.for_object(register.mdo_type(), register.name());
+            if !applied.is_empty() {
+                register.set_common_attributes(applied);
+            }
+        }
+    }
+
     pub fn has_metadata_object(&self, mdo_type: MdoType, name: &str) -> bool {
         let name_lower = name.fold_lower();
 

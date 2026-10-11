@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" version="2.10">
+  <AccumulationRegister uuid="0ca00000-0000-0000-0000-000000000015">
+    <Properties><Name>РегистрНакопления1</Name><RegisterType>Balance</RegisterType></Properties>
+    <ChildObjects>
+      <Dimension uuid="0ca00000-0000-0000-0000-0000000001d1">
+        <Properties><Name>Измерение1</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties>
+      </Dimension>
+      <Resource uuid="0ca00000-0000-0000-0000-0000000001e1">
+        <Properties><Name>Ресурс1</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties>
+      </Resource>
+    </ChildObjects>
+  </AccumulationRegister>
+</MetaDataObject>

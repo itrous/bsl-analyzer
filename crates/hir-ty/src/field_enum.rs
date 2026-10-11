@@ -368,6 +368,18 @@ fn enumerate_mdo_fields(
         push_unique(&mut out, &mut seen, info);
     }
 
+    for common in &mdo.common_attributes {
+        let info = FieldInfo {
+            name: Name::new(&common.name),
+            name_en: None,
+            ty: attribute_type_to_typeid(db, &common.attr_type, resolver),
+            value_ty: None,
+            is_readonly: false,
+            origin: FieldOrigin::UserAttribute,
+        };
+        push_unique(&mut out, &mut seen, info);
+    }
+
     for ts in &mdo.tabular_sections {
         let qualified = format!("{}.{}", mdo_name.as_str(), ts.name());
         let info = FieldInfo {
@@ -453,6 +465,24 @@ fn enumerate_register_fields(
                 value_ty: None,
                 is_readonly: false,
                 origin: FieldOrigin::RegisterDimension,
+            };
+            push_unique(&mut out, &mut seen, info);
+        }
+
+        // A separator is part of the record key like a dimension; a plain common attribute
+        // is a register attribute.
+        for common in register.common_attributes() {
+            let info = FieldInfo {
+                name: Name::new(&common.name),
+                name_en: None,
+                ty: attribute_type_to_typeid(db, &common.attr_type, resolver),
+                value_ty: None,
+                is_readonly: false,
+                origin: if common.separator {
+                    FieldOrigin::RegisterDimension
+                } else {
+                    FieldOrigin::RegisterAttribute
+                },
             };
             push_unique(&mut out, &mut seen, info);
         }
@@ -572,6 +602,20 @@ fn enumerate_filter_fields(
             name_en: None,
             ty: db.platform_object("ЭлементОтбора".to_string()),
             value_ty: Some(value_ty),
+            is_readonly: false,
+            origin: FieldOrigin::RegisterDimension,
+        };
+        push_unique(&mut out, &mut seen, info);
+    }
+
+    // A record set's filter carries every separator of the register (ITS, Приложение 7: a set
+    // is read and written within one value of each separator).
+    for common in register.common_attributes().iter().filter(|c| c.separator) {
+        let info = FieldInfo {
+            name: Name::new(&common.name),
+            name_en: None,
+            ty: db.platform_object("ЭлементОтбора".to_string()),
+            value_ty: Some(attribute_type_to_typeid(db, &common.attr_type, resolver)),
             is_readonly: false,
             origin: FieldOrigin::RegisterDimension,
         };
@@ -755,6 +799,36 @@ pub(crate) fn register_parent_for_kind(kind: MetadataKind) -> Option<MdoType> {
         | MetadataKind::CalculationRegisterRef => Some(MdoType::CalculationRegister),
         _ => None,
     }
+}
+
+/// Whether the field set of a metadata receiver may be short of a field the platform has,
+/// because a common attribute's composition could not be read. A miss on such a receiver
+/// proves nothing about the code.
+pub(crate) fn metadata_fields_open(
+    db: &dyn TypeKernelDb,
+    resolver: &dyn MetadataResolution,
+    receiver: TypeId,
+) -> bool {
+    let ty = crate::this_object::coerce_to_metadata_ref_id(db, receiver).unwrap_or(receiver);
+    let (kind, name) = match db.lookup_type(ty) {
+        TypeKind::MetadataRef(facet) => (facet.kind, facet.name.clone()),
+        TypeKind::MetadataObject(facet) => (facet.kind, facet.name.clone()),
+        _ => return false,
+    };
+    if let Some(mdo_type) = mdo_type_for_kind(kind) {
+        return resolver
+            .resolve_metadata_object(mdo_type, name.as_str())
+            .is_some_and(|mdo| mdo.common_attributes_open);
+    }
+    if let Some(parent) = register_parent_for_kind(kind).or(match kind {
+        MetadataKind::RegisterFilter { parent } => Some(parent),
+        _ => None,
+    }) {
+        return resolver
+            .resolve_register(parent, name.as_str())
+            .is_some_and(|register| register.common_attributes_open());
+    }
+    false
 }
 
 pub(crate) fn split_parent_section(name: &str) -> Option<(&str, &str)> {

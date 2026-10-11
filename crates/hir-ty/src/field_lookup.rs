@@ -18,8 +18,28 @@ pub(crate) fn project_form_data_for_fields_id(db: &dyn TypeKernelDb, ty: TypeId)
     if !matches!(kind, FormDataFacet::Structure | FormDataFacet::StructureWithCollection) {
         return None;
     }
-    let object_kind = MetadataKind::object_kind_for(owner.mdo_type)?;
+    let object_kind = form_data_structure_kind(owner.mdo_type)?;
     Some(db.metadata_ref(object_kind, owner.name.clone(), &RootConfigCtx))
+}
+
+/// What a form-data structure over an object of this kind stands for. An
+/// information register reaches a form as a single record only through its record
+/// manager — a record set is a collection — so its structure is that manager.
+fn form_data_structure_kind(mdo_type: MdoType) -> Option<MetadataKind> {
+    match mdo_type {
+        MdoType::InformationRegister => Some(MetadataKind::InformationRegisterRecordManager),
+        other => MetadataKind::object_kind_for(other),
+    }
+}
+
+/// A record form's data has exactly the fields of the record manager it mirrors
+/// (the register's columns), so a name it lacks is as absent as on the manager.
+pub(crate) fn is_record_manager_form_data(db: &dyn TypeKernelDb, ty: TypeId) -> bool {
+    matches!(
+        db.lookup_type(ty),
+        TypeKind::FormData { kind: FormDataFacet::Structure, underlying: Some(owner) }
+            if owner.mdo_type == MdoType::InformationRegister
+    )
 }
 
 fn lookup_form_data_tabular_section_field(
@@ -147,7 +167,14 @@ fn lookup_field_raw(
             return lookup_field_in_union_intersection(db, resolver, &arms, field_name);
         }
         TypeKind::MetadataRef(_) => {
-            return lookup_field_on_metadata_ref(db, resolver, effective_ty, field_name);
+            let found = lookup_field_on_metadata_ref(db, resolver, effective_ty, field_name);
+            // Form data proxies its object but is a platform object of its own too:
+            // `Запись.ИсходныйКлючЗаписи` belongs to ДанныеФормыСтруктура, not to the
+            // register record behind it.
+            if found.is_none() && projected_ty != receiver {
+                return lookup_field_via_platform_property(db, receiver, field_name);
+            }
+            return found;
         }
         _ => {}
     }

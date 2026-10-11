@@ -1705,6 +1705,8 @@ fn test_join_paren_field_resolution() {
         uuid: None,
         object_belonging: bsl_metadata::ObjectBelonging::Own,
         extended_configuration_object: None,
+        common_attributes: Vec::new(),
+        common_attributes_open: false,
     };
     config.add_metadata_object(catalog);
 

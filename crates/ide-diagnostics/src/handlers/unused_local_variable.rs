@@ -50,6 +50,9 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
                     names.insert(en.fold_lower());
                 }
             }
+            for common in &mdo.common_attributes {
+                names.insert(common.name.fold_lower());
+            }
 
             for ts in &mdo.tabular_sections {
                 names.insert(ts.name().fold_lower());
@@ -82,6 +85,9 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
                 if let Some(en) = attr.name_en() {
                     names.insert(en.fold_lower());
                 }
+            }
+            for common in register.common_attributes() {
+                names.insert(common.name.fold_lower());
             }
 
             names

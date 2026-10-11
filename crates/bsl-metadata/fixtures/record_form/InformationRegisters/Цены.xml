@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10">
+	<InformationRegister uuid="00000000-0000-0000-0000-0000000000c2">
+		<Properties>
+			<Name>Цены</Name>
+			<InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity>
+			<WriteMode>Independent</WriteMode>
+		</Properties>
+		<ChildObjects>
+			<Form>ФормаЗаписи</Form>
+			<Dimension uuid="00000000-0000-0000-0000-0000000000c3">
+				<Properties>
+					<Name>Товар</Name>
+					<Type>
+						<v8:Type>xs:string</v8:Type>
+					</Type>
+				</Properties>
+			</Dimension>
+			<Resource uuid="00000000-0000-0000-0000-0000000000c4">
+				<Properties>
+					<Name>Цена</Name>
+					<Type>
+						<v8:Type>xs:decimal</v8:Type>
+					</Type>
+				</Properties>
+			</Resource>
+		</ChildObjects>
+	</InformationRegister>
+</MetaDataObject>

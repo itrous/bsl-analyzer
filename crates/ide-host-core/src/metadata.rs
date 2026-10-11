@@ -14,9 +14,9 @@ use std::time::Instant;
 
 use base_db::{content_revision, read_disk_text, SourceDatabase, SourceRoot, METADATA_SOURCE_ROOT};
 use ide_db::metadata::{
-    CommonModuleEntry, DefinedTypeEntry, EventSubscriptionEntry, HTTPServiceEntry,
-    IntegrationServiceEntry, MdoEntry, MetadataListingData, RoleEntry, ScheduledJobEntry,
-    SubsystemEntry, WebServiceEntry,
+    CommonAttributeEntry, CommonModuleEntry, DefinedTypeEntry, EventSubscriptionEntry,
+    HTTPServiceEntry, IntegrationServiceEntry, MdoEntry, MetadataListingData, RoleEntry,
+    ScheduledJobEntry, SubsystemEntry, WebServiceEntry,
 };
 use vfs::{file_set::FileSet, FileId, Vfs, VfsPath};
 
@@ -71,6 +71,7 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
         web_services: Vec<bsl_metadata::DiscoveredWebService>,
         integration_services: Vec<bsl_metadata::DiscoveredIntegrationService>,
         subsystems: Vec<bsl_metadata::DiscoveredSubsystem>,
+        common_attributes: Vec<bsl_metadata::DiscoveredCommonAttribute>,
     }
 
     // Discover every root's structure WITHOUT the vfs lock — discovery walks
@@ -104,6 +105,9 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
                     root_path, &tree,
                 ),
                 subsystems: bsl_metadata::discover_subsystem_structure(root_path, &tree),
+                common_attributes: bsl_metadata::discover_common_attribute_structure(
+                    root_path, &tree,
+                ),
             }
         })
         .collect();
@@ -128,6 +132,7 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
         to_read.extend(d.web_services.iter().map(|s| s.main.clone()));
         to_read.extend(d.integration_services.iter().map(|s| s.main.clone()));
         to_read.extend(d.subsystems.iter().map(|s| s.main.clone()));
+        to_read.extend(d.common_attributes.iter().map(|a| a.main.clone()));
         for role in &d.roles {
             to_read.push(role.main.clone());
             if let Some(rights) = &role.rights {
@@ -343,9 +348,23 @@ pub fn bootstrap_metadata_substrate(db: &mut RootDatabaseImpl, vfs: &impl VfsWri
                 };
                 subsystems.push(SubsystemEntry { name: subsystem.name, main });
             }
+            let mut common_attributes = Vec::new();
+            for attribute in d.common_attributes {
+                let Some(main) = intern_metadata_file(
+                    vfs,
+                    &attribute.main,
+                    &revisions_by_path,
+                    &mut metadata_file_set,
+                    &mut revisions,
+                ) else {
+                    continue;
+                };
+                common_attributes.push(CommonAttributeEntry { name: attribute.name, main });
+            }
             listings.push(RootStructureListing {
                 root: d.root_string,
                 data: MetadataListingData {
+                    common_attributes,
                     entries,
                     defined_types,
                     common_modules,
@@ -637,9 +656,24 @@ pub fn refresh_metadata_substrate(
                 };
                 subsystems.push(SubsystemEntry { name: d.name, main });
             }
+            let mut common_attributes = Vec::new();
+            for d in bsl_metadata::discover_common_attribute_structure(root, &tree) {
+                let Some(main) = enroll_refresh(
+                    vfs,
+                    &d.main,
+                    &changed_set,
+                    &mut metadata_file_set,
+                    &mut new_file_ids,
+                    &mut revisions,
+                ) else {
+                    continue;
+                };
+                common_attributes.push(CommonAttributeEntry { name: d.name, main });
+            }
             listings.push(RootStructureListing {
                 root: root.to_string_lossy().to_string(),
                 data: MetadataListingData {
+                    common_attributes,
                     entries,
                     defined_types,
                     common_modules,
@@ -684,6 +718,7 @@ pub fn refresh_metadata_substrate(
                     || input.web_services(db).as_ref() != &data.web_services
                     || input.integration_services(db).as_ref() != &data.integration_services
                     || input.subsystems(db).as_ref() != &data.subsystems
+                    || input.common_attributes(db).as_ref() != &data.common_attributes
             }
             None => true,
         };
@@ -1208,6 +1243,78 @@ mod tests {
         assert!(
             after_remove.iter().any(|n| n == "Корневая"),
             "untouched parent subsystem stays after the child removal"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+    /// The bootstrapped substrate attaches common attributes to the objects their
+    /// composition names, and an edit of a common attribute's `Content` re-derives the
+    /// objects it reaches without touching their own XML.
+    #[test]
+    fn bootstrap_and_refresh_track_common_attribute_composition() {
+        let fixture = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bsl-metadata/fixtures/common_attributes"
+        ));
+        let root = std::env::temp_dir().join(format!(
+            "ihc_common_attributes_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        for dir in ["Catalogs", "CommonAttributes"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            for entry in std::fs::read_dir(fixture.join(dir)).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), root.join(dir).join(entry.file_name())).unwrap();
+            }
+        }
+
+        let mut host = AnalysisHost::default();
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())]);
+        let vfs = TestVfs(RefCell::new(Vfs::default()));
+        host.bootstrap_metadata_substrate(&vfs);
+
+        let root_key = root.to_string_lossy().to_string();
+        let common_names = |host: &AnalysisHost, name: &str| -> Vec<String> {
+            let db = host.raw_database();
+            let listing = db.metadata_listing(&root_key).expect("listing set for the config root");
+            let object = resolve_metadata_object(
+                db,
+                listing,
+                bsl_metadata::MdoType::Catalog,
+                name.to_string(),
+            )
+            .expect("catalog resolves through the bootstrapped listing");
+            let mut names: Vec<String> =
+                object.common_attributes.iter().map(|f| f.name.clone()).collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            common_names(&host, "Справочник1"),
+            ["ОбластьДанныхОсновныеДанные", "ОбщийКомментарий", "Организация"]
+        );
+        assert_eq!(common_names(&host, "СправочникБезРазделения"), ["ОбщийКомментарий"]);
+
+        let organisation = root.join("CommonAttributes").join("Организация.xml");
+        let text = std::fs::read_to_string(&organisation).unwrap();
+        // Flip the setting that follows this object's reference; the search is positional
+        // so the checkout's line endings do not matter.
+        let anchor = text.find("Catalog.СправочникБезРазделения").unwrap();
+        let setting = anchor + text[anchor..].find("<xr:Use>DontUse</xr:Use>").unwrap();
+        let edited = format!(
+            "{}<xr:Use>Use</xr:Use>{}",
+            &text[..setting],
+            &text[setting + "<xr:Use>DontUse</xr:Use>".len()..]
+        );
+        assert_ne!(edited, text, "the fixture still carries the setting this test flips");
+        std::fs::write(&organisation, edited).unwrap();
+        assert!(host.refresh_metadata_substrate(&vfs, std::slice::from_ref(&organisation)));
+
+        assert_eq!(
+            common_names(&host, "СправочникБезРазделения"),
+            ["ОбщийКомментарий", "Организация"]
         );
 
         std::fs::remove_dir_all(&root).ok();

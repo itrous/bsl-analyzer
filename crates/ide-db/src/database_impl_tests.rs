@@ -138,7 +138,21 @@ fn parse_mdo_query_parses_catalog_from_overlay() {
     ));
     db.set_file_text(file_id, xml);
 
-    let files = MdoFiles::new(&db, MdoType::Catalog, file_id, None);
+    let listing = crate::metadata::MetadataListingInput::new(
+        &db,
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    let files = MdoFiles::new(&db, MdoType::Catalog, file_id, None, listing);
     let mdo = parse_mdo_query(&db, files).expect("catalog parsed via per-MDO query");
     assert_eq!(mdo.name, "Справочник1");
 
@@ -193,6 +207,7 @@ fn resolve_metadata_object_isolates_content_and_structure() {
             main: f1,
             predefined: None,
         }]),
+        Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
@@ -299,6 +314,7 @@ fn resolve_register_by_name_resolves_via_listing_substrate() {
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
     );
 
     let reg = resolve_register_by_name(&db, listing, "РегистрСведений1".to_string())
@@ -355,6 +371,7 @@ fn resolve_defined_type_isolates_content_and_structure() {
         Arc::new(vec![DefinedTypeEntry {
             name: "ДенежнаяСумма".to_string(), main: f1
         }]),
+        Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
@@ -431,6 +448,7 @@ fn resolve_common_module_by_name_and_by_body_file() {
             module_file: Some(bsl_file),
             unread_module_file: None,
         }]),
+        Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
@@ -546,6 +564,7 @@ fn resolve_event_subscription_isolates_content_and_structure() {
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
     );
     assert_eq!(event_subscription_index(&db, listing).lookup("передзаписью"), Some(before_file));
 
@@ -651,6 +670,7 @@ fn resolve_event_subscription_for_file_uses_bootstrapped_listing() {
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -737,6 +757,7 @@ fn main_event_subscription_names_fall_back_to_the_chain_for_an_extension_only_pr
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -898,6 +919,7 @@ fn resolve_scheduled_job_isolates_content_and_structure() {
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
     );
     assert_eq!(scheduled_job_index(&db, listing).lookup("регламентноезадание1"), Some(before_file));
 
@@ -1005,6 +1027,7 @@ fn resolve_scheduled_job_for_file_uses_bootstrapped_listing() {
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -1130,6 +1153,7 @@ fn resolve_role_isolates_main_and_rights_content() {
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
     );
 
     let files = role_index(&db, listing)
@@ -1249,6 +1273,7 @@ fn resolve_role_for_file_uses_bootstrapped_listing() {
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -1352,6 +1377,7 @@ fn a_chain_resolves_the_owning_extension_first_and_lists_each_name_once() {
         db.set_metadata_listing(
             &root.to_string_lossy(),
             MetadataListingData {
+                common_attributes: Vec::new(),
                 entries: Vec::new(),
                 defined_types: Vec::new(),
                 common_modules: Vec::new(),
@@ -1432,6 +1458,7 @@ fn per_file_lookups_serve_an_extension_only_project_from_its_chain() {
         db.set_metadata_listing(
             &root.to_string_lossy(),
             MetadataListingData {
+                common_attributes: Vec::new(),
                 entries: Vec::new(),
                 defined_types: Vec::new(),
                 common_modules: Vec::new(),
@@ -1551,6 +1578,7 @@ fn role_links_to_object_rights_and_rls_condition_object_from_listed_substrate() 
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -1657,6 +1685,7 @@ fn role_names_for_file_uses_bootstrapped_listing() {
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -5331,6 +5360,7 @@ fn service_indexes_are_case_insensitive_and_track_module_file() {
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
     );
     listing.set_http_services(&mut db).to(Arc::new(vec![HTTPServiceEntry {
         name: "Сервис1".to_string(),
@@ -5401,6 +5431,7 @@ fn module_metadata_http_service_late_module_file_registration_falls_back_to_whol
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -5467,6 +5498,7 @@ fn module_metadata_web_service_late_module_file_registration_falls_back_to_whole
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -5539,6 +5571,7 @@ fn subsystem_index_is_case_insensitive() {
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -5683,6 +5716,7 @@ fn subsystem_membership_from_listed_substrate() {
     db.set_metadata_listing(
         &main_root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -5701,6 +5735,7 @@ fn subsystem_membership_from_listed_substrate() {
     db.set_metadata_listing(
         &ext_root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -5807,6 +5842,7 @@ fn subsystem_reference_resolver_uses_listed_substrate() {
     db.set_metadata_listing(
         &root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -5825,6 +5861,7 @@ fn subsystem_reference_resolver_uses_listed_substrate() {
     db.set_metadata_listing(
         &ext_root.to_string_lossy(),
         MetadataListingData {
+            common_attributes: Vec::new(),
             entries: Vec::new(),
             defined_types: Vec::new(),
             common_modules: Vec::new(),
@@ -5868,6 +5905,7 @@ fn subsystem_reference_resolver_uses_listed_substrate() {
 /// via struct-update syntax (`MetadataListingData { entries: …, ..empty_listing_data() }`).
 fn empty_listing_data() -> MetadataListingData {
     MetadataListingData {
+        common_attributes: Vec::new(),
         entries: Vec::new(),
         defined_types: Vec::new(),
         common_modules: Vec::new(),

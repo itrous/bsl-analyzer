@@ -840,6 +840,7 @@ impl RootDatabaseImpl {
             web_services,
             integration_services,
             subsystems,
+            common_attributes,
         } = listing;
         let entries = Arc::new(entries);
         let defined_types = Arc::new(defined_types);
@@ -851,6 +852,7 @@ impl RootDatabaseImpl {
         let web_services = Arc::new(web_services);
         let integration_services = Arc::new(integration_services);
         let subsystems = Arc::new(subsystems);
+        let common_attributes = Arc::new(common_attributes);
         match self.metadata_listings.get(&key).map(|e| *e.value()) {
             Some(input) => {
                 input.set_entries(self).to(entries);
@@ -863,6 +865,7 @@ impl RootDatabaseImpl {
                 input.set_web_services(self).to(web_services);
                 input.set_integration_services(self).to(integration_services);
                 input.set_subsystems(self).to(subsystems);
+                input.set_common_attributes(self).to(common_attributes);
             }
             None => {
                 let input = metadata::MetadataListingInput::builder(
@@ -876,6 +879,7 @@ impl RootDatabaseImpl {
                     web_services,
                     integration_services,
                     subsystems,
+                    common_attributes,
                 )
                 .durability(salsa::Durability::MEDIUM)
                 .new(self);

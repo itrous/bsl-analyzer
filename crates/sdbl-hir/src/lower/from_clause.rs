@@ -516,6 +516,13 @@ impl LoweringContext<'_> {
             ));
         }
 
+        // A separator is part of the record key and a column of every virtual table, which is
+        // what a dimension is; a plain common attribute behaves like a register attribute.
+        for common in register.common_attributes().iter().filter(|c| c.separator) {
+            dimensions
+                .push(FieldDef::new(&common.name, self.resolve_attribute_type(&common.attr_type)));
+        }
+
         let mut attributes = Vec::new();
         for attr in register.attributes() {
             let ty = attr
@@ -539,6 +546,14 @@ impl LoweringContext<'_> {
             field.provisional = Self::is_conditional_standard_field(mdo_type, attr.name());
             attributes.push(field);
         }
+        for common in register.common_attributes().iter().filter(|c| !c.separator) {
+            attributes.push(FieldDef::new_with_names(
+                common.name.clone(),
+                None,
+                self.resolve_attribute_type(&common.attr_type),
+                false,
+            ));
+        }
 
         let mut fields = Vec::new();
         fields.extend(dimensions.iter().cloned());
@@ -552,8 +567,9 @@ impl LoweringContext<'_> {
         // conditional names the reader did not emit for this very register. What the reader
         // did emit is answered by `attributes` itself, not by re-deriving the condition.
         let reader_has_period = attributes.iter().any(|field| field.matches_name("Период"));
-        let (query_only_fields, field_model_complete) =
+        let (query_only_fields, standard_complete) =
             Self::register_query_only_fields(mdo_type, reader_has_period);
+        let field_model_complete = standard_complete && !register.common_attributes_open();
         fields.extend(query_only_fields);
 
         tracing::debug!(
@@ -961,6 +977,15 @@ impl LoweringContext<'_> {
                         ));
                     }
 
+                    for common in &obj.common_attributes {
+                        fields.push(FieldDef::new_with_names(
+                            common.name.clone(),
+                            None,
+                            self.resolve_attribute_type(&common.attr_type),
+                            false,
+                        ));
+                    }
+
                     // Tabular-section names are valid columns of the parent
                     // (ITS ch.26, type РезультатЗапроса).
                     for ts in &obj.tabular_sections {
@@ -984,7 +1009,7 @@ impl LoweringContext<'_> {
                         total_fields = fields.len(),
                         "Added metadata fields to object"
                     );
-                    true
+                    !obj.common_attributes_open
                 } else {
                     tracing::debug!(
                         full_name = %full_name,
