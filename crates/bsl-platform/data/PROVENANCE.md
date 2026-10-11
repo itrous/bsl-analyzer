@@ -40,8 +40,7 @@ platform 8.3.27.2214 (the release the pinned corpus was extracted from) and is
 
 The analyzer serves it when nothing richer is available: for
 `source = "bundled"`, for library use that selected no source, and as the last
-step of `auto` after the installed platform, the saved snapshot and the pinned
-download. `none` still serves nothing. Over the facts, hover and completion
+step of `auto` after the installed platform and the saved snapshot. `none` still serves nothing. Over the facts, hover and completion
 answer with names, signatures and parameters; descriptions stay empty until a
 full corpus is configured.
 
@@ -64,12 +63,9 @@ performed by `crates/bsl-platform/tools/html-parser/`. The full corpus used to
 be committed here for reproducible builds; it is now read at runtime from the
 user's installed platform, or from a help package distributed separately
 from bsl-analyzer, each package carrying its own `NOTICE.md` with the
-statements below. With no platform installed, the default `auto` source
-downloads one pinned corpus file from the separate repository
-`itrous/bsl-platform-help` (URL and SHA-256 in
-`crates/platform-help/src/pinned.rs`) and caches it together with that
-`NOTICE.md` (`[platform_help]`, `docs/configuration/PROJECT_CONFIGURATION.md`).
-When that fails as well, the built-in interface facts serve.
+statements below (`[platform_help]`,
+`docs/configuration/PROJECT_CONFIGURATION.md`). With no platform installed,
+the default `auto` source serves the built-in interface facts.
 
 ## Ownership
 
@@ -134,8 +130,8 @@ the manifest is unavailable the build emits an empty catalog with status
 
 ### Built-in interface facts
 
-From the pinned corpus (`git show af94692c:crates/bsl-platform/data/platform_data.json`
-or the `corpus-3c759994` release asset; check its SHA-256 first):
+From the pinned corpus (`git show af94692c:crates/bsl-platform/data/platform_data.json`;
+check its SHA-256 first):
 
 ```bash
 scripts/strip-help-corpus-texts.py \

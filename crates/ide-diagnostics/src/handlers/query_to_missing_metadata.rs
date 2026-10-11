@@ -29,7 +29,7 @@ pub(crate) fn dispatch(
         diagnostics.push(Diagnostic {
             code,
             message: format!(
-                "Исправьте обращение к несуществующему метаданному \"{}\" в запросе",
+                "Источник запроса \"{}\" не разрешается в таблицу метаданных конфигурации",
                 table_name
             ),
             severity: config.severity(code),
@@ -118,7 +118,7 @@ mod tests {
             &[("ЗапросыМетаданных", common_module)],
             expect![[r#"
                 QueryToMissingMetadata @ 6:57..6:86
-                  message: Исправьте обращение к несуществующему метаданному "ОбщийМодуль.ЗапросыМетаданных" в запросе
+                  message: Источник запроса "ОбщийМодуль.ЗапросыМетаданных" не разрешается в таблицу метаданных конфигурации
                   severity: Blocker"#]],
         );
     }
@@ -158,7 +158,7 @@ mod tests {
             &[("ЗапросыМетаданных", common_module)],
             expect![[r#"
                 QueryToMissingMetadata @ 6:57..6:89
-                  message: Исправьте обращение к несуществующему метаданному "ОбщийМодуль.НесуществующийМодуль" в запросе
+                  message: Источник запроса "ОбщийМодуль.НесуществующийМодуль" не разрешается в таблицу метаданных конфигурации
                   severity: Blocker"#]],
         );
     }
@@ -206,10 +206,10 @@ mod tests {
             &[("ЗапросыМетаданных", common_module), ("MetadataQueries", common_module)],
             expect![[r#"
                 QueryToMissingMetadata @ 8:13..8:42
-                  message: Исправьте обращение к несуществующему метаданному "ОбщийМодуль.ЗапросыМетаданных" в запросе
+                  message: Источник запроса "ОбщийМодуль.ЗапросыМетаданных" не разрешается в таблицу метаданных конфигурации
                   severity: Blocker
                 QueryToMissingMetadata @ 13:15..13:43
-                  message: Исправьте обращение к несуществующему метаданному "CommonModule.MetadataQueries" в запросе
+                  message: Источник запроса "CommonModule.MetadataQueries" не разрешается в таблицу метаданных конфигурации
                   severity: Blocker"#]],
         );
     }

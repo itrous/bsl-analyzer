@@ -79,3 +79,4 @@ crates/mcp-server/src/lib.rs	module	2	вне-класса: вид узла гр�
 crates/mcp-server/src/tools/graph.rs	module	2	вне-класса: вид узла графа
 crates/mcp-server/src/tools/location.rs	module	1	вне-класса: вид узла графа
 crates/mcp-server/src/tools/symbol_info.rs	module	2	вне-класса: вид символа
+crates/platform-help/src/installed.rs	bin	1	вне-класса: подкаталог установки платформы с архивами справки

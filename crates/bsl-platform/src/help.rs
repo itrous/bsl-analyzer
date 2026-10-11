@@ -24,6 +24,109 @@ use crate::snapshot::PlatformSnapshot;
 /// corpus-contract test suite runs with it.
 pub const CORPUS_ENV: &str = "BSL_PLATFORM_HELP_CORPUS";
 
+/// `url` without what can carry a secret: the userinfo and the query and
+/// fragment. The scheme, host, port and path stay, which is what identifies a
+/// source in a log.
+///
+/// The authority is read the way the transport reads it: it ends at the first
+/// `/`, `?` or `#`, and its userinfo ends at the last `@` inside it. An
+/// authority that is not a plain `host[:port]` after that is not shown at all,
+/// since it can hold a password that the usual rules would leave in place. A
+/// value without `://` is not shown either.
+pub fn redact_url(url: &str) -> String {
+    let cut = |text: &str| text.split(['?', '#']).next().unwrap_or(text).to_owned();
+    // Without a literal `://` the authority cannot be told from the rest, so
+    // nothing of the value is shown.
+    let Some((scheme, rest)) = url.split_once("://").filter(|(scheme, _)| is_scheme(scheme)) else {
+        return "<invalid>".to_owned();
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    if !is_host_and_port(host) {
+        return format!("{scheme}://<invalid>");
+    }
+    let path = if tail.starts_with('/') { cut(tail) } else { String::new() };
+    // A control character (a line feed) would split or forge a log record.
+    if path.chars().any(char::is_control) {
+        return format!("{scheme}://{host}/<invalid>");
+    }
+    format!("{scheme}://{host}{path}")
+}
+
+/// A URL scheme: a letter, then letters, digits, `+`, `-` and `.`.
+fn is_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// `host`, `host:port` or `[ipv6]:port`, in the characters a host can have.
+fn is_host_and_port(authority: &str) -> bool {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !authority.ends_with(']') && !port.contains(']') => {
+            (host, Some(port))
+        }
+        _ => (authority, None),
+    };
+    let host_ok = match host.strip_prefix('[') {
+        Some(inner) => inner.strip_suffix(']').is_some_and(|ip| {
+            // `%` starts a zone id (`fe80::1%eth0`).
+            !ip.is_empty()
+                && ip.chars().all(|c| {
+                    c.is_ascii_hexdigit() || c.is_alphanumeric() || matches!(c, ':' | '.' | '%')
+                })
+        }),
+        None => {
+            !host.is_empty()
+                // Unicode letters: an internationalized name is a host as it is.
+                && host.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        }
+    };
+    host_ok && port.is_none_or(|port| port.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether a [`CORPUS_ENV`] value is a URL or an attempt at one, rather than a
+/// path. A value that is only almost a URL (`https:/host`, `https//host`,
+/// `//user:pw@host`, `user:pw@host/m.json`) must not be read as a path and
+/// printed with whatever secrets it holds, so it counts as a URL here, as does
+/// any value with a `?`, `#` or `@`.
+///
+/// A drive path (`C:/help`), a path with a blank (`C:/Program Files/help`) and a
+/// path that merely mentions a scheme (`./https://x`) are paths.
+pub fn is_url_like(value: &str) -> bool {
+    let text = value.trim();
+    let starts = |scheme: &str| {
+        text.get(..scheme.len()).is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    };
+    if starts("https://") || starts("http://") || text.starts_with("//") {
+        return true;
+    }
+    // Characters a URL carries and a path hardly does. A path that needs one
+    // of them is given by `[platform_help]` instead.
+    if text.contains(['?', '#', '@']) || text.starts_with("://") {
+        return true;
+    }
+    // A scheme broken by a blank (`ht tps://…`).
+    if text.contains("://") && text.contains(char::is_whitespace) {
+        return true;
+    }
+    let word_len = text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .unwrap_or(text.len());
+    let (word, rest) = text.split_at(word_len);
+    if word.is_empty() {
+        return false;
+    }
+    if rest.starts_with("//") {
+        return true;
+    }
+    if rest.starts_with(':') {
+        // One letter is a drive, which carries none of a URL's characters.
+        return word.len() >= 2 || text.contains(['?', '@']);
+    }
+    false
+}
+
 /// The interface facts compiled into the analyzer, in the help corpus JSON
 /// shape. Regenerated from a full corpus by `scripts/strip-help-corpus-texts.py`.
 const BUNDLED_FACTS: &[u8] = include_bytes!("../data/platform_facts.json");
@@ -46,7 +149,7 @@ pub enum PlatformHelpRequest {
     /// A corpus package manifest published at a URL.
     ExternalUrl(String),
     /// The snapshot saved for `auto`, else an installed platform, else the
-    /// pinned corpus download, else the built-in interface facts.
+    /// built-in interface facts.
     Auto,
     /// Help explicitly disabled: no discovery, extraction or network.
     None,
@@ -80,7 +183,7 @@ impl fmt::Display for PlatformHelpRequest {
             }
             Self::Installed { path: None } => formatter.write_str("installed (discovery)"),
             Self::ExternalPath(path) => write!(formatter, "external ({})", path.display()),
-            Self::ExternalUrl(url) => write!(formatter, "external ({url})"),
+            Self::ExternalUrl(url) => write!(formatter, "external ({})", redact_url(url)),
             Self::Auto => formatter.write_str("auto"),
             Self::None => formatter.write_str("none"),
             Self::Unselected => formatter.write_str("not selected"),
@@ -212,9 +315,25 @@ impl PlatformHelp {
     }
 
     /// The selection for library use that selected nothing: the corpus named by
-    /// [`CORPUS_ENV`] when set, otherwise the built-in interface facts.
+    /// [`CORPUS_ENV`] when set and not blank, otherwise the built-in interface facts.
     pub fn unselected() -> Self {
-        match std::env::var_os(CORPUS_ENV).filter(|value| !value.is_empty()) {
+        let blank = |value: &std::ffi::OsString| {
+            value.is_empty() || value.to_str().is_some_and(|text| text.trim().is_empty())
+        };
+        match std::env::var_os(CORPUS_ENV).filter(|value| !blank(value)) {
+            Some(value) if is_url_like(&value.to_string_lossy()) => {
+                let text = value.to_string_lossy();
+                let shown = redact_url(&text);
+                let reason = if text.trim_start().to_ascii_lowercase().starts_with("http://") {
+                    format!("{CORPUS_ENV}: `http` is not accepted ({shown}); use `https` or a path")
+                } else {
+                    format!(
+                        "{CORPUS_ENV}: a URL ({shown}) is supported only by the bsl-analyzer \
+                         application; the library accepts a path"
+                    )
+                };
+                Self::missing(PlatformHelpRequest::Unselected, reason)
+            }
             Some(path) => Self::from_corpus_file(std::path::Path::new(&path)),
             None => Self::bundled(PlatformHelpRequest::Unselected, None),
         }

@@ -27,7 +27,7 @@ pub(crate) fn dispatch(
         crate::sdbl_utils::dispatch_simple(
             config,
             DiagnosticCode::LogicalOrInJoinQuerySection,
-            "Обнаружен оператор 'ИЛИ' в условии соединения",
+            "ИЛИ в условии соединения мешает СУБД использовать индекс, если не сводится к В; разбивать запрос на части через ОБЪЕДИНИТЬ ВСЕ можно, только если результат не изменится",
             *range,
             mapper,
             query_text,
@@ -88,18 +88,18 @@ mod tests {
         check(
             code,
             expect![[r#"
-            LogicalOrInJoinQuerySection @ 11:34..11:37
-              message: Обнаружен оператор 'ИЛИ' в условии соединения
-              severity: Warning
-            LogicalOrInJoinQuerySection @ 11:51..11:54
-              message: Обнаружен оператор 'ИЛИ' в условии соединения
-              severity: Warning
-            LogicalOrInJoinQuerySection @ 18:8..18:11
-              message: Обнаружен оператор 'ИЛИ' в условии соединения
-              severity: Warning
-            LogicalOrInJoinQuerySection @ 24:7..24:10
-              message: Обнаружен оператор 'ИЛИ' в условии соединения
-              severity: Warning"#]],
+                LogicalOrInJoinQuerySection @ 11:34..11:37
+                  message: ИЛИ в условии соединения мешает СУБД использовать индекс, если не сводится к В; разбивать запрос на части через ОБЪЕДИНИТЬ ВСЕ можно, только если результат не изменится
+                  severity: Warning
+                LogicalOrInJoinQuerySection @ 11:51..11:54
+                  message: ИЛИ в условии соединения мешает СУБД использовать индекс, если не сводится к В; разбивать запрос на части через ОБЪЕДИНИТЬ ВСЕ можно, только если результат не изменится
+                  severity: Warning
+                LogicalOrInJoinQuerySection @ 18:8..18:11
+                  message: ИЛИ в условии соединения мешает СУБД использовать индекс, если не сводится к В; разбивать запрос на части через ОБЪЕДИНИТЬ ВСЕ можно, только если результат не изменится
+                  severity: Warning
+                LogicalOrInJoinQuerySection @ 24:7..24:10
+                  message: ИЛИ в условии соединения мешает СУБД использовать индекс, если не сводится к В; разбивать запрос на части через ОБЪЕДИНИТЬ ВСЕ можно, только если результат не изменится
+                  severity: Warning"#]],
         );
     }
 
@@ -132,9 +132,9 @@ mod tests {
         check(
             code,
             expect![[r#"
-            LogicalOrInJoinQuerySection @ 2:105..2:107
-              message: Обнаружен оператор 'ИЛИ' в условии соединения
-              severity: Warning"#]],
+                LogicalOrInJoinQuerySection @ 2:105..2:107
+                  message: ИЛИ в условии соединения мешает СУБД использовать индекс, если не сводится к В; разбивать запрос на части через ОБЪЕДИНИТЬ ВСЕ можно, только если результат не изменится
+                  severity: Warning"#]],
         );
     }
 
@@ -149,9 +149,9 @@ EndProcedure
         check(
             code,
             expect![[r#"
-            LogicalOrInJoinQuerySection @ 4:24..4:26
-              message: Обнаружен оператор 'ИЛИ' в условии соединения
-              severity: Warning"#]],
+                LogicalOrInJoinQuerySection @ 4:24..4:26
+                  message: ИЛИ в условии соединения мешает СУБД использовать индекс, если не сводится к В; разбивать запрос на части через ОБЪЕДИНИТЬ ВСЕ можно, только если результат не изменится
+                  severity: Warning"#]],
         );
     }
 
@@ -166,9 +166,9 @@ EndProcedure
         check(
             code,
             expect![[r#"
-            LogicalOrInJoinQuerySection @ 4:25..4:28
-              message: Обнаружен оператор 'ИЛИ' в условии соединения
-              severity: Warning"#]],
+                LogicalOrInJoinQuerySection @ 4:25..4:28
+                  message: ИЛИ в условии соединения мешает СУБД использовать индекс, если не сводится к В; разбивать запрос на части через ОБЪЕДИНИТЬ ВСЕ можно, только если результат не изменится
+                  severity: Warning"#]],
         );
     }
 

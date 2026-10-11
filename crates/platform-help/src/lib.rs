@@ -10,7 +10,6 @@
 pub mod external;
 pub mod installed;
 pub mod package;
-pub mod pinned;
 
 use std::path::Path;
 
@@ -21,29 +20,114 @@ use bsl_platform::{
 pub use installed::LoadContext;
 use project_model::{PlatformHelpSelection, ProjectConfig};
 
+/// The variable that named the corpus mirror of the removed download step.
+/// Ignoring it would silently leave a user who set it without the corpus.
+pub const RETIRED_PINNED_URL_ENV: &str = "BSL_PLATFORM_HELP_PINNED_URL";
+
+/// What named the help source a process runs with.
+enum SourceOrigin {
+    /// The `[platform_help]` section, or the build default when it is absent.
+    Configuration,
+    /// [`bsl_platform::CORPUS_ENV`] stood in for the missing section.
+    Environment,
+    /// The section decided; [`bsl_platform::CORPUS_ENV`] is set and unused.
+    EnvironmentIgnored,
+}
+
+/// The variable's value: `None` when unset, empty or blank; a URL for `https`,
+/// an error for `http`, otherwise a path.
+fn corpus_from_environment() -> Result<Option<PlatformHelpRequest>, String> {
+    match std::env::var_os(bsl_platform::CORPUS_ENV) {
+        Some(value) => parse_corpus_value(value),
+        None => Ok(None),
+    }
+}
+
+fn parse_corpus_value(value: std::ffi::OsString) -> Result<Option<PlatformHelpRequest>, String> {
+    // A value that is not UTF-8 is still classified, by its lossy reading: a
+    // URL with a stray byte must not be printed as a path.
+    let lossy = value.to_string_lossy();
+    let text = lossy.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let has_scheme = |scheme: &str| {
+        text.get(..scheme.len()).is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    };
+    if has_scheme("https://") {
+        Ok(Some(PlatformHelpRequest::ExternalUrl(text.to_owned())))
+    } else if has_scheme("http://") {
+        Err(format!(
+            "{}: `http` is not accepted ({}); use an `https` URL, or `[platform_help]` with `url`",
+            bsl_platform::CORPUS_ENV,
+            bsl_platform::redact_url(text)
+        ))
+    } else if bsl_platform::is_url_like(text) {
+        // Printed as a path it would reach the log with whatever secrets it holds.
+        Err(format!(
+            "{}: the value looks like a URL but was not parsed (it is not shown); use an \
+             `https://` URL, or a path, or `[platform_help]` with `path`",
+            bsl_platform::CORPUS_ENV
+        ))
+    } else {
+        Ok(Some(PlatformHelpRequest::ExternalPath(value.into())))
+    }
+}
+
 /// The help source a configuration asks for; the build default when it names none.
 pub fn requested_source(
     config: Option<&ProjectConfig>,
     project_root: &Path,
 ) -> Result<PlatformHelpRequest, String> {
+    resolve_source(config, project_root).map(|(request, _)| request)
+}
+
+fn resolve_source(
+    config: Option<&ProjectConfig>,
+    project_root: &Path,
+) -> Result<(PlatformHelpRequest, SourceOrigin), String> {
     let selection = match config {
         Some(config) => config.platform_help_selection(project_root).map_err(|e| e.to_string())?,
         None => None,
     };
-    Ok(match selection {
+    let mut origin = SourceOrigin::Configuration;
+    let request = match selection {
         // A corpus named for the process stands in for an unset configuration,
         // which is how the corpus-contract suite runs the application.
-        None => match std::env::var_os(bsl_platform::CORPUS_ENV).filter(|v| !v.is_empty()) {
-            Some(corpus) => PlatformHelpRequest::ExternalPath(corpus.into()),
+        None => match corpus_from_environment()? {
+            Some(request) => {
+                origin = SourceOrigin::Environment;
+                request
+            }
             None => PlatformHelpRequest::default_for_build(),
         },
-        Some(PlatformHelpSelection::Bundled) => PlatformHelpRequest::Bundled,
-        Some(PlatformHelpSelection::Installed { path }) => PlatformHelpRequest::Installed { path },
-        Some(PlatformHelpSelection::ExternalPath(path)) => PlatformHelpRequest::ExternalPath(path),
-        Some(PlatformHelpSelection::ExternalUrl(url)) => PlatformHelpRequest::ExternalUrl(url),
-        Some(PlatformHelpSelection::Auto) => PlatformHelpRequest::Auto,
-        Some(PlatformHelpSelection::None) => PlatformHelpRequest::None,
-    })
+        Some(selection) => {
+            if matches!(corpus_from_environment(), Ok(Some(_)) | Err(_)) {
+                origin = SourceOrigin::EnvironmentIgnored;
+            }
+            match selection {
+                PlatformHelpSelection::Bundled => PlatformHelpRequest::Bundled,
+                PlatformHelpSelection::Installed { path } => {
+                    PlatformHelpRequest::Installed { path }
+                }
+                PlatformHelpSelection::ExternalPath(path) => {
+                    PlatformHelpRequest::ExternalPath(path)
+                }
+                PlatformHelpSelection::ExternalUrl(url) => PlatformHelpRequest::ExternalUrl(url),
+                PlatformHelpSelection::Auto => PlatformHelpRequest::Auto,
+                PlatformHelpSelection::None => PlatformHelpRequest::None,
+            }
+        }
+    };
+    if request == PlatformHelpRequest::Auto
+        && std::env::var_os(RETIRED_PINNED_URL_ENV).is_some_and(|value| !value.is_empty())
+    {
+        return Err(format!(
+            "{RETIRED_PINNED_URL_ENV} is no longer supported: `auto` does not download a corpus; \
+             unset it, or use `source = \"external\"` with the `url` of a help package"
+        ));
+    }
+    Ok((request, origin))
 }
 
 /// Loads `request`. Never fails: a source that cannot deliver yields an empty
@@ -99,17 +183,20 @@ fn load_external_url(
     url: &str,
     context: &LoadContext,
 ) -> PlatformHelp {
+    let shown = bsl_platform::redact_url(url);
     let result = external::load_url(url, context).and_then(|(corpus, cache, stale_reason)| {
         if let Some(reason) = &stale_reason {
-            tracing::warn!(%url, %reason, "serving the last valid package downloaded from this URL");
+            tracing::warn!(url = %shown, %reason, "serving the last valid package downloaded from this URL");
         }
         let mut help = decode(request, corpus, PlatformHelpSourceKind::External, &cache)
             .map_err(|reason| match &stale_reason {
-                Some(fetch) => format!("{url}: {fetch}; the last downloaded package is unusable: {reason}"),
+                Some(fetch) => {
+                    format!("{shown}: {fetch}; the last downloaded package is unusable: {reason}")
+                }
                 None => reason,
             })?;
         if let Some(origin) = help.origin.as_mut() {
-            origin.location = Some(url.to_owned());
+            origin.location = Some(shown.clone());
         }
         Ok(help)
     });
@@ -129,38 +216,17 @@ fn load_installed(
 }
 
 /// The installation when there is one — reusing the `auto` snapshot while its
-/// archives are unchanged — else the saved `auto` snapshot, else the pinned
-/// corpus, else the built-in interface facts with the reason nothing richer
-/// serves.
+/// archives are unchanged — else the saved `auto` snapshot, else the built-in
+/// interface facts with the reason nothing richer serves. `auto` never
+/// touches the network.
 fn load_auto(request: &PlatformHelpRequest, context: &LoadContext) -> PlatformHelp {
     match load_local_auto(request, context) {
         Ok(help) => help,
-        Err(local) => load_pinned(request, context, &local),
+        Err(local) => PlatformHelp::bundled(request.clone(), Some(local)),
     }
 }
 
-/// The pinned corpus once nothing local can serve; `local` says why. Without
-/// it the built-in interface facts serve, so `auto` never answers nothing.
-fn load_pinned(request: &PlatformHelpRequest, context: &LoadContext, local: &str) -> PlatformHelp {
-    let Some(pinned) = &context.pinned else {
-        return PlatformHelp::bundled(
-            request.clone(),
-            Some(format!("{local}; the pinned corpus download is turned off")),
-        );
-    };
-    let loaded = pinned::load(pinned, context).and_then(|(corpus, cache)| {
-        let mut help = decode(request, corpus, PlatformHelpSourceKind::Auto, &cache)?;
-        if let Some(origin) = help.origin.as_mut() {
-            origin.location = Some(pinned.url.clone());
-        }
-        Ok(help)
-    });
-    loaded.unwrap_or_else(|reason| {
-        PlatformHelp::bundled(request.clone(), Some(format!("{local}; pinned corpus: {reason}")))
-    })
-}
-
-/// [`load_auto`] without the network: the reason when nothing local serves.
+/// The saved snapshot or the installation: the reason when neither serves.
 fn load_local_auto(
     request: &PlatformHelpRequest,
     context: &LoadContext,
@@ -272,13 +338,25 @@ pub enum BootstrapOutcome {
 /// the result in the log. `config` is `None` when the project has no config file.
 pub fn bootstrap(config: Option<&ProjectConfig>, project_root: &Path) -> BootstrapOutcome {
     let _span = tracing::info_span!("platform_help_bootstrap").entered();
-    let request = match requested_source(config, project_root) {
-        Ok(request) => request,
+    let (request, origin) = match resolve_source(config, project_root) {
+        Ok(resolved) => resolved,
         Err(reason) => {
             tracing::warn!(%reason, "invalid platform_help configuration; platform help is unavailable");
             return publish(PlatformHelp::missing(PlatformHelpRequest::None, reason), config);
         }
     };
+    match origin {
+        SourceOrigin::Environment => tracing::info!(
+            variable = bsl_platform::CORPUS_ENV,
+            source = %request,
+            "platform help source chosen by the environment variable"
+        ),
+        SourceOrigin::EnvironmentIgnored => tracing::warn!(
+            "{} is ignored: the configuration has a [platform_help] section, which decides the source",
+            bsl_platform::CORPUS_ENV
+        ),
+        SourceOrigin::Configuration => {}
+    }
     if let Some(warning) = active_source_conflict(&request) {
         tracing::warn!("{warning}");
         return BootstrapOutcome::RestartRequired(warning);
@@ -422,5 +500,134 @@ mod tests {
             requested_source(Some(&config), Path::new("/")).unwrap(),
             PlatformHelpRequest::None
         );
+    }
+
+    #[test]
+    fn corpus_variable_value_selects_url_path_or_nothing() {
+        let parse = |value: &str| parse_corpus_value(value.into());
+        assert_eq!(parse("").unwrap(), None);
+        assert_eq!(parse("   ").unwrap(), None);
+        assert_eq!(
+            parse("https://example.invalid/m.json").unwrap(),
+            Some(PlatformHelpRequest::ExternalUrl("https://example.invalid/m.json".to_owned()))
+        );
+        assert_eq!(
+            parse("HTTPS://example.invalid/m.json").unwrap(),
+            Some(PlatformHelpRequest::ExternalUrl("HTTPS://example.invalid/m.json".to_owned()))
+        );
+        assert_eq!(
+            parse("/srv/help/corpus.json").unwrap(),
+            Some(PlatformHelpRequest::ExternalPath("/srv/help/corpus.json".into()))
+        );
+        // A URL that lost a slash is refused without being shown, but a drive
+        // path is a path.
+        let malformed = parse("https:/user:secret@host.invalid/m.json?token=abc").unwrap_err();
+        assert!(!malformed.contains("secret") && !malformed.contains("token"), "{malformed}");
+        // The same holds for a value with a leading blank or a byte that is not
+        // UTF-8.
+        assert_eq!(
+            parse("\nhttps://user:secret@host.invalid/m.json?token=abc").unwrap(),
+            Some(PlatformHelpRequest::ExternalUrl(
+                "https://user:secret@host.invalid/m.json?token=abc".to_owned()
+            ))
+        );
+        let refused = parse("  https:/user:secret@host.invalid/m.json?token=abc").unwrap_err();
+        assert!(!refused.contains("secret") && !refused.contains("token"), "{refused}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bytes = b"https:/user:secret@host.invalid/m.json?token=abc\xff".to_vec();
+            let refused = parse_corpus_value(std::ffi::OsString::from_vec(bytes)).unwrap_err();
+            assert!(!refused.contains("secret") && !refused.contains("token"), "{refused}");
+        }
+        // A broken scheme, a query-only value, and an empty scheme are URLs that
+        // did not parse; a path with a blank is still a path.
+        for unparsed in [
+            "ht tps://user:secret@host.invalid/m.json?token=abc",
+            "m.json?token=abc",
+            "://host.invalid/m.json#secret",
+        ] {
+            let refused = parse(unparsed).unwrap_err();
+            assert!(!refused.contains("secret") && !refused.contains("token"), "{refused}");
+            assert!(refused.contains("looks like a URL but was not parsed"), "{refused}");
+        }
+        assert_eq!(
+            parse("C:/Program Files/help/corpus.json").unwrap(),
+            Some(PlatformHelpRequest::ExternalPath("C:/Program Files/help/corpus.json".into()))
+        );
+        // Every near miss of a URL is refused without being shown.
+        for near_miss in [
+            "https:user:secret@host.invalid/m.json?token=abc",
+            "https//user:secret@host.invalid/m.json?token=abc",
+            "//user:secret@host.invalid/m.json?token=abc",
+            "user:secret@host.invalid/m.json?token=abc",
+            "1https://user:secret@host.invalid/m.json?token=abc",
+            "ftp://user:secret@host.invalid/m.json?token=abc",
+            "x:/m.json?token=abc",
+        ] {
+            let refused = parse(near_miss).unwrap_err();
+            assert!(!refused.contains("secret") && !refused.contains("token"), "{refused}");
+        }
+        assert_eq!(
+            parse("C:/help/corpus.json").unwrap(),
+            Some(PlatformHelpRequest::ExternalPath("C:/help/corpus.json".into()))
+        );
+        // Only a leading scheme is a URL: a path that merely mentions one is a path.
+        assert_eq!(
+            parse("./https://x").unwrap(),
+            Some(PlatformHelpRequest::ExternalPath("./https://x".into()))
+        );
+
+        let refused = parse("http://user:secret@example.invalid/m.json?token=abc").unwrap_err();
+        assert!(
+            refused.contains("`http` is not accepted") && refused.contains("https"),
+            "{refused}"
+        );
+        assert!(refused.contains("example.invalid/m.json"), "{refused}");
+        assert!(!refused.contains("secret") && !refused.contains("token"), "{refused}");
+    }
+
+    #[test]
+    fn urls_shown_to_users_lose_userinfo_query_and_fragment() {
+        let request = PlatformHelpRequest::ExternalUrl(
+            "https://user:secret@host.invalid:8443/help/m.json?token=abc#frag".to_owned(),
+        );
+        assert_eq!(request.to_string(), "external (https://host.invalid:8443/help/m.json)");
+        // Any `/`, `?`, `#` or `@` a secret can hold must leave no part of it.
+        let shown = bsl_platform::redact_url;
+        assert_eq!(shown("https://user:pw@host.invalid/m.json"), "https://host.invalid/m.json");
+        assert_eq!(
+            shown("https://host.invalid/@scope/m.json"),
+            "https://host.invalid/@scope/m.json"
+        );
+        assert_eq!(shown("https://[::1]:8443/m.json?a=1"), "https://[::1]:8443/m.json");
+        // Without a literal `://` nothing is shown, whatever it holds.
+        let single_slash = shown("https:/user:secret@host.invalid/m.json?token=abc");
+        assert!(!single_slash.contains("secret") && !single_slash.contains("token"));
+        // A prefix that is not a scheme is not shown, and a line feed in the path
+        // cannot reach the log.
+        let prefixed = shown("user:secret?token=abc://example.invalid/manifest.json");
+        assert!(!prefixed.contains("secret") && !prefixed.contains("token"), "{prefixed}");
+        assert!(!shown("https://127.0.0.1:1/\nforged").contains('\n'));
+        // A parsed authority keeps its host as it is.
+        assert_eq!(shown("https://пример.рф/m.json"), "https://пример.рф/m.json");
+        assert_eq!(
+            shown("https://[fe80::1%eth0]:8443/m.json"),
+            "https://[fe80::1%eth0]:8443/m.json"
+        );
+        for secret_url in [
+            "https://user:p#ss@host.invalid/m.json",
+            "https://user:p?ss@host.invalid/m.json",
+            "https://user:p/ss@host.invalid/m.json",
+        ] {
+            assert_eq!(shown(secret_url), "https://<invalid>", "{secret_url}");
+        }
+        for query_url in [
+            "https://host.invalid/m.json?token=@secret",
+            "https://user:pw@host.invalid/m.json?x=a@b&token=abc",
+            "https://host.invalid/m.json?token=abc@secret",
+        ] {
+            assert_eq!(shown(query_url), "https://host.invalid/m.json", "{query_url}");
+        }
     }
 }

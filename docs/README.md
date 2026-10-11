@@ -17,6 +17,7 @@
 - `../README.md` — установка и базовые сценарии CLI
 - `configuration/PROJECT_CONFIGURATION.md` — структура `bsl-analyzer.toml`
 - `configuration/DIAGNOSTICS.md` — параметры диагностик и правила включения / отключения
+- `platform-help.md` — сборка корпуса справки платформы 1С и его подключение
 - `CI_REPORTERS.md` — форматы отчётов `analyze` для CI (SARIF, GitLab Code Quality, JUnit)
 - `METADATA_COMPATIBILITY.md` — ограничения и совместимость загрузки метаданных
 

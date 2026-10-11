@@ -30,8 +30,32 @@ MOVED_TO_A = {"sdbl-hir", "parser", "lexer"}
 VERIFIED = "d50f2fd8"
 DIFF_BASE = "c6d140ee"
 RECOVERY_301 = "crates/parser/src/grammar/sdbl/expressions.rs"
-GUARDED_PREFIXES = ("crates/parser/", "crates/lexer/", "crates/ide-diagnostics/")
+GUARDED_PREFIXES = ("crates/parser/", "crates/lexer/")
 MOVED_MANIFESTS = ("crates/parser/Cargo.toml", "crates/lexer/Cargo.toml")
+HANDLERS = "crates/ide-diagnostics/src/handlers/"
+# Handler files the attestation touched, by exact path: test material replaced (None) or one
+# user-facing message rewritten by the owner's decision (the base line and its replacement).
+# Everything before the first `#[cfg(test)]` must otherwise equal DIFF_BASE byte for byte.
+HANDLER_EDITS = {
+    HANDLERS + "assign_alias_fields_in_query.rs": None,
+    HANDLERS + "using_like_in_query.rs": None,
+    HANDLERS + "full_outer_join_query.rs": None,
+    HANDLERS + "join_with_sub_query.rs": None,
+    HANDLERS + "join_with_virtual_table.rs": None,
+    HANDLERS + "multiline_string_in_query.rs": None,
+    HANDLERS + "query_nested_fields_by_dot.rs": None,
+    HANDLERS + "query_parse_error.rs": None,
+    HANDLERS + "select_top_without_order_by.rs": None,
+    HANDLERS + "virtual_table_call_without_parameters.rs": None,
+    HANDLERS + "logical_or_in_join_query_section.rs": (
+        """            "Обнаружен оператор 'ИЛИ' в условии соединения",\n""",
+        """            "ИЛИ в условии соединения мешает СУБД использовать индекс, если не сводится к В; разбивать запрос на части через ОБЪЕДИНИТЬ ВСЕ можно, только если результат не изменится",\n""",
+    ),
+    HANDLERS + "query_to_missing_metadata.rs": (
+        """                "Исправьте обращение к несуществующему метаданному \\"{}\\" в запросе",\n""",
+        """                "Источник запроса \\"{}\\" не разрешается в таблицу метаданных конфигурации",\n""",
+    ),
+}
 DIFF_ALLOWLIST = (
     "crates/sdbl-hir/**",
     RECOVERY_301,
@@ -41,8 +65,14 @@ DIFF_ALLOWLIST = (
     "LICENSING.md",
     "NOTICE",
     "scripts/test-tier-registry.py",
+    # The contribution terms and the README licence section, by the owner's decision on
+    # the contributions finding: they stated LGPL only, against the published policy.
+    # Only the named section may differ from DIFF_BASE, see SECTION_EDITS.
+    "CONTRIBUTING.md",
+    "README.md",
     "Cargo.toml",
     "crates/*/Cargo.toml",
+    *HANDLER_EDITS,
 )
 
 
@@ -66,6 +96,38 @@ def name_status_paths(output):
         fields = line.split("\t")
         paths.extend(fields[1:])
     return paths
+
+
+SECTION_EDITS = {"README.md": "## Лицензия", "CONTRIBUTING.md": "## Вопросы и лицензия"}
+
+
+def without_section(text, heading):
+    """The text with one level-2 section — heading to the next level-2 heading — cut out."""
+    lines = text.split("\n")
+    start = lines.index(heading)
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    return "\n".join(lines[:start] + lines[end:])
+
+
+def product_prefix(text):
+    """The part of a handler file before its test module."""
+    return text.split("#[cfg(test)]", 1)[0]
+
+
+def handler_edit_violations(read_base, read_current, edits=None):
+    """Handler files whose product part differs from the base beyond their one named edit."""
+    bad = []
+    for path, edit in (HANDLER_EDITS if edits is None else edits).items():
+        before, after = product_prefix(read_base(path)), product_prefix(read_current(path))
+        if edit is not None:
+            old, new = edit
+            if before.count(old) != 1:
+                bad.append(f"{path}: the base line of the edit is not unique")
+                continue
+            before = before.replace(old, new)
+        if before != after:
+            bad.append(path)
+    return bad
 
 
 def diff_violations(changed):
@@ -366,6 +428,43 @@ class TierRegistryTests(unittest.TestCase):
         self.assertEqual(diff_violations(sorted(set(changed))), [], "changes outside the allowlist")
         print("I6 diff vs", DIFF_BASE, ":", len(set(changed)), "paths, all allowlisted")
 
+    def test_I6_handler_product_bytes_equal_the_base_but_for_named_messages(self):
+        base = lambda path: historical(path, DIFF_BASE)
+        current = lambda path: (ROOT / path).read_text()
+        self.assertEqual(handler_edit_violations(base, current), [])
+        for path, edit in HANDLER_EDITS.items():
+            with self.subTest(edited=path):
+                changed = product_prefix(current(path)) != product_prefix(base(path))
+                self.assertEqual(changed, edit is not None, "a listed message edit must be present, a test-only file must keep its product part")
+        print("I6 handler edits:", len(HANDLER_EDITS), "files; product parts equal the base but for",
+              sum(edit is not None for edit in HANDLER_EDITS.values()), "named messages")
+
+    def test_I6_handler_comparison_detects_a_changed_byte(self):
+        path = HANDLERS + "using_like_in_query.rs"
+        base = "fn a() {}\n#[cfg(test)]\nmod tests {}\n"
+        same_product = "fn a() {}\n#[cfg(test)]\nmod tests { new }\n"
+        changed_product = "fn b() {}\n#[cfg(test)]\nmod tests {}\n"
+        edits = {path: None}
+        self.assertEqual(handler_edit_violations(lambda _: base, lambda _: same_product, edits), [])
+        self.assertEqual(handler_edit_violations(lambda _: base, lambda _: changed_product, edits), [path])
+        message = {path: ('"old",\n', '"new",\n')}
+        old, new = 'x("old",\n);\n', 'x("new",\n);\n'
+        self.assertEqual(handler_edit_violations(lambda _: old, lambda _: new, message), [])
+        self.assertEqual(handler_edit_violations(lambda _: old, lambda _: 'x("other",\n);\n', message), [path])
+        self.assertEqual(handler_edit_violations(lambda _: new, lambda _: new, message), [f"{path}: the base line of the edit is not unique"])
+
+    def test_I6_docs_change_only_their_licence_sections(self):
+        for path, heading in SECTION_EDITS.items():
+            with self.subTest(document=path):
+                before, after = historical(path, DIFF_BASE), (ROOT / path).read_text()
+                self.assertEqual(without_section(after, heading), without_section(before, heading),
+                                 f"{path} differs from the base outside {heading!r}")
+        sample = "# T\n\n## A\n\na\n\n## Лицензия\n\nold\n\n## B\n\nb\n"
+        self.assertEqual(without_section(sample.replace("old", "new"), "## Лицензия"),
+                         without_section(sample, "## Лицензия"))
+        self.assertNotEqual(without_section(sample.replace("b\n", "c\n"), "## Лицензия"),
+                            without_section(sample, "## Лицензия"))
+
     def test_I6_rename_names_both_paths(self):
         paths = name_status_paths("R100\tcrates/lexer/src/lib.rs\tcrates/sdbl-hir/src/x.rs\nM\tNOTICE\nC075\tcrates/parser/src/a.rs\tdocs/legal/a.md")
         self.assertEqual(paths, [
@@ -380,14 +479,20 @@ class TierRegistryTests(unittest.TestCase):
             "docs/legal/a.md", "docs/plans/p.md", "LICENSING.md", "NOTICE", "Cargo.toml",
             "crates/hir-ty/Cargo.toml", RECOVERY_301, "crates/ide/tests/a/b/c.rs", "crates/sdbl-hir/tests/f.rs",
             "crates/parser/Cargo.toml", "crates/lexer/Cargo.toml",
+            "crates/ide-diagnostics/Cargo.toml", "crates/ide-diagnostics/tests/handler_attestation.rs",
+            "CONTRIBUTING.md", "README.md",
+            HANDLERS + "using_like_in_query.rs",
         ]), [])
         rejected = [
             "crates/lexer/src/lib.rs", "crates/ide-diagnostics/src/lib.rs", "crates/parser/src/lib.rs",
-            "crates/parser/tests/t.rs", "crates/parser/src/Cargo.toml", "crates/ide-diagnostics/Cargo.toml", "crates/hir-ty/src/lib.rs",
+            HANDLERS + "union_all.rs", "crates/ide-diagnostics/src/handlers.rs", HANDLERS + "fixtures/x.bsl",
+            "crates/ide-diagnostics/src/handlers/using_like_in_query.rs/x",
+            "crates/parser/tests/t.rs", "crates/parser/src/Cargo.toml", "crates/hir-ty/src/lib.rs",
             ".gitlab-ci.yml", "Cargo.lock", "docs/other.md",
             "crates/hir-ty/src/Cargo.toml", "crates/hir-ty/Cargo.toml/x", "crates/a/b/Cargo.toml",
             "crates/lexer/tests/a/b.rs", "crates/parser/tests/a/b/c.rs", "crates/ide/tests", "crates/ide/src/tests/x.rs",
             "docs/legal", "docs/legalx/a.md", "crates/sdbl-hir", "crates/sdbl-hirx/a.rs", "Cargo.toml/x",
+            "docs/README.md", "README.md/x",
         ]
         self.assertEqual(diff_violations(rejected), rejected)
 

@@ -37,9 +37,9 @@ pub use global_catalog::{
     PlatformVersionParseError,
 };
 pub use help::{
-    active_platform_help_request, install_platform_help, InstallOutcome, PlatformHelp,
-    PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind, PlatformHelpStatus,
-    RestartRequired, BUNDLED_PLATFORM_VERSION, CORPUS_ENV,
+    active_platform_help_request, install_platform_help, is_url_like, redact_url, InstallOutcome,
+    PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
+    PlatformHelpStatus, RestartRequired, BUNDLED_PLATFORM_VERSION, CORPUS_ENV,
 };
 pub use parameter_series::ParameterSeries;
 pub use snapshot::{PlatformSnapshot, SnapshotDecodeError};

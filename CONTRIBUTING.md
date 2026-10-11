@@ -103,6 +103,6 @@ git push -u origin feature/my-change
 - Issues: https://github.com/itrous/bsl-analyzer/issues
 - Pull Requests: https://github.com/itrous/bsl-analyzer/pulls
 
-Отправляя изменения в репозиторий, вы соглашаетесь, что вклад будет
-распространяться на условиях `LGPL-3.0-or-later`, если явно не согласовано
-иное.
+Отправляя изменения в репозиторий, вы соглашаетесь, что ваш вклад
+распространяется на условиях лицензии MIT (см. `LICENSE-MIT`), если явно не
+согласовано иное.

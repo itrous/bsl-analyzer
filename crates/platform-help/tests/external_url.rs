@@ -17,7 +17,6 @@ fn context(cache: &std::path::Path) -> LoadContext {
         cache_dir: cache.to_path_buf(),
         discovery_roots: Vec::new(),
         platform_path_env: None,
-        pinned: None,
     }
 }
 
@@ -144,7 +143,7 @@ fn a_failing_url_never_serves_another_urls_package() {
     // Nor does `auto` use the external cache: it degrades to the built-in facts.
     let auto = load_with(&PlatformHelpRequest::Auto, &context(cache.path()));
     assert_eq!(auto.origin.map(|o| o.source), Some(PlatformHelpSourceKind::Bundled));
-    assert!(auto.missing_reason.unwrap().contains("turned off"));
+    assert!(auto.missing_reason.unwrap().contains("no saved auto snapshot"));
 }
 
 #[test]

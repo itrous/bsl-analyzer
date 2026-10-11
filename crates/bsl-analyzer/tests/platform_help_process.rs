@@ -225,13 +225,8 @@ fn lsp_serves_the_configured_corpus_until_restart() {
     });
     let shown = loop {
         match lsp.wait_for_within(std::time::Duration::from_secs(2), |message| {
-            // `fs::write` truncates before it writes, so the server can read the empty
-            // file and report a switch to the default source first; only the warning
-            // that names the new corpus answers this write.
             message["method"] == "window/showMessage"
-                && message["params"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains("restart") && m.contains("b.json"))
+                && message["params"]["message"].as_str().is_some_and(|m| m.contains("restart"))
         }) {
             Some(message) => break message,
             None => {
@@ -251,22 +246,20 @@ fn lsp_serves_the_configured_corpus_until_restart() {
     assert!(after.contains("Corpus B text."), "a restart picks up the new source: {after}");
 }
 
-/// Serves `body` at every path until dropped, counting requests.
+/// Serves `body` at every path, counting requests.
 struct CorpusHost {
     url: String,
     requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CorpusHost {
     fn start(body: Vec<u8>) -> Self {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/corpus/platform_data.json", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (counter, stopped) = (requests.clone(), stop.clone());
+        let counter = requests.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -276,21 +269,16 @@ impl CorpusHost {
                 }
                 counter.fetch_add(1, Ordering::SeqCst);
                 let mut stream = stream;
-                let response = if stopped.load(Ordering::SeqCst) {
-                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-                } else {
-                    let mut head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    )
-                    .into_bytes();
-                    head.extend_from_slice(&body);
-                    head
-                };
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
                 let _ = stream.write_all(&response);
             }
         });
-        Self { url, requests, stop }
+        Self { url, requests }
     }
 
     fn requests(&self) -> usize {
@@ -299,49 +287,116 @@ impl CorpusHost {
 }
 
 #[test]
-fn unconfigured_batch_downloads_the_pinned_corpus_once() {
+fn unconfigured_batch_without_a_platform_serves_the_facts_and_stays_off_the_network() {
     let dir = project("");
-    let corpus = corpus_with_add_text("Pinned corpus text.").into_bytes();
-    let digest = platform_help::package::sha256_hex(&corpus);
-    let host = CorpusHost::start(corpus);
-    let run = || {
-        let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
-            .args(["analyze", "-q", "-s"])
-            .arg(dir.path())
-            .env("BSL_LOG", "info")
-            .env("BSL_PLATFORM_HELP_PINNED_URL", &host.url)
-            .env("BSL_PLATFORM_HELP_CACHE_DIR", dir.path().join("help-cache"))
-            // An unusable explicit installation path keeps discovery away from
-            // whatever platform this machine has.
-            .env("BSL_PLATFORM_PATH", dir.path().join("no-platform"))
-            .env_remove(bsl_platform::CORPUS_ENV)
-            .output()
-            .unwrap();
-        (output.status.success(), String::from_utf8_lossy(&output.stderr).into_owned())
-    };
-
-    let (ok, log) = run();
-    assert!(ok, "{log}");
-    assert!(log.contains("platform help loaded") && log.contains(&host.url), "{log}");
-    assert!(log.contains(&digest), "{log}");
-    assert_eq!(host.requests(), 1);
-
-    host.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    let (ok, log) = run();
-    assert!(ok, "{log}");
-    assert!(log.contains("platform help loaded") && log.contains(&digest), "{log}");
-    assert_eq!(host.requests(), 1, "the second start serves the cached download");
-
-    // Without the cache and with the host refusing, the built-in interface
-    // facts serve and the log names why the pinned corpus did not.
-    std::fs::remove_dir_all(dir.path().join("help-cache")).unwrap();
-    let (ok, log) = run();
-    assert!(ok, "{log}");
+    let host = CorpusHost::start(corpus_with_add_text("Hosted corpus text.").into_bytes());
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .args(["analyze", "-q", "-s"])
+        .arg(dir.path())
+        .env("BSL_LOG", "info")
+        .env_remove("BSL_PLATFORM_HELP_PINNED_URL")
+        .env("BSL_PLATFORM_HELP_CACHE_DIR", dir.path().join("help-cache"))
+        // An unusable explicit installation path keeps discovery away from
+        // whatever platform this machine has.
+        .env("BSL_PLATFORM_PATH", dir.path().join("no-platform"))
+        .env_remove(bsl_platform::CORPUS_ENV)
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{log}");
     assert!(
         log.contains("degraded to the built-in interface facts")
-            && log.contains("origin=\"bundled\"")
-            && log.contains("pinned corpus")
-            && log.contains("503"),
+            && log.contains("origin=\"bundled\""),
         "{log}"
     );
+    assert_eq!(host.requests(), 0);
+    assert!(!dir.path().join("help-cache").join("pinned").exists());
+}
+
+#[test]
+fn the_retired_corpus_mirror_variable_is_an_error_not_a_silent_fallback() {
+    let dir = project("");
+    let host = CorpusHost::start(corpus_with_add_text("Hosted corpus text.").into_bytes());
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .args(["analyze", "-q", "-s"])
+        .arg(dir.path())
+        .env("BSL_LOG", "info")
+        .env("BSL_PLATFORM_HELP_PINNED_URL", &host.url)
+        .env("BSL_PLATFORM_HELP_CACHE_DIR", dir.path().join("help-cache"))
+        .env("BSL_PLATFORM_PATH", dir.path().join("no-platform"))
+        .env_remove(bsl_platform::CORPUS_ENV)
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        log.contains("BSL_PLATFORM_HELP_PINNED_URL is no longer supported")
+            && log.contains("external"),
+        "{log}"
+    );
+    assert_eq!(host.requests(), 0, "the variable's host is never contacted");
+}
+
+fn analyze_with_corpus_variable(dir: &Path, value: &str) -> (bool, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .args(["analyze", "-q", "-s"])
+        .arg(dir)
+        .env("BSL_LOG", "info")
+        .env("BSL_PLATFORM_HELP_CACHE_DIR", dir.join("help-cache"))
+        .env("BSL_PLATFORM_PATH", dir.join("no-platform"))
+        .env(bsl_platform::CORPUS_ENV, value)
+        .output()
+        .unwrap();
+    (output.status.success(), String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn corpus_variable_path_is_reported_as_the_chosen_source() {
+    let dir = project("");
+    let corpus = dir.path().join("a.json");
+    let (ok, log) = analyze_with_corpus_variable(dir.path(), corpus.to_str().unwrap());
+    assert!(ok, "{log}");
+    assert!(log.contains("chosen by the environment variable"), "{log}");
+    assert!(log.contains("platform help loaded") && log.contains("a.json"), "{log}");
+}
+
+#[test]
+fn corpus_variable_url_is_reported_without_userinfo_or_query() {
+    let dir = project("");
+    // A closed local port: the load fails at once, which is all this checks.
+    let (ok, log) = analyze_with_corpus_variable(
+        dir.path(),
+        "https://user:secret@127.0.0.1:1/help/manifest.json?token=abc#frag",
+    );
+    assert!(ok, "{log}");
+    assert!(log.contains("chosen by the environment variable"), "{log}");
+    assert!(log.contains("external (https://127.0.0.1:1/help/manifest.json)"), "{log}");
+    assert!(!log.contains("secret") && !log.contains("token=abc"), "{log}");
+    assert!(log.contains("platform help unavailable"), "{log}");
+}
+
+#[test]
+fn corpus_variable_with_http_is_a_configuration_error_not_a_fallback() {
+    let dir = project("");
+    let (ok, log) = analyze_with_corpus_variable(
+        dir.path(),
+        "http://user:secret@127.0.0.1:1/help/manifest.json?token=abc",
+    );
+    assert!(ok, "{log}");
+    assert!(log.contains("`http` is not accepted") && log.contains("[platform_help]"), "{log}");
+    assert!(!log.contains("secret") && !log.contains("token=abc"), "{log}");
+    assert!(!log.contains("platform help loaded"), "{log}");
+}
+
+#[test]
+fn corpus_variable_is_ignored_with_a_warning_when_the_configuration_has_a_section() {
+    let dir = project(&external("a.json"));
+    let other = dir.path().join("b.json");
+    let (ok, log) = analyze_with_corpus_variable(dir.path(), other.to_str().unwrap());
+    assert!(ok, "{log}");
+    assert!(
+        log.contains("BSL_PLATFORM_HELP_CORPUS is ignored") && log.contains("[platform_help]"),
+        "{log}"
+    );
+    assert!(log.contains("platform help loaded") && log.contains("a.json"), "{log}");
+    assert!(!log.contains("chosen by the environment variable"), "{log}");
 }

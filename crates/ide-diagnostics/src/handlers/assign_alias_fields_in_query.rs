@@ -101,29 +101,29 @@ mod tests {
 
     #[test]
     fn test_field_with_explicit_as() {
-        let query = "SELECT Name AS ProductName FROM Products";
+        let query = "SELECT Shelf AS ShelfCode FROM Library";
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_field_without_as_keyword() {
-        let query = "SELECT Name ProductName FROM Products";
+        let query = "SELECT Shelf ShelfCode FROM Library";
         check_standalone_query_snapshot(
             query,
             expect![[r#"
-            AssignAliasFieldsInQuery @ 1:8..1:24
-              message: Поле 'ProductName' должно иметь явный псевдоним с ключевым словом AS/КАК
+            AssignAliasFieldsInQuery @ 1:8..1:23
+              message: Поле 'ShelfCode' должно иметь явный псевдоним с ключевым словом AS/КАК
               severity: Warning"#]],
         );
     }
 
     #[test]
     fn test_field_without_alias() {
-        let query = "SELECT Name FROM Products";
+        let query = "SELECT Shelf FROM Library";
         check_standalone_query_snapshot(
             query,
             expect![[r#"
-            AssignAliasFieldsInQuery @ 1:8..1:12
+            AssignAliasFieldsInQuery @ 1:8..1:13
               message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
               severity: Warning"#]],
         );
@@ -131,51 +131,50 @@ mod tests {
 
     #[test]
     fn test_asterisk_field() {
-        let query = "SELECT * FROM Products";
+        let query = "SELECT * FROM Library";
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_table_asterisk() {
-        let query = "SELECT Products.* FROM Products";
+        let query = "SELECT Library.* FROM Library";
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_multiple_fields_mixed() {
-        let query = "SELECT Name AS ProductName, Code ProductCode, Price FROM Products";
+        let query = "SELECT Author, Title AS BookTitle, Year Published FROM Library";
         check_standalone_query_snapshot(
             query,
             expect![[r#"
-            AssignAliasFieldsInQuery @ 1:29..1:45
-              message: Поле 'ProductCode' должно иметь явный псевдоним с ключевым словом AS/КАК
-              severity: Warning
-            AssignAliasFieldsInQuery @ 1:47..1:52
+            AssignAliasFieldsInQuery @ 1:8..1:14
               message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
+              severity: Warning
+            AssignAliasFieldsInQuery @ 1:36..1:50
+              message: Поле 'Published' должно иметь явный псевдоним с ключевым словом AS/КАК
               severity: Warning"#]],
         );
     }
 
     #[test]
     fn test_russian_kak_keyword() {
-        let query = "ВЫБРАТЬ Имя КАК ИмяПродукта ИЗ Товары";
+        let query = "ВЫБРАТЬ Стаж КАК ЛетРаботы ИЗ Кадры";
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_union_query() {
-        let query = "SELECT Name AS N FROM Products UNION SELECT Title FROM Services";
+        let query = "SELECT Title AS T FROM Library UNION SELECT Caption FROM Archive";
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_sdbl_russian_query() {
-        let query = "ВЫБРАТЬ Артикул, Наименование КАК ИмяТовара ИЗ Справочник.Номенклатура";
-
+        let query = "ВЫБРАТЬ Должность КАК Позиция, Оклад ИЗ Справочник.Сотрудники";
         check_standalone_query_snapshot(
             query,
             expect![[r#"
-            AssignAliasFieldsInQuery @ 1:9..1:16
+            AssignAliasFieldsInQuery @ 1:32..1:37
               message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
               severity: Warning"#]],
         );
@@ -184,29 +183,29 @@ mod tests {
     #[test]
     fn test_query_with_comments() {
         let query = r#"ВЫБРАТЬ
-	Товары.Артикул, // Неправильно
-	Товары.Артикул КАК АртикулТовара, // Правильно
-	Товары.Цена ЦенаПродажи // Неправильно
+	Поездки.Город КАК Назначение, // имя задано
+	Поездки.Суточные, // без имени
+	Поездки.ДатаВыезда Выезд // имя без КАК
 ИЗ
-	Справочник.Номенклатура КАК Товары // Игнорируется
+	Документ.Командировка КАК Поездки // источник
 
 ОБЪЕДИНИТЬ ВСЕ
 
 ВЫБРАТЬ
-	Услуги.Артикул, // Игнорируется
-	Услуги.Артикул, // Игнорируется
-	Услуги.Тариф // Игнорируется
+	Архив.Город, // имена берутся из первой части
+	Архив.Суточные,
+	Архив.ДатаВыезда
 ИЗ
-	Справочник.Услуги КАК Услуги"#;
+	Документ.КомандировкаАрхив КАК Архив"#;
 
         check_standalone_query_snapshot(
             query,
             expect![[r#"
-            AssignAliasFieldsInQuery @ 2:2..2:16
+            AssignAliasFieldsInQuery @ 3:2..3:18
               message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
               severity: Warning
-            AssignAliasFieldsInQuery @ 4:2..4:25
-              message: Поле 'ЦенаПродажи' должно иметь явный псевдоним с ключевым словом AS/КАК
+            AssignAliasFieldsInQuery @ 4:2..4:26
+              message: Поле 'Выезд' должно иметь явный псевдоним с ключевым словом AS/КАК
               severity: Warning"#]],
         );
     }
@@ -218,8 +217,8 @@ mod tests {
         use test_fixture::Fixture;
         use vfs::VfsPath;
 
-        let code = r#"Процедура Тест()
-Запрос = "ВЫБРАТЬ Товары.Артикул, Товары.Цена ЦенаПродажи ИЗ Справочник.Номенклатура КАК Товары";
+        let code = r#"Процедура ЗагрузитьШтат()
+Запрос = "ВЫБРАТЬ Штат.Подразделение, Штат.Ставка КАК Ставка ИЗ РегистрСведений.Штатка КАК Штат";
 КонецПроцедуры"#;
 
         let fixture_text = format!("//- /test.bsl\n{}", code);
@@ -252,8 +251,8 @@ mod tests {
         use test_fixture::Fixture;
         use vfs::VfsPath;
 
-        let code_wrapped = r#"Процедура Тест()
-    Запрос = "ВЫБРАТЬ Товары.Артикул, Товары.Цена ЦенаПродажи ИЗ Справочник.Номенклатура КАК Товары";
+        let code_wrapped = r#"Процедура ПрочитатьОтпуска()
+    Текст = "ВЫБРАТЬ Отпуска.Работник Сотрудник, Отпуска.Дней КАК Дней ИЗ Документ.Отпуск КАК Отпуска";
 КонецПроцедуры"#;
 
         let fixture_text = format!("//- /test.bsl\n{}", code_wrapped);
@@ -272,7 +271,7 @@ mod tests {
 
         let sdbl_hirs_wrapped = db.sdbl_hir_in_file(file_id);
 
-        let code_unwrapped = r#"Запрос = "ВЫБРАТЬ Товары.Артикул, Товары.Цена ЦенаПродажи ИЗ Справочник.Номенклатура КАК Товары";"#;
+        let code_unwrapped = r#"Текст = "ВЫБРАТЬ Отпуска.Работник Сотрудник, Отпуска.Дней КАК Дней ИЗ Документ.Отпуск КАК Отпуска";"#;
 
         let fixture_text = format!("//- /test.bsl\n{}", code_unwrapped);
         let fixture = Fixture::parse(&fixture_text);
@@ -296,49 +295,50 @@ mod tests {
     #[test]
     fn test_union_with_diagnostics() {
         let query = r#"ВЫБРАТЬ
-	Товары.Артикул,
-	Товары.Артикул КАК АртикулТовара,
-	Товары.Цена ЦенаПродажи
+	Взносы.Фонд Получатель,
+	Взносы.Ставка КАК Процент,
+	Взносы.Предел
 ИЗ
-	Справочник.Номенклатура КАК Товары
+	РегистрСведений.СтавкиВзносов КАК Взносы
 
 ОБЪЕДИНИТЬ ВСЕ
 
 ВЫБРАТЬ
-	Услуги.Артикул,
-	Услуги.Артикул,
-	Услуги.Тариф
+	Льготы.Фонд,
+	Льготы.Ставка,
+	Льготы.Предел
 ИЗ
-	Справочник.Услуги КАК Услуги"#;
+	РегистрСведений.ЛьготныеСтавки КАК Льготы"#;
 
         check_standalone_query_snapshot(
             query,
             expect![[r#"
-            AssignAliasFieldsInQuery @ 2:2..2:16
-              message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
+            AssignAliasFieldsInQuery @ 2:2..2:24
+              message: Поле 'Получатель' должно иметь явный псевдоним с ключевым словом AS/КАК
               severity: Warning
-            AssignAliasFieldsInQuery @ 4:2..4:25
-              message: Поле 'ЦенаПродажи' должно иметь явный псевдоним с ключевым словом AS/КАК
+            AssignAliasFieldsInQuery @ 4:2..4:15
+              message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
               severity: Warning"#]],
         );
     }
 
     #[test]
     fn test_top_clause_with_explicit_alias() {
-        let query = r#"ВЫБРАТЬ ПЕРВЫЕ 100
-Спр.Номенклатура КАК Номенклатура
+        let query = r#"ВЫБРАТЬ ПЕРВЫЕ 25
+Анкеты.Кандидат КАК Кандидат
 ИЗ
-Справочник.Номенклатура КАК Спр"#;
+Документ.Анкета КАК Анкеты"#;
 
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_top_clause_parsing() {
-        let query = r#"ВЫБРАТЬ ПЕРВЫЕ 100
-Спр.Номенклатура КАК Номенклатура
+        let query = r#"ВЫБРАТЬ ПЕРВЫЕ 7
+Вакансии.Позиция КАК Позиция,
+Вакансии.Оклад КАК Оклад
 ИЗ
-Справочник.Номенклатура КАК Спр"#;
+Справочник.Вакансии КАК Вакансии"#;
 
         let parse = parser::parse_sdbl(query);
         assert!(!parse.has_errors(), "Parse should not have errors");
@@ -348,15 +348,15 @@ mod tests {
 
     #[test]
     fn test_top_clause_without_alias() {
-        let query = r#"ВЫБРАТЬ ПЕРВЫЕ 100
-Спр.Номенклатура
+        let query = r#"ВЫБРАТЬ ПЕРВЫЕ 25
+Анкеты.Кандидат
 ИЗ
-Справочник.Номенклатура КАК Спр"#;
+Документ.Анкета КАК Анкеты"#;
 
         check_standalone_query_snapshot(
             query,
             expect![[r#"
-            AssignAliasFieldsInQuery @ 2:1..2:17
+            AssignAliasFieldsInQuery @ 2:1..2:16
               message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
               severity: Warning"#]],
         );
@@ -364,145 +364,150 @@ mod tests {
 
     #[test]
     fn test_top_clause_implicit_alias() {
-        let query = r#"ВЫБРАТЬ ПЕРВЫЕ 100
-Спр.Номенклатура Номенклатура
+        let query = r#"ВЫБРАТЬ ПЕРВЫЕ 25
+Анкеты.Кандидат Соискатель
 ИЗ
-Справочник.Номенклатура КАК Спр"#;
+Документ.Анкета КАК Анкеты"#;
 
         check_standalone_query_snapshot(
             query,
             expect![[r#"
-            AssignAliasFieldsInQuery @ 2:1..2:30
-              message: Поле 'Номенклатура' должно иметь явный псевдоним с ключевым словом AS/КАК
+            AssignAliasFieldsInQuery @ 2:1..2:27
+              message: Поле 'Соискатель' должно иметь явный псевдоним с ключевым словом AS/КАК
               severity: Warning"#]],
         );
     }
 
     #[test]
     fn test_distinct_clause() {
-        let query = "SELECT DISTINCT Name AS ProductName FROM Products";
+        let query = "SELECT DISTINCT Genre AS Kind FROM Library";
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_distinct_top_combination() {
-        let query = "ВЫБРАТЬ РАЗЛИЧНЫЕ ПЕРВЫЕ 10 Код КАК К ИЗ Товары";
+        let query = "ВЫБРАТЬ РАЗЛИЧНЫЕ ПЕРВЫЕ 3 Город КАК Г ИЗ Филиалы";
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_top_distinct_order() {
-        let query = "SELECT TOP 50 DISTINCT Name AS N FROM Products";
+        let query = "SELECT TOP 5 DISTINCT Genre AS G FROM Library";
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_query_with_union_two_diagnostics() {
-        let code = r#"Запрос = Новый Запрос;
-Запрос.Текст =
+        let code = r#"Отчёт = Новый Запрос;
+Отчёт.Текст =
 	"ВЫБРАТЬ
-	|	Валюты.Ссылка,
-	|	Валюты.Ссылка КАК ПсевдонимПоляСсылка,
-	|	Валюты.Код Код
+	|	Табель.Работник Сотрудник,
+	|	Табель.Часы КАК Часы,
+	|	Табель.Месяц
 	|ИЗ
-	|	Справочник.Валюты КАК Валюты
+	|	РегистрНакопления.Табель КАК Табель
 	|
 	|ОБЪЕДИНИТЬ ВСЕ
 	|
 	|ВЫБРАТЬ
-	|	Валюты.Ссылка,
-	|	Валюты.Ссылка,
-	|	Валюты.Код
+	|	Подработка.Работник,
+	|	Подработка.Часы,
+	|	Подработка.Месяц
 	|ИЗ
-	|	Справочник.Валюты КАК Валюты";"#;
+	|	РегистрНакопления.Подработка КАК Подработка";"#;
 
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::AssignAliasFieldsInQuery,
             expect![[r#"
-                AssignAliasFieldsInQuery @ 4:4..4:17
-                  message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
+                AssignAliasFieldsInQuery @ 4:4..4:29
+                  message: Поле 'Сотрудник' должно иметь явный псевдоним с ключевым словом AS/КАК
                   severity: Warning
-                AssignAliasFieldsInQuery @ 6:4..6:18
-                  message: Поле 'Код' должно иметь явный псевдоним с ключевым словом AS/КАК
+                AssignAliasFieldsInQuery @ 6:4..6:16
+                  message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
                   severity: Warning"#]],
         );
     }
 
     #[test]
     fn test_second_query_with_union_two_diagnostics() {
-        let code = r#"Запрос = Новый Запрос;
-Запрос.Текст =
+        let code = r#"Премии = Новый Запрос;
+Премии.Текст =
 	"ВЫБРАТЬ
-	|	Валюты.Ссылка,
-	|	Валюты.Ссылка КАК ПсевдонимПоляСсылка,
-	|	Валюты.Код Код
+	|	Начисления.Отдел,
+	|	Начисления.Сумма КАК Сумма,
+	|	Начисления.Повод Основание
 	|ИЗ
-	|	Справочник.Валюты КАК Валюты
+	|	Документ.Премия КАК Начисления
 	|
 	|ОБЪЕДИНИТЬ ВСЕ
 	|
 	|ВЫБРАТЬ
-	|	Валюты.Ссылка,
-	|	Валюты.Ссылка,
-	|	Валюты.Код
+	|	Разовые.Отдел,
+	|	Разовые.Сумма,
+	|	Разовые.Повод
 	|ИЗ
-	|	Справочник.Валюты КАК Валюты";
+	|	Документ.РазоваяВыплата КАК Разовые";
 
-Запрос2 = Новый Запрос;
-Запрос2.Текст =
+Удержания = Новый Запрос;
+Удержания.Текст =
 	"ВЫБРАТЬ
-	|	Валюты.Ссылка,
-	|	Валюты.Ссылка КАК ПсевдонимПоляСсылка,
-	|	Валюты.Код Код
+	|	Штрафы.Работник Нарушитель,
+	|	Штрафы.Размер,
+	|	Штрафы.Дата КАК Дата
 	|ИЗ
-	|	Справочник.Валюты КАК Валюты
+	|	Документ.Взыскание КАК Штрафы
 	|
-	|ОБЪЕДИНИТЬ ВСЕ
+	|ОБЪЕДИНИТЬ
 	|
 	|ВЫБРАТЬ
-	|	Валюты.Ссылка,
-	|	Валюты.Ссылка,
-	|	Валюты.Код
+	|	Займы.Работник,
+	|	Займы.Размер,
+	|	Займы.Дата
 	|ИЗ
-	|	Справочник.Валюты КАК Валюты";"#;
+	|	Документ.ВозвратЗайма КАК Займы";"#;
 
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::AssignAliasFieldsInQuery,
             expect![[r#"
-                AssignAliasFieldsInQuery @ 4:4..4:17
+                AssignAliasFieldsInQuery @ 4:4..4:20
                   message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
                   severity: Warning
-                AssignAliasFieldsInQuery @ 6:4..6:18
-                  message: Поле 'Код' должно иметь явный псевдоним с ключевым словом AS/КАК
+                AssignAliasFieldsInQuery @ 6:4..6:30
+                  message: Поле 'Основание' должно иметь явный псевдоним с ключевым словом AS/КАК
                   severity: Warning
-                AssignAliasFieldsInQuery @ 22:4..22:17
+                AssignAliasFieldsInQuery @ 22:4..22:30
+                  message: Поле 'Нарушитель' должно иметь явный псевдоним с ключевым словом AS/КАК
+                  severity: Warning
+                AssignAliasFieldsInQuery @ 23:4..23:17
                   message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
-                  severity: Warning
-                AssignAliasFieldsInQuery @ 24:4..24:18
-                  message: Поле 'Код' должно иметь явный псевдоним с ключевым словом AS/КАК
                   severity: Warning"#]],
         );
     }
 
     #[test]
     fn test_nested_subquery_field_without_alias() {
-        let code = r#"Запрос1 = Новый Запрос;
-Запрос1.Текст =
+        let code = r#"Сводка = Новый Запрос;
+Сводка.Текст =
 	"ВЫБРАТЬ
-	|	ВложенныйЗапрос.Ссылка КАК Ссылка
+	|	Итог.Отдел КАК Отдел,
+	|	Итог.Людей КАК Людей
 	|ИЗ
 	|	(ВЫБРАТЬ
-	|		Валюты.Ссылка
+	|		Кадры.Отдел КАК Отдел,
+	|		КОЛИЧЕСТВО(Кадры.Работник) КАК Людей,
+	|		Кадры.Город
 	|	ИЗ
-	|		Справочник.Валюты КАК Валюты) КАК ВложенныйЗапрос";"#;
+	|		РегистрСведений.Кадры КАК Кадры
+	|	СГРУППИРОВАТЬ ПО
+	|		Кадры.Отдел, Кадры.Город) КАК Итог";"#;
 
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::AssignAliasFieldsInQuery,
             expect![[r#"
-                AssignAliasFieldsInQuery @ 7:5..7:18
+                AssignAliasFieldsInQuery @ 10:5..10:16
                   message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
                   severity: Warning"#]],
         );
@@ -510,28 +515,28 @@ mod tests {
 
     #[test]
     fn test_union_part_does_not_emit_when_alias_missing() {
-        let query = "SELECT Name AS Name FROM Products UNION ALL SELECT Title FROM Services";
+        let query = "SELECT Title AS Title FROM Library UNION ALL SELECT Caption FROM Archive";
         check_standalone_query_snapshot(query, expect![[r#""#]]);
     }
 
     #[test]
     fn test_union_part_uses_first_query_aliases_regression() {
-        let code = r#"Запрос = Новый Запрос;
-Запрос.Текст =
+        let code = r#"Обучение = Новый Запрос;
+Обучение.Текст =
 	"ВЫБРАТЬ
-	|	ДополнительныеРеквизиты.Ссылка КАК Набор,
-	|	ДополнительныеРеквизиты.Свойство КАК Свойство
-	|ПОМЕСТИТЬ ВТ_ВсеНаборы
+	|	Курсы.Ссылка КАК Программа,
+	|	Курсы.Преподаватель КАК Ведущий
+	|ПОМЕСТИТЬ ВТ_Занятия
 	|ИЗ
-	|	Справочник.НаборыДополнительныхРеквизитовИСведений.ДополнительныеРеквизиты КАК ДополнительныеРеквизиты
+	|	Справочник.ПланОбучения.ОчныеКурсы КАК Курсы
 	|
 	|ОБЪЕДИНИТЬ ВСЕ
 	|
 	|ВЫБРАТЬ
-	|	ДополнительныеСведения.Ссылка,
-	|	ДополнительныеСведения.Свойство
+	|	Вебинары.Ссылка,
+	|	Вебинары.Преподаватель
 	|ИЗ
-	|	Справочник.НаборыДополнительныхРеквизитовИСведений.ДополнительныеСведения КАК ДополнительныеСведения";"#;
+	|	Справочник.ПланОбучения.ДистанционныеКурсы КАК Вебинары";"#;
 
         check_diagnostics_snapshot_for(
             code,
@@ -542,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_query_with_leading_newline_field_without_alias() {
-        let code = "ТекстЗапроса = \"\n\t|ВЫБРАТЬ\n\t|\tВТ_ТЧ.НомерСтроки\n\t|ИЗ\n\t|\t&ВТ_Цены КАК ВТ_Цены\n\t|;\n\t|\n\t|ВЫБРАТЬ\n\t|\t\" + ПоляТЧДокумента + \"\n\t|ИЗ\n\t|\t&ВТ_ТЧ КАК Товары\";";
+        let code = "Текст = \"\n\t|ВЫБРАТЬ\n\t|\tВТ_Смены.Работник\n\t|ИЗ\n\t|\t&ВТ_Смены КАК ВТ_Смены\n\t|;\n\t|\n\t|ВЫБРАТЬ\n\t|\t\" + КолонкиГрафика + \"\n\t|ИЗ\n\t|\t&ВТ_График КАК График\";";
 
         check_diagnostics_snapshot_for(
             code,
@@ -557,25 +562,25 @@ mod tests {
     #[test]
     fn track3_function_aggregate_and_case_fields_require_explicit_aliases_snapshot() {
         check_diagnostics_snapshot_for(
-            r#"Процедура Тест()
-    Запрос = Новый Запрос;
-    Запрос.Текст =
+            r#"Процедура ПосчитатьОтпускные()
+    Расчёт = Новый Запрос;
+    Расчёт.Текст =
         "ВЫБРАТЬ
-        |   ЕСТЬNULL(Товары.Артикул, """"),
-        |   СУММА(Товары.Количество),
+        |   МАКСИМУМ(Отпуска.Дней),
+        |   ЕСТЬNULL(Отпуска.Замещающий, НЕОПРЕДЕЛЕНО),
         |   ВЫБОР
-        |       КОГДА Товары.ПометкаУдаления ТОГДА 1
-        |       ИНАЧЕ 0
+        |       КОГДА Отпуска.Дней > 14 ТОГДА ""Основной""
+        |       ИНАЧЕ ""Дробный""
         |   КОНЕЦ
         |ИЗ
-        |   Справочник.Номенклатура КАК Товары";
+        |   Документ.Отпуск КАК Отпуска";
 КонецПроцедуры"#,
             DiagnosticCode::AssignAliasFieldsInQuery,
             expect![[r#"
-                AssignAliasFieldsInQuery @ 5:13..5:43
+                AssignAliasFieldsInQuery @ 5:13..5:35
                   message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
                   severity: Warning
-                AssignAliasFieldsInQuery @ 6:13..6:37
+                AssignAliasFieldsInQuery @ 6:13..6:55
                   message: Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК
                   severity: Warning
                 AssignAliasFieldsInQuery @ 7:13..10:18
@@ -587,13 +592,13 @@ mod tests {
     #[test]
     fn track3_split_concatenated_query_is_not_reconstructed_snapshot() {
         check_diagnostics_snapshot_for(
-            r#"Процедура Тест()
-    Запрос = Новый Запрос;
-    Запрос.Текст =
+            r#"Процедура СобратьВыборку()
+    Выборка = Новый Запрос;
+    Выборка.Текст =
         "ВЫБРАТЬ
-        |   " + ИмяПоля + "
+        |   " + СписокКолонок + "
         |ИЗ
-        |   Справочник.Номенклатура КАК Товары";
+        |   Справочник.Сотрудники КАК Работники";
 КонецПроцедуры"#,
             DiagnosticCode::AssignAliasFieldsInQuery,
             expect![[r#""#]],

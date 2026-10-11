@@ -66,7 +66,7 @@ text. It contains none of 1C's descriptions, parameter documentation,
 examples or notes; a test fails if any such field appears. The full help
 corpus, whose texts are the copyright of ООО «1С-Софт», never enters this
 repository or the binary: it is read at run time from the user's own
-platform installation, from a help package, or as a pinned download,
+platform installation or from a help package,
 each carrying its own NOTICE.md. See crates/bsl-platform/data/PROVENANCE.md.
 
 Diagnostic rules
@@ -368,11 +368,10 @@ bundled; it is removed from the tree and from builds, and remains only in
 the history. The help is now read at runtime from the user's installed
 platform or from a separately distributed help package
 (docs/configuration/PROJECT_CONFIGURATION.md, [platform_help]); with no
-platform installed, the default `auto` source downloads one pinned corpus
-file, verified by its SHA-256, from the separate repository
-itrous/bsl-platform-help and caches it next to the package NOTICE.md.
+platform installed, the default `auto` source serves the built-in
+interface facts; a corpus with descriptions is configured explicitly.
 
-The contents of that corpus, of the pinned download and of every help package — in particular
+The contents of that corpus and of every help package — in particular
 method descriptions, parameter documentation and code examples — are
 © ООО «1С-Софт» and are NOT covered by this workspace's MIT, Apache-2.0
 or LGPL-3.0 licensing. A help package carries its own NOTICE.md with that

@@ -33,7 +33,6 @@ fn imported_corpus_stays_unmodified_and_carries_its_content_notice() {
         cache_dir: dir.path().join("cache"),
         discovery_roots: Vec::new(),
         platform_path_env: None,
-        pinned: None,
     };
     let help = load_with(&PlatformHelpRequest::ExternalPath(output), &context);
     assert_eq!(help.origin.as_ref().unwrap().platform_version.as_deref(), Some("8.3.27.1"));
@@ -63,7 +62,6 @@ fn archive_input_uses_the_native_reader_and_produces_served_method_docs() {
         cache_dir: dir.path().join("cache"),
         discovery_roots: Vec::new(),
         platform_path_env: None,
-        pinned: None,
     };
     let data =
         PlatformData::from_help(load_with(&PlatformHelpRequest::ExternalPath(output), &context));

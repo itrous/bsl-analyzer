@@ -37,7 +37,6 @@ fn context(cache: &Path) -> LoadContext {
         cache_dir: cache.to_path_buf(),
         discovery_roots: Vec::new(),
         platform_path_env: None,
-        pinned: None,
     }
 }
 

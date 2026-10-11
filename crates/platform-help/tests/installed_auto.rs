@@ -30,7 +30,6 @@ impl Stand {
             cache_dir: self.cache.clone(),
             discovery_roots: vec![self.root.clone()],
             platform_path_env: None,
-            pinned: None,
         }
     }
 

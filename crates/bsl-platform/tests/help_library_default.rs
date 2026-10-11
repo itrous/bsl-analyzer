@@ -37,6 +37,19 @@ fn library_default_is_fixed_on_first_access_and_never_discovers_an_installation(
                 .unwrap()
                 .description
                 .contains("appends one element"));
+        } else if matches!(mode.as_str(), "url" | "malformed" | "blank_then_url") {
+            // A URL is the application's input; the library neither reads a file
+            // of that name nor serves something else in its place.
+            assert_eq!(data.help_status_for_target(None), PlatformHelpStatus::Missing);
+            let reason = data.help_missing_reason().unwrap();
+            assert!(reason.contains("supported only by the bsl-analyzer application"), "{reason}");
+            assert!(mode != "url" || reason.contains("host.invalid/m.json"), "{reason}");
+            assert!(!reason.contains("secret") && !reason.contains("token"), "{reason}");
+            assert!(data.all_types().is_empty() && data.all_methods().is_empty());
+        } else if mode == "http" {
+            let reason = data.help_missing_reason().unwrap();
+            assert!(reason.contains("use `https` or a path"), "{reason}");
+            assert!(!reason.contains("secret") && !reason.contains("token"), "{reason}");
         } else if mode == "absent" {
             // An explicitly named corpus that cannot load is an error to report,
             // not a reason to serve something else.
@@ -74,11 +87,21 @@ fn library_default_is_fixed_on_first_access_and_never_discovers_an_installation(
     let corpus = dir.path().join("corpus.json");
     std::fs::write(&corpus, FIXTURE).unwrap();
     let absent = dir.path().join("absent.json");
+    let url = std::path::PathBuf::from("https://user:secret@host.invalid/m.json?token=abc");
+    let malformed = std::path::PathBuf::from("https:/user:secret@host.invalid/m.json?token=abc");
+    let http = std::path::PathBuf::from("http://user:secret@host.invalid/m.json?token=abc");
+    let blank_then_url =
+        std::path::PathBuf::from("\nhttps://user:secret@host.invalid/m.json?token=abc");
     for (mode, path) in [
         ("unset", None),
         ("empty", Some(std::path::Path::new(""))),
+        ("blank", Some(std::path::Path::new("   "))),
         ("fixture", Some(corpus.as_path())),
         ("absent", Some(absent.as_path())),
+        ("url", Some(url.as_path())),
+        ("malformed", Some(malformed.as_path())),
+        ("blank_then_url", Some(blank_then_url.as_path())),
+        ("http", Some(http.as_path())),
     ] {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command

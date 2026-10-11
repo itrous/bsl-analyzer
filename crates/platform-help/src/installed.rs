@@ -8,7 +8,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::package::{self, Slot, VerifiedCorpus};
-use crate::pinned::PinnedCorpus;
 
 pub const SHCNTX: &str = "shcntx_ru.hbk";
 pub const SHLANG: &str = "shlang_ru.hbk";
@@ -17,19 +16,36 @@ pub const SHLANG: &str = "shlang_ru.hbk";
 pub const CACHE_DIR_ENV: &str = "BSL_PLATFORM_HELP_CACHE_DIR";
 pub const PLATFORM_PATH_ENV: &str = "BSL_PLATFORM_PATH";
 
+const BIN_DIR: &str = "bin";
+
 /// The two help archives of one platform installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HbkPair {
+    /// The installation directory, the one named after the platform version;
+    /// the archives themselves may sit in its `bin` subdirectory.
     pub dir: PathBuf,
     pub shcntx: PathBuf,
     pub shlang: PathBuf,
 }
 
 impl HbkPair {
+    /// The archives of the installation `dir`: next to it first, then in its
+    /// `bin`. A `dir` that is itself an installation's `bin` stands for that
+    /// installation.
     fn in_dir(dir: &Path) -> Option<Self> {
-        let pair =
-            Self { dir: dir.to_path_buf(), shcntx: dir.join(SHCNTX), shlang: dir.join(SHLANG) };
-        (pair.shcntx.is_file() && pair.shlang.is_file()).then_some(pair)
+        let holding = |holder: &Path, installation: &Path| {
+            let pair = Self {
+                dir: installation.to_path_buf(),
+                shcntx: holder.join(SHCNTX),
+                shlang: holder.join(SHLANG),
+            };
+            (pair.shcntx.is_file() && pair.shlang.is_file()).then_some(pair)
+        };
+        let installation = match dir.file_name() {
+            Some(name) if name.eq_ignore_ascii_case(BIN_DIR) => dir.parent().unwrap_or(dir),
+            _ => dir,
+        };
+        holding(dir, installation).or_else(|| holding(&dir.join(BIN_DIR), dir))
     }
 
     /// The platform version named by the installation directory, when it is one.
@@ -47,9 +63,6 @@ pub struct LoadContext {
     /// Directories whose subdirectories are candidate installations.
     pub discovery_roots: Vec<PathBuf>,
     pub platform_path_env: Option<OsString>,
-    /// The corpus `auto` downloads when nothing local serves; `None` keeps
-    /// `auto` off the network.
-    pub pinned: Option<PinnedCorpus>,
 }
 
 impl LoadContext {
@@ -64,7 +77,6 @@ impl LoadContext {
             discovery_roots: default_discovery_roots(),
             platform_path_env: std::env::var_os(PLATFORM_PATH_ENV)
                 .filter(|value| !value.is_empty()),
-            pinned: PinnedCorpus::from_environment(),
         }
     }
 }
@@ -273,7 +285,6 @@ mod tests {
             cache_dir: cache.to_path_buf(),
             discovery_roots: roots,
             platform_path_env: env.map(|p| p.as_os_str().to_owned()),
-            pinned: None,
         }
     }
 
@@ -311,6 +322,38 @@ mod tests {
         assert!(locate(None, &with_env).unwrap_err().contains(PLATFORM_PATH_ENV));
         let env_ok = context(elsewhere.path(), vec![], Some(&discovered));
         assert_eq!(locate(None, &env_ok).unwrap().dir, discovered);
+    }
+
+    #[test]
+    fn archives_in_the_bin_subdirectory_belong_to_the_installation() {
+        let root = tempfile::tempdir().unwrap();
+        let install = root.path().join("8.3.27.1786");
+        let bin = install.join(BIN_DIR);
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join(SHCNTX), b"x").unwrap();
+        fs::write(bin.join(SHLANG), b"y").unwrap();
+
+        let discovered = discover(&[root.path().to_path_buf()]).unwrap();
+        assert_eq!(discovered.dir, install);
+        assert_eq!(discovered.shcntx, bin.join(SHCNTX));
+        assert_eq!(discovered.platform_version().as_deref(), Some("8.3.27.1786"));
+
+        for given in [&install, &bin] {
+            let pair = pair_in(given, "platform_help.path").unwrap();
+            assert_eq!(pair.dir, install);
+            assert_eq!(pair.platform_version().as_deref(), Some("8.3.27.1786"));
+        }
+    }
+
+    #[test]
+    fn archives_beside_the_version_directory_win_over_bin() {
+        let root = tempfile::tempdir().unwrap();
+        let install = installation(root.path(), "8.3.27.1786");
+        let bin = install.join(BIN_DIR);
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join(SHCNTX), b"x").unwrap();
+        fs::write(bin.join(SHLANG), b"y").unwrap();
+        assert_eq!(pair_in(&install, "p").unwrap().shcntx, install.join(SHCNTX));
     }
 
     #[test]

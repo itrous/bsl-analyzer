@@ -40,41 +40,43 @@ mod tests {
 
     #[test]
     fn test_fixture_full_outer_join_detected_left_join_not() {
-        let code_test1 = r#"Процедура Тест1()
-    Запрос = Новый Запрос;
-    Запрос.Текст = "ВЫБРАТЬ
-                   |    Товары.Номенклатура КАК Номенклатура,
-                   |    ЕСТЬNULL(ПланПродаж.Сумма, 0) КАК СуммаПлан,
-                   |    ЕСТЬNULL(ФактическиеПродажи.Сумма, 0) КАК СуммаФакт
+        let nested_full = r#"Функция СверкаРейсов()
+    Сверка = Новый Запрос;
+    Сверка.Текст = "ВЫБРАТЬ
+                   |    Рейсы.Номер КАК Рейс,
+                   |    ЕСТЬNULL(Погрузка.Вес, 0) КАК Погружено,
+                   |    ЕСТЬNULL(Выгрузка.Вес, 0) КАК Выгружено
                    |ИЗ
-                   |    Товары КАК Товары
-                   |        ЛЕВОЕ СОЕДИНЕНИЕ ПланПродаж КАК ПланПродаж
-                   |            ПОЛНОЕ ВНЕШНЕЕ СОЕДИНЕНИЕ ФактическиеПродажи КАК ФактическиеПродажи
-                   |            ПО ПланПродаж.Номенклатура = ФактическиеПродажи.Номенклатура
-                   |        ПО Товары.Номенклатура = ПланПродаж.Номенклатура";
-КонецПроцедуры"#;
+                   |    Документ.Рейс КАК Рейсы
+                   |        ЛЕВОЕ СОЕДИНЕНИЕ РегистрНакопления.Погрузка КАК Погрузка
+                   |            ПОЛНОЕ ВНЕШНЕЕ СОЕДИНЕНИЕ РегистрНакопления.Выгрузка КАК Выгрузка
+                   |            ПО Погрузка.Рейс = Выгрузка.Рейс
+                   |        ПО Рейсы.Ссылка = Погрузка.Рейс";
+    Возврат Сверка.Выполнить();
+КонецФункции"#;
         check_diagnostics_snapshot_for(
-            code_test1,
+            nested_full,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#"
-                FullOuterJoinQuery @ 10:33..11:93
+                FullOuterJoinQuery @ 10:33..11:65
                   message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
                   severity: Warning"#]],
         );
 
-        let code_test2 = r#"Процедура Тест2()
-    Запрос = Новый Запрос;
-    Запрос.Текст = "ВЫБРАТЬ
-                   |    Товары.Номенклатура КАК Номенклатура
+        let nested_left = r#"Функция СверкаРейсов()
+    Сверка = Новый Запрос;
+    Сверка.Текст = "ВЫБРАТЬ
+                   |    Рейсы.Номер КАК Рейс
                    |ИЗ
-                   |    Товары КАК Товары
-                   |        ЛЕВОЕ СОЕДИНЕНИЕ ПланПродаж КАК ПланПродаж
-                   |            ЛЕВОЕ СОЕДИНЕНИЕ ФактическиеПродажи КАК ФактическиеПродажи
-                   |            ПО ПланПродаж.Номенклатура = ФактическиеПродажи.Номенклатура
-                   |        ПО Товары.Номенклатура = ПланПродаж.Номенклатура";
-КонецПроцедуры"#;
+                   |    Документ.Рейс КАК Рейсы
+                   |        ЛЕВОЕ СОЕДИНЕНИЕ РегистрНакопления.Погрузка КАК Погрузка
+                   |            ЛЕВОЕ СОЕДИНЕНИЕ РегистрНакопления.Выгрузка КАК Выгрузка
+                   |            ПО Погрузка.Рейс = Выгрузка.Рейс
+                   |        ПО Рейсы.Ссылка = Погрузка.Рейс";
+    Возврат Сверка.Выполнить();
+КонецФункции"#;
         check_diagnostics_snapshot_for(
-            code_test2,
+            nested_left,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#""#]],
         );
@@ -83,15 +85,15 @@ mod tests {
     #[test]
     fn test_simple_english() {
         let code = r#"
-Procedure Test()
-    Query = "SELECT * FROM T1 FULL JOIN T2 ON T1.ID = T2.ID";
+Procedure Reconcile()
+    Text = "SELECT * FROM Shipments AS S FULL JOIN Invoices AS I ON S.Ref = I.Shipment";
 EndProcedure
 "#;
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#"
-            FullOuterJoinQuery @ 3:31..3:60
+            FullOuterJoinQuery @ 3:42..3:87
               message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
               severity: Warning"#]],
         );
@@ -100,15 +102,15 @@ EndProcedure
     #[test]
     fn test_simple_russian() {
         let code = r#"
-Процедура Тест()
-    Запрос = "ВЫБРАТЬ * ИЗ Т1 ПОЛНОЕ СОЕДИНЕНИЕ Т2 ПО Т1.ID = Т2.ID";
+Процедура Сверить()
+    Текст = "ВЫБРАТЬ * ИЗ Заявки КАК З ПОЛНОЕ СОЕДИНЕНИЕ Отгрузки КАК О ПО З.Номер = О.Заявка";
 КонецПроцедуры
 "#;
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#"
-            FullOuterJoinQuery @ 3:31..3:68
+            FullOuterJoinQuery @ 3:40..3:94
               message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
               severity: Warning"#]],
         );
@@ -117,13 +119,13 @@ EndProcedure
     #[test]
     fn test_no_false_positives_left_join() {
         let code = r#"
-Процедура Тест2()
-    Запрос = Новый Запрос;
-    Запрос.Текст = "ВЫБРАТЬ
-                   |    Товары.Номенклатура
+Процедура Сверить()
+    Сверка = Новый Запрос;
+    Сверка.Текст = "ВЫБРАТЬ
+                   |    Водители.ФИО
                    |ИЗ
-                   |    Товары КАК Товары
-                   |        ЛЕВОЕ СОЕДИНЕНИЕ ПланПродаж";
+                   |    Справочник.Водители КАК Водители
+                   |        ЛЕВОЕ СОЕДИНЕНИЕ Путевки";
 КонецПроцедуры
 "#;
         check_diagnostics_snapshot_for(code, DiagnosticCode::FullOuterJoinQuery, expect![[r#""#]]);
@@ -132,15 +134,15 @@ EndProcedure
     #[test]
     fn test_full_join_without_outer() {
         let code = r#"
-Процедура Тест()
-    Query = "SELECT * FROM T1 ПОЛНОЕ СОЕДИНЕНИЕ T2 ПО T1.ID = T2.ID";
+Процедура Сверить()
+    Text = "SELECT * FROM Shipments ПОЛНОЕ СОЕДИНЕНИЕ Invoices ПО Shipments.Ref = Invoices.Shipment";
 КонецПроцедуры
 "#;
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#"
-            FullOuterJoinQuery @ 3:31..3:68
+            FullOuterJoinQuery @ 3:37..3:100
               message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
               severity: Warning"#]],
         );
@@ -149,38 +151,38 @@ EndProcedure
     #[test]
     fn test_multiple_full_joins() {
         let code = r#"
-Процедура Тест()
-    Query = "SELECT * FROM T1 FULL OUTER JOIN T2 ON T1.A = T2.A FULL OUTER JOIN T3 ON T1.B = T3.B";
+Процедура Сверить()
+    Text = "SELECT * FROM Trips FULL OUTER JOIN Fuel ON Trips.Car = Fuel.Car FULL OUTER JOIN Repairs ON Trips.Car = Repairs.Car";
 КонецПроцедуры
 "#;
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#"
-                FullOuterJoinQuery @ 3:31..3:64
-                  message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
-                  severity: Warning
-                FullOuterJoinQuery @ 3:65..3:98
-                  message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
-                  severity: Warning"#]],
+            FullOuterJoinQuery @ 3:33..3:77
+              message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
+              severity: Warning
+            FullOuterJoinQuery @ 3:78..3:128
+              message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
+              severity: Warning"#]],
         );
     }
 
     #[test]
     fn test_multiline_simple() {
         let code = r#"
-Процедура Тест()
-    Запрос = "ВЫБРАТЬ *
-             |ИЗ Товары
-             |    ПОЛНОЕ СОЕДИНЕНИЕ Продажи
-             |    ПО Товары.ID = Продажи.ID";
+Процедура Сверить()
+    Текст = "ВЫБРАТЬ *
+            |ИЗ Путевки
+            |    ПОЛНОЕ СОЕДИНЕНИЕ Заправки
+            |    ПО Путевки.Машина = Заправки.Машина";
 КонецПроцедуры
 "#;
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#"
-            FullOuterJoinQuery @ 5:19..6:44
+            FullOuterJoinQuery @ 5:18..6:53
               message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
               severity: Warning"#]],
         );
@@ -189,18 +191,18 @@ EndProcedure
     #[test]
     fn test_multiline_with_comment() {
         let code = r#"
-Процедура Тест()
-    Запрос = "ВЫБРАТЬ *
-             |ИЗ Товары
-             |    ПОЛНОЕ СОЕДИНЕНИЕ Продажи // тест
-             |    ПО Товары.ID = Продажи.ID";
+Процедура Сверить()
+    Текст = "ВЫБРАТЬ *
+            |ИЗ Путевки
+            |    ПОЛНОЕ СОЕДИНЕНИЕ Заправки // все машины обеих таблиц
+            |    ПО Путевки.Машина = Заправки.Машина";
 КонецПроцедуры
 "#;
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#"
-            FullOuterJoinQuery @ 5:19..6:44
+            FullOuterJoinQuery @ 5:18..6:53
               message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
               severity: Warning"#]],
         );
@@ -209,47 +211,49 @@ EndProcedure
     #[test]
     fn test_nested_joins_like_fixture() {
         let code = r#"
-Процедура Тест()
-    Запрос = Новый Запрос;
-    Запрос.Текст = "ВЫБРАТЬ
-                   |    Товары.Номенклатура
+Процедура Сверить()
+    Сверка = Новый Запрос;
+    Сверка.Текст = "ВЫБРАТЬ
+                   |    Склады.Наименование
                    |ИЗ
-                   |    Товары КАК Товары
-                   |        ЛЕВОЕ СОЕДИНЕНИЕ ПланПродаж КАК ПланПродаж
-                   |            ПОЛНОЕ ВНЕШНЕЕ СОЕДИНЕНИЕ ФактическиеПродажи КАК ФактическиеПродажи
-                   |            ПО ПланПродаж.Номенклатура = ФактическиеПродажи.Номенклатура
-                   |        ПО Товары.Номенклатура = ПланПродаж.Номенклатура";
+                   |    Справочник.Склады КАК Склады
+                   |        ВНУТРЕННЕЕ СОЕДИНЕНИЕ РегистрНакопления.Приход КАК Приход
+                   |            ПОЛНОЕ СОЕДИНЕНИЕ РегистрНакопления.Расход КАК Расход
+                   |            ПО Приход.Склад = Расход.Склад
+                   |        ПО Склады.Ссылка = Приход.Склад";
 КонецПроцедуры
 "#;
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#"
-                FullOuterJoinQuery @ 9:33..10:93
-                  message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
-                  severity: Warning"#]],
+            FullOuterJoinQuery @ 9:33..10:63
+              message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
+              severity: Warning"#]],
         );
     }
 
     #[test]
     fn test_with_function_calls_in_select() {
         let code = r#"
-Процедура Тест()
-    Запрос = Новый Запрос;
-    Запрос.Текст = "ВЫБРАТЬ
-                   |    Товары.Номенклатура КАК Номенклатура,
-                   |    ЕСТЬNULL(ПланПродаж.Сумма, 0) КАК СуммаПлан
+Процедура Сверить()
+    Сверка = Новый Запрос;
+    Сверка.Текст = "ВЫБРАТЬ
+                   |    ЕСТЬNULL(Пробег.Машина, Топливо.Машина) КАК Машина,
+                   |    СУММА(Топливо.Литры) КАК Литры
                    |ИЗ
-                   |    Товары КАК Товары
-                   |        ПОЛНОЕ СОЕДИНЕНИЕ ПланПродаж
-                   |        ПО Товары.ID = ПланПродаж.ID";
+                   |    РегистрНакопления.Пробег КАК Пробег
+                   |        ПОЛНОЕ ВНЕШНЕЕ СОЕДИНЕНИЕ РегистрНакопления.Топливо КАК Топливо
+                   |        ПО Пробег.Машина = Топливо.Машина
+                   |СГРУППИРОВАТЬ ПО
+                   |    ЕСТЬNULL(Пробег.Машина, Топливо.Машина)";
 КонецПроцедуры
 "#;
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::FullOuterJoinQuery,
             expect![[r#"
-            FullOuterJoinQuery @ 9:29..10:57
+            FullOuterJoinQuery @ 9:29..10:62
               message: Использование FULL OUTER JOIN значительно снижает производительность запроса. Рассмотрите возможность переписать с использованием UNION и LEFT JOIN
               severity: Warning"#]],
         );
