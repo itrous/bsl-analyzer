@@ -2243,6 +2243,126 @@ mod tests {
         }
     }
 
+    /// Hang guard for a response that the test has already caused to be sent.
+    /// Not an expected wait: notifications may precede the response, so the
+    /// reader must not sleep for a particular arrival order.
+    const CLIENT_RESPONSE_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Read client messages until the `Response` for `id`.
+    ///
+    /// `textDocument/publishDiagnostics`, `window/logMessage`, and other
+    /// notifications share this channel with responses. Their order relative to
+    /// the response depends on which task the event loop finished first, so a
+    /// reader that requires the next message to be a `Response` flakes. Server
+    /// requests are skipped for the same reason. A `Response` for a different
+    /// id is still a test failure.
+    fn take_matching_response(
+        message: Message,
+        id: &lsp_server::RequestId,
+    ) -> Option<lsp_server::Response> {
+        match message {
+            Message::Response(response) if response.id == *id => Some(response),
+            Message::Response(response) => {
+                panic!("unexpected response {:?} while waiting for {id:?}", response.id)
+            }
+            Message::Notification(_) | Message::Request(_) => None,
+        }
+    }
+
+    /// The response was sent on this thread before the read. It must already be
+    /// queued: waiting would hide a send that is no longer synchronous. Notifications
+    /// already on the channel are still skipped.
+    fn recv_queued_client_response(
+        receiver: &crossbeam_channel::Receiver<Message>,
+        id: lsp_server::RequestId,
+    ) -> lsp_server::Response {
+        loop {
+            match receiver.try_recv() {
+                Ok(message) => {
+                    if let Some(response) = take_matching_response(message, &id) {
+                        return response;
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    panic!("response {id:?} was not already on the client channel")
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    panic!("client channel closed while reading response {id:?}")
+                }
+            }
+        }
+    }
+
+    fn recv_client_response(
+        receiver: &crossbeam_channel::Receiver<Message>,
+        id: lsp_server::RequestId,
+    ) -> lsp_server::Response {
+        let deadline = std::time::Instant::now() + CLIENT_RESPONSE_HANG_GUARD;
+        loop {
+            // `recv_timeout(0)` still returns a message that is already queued, so a
+            // stream of notifications would never hit the timeout error. Leave once
+            // the hang guard has elapsed, even if the channel is not empty.
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for response {id:?}");
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match receiver.recv_timeout(remaining) {
+                Ok(message) => {
+                    if let Some(response) = take_matching_response(message, &id) {
+                        return response;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    panic!("timed out waiting for response {id:?}")
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("client channel closed while waiting for response {id:?}")
+                }
+            }
+        }
+    }
+
+    /// The previous client read: the next message must already be a `Response`.
+    /// Kept so the notification-first order can keep proving this assertion panics.
+    fn legacy_next_message_must_be_response(receiver: &crossbeam_channel::Receiver<Message>) {
+        let lsp_server::Message::Response(_response) = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("queued cancellation must answer once")
+        else {
+            panic!("queued cancellation produced a non-response")
+        };
+    }
+
+    fn queue_publish_diagnostics_then_cancelled_response(
+        id: i32,
+    ) -> crossbeam_channel::Receiver<Message> {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let uri = lsp_types::Url::parse("file:///Caller.bsl").expect("fixture uri");
+        sender
+            .send(Message::Notification(Notification::new(
+                "textDocument/publishDiagnostics".to_string(),
+                lsp_types::PublishDiagnosticsParams { uri, diagnostics: vec![], version: None },
+            )))
+            .expect("queue diagnostics notification");
+        sender
+            .send(Message::Notification(Notification::new(
+                "window/logMessage".to_string(),
+                lsp_types::LogMessageParams {
+                    typ: lsp_types::MessageType::INFO,
+                    message: "diagnostics published".to_owned(),
+                },
+            )))
+            .expect("queue log notification");
+        sender
+            .send(Message::Response(Response::new_err(
+                lsp_server::RequestId::from(id),
+                lsp_server::ErrorCode::RequestCanceled as i32,
+                "request cancelled".to_owned(),
+            )))
+            .expect("queue cancel response");
+        receiver
+    }
+
     fn g1_drain_task_pool_to_fixed_point(
         state: &mut crate::global_state::GlobalState,
         receiver: &crossbeam_channel::Receiver<Task>,
@@ -2489,6 +2609,72 @@ mod tests {
     }
 
     #[test]
+    fn client_response_reader_accepts_publish_diagnostics_before_response() {
+        let legacy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            legacy_next_message_must_be_response(
+                &queue_publish_diagnostics_then_cancelled_response(375),
+            );
+        }));
+        let panic = legacy.expect_err("legacy next-message assertion must panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        assert!(
+            message.contains("queued cancellation produced a non-response"),
+            "legacy assertion panicked for a different reason: {message}"
+        );
+
+        let response = recv_queued_client_response(
+            &queue_publish_diagnostics_then_cancelled_response(375),
+            lsp_server::RequestId::from(375),
+        );
+        assert_eq!(response.id, lsp_server::RequestId::from(375));
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(lsp_server::ErrorCode::RequestCanceled as i32)
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.message.as_str()),
+            Some("request cancelled")
+        );
+
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        sender
+            .send(Message::Response(Response::new_ok(
+                lsp_server::RequestId::from(368),
+                serde_json::Value::Null,
+            )))
+            .expect("queue response with no preceding notification");
+        let response = recv_queued_client_response(&receiver, lsp_server::RequestId::from(368));
+        assert_eq!(response.id, lsp_server::RequestId::from(368));
+        assert!(response.error.is_none());
+        assert_eq!(response.result, Some(serde_json::Value::Null));
+
+        let waited = recv_client_response(
+            &queue_publish_diagnostics_then_cancelled_response(375),
+            lsp_server::RequestId::from(375),
+        );
+        assert_eq!(waited.id, lsp_server::RequestId::from(375));
+        assert_eq!(
+            waited.error.as_ref().map(|error| error.message.as_str()),
+            Some("request cancelled")
+        );
+
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        drop(sender);
+        let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recv_client_response(&receiver, lsp_server::RequestId::from(1));
+        }));
+        let panic = closed.expect_err("closed channel must panic");
+        let message =
+            panic.downcast_ref::<String>().map(String::as_str).unwrap_or("non-string panic");
+        assert!(!message.contains("timed out"), "{message}");
+        assert!(message.contains("closed"), "{message}");
+    }
+
+    #[test]
     fn g1_live_vfs_pending_write_cancels_real_definition_then_fresh_request_succeeds() {
         g1_with_tracing(|| {
             use base_db::SourceDatabase;
@@ -2521,12 +2707,8 @@ mod tests {
             }
             .on_latency::<GotoDefinition>(g1_definition)
             .finish();
-            let cold = client_receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("cold-start guard must answer synchronously");
-            let lsp_server::Message::Response(cold) = cold else {
-                panic!("expected cold-start response, got {cold:?}");
-            };
+            let cold =
+                recv_queued_client_response(&client_receiver, lsp_server::RequestId::from(367));
             assert_eq!(cold.id, lsp_server::RequestId::from(367));
             assert_eq!(
                 cold.error.as_ref().map(|error| error.code),
@@ -2804,17 +2986,29 @@ mod tests {
                     .expect("fill the bounded worker queue");
             }
             assert!(!state.task_pool.pool.has_capacity());
+            // Diagnostics publication and the cancel response share the client
+            // channel. Queue the notification first so this read does not depend
+            // on which task the pool finished earlier.
+            state
+                .sender
+                .send(
+                    lsp_server::Notification::new(
+                        "textDocument/publishDiagnostics".to_string(),
+                        lsp_types::PublishDiagnosticsParams {
+                            uri: caller_uri.clone(),
+                            diagnostics: vec![],
+                            version: None,
+                        },
+                    )
+                    .into(),
+                )
+                .expect("queue publishDiagnostics ahead of the cancel response");
             crate::handlers::notification::handle_cancel(
                 &mut state,
                 lsp_types::CancelParams { id: lsp_types::NumberOrString::Number(375) },
             )
             .unwrap();
-            let lsp_server::Message::Response(cancelled) = client_receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("queued cancellation must answer once")
-            else {
-                panic!("queued cancellation produced a non-response")
-            };
+            let cancelled = recv_queued_client_response(&client_receiver, queued_cancel_id.clone());
             assert_eq!(cancelled.id, queued_cancel_id);
             assert_eq!(
                 cancelled.error.as_ref().map(|error| error.code),
@@ -2829,7 +3023,7 @@ mod tests {
             assert!(!state.request_tokens.contains_key(&queued_cancel_id));
             assert!(state.pending_latency_retries.is_empty());
             assert!(
-                client_receiver.try_recv().is_err(),
+                client_receiver.try_iter().all(|message| !matches!(message, Message::Response(_))),
                 "queued cancel sends exactly one response"
             );
             tracing::info!(
@@ -3032,12 +3226,7 @@ mod tests {
             }
             .on_latency::<lsp_types::request::GotoDefinition>(g1_definition)
             .finish();
-            let message = receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("failed-load guard must answer synchronously");
-            let lsp_server::Message::Response(response) = message else {
-                panic!("expected failed-load response, got {message:?}");
-            };
+            let response = recv_queued_client_response(&receiver, lsp_server::RequestId::from(371));
             assert_eq!(response.id, lsp_server::RequestId::from(371));
             assert_eq!(
                 response.error.as_ref().map(|error| error.code),
@@ -4137,9 +4326,7 @@ mod tests {
         }
         assert_eq!(queued, 2);
         assert!(state.request_lifecycles.is_empty());
-        let Message::Response(response) = receiver.try_recv().unwrap() else {
-            panic!("retry exhaustion emits an LSP response");
-        };
+        let response = recv_queued_client_response(&receiver, id.clone());
         assert_eq!(response.id, id);
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
@@ -4202,7 +4389,7 @@ mod tests {
             ),
         );
         assert!(state.pending_latency_retries.is_empty());
-        assert!(matches!(receiver.try_recv(), Ok(Message::Response(_))));
+        let _reopened = recv_queued_client_response(&receiver, lsp_server::RequestId::from(602));
 
         let unopened_id = lsp_server::RequestId::from(603);
         state.request_lifecycles.insert(
@@ -4727,9 +4914,7 @@ mod tests {
         .unwrap();
         assert!(state.request_lifecycles.is_empty());
         assert!(!state.request_tokens.contains_key(&id));
-        let Message::Response(response) = receiver.try_recv().unwrap() else {
-            panic!("current completion sends the only response");
-        };
+        let response = recv_queued_client_response(&receiver, id.clone());
         assert_eq!(response.result, Some(serde_json::json!({"current": true})));
         assert!(receiver.try_recv().is_err());
 
