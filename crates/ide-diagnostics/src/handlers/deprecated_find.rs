@@ -1,16 +1,17 @@
-use crate::AnalysisContext;
-use crate::{Diagnostic, DiagnosticCode};
+use crate::BodyContext;
+use crate::{Diagnostic, DiagnosticCode, Fix, TextEdit};
 use bsl_platform::deprecation::{DeprecationEntry, LifecycleGroup};
 use hir::LocalRange;
 
 use super::deprecated_platform_facts::{
-    canonical_name_for, global_function_fact, is_russian_alias, replacement_for_name,
+    canonical_name_for, global_function_fact, is_russian_alias, module_owns_bare_call,
+    replacement_compiles_here, replacement_for_name,
 };
 
 pub fn from_hir(
     name: &str,
     range: LocalRange,
-    ctx: &AnalysisContext,
+    ctx: &BodyContext,
 ) -> Option<Diagnostic<LocalRange>> {
     let code = DiagnosticCode::DeprecatedPlatformApi;
 
@@ -27,8 +28,28 @@ pub fn from_hir(
         severity: ctx.severity(code),
         range,
         tags: ctx.tags(code),
-        fixes: vec![],
+        fixes: get_fix(name, fact, range, ctx).into_iter().collect(),
     })
+}
+
+/// `СтрНайти(Строка, ПодстрокаПоиска)` behaves as `Найти(Строка, ПодстрокаПоиска)`:
+/// the same two leading parameters, case-sensitive search, the same result (0 when
+/// not found, 1 for an empty substring). Renaming the call is therefore safe.
+fn get_fix(
+    name: &str,
+    fact: &DeprecationEntry,
+    range: LocalRange,
+    ctx: &BodyContext,
+) -> Option<Fix<LocalRange>> {
+    let replacement = replacement_for_name(fact, name)?;
+    if module_owns_bare_call(name, ctx) || module_owns_bare_call(replacement, ctx) {
+        return None;
+    }
+    if !replacement_compiles_here(replacement, ctx) {
+        return None;
+    }
+    let label = format!("Заменить на \"{}\"", replacement);
+    Some(Fix::safe(label, vec![TextEdit { range, new_text: replacement.to_string() }]))
 }
 
 fn get_message(method_name: &str, fact: &DeprecationEntry) -> Option<String> {

@@ -253,6 +253,14 @@ impl AnalysisProvider for SalsaProvider<'_> {
         HirDatabase::min_platform_version(self.db)
     }
 
+    fn compatibility_mode(&self) -> Option<Arc<str>> {
+        HirDatabase::compatibility_mode(self.db)
+    }
+
+    fn env_options(&self) -> hir::execution_env::EnvOptions {
+        HirDatabase::env_options(self.db)
+    }
+
     fn module_implicit_field_names(&self, file_id: FileId) -> Vec<String> {
         hir::module_implicit_field_names(self.db, file_id)
     }

@@ -9,7 +9,7 @@
 //! Соседство выражается через токены `NEWLINE`, а не через индекс строк: обход
 //! дерева и так идёт по тексту, и номера строк тут ничего не добавляют.
 
-use crate::{LineToken, NodeOrToken, SyntaxKind, SyntaxNode, TextRange};
+use crate::{LineToken, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange};
 
 /// Одна строка серии: диапазон токена `COMMENT` в тексте, откуда серия взята.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,49 @@ impl CommentRun {
     pub fn range(&self) -> TextRange {
         self.range
     }
+}
+
+/// A `//` token the lexer emitted as text of a multiline literal, not as a
+/// comment. A continuation line that starts with `//` (no leading `|`) is still
+/// `Comment`; what makes it string text is the open literal on the left and the
+/// continuing literal, or the method's end, on the right.
+pub fn comment_token_is_string_text(token: &SyntaxToken) -> bool {
+    if token.kind() != SyntaxKind::COMMENT {
+        return false;
+    }
+    let left = non_trivia_kind(token, false);
+    let right = non_trivia_kind(token, true);
+    matches!(left, Some(SyntaxKind::STRING_START | SyntaxKind::STRING_PART))
+        && matches!(
+            right,
+            Some(
+                SyntaxKind::STRING_PART
+                    | SyntaxKind::STRING_TAIL
+                    | SyntaxKind::KW_END_PROCEDURE
+                    | SyntaxKind::KW_END_FUNCTION
+            )
+        )
+}
+
+/// A `//` line of a multiline literal sits a few tokens from the string boundary.
+/// Past that, the walk is a comment run: scanning it again from every line is
+/// quadratic, and such a run is not string text.
+const NEIGHBOR_WALK_LIMIT: u32 = 32;
+
+fn non_trivia_kind(token: &SyntaxToken, forward: bool) -> Option<SyntaxKind> {
+    let mut cursor = if forward { token.next_token() } else { token.prev_token() };
+    let mut steps = 0u32;
+    while let Some(current) = cursor {
+        if !current.kind().is_trivia() {
+            return Some(current.kind());
+        }
+        steps += 1;
+        if steps >= NEIGHBOR_WALK_LIMIT {
+            return None;
+        }
+        cursor = if forward { current.next_token() } else { current.prev_token() };
+    }
+    None
 }
 
 /// Все серии комментариев дерева в порядке текста.

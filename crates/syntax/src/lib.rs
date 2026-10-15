@@ -17,7 +17,9 @@ pub use crate::{
         extract_leading_comments_at_offset, extract_variable_comments_at_offset,
         has_trailing_comment, has_variable_description, trailing_semicolon,
     },
-    comment_run::{comment_runs, comment_runs_of, CommentLine, CommentRun},
+    comment_run::{
+        comment_runs, comment_runs_of, comment_token_is_string_text, CommentLine, CommentRun,
+    },
     sdbl_query::{extract_sdbl_with_corrections, SdblQuery, SdblQueryInfo},
     syntax_kind::SyntaxKind,
     syntax_node::{

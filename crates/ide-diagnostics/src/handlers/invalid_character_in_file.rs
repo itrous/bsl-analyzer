@@ -1,8 +1,10 @@
 use crate::define_metadata;
 use crate::metadata::*;
-use crate::{BodyContext, Diagnostic, DiagnosticCode};
+use crate::{BodyContext, Diagnostic, DiagnosticCode, Fix, TextEdit};
 use hir::LocalRange;
-use syntax::SyntaxKind;
+use ide_db::TextRange;
+use stdx::case::CaseExt;
+use syntax::{SyntaxKind, SyntaxToken, TextSize};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -23,14 +25,127 @@ const ILLEGAL_DASHES: &[char] =
 
 const ILLEGAL_SPACE: char = '\u{00A0}';
 
+const SOFT_HYPHEN: char = '\u{00AD}';
+
 enum InvalidCharType {
     IllegalDash,
     IllegalSpace,
 }
 
+/// What an illegal character becomes, or `None` for a legal one. The soft hyphen is
+/// invisible, so it is removed rather than turned into a visible `-`.
+fn replacement_for(ch: char) -> Option<&'static str> {
+    if ch == ILLEGAL_SPACE {
+        Some(" ")
+    } else if ch == SOFT_HYPHEN {
+        Some("")
+    } else if ILLEGAL_DASHES.contains(&ch) {
+        Some("-")
+    } else {
+        None
+    }
+}
+
+/// Replaces every illegal character of one token. Safe in whitespace and comments,
+/// where the program does not see the text; manual in a string literal (the value
+/// changes: a non-breaking space may be exactly what the code searches for) and in
+/// an error token (the replacement changes how the line parses).
+fn token_fix(
+    kind: SyntaxKind,
+    text: &str,
+    start: TextSize,
+    changes_text: bool,
+) -> Option<Fix<LocalRange>> {
+    let edits: Vec<TextEdit<LocalRange>> = text
+        .char_indices()
+        .filter_map(|(offset, ch)| {
+            let new_text = replacement_for(ch)?;
+            let at = start + TextSize::from(offset as u32);
+            Some(TextEdit {
+                range: LocalRange::of_detached_node(TextRange::at(at, TextSize::of(ch))),
+                new_text: new_text.to_string(),
+            })
+        })
+        .collect();
+    if edits.is_empty() {
+        return None;
+    }
+    // A comment the program does not read stays safe. A `//` line of a multiline
+    // literal, and a parameter-doc separator the analyzer parses, do not: the
+    // replacement changes a value or a computed type.
+    let invisible =
+        matches!(kind, SyntaxKind::WHITESPACE) || (kind == SyntaxKind::COMMENT && !changes_text);
+    Some(if invisible {
+        Fix::safe("Заменить недопустимые символы", edits)
+    } else {
+        Fix::manual("Заменить недопустимые символы (меняет текст программы)", edits)
+    })
+}
+
+fn comment_replacement_changes_meaning(token: &SyntaxToken, text: &str) -> bool {
+    if token.kind() != SyntaxKind::COMMENT {
+        return false;
+    }
+    if syntax::comment_token_is_string_text(token) {
+        return true;
+    }
+    let replaced = apply_char_replacements(text);
+    parameter_doc_parts(text) != parameter_doc_parts(&replaced) && in_parameters_section(token)
+}
+
+fn apply_char_replacements(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match replacement_for(ch) {
+            Some(repl) => out.push_str(repl),
+            None => out.push(ch),
+        }
+    }
+    out
+}
+
+/// `Имя - Тип` as the doc parser splits it, or `None` when the ASCII separator
+/// is absent. Illegal spaces and dashes around the hyphen fail this split.
+fn parameter_doc_parts(text: &str) -> Option<(String, String)> {
+    let body = text.trim().trim_start_matches('/').trim().replace('\t', " ");
+    let mut parts = body.splitn(3, " - ");
+    let name = parts.next()?.trim();
+    let ty = parts.next()?.trim();
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first.is_alphabetic() || first == '_')
+        || !chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some((name.to_string(), ty.to_string()))
+}
+
+fn in_parameters_section(token: &SyntaxToken) -> bool {
+    let mut cursor = token.prev_token();
+    let mut steps = 0u32;
+    while let Some(current) = cursor {
+        steps += 1;
+        if steps > 400 {
+            return false;
+        }
+        if current.kind() == SyntaxKind::COMMENT {
+            let body = current.text().trim().trim_start_matches('/').trim().fold_lower();
+            if body.starts_with("параметры:") || body.starts_with("parameters:") {
+                return true;
+            }
+        } else if !current.kind().is_trivia() {
+            return false;
+        }
+        cursor = current.prev_token();
+    }
+    false
+}
+
 fn create_diagnostic(
     range: LocalRange,
     char_type: InvalidCharType,
+    fixes: Vec<Fix<LocalRange>>,
     code: DiagnosticCode,
     ctx: &BodyContext,
 ) -> Diagnostic<LocalRange> {
@@ -47,7 +162,7 @@ fn create_diagnostic(
         severity: ctx.severity(code),
         range,
         tags: ctx.tags(code),
-        fixes: vec![],
+        fixes,
     }
 }
 
@@ -86,9 +201,13 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
                         InvalidCharType::IllegalDash
                     };
 
+                    let changes_text = comment_replacement_changes_meaning(&token, text);
+                    let fix =
+                        token_fix(token.kind(), text, token.text_range().start(), changes_text);
                     diagnostics.push(create_diagnostic(
                         LocalRange::of_detached_node(token.text_range()),
                         char_type,
+                        fix.into_iter().collect(),
                         code,
                         ctx,
                     ));

@@ -1,10 +1,12 @@
 use bsl_metadata::{FormType, ModuleType};
 use hir::AnnotationKind;
 use ide_db::TextRange;
+use syntax::ast::{AstNode, FunctionDef, ProcedureDef};
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
 use crate::define_metadata;
 use crate::metadata::*;
-use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Fix, TextEdit};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -39,21 +41,55 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     }
 
     let item_tree = ctx.item_tree();
+    let root = ctx.parse().syntax_node();
     let mut diagnostics = Vec::new();
 
     for (_, proc) in item_tree.procedures() {
         if proc.is_export && !has_client_annotation(&proc.annotations) {
-            diagnostics.push(make_diagnostic(proc.name_range, code, ctx));
+            let fixes = remove_export_fix(&root, proc.source_range);
+            diagnostics.push(make_diagnostic(proc.name_range, fixes, code, ctx));
         }
     }
 
     for (_, func) in item_tree.functions() {
         if func.is_export && !has_client_annotation(&func.annotations) {
-            diagnostics.push(make_diagnostic(func.name_range, code, ctx));
+            let fixes = remove_export_fix(&root, func.source_range);
+            diagnostics.push(make_diagnostic(func.name_range, fixes, code, ctx));
         }
     }
 
     diagnostics
+}
+
+/// Drops `Экспорт` (and the blank run before it on the same line) from the method
+/// header. Manual: a call through `ЭтаФорма.`/`ЭтотОбъект.` still compiles after the
+/// edit but fails at run time, because the platform resolves a member call only
+/// against exported methods.
+fn remove_export_fix(root: &SyntaxNode, source_range: TextRange) -> Vec<Fix> {
+    let Some(export) = export_keyword(root, source_range) else {
+        return Vec::new();
+    };
+    let mut start = export.text_range().start();
+    if let Some(prev) = export.prev_token() {
+        if prev.kind() == SyntaxKind::WHITESPACE && !prev.text().contains(['\n', '\r']) {
+            start = prev.text_range().start();
+        }
+    }
+    vec![Fix::manual(
+        "Убрать \"Экспорт\"",
+        vec![TextEdit {
+            range: TextRange::new(start, export.text_range().end()),
+            new_text: String::new(),
+        }],
+    )]
+}
+
+fn export_keyword(root: &SyntaxNode, source_range: TextRange) -> Option<SyntaxToken> {
+    root.descendants().filter(|node| node.text_range() == source_range).find_map(|node| {
+        ProcedureDef::cast(node.clone())
+            .and_then(|proc| proc.export_keyword())
+            .or_else(|| FunctionDef::cast(node).and_then(|func| func.export_keyword()))
+    })
 }
 
 /// A method reachable on the client is not a forbidden server-only export. Besides
@@ -71,14 +107,19 @@ fn has_client_annotation(annotations: &[hir::Annotation]) -> bool {
     })
 }
 
-fn make_diagnostic(range: TextRange, code: DiagnosticCode, ctx: &DiagnosticsContext) -> Diagnostic {
+fn make_diagnostic(
+    range: TextRange,
+    fixes: Vec<Fix>,
+    code: DiagnosticCode,
+    ctx: &DiagnosticsContext,
+) -> Diagnostic {
     Diagnostic {
         code,
         message: "Запрещено создавать серверные экспортные методы в форме".to_string(),
         range,
         severity: ctx.severity(code),
         tags: ctx.tags(code),
-        fixes: Vec::new(),
+        fixes,
     }
 }
 
