@@ -372,6 +372,7 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
             ctx.emit(BodyDiagnostic::DeprecatedAttribute8312 {
                 name: name.clone(),
                 kind: crate::body::DeprecatedKind8312::GlobalMethod,
+                owner: None,
                 range: actual_callee.text_range(),
             });
         }
@@ -653,6 +654,7 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
                 ctx.emit(BodyDiagnostic::DeprecatedAttribute8312 {
                     name: method_token.text().to_string(),
                     kind,
+                    owner: Some(object_name.clone()),
                     range: method_token.text_range(),
                 });
             }
@@ -1001,6 +1003,7 @@ fn lower_field_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
             ctx.emit(BodyDiagnostic::DeprecatedAttribute8312 {
                 name: field_tok.text().to_string(),
                 kind,
+                owner: Some(object_name.clone()),
                 range: field_tok.text_range(),
             });
         }

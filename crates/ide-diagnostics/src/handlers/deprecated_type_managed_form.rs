@@ -3,6 +3,7 @@ use crate::{Diagnostic, DiagnosticCode};
 use bsl_platform::deprecation::DeprecationEntry;
 use hir::LocalRange;
 
+use super::deprecated_platform_api;
 use super::deprecated_platform_facts::{
     canonical_name_for, is_russian_alias, managed_form_type_fact, replacement_for_name,
 };
@@ -15,6 +16,9 @@ pub fn from_hir(
     let code = DiagnosticCode::DeprecatedPlatformApi;
 
     if ctx.is_disabled_with_metadata(code) {
+        return None;
+    }
+    if deprecated_platform_api::is_excluded(ctx.config, type_name) {
         return None;
     }
 

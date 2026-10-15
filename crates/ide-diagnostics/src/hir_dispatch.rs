@@ -203,8 +203,14 @@ pub fn dispatch_hir_diagnostic(
             handlers::deleting_collection_item::from_hir(collection_text, *range, ctx)
         }
         BodyDiagnostic::SelfInsertion { range } => handlers::self_insertion::from_hir(*range, ctx),
-        BodyDiagnostic::DeprecatedAttribute8312 { name, kind, range } => {
-            handlers::deprecated_attributes_8312::from_hir(name, *kind, *range, ctx)
+        BodyDiagnostic::DeprecatedAttribute8312 { name, kind, owner, range } => {
+            handlers::deprecated_attributes_8312::from_hir(
+                name,
+                *kind,
+                owner.as_deref(),
+                *range,
+                ctx,
+            )
         }
         BodyDiagnostic::ExecuteExternalCode { range } => {
             handlers::execute_external_code::from_hir(*range, ctx)

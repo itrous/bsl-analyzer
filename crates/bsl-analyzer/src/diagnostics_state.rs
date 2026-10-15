@@ -168,4 +168,45 @@ MagicNumber = false
         disabled.sort();
         assert_eq!(disabled, ["LineLength", "MagicNumber"]);
     }
+
+    /// The same loader reports a name of `exclude` that is no deprecated platform
+    /// feature, and the valid names reach the configuration the server runs on.
+    #[test]
+    fn an_unknown_excluded_name_in_the_project_config_is_reported_by_the_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bsl-analyzer.toml"),
+            r#"
+min_platform_version = "8.3.17"
+
+[diagnostics.parameters.DeprecatedPlatformApi]
+exclude = ["ТекущаяДата", "ТекущаяДатта"]
+"#,
+        )
+        .unwrap();
+        let project = project_model::Project::new(dir.path()).expect("valid test project");
+
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let input = tracing::subscriber::with_default(WarningTexts(texts.clone()), || {
+            GlobalState::config_from_project(&project, Locale::default())
+        });
+        let warnings = texts.lock().unwrap().clone();
+
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("`ТекущаяДатта`"), "{warnings:#?}");
+        assert!(warnings[0].contains("bsl-analyzer.toml"), "{warnings:#?}");
+        assert!(
+            warnings[0].contains("[diagnostics.parameters.DeprecatedPlatformApi].exclude"),
+            "{warnings:#?}"
+        );
+
+        let (_, raw) = input
+            .parameters
+            .iter()
+            .find(|(code, _)| code == "DeprecatedPlatformApi")
+            .expect("the table enables the rule with its parameters");
+        let parameters: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(parameters["exclude"], serde_json::json!(["ТекущаяДата", "ТекущаяДатта"]));
+        assert!(!input.disabled.iter().any(|code| code == "DeprecatedPlatformApi"));
+    }
 }

@@ -1,4 +1,5 @@
 use crate::handlers;
+use crate::handlers::deprecated_platform_api::ExcludeProblem;
 use crate::metadata::{DiagnosticSeverityLevel, DiagnosticType, MetadataTag};
 use crate::{DiagnosticCode, Severity};
 use base_db::{DiagnosticsConfigInput, Locale};
@@ -111,9 +112,9 @@ impl DiagnosticsConfig {
     }
 
     /// [`Self::from_project_json`] for the loaders that know which file the
-    /// `[diagnostics]` section came from: a code in `[diagnostics.parameters]` that
-    /// is not a diagnostic of this analyzer is reported (key and file) instead of
-    /// being dropped without a trace. The effective config is the same.
+    /// `[diagnostics]` section came from: what the section cannot apply is reported
+    /// (see [`Self::warn_unknown_parameters`]) instead of being dropped without a
+    /// trace. The effective config is the same.
     ///
     /// Not used by per-request readers (a `query` call re-reads the section each
     /// time): they would repeat the warning on every call.
@@ -122,16 +123,19 @@ impl DiagnosticsConfig {
         locale: Locale,
         source: Option<&Path>,
     ) -> Self {
-        Self::warn_unknown_parameter_codes(diagnostics, source);
+        Self::warn_unknown_parameters(diagnostics, source);
         Self::from_project_json(diagnostics, locale)
     }
 
-    /// Reports every code in `[diagnostics.parameters]` that is not a diagnostic of
-    /// this analyzer, for loaders that parse the section themselves.
-    pub fn warn_unknown_parameter_codes(diagnostics: &serde_json::Value, source: Option<&Path>) {
+    /// Reports what `[diagnostics.parameters]` names but the analyzer cannot apply,
+    /// for loaders that parse the section themselves: every code that is not a
+    /// diagnostic of this analyzer, and every name in
+    /// `[diagnostics.parameters.DeprecatedPlatformApi].exclude` that is not a
+    /// deprecated platform feature (or an `exclude` that is not an array).
+    pub fn warn_unknown_parameters(diagnostics: &serde_json::Value, source: Option<&Path>) {
+        let file =
+            source.map_or_else(|| "<project config>".to_owned(), |p| p.display().to_string());
         for name in unknown_parameter_codes(diagnostics) {
-            let file =
-                source.map_or_else(|| "<project config>".to_owned(), |p| p.display().to_string());
             tracing::warn!(
                 key = name,
                 config_file = %file,
@@ -139,6 +143,26 @@ impl DiagnosticsConfig {
                  the key is ignored and the rule keeps its default; {}",
                 unknown_code_hint(name)
             );
+        }
+        for problem in handlers::deprecated_platform_api::unknown_excluded_names(diagnostics) {
+            match problem {
+                ExcludeProblem::UnknownName(name) => tracing::warn!(
+                    key = "DeprecatedPlatformApi.exclude",
+                    config_file = %file,
+                    "unknown deprecated platform feature `{name}` in \
+                     [diagnostics.parameters.DeprecatedPlatformApi].exclude of {file}: \
+                     the name is ignored, every other name still applies; use the name of \
+                     a deprecated platform feature as the diagnostic message quotes it, \
+                     without the owner type; an enum-name finding whose quoted name is not \
+                     such a feature is silenced by the enum name before the dot"
+                ),
+                ExcludeProblem::NotAnArray => tracing::warn!(
+                    key = "DeprecatedPlatformApi.exclude",
+                    config_file = %file,
+                    "[diagnostics.parameters.DeprecatedPlatformApi].exclude of {file} \
+                     must be an array of names; the value is ignored"
+                ),
+            }
         }
     }
 
@@ -222,7 +246,7 @@ impl DiagnosticsConfig {
 
 /// Codes this analyzer used to have, with the code that took over their checks.
 /// All of them were merged into `DeprecatedPlatformApi` in v0.2.50.
-const REMOVED_CODES: &[(&str, &str, &str)] = &[
+pub(crate) const REMOVED_CODES: &[(&str, &str, &str)] = &[
     ("DeprecatedCurrentDate", "DeprecatedPlatformApi", "v0.2.50"),
     ("DeprecatedFind", "DeprecatedPlatformApi", "v0.2.50"),
     ("DeprecatedMessage", "DeprecatedPlatformApi", "v0.2.50"),
@@ -253,14 +277,20 @@ pub fn unknown_parameter_codes(diagnostics: &serde_json::Value) -> Vec<&str> {
 /// names its successor but is deliberately not mapped to it: the successor covers
 /// a whole group of checks, so switching it off would silence more than the
 /// removed key ever did.
+/// A stale `Deprecated…` key also gets a ready `exclude` entry when the registry
+/// can name its features.
 fn unknown_code_hint(name: &str) -> String {
-    match REMOVED_CODES.iter().find(|(removed, _, _)| *removed == name) {
+    let reason = match REMOVED_CODES.iter().find(|(removed, _, _)| *removed == name) {
         Some((_, successor, release)) => format!(
             "the code was removed in {release}; its check is now part of `{successor}` \
              (not mapped automatically: `{successor} = false` would switch off every \
              deprecated-API finding, not only this one)"
         ),
         None => "no diagnostic has this name (typo, or a code of another analyzer)".to_owned(),
+    };
+    match handlers::deprecated_platform_api::exclude_suggestion(name) {
+        Some(suggestion) => format!("{reason}; {suggestion}"),
+        None => reason,
     }
 }
 
@@ -619,10 +649,16 @@ mod tests {
         assert!(removed.contains("[diagnostics.parameters]"), "names the section: {removed}");
         assert!(removed.contains("removed in v0.2.50"), "{removed}");
         assert!(removed.contains("`DeprecatedPlatformApi`"), "names the successor: {removed}");
+        assert!(removed.contains(r#"exclude = ["ТекущаяДата"]"#), "ready entry: {removed}");
         let never_existed =
             warnings.iter().find(|w| w.contains("`DeprecatedErrorProcessing`")).unwrap();
         assert!(never_existed.contains("no diagnostic has this name"), "{never_existed}");
-        assert!(!never_existed.contains("DeprecatedPlatformApi"), "{never_existed}");
+        assert!(
+            never_existed.contains(
+                r#"exclude = ["КраткоеПредставлениеОшибки", "ПодробноеПредставлениеОшибки", "ПоказатьИнформациюОбОшибке"]"#
+            ),
+            "{never_existed}"
+        );
 
         // Behaviour is unchanged: the stale keys are still ignored and are NOT
         // mapped to the successor, which would silence the whole group.
@@ -631,6 +667,11 @@ mod tests {
         assert!(!config.is_disabled(DiagnosticCode::DeprecatedPlatformApi));
         assert_eq!(config.get_int(DiagnosticCode::MethodSize, "maxMethodSize"), Some(80));
         assert_eq!(config.disabled, vec![DiagnosticCode::LineLength]);
+        assert!(
+            !config.parameters.contains_key(&DiagnosticCode::DeprecatedPlatformApi),
+            "a stale key adds no `exclude`: {:?}",
+            config.parameters
+        );
     }
 
     #[test]
@@ -668,6 +709,206 @@ mod tests {
         );
         assert!(warnings[1].contains("`Nope`") && warnings[1].contains("--disable-diagnostic"));
         assert!(config.only_enabled.is_none(), "an unknown name selects nothing");
+    }
+
+    /// `[diagnostics.parameters.DeprecatedPlatformApi]` with this `exclude` value.
+    fn project_excluding(exclude: serde_json::Value) -> serde_json::Value {
+        json!({ "parameters": { "DeprecatedPlatformApi": { "exclude": exclude } } })
+    }
+
+    #[test]
+    fn an_unknown_excluded_name_is_reported() {
+        use crate::handlers::deprecated_platform_api::is_excluded;
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let key = "[diagnostics.parameters.DeprecatedPlatformApi].exclude";
+
+        // `ТекущаяДата` is a registry name; `ТекущаяДатаСеанса` is only its
+        // replacement, `ТекущаяДатта` a typo, `1` not a string.
+        let raw = project_excluding(json!(["ТекущаяДата", "ТекущаяДатаСеанса", "ТекущаяДатта", 1]));
+        let mut config = None;
+        let warnings = warnings_of(|| {
+            config = Some(DiagnosticsConfig::from_project_file(&raw, Locale::En, Some(file)));
+        });
+        assert_eq!(warnings.len(), 3, "one warning per bad element: {warnings:#?}");
+        for name in ["ТекущаяДатаСеанса", "ТекущаяДатта", "1"] {
+            let named: Vec<_> =
+                warnings.iter().filter(|w| w.contains(&format!("`{name}`"))).collect();
+            assert_eq!(named.len(), 1, "one warning names `{name}`: {warnings:#?}");
+            assert!(named[0].contains("bsl-analyzer.toml"), "names the file: {}", named[0]);
+            assert!(named[0].contains(key), "names the key: {}", named[0]);
+        }
+        assert!(
+            warnings.iter().all(|w| !w.contains("`ТекущаяДата`")),
+            "a registry name is not reported: {warnings:#?}"
+        );
+
+        // The loader reports the rest and still applies the valid names.
+        let config = config.unwrap();
+        assert!(is_excluded(&config, "ТекущаяДата"));
+        assert!(is_excluded(&config, "CurrentDate"), "one spelling covers both");
+        assert!(!is_excluded(&config, "Найти"), "a name outside the list is not silenced");
+        assert!(!is_excluded(&config, "ТекущаяДатта"), "a typo silences nothing");
+
+        // The loaders that parse the section themselves (`check-config`) get the
+        // same report.
+        let direct = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&raw, Some(file)));
+        assert_eq!(direct.len(), 3, "{direct:#?}");
+
+        // A value that is not an array is one warning and is ignored as a whole.
+        let raw = project_excluding(json!("ТекущаяДата"));
+        let mut config = None;
+        let warnings = warnings_of(|| {
+            config = Some(DiagnosticsConfig::from_project_file(&raw, Locale::En, Some(file)));
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains(key), "{}", warnings[0]);
+        assert!(warnings[0].contains("bsl-analyzer.toml"), "{}", warnings[0]);
+        assert!(warnings[0].contains("must be an array"), "{}", warnings[0]);
+        assert!(!is_excluded(&config.unwrap(), "ТекущаяДата"), "the value is ignored");
+
+        // A qualified name and an enum member are no feature names either.
+        for name in ["HTTPСоединение.Получить", "Вертикальная"] {
+            let raw = project_excluding(json!([name]));
+            let warnings = warnings_of(|| {
+                DiagnosticsConfig::from_project_file(&raw, Locale::En, Some(file));
+            });
+            assert_eq!(warnings.len(), 1, "`{name}`: {warnings:#?}");
+            assert!(warnings[0].contains(&format!("`{name}`")), "{}", warnings[0]);
+        }
+
+        // The controls: right names of either spelling, an empty list and a
+        // section without the table are silent.
+        let silent = [
+            project_excluding(json!([
+                "ТекущаяДата",
+                "CurrentDate",
+                "Find",
+                "сообщить",
+                "BriefErrorDescription",
+                "УправляемаяФорма",
+                "ManagedForm",
+                "Получить",
+                "ОриентацияМетокДиаграммы",
+            ])),
+            project_excluding(json!([])),
+            json!({ "parameters": { "DeprecatedPlatformApi": {} } }),
+            json!({ "parameters": { "LineLength": false } }),
+        ];
+        for raw in &silent {
+            let warnings = warnings_of(|| {
+                DiagnosticsConfig::from_project_file(raw, Locale::En, Some(file));
+            });
+            assert!(warnings.is_empty(), "{raw}: {warnings:#?}");
+        }
+    }
+
+    #[test]
+    fn stale_key_suggestion_is_derived_from_the_registry() {
+        use crate::handlers::deprecated_platform_api::exclude_suggestion;
+        let entry = |names: &str| {
+            format!(
+                "to silence only these findings keep `DeprecatedPlatformApi` on and write \
+                 `[diagnostics.parameters.DeprecatedPlatformApi] exclude = [{names}]`"
+            )
+        };
+        let general = "to silence individual deprecated features list their names in \
+                       `[diagnostics.parameters.DeprecatedPlatformApi] exclude`";
+
+        // The three error-processing methods are exactly the registry entries
+        // whose replacement lives in the `ErrorProcessing` manager.
+        let error_processing: Vec<String> = bsl_platform::deprecation::registry()
+            .entries()
+            .iter()
+            .filter(|e| e.replacement.is_some_and(|r| r.en.starts_with("ErrorProcessing.")))
+            .map(|e| format!("\"{}\"", e.ru))
+            .collect();
+        assert_eq!(error_processing.len(), 3, "{error_processing:?}");
+
+        assert_eq!(
+            exclude_suggestion("DeprecatedCurrentDate").as_deref(),
+            Some(entry(r#""ТекущаяДата""#).as_str())
+        );
+        assert_eq!(
+            exclude_suggestion("DeprecatedErrorProcessing").as_deref(),
+            Some(entry(&error_processing.join(", ")).as_str())
+        );
+        assert_eq!(
+            exclude_suggestion("DeprecatedErrorProcessing").as_deref(),
+            Some(
+                entry(
+                    r#""КраткоеПредставлениеОшибки", "ПодробноеПредставлениеОшибки", "ПоказатьИнформациюОбОшибке""#
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            exclude_suggestion("DeprecatedFind").as_deref(),
+            Some(entry(r#""Найти""#).as_str())
+        );
+        assert_eq!(
+            exclude_suggestion("DeprecatedMessage").as_deref(),
+            Some(entry(r#""Сообщить""#).as_str())
+        );
+
+        // Removed codes whose features the registry cannot name from the key.
+        for removed in [
+            "DeprecatedTypeManagedForm",
+            "DeprecatedMethods8310",
+            "DeprecatedMethods8317",
+            "DeprecatedAttributes8312",
+        ] {
+            assert_eq!(exclude_suggestion(removed).as_deref(), Some(general), "{removed}");
+        }
+
+        // Anything else gets no pointer to `exclude` at all.
+        for other in ["Nope", "DeprecatedFoo", "Deprecated", "deprecatedFind", "FindDeprecated"] {
+            assert_eq!(exclude_suggestion(other), None, "{other}");
+        }
+
+        // The loader appends it to the reason of the stale key and to nothing else;
+        // the behaviour of the keys is unchanged.
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let raw = json!({
+            "parameters": {
+                "DeprecatedErrorProcessing": false,
+                "DeprecatedTypeManagedForm": false,
+                "Nope": false,
+                "DeprecatedFoo": false,
+                "Deprecated": false,
+            }
+        });
+        let mut config = None;
+        let warnings = warnings_of(|| {
+            config = Some(DiagnosticsConfig::from_project_file(&raw, Locale::En, Some(file)));
+        });
+        assert_eq!(warnings.len(), 5, "{warnings:#?}");
+        let of = |key: &str| {
+            warnings
+                .iter()
+                .find(|w| w.contains(&format!("`{key}`")))
+                .unwrap_or_else(|| panic!("no warning for {key}: {warnings:#?}"))
+        };
+        assert!(of("DeprecatedErrorProcessing").contains(&entry(&error_processing.join(", "))));
+        assert!(of("DeprecatedTypeManagedForm").contains(general));
+        for key in ["Nope", "DeprecatedFoo", "Deprecated"] {
+            assert!(!of(key).contains("exclude"), "{key} gets no pointer: {}", of(key));
+        }
+        let config = config.unwrap();
+        assert!(config.disabled.is_empty(), "{:?}", config.disabled);
+        assert!(config.parameters.is_empty(), "{:?}", config.parameters);
+
+        // The same hint reaches the command-line filters.
+        let mut cli = DiagnosticsConfig::default();
+        let warnings = warnings_of(|| {
+            cli.apply_cli_filters(
+                &["DeprecatedCurrentDate".to_owned()],
+                &["DeprecatedErrorProcessing".to_owned(), "Nope".to_owned()],
+            );
+        });
+        assert_eq!(warnings.len(), 3, "{warnings:#?}");
+        assert!(warnings[0].contains(&entry(r#""ТекущаяДата""#)), "{}", warnings[0]);
+        assert!(warnings[1].contains(&entry(&error_processing.join(", "))), "{}", warnings[1]);
+        assert!(!warnings[2].contains("exclude"), "{}", warnings[2]);
     }
 
     fn parse_with_warning_count(

@@ -39,7 +39,7 @@ pub fn check_config(
     };
     source_set.resolve(project_root)?.apply_to(&mut project_config);
 
-    ide::DiagnosticsConfig::warn_unknown_parameter_codes(
+    ide::DiagnosticsConfig::warn_unknown_parameters(
         &project_config.diagnostics.rules_json(),
         Some(&config),
     );

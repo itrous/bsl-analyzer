@@ -631,6 +631,8 @@ pub enum BodyDiagnostic<R = TextRange> {
     DeprecatedAttribute8312 {
         name: String,
         kind: DeprecatedKind8312,
+        /// The object before the dot; `None` for a global method.
+        owner: Option<String>,
         range: R,
     },
 
@@ -925,8 +927,8 @@ impl<R> BodyDiagnostic<R> {
             BodyDiagnostic::SelfInsertion { range } => {
                 BodyDiagnostic::SelfInsertion { range: f(range) }
             }
-            BodyDiagnostic::DeprecatedAttribute8312 { name, kind, range } => {
-                BodyDiagnostic::DeprecatedAttribute8312 { name, kind, range: f(range) }
+            BodyDiagnostic::DeprecatedAttribute8312 { name, kind, owner, range } => {
+                BodyDiagnostic::DeprecatedAttribute8312 { name, kind, owner, range: f(range) }
             }
             BodyDiagnostic::ExecuteExternalCode { range } => {
                 BodyDiagnostic::ExecuteExternalCode { range: f(range) }

@@ -205,6 +205,7 @@ MethodSize = { maxMethodSize = 250 }
 | `BadWords` | `badWords` | пусто |
 | `CommentedCode` | `threshold` | `0.9` |
 | `ConsecutiveEmptyLines` | `allowedEmptyLinesCount` | `1` |
+| `DeprecatedPlatformApi` | `exclude` | пусто |
 
 Примеры:
 
@@ -223,6 +224,9 @@ authorizedNumbers = "-1,0,1,2,10,100"
 
 [diagnostics.parameters.BadWords]
 badWords = "хрень,костыль,тупой"
+
+[diagnostics.parameters.DeprecatedPlatformApi]
+exclude = ["ТекущаяДата", "КраткоеПредставлениеОшибки", "ПодробноеПредставлениеОшибки", "ПоказатьИнформациюОбОшибке"]
 ```
 
 ## Как включать правила, выключенные по умолчанию

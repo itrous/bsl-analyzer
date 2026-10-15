@@ -4,6 +4,7 @@ use bsl_platform::deprecation::DeprecationEntry;
 use hir::LocalRange;
 use stdx::case::CaseExt;
 
+use super::deprecated_platform_api;
 use super::deprecated_platform_facts::{deprecated_method_fact, replacement_for_name};
 
 pub fn from_hir(
@@ -14,6 +15,9 @@ pub fn from_hir(
     let (code, replacement) = get_diagnostic_code_and_replacement(name)?;
 
     if ctx.is_disabled_with_metadata(code) {
+        return None;
+    }
+    if deprecated_platform_api::is_excluded(ctx.config, name) {
         return None;
     }
 

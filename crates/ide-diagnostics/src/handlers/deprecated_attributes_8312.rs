@@ -4,17 +4,27 @@ use hir::DeprecatedKind8312;
 use hir::LocalRange;
 use stdx::case::CaseExt;
 
+use super::deprecated_platform_api;
 use super::deprecated_platform_facts::deprecated_8312_replacement;
 
 pub fn from_hir(
     name: &str,
     kind: DeprecatedKind8312,
+    owner: Option<&str>,
     range: LocalRange,
     ctx: &AnalysisContext,
 ) -> Option<Diagnostic<LocalRange>> {
     let code = DiagnosticCode::DeprecatedPlatformApi;
 
     if ctx.is_disabled_with_metadata(code) {
+        return None;
+    }
+    // An enum-name finding quotes the member, which is often not in the registry
+    // (`ОриентацияМетокДиаграммы.Вертикальная`), so the enum before the dot is the
+    // name that silences it. For other kinds the object is a variable, not a feature.
+    let owner_excluded = kind == DeprecatedKind8312::EnumName
+        && owner.is_some_and(|owner| deprecated_platform_api::is_excluded(ctx.config, owner));
+    if owner_excluded || deprecated_platform_api::is_excluded(ctx.config, name) {
         return None;
     }
 
@@ -80,8 +90,14 @@ fn get_message_and_replacement(name: &str, kind: &DeprecatedKind8312) -> (String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{check_hir_diagnostic, format_diags};
+    use crate::test_utils::{
+        check_ast_diagnostic_with_config, check_diagnostics_for_with_config, check_hir_diagnostic,
+        format_diags, range_to_line_col,
+    };
+    use crate::DiagnosticsConfig;
+    use base_db::Locale;
     use expect_test::expect;
+    use serde_json::json;
 
     fn format_diags_trim_trailing(source: &str, diags: &[crate::Diagnostic]) -> String {
         format_diags(source, diags).lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
@@ -539,5 +555,97 @@ EndProcedure"#;
               message: Enum value "Horizontal" is deprecated. Используйте: AlwaysHorizontal
               severity: Warning"#]]
         .assert_eq(&format_diags(code, &diags));
+    }
+
+    /// `Вертикальная` is not a feature of the registry, so only the enum in front
+    /// of the dot can silence it; `Авто` is one, and `Горизонтальная` is a value,
+    /// not an enum name.
+    const ENUM_FIXTURE: &str = r#"Процедура Тест()
+    О1 = ОриентацияМетокДиаграммы.Вертикальная;
+    О2 = ОриентацияМетокДиаграммы.Авто;
+    Г1 = ГруппировкаПодчиненныхЭлементовФормы.Горизонтальная;
+    ОриентацияМетокДиаграммы.Вертикальная();
+КонецПроцедуры"#;
+
+    fn enum_fixture_findings(names: &[&str]) -> Vec<crate::Diagnostic> {
+        let config = DiagnosticsConfig::from_project_json(
+            &json!({ "parameters": { "DeprecatedPlatformApi": { "exclude": names } } }),
+            Locale::Ru,
+        );
+        check_diagnostics_for_with_config(
+            ENUM_FIXTURE,
+            config,
+            DiagnosticCode::DeprecatedPlatformApi,
+        )
+    }
+
+    fn enum_fixture_lines(names: &[&str]) -> Vec<u32> {
+        enum_fixture_findings(names)
+            .iter()
+            .map(|d| range_to_line_col(ENUM_FIXTURE, d.range).0 + 1)
+            .collect()
+    }
+
+    #[test]
+    fn exclude_matches_enum_name_findings_by_enum() {
+        // The control: five findings, one on each of the three reads and two on
+        // the call (the member of a call is reported by two lowering paths).
+        let baseline = enum_fixture_findings(&[]);
+        assert_eq!(enum_fixture_lines(&[]), [2, 3, 4, 5, 5]);
+        let texts: Vec<_> = baseline.iter().map(|d| d.message.trim_end().to_owned()).collect();
+        assert_eq!(
+            texts,
+            [
+                r#"Имя перечисления "Вертикальная" устарело. Используйте:"#,
+                r#"Имя перечисления "Авто" устарело. Используйте:"#,
+                r#"Значение перечисления "Горизонтальная" устарело. Используйте: ГоризонтальнаяВсегда"#,
+                r#"Имя перечисления "Вертикальная" устарело. Используйте:"#,
+                r#"Имя перечисления "Вертикальная" устарело. Используйте:"#,
+            ]
+        );
+
+        // The enum silences its name findings, the call included; the value
+        // finding of the other enum stays untouched.
+        assert_eq!(enum_fixture_lines(&["ОриентацияМетокДиаграммы"]), [4]);
+        assert_eq!(enum_fixture_lines(&["ориентацияметокдиаграммы"]), [4], "case is ignored");
+
+        // A member that is a feature of the registry silences itself and no
+        // neighbour.
+        assert_eq!(enum_fixture_lines(&["Авто"]), [2, 4, 5, 5]);
+
+        // A member that is no feature silences nothing: the name of the enum is
+        // the only way to silence it.
+        assert_eq!(enum_fixture_lines(&["Вертикальная"]), [2, 3, 4, 5, 5]);
+
+        // The object in front of the dot is not compared for a value finding.
+        assert_eq!(enum_fixture_lines(&["ГруппировкаПодчиненныхЭлементовФормы"]), [2, 3, 4, 5, 5]);
+    }
+
+    #[test]
+    fn exclude_compares_the_object_only_for_enum_name_findings() {
+        // The only object that is both an owner and a feature name is the enum of
+        // the registry, and it is only ever reported as an enum name; so the other
+        // kinds cannot be built from source and the handler is called directly.
+        let flagged = |kind: DeprecatedKind8312, names: &[&str]| {
+            let config = DiagnosticsConfig::from_project_json(
+                &json!({ "parameters": { "DeprecatedPlatformApi": { "exclude": names } } }),
+                Locale::Ru,
+            );
+            let emitted = std::cell::Cell::new(false);
+            check_ast_diagnostic_with_config("", config, |ctx| {
+                let range = LocalRange::of_detached_node(ide_db::TextRange::empty(0.into()));
+                let owner = Some("ОриентацияМетокДиаграммы");
+                emitted.set(from_hir("ОтображатьШкалу", kind, owner, range, ctx).is_some());
+                Vec::new()
+            });
+            emitted.get()
+        };
+
+        assert!(flagged(DeprecatedKind8312::EnumName, &[]), "the control");
+        assert!(flagged(DeprecatedKind8312::Attribute, &[]), "the control");
+        assert!(!flagged(DeprecatedKind8312::EnumName, &["ОриентацияМетокДиаграммы"]));
+        assert!(flagged(DeprecatedKind8312::Attribute, &["ОриентацияМетокДиаграммы"]));
+        assert!(flagged(DeprecatedKind8312::EnumValue, &["ОриентацияМетокДиаграммы"]));
+        assert!(flagged(DeprecatedKind8312::Method, &["ОриентацияМетокДиаграммы"]));
     }
 }
