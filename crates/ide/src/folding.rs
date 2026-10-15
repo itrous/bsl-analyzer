@@ -57,9 +57,30 @@ fn collect_syntax_ranges(
                 push_multiline_range(ranges, line_index, range, None);
             }
         } else if is_foldable_syntax_node(node.kind()) {
-            push_multiline_range(ranges, line_index, node.text_range(), None);
+            push_multiline_range(ranges, line_index, syntax_fold_range(&node), None);
         }
     }
+}
+
+/// Узел метода начинается с директив компиляции и аннотаций (`&НаКлиенте`,
+/// `&После("...")`), а редактор оставляет видимой первую строку складки:
+/// начатая с директивы, свёрнутая процедура прячет своё имя, и модуль
+/// превращается в столбец одинаковых `&НаКлиенте`. Складка метода идёт от
+/// `Асинх`/`Процедура`/`Функция`, директивы остаются над ней.
+fn syntax_fold_range(node: &SyntaxNode) -> TextRange {
+    let range = node.text_range();
+    if !matches!(node.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF) {
+        return range;
+    }
+    node.children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| {
+            matches!(
+                token.kind(),
+                SyntaxKind::KW_ASYNC | SyntaxKind::KW_PROCEDURE | SyntaxKind::KW_FUNCTION
+            )
+        })
+        .map_or(range, |keyword| TextRange::new(keyword.text_range().start(), range.end()))
 }
 
 /// Текст запроса — многострочный литерал: складка идёт от первой кавычки
