@@ -429,3 +429,136 @@ mod qualified_head {
         );
     }
 }
+
+/// An output alias named in `ИТОГИ` is a column of the result, not a bare name to look up in
+/// the sources.
+///
+/// Both `Ключ` and `Количество` are output aliases here, and `ВТ2` offers a `Количество` of its
+/// own: the totals clause names the result column, so resolving it against the sources made
+/// the alias collide with the columns it was derived from. No metadata is loaded, which is the
+/// case the temporary tables of one batch are in.
+///
+/// Every route is asserted twice: the batch from the report stays quiet, and the same batch
+/// with the bare name moved into the select list — where it really is offered by both tables —
+/// is reported. The second half is what makes the first one able to fail: a route that
+/// analysed nothing would otherwise stay quiet on both.
+mod output_alias_in_totals {
+    use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+    use ide_db::RootDatabaseImpl;
+    use ide_diagnostics::{DiagnosticCode, DiagnosticsConfig};
+    use vfs::{FileId, FileSet, VfsPath};
+
+    const TEMPORARY_TABLES: &str = "ВЫБРАТЬ\n\
+        \t1 КАК Ключ,\n\
+        \t10 КАК Количество\n\
+        ПОМЕСТИТЬ ВТ1\n\
+        ;\n\
+        ВЫБРАТЬ\n\
+        \t1 КАК Ключ,\n\
+        \t20 КАК Количество\n\
+        ПОМЕСТИТЬ ВТ2\n\
+        ;\n";
+
+    const SOURCES: &str = "ИЗ\n\
+        \tВТ1 КАК ВТ1\n\
+        \t\tЛЕВОЕ СОЕДИНЕНИЕ ВТ2 КАК ВТ2\n\
+        \t\tПО ВТ1.Ключ = ВТ2.Ключ";
+
+    /// The query of the report: the alias is named only in the totals clause.
+    fn reported_query() -> String {
+        format!(
+            "{TEMPORARY_TABLES}ВЫБРАТЬ\n\
+             \tВТ1.Ключ КАК Ключ,\n\
+             \tЕСТЬNULL(ВТ2.Количество, 0) КАК Количество\n\
+             {SOURCES}\n\
+             ИТОГИ\n\
+             \tСУММА(Количество)\n\
+             ПО\n\
+             \tКлюч"
+        )
+    }
+
+    /// The control: no totals, and the bare name stands in the select list, where both tables
+    /// offer it.
+    fn control_query() -> String {
+        format!(
+            "{TEMPORARY_TABLES}ВЫБРАТЬ\n\
+             \tВТ1.Ключ КАК Ключ,\n\
+             \tЕСТЬNULL(Количество, 0) КАК Количество\n\
+             {SOURCES}"
+        )
+    }
+
+    fn module_codes(query: &str) -> Vec<DiagnosticCode> {
+        let body = query.replace('\n', "\n\t|");
+        let source = format!(
+            "Процедура ИтогиПоПсевдониму() Экспорт\n\
+             \tЗапрос = Новый Запрос;\n\
+             \tЗапрос.Текст =\n\
+             \t\"{body}\";\n\
+             \tЗапрос.Выполнить();\n\
+             КонецПроцедуры\n"
+        );
+        let mut db = RootDatabaseImpl::new();
+        let file_id = FileId(0);
+        let mut files = FileSet::default();
+        files.insert(file_id, VfsPath::new("/test/Module.bsl".to_string()));
+        db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+        db.set_file_source_root(file_id, SourceRootId(0));
+        db.set_file_text(file_id, &source);
+        ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    fn bare_codes(query: &str) -> Vec<DiagnosticCode> {
+        ide_diagnostics::validate_query_text(&DiagnosticsConfig::all_enabled(), None, query)
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    fn codes_over_empty_configuration(query: &str) -> Vec<DiagnosticCode> {
+        let configuration = bsl_metadata::Configuration::new("Test");
+        ide_diagnostics::validate_query_text(
+            &DiagnosticsConfig::all_enabled(),
+            Some(&configuration),
+            query,
+        )
+        .into_iter()
+        .map(|d| d.code)
+        .collect()
+    }
+
+    fn assert_alias_quiet_and_control_reported(route: fn(&str) -> Vec<DiagnosticCode>) {
+        let reported = route(&reported_query());
+        assert!(
+            !reported.contains(&DiagnosticCode::AmbiguousFieldInQuery),
+            "the totals clause names result columns, not source columns: {reported:?}",
+        );
+
+        let control = route(&control_query());
+        assert!(
+            control.contains(&DiagnosticCode::AmbiguousFieldInQuery),
+            "the same batch with the bare name in the select list is ambiguous, so this \
+             route must be able to say so: {control:?}",
+        );
+    }
+
+    #[test]
+    fn an_output_alias_in_totals_is_not_ambiguous_in_a_module_literal() {
+        assert_alias_quiet_and_control_reported(module_codes);
+    }
+
+    #[test]
+    fn an_output_alias_in_totals_is_not_ambiguous_in_a_bare_query() {
+        assert_alias_quiet_and_control_reported(bare_codes);
+    }
+
+    /// The same batch with a resolver present that holds none of its sources.
+    #[test]
+    fn an_output_alias_in_totals_is_not_ambiguous_over_an_empty_configuration() {
+        assert_alias_quiet_and_control_reported(codes_over_empty_configuration);
+    }
+}
