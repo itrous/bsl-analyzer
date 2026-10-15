@@ -24,12 +24,13 @@ pub use standard_mdo_attributes::{
 };
 
 pub use db::{
-    find_prefixed_method, find_prefixed_methods, global_function_query, global_member_method_query,
-    global_property_query, manager_methods_query, method_display_names,
-    platform_constructors_query, platform_method_query, platform_property_query,
-    platform_type_query, prefixed_method_query, type_methods_query, type_properties_query,
-    MethodLookupInput, PlatformData, PlatformDataInner, PrefixedMethodLookupInput, TypeNameInput,
-    GLOBAL_CONTEXT_OWNER, LEGACY_GLOBAL_FUNCTION_EN_ALIASES,
+    docs_gap_synthesized_member_types, find_prefixed_method, find_prefixed_methods,
+    global_function_query, global_member_method_query, global_property_query,
+    manager_methods_query, method_display_names, platform_constructors_query,
+    platform_method_query, platform_property_query, platform_type_query, prefixed_method_query,
+    type_methods_query, type_properties_query, MethodLookupInput, PlatformData, PlatformDataInner,
+    PrefixedMethodLookupInput, TypeNameInput, GLOBAL_CONTEXT_OWNER,
+    LEGACY_GLOBAL_FUNCTION_EN_ALIASES,
 };
 pub use global_catalog::{
     PlatformCatalogStatus, PlatformGlobalCatalog, PlatformGlobalCatalogMetadata,
@@ -42,7 +43,7 @@ pub use help::{
     PlatformHelpStatus, RestartRequired, BUNDLED_PLATFORM_VERSION, CORPUS_ENV,
 };
 pub use parameter_series::ParameterSeries;
-pub use snapshot::{PlatformSnapshot, SnapshotDecodeError};
+pub use snapshot::{MemberSurfaceAttestation, PlatformSnapshot, SnapshotDecodeError};
 pub use types::*;
 
 pub fn split_type_alternatives(raw: &str) -> Vec<&str> {

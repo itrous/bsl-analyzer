@@ -101,6 +101,17 @@ pub struct PlatformDataInner {
     /// Writing an extension property is a side effect on the form context, never
     /// a dead local, so the unused-local-variable check skips these.
     form_extension_property_names: rustc_hash::FxHashSet<SmolStr>,
+    /// Folded RU and EN names of the types whose member surface the curated
+    /// overlays attest as complete (`type_member_surface_attestations`), each
+    /// mapped to the platform release it was verified against. Only these types
+    /// may be treated as closed receivers: for any other type the extract is
+    /// not known to list every member, and a member missing from it proves
+    /// nothing about the platform.
+    member_surface_versions: FxHashMap<SmolStr, Vec<u32>>,
+    /// The served corpus's own platform release, parsed once: the gate above
+    /// compares it on every member miss, and re-reading the origin string there
+    /// would parse it again per miss.
+    served_platform_version: Option<Vec<u32>>,
 }
 
 impl PlatformDataInner {
@@ -143,6 +154,7 @@ impl PlatformDataInner {
             global_function_docs,
             constructor_docs,
             property_docs,
+            member_surface_attestations,
         } = snapshot;
 
         apply_docs_gap_iter_types_overlay(&mut types);
@@ -183,6 +195,35 @@ impl PlatformDataInner {
                 if xdto_counts.get(&key) == Some(&1) {
                     types_by_name.entry(key).or_insert(idx);
                 }
+            }
+        }
+
+        let served_platform_version = origin
+            .as_ref()
+            .and_then(|origin| origin.platform_version.as_deref())
+            .and_then(crate::overlays::parse_version);
+
+        let mut member_surface_versions: FxHashMap<SmolStr, Vec<u32>> = FxHashMap::default();
+        for attestation in &member_surface_attestations {
+            let Some(version) =
+                crate::overlays::parse_version(&attestation.verified_against_version)
+            else {
+                continue;
+            };
+            let english_key = attestation.type_name.fold_lower();
+            let mut named = types.iter().filter(|ty| ty.english_name.fold_lower() == english_key);
+            let Some(ty) = named.next() else { continue };
+            if named.next().is_some() {
+                continue;
+            }
+            // Both spellings of the type name reach the receiver alike, so both
+            // are indexed. An alias two namesakes share may end up here through
+            // the unambiguous spelling of one of them; that is why the verdict,
+            // and not this index, refuses a name with more than one meaning
+            // ([`Self::platform_type_member_surface_verified`]).
+            for alias in [&ty.name, &ty.english_name] {
+                let folded: SmolStr = alias.fold_lower().into();
+                member_surface_versions.insert(folded, version.clone());
             }
         }
 
@@ -348,6 +389,8 @@ impl PlatformDataInner {
             global_properties_by_name,
             ambiguous_type_names,
             form_extension_property_names,
+            member_surface_versions,
+            served_platform_version,
         }
     }
 
@@ -379,6 +422,31 @@ impl PlatformDataInner {
     pub fn is_ambiguous_type_name(&self, name: &str) -> bool {
         let key: SmolStr = name.fold_lower().into();
         self.ambiguous_type_names.contains(&key)
+    }
+
+    /// Whether the curated overlays attest that the extracted member surface of
+    /// the type `name` names is complete — that is, that the served corpus
+    /// lists every method and property the type has, so a member absent from it
+    /// is absent from the platform too.
+    ///
+    /// Two facts must hold beyond the attestation itself, and both fail closed:
+    /// the served corpus has to be of the attested release or newer (a member
+    /// the extract may have lost is one the attestation never covered, and a
+    /// corpus of an unknown version proves nothing either way), and the name
+    /// must denote a single type (the member surface of an arbitrary namesake
+    /// answers for the wrong one).
+    pub fn platform_type_member_surface_verified(&self, name: &str) -> bool {
+        if self.is_ambiguous_type_name(name) {
+            return false;
+        }
+        let key: SmolStr = name.fold_lower().into();
+        let Some(attested) = self.member_surface_versions.get(&key) else {
+            return false;
+        };
+        match self.served_platform_version.as_deref() {
+            Some(active) => version_at_least(active, attested),
+            None => false,
+        }
     }
 
     pub fn get_type(&self, name: &str) -> Option<&PlatformType> {
@@ -691,6 +759,18 @@ const DOCS_GAP_MANAGER_METHODS: &[(&str, &str)] = &[
     ("XMLStringProcessingManager", "УдалитьНедопустимыеСимволыXML"),
 ];
 
+/// The type names whose *member lists* the `DOCS_GAP_*` overlays synthesize: a
+/// member page missing from the archive forces the overlay to add one, so the
+/// extract is not an extract whose member list is complete and a member-surface
+/// attestation must not cover these types. The curated attestations are held to
+/// that by `tests/bundled_facts.rs`, which is what keeps the rule from living in
+/// prose only. The neighbouring overlays patch iteration element types and
+/// member availability rather than the member list, so a member-surface
+/// attestation is not disqualified by them.
+pub fn docs_gap_synthesized_member_types() -> Vec<&'static str> {
+    DOCS_GAP_MANAGER_METHODS.iter().map(|(type_name, _)| *type_name).collect()
+}
+
 fn apply_docs_gap_method_overlay(
     methods: &mut Vec<PlatformMethod>,
     global_functions: &[GlobalFunction],
@@ -821,6 +901,23 @@ fn get_keyword_docs_static(keyword: &str) -> Option<crate::types::KeywordDocs> {
 }
 
 pub type PlatformData = PlatformDataInner;
+
+/// Whether `active` is the version an attestation was verified against or a
+/// newer one. The two are compared component by component with the shorter
+/// treated as zero-padded on the right, so `8.3.27` and `8.3.27.0` are the same
+/// release while `8.3.26.1` is older.
+fn version_at_least(active: &[u32], attested: &[u32]) -> bool {
+    let depth = active.len().max(attested.len());
+    let component = |version: &[u32], index: usize| version.get(index).copied().unwrap_or(0);
+    for index in 0..depth {
+        let active = component(active, index);
+        let attested = component(attested, index);
+        if active != attested {
+            return active > attested;
+        }
+    }
+    true
+}
 
 /// `heap_size` estimators for Salsa's `memory_usage` report on the platform
 /// lookup queries. Each thinly wraps the target type's own `estimated_heap_size`

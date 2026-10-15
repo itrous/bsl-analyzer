@@ -12,6 +12,10 @@ use serde_json::Value;
 
 const FACTS: &str = include_str!("../data/platform_facts.json");
 
+/// The type the curated property correction and the first attestation name.
+const RANGE_TYPE: &str = "ОбластьЯчеекТабличногоДокумента";
+const RANGE_EN: &str = "SpreadsheetDocumentRange";
+
 const RECORD_KEYS: &[(&str, &[&str])] = &[
     (
         "types",
@@ -215,4 +219,172 @@ fn the_built_in_facts_serve_signatures_without_texts() {
     assert!(data.all_constructors().iter().all(|c| data
         .get_constructor_docs(c.id)
         .is_none_or(|d| d.description.is_empty() && d.params.is_empty() && d.examples.is_empty())));
+}
+
+/// The curated corrections and attestations of `platform_overlays.json` are
+/// authored against the built-in facts, and a typo in either would leave them
+/// silently unapplied — the overlay skips a target its corpus does not have.
+/// Every fact here is therefore asserted against the built-in corpus: the
+/// targets exist, and the values the entries name are the ones that come out.
+#[test]
+fn the_curated_overlays_reach_the_built_in_facts() {
+    let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+    let data = PlatformData::from_help(help);
+
+    // The correction's target exists and carries the corrected fact; the record
+    // keeps its identity, so documentation lookups still find it.
+    let value = data
+        .get_property("SpreadsheetDocumentRange", "Значение")
+        .expect("the correction's target must exist in the built-in facts");
+    assert_eq!(value.id, 12748);
+    assert!(value.is_readonly, "ОбластьЯчеекТабличногоДокумента.Значение is read-only at run time");
+    assert_eq!(
+        data.get_property("ОбластьЯчеекТабличногоДокумента", "Value").map(|p| p.id),
+        Some(12748)
+    );
+
+    // Only the named property moved: its neighbours and the identically named
+    // property of the drawing keep their extracted flags.
+    assert!(!data.get_property("SpreadsheetDocumentRange", "Текст").unwrap().is_readonly);
+    assert!(
+        !data.get_property("SpreadsheetDocumentDrawing", "Значение").unwrap().is_readonly,
+        "the drawing's Значение is not part of the correction"
+    );
+
+    // The attested surfaces, under both spellings of their names.
+    for name in [RANGE_TYPE, RANGE_EN] {
+        assert!(
+            data.platform_type_member_surface_verified(name),
+            "{name} is attested and the built-in facts are of the attested release"
+        );
+    }
+    for name in ["ЗаписьJSON", "JSONWriter"] {
+        assert!(data.platform_type_member_surface_verified(name), "{name} is attested");
+    }
+    // ...and the types nobody attested stay open, however complete they look.
+    assert!(!data.platform_type_member_surface_verified("ТабличныйДокумент"));
+    assert!(!data.platform_type_member_surface_verified("Запрос"));
+    assert!(!data.platform_type_member_surface_verified("ЗаписьJSONНеТакой"));
+
+    // The members the attestation covers are the ones the positive tests call
+    // absent: were the corpus to gain them, those tests would have to change.
+    assert_eq!(
+        data.get_type_methods("JSONWriter").len(),
+        11,
+        "the attested surface is the 8.3 one"
+    );
+    assert_eq!(data.get_type_properties("SpreadsheetDocumentRange").len(), 63);
+    assert!(data.get_property("SpreadsheetDocumentRange", "ТекущаяОбласть").is_none());
+    assert!(data.get_method("JSONWriter", "ЗаписатьНачалоТаблицы").is_none());
+}
+
+/// The curating rule of an attestation, held by a test rather than by prose in
+/// `OVERLAYS.md`: a type whose extract had to be patched has no surface the
+/// extract may call complete, and neither has a type a configuration extends.
+///
+/// The form half is a name check with a stated limit: a managed form gains
+/// properties from its per-MDO extensions (`form_extension_property_names` in
+/// `crates/bsl-platform/src/db.rs`), and the extract knows nothing of them, so
+/// such a type must not be attested. The corpus spells those names both with and
+/// without a space (`DataComposition…`, `…КомпоновкиДанных`), so the comparison
+/// drops whitespace on both sides. A type whose name hides that it is extended
+/// would still slip through (the corpus names are not a classification), which is
+/// why the check is written down here as the rule's ceiling rather than as a
+/// proof of it.
+#[test]
+fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
+    const EXTENDED_TYPE_MARKERS: &[&str] =
+        &["form", "форма", "extension", "расширение", "datacomposition", "компоновкаданных"];
+
+    fn normalized(name: &str) -> String {
+        name.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    let document: Value =
+        serde_json::from_str(include_str!("../data/platform_overlays.json")).expect("overlay JSON");
+    let entries = document["type_member_surface_attestations"]
+        .as_array()
+        .expect("the curated document carries the attestations");
+    assert!(!entries.is_empty(), "the rule would be vacuous without curated attestations");
+
+    let synthesized = bsl_platform::docs_gap_synthesized_member_types();
+    assert!(
+        !synthesized.is_empty(),
+        "an empty synthesis list would let this check pass on any attestation"
+    );
+
+    let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+    let data = PlatformData::from_help(help);
+    for entry in entries {
+        let name = entry["type"].as_str().expect("an attested type is named");
+        let ty = data
+            .get_type(name)
+            .unwrap_or_else(|| panic!("attested type {name} must exist in the built-in facts"));
+        assert!(
+            !synthesized.iter().any(|patched| *patched == ty.english_name.as_str()),
+            "{name} is a type whose member list the docs-gap overlays synthesize: \
+             its extract is patched, so it has no attested-complete surface"
+        );
+        for alias in [ty.name.as_str(), ty.english_name.as_str()] {
+            let folded = normalized(alias);
+            assert!(
+                !EXTENDED_TYPE_MARKERS.iter().any(|marker| folded.contains(marker)),
+                "{alias} is extended by a configuration, so the extract cannot list its members"
+            );
+        }
+    }
+}
+
+/// The marker check is only worth its name if it catches the corpus spellings: the
+/// data-composition family is the biggest extended one (251 types), and its names are
+/// written without a space. The check is exercised on the corpus's own names, not on
+/// invented ones.
+#[test]
+fn the_extended_type_marker_check_catches_the_corpus_spellings() {
+    fn normalized(name: &str) -> String {
+        name.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
+    }
+    const EXTENDED_TYPE_MARKERS: &[&str] =
+        &["form", "форма", "extension", "расширение", "datacomposition", "компоновкаданных"];
+
+    let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+    let data = PlatformData::from_help(help);
+    let is_extended = |name: &str| {
+        data.get_type(name).is_some_and(|ty| {
+            [ty.name.as_str(), ty.english_name.as_str()]
+                .iter()
+                .any(|alias| EXTENDED_TYPE_MARKERS.iter().any(|m| normalized(alias).contains(m)))
+        })
+    };
+
+    let marked = data
+        .all_types()
+        .iter()
+        .filter(|ty| {
+            [ty.name.as_str(), ty.english_name.as_str()]
+                .iter()
+                .any(|alias| EXTENDED_TYPE_MARKERS.iter().any(|m| normalized(alias).contains(m)))
+        })
+        .count();
+    assert!(
+        marked > 250,
+        "the corpus names a whole extended family with these markers, found {marked}"
+    );
+
+    // Real spellings of every marker, including the ones a spaced comparison missed:
+    // the data-composition family and the extension types are written both ways.
+    for name in [
+        "DataCompositionSettings",
+        "НастройкиКомпоновкиДанных",
+        "ФормаКлиентскогоПриложения",
+        "ClientApplicationForm",
+        "Расширение табличного поля отбора",
+        "Filter table box extension",
+    ] {
+        assert!(
+            data.get_type(name).is_some(),
+            "{name} must exist in the built-in facts for this check to mean anything"
+        );
+        assert!(is_extended(name), "{name} must be recognized as a type a configuration extends");
+    }
 }

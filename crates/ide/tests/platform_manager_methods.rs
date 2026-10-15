@@ -1015,3 +1015,138 @@ fn an_unread_manager_module_still_resolves_the_platform_manager_method() {
         unresolved_method_names(&db, file_id),
     );
 }
+
+/// Whether the process snapshot serves the built-in interface facts: no
+/// `--cfg corpus_contract` and no `BSL_PLATFORM_HELP_CORPUS`.
+///
+/// The two are one input, not one condition: the documented corpus profile sets both,
+/// a bare variable is a corpus run without the flag. What matters here is that a corpus
+/// file carries no platform version, so a verdict resting on the release of the served
+/// data — the member-surface gate — has no answer in either (see
+/// `docs/ru/UnresolvedField.md`, «если версию данных определить нельзя, проверка
+/// молчит»), and the test either stands aside or asserts that silence.
+fn built_in_facts_are_served() -> bool {
+    !cfg!(corpus_contract) && std::env::var_os(bsl_platform::CORPUS_ENV).is_none()
+}
+
+/// The absent-member checks judge a platform type only where the curated overlays
+/// attest that the extract lists its whole member surface. With the platform data of
+/// this build the spreadsheet range is attested and the spreadsheet document is not,
+/// so the same two misses answer differently — and the members that do exist stay
+/// silent on both. Both diagnostic kinds are checked together, because a receiver
+/// closed for a field must be closed for a method too.
+///
+/// The assertion describes a source of a known release. The documented corpus profile
+/// serves a corpus file, which carries no platform version, so there the contract keeps
+/// the check silent by design; the silence is asserted by
+/// [`a_versionless_corpus_keeps_the_platform_misses_silent`] instead.
+#[test]
+#[cfg_attr(
+    corpus_contract,
+    ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+)]
+fn platform_member_misses_follow_the_completeness_attestation() {
+    let fixture = r#"
+//- /test.bsl
+Процедура Тест()
+    ТабДок = Новый ТабличныйДокумент;
+    Область = ТабДок.ТекущаяОбласть;
+    Есть = Область.Значение;
+    НетПоля = Область.ТекущаяОбласть;
+    НетМетода = Область.НетТакогоМетода();
+    Запись = Новый ЗаписьJSON;
+    Запись.ЗаписатьНачалоОбъекта();
+    Запись.ЗаписатьНачалоТаблицы();
+    ТабДок.ОбластьСоОпечаткой();
+КонецПроцедуры
+"#;
+    let (db, file_id) = setup(fixture);
+
+    if built_in_facts_are_served() {
+        assert_eq!(
+            unresolved_field_names(&db, file_id),
+            vec!["ТекущаяОбласть"],
+            "only the attested range's field miss is a verdict"
+        );
+        assert_eq!(
+            unresolved_method_names(&db, file_id),
+            vec!["НетТакогоМетода", "ЗаписатьНачалоТаблицы"],
+            "both attested types answer for their method misses, the unattested document does not"
+        );
+    } else {
+        // A corpus run: the served file carries no platform version, so the
+        // completeness gate is shut by contract (see the class docs) and both misses are
+        // silent. The control says the silence is that gate and not a corpus that went
+        // missing.
+        let data = bsl_platform::PlatformData::instance();
+        assert!(
+            !data.platform_type_member_surface_verified("ОбластьЯчеекТабличногоДокумента")
+                && !data.platform_type_member_surface_verified("JSONWriter"),
+            "a corpus without a version must leave the gate shut"
+        );
+        assert!(
+            unresolved_field_names(&db, file_id).is_empty(),
+            "an unknown platform version keeps the field miss silent: {:?}",
+            unresolved_field_names(&db, file_id)
+        );
+        assert!(
+            unresolved_method_names(&db, file_id).is_empty(),
+            "an unknown platform version keeps the method miss silent: {:?}",
+            unresolved_method_names(&db, file_id)
+        );
+    }
+}
+
+/// The other half of the contract, on the profile that exercises it: with a corpus whose
+/// platform version cannot be determined the completeness gate stays shut, so both misses
+/// are silent. The controls say why that silence is the contract and not a lost corpus:
+/// the served data knows both types, the members really are absent from it, and the gate
+/// really is the thing that is closed.
+#[test]
+#[cfg_attr(
+    not(corpus_contract),
+    ignore = "corpus contract: needs a corpus that carries no platform version"
+)]
+fn a_versionless_corpus_keeps_the_platform_misses_silent() {
+    let data = bsl_platform::PlatformData::instance();
+    assert!(
+        data.get_type("ОбластьЯчеекТабличногоДокумента").is_some()
+            && data.get_type("ЗаписьJSON").is_some(),
+        "the corpus profile must serve the pinned corpus"
+    );
+    assert!(
+        data.get_property("SpreadsheetDocumentRange", "ТекущаяОбласть").is_none()
+            && data.get_method("JSONWriter", "ЗаписатьНачалоТаблицы").is_none(),
+        "the members the positive test misses must still be absent from the corpus"
+    );
+    assert!(
+        !data.platform_type_member_surface_verified("ОбластьЯчеекТабличногоДокумента")
+            && !data.platform_type_member_surface_verified("JSONWriter"),
+        "a corpus without a version must leave the gate shut"
+    );
+
+    let fixture = r#"
+//- /test.bsl
+Процедура Тест()
+    ТабДок = Новый ТабличныйДокумент;
+    Область = ТабДок.ТекущаяОбласть;
+    НетПоля = Область.ТекущаяОбласть;
+    НетМетода = Область.НетТакогоМетода();
+    Запись = Новый ЗаписьJSON;
+    Запись.ЗаписатьНачалоТаблицы();
+    ТабДок.ОбластьСоОпечаткой();
+КонецПроцедуры
+"#;
+    let (db, file_id) = setup(fixture);
+
+    assert!(
+        unresolved_field_names(&db, file_id).is_empty(),
+        "an unknown platform version keeps the field miss silent: {:?}",
+        unresolved_field_names(&db, file_id)
+    );
+    assert!(
+        unresolved_method_names(&db, file_id).is_empty(),
+        "an unknown platform version keeps the method miss silent: {:?}",
+        unresolved_method_names(&db, file_id)
+    );
+}

@@ -3,11 +3,21 @@ mod overlay_schema;
 
 pub(crate) use overlay_schema::OverlayError;
 use overlay_schema::{
-    parse_global_function_overrides, parse_overrides, parse_property_additions,
-    validate_version_bounds, MethodParameterOverride, TypePropertyAddition,
+    parse_global_function_overrides, parse_member_surface_attestations, parse_overrides,
+    parse_property_additions, parse_property_corrections, validate_version_bounds,
+    MethodParameterOverride, TypeMemberSurfaceAttestation, TypePropertyAddition,
 };
 use serde_json::{Map, Value};
 use std::collections::HashSet;
+use stdx::case::CaseExt;
+
+/// A dotted numeric version (`8.3.27.2214`) as comparable components. The
+/// curated overlays and the served corpus stand at different depths, so a
+/// shorter version borrows nothing: components are compared pair by pair with
+/// the missing ones taken as zero (`8.3.27` is not newer than `8.3.27.2214`).
+pub(crate) fn parse_version(value: &str) -> Option<Vec<u32>> {
+    overlay_schema::parse_version(value)
+}
 
 pub(crate) fn apply_method_parameter_overlays(
     data: &mut Value,
@@ -198,6 +208,198 @@ pub(crate) fn apply_type_property_additions(
     }
 
     Ok(())
+}
+
+/// Corrects properties the extract carries with a wrong fact, in place.
+///
+/// The overlay is applied to every corpus the analyzer loads, and a corpus of
+/// another platform release may well lack the target (`SpreadsheetDocumentRange`
+/// exists since 8.2, a property since some later release). Such a corpus is not
+/// rejected: the correction simply does not apply to it. `bsl-platform` carries
+/// no logger of its own, so a skipped target is not journaled at runtime; the
+/// curated entries are instead guarded by the tests over the built-in facts
+/// (`tests/bundled_facts.rs`), which fail if a target stops resolving there.
+///
+/// Resolved targets are unique: two entries that name one property through
+/// different spellings (`SpreadsheetDocumentRange.Значение` and
+/// `ОбластьЯчеекТабличногоДокумента.Value`) would otherwise fight over one
+/// record, and which of them won would be an accident of their order.
+pub(crate) fn apply_type_property_corrections(
+    data: &mut Value,
+    overlay_source: &str,
+) -> Result<(), OverlayError> {
+    let corrections = parse_property_corrections(overlay_source)?;
+    if corrections.is_empty() {
+        return Ok(());
+    }
+
+    let type_keys = extracted_type_keys(data);
+    let mut corrected: std::collections::HashMap<(String, usize), String> =
+        std::collections::HashMap::new();
+    for correction in corrections {
+        let written = format!("{}.{}", correction.type_name, correction.property_name);
+        let folded_type = correction.type_name.fold_lower();
+        let Some(canonical_type) = type_keys.get(folded_type.as_str()).cloned() else {
+            continue;
+        };
+        let Some(index) = unique_property_index(data, &canonical_type, &correction.property_name)
+        else {
+            continue;
+        };
+        let key = (canonical_type.clone(), index);
+        if let Some(previous) = corrected.insert(key, written.clone()) {
+            return Err(OverlayError(format!(
+                "type property corrections {previous} and {written} resolve to the same property of {canonical_type}"
+            )));
+        }
+        let Some(property) = data
+            .get_mut("properties")
+            .and_then(Value::as_array_mut)
+            .and_then(|properties| properties.get_mut(index))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        if let Some(is_readonly) = correction.is_readonly {
+            property.insert("is_readonly".to_owned(), Value::Bool(is_readonly));
+        }
+        if let Some(property_types) = &correction.property_types {
+            property.insert(
+                "property_types".to_owned(),
+                Value::Array(property_types.iter().cloned().map(Value::String).collect()),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Folded Russian and English spellings of every extracted type → that type's
+/// English name, which is how `properties_by_type` and `methods_by_type` key
+/// their entries.
+///
+/// A spelling is dropped from the map when it does not denote exactly one type.
+/// Two cases make that happen, and both must be ruled out or an overlay would
+/// correct a record picked from two candidates by accident of order: two records
+/// answering to one spelling under *different* English names (`ЭлементыФормы` is
+/// both `FormItems` and `Controls`), and one English name shared by more than one
+/// record — the corpus has such pairs, and everything that resolves to that name
+/// means an arbitrary one of them.
+fn extracted_type_keys(data: &Value) -> std::collections::HashMap<String, String> {
+    let mut records: Vec<(String, String)> = Vec::new();
+    let mut english_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for ty in data.get("types").and_then(Value::as_array).into_iter().flatten() {
+        let Some(object) = ty.as_object() else { continue };
+        let Some(english_name) = object.get("english_name").and_then(Value::as_str) else {
+            continue;
+        };
+        *english_counts.entry(english_name.fold_lower()).or_insert(0) += 1;
+        let russian_name = object.get("name").and_then(Value::as_str).unwrap_or("");
+        records.push((russian_name.to_owned(), english_name.to_owned()));
+    }
+
+    let mut keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for (russian_name, english_name) in &records {
+        let shared_english_name =
+            english_counts.get(english_name.fold_lower().as_str()).is_some_and(|count| *count > 1);
+        for name in [russian_name.as_str(), english_name.as_str()] {
+            if name.is_empty() {
+                continue;
+            }
+            let key = name.fold_lower();
+            if shared_english_name {
+                ambiguous.insert(key);
+                continue;
+            }
+            match keys.get(&key) {
+                Some(existing) if existing != english_name => {
+                    ambiguous.insert(key);
+                }
+                Some(_) => {}
+                None => {
+                    keys.insert(key, english_name.clone());
+                }
+            }
+        }
+    }
+    for key in ambiguous {
+        keys.remove(&key);
+    }
+    keys
+}
+
+/// Index of the single property `canonical_type.name` names, by either spelling
+/// of the property and with the type's English name as the record carries it.
+fn unique_property_index(data: &Value, canonical_type: &str, property_name: &str) -> Option<usize> {
+    let wanted = property_name.fold_lower();
+    let mut found = None;
+    for (index, property) in
+        data.get("properties").and_then(Value::as_array).into_iter().flatten().enumerate()
+    {
+        let Some(object) = property.as_object() else { continue };
+        if !stdx::case::eq_ignore_case(
+            object.get("type_name").and_then(Value::as_str).unwrap_or(""),
+            canonical_type,
+        ) {
+            continue;
+        }
+        let named = ["name", "english_name"].iter().any(|field| {
+            object
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|existing| existing.fold_lower() == wanted)
+        });
+        if !named {
+            continue;
+        }
+        // Two records of one (type, name) pair cannot both answer a lookup, so
+        // neither is corrected rather than an arbitrary one of them.
+        if found.is_some() {
+            return None;
+        }
+        found = Some(index);
+    }
+    found
+}
+
+/// The attestations of `type_member_surface_attestations`, resolved to the
+/// corpus: an entry whose type the corpus does not have is dropped, for the
+/// same reason a correction with a missing target is, and the entry then names
+/// the type by its English canonical name.
+///
+/// One type is attested once: two entries naming it through different spellings
+/// (`SpreadsheetDocumentRange` and `ОбластьЯчеекТабличногоДокумента`) would
+/// silently keep whichever version came last.
+pub(crate) fn parse_resolved_member_surface_attestations(
+    data: &Value,
+    overlay_source: &str,
+) -> Result<Vec<TypeMemberSurfaceAttestation>, OverlayError> {
+    let attestations = parse_member_surface_attestations(overlay_source)?;
+    if attestations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let type_keys = extracted_type_keys(data);
+    let mut attested: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut resolved = Vec::new();
+    for mut attestation in attestations {
+        let folded_type = attestation.type_name.fold_lower();
+        let Some(canonical_name) = type_keys.get(folded_type.as_str()).cloned() else {
+            continue;
+        };
+        if let Some(previous) =
+            attested.insert(canonical_name.clone(), attestation.type_name.clone())
+        {
+            return Err(OverlayError(format!(
+                "type member surface attestations {previous} and {} resolve to the same type {canonical_name}",
+                attestation.type_name
+            )));
+        }
+        attestation.type_name = canonical_name;
+        resolved.push(attestation);
+    }
+    Ok(resolved)
 }
 
 fn property_exists(data: &Value, addition: &TypePropertyAddition) -> bool {

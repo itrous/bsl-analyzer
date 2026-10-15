@@ -50,11 +50,46 @@ pub(crate) struct TypePropertyAddition {
     pub(crate) min_version: Option<String>,
 }
 
+/// A correction to a property the extract already carries, but with a wrong
+/// fact — the help page omits the read-only mark, so the extracted record says
+/// the property is writable and the analyzer accepts a write the runtime
+/// refuses. Unlike [`TypePropertyAddition`] this never invents a property: the
+/// target must exist in the corpus, and a corpus of another platform release
+/// that lacks it is left alone (the same overlay serves every source).
+#[derive(Debug)]
+pub(crate) struct TypePropertyCorrection {
+    /// The owning type, by its Russian or English spelling.
+    pub(crate) type_name: String,
+    /// The property, by its Russian or English spelling.
+    pub(crate) property_name: String,
+    /// `Some` replaces the extracted flag, `None` leaves it as extracted.
+    pub(crate) is_readonly: Option<bool>,
+    /// `Some` replaces the whole extracted value-type list.
+    pub(crate) property_types: Option<Vec<String>>,
+}
+
+/// A platform type whose extracted member surface — every method and property —
+/// is attested as complete for the named platform release. A miss on such a
+/// receiver is a defect of the checked code rather than a gap in the extract,
+/// which is what lets the absent-member checks judge a platform type at all:
+/// for the types without an attestation the extract is not known to be
+/// exhaustive, and a miss there proves nothing.
+#[derive(Debug)]
+pub(crate) struct TypeMemberSurfaceAttestation {
+    /// The attested type, by its Russian or English spelling.
+    pub(crate) type_name: String,
+    /// The platform release the surface was verified against, `8.3.27` — the
+    /// check runs only where the served corpus is of that version or newer.
+    pub(crate) verified_against_version: String,
+}
+
 const OVERLAY_ROOT_FIELDS: &[&str] = &[
     "schema_version",
     "method_parameter_overrides",
     "global_function_parameter_overrides",
     "type_property_additions",
+    "type_property_corrections",
+    "type_member_surface_attestations",
 ];
 
 pub(crate) fn parse_overrides(
@@ -133,6 +168,183 @@ pub(crate) fn parse_property_additions(
     };
 
     entries.iter().enumerate().map(|(index, entry)| parse_property_addition(index, entry)).collect()
+}
+
+/// Parses the optional `type_property_corrections` section. An absent section
+/// yields no corrections; the root schema is validated the same way as
+/// [`parse_overrides`].
+pub(crate) fn parse_property_corrections(
+    overlay_source: &str,
+) -> Result<Vec<TypePropertyCorrection>, OverlayError> {
+    let root: Value = serde_json::from_str(overlay_source)
+        .map_err(|error| OverlayError(format!("malformed overlay JSON: {error}")))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| OverlayError("overlay root must be an object".to_owned()))?;
+    require_only_fields(object, OVERLAY_ROOT_FIELDS, "overlay root")?;
+    validate_schema_version(object)?;
+    let entries = match object.get("type_property_corrections") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_array().ok_or_else(|| {
+            OverlayError("overlay type_property_corrections must be an array".to_owned())
+        })?,
+    };
+
+    let corrections: Vec<TypePropertyCorrection> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_property_correction(index, entry))
+        .collect::<Result<_, _>>()?;
+    // Two corrections of one property would fight over the same record; the
+    // loser's correction would silently not apply, so refuse the document.
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for correction in &corrections {
+        let key = (correction.type_name.to_lowercase(), correction.property_name.to_lowercase());
+        if !seen.insert(key) {
+            return Err(OverlayError(format!(
+                "duplicate type property correction for {}.{}",
+                correction.type_name, correction.property_name
+            )));
+        }
+    }
+    Ok(corrections)
+}
+
+/// Parses the optional `type_member_surface_attestations` section. An absent
+/// section yields no attestations; the root schema is validated the same way as
+/// [`parse_overrides`].
+pub(crate) fn parse_member_surface_attestations(
+    overlay_source: &str,
+) -> Result<Vec<TypeMemberSurfaceAttestation>, OverlayError> {
+    let root: Value = serde_json::from_str(overlay_source)
+        .map_err(|error| OverlayError(format!("malformed overlay JSON: {error}")))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| OverlayError("overlay root must be an object".to_owned()))?;
+    require_only_fields(object, OVERLAY_ROOT_FIELDS, "overlay root")?;
+    validate_schema_version(object)?;
+    let entries = match object.get("type_member_surface_attestations") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_array().ok_or_else(|| {
+            OverlayError("overlay type_member_surface_attestations must be an array".to_owned())
+        })?,
+    };
+
+    let attestations: Vec<TypeMemberSurfaceAttestation> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_member_surface_attestation(index, entry))
+        .collect::<Result<_, _>>()?;
+    let mut seen: HashSet<String> = HashSet::new();
+    for attestation in &attestations {
+        if !seen.insert(attestation.type_name.to_lowercase()) {
+            return Err(OverlayError(format!(
+                "duplicate type member surface attestation for {}",
+                attestation.type_name
+            )));
+        }
+    }
+    Ok(attestations)
+}
+
+fn parse_property_correction(
+    index: usize,
+    entry: &Value,
+) -> Result<TypePropertyCorrection, OverlayError> {
+    let context = format!("type property correction {index}");
+    let object =
+        entry.as_object().ok_or_else(|| OverlayError(format!("{context} must be an object")))?;
+    require_only_fields(
+        object,
+        &["type", "name", "is_readonly", "property_types", "evidence_source", "rationale"],
+        &context,
+    )?;
+    let type_name = required_string(object, "type", index)?;
+    let property_name = required_string(object, "name", index)?;
+    let is_readonly = match object.get("is_readonly") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_bool()
+                .ok_or_else(|| OverlayError(format!("{context} is_readonly must be a boolean")))?,
+        ),
+    };
+    let property_types = match object.get("property_types") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let types = value
+                .as_array()
+                .ok_or_else(|| OverlayError(format!("{context} property_types must be an array")))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            OverlayError(format!(
+                                "{context} property_types must contain non-empty strings"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if types.is_empty() {
+                return Err(OverlayError(format!("{context} property_types must not be empty")));
+            }
+            let unique: HashSet<&str> = types.iter().map(String::as_str).collect();
+            if unique.len() != types.len() {
+                return Err(OverlayError(format!(
+                    "{context} property_types contains duplicate types"
+                )));
+            }
+            Some(types)
+        }
+    };
+    if is_readonly.is_none() && property_types.is_none() {
+        return Err(OverlayError(format!(
+            "{context} changes nothing: it needs is_readonly or property_types"
+        )));
+    }
+    required_string(object, "evidence_source", index)?;
+    required_string(object, "rationale", index)?;
+
+    Ok(TypePropertyCorrection { type_name, property_name, is_readonly, property_types })
+}
+
+fn parse_member_surface_attestation(
+    index: usize,
+    entry: &Value,
+) -> Result<TypeMemberSurfaceAttestation, OverlayError> {
+    let context = format!("type member surface attestation {index}");
+    let object =
+        entry.as_object().ok_or_else(|| OverlayError(format!("{context} must be an object")))?;
+    require_only_fields(
+        object,
+        &["type", "verified_against_version", "evidence_source", "rationale"],
+        &context,
+    )?;
+    let type_name = required_string(object, "type", index)?;
+    let verified_against_version = required_string(object, "verified_against_version", index)?;
+    match parse_version(&verified_against_version) {
+        // A release, not a version line: `8` or `8.3` would stand for every
+        // release of that line and open the check on each of them, so the
+        // attestation has to name at least major.minor.patch.
+        Some(components) if components.len() >= 3 => {}
+        Some(_) => {
+            return Err(OverlayError(format!(
+                "{context} verified_against_version must be at least major.minor.patch"
+            )))
+        }
+        None => {
+            return Err(OverlayError(format!(
+                "{context} verified_against_version must be a dotted numeric version"
+            )))
+        }
+    }
+    required_string(object, "evidence_source", index)?;
+    required_string(object, "rationale", index)?;
+
+    Ok(TypeMemberSurfaceAttestation { type_name, verified_against_version })
 }
 
 fn validate_schema_version(object: &Map<String, Value>) -> Result<(), OverlayError> {
@@ -393,7 +605,18 @@ fn optional_version(
     }
 }
 
-fn parse_version(value: &str) -> Option<Vec<u32>> {
-    let components = value.split('.').map(str::parse).collect::<Result<Vec<u32>, _>>().ok()?;
+/// A dotted numeric version (`8.3.27.2214`) as comparable components. Components
+/// are plain decimal digits: `u32`'s own parser would accept a sign, and
+/// `+8.3.27` is no release spelling.
+pub(crate) fn parse_version(value: &str) -> Option<Vec<u32>> {
+    let components = value
+        .split('.')
+        .map(|component| {
+            if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            component.parse::<u32>().ok()
+        })
+        .collect::<Option<Vec<u32>>>()?;
     (!components.is_empty()).then_some(components)
 }

@@ -226,5 +226,28 @@
       "evidence_source": "1C vendor standard v8std #std742 (https://its.1c.ru/db/v8std#content:742): the managed-form window mode is set as `РежимОткрытияОкна = БлокироватьОкноВладельца`.",
       "rationale": "shcntx_ru.hbk files this writable managed-form property under its enum type name (FormWindowOpeningMode / РежимОткрытияОкнаФормы), so the extracted data lacks ClientApplicationForm.РежимОткрытияОкна and the unused-local check reports every `РежимОткрытияОкна = …` form-context write as a dead local."
     }
+  ],
+  "type_property_corrections": [
+    {
+      "type": "SpreadsheetDocumentRange",
+      "name": "Значение",
+      "is_readonly": true,
+      "evidence_source": "ISSUE #230: a runtime probe on platform 8.3.27.2214 — `Область = ТабДок.ТекущаяОбласть; Область.Значение = 5;` is refused at run time with «Поле объекта недоступно для записи (Значение)». The extracted record of ОбластьЯчеекТабличногоДокумента.Значение (property id 12748) carries `is_readonly: false`; the same flag is false in the legacy `platform_data.json` of releases before v0.3.0 (the file left the tree with #312), so this is a data gap and not a regression of the dump.",
+      "rationale": "The help page of ОбластьЯчеекТабличногоДокумента.Значение omits the read-only mark the runtime enforces, so every `Обл.Значение = …` on a range is accepted silently by the analyzer although the assignment can never succeed — the value of a range belongs to the document that computed it. ReadOnlyPropertyAssignment has to answer for this property as it does for Запрос.Параметры."
+    }
+  ],
+  "type_member_surface_attestations": [
+    {
+      "type": "SpreadsheetDocumentRange",
+      "verified_against_version": "8.3.27",
+      "evidence_source": "The pinned 8.3.27 corpus (PROVENANCE.md) documents ОбластьЯчеекТабличногоДокумента with 8 methods (ids 6361-6368) and 63 properties (ids 12690-12752); platform_facts.json holds exactly those records, each with its own execution contexts and minimum version (one property, ЭлементУправления, carries no value-type list in the extract, which says nothing about the member list). The type is not one of the 57 corpus types the extract records with neither a method nor a property, its name is unique (ОбластьЯчеекТабличногоДокумента / SpreadsheetDocumentRange resolve to one type), and no docs-gap overlay of crates/bsl-platform/src/db.rs synthesizes or withholds a member of it — the only synthesized member in the corpus belongs to XMLStringProcessingManager.",
+      "rationale": "An absent-member check on a platform type is only sound where the extract is known to list the whole surface: for the 57 types the extract records with neither a method nor a property, and for the types the docs-gap overlays patch, a miss proves nothing. SpreadsheetDocumentRange is neither, so its 71 extracted members are the platform's own surface at 8.3.27 and a miss on a receiver of it is a defect of the checked code."
+    },
+    {
+      "type": "JSONWriter",
+      "verified_against_version": "8.3.27",
+      "evidence_source": "The pinned 8.3.27 corpus documents ЗаписьJSON / JSONWriter with 11 methods (ids 4602-4612: УстановитьСтроку, ОткрытьФайл, ОткрытьПоток, ЗаписатьНачалоМассива, ЗаписатьКонецМассива, ЗаписатьЗначение, ЗаписатьИмяСвойства, ЗаписатьНачалоОбъекта, ЗаписатьКонецОбъекта, ЗаписатьБезОбработки, Закрыть) and 2 properties (ids 9550-9551: Параметры, ПроверятьСтруктуру); platform_facts.json holds exactly these 13 records, and the published syntax assistant of 8.3 names the same eleven methods. The type is not among the corpus types without members, its name is unique (ЗаписьJSON / JSONWriter resolve to one type), and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it.",
+      "rationale": "JSON is written through the object/array/value members the extract lists; there is no table-level member, so a call like `Запись.ЗаписатьНачалоТаблицы()` is a call the platform does not answer. Attesting the 13 members makes the method-miss check able to say so, where before the receiver was a PlatformObject with an unjudgeable surface."
+    }
   ]
 }

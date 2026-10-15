@@ -3,6 +3,21 @@ use hir::DefDatabase;
 use ide_db::TextRange;
 use stdx::case::CaseExt;
 
+/// Whether the process snapshot serves the built-in interface facts: no
+/// `--cfg corpus_contract` and no `BSL_PLATFORM_HELP_CORPUS`.
+///
+/// The two are one input, not one condition. The documented corpus profile sets
+/// both the flag and the variable; a bare variable is a corpus run without the
+/// flag. What they have in common is what matters to a verdict that rests on the
+/// platform release of the served data: a corpus file carries no version
+/// (`PlatformHelpOrigin::platform_version` is `None` for it), so such a verdict
+/// has no answer in either — see `docs/ru/UnresolvedField.md`, «если версию
+/// данных определить нельзя, проверка молчит». A test in that position either
+/// stands aside (early return) or asserts the silence itself.
+pub fn built_in_facts_are_served() -> bool {
+    !cfg!(corpus_contract) && std::env::var_os(bsl_platform::CORPUS_ENV).is_none()
+}
+
 pub fn range_to_line_col(text: &str, range: TextRange) -> (u32, u32, u32, u32) {
     let start_offset: usize = range.start().into();
     let end_offset: usize = range.end().into();

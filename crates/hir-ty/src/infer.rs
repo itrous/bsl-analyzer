@@ -2691,6 +2691,27 @@ impl<'db> InferenceContext<'db> {
                     //
                     // An object a common attribute may reach without the reader being able
                     // to say so has an open field set, and a miss on it proves nothing.
+                    // A platform type is as closed a receiver as a metadata
+                    // collection where the curated overlays attest that the
+                    // extract lists its whole member surface: a miss is then a
+                    // defect of the checked code, not a gap in the corpus. The
+                    // attestation holds for one type at a known platform
+                    // release, so anything less — a corpus older than the
+                    // attested release, a corpus of unknown version — keeps the
+                    // receiver open, and so does a homonym, whose namesake may
+                    // well own the name (the verification already refuses an
+                    // ambiguous name itself; the guard restates the
+                    // precondition here so this verdict does not rest on an
+                    // unseen detail of another module's contract).
+                    let closed_platform_object = {
+                        let platform = bsl_platform::PlatformData::instance();
+                        matches!(
+                            base_kind,
+                            TypeKind::PlatformObject(facet)
+                                if platform.platform_type_member_surface_verified(&facet.name)
+                                    && !platform.is_ambiguous_type_name(&facet.name)
+                        )
+                    };
                     let closed_receiver = (matches!(
                         base_kind,
                         TypeKind::MetadataRef(_)
@@ -2709,7 +2730,8 @@ impl<'db> InferenceContext<'db> {
                                     self.db, base_ty,
                                 )
                                 .unwrap_or(base_ty),
-                            ));
+                            ))
+                        || closed_platform_object;
                     // `Метаданные.Справочники` is closed on the same grounds as the manager
                     // collection, but only where the configuration is visible: an external
                     // processor or a loose module names objects of a configuration this
@@ -3639,13 +3661,32 @@ impl<'db> InferenceContext<'db> {
                             method_name: method_name.clone(),
                             kind: UnresolvedMethodKind::MethodNotFound,
                         });
-                    } else if matches!(
-                        self.db.lookup_type(receiver_ty),
-                        TypeKind::PlatformObject(_)
-                    ) {
-                        let base_expr = self.body.expr(base_id).clone();
-                        if let Expr::Path(receiver_path_name) = base_expr {
-                            if matches!(
+                    } else if let Some(platform_type) = match self.db.lookup_type(receiver_ty) {
+                        TypeKind::PlatformObject(facet) => Some(facet.name.clone()),
+                        _ => None,
+                    } {
+                        // A platform type whose member surface is attested as
+                        // complete is a closed receiver: the extract lists every
+                        // method it has, so a miss is the platform's own answer
+                        // and not a gap in the corpus. The name is the receiver
+                        // to the reader — the platform type in the spelling the
+                        // corpus uses.
+                        let platform = bsl_platform::PlatformData::instance();
+                        if platform.platform_type_member_surface_verified(&platform_type)
+                            && !platform.is_ambiguous_type_name(&platform_type)
+                        {
+                            self.push_inference_diagnostic(
+                                InferenceDiagnostic::UnresolvedMethodCall {
+                                    expr: callee,
+                                    receiver_name: hir_def::Name::new(&platform_type),
+                                    method_name: method_name.clone(),
+                                    kind: UnresolvedMethodKind::MethodNotFound,
+                                },
+                            );
+                        } else {
+                            let base_expr = self.body.expr(base_id).clone();
+                            if let Expr::Path(receiver_path_name) = base_expr {
+                                if matches!(
                                 crate::platform_global_lookup::try_resolve_platform_global_member(
                                     self.db,
                                     &receiver_path_name,
@@ -3653,14 +3694,15 @@ impl<'db> InferenceContext<'db> {
                                 ),
                                 crate::platform_global_lookup::PlatformGlobalLookup::KnownContainerMissingMember
                             ) {
-                                self.push_inference_diagnostic(
-                                    InferenceDiagnostic::UnresolvedMethodCall {
-                                        expr: callee,
-                                        receiver_name: receiver_path_name,
-                                        method_name: method_name.clone(),
-                                        kind: UnresolvedMethodKind::MethodNotFound,
-                                    },
-                                );
+                                    self.push_inference_diagnostic(
+                                        InferenceDiagnostic::UnresolvedMethodCall {
+                                            expr: callee,
+                                            receiver_name: receiver_path_name,
+                                            method_name: method_name.clone(),
+                                            kind: UnresolvedMethodKind::MethodNotFound,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }

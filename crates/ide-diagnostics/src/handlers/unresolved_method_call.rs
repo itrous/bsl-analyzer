@@ -647,4 +647,110 @@ mod tests {
             "the parameter shadows the predefined name and carries an array, got: {umc:?}"
         );
     }
+
+    fn platform_umc(code: &str) -> Vec<String> {
+        check_hir_diagnostic(code)
+            .into_iter()
+            .filter(|d| d.code == DiagnosticCode::UnresolvedMethodCall)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// JSON is written through object, array and value members; the platform has no
+    /// table-level call. `ЗаписьJSON` is a platform type whose member surface the curated
+    /// overlays attest as complete, so the miss is reported against the type — where for
+    /// any type without an attestation an unlisted member proves nothing.
+    ///
+    /// The assertion describes a source of a known release. The documented corpus profile
+    /// serves a corpus file, which carries no platform version, so there the contract keeps
+    /// the check silent by design; the silence is asserted by
+    /// [`a_versionless_corpus_keeps_the_platform_miss_silent`] instead.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_an_attested_platform_type_is_reported() {
+        let umc = platform_umc(
+            "Процедура Тест()\n    Запись = Новый ЗаписьJSON;\n    Запись.ЗаписатьНачалоТаблицы();\nКонецПроцедуры",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(
+                umc[0].contains("ЗаписатьНачалоТаблицы"),
+                "message must name the method: {umc:?}"
+            );
+            assert!(umc[0].contains("ЗаписьJSON"), "message must name the receiver type: {umc:?}");
+        } else {
+            // A corpus run: the served file carries no platform version, so the
+            // completeness gate is shut by contract (see the class docs) and the very
+            // same call is silent. The control says the silence is that gate and not a
+            // corpus that went missing.
+            assert!(
+                !bsl_platform::PlatformData::instance()
+                    .platform_type_member_surface_verified("JSONWriter"),
+                "a corpus without a version must leave the gate shut"
+            );
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// The other half of the contract, on the profile that exercises it: with a corpus
+    /// whose platform version cannot be determined the completeness gate stays shut, so
+    /// the very same call is silent. The controls say why that silence is the contract
+    /// and not a lost corpus: the served data knows the writer, the method really is
+    /// absent from it, and the gate really is the thing that is closed.
+    #[test]
+    #[cfg_attr(
+        not(corpus_contract),
+        ignore = "corpus contract: needs a corpus that carries no platform version"
+    )]
+    fn a_versionless_corpus_keeps_the_platform_miss_silent() {
+        let data = bsl_platform::PlatformData::instance();
+        assert!(
+            data.get_type("ЗаписьJSON").is_some(),
+            "the corpus profile must serve the pinned corpus"
+        );
+        assert!(
+            data.get_method("JSONWriter", "ЗаписатьНачалоТаблицы").is_none(),
+            "the method the positive test misses must still be absent from the corpus"
+        );
+        assert!(
+            !data.platform_type_member_surface_verified("JSONWriter"),
+            "a corpus without a version must leave the gate shut"
+        );
+
+        let umc = platform_umc(
+            "Процедура Тест()\n    Запись = Новый ЗаписьJSON;\n    Запись.ЗаписатьНачалоТаблицы();\n    Запись.ЗаписатьНачалоОбъекта();\nКонецПроцедуры",
+        );
+        assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+    }
+
+    /// The gate and the existing members: a spreadsheet document is not attested, so the
+    /// same kind of miss on it stays silent, and the JSON members that do exist never
+    /// report. Without the first half a rule phrased as "every platform type is closed"
+    /// would be green here too.
+    #[test]
+    fn a_miss_without_an_attestation_and_known_members_stay_silent() {
+        let unattested = platform_umc(
+            "Процедура Тест()\n    ТабДок = Новый ТабличныйДокумент;\n    ТабДок.ЗаписатьНачалоТаблицы();\nКонецПроцедуры",
+        );
+        assert!(
+            unattested.is_empty(),
+            "an unattested platform type must stay soft: {unattested:?}"
+        );
+
+        let known_members = platform_umc(
+            "Процедура Тест()\n    Запись = Новый ЗаписьJSON;\n    Запись.ЗаписатьНачалоОбъекта();\n    Запись.ЗаписатьЗначение(1);\n    Запись.Закрыть();\nКонецПроцедуры",
+        );
+        assert!(
+            known_members.is_empty(),
+            "members the extract has must never report: {known_members:?}"
+        );
+
+        let undefined_receiver = platform_umc(
+            "Процедура Тест()\n    Н = Неопределено;\n    Н.НетТакогоМетода();\nКонецПроцедуры",
+        );
+        assert!(undefined_receiver.is_empty(), "Неопределено stays soft: {undefined_receiver:?}");
+    }
 }

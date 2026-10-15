@@ -34,6 +34,23 @@ pub struct PlatformSnapshot {
     pub global_function_docs: Vec<MethodDocs>,
     pub constructor_docs: Vec<ConstructorDocs>,
     pub property_docs: Vec<PropertyDocs>,
+    /// Types whose extracted member surface is attested as complete, carried by
+    /// the curated overlays (`type_member_surface_attestations`). The evidence
+    /// lives on the corpus side of the overlay, so every source ends up here
+    /// with it. Empty when no overlay attests anything.
+    pub member_surface_attestations: Vec<MemberSurfaceAttestation>,
+}
+
+/// One `type_member_surface_attestations` entry, resolved to the corpus it was
+/// applied to: the extract lists every method and property the named type has,
+/// so a member the extract does not know is genuinely absent from the platform
+/// release the surface was verified against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberSurfaceAttestation {
+    /// The attested type's English canonical name, as the extract spells it.
+    pub type_name: String,
+    /// The platform release the completeness was verified against, `8.3.27`.
+    pub verified_against_version: String,
 }
 
 /// Why a corpus could not become a snapshot. Nothing is published on error: the
@@ -103,8 +120,20 @@ impl PlatformSnapshot {
             .map_err(overlay_error)?;
         crate::overlays::apply_type_property_additions(&mut data, overlays)
             .map_err(overlay_error)?;
+        crate::overlays::apply_type_property_corrections(&mut data, overlays)
+            .map_err(overlay_error)?;
+        let member_surface_attestations =
+            crate::overlays::parse_resolved_member_surface_attestations(&data, overlays)
+                .map_err(overlay_error)?;
 
-        let snapshot = decode(&data)?;
+        let mut snapshot = decode(&data)?;
+        snapshot.member_surface_attestations = member_surface_attestations
+            .into_iter()
+            .map(|attestation| MemberSurfaceAttestation {
+                type_name: attestation.type_name,
+                verified_against_version: attestation.verified_against_version,
+            })
+            .collect();
         snapshot.validate()?;
         Ok(snapshot)
     }

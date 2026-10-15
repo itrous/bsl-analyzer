@@ -447,3 +447,60 @@ fn query_selection_field_assignment_still_emits_diagnostic() {
         db.lookup_type(diags[0].1)
     );
 }
+
+/// The range value is read-only at run time — the platform refuses
+/// `Обл.Значение = …` with «Поле объекта недоступно для записи (Значение)» — while its
+/// help page omits the mark. The curated property correction of
+/// `platform_overlays.json` restores the fact, so the assignment is reported.
+#[test]
+fn spreadsheet_range_value_assignment_emits_diagnostic() {
+    let code = "\
+Процедура Тест()
+    ТабДок = Новый ТабличныйДокумент;
+    Область = ТабДок.ТекущаяОбласть;
+    Область.Значение = 5;
+КонецПроцедуры
+";
+    let (db, file_id) = setup_inline(code);
+    let diags = readonly_diagnostics(&db, file_id);
+    assert_eq!(diags.len(), 1, "expected exactly one ReadOnlyPropertyAssignment, got: {diags:?}");
+    assert_eq!(diags[0].0.as_str(), "Значение");
+    assert!(
+        matches!(
+            db.lookup_type(diags[0].1),
+            TypeKind::PlatformObject(ref facet) if facet.name.as_str() == "ОбластьЯчеекТабличногоДокумента"
+        ),
+        "receiver must be the range, got {:?}",
+        db.lookup_type(diags[0].1)
+    );
+}
+
+/// The same property read is not an assignment: only a write is refused, and
+/// nothing else about `ОбластьЯчеекТабличногоДокумента` is affected by the
+/// correction — its neighbours stay writable.
+#[test]
+fn spreadsheet_range_value_read_and_writable_neighbours_stay_silent() {
+    let code = "\
+Процедура Тест()
+    ТабДок = Новый ТабличныйДокумент;
+    Область = ТабДок.ТекущаяОбласть;
+    Х = Область.Значение;
+    Область.Текст = \"итог\";
+КонецПроцедуры
+";
+    let (db, file_id) = setup_inline(code);
+    let diags = readonly_diagnostics(&db, file_id);
+    assert!(diags.is_empty(), "reading the value and writing Текст must stay silent: {diags:?}");
+
+    // Control: the receiver really is the corrected type, so the silence above is
+    // about the operation and not about an unresolved receiver.
+    let range = var_ty(&db, file_id, "область").expect("Область must be inferred");
+    assert!(
+        matches!(
+            db.lookup_type(range),
+            TypeKind::PlatformObject(ref facet) if facet.name.as_str() == "ОбластьЯчеекТабличногоДокумента"
+        ),
+        "Область must be the range, got {:?}",
+        db.lookup_type(range)
+    );
+}

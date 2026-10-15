@@ -1,6 +1,8 @@
 # Assignment to a read-only property
 
-Fires on an assignment whose left-hand side is a field access on a platform-type property marked `Использование: Только чтение` (read-only) in the platform help book. Examples: `Query.Parameters`, `QueryResult.Columns`.
+Fires on an assignment whose left-hand side is a field access on a platform-type property that is read-only. Examples: `Query.Parameters`, `QueryResult.Columns`.
+
+The read-only fact comes from the platform data. Its main source is the platform help book (`Использование: Только чтение`), but not the only one: where the help page carries no mark while the platform refuses the write, the fact is restored by a correction in `platform_overlays.json` (`type_property_corrections`, see `crates/bsl-platform/data/OVERLAYS.md`). `SpreadsheetDocumentRange.Значение` is fixed that way.
 
 ## Why this is a problem
 
@@ -24,4 +26,4 @@ Query.SetParameter("Key", Value);
 
 ## Suppression
 
-If the HBK entry is stale for a given property, or the diagnostic fires on legitimate code, it can be disabled through the analyzer configuration in the usual way.
+If the platform data is stale for a given property, or the diagnostic fires on legitimate code, it can be disabled through the analyzer configuration in the usual way.

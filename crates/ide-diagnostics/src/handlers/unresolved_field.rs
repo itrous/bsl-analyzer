@@ -531,4 +531,133 @@ mod tests {
 КонецПроцедуры"#;
         assert!(unresolved_fields(code).is_empty(), "{:?}", unresolved_fields(code));
     }
+
+    /// `ТекущаяОбласть` belongs to the spreadsheet document, not to the range it returns.
+    /// The range is a platform type whose member surface the curated overlays attest as
+    /// complete (`type_member_surface_attestations`), so the miss is a defect of the code
+    /// and not a gap in the extract — which is what makes it reportable at all.
+    ///
+    /// The assertion describes a source of a known release. The documented corpus profile
+    /// serves a corpus file, which carries no platform version, so there the contract keeps
+    /// the check silent by design; the silence is asserted by
+    /// [`a_versionless_corpus_keeps_the_platform_miss_silent`] instead.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_an_attested_platform_type_is_reported() {
+        let code = r#"Процедура Тест()
+    ТабДок = Новый ТабличныйДокумент;
+    Область = ТабДок.ТекущаяОбласть;
+    Нет = Область.ТекущаяОбласть;
+КонецПроцедуры"#;
+        if crate::test_utils::built_in_facts_are_served() {
+            let unresolved = unresolved_fields(code);
+            assert_eq!(unresolved.len(), 1, "expected one miss on the range, got: {unresolved:?}");
+            assert!(
+                unresolved[0].message.contains("ТекущаяОбласть"),
+                "message must name the missing field, got: {}",
+                unresolved[0].message
+            );
+            assert!(
+                unresolved[0].message.contains("ОбластьЯчеекТабличногоДокумента"),
+                "message must name the receiver type, got: {}",
+                unresolved[0].message
+            );
+        } else {
+            // A corpus run: the served file carries no platform version, so the
+            // completeness gate is shut by contract (see the class docs) and the very
+            // same miss is silent. The control says the silence is that gate and not a
+            // corpus that went missing — which is what a failure here would mean.
+            assert!(
+                !bsl_platform::PlatformData::instance()
+                    .platform_type_member_surface_verified("ОбластьЯчеекТабличногоДокумента"),
+                "a corpus without a version must leave the gate shut"
+            );
+            let unresolved = unresolved_fields(code);
+            assert!(
+                unresolved.is_empty(),
+                "an unknown platform version keeps the miss silent: {unresolved:?}"
+            );
+        }
+    }
+
+    /// The other half of the contract, on the profile that exercises it: with a corpus
+    /// whose platform version cannot be determined the completeness gate stays shut, so
+    /// the very same miss is silent. The controls say why that silence is the contract
+    /// and not a lost corpus: the served data knows the range, the member really is
+    /// absent from it, and the gate really is the thing that is closed.
+    #[test]
+    #[cfg_attr(
+        not(corpus_contract),
+        ignore = "corpus contract: needs a corpus that carries no platform version"
+    )]
+    fn a_versionless_corpus_keeps_the_platform_miss_silent() {
+        let data = bsl_platform::PlatformData::instance();
+        assert!(
+            data.get_type("ОбластьЯчеекТабличногоДокумента").is_some(),
+            "the corpus profile must serve the pinned corpus"
+        );
+        assert!(
+            data.get_property("SpreadsheetDocumentRange", "ТекущаяОбласть").is_none(),
+            "the member the positive test misses must still be absent from the corpus"
+        );
+        assert!(
+            !data.platform_type_member_surface_verified("ОбластьЯчеекТабличногоДокумента"),
+            "a corpus without a version must leave the gate shut"
+        );
+
+        let code = r#"Процедура Тест()
+    ТабДок = Новый ТабличныйДокумент;
+    Область = ТабДок.ТекущаяОбласть;
+    Нет = Область.ТекущаяОбласть;
+    Есть = Область.Значение;
+КонецПроцедуры"#;
+        assert!(
+            unresolved_fields(code).is_empty(),
+            "an unknown platform version keeps the miss silent: {:?}",
+            unresolved_fields(code)
+        );
+    }
+
+    /// The gate: without an attestation the extract is not known to list every member,
+    /// so the very same kind of miss proves nothing and stays silent. The receiver here
+    /// is the spreadsheet document itself, whose surface is deliberately not attested —
+    /// and reading a member that does exist is silent on the attested type, so the
+    /// check does not fire on ordinary code either.
+    #[test]
+    fn a_miss_without_an_attestation_and_known_members_stay_silent() {
+        let unattested = r#"Процедура Тест()
+    ТабДок = Новый ТабличныйДокумент;
+    Нет = ТабДок.ТекущаяОбластьНеТак;
+КонецПроцедуры"#;
+        assert!(
+            unresolved_fields(unattested).is_empty(),
+            "a type nobody attested must stay soft: {:?}",
+            unresolved_fields(unattested)
+        );
+
+        let known_members = r#"Процедура Тест()
+    ТабДок = Новый ТабличныйДокумент;
+    Область = ТабДок.ТекущаяОбласть;
+    Есть = Область.Значение;
+    Ещё = Область.Текст;
+КонецПроцедуры"#;
+        assert!(
+            unresolved_fields(known_members).is_empty(),
+            "members the extract has must never be reported: {:?}",
+            unresolved_fields(known_members)
+        );
+
+        let undefined_receiver = r#"Процедура Тест()
+    Н = Неопределено;
+    Нет = Н.НетТакогоПоля;
+КонецПроцедуры"#;
+        assert!(
+            unresolved_fields(undefined_receiver).is_empty(),
+            "Неопределено is no platform type and must stay soft: {:?}",
+            unresolved_fields(undefined_receiver)
+        );
+    }
 }
