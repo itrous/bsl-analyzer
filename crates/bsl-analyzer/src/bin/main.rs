@@ -56,7 +56,7 @@ use cli::{
     diagnostics_baseline::{self, DiagnosticsCommand},
     extension::{self, ExtensionCommands},
     format::run_format,
-    logging::setup_logging,
+    logging::{expand_log_file_path, setup_logging},
     lsp::run_lsp_server,
     mcp::{self, McpCommand},
     platform_help::{self as platform_help_cli, PlatformHelpCommand},
@@ -264,7 +264,10 @@ enum Commands {
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
 
-    let (log_file, append_log) = match env::var("BSL_LOG_FILE").ok().map(PathBuf::from) {
+    let (log_file, append_log) = match env::var("BSL_LOG_FILE")
+        .ok()
+        .map(|value| expand_log_file_path(PathBuf::from(value), std::process::id()))
+    {
         Some(file) => (Some(file), false),
         None => match &cli.command {
             Some(Commands::Mcp { command }) => (command.default_daemon_log_file(), true),
