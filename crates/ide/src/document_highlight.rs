@@ -1,6 +1,6 @@
 use hir::Semantics;
 use ide_db::RootDatabase;
-use syntax::{SyntaxNode, SyntaxToken, TextRange, TextSize};
+use syntax::{NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize};
 use vfs::FileId;
 
 use crate::reference_kind::{classify_reference_token, ReferenceKind};
@@ -25,6 +25,10 @@ pub enum DocumentHighlightKind {
 /// local, while the gate protects walks that leave the file and feeds rename. A typed member
 /// carries a real identity — its receiver and its field name — so the ungated walk lights
 /// every read of the member instead of the occurrence alone.
+///
+/// On a structural keyword (`Если`, `Цикл`, `Попытка`, `Процедура`, `#Если`, ...) or a region
+/// directive the answer is the keywords of that one construct, the way an editor matches a
+/// bracket: there is no symbol under the cursor to highlight there.
 pub fn document_highlights<DB: RootDatabase>(
     db: &DB,
     file_id: FileId,
@@ -34,6 +38,14 @@ pub fn document_highlights<DB: RootDatabase>(
 
     let parse = db.parse(file_id);
     let root = parse.syntax_node();
+
+    if let Some(marker) = root.token_at_offset(offset).find(|t| is_region_marker(t.kind())) {
+        return region_pair_highlights(&root, &marker);
+    }
+
+    if let Some(construct) = root.token_at_offset(offset).find_map(|t| keyword_construct(&t)) {
+        return construct_keyword_highlights(&construct);
+    }
 
     let token = match root.token_at_offset(offset).right_biased() {
         Some(t) if t.kind().is_name_token() => t,
@@ -53,6 +65,123 @@ pub fn document_highlights<DB: RootDatabase>(
             let kind = classify_highlight_token(&token);
             Some(DocumentHighlight { range: loc.range, kind })
         })
+        .collect()
+}
+
+/// The structural keywords of a block construct; the last one closes it.
+fn construct_keywords(kind: SyntaxKind) -> &'static [SyntaxKind] {
+    use SyntaxKind::*;
+    match kind {
+        PROCEDURE_DEF => &[KW_PROCEDURE, KW_END_PROCEDURE],
+        FUNCTION_DEF => &[KW_FUNCTION, KW_END_FUNCTION],
+        IF_STMT => &[KW_IF, KW_THEN, KW_ELSIF, KW_ELSE, KW_END_IF],
+        WHILE_STMT => &[KW_WHILE, KW_DO, KW_END_DO],
+        FOR_STMT => &[KW_FOR, KW_DO, KW_END_DO],
+        FOR_EACH_STMT => &[KW_FOR, KW_EACH, KW_DO, KW_END_DO],
+        TRY_STMT => &[KW_TRY, KW_EXCEPT, KW_END_TRY],
+        PRE_IF_DIR => &[PRE_IF, KW_THEN, PRE_ELSIF, PRE_ELSE, PRE_END_IF],
+        _ => &[],
+    }
+}
+
+/// Branch nodes whose leading keyword belongs to the enclosing construct.
+fn is_construct_clause(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::ELSIF_CLAUSE
+            | SyntaxKind::ELSE_CLAUSE
+            | SyntaxKind::EXCEPT_CLAUSE
+            | SyntaxKind::PRE_ELSIF_CLAUSE
+            | SyntaxKind::PRE_ELSE_CLAUSE
+    )
+}
+
+/// The construct a keyword token opens, divides or closes.
+///
+/// Only a keyword standing directly in the construct or in one of its branch nodes counts:
+/// the same word elsewhere — inside an expression, in a recovered error node — is not
+/// structural, and the cursor there keeps the ordinary symbol highlight.
+fn keyword_construct(token: &SyntaxToken) -> Option<SyntaxNode> {
+    let parent = token.parent()?;
+    let construct = if is_construct_clause(parent.kind()) { parent.parent()? } else { parent };
+    construct_keywords(construct.kind()).contains(&token.kind()).then_some(construct)
+}
+
+/// Every structural keyword of `construct`. Nested constructs own their keywords and are
+/// not entered: the keywords sit only in the construct node itself and its branch nodes.
+///
+/// A construct the parser left without its closing keyword answers nothing: half a pair
+/// would point at a block end that is not there.
+fn construct_keyword_highlights(construct: &SyntaxNode) -> Vec<DocumentHighlight> {
+    let keywords = construct_keywords(construct.kind());
+    let Some(&closing) = keywords.last() else {
+        return Vec::new();
+    };
+
+    let tokens: Vec<SyntaxToken> = construct
+        .children_with_tokens()
+        .flat_map(|element| match element {
+            NodeOrToken::Token(token) => vec![token],
+            NodeOrToken::Node(node) if is_construct_clause(node.kind()) => {
+                node.children_with_tokens().filter_map(|it| it.into_token()).collect()
+            }
+            NodeOrToken::Node(_) => Vec::new(),
+        })
+        .filter(|token| keywords.contains(&token.kind()))
+        .collect();
+
+    if !tokens.iter().any(|token| token.kind() == closing) {
+        return Vec::new();
+    }
+
+    tokens
+        .into_iter()
+        .map(|token| DocumentHighlight {
+            range: token.text_range(),
+            kind: DocumentHighlightKind::Text,
+        })
+        .collect()
+}
+
+fn is_region_marker(kind: SyntaxKind) -> bool {
+    matches!(kind, SyntaxKind::PRE_REGION | SyntaxKind::PRE_END_REGION)
+}
+
+/// A region directive and its balanced partner.
+///
+/// Region directives are flat markers, not containers, so the pairs are rebuilt in source
+/// order with a stack, the way the region tree builds them. A marker left without a partner
+/// answers nothing.
+fn region_pair_highlights(root: &SyntaxNode, marker: &SyntaxToken) -> Vec<DocumentHighlight> {
+    let mut open: Vec<SyntaxToken> = Vec::new();
+    let mut partner = None;
+    for token in root
+        .descendants_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|token| is_region_marker(token.kind()))
+    {
+        if token.kind() == SyntaxKind::PRE_REGION {
+            open.push(token);
+            continue;
+        }
+        let Some(start) = open.pop() else { continue };
+        if &start == marker {
+            partner = Some(token);
+            break;
+        }
+        if &token == marker {
+            partner = Some(start);
+            break;
+        }
+    }
+
+    let Some(partner) = partner else {
+        return Vec::new();
+    };
+    let mut pair = [marker.text_range(), partner.text_range()];
+    pair.sort_by_key(|range| range.start());
+    pair.into_iter()
+        .map(|range| DocumentHighlight { range, kind: DocumentHighlightKind::Text })
         .collect()
 }
 
@@ -412,7 +541,7 @@ mod tests {
         let source = "Процедура Тест() КонецПроцедуры";
         let (db, file_id) = create_db_with_file(source);
 
-        let offset = TextSize::from(source.find("Процедура").unwrap() as u32);
+        let offset = TextSize::from(source.find('(').unwrap() as u32);
         let highlights = document_highlights(&db, file_id, offset);
 
         assert!(highlights.is_empty());
