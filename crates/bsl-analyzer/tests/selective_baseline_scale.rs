@@ -99,7 +99,7 @@ fn child_peak_rss(child: &mut Child) -> (std::process::ExitStatus, u64) {
 
 fn run_child(mode: &str, root: &std::path::Path) -> u64 {
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([TEST_NAME, "--ignored", "--exact"])
+        .args([TEST_NAME, "--ignored", "--exact", "--nocapture"])
         .env("BSL_SELECTIVE_MIGRATION_SCALE_MODE", mode)
         .env("BSL_SELECTIVE_MIGRATION_SCALE_ROOT", root)
         .stdout(Stdio::null())
@@ -164,7 +164,7 @@ fn large_selective_v1_migration_streams_skipped_entries_with_bounded_rss() {
     let mut writer = BufWriter::new(std::fs::File::create(root.join("legacy.json")).unwrap());
     writer
         .write_all(
-            br#"{"schema_version":1,"scope":{"source_root":"src/cf","extensions":[{"name":"Ext","path":"src/cfe/Ext","depends_on":[]}]},"diagnostics":["#,
+            br#"{"schema_version":1,"scope":{"source_root":"src/cf","extensions":[{"name":"Ext","path":"src/cfe/Ext","scope":"InfoBase","depends_on":[]}]},"diagnostics":["#,
         )
         .unwrap();
     for index in 0..RECORDS {
