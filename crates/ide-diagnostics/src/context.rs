@@ -314,6 +314,14 @@ impl<'a> AnalysisContext<'a> {
         self.query(|p| p.module_index(source_root_id))
     }
 
+    /// Handler names some module of this file's source root binds by string to
+    /// another module's object - `Форма.ПодключитьОбработчикОжидания("Имя", …)` in a
+    /// helper handed the form.
+    pub fn workspace_foreign_handler_bindings(&self) -> Arc<hir::ForeignHandlerBindings> {
+        let source_root_id = self.source_root_id();
+        self.query(|p| p.workspace_foreign_handler_bindings(source_root_id))
+    }
+
     pub fn method_cfg(&self, method_id: hir::MethodId) -> Arc<hir::cfg::ControlFlowGraph> {
         self.query(|p| p.method_cfg(method_id))
     }

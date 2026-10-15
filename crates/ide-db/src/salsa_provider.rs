@@ -235,6 +235,13 @@ impl AnalysisProvider for SalsaProvider<'_> {
         self.db.module_members(source_root_id)
     }
 
+    fn workspace_foreign_handler_bindings(
+        &self,
+        source_root_id: SourceRootId,
+    ) -> Arc<hir::ForeignHandlerBindings> {
+        self.db.workspace_foreign_handler_bindings(source_root_id)
+    }
+
     fn module_index(&self, source_root_id: SourceRootId) -> Arc<ModuleIndex> {
         self.db.module_index(source_root_id)
     }

@@ -43,6 +43,22 @@ mod heap_estimate {
         v.estimated_heap()
     }
 
+    pub(super) fn foreign_handler_bindings_heap(
+        v: &Arc<crate::call_graph::ForeignHandlerBindings>,
+    ) -> usize {
+        std::mem::size_of::<crate::call_graph::ForeignHandlerBindings>()
+            + crate::heap_estimate::map_table_bytes::<intern::NormName, ()>(v.len())
+    }
+
+    pub(super) fn file_foreign_handler_bindings_heap(
+        v: &Arc<[crate::call_graph::ForeignHandlerBinding]>,
+    ) -> usize {
+        vec_bytes::<crate::call_graph::ForeignHandlerBinding>(v.len())
+            + v.iter()
+                .map(|b| name_bytes(&b.handler_name) + name_bytes(&b.receiver_root))
+                .sum::<usize>()
+    }
+
     fn call_target_name_heap(target: &CallTarget) -> usize {
         match target {
             CallTarget::QualifiedModule { module_name, method_name } => {
@@ -223,6 +239,142 @@ pub fn module_members_query(
         .collect();
     let _span = tracing::info_span!("module_members", file_count = files.len()).entered();
     Arc::new(crate::workspace::module_members(db, &files))
+}
+
+/// The handler bindings one file makes into other modules
+/// ([`crate::call_graph::collect_foreign_handler_bindings`]), sorted and deduplicated.
+/// Only the methods whose text holds a binding-method name token are lowered: the fold
+/// below visits every candidate file of the source root, and lowering whole modules
+/// there would cost a large configuration about as much as analysing it.
+#[salsa::tracked(heap_size = heap_estimate::file_foreign_handler_bindings_heap, returns(clone))]
+pub fn file_foreign_handler_bindings_query<'db>(
+    db: &'db dyn DefDatabase,
+    file_id_input: FileIdInput<'db>,
+) -> Arc<[crate::call_graph::ForeignHandlerBinding]> {
+    let file_id = file_id_input.file_id(db);
+    let name_offsets = db.file_name_offsets_ref(file_id);
+    let mut offsets: Vec<u32> = HANDLER_BINDING_TOKENS
+        .iter()
+        .flat_map(|token| {
+            name_offsets.offsets(&crate::normalize_match_name(&crate::Name::new(token))).iter()
+        })
+        .copied()
+        .collect();
+    if offsets.is_empty() {
+        return Arc::from([]);
+    }
+    offsets.sort_unstable();
+
+    let module_id = ModuleId::new(file_id);
+    let item_tree = db.item_tree_ref(file_id);
+    let mut bindings = Vec::new();
+    let mut outside_methods = offsets.clone();
+    for item in item_tree.methods() {
+        let range = item.source_range();
+        if !offsets.iter().any(|&offset| range.contains(offset.into())) {
+            continue;
+        }
+        outside_methods.retain(|&offset| !range.contains(offset.into()));
+        let input = crate::MethodIdInput::new(
+            db,
+            crate::MethodId { module: module_id, local_id: item.key() },
+        );
+        if let Some(lowered) = crate::method_body::method_lower_query(db, input) {
+            crate::call_graph::collect_foreign_handler_bindings(&lowered.body, &mut bindings);
+        }
+    }
+    if !outside_methods.is_empty() {
+        let module_code = module_code_lower_query(db, file_id_input);
+        crate::call_graph::collect_foreign_handler_bindings(&module_code.body, &mut bindings);
+    }
+    bindings.sort_unstable();
+    bindings.dedup();
+    Arc::from(bindings)
+}
+
+/// Method names that can bind a handler collected by
+/// [`crate::call_graph::collect_foreign_handler_bindings`].
+const HANDLER_BINDING_TOKENS: &[&str] = &[
+    "подключитьобработчикожидания",
+    "attachidlehandler",
+    "отключитьобработчикожидания",
+    "detachidlehandler",
+    "подключитьобработчикизмененияданных",
+    "attachdatachangehandler",
+    "установитьдействие",
+    "setaction",
+];
+
+/// Every handler name bound by string to another module's object anywhere in the
+/// source root - the fold of [`file_foreign_handler_bindings_query`] over the files
+/// that call a binding method on a receiver, minus bindings whose receiver is a common
+/// module (an exported method that merely shares the platform method's name).
+/// A form module consults it to keep a procedure wired from ANOTHER module (a helper
+/// handed the form) out of `UnusedLocalMethod`/`UnusedParameters`.
+#[salsa::tracked(
+    lru = 4,
+    heap_size = heap_estimate::foreign_handler_bindings_heap,
+    returns(clone)
+)]
+pub fn workspace_foreign_handler_bindings_query(
+    db: &dyn DefDatabase,
+    source_root_input: base_db::SourceRootInput,
+) -> Arc<crate::call_graph::ForeignHandlerBindings> {
+    let _span = tracing::info_span!("workspace_foreign_handler_bindings").entered();
+    let source_root = source_root_input.root(db);
+    let file_set = source_root.file_set();
+    // A text scan, not the source root's name-usage index: that index parses every
+    // file of the root inside this one query, serially, while the fold needs only the
+    // few files that call a binding method on a receiver.
+    let files: Vec<FileId> = source_root
+        .iter()
+        .filter(|&file_id| crate::workspace::is_bsl_source(file_set, file_id))
+        .filter(|&file_id| {
+            db.unwind_if_revision_cancelled();
+            *file_mentions_handler_binding_query(db, FileIdInput::new(db, file_id))
+        })
+        .collect();
+
+    let common_modules: FxHashSet<intern::NormName> = source_root
+        .iter()
+        .filter_map(|file_id| file_set.path_for_file(&file_id))
+        .filter_map(|path| {
+            crate::workspace::common_module_name_from_path(&path.as_path().to_string_lossy())
+        })
+        .map(|name| intern::NormName::intern(name.as_str()))
+        .collect();
+
+    let candidates = files.len();
+    let mut names: FxHashSet<intern::NormName> = FxHashSet::default();
+    for file_id in files {
+        db.unwind_if_revision_cancelled();
+        let input = FileIdInput::new(db, file_id);
+        for binding in file_foreign_handler_bindings_query(db, input).iter() {
+            let receiver = intern::NormName::intern(binding.receiver_root.as_str());
+            if !common_modules.contains(&receiver) {
+                names.insert(intern::NormName::intern(binding.handler_name.as_str()));
+            }
+        }
+    }
+    tracing::info!(candidates = candidates, names = names.len(), "ForeignHandlerBindings built");
+    Arc::new(crate::call_graph::ForeignHandlerBindings::new(names))
+}
+
+/// Whether the file's text calls a [`HANDLER_BINDING_TOKENS`] method on a receiver
+/// (`.ПодключитьОбработчикОжидания`, any letter case) - a pre-filter that reads the
+/// text without parsing it. A bare call binds the current module, which the
+/// same-module summary facts already cover, so it does not make a file a candidate.
+#[salsa::tracked]
+pub fn file_mentions_handler_binding_query<'db>(
+    db: &'db dyn DefDatabase,
+    file_id_input: FileIdInput<'db>,
+) -> bool {
+    let _span = tracing::info_span!("file_mentions_handler_binding").entered();
+    let text = stdx::case::fold_lower_per_char(db.file_text_ref(file_id_input.file_id(db)));
+    text.match_indices('.').any(|(dot, _)| {
+        let after = &text[dot + 1..];
+        HANDLER_BINDING_TOKENS.iter().any(|token| after.starts_with(token))
+    })
 }
 
 #[salsa::tracked(lru = 256, heap_size = heap_estimate::module_call_summary_heap, returns(clone))]

@@ -114,6 +114,17 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 called_methods.insert(method.name.as_str().fold_lower());
             }
         }
+        // The binding may sit in ANOTHER module: a helper handed the form runs
+        // `Форма.ПодключитьОбработчикОжидания("Имя", …)`, and the only trace of the name is
+        // that literal, in that helper.
+        let bindings = ctx.workspace_foreign_handler_bindings();
+        if !bindings.is_empty() {
+            for method in &summary.methods {
+                if bindings.is_bound(method.name.as_str()) {
+                    called_methods.insert(method.name.as_str().fold_lower());
+                }
+            }
+        }
     }
 
     if let Some(ref form) = metadata.form {

@@ -267,6 +267,15 @@ pub trait AnalysisProvider {
 
     fn module_members(&self, source_root_id: SourceRootId) -> Arc<hir::WorkspaceMembers>;
 
+    /// Handler names bound by string into another module anywhere in the source root;
+    /// empty for providers without a workspace (metadata-only test providers).
+    fn workspace_foreign_handler_bindings(
+        &self,
+        _source_root_id: SourceRootId,
+    ) -> Arc<hir::ForeignHandlerBindings> {
+        Arc::new(hir::ForeignHandlerBindings::default())
+    }
+
     fn module_index(&self, source_root_id: SourceRootId) -> Arc<ModuleIndex>;
 
     fn assignment_target_kind(&self, _file_id: FileId, _name: &str) -> AssignmentResolution {

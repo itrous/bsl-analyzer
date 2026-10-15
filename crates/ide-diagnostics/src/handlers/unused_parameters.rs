@@ -110,6 +110,16 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 fixed_signature_handlers.insert(method.name.as_str().fold_lower());
             }
         }
+        // A handler bound by string from another module (a helper handed the form) is
+        // called by the platform with its own fixed signature, like any other handler.
+        let bindings = ctx.workspace_foreign_handler_bindings();
+        if !bindings.is_empty() {
+            for method in &summary.methods {
+                if bindings.is_bound(method.name.as_str()) {
+                    fixed_signature_handlers.insert(method.name.as_str().fold_lower());
+                }
+            }
+        }
     }
 
     for (local_id, _) in module_bodies.iter_bodies() {

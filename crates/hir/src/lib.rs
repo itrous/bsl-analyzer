@@ -78,8 +78,8 @@ pub use hir_def::DefDatabase;
 
 pub use hir_def::call_graph;
 pub use hir_def::call_graph::{
-    CallSite, EdgeProvenance, GraphNode, ModuleCallSummary, NotifyTarget, ResolvedCallEdge,
-    ResolvedModuleSummary, ResolvedTarget, WorkspaceCallEdge, WorkspaceCallGraph,
+    CallSite, EdgeProvenance, ForeignHandlerBindings, GraphNode, ModuleCallSummary, NotifyTarget,
+    ResolvedCallEdge, ResolvedModuleSummary, ResolvedTarget, WorkspaceCallEdge, WorkspaceCallGraph,
     CALL_SITE_NOT_RECORDED, NO_CALL_SITE,
 };
 pub use hir_def::docs::{
@@ -173,7 +173,7 @@ pub use hir_def::{
     module_bodies_query, module_call_summary_query, module_code_lower_query, module_data_query,
     module_index_query, module_interface_query, module_members_query, region_tree_query,
     set_lowering_lru_sweep_mode, source_root_name_usage_query, symbol_tree_query,
-    workspace_index_query,
+    workspace_foreign_handler_bindings_query, workspace_index_query,
 };
 
 pub use bsl_config::VisibleConfig;

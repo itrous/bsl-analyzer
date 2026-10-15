@@ -89,11 +89,13 @@ pub use workspace_index::{SymbolInfo, SymbolKind, WorkspaceIndex};
 pub use method_body::{lower_detached_method, method_body_query, method_lower_query};
 pub use method_syntax::{method_syntax_query, MethodSyntax};
 pub use queries::{
-    conditional_tree_query, file_dependencies_query, file_external_refs_query, item_tree_query,
-    method_outbound_facts, module_bodies_query, module_call_summary_query, module_code_lower_query,
-    module_data_query, module_index_query, module_members_query, region_tree_query,
-    resolved_module_summary_query, set_lowering_lru_sweep_mode, symbol_tree_query,
-    workspace_call_graph_query, workspace_index_query, ManagerRef, MethodOutboundFacts,
+    conditional_tree_query, file_dependencies_query, file_external_refs_query,
+    file_foreign_handler_bindings_query, item_tree_query, method_outbound_facts,
+    module_bodies_query, module_call_summary_query, module_code_lower_query, module_data_query,
+    module_index_query, module_members_query, region_tree_query, resolved_module_summary_query,
+    set_lowering_lru_sweep_mode, symbol_tree_query, workspace_call_graph_query,
+    workspace_foreign_handler_bindings_query, workspace_index_query, ManagerRef,
+    MethodOutboundFacts,
 };
 
 #[salsa::db]
@@ -170,6 +172,13 @@ pub trait DefDatabase: base_db::RootQueryDb {
     fn variable_docs(&self, variable: VariableId) -> Option<Arc<crate::docs::VariableDocs>>;
 
     fn module_members(&self, source_root_id: SourceRootId) -> Arc<WorkspaceMembers>;
+
+    /// Handler names bound by string into another module anywhere in the source root
+    /// ([`workspace_foreign_handler_bindings_query`]).
+    fn workspace_foreign_handler_bindings(
+        &self,
+        source_root_id: SourceRootId,
+    ) -> Arc<call_graph::ForeignHandlerBindings>;
 
     fn workspace_index(
         &self,

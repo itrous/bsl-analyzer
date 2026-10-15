@@ -3057,6 +3057,14 @@ impl DefDatabase for RootDatabaseImpl {
         hir::module_members_query(self, source_root_input)
     }
 
+    fn workspace_foreign_handler_bindings(
+        &self,
+        source_root_id: base_db::SourceRootId,
+    ) -> Arc<hir::ForeignHandlerBindings> {
+        let source_root_input = self.source_root_input(source_root_id);
+        hir::workspace_foreign_handler_bindings_query(self, source_root_input)
+    }
+
     fn workspace_index(&self, source_root_id: base_db::SourceRootId) -> Arc<hir::WorkspaceIndex> {
         let source_root_input = self.source_root_input(source_root_id);
         hir::workspace_index_query(self, source_root_input)

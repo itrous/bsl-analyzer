@@ -124,6 +124,22 @@ fn extract_module_name_from_file(db: &dyn DefDatabase, file_id: FileId) -> Optio
     module_name_from_path(&path_str)
 }
 
+/// The common module a file path belongs to: the segment after `CommonModules/`
+/// (localized `ОбщиеМодули/`) when a deeper path follows it, else `None`.
+pub(crate) fn common_module_name_from_path(path: &str) -> Option<Name> {
+    let path_str = path.replace('\\', "/");
+    let mut segments = path_str.split('/');
+    while let Some(segment) = segments.next() {
+        if segment.eq_ignore_ascii_case("CommonModules") || segment.fold_lower() == "общиемодули"
+        {
+            let module_name = segments.next()?;
+            segments.next()?;
+            return Some(Name::new(module_name));
+        }
+    }
+    None
+}
+
 /// Derive a module name from a file path: the segment after `CommonModules/`
 /// (localized `ОбщиеМодули/`), else the `.bsl` file stem.
 fn module_name_from_path(path: &str) -> Option<Name> {
