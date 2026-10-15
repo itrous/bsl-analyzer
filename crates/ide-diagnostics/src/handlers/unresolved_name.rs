@@ -337,6 +337,493 @@ mod tests {
         );
     }
 
+    /// A method of the implicit object, as the call channel already recognises
+    /// it, must not be `UnresolvedName` when read as a bare callee. A value
+    /// read of the same spelling, a name that kind does not own, and the same
+    /// call in a module with no such receiver stay diagnosed.
+    struct ObjectKind {
+        collection: &'static str,
+        element: &'static str,
+        methods: &'static [&'static str],
+        absent_calls: &'static [&'static str],
+        attributes: &'static [&'static str],
+    }
+
+    fn object_kinds() -> Vec<ObjectKind> {
+        vec![
+            ObjectKind {
+                collection: "Documents",
+                element: "Document",
+                methods: &[
+                    "ЭтоНовый",
+                    "IsNew",
+                    "УстановитьНовыйНомер",
+                    "ПроверитьЗаполнение",
+                    "ПолучитьМакет",
+                    "Записать",
+                    "Заполнить",
+                    "Модифицированность",
+                    "УстановитьСсылкуНового",
+                    "ПолучитьСсылкуНового",
+                    "МоментВремени",
+                ],
+                absent_calls: &["УстановитьНовыйКод", "ЭтоГруппа", "СовсемНеизвестныйВызов"],
+                attributes: &["Сумма", "Ссылка", "ОбменДанными"],
+            },
+            ObjectKind {
+                collection: "Catalogs",
+                element: "Catalog",
+                methods: &[
+                    "ЭтоНовый",
+                    "УстановитьНовыйКод",
+                    "ПроверитьЗаполнение",
+                    "ПолучитьМакет",
+                    "Записать",
+                    "Заполнить",
+                    "Модифицированность",
+                    "УстановитьСсылкуНового",
+                    "ПолучитьСсылкуНового",
+                ],
+                absent_calls: &[
+                    "УстановитьНовыйНомер",
+                    "МоментВремени",
+                    "ЭтоГруппа",
+                    "СовсемНеизвестныйВызов",
+                ],
+                attributes: &["Сумма", "Ссылка", "ОбменДанными"],
+            },
+            ObjectKind {
+                collection: "ExchangePlans",
+                element: "ExchangePlan",
+                methods: &["ЭтоНовый", "УстановитьНовыйКод", "ПроверитьЗаполнение", "Записать"],
+                absent_calls: &["УстановитьНовыйНомер", "МоментВремени", "СовсемНеизвестныйВызов"],
+                attributes: &["Сумма", "Ссылка", "ОбменДанными"],
+            },
+            ObjectKind {
+                collection: "ChartsOfAccounts",
+                element: "ChartOfAccounts",
+                methods: &["ЭтоНовый", "ПроверитьЗаполнение", "ПолучитьМакет", "Записать"],
+                absent_calls: &[
+                    "УстановитьНовыйНомер",
+                    "УстановитьНовыйКод",
+                    "МоментВремени",
+                    "СовсемНеизвестныйВызов",
+                ],
+                attributes: &["Сумма", "Ссылка", "ОбменДанными"],
+            },
+            ObjectKind {
+                collection: "Tasks",
+                element: "Task",
+                methods: &[
+                    "ЭтоНовый",
+                    "УстановитьНовыйНомер",
+                    "ПроверитьЗаполнение",
+                    "Модифицированность",
+                ],
+                absent_calls: &["УстановитьНовыйКод", "МоментВремени", "СовсемНеизвестныйВызов"],
+                attributes: &["Сумма", "Ссылка", "ОбменДанными"],
+            },
+            ObjectKind {
+                collection: "BusinessProcesses",
+                element: "BusinessProcess",
+                methods: &["ЭтоНовый", "УстановитьНовыйНомер", "ПроверитьЗаполнение", "Записать"],
+                absent_calls: &["УстановитьНовыйКод", "МоментВремени", "СовсемНеизвестныйВызов"],
+                attributes: &["Сумма", "Ссылка", "ОбменДанными"],
+            },
+            ObjectKind {
+                collection: "ChartsOfCharacteristicTypes",
+                element: "ChartOfCharacteristicTypes",
+                methods: &["ЭтоНовый", "УстановитьНовыйКод", "ПроверитьЗаполнение", "Записать"],
+                absent_calls: &[
+                    "ПолучитьМакет",
+                    "МоментВремени",
+                    "ЭтоГруппа",
+                    "СовсемНеизвестныйВызов",
+                ],
+                attributes: &["Сумма", "Ссылка", "ОбменДанными"],
+            },
+            ObjectKind {
+                collection: "ChartsOfCalculationTypes",
+                element: "ChartOfCalculationTypes",
+                methods: &["ЭтоНовый", "ПроверитьЗаполнение", "ПолучитьМакет", "Записать"],
+                absent_calls: &[
+                    "УстановитьНовыйНомер",
+                    "УстановитьНовыйКод",
+                    "МоментВремени",
+                    "СовсемНеизвестныйВызов",
+                ],
+                attributes: &["Сумма", "Ссылка", "ОбменДанными"],
+            },
+            ObjectKind {
+                collection: "DataProcessors",
+                element: "DataProcessor",
+                methods: &["ПроверитьЗаполнение", "ПолучитьМакет"],
+                absent_calls: &["ЭтоНовый", "Записать", "МоментВремени", "СовсемНеизвестныйВызов"],
+                attributes: &["Сумма"],
+            },
+            ObjectKind {
+                collection: "Reports",
+                element: "Report",
+                methods: &["ПроверитьЗаполнение", "ПолучитьМакет"],
+                absent_calls: &["ЭтоНовый", "Записать", "МоментВремени", "СовсемНеизвестныйВызов"],
+                attributes: &["Сумма"],
+            },
+        ]
+    }
+
+    fn object_module_source(kind: &ObjectKind) -> String {
+        let mut body = String::from("Процедура Тест()\n");
+        for method in kind.methods {
+            body.push_str(&format!("    {method}();\n"));
+        }
+        if kind.methods.contains(&"ЭтоНовый") {
+            body.push_str("    ЭтотОбъект.ЭтоНовый();\n");
+        }
+        for attribute in kind.attributes {
+            body.push_str(&format!("    Значение = {attribute};\n"));
+        }
+        // A method is not a value: the same spelling read, not called, stays absent.
+        body.push_str("    Значение = ЭтоНовый;\n");
+        for call in kind.absent_calls {
+            body.push_str(&format!("    {call}();\n"));
+        }
+        body.push_str("КонецПроцедуры\n");
+        body
+    }
+
+    fn write_object_xml(root: &std::path::Path, kind: &ObjectKind, name: &str) {
+        let dir = root.join(kind.collection);
+        std::fs::create_dir_all(&dir).expect("create collection directory");
+        let xml = format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+<{element} uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"><Properties><Name>{name}</Name></Properties><ChildObjects>
+<Attribute uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeef"><Properties><Name>Сумма</Name><Type/></Properties></Attribute>
+</ChildObjects></{element}></MetaDataObject>"#,
+            element = kind.element,
+        );
+        std::fs::write(dir.join(format!("{name}.xml")), xml).expect("write object metadata");
+    }
+
+    fn tokens(
+        source: &str,
+        diagnostics: &[crate::Diagnostic],
+        code: DiagnosticCode,
+    ) -> Vec<String> {
+        diagnostics
+            .iter()
+            .filter(|diag| diag.code == code)
+            .map(|diag| {
+                source[usize::from(diag.range.start())..usize::from(diag.range.end())].to_string()
+            })
+            .collect()
+    }
+
+    fn diagnosed_token<'a>(source: &'a str, diag: &crate::Diagnostic) -> (&'a str, &'a str) {
+        let end = usize::from(diag.range.end());
+        (&source[usize::from(diag.range.start())..end], source[end..].trim_start())
+    }
+
+    fn is_call_callee(
+        source: &str,
+        diagnostics: &[crate::Diagnostic],
+        code: DiagnosticCode,
+        name: &str,
+    ) -> bool {
+        diagnostics.iter().filter(|diag| diag.code == code).any(|diag| {
+            let (token, after) = diagnosed_token(source, diag);
+            token == name && after.starts_with('(')
+        })
+    }
+
+    fn value_read_is_unresolved(
+        source: &str,
+        diagnostics: &[crate::Diagnostic],
+        name: &str,
+    ) -> bool {
+        diagnostics.iter().filter(|diag| diag.code == DiagnosticCode::UnresolvedName).any(|diag| {
+            let (token, after) = diagnosed_token(source, diag);
+            token == name && !after.starts_with('(')
+        })
+    }
+
+    #[test]
+    fn object_module_bare_method_is_not_an_unresolved_name() {
+        for kind in object_kinds() {
+            let name = "Объект";
+            let source = object_module_source(&kind);
+            let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+            write_object_xml(fixture.root(), &kind, name);
+            let relative = format!("{}/{name}/Ext/ObjectModule.bsl", kind.collection);
+            let diagnostics = crate::test_utils::check_cfe_at_with_unreadable(
+                &relative,
+                &source,
+                fixture,
+                &[],
+                crate::diagnostics,
+            );
+            let unresolved = tokens(&source, &diagnostics, DiagnosticCode::UnresolvedName);
+            let bare = tokens(&source, &diagnostics, DiagnosticCode::UnresolvedBareCall);
+            assert!(
+                bare.is_empty(),
+                "{}: UnresolvedName owns the token when it is on: bare={bare:?} unresolved={unresolved:?}",
+                kind.collection
+            );
+            for method in kind.methods {
+                assert!(
+                    !is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, method),
+                    "{}: bare {method}() is a method of the implicit object: {unresolved:?}",
+                    kind.collection
+                );
+            }
+            for attribute in kind.attributes {
+                assert!(
+                    !unresolved.iter().any(|token| token == attribute),
+                    "{}: attribute {attribute} must stay resolved: {unresolved:?}",
+                    kind.collection
+                );
+            }
+            for call in kind.absent_calls {
+                assert!(
+                    is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
+                    "{}: {call}() is not a method of this object: {unresolved:?}",
+                    kind.collection
+                );
+            }
+            assert!(
+                value_read_is_unresolved(&source, &diagnostics, "ЭтоНовый"),
+                "{}: a value read of a method is still not a value: {unresolved:?}",
+                kind.collection
+            );
+            if kind.methods.contains(&"ЭтоНовый") {
+                assert!(
+                    !is_call_callee(
+                        &source,
+                        &diagnostics,
+                        DiagnosticCode::UnresolvedName,
+                        "ЭтоНовый"
+                    ),
+                    "{}: the value-read diagnostic must not land on the call: {unresolved:?}",
+                    kind.collection
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_of_the_method_name_still_binds_the_value() {
+        let source = r#"
+Процедура Тест(ЭтоНовый)
+    Значение = ЭтоНовый;
+    ЭтоНовый();
+    СовсемНеизвестныйВызов();
+КонецПроцедуры
+"#;
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        write_object_xml(
+            fixture.root(),
+            &ObjectKind {
+                collection: "Documents",
+                element: "Document",
+                methods: &[],
+                absent_calls: &[],
+                attributes: &[],
+            },
+            "Объект",
+        );
+        let diagnostics = crate::test_utils::check_cfe_at_with_unreadable(
+            "Documents/Объект/Ext/ObjectModule.bsl",
+            source,
+            fixture,
+            &[],
+            crate::diagnostics,
+        );
+        let unresolved = tokens(source, &diagnostics, DiagnosticCode::UnresolvedName);
+        assert_eq!(
+            unresolved,
+            vec!["СовсемНеизвестныйВызов".to_string()],
+            "the parameter owns the value read, the call is the object method: {diagnostics:?}"
+        );
+        assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedBareCall));
+    }
+
+    /// An export root has no collection directory. The call channel still
+    /// looks up methods of `ExternalDataProcessor` / `ExternalReport` once the
+    /// owner is attached; the callee read must use that same recognition.
+    #[test]
+    fn external_object_module_bare_method_is_not_an_unresolved_name() {
+        for (element, kind) in [
+            ("ExternalDataProcessor", bsl_metadata::ExternalObjectKind::DataProcessor),
+            ("ExternalReport", bsl_metadata::ExternalObjectKind::Report),
+        ] {
+            let diagnostics = external_object_diagnostics(element, kind);
+            let source = external_object_source();
+            let unresolved = tokens(&source, &diagnostics, DiagnosticCode::UnresolvedName);
+            assert!(
+                diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedBareCall),
+                "{element}: UnresolvedBareCall must defer: {diagnostics:?}"
+            );
+            for method in ["ПроверитьЗаполнение", "ПолучитьМакет"] {
+                assert!(
+                    !is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, method),
+                    "{element}: bare {method}() is a method of the export: {unresolved:?}"
+                );
+            }
+            assert!(
+                !unresolved.iter().any(|token| token == "Сумма"),
+                "{element}: own attribute must stay resolved: {unresolved:?}"
+            );
+            for call in ["ЭтоНовый", "СовсемНеизвестныйВызов"] {
+                assert!(
+                    is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
+                    "{element}: {call}() is not a method of this export: {unresolved:?}"
+                );
+            }
+        }
+    }
+
+    fn external_object_source() -> String {
+        "\
+Процедура Тест()
+    ПроверитьЗаполнение();
+    ПолучитьМакет();
+    Значение = Сумма;
+    ЭтоНовый();
+    СовсемНеизвестныйВызов();
+КонецПроцедуры
+"
+        .to_string()
+    }
+
+    fn external_object_diagnostics(
+        element: &str,
+        kind: bsl_metadata::ExternalObjectKind,
+    ) -> Vec<crate::Diagnostic> {
+        use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+        use ide_db::metadata::{RootKind, WorkspaceConfigsSnapshot};
+        use ide_db::RootDatabaseImpl;
+        use vfs::{FileId, FileSet, VfsPath};
+
+        let root = std::env::temp_dir().join(format!(
+            "bsl_external_object_bare_{}_{}",
+            std::process::id(),
+            element
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let base = root.join("cf");
+        let export = root.join("export");
+        std::fs::create_dir_all(base.join("CommonModules")).expect("base");
+        std::fs::write(base.join("Configuration.xml"), "<MetaDataObject/>").expect("base xml");
+        let name = "Внешняя";
+        std::fs::create_dir_all(export.join(name).join("Ext")).expect("export module dir");
+        let xml = format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+<{element} uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"><Properties><Name>{name}</Name></Properties><ChildObjects>
+<Attribute uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeef"><Properties><Name>Сумма</Name><Type/></Properties></Attribute>
+</ChildObjects></{element}></MetaDataObject>"#
+        );
+        std::fs::write(export.join(format!("{name}.xml")), xml).expect("export xml");
+
+        let mut db = RootDatabaseImpl::new();
+        let file_id = FileId(0);
+        let module_path = export.join(name).join("Ext/ObjectModule.bsl");
+        let mut file_set = FileSet::default();
+        file_set.insert(file_id, VfsPath::new(module_path.to_string_lossy().into_owned()));
+        db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+        db.set_file_source_root(file_id, SourceRootId(0));
+        db.set_file_text(file_id, &external_object_source());
+
+        let paths = vec![(None, base.clone()), (Some("EXPORT".to_string()), export.clone())];
+        db.set_workspace_configs_snapshot(WorkspaceConfigsSnapshot {
+            extension_scopes: vec![None, None],
+            canonical_paths: paths.iter().map(|(_, path)| path.clone()).collect(),
+            kinds: vec![RootKind::Base, RootKind::External(kind)],
+            paths,
+            closures: vec![vec![], vec![]],
+            topological_order: vec![0, 1],
+            fingerprint: Some(element.to_string()),
+            source_exclusions: Default::default(),
+        });
+
+        let config_path = export.to_string_lossy();
+        let config_path_input = ide_db::metadata::intern_configuration_path(
+            &db,
+            config_path.as_ref(),
+            db.config_root_revision_for_path(std::path::Path::new(config_path.as_ref())),
+        );
+        let config = crate::DiagnosticsConfig::all_enabled();
+        let provider = ide_db::SalsaProvider::new(&db, Some(config_path_input));
+        let ctx = crate::DiagnosticsContext::new(&config, file_id, &provider);
+        let diagnostics = crate::diagnostics(&ctx);
+        let _ = std::fs::remove_dir_all(&root);
+        diagnostics
+    }
+
+    /// With `UnresolvedName` off, the call channel still owns the token: a
+    /// method of the implicit object stays silent, a name it does not own is
+    /// `UnresolvedBareCall`.
+    #[test]
+    fn default_profile_keeps_the_call_channel_for_an_object_module() {
+        let source = "\
+Процедура Тест()
+    ЭтоНовый();
+    СовсемНеизвестныйВызов();
+КонецПроцедуры
+";
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        write_object_xml(
+            fixture.root(),
+            &ObjectKind {
+                collection: "Documents",
+                element: "Document",
+                methods: &[],
+                absent_calls: &[],
+                attributes: &[],
+            },
+            "Объект",
+        );
+        let diagnostics = crate::test_utils::check_cfe_at_with_unreadable_config_and_setup(
+            "Documents/Объект/Ext/ObjectModule.bsl",
+            source,
+            fixture,
+            &[],
+            crate::DiagnosticsConfig::default(),
+            |_| {},
+            crate::diagnostics,
+        );
+        assert!(
+            !is_call_callee(source, &diagnostics, DiagnosticCode::UnresolvedBareCall, "ЭтоНовый"),
+            "the call channel already recognises ЭтоНовый(): {diagnostics:?}"
+        );
+        assert!(
+            is_call_callee(
+                source,
+                &diagnostics,
+                DiagnosticCode::UnresolvedBareCall,
+                "СовсемНеизвестныйВызов",
+            ),
+            "an unknown bare call stays on the call channel: {diagnostics:?}"
+        );
+        assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedName));
+    }
+
+    #[test]
+    fn a_common_module_has_no_implicit_object_method() {
+        let source = r#"
+Процедура Тест()
+    ЭтоНовый();
+КонецПроцедуры
+"#;
+        let diagnostics = crate::test_utils::check_with_cfe(
+            source,
+            test_fixture::CfeFixtureBuilder::new("").build(),
+        );
+        assert!(
+            is_call_callee(source, &diagnostics, DiagnosticCode::UnresolvedName, "ЭтоНовый"),
+            "a common module has no implicit object: {diagnostics:?}"
+        );
+        assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedBareCall));
+    }
+
     #[test]
     fn metadata_keeps_the_rule_default_off_until_corpus_gates_pass() {
         let metadata = crate::handlers::get_metadata(DiagnosticCode::UnresolvedName).unwrap();

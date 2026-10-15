@@ -695,6 +695,13 @@ pub struct InferenceContext<'db> {
     /// [`method_body_env`] per same-module callee, for the local cross-directive
     /// accessibility check.
     local_callee_env: FxHashMap<hir_def::MethodKey, hir_def::execution_env::EnvFlags>,
+
+    /// The path under inference is the callee of a bare call, not a value read.
+    /// The cascade still classifies the name as a value — a method is not one —
+    /// but `UnresolvedName` must stay silent when the call channel already owns
+    /// that callee as a method of the implicit receiver. A value read of the
+    /// same spelling (`Значение = ЭтоНовый`) keeps the diagnostic.
+    reading_bare_call_callee: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -957,6 +964,7 @@ impl<'db> InferenceContext<'db> {
             structure_shapes: FxHashMap::default(),
             callee_module_env: FxHashMap::default(),
             local_callee_env: FxHashMap::default(),
+            reading_bare_call_callee: false,
         }
     }
 
@@ -2859,7 +2867,17 @@ impl<'db> InferenceContext<'db> {
         match resolution {
             BareNameResolution::Resolved { ty, .. } => ty,
             BareNameResolution::Absent => {
-                if usage == BareNameUse::ReadValue && !name.is_missing() {
+                // A bare call reads its callee as a value before the call channel
+                // runs. That channel already treats a method of the implicit
+                // receiver as present; emitting `UnresolvedName` here would
+                // accuse the same token, and with the rule enabled the call
+                // channel defers to it. Silence only on that callee, and only
+                // when the call channel's own recognition says the method is
+                // there. The verdict stays `Absent`: the name is still not a value.
+                if usage == BareNameUse::ReadValue
+                    && !name.is_missing()
+                    && !self.bare_callee_method_recognized(name)
+                {
                     self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedName {
                         expr: expr_id,
                         name: name.clone(),
@@ -2869,6 +2887,12 @@ impl<'db> InferenceContext<'db> {
             }
             BareNameResolution::Indeterminate { .. } => self.db.unknown(),
         }
+    }
+
+    /// `true` only while this read is the callee of a bare call and the call
+    /// channel already recognises `name` as a method of the implicit receiver.
+    fn bare_callee_method_recognized(&self, name: &hir_def::Name) -> bool {
+        self.reading_bare_call_callee && self.implicit_receiver_owns_method(name)
     }
 
     fn resolve_bare_name(
@@ -3840,7 +3864,7 @@ impl<'db> InferenceContext<'db> {
             }
         }
 
-        let callee_ty = self.infer_expr(callee);
+        let callee_ty = self.infer_bare_call_callee(callee);
 
         for arg in args {
             self.infer_expr(*arg);
@@ -3914,7 +3938,10 @@ impl<'db> InferenceContext<'db> {
     /// in a managed form module are all `ЭтотОбъект.<метод>()` written without the
     /// receiver. So it is cleared here, through the platform catalog the qualified
     /// spelling is judged by, and where the receiver exists but cannot be built the
-    /// call keeps its silence.
+    /// call keeps its silence. The callee's value read asks the same recognition
+    /// ([`Self::implicit_receiver_owns_method`]) before emitting `UnresolvedName`,
+    /// so the two channels agree on the method and still disagree on a value read
+    /// of that spelling.
     fn report_absent_bare_call(
         &mut self,
         name: &hir_def::Name,
@@ -3934,37 +3961,61 @@ impl<'db> InferenceContext<'db> {
         if self.in_uncompiled_branch {
             return;
         }
+        // `Unreadable` is silence without recognition: a receiver exists, but
+        // its surface cannot be produced, so absence is not proven. Recognition
+        // itself is [`Self::implicit_receiver_owns_method`] — the same predicate
+        // the callee's value read uses, so the two channels cannot disagree
+        // about whether the method is there.
+        if matches!(self.implicit_self_surface(), ImplicitSelfSurface::Unreadable)
+            || self.implicit_receiver_owns_method(name)
+        {
+            return;
+        }
+        self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedBareCall {
+            expr: callee,
+            name: name.clone(),
+        });
+    }
+
+    /// Infer the callee of a bare call. A path callee is marked so the value
+    /// read does not emit `UnresolvedName` for a method the call channel
+    /// already recognises; a nested read inside any other callee shape is not
+    /// that callee and keeps the ordinary value diagnostic.
+    fn infer_bare_call_callee(&mut self, callee: ExprId) -> TypeId {
+        let is_path = matches!(self.body.expr(callee), Expr::Path(_));
+        let previous = self.reading_bare_call_callee;
+        if is_path {
+            self.reading_bare_call_callee = true;
+        }
+        let ty = self.infer_expr(callee);
+        self.reading_bare_call_callee = previous;
+        ty
+    }
+
+    /// Whether the call channel already recognises `name` as a method of this
+    /// module's implicit receiver. `Unreadable` is not recognition: the
+    /// surface cannot be produced, so this answers `false` and the caller
+    /// decides silence separately.
+    fn implicit_receiver_owns_method(&self, name: &hir_def::Name) -> bool {
         match self.implicit_self_surface() {
-            ImplicitSelfSurface::None => {}
-            ImplicitSelfSurface::Unreadable => return,
             ImplicitSelfSurface::Receiver(receiver_ty) => {
-                if crate::method_lookup::lookup_method_with_refinement(
+                crate::method_lookup::lookup_method_with_refinement(
                     self.db,
                     receiver_ty,
                     name,
                     None,
                 )
                 .is_some()
-                {
-                    return;
-                }
             }
             ImplicitSelfSurface::PlatformTypes(type_names) => {
                 let data = bsl_platform::PlatformData::instance();
-                if type_names.iter().any(|ty| data.get_method(ty, name.as_str()).is_some()) {
-                    return;
-                }
+                type_names.iter().any(|ty| data.get_method(ty, name.as_str()).is_some())
             }
             ImplicitSelfSurface::PlatformPrefix(prefix) => {
-                if !bsl_platform::find_prefixed_methods(prefix, name.as_str()).is_empty() {
-                    return;
-                }
+                !bsl_platform::find_prefixed_methods(prefix, name.as_str()).is_empty()
             }
+            ImplicitSelfSurface::None | ImplicitSelfSurface::Unreadable => false,
         }
-        self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedBareCall {
-            expr: callee,
-            name: name.clone(),
-        });
     }
 
     /// See [`hir_def::ModuleMetadata::compiles_nowhere`].
