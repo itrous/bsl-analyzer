@@ -219,6 +219,7 @@ impl<'db, DB: ConfigsDatabase + TypeKernelDb> Type<'db, DB> {
             | MetadataKind::AccountingRegisterRecord
             | MetadataKind::CalculationRegisterRecordSet
             | MetadataKind::CalculationRegisterRecord
+            | MetadataKind::ConstantValueManager
             | MetadataKind::RegisterDimension { .. }
             | MetadataKind::RegisterResource { .. }
             | MetadataKind::RegisterAttribute { .. }

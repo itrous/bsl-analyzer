@@ -747,6 +747,7 @@ pub(crate) fn mdo_type_for_kind(kind: MetadataKind) -> Option<MdoType> {
         MetadataKind::ReportObject => Some(MdoType::Report),
         MetadataKind::ExternalDataProcessorObject => Some(MdoType::ExternalDataProcessor),
         MetadataKind::ExternalReportObject => Some(MdoType::ExternalReport),
+        MetadataKind::ConstantValueManager => Some(MdoType::Constant),
         MetadataKind::ExchangePlanRef | MetadataKind::ExchangePlanObject => {
             Some(MdoType::ExchangePlan)
         }

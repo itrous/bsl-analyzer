@@ -4734,6 +4734,8 @@ fn mdo_kind_to_receiver_label(kind: hir_def::ty::MetadataKind) -> Option<&'stati
         MetadataKind::ReportObject => bsl_metadata::MdoType::Report,
         MetadataKind::ExternalDataProcessorObject => bsl_metadata::MdoType::ExternalDataProcessor,
         MetadataKind::ExternalReportObject => bsl_metadata::MdoType::ExternalReport,
+        // `Константы.<Имя>` is the manager; the value manager is named by its own type.
+        MetadataKind::ConstantValueManager => return Some("КонстантаМенеджерЗначения"),
         MetadataKind::ExchangePlanRef | MetadataKind::ExchangePlanObject => {
             bsl_metadata::MdoType::ExchangePlan
         }

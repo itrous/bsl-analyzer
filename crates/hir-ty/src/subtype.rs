@@ -271,6 +271,9 @@ fn is_concrete_to_generic_platform_bridge(from: &TypeKind, to: &TypeKind) -> boo
         }
         TypeKind::MetadataRef(f) => match f.kind {
             MetadataKind::TabularSection { .. } => matches(("ТабличнаяЧасть", "TabularSection")),
+            MetadataKind::ConstantValueManager => {
+                matches(("КонстантаМенеджерЗначения", "ConstantValueManager"))
+            }
             kind => object_mdo_of_kind(kind).and_then(generic_object_names).is_some_and(matches),
         },
         TypeKind::FormControl { kind, .. } => {
@@ -983,6 +986,24 @@ mod tests {
         let this_manager = db.mk_this_manager(bsl_types::kind::ConfigId::Root, owner);
         let generic_manager = db.platform_object("ДокументМенеджер".to_string());
         assert!(is_assignable(&db, this_manager, generic_manager));
+    }
+
+    #[test]
+    fn constant_value_manager_assignable_to_its_generic_name() {
+        let db = InMemoryDb::new();
+        let value_manager = metadata_ref_id(&db, MetadataKind::ConstantValueManager, "СтрокаКонст");
+        let generic = db.platform_object("КонстантаМенеджерЗначения".to_string());
+        assert!(is_assignable(&db, value_manager, generic));
+        assert!(!is_assignable(
+            &db,
+            value_manager,
+            db.platform_object("СправочникОбъект".to_string())
+        ));
+        assert!(!is_assignable(
+            &db,
+            db.platform_object("КонстантаМенеджерЗначения".to_string()),
+            value_manager
+        ));
     }
 
     #[test]

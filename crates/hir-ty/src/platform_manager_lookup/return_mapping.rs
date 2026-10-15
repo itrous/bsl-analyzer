@@ -51,6 +51,7 @@ pub(crate) fn metadata_kind_to_prefix_and_mdo(
         MetadataKind::CalculationRegisterRecordSet | MetadataKind::CalculationRegisterRecord => {
             MdoType::CalculationRegister
         }
+        MetadataKind::ConstantValueManager => MdoType::Constant,
         // The external kinds have no prefix; `?` above already answered for them.
         MetadataKind::ExternalDataProcessorObject
         | MetadataKind::ExternalReportObject
@@ -162,6 +163,10 @@ pub(crate) fn map_generic_metadata_return_type(
         }
         ("РегистрРасчетаЗапись" | "CalculationRegisterRecord", MdoType::CalculationRegister) => {
             MetadataKind::CalculationRegisterRecord
+        }
+        // `Константы.<Имя>.СоздатьМенеджерЗначения()`.
+        ("КонстантаМенеджерЗначения" | "ConstantValueManager", MdoType::Constant) => {
+            MetadataKind::ConstantValueManager
         }
         _ => return None,
     };

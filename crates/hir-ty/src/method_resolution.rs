@@ -54,7 +54,9 @@ pub fn resolve_qualified_call(
     Ok(MethodResolution::new(resolution.method_id, resolution.is_export, signature))
 }
 
-fn object_kind_to_mdo(kind: hir_def::ty::MetadataKind) -> Option<bsl_metadata::MdoType> {
+/// The object family whose `ObjectModule` slot holds the user module of a value of
+/// `kind`: its export methods and export variables are the value's user members.
+pub(crate) fn object_kind_to_mdo(kind: hir_def::ty::MetadataKind) -> Option<bsl_metadata::MdoType> {
     use bsl_metadata::MdoType;
     use hir_def::ty::MetadataKind;
     Some(match kind {
@@ -70,6 +72,8 @@ fn object_kind_to_mdo(kind: hir_def::ty::MetadataKind) -> Option<bsl_metadata::M
         MetadataKind::ExternalReportObject => MdoType::ExternalReport,
         MetadataKind::ChartOfCharacteristicTypesObject => MdoType::ChartOfCharacteristicTypes,
         MetadataKind::ChartOfCalculationTypesObject => MdoType::ChartOfCalculationTypes,
+        // The module index files a constant's value-manager module in its object slot.
+        MetadataKind::ConstantValueManager => MdoType::Constant,
         MetadataKind::CatalogRef
         | MetadataKind::DocumentRef
         | MetadataKind::EnumRef
@@ -121,7 +125,8 @@ fn record_set_kind_to_mdo(kind: hir_def::ty::MetadataKind) -> Option<bsl_metadat
         | MetadataKind::ChartOfCalculationTypesObject
         | MetadataKind::ReportObject
         | MetadataKind::ExternalDataProcessorObject
-        | MetadataKind::ExternalReportObject => return None,
+        | MetadataKind::ExternalReportObject
+        | MetadataKind::ConstantValueManager => return None,
         MetadataKind::CatalogRef
         | MetadataKind::DocumentRef
         | MetadataKind::EnumRef

@@ -51,6 +51,10 @@ pub enum MetadataKind {
     ExternalDataProcessorObject,
     /// `ВнешнийОтчетОбъект.<Имя>`: the ERF counterpart.
     ExternalReportObject,
+    /// `КонстантаМенеджерЗначения.<Имя>`: what `Константы.<Имя>.СоздатьМенеджерЗначения()`
+    /// returns. Its user methods are the exports of the constant's `ValueManagerModule`,
+    /// which the module index files in the constant's object slot.
+    ConstantValueManager,
     ExchangePlanRef,
     ExchangePlanObject,
     ChartOfAccountsRef,
@@ -264,6 +268,7 @@ impl MetadataKind {
             Self::AccumulationRegisterRecord => Some("AccumulationRegisterRecord"),
             Self::AccountingRegisterRecord => Some("AccountingRegisterRecord"),
             Self::CalculationRegisterRecord => Some("CalculationRegisterRecord"),
+            Self::ConstantValueManager => Some("ConstantValueManager"),
             // The platform corpus keys an external object's members under the bare
             // type, not under a dotted `<Kind>.<Name>` prefix: see `bare_platform_type`.
             Self::ExternalDataProcessorObject
@@ -336,6 +341,8 @@ impl MetadataKind {
             (Self::ExternalDataProcessorObject, true) => "ExternalDataProcessorObject",
             (Self::ExternalReportObject, false) => "ВнешнийОтчётОбъект",
             (Self::ExternalReportObject, true) => "ExternalReportObject",
+            (Self::ConstantValueManager, false) => "КонстантаМенеджерЗначения",
+            (Self::ConstantValueManager, true) => "ConstantValueManager",
             (Self::ExchangePlanRef, false) => "ПланОбменаСсылка",
             (Self::ExchangePlanRef, true) => "ExchangePlanRef",
             (Self::ExchangePlanObject, false) => "ПланОбменаОбъект",

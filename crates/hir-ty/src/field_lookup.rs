@@ -350,21 +350,7 @@ fn lookup_field_on_metadata_ref(
     }
 
     let TypeKind::MetadataRef(facet) = db.lookup_type(effective_ty) else { return None };
-    let mdo_type = match facet.kind {
-        MetadataKind::CatalogObject => MdoType::Catalog,
-        MetadataKind::DocumentObject => MdoType::Document,
-        MetadataKind::ExchangePlanObject => MdoType::ExchangePlan,
-        MetadataKind::ChartOfAccountsObject => MdoType::ChartOfAccounts,
-        MetadataKind::TaskObject => MdoType::Task,
-        MetadataKind::BusinessProcessObject => MdoType::BusinessProcess,
-        MetadataKind::DataProcessorObject => MdoType::DataProcessor,
-        MetadataKind::ReportObject => MdoType::Report,
-        MetadataKind::ExternalDataProcessorObject => MdoType::ExternalDataProcessor,
-        MetadataKind::ExternalReportObject => MdoType::ExternalReport,
-        MetadataKind::ChartOfCharacteristicTypesObject => MdoType::ChartOfCharacteristicTypes,
-        MetadataKind::ChartOfCalculationTypesObject => MdoType::ChartOfCalculationTypes,
-        _ => return None,
-    };
+    let mdo_type = crate::method_resolution::object_kind_to_mdo(facet.kind)?;
     resolver
         .has_effective_module_variable(
             ModuleType::ObjectModule,

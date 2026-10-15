@@ -100,6 +100,7 @@ fn mdo_type_of_kind(kind: MetadataKind) -> Option<MdoType> {
         MetadataKind::ChartOfCalculationTypesObject => MdoType::ChartOfCalculationTypes,
         MetadataKind::DataProcessorObject => MdoType::DataProcessor,
         MetadataKind::ReportObject => MdoType::Report,
+        MetadataKind::ConstantValueManager => MdoType::Constant,
         MetadataKind::InformationRegisterRecordSet
         | MetadataKind::InformationRegisterRecordManager
         | MetadataKind::InformationRegisterRecord => MdoType::InformationRegister,
