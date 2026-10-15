@@ -322,7 +322,11 @@ fn vector_lifecycle_fused_writer_retains_totals_across_emit_batches_and_takeover
     assert!(lease.is_superseded());
     newer.lock().unwrap().take().unwrap().release();
     let summaries: Vec<_> = records.iter().filter(|r| r["kind"] == "mutation_summary").collect();
-    assert_eq!(summaries.iter().filter(|r| r["outcome"] == "started").count(), 1);
+    // A one-second timer decides whether a flush happens, so the count of progress summaries
+    // varies; each one opens a fresh interval with its own started intent.
+    let started = summaries.iter().filter(|r| r["outcome"] == "started").count();
+    let progress = summaries.iter().filter(|r| r["outcome"] == "progress").count();
+    assert_eq!(started, 1 + progress, "lifecycle summaries: {summaries:#?}");
     let terminal = summaries.last().unwrap();
     assert_eq!(terminal["outcome"], "interrupted");
     assert_eq!(terminal["committed_totals"]["sqlite_vectors_removed"], 1);
