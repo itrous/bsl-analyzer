@@ -135,6 +135,7 @@ strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
 walkdir = "2.4"
 ignore = "0.4"
+globset = "0.4"
 spellbook = "0.4"
 notify = "6.1"
 camino = "1.1"

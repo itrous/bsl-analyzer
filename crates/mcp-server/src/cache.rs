@@ -377,6 +377,12 @@ fn project_scope(project: &project_model::Project) -> std::io::Result<[u8; 32]> 
     for exclusion in exclusions {
         append_field(&mut hasher, &exclusion);
     }
+    // Patterns are folded in only when declared, so a project without them keeps the
+    // stamp it had before patterns existed.
+    for pattern in project.source_exclusions().patterns() {
+        append_field(&mut hasher, b"pattern");
+        append_field(&mut hasher, pattern.as_bytes());
+    }
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -670,6 +676,21 @@ mod tests {
             d.root(),
             "creating an excluded directory is not a declaration change"
         );
+
+        std::fs::write(
+            workspace.path().join("bsl-analyzer.toml"),
+            "[source]\nexclude = [\"ignored\"]\nexclude_globs = [\"**/*.Queries.bsl\"]\n",
+        )
+        .unwrap();
+        let patterns_added = project(workspace.path());
+        let e = WorkspaceCacheLayout::for_project(
+            &patterns_added,
+            Some(Path::new("cache")),
+            cwd.path(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(c.root(), e.root(), "declared exclusion patterns identify the scan topology");
     }
 
     #[test]

@@ -1731,8 +1731,11 @@ fn collect_subtree_noting(
     // already full of files must not be read inside an exclusion, under any spelling.
     let mut pruned = project_model::ResolvedDirs::default();
     let walk = WalkDir::new(dir).follow_links(true).into_iter().filter_entry(|entry| {
-        !(entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink())
-            || !user_excluded.prunes_walked_dir(entry.path(), entry.path_is_symlink(), &mut pruned)
+        if entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink() {
+            !user_excluded.prunes_walked_dir(entry.path(), entry.path_is_symlink(), &mut pruned)
+        } else {
+            !user_excluded.excludes_walked_file(entry.path())
+        }
     });
     for entry in walk {
         let entry = match entry {

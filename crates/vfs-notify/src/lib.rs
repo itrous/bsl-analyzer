@@ -557,12 +557,14 @@ impl NotifyActor {
                             let path = entry.path();
                             if !entry.file_type().is_dir() {
                                 // A file symlink may point into an exclusion.
-                                return !entry.path_is_symlink()
-                                    || !dirs.hard_exclude.prunes_walked_dir(
+                                if entry.path_is_symlink() {
+                                    return !dirs.hard_exclude.prunes_walked_dir(
                                         path,
                                         true,
                                         &mut resolved,
                                     );
+                                }
+                                return !dirs.hard_exclude.excludes_walked_file(path);
                             }
 
                             if entry.path_is_symlink() && symlink_might_be_cyclic(path) {
@@ -936,7 +938,10 @@ impl NotifyActor {
                 }
                 let is_dir = entry.file_type().is_dir();
                 if !is_dir && !entry.path_is_symlink() {
-                    return true;
+                    return !self
+                        .watched_dir_entries
+                        .iter()
+                        .any(|dirs| dirs.hard_exclude.excludes_walked_file(path));
                 }
                 if entry.path_is_symlink() && is_dir && symlink_might_be_cyclic(path) {
                     return false;
@@ -1657,6 +1662,63 @@ mod tests {
         assert!(
             cap.walked_dirs.iter().any(|path| AsRef::<Path>::as_ref(path).ends_with(".tmp2")),
             "the initial loader did not visit the allowed prefix sibling: {:?}",
+            cap.walked_dirs
+        );
+    }
+
+    #[test]
+    fn initial_walk_skips_files_and_directories_matched_by_exclusion_patterns() {
+        let guard = tempfile::tempdir().unwrap();
+        let root = AbsPathBuf::assert_utf8(guard.path().canonicalize().unwrap());
+        let root_path = AsRef::<Path>::as_ref(&root);
+        let write = |relative: &str| {
+            let path = root_path.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        };
+        write("Allowed.bsl");
+        write("temp/Hidden.bsl");
+        write(".tool/Hidden.bsl");
+        write("Reports/R/Templates/T/Ext/Template.Queries.bsl");
+        write("Reports/R/Ext/ObjectModule.bsl");
+        write("temporary/Visible.bsl");
+        let patterns = ["temp", ".tool", "**/*.Queries.bsl"];
+        let dirs = loader::Directories {
+            extensions: vec!["bsl".to_owned()],
+            include: vec![root.clone()],
+            exclude: Vec::new(),
+            hard_exclude: ExcludedPaths::default().with_patterns(root_path, patterns).unwrap(),
+            rules: Vec::new(),
+        };
+
+        let count = NotifyActor::count_files_in_entry(
+            &loader::Entry::Directories(dirs.clone()),
+            &AtomicBool::new(false),
+        );
+        let cap = run_full(dirs, 1024 * 1024, 1024);
+        let mut loaded: Vec<String> = cap
+            .loaded
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                let path = AsRef::<Path>::as_ref(&entry.0).strip_prefix(root_path).unwrap();
+                path.to_string_lossy().replace('\\', "/")
+            })
+            .collect();
+        loaded.sort();
+
+        assert_eq!(
+            loaded,
+            ["Allowed.bsl", "Reports/R/Ext/ObjectModule.bsl", "temporary/Visible.bsl"]
+        );
+        assert_eq!(count, 3, "the counting walk disagrees with the loading walk");
+        assert!(
+            cap.walked_dirs.iter().all(|path| {
+                let path = AsRef::<Path>::as_ref(path);
+                !path.starts_with(root_path.join("temp"))
+                    && !path.starts_with(root_path.join(".tool"))
+            }),
+            "the walk entered a directory a pattern excludes: {:?}",
             cap.walked_dirs
         );
     }

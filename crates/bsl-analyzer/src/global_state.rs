@@ -1512,6 +1512,99 @@ mod vfs_race_tests {
         assert_eq!(take_warnings(&receiver).len(), 1, "legacy scope warns again");
     }
 
+    /// `[source].exclude_globs` reaches the LSP loader and the live state the same way
+    /// `[source].exclude` does: the loader's walk skips the matched files and an
+    /// opened matched document is not admitted.
+    #[test]
+    fn exclude_globs_reach_the_lsp_loader_and_the_live_state() {
+        #[derive(Debug)]
+        struct RecordingLoader(std::sync::mpsc::Sender<loader::Config>);
+        impl loader::Handle for RecordingLoader {
+            fn spawn(_sender: loader::Sender) -> Self
+            where
+                Self: Sized,
+            {
+                unreachable!("injected via with_loader, never spawned")
+            }
+            fn set_config(&mut self, config: loader::Config) {
+                let _ = self.0.send(config);
+            }
+            fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
+            fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
+                None
+            }
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        for relative in [
+            "Allowed.bsl",
+            "temp/Hidden.bsl",
+            ".tool/Hidden.bsl",
+            "Reports/R/Templates/T/Ext/Template.Queries.bsl",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/*.Queries.bsl\"]\n",
+        )
+        .unwrap();
+
+        let (configs_tx, configs_rx) = std::sync::mpsc::channel();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let (_loader_tx, loader_receiver) = crossbeam_channel::bounded(4);
+        let mut state = GlobalState::with_loader(
+            sender,
+            Box::new(RecordingLoader(configs_tx)),
+            loader_receiver,
+        );
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).expect("initial load");
+
+        let config = configs_rx.try_recv().expect("the initial load emits a loader config");
+        let source_entry = config
+            .load
+            .iter()
+            .find_map(|entry| match entry {
+                loader::Entry::Directories(dirs) => Some(dirs),
+                _ => None,
+            })
+            .expect("a directory scan");
+        let queries = root.join("Reports/R/Templates/T/Ext/Template.Queries.bsl");
+        for hidden in [root.join("temp/Hidden.bsl"), root.join(".tool/Hidden.bsl"), queries.clone()]
+        {
+            assert!(
+                source_entry.hard_exclude.is_excluded(&hidden),
+                "the LSP loader dropped [source].exclude_globs for {}",
+                hidden.display()
+            );
+            assert!(state.is_source_excluded_resolved(&hidden), "{}", hidden.display());
+        }
+        assert!(!source_entry.hard_exclude.is_excluded(&root.join("Allowed.bsl")));
+        assert!(!state.is_source_excluded_resolved(&root.join("Allowed.bsl")));
+
+        let queries_uri = Url::from_file_path(&queries).unwrap();
+        crate::handlers::handle_did_open(
+            &mut state,
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: queries_uri.clone(),
+                    language_id: "bsl".to_owned(),
+                    version: 1,
+                    text: "ВЫБРАТЬ 1".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            state.vfs.read().file_id(&vfs::VfsPath::new(queries.clone())).is_none(),
+            "didOpen admitted a document matched by an exclusion pattern"
+        );
+        assert!(!state.diagnostics_tokens.contains_key(&queries_uri));
+    }
+
     /// A live workspace reload that adds an extension root must emit a loader
     /// config whose include set covers the new root (and still watches the config
     /// files) — otherwise the VFS never scans the extension and no analysis sees

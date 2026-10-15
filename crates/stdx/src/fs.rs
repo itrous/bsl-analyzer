@@ -41,8 +41,11 @@ fn skips(config: &WalkConfig<'_>, entry: &ignore::DirEntry, resolved: &mut Resol
     }
     let Some(excluded) = config.excluded else { return false };
     let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-    (is_dir || entry.depth() == 0 || entry.path_is_symlink())
-        && excluded.prunes_walked_dir(path, entry.path_is_symlink(), resolved)
+    if is_dir || entry.depth() == 0 || entry.path_is_symlink() {
+        excluded.prunes_walked_dir(path, entry.path_is_symlink(), resolved)
+    } else {
+        excluded.excludes_walked_file(path)
+    }
 }
 
 pub fn parallel_count(roots: &[&Path], config: &WalkConfig<'_>) -> usize {

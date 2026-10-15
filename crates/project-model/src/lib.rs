@@ -2382,6 +2382,12 @@ pub struct ProjectConfig {
     #[serde(skip)]
     pub source_exclude: Vec<String>,
 
+    /// `[source].exclude_globs`: glob patterns of files and directories taken out of
+    /// the project, matched against paths relative to the directory of the config file.
+    /// Only the TOML config carries it.
+    #[serde(skip)]
+    pub source_exclude_globs: Vec<String>,
+
     #[serde(default, alias = "target_platform_version")]
     pub target_platform_version: Option<String>,
 
@@ -2695,7 +2701,19 @@ impl ProjectConfig {
                 )));
             }
         }
+        self.source_exclude_patterns(Path::new("."))?;
         Ok(())
+    }
+
+    /// `[source].exclude_globs` compiled against `base`; an unusable pattern is a
+    /// configuration error, for the same reason an unusable `exclude` entry is.
+    fn source_exclude_patterns(
+        &self,
+        base: &Path,
+    ) -> Result<stdx::path_exclusion::ExcludedPaths, ConfigLoadError> {
+        stdx::path_exclusion::ExcludedPaths::default()
+            .with_patterns(base, &self.source_exclude_globs)
+            .map_err(|error| self.config_error(format!("source.exclude_globs {error}")))
     }
 
     /// `[source].exclude` resolved against the directory of the config file — not the
@@ -2706,9 +2724,12 @@ impl ProjectConfig {
         project_root: &Path,
     ) -> Result<stdx::path_exclusion::ExcludedPaths, ConfigLoadError> {
         self.validate_source_exclude()?;
-        Ok(stdx::path_exclusion::ExcludedPaths::new(
+        let base = self.config_file_path.as_deref().and_then(Path::parent).unwrap_or(project_root);
+        stdx::path_exclusion::ExcludedPaths::new(
             self.source_exclude.iter().map(|value| self.resolve_config_path(project_root, value)),
-        ))
+        )
+        .with_patterns(base, &self.source_exclude_globs)
+        .map_err(|error| self.config_error(format!("source.exclude_globs {error}")))
     }
 
     pub fn resolve_configuration_path(
@@ -3467,6 +3488,8 @@ struct TomlSourceConfig {
     externals: Option<Vec<ExternalDecl>>,
     #[serde(default)]
     exclude: Vec<String>,
+    #[serde(default)]
+    exclude_globs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3533,6 +3556,7 @@ impl From<TomlConfig> for ProjectConfig {
             configuration_root: toml.source.root,
             configuration_dependency: toml.source.configuration,
             source_exclude: toml.source.exclude,
+            source_exclude_globs: toml.source.exclude_globs,
             target_platform_version: toml.target_platform_version,
             platform_help: toml.platform_help,
             min_platform_version: toml.min_platform_version,
@@ -5802,6 +5826,108 @@ extensions = [{ name = "T" }]
         };
         assert_eq!(signature(&absent.3), signature(&explicit.3));
         assert!(explicit.3.files.iter().any(|file| file.walked.ends_with("Allowed.bsl")));
+    }
+
+    #[test]
+    fn source_exclude_globs_take_matching_files_out_of_the_scan() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for relative in [
+            "Allowed.bsl",
+            "temp/Hidden.bsl",
+            ".tool/Hidden.bsl",
+            "Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "Reports/R/Ext/ObjectModule.bsl",
+            "temporary/Visible.bsl",
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let path = root.join("bsl-analyzer.toml");
+        let scan = |body: &str| {
+            fs::write(&path, body).unwrap();
+            let config = ProjectConfig::load_from_file(&path).unwrap();
+            let project = Project::with_config(root, config).unwrap();
+            let set =
+                SourceSet::scan_in_scope(&project.source_roots(), &[], project.source_exclusions());
+            let mut walked: Vec<String> = set
+                .files
+                .iter()
+                .map(|file| {
+                    let relative = file.walked.strip_prefix(root).unwrap();
+                    relative.to_string_lossy().replace('\\', "/")
+                })
+                .filter(|relative| relative.ends_with(".bsl"))
+                .collect();
+            walked.sort();
+            (walked, project)
+        };
+
+        let (without, _) = scan("[source]\nroot = \".\"\n");
+        assert_eq!(without.len(), 6, "positive control: every file is scanned without patterns");
+
+        let (with, project) = scan(
+            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/*.Queries.bsl\"]\n",
+        );
+        assert_eq!(
+            with,
+            ["Allowed.bsl", "Reports/R/Ext/ObjectModule.bsl", "temporary/Visible.bsl"]
+        );
+        assert!(project.is_source_excluded(&root.join("temp/Hidden.bsl")));
+        assert!(project
+            .is_source_excluded(&root.join("Reports/R/Templates/T/Ext/Template.Queries.bsl")));
+        assert!(!project.is_source_excluded(&root.join("temporary/Visible.bsl")));
+    }
+
+    #[test]
+    fn source_exclude_globs_are_relative_to_the_config_directory() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("project");
+        let config_dir = project_root.join("ci");
+        fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("bsl-analyzer.toml");
+        fs::write(&path, "[source]\nroot = \"../src\"\nexclude_globs = [\"gen/**\"]\n").unwrap();
+
+        let excluded =
+            ProjectConfig::load_from_file(&path).unwrap().source_exclusions(&project_root).unwrap();
+
+        assert!(excluded.is_excluded(&config_dir.join("gen/Module.bsl")));
+        assert!(!excluded.is_excluded(&project_root.join("gen/Module.bsl")));
+    }
+
+    #[test]
+    fn an_absent_or_empty_exclude_globs_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("bsl-analyzer.toml");
+        let load = |body: &str| {
+            fs::write(&path, body).unwrap();
+            ProjectConfig::load_from_file(&path).unwrap().source_exclusions(root).unwrap()
+        };
+
+        let absent = load("[source]\nroot = \".\"\nexclude = [\".tmp\"]\n");
+        let empty = load("[source]\nroot = \".\"\nexclude = [\".tmp\"]\nexclude_globs = []\n");
+        assert_eq!(absent, empty);
+        assert_eq!(absent, crate::ExcludedPaths::new([root.join(".tmp")]));
+        assert!(absent.patterns().next().is_none());
+    }
+
+    #[test]
+    fn source_exclude_globs_reject_unusable_patterns() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bsl-analyzer.toml");
+
+        fs::write(&path, "[source]\nexclude_globs = \"temp\"\n").unwrap();
+        assert!(ProjectConfig::load_from_file(&path).is_err(), "a string is not the list contract");
+
+        for pattern in ["", "!temp", "/temp", "a["] {
+            fs::write(&path, format!("[source]\nexclude_globs = [{pattern:?}]\n")).unwrap();
+            let error = ProjectConfig::load_from_file(&path)
+                .expect_err(&format!("{pattern:?} was accepted"))
+                .to_string();
+            assert!(error.contains("source.exclude_globs"), "{pattern:?}: {error}");
+        }
     }
 
     #[test]

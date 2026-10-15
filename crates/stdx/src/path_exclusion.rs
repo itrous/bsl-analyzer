@@ -11,9 +11,16 @@
 //! it started from, a watcher reports the path it armed, and the file system resolves
 //! both to a third. Matching is by whole components, never by string prefix, so
 //! `.tmp2` is not inside `.tmp`.
+//!
+//! Besides literal directories the set may carry glob patterns, matched against a
+//! path relative to one base directory (the directory of the project config). A path
+//! is excluded when it, or any directory above it below the base, matches: that is
+//! how files no single directory can describe — a generated listing next to every
+//! template — are taken out under the same hard rule.
 
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// A set of excluded directories.
 ///
@@ -23,7 +30,42 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug, Clone, Default)]
 pub struct ExcludedPaths {
     entries: Vec<Excluded>,
+    /// Boxed so a set without patterns stays as small as it was: the set is embedded by
+    /// value in many structures, enums among them.
+    patterns: Option<Box<Patterns>>,
 }
+
+/// Glob patterns and the base they are relative to.
+#[derive(Debug, Clone)]
+struct Patterns {
+    declared_base: PathBuf,
+    /// Every prefix a matched path can arrive under, each with the base-relative path
+    /// it stands for: the base under its declared and resolved spellings, and each walk
+    /// root re-spelled by [`ExcludedPaths::respelled_under`].
+    anchors: Vec<(PathBuf, PathBuf)>,
+    globs: Arc<CompiledGlobs>,
+}
+
+#[derive(Debug)]
+struct CompiledGlobs {
+    sources: Vec<String>,
+    set: globset::GlobSet,
+}
+
+/// A pattern that cannot be used, with the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidPattern {
+    pub pattern: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for InvalidPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pattern {:?} {}", self.pattern, self.reason)
+    }
+}
+
+impl std::error::Error for InvalidPattern {}
 
 #[derive(Debug, Clone)]
 struct Excluded {
@@ -57,11 +99,91 @@ impl ExcludedPaths {
             }
             entries.push(Excluded { declared, spellings });
         }
-        Self { entries }
+        Self { entries, patterns: None }
     }
 
+    /// Adds glob patterns matched against paths relative to the absolute `base`.
+    ///
+    /// The syntax is `globset`'s with `/` as the separator: `*` and `?` stay within one
+    /// path component, `**` crosses any number of them. A pattern without a `/` matches
+    /// a name at any depth (`*.tmp` is `**/*.tmp`). An empty pattern, an absolute one, a
+    /// negation (`!x`, which a hard exclusion cannot honour) and one the glob parser
+    /// rejects are refused rather than dropped: a dropped exclusion silently puts back
+    /// the tree it was meant to hide. On Windows matching ignores case, like the rest of
+    /// this set. An empty list leaves the set exactly as it was.
+    pub fn with_patterns<I, S>(mut self, base: &Path, patterns: I) -> Result<Self, InvalidPattern>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut sources = Vec::new();
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in patterns {
+            let pattern = pattern.as_ref();
+            let invalid = |reason: String| InvalidPattern { pattern: pattern.to_owned(), reason };
+            let trimmed = pattern.trim();
+            if trimmed.is_empty() {
+                return Err(invalid("must not be empty".to_owned()));
+            }
+            if trimmed.starts_with('!') {
+                return Err(invalid(
+                    "is a negation; negated patterns are not supported".to_owned(),
+                ));
+            }
+            let normalized = trimmed.replace('\\', "/");
+            let path = Path::new(&normalized);
+            // A drive-relative Windows value (`C:tmp`) is neither absolute nor rooted.
+            let prefixed = path.components().any(|c| matches!(c, Component::Prefix(_)));
+            if normalized.starts_with('/') || path.is_absolute() || prefixed {
+                return Err(invalid("must be relative to the config file".to_owned()));
+            }
+            let normalized = normalized.trim_end_matches('/').trim_start_matches("./");
+            let anchored = if normalized.contains('/') {
+                normalized.to_owned()
+            } else {
+                format!("**/{normalized}")
+            };
+            let glob = globset::GlobBuilder::new(&anchored)
+                .literal_separator(true)
+                .case_insensitive(cfg!(windows))
+                .backslash_escape(false)
+                .build()
+                .map_err(|error| invalid(format!("is not a valid glob: {}", error.kind())))?;
+            builder.add(glob);
+            sources.push(pattern.to_owned());
+        }
+        if sources.is_empty() {
+            return Ok(self);
+        }
+        let set = builder.build().map_err(|error| InvalidPattern {
+            pattern: sources.join(", "),
+            reason: format!("cannot be compiled: {}", error.kind()),
+        })?;
+        let declared_base = normalize_lexically(base);
+        let mut anchors = vec![(declared_base.clone(), PathBuf::new())];
+        if let Some(resolved) = resolve_as_far_as_it_goes(&declared_base) {
+            push_anchor(&mut anchors, resolved, PathBuf::new());
+        }
+        let globs = Arc::new(CompiledGlobs { sources, set });
+        self.patterns = Some(Box::new(Patterns { declared_base, anchors, globs }));
+        Ok(self)
+    }
+
+    /// Whether nothing is excluded: no directory and no pattern.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.patterns.is_none()
+    }
+
+    /// The patterns as they were declared.
+    pub fn patterns(&self) -> impl Iterator<Item = &str> + '_ {
+        self.patterns.iter().flat_map(|patterns| patterns.globs.sources.iter().map(String::as_str))
+    }
+
+    /// Whether a file a walk reached, inside directories it did not prune, is taken out
+    /// by a pattern. Directories are pruned by [`Self::prunes_walked_dir`], so only the
+    /// patterns are asked here; without patterns this costs nothing.
+    pub fn excludes_walked_file(&self, path: &Path) -> bool {
+        self.patterns.as_ref().is_some_and(|patterns| patterns.matches_any_spelling(path))
     }
 
     /// The excluded directories as they were declared (after lexical normalisation).
@@ -102,15 +224,20 @@ impl ExcludedPaths {
                 Excluded { declared: entry.declared.clone(), spellings }
             })
             .collect();
-        Self { entries }
+        let patterns =
+            self.patterns.as_ref().map(|patterns| Box::new(patterns.respelled_under(&roots)));
+        Self { entries, patterns }
     }
 
     /// Whether `path` is an excluded directory or lies anywhere beneath one.
     pub fn is_excluded(&self, path: &Path) -> bool {
-        if self.entries.is_empty() {
+        if self.is_empty() {
             return false;
         }
         if self.any_spelling(|spelling| is_within(path, spelling)) {
+            return true;
+        }
+        if self.excludes_walked_file(path) {
             return true;
         }
         has_dot_components(path) && {
@@ -127,7 +254,7 @@ impl ExcludedPaths {
     /// ancestor, so a symlink alias still leads into the exclusion.
     pub fn is_excluded_resolved(&self, path: &Path) -> bool {
         self.is_excluded(path)
-            || (!self.entries.is_empty()
+            || (!self.is_empty()
                 && resolve_as_far_as_it_goes(path)
                     .is_some_and(|resolved| self.is_excluded(&resolved)))
     }
@@ -146,7 +273,7 @@ impl ExcludedPaths {
         is_symlink: bool,
         resolved: &mut ResolvedDirs,
     ) -> bool {
-        if self.entries.is_empty() {
+        if self.is_empty() {
             return false;
         }
         if self.is_excluded(path) {
@@ -170,7 +297,7 @@ impl ExcludedPaths {
     /// is itself a symlink is resolved on its own. For bulk decisions over files that
     /// may have been reached through a symlink alias of an excluded directory.
     pub fn is_excluded_resolving(&self, path: &Path, resolved: &mut ResolvedDirs) -> bool {
-        if self.entries.is_empty() {
+        if self.is_empty() {
             return false;
         }
         if self.is_excluded(path) {
@@ -193,11 +320,12 @@ impl ExcludedPaths {
         canonical.is_some_and(|canonical| self.is_excluded(&canonical))
     }
 
-    /// Whether some exclusion lies strictly beneath `dir`.
+    /// Whether some excluded directory lies strictly beneath `dir`.
     ///
     /// The question a watcher asks before arming `dir` recursively: a recursive watch on
     /// such a directory would cover the exclusion too, including one that does not
-    /// exist yet and is only created later.
+    /// exist yet and is only created later. Patterns do not count: any directory may
+    /// hold a match, so they are applied to each path a watch reports instead.
     pub fn has_exclusion_below(&self, dir: &Path) -> bool {
         if self.entries.is_empty() {
             return false;
@@ -220,7 +348,18 @@ impl ExcludedPaths {
 
     /// The heap this set owns: the entries and every spelling of each.
     pub fn heap_bytes(&self) -> usize {
-        crate::heap::vec_bytes::<Excluded>(self.entries.capacity())
+        let patterns = self.patterns.as_ref().map_or(0, |patterns| {
+            std::mem::size_of::<Patterns>()
+                + patterns.declared_base.capacity()
+                + crate::heap::vec_bytes::<(PathBuf, PathBuf)>(patterns.anchors.capacity())
+                + patterns
+                    .anchors
+                    .iter()
+                    .map(|(prefix, relative)| prefix.capacity() + relative.capacity())
+                    .sum::<usize>()
+        });
+        patterns
+            + crate::heap::vec_bytes::<Excluded>(self.entries.capacity())
             + self
                 .entries
                 .iter()
@@ -243,10 +382,87 @@ impl ExcludedPaths {
 #[derive(Debug, Default)]
 pub struct ResolvedDirs(std::collections::HashMap<PathBuf, PathBuf>);
 
+impl Patterns {
+    fn respelled_under(&self, roots: &[(PathBuf, PathBuf)]) -> Self {
+        let mut anchors = self.anchors.clone();
+        for (declared_root, canonical_root) in roots {
+            for (prefix, relative) in &self.anchors {
+                // A root inside the base: a path spelled after the root stands for the
+                // root's place relative to the base, under either spelling of the root.
+                if let Some(below) = strip_within(canonical_root, prefix) {
+                    push_anchor(&mut anchors, declared_root.clone(), relative.join(below));
+                }
+                if let Some(below) = strip_within(declared_root, prefix) {
+                    push_anchor(&mut anchors, canonical_root.clone(), relative.join(below));
+                }
+                // The base inside a root: the base re-spelled after the root.
+                if relative.as_os_str().is_empty() {
+                    if let Some(below) = strip_within(prefix, canonical_root) {
+                        push_anchor(&mut anchors, declared_root.join(below), PathBuf::new());
+                    }
+                }
+            }
+        }
+        Self { declared_base: self.declared_base.clone(), anchors, globs: self.globs.clone() }
+    }
+
+    fn matches_any_spelling(&self, path: &Path) -> bool {
+        if has_dot_components(path) {
+            self.matches(&normalize_lexically(path))
+        } else {
+            self.matches(path)
+        }
+    }
+
+    fn matches(&self, path: &Path) -> bool {
+        self.anchors.iter().any(|(prefix, relative)| {
+            strip_within(path, prefix).is_some_and(|below| self.matches_relative(relative, &below))
+        })
+    }
+
+    /// Whether the base-relative path, or a directory above it, matches a pattern.
+    fn matches_relative(&self, relative: &Path, below: &Path) -> bool {
+        let mut candidate = String::new();
+        for component in relative.components().chain(below.components()) {
+            let Component::Normal(name) = component else { continue };
+            if !candidate.is_empty() {
+                candidate.push('/');
+            }
+            candidate.push_str(&name.to_string_lossy());
+            if self.globs.set.is_match(&candidate) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn push_anchor(anchors: &mut Vec<(PathBuf, PathBuf)>, prefix: PathBuf, relative: PathBuf) {
+    if !anchors.iter().any(|(existing, _)| *existing == prefix) {
+        anchors.push((prefix, relative));
+    }
+}
+
+/// `path` with `prefix` taken off, compared by whole components the way [`is_within`]
+/// compares them; `None` when `path` is not at or under `prefix`.
+fn strip_within(path: &Path, prefix: &Path) -> Option<PathBuf> {
+    if !is_within(path, prefix) {
+        return None;
+    }
+    Some(path.components().skip(prefix.components().count()).collect())
+}
+
 impl PartialEq for ExcludedPaths {
     fn eq(&self, other: &Self) -> bool {
         self.entries.len() == other.entries.len()
             && self.entries.iter().zip(&other.entries).all(|(a, b)| a.declared == b.declared)
+            && match (&self.patterns, &other.patterns) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.declared_base == b.declared_base && a.globs.sources == b.globs.sources
+                }
+                _ => false,
+            }
     }
 }
 
@@ -257,6 +473,10 @@ impl Hash for ExcludedPaths {
         self.entries.len().hash(state);
         for entry in &self.entries {
             entry.declared.hash(state);
+        }
+        if let Some(patterns) = &self.patterns {
+            patterns.declared_base.hash(state);
+            patterns.globs.sources.hash(state);
         }
     }
 }
@@ -386,6 +606,121 @@ mod tests {
         assert!(excluded.is_excluded(&root.join("./.tmp/child/Module.bsl")));
         assert!(!excluded.is_excluded(&root.join(".tmp2/Module.bsl")));
         assert!(!excluded.is_excluded(&root.join("allowed/Module.bsl")));
+    }
+
+    fn with_patterns(base: &Path, patterns: &[&str]) -> ExcludedPaths {
+        ExcludedPaths::default().with_patterns(base, patterns).unwrap()
+    }
+
+    #[test]
+    fn patterns_match_files_and_directories_relative_to_the_base() {
+        let base = absolute("patterns");
+        let excluded = with_patterns(&base, &["temp", ".tool/**", "**/*.Queries.bsl", "src/gen"]);
+
+        for hidden in [
+            "temp",
+            "temp/Module.bsl",
+            "src/cf/temp/deep/Module.bsl",
+            ".tool/Module.bsl",
+            "src/cf/Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "src/gen/Module.bsl",
+            "./src/../temp/Module.bsl",
+        ] {
+            assert!(excluded.is_excluded(&base.join(hidden)), "{hidden} must be excluded");
+            assert!(excluded.excludes_walked_file(&base.join(hidden)), "{hidden} (walk)");
+        }
+        for visible in [
+            "temporary/Module.bsl",
+            "src/cf/Reports/R/Ext/ObjectModule.bsl",
+            "src/cf/Queries.bsl.txt",
+            "other/src/gen/Module.bsl",
+            ".tool2/Module.bsl",
+        ] {
+            assert!(!excluded.is_excluded(&base.join(visible)), "{visible} must stay");
+        }
+        assert!(
+            !excluded.is_excluded(&absolute("elsewhere").join("temp/Module.bsl")),
+            "a pattern matched a path outside its base"
+        );
+        assert!(!excluded.is_empty());
+        assert_eq!(
+            excluded.patterns().collect::<Vec<_>>(),
+            ["temp", ".tool/**", "**/*.Queries.bsl", "src/gen"]
+        );
+    }
+
+    #[test]
+    fn a_star_does_not_cross_a_separator_in_an_anchored_pattern() {
+        let base = absolute("separator");
+        let excluded = with_patterns(&base, &["src/*.bsl"]);
+
+        assert!(excluded.is_excluded(&base.join("src/Module.bsl")));
+        assert!(!excluded.is_excluded(&base.join("src/nested/Module.bsl")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn patterns_ignore_case_on_windows() {
+        let base = absolute("case");
+        let excluded = with_patterns(&base, &["**/*.Queries.bsl"]);
+
+        assert!(excluded.is_excluded(&base.join("Ext/TEMPLATE.QUERIES.BSL")));
+    }
+
+    #[test]
+    fn patterns_follow_a_walk_root_respelled_under_another_name() {
+        let base = absolute("respelled");
+        let root = base.join("src/cf");
+        let excluded = with_patterns(&base, &["src/cf/temp"]);
+        // A root reached under another spelling: the walk yields paths under `alias`,
+        // which the canonical root stands for.
+        let alias = absolute("respelled-alias");
+        let respelled = excluded.respelled_under(std::slice::from_ref(&root));
+        assert!(respelled.is_excluded(&root.join("temp/Module.bsl")));
+
+        let roots = [(alias.clone(), root.clone())];
+        let patterns = excluded.patterns.as_ref().unwrap().respelled_under(&roots);
+        assert!(patterns.matches(&alias.join("temp/Module.bsl")));
+        assert!(!patterns.matches(&alias.join("kept/Module.bsl")));
+
+        // The other direction: a root declared inside the base through a link whose
+        // target lies elsewhere — files keyed by the target still match.
+        let target = absolute("respelled-target");
+        let roots = [(root.clone(), target.clone())];
+        let patterns = excluded.patterns.as_ref().unwrap().respelled_under(&roots);
+        assert!(patterns.matches(&target.join("temp/Module.bsl")));
+        assert!(!patterns.matches(&target.join("kept/Module.bsl")));
+    }
+
+    #[test]
+    fn unusable_patterns_are_refused_with_the_offending_value() {
+        let base = absolute("invalid");
+        for (pattern, reason) in [
+            ("", "must not be empty"),
+            ("   ", "must not be empty"),
+            ("!temp", "negation"),
+            ("/temp", "relative"),
+            ("a[", "not a valid glob"),
+        ] {
+            let error = ExcludedPaths::default().with_patterns(&base, [pattern]).unwrap_err();
+            assert_eq!(error.pattern, pattern);
+            assert!(error.to_string().contains(reason), "{pattern:?}: {error}");
+        }
+        #[cfg(windows)]
+        assert!(ExcludedPaths::default().with_patterns(&base, ["C:temp"]).is_err());
+    }
+
+    #[test]
+    fn no_patterns_leave_the_set_unchanged() {
+        let base = absolute("none");
+        let plain = ExcludedPaths::new([base.join(".tmp")]);
+        let with_none = plain.clone().with_patterns(&base, Vec::<String>::new()).unwrap();
+
+        assert_eq!(plain, with_none);
+        assert!(with_none.patterns().next().is_none());
+        assert!(!with_none.excludes_walked_file(&base.join("temp/Module.bsl")));
+        assert!(ExcludedPaths::default().with_patterns(&base, [""; 0]).unwrap().is_empty());
+        assert_ne!(plain, plain.clone().with_patterns(&base, ["temp"]).unwrap());
     }
 
     #[test]

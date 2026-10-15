@@ -142,6 +142,12 @@ fn portable_topology(
             .declared()
             .map(|path| portable_user_exclusion_key(&project.root, path)),
     );
+    exclusions.extend(
+        project
+            .source_exclusions()
+            .patterns()
+            .map(|pattern| [b"pattern\0".as_slice(), pattern.as_bytes()].concat()),
+    );
     // Cache aliases must identify one exclusion even when its directory appears.
     exclusions.sort();
     exclusions.dedup();
@@ -388,6 +394,66 @@ mod tests {
         assert!(
             files.iter().any(|(_, path)| path.ends_with("CommonModules/РасшМодуль/Ext/Module.bsl")),
             "the extension module must be enumerated: {files:?}"
+        );
+    }
+
+    /// `[source].exclude_globs` narrows the MCP universe the same way for the graph scan
+    /// and for the search roots, and a project without patterns keeps its scope stamp.
+    #[test]
+    fn exclude_globs_narrow_the_graph_universe_and_the_search_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        for relative in [
+            "Allowed.bsl",
+            "temp/Hidden.bsl",
+            ".tool/Hidden.bsl",
+            "Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "Reports/R/Ext/ObjectModule.bsl",
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let scanned = |project: &project_model::Project| {
+            let snapshot = ProjectSnapshot::from_project(project);
+            let (stats, _) = crate::graph::scan::scan_stats_over_project(&snapshot);
+            let mut names: Vec<String> = stats
+                .iter()
+                .filter(|stat| stat.path.ends_with(".bsl"))
+                .map(|stat| {
+                    let path = Path::new(&stat.path);
+                    let canonical_root = root.canonicalize().unwrap();
+                    let relative = path
+                        .strip_prefix(root)
+                        .or_else(|_| stat.canonical.strip_prefix(&canonical_root))
+                        .unwrap_or(path);
+                    relative.to_string_lossy().replace('\\', "/")
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        let ordinary = project_model::Project::new(root).unwrap();
+        assert_eq!(scanned(&ordinary).len(), 5, "positive control: every module is scanned");
+
+        fs::write(
+            root.join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/*.Queries.bsl\"]\n",
+        )
+        .unwrap();
+        let scoped = project_model::Project::new(root).unwrap();
+        assert_eq!(scanned(&scoped), ["Allowed.bsl", "Reports/R/Ext/ObjectModule.bsl"]);
+
+        let (roots, _) = crate::project::workspace_roots(&scoped, &[]);
+        let queries = root.join("Reports/R/Templates/T/Ext/Template.Queries.bsl");
+        assert!(roots.user_excluded().is_excluded(&queries), "search roots lost the patterns");
+        assert!(!roots.user_excluded().is_excluded(&root.join("Allowed.bsl")));
+        assert_ne!(
+            ProjectSnapshot::from_project(&ordinary).portable_topology,
+            ProjectSnapshot::from_project(&scoped).portable_topology,
+            "a graph stored without the patterns must not be reused under them"
         );
     }
 

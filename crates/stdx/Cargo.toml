@@ -12,6 +12,7 @@ crossbeam-utils.workspace = true
 jod-thread.workspace = true
 libc.workspace = true
 ignore.workspace = true
+globset.workspace = true
 
 [lints]
 workspace = true
