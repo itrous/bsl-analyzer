@@ -66,12 +66,14 @@ fn resolve_iter_element_ty_inner(db: &dyn TypeKernelDb, collection: TypeId) -> O
         TypeKind::ValueList(_) => from_name("СписокЗначений"),
         TypeKind::Structure(_) => from_name("Структура"),
         TypeKind::Union(arms) => IterShape::Union(arms.to_vec()),
-        // The element stays the platform's union of every description kind rather than the
-        // collection's own kind: a loop variable is the receiver most often re-bound from an
-        // unknown collection (`Для Каждого М Из Метаданные[Вид]`), which leaves it holding
-        // the precise type of an earlier loop, and every member check downstream would judge
-        // the wrong kind.
-        TypeKind::MetadataObjectCollection(_) => from_name("КоллекцияОбъектовМетаданных"),
+        // Every element of `Метаданные.Справочники` is a catalog description. Kinds without a
+        // trusted description type keep the platform's union of every description kind.
+        TypeKind::MetadataObjectCollection(kind) => {
+            match crate::field_lookup::metadata_description_type_name(*kind) {
+                Some(name) => IterShape::Element(db.platform_object(name)),
+                None => from_name("КоллекцияОбъектовМетаданных"),
+            }
+        }
         _ => IterShape::Unsupported,
     };
 

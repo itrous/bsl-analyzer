@@ -231,9 +231,49 @@ fn is_checked_metadata_collection(kind: MdoType) -> bool {
     kind.manager_type_prefix().is_some() && kind != MdoType::ExternalDataSource
 }
 
+/// The platform type of one element of `Метаданные.<plural of kind>` — the
+/// `ОбъектМетаданных: Справочник` family — for the kinds whose member set may be
+/// trusted as complete.
+///
+/// Only the manager-backed kinds qualify. Their member lists in the platform data
+/// were checked against every `Метаданные.<Коллекция>.<Объект>.<член>` written in
+/// a corpus of 32 configurations (≈17 600 occurrences across typical and custom
+/// configurations, no miss); the other description kinds (`Форма`,
+/// `Реквизит`, `МетодHTTPСервиса`, …) carry visibly thinner lists, and treating
+/// those as closed would accuse valid code. `ВнешнийИсточникДанных` is left out
+/// because the object resolver does not see external data sources, so its
+/// collection could not tell a typo from a real member.
+pub(crate) fn metadata_description_type_name(kind: MdoType) -> Option<String> {
+    if kind.manager_type_prefix().is_none() || kind == MdoType::ExternalDataSource {
+        return None;
+    }
+    let name = format!("ОбъектМетаданных: {}", kind.russian_name());
+    let platform = bsl_platform::PlatformData::instance();
+    platform.get_type(&name)?;
+    if platform.get_type_properties(&name).is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
+/// Whether `ty` is a metadata-description object whose members are known in full,
+/// so a member the platform data lacks is a defect rather than an unknown shape.
+pub(crate) fn is_closed_metadata_description(db: &dyn TypeKernelDb, ty: TypeId) -> bool {
+    let TypeKind::PlatformObject(facet) = db.lookup_type(ty) else {
+        return false;
+    };
+    let Some(platform_type) = bsl_platform::PlatformData::instance().get_type(&facet.name) else {
+        return false;
+    };
+    MdoType::all()
+        .iter()
+        .filter_map(|kind| metadata_description_type_name(*kind))
+        .any(|name| stdx::case::eq_ignore_case(&name, &platform_type.name))
+}
+
 /// A member of `Метаданные.Справочники`: present when the configuration holds a
-/// catalog of that name. Its type stays unknown, as before the collection learned
-/// its kind — typing the description itself is a separate change.
+/// catalog of that name, typed as its metadata description where that description
+/// is closed (see [`metadata_description_type_name`]).
 fn lookup_metadata_object_collection_member(
     db: &dyn TypeKernelDb,
     resolver: &dyn MetadataResolution,
@@ -243,10 +283,12 @@ fn lookup_metadata_object_collection_member(
     if !crate::manager_lookup::collection_member_exists(resolver, kind, field_name.as_str()) {
         return None;
     }
+    let ty = metadata_description_type_name(kind)
+        .map_or_else(|| db.unknown(), |name| db.platform_object(name));
     Some(FieldInfo {
         name: field_name.clone(),
         name_en: None,
-        ty: db.unknown(),
+        ty,
         value_ty: None,
         is_readonly: true,
         origin: crate::field_enum::FieldOrigin::MetadataReference,

@@ -2105,6 +2105,111 @@ impl<'db> InferenceContext<'db> {
         })
     }
 
+    /// True when every definition of the local read at `receiver_expr` that reaches the read
+    /// is a metadata description with a closed member list, and none of them has `field`.
+    ///
+    /// The walk types a local by its textually latest write, which at a merge (`Если`,
+    /// a loop back-edge) is one path's type only. A definition inference could not type, or
+    /// typed as anything but such a description, leaves the member possibly present.
+    fn description_miss_holds_on_every_path(
+        &self,
+        receiver_expr: ExprId,
+        field: &hir_def::Name,
+    ) -> bool {
+        let Expr::Path(name) = self.body.expr(receiver_expr) else {
+            return false;
+        };
+        let key = name.as_str().fold_lower();
+        let Some(reaching) = self.reaching_assignment_types(receiver_expr, &key) else {
+            return false;
+        };
+        let Some(use_stmt) = self.body.enclosing_stmt(receiver_expr).map(|stmt| stmt.to_idx())
+        else {
+            return false;
+        };
+        let Some(definitions) = self.loop_aware_definitions(&key, use_stmt, reaching) else {
+            return false;
+        };
+        if definitions.is_empty() {
+            return false;
+        }
+        let obj_resolver =
+            crate::object_resolver::DbObjectResolver::new(self.db, self.context_file_id);
+        definitions.iter().all(|ty| {
+            ty.is_some_and(|ty| {
+                crate::field_lookup::is_closed_metadata_description(self.db, ty)
+                    && crate::field_lookup::lookup_field(self.db, &obj_resolver, ty, field)
+                        .is_none()
+                    && crate::manager_lookup::lookup_manager_field(
+                        self.db,
+                        &obj_resolver,
+                        ty,
+                        field,
+                    )
+                    .is_none()
+            })
+        })
+    }
+
+    /// The types of the definitions of `var_key` reaching `use_stmt`, with loop variables
+    /// put back. `None` when no set can be vouched for.
+    ///
+    /// Reaching definitions do not see a `Для`/`Для Каждого` header rebind its variable: the
+    /// header is not a statement of any block. Inside a loop over the name, writes made
+    /// before the loop still look as if they reached and the loop's own element does not.
+    /// Inside the innermost such loop the element and the writes made in that loop's body
+    /// are what can reach; outside every such loop, a loop of the name may have left its
+    /// last element behind, and nothing is vouched for.
+    fn loop_aware_definitions(
+        &self,
+        var_key: &str,
+        use_stmt: StmtIdx,
+        reaching: Vec<ReachingDef>,
+    ) -> Option<Vec<Option<TypeId>>> {
+        let loops: Vec<(StmtIdx, BindingId)> = self
+            .body
+            .stmts_iter()
+            .filter_map(|(id, stmt)| match stmt {
+                Stmt::For { var, .. } | Stmt::ForEach { var, .. }
+                    if self.body.binding_idx(*var).name.as_str().fold_lower() == var_key =>
+                {
+                    Some((id.to_idx(), BindingId::from_idx(*var)))
+                }
+                _ => None,
+            })
+            .collect();
+        if loops.is_empty() {
+            return Some(reaching.into_iter().map(|def| def.ty).collect());
+        }
+
+        let covers = |outer: StmtIdx, inner: StmtIdx| {
+            crate::narrow::stmt_covers_stmt(&self.body, outer, inner)
+        };
+        // The loop's own statement owns its collection expression, which is read before
+        // the variable is rebound, so a read there is not inside the loop.
+        let enclosing: Vec<(StmtIdx, BindingId)> = loops
+            .iter()
+            .copied()
+            .filter(|(loop_stmt, _)| *loop_stmt != use_stmt && covers(*loop_stmt, use_stmt))
+            .collect();
+        let (innermost, binding) = enclosing
+            .iter()
+            .copied()
+            .find(|(candidate, _)| enclosing.iter().all(|(other, _)| covers(*other, *candidate)))?;
+        if loops.iter().any(|(other, _)| *other != innermost && covers(innermost, *other)) {
+            return None;
+        }
+
+        let mut definitions = vec![self.binding_types.get(&binding).copied()];
+        definitions.extend(
+            reaching
+                .into_iter()
+                .filter(|def| def.stmt.is_some_and(|stmt| covers(innermost, stmt.to_idx())))
+                .map(|def| def.ty),
+        );
+        Some(definitions)
+    }
+
     /// The definitions of `var_key` reaching `use_expr`. `None` overall when
     /// reaching definitions are unavailable for the owner.
     fn reaching_assignment_types(
@@ -2717,7 +2822,20 @@ impl<'db> InferenceContext<'db> {
                     let closed_metadata_collection =
                         matches!(base_kind, TypeKind::MetadataObjectCollection(_))
                             && self.db.file_has_visible_config(self.context_file_id);
-                    if !field.is_missing() && (closed_receiver || closed_metadata_collection) {
+                    // A metadata-description object (`Метаданные.Справочники.X`) is closed by the
+                    // platform, not by the configuration — its members are the same for every catalog.
+                    // Through a local it is closed only when every definition reaching this read is
+                    // such a description lacking the member: the walk types a local by its textually
+                    // latest write, so after `Если … Иначе` or around a loop back-edge it can name one
+                    // path's kind while another path holds `Метаданные[Вид][Имя]`.
+                    let base_id = ExprId::from_idx(*base);
+                    let closed_description =
+                        crate::field_lookup::is_closed_metadata_description(self.db, base_ty)
+                            && (!matches!(self.body.expr(base_id), Expr::Path(_))
+                                || self.description_miss_holds_on_every_path(base_id, field));
+                    if !field.is_missing()
+                        && (closed_receiver || closed_metadata_collection || closed_description)
+                    {
                         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedField {
                             expr: expr_id,
                             receiver_ty: base_ty,

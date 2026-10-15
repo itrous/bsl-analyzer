@@ -94,24 +94,40 @@ fn collection_reached_through_a_local_keeps_its_kind() {
 #[test]
 fn collection_methods_and_untrusted_shapes_stay_silent() {
     // The collection keeps the platform's methods; kinds without a manager, the
-    // configuration root and anything below an existing object are not judged here.
+    // configuration root and the nested collections of an existing object
+    // (`Реквизиты.<имя>` depends on the object, not on the platform) are not judged here.
     let found = unresolved_fields(
         r#"Процедура Тест(Описание)
     Есть = Метаданные.Справочники.Содержит(Описание);
     Найден = Метаданные.Справочники.Найти("Справочник1");
     Число = Метаданные.Документы.Количество();
     А = Метаданные.Справочники.Справочник1.Реквизиты.НетТакогоРеквизита;
-    Б = Метаданные.Справочники.Справочник1.НетТакогоСвойства;
     В = Метаданные.ОсновнаяРоль;
     Г = Метаданные.ОбщиеМодули.НетТакогоМодуля;
     Д = Метаданные.ВнешниеИсточникиДанных.НетТакогоИсточника;
+КонецПроцедуры
+"#,
+    );
+    assert!(found.is_empty(), "these shapes must stay silent: {found:?}");
+}
+
+#[test]
+fn a_member_the_object_description_lacks_is_reported() {
+    // An existing catalog's description is `ОбъектМетаданных: Справочник`, the same for
+    // every catalog, so a property it lacks fails at run time with «Поле объекта не
+    // обнаружено» - in a chain and through the loop element over the collection alike.
+    let found = unresolved_fields(
+        r#"Процедура Тест()
+    Есть = Метаданные.Справочники.Справочник1.Реквизиты;
+    Б = Метаданные.Справочники.Справочник1.НетТакогоСвойства;
     Для Каждого Элемент Из Метаданные.Справочники Цикл
+        Имя = Элемент.Имя;
         Е = Элемент.НетТакогоСвойства;
     КонецЦикла;
 КонецПроцедуры
 "#,
     );
-    assert!(found.is_empty(), "these shapes must stay silent: {found:?}");
+    assert_eq!(found, vec!["НетТакогоСвойства".to_string(), "НетТакогоСвойства".to_string()]);
 }
 
 fn unresolved_field_messages(code: &str, with_configuration: bool) -> Vec<String> {

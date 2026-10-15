@@ -482,10 +482,11 @@ mod tests {
     }
 
     #[test]
-    fn loop_variable_over_a_metadata_collection_stays_soft() {
-        // The second loop iterates an unknown collection, and the variable would keep the
-        // first loop's kind if the element were typed by it: `Регистр.ТабличныеЧасти` below
-        // is valid code on a catalog.
+    fn loop_variable_over_a_metadata_collection_is_checked_until_rebound() {
+        // The first loop's variable is an information-register description, so a member the
+        // description lacks is reported. The second loop iterates an unknown collection and
+        // rebinds the name: `ТабличныеЧасти` there is valid code on a catalog, and judging it
+        // by the first loop's kind would accuse it.
         let fixture = r#"
 //- /test.bsl
 Процедура Тест(Вид)
@@ -498,7 +499,8 @@ mod tests {
 КонецПроцедуры
 "#;
         let unresolved = unresolved_in_fixture(fixture);
-        assert!(unresolved.is_empty(), "loop variables must stay soft: {unresolved:?}");
+        assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+        assert!(unresolved[0].message.contains("НетТакогоСвойства"), "{unresolved:?}");
     }
 
     #[test]
