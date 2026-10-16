@@ -153,6 +153,7 @@ pub enum DiagnosticCode {
     MetadataObjectNameLength,
     MissingCommonModuleMethod,
     MissingEventSubscriptionHandler,
+    MissingFormEventHandler,
     OrdinaryAppSupport,
     PrivilegedModuleMethodCall,
     ProtectedModule,

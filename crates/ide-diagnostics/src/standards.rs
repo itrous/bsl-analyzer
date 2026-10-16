@@ -192,6 +192,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::MetadataObjectNameLength => &[474],
         DiagnosticCode::MissingCommonModuleMethod => &[],
         DiagnosticCode::MissingEventSubscriptionHandler => &[],
+        DiagnosticCode::MissingFormEventHandler => &[],
         DiagnosticCode::OrdinaryAppSupport => &[467],
         DiagnosticCode::PrivilegedModuleMethodCall => &[],
         DiagnosticCode::ProtectedModule => &[],

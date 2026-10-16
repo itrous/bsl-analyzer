@@ -96,6 +96,7 @@ pub mod missed_required_parameter;
 pub mod missing_code_try_catch_ex;
 pub mod missing_common_module_method;
 pub mod missing_event_subscription_handler;
+pub mod missing_form_event_handler;
 pub mod missing_parameter_description;
 pub mod missing_returned_value_description;
 pub mod missing_space;
@@ -404,6 +405,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::MissingEventSubscriptionHandler => {
             Some(&missing_event_subscription_handler::METADATA)
         }
+        DiagnosticCode::MissingFormEventHandler => Some(&missing_form_event_handler::METADATA),
         DiagnosticCode::MultilineStringInQuery => Some(&multiline_string_in_query::METADATA),
         DiagnosticCode::OrdinaryAppSupport => Some(&ordinary_app_support::METADATA),
         DiagnosticCode::PrivilegedModuleMethodCall => {

@@ -68,6 +68,14 @@ impl FormEventHandler {
     pub fn estimated_heap_size(&self) -> usize {
         self.event_type.capacity() + self.handler_name.capacity()
     }
+
+    /// The event is named by an identifier instead of a name. The designer keeps
+    /// such bindings for events the form does not have: an object-write event on a
+    /// form whose main attribute is not an object, a settings event outside a
+    /// report form. Its handler-existence check passes over them.
+    pub fn is_unnamed_event(&self) -> bool {
+        Uuid::parse_str(&self.event_type).is_ok()
+    }
 }
 
 impl FormElement {
@@ -178,6 +186,9 @@ pub struct Form {
     pub event_handlers: Vec<FormEventHandler>,
     pub command_handlers: Vec<String>,
     pub attributes: Vec<FormAttribute>,
+    /// The dialog carries `<BaseForm>`: a form borrowed by an extension, whose
+    /// bindings also name the base form's handlers, which live in the base module.
+    pub has_base_form: bool,
 }
 
 impl Form {
@@ -190,6 +201,7 @@ impl Form {
             event_handlers: Vec::new(),
             command_handlers: Vec::new(),
             attributes: Vec::new(),
+            has_base_form: false,
         }
     }
 
@@ -207,6 +219,7 @@ impl Form {
             event_handlers: Vec::new(),
             command_handlers: Vec::new(),
             attributes: Vec::new(),
+            has_base_form: false,
         }
     }
 
@@ -226,6 +239,7 @@ impl Form {
             event_handlers,
             command_handlers,
             attributes: Vec::new(),
+            has_base_form: false,
         }
     }
 
@@ -280,6 +294,10 @@ impl Form {
 
     pub fn is_ordinary(&self) -> bool {
         self.form_type == FormType::Ordinary
+    }
+
+    pub fn has_base_form(&self) -> bool {
+        self.has_base_form
     }
 
     pub fn event_handlers(&self) -> &[FormEventHandler] {

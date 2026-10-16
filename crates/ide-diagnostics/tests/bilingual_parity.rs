@@ -253,6 +253,7 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         DiagnosticCode::MissingEventSubscriptionHandler,
         "metadata event subscription handler diagnostic",
     ),
+    (DiagnosticCode::MissingFormEventHandler, "form metadata handler-name resolution"),
     (DiagnosticCode::OrdinaryAppSupport, "configuration compatibility diagnostic"),
     (
         DiagnosticCode::PrivilegedModuleMethodCall,
@@ -632,7 +633,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 200, "update the Track 3 Phase E inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 201, "update the Track 3 Phase E inventory when DiagnosticCode changes");
 }
 
 #[test]

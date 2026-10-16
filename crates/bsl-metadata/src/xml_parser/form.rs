@@ -90,6 +90,8 @@ pub fn parse_form_xml(xml: &str) -> Result<Form> {
     let mut form =
         Form::with_handlers(name, form_type, uuid, elements, event_handlers, command_handlers);
     form.attributes = attributes;
+    form.has_base_form =
+        form_node.children().any(|n| n.is_element() && n.tag_name().name() == "BaseForm");
 
     tracing::debug!(
         form_name = %form.name(),
