@@ -7,6 +7,8 @@ The current implementation is only a rough Hunspell-based heuristic:
 
 - it checks selected identifiers and string literals against embedded Russian and English dictionaries;
 - camelCase identifiers are split into separate word chunks;
+- identifier checks cover procedure and function names, parameters, variable declarations, and assignment targets; other identifier uses are not checked;
+- each finding points to the word in the original source, including quoted text and every part of a multiline literal;
 - a large built-in exception list is used to suppress common false positives;
 - users can add extra ignored words through configuration.
 
@@ -16,7 +18,7 @@ Because of the large number of false positives and false negatives, the diagnost
 
 ### Parameters
 
-- `minWordLength`: minimum word length to check, default `3`
+- `minWordLength`: minimum number of Unicode scalar values in a word, default `3`
 - `userWordsToIgnore`: comma-separated custom ignore list
 - `caseInsensitive`: case-insensitive matching for `userWordsToIgnore`
 

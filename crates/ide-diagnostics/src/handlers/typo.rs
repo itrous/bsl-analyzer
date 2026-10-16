@@ -245,13 +245,12 @@ fn split_camel_case(text: &str) -> Vec<(String, usize)> {
     let mut words = Vec::new();
     let mut current_word = String::new();
     let mut start_offset = 0;
-    let chars: Vec<char> = text.chars().collect();
 
-    for (i, &ch) in chars.iter().enumerate() {
+    for (offset, ch) in text.char_indices() {
         if ch.is_uppercase() && !current_word.is_empty() {
             words.push((current_word.clone(), start_offset));
             current_word.clear();
-            start_offset = i;
+            start_offset = offset;
         }
         current_word.push(ch);
     }
@@ -279,19 +278,6 @@ fn is_valid_word(word: &str, dictionaries: &Dictionaries) -> bool {
     dictionaries.en.check(word) || dictionaries.ru.check(word)
 }
 
-fn remove_quotes(text: &str) -> String {
-    if text.len() < 2 {
-        return text.to_string();
-    }
-    let first = text.chars().next();
-    let last = text.chars().last();
-    if first == Some('"') && last == Some('"') || first == Some('\'') && last == Some('\'') {
-        text[1..text.len() - 1].to_string()
-    } else {
-        text.to_string()
-    }
-}
-
 fn check_ident_token(
     token: &SyntaxToken,
     acc: &mut Vec<Diagnostic<LocalRange>>,
@@ -300,11 +286,10 @@ fn check_ident_token(
     dictionaries: &Dictionaries,
 ) {
     let code = DiagnosticCode::Typo;
-    let text = token.text().to_string();
-    let words = split_camel_case(&text);
+    let words = split_camel_case(token.text());
 
     for (word, offset) in words {
-        if word.len() < config.min_word_length {
+        if word.chars().count() < config.min_word_length {
             continue;
         }
 
@@ -332,6 +317,32 @@ fn check_ident_token(
     }
 }
 
+pub fn check_token(token: &SyntaxToken, acc: &mut Vec<Diagnostic<LocalRange>>, ctx: &BodyContext) {
+    if !matches!(token.kind(), SyntaxKind::STRING | SyntaxKind::STRING_START) {
+        return;
+    }
+
+    let code = DiagnosticCode::Typo;
+    if ctx.is_disabled_with_metadata(code) {
+        return;
+    }
+
+    let config = Config::from_context(ctx);
+    let dictionaries = get_dictionaries();
+    let Some(literal) = token
+        .parent()
+        .and_then(|parent| parent.ancestors().find(|node| node.kind() == SyntaxKind::LITERAL))
+    else {
+        return;
+    };
+    if literal.first_token().map(|first| first.text_range()) != Some(token.text_range()) {
+        return;
+    }
+
+    let text = literal.text().to_string();
+    check_text(&text, literal.text_range().start(), acc, ctx, &config, &dictionaries);
+}
+
 fn find_first_ident_token(node: &SyntaxNode) -> Option<SyntaxToken> {
     node.children_with_tokens()
         .filter_map(|e| e.into_token())
@@ -340,13 +351,12 @@ fn find_first_ident_token(node: &SyntaxNode) -> Option<SyntaxToken> {
 
 fn find_lvalue_ident_token(node: &SyntaxNode) -> Option<SyntaxToken> {
     for element in node.children_with_tokens() {
-        if let SyntaxElement::Token(token) = element {
-            if token.kind() == SyntaxKind::IDENT {
-                return Some(token);
+        match element {
+            SyntaxElement::Node(ident) if ident.kind() == SyntaxKind::IDENT => {
+                return ident.first_token();
             }
-            if token.kind() == SyntaxKind::EQ {
-                return None;
-            }
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::EQ => return None,
+            _ => {}
         }
     }
     None
@@ -383,23 +393,7 @@ pub fn check_node(node: &SyntaxNode, acc: &mut Vec<Diagnostic<LocalRange>>, ctx:
                 check_ident_token(&token, acc, ctx, &config, &dictionaries);
             }
         }
-        _ => {
-            if let Some(token) = node.first_token() {
-                if token.kind() == SyntaxKind::STRING {
-                    let text = remove_quotes(token.text());
-                    if !is_format_string(&text) {
-                        check_text(
-                            &text,
-                            token.text_range().start(),
-                            acc,
-                            ctx,
-                            &config,
-                            &dictionaries,
-                        );
-                    }
-                }
-            }
-        }
+        _ => {}
     }
 }
 
@@ -412,43 +406,51 @@ fn check_text(
     dictionaries: &Dictionaries,
 ) {
     let code = DiagnosticCode::Typo;
+    if is_format_string(text) {
+        return;
+    }
 
-    for word in text.split_whitespace() {
-        let word = word.trim_matches(|c: char| !c.is_alphabetic());
+    let mut chunk_start = None;
+    for (offset, ch) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+        if ch.is_whitespace() {
+            let Some(start) = chunk_start.take() else {
+                continue;
+            };
+            let chunk = &text[start..offset];
+            let word = chunk.trim_matches(|c: char| !c.is_alphabetic());
+            let leading_bytes =
+                chunk.len() - chunk.trim_start_matches(|c: char| !c.is_alphabetic()).len();
 
-        if word.len() < config.min_word_length {
-            continue;
-        }
+            if word.chars().count() < config.min_word_length {
+                continue;
+            }
 
-        if config.should_ignore(word) {
-            continue;
-        }
+            if config.should_ignore(word) {
+                continue;
+            }
 
-        if !is_valid_word(word, dictionaries) {
-            if let Some(pos) = text.find(word) {
-                let start: u32 = base_offset.into();
-                let word_start = start + pos as u32;
-                let word_end = word_start + word.len() as u32;
+            if !is_valid_word(word, dictionaries) {
+                let word_start = base_offset + TextSize::from((start + leading_bytes) as u32);
+                let word_end = word_start + TextSize::from(word.len() as u32);
 
                 acc.push(Diagnostic {
                     code,
                     message: format!("Возможная опечатка в \"{}\"", word),
                     severity: ctx.severity(code),
-                    range: LocalRange::of_detached_node(TextRange::new(
-                        word_start.into(),
-                        word_end.into(),
-                    )),
+                    range: LocalRange::of_detached_node(TextRange::new(word_start, word_end)),
                     tags: ctx.tags(code).to_vec(),
                     fixes: vec![],
                 });
             }
+        } else if chunk_start.is_none() {
+            chunk_start = Some(offset);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::check_hir_diagnostic_with_config;
+    use crate::test_utils::{check_hir_diagnostic_with_config, create_test_db};
     use crate::{DiagnosticCode, DiagnosticsConfig};
     use expect_test::expect;
 
@@ -482,11 +484,28 @@ mod tests {
         config
     }
 
-    /// The distinct words reported as typos, one per line, sorted.
-    ///
-    /// Words, not ranges: today each word is reported several times and its range is
-    /// shifted by the opening quote of the literal (recorded as a finding in the
-    /// attestation), so a range snapshot would pin that defect instead of the rule.
+    fn raw_typo_diagnostics(code: &str, config: DiagnosticsConfig) -> Vec<crate::Diagnostic> {
+        use ide_db::base_db::SourceDatabase;
+
+        let (mut db, file_id) = create_test_db(code);
+        db.set_file_text(file_id, code);
+        let provider = ide_db::SalsaProvider::new(&db, None);
+        let ctx = crate::DiagnosticsContext::new(&config, file_id, &provider);
+        crate::body::for_each_body_context(&ctx, |body_ctx, acc| {
+            crate::single_pass::collect_body_single_pass(body_ctx, acc)
+        })
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::Typo)
+        .collect()
+    }
+
+    fn source_slice<'a>(source: &'a str, diagnostic: &crate::Diagnostic) -> &'a str {
+        let start: usize = diagnostic.range.start().into();
+        let end: usize = diagnostic.range.end().into();
+        source.get(start..end).expect("Typo range must be valid UTF-8 source bytes")
+    }
+
+    /// Snapshot distinct typo messages; range behavior is asserted against raw diagnostics below.
     fn snapshot(code: &str, config: DiagnosticsConfig, expected: expect_test::Expect) {
         let all = check_hir_diagnostic_with_config(code, config, crate::diagnostics);
         let mut words: Vec<_> =
@@ -576,6 +595,152 @@ mod tests {
             Возможная опечатка в "Цеены"
             Возможная опечатка в "гатово""#]],
         );
+    }
+
+    #[test]
+    fn repeated_literal_occurrences_keep_distinct_ranges() {
+        let code = "Процедура Первая()\n\tСообщить(\"гатово гатово\");\nКонецПроцедуры\n\
+Процедура Вторая()\n\tСообщить(\"гатово\");\nКонецПроцедуры";
+        let diagnostics = raw_typo_diagnostics(code, config_with_typo_enabled());
+
+        assert_eq!(diagnostics.len(), 3);
+        let ranges: Vec<_> =
+            diagnostics.iter().map(|diagnostic| usize::from(diagnostic.range.start())).collect();
+        let expected_ranges: Vec<_> =
+            code.match_indices("гатово").map(|(start, _)| start).collect();
+        assert_eq!(ranges, expected_ranges);
+        assert!(diagnostics.iter().all(|diagnostic| source_slice(code, diagnostic) == "гатово"));
+    }
+
+    #[test]
+    fn identifier_ranges_slice_camel_case_words_and_keep_existing_owners() {
+        let code = "Процедура ТестГатово(ГатовоПараметр)\n\tГатовоПеременная = 1;\n\tСообщить(ГатовоПараметр);\nКонецПроцедуры";
+        let diagnostics = raw_typo_diagnostics(code, config_with_typo_enabled());
+        let slices: Vec<_> =
+            diagnostics.iter().map(|diagnostic| source_slice(code, diagnostic)).collect();
+        assert_eq!(slices, ["Гатово", "Гатово", "Гатово"]);
+        let starts: Vec<_> =
+            diagnostics.iter().map(|diagnostic| usize::from(diagnostic.range.start())).collect();
+        assert_eq!(
+            starts,
+            [
+                code.find("ТестГатово").unwrap() + "Тест".len(),
+                code.find("ГатовоПараметр").unwrap(),
+                code.find("ГатовоПеременная").unwrap(),
+            ]
+        );
+        assert_eq!(diagnostics.len(), 3, "a plain identifier use is not an additional owner");
+
+        let ascii_code = "Procedure TestZqx(ZqxParameter)\n\tZqxVariable = 1;\n\tMessage(ZqxParameter);\nEndProcedure";
+        let diagnostics = raw_typo_diagnostics(ascii_code, config_with_typo_enabled());
+        let slices: Vec<_> =
+            diagnostics.iter().map(|diagnostic| source_slice(ascii_code, diagnostic)).collect();
+        assert_eq!(slices, ["Zqx", "Zqx", "Zqx"]);
+        let starts: Vec<_> =
+            diagnostics.iter().map(|diagnostic| usize::from(diagnostic.range.start())).collect();
+        assert_eq!(
+            starts,
+            [
+                ascii_code.find("TestZqx").unwrap() + "Test".len(),
+                ascii_code.find("ZqxParameter").unwrap(),
+                ascii_code.find("ZqxVariable").unwrap(),
+            ]
+        );
+        assert_eq!(diagnostics.len(), 3, "a plain identifier use is not an additional owner");
+    }
+
+    #[test]
+    fn literal_ranges_exclude_quotes_and_track_emoji_and_line_endings() {
+        let sources = [
+            ("Процедура Тест()\n\tСообщить(\"текст гатово\");\nКонецПроцедуры", 1),
+            ("Процедура Тест()\n\tСообщить(\"текст \"\"😀 гатово\"\"\");\nКонецПроцедуры", 1),
+            (
+                "Процедура Тест()\n\tСообщить(\"начало\n|😀 гатово\n|😀 гатово\");\nКонецПроцедуры",
+                2,
+            ),
+            (
+                "Процедура Тест()\r\n\tСообщить(\"начало\r\n|😀 гатово\r\n|😀 гатово\");\r\nКонецПроцедуры",
+                2,
+            ),
+        ];
+
+        for (code, expected_count) in sources {
+            let diagnostics = raw_typo_diagnostics(code, config_with_typo_enabled());
+            assert_eq!(diagnostics.len(), expected_count, "source: {code:?}");
+            assert!(diagnostics
+                .iter()
+                .all(|diagnostic| source_slice(code, diagnostic) == "гатово"));
+        }
+
+        let multiline = parser::parse(sources[2].0).syntax_node();
+        let string_parts: Vec<_> = multiline
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token().map(|token| token.kind()))
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    syntax::SyntaxKind::STRING_START
+                        | syntax::SyntaxKind::STRING_PART
+                        | syntax::SyntaxKind::STRING_TAIL
+                )
+            })
+            .collect();
+        assert_eq!(
+            string_parts,
+            [
+                syntax::SyntaxKind::STRING_START,
+                syntax::SyntaxKind::STRING_PART,
+                syntax::SyntaxKind::STRING_TAIL,
+            ]
+        );
+
+        let format_string =
+            "Процедура Тест()\n\tСообщить(Формат(1, \"ДФ=\n|гатово\"));\nКонецПроцедуры";
+        assert!(raw_typo_diagnostics(format_string, config_with_typo_enabled()).is_empty());
+    }
+
+    #[test]
+    fn min_word_length_counts_unicode_scalars_and_keeps_ascii_control() {
+        let code = "Процедура Тест()\n\tСообщить(\"гатово zqx\");\nКонецПроцедуры";
+        let mut config = config_with_typo_enabled();
+        config.parameters.insert(DiagnosticCode::Typo, serde_json::json!({"minWordLength": 7}));
+        assert!(raw_typo_diagnostics(code, config).is_empty());
+
+        let mut config = config_with_typo_enabled();
+        config.parameters.insert(DiagnosticCode::Typo, serde_json::json!({"minWordLength": 6}));
+        let diagnostics = raw_typo_diagnostics(code, config);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(source_slice(code, &diagnostics[0]), "гатово");
+
+        let mut config = config_with_typo_enabled();
+        config.parameters.insert(DiagnosticCode::Typo, serde_json::json!({"minWordLength": 4}));
+        assert!(raw_typo_diagnostics("Сообщить(\"zqx\");", config).is_empty());
+        let mut config = config_with_typo_enabled();
+        config.parameters.insert(DiagnosticCode::Typo, serde_json::json!({"minWordLength": 3}));
+        let diagnostics = raw_typo_diagnostics("Сообщить(\"zqx\");", config);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(source_slice("Сообщить(\"zqx\");", &diagnostics[0]), "zqx");
+    }
+
+    #[test]
+    fn defaults_dictionary_ignore_case_and_format_string_behavior_remain() {
+        let code = "Процедура Тест()\n\tСообщить(\"Тесто гатово Цеены zqx\");\n\tСообщить(Формат(1, \"ДФ=гатово\"));\nКонецПроцедуры";
+        assert!(raw_typo_diagnostics(code, DiagnosticsConfig::default()).is_empty());
+
+        let diagnostics = raw_typo_diagnostics(code, config_with_typo_enabled());
+        let words: Vec<_> =
+            diagnostics.iter().map(|diagnostic| source_slice(code, diagnostic)).collect();
+        assert_eq!(words, ["гатово", "Цеены", "zqx"]);
+
+        let mut config = config_with_typo_enabled();
+        config.parameters.insert(
+            DiagnosticCode::Typo,
+            serde_json::json!({"userWordsToIgnore": "ГАТОВО,Цеены", "caseInsensitive": true}),
+        );
+        let diagnostics = raw_typo_diagnostics(code, config);
+        let words: Vec<_> =
+            diagnostics.iter().map(|diagnostic| source_slice(code, diagnostic)).collect();
+        assert_eq!(words, ["zqx"]);
     }
 
     #[test]

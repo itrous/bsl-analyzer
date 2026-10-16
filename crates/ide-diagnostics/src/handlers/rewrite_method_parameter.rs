@@ -4,6 +4,7 @@ use crate::BodyContext;
 use crate::{Diagnostic, DiagnosticCode};
 use hir::LocalRange;
 use hir::{BindingId, ExprId, IdConversion, StmtId};
+use std::collections::{HashSet, VecDeque};
 use stdx::case::{eq_ignore_case, CaseExt};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
@@ -40,45 +41,179 @@ pub fn from_hir(
     let param_name = param.name.as_str();
 
     let reaching_defs_result = ctx.reaching_definitions()?;
-
     let reaching_defs_set = reaching_defs_result.defs_before_stmt(stmt_id)?;
-
     let param_name_lower = param_name.fold_lower();
-
     let param_definitions: Vec<_> =
         reaching_defs_set.iter().filter(|def| def.var_name.as_str() == param_name_lower).collect();
 
-    if param_definitions.is_empty() {
+    let eligible_entry = if target_is_inside_while(body, stmt_id) {
+        has_unwritten_entry_path(&ctx.cfg(), body, stmt_id, param_id)
+    } else if param_definitions.len() == 1 {
+        matches!(
+            param_definitions[0].def_site,
+            hir::dataflow::reaching_defs::DefSite::Parameter(def_binding_id)
+                if def_binding_id == param_id
+        )
+    } else {
+        false
+    };
+
+    if parameter_used_in_assignment_rhs(body, stmt_id, param_id)
+        || parameter_used_before_stmt(body, stmt_id, param_id)
+        || !eligible_entry
+    {
         return None;
     }
 
-    if param_definitions.len() == 1 {
-        let single_def = param_definitions[0];
-        if let hir::dataflow::reaching_defs::DefSite::Parameter(def_binding_id) =
-            single_def.def_site
-        {
-            if def_binding_id == param_id {
-                if parameter_used_in_assignment_rhs(body, stmt_id, param_id) {
-                    return None;
-                }
+    Some(Diagnostic {
+        code,
+        message: format!("Переприсваивание параметра метода '{}'", param_name),
+        severity: ctx.severity(code),
+        range: ident_range,
+        tags: ctx.tags(code),
+        fixes: vec![],
+    })
+}
 
-                if parameter_used_before_stmt(body, stmt_id, param_id) {
-                    return None;
-                }
+fn target_is_inside_while(body: &hir::Body, target_stmt_id: StmtId) -> bool {
+    fn contains_target_in_loop(
+        body: &hir::Body,
+        stmts: impl IntoIterator<Item = StmtId>,
+        target_stmt_id: StmtId,
+    ) -> bool {
+        use hir::Stmt;
 
-                return Some(Diagnostic {
-                    code,
-                    message: format!("Переприсваивание параметра метода '{}'", param_name),
-                    severity: ctx.severity(code),
-                    range: ident_range,
-                    tags: ctx.tags(code),
-                    fixes: vec![],
-                });
+        for stmt_id in stmts {
+            if stmt_id == target_stmt_id {
+                continue;
+            }
+            match body.stmt(stmt_id) {
+                Stmt::While { body: loop_body, .. } => {
+                    if stmts_contain_target(body, loop_body, target_stmt_id) {
+                        return true;
+                    }
+                }
+                Stmt::If(if_stmt) => {
+                    if contains_target_in_loop(body, ids(&if_stmt.then_branch), target_stmt_id)
+                        || if_stmt.elsif_branches.iter().any(|(_, branch)| {
+                            contains_target_in_loop(body, ids(branch), target_stmt_id)
+                        })
+                        || if_stmt.else_branch.as_ref().is_some_and(|branch| {
+                            contains_target_in_loop(body, ids(branch), target_stmt_id)
+                        })
+                    {
+                        return true;
+                    }
+                }
+                Stmt::PreprocIf(preproc) => {
+                    if preproc.branches().any(|branch| {
+                        contains_target_in_loop(body, ids(branch.stmts), target_stmt_id)
+                    }) {
+                        return true;
+                    }
+                }
+                Stmt::For { body: loop_body, .. } | Stmt::ForEach { body: loop_body, .. } => {
+                    if contains_target_in_loop(body, ids(loop_body), target_stmt_id) {
+                        return true;
+                    }
+                }
+                Stmt::Try { body: try_body, except }
+                    if contains_target_in_loop(body, ids(try_body), target_stmt_id)
+                        || contains_target_in_loop(body, ids(except), target_stmt_id) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn ids(stmts: &[hir::StmtIdx]) -> impl Iterator<Item = StmtId> + '_ {
+        stmts.iter().copied().map(StmtId::from_idx)
+    }
+
+    contains_target_in_loop(body, body.body_stmts(), target_stmt_id)
+}
+
+/// Keep loop-carried assignments separate from paths that still carry the
+/// parameter's entry value. The two states reach a loop header independently.
+fn has_unwritten_entry_path(
+    cfg: &hir::cfg::ControlFlowGraph,
+    body: &hir::Body,
+    target_stmt_id: StmtId,
+    param_id: BindingId,
+) -> bool {
+    let Some(start) = cfg.start() else { return false };
+    let mut pending = VecDeque::from([(start, true)]);
+    let mut visited = HashSet::new();
+
+    while let Some((vertex_id, entry_value_intact)) = pending.pop_front() {
+        if !visited.insert((vertex_id, entry_value_intact)) {
+            continue;
+        }
+
+        let entry_value_intact =
+            entry_value_intact && !loop_header_writes_binding(cfg, body, vertex_id, param_id);
+
+        if let Some(hir::cfg::CfgVertex::BasicBlock(block)) = cfg.vertex(vertex_id) {
+            let mut entry_value_intact = entry_value_intact;
+            for &stmt_id in block.statements() {
+                if stmt_id == target_stmt_id {
+                    if entry_value_intact {
+                        return true;
+                    }
+                    break;
+                }
+                if is_real_assignment_to_binding(body, stmt_id, param_id) {
+                    entry_value_intact = false;
+                }
+            }
+            // A target with no entry value cannot regain it on a later iteration.
+            if block.statements().contains(&target_stmt_id) {
+                continue;
+            }
+            for (next, edge_type) in cfg.outgoing_edges(vertex_id) {
+                if edge_type.is_executable() {
+                    pending.push_back((next, entry_value_intact));
+                }
+            }
+        } else {
+            for (next, edge_type) in cfg.outgoing_edges(vertex_id) {
+                if edge_type.is_executable() {
+                    pending.push_back((next, entry_value_intact));
+                }
             }
         }
     }
 
-    None
+    false
+}
+
+fn loop_header_writes_binding(
+    cfg: &hir::cfg::ControlFlowGraph,
+    body: &hir::Body,
+    vertex_id: hir::cfg::NodeIndex,
+    binding_id: BindingId,
+) -> bool {
+    let Some(vertex) = cfg.vertex(vertex_id) else { return false };
+    let loop_var = match vertex {
+        hir::cfg::CfgVertex::ForHeader(header) => header.loop_var,
+        hir::cfg::CfgVertex::ForEachHeader(header) => header.loop_var,
+        _ => return false,
+    };
+
+    eq_ignore_case(body.binding(loop_var).name.as_str(), body.binding(binding_id).name.as_str())
+}
+
+fn is_real_assignment_to_binding(body: &hir::Body, stmt_id: StmtId, binding_id: BindingId) -> bool {
+    use hir::{Expr, Stmt};
+
+    let Stmt::Assign { target, .. } = body.stmt(stmt_id) else { return false };
+    let Expr::Path(target_name) = body.expr(ExprId::from_idx(*target)) else { return false };
+    let binding_name = body.binding(binding_id).name.as_str();
+    eq_ignore_case(target_name.as_str(), binding_name)
+        && !is_self_assign_to_binding(body, stmt_id, binding_id)
 }
 
 /// Outcome of scanning statements in execution order looking for a read of the
@@ -493,12 +628,242 @@ fn expr_uses_binding(body: &hir::Body, expr_id: ExprId, binding_id: BindingId) -
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::check_diagnostics_snapshot_for;
+    use crate::test_utils::{
+        assert_diagnostic_range, check_diagnostics_for, check_diagnostics_snapshot_for,
+    };
     use crate::DiagnosticCode;
     use expect_test::expect;
 
     fn check(code: &str, expected: expect_test::Expect) {
         check_diagnostics_snapshot_for(code, DiagnosticCode::RewriteMethodParameter, expected);
+    }
+
+    fn assert_targets(code: &str, expected_lines: &[u32]) {
+        let diagnostics = check_diagnostics_for(code, DiagnosticCode::RewriteMethodParameter);
+        assert_eq!(diagnostics.len(), expected_lines.len());
+
+        for (diagnostic, &line) in diagnostics.iter().zip(expected_lines) {
+            let assignment = code
+                .lines()
+                .nth(line as usize)
+                .expect("expected target line")
+                .find("Уставка =")
+                .expect("expected target assignment");
+            let start_col = code.lines().nth(line as usize).expect("expected target line")
+                [..assignment]
+                .chars()
+                .count() as u32;
+            assert_diagnostic_range(
+                code,
+                diagnostic,
+                line,
+                start_col,
+                start_col + "Уставка".chars().count() as u32,
+            );
+            let start: u32 = diagnostic.range.start().into();
+            let end: u32 = diagnostic.range.end().into();
+            assert_eq!(&code[start as usize..end as usize], "Уставка");
+        }
+    }
+
+    #[test]
+    fn test_s7_first_blind_write_in_while_reports_exact_target() {
+        let code = r#"Процедура Установить(Знач Уставка, Знач Повторять)
+	Пока Повторять Цикл
+		Уставка = 21;
+	КонецЦикла;
+КонецПроцедуры
+"#;
+
+        assert_targets(code, &[2]);
+    }
+
+    #[test]
+    fn test_s8_nested_branches_report_first_writes_once() {
+        let code = r#"Процедура Установить(Знач Уставка, Знач Повторять, Знач Ветка, Знач ВложенныйЦикл, Знач ЕщёВетка)
+	Пока Повторять Цикл
+		Если Ветка Тогда
+			Уставка = 1;
+			Уставка = 2;
+		Иначе
+			Пока ВложенныйЦикл Цикл
+				Если ЕщёВетка Тогда
+					Уставка = 3;
+					Уставка = 4;
+				Иначе
+					Уставка = 5;
+					Уставка = 6;
+				КонецЕсли;
+			КонецЦикла;
+		КонецЕсли;
+	КонецЦикла;
+КонецПроцедуры
+"#;
+
+        assert_targets(code, &[3, 8, 11]);
+    }
+
+    #[test]
+    fn test_s9_read_before_condition_and_rhs_suppress_but_later_and_sibling_reads_do_not() {
+        let code = r#"Процедура ДоЗаписи(Знач Уставка, Знач Повторять)
+	Журнал.Добавить(Уставка);
+	Пока Повторять Цикл
+		Уставка = 1;
+	КонецЦикла;
+КонецПроцедуры
+
+Процедура Условие(Знач Уставка)
+	Пока Уставка > 0 Цикл
+		Уставка = 1;
+	КонецЦикла;
+КонецПроцедуры
+
+Процедура ПраваяЧасть(Знач Уставка, Знач Повторять)
+	Пока Повторять Цикл
+		Уставка = Уставка + 1;
+	КонецЦикла;
+КонецПроцедуры
+
+Процедура ПослеЗаписи(Знач Уставка, Знач Повторять)
+	Пока Повторять Цикл
+		Уставка = 1;
+		Журнал.Добавить(Уставка);
+	КонецЦикла;
+КонецПроцедуры
+
+Процедура СоседняяВетвь(Знач Уставка, Знач Повторять, Знач Ветка)
+	Пока Повторять Цикл
+		Если Ветка Тогда
+			Журнал.Добавить(Уставка);
+		Иначе
+			Уставка = 1;
+		КонецЕсли;
+	КонецЦикла;
+КонецПроцедуры
+"#;
+
+        assert_targets(code, &[21, 31]);
+    }
+
+    #[test]
+    fn test_s10_prior_write_suppresses_next_write_but_prior_self_assign_does_not() {
+        let code = r#"Процедура РеальнаяЗапись(Знач Уставка, Знач Повторять)
+	Уставка = 5;
+	Пока Повторять Цикл
+		Уставка = 21;
+	КонецЦикла;
+КонецПроцедуры
+
+Процедура СамоприсваиваниеДоЦикла(Знач Уставка, Знач Повторять)
+	Уставка = Уставка;
+	Пока Повторять Цикл
+		Уставка = 21;
+	КонецЦикла;
+КонецПроцедуры
+"#;
+
+        assert_targets(code, &[1, 10]);
+    }
+
+    #[test]
+    fn test_s10_self_assign_inside_while_does_not_hide_first_real_write() {
+        let code = r#"Процедура Установить(Знач Уставка, Знач Повторять)
+	Пока Повторять Цикл
+		Уставка = Уставка;
+		Уставка = 21;
+	КонецЦикла;
+КонецПроцедуры
+"#;
+
+        assert_targets(code, &[3]);
+    }
+
+    #[test]
+    fn test_s10_by_ref_parameter_is_silent_inside_while() {
+        let code = r#"Процедура Установить(Уставка, Знач Повторять)
+	Пока Повторять Цикл
+		Уставка = 21;
+	КонецЦикла;
+КонецПроцедуры
+"#;
+
+        assert_targets(code, &[]);
+    }
+
+    #[test]
+    fn test_s11_break_and_continue_keep_unreachable_targets_silent() {
+        let code = r#"Процедура ПослеПрерывания(Знач Уставка, Знач Повторять)
+	Пока Повторять Цикл
+		Прервать;
+		Уставка = 1;
+	КонецЦикла;
+КонецПроцедуры
+
+Процедура ПослеПродолжения(Знач Уставка, Знач Повторять)
+	Пока Повторять Цикл
+		Продолжить;
+		Уставка = 1;
+	КонецЦикла;
+КонецПроцедуры
+
+Процедура ДоступныйПослеВетвиПродолжения(Знач Уставка, Знач Повторять, Знач Пропустить)
+	Пока Повторять Цикл
+		Если Пропустить Тогда
+			Продолжить;
+		КонецЕсли;
+		Уставка = 1;
+	КонецЦикла;
+КонецПроцедуры
+"#;
+
+        assert_targets(code, &[19]);
+    }
+
+    #[test]
+    fn test_s11_non_while_reaching_definition_guards_remain_unchanged() {
+        let code = r#"Процедура ПослеВетви(Знач Уставка, Знач Флаг)
+	Если Флаг Тогда
+		Уставка = 1;
+	КонецЕсли;
+	Уставка = 2;
+КонецПроцедуры
+
+Процедура ВЦиклеДля(Знач Уставка, Знач Количество)
+	Для Номер = 1 По Количество Цикл
+		Уставка = 1;
+	КонецЦикла;
+КонецПроцедуры
+
+Процедура ВЦиклеДляКаждого(Знач Уставка, Знач Элементы)
+	Для Каждого Элемент Из Элементы Цикл
+		Уставка = 1;
+	КонецЦикла;
+КонецПроцедуры
+"#;
+
+        assert_targets(code, &[2]);
+    }
+
+    #[test]
+    fn test_s11_for_headers_replace_parameter_before_nested_while() {
+        let code = r#"Процедура ЦиклДля(Знач Уставка, Знач Количество, Знач Повторять)
+	Для Уставка = 1 По Количество Цикл
+		Пока Повторять Цикл
+			Уставка = 21;
+		КонецЦикла;
+	КонецЦикла;
+КонецПроцедуры
+
+Процедура ЦиклДляКаждого(Знач Уставка, Знач Значения, Знач Повторять)
+	Для Каждого Уставка Из Значения Цикл
+		Пока Повторять Цикл
+			Уставка = 21;
+		КонецЦикла;
+	КонецЦикла;
+КонецПроцедуры
+"#;
+
+        assert_targets(code, &[]);
     }
 
     #[test]

@@ -25,6 +25,62 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 
+#[path = "fixtures/diagnostic_rules/mod.rs"]
+mod diagnostic_rules;
+
+#[test]
+fn diagnostics_rules_stdio_reuses_config_until_real_reload_and_preserves_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = diagnostic_rules::project(dir.path());
+    let mut session = McpSession::start(dir.path(), &[]);
+    let findings = |session: &mut McpSession| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let response = session.diagnostics(serde_json::json!({
+                "action":"file", "path":"src/Module.bsl", "min_severity":"hint"
+            }));
+            let body = &response["result"]["structuredContent"];
+            if body["status"] != "loading" {
+                return diagnostic_rules::legacy_ranges(
+                    body["result"]["findings"].as_array().expect("findings"),
+                );
+            }
+            assert!(Instant::now() < deadline, "MCP diagnostics never became ready: {response}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, true));
+    let initial_log = session
+        .stderr
+        .wait_for_text(diagnostic_rules::WARNING, Duration::from_secs(2))
+        .expect("the load-time warning reaches stderr");
+    let initial = diagnostic_rules::warning_count(&initial_log);
+    assert!(initial > 0);
+    for _ in 0..2 {
+        assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, true));
+    }
+    assert_eq!(diagnostic_rules::warning_count(&session.stderr.snapshot()), initial);
+
+    diagnostic_rules::replace_config(dir.path(), 7);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if findings(&mut session) == diagnostic_rules::expected(&source, false, false)
+            && diagnostic_rules::warning_count(&session.stderr.snapshot()) > initial
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "MCP config reload did not change the Typo result");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reloaded = diagnostic_rules::warning_count(&session.stderr.snapshot());
+    assert!(reloaded > initial);
+    for _ in 0..2 {
+        assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, false));
+    }
+    assert_eq!(diagnostic_rules::warning_count(&session.stderr.snapshot()), reloaded);
+    assert!(session.shutdown().unwrap().success());
+}
+
 const MAIN_MODULE: &str = "БазовыйМодуль";
 const DEP_MODULE: &str = "МодульЗависимости";
 const EXT_MODULE: &str = "МодульРасширения";
@@ -111,7 +167,6 @@ impl StderrCapture {
         }
     }
 
-    #[cfg(unix)]
     fn wait_for_text(&self, needle: &str, timeout: Duration) -> Option<String> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -4031,10 +4086,10 @@ impl McpSession {
                 )
             });
             assert!(!line.starts_with("__read_error__:"), "failed to read MCP stdout: {line}");
-            if let Ok(message) = serde_json::from_str::<Value>(&line) {
-                if message["id"] == id {
-                    return message;
-                }
+            let message: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|error| panic!("non-protocol MCP stdout ({error}): {line}"));
+            if message["id"] == id {
+                return message;
             }
         }
     }

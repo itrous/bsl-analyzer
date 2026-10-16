@@ -46,5 +46,33 @@ fn check_token_handlers(
 ) {
     handlers::yo_letter_usage::check_token(token, acc, ctx);
     handlers::magic_date::check_token(token, acc, ctx);
+    handlers::typo::check_token(token, acc, ctx);
     handlers::using_hardcode_path::check_token(token, acc, ctx);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{DiagnosticCode, DiagnosticsConfig};
+
+    #[test]
+    fn one_string_occurrence_inside_a_method_emits_one_raw_typo() {
+        let source = "Процедура Тест()\n\tСообщить(\"гатово\");\nКонецПроцедуры";
+        let (db, file_id) = crate::test_utils::create_test_db(source);
+        let provider = ide_db::SalsaProvider::new(&db, None);
+        let mut config = DiagnosticsConfig::default();
+        config.enabled.push(DiagnosticCode::Typo);
+        let ctx = crate::DiagnosticsContext::new(&config, file_id, &provider);
+        let diagnostics = crate::body::for_each_body_context(&ctx, |body_ctx, acc| {
+            super::collect_body_single_pass(body_ctx, acc)
+        });
+        let typos: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::Typo)
+            .collect();
+
+        assert_eq!(typos.len(), 1);
+        let start: usize = typos[0].range.start().into();
+        let end: usize = typos[0].range.end().into();
+        assert_eq!(source.get(start..end), Some("гатово"));
+    }
 }

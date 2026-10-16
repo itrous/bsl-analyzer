@@ -42,9 +42,11 @@ EndProcedure
 The current implementation is narrower and more precise than a simple textual scan:
 
 - it only checks by-value parameters (`Val` / `Знач`);
-- it uses reaching definitions to verify that the assignment still sees only the original parameter definition;
+- for a target inside `While`, it follows reachable paths from method entry: a first blind write is not hidden by loop-back definitions, while an earlier real write on the same path suppresses a later finding; an enclosing `For` or `For Each` header counts as a write to its loop variable;
 - it suppresses diagnostics when the parameter is read in the right-hand side or in any statement that executes before the rewrite — including the condition of an enclosing `If`/`While`/loop header (the `If Param = Undefined Then Param = …` default-initialization idiom is *not* reported);
-- self-assignments like `Param = Param` are skipped and do not count as meaningful use.
+- self-assignments like `Param = Param` are skipped and do not count as meaningful use;
+- unreachable writes after `Break` or `Continue` are not reported;
+- targets outside `While` retain the previous reaching-definitions check.
 
 Parameter names are compared case-insensitively, including Cyrillic letters.
 

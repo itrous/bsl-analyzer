@@ -12,6 +12,39 @@ use rmcp::service::{PeerRequestOptions, RunningService};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 
+#[path = "../../bsl-analyzer/tests/fixtures/diagnostic_rules/mod.rs"]
+mod diagnostic_rules;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn diagnostic_rules_resident_preserves_occurrence_ranges_and_reloads_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = diagnostic_rules::project(dir.path());
+    let client = client(dir.path()).await;
+    let mut arguments = args("file");
+    arguments.insert("path".to_owned(), json!("src/Module.bsl"));
+    arguments.insert("min_severity".to_owned(), json!("hint"));
+    for _ in 0..2 {
+        let body = diagnostics(&client, arguments.clone()).await;
+        assert_eq!(
+            diagnostic_rules::legacy_ranges(body["result"]["findings"].as_array().unwrap()),
+            diagnostic_rules::expected(&source, false, true)
+        );
+    }
+    diagnostic_rules::replace_config(dir.path(), 7);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let body = diagnostics(&client, arguments.clone()).await;
+        if diagnostic_rules::legacy_ranges(body["result"]["findings"].as_array().unwrap())
+            == diagnostic_rules::expected(&source, false, false)
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "resident config was not reloaded: {body}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client.cancel().await.unwrap();
+}
+
 // Shared helpers for the gates in this binary; not every binary uses every one.
 #[allow(dead_code)]
 mod common;

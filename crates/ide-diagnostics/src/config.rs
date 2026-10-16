@@ -127,14 +127,29 @@ impl DiagnosticsConfig {
         Self::from_project_json(diagnostics, locale)
     }
 
-    /// Reports what `[diagnostics.parameters]` names but the analyzer cannot apply,
-    /// for loaders that parse the section themselves: every code that is not a
-    /// diagnostic of this analyzer, and every name in
-    /// `[diagnostics.parameters.DeprecatedPlatformApi].exclude` that is not a
-    /// deprecated platform feature (or an `exclude` that is not an array).
+    /// Reports parameter entries that the analyzer cannot apply, for loaders that
+    /// parse the section themselves: unknown codes, known codes with an unsupported
+    /// outer value, and invalid names in `DeprecatedPlatformApi.exclude`.
     pub fn warn_unknown_parameters(diagnostics: &serde_json::Value, source: Option<&Path>) {
         let file =
             source.map_or_else(|| "<project config>".to_owned(), |p| p.display().to_string());
+        if let Some(parameters) =
+            diagnostics.get("parameters").and_then(serde_json::Value::as_object)
+        {
+            for (name, value) in parameters {
+                if name.parse::<DiagnosticCode>().is_ok()
+                    && !matches!(value, serde_json::Value::Bool(_) | serde_json::Value::Object(_))
+                {
+                    tracing::warn!(
+                        key = name.as_str(),
+                        config_file = %file,
+                        "invalid value for diagnostic code `{name}` in [diagnostics.parameters] \
+                         of {file}: expected a bool or table; the value is ignored and the rule \
+                         keeps its default; use `[diagnostics.parameters.{name}]` for rule parameters"
+                    );
+                }
+            }
+        }
         for name in unknown_parameter_codes(diagnostics) {
             tracing::warn!(
                 key = name,
@@ -694,6 +709,123 @@ mod tests {
             DiagnosticsConfig::from_project_file(&json!({}), Locale::En, None);
         });
         assert!(warnings.is_empty(), "{warnings:#?}");
+    }
+
+    #[test]
+    fn invalid_outer_parameter_shapes_warn_once_and_valid_shapes_stay_silent() {
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let raw = json!({
+            "parameters": {
+                "LineLength": 120,
+                "MethodSize": "line_length_marker",
+                "Typo": ["array_marker"],
+                "BadWords": null,
+                "FunctionNameStartsWithGet": true,
+                "CommentedCode": false,
+                "CognitiveComplexity": {},
+                "NumberOfParams": { "maxParamsCount": 9 },
+            }
+        });
+
+        let warnings = warnings_of(|| {
+            DiagnosticsConfig::from_project_file(&raw, Locale::En, Some(file));
+        });
+
+        assert_eq!(warnings.len(), 4, "one warning per invalid known key: {warnings:#?}");
+        for code in ["LineLength", "MethodSize", "Typo", "BadWords"] {
+            let matching: Vec<_> =
+                warnings.iter().filter(|warning| warning.contains(code)).collect();
+            assert_eq!(matching.len(), 1, "one warning for {code}: {warnings:#?}");
+            let warning = matching[0];
+            assert!(warning.contains("[diagnostics.parameters]"), "{warning}");
+            assert!(warning.contains("bsl-analyzer.toml"), "{warning}");
+            assert!(warning.contains("bool") && warning.contains("table"), "{warning}");
+            assert!(warning.contains("default"), "{warning}");
+        }
+        assert!(
+            warnings.iter().all(|warning| {
+                !warning.contains("line_length_marker") && !warning.contains("array_marker")
+            }),
+            "invalid values must not be logged: {warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn invalid_parameter_shape_keeps_defaults_and_valid_siblings() {
+        let raw = json!({
+            "parameters": {
+                "LineLength": 120,
+                "Typo": "typo_marker",
+                "BadWords": false,
+                "MethodSize": { "maxMethodSize": 250 },
+            }
+        });
+        let mut config = None;
+        let warnings = warnings_of(|| {
+            config = Some(DiagnosticsConfig::from_project_file(&raw, Locale::En, None));
+        });
+
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        let config = config.unwrap();
+        assert_eq!(config.get_int(DiagnosticCode::LineLength, "maxLineLength"), None);
+        assert!(!config.is_disabled(DiagnosticCode::LineLength));
+        assert!(config.is_disabled(DiagnosticCode::Typo), "Typo remains default-off");
+        assert!(config.is_disabled(DiagnosticCode::BadWords));
+        assert_eq!(config.get_int(DiagnosticCode::MethodSize, "maxMethodSize"), Some(250));
+    }
+
+    #[test]
+    fn unknown_invalid_parameter_gets_only_the_existing_warning() {
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let raw = json!({ "parameters": { "UnknownDiagnostic": "private_marker" } });
+        let warnings = warnings_of(|| {
+            DiagnosticsConfig::from_project_file(&raw, Locale::En, Some(file));
+        });
+
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("unknown diagnostic code `UnknownDiagnostic`"));
+        assert!(warnings[0].contains("[diagnostics.parameters]"));
+        assert!(warnings[0].contains("bsl-analyzer.toml"));
+        assert!(!warnings[0].contains("private_marker"), "{:#?}", warnings);
+
+        let known = json!({ "parameters": { "LineLength": "private_marker" } });
+        let with_source = warnings_of(|| {
+            DiagnosticsConfig::from_project_file(&known, Locale::En, Some(file));
+        });
+        assert_eq!(with_source.len(), 1, "{with_source:#?}");
+        assert!(with_source[0].contains("bsl-analyzer.toml"), "{}", with_source[0]);
+        assert!(!with_source[0].contains("private_marker"), "{with_source:#?}");
+
+        let without_source = warnings_of(|| {
+            DiagnosticsConfig::from_project_file(&known, Locale::En, None);
+        });
+        assert_eq!(without_source.len(), 1, "{without_source:#?}");
+        assert!(without_source[0].contains("<project config>"), "{}", without_source[0]);
+        assert!(!without_source[0].contains("private_marker"), "{without_source:#?}");
+    }
+
+    #[test]
+    fn parameter_shape_warnings_are_load_time_only_and_repeat_on_reload() {
+        let raw = json!({ "parameters": { "LineLength": "reload_marker" } });
+        let (_, pure_warnings) = parse_with_warning_count(&raw, Locale::En);
+        assert_eq!(pure_warnings, 0, "pure from_project_json stays quiet");
+        let direct_serde_warnings = warnings_of(|| {
+            let _: DiagnosticsConfig = serde_json::from_value(raw.clone()).unwrap();
+        });
+        assert!(direct_serde_warnings.is_empty(), "pure serde stays quiet");
+
+        let first_load = warnings_of(|| {
+            DiagnosticsConfig::from_project_file(&raw, Locale::En, None);
+        });
+        let second_load = warnings_of(|| {
+            DiagnosticsConfig::from_project_file(&raw, Locale::En, None);
+        });
+        assert_eq!(first_load.len(), 1, "{first_load:#?}");
+        assert_eq!(second_load.len(), 1, "a new load warns again: {second_load:#?}");
+        assert!(first_load[0].contains("<project config>"), "{}", first_load[0]);
+        assert!(second_load[0].contains("<project config>"), "{}", second_load[0]);
+        assert!(!first_load[0].contains("reload_marker"), "{first_load:#?}");
+        assert!(!second_load[0].contains("reload_marker"), "{second_load:#?}");
     }
 
     #[test]
