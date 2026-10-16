@@ -144,6 +144,7 @@ mod tests {
             attr_type,
             is_main: true,
             columns: vec![],
+            additional_columns: vec![],
         });
         form
     }

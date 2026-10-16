@@ -2685,6 +2685,10 @@ impl<'db> InferenceContext<'db> {
                     field,
                 ) {
                     info.ty
+                } else if let Some(info) = crate::form_attr::lookup_form_additional_column(
+                    self.db, &resolver, base_ty, field,
+                ) {
+                    info.ty
                 } else {
                     let base_kind = self.db.lookup_type(base_ty);
                     // A metadata collection is as closed a receiver as an object: its

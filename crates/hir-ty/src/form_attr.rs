@@ -2,13 +2,13 @@ use bsl_metadata::{AttributeType, FormAttribute, MdoType, MetadataResolver};
 use bsl_types::builders::Builders;
 use bsl_types::facet::{FormDataFacet, MdoRefFacet};
 use bsl_types::intern::TypeKernelDb;
-use bsl_types::kind::{MetadataKind, TypeId};
+use bsl_types::kind::{MetadataKind, TypeId, TypeKind};
 use bsl_types::testing::RootConfigCtx;
 use hir_def::resolver::Resolver;
 use hir_def::Name;
 
 use crate::db::HirDatabase;
-use crate::field_enum::attribute_type_to_typeid;
+use crate::field_enum::{attribute_type_to_typeid, FieldInfo, FieldOrigin};
 
 pub fn lower_form_attribute_to_typeid(
     db: &dyn TypeKernelDb,
@@ -127,6 +127,58 @@ pub(crate) fn resolve_form_attribute(
     Some(lower_form_attribute_to_typeid(db, attr, &obj_resolver))
 }
 
+/// A column the managed form this module belongs to adds to the rows of a tabular
+/// section (`<AdditionalColumns table="Объект.Товары">`).
+///
+/// The platform puts such a column on the rows of that table in this form only: the
+/// object and its other forms do not have it. So it is looked up only from the form's
+/// own module, and only on rows of the tabular section of the object type of the
+/// attribute that owns the table.
+pub(crate) fn lookup_form_additional_column(
+    db: &dyn HirDatabase,
+    resolver: &Resolver,
+    receiver: TypeId,
+    field: &Name,
+) -> Option<FieldInfo> {
+    let TypeKind::MetadataRef(facet) = db.lookup_type(receiver) else { return None };
+    let MetadataKind::TabularSectionRow { parent } = facet.kind else { return None };
+    let (owner, section) = facet.name.as_str().rsplit_once('.')?;
+    if !crate::this_object::is_managed_form_module(db, resolver) {
+        return None;
+    }
+
+    let module_id = resolver.module_id()?;
+    let metadata = db.module_metadata(module_id);
+    let form = metadata.form.as_ref()?;
+    let column = form
+        .attributes()
+        .iter()
+        .filter(|attr| {
+            matches!(&attr.attr_type, AttributeType::Ref { mdo_type, name }
+                if *mdo_type == parent && stdx::case::eq_ignore_case(name, owner))
+        })
+        .flat_map(|attr| {
+            attr.additional_columns.iter().filter(|group| {
+                group.table.split_once('.').is_some_and(|(head, tail)| {
+                    stdx::case::eq_ignore_case(head, &attr.name)
+                        && stdx::case::eq_ignore_case(tail, section)
+                })
+            })
+        })
+        .flat_map(|group| group.columns.iter())
+        .find(|column| stdx::case::eq_ignore_case(&column.name, field.as_str()))?;
+
+    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
+    Some(FieldInfo {
+        name: Name::new(&column.name),
+        name_en: None,
+        ty: attribute_type_to_typeid(db, &column.attr_type, &obj_resolver),
+        value_ty: None,
+        is_readonly: false,
+        origin: FieldOrigin::FormAttribute,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,7 +192,13 @@ mod tests {
     }
 
     fn main_attr(name: &str, attr_type: AttributeType) -> FormAttribute {
-        FormAttribute { name: name.to_string(), attr_type, is_main: true, columns: vec![] }
+        FormAttribute {
+            name: name.to_string(),
+            attr_type,
+            is_main: true,
+            columns: vec![],
+            additional_columns: vec![],
+        }
     }
 
     fn assert_metadata_ref(
@@ -401,6 +459,7 @@ mod tests {
                 name: "Колонка1".to_string(),
                 attr_type: AttributeType::Boolean,
             }],
+            additional_columns: vec![],
         };
         let db = InMemoryDb::new();
         let id = lower_form_attribute_to_typeid(&db, &attr, &ConfigsObjectResolver(&[]));
@@ -417,6 +476,7 @@ mod tests {
                 name: "К".to_string(),
                 attr_type: AttributeType::Boolean,
             }],
+            additional_columns: vec![],
         };
         let db = InMemoryDb::new();
         let id = lower_form_attribute_to_typeid(&db, &attr, &ConfigsObjectResolver(&[]));
@@ -446,6 +506,7 @@ mod tests {
                 name: "Товары".to_string(),
                 attr_type: AttributeType::Unknown,
             }],
+            additional_columns: vec![],
         };
         let db = InMemoryDb::new();
         let id = lower_form_attribute_to_typeid(&db, &attr, &ConfigsObjectResolver(&[]));

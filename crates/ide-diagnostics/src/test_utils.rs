@@ -1062,6 +1062,73 @@ fn check_form_module_impl(
     crate::diagnostics(&ctx)
 }
 
+/// Diagnostics of the module `checked` in a configuration written to disk whole:
+/// `files` are `(path relative to the root, content)` and must include
+/// `Configuration.xml`. Every `.bsl` among them is a workspace file, so a form,
+/// its object and the object's other forms can be checked side by side.
+pub fn check_config_files(files: &[(&str, &str)], checked: &str) -> Vec<Diagnostic> {
+    use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+    use ide_db::metadata::intern_configuration_path;
+    use ide_db::RootDatabaseImpl;
+    use vfs::{FileId, FileSet, VfsPath};
+
+    struct TempRootGuard(std::path::PathBuf);
+    impl Drop for TempRootGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let root = next_config_xml_fixture_root();
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create fixture root");
+    let _guard = TempRootGuard(root.clone());
+    for (relative, content) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("fixture file has a parent"))
+            .expect("create fixture directory");
+        std::fs::write(&path, content).expect("write fixture file");
+    }
+
+    let modules: Vec<(FileId, &str, &str)> = files
+        .iter()
+        .filter(|(relative, _)| relative.ends_with(".bsl"))
+        .enumerate()
+        .map(|(idx, (relative, content))| (FileId(idx as u32), *relative, *content))
+        .collect();
+    let checked_file_id = modules
+        .iter()
+        .find(|(_, relative, _)| *relative == checked)
+        .map(|(fid, _, _)| *fid)
+        .expect("the checked module must be one of the fixture files");
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(vec![(None, root.clone())], None);
+
+    let mut file_set = FileSet::default();
+    for (fid, relative, _) in &modules {
+        let path = root.join(relative);
+        file_set.insert(*fid, VfsPath::new(path.to_string_lossy().into_owned()));
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for (fid, _, content) in &modules {
+        db.set_file_source_root(*fid, SourceRootId(0));
+        db.set_file_text(*fid, content);
+    }
+
+    let config_path = root.to_string_lossy();
+    let config_path_input = intern_configuration_path(
+        &db,
+        config_path.as_ref(),
+        db.config_root_revision_for_path(std::path::Path::new(config_path.as_ref())),
+    );
+    let provider = ide_db::SalsaProvider::new(&db, Some(config_path_input));
+    let config = crate::DiagnosticsConfig::all_enabled();
+    let ctx = crate::DiagnosticsContext::new(&config, checked_file_id, &provider);
+
+    crate::diagnostics(&ctx)
+}
+
 pub fn check_snapshot_with_config_xml(
     source: &str,
     config_xml: &str,

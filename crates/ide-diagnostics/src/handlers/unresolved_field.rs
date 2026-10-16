@@ -531,4 +531,205 @@ mod tests {
 КонецПроцедуры"#;
         assert!(unresolved_fields(code).is_empty(), "{:?}", unresolved_fields(code));
     }
+
+    const ADDITIONAL_COLUMNS_CONFIGURATION: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Configuration uuid="00000000-0000-0000-0000-000000000000">
+        <Properties>
+            <Name>TestConfiguration</Name>
+        </Properties>
+        <ChildObjects>
+            <Catalog>Товары</Catalog>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+
+    const ADDITIONAL_COLUMNS_CATALOG: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
+    <Catalog uuid="7e1c0000-0000-0000-0000-000000000001">
+        <Properties>
+            <Name>Товары</Name>
+        </Properties>
+        <ChildObjects>
+            <TabularSection uuid="7e1c0000-0000-0000-0000-000000000002">
+                <Properties>
+                    <Name>Состав</Name>
+                </Properties>
+                <ChildObjects>
+                    <Attribute uuid="7e1c0000-0000-0000-0000-000000000003">
+                        <Properties>
+                            <Name>Количество</Name>
+                            <Type><v8:Type>xs:decimal</v8:Type></Type>
+                        </Properties>
+                    </Attribute>
+                </ChildObjects>
+            </TabularSection>
+            <TabularSection uuid="7e1c0000-0000-0000-0000-000000000004">
+                <Properties>
+                    <Name>Цены</Name>
+                </Properties>
+                <ChildObjects>
+                    <Attribute uuid="7e1c0000-0000-0000-0000-000000000005">
+                        <Properties>
+                            <Name>Цена</Name>
+                            <Type><v8:Type>xs:decimal</v8:Type></Type>
+                        </Properties>
+                    </Attribute>
+                </ChildObjects>
+            </TabularSection>
+            <Form>ФормаЭлемента</Form>
+            <Form>ФормаВыбора</Form>
+        </ChildObjects>
+    </Catalog>
+</MetaDataObject>"#;
+
+    /// The item form adds `ЭтоНабор` to the rows of `Объект.Состав` and binds a table
+    /// to that tabular section.
+    const ITEM_FORM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10">
+    <ChildItems>
+        <Table name="Состав" id="1">
+            <DataPath>Объект.Состав</DataPath>
+        </Table>
+    </ChildItems>
+    <Attributes>
+        <Attribute name="Объект" id="1">
+            <Type>
+                <v8:Type>cfg:CatalogObject.Товары</v8:Type>
+            </Type>
+            <MainAttribute>true</MainAttribute>
+            <SavedData>true</SavedData>
+            <Columns>
+                <AdditionalColumns table="Объект.Состав">
+                    <Column name="ЭтоНабор" id="1">
+                        <Type>
+                            <v8:Type>xs:boolean</v8:Type>
+                        </Type>
+                    </Column>
+                </AdditionalColumns>
+            </Columns>
+        </Attribute>
+    </Attributes>
+</Form>"#;
+
+    /// Another form of the same catalog: the same main attribute, no additional columns.
+    const CHOICE_FORM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10">
+    <Attributes>
+        <Attribute name="Объект" id="1">
+            <Type>
+                <v8:Type>cfg:CatalogObject.Товары</v8:Type>
+            </Type>
+            <MainAttribute>true</MainAttribute>
+        </Attribute>
+    </Attributes>
+</Form>"#;
+
+    const ITEM_FORM_MODULE: &str = "Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl";
+    const CHOICE_FORM_MODULE: &str = "Catalogs/Товары/Forms/ФормаВыбора/Ext/Form/Module.bsl";
+    const OBJECT_MODULE: &str = "Catalogs/Товары/Ext/ObjectModule.bsl";
+
+    const EMPTY_FORM_MODULE: &str = "&НаКлиенте\nПроцедура Пусто()\nКонецПроцедуры\n";
+    const EMPTY_OBJECT_MODULE: &str = "Процедура Пусто()\nКонецПроцедуры\n";
+
+    /// The messages of `UnresolvedField` in `checked`, with the item form, the choice
+    /// form and the object module in one configuration.
+    fn unresolved_with_additional_columns(
+        item_form: &str,
+        choice_form: &str,
+        object_module: &str,
+        checked: &str,
+    ) -> Vec<String> {
+        let files = [
+            ("Configuration.xml", ADDITIONAL_COLUMNS_CONFIGURATION),
+            ("Catalogs/Товары.xml", ADDITIONAL_COLUMNS_CATALOG),
+            ("Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form.xml", ITEM_FORM_XML),
+            ("Catalogs/Товары/Forms/ФормаВыбора/Ext/Form.xml", CHOICE_FORM_XML),
+            (ITEM_FORM_MODULE, item_form),
+            (CHOICE_FORM_MODULE, choice_form),
+            (OBJECT_MODULE, object_module),
+        ];
+        crate::test_utils::check_config_files(&files, checked)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnresolvedField)
+            .map(|diag| diag.message)
+            .collect()
+    }
+
+    #[test]
+    fn a_form_additional_column_resolves_on_the_rows_of_its_tabular_section() {
+        // The rows come through the main attribute and through the bound table; the
+        // column name is matched regardless of case, as the platform does.
+        let item_form = "&НаКлиенте
+Процедура Тест()
+    Строка = Объект.Состав.Добавить();
+    Строка.ЭтоНабор = Истина;
+    Текущие = Элементы.Состав.ТекущиеДанные;
+    Флаг = Текущие.этонабор;
+КонецПроцедуры
+";
+        let unresolved = unresolved_with_additional_columns(
+            item_form,
+            EMPTY_FORM_MODULE,
+            EMPTY_OBJECT_MODULE,
+            ITEM_FORM_MODULE,
+        );
+        assert!(unresolved.is_empty(), "additional column must resolve: {unresolved:?}");
+    }
+
+    #[test]
+    fn a_misspelled_or_misplaced_additional_column_is_still_reported() {
+        // The misspelling is not a column; the right name on the rows of another tabular
+        // section of the same object is not one either.
+        let item_form = "&НаКлиенте
+Процедура Тест()
+    Строка = Объект.Состав.Добавить();
+    Строка.ЭтоНобор = Истина;
+    Цена = Объект.Цены.Добавить();
+    Цена.ЭтоНабор = Истина;
+КонецПроцедуры
+";
+        let unresolved = unresolved_with_additional_columns(
+            item_form,
+            EMPTY_FORM_MODULE,
+            EMPTY_OBJECT_MODULE,
+            ITEM_FORM_MODULE,
+        );
+        assert_eq!(unresolved.len(), 2, "{unresolved:?}");
+        assert!(unresolved[0].contains("'ЭтоНобор'"), "{unresolved:?}");
+        assert!(unresolved[1].contains("'ЭтоНабор'"), "{unresolved:?}");
+        assert!(unresolved[1].contains("Цены"), "{unresolved:?}");
+    }
+
+    #[test]
+    fn an_additional_column_does_not_leak_into_other_forms_or_the_object_module() {
+        let choice_form = "&НаКлиенте
+Процедура Тест()
+    Строка = Объект.Состав.Добавить();
+    Строка.ЭтоНабор = Истина;
+КонецПроцедуры
+";
+        let object_module = "Процедура Тест()
+    Строка = Состав.Добавить();
+    Строка.ЭтоНабор = Истина;
+КонецПроцедуры
+";
+        let in_choice_form = unresolved_with_additional_columns(
+            EMPTY_FORM_MODULE,
+            choice_form,
+            EMPTY_OBJECT_MODULE,
+            CHOICE_FORM_MODULE,
+        );
+        assert_eq!(in_choice_form.len(), 1, "another form: {in_choice_form:?}");
+        assert!(in_choice_form[0].contains("'ЭтоНабор'"), "{in_choice_form:?}");
+
+        let in_object_module = unresolved_with_additional_columns(
+            EMPTY_FORM_MODULE,
+            EMPTY_FORM_MODULE,
+            object_module,
+            OBJECT_MODULE,
+        );
+        assert_eq!(in_object_module.len(), 1, "object module: {in_object_module:?}");
+        assert!(in_object_module[0].contains("'ЭтоНабор'"), "{in_object_module:?}");
+    }
 }

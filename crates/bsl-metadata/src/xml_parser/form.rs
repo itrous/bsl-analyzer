@@ -1,7 +1,8 @@
 use crate::enums::FormType;
 use crate::error::{MetadataError, Result};
 use crate::form::{
-    Form, FormAttribute, FormAttributeColumn, FormElement, FormElementKind, FormEventHandler,
+    Form, FormAdditionalColumns, FormAttribute, FormAttributeColumn, FormElement, FormElementKind,
+    FormEventHandler,
 };
 use crate::metadata_object::AttributeType;
 
@@ -120,9 +121,9 @@ fn parse_form_attribute(node: roxmltree::Node<'_, '_>) -> Option<FormAttribute> 
         .and_then(|n| n.text())
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("true"));
 
-    let columns = node
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "Columns")
+    let columns_node = node.children().find(|n| n.is_element() && n.tag_name().name() == "Columns");
+
+    let columns = columns_node
         .map(|cols| {
             cols.children()
                 .filter(|n| n.is_element() && n.tag_name().name() == "Column")
@@ -131,7 +132,28 @@ fn parse_form_attribute(node: roxmltree::Node<'_, '_>) -> Option<FormAttribute> 
         })
         .unwrap_or_default();
 
-    Some(FormAttribute { name, attr_type, is_main, columns })
+    // `<AdditionalColumns table="Объект.Товары">` sits beside the attribute's own
+    // columns and extends a table reached through the attribute, not the attribute.
+    let additional_columns = columns_node
+        .map(|cols| {
+            cols.children()
+                .filter(|n| n.is_element() && n.tag_name().name() == "AdditionalColumns")
+                .filter_map(parse_form_additional_columns)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(FormAttribute { name, attr_type, is_main, columns, additional_columns })
+}
+
+fn parse_form_additional_columns(node: roxmltree::Node<'_, '_>) -> Option<FormAdditionalColumns> {
+    let table = node.attribute("table").filter(|s| !s.is_empty())?.to_string();
+    let columns = node
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "Column")
+        .filter_map(parse_form_attribute_column)
+        .collect();
+    Some(FormAdditionalColumns { table, columns })
 }
 
 fn parse_form_attribute_column(node: roxmltree::Node<'_, '_>) -> Option<FormAttributeColumn> {
@@ -760,6 +782,49 @@ mod tests {
 
         let bez_tipa = form.find_attribute("БезТипа").unwrap();
         assert_eq!(bez_tipa.attr_type, crate::metadata_object::AttributeType::Unknown);
+    }
+
+    #[test]
+    fn additional_columns_belong_to_the_table_they_name_not_to_the_attribute() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10">
+    <Attributes>
+        <Attribute name="Объект" id="1">
+            <Type>
+                <v8:Type>cfg:CatalogObject.Товары</v8:Type>
+            </Type>
+            <MainAttribute>true</MainAttribute>
+            <Columns>
+                <AdditionalColumns table="Объект.Состав">
+                    <Column name="ЭтоНабор" id="1">
+                        <Type><v8:Type>xs:boolean</v8:Type></Type>
+                    </Column>
+                    <Column name="Пояснение" id="2">
+                        <Type><v8:Type>xs:string</v8:Type></Type>
+                    </Column>
+                </AdditionalColumns>
+                <AdditionalColumns table="Объект.Цены"/>
+            </Columns>
+        </Attribute>
+    </Attributes>
+</Form>"#;
+
+        let form = parse_form_xml(xml).unwrap();
+        let main = form.main_attribute().expect("Объект is MainAttribute");
+        assert!(main.columns.is_empty(), "additional columns are not the attribute's own");
+        assert_eq!(main.additional_columns.len(), 2);
+
+        let composition = &main.additional_columns[0];
+        assert_eq!(composition.table, "Объект.Состав");
+        let names: Vec<&str> = composition.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["ЭтоНабор", "Пояснение"]);
+        assert_eq!(
+            composition.columns[0].attr_type,
+            crate::metadata_object::AttributeType::Boolean
+        );
+
+        assert_eq!(main.additional_columns[1].table, "Объект.Цены");
+        assert!(main.additional_columns[1].columns.is_empty());
     }
 
     #[test]

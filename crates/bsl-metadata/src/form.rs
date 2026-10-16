@@ -104,27 +104,59 @@ impl FormAttributeColumn {
     }
 }
 
+/// Columns a form adds to a table inside one of its attributes
+/// (`<AdditionalColumns table="Объект.Товары">`): they exist on that table's rows
+/// in this form only, never in the object itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormAdditionalColumns {
+    /// Data path of the extended table, as the form spells it: `Объект.Товары`.
+    pub table: String,
+    pub columns: Vec<FormAttributeColumn>,
+}
+
+impl FormAdditionalColumns {
+    /// Heap bytes owned by this group: the table path and the column vec.
+    pub fn estimated_heap_size(&self) -> usize {
+        self.table.capacity()
+            + stdx::heap::vec_bytes::<FormAttributeColumn>(self.columns.len())
+            + self.columns.iter().map(FormAttributeColumn::estimated_heap_size).sum::<usize>()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormAttribute {
     pub name: String,
     pub attr_type: AttributeType,
     pub is_main: bool,
     pub columns: Vec<FormAttributeColumn>,
+    pub additional_columns: Vec<FormAdditionalColumns>,
 }
 
 impl FormAttribute {
     pub fn new(name: impl Into<String>, attr_type: AttributeType) -> Self {
-        Self { name: name.into(), attr_type, is_main: false, columns: Vec::new() }
+        Self {
+            name: name.into(),
+            attr_type,
+            is_main: false,
+            columns: Vec::new(),
+            additional_columns: Vec::new(),
+        }
     }
 
     /// Heap bytes owned by this attribute: its name, its type's own payload,
-    /// and the tabular-section column vec. `is_main` is `Copy` and owns no
-    /// heap.
+    /// the tabular-section column vec and the additional-column groups.
+    /// `is_main` is `Copy` and owns no heap.
     pub fn estimated_heap_size(&self) -> usize {
         self.name.capacity()
             + self.attr_type.estimated_heap_size()
             + stdx::heap::vec_bytes::<FormAttributeColumn>(self.columns.len())
             + self.columns.iter().map(FormAttributeColumn::estimated_heap_size).sum::<usize>()
+            + stdx::heap::vec_bytes::<FormAdditionalColumns>(self.additional_columns.len())
+            + self
+                .additional_columns
+                .iter()
+                .map(FormAdditionalColumns::estimated_heap_size)
+                .sum::<usize>()
     }
 }
 

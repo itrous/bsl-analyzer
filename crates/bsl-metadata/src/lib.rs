@@ -44,7 +44,8 @@ pub use external_object::{
     ExternalObjectKind,
 };
 pub use form::{
-    Form, FormAttribute, FormAttributeColumn, FormElement, FormElementKind, FormEventHandler,
+    Form, FormAdditionalColumns, FormAttribute, FormAttributeColumn, FormElement, FormElementKind,
+    FormEventHandler,
 };
 pub use http_service::{
     HTTPService, HTTPServiceBuilder, HTTPServiceMethod, HTTPServiceMethodBuilder,

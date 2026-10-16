@@ -339,6 +339,7 @@ mod tests {
             },
             is_main: true,
             columns: vec![],
+            additional_columns: vec![],
         });
         let element = FormElement::with_kind(
             "ИНН",
@@ -382,6 +383,7 @@ mod tests {
             },
             is_main: true,
             columns: vec![],
+            additional_columns: vec![],
         });
 
         let mut config = Configuration::new("Test");
@@ -668,6 +670,7 @@ mod tests {
             },
             is_main: true,
             columns: vec![],
+            additional_columns: vec![],
         });
         let element = FormElement::with_kind(
             "ПолеОбъекта",
