@@ -506,7 +506,9 @@ pub fn handle_did_save(state: &mut GlobalState, params: DidSaveTextDocumentParam
     let mut config_reloaded = false;
     if let Ok(path) = uri.to_file_path() {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if project_model::is_project_input_file_name(name) && state.reload_project_config() {
+            let config_input = project_model::is_project_input_file_name(name)
+                || state.is_config_extends_path(&path);
+            if config_input && state.reload_project_config() {
                 config_reloaded = true;
                 for uri in state.opened_document_uris() {
                     schedule_diagnostics(state, &uri);
@@ -623,7 +625,7 @@ pub fn handle_did_change_watched_files(
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(project_model::is_project_input_file_name)
-        });
+        }) || state.is_config_extends_path(std_path);
         if !relevant_source && !relevant_config {
             rejected += 1;
             continue;

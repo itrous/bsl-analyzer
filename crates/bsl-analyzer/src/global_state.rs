@@ -310,6 +310,10 @@ pub struct GlobalState {
     /// The project's `[source].exclude`, also spelled under each source root the
     /// loader walks — the one test every way into the VFS asks.
     pub(crate) source_exclusions: stdx::path_exclusion::ExcludedPaths,
+    /// Parent configs the workspace `bsl-analyzer.toml` inherits through `extends`
+    /// (best effort, missing ones included): watched like the config itself, so an
+    /// edit to a shared parent reloads the project.
+    pub(crate) config_extends_paths: Vec<PathBuf>,
     pub diagnostics_baseline: Arc<ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot>,
     pub(crate) diagnostics_baseline_notification_ledger: BTreeSet<String>,
     /// Baseline errors seen once on an input read as empty and not yet announced.
@@ -554,6 +558,7 @@ impl GlobalState {
             workspace_root: None,
             project: None,
             source_exclusions: Default::default(),
+            config_extends_paths: Vec::new(),
             diagnostics_baseline: Arc::new(
                 ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::Disabled,
             ),
@@ -1006,6 +1011,31 @@ mod vfs_race_tests {
         assert_eq!(index.generation(source_root), None);
         assert_eq!(index.next_generation(source_root), Some(1));
         assert!(state.call_hierarchy_index.active().is_some());
+    }
+
+    /// A parent named by `extends` is watched like the workspace config, so an
+    /// edit to a shared parent reloads the project.
+    #[test]
+    fn extends_parent_is_watched_as_a_config_input() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shared = tmp.path().join("shared");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(shared.join("base.toml"), "[diagnostics]\n").unwrap();
+        std::fs::write(project.join("bsl-analyzer.toml"), "extends = \"../shared/base.toml\"\n")
+            .unwrap();
+
+        state.set_workspace_root(project.clone()).expect("valid test workspace");
+        // Spelled as `extends` spells it: `absolute` folds `..` on Windows only.
+        let parent = std::path::absolute(project.join("../shared/base.toml")).unwrap();
+        assert_eq!(state.config_extends_paths, std::slice::from_ref(&parent));
+        assert!(state.is_config_extends_path(&parent));
+        assert!(!state.is_config_extends_path(&project.join("bsl-analyzer.toml")));
     }
 
     #[test]

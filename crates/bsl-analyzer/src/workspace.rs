@@ -144,10 +144,14 @@ impl GlobalState {
         // A config file inside an excluded directory is not watched either — with
         // `exclude = ["."]` that is the project's own config. It is still reloaded on a
         // delivered didSave, which does not go through the loader.
+        // Parents named by `extends` may live anywhere, typically outside the
+        // workspace; they are watched by exact path, the exclusions do not apply.
+        self.config_extends_paths = project_model::workspace_config_extends_paths(root);
         let mut config_files: Vec<_> = project_model::PROJECT_INPUT_FILE_NAMES
             .iter()
             .map(|name| root.join(name))
             .filter(|path| !self.source_exclusions.is_excluded_resolved(path))
+            .chain(self.config_extends_paths.iter().cloned())
             .map(paths::AbsPathBuf::assert_utf8)
             .collect();
         config_files.sort();
@@ -267,7 +271,9 @@ impl GlobalState {
                 let path = vfs.file_path(file.file_id);
                 let path_path = path.as_path();
                 let file_name = path_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if project_model::is_project_input_file_name(file_name) {
+                if project_model::is_project_input_file_name(file_name)
+                    || self.config_extends_paths.iter().any(|parent| parent == path_path)
+                {
                     tracing::info!(path = %path_path.display(), "config file changed");
                     // Whether this is structural is decided after the reload
                     // attempt below: only a successful reload changes the
@@ -656,6 +662,12 @@ impl GlobalState {
         // `ChangeOutcome` does not reflect, so a refresh is warranted regardless.
         self.process_changes(false);
         true
+    }
+
+    /// Whether `path` is a parent config the workspace config inherits through
+    /// `extends`.
+    pub(crate) fn is_config_extends_path(&self, path: &Path) -> bool {
+        self.config_extends_paths.iter().any(|parent| parent == path)
     }
 
     pub fn reload_project_config(&mut self) -> bool {

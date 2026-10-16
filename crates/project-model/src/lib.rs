@@ -2365,6 +2365,12 @@ pub struct ProjectConfig {
     #[doc(hidden)]
     pub config_file_path: Option<PathBuf>,
 
+    /// Parent files merged in through `extends` (TOML only), nearest first. Set by
+    /// the loader; read it through [`Self::extends_chain`].
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub extends_chain: Vec<PathBuf>,
+
     #[serde(default)]
     pub code_lens: CodeLensConfig,
 
@@ -2517,6 +2523,135 @@ pub fn is_project_input_file_name(name: &str) -> bool {
     PROJECT_INPUT_FILE_NAMES.contains(&name)
 }
 
+/// The top-level `bsl-analyzer.toml` key naming a parent config to inherit from.
+pub const EXTENDS_KEY: &str = "extends";
+
+/// Parses one `bsl-analyzer.toml`, resolving its `extends` chain. Returns the config
+/// and the parent files merged in, nearest first.
+///
+/// A file without `extends` goes straight through `toml::from_str`, keeping the
+/// parser's line-and-column error messages; only an inheriting file is merged as
+/// a table and then deserialized.
+fn load_toml_config(
+    path: &Path,
+    content: &str,
+) -> Result<(TomlConfig, Vec<PathBuf>), ConfigLoadError> {
+    let err = |message: String| ConfigLoadError { path: path.to_path_buf(), message };
+    let direct = || toml::from_str::<TomlConfig>(content).map_err(|e| err(e.to_string()));
+    let table = match toml::from_str::<toml::Table>(content) {
+        Ok(table) if table.contains_key(EXTENDS_KEY) => table,
+        _ => return direct().map(|config| (config, Vec::new())),
+    };
+    let mut visited = vec![config_file_identity(path)];
+    let mut chain = Vec::new();
+    let merged = resolve_extends(path, table, &mut visited, &mut chain)?;
+    let config = toml::Value::Table(merged).try_into::<TomlConfig>().map_err(|e| {
+        let files: Vec<String> = chain.iter().map(|p| p.display().to_string()).collect();
+        err(format!("{e} (in the config merged with `{EXTENDS_KEY}`: {})", files.join(", ")))
+    })?;
+    Ok((config, chain))
+}
+
+/// `table` (read from `file`) with its `extends` parent chain merged under it.
+fn resolve_extends(
+    file: &Path,
+    mut table: toml::Table,
+    visited: &mut Vec<PathBuf>,
+    chain: &mut Vec<PathBuf>,
+) -> Result<toml::Table, ConfigLoadError> {
+    let Some(value) = table.remove(EXTENDS_KEY) else {
+        return Ok(table);
+    };
+    let err = |message: String| ConfigLoadError { path: file.to_path_buf(), message };
+    let target = match value {
+        toml::Value::String(target) if !target.trim().is_empty() => target,
+        _ => return Err(err(format!("`{EXTENDS_KEY}` must be a non-empty path string"))),
+    };
+    let parent = extends_target(file, &target);
+    let identity = config_file_identity(&parent);
+    if visited.contains(&identity) {
+        let mut cycle: Vec<String> = visited.iter().map(|p| p.display().to_string()).collect();
+        cycle.push(identity.display().to_string());
+        return Err(err(format!("`{EXTENDS_KEY}` cycle: {}", cycle.join(" -> "))));
+    }
+    visited.push(identity);
+    chain.push(parent.clone());
+    let content = std::fs::read_to_string(&parent).map_err(|e| {
+        err(format!("`{EXTENDS_KEY}` parent config {} cannot be read: {e}", parent.display()))
+    })?;
+    let parent_table = toml::from_str::<toml::Table>(&content).map_err(|e| ConfigLoadError {
+        path: parent.clone(),
+        message: format!("parent config of {} (`{EXTENDS_KEY}`): {e}", file.display()),
+    })?;
+    let parent_table = resolve_extends(&parent, parent_table, visited, chain)?;
+    Ok(merge_toml_tables(parent_table, table))
+}
+
+/// `extends = target` written in `file`: an absolute path as is, a relative one
+/// against the directory of `file` (as spelled, not through a symlink).
+fn extends_target(file: &Path, target: &str) -> PathBuf {
+    let target = Path::new(target);
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        file.parent().unwrap_or(Path::new("")).join(target)
+    };
+    std::path::absolute(&joined).unwrap_or(joined)
+}
+
+/// What makes two spellings of a config file the same file for cycle detection.
+fn config_file_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `overlay` over `base`: tables merge key by key, recursively; any other value
+/// (scalar, array, array of tables) in `overlay` replaces the one in `base`.
+fn merge_toml_tables(mut base: toml::Table, overlay: toml::Table) -> toml::Table {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(value)) => {
+                let merged = merge_toml_tables(std::mem::take(existing), value);
+                *existing = merged;
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+    base
+}
+
+/// The parent files the workspace config at `root` names through `extends`,
+/// nearest first, followed as far as they can be read. For watching rather than
+/// loading: a parent that is missing or broken is still listed (its appearance or
+/// repair must trigger a reload), and nothing here is an error.
+pub fn workspace_config_extends_paths(root: &Path) -> Vec<PathBuf> {
+    let file = root.join(CONFIG_FILE_NAMES[0]);
+    let mut paths = Vec::new();
+    if !file.is_file() {
+        return paths;
+    }
+    let mut current = std::path::absolute(&file).unwrap_or(file);
+    let mut visited = vec![config_file_identity(&current)];
+    loop {
+        let Some(target) = std::fs::read_to_string(&current)
+            .ok()
+            .and_then(|content| toml::from_str::<toml::Table>(&content).ok())
+            .and_then(|table| table.get(EXTENDS_KEY).and_then(|v| v.as_str()).map(str::to_owned))
+        else {
+            return paths;
+        };
+        let parent = extends_target(&current, &target);
+        let identity = config_file_identity(&parent);
+        if visited.contains(&identity) {
+            return paths;
+        }
+        visited.push(identity);
+        paths.push(parent.clone());
+        current = parent;
+    }
+}
+
 impl ProjectConfig {
     /// Loads the project config from the conventional file names under `root`.
     /// `Ok(None)` means no config file exists (callers default); a file that
@@ -2550,10 +2685,10 @@ impl ProjectConfig {
         let path = std::path::absolute(path).map_err(|error| err(error.to_string()))?;
         let content = std::fs::read_to_string(&path).map_err(|e| err(e.to_string()))?;
         if path.extension().is_some_and(|ext| ext == "toml") {
-            let toml_config =
-                toml::from_str::<TomlConfig>(&content).map_err(|e| err(e.to_string()))?;
+            let (toml_config, extends_chain) = load_toml_config(&path, &content)?;
             let mut config = ProjectConfig::from(toml_config);
             config.config_file_path = Some(path.to_path_buf());
+            config.extends_chain = extends_chain;
             config.validate_configuration_source()?;
             tracing::info!(
                 path = %path.display(),
@@ -2562,6 +2697,16 @@ impl ProjectConfig {
             );
             Ok(config)
         } else {
+            // A JSON config is read as `ProjectConfig` itself, which ignores unknown
+            // keys: `extends` there would be dropped without a trace.
+            if serde_json::from_str::<serde_json::Value>(&content)
+                .is_ok_and(|value| value.get(EXTENDS_KEY).is_some())
+            {
+                return Err(err(format!(
+                    "`{EXTENDS_KEY}` is supported only in {}",
+                    CONFIG_FILE_NAMES[0]
+                )));
+            }
             let mut config: ProjectConfig =
                 serde_json::from_str(&content).map_err(|e| err(e.to_string()))?;
             config.config_file_path = Some(path.to_path_buf());
@@ -2572,6 +2717,12 @@ impl ProjectConfig {
 
     pub fn config_file_path(&self) -> Option<&Path> {
         self.config_file_path.as_deref()
+    }
+
+    /// The files `extends` pulled into this config, nearest parent first. Empty for
+    /// a config without `extends`.
+    pub fn extends_chain(&self) -> &[PathBuf] {
+        &self.extends_chain
     }
 
     /// Resolve the local tokenizer artifact from its declaring config directory.
@@ -3528,6 +3679,7 @@ impl From<TomlConfig> for ProjectConfig {
         Self {
             diagnostics: toml.diagnostics,
             config_file_path: None,
+            extends_chain: Vec::new(),
             code_lens: toml.code_lens,
             formatting: toml.formatting,
             configuration_root: toml.source.root,
@@ -4254,6 +4406,165 @@ mod tests {
             project.compatibility_mode(),
             Some(("8.3.15".to_string(), CompatibilityModeSource::Setting))
         );
+    }
+
+    #[test]
+    fn extends_merges_nested_tables_and_replaces_scalars_and_arrays() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("shared").join("base.toml");
+        fs::create_dir_all(base.parent().unwrap()).unwrap();
+        fs::write(
+            &base,
+            "target_platform_version = \"8.3.17\"\n\
+             [source]\nexclude = [\"a\", \"b\"]\n\
+             [diagnostics]\ndataflowMaxIterations = 500\n\
+             [diagnostics.parameters]\nLineLength = false\nMagicNumber = false\n",
+        )
+        .unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let child = project.join("bsl-analyzer.toml");
+        fs::write(
+            &child,
+            "extends = \"../shared/base.toml\"\n\
+             target_platform_version = \"8.3.27\"\n\
+             [source]\nexclude = [\"c\"]\n\
+             [diagnostics.parameters]\nMagicNumber = true\n",
+        )
+        .unwrap();
+
+        let config = ProjectConfig::load_from_file(&child).unwrap();
+        let rules = config.diagnostics.rules_json();
+        assert_eq!(rules["parameters"]["LineLength"], false, "kept from the parent");
+        assert_eq!(rules["parameters"]["MagicNumber"], true, "overridden by the child");
+        assert_eq!(rules["dataflowMaxIterations"], 500, "a sibling table key survives");
+        assert_eq!(config.target_platform_version.as_deref(), Some("8.3.27"));
+        assert_eq!(config.source_exclude, ["c"], "an array is replaced, not appended");
+        // Spelled as `extends` spells it: `absolute` folds `..` on Windows only.
+        let expected = std::path::absolute(project.join("../shared/base.toml")).unwrap();
+        assert_eq!(config.extends_chain(), [expected]);
+        assert_eq!(config.config_file_path(), Some(child.as_path()));
+    }
+
+    #[test]
+    fn extends_reads_relative_paths_of_the_parent_against_the_child() {
+        let dir = tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(
+            shared.join("base.toml"),
+            "[source]\nroot = \"src/cf\"\n[diagnostics.baseline]\npath = \"baseline.json\"\n",
+        )
+        .unwrap();
+        let project = dir.path().join("project");
+        let cf = project.join("src").join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(
+            cf.join("Configuration.xml"),
+            "<MetaDataObject><Configuration><Properties><Name>Тест</Name></Properties>\
+             </Configuration></MetaDataObject>",
+        )
+        .unwrap();
+        // An absolute `extends`, so the parent's own directory is unambiguous.
+        fs::write(
+            project.join("bsl-analyzer.toml"),
+            format!("extends = '{}'\n", shared.join("base.toml").display()),
+        )
+        .unwrap();
+
+        let project_model = Project::new(&project).unwrap();
+        assert_eq!(project_model.configuration_path(), Some(cf.as_path()));
+        let project_abs = std::path::absolute(&project).unwrap();
+        assert_eq!(
+            project_model.config.diagnostics_baseline_path(&project),
+            Some(project_abs.join("baseline.json")),
+            "a config-relative path resolves against the child, not the parent"
+        );
+    }
+
+    #[test]
+    fn extends_follows_a_chain_relative_to_each_file() {
+        let dir = tempdir().unwrap();
+        let top = dir.path().join("top");
+        let mid = dir.path().join("mid");
+        let project = dir.path().join("project");
+        for d in [&top, &mid, &project] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(top.join("top.toml"), "[diagnostics.parameters]\nLineLength = false\n").unwrap();
+        fs::write(
+            mid.join("mid.toml"),
+            "extends = \"../top/top.toml\"\n[diagnostics.parameters]\nMagicNumber = false\n",
+        )
+        .unwrap();
+        fs::write(project.join("bsl-analyzer.toml"), "extends = \"../mid/mid.toml\"\n").unwrap();
+
+        let config = ProjectConfig::load_from_file(&project.join("bsl-analyzer.toml")).unwrap();
+        let rules = config.diagnostics.rules_json();
+        assert_eq!(rules["parameters"]["LineLength"], false);
+        assert_eq!(rules["parameters"]["MagicNumber"], false);
+        assert_eq!(config.extends_chain().len(), 2);
+        assert_eq!(
+            super::workspace_config_extends_paths(&project),
+            config.extends_chain(),
+            "the watch list names the same files"
+        );
+    }
+
+    #[test]
+    fn extends_cycle_is_an_error_naming_the_files() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        fs::write(&a, "extends = \"b.toml\"\n").unwrap();
+        fs::write(&b, "extends = \"a.toml\"\n").unwrap();
+        let error = ProjectConfig::load_from_file(&a).unwrap_err();
+        assert!(error.message.contains("cycle"), "{error}");
+        assert!(error.message.contains("a.toml") && error.message.contains("b.toml"), "{error}");
+
+        let selfish = dir.path().join("self.toml");
+        fs::write(&selfish, "extends = \"self.toml\"\n").unwrap();
+        let error = ProjectConfig::load_from_file(&selfish).unwrap_err();
+        assert!(error.message.contains("cycle"), "{error}");
+    }
+
+    #[test]
+    fn extends_parent_missing_or_broken_is_an_error_naming_it() {
+        let dir = tempdir().unwrap();
+        let child = dir.path().join("bsl-analyzer.toml");
+        fs::write(&child, "extends = \"missing.toml\"\n").unwrap();
+        let error = ProjectConfig::load_from_file(&child).unwrap_err();
+        assert_eq!(error.path, std::path::absolute(&child).unwrap());
+        assert!(error.message.contains("missing.toml"), "{error}");
+        assert_eq!(
+            super::workspace_config_extends_paths(dir.path()),
+            [std::path::absolute(dir.path().join("missing.toml")).unwrap()],
+            "a missing parent is still watched"
+        );
+
+        fs::write(dir.path().join("broken.toml"), "[diagnostics\n").unwrap();
+        fs::write(&child, "extends = \"broken.toml\"\n").unwrap();
+        let error = ProjectConfig::load_from_file(&child).unwrap_err();
+        assert!(error.path.ends_with("broken.toml"), "{error}");
+
+        // The merged document is checked like a single file: an unknown key in
+        // the parent is refused, `extends` itself is not.
+        fs::write(dir.path().join("unknown.toml"), "no_such_key = 1\n").unwrap();
+        fs::write(&child, "extends = \"unknown.toml\"\n").unwrap();
+        let error = ProjectConfig::load_from_file(&child).unwrap_err();
+        assert!(error.message.contains("no_such_key"), "{error}");
+
+        fs::write(&child, "extends = 5\n").unwrap();
+        assert!(ProjectConfig::load_from_file(&child).is_err());
+    }
+
+    #[test]
+    fn extends_in_a_json_config_is_refused() {
+        let dir = tempdir().unwrap();
+        let json = dir.path().join(".bsl-analyzer.json");
+        fs::write(&json, r#"{"extends": "base.toml"}"#).unwrap();
+        let error = ProjectConfig::load_from_file(&json).unwrap_err();
+        assert!(error.message.contains("bsl-analyzer.toml"), "{error}");
     }
 
     #[test]

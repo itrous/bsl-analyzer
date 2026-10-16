@@ -956,10 +956,9 @@ impl DiagnosticsState {
         };
         project_model::PROJECT_INPUT_FILE_NAMES
             .iter()
-            .map(|name| {
-                let path = root.join(name);
-                path.canonicalize().unwrap_or(path)
-            })
+            .map(|name| root.join(name))
+            .chain(project_model::workspace_config_extends_paths(root))
+            .map(|path| path.canonicalize().unwrap_or(path))
             .collect()
     }
 
@@ -1445,8 +1444,14 @@ pub(super) fn config_files_fingerprint(root: &Path) -> u64 {
     use std::time::UNIX_EPOCH;
 
     let mut entries: Vec<(String, u64, u128)> = Vec::new();
-    for name in project_model::PROJECT_INPUT_FILE_NAMES {
-        let path = root.join(name);
+    // Parents named by `extends` shape the effective config as much as the file at
+    // the root; they are keyed by their full path.
+    let parents = project_model::workspace_config_extends_paths(root);
+    let named = project_model::PROJECT_INPUT_FILE_NAMES
+        .iter()
+        .map(|name| (name.to_string(), root.join(name)))
+        .chain(parents.into_iter().map(|path| (path.display().to_string(), path)));
+    for (key, path) in named {
         if let Ok(meta) = std::fs::metadata(&path) {
             let mtime = meta
                 .modified()
@@ -1454,7 +1459,7 @@ pub(super) fn config_files_fingerprint(root: &Path) -> u64 {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            entries.push((name.to_string(), meta.len(), mtime));
+            entries.push((key, meta.len(), mtime));
         }
     }
     entries.sort();
@@ -1541,6 +1546,36 @@ mod tests {
         assert!(
             watched.contains(&canonical(env_path)),
             "the .env file must be watched for drift as well"
+        );
+    }
+
+    /// A parent named by `extends` lives outside the workspace, yet an edit to it
+    /// changes the effective config: both channels must see it.
+    #[test]
+    fn an_extends_parent_edit_is_config_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let shared = dir.path().join("shared");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        let parent = shared.join("base.toml");
+        fs::write(&parent, "[diagnostics]\n").unwrap();
+        fs::write(
+            root.join(project_model::CONFIG_FILE_NAMES[0]),
+            "extends = \"../shared/base.toml\"\n",
+        )
+        .unwrap();
+
+        // Different LENGTH: the fingerprint is (key, len, mtime).
+        let before = config_files_fingerprint(&root);
+        fs::write(&parent, "[diagnostics]\ndataflowMaxIterations = 20000\n").unwrap();
+        assert_ne!(before, config_files_fingerprint(&root), "a parent edit must move the identity");
+
+        let (state, _hub) = state_with_hub(&root);
+        let canonical = |p: std::path::PathBuf| p.canonicalize().unwrap_or(p);
+        assert!(
+            state.config_file_paths().contains(&canonical(parent)),
+            "the parent must be watched for drift"
         );
     }
 
