@@ -885,3 +885,45 @@ fn method_size_ignores_file_padding_and_line_ending_width() {
         }
     }
 }
+
+#[test]
+fn torn_conditional_group_leaves_only_the_branch_read_in_hir() {
+    let method = parse_method(
+        r#"Функция Проверка(Данные)
+    Если Ложь
+        #Если Сервер Тогда
+        Или Данные.Прочитанное
+        #Иначе
+        Или Данные.Пропущенное
+        #КонецЕсли
+        Или Данные.После Тогда
+        Возврат Ложь;
+    КонецЕсли;
+    Возврат Истина;
+КонецФункции"#,
+    );
+    let result = lower_method(&method, true);
+    let if_stmt = match result.body.stmt_idx(result.body.body_stmts[0]) {
+        Stmt::If(stmt) => stmt,
+        other => panic!("expected If, got {other:?}"),
+    };
+
+    fn fields(body: &crate::body::Body, id: crate::hir::ExprIdx, out: &mut Vec<String>) {
+        match body.expr_idx(id) {
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                fields(body, *lhs, out);
+                fields(body, *rhs, out);
+            }
+            Expr::Field { base, field } => {
+                out.push(field.as_str().to_string());
+                fields(body, *base, out);
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    fields(&result.body, if_stmt.condition, &mut found);
+    assert_eq!(found, ["Прочитанное", "После"]);
+    assert!(!result.body.exprs_iter().any(|(_, expr)| matches!(expr, Expr::Missing)));
+    assert_eq!(result.body.body_stmts.len(), 2, "the `Возврат` after the `Если` survives");
+}

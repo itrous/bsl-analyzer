@@ -438,20 +438,17 @@ fn a_header_keeps_its_last_word_through_the_separator_before_it() {
 }
 
 #[test]
-fn a_region_that_crosses_a_block_keeps_its_own_closer_only_by_luck() {
+fn a_region_that_crosses_a_block_is_read_as_one_variant() {
     // The scope stack holds constructs that nest. A conditional region and a
-    // statement block may cross instead, and then the region returns on a word
-    // that is not its own, its scope is dropped, and the `#КонецЕсли` that
-    // does belong to it is no longer protected from anything.
-    //
-    // Pinned as it behaves, which is as it behaved before any of this: the
-    // mechanism does not make it worse and cannot make it better. Expressing
-    // a scope that outlives the rule that opened it is what would fix it.
+    // statement block may cross instead; such a region tears the block apart
+    // and is read as one variant of the text — its branch as code, its
+    // directives as opaque parts — so its `#КонецЕсли` is taken where the
+    // branch ends, whatever rule stands there.
     let input = "Процедура П()\nЕсли А Тогда\n#Если Клиент Тогда\n\tИначеЕсли Б Тогда\n#КонецЕсли\n\tКонецЕсли;\nКонецПроцедуры";
 
     assert!(covers(input, true));
-    assert!(swallowed(input, true, "#КонецЕсли"), "{:?}", error_node_texts(input, true));
-    assert_eq!(messages(input, true).len(), 2, "{:?}", messages(input, true));
+    assert!(!swallowed(input, true, "#КонецЕсли"), "{:?}", error_node_texts(input, true));
+    assert!(messages(input, true).is_empty(), "{:?}", messages(input, true));
 }
 
 #[test]

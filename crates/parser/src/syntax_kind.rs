@@ -60,6 +60,7 @@ pub fn node_kind_to_syntax(kind: NodeKind) -> syntax::SyntaxKind {
         NodeKind::PreRegionDir => SK::PRE_REGION_DIR,
         NodeKind::PreDeleteDir => SK::PRE_DELETE_DIR,
         NodeKind::PreInsertDir => SK::PRE_INSERT_DIR,
+        NodeKind::PreTornIfPart => SK::PRE_TORN_IF_PART,
         NodeKind::PreExpr => SK::PRE_EXPR,
         NodeKind::PreLogicalExpr => SK::PRE_LOGICAL_EXPR,
         NodeKind::PreLogicalOperand => SK::PRE_LOGICAL_OPERAND,

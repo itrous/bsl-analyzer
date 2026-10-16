@@ -7,17 +7,25 @@ use crate::{comment_runs, CommentRun, SyntaxElement, SyntaxKind, SyntaxNode, Syn
 /// an insertion as tokens, a removal as an opaque `PRE_DELETE_DIR`. Whatever
 /// reads the expression for its meaning has to step over both, or the removed
 /// argument comes back as an argument and a marker as an operand.
+///
+/// A conditional group that tears a construct apart is kept the same way: its
+/// directives and the branches not read are opaque `PRE_TORN_IF_PART` nodes.
 pub fn is_extension_directive(element: &SyntaxElement) -> bool {
     matches!(
         element.kind(),
-        SyntaxKind::PRE_DELETE_DIR | SyntaxKind::PRE_INSERT | SyntaxKind::PRE_END_INSERT
+        SyntaxKind::PRE_DELETE_DIR
+            | SyntaxKind::PRE_TORN_IF_PART
+            | SyntaxKind::PRE_INSERT
+            | SyntaxKind::PRE_END_INSERT
     )
 }
 
 /// Child nodes of `node` that stand in the compiled module: everything but
-/// the text an extension removed.
+/// the text an extension removed and the parts of a torn conditional group.
 pub fn active_children(node: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> {
-    node.children().filter(|child| child.kind() != SyntaxKind::PRE_DELETE_DIR)
+    node.children().filter(|child| {
+        !matches!(child.kind(), SyntaxKind::PRE_DELETE_DIR | SyntaxKind::PRE_TORN_IF_PART)
+    })
 }
 
 /// Children of `node`, nodes and tokens, that stand in the compiled module:

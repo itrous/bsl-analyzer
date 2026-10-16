@@ -155,16 +155,76 @@ impl ConditionalTree {
 struct ConditionalTreeBuilder {
     tree: ConditionalTree,
     parent_stack: Vec<ConditionalIdx>,
+    /// Where each torn group ends, by the start of its `#Если` part.
+    torn_ends: FxHashMap<u32, text_size::TextSize>,
 }
 
 impl ConditionalTreeBuilder {
     fn new() -> Self {
-        Self { tree: ConditionalTree::new(), parent_stack: Vec::new() }
+        Self {
+            tree: ConditionalTree::new(),
+            parent_stack: Vec::new(),
+            torn_ends: FxHashMap::default(),
+        }
     }
 
     fn build(mut self, root: &SyntaxNode) -> ConditionalTree {
+        self.torn_ends = torn_group_ends(root);
         self.collect_conditionals(root);
         self.tree
+    }
+
+    /// A group that tears a construct apart is read as one branch, kept as
+    /// code between two opaque parts, and that branch is where the group's
+    /// condition holds: the conditional covers both parts and the branch.
+    ///
+    /// Only a group read as its first branch gets its header's condition. A
+    /// later branch holds where the earlier conditions fail, which a single
+    /// node cannot state; it gets no condition, which availability checks
+    /// read as undecidable and skip.
+    fn process_torn_if(&mut self, node: &SyntaxNode) {
+        let Some(&end) = self.torn_ends.get(&u32::from(node.text_range().start())) else {
+            return;
+        };
+        let directives = node
+            .descendants_with_tokens()
+            .filter(|element| {
+                matches!(
+                    element.kind(),
+                    SyntaxKind::PRE_IF
+                        | SyntaxKind::PRE_ELSIF
+                        | SyntaxKind::PRE_ELSE
+                        | SyntaxKind::PRE_END_IF
+                )
+            })
+            .count();
+        let (condition_text, condition_range) = if directives == 1 {
+            let (text, range) = self.extract_condition(node);
+            (Some(text), Some(range))
+        } else {
+            (None, None)
+        };
+
+        let range = TextRange::new(node.text_range().start(), end);
+        let parent = self.parent_stack.last().copied();
+        let idx = self.tree.conditionals.alloc(ConditionalData {
+            kind: ConditionalKind::If,
+            condition_text,
+            range,
+            directive_range: self.find_first_line_range(node),
+            condition_range,
+            parent,
+            children: Vec::new(),
+            siblings: Vec::new(),
+            depth: self.parent_stack.len() as u32,
+            parent_ast_kind: find_parent_ast_kind(node),
+        });
+        self.tree.position_map.insert(range.start().into(), idx);
+        if let Some(parent_idx) = parent {
+            self.tree.conditionals[parent_idx].children.push(idx);
+        } else {
+            self.tree.root_conditionals.push(idx);
+        }
     }
 
     fn collect_conditionals(&mut self, node: &SyntaxNode) {
@@ -173,6 +233,7 @@ impl ConditionalTreeBuilder {
                 SyntaxKind::PRE_IF_DIR => {
                     self.process_if_directive(&child);
                 }
+                SyntaxKind::PRE_TORN_IF_PART => self.process_torn_if(&child),
                 _ => {
                     self.collect_conditionals(&child);
                 }
@@ -232,6 +293,7 @@ impl ConditionalTreeBuilder {
             match child.kind() {
                 SyntaxKind::PRE_ELSIF_CLAUSE | SyntaxKind::PRE_ELSE_CLAUSE => {}
                 SyntaxKind::PRE_IF_DIR => self.process_if_directive(&child),
+                SyntaxKind::PRE_TORN_IF_PART => self.process_torn_if(&child),
                 _ => self.collect_nested_conditionals(&child),
             }
         }
@@ -309,6 +371,7 @@ impl ConditionalTreeBuilder {
                 SyntaxKind::PRE_IF_DIR => {
                     self.process_if_directive(&child);
                 }
+                SyntaxKind::PRE_TORN_IF_PART => self.process_torn_if(&child),
                 _ => {
                     self.collect_nested_conditionals(&child);
                 }
@@ -353,6 +416,33 @@ impl ConditionalTreeBuilder {
             node.text_range().start() + text_size::TextSize::from(first_line_len as u32),
         )
     }
+}
+
+/// The end of every torn group, by the start of its `#Если` part.
+///
+/// The parts of one group are not linked in the tree: the `#Если` part stands
+/// where the group opened and the part with its other directives where the
+/// branch read ended, possibly in another construct. Groups nest in the text,
+/// so the parts pair up in document order. A `#Если` part that ends with the
+/// group's `#КонецЕсли` read no branch and is a group by itself.
+fn torn_group_ends(root: &SyntaxNode) -> FxHashMap<u32, text_size::TextSize> {
+    let mut ends = FxHashMap::default();
+    let mut open = Vec::new();
+    for node in root.descendants().filter(|node| node.kind() == SyntaxKind::PRE_TORN_IF_PART) {
+        let range = node.text_range();
+        let first = node.first_token().map(|token| token.kind());
+        let last = node.last_token().map(|token| token.kind());
+        if first == Some(SyntaxKind::PRE_IF) {
+            if last == Some(SyntaxKind::PRE_END_IF) {
+                ends.insert(u32::from(range.start()), range.end());
+            } else {
+                open.push(range.start());
+            }
+        } else if let Some(start) = open.pop() {
+            ends.insert(u32::from(start), range.end());
+        }
+    }
+    ends
 }
 
 fn find_parent_ast_kind(directive_node: &SyntaxNode) -> Option<SyntaxKind> {
@@ -650,6 +740,44 @@ mod tests {
 
         assert_eq!(tree.len(), 1);
         let _cond = tree.conditional(tree.root_conditionals()[0]);
+    }
+
+    #[test]
+    fn torn_group_covers_the_branch_read() {
+        let code = r#"
+Процедура Тест()
+    Если Ложь
+        #Если Клиент Тогда
+        Или Прочитанное
+        #Иначе
+        Или Пропущенное
+        #КонецЕсли
+    Тогда
+    КонецЕсли;
+    #Если Не Клиент Тогда
+    Если Пропущенное
+    #Иначе
+    Если Прочитанное
+    #КонецЕсли
+    Тогда
+    КонецЕсли;
+КонецПроцедуры
+"#;
+        let tree = parse_and_lower(code);
+        assert_eq!(tree.len(), 2);
+        let roots = tree.root_conditionals();
+        let first = tree.conditional(roots[0]);
+        assert_eq!(first.condition_text.as_deref(), Some("Клиент"));
+        let read = code.find("Прочитанное").unwrap() as u32;
+        assert!(first.range.contains(read.into()));
+        assert!(
+            first.range.end() > text_size::TextSize::from(code.find("Пропущенное").unwrap() as u32)
+        );
+        // Read as its `#Иначе` branch: no single condition states where it holds.
+        let second = tree.conditional(roots[1]);
+        assert_eq!(second.condition_text, None);
+        let read_second = code.rfind("Прочитанное").unwrap() as u32;
+        assert!(second.range.contains(read_second.into()));
     }
 
     #[test]

@@ -204,11 +204,14 @@ fn reparse_matches_full_parse_on_adversarial_insertions() {
 /// вход даёт дерево, отличное от полного разбора: отказ не вхолостую. Два
 /// гарда определяют саму операцию и не выключаются: `OutsideMethod` без узла
 /// метода (вклеивать некуда) и `Kind` (`replace_with` паникует на чужом
-/// виде). Два других — вторая линия: `TokenBoundary` доказывает границу
+/// виде). Три других — вторая линия: `TokenBoundary` доказывает границу
 /// лексером, но токен, вросший через границу узла, на известных входах
 /// ломает и закрыватель; `NewUnclosed` — незакрытый фрагмент всегда несёт
-/// ошибку на своём последнем токене, и её ловит `ContextError`. Для них
-/// проверяется только сам отказ и то, что без ВСЕХ гардов вход опасен.
+/// ошибку на своём последнем токене, и её ловит `ContextError`;
+/// `OldUnclosed` — метод, которому границу поставил `#Иначе` снаружи,
+/// стоит в разорванной условной группе, и её директивы внутри узла ловит
+/// `Preprocessor`. Для них проверяется только сам отказ и то, что без ВСЕХ
+/// гардов вход опасен.
 #[test]
 fn each_guard_refuses_an_input_that_would_otherwise_splice_wrong() {
     // (гард, старый текст, якорь — вставка идёт перед ним, вставка)
@@ -255,7 +258,8 @@ fn each_guard_refuses_an_input_that_would_otherwise_splice_wrong() {
             "З = 3;",
         ),
     ];
-    const SECOND_LINE: &[Refusal] = &[Refusal::TokenBoundary, Refusal::NewUnclosed];
+    const SECOND_LINE: &[Refusal] =
+        &[Refusal::OldUnclosed, Refusal::TokenBoundary, Refusal::NewUnclosed];
     let mut without_all = Guards::ALL;
     for refusal in Refusal::ALL {
         without_all = without_all.without(refusal);

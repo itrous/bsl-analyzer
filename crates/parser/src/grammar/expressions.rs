@@ -237,8 +237,15 @@ fn postfix_expr_with_call_info(p: &mut Parser) -> bool {
                 lhs = m.complete(p, NodeKind::CallExpr);
                 is_valid_statement = true;
             }
-            Some(T![PreInsert] | T![PreEndInsert] | T![PreDelete])
-                if continue_across_inline_directives(p) => {}
+            Some(
+                T![PreInsert]
+                | T![PreEndInsert]
+                | T![PreDelete]
+                | T![PreIf]
+                | T![PreElsIf]
+                | T![PreElse]
+                | T![PreEndIf],
+            ) if continue_across_inline_directives(p) => {}
             _ => break,
         }
     }
@@ -476,6 +483,11 @@ fn arg_list(p: &mut Parser) {
 // statement rules take them as opaque blocks; the rules below accept them inside
 // an expression, where what is inserted is parsed as part of the expression and
 // what is removed stays an opaque `PreDeleteDir` the expression does not see.
+//
+// A conditional group (`#Если … #КонецЕсли`) is text-level in the platform as
+// well, and inside an expression the same rules take it: the branch read is
+// parsed as part of the expression, the directives and the other branches stay
+// opaque `PreTornIfPart` nodes (see `torn_preprocessor_if`).
 
 /// Whether a marker an expression may take stands here.
 ///
@@ -485,6 +497,8 @@ pub(super) fn at_inline_directive(p: &Parser) -> bool {
     match p.current() {
         Some(T![PreInsert] | T![PreDelete]) => true,
         Some(T![PreEndInsert]) => p.inline_insert_open(),
+        Some(T![PreIf]) => p.at_torn_if_inline(),
+        Some(T![PreElsIf] | T![PreElse] | T![PreEndIf]) => p.at_torn_if_end(),
         _ => false,
     }
 }
@@ -495,7 +509,11 @@ pub(super) fn at_inline_directive(p: &Parser) -> bool {
 pub(super) fn inline_directives(p: &mut Parser) {
     while at_inline_directive(p) {
         p.check_iteration_limit();
-        if p.at(T![PreDelete]) {
+        if p.at(T![PreIf]) {
+            super::torn_preprocessor_if(p);
+        } else if p.at_torn_if_end() {
+            super::torn_preprocessor_if_end(p);
+        } else if p.at(T![PreDelete]) {
             inline_delete(p);
         } else if p.at(T![PreInsert]) && !at_closed_inline_insert(p) {
             // Nothing will close it, so it opens nothing either: counted, it
@@ -542,7 +560,13 @@ fn continue_across_inline_directives(p: &mut Parser) -> bool {
         p.bump_inline_insert_marker();
         return true;
     }
-    if at_inline_directives_before(p, |kind| TORN_EXPRESSION_CONTINUATION.contains(kind)) {
+    // A conditional group in front of `;` stands inside the statement the `;`
+    // ends: no statement of its own is left between them. So does the end of
+    // a torn group's branch, which was opened inside that statement.
+    let torn = p.at_torn_if_end() || p.at_torn_if_inline();
+    if at_inline_directives_before(p, |kind| {
+        TORN_EXPRESSION_CONTINUATION.contains(kind) || (torn && kind == T![Semicolon])
+    }) {
         inline_directives(p);
         return true;
     }
@@ -557,7 +581,12 @@ fn continue_across_inline_directives(p: &mut Parser) -> bool {
 fn at_inline_directives_before(p: &Parser, continues: impl Fn(Sig) -> bool) -> bool {
     let mut n = 0;
     let mut open = p.open_inline_inserts();
+    let mut torn = Vec::new();
     loop {
+        if let Some(resume) = p.torn_if_skip(n, &mut torn) {
+            n = resume;
+            continue;
+        }
         match p.nth(n) {
             Some(T![PreInsert]) => {
                 open += 1;

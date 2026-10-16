@@ -45,11 +45,17 @@ fn annotated_item(p: &mut Parser) {
         // annotation and the declaration it applies to (e.g. `&НаКлиенте #Область X
         // <newline> Перем Y;`). Consume them here so the annotation still binds to
         // the following Procedure/Function/Var instead of derailing the parse.
-        while matches!(p.current(), Some(T![PreRegion]) | Some(T![PreEndRegion])) {
+        // So may the end of a torn group whose branches give the declaration
+        // different annotations (`#Если Сервер Тогда &НаСервере #Иначе
+        // &НаКлиенте #КонецЕсли Процедура …`).
+        while matches!(p.current(), Some(T![PreRegion]) | Some(T![PreEndRegion]))
+            || p.at_torn_if_end()
+        {
             p.check_iteration_limit();
             match p.current() {
                 Some(T![PreRegion]) => preprocessor_region(p),
-                _ => preprocessor_end_region(p),
+                Some(T![PreEndRegion]) => preprocessor_end_region(p),
+                _ => torn_preprocessor_if_end(p),
             }
         }
     });
@@ -163,8 +169,14 @@ pub(super) fn preprocessor_end_region(p: &mut Parser) {
 }
 
 pub(super) fn preprocessor_if(p: &mut Parser) {
+    if p.at_torn_if_statement() {
+        torn_preprocessor_if(p);
+        return;
+    }
+
     let m = p.start();
     p.bump();
+    p.enter_preproc_if();
 
     p.within_boundary(at_preproc_closer, |p| {
         p.within_boundary(at_then, preproc_expression);
@@ -197,8 +209,58 @@ pub(super) fn preprocessor_if(p: &mut Parser) {
         }
     });
 
+    p.leave_preproc_if();
+    // Content that stopped at a statement closer (an `ИначеЕсли` of the `Если`
+    // around the block) left the block open: its own directives follow.
+    let crossed = !p.at_end() && !p.at_preproc_if_directive() && p.at_enclosing_boundary();
     p.expect(T![PreEndIf]);
+    if crossed {
+        p.cross_preproc_if();
+    }
     m.complete(p, NodeKind::PreIfDir);
+}
+
+/// A conditional group that tears a construct apart, read as one variant.
+///
+/// The platform chooses lines before it parses, so a group may stand inside
+/// an expression, between `Если` and `Тогда`, or give each branch its own
+/// header for one shared body; every environment compiles a whole construct.
+/// A tree holds one reading of the text, so the branch whose condition holds
+/// with every symbol defined is read as code, and the header, the directives
+/// and the other branches become opaque `PreTornIfPart` nodes around it —
+/// text this variant does not compile, as a removal is. The part opened here
+/// ends at the directive closing the branch, taken by
+/// [`torn_preprocessor_if_end`] wherever the parse stands then.
+pub(super) fn torn_preprocessor_if(p: &mut Parser) {
+    let Some(group) = p.torn_if_here() else {
+        return;
+    };
+    let m = p.start();
+    p.bump();
+
+    p.within_boundary(at_then, preproc_expression);
+    p.expect(T![KwThen]);
+
+    match group.active {
+        Some((start, end)) => {
+            p.bump_removed_until(start);
+            p.open_torn_if(end, group.close);
+        }
+        None => p.bump_removed_until(group.close + 1),
+    }
+
+    m.complete(p, NodeKind::PreTornIfPart);
+}
+
+/// The directive ending the branch read of a torn group, together with the
+/// branches after it and the `#КонецЕсли`. See [`torn_preprocessor_if`].
+pub(super) fn torn_preprocessor_if_end(p: &mut Parser) {
+    let Some(close) = p.close_torn_if() else {
+        return;
+    };
+    let m = p.start();
+    p.bump_removed_until(close + 1);
+    m.complete(p, NodeKind::PreTornIfPart);
 }
 
 /// The `Тогда` a preprocessor condition ends at.
@@ -271,8 +333,10 @@ fn at_declaration_start(p: &Parser) -> bool {
     )
 }
 
+/// The directive ending a branch of a torn group inside the region is not the
+/// region's: the torn group takes it.
 fn at_preproc_closer(p: &Parser) -> bool {
-    matches!(p.current(), Some(T![PreElsIf] | T![PreElse] | T![PreEndIf]))
+    p.at_preproc_if_directive() && !p.at_crossed_preproc_if_directive() && !p.at_torn_if_end()
 }
 
 /// A conditional region and a statement block can cross each other: a

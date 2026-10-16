@@ -66,6 +66,7 @@ pub enum NodeKind {
     PreRegionDir,
     PreDeleteDir,
     PreInsertDir,
+    PreTornIfPart,
     PreExpr,
     PreLogicalExpr,
     PreLogicalOperand,

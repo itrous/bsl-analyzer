@@ -48,12 +48,29 @@ pub fn statement(p: &mut Parser) -> bool {
         Some(T![PreRegion]) => super::preprocessor_region(p),
         Some(T![PreEndRegion]) => super::preprocessor_end_region(p),
         Some(T![PreIf]) => super::preprocessor_if(p),
+        // A directive of a `#Если` block that ended at the closer of a statement
+        // it crossed (see `Parser::cross_preproc_if`). It stands among the
+        // statements, as the platform reads it; only `#КонецЕсли` closes the block.
+        Some(T![PreElsIf]) if p.at_crossed_preproc_if_directive() => {
+            p.bump();
+            p.within_boundary(at_then, super::preproc_expression);
+            p.expect(T![KwThen]);
+        }
+        Some(T![PreElse]) if p.at_crossed_preproc_if_directive() => p.bump(),
+        Some(T![PreEndIf]) if p.at_crossed_preproc_if_directive() => {
+            p.bump_crossed_preproc_if_end()
+        }
         Some(T![PreDelete]) => super::preprocessor_delete(p),
         Some(T![PreInsert]) => super::preprocessor_insert(p),
         // The closer of an insertion that tore apart the statement before this
         // one, when the statement ended inside it — a literal whose closing
         // line was inserted takes its `;` along.
         Some(T![PreEndInsert]) if p.inline_insert_open() => p.bump_inline_insert_marker(),
+        // The end of the branch read of a torn conditional group, where the
+        // statements of that branch end.
+        Some(T![PreElsIf] | T![PreElse] | T![PreEndIf]) if p.at_torn_if_end() => {
+            super::torn_preprocessor_if_end(p)
+        }
         _ => {
             if p.current().is_some() {
                 let m = p.start();

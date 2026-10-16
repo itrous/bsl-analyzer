@@ -87,7 +87,9 @@ pub enum Refusal {
     /// дорастила токен, начатый до узла, либо разорвала последний.
     TokenBoundary,
     /// Директивы препроцессора во фрагменте не сбалансированы или
-    /// `#ИначеЕсли`/`#Иначе` на нулевой глубине.
+    /// `#ИначеЕсли`/`#Иначе` на нулевой глубине; либо метод стоит внутри
+    /// условной группы, а старый или новый его текст не держит целых
+    /// конструкций — тогда от правки зависит, разорвана ли группа вокруг.
     Preprocessor,
     /// У корня фрагмента не ровно один ребёнок-узел.
     Shape,
@@ -181,6 +183,13 @@ pub fn reparse_method_guarded(
     if guards.has(Refusal::Preprocessor) && !preprocessor_balanced(&tokens) {
         return Err(Refusal::Preprocessor);
     }
+    if guards.has(Refusal::Preprocessor)
+        && !(Parser::new(&tokens).is_whole()
+            && Parser::new(&lexer::tokenize(&old_text[old_range])).is_whole())
+        && inside_conditional_group(&root, &node)
+    {
+        return Err(Refusal::Preprocessor);
+    }
 
     let mut p = Parser::new(&tokens);
     grammar::source_file(&mut p);
@@ -233,6 +242,18 @@ fn enclosing_method(root: &SyntaxNode, range: TextRange) -> Option<SyntaxNode> {
         }
     }
     found
+}
+
+/// Стоит ли метод внутри условной группы: структурной — тогда она среди
+/// предков, или разорванной — тогда её части есть в дереве. Разорвана ли
+/// группа, решает текст её ветвей, а метод — часть этого текста.
+fn inside_conditional_group(root: &SyntaxNode, node: &SyntaxNode) -> bool {
+    node.ancestors().any(|ancestor| {
+        matches!(
+            ancestor.kind(),
+            SyntaxKind::PRE_IF_DIR | SyntaxKind::PRE_ELSIF_CLAUSE | SyntaxKind::PRE_ELSE_CLAUSE
+        )
+    }) || root.descendants().any(|descendant| descendant.kind() == SyntaxKind::PRE_TORN_IF_PART)
 }
 
 fn closing_word(kind: SyntaxKind) -> SyntaxKind {
