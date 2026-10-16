@@ -22,6 +22,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: python3 scripts/test-ci-test-output.py
       - run: cargo clippy --all-targets --all-features
+      - name: Native check executor tests without 1C
+        run: cargo test --locked -p bsl-check-executor
       - name: Workspace cache paths and scopes
         shell: bash
         run: |
@@ -353,6 +355,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build binary
         run: cargo build -p bsl-analyzer --bin bsl-analyzer-app
+      - name: Native check executor tests without 1C
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty --locked -p bsl-check-executor
+      - name: Build native check executor
+        run: cargo build --locked --release -p bsl-check-executor --bin bsl-native-check
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-check-windows-amd64
+          path: target/release/bsl-native-check.exe
       - name: Workspace cache paths and scopes
         shell: bash
         run: |

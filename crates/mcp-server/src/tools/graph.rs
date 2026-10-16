@@ -555,7 +555,9 @@ mod tests {
         let graph = crate::graph::GraphState::for_workspace_with_cache(root.to_path_buf(), cache)
             .with_lease(lease.clone());
         graph.ensure_first_build();
-        crate::graph::test_support::wait_ready(&graph);
+        crate::graph::test_support::wait_settled(&graph);
+        // Populate the idle pool before timing reads with lease I/O blocked.
+        drop(crate::graph::test_support::hold_every_handle(&graph));
         let held_lease = lease.hold_file_lock_for_test();
         std::fs::remove_file(lease_path).unwrap();
         lease.invalidate_verdict_for_test();

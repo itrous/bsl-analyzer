@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
+                xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"
+                version="2.20">
+  <Catalog uuid="{{CATALOG_UUID}}">
+    <InternalInfo>
+      <xr:GeneratedType name="CatalogObject.{{CATALOG_NAME}}" category="Object">
+        <xr:TypeId>{{TYPE_ID_OBJECT}}</xr:TypeId>
+        <xr:ValueId>{{VALUE_ID_OBJECT}}</xr:ValueId>
+      </xr:GeneratedType>
+      <xr:GeneratedType name="CatalogRef.{{CATALOG_NAME}}" category="Ref">
+        <xr:TypeId>{{TYPE_ID_REF}}</xr:TypeId>
+        <xr:ValueId>{{VALUE_ID_REF}}</xr:ValueId>
+      </xr:GeneratedType>
+      <xr:GeneratedType name="CatalogSelection.{{CATALOG_NAME}}" category="Selection">
+        <xr:TypeId>{{TYPE_ID_SELECTION}}</xr:TypeId>
+        <xr:ValueId>{{VALUE_ID_SELECTION}}</xr:ValueId>
+      </xr:GeneratedType>
+      <xr:GeneratedType name="CatalogList.{{CATALOG_NAME}}" category="List">
+        <xr:TypeId>{{TYPE_ID_LIST}}</xr:TypeId>
+        <xr:ValueId>{{VALUE_ID_LIST}}</xr:ValueId>
+      </xr:GeneratedType>
+      <xr:GeneratedType name="CatalogManager.{{CATALOG_NAME}}" category="Manager">
+        <xr:TypeId>{{TYPE_ID_MANAGER}}</xr:TypeId>
+        <xr:ValueId>{{VALUE_ID_MANAGER}}</xr:ValueId>
+      </xr:GeneratedType>
+    </InternalInfo>
+    <Properties>
+      <Name>{{CATALOG_NAME}}</Name>
+      <Synonym />
+      <Comment />
+      <Hierarchical>false</Hierarchical>
+      <HierarchyType>HierarchyFoldersAndItems</HierarchyType>
+      <LimitLevelCount>false</LimitLevelCount>
+      <LevelCount>2</LevelCount>
+      <FoldersOnTop>true</FoldersOnTop>
+      <UseStandardCommands>true</UseStandardCommands>
+      <SubordinationUse>ToItems</SubordinationUse>
+      <CodeLength>9</CodeLength>
+      <DescriptionLength>25</DescriptionLength>
+      <CodeType>String</CodeType>
+      <CodeAllowedLength>Variable</CodeAllowedLength>
+      <CodeSeries>WholeCatalog</CodeSeries>
+      <CheckUnique>true</CheckUnique>
+      <Autonumbering>true</Autonumbering>
+      <DefaultPresentation>AsDescription</DefaultPresentation>
+    </Properties>
+    <ChildObjects />
+  </Catalog>
+</MetaDataObject>

@@ -4,6 +4,11 @@
 # Причина "сравнение" исчерпана миграцией: гейт её больше не принимает.
 crates/bsl-analyzer/src/reporters/junit.rs	bsl-analyzer.junit.xml	1	вне-класса: имя собственного отчёта анализатора
 crates/bsl-analyzer/src/server.rs	bsl	1	вне-класса: идентификатор источника LSP-диагностик
+crates/bsl-check-executor/src/native_check/profile.rs	fixtures/catalog.xml	1	вне-класса: путь встроенного XML-шаблона executor
+crates/bsl-check-executor/src/native_check/profile.rs	fixtures/common_module.xml	1	вне-класса: путь встроенного XML-шаблона executor
+crates/bsl-check-executor/src/native_check/profile.rs	fixtures/managed_form.xml	1	вне-класса: путь встроенного XML-шаблона executor
+crates/bsl-check-executor/src/native_check/profile.rs	fixtures/managed_form_body.xml	1	вне-класса: путь встроенного XML-шаблона executor
+crates/bsl-check-executor/src/native_check/profile.rs	fixtures/ordinary_form.xml	1	вне-класса: путь встроенного XML-шаблона executor
 crates/bsl-debug/src/module_index.rs	Commands	1	конструкция: fallback канонического написания
 crates/bsl-debug/src/module_index.rs	Configuration.xml	1	конструкция: fallback канонического написания
 crates/bsl-debug/src/module_index.rs	Ext	1	конструкция: fallback канонического написания

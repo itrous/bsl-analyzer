@@ -414,6 +414,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsl-check-executor"
+version = "0.3.2"
+dependencies = [
+ "blake3",
+ "bsl-conventions",
+ "bsl-metadata",
+ "check-contract",
+ "clap",
+ "libc",
+ "onec-client",
+ "quick-xml",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "win-security-identifier",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "bsl-config"
 version = "0.3.2"
 dependencies = [

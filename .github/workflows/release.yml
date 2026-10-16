@@ -65,15 +65,21 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin bsl-analyzer --bin bsl-analyzer-app
         env:
           CXXFLAGS: ${{ matrix.cxxflags || '' }}
+          RUSTFLAGS: ${{ matrix.rustflags || '' }}
+
+      - name: Build native check executor
+        if: runner.os != 'macOS'
+        run: cargo build --locked --release --target ${{ matrix.target }} -p bsl-check-executor --bin bsl-native-check
+        env:
           RUSTFLAGS: ${{ matrix.rustflags || '' }}
 
       - name: Verify glibc floor
         if: matrix.container != ''
         run: |
-          for name in bsl-analyzer bsl-analyzer-app; do
+          for name in bsl-analyzer bsl-analyzer-app bsl-native-check; do
             bin=target/${{ matrix.target }}/release/$name
             max=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
             # Пустой результат — это отказ objdump или неверный путь, а не
@@ -95,6 +101,9 @@ jobs:
           mkdir -p artifacts
           cp target/${{ matrix.target }}/release/bsl-analyzer artifacts/bsl-analyzer-${{ matrix.platform }}
           cp target/${{ matrix.target }}/release/bsl-analyzer-app artifacts/bsl-analyzer-app-${{ matrix.platform }}
+          if [ "$RUNNER_OS" = Linux ]; then
+            cp target/${{ matrix.target }}/release/bsl-native-check artifacts/bsl-native-check-${{ matrix.platform }}
+          fi
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -102,6 +111,7 @@ jobs:
           mkdir artifacts
           cp target/${{ matrix.target }}/release/bsl-analyzer.exe artifacts/bsl-analyzer-${{ matrix.platform }}.exe
           cp target/${{ matrix.target }}/release/bsl-analyzer-app.exe artifacts/bsl-analyzer-app-${{ matrix.platform }}.exe
+          cp target/${{ matrix.target }}/release/bsl-native-check.exe artifacts/bsl-native-check-${{ matrix.platform }}.exe
 
       - uses: actions/upload-artifact@v7
         with:
@@ -130,6 +140,9 @@ jobs:
             /a/bsl-analyzer-app-linux-amd64 --version
           docker run --rm --network none -v "$PWD/artifacts:/a:ro" debian:12 \
             /a/bsl-analyzer-linux-amd64 --launcher-version
+          chmod +x artifacts/bsl-native-check-linux-amd64
+          docker run --rm --network none -v "$PWD/artifacts:/a:ro" debian:12 \
+            /a/bsl-native-check-linux-amd64 --help
 
   release:
     name: Create Release
@@ -148,7 +161,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum * > checksums.txt
+          sha256sum -- bsl-* > checksums.txt
 
       - name: List artifacts
         run: ls -la artifacts/
@@ -158,6 +171,7 @@ jobs:
         with:
           subject-path: |
             artifacts/bsl-analyzer-*
+            artifacts/bsl-native-check-*
 
       - uses: softprops/action-gh-release@v3
         with:
