@@ -673,3 +673,190 @@ fn trivia_after_a_closed_method_offers_no_locals() {
         "за закрытым методом его локальных имён быть не должно"
     );
 }
+
+fn sort_text_of<'a>(items: &'a [CompletionItem], label: &str) -> Option<&'a str> {
+    items.iter().find(|i| i.label == label)?.sort_text.as_deref()
+}
+
+#[test]
+fn completion_latin_typed_for_cyrillic_name_offers_it_in_fuzzy_tier() {
+    // `vjz` is what the keys of `моя` produce while the Latin layout is active.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Перем МояПеременная;
+    vjz$0
+КонецПроцедуры
+"#,
+    );
+    let sort_text = sort_text_of(&items, "МояПеременная").unwrap_or_else(|| {
+        panic!(
+            "a name typed in the wrong keyboard layout must still be offered; got: {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        sort_text.starts_with('3'),
+        "a layout-corrected hit must sit in the Fuzzy tier; got {sort_text:?}"
+    );
+}
+
+#[test]
+fn completion_cyrillic_typed_for_latin_name_offers_it() {
+    // `ьнм` is what the keys of `myv` produce while the Cyrillic layout is active.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Перем MyValue;
+    ьнм$0
+КонецПроцедуры
+"#,
+    );
+    assert!(
+        has_label(&items, "MyValue"),
+        "a Latin name typed with Cyrillic keys must still be offered; got: {:?}",
+        items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn completion_correct_layout_hit_outranks_layout_corrected_hit() {
+    // `Сум` hits `СуммаИтог` directly; on the other layout the same keys read
+    // `cev`, which hits `CevДанные`. The direct hit must keep the top tier and
+    // sort ahead.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    СуммаИтог = 0;
+    CevДанные = 1;
+    Сум$0
+КонецПроцедуры
+"#,
+    );
+    let direct = sort_text_of(&items, "СуммаИтог").expect("direct prefix hit must be offered");
+    let corrected =
+        sort_text_of(&items, "CevДанные").expect("layout-corrected hit must be offered too");
+    assert!(direct.starts_with('0'), "direct prefix hit must stay in the top tier; got {direct:?}");
+    assert!(corrected.starts_with('3'), "layout-corrected hit must be Fuzzy; got {corrected:?}");
+    assert!(direct < corrected, "direct hit must sort first; got {direct:?} vs {corrected:?}");
+}
+
+#[test]
+fn completion_correct_layout_prefix_keeps_its_tier() {
+    // Input typed in the right layout ranks exactly as before: top tier.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Перем МояПеременная;
+    Моя$0
+КонецПроцедуры
+"#,
+    );
+    let sort_text =
+        sort_text_of(&items, "МояПеременная").expect("correct-layout prefix hit must be offered");
+    assert!(
+        sort_text.starts_with('0'),
+        "correct-layout prefix must be top tier; got {sort_text:?}"
+    );
+}
+
+/// What the client (VS Code) does with the list: it filters it again by the word
+/// at the cursor against `filterText` (the label when absent), and the first typed
+/// char must land on a word start. A typed word that is a prefix of one of the
+/// space-separated words is the plain case it always accepts.
+fn client_accepts(item: &CompletionItem, typed: &str) -> bool {
+    let text = item.filter_text.as_deref().unwrap_or(&item.label).to_lowercase();
+    let typed = typed.to_lowercase();
+    text.split_whitespace().any(|word| word.starts_with(&typed))
+}
+
+fn item_with_label<'a>(items: &'a [CompletionItem], label: &str) -> &'a CompletionItem {
+    items.iter().find(|i| i.label == label).unwrap_or_else(|| {
+        panic!(
+            "{label} must be offered; got: {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        )
+    })
+}
+
+#[test]
+fn completion_layout_hit_survives_client_filter_latin_keys() {
+    // `pfg` is what the keys of `зап` produce while the Latin layout is active.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Перем ЗапросДанных;
+    pfg$0
+КонецПроцедуры
+"#,
+    );
+    let item = item_with_label(&items, "ЗапросДанных");
+    assert!(
+        client_accepts(item, "pfg"),
+        "the client must keep a layout-corrected hit; filter_text = {:?}",
+        item.filter_text
+    );
+    assert!(item.sort_text.as_deref().is_some_and(|s| s.starts_with('3')), "still Fuzzy tier");
+}
+
+#[test]
+fn completion_layout_hit_survives_client_filter_cyrillic_keys() {
+    // `ьнм` is what the keys of `myv` produce while the Cyrillic layout is active.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Перем MyValue;
+    ьнм$0
+КонецПроцедуры
+"#,
+    );
+    let item = item_with_label(&items, "MyValue");
+    assert!(
+        client_accepts(item, "ьнм"),
+        "the client must keep a layout-corrected hit; filter_text = {:?}",
+        item.filter_text
+    );
+}
+
+#[test]
+fn completion_layout_hit_on_bilingual_item_keeps_its_aliases() {
+    // `tck` = `есл` on ЙЦУКЕН: the `Если` template already carries `Если If` as its
+    // filter text; both stay and the transposed word is added after them.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    tck$0
+КонецПроцедуры
+"#,
+    );
+    let item = item_with_label(&items, "Если … Тогда … КонецЕсли");
+    assert!(client_accepts(item, "tck"), "filter_text = {:?}", item.filter_text);
+    let filter = item.filter_text.as_deref().unwrap_or_default();
+    assert!(filter.starts_with("Если If "), "aliases must stay first; got {filter:?}");
+}
+
+#[test]
+fn completion_correct_layout_hits_keep_their_filter_text() {
+    // Typed in the right layout: nothing is added to the filter text, so the
+    // client's own ranking of these items is exactly as before.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Перем МояПеременная;
+    Моя$0
+КонецПроцедуры
+"#,
+    );
+    assert_eq!(item_with_label(&items, "МояПеременная").filter_text, None);
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Есл$0
+КонецПроцедуры
+"#,
+    );
+    assert_eq!(
+        item_with_label(&items, "Если … Тогда … КонецЕсли").filter_text.as_deref(),
+        Some("Если If")
+    );
+}

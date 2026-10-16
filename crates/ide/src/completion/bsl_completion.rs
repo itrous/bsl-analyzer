@@ -92,7 +92,7 @@ pub(super) fn bsl_completions<DB: RootDatabase>(
             // The cursor sits on a fully-typed keyword: an exact self-match, so
             // rank it in the best tier within the template/keyword band to keep
             // the composite-sort-key contract uniform across all items.
-            let exact = MatchResult { tier: MatchTier::Prefix, score: u16::MAX };
+            let exact = MatchResult { tier: MatchTier::Prefix, score: u16::MAX, layout: false };
             let keyword_item = CompletionItem {
                 label: token_text.to_string(),
                 detail: Some(detail),
@@ -188,6 +188,7 @@ fn complete_top_level<DB: RootDatabase>(
             continue;
         }
         item.sort_text = Some(sort_key(scored.result, TEMPLATE_BAND, '1', '1', &item.label));
+        apply_layout_filter_text(&mut item, scored.result);
         out.push(item);
     }
 
@@ -257,7 +258,17 @@ fn push_band<DB: RootDatabase>(
             freq_bucket(freq, &item.label),
             &item.label,
         ));
+        apply_layout_filter_text(&mut item, result);
         out.push(item);
+    }
+}
+
+/// An item found only through the wrong keyboard layout of the typed text gets a
+/// `filter_text` the client's own filter accepts; other items keep theirs as is.
+fn apply_layout_filter_text(item: &mut CompletionItem, result: MatchResult) {
+    if result.layout {
+        item.filter_text =
+            Some(super::fuzzy::layout_filter_text(&item.label, item.filter_text.as_deref()));
     }
 }
 
@@ -265,7 +276,7 @@ fn push_band<DB: RootDatabase>(
 /// candidates always match, so fall back to the worst tier only defensively.
 fn best_match(matcher: &mut PrefixMatcher, item: &CompletionItem) -> MatchResult {
     super::fuzzy::score_item(matcher, &item.label, item.filter_text.as_deref())
-        .unwrap_or(MatchResult { tier: MatchTier::Fuzzy, score: 0 })
+        .unwrap_or(MatchResult { tier: MatchTier::Fuzzy, score: 0, layout: false })
 }
 
 /// Count identifier occurrences in the current file as a cheap "used here"
