@@ -165,6 +165,7 @@ pub(super) fn preprocessor_end_region(p: &mut Parser) {
 pub(super) fn preprocessor_if(p: &mut Parser) {
     let m = p.start();
     p.bump();
+    p.enter_preproc_if();
 
     p.within_boundary(at_preproc_closer, |p| {
         p.within_boundary(at_then, preproc_expression);
@@ -197,7 +198,14 @@ pub(super) fn preprocessor_if(p: &mut Parser) {
         }
     });
 
+    p.leave_preproc_if();
+    // Content that stopped at a statement closer (an `ИначеЕсли` of the `Если`
+    // around the block) left the block open: its own directives follow.
+    let crossed = !p.at_end() && !p.at_preproc_if_directive() && p.at_enclosing_boundary();
     p.expect(T![PreEndIf]);
+    if crossed {
+        p.cross_preproc_if();
+    }
     m.complete(p, NodeKind::PreIfDir);
 }
 
@@ -272,7 +280,7 @@ fn at_declaration_start(p: &Parser) -> bool {
 }
 
 fn at_preproc_closer(p: &Parser) -> bool {
-    matches!(p.current(), Some(T![PreElsIf] | T![PreElse] | T![PreEndIf]))
+    p.at_preproc_if_directive() && !p.at_crossed_preproc_if_directive()
 }
 
 /// A conditional region and a statement block can cross each other: a

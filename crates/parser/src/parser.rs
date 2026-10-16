@@ -27,6 +27,8 @@ pub struct Parser<'a> {
     names_are_fields: bool,
     open_inline_inserts: u32,
     closed_inserts: std::cell::OnceCell<Vec<usize>>,
+    open_preproc_ifs: u32,
+    crossed_preproc_ifs: Vec<u32>,
 }
 
 impl<'a> Parser<'a> {
@@ -44,6 +46,8 @@ impl<'a> Parser<'a> {
             enclosing_boundaries: Vec::new(),
             open_inline_inserts: 0,
             closed_inserts: std::cell::OnceCell::new(),
+            open_preproc_ifs: 0,
+            crossed_preproc_ifs: Vec::new(),
         }
     }
 
@@ -186,6 +190,54 @@ impl<'a> Parser<'a> {
     /// with the same method in the full parse.
     pub(crate) fn forget_inline_inserts(&mut self) {
         self.open_inline_inserts = 0;
+    }
+
+    /// Drops the crossed `#Если` blocks still waiting for their closer, for
+    /// the same reason as [`Self::forget_inline_inserts`].
+    pub(crate) fn forget_crossed_preproc_ifs(&mut self) {
+        self.crossed_preproc_ifs.clear();
+    }
+
+    /// Counts the `#Если` blocks being parsed, so that a closer can be told
+    /// apart from the closer of a block opened after a crossing.
+    pub(crate) fn enter_preproc_if(&mut self) {
+        self.open_preproc_ifs += 1;
+    }
+
+    pub(crate) fn leave_preproc_if(&mut self) {
+        self.open_preproc_ifs = self.open_preproc_ifs.saturating_sub(1);
+    }
+
+    /// Records that the `#Если` just parsed ended at the closer of a statement
+    /// it was opened in, so its `#Иначе`/`#КонецЕсли` still lie ahead.
+    ///
+    /// The preprocessor is textual: `#Если Клиент Тогда` may cover an
+    /// `ИначеЕсли` clause of the `Если` around it. The block's content ends at
+    /// that clause, and without this record its `#КонецЕсли` would close the
+    /// first block further out instead — at module level, a region that
+    /// wraps whole methods would end in the middle of one.
+    pub(crate) fn cross_preproc_if(&mut self) {
+        self.crossed_preproc_ifs.push(self.open_preproc_ifs);
+    }
+
+    /// Whether a `#ИначеЕсли`, `#Иначе` or `#КонецЕсли` stands here.
+    pub(crate) fn at_preproc_if_directive(&self) -> bool {
+        matches!(self.current(), Some(T![PreElsIf] | T![PreElse] | T![PreEndIf]))
+    }
+
+    /// Whether the directive here continues a block recorded by
+    /// [`Self::cross_preproc_if`] rather than a block still being parsed.
+    pub(crate) fn at_crossed_preproc_if_directive(&self) -> bool {
+        self.at_preproc_if_directive()
+            && self.crossed_preproc_ifs.last() == Some(&self.open_preproc_ifs)
+    }
+
+    /// Consumes the `#КонецЕсли` of a crossed block, closing it.
+    pub(crate) fn bump_crossed_preproc_if_end(&mut self) {
+        if self.at(T![PreEndIf]) && self.at_crossed_preproc_if_directive() {
+            self.crossed_preproc_ifs.pop();
+            self.bump();
+        }
     }
 
     /// Whether the `#Вставка` here has its `#КонецВставки` before its method
@@ -552,8 +604,17 @@ impl<'a> Parser<'a> {
     /// behaves like reporting at end of input: the complaint is recorded
     /// where the missing element should have been, and the token stays for
     /// the caller.
+    ///
+    /// `#Если` is one too. It opens a block whose `#КонецЕсли` is parsed as a
+    /// closer wherever it stands, so an error that consumed the opener alone
+    /// would hand that closer to the enclosing `#Если` and end it early: every
+    /// method after the spot would fall outside a region it lies inside. Left
+    /// for the statement rules, the opener pairs with its own closer.
     fn at_statement_separator(&self) -> bool {
-        self.at(T![Semicolon]) || self.at_declared_boundary() || self.at_enclosing_boundary()
+        self.at(T![Semicolon])
+            || self.at(T![PreIf])
+            || self.at_declared_boundary()
+            || self.at_enclosing_boundary()
     }
 
     /// The part of the boundary that holds for the whole parse, without the

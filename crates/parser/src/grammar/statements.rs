@@ -48,6 +48,18 @@ pub fn statement(p: &mut Parser) -> bool {
         Some(T![PreRegion]) => super::preprocessor_region(p),
         Some(T![PreEndRegion]) => super::preprocessor_end_region(p),
         Some(T![PreIf]) => super::preprocessor_if(p),
+        // A directive of a `#Если` block that ended at the closer of a statement
+        // it crossed (see `Parser::cross_preproc_if`). It stands among the
+        // statements, as the platform reads it; only `#КонецЕсли` closes the block.
+        Some(T![PreElsIf]) if p.at_crossed_preproc_if_directive() => {
+            p.bump();
+            p.within_boundary(at_then, super::preproc_expression);
+            p.expect(T![KwThen]);
+        }
+        Some(T![PreElse]) if p.at_crossed_preproc_if_directive() => p.bump(),
+        Some(T![PreEndIf]) if p.at_crossed_preproc_if_directive() => {
+            p.bump_crossed_preproc_if_end()
+        }
         Some(T![PreDelete]) => super::preprocessor_delete(p),
         Some(T![PreInsert]) => super::preprocessor_insert(p),
         // The closer of an insertion that tore apart the statement before this

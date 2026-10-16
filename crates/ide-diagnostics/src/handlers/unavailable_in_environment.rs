@@ -42,7 +42,9 @@ pub fn from_hir(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::check_hir_diagnostic_with_fixtures;
+    use crate::test_utils::{
+        check_hir_diagnostic_with_fixtures, PREPROC_CROSSED_ELSE_IF, PREPROC_TORN_CONDITION,
+    };
     use crate::DiagnosticCode;
 
     fn env_diags(fixture: &str) -> Vec<(String, String)> {
@@ -723,5 +725,74 @@ mod tests {
 "#;
         let diags = env_diags(fixture);
         assert!(diags.is_empty(), "server module may use server API, got: {diags:?}");
+    }
+
+    /// A module-level region around whole methods; `preceding` is a method
+    /// inside it whose own directive the parser does not read as a plain block.
+    fn region_fixture(region_condition: &str, preceding: &str, reader_inside: bool) -> String {
+        let reader = "&НаКлиенте
+Процедура Прочитать()
+    Чтение = Новый ЧтениеТекста;
+    Стр = Чтение.ПрочитатьСтроку();
+КонецПроцедуры
+";
+        let (inside, outside) = if reader_inside { (reader, "") } else { ("", reader) };
+        format!(
+            "
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+#Если {region_condition} Тогда
+
+{preceding}
+{inside}
+#КонецЕсли
+
+{outside}"
+        )
+    }
+
+    const REGION_WITHOUT_WEB: &str = "Не ТонкийКлиент И Не ВебКлиент И Не МобильныйКлиент";
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn module_region_narrows_methods_after_torn_condition() {
+        let fixture = region_fixture(REGION_WITHOUT_WEB, PREPROC_TORN_CONDITION, true);
+        let diags = env_diags(&fixture);
+        assert!(
+            diags.is_empty(),
+            "the region leaves no client lacking ЧтениеТекста, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn module_region_narrows_methods_after_crossed_else_if() {
+        let fixture = region_fixture(REGION_WITHOUT_WEB, PREPROC_CROSSED_ELSE_IF, true);
+        let diags = env_diags(&fixture);
+        assert!(
+            diags.is_empty(),
+            "the region leaves no client lacking ЧтениеТекста, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn method_after_module_region_is_not_narrowed() {
+        for preceding in [PREPROC_TORN_CONDITION, PREPROC_CROSSED_ELSE_IF] {
+            let fixture = region_fixture(REGION_WITHOUT_WEB, preceding, false);
+            let diags = env_diags(&fixture);
+            assert_eq!(diags.len(), 2, "outside the region the web client remains, got: {diags:?}");
+            assert!(diags.iter().all(|d| d.0.contains("Веб-клиент")), "{diags:?}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn module_region_keeping_web_client_still_checks_it() {
+        for preceding in [PREPROC_TORN_CONDITION, PREPROC_CROSSED_ELSE_IF] {
+            let fixture = region_fixture("Не ТонкийКлиент", preceding, true);
+            let diags = env_diags(&fixture);
+            assert_eq!(diags.len(), 2, "the region keeps the web client, got: {diags:?}");
+            assert!(diags.iter().all(|d| d.0.contains("Веб-клиент")), "{diags:?}");
+        }
     }
 }

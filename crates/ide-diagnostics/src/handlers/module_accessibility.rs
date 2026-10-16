@@ -38,7 +38,10 @@ pub fn from_hir(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::{check_form_with_common_modules, check_hir_diagnostic_with_fixtures};
+    use crate::test_utils::{
+        check_form_with_common_modules, check_hir_diagnostic_with_fixtures,
+        PREPROC_CROSSED_ELSE_IF, PREPROC_TORN_CONDITION,
+    };
     use crate::DiagnosticCode;
 
     fn access_diags(fixture: &str) -> Vec<String> {
@@ -136,6 +139,66 @@ mod tests {
             "message must report the server side: {}",
             diags[0]
         );
+    }
+
+    /// A module-level region around whole methods; `preceding` is a method
+    /// inside it whose own directive the parser does not read as a plain block.
+    fn region_source(region_condition: &str, preceding: &str, caller_inside: bool) -> String {
+        let caller = "&НаКлиентеНаСервереБезКонтекста
+Процедура Сохранить()
+    Серверный.Записать();
+КонецПроцедуры
+";
+        let (inside, outside) = if caller_inside { (caller, "") } else { ("", caller) };
+        format!(
+            "#Если {region_condition} Тогда
+
+{preceding}
+{inside}
+#КонецЕсли
+
+{outside}"
+        )
+    }
+
+    #[test]
+    fn module_region_narrows_caller_after_torn_condition() {
+        let diags = form_access_diags(
+            &region_source("Сервер", PREPROC_TORN_CONDITION, true),
+            &[("Серверный", EXPORT_WRITE, SERVER_MODULE_XML)],
+        );
+        assert!(diags.is_empty(), "the region leaves only the server, got: {diags:?}");
+    }
+
+    #[test]
+    fn module_region_narrows_caller_after_crossed_else_if() {
+        let diags = form_access_diags(
+            &region_source("Сервер", PREPROC_CROSSED_ELSE_IF, true),
+            &[("Серверный", EXPORT_WRITE, SERVER_MODULE_XML)],
+        );
+        assert!(diags.is_empty(), "the region leaves only the server, got: {diags:?}");
+    }
+
+    #[test]
+    fn caller_after_module_region_is_not_narrowed() {
+        for preceding in [PREPROC_TORN_CONDITION, PREPROC_CROSSED_ELSE_IF] {
+            let diags = form_access_diags(
+                &region_source("Сервер", preceding, false),
+                &[("Серверный", EXPORT_WRITE, SERVER_MODULE_XML)],
+            );
+            assert_eq!(diags.len(), 1, "outside the region the clients remain, got: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn module_region_keeping_clients_still_checks_them() {
+        for preceding in [PREPROC_TORN_CONDITION, PREPROC_CROSSED_ELSE_IF] {
+            let diags = form_access_diags(
+                &region_source("Не МобильныйКлиент", preceding, true),
+                &[("Серверный", EXPORT_WRITE, SERVER_MODULE_XML)],
+            );
+            assert_eq!(diags.len(), 1, "the region keeps the clients, got: {diags:?}");
+        }
     }
 
     #[test]

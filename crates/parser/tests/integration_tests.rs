@@ -606,6 +606,87 @@ fn test_preprocessor_not_without_parens() {
 }
 
 #[test]
+fn test_preprocessor_if_torn_into_expression_keeps_enclosing_region() {
+    // A directive inside a condition is still an error, but recovery must not
+    // take its `#Если` alone: the `#КонецЕсли` left over would close the
+    // module-level region before the procedure that follows.
+    let input = r#"#Если Не ТонкийКлиент И Не ВебКлиент Тогда
+Функция Первая()
+    Если Ложь
+        #Если ТолстыйКлиентУправляемоеПриложение Тогда
+        Или Ложь
+        #КонецЕсли
+    Тогда
+        Возврат 1;
+    КонецЕсли;
+    Возврат 0;
+КонецФункции
+
+Процедура Вторая()
+КонецПроцедуры
+#КонецЕсли
+"#;
+    let root = parse(input).syntax_node();
+    let regions: Vec<_> = root.children().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).collect();
+    assert_eq!(regions.len(), 1, "one module-level region: {regions:?}");
+    let region = &regions[0];
+    assert_eq!(
+        region.text().to_string().trim_end(),
+        input.trim_end(),
+        "the region must end at the last #КонецЕсли"
+    );
+    assert!(
+        region.descendants().any(|n| n.kind() == SyntaxKind::PROCEDURE_DEF),
+        "the procedure after the torn condition stays inside the region"
+    );
+    let nested = region.descendants().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).count() - 1;
+    assert_eq!(nested, 1, "the directive in the condition is a block of its own");
+}
+
+#[test]
+fn test_preprocessor_if_crossing_an_else_if_keeps_enclosing_region() {
+    // The block covers an `ИначеЕсли` clause of the `Если` it was opened in:
+    // its `#КонецЕсли` is its own, not the module-level region's.
+    let input = r#"#Если Не ТонкийКлиент И Не ВебКлиент Тогда
+Процедура Первая(А)
+    Если А = 1 Тогда
+        Сообщить("1");
+    #Если Клиент Тогда
+    ИначеЕсли А = 2 Тогда
+        Сообщить("2");
+    #Иначе
+    ИначеЕсли А = 3 Тогда
+        Сообщить("3");
+    #КонецЕсли
+    КонецЕсли;
+КонецПроцедуры
+
+Процедура Вторая()
+КонецПроцедуры
+#КонецЕсли
+"#;
+    let parse = parse(input);
+    let root = parse.syntax_node();
+    let regions: Vec<_> = root.children().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).collect();
+    assert_eq!(regions.len(), 1, "one module-level region: {regions:?}");
+    assert_eq!(
+        regions[0].text().to_string().trim_end(),
+        input.trim_end(),
+        "the region must end at the last #КонецЕсли"
+    );
+    let procedures =
+        regions[0].descendants().filter(|n| n.kind() == SyntaxKind::PROCEDURE_DEF).count();
+    assert_eq!(procedures, 2, "both procedures stay inside the region");
+    let if_stmts: Vec<_> = root.descendants().filter(|n| n.kind() == SyntaxKind::IF_STMT).collect();
+    assert_eq!(if_stmts.len(), 1, "{if_stmts:?}");
+    assert!(
+        if_stmts[0].text().to_string().trim_end().ends_with("КонецЕсли;"),
+        "the statement keeps its own closer: {}",
+        if_stmts[0].text()
+    );
+}
+
+#[test]
 fn test_small_file_performance() {
     let input = r#"Функция Тест() Экспорт
     Результат = 10 + 20;

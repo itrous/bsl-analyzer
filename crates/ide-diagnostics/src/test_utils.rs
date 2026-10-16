@@ -1707,3 +1707,36 @@ mod tests {
         );
     }
 }
+
+/// A method whose `Если` condition is torn by a `#Если` block of its own — a
+/// directive the platform reads as text and the parser reports as an error.
+pub const PREPROC_TORN_CONDITION: &str = "&НаКлиенте
+Функция Признак()
+    Если Ложь
+        #Если ТолстыйКлиентУправляемоеПриложение Тогда
+        Или Истина
+        #КонецЕсли
+    Тогда
+        Возврат 1;
+    КонецЕсли;
+    Возврат 0;
+КонецФункции
+";
+
+/// A method with a `#Если` block that covers `ИначеЕсли` clauses of the `Если`
+/// it opens in, the closer of that `Если` lying past the block.
+pub const PREPROC_CROSSED_ELSE_IF: &str = "&НаКлиенте
+Функция Признак(Значение)
+    Если Значение = 1 Тогда
+        Возврат 1;
+    #Если ТолстыйКлиентУправляемоеПриложение Тогда
+    ИначеЕсли Значение = 2 Тогда
+        Возврат 2;
+    #Иначе
+    ИначеЕсли Значение = 3 Тогда
+        Возврат 3;
+    #КонецЕсли
+    КонецЕсли;
+    Возврат 0;
+КонецФункции
+";
