@@ -29,6 +29,7 @@ pub(super) fn migrate(
     args: SearchBaselineAdminMigrateArgs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let project = project_model::Project::new(&args.source_dir)?;
+    project.warn_about_external_discovery_rejections();
     let resolved_pg = postgres::resolve_project_url(
         &project.config.search.baseline.postgres,
         project_model::PostgresAccessMode::Migrator,

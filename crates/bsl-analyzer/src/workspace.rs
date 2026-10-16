@@ -74,6 +74,7 @@ impl GlobalState {
                 return Err(e);
             }
         };
+        project.warn_about_external_discovery_rejections();
 
         for notice in [project.standalone_extension_notice(), project.standalone_external_notice()]
             .into_iter()

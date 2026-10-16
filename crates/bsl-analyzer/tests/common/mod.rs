@@ -74,6 +74,8 @@ pub struct Lsp {
     pub child: Child,
     pub stdin: ChildStdin,
     pub messages: Receiver<Value>,
+    stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     /// Server notifications sent during initialize are valid LSP traffic too; keep
     /// them for the test that owns the channel instead of eating them while waiting
     /// for the initialize response.
@@ -97,11 +99,25 @@ impl Lsp {
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let stderr_buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr_capture = stderr_buffer.clone();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut chunk = [0; 4096];
+            loop {
+                let Ok(read) = reader.read(&mut chunk) else { return };
+                if read == 0 {
+                    return;
+                }
+                stderr_capture.lock().unwrap().extend_from_slice(&chunk[..read]);
+            }
+        });
         let (tx, messages) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -135,6 +151,8 @@ impl Lsp {
             child,
             stdin,
             messages,
+            stderr: stderr_buffer,
+            stderr_reader: Some(stderr_reader),
             pending: Default::default(),
             recent: Default::default(),
         };
@@ -179,6 +197,16 @@ impl Lsp {
         let body = message.to_string();
         write!(self.stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
         self.stdin.flush().unwrap();
+    }
+
+    pub fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.lock().unwrap()).into_owned()
+    }
+
+    fn join_stderr_reader(&mut self) {
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.join().expect("LSP stderr reader thread");
+        }
     }
 
     /// Wait for a message, telling a server that is busy from one that is done.
@@ -429,7 +457,7 @@ impl Lsp {
         let response = self.request(id, "shutdown", Value::Null);
         assert!(response["error"].is_null(), "shutdown request failed: {response}");
         self.send(json!({"jsonrpc": "2.0", "method": "exit"}));
-        match self.wait_for_exit_within(PROCESS_SHUTDOWN_TIMEOUT, "shutdown/exit") {
+        let status = match self.wait_for_exit_within(PROCESS_SHUTDOWN_TIMEOUT, "shutdown/exit") {
             Ok(Some(status)) => status,
             Ok(None) => {
                 let pid = self.child.id();
@@ -443,7 +471,9 @@ impl Lsp {
                 let cleanup = self.stop_child("shutdown error cleanup", PROCESS_CLEANUP_TIMEOUT);
                 panic!("{error}; forced cleanup: {cleanup:?}");
             }
-        }
+        };
+        self.join_stderr_reader();
+        status
     }
 }
 
@@ -452,5 +482,6 @@ impl Drop for Lsp {
         if let Err(error) = self.stop_child("Drop", PROCESS_CLEANUP_TIMEOUT) {
             eprintln!("{error}");
         }
+        self.join_stderr_reader();
     }
 }

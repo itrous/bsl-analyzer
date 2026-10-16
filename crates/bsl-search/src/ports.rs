@@ -105,6 +105,20 @@ pub trait GraphContextProvider: Send + Sync {
         Ok(self.graph_context(rel_path, symbol_name, kind))
     }
 
+    /// Render graph context for a file pass that already holds its source text. The full key
+    /// prevents reusing bytes from another root that happens to have the same relative path.
+    /// Providers that can use the supplied source may override this; the default preserves the
+    /// existing renderer behavior.
+    fn try_graph_context_with_source(
+        &self,
+        source_key: &crate::workspace_roots::FileKey,
+        symbol_name: &str,
+        kind: &str,
+        _source: &str,
+    ) -> Result<Option<String>, GraphContextError> {
+        self.try_graph_context(&source_key.path, symbol_name, kind)
+    }
+
     /// Files written without a context this provider failed to render have been marked
     /// context-dirty, the highest of those marks being `mark_high`. The provider's owner decides
     /// when the marks are rendered; the call must not block, since the engine is held while it

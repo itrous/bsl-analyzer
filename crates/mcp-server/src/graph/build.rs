@@ -155,6 +155,23 @@ thread_local! {
 }
 
 impl GraphState {
+    /// Give the search work triggered by a graph publication one bounded parent operation id.
+    fn notify_graph_published(&self, topology_changed: bool) {
+        let Some(path) = self.graph_db_path() else {
+            self.notify_published(topology_changed);
+            return;
+        };
+        if let Some(context) = bsl_search::lifecycle::Context::current() {
+            context.in_scope(|| self.notify_published(topology_changed));
+            return;
+        }
+        let operation =
+            bsl_search::lifecycle::Batch::new(&path, bsl_search::lifecycle::Reason::GraphReload);
+        let context = operation.context();
+        context.in_scope(|| self.notify_published(topology_changed));
+        operation.finish(bsl_search::lifecycle::Outcome::Completed);
+    }
+
     /// The fused cold build, and the report of its own outcome.
     ///
     /// Reported HERE, while the ticket this build was admitted on is still carried. The grant
@@ -167,13 +184,34 @@ impl GraphState {
         source_path: &Path,
         observed_through: u64,
     ) -> Result<(), LoadFailure> {
-        let ticket = self.take_claimed_ticket();
-        // Carried from here to every way this build can end, its outcome included.
-        let _carried = self.carry_ticket(ticket);
-        let outcome = self.fused_cold_build(engine, source_path, observed_through, ticket);
-        if let Err(failure) = &outcome {
-            self.record_load_failure(false, failure.clone());
-        }
+        let path = self.graph_db_path().unwrap_or_else(|| source_path.to_path_buf());
+        let operation =
+            bsl_search::lifecycle::Batch::new(&path, bsl_search::lifecycle::Reason::GraphReload);
+        let context = operation.context();
+        let started = std::time::Instant::now();
+        let outcome = context.in_scope(|| {
+            let ticket = self.take_claimed_ticket();
+            // Carried from here to every way this build can end, its outcome included.
+            let _carried = self.carry_ticket(ticket);
+            let outcome = self.fused_cold_build(engine, source_path, observed_through, ticket);
+            if let Err(failure) = &outcome {
+                self.record_load_failure(false, failure.clone());
+            }
+            outcome
+        });
+        context.graph_event(
+            bsl_search::lifecycle::GraphObservation::new(
+                "graph_reload",
+                "fused_cold_build",
+                "owner",
+                if outcome.is_ok() { "completed" } else { "refused" },
+            )
+            .with_counts(None, None, None, Some(started.elapsed().as_millis() as u64)),
+        );
+        operation.finish(outcome.as_ref().map_or_else(
+            |failure| failure.lifecycle_outcome(),
+            |_| bsl_search::lifecycle::Outcome::Completed,
+        ));
         outcome
     }
 
@@ -220,16 +258,17 @@ impl GraphState {
             tracing::warn!("fused graph build straddled a disk write; snapshot marked stale");
         }
         let recovery_through = ticket.map(|ticket| ticket.recovery_cutoff);
+        let published_through = built.observed_through.unwrap_or(observed_through);
         install_failure(self.install_prepared_snapshot(
             built.prepared,
             Published {
                 generation,
-                fingerprint: built.fp_pre,
+                fingerprint: built.fingerprint,
                 stale: false,
                 reload: ReloadState::Idle,
                 force_stale: built.force_stale,
                 search_roots: built.search_roots.clone(),
-                observed_through: Some(observed_through),
+                observed_through: Some(published_through),
             },
             GraphStatus::Ready { files: built.files },
             // Whatever its ticket was admitted to answer. A fused build that ran forced
@@ -243,7 +282,7 @@ impl GraphState {
         self.ensure_hub_roots(&built.scan_roots, built.physical_topology, built.declaration_epoch);
         // The fused sink just wrote every indexed document's context from THIS
         // build — nothing persisted predates it, so no whole-collection re-render.
-        self.notify_published(false);
+        self.notify_graph_published(false);
         tracing::info!(
             files,
             xml_files,
@@ -307,33 +346,49 @@ impl GraphState {
     /// from a drift-triggered reload (bumps the generation, keeps the old snapshot
     /// served on failure).
     pub(super) fn run_load(&self, is_reload: bool) {
+        let path = self.graph_db_path().expect("workspace graph has a cache layout");
+        let operation =
+            bsl_search::lifecycle::Batch::new(&path, bsl_search::lifecycle::Reason::GraphReload);
+        let context = operation.context();
+        let started = std::time::Instant::now();
+        let outcome = context.in_scope(|| self.run_load_inner(is_reload));
+        context.graph_event(
+            bsl_search::lifecycle::GraphObservation::new(
+                "graph_reload",
+                if is_reload { "workspace_drift" } else { "initial_load" },
+                "owner",
+                "finished",
+            )
+            .with_counts(None, None, None, Some(started.elapsed().as_millis() as u64)),
+        );
+        operation.finish(outcome);
+    }
+
+    fn run_load_inner(&self, is_reload: bool) -> bsl_search::lifecycle::Outcome {
         self.clear_cold_build_ticker();
         if self.is_superseded() {
-            self.record_load_failure(
+            return self.record_load_failure(
                 is_reload,
                 LoadFailure::new(
                     LoadFailureReason::Superseded,
                     super::types::SUPERSEDED_GRAPH_ERROR,
                 ),
             );
-            return;
         }
         let Some(workspace_root) = self.workspace_root.clone() else {
-            return;
+            return bsl_search::lifecycle::Outcome::Completed;
         };
         if !self.validate_workspace_scope() {
-            self.record_load_failure(
+            return self.record_load_failure(
                 is_reload,
                 LoadFailure::operation("workspace cache scope changed before graph preparation"),
             );
-            return;
         }
         if let Some(reason) = self.ownership_refusal() {
-            self.record_load_failure(
+            return self.record_load_failure(
                 is_reload,
                 LoadFailure::new(LoadFailureReason::TransientRefusal, reason),
             );
-            return;
         }
         // Nothing below opens the graph file before this process holds its access lock. The
         // wait has no deadline: the previous owner lets go once its reads are done.
@@ -346,14 +401,13 @@ impl GraphState {
                     "this process does not hold the graph file's access lock",
                 )
             };
-            self.record_load_failure(is_reload, failure);
-            return;
+            return self.record_load_failure(is_reload, failure);
         }
         // An interrupted writer's journal is finished by the new holder of the file before any
         // read-only handle opens it: the process that left it may have crashed mid-write.
         if let Some(path) = self.graph_db_path() {
             if let Err(error) = super::snapshot::recover_hot_journal(&path) {
-                self.record_load_failure(
+                return self.record_load_failure(
                     is_reload,
                     LoadFailure::new(
                         LoadFailureReason::OperationError,
@@ -362,7 +416,6 @@ impl GraphState {
                         ),
                     ),
                 );
-                return;
             }
         }
         // The generation this build will carry. Only one load runs at a time (the
@@ -406,11 +459,12 @@ impl GraphState {
         // been detected, so the on-disk file is known stale and must be rebuilt.
         if !force_project_reload && !is_reload {
             match self.try_publish_cached(&workspace_root, observed_through) {
-                PublishAttemptOutcome::Published => return,
+                PublishAttemptOutcome::Published => {
+                    return bsl_search::lifecycle::Outcome::Completed;
+                }
                 PublishAttemptOutcome::FallBack => {}
                 PublishAttemptOutcome::Refused(failure) => {
-                    self.record_load_failure(is_reload, failure);
-                    return;
+                    return self.record_load_failure(is_reload, failure);
                 }
             }
         }
@@ -421,26 +475,27 @@ impl GraphState {
         // recomputes its own generation from the just-published revision.
         if !force_project_reload && !is_reload {
             match self.try_publish_stale_and_catch_up(&workspace_root) {
-                PublishAttemptOutcome::Published => return,
+                PublishAttemptOutcome::Published => {
+                    return bsl_search::lifecycle::Outcome::Completed;
+                }
                 PublishAttemptOutcome::FallBack => {}
                 PublishAttemptOutcome::Refused(failure) => {
-                    self.record_load_failure(is_reload, failure);
-                    return;
+                    return self.record_load_failure(is_reload, failure);
                 }
             }
         }
 
         // On reload, try the body-only fast path first: if only `.bsl` bodies changed
         // (signatures intact, nothing added/removed, no `.xml` drift) reproject just
-        // those modules instead of the whole config. On any ineligibility or failure
-        // it returns false and we fall through to a full rebuild.
+        // those modules instead of the whole config. Only an unsafe plan requests a full projection.
         if !force_project_reload && is_reload {
             match self.try_incremental_reload(&workspace_root, generation, observed_through) {
-                PublishAttemptOutcome::Published => return,
+                PublishAttemptOutcome::Published => {
+                    return bsl_search::lifecycle::Outcome::Completed;
+                }
                 PublishAttemptOutcome::FallBack => {}
                 PublishAttemptOutcome::Refused(failure) => {
-                    self.record_load_failure(is_reload, failure);
-                    return;
+                    return self.record_load_failure(is_reload, failure);
                 }
             }
         }
@@ -451,7 +506,7 @@ impl GraphState {
             generation,
             fact_seq = observed_through,
             forced = force_project_reload,
-            "graph database build started"
+            "graph owner entered the candidate preparation path"
         );
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build_and_publish_graph_file(&workspace_root, generation, self, None)
@@ -463,7 +518,8 @@ impl GraphState {
                     generation,
                     files,
                     xml_files,
-                    fp_pre,
+                    fingerprint,
+                    observed_through: built_observed_through,
                     force_stale,
                     scan_roots,
                     declaration_epoch,
@@ -496,18 +552,18 @@ impl GraphState {
                     topology_changed = inner
                         .published
                         .as_ref()
-                        .is_some_and(|p| p.fingerprint.topology != fp_pre.topology);
+                        .is_some_and(|p| p.fingerprint.topology != fingerprint.topology);
                 }
                 if let Err(error) = install_failure(self.install_prepared_snapshot(
                     prepared,
                     Published {
                         generation,
-                        fingerprint: fp_pre,
+                        fingerprint,
                         stale: false,
                         reload: ReloadState::Idle,
                         force_stale,
                         search_roots: search_roots.clone(),
-                        observed_through: Some(observed_through),
+                        observed_through: Some(built_observed_through.unwrap_or(observed_through)),
                     },
                     GraphStatus::Ready { files },
                     // The only path that runs under a forced reload. The fact was captured
@@ -517,8 +573,7 @@ impl GraphState {
                     recovery_through,
                     recovery,
                 )) {
-                    self.record_load_failure(is_reload, error);
-                    return;
+                    return self.record_load_failure(is_reload, error);
                 }
                 self.finish_cold_build_ticker();
                 #[cfg(test)]
@@ -526,7 +581,7 @@ impl GraphState {
                     hook();
                 }
                 self.ensure_hub_roots(&scan_roots, physical_topology, declaration_epoch);
-                self.notify_published(topology_changed);
+                self.notify_graph_published(topology_changed);
                 tracing::info!(
                     files,
                     xml_files,
@@ -539,17 +594,18 @@ impl GraphState {
                     publication_id = publication_id.as_deref(),
                     "graph database build complete"
                 );
+                bsl_search::lifecycle::Outcome::Completed
             }
             Ok(Err(e)) => {
                 tracing::warn!("graph database build failed: {}", e.message);
-                self.record_load_failure(is_reload, e);
+                self.record_load_failure(is_reload, e)
             }
             Err(_) => {
                 tracing::error!("graph database build panicked");
                 self.record_load_failure(
                     is_reload,
                     LoadFailure::new(LoadFailureReason::OperationError, "builder panicked"),
-                );
+                )
             }
         }
     }
@@ -558,8 +614,8 @@ impl GraphState {
     /// a `.bsl` whose signature hash still matches its persisted value, with nothing
     /// added/removed and no `.xml` drift — then no caller's resolution can have moved,
     /// so reprojecting just those modules yields a database byte-identical to a full
-    /// rebuild. Patches a copy of the published file and atomically renames it in,
-    /// then publishes `generation`. Structural ineligibility falls back to a full rebuild;
+    /// rebuild. Patches the published file or a bounded private backup, then publishes
+    /// `generation`. Structural ineligibility requests a full projection;
     /// an ownership refusal retains its classification for the load lifecycle.
     /// What the point-patch path did and why, for a test that has to know WHICH branch ran.
     ///
@@ -567,7 +623,22 @@ impl GraphState {
     /// gate consults it. A test asserting a point rewrite must be able to tell a patch from a
     /// full rebuild that quietly replaced it, or it is asserting about the wrong path.
     fn note_incremental(&self, outcome: &'static str) -> PublishAttemptOutcome {
-        tracing::info!(reason_code = outcome, "incremental reload fell back to a full build");
+        tracing::info!(
+            graph_operation = "unsafe_incremental",
+            reason_code = outcome,
+            "incremental plan requires a full projection"
+        );
+        if let Some(context) = bsl_search::lifecycle::Context::current() {
+            context.graph_event(
+                bsl_search::lifecycle::GraphObservation::new(
+                    "incremental_reload",
+                    outcome,
+                    "plan",
+                    "unsafe_incremental",
+                )
+                .with_category("full_projection_required"),
+            );
+        }
         #[cfg(test)]
         lock_recover(&self.incremental_decisions).push(outcome);
         PublishAttemptOutcome::FallBack
@@ -579,7 +650,15 @@ impl GraphState {
         generation: u64,
         observed_through: u64,
     ) -> PublishAttemptOutcome {
+        let started = std::time::Instant::now();
         tracing::info!(generation, fact_seq = observed_through, "graph incremental reload started");
+        if lock_recover(&self.pending_candidate).is_some() {
+            tracing::info!(
+                graph_operation = "pending_candidate_resume",
+                "resuming the existing private candidate through the graph owner"
+            );
+            return PublishAttemptOutcome::FallBack;
+        }
         let db_path = self.graph_db_path().expect("workspace graph has cache layout");
         // Every read of the published build below names the generation this first one saw,
         // and none holds a handle across the scans and analysis between them.
@@ -627,6 +706,13 @@ impl GraphState {
         // coherence window. Events that arrived before this authoritative pre-scan are already
         // represented by `pre`; start the ABA window before the first analyzer read instead.
         let coherence_cutoff = self.observation();
+        let mut incremental_coherence = Some(BuildCoherence {
+            cursor: self
+                .change_hub
+                .as_ref()
+                .map(|hub| crate::change_hub::CursorLease::new(hub.clone())),
+            cutoff: coherence_cutoff,
+        });
         // A symlink target outside every registered root is retained under the
         // walked spelling during a full build. The point patch receives canonical
         // paths from the analyzer, so it cannot safely reconstruct that alias map;
@@ -837,6 +923,24 @@ impl GraphState {
             }
         }
 
+        if let Some(context) = bsl_search::lifecycle::Context::current() {
+            context.graph_event(
+                bsl_search::lifecycle::GraphObservation::new(
+                    "incremental_reload",
+                    trigger,
+                    "plan",
+                    "candidate_ready",
+                )
+                .with_counts(
+                    Some(diff.modified.len() as u64),
+                    Some(changed_paths.len() as u64),
+                    Some(crate::graph_db::PATCH_SQL_BUDGET.as_millis() as u64),
+                    Some(started.elapsed().as_millis() as u64),
+                )
+                .with_category("graph_patch"),
+            );
+        }
+
         // Bracket the patch with the shared pre-scan and a fresh post-scan,
         // mirroring the full build's straddle detection: a write landing after the
         // pre-scan marks the snapshot stale.
@@ -917,6 +1021,88 @@ impl GraphState {
                 built_at,
                 publication_id: self.next_publication_id(),
             };
+            #[cfg(test)]
+            let injected_budget =
+                self.inject_patch_budget_once.swap(false, std::sync::atomic::Ordering::SeqCst);
+            let retry_budget = self.patch_was_overrun(&plan);
+            if force_stale || retry_budget {
+                if retry_budget {
+                    tracing::info!(
+                        graph_operation = "retry_budget",
+                        "continuing the same incremental plan on a private candidate"
+                    );
+                    if let Some(context) = bsl_search::lifecycle::Context::current() {
+                        context.graph_event(
+                            bsl_search::lifecycle::GraphObservation::new(
+                                "incremental_reload",
+                                "sql_budget",
+                                "plan_retry",
+                                "private_candidate",
+                            )
+                            .with_counts(
+                                Some(plan.changed.len() as u64),
+                                Some(patch.reprojected_modules() as u64),
+                                Some(crate::graph_db::PATCH_SQL_BUDGET.as_millis() as u64),
+                                Some(started.elapsed().as_millis() as u64),
+                            )
+                            .with_category("budget_retry"),
+                        );
+                    }
+                }
+                let application = apply_patch_candidate(
+                    self,
+                    &project,
+                    &pre,
+                    &patch,
+                    &meta,
+                    &db_path,
+                    &plan,
+                    incremental_coherence.take().expect("incremental coherence is available"),
+                )?;
+                let PatchApplication {
+                    modules,
+                    reprojected,
+                    generation,
+                    fingerprint,
+                    force_stale,
+                    observed_through: candidate_frontier,
+                    pause,
+                } = application;
+                let prepared = open_installed_replacement(
+                    self,
+                    generation,
+                    fingerprint,
+                    force_stale,
+                    &db_path,
+                    pause,
+                )?;
+                let rewritten: std::collections::HashSet<bsl_search::FileKey> = project
+                    .search_roots
+                    .as_ref()
+                    .map(|roots| {
+                        changed_paths
+                            .iter()
+                            .filter_map(|path| pre.key_for_path(roots, path))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let recovery = self.recovery_proof_with_roots(
+                    generation,
+                    prepared.declared_unread(),
+                    crate::graph::snapshot::RecoveryCoverage::PatchedKeys { rewritten: &rewritten },
+                    project.search_roots.as_ref(),
+                );
+                return Ok::<_, LoadFailure>((
+                    modules,
+                    reprojected,
+                    fingerprint,
+                    force_stale,
+                    candidate_frontier.unwrap_or(observed_through),
+                    generation,
+                    prepared,
+                    recovery,
+                ));
+            }
             let pause = match self.store.pause_for_replacement(INSTALL_READERS_WAIT) {
                 super::snapshot::Pausing::Paused(pause) => pause,
                 super::snapshot::Pausing::ReadersBusy => {
@@ -928,7 +1114,15 @@ impl GraphState {
                 }
                 super::snapshot::Pausing::Retired => return Err(lost_workspace_failure(self)),
             };
-            let (modules, pause) = write_patch_in_place(
+            #[cfg(test)]
+            let sql_budget = if injected_budget {
+                std::time::Duration::ZERO
+            } else {
+                crate::graph_db::PATCH_SQL_BUDGET
+            };
+            #[cfg(not(test))]
+            let sql_budget = crate::graph_db::PATCH_SQL_BUDGET;
+            let in_place = write_patch_in_place(
                 self,
                 &project,
                 &pre,
@@ -937,11 +1131,43 @@ impl GraphState {
                 force_stale,
                 &db_path,
                 &plan,
+                coherence_cutoff,
+                sql_budget,
+                pause,
+                &mut incremental_coherence,
+            );
+            let application = match in_place {
+                Ok(result) => result,
+                Err(error)
+                    if error.reason == LoadFailureReason::TransientRefusal
+                        && self.observation() > coherence_cutoff =>
+                {
+                    let coherence = incremental_coherence
+                        .take()
+                        .unwrap_or(BuildCoherence { cursor: None, cutoff: coherence_cutoff });
+                    apply_patch_candidate(
+                        self, &project, &pre, &patch, &meta, &db_path, &plan, coherence,
+                    )?
+                }
+                Err(error) => return Err(error),
+            };
+            let PatchApplication {
+                modules,
+                reprojected,
+                generation,
+                fingerprint,
+                force_stale,
+                observed_through: candidate_frontier,
+                pause,
+            } = application;
+            let prepared = open_installed_replacement(
+                self,
+                generation,
+                fingerprint,
+                force_stale,
+                &db_path,
                 pause,
             )?;
-            let reprojected = patch.reprojected_modules();
-            let prepared =
-                open_installed_replacement(self, generation, fp_pre, force_stale, &db_path, pause)?;
             // A point patch re-projected exactly what it was given. It proves nothing about
             // absence and nothing about the rest of the tree: it never looked there.
             let rewritten: std::collections::HashSet<bsl_search::FileKey> = project
@@ -957,11 +1183,29 @@ impl GraphState {
                 crate::graph::snapshot::RecoveryCoverage::PatchedKeys { rewritten: &rewritten },
                 project.search_roots.as_ref(),
             );
-            Ok::<_, LoadFailure>((modules, reprojected, fp_pre, force_stale, prepared, recovery))
+            Ok::<_, LoadFailure>((
+                modules,
+                reprojected,
+                fingerprint,
+                force_stale,
+                candidate_frontier.unwrap_or(observed_through),
+                generation,
+                prepared,
+                recovery,
+            ))
         }));
 
         match outcome {
-            Ok(Ok((files, reprojected, fp, force_stale, prepared, recovery))) => {
+            Ok(Ok((
+                files,
+                reprojected,
+                fp,
+                force_stale,
+                publication_frontier,
+                generation,
+                prepared,
+                recovery,
+            ))) => {
                 let publication_id = prepared.publication_id();
                 let removed = bsl_removed;
                 if force_stale {
@@ -979,7 +1223,7 @@ impl GraphState {
                         reload: ReloadState::Idle,
                         force_stale,
                         search_roots: project.search_roots.clone(),
-                        observed_through: Some(observed_through),
+                        observed_through: Some(publication_frontier),
                     },
                     GraphStatus::Ready { files },
                     // An incremental reload never runs under a forced reload, so it answers
@@ -992,13 +1236,13 @@ impl GraphState {
                         LoadFailureReason::TransientRefusal
                         | LoadFailureReason::Superseded
                         | LoadFailureReason::Released => PublishAttemptOutcome::Refused(error),
-                        LoadFailureReason::OperationError => PublishAttemptOutcome::FallBack,
+                        LoadFailureReason::OperationError => PublishAttemptOutcome::Refused(error),
                     };
                 }
                 #[cfg(test)]
                 lock_recover(&self.incremental_decisions).push("published");
                 // The body-only gate proved the stored topology unchanged.
-                self.notify_published(false);
+                self.notify_graph_published(false);
                 tracing::info!(
                     files,
                     generation,
@@ -1019,6 +1263,7 @@ impl GraphState {
                     removed,
                     fact_seq = observed_through,
                     publication_id = publication_id.as_deref(),
+                    graph_operation = "patched",
                     "graph incremental reload complete"
                 );
                 PublishAttemptOutcome::Published
@@ -1026,16 +1271,15 @@ impl GraphState {
             Ok(Err(e)) => {
                 tracing::warn!(
                     reason_code = "patch_operation_failed",
+                    graph_operation = "unsafe_incremental",
                     error = %e.message,
-                    "incremental reload failed, falling back to full rebuild"
+                    "incremental reload could not prove a safe patch"
                 );
                 match e.reason {
                     LoadFailureReason::TransientRefusal
                     | LoadFailureReason::Superseded
                     | LoadFailureReason::Released => PublishAttemptOutcome::Refused(e),
-                    LoadFailureReason::OperationError => {
-                        self.note_incremental("patch_operation_failed")
-                    }
+                    LoadFailureReason::OperationError => PublishAttemptOutcome::Refused(e),
                 }
             }
             Err(payload) => {
@@ -1046,8 +1290,9 @@ impl GraphState {
                     .unwrap_or("non-string panic");
                 tracing::error!(
                     reason_code = "patch_panicked",
+                    graph_operation = "unsafe_incremental",
                     panic = panic_message,
-                    "incremental reload panicked, falling back to full rebuild"
+                    "incremental reload panicked"
                 );
                 self.note_incremental("patch_panicked")
             }
@@ -1194,7 +1439,7 @@ impl GraphState {
         self.release_unused_claim(own_claim);
         // Exact fingerprint match (files AND topology): the persisted search
         // contexts were rendered against this same workspace state.
-        self.notify_published(false);
+        self.notify_graph_published(false);
         tracing::info!(files, revision, "reused cached graph database (workspace unchanged)");
         PublishAttemptOutcome::Published
     }
@@ -1331,7 +1576,29 @@ impl GraphState {
     ///
     /// A transient refusal keeps its retry budget. An operation error stops that obligation,
     /// but fresh external work may start a new graph epoch; terminal lease outcomes never do.
-    pub(super) fn record_load_failure(&self, is_reload: bool, failure: LoadFailure) {
+    pub(super) fn record_load_failure(
+        &self,
+        is_reload: bool,
+        failure: LoadFailure,
+    ) -> bsl_search::lifecycle::Outcome {
+        let outcome = failure.lifecycle_outcome();
+        if let Some(context) = bsl_search::lifecycle::Context::current() {
+            let result = match failure.reason {
+                LoadFailureReason::TransientRefusal => "transient_refusal",
+                LoadFailureReason::OperationError => "operation_error",
+                LoadFailureReason::Superseded => "superseded",
+                LoadFailureReason::Released => "released",
+            };
+            context.graph_event(
+                bsl_search::lifecycle::GraphObservation::new(
+                    "graph_reload",
+                    if is_reload { "workspace_drift" } else { "initial_load" },
+                    "outcome",
+                    result,
+                )
+                .with_counts(None, None, None, None),
+            );
+        }
         let kind = match failure.reason {
             LoadFailureReason::TransientRefusal => super::debt::FailureKind::Transient,
             LoadFailureReason::OperationError => super::debt::FailureKind::Operation,
@@ -1361,6 +1628,7 @@ impl GraphState {
         if rearmed {
             self.drive();
         }
+        outcome
     }
 }
 
@@ -1378,13 +1646,24 @@ fn build_and_publish_graph_file(
     graph: &GraphState,
     chunk_sink: Option<&mut dyn ide::FusedChunkSink>,
 ) -> Result<PublishedBuild, LoadFailure> {
+    // Subscribe before the authoritative pre-scan: any edit after it belongs to the lowering
+    // closure, even when an ABA sequence settles back to the same final fingerprint.
+    let coherence = BuildCoherence::begin(graph);
     // ONE project snapshot and ONE scanned universe serve the pre-fingerprint,
     // the build and the persisted `files` rows: every pre-publication pass sees
     // the same tree by construction. Only the straddle check walks again.
     let project =
         crate::graph::ProjectSnapshot::load_excluding(workspace_root, &graph.cache_exclusions());
     let pre = crate::graph::universe::ScannedUniverse::scan_project(&project);
-    build_and_publish_scanned_inner(workspace_root, &project, &pre, generation, graph, chunk_sink)
+    build_and_publish_scanned_inner(
+        workspace_root,
+        &project,
+        &pre,
+        generation,
+        graph,
+        chunk_sink,
+        coherence,
+    )
 }
 
 /// The publication over an ALREADY-SCANNED universe — split from
@@ -1415,7 +1694,32 @@ fn build_and_publish_scanned(
     graph: &GraphState,
     chunk_sink: Option<&mut dyn ide::FusedChunkSink>,
 ) -> Result<PublishedBuild, LoadFailure> {
-    build_and_publish_scanned_inner(workspace_root, project, pre, generation, graph, chunk_sink)
+    build_and_publish_scanned_inner(
+        workspace_root,
+        project,
+        pre,
+        generation,
+        graph,
+        chunk_sink,
+        BuildCoherence::begin(graph),
+    )
+}
+
+struct BuildCoherence {
+    cursor: Option<crate::change_hub::CursorLease>,
+    cutoff: u64,
+}
+
+impl BuildCoherence {
+    fn begin(graph: &GraphState) -> Self {
+        Self {
+            cursor: graph
+                .change_hub
+                .as_ref()
+                .map(|hub| crate::change_hub::CursorLease::new(hub.clone())),
+            cutoff: graph.observation(),
+        }
+    }
 }
 
 fn build_and_publish_scanned_inner(
@@ -1425,6 +1729,7 @@ fn build_and_publish_scanned_inner(
     generation: u64,
     graph: &GraphState,
     chunk_sink: Option<&mut dyn ide::FusedChunkSink>,
+    coherence: BuildCoherence,
 ) -> Result<PublishedBuild, LoadFailure> {
     if !graph.validate_workspace_scope() {
         return Err(LoadFailure::operation(
@@ -1449,6 +1754,8 @@ fn build_and_publish_scanned_inner(
         std::fs::create_dir_all(parent).map_err(LoadFailure::operation)?;
     }
     let _candidate_lock = hold_candidate(graph, &cache.graph_candidate_lock_path())?;
+    let resumed =
+        resume_pending_full_candidate(workspace_root, graph, project, generation, base.as_deref())?;
     // A fused build streams the search chunks from its own parse pass, so only a build that
     // streams nothing may take a candidate prepared earlier instead of building.
     let reusable = match inspect_candidate(&candidate, base.as_deref(), fp_pre, pre.clean()) {
@@ -1461,17 +1768,20 @@ fn build_and_publish_scanned_inner(
         }
         CandidateState::Reusable { .. } | CandidateState::Stale | CandidateState::Absent => None,
     };
-    let (modules, force_stale, generation) = match reusable {
+    let (modules, force_stale, generation, published_fingerprint, observed_through) = match reusable
+    {
         Some((modules, revision)) => {
             tracing::info!(
                 path = %candidate.display(),
                 "installing the replacement prepared earlier from the same publication and \
                  sources; not building it again"
             );
-            (modules, false, revision)
+            let (fingerprint, frontier) = resumed
+                .map_or((fp_pre, None), |(fingerprint, frontier)| (fingerprint, Some(frontier)));
+            (modules, false, revision, fingerprint, frontier)
         }
         None => {
-            let (modules, force_stale) = build_candidate(
+            let (modules, force_stale, fingerprint, frontier) = build_candidate(
                 workspace_root,
                 project,
                 pre,
@@ -1481,8 +1791,9 @@ fn build_and_publish_scanned_inner(
                 &candidate,
                 base.as_deref(),
                 fp_pre,
+                coherence,
             )?;
-            (modules, force_stale, generation)
+            (modules, force_stale, generation, fingerprint, frontier)
         }
     };
     let mut delays =
@@ -1507,8 +1818,14 @@ fn build_and_publish_scanned_inner(
         }
     };
     let _ = std::fs::remove_file(candidate_marker_path(&candidate));
-    let prepared =
-        open_installed_replacement(graph, generation, fp_pre, force_stale, &out_path, pause)?;
+    let prepared = open_installed_replacement(
+        graph,
+        generation,
+        published_fingerprint,
+        force_stale,
+        &out_path,
+        pause,
+    )?;
     let summary = GraphBuildModules { modules };
     // Borrowed from the walk, not cloned out of it: what the coverage needs is membership, and
     // the universe already holds every address it listed.
@@ -1538,7 +1855,8 @@ fn build_and_publish_scanned_inner(
                 bsl_conventions::str_has_extension(&stat.path, bsl_conventions::XML_EXTENSION)
             })
             .count(),
-        fp_pre,
+        fingerprint: published_fingerprint,
+        observed_through,
         force_stale,
         scan_roots: project.scan_roots.clone(),
         declaration_epoch: project.declaration_epoch,
@@ -1556,6 +1874,14 @@ fn hold_candidate(
     graph: &GraphState,
     lock_path: &Path,
 ) -> Result<crate::workspace_lease::ExclusiveFileLock, LoadFailure> {
+    hold_candidate_until(graph, lock_path, None)
+}
+
+fn hold_candidate_until(
+    graph: &GraphState,
+    lock_path: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<crate::workspace_lease::ExclusiveFileLock, LoadFailure> {
     let mut warned = false;
     loop {
         if let Some(lock) = crate::workspace_lease::ExclusiveFileLock::try_acquire(lock_path)
@@ -1570,7 +1896,23 @@ fn hold_candidate(
                 "another builder still holds the graph replacement; waiting for it to let go"
             );
         }
-        if graph.stop.sleep(CANDIDATE_RETRY) || graph.lease_is_terminal() {
+        if graph.lease_is_terminal() {
+            return Err(left_before_installation(
+                graph,
+                "the graph replacement was still held by another builder when this daemon left",
+            ));
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(LoadFailure::refused(
+                "incremental graph candidate deadline expired while waiting for its writer lock",
+            ));
+        }
+        let delay = deadline
+            .map(|deadline| {
+                CANDIDATE_RETRY.min(deadline.saturating_duration_since(std::time::Instant::now()))
+            })
+            .unwrap_or(CANDIDATE_RETRY);
+        if graph.stop.sleep(delay) {
             return Err(left_before_installation(
                 graph,
                 "the graph replacement was still held by another builder when this daemon left",
@@ -1715,7 +2057,8 @@ fn build_candidate(
     candidate: &Path,
     base: Option<&str>,
     fp_pre: crate::graph_db::GraphFp,
-) -> Result<(usize, bool), LoadFailure> {
+    coherence: BuildCoherence,
+) -> Result<(usize, bool, crate::graph_db::GraphFp, Option<u64>), LoadFailure> {
     if !graph.validate_workspace_scope() {
         return Err(LoadFailure::operation(
             "workspace cache scope changed before graph candidate write",
@@ -1735,13 +2078,39 @@ fn build_candidate(
         built_at,
         publication_id: graph.next_publication_id(),
     };
-    // The ticket's fact frontier is kept separately as `Published::observed_through` for debt
-    // and marks. It is not the coherence window: a delivery after admission but before this
-    // authoritative pre-scan is already represented by `pre`. Start the ABA window after that
-    // scan and immediately before the analyzer reads the files for lowering.
-    let coherence_cutoff = graph.observation();
+    // `BuildCoherence` subscribed before the authoritative pre-scan. Its cutoff remains separate
+    // from the ticket frontier: edits delivered before the scan are represented by `pre`, and
+    // the retained cursor captures edits during lowering even if the watcher drains its cursor.
+    let mut pending = super::state::PendingCandidate {
+        path: candidate.to_path_buf(),
+        base: base.map(str::to_owned),
+        topology: project.portable_topology,
+        frontier: coherence.cutoff,
+        dirty_paths: std::collections::HashSet::new(),
+        cursor: coherence.cursor,
+        resumable: true,
+    };
+    let coherence_cutoff = pending.frontier;
     #[cfg(test)]
     graph.full_builds_started.fetch_add(1, Ordering::SeqCst);
+    tracing::info!(
+        generation,
+        graph_operation = "full_started",
+        stage = "projection",
+        "graph full projection started"
+    );
+    if let Some(context) = bsl_search::lifecycle::Context::current() {
+        context.graph_event(
+            bsl_search::lifecycle::GraphObservation::new(
+                "full_build",
+                "coherent_projection_required",
+                "projection",
+                "started",
+            )
+            .with_counts(None, None, None, Some(0))
+            .with_category("full_projection"),
+        );
+    }
     let ticker = Arc::new(ide::GraphBuildTicker::default());
     graph.start_cold_build_ticker(Arc::clone(&ticker));
     let summary = match crate::graph_db::build_graph_database_inner(
@@ -1790,14 +2159,63 @@ fn build_candidate(
             crate::change_hub::Health::Healthy
         )
     });
-    let force_stale = publish_force_stale(fp_pre, fp_post, pre.clean(), post.clean())
-        || hub_moved
-        || hub_unhealthy;
+    // A short/unreadable walk is degraded coverage, not evidence that the analyzer consumed
+    // bytes from two different workspace states. Keep the established force_stale publication
+    // for that case so scoped answers and recovery probes can continue. Only a changed
+    // fingerprint or a delivered fact inside the lowering window proves a straddle and requires
+    // private catch-up before installation.
+    let observed_straddle = build_candidate_observed_straddle(fp_pre, fp_post, hub_moved);
+    let mut published_frontier = None;
+    let (fp_publish, publish_clean) = if observed_straddle {
+        let catchup = catch_up_straddled_candidate(
+            workspace_root,
+            graph,
+            candidate,
+            project,
+            generation,
+            base,
+            &mut pending,
+            std::time::Instant::now() + INCREMENTAL_CANDIDATE_BUDGET,
+        );
+        match catchup {
+            Err(error) => {
+                if error.reason == LoadFailureReason::TransientRefusal && pending.resumable {
+                    *lock_recover(&graph.pending_candidate) = Some(pending);
+                }
+                return Err(error);
+            }
+            Ok(Some((fingerprint, clean))) => {
+                published_frontier = Some(pending.frontier);
+                (fingerprint, clean)
+            }
+            Ok(None) => {
+                if pending.resumable {
+                    *lock_recover(&graph.pending_candidate) = Some(pending);
+                }
+                return Err(LoadFailure::refused(
+                    "straddled graph candidate could not be proven coherent within its catch-up budget",
+                ));
+            }
+        }
+    } else {
+        (fp_post, pre.clean() && post.clean() && !hub_unhealthy)
+    };
+    let force_stale = !publish_clean;
     {
         let conn = rusqlite::Connection::open(candidate).map_err(LoadFailure::operation)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('force_stale', ?1)",
             rusqlite::params![if force_stale { "1" } else { "0" }],
+        )
+        .map_err(LoadFailure::operation)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('fingerprint', ?1)",
+            rusqlite::params![fp_publish.files.to_string()],
+        )
+        .map_err(LoadFailure::operation)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('topology_fp', ?1)",
+            rusqlite::params![fp_publish.topology.to_string()],
         )
         .map_err(LoadFailure::operation)?;
         conn.execute(
@@ -1817,7 +2235,7 @@ fn build_candidate(
     marker.complete = true;
     write_candidate_marker(candidate, &marker)?;
     crate::graph_db::record_candidate(file.metadata().map_err(LoadFailure::operation)?.len());
-    Ok((summary.modules, force_stale))
+    Ok((summary.modules, force_stale, fp_publish, published_frontier))
 }
 
 /// Open the replacement just renamed in and check it is the publication that was built. A
@@ -1873,6 +2291,17 @@ fn publish_force_stale(
     fp_pre != fp_post || !pre_clean || !post_clean
 }
 
+/// Whether there is positive evidence that lowering crossed a workspace change. Incomplete
+/// visibility and a degraded hub still make a publication stale, but alone do not prove that
+/// the rows mixed two versions of a file.
+fn build_candidate_observed_straddle(
+    fp_pre: crate::graph_db::GraphFp,
+    fp_post: crate::graph_db::GraphFp,
+    hub_moved: bool,
+) -> bool {
+    fp_pre != fp_post || hub_moved
+}
+
 /// Whether an on-disk build may be adopted as FRESH. `force_stale` means it never
 /// was a coherent snapshot; a fingerprint mismatch means the workspace moved since
 /// it was built; an unclean scan means `fp_now` describes only the part of the
@@ -1887,6 +2316,179 @@ fn cache_is_reusable(
     !force_stale && scan_clean && stored == fp_now
 }
 
+/// Continue a full candidate that yielded its bounded catch-up. The candidate and retained hub
+/// cursor are one process-local pending item; on restart the incomplete marker is discarded by
+/// the existing candidate ownership rules.
+fn resume_pending_full_candidate(
+    workspace_root: &Path,
+    graph: &GraphState,
+    project: &crate::graph::ProjectSnapshot,
+    generation: u64,
+    base: Option<&str>,
+) -> Result<Option<(crate::graph_db::GraphFp, u64)>, LoadFailure> {
+    let mut pending = lock_recover(&graph.pending_candidate).take();
+    let Some(mut pending) = pending.take() else { return Ok(None) };
+    let started = std::time::Instant::now();
+    if let Some(context) = bsl_search::lifecycle::Context::current() {
+        context.graph_event(
+            bsl_search::lifecycle::GraphObservation::new(
+                "graph_candidate",
+                "straddle_or_retry_budget",
+                "resume",
+                "started",
+            )
+            .with_category("private_candidate"),
+        );
+    }
+    #[cfg(test)]
+    {
+        lock_recover(&graph.catchup_stats).1 += 1;
+    }
+    if !pending.resumable
+        || pending.base.as_deref() != base
+        || pending.path
+            != graph.cache().expect("workspace graph has cache layout").graph_candidate_path()
+        || pending.topology != project.portable_topology
+    {
+        return Ok(None);
+    }
+    let marker_text = match std::fs::read_to_string(candidate_marker_path(&pending.path)) {
+        Ok(text) => text,
+        Err(_) => return Ok(None),
+    };
+    let marker: CandidateMarker = match serde_json::from_str(&marker_text) {
+        Ok(marker) => marker,
+        Err(_) => return Ok(None),
+    };
+    if marker.format != crate::graph_db::SCHEMA_VERSION
+        || marker.base.as_deref() != base
+        || marker.complete
+    {
+        return Ok(None);
+    }
+    let pending_path = pending.path.clone();
+    match catch_up_straddled_candidate(
+        workspace_root,
+        graph,
+        &pending_path,
+        project,
+        generation,
+        base,
+        &mut pending,
+        std::time::Instant::now() + INCREMENTAL_CANDIDATE_BUDGET,
+    ) {
+        Ok(Some((fingerprint, true))) => {
+            let marker_path = candidate_marker_path(&pending.path);
+            let marker_text =
+                std::fs::read_to_string(&marker_path).map_err(LoadFailure::operation)?;
+            let mut marker: CandidateMarker =
+                serde_json::from_str(&marker_text).map_err(LoadFailure::operation)?;
+            if marker.base.as_deref() != base || marker.format != crate::graph_db::SCHEMA_VERSION {
+                return Err(LoadFailure::operation("pending graph candidate ownership changed"));
+            }
+            let conn = rusqlite::Connection::open(&pending.path).map_err(LoadFailure::operation)?;
+            conn.execute_batch("BEGIN IMMEDIATE;").map_err(LoadFailure::operation)?;
+            for (key, value) in [
+                ("revision", generation.to_string()),
+                ("fingerprint", fingerprint.files.to_string()),
+                ("topology_fp", fingerprint.topology.to_string()),
+                ("force_stale", "0".to_owned()),
+                ("publication_id", graph.next_publication_id()),
+            ] {
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![key, value],
+                )
+                .map_err(LoadFailure::operation)?;
+            }
+            conn.execute_batch("COMMIT;").map_err(LoadFailure::operation)?;
+            drop(conn);
+            crate::graph_query::GraphDb::open(&pending.path)
+                .and_then(|db| db.quick_check())
+                .map_err(LoadFailure::operation)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&pending.path)
+                .and_then(|file| file.sync_all())
+                .map_err(LoadFailure::operation)?;
+            marker.complete = true;
+            write_candidate_marker(&pending.path, &marker)?;
+            if let Some(context) = bsl_search::lifecycle::Context::current() {
+                context.graph_event(
+                    bsl_search::lifecycle::GraphObservation::new(
+                        "graph_candidate",
+                        "straddle_or_retry_budget",
+                        "resume",
+                        "complete",
+                    )
+                    .with_counts(
+                        None,
+                        None,
+                        Some(INCREMENTAL_CANDIDATE_BUDGET.as_millis() as u64),
+                        Some(started.elapsed().as_millis() as u64),
+                    )
+                    .with_category("private_candidate"),
+                );
+            }
+            Ok(Some((fingerprint, pending.frontier)))
+        }
+        Ok(Some((_, false))) => {
+            if pending.resumable {
+                *lock_recover(&graph.pending_candidate) = Some(pending);
+                emit_pending_resume_result(started, "candidate_pending");
+                Err(LoadFailure::refused("pending graph candidate did not prove a complete scan"))
+            } else {
+                emit_pending_resume_result(started, "discarded");
+                Ok(None)
+            }
+        }
+        Ok(None) => {
+            if pending.resumable {
+                *lock_recover(&graph.pending_candidate) = Some(pending);
+                emit_pending_resume_result(started, "candidate_pending");
+                Err(LoadFailure::refused("pending graph candidate catch-up remains incomplete"))
+            } else {
+                emit_pending_resume_result(started, "discarded");
+                Ok(None)
+            }
+        }
+        Err(error) => {
+            if error.reason == LoadFailureReason::TransientRefusal && pending.resumable {
+                *lock_recover(&graph.pending_candidate) = Some(pending);
+            }
+            emit_pending_resume_result(
+                started,
+                if error.reason == LoadFailureReason::TransientRefusal {
+                    "candidate_pending"
+                } else {
+                    "failed"
+                },
+            );
+            Err(error)
+        }
+    }
+}
+
+fn emit_pending_resume_result(started: std::time::Instant, result: &'static str) {
+    if let Some(context) = bsl_search::lifecycle::Context::current() {
+        context.graph_event(
+            bsl_search::lifecycle::GraphObservation::new(
+                "graph_candidate",
+                "straddle_or_retry_budget",
+                "resume",
+                result,
+            )
+            .with_counts(
+                None,
+                None,
+                Some(INCREMENTAL_CANDIDATE_BUDGET.as_millis() as u64),
+                Some(started.elapsed().as_millis() as u64),
+            )
+            .with_category("private_candidate"),
+        );
+    }
+}
+
 /// What identifies one attempt to patch: the publication it is written over, the fingerprint it
 /// leads to and the files it rewrites. An attempt of the same plan that outlasts its SQL budget
 /// twice is not tried a third time.
@@ -1895,6 +2497,17 @@ pub(super) struct PatchPlan {
     base: Option<String>,
     target: crate::graph_db::GraphFp,
     changed: Vec<PathBuf>,
+}
+
+struct PatchApplication {
+    modules: usize,
+    reprojected: usize,
+    generation: u64,
+    fingerprint: crate::graph_db::GraphFp,
+    force_stale: bool,
+    /// A private candidate proves the hub only through this retained cursor frontier.
+    observed_through: Option<u64>,
+    pause: super::snapshot::ReplacementPause,
 }
 
 impl GraphState {
@@ -1912,6 +2525,12 @@ impl GraphState {
                 1
             }
         }
+    }
+
+    fn patch_was_overrun(&self, plan: &PatchPlan) -> bool {
+        lock_recover(&self.patch_overruns)
+            .as_ref()
+            .is_some_and(|(seen, count)| seen == plan && *count > 0)
     }
 }
 
@@ -1939,6 +2558,842 @@ fn settle_after_rollback(
     }
 }
 
+const INCREMENTAL_CANDIDATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn record_retry_busy(
+    reason: &'static str,
+    stage: &'static str,
+    dirty: Option<u64>,
+    closure: Option<u64>,
+    budget: Option<std::time::Duration>,
+) {
+    if let Some(context) = bsl_search::lifecycle::Context::current() {
+        context.graph_event(
+            bsl_search::lifecycle::GraphObservation::new(
+                "incremental_reload",
+                reason,
+                stage,
+                "retry_busy",
+            )
+            .with_counts(dirty, closure, budget.map(|value| value.as_millis() as u64), None)
+            .with_category("busy"),
+        );
+    }
+}
+
+/// Finish a full projection that straddled ordinary body edits without publishing its mixed
+/// input. The initial full projection has its own lifecycle and deadline; this bounded window
+/// starts only after it completes. Existing graph/debt ownership remains the single scheduler.
+#[allow(clippy::too_many_arguments)]
+fn catch_up_straddled_candidate(
+    workspace_root: &Path,
+    graph: &GraphState,
+    candidate: &Path,
+    initial_project: &crate::graph::ProjectSnapshot,
+    generation: u64,
+    base: Option<&str>,
+    pending: &mut super::state::PendingCandidate,
+    deadline: std::time::Instant,
+) -> Result<Option<(crate::graph_db::GraphFp, bool)>, LoadFailure> {
+    let started = std::time::Instant::now();
+    let roots = initial_project.search_roots.as_ref();
+    let Some(roots) = roots else {
+        pending.resumable = false;
+        return Ok(None);
+    };
+    let Some(hub) = graph.change_hub.as_ref() else {
+        pending.resumable = false;
+        return Ok(None);
+    };
+    if pending.cursor.is_none() {
+        pending.resumable = false;
+        return Ok(None);
+    }
+    if pending.base.as_deref() != base || pending.path != candidate {
+        pending.resumable = false;
+        return Ok(None);
+    }
+    let Some(cursor) = pending.cursor.as_ref().and_then(crate::change_hub::CursorLease::cursor)
+    else {
+        return Ok(None);
+    };
+    let original_topology = initial_project.portable_topology;
+    let mut latest_frontier = pending.frontier;
+
+    for pass in 0..2 {
+        if graph.lease_is_terminal() {
+            return Err(lost_workspace_failure(graph));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        {
+            lock_recover(&graph.catchup_stats).0 += 1;
+        }
+        if !graph.validate_workspace_scope() {
+            return Err(LoadFailure::operation(
+                "workspace cache scope changed during graph catch-up",
+            ));
+        }
+        let batch = hub.materialize(cursor);
+        if batch.rescan_required
+            || !matches!(hub.health_for(Some(cursor)), crate::change_hub::Health::Healthy)
+        {
+            pending.resumable = false;
+            hub.acknowledge(&batch);
+            return Ok(None);
+        }
+        let mut dirty_keys: std::collections::HashSet<bsl_search::FileKey> =
+            batch.entries.iter().filter_map(|entry| roots.key_of_path(&entry.canonical)).collect();
+        latest_frontier = batch.fact_seq().max(latest_frontier);
+        pending.frontier = latest_frontier;
+        #[cfg(test)]
+        {
+            let mut stats = lock_recover(&graph.catchup_stats);
+            stats.2 = stats.2.max(latest_frontier);
+        }
+        pending.dirty_paths.extend(batch.entries.iter().map(|entry| entry.canonical.clone()));
+        if pending.dirty_paths.len() > 8192 {
+            pending.resumable = false;
+            hub.acknowledge(&batch);
+            return Ok(None);
+        }
+        dirty_keys.extend(pending.dirty_paths.iter().filter_map(|path| roots.key_of_path(path)));
+        hub.acknowledge(&batch);
+
+        let project = crate::graph::ProjectSnapshot::load_excluding(
+            workspace_root,
+            &graph.cache_exclusions(),
+        );
+        if !project.validated || project.portable_topology != original_topology {
+            pending.resumable = false;
+            return Ok(None);
+        }
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if !universe.clean() {
+            return Ok(None);
+        }
+        let Some(fingerprint) = super::scan::fingerprint_of_project(&universe.stats, &project)
+        else {
+            return Ok(None);
+        };
+        let db = match GraphDb::open(candidate) {
+            Ok(db) => db,
+            Err(error) => return Err(LoadFailure::operation(error)),
+        };
+        let (_, candidate_fp, force_stale) =
+            db.freshness_token().map_err(LoadFailure::operation)?;
+        if force_stale || candidate_fp.topology != original_topology {
+            pending.resumable = false;
+            return Ok(None);
+        }
+        let diff = super::scan::classify_changes_with_roots(
+            &db.stored_fingerprints(),
+            &universe.stats,
+            project.search_roots.as_ref(),
+        );
+        if !diff.added.is_empty() || !diff.removed.is_empty() {
+            pending.resumable = false;
+            return Ok(None);
+        }
+        let mut paths: std::collections::HashSet<PathBuf> =
+            diff.modified.iter().map(PathBuf::from).collect();
+        let by_key: std::collections::HashMap<_, _> = universe
+            .stats
+            .iter()
+            .filter_map(|stat| stat.key(roots).map(|key| (key, PathBuf::from(&stat.path))))
+            .collect();
+        paths.extend(dirty_keys.iter().filter_map(|key| by_key.get(key).cloned()));
+        if paths.iter().any(|path| !universe.files.iter().any(|(_, found)| found == path)) {
+            pending.resumable = false;
+            return Ok(None);
+        }
+        if paths.is_empty() {
+            // A path delivered after the final batch but before this check belongs to the next
+            // pass; never advance the proven frontier by merely sampling the global sequence.
+            if graph.observation() > latest_frontier {
+                if pass == 0 {
+                    continue;
+                }
+                return Ok(None);
+            }
+            pending.dirty_paths.clear();
+            pending.frontier = latest_frontier;
+            if let Some(context) = bsl_search::lifecycle::Context::current() {
+                context.graph_event(
+                    bsl_search::lifecycle::GraphObservation::new(
+                        "graph_candidate",
+                        "straddle_or_retry_budget",
+                        "catchup",
+                        "coherent",
+                    )
+                    .with_counts(
+                        Some(0),
+                        Some(0),
+                        Some(
+                            deadline
+                                .saturating_duration_since(std::time::Instant::now())
+                                .as_millis() as u64,
+                        ),
+                        Some(started.elapsed().as_millis() as u64),
+                    )
+                    .with_category("private_candidate"),
+                );
+            }
+            return Ok(Some((fingerprint, true)));
+        }
+        let dirty_count = paths.len() as u64;
+        let stored_sig = db.stored_sig_hashes();
+        let mut changed = Vec::new();
+        let mut metadata_paths = Vec::new();
+        let mut xml_observations = Vec::new();
+        for path in paths {
+            if bsl_conventions::str_has_extension(
+                &path.to_string_lossy(),
+                bsl_conventions::XML_EXTENSION,
+            ) {
+                let Some(key) = universe.key_for_path(roots, &path) else {
+                    pending.resumable = false;
+                    return Ok(None);
+                };
+                let current_sig = super::scan::xml_semantic_hash_file(&path).map(|hash| {
+                    u64::from_le_bytes(hash[..8].try_into().expect("BLAKE3 hash has 8 bytes"))
+                });
+                xml_observations.push((path.clone(), current_sig));
+                if current_sig.is_none() || current_sig != stored_sig.get(&key).copied().flatten() {
+                    metadata_paths.push(path);
+                }
+            } else {
+                changed.push(path);
+            }
+        }
+        changed.sort();
+        metadata_paths.sort();
+        let (owner_ids, form_paths) = if metadata_paths.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let Some(delta) = crate::graph_db::local_metadata_delta(
+                &project,
+                &universe,
+                candidate,
+                &metadata_paths,
+            )
+            .map_err(LoadFailure::operation)?
+            else {
+                pending.resumable = false;
+                return Ok(None);
+            };
+            delta
+        };
+        let profiles =
+            crate::graph_db::recompute_module_profiles(&project, &universe.files, &changed)
+                .map_err(LoadFailure::operation)?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let mut sig_changed = Vec::new();
+        for path in &changed {
+            let key_text = path.to_string_lossy().into_owned();
+            let Some(profile) = profiles.get(&key_text) else { return Ok(None) };
+            let Some(key) =
+                project.search_roots.as_ref().and_then(|roots| universe.key_for_path(roots, path))
+            else {
+                return Ok(None);
+            };
+            if !matches!(stored_sig.get(&key), Some(Some(hash)) if *hash == profile.sig_hash) {
+                sig_changed.push((key_text, profile));
+            }
+        }
+        let mut reprojection = changed.clone();
+        reprojection.extend(form_paths.iter().cloned());
+        if !sig_changed.is_empty() {
+            let refs: Vec<(&str, &crate::graph_db::ModuleProfile)> =
+                sig_changed.iter().map(|(path, profile)| (path.as_str(), *profile)).collect();
+            let Some(callers) = db
+                .caller_delta_plan(&refs, project.search_roots.as_ref())
+                .map_err(LoadFailure::operation)?
+            else {
+                return Ok(None);
+            };
+            reprojection.extend(callers);
+            reprojection.sort();
+            reprojection.dedup();
+        }
+        if let Some(context) = bsl_search::lifecycle::Context::current() {
+            context.graph_event(
+                bsl_search::lifecycle::GraphObservation::new(
+                    "graph_candidate",
+                    "straddle_or_retry_budget",
+                    "catchup",
+                    "apply_delta",
+                )
+                .with_counts(
+                    Some(dirty_count),
+                    Some(reprojection.len() as u64),
+                    Some(deadline.saturating_duration_since(std::time::Instant::now()).as_millis()
+                        as u64),
+                    Some(started.elapsed().as_millis() as u64),
+                )
+                .with_category("private_candidate"),
+            );
+        }
+        drop(db);
+        let patch = crate::graph_db::compute_body_patch_with_metadata(
+            &project,
+            &universe,
+            candidate,
+            &reprojection,
+            &metadata_paths,
+            &owner_ids,
+            &form_paths,
+            &xml_observations,
+            GRAPH_BUILD_BATCH,
+        )
+        .map_err(LoadFailure::operation)?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let meta = crate::graph_db::GraphMeta {
+            revision: generation,
+            fingerprint,
+            files: 0,
+            built_at: chrono::Utc::now().to_rfc3339(),
+            publication_id: graph.next_publication_id(),
+        };
+        let transaction = crate::graph_db::begin_body_patch(
+            candidate, &project, &universe, &patch, &meta, false, remaining,
+        )
+        .map_err(|error| match error {
+            crate::graph_db::PatchError::Busy => {
+                record_retry_busy(
+                    "catchup_sql_lock",
+                    "catchup_sql",
+                    Some(dirty_count),
+                    Some(reprojection.len() as u64),
+                    Some(remaining),
+                );
+                LoadFailure::refused("private graph catch-up candidate is busy")
+            }
+            crate::graph_db::PatchError::Budget => {
+                LoadFailure::refused("graph catch-up reached its 60-second deadline")
+            }
+            crate::graph_db::PatchError::Failed(error) => LoadFailure::operation(error),
+        })?;
+        transaction.commit().map_err(LoadFailure::operation)?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        pending.dirty_paths.clear();
+        pending.frontier = latest_frontier;
+        #[cfg(test)]
+        if graph.catchup_yield_once.swap(false, Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if pass == 1 {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
+/// Apply one supported patch to an online backup, then use the existing candidate installer.
+/// Copying and SQL hold neither the published-read pause nor the workspace lease.
+#[allow(clippy::too_many_arguments)]
+fn apply_patch_candidate(
+    graph: &GraphState,
+    project: &crate::graph::ProjectSnapshot,
+    universe: &crate::graph::universe::ScannedUniverse,
+    patch: &crate::graph_db::BodyPatch,
+    meta: &crate::graph_db::GraphMeta,
+    db_path: &Path,
+    plan: &PatchPlan,
+    coherence: BuildCoherence,
+) -> Result<PatchApplication, LoadFailure> {
+    let started = std::time::Instant::now();
+    let deadline = started + INCREMENTAL_CANDIDATE_BUDGET;
+    let result = apply_patch_candidate_inner(
+        graph, project, universe, patch, meta, db_path, plan, coherence, deadline,
+    );
+    if let Some(context) = bsl_search::lifecycle::Context::current() {
+        context.graph_event(
+            bsl_search::lifecycle::GraphObservation::new(
+                "incremental_reload",
+                "budget_or_straddle",
+                "candidate_install",
+                match &result {
+                    Ok(_) => "published",
+                    Err(failure) if failure.reason == LoadFailureReason::TransientRefusal => {
+                        "candidate_pending"
+                    }
+                    Err(_) => "failed",
+                },
+            )
+            .with_counts(
+                Some(plan.changed.len() as u64),
+                Some(patch.reprojected_modules() as u64),
+                Some(INCREMENTAL_CANDIDATE_BUDGET.as_millis() as u64),
+                Some(started.elapsed().as_millis() as u64),
+            )
+            .with_category("private_candidate"),
+        );
+    }
+    if let Err(failure) = &result {
+        tracing::warn!(graph_operation = "candidate_pending", reason_code = ?failure.reason, "private graph candidate did not publish");
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_patch_candidate_inner(
+    graph: &GraphState,
+    project: &crate::graph::ProjectSnapshot,
+    universe: &crate::graph::universe::ScannedUniverse,
+    patch: &crate::graph_db::BodyPatch,
+    meta: &crate::graph_db::GraphMeta,
+    db_path: &Path,
+    plan: &PatchPlan,
+    coherence: BuildCoherence,
+    deadline: std::time::Instant,
+) -> Result<PatchApplication, LoadFailure> {
+    use rusqlite::backup::{Backup, StepResult};
+
+    let started = std::time::Instant::now();
+    let coherence_cutoff = coherence.cutoff;
+    let has_cursor = coherence.cursor.is_some();
+    let mut published_fingerprint = plan.target;
+    let mut published_frontier = coherence_cutoff;
+    if let Some(context) = bsl_search::lifecycle::Context::current() {
+        context.graph_event(
+            bsl_search::lifecycle::GraphObservation::new(
+                "incremental_reload",
+                "budget_or_straddle",
+                "backup",
+                "started",
+            )
+            .with_counts(
+                Some(plan.changed.len() as u64),
+                Some(patch.reprojected_modules() as u64),
+                Some(INCREMENTAL_CANDIDATE_BUDGET.as_millis() as u64),
+                Some(0),
+            )
+            .with_category("private_candidate"),
+        );
+    }
+    if !graph.validate_workspace_scope() {
+        return Err(LoadFailure::operation(
+            "workspace cache scope changed before graph candidate preparation",
+        ));
+    }
+    let cache = graph.cache().expect("workspace graph has cache layout");
+    let candidate = cache.graph_candidate_path();
+    let candidate_lock =
+        hold_candidate_until(graph, &cache.graph_candidate_lock_path(), Some(deadline));
+    let _candidate_lock = match candidate_lock {
+        Ok(lock) => lock,
+        Err(failure) => {
+            if failure.reason == LoadFailureReason::TransientRefusal {
+                record_retry_busy(
+                    "candidate_lock",
+                    "backup_lock",
+                    Some(plan.changed.len() as u64),
+                    Some(patch.reprojected_modules() as u64),
+                    Some(INCREMENTAL_CANDIDATE_BUDGET),
+                );
+            }
+            return Err(failure);
+        }
+    };
+    let base = plan.base.as_deref();
+    let target = plan.target;
+
+    let reusable = match inspect_candidate(&candidate, base, target, universe.clean()) {
+        CandidateState::Reusable { revision, .. } if revision == meta.revision => Some(revision),
+        CandidateState::Reusable { .. } => None,
+        CandidateState::Blocked(reason) => return Err(LoadFailure::operation(reason)),
+        CandidateState::Absent | CandidateState::Stale => None,
+    };
+    let reused_candidate = reusable.is_some();
+    let mut candidate_force_stale = false;
+    let revision = if let Some(revision) = reusable {
+        revision
+    } else {
+        if candidate.exists() {
+            let marker = std::fs::read_to_string(candidate_marker_path(&candidate))
+                .ok()
+                .and_then(|text| serde_json::from_str::<CandidateMarker>(&text).ok());
+            if !matches!(marker, Some(marker) if marker.format == crate::graph_db::SCHEMA_VERSION && marker.base.as_deref() == base)
+            {
+                return Err(LoadFailure::operation(format!(
+                    "an unrelated graph replacement is at {}; it is neither used nor overwritten",
+                    candidate.display()
+                )));
+            }
+            for suffix in ["", "-wal", "-shm"] {
+                let path = candidate.with_file_name(format!(
+                    "{}{suffix}",
+                    candidate
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("bsl-graph.pending.db")
+                ));
+                if path.exists() {
+                    std::fs::remove_file(path).map_err(LoadFailure::operation)?;
+                }
+            }
+        }
+        let mut marker = CandidateMarker {
+            format: crate::graph_db::SCHEMA_VERSION,
+            base: base.map(str::to_owned),
+            complete: false,
+        };
+        write_candidate_marker(&candidate, &marker)?;
+        let file_use = graph.store.use_file().map_err(|_| lost_workspace_failure(graph))?;
+        super::snapshot::recover_hot_journal(db_path).map_err(LoadFailure::operation)?;
+        let source_identity =
+            super::snapshot::on_disk_identity(db_path).map_err(LoadFailure::operation)?;
+        if source_identity.as_ref().and_then(|identity| identity.publication_id.as_deref()) != base
+        {
+            return Err(LoadFailure::refused("published graph changed before the private backup"));
+        }
+        let source = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(LoadFailure::operation)?;
+        let mut destination =
+            rusqlite::Connection::open(&candidate).map_err(LoadFailure::operation)?;
+        #[cfg(test)]
+        graph.prepare_backup_destination_for_test(&destination);
+        {
+            let backup = Backup::new(&source, &mut destination).map_err(LoadFailure::operation)?;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err(LoadFailure::refused(
+                        "incremental graph candidate reached its 60-second deadline during backup",
+                    ));
+                }
+                if graph.stop.is_stopped() {
+                    return Err(left_before_installation(
+                        graph,
+                        "the graph backup was still in progress when this daemon stopped",
+                    ));
+                }
+                if !graph.validate_workspace_scope() || graph.lease_is_terminal() {
+                    return Err(lost_workspace_failure(graph));
+                }
+                match backup.step(128).map_err(LoadFailure::operation)? {
+                    StepResult::Done => break,
+                    StepResult::More => {}
+                    StepResult::Busy | StepResult::Locked => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    other => {
+                        return Err(LoadFailure::operation(format!(
+                            "SQLite online backup returned unexpected step result: {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        drop(destination);
+        let copied_identity =
+            super::snapshot::on_disk_identity(&candidate).map_err(LoadFailure::operation)?;
+        if copied_identity.as_ref().and_then(|identity| identity.publication_id.as_deref()) != base
+        {
+            return Err(LoadFailure::refused(
+                "online graph backup did not preserve its source publication",
+            ));
+        }
+        drop(source);
+        drop(file_use);
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(LoadFailure::refused(
+                "incremental graph candidate reached its 60-second deadline before SQL",
+            ));
+        }
+        let transaction = crate::graph_db::begin_body_patch(
+            &candidate, project, universe, patch, meta, false, remaining,
+        )
+        .map_err(|error| match error {
+            crate::graph_db::PatchError::Busy => {
+                record_retry_busy(
+                    "candidate_sql_lock",
+                    "candidate_sql",
+                    Some(plan.changed.len() as u64),
+                    Some(patch.reprojected_modules() as u64),
+                    Some(remaining),
+                );
+                LoadFailure::refused("private graph candidate is busy")
+            }
+            crate::graph_db::PatchError::Budget => {
+                if let Some(context) = bsl_search::lifecycle::Context::current() {
+                    context.graph_event(
+                        bsl_search::lifecycle::GraphObservation::new(
+                            "incremental_reload",
+                            "sql_budget",
+                            "candidate_sql",
+                            "budget_exhausted",
+                        )
+                        .with_counts(
+                            Some(plan.changed.len() as u64),
+                            Some(patch.reprojected_modules() as u64),
+                            Some(INCREMENTAL_CANDIDATE_BUDGET.as_millis() as u64),
+                            Some(started.elapsed().as_millis() as u64),
+                        )
+                        .with_category("budget_retry"),
+                    );
+                }
+                LoadFailure::refused(
+                    "incremental graph candidate reached its 60-second SQL deadline",
+                )
+            }
+            crate::graph_db::PatchError::Failed(error) => LoadFailure::operation(error),
+        })?;
+        #[cfg(test)]
+        graph.enter_patch_precommit_hook();
+        transaction.commit().map_err(LoadFailure::operation)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(LoadFailure::refused(
+                "incremental graph candidate reached its 60-second deadline after SQL",
+            ));
+        }
+        crate::graph_query::GraphDb::open(&candidate)
+            .and_then(|db| db.quick_check())
+            .map_err(LoadFailure::operation)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&candidate)
+            .and_then(|file| file.sync_all())
+            .map_err(LoadFailure::operation)?;
+        let post_project = crate::graph::ProjectSnapshot::load_excluding(
+            graph.workspace_root.as_deref().expect("workspace graph has a root"),
+            &graph.cache_exclusions(),
+        );
+        let post = crate::graph::universe::ScannedUniverse::scan_project(&post_project);
+        let fp_post = super::scan::fingerprint_of_project(&post.stats, &post_project)
+            .ok_or_else(|| LoadFailure::operation("incomplete candidate post-scan fingerprint"))?;
+        if std::time::Instant::now() >= deadline {
+            return Err(LoadFailure::refused(
+                "incremental graph candidate reached its 60-second deadline during final validation",
+            ));
+        }
+        if !graph.validate_workspace_scope() {
+            return Err(LoadFailure::operation(
+                "workspace cache scope changed during private graph candidate preparation",
+            ));
+        }
+        let hub_unhealthy = graph.change_hub.as_ref().is_some_and(|hub| {
+            !matches!(
+                hub.health_for(lock_recover(&graph.hub_cursor).peek()),
+                crate::change_hub::Health::Healthy
+            )
+        });
+        let observed_straddle = graph.observation() > coherence_cutoff || fp_post != target;
+        candidate_force_stale = !post.clean() || hub_unhealthy;
+        if observed_straddle {
+            let mut pending = super::state::PendingCandidate {
+                path: candidate.clone(),
+                base: base.map(str::to_owned),
+                topology: project.portable_topology,
+                frontier: coherence_cutoff,
+                dirty_paths: std::collections::HashSet::new(),
+                cursor: coherence.cursor,
+                resumable: true,
+            };
+            let root = graph.workspace_root.as_deref().expect("workspace graph has a root");
+            let caught_up = catch_up_straddled_candidate(
+                root,
+                graph,
+                &candidate,
+                project,
+                meta.revision,
+                base,
+                &mut pending,
+                deadline,
+            );
+            match caught_up {
+                Err(error) => {
+                    if error.reason == LoadFailureReason::TransientRefusal && pending.resumable {
+                        *lock_recover(&graph.pending_candidate) = Some(pending);
+                    }
+                    return Err(error);
+                }
+                Ok(result) => match result {
+                    Some((caught_up_fingerprint, true)) => {
+                        published_fingerprint = caught_up_fingerprint;
+                        published_frontier = pending.frontier;
+                        candidate_force_stale = false;
+                        let connection = rusqlite::Connection::open(&candidate)
+                            .map_err(LoadFailure::operation)?;
+                        connection
+                            .execute_batch("BEGIN IMMEDIATE;")
+                            .map_err(LoadFailure::operation)?;
+                        for (key, value) in [
+                            ("revision", meta.revision.to_string()),
+                            ("fingerprint", caught_up_fingerprint.files.to_string()),
+                            ("topology_fp", caught_up_fingerprint.topology.to_string()),
+                            ("force_stale", "0".to_owned()),
+                            ("publication_id", graph.next_publication_id()),
+                        ] {
+                            connection
+                                .execute(
+                                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                                    rusqlite::params![key, value],
+                                )
+                                .map_err(LoadFailure::operation)?;
+                        }
+                        connection.execute_batch("COMMIT;").map_err(LoadFailure::operation)?;
+                        drop(connection);
+                        crate::graph_query::GraphDb::open(&candidate)
+                            .and_then(|db| db.quick_check())
+                            .map_err(LoadFailure::operation)?;
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&candidate)
+                            .and_then(|file| file.sync_all())
+                            .map_err(LoadFailure::operation)?;
+                    }
+                    _ => {
+                        marker.complete = false;
+                        write_candidate_marker(&candidate, &marker)?;
+                        if pending.resumable {
+                            *lock_recover(&graph.pending_candidate) = Some(pending);
+                        }
+                        return Err(LoadFailure::refused(
+                            "workspace changed while the private graph candidate was prepared; catch-up remains pending",
+                        ));
+                    }
+                },
+            }
+        } else {
+            published_fingerprint = fp_post;
+            if candidate_force_stale {
+                let connection =
+                    rusqlite::Connection::open(&candidate).map_err(LoadFailure::operation)?;
+                connection
+                    .execute(
+                        "INSERT OR REPLACE INTO meta (key, value) VALUES ('force_stale', '1')",
+                        [],
+                    )
+                    .map_err(LoadFailure::operation)?;
+                drop(connection);
+                crate::graph_query::GraphDb::open(&candidate)
+                    .and_then(|db| db.quick_check())
+                    .map_err(LoadFailure::operation)?;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&candidate)
+                    .and_then(|file| file.sync_all())
+                    .map_err(LoadFailure::operation)?;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            marker.complete = false;
+            write_candidate_marker(&candidate, &marker)?;
+            return Err(LoadFailure::refused(
+                "incremental graph candidate reached its 60-second deadline before installation",
+            ));
+        }
+        marker.complete = true;
+        write_candidate_marker(&candidate, &marker)?;
+        crate::graph_db::record_candidate(
+            std::fs::metadata(&candidate).map_err(LoadFailure::operation)?.len(),
+        );
+        meta.revision
+    };
+
+    if reused_candidate {
+        let post_project = crate::graph::ProjectSnapshot::load_excluding(
+            graph.workspace_root.as_deref().expect("workspace graph has a root"),
+            &graph.cache_exclusions(),
+        );
+        let post = crate::graph::universe::ScannedUniverse::scan_project(&post_project);
+        let Some(fp_post) = super::scan::fingerprint_of_project(&post.stats, &post_project) else {
+            return Err(LoadFailure::operation(
+                "incomplete fingerprint while validating the private graph candidate",
+            ));
+        };
+        if !graph.validate_workspace_scope() {
+            return Err(LoadFailure::operation(
+                "workspace cache scope changed while validating the private graph candidate",
+            ));
+        }
+        let hub_unhealthy = graph.change_hub.as_ref().is_some_and(|hub| {
+            !matches!(
+                hub.health_for(lock_recover(&graph.hub_cursor).peek()),
+                crate::change_hub::Health::Healthy
+            )
+        });
+        if graph.observation() > coherence_cutoff || fp_post != target {
+            let marker_path = candidate_marker_path(&candidate);
+            if let Ok(text) = std::fs::read_to_string(&marker_path) {
+                if let Ok(mut marker) = serde_json::from_str::<CandidateMarker>(&text) {
+                    marker.complete = false;
+                    write_candidate_marker(&candidate, &marker)?;
+                }
+            }
+            return Err(LoadFailure::refused(
+                "reused graph candidate lost its source coherence before installation",
+            ));
+        }
+        published_fingerprint = fp_post;
+        candidate_force_stale = !post.clean() || hub_unhealthy;
+        if candidate_force_stale {
+            let connection =
+                rusqlite::Connection::open(&candidate).map_err(LoadFailure::operation)?;
+            connection
+                .execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('force_stale', '1')", [])
+                .map_err(LoadFailure::operation)?;
+            drop(connection);
+            crate::graph_query::GraphDb::open(&candidate)
+                .and_then(|db| db.quick_check())
+                .map_err(LoadFailure::operation)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&candidate)
+                .and_then(|file| file.sync_all())
+                .map_err(LoadFailure::operation)?;
+        }
+    }
+
+    if deadline.saturating_duration_since(std::time::Instant::now()) < INSTALL_READERS_WAIT {
+        return Err(LoadFailure::refused(
+            "incremental graph candidate has insufficient budget for the bounded reader wait",
+        ));
+    }
+    match publish_or_discard(graph, &candidate, db_path, base, true)? {
+        Replaced::Done(pause) => {
+            let _ = std::fs::remove_file(candidate_marker_path(&candidate));
+            tracing::info!(
+                graph_operation = "patched_candidate",
+                generation = revision,
+                "incremental graph candidate installed"
+            );
+            Ok(PatchApplication {
+                modules: patch.modules(),
+                reprojected: patch.reprojected_modules(),
+                generation: revision,
+                fingerprint: published_fingerprint,
+                force_stale: candidate_force_stale,
+                observed_through: has_cursor.then_some(published_frontier),
+                pause,
+            })
+        }
+        Replaced::ReadersBusy => Err(LoadFailure::refused(
+            "graph readers delayed candidate installation; the prepared candidate remains pending",
+        )),
+    }
+}
+
 /// Write a computed patch into the graph file in one transaction and commit it under the lease.
 ///
 /// Reads are held back by `pause` while the SQL is applied, and the transaction counts as a use
@@ -1957,17 +3412,18 @@ fn write_patch_in_place(
     force_stale: bool,
     db_path: &Path,
     plan: &PatchPlan,
+    coherence_cutoff: u64,
+    sql_budget: std::time::Duration,
     pause: super::snapshot::ReplacementPause,
-) -> Result<(usize, super::snapshot::ReplacementPause), LoadFailure> {
+    coherence: &mut Option<BuildCoherence>,
+) -> Result<PatchApplication, LoadFailure> {
     if !graph.validate_workspace_scope() {
         return Err(LoadFailure::operation(
             "workspace cache scope changed before graph patch preparation",
         ));
     }
     let base = plan.base.as_deref();
-    let Ok(_file_use) = graph.store.use_file() else {
-        return Err(lost_workspace_failure(graph));
-    };
+    let file_use = graph.store.use_file().map_err(|_| lost_workspace_failure(graph))?;
     super::snapshot::recover_hot_journal(db_path).map_err(LoadFailure::operation)?;
     let current = super::snapshot::on_disk_identity(db_path)
         .map_err(|error| LoadFailure::operation(error.to_string()))?;
@@ -1991,35 +3447,85 @@ fn write_patch_in_place(
         patch,
         meta,
         force_stale,
-        crate::graph_db::PATCH_SQL_BUDGET,
+        sql_budget,
     ) {
         Ok(transaction) => transaction,
         Err(error) => {
             settle_after_rollback(graph, db_path, base, &pause);
             return Err(match error {
-                crate::graph_db::PatchError::Busy => LoadFailure::new(
-                    LoadFailureReason::TransientRefusal,
-                    "another process holds the graph file's write lock; the patch is prepared \
-                     again on the next reload",
-                ),
+                crate::graph_db::PatchError::Busy => {
+                    record_retry_busy(
+                        "published_sql_lock",
+                        "patch_sql",
+                        Some(plan.changed.len() as u64),
+                        Some(patch.reprojected_modules() as u64),
+                        Some(sql_budget),
+                    );
+                    LoadFailure::new(
+                        LoadFailureReason::TransientRefusal,
+                        "another process holds the graph file's write lock; the patch is prepared \
+                         again on the next reload",
+                    )
+                }
                 crate::graph_db::PatchError::Budget => {
                     let overruns = graph.note_patch_overrun(plan);
-                    tracing::warn!(overruns, "applying a graph patch outlasted its budget");
-                    if overruns >= 2 {
-                        LoadFailure::operation(
-                            "applying the same graph patch outlasted its budget twice",
-                        )
-                    } else {
-                        LoadFailure::new(
-                            LoadFailureReason::TransientRefusal,
-                            "applying a graph patch outlasted its budget; it is prepared again",
-                        )
+                    if let Some(context) = bsl_search::lifecycle::Context::current() {
+                        context.graph_event(
+                            bsl_search::lifecycle::GraphObservation::new(
+                                "incremental_reload",
+                                "sql_budget",
+                                "patch_sql",
+                                "private_candidate",
+                            )
+                            .with_counts(
+                                Some(plan.changed.len() as u64),
+                                Some(patch.reprojected_modules() as u64),
+                                Some(sql_budget.as_millis() as u64),
+                                None,
+                            )
+                            .with_category("budget_retry"),
+                        );
                     }
+                    tracing::warn!(
+                        overruns,
+                        graph_operation = "retry_budget",
+                        "applying a graph patch outlasted its budget"
+                    );
+                    drop(pause);
+                    drop(file_use);
+                    return apply_patch_candidate(
+                        graph,
+                        project,
+                        universe,
+                        patch,
+                        meta,
+                        db_path,
+                        plan,
+                        coherence
+                            .take()
+                            .unwrap_or(BuildCoherence { cursor: None, cutoff: coherence_cutoff }),
+                    );
                 }
                 crate::graph_db::PatchError::Failed(error) => LoadFailure::operation(error),
             });
         }
     };
+    #[cfg(test)]
+    graph.enter_patch_precommit_hook();
+    let hub_unhealthy = graph.change_hub.as_ref().is_some_and(|hub| {
+        !matches!(
+            hub.health_for(lock_recover(&graph.hub_cursor).peek()),
+            crate::change_hub::Health::Healthy
+        )
+    });
+    if graph.observation() > coherence_cutoff || hub_unhealthy {
+        drop(transaction);
+        settle_after_rollback(graph, db_path, base, &pause);
+        return Err(LoadFailure::new(
+            LoadFailureReason::TransientRefusal,
+            "workspace changed before graph patch commit; the published graph was preserved",
+        ));
+    }
     if !graph.validate_workspace_scope() {
         drop(transaction);
         settle_after_rollback(graph, db_path, base, &pause);
@@ -2032,7 +3538,15 @@ fn write_patch_in_place(
         held.take().expect("the transaction is committed once").commit()
     });
     match outcome {
-        LeaseOperationOutcome::Applied(_) => Ok((patch.modules(), pause)),
+        LeaseOperationOutcome::Applied(_) => Ok(PatchApplication {
+            modules: patch.modules(),
+            reprojected: patch.reprojected_modules(),
+            generation: meta.revision,
+            fingerprint: meta.fingerprint,
+            force_stale,
+            observed_through: None,
+            pause,
+        }),
         LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(error)) => {
             drop(held);
             let message =
@@ -2044,7 +3558,15 @@ fn write_patch_in_place(
                     if identity.publication_id.as_deref() == Some(meta.publication_id.as_str()) =>
                 {
                     tracing::warn!("{message}; the patch is committed all the same");
-                    Ok((patch.modules(), pause))
+                    Ok(PatchApplication {
+                        modules: patch.modules(),
+                        reprojected: patch.reprojected_modules(),
+                        generation: meta.revision,
+                        fingerprint: meta.fingerprint,
+                        force_stale,
+                        observed_through: None,
+                        pause,
+                    })
                 }
                 Ok(Some(identity)) if identity.publication_id.as_deref() == base => {
                     graph.store.accept_rewritten_file(db_path, &pause);
@@ -2315,7 +3837,9 @@ struct PublishedBuild {
     generation: u64,
     files: usize,
     xml_files: usize,
-    fp_pre: crate::graph_db::GraphFp,
+    fingerprint: crate::graph_db::GraphFp,
+    /// A catch-up candidate proves hub events through this retained cursor frontier.
+    observed_through: Option<u64>,
     force_stale: bool,
     scan_roots: Vec<PathBuf>,
     /// The age of the build snapshot these roots were taken from, for the hub declaration:
@@ -2427,13 +3951,13 @@ impl ide::FusedChunkSink for FusedChunkWriter<'_> {
                 ctxs.push(row.graph_context.clone());
             }
 
-            for (abs, chunks, ctxs) in &groups {
+            for (abs, chunks, ctxs) in &mut groups {
                 // Graph paths use `/` even on Windows. A canonical Windows path can start
                 // with `\\?\`; turning that prefix into `//?/` makes it unreadable there.
                 #[cfg(windows)]
                 let disk_path = std::path::PathBuf::from(abs.replace('/', "\\"));
                 #[cfg(not(windows))]
-                let disk_path = std::path::PathBuf::from(abs);
+                let disk_path = std::path::PathBuf::from(abs.as_str());
                 // A module outside every registered root is not this index's business. With a table
                 // configured that means "under no declared root"; without one it means "outside the
                 // configuration", which is the prefix check this used to be — a separator boundary
@@ -2441,6 +3965,15 @@ impl ide::FusedChunkSink for FusedChunkWriter<'_> {
                 let Some(key) = self.key_of(&disk_path) else {
                     continue;
                 };
+                // Fused IDE rows also contain contexts for path-fallback methods, but the
+                // published MCP provider enriches only metadata-shaped module paths. Keep
+                // this persisted embedding context on that same store-key policy.
+                if chunks
+                    .iter()
+                    .all(|chunk| ide::method_id_for_path(&key.path, &chunk.name).is_none())
+                {
+                    ctxs.fill(None);
+                }
                 // The fused writer is one of the index-write paths, so the spelling it reached
                 // this module through is recorded beside the key: a removal arriving as that
                 // path finds it even when re-attribution cannot (github#192). Best effort —
@@ -2593,6 +4126,173 @@ mod vector_lifecycle_tests;
 mod tests {
 
     #[test]
+    fn run_load_finishes_the_journal_with_its_real_operation_error() {
+        use tracing_subscriber::prelude::*;
+
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor<'a>(&'a mut Vec<serde_json::Value>);
+                impl tracing::field::Visit for Visitor<'_> {
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "record" {
+                            self.0.push(serde_json::from_str(value).unwrap());
+                        }
+                    }
+                }
+                if event.metadata().target() == bsl_search::lifecycle::TARGET {
+                    event.record(&mut Visitor(&mut self.0.lock().unwrap()));
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        fs::write(root.join("bsl-analyzer.toml"), "[source\n").unwrap();
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        test_utils::with_subscriber(
+            tracing_subscriber::registry().with(Capture(records.clone())),
+            || graph.run_load(false),
+        );
+        let records = std::sync::Arc::try_unwrap(records).unwrap().into_inner().unwrap();
+        let terminal = records
+            .iter()
+            .find(|record| record["kind"] == "mutation_summary" && record["outcome"] == "failed")
+            .expect("the graph operation ends with the typed failure outcome");
+        let failure = records
+            .iter()
+            .find(|record| {
+                record["kind"] == "graph_operation"
+                    && record["graph"]["result"] == "operation_error"
+            })
+            .expect("the graph failure observation is present");
+        assert_eq!(terminal["operation_id"], failure["operation_id"]);
+        assert!(!records.iter().any(|record| {
+            record["kind"] == "mutation_summary" && record["outcome"] == "completed"
+        }));
+    }
+
+    #[test]
+    fn a_budget_backup_operation_error_with_new_hub_fact_keeps_the_old_publication() {
+        use tracing_subscriber::prelude::*;
+
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor<'a>(&'a mut Vec<serde_json::Value>);
+                impl tracing::field::Visit for Visitor<'_> {
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "record" {
+                            self.0.push(serde_json::from_str(value).unwrap());
+                        }
+                    }
+                }
+                if event.metadata().target() == bsl_search::lifecycle::TARGET {
+                    event.record(&mut Visitor(&mut self.0.lock().unwrap()));
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let hub = crate::graph::test_support::workspace_hub(root);
+        assert!(hub.wait_until_watching());
+        let initial = hub.seq();
+        let hook_hub = hub.clone();
+        let hook_root = root.to_path_buf();
+        let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_calls_for_hook = hook_calls.clone();
+        let deliver_fact = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deliver_fact_for_hook = deliver_fact.clone();
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
+        graph.set_backup_destination_hook_for_test(Arc::new(move |connection| {
+            hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            connection.pragma_update(None, "max_page_count", 1).unwrap();
+            if !deliver_fact_for_hook.swap(true, Ordering::SeqCst) {
+                let before = hook_hub.seq();
+                write(
+                    &hook_root,
+                    "CommonModules/Сервер/Ext/Module.bsl",
+                    "&НаСервере\nФункция Считать() Экспорт\nВозврат 3;\nКонецФункции",
+                );
+                crate::graph::test_support::wait_for_hub_seq_above(&hook_hub, before);
+            }
+        }));
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let db = graph.graph_db_path().unwrap();
+        let base = publication_base(&db).unwrap();
+        let full_builds = graph.full_builds_started.load(Ordering::SeqCst);
+        graph.inject_next_patch_budget_for_test();
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере\nФункция Считать() Экспорт\nВозврат 2;\nКонецФункции",
+        );
+        crate::graph::test_support::wait_for_hub_seq_above(&hub, initial);
+
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        test_utils::with_subscriber(
+            tracing_subscriber::registry().with(Capture(records.clone())),
+            || graph.run_load(true),
+        );
+        let records = std::sync::Arc::try_unwrap(records).unwrap().into_inner().unwrap();
+
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1, "the failed candidate is not retried");
+        assert_eq!(publication_base(&db).unwrap(), base);
+        assert_eq!(stored_revision(&db), 1);
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), full_builds);
+        let snapshot = graph.snapshot().expect("the old publication remains readable");
+        assert_eq!(snapshot.generation, 1);
+        drop(snapshot);
+
+        let terminal = records
+            .iter()
+            .find(|record| record["kind"] == "mutation_summary" && record["outcome"] == "failed")
+            .expect("the owning reload finishes as a failure");
+        let operation_error = records
+            .iter()
+            .find(|record| {
+                record["kind"] == "graph_operation"
+                    && record["graph"]["result"] == "operation_error"
+            })
+            .expect("the original SQLite error reaches the graph owner journal");
+        let sql_budget = records
+            .iter()
+            .find(|record| {
+                record["kind"] == "graph_operation"
+                    && record["graph"]["reason"] == "sql_budget"
+                    && record["graph"]["stage"] == "patch_sql"
+            })
+            .expect("the SQL budget has its own bounded journal observation");
+        assert_eq!(terminal["operation_id"], operation_error["operation_id"]);
+        assert_eq!(terminal["operation_id"], sql_budget["operation_id"]);
+        assert!(!records.iter().any(|record| {
+            record["kind"] == "graph_operation"
+                && record["graph"]["result"] == "started"
+                && record["graph"]["stage"] == "projection"
+        }));
+        hub.shutdown();
+    }
+
+    #[test]
     fn workspace_cache_scope_graph_candidate_drift_rolls_back_before_publish() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2623,9 +4323,17 @@ mod tests {
         let snapshot = crate::graph::ProjectSnapshot::load_excluding(root, &cache.exclusions(root));
         let pre = crate::graph::universe::ScannedUniverse::scan_project(&snapshot);
 
-        let error = build_and_publish_scanned_inner(root, &snapshot, &pre, 1, &graph, None)
-            .err()
-            .expect("scope drift during candidate build is terminal");
+        let error = build_and_publish_scanned_inner(
+            root,
+            &snapshot,
+            &pre,
+            1,
+            &graph,
+            None,
+            BuildCoherence::begin(&graph),
+        )
+        .err()
+        .expect("scope drift during candidate build is terminal");
         assert!(!matches!(error.reason, LoadFailureReason::TransientRefusal));
         assert!(!cache.graph_db_path().exists(), "the candidate was not renamed into the old leaf");
         assert!(!cache.graph_candidate_path().exists(), "the drifted candidate was rolled back");
@@ -2668,6 +4376,57 @@ mod tests {
     use std::fs;
     use std::time::{Duration, UNIX_EPOCH};
     use walkdir::WalkDir;
+
+    fn graph_projection(path: &Path) -> (Vec<String>, Vec<String>) {
+        let connection = Connection::open(path).unwrap();
+        let collect = |sql: &str, columns: usize| {
+            let mut statement = connection.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| {
+                            row.get::<_, rusqlite::types::Value>(index)
+                                .map(|value| format!("{value:?}"))
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|parts| parts.join("|"))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        (
+            collect(
+                "SELECT id,kind,name,qualified,module,file_root_id,file_path,name_offset,sig_end,src_start,src_end,dispatch,is_export,addressable FROM nodes ORDER BY id",
+                14,
+            ),
+            collect(
+                "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses",
+                8,
+            ),
+        )
+    }
+
+    fn build_cold_graph(root: &Path, out: &Path) {
+        let exclusions = crate::cache::WorkspaceCacheLayout::for_workspace(root).exclusions(root);
+        let project = crate::graph::ProjectSnapshot::load_excluding(root, &exclusions);
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        build_graph_database(
+            &project,
+            &universe,
+            out,
+            GRAPH_BUILD_BATCH,
+            &crate::graph_db::GraphMeta {
+                revision: 1,
+                fingerprint: crate::graph_db::GraphFp::default(),
+                files: 0,
+                built_at: "cold-test".to_owned(),
+                publication_id: "cold-test".to_owned(),
+            },
+        )
+        .unwrap();
+    }
 
     /// A copy of the published graph restamped as the next publication, for a stand that
     /// installs a replacement without building one.
@@ -3751,7 +5510,7 @@ mod tests {
             built.prepared,
             Published {
                 generation: 1,
-                fingerprint: built.fp_pre,
+                fingerprint: built.fingerprint,
                 stale: false,
                 reload: ReloadState::Idle,
                 force_stale: built.force_stale,
@@ -3879,8 +5638,9 @@ mod tests {
             "&НаСервере\nФункция Считать() Экспорт\nЗначение = 1;\nВозврат Значение;\nКонецФункции",
         );
         let module = root.join("CommonModules/Сервер/Ext/Module.bsl").canonicalize().unwrap();
-        let project = crate::graph::ProjectSnapshot::load(root);
-        let universe = crate::graph::universe::ScannedUniverse::scan(&project.scan_roots);
+        let exclusions = crate::cache::WorkspaceCacheLayout::for_workspace(root).exclusions(root);
+        let project = crate::graph::ProjectSnapshot::load_excluding(root, &exclusions);
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
         let fingerprint =
             crate::graph::scan::fingerprint_of_project(&universe.stats, &project).unwrap();
         let patch = crate::graph_db::compute_body_patch(
@@ -3976,7 +5736,10 @@ mod tests {
             false,
             &fixture.db,
             &fixture.plan,
+            fixture.graph.observation(),
+            crate::graph_db::PATCH_SQL_BUDGET,
             pause,
+            &mut None,
         ) else {
             panic!("a patch lost to a new owner was committed");
         };
@@ -3986,6 +5749,255 @@ mod tests {
         assert_eq!(stored_revision(&fixture.db), 1);
         assert_eq!(fs::read(&fixture.db).unwrap(), before, "nothing of the patch is left");
         newer.release();
+    }
+
+    #[test]
+    fn a_hub_event_between_post_scan_and_commit_catches_up_a_private_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let hub = crate::graph::test_support::workspace_hub(root);
+        assert!(hub.wait_until_watching());
+        let initial = hub.seq();
+        let barrier_hub = hub.clone();
+        let barrier_root = root.to_path_buf();
+        let graph = GraphState::for_workspace(root.to_path_buf())
+            .with_change_hub(hub.clone())
+            .with_patch_precommit_hook_for_test(Arc::new(move |graph| {
+                let observed = graph.observation();
+                assert_eq!(
+                    stored_revision(&graph.graph_db_path().unwrap()),
+                    1,
+                    "canonical readers keep the old publication while the candidate is prepared",
+                );
+                write(
+                    &barrier_root,
+                    "CommonModules/Сервер/Ext/Module.bsl",
+                    "&НаСервере\nФункция Считать() Экспорт\nВозврат 3;\nКонецФункции",
+                );
+                crate::graph::test_support::wait_for_hub_seq_above(&barrier_hub, observed);
+            }));
+        graph.ensure_loading();
+        wait_ready(&graph);
+        let db = graph.graph_db_path().unwrap();
+        let base = publication_base(&db).unwrap();
+        let full_builds = graph.full_builds_started.load(Ordering::SeqCst);
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере\nФункция Считать() Экспорт\nВозврат 2;\nКонецФункции",
+        );
+        crate::graph::test_support::wait_for_hub_seq_above(&hub, initial);
+
+        let outcome = graph.try_incremental_reload(root, 2, hub.seq());
+
+        match &outcome {
+            PublishAttemptOutcome::Published => {}
+            PublishAttemptOutcome::FallBack => {
+                panic!("precommit catch-up fell back instead of publishing the proven candidate")
+            }
+            PublishAttemptOutcome::Refused(error) => {
+                panic!("precommit catch-up was refused: {:?}: {}", error.reason, error.message)
+            }
+        }
+        assert_ne!(publication_base(&db).unwrap().as_deref(), base.as_deref());
+        assert_eq!(stored_revision(&db), 2);
+        let current_project =
+            crate::graph::ProjectSnapshot::load_excluding(root, &graph.cache_exclusions());
+        let current = crate::graph::universe::ScannedUniverse::scan_project(&current_project);
+        let current_fp =
+            super::super::scan::fingerprint_of_project(&current.stats, &current_project).unwrap();
+        let published = graph.snapshot().expect("the caught-up graph is published");
+        assert_eq!(published.fingerprint, current_fp);
+        assert_eq!(published.generation, 2);
+        assert_eq!(
+            lock_recover(&graph.inner).published.as_ref().unwrap().observed_through,
+            Some(graph.catchup_stats_for_test().2)
+        );
+        let cold = root.join("cold-precommit-catchup.db");
+        build_cold_graph(root, &cold);
+        assert_eq!(graph_projection(&db), graph_projection(&cold));
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), full_builds);
+        hub.shutdown();
+    }
+
+    #[test]
+    fn a_full_candidate_catches_up_an_aba_body_edit_before_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let hub = crate::graph::test_support::workspace_hub(root);
+        assert!(hub.wait_until_watching());
+        let edit_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let edit_once_for_hook = edit_once.clone();
+        let hook_hub = hub.clone();
+        let hook_root = root.to_path_buf();
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
+        graph.set_build_candidate_hook_for_test(Arc::new(move |graph| {
+            if edit_once_for_hook.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let before = graph.observation();
+            write(
+                &hook_root,
+                "CommonModules/Сервер/Ext/Module.bsl",
+                "&НаСервере\nФункция Считать() Экспорт\nВозврат 99;\nКонецФункции",
+            );
+            crate::graph::test_support::wait_for_hub_seq_above(&hook_hub, before);
+            let before_restore = graph.observation();
+            write(
+                &hook_root,
+                "CommonModules/Сервер/Ext/Module.bsl",
+                "&НаСервере\nФункция Считать() Экспорт КонецФункции",
+            );
+            crate::graph::test_support::wait_for_hub_seq_above(&hook_hub, before_restore);
+        }));
+        graph.ensure_loading();
+        wait_ready(&graph);
+
+        let cold = root.join("cold-full-straddle.db");
+        build_cold_graph(root, &cold);
+        let db = graph.graph_db_path().unwrap();
+        assert_eq!(graph_projection(&db), graph_projection(&cold));
+        let (passes, _, frontier) = graph.catchup_stats_for_test();
+        assert!(passes > 0, "the ABA delivery must enter candidate catch-up");
+        assert!(passes <= 2, "one bounded catch-up step uses at most two passes");
+        assert!(frontier > 0, "the caught-up publication records the delivered frontier");
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 1);
+        hub.shutdown();
+    }
+
+    #[test]
+    fn a_full_candidate_publishes_the_fingerprint_after_catch_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let hub = crate::graph::test_support::workspace_hub(root);
+        assert!(hub.wait_until_watching());
+        let hook_hub = hub.clone();
+        let hook_root = root.to_path_buf();
+        let edit_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let edit_once_for_hook = edit_once.clone();
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
+        graph.set_build_candidate_hook_for_test(Arc::new(move |graph| {
+            if edit_once_for_hook.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let before = graph.observation();
+            write(
+                &hook_root,
+                "CommonModules/Сервер/Ext/Module.bsl",
+                "&НаСервере\nФункция Считать() Экспорт\nВозврат 99;\nКонецФункции",
+            );
+            crate::graph::test_support::wait_for_hub_seq_above(&hook_hub, before);
+        }));
+        graph.ensure_loading();
+        wait_ready(&graph);
+
+        let project =
+            crate::graph::ProjectSnapshot::load_excluding(root, &graph.cache_exclusions());
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        let expected = super::super::scan::fingerprint_of_project(&universe.stats, &project)
+            .expect("the final source tree has a complete fingerprint");
+        let published = graph.snapshot().expect("the caught-up candidate is published");
+        assert_eq!(published.fingerprint, expected);
+        assert!(!published.force_stale);
+        assert_eq!(
+            lock_recover(&graph.inner).published.as_ref().unwrap().observed_through,
+            Some(graph.catchup_stats_for_test().2)
+        );
+        let cold = root.join("cold-full-catchup-final-fingerprint.db");
+        build_cold_graph(root, &cold);
+        assert_eq!(graph_projection(&graph.graph_db_path().unwrap()), graph_projection(&cold));
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 1);
+        hub.shutdown();
+    }
+
+    #[test]
+    fn an_incomplete_full_candidate_resumes_its_catchup_without_a_second_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let hub = crate::graph::test_support::workspace_hub(root);
+        assert!(hub.wait_until_watching());
+        let edit_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let edit_once_for_hook = edit_once.clone();
+        let hook_hub = hub.clone();
+        let hook_root = root.to_path_buf();
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
+        graph.yield_next_catchup_step_for_test();
+        graph.set_build_candidate_hook_for_test(Arc::new(move |graph| {
+            if edit_once_for_hook.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let before = graph.observation();
+            write(
+                &hook_root,
+                "CommonModules/Сервер/Ext/Module.bsl",
+                "&НаСервере\nФункция Считать() Экспорт\nВозврат 7;\nКонецФункции",
+            );
+            crate::graph::test_support::wait_for_hub_seq_above(&hook_hub, before);
+        }));
+
+        let failure = match build_and_publish_graph_file(root, 1, &graph, None) {
+            Ok(_) => panic!("the deterministic step boundary must leave a pending candidate"),
+            Err(error) => error,
+        };
+        assert_eq!(failure.reason, LoadFailureReason::TransientRefusal);
+        assert!(lock_recover(&graph.pending_candidate).is_some());
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 1);
+
+        let project =
+            crate::graph::ProjectSnapshot::load_excluding(root, &graph.cache_exclusions());
+        let candidate = graph.cache().unwrap().graph_candidate_path();
+        let passes_before_expired_step = graph.catchup_stats_for_test().0;
+        {
+            let mut pending = lock_recover(&graph.pending_candidate);
+            let pending = pending.as_mut().unwrap();
+            assert!(catch_up_straddled_candidate(
+                root,
+                &graph,
+                &candidate,
+                &project,
+                2,
+                None,
+                pending,
+                std::time::Instant::now() - std::time::Duration::from_millis(1),
+            )
+            .unwrap()
+            .is_none());
+        }
+        assert_eq!(graph.catchup_stats_for_test().0, passes_before_expired_step);
+        let resumed = resume_pending_full_candidate(root, &graph, &project, 2, None)
+            .unwrap()
+            .expect("the pending candidate resumes with its final stamp");
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        assert_eq!(
+            resumed.0,
+            super::super::scan::fingerprint_of_project(&universe.stats, &project).unwrap()
+        );
+        assert_eq!(resumed.1, graph.catchup_stats_for_test().2);
+        assert!(lock_recover(&graph.pending_candidate).is_none());
+        assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 1);
+        assert_eq!(graph.catchup_stats_for_test().1, 1, "one retained candidate was resumed");
+
+        let cold = root.join("cold-resumed-candidate.db");
+        build_cold_graph(root, &cold);
+        assert_eq!(graph_projection(&candidate), graph_projection(&cold));
+        assert!(matches!(
+            inspect_candidate(
+                &candidate,
+                None,
+                super::super::scan::fingerprint_of_project(
+                    &crate::graph::universe::ScannedUniverse::scan_project(&project).stats,
+                    &project,
+                )
+                .unwrap(),
+                true,
+            ),
+            CandidateState::Reusable { revision: 2, .. }
+        ));
+        hub.shutdown();
     }
 
     /// SQL that outlasts its budget is interrupted and rolled back, and the same plan doing it
@@ -4014,6 +6026,130 @@ mod tests {
         assert_eq!(fixture.graph.note_patch_overrun(&fixture.plan), 2);
         let other = PatchPlan { base: Some("elsewhere-1".into()), ..fixture.plan.clone() };
         assert_eq!(fixture.graph.note_patch_overrun(&other), 1, "another base starts again");
+    }
+
+    #[test]
+    fn a_budgeted_patch_is_applied_to_a_private_backup_without_a_full_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = patch_fixture(dir.path());
+        let full_builds = fixture.graph.full_builds_started.load(Ordering::SeqCst);
+        let super::super::snapshot::Pausing::Paused(pause) =
+            fixture.graph.store.pause_for_replacement(std::time::Duration::from_secs(1))
+        else {
+            panic!("the published graph is readable before the patch");
+        };
+
+        let application = write_patch_in_place(
+            &fixture.graph,
+            &fixture.project,
+            &fixture.universe,
+            &fixture.patch,
+            &fixture.meta,
+            false,
+            &fixture.db,
+            &fixture.plan,
+            fixture.graph.observation(),
+            std::time::Duration::ZERO,
+            pause,
+            &mut None,
+        )
+        .expect("a budget timeout continues on the private backup");
+
+        assert_eq!(application.modules, fixture.patch.modules());
+        assert_eq!(application.fingerprint, fixture.plan.target);
+        assert_eq!(
+            publication_base(&fixture.db).unwrap(),
+            Some(fixture.meta.publication_id.clone())
+        );
+        assert_eq!(stored_revision(&fixture.db), fixture.meta.revision);
+        assert_eq!(
+            fixture.graph.full_builds_started.load(Ordering::SeqCst),
+            full_builds,
+            "a SQL budget does not start a full projection",
+        );
+        let candidate = fixture.cache.graph_candidate_path();
+        assert!(!candidate.exists());
+        drop(application.pause);
+    }
+
+    #[test]
+    fn a_full_sqlite_candidate_preserves_the_good_publication_and_operation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = patch_fixture(dir.path());
+        let base = publication_base(&fixture.db).unwrap();
+        let before = fs::read(&fixture.db).unwrap();
+        fixture.graph.set_backup_destination_hook_for_test(Arc::new(|connection| {
+            connection.pragma_update(None, "max_page_count", 1).unwrap();
+        }));
+
+        let result = apply_patch_candidate(
+            &fixture.graph,
+            &fixture.project,
+            &fixture.universe,
+            &fixture.patch,
+            &fixture.meta,
+            &fixture.db,
+            &fixture.plan,
+            BuildCoherence { cursor: None, cutoff: fixture.graph.observation() },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("the one-page destination must reject the online backup"),
+            Err(error) => error,
+        };
+        assert_eq!(error.reason, LoadFailureReason::OperationError);
+        assert_eq!(publication_base(&fixture.db).unwrap(), base);
+        assert_eq!(stored_revision(&fixture.db), 1);
+        assert_eq!(fs::read(&fixture.db).unwrap(), before, "the old canonical bytes remain good");
+        let candidate = fixture.cache.graph_candidate_path();
+        assert!(candidate.exists(), "the failed private candidate is retained for owner cleanup");
+        let marker: CandidateMarker =
+            serde_json::from_slice(&fs::read(candidate_marker_path(&candidate)).unwrap()).unwrap();
+        assert!(!marker.complete, "a partial backup is never adoptable");
+    }
+
+    #[test]
+    fn an_expired_incremental_candidate_deadline_keeps_the_backup_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = patch_fixture(dir.path());
+        let base = publication_base(&fixture.db).unwrap();
+        let before = fs::read(&fixture.db).unwrap();
+        let before_projection = graph_projection(&fixture.db);
+        let full_builds = fixture.graph.full_builds_started.load(Ordering::SeqCst);
+
+        let result = apply_patch_candidate_inner(
+            &fixture.graph,
+            &fixture.project,
+            &fixture.universe,
+            &fixture.patch,
+            &fixture.meta,
+            &fixture.db,
+            &fixture.plan,
+            BuildCoherence { cursor: None, cutoff: fixture.graph.observation() },
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("an expired deadline must refuse the private candidate"),
+            Err(error) => error,
+        };
+        assert_eq!(error.reason, LoadFailureReason::TransientRefusal, "{error}");
+        assert!(error.message.contains("deadline during backup"), "{error}");
+        assert_eq!(publication_base(&fixture.db).unwrap(), base);
+        assert_eq!(stored_revision(&fixture.db), 1);
+        assert_eq!(fs::read(&fixture.db).unwrap(), before, "canonical database stays unchanged");
+        assert_eq!(graph_projection(&fixture.db), before_projection);
+        assert_eq!(
+            fixture.graph.full_builds_started.load(Ordering::SeqCst),
+            full_builds,
+            "a spent candidate budget does not start a full projection",
+        );
+
+        let candidate = fixture.cache.graph_candidate_path();
+        assert!(candidate.exists(), "the interrupted backup remains private for owner cleanup");
+        let marker: CandidateMarker =
+            serde_json::from_slice(&fs::read(candidate_marker_path(&candidate)).unwrap()).unwrap();
+        assert!(!marker.complete, "a timed-out backup cannot be installed or adopted");
     }
 
     /// Another process holding the file's write lock is waited for briefly, and then the patch
@@ -4685,9 +6821,9 @@ mod tests {
         );
     }
 
-    /// The straddle verdict is more than a fingerprint comparison: either
-    /// bracketing scan failing to cover the whole tree loses the coherence claim
-    /// even when the fingerprints match exactly.
+    /// Staleness is more than a fingerprint comparison: either bracketing scan
+    /// failing to cover the whole tree loses the freshness claim even when the
+    /// fingerprints match exactly.
     #[test]
     fn coherence_is_lost_to_an_unclean_scan_even_with_equal_fingerprints() {
         let fp = crate::graph_db::GraphFp::default();
@@ -4699,6 +6835,15 @@ mod tests {
             publish_force_stale(fp, fp, true, false),
             "a short post-scan with equal fingerprints is exactly what the comparison cannot see"
         );
+    }
+
+    #[test]
+    fn incomplete_coverage_without_observed_drift_is_not_a_build_straddle() {
+        let fp = crate::graph_db::GraphFp::default();
+        let moved = crate::graph_db::GraphFp { files: 1, ..Default::default() };
+        assert!(!build_candidate_observed_straddle(fp, fp, false));
+        assert!(build_candidate_observed_straddle(fp, moved, false));
+        assert!(build_candidate_observed_straddle(fp, fp, true));
     }
 
     /// Fresh adoption needs a clean scan behind the compared value: equality
@@ -4752,6 +6897,23 @@ mod tests {
             assert!(fresh.stale, "a force_stale build is served as stale");
             assert_eq!(fresh.reload, "none", "an unclean scan must not chase its own tail");
         }
+
+        // A supported edit in the visible tree remains usable while the unrelated subtree is
+        // unreadable. The replacement stays force_stale and its partial graph matches a cold
+        // projection of exactly the same visible workspace.
+        write(
+            root,
+            "CommonModules/Клиент/Ext/Module.bsl",
+            "&НаКлиенте\nПроцедура Главная() Экспорт\nСервер.Считать();\nСервер.Считать();\nКонецПроцедуры",
+        );
+        graph.run_load(false);
+        assert_eq!(meta_string(&graph_db_path(root), "force_stale"), "1");
+        let snapshot = graph.snapshot().expect("degraded graph remains available");
+        assert!(graph.freshness(&snapshot).stale, "partial coverage never becomes fresh");
+        drop(snapshot);
+        let cold = root.join("cold-partial-body-edit.db");
+        build_cold_graph(root, &cold);
+        assert_eq!(graph_projection(&graph_db_path(root)), graph_projection(&cold));
 
         // Once the tree heals, the SAME fingerprints plus a clean scan retire the
         // incoherent build with exactly one fresh rebuild.
@@ -4897,7 +7059,7 @@ mod tests {
         assert!(published.configuration().unwrap().ends_with("alias-a"));
         assert!(live.configuration().unwrap().ends_with("alias-b"));
         assert_eq!(
-            built.fp_pre,
+            built.fingerprint,
             crate::graph::scan::workspace_fingerprint(root),
             "the alias-only edit is deliberately invisible to GraphFp"
         );
@@ -6357,6 +8519,78 @@ mod tests {
             1,
             "a changed file is re-ingested back to a pending embedding"
         );
+    }
+
+    #[test]
+    fn fused_writer_persists_context_only_for_metadata_modules() {
+        use ide::FusedChunkSink;
+
+        for rooted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("workspace");
+            let metadata = source.join("CommonModules/Eligible/Ext/Module.bsl");
+            let epf = source.join("Ext/ObjectModule.bsl");
+            fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+            fs::create_dir_all(epf.parent().unwrap()).unwrap();
+            fs::write(&metadata, "Процедура MetadataMethod()\nКонецПроцедуры").unwrap();
+            fs::write(&epf, "Процедура EpfMethod()\nКонецПроцедуры").unwrap();
+
+            let db_path = dir.path().join("search.db");
+            let mut engine = bsl_search::SearchEngine::fts_only(&db_path).unwrap();
+            if rooted {
+                let (roots, rejected) = bsl_search::WorkspaceRoots::build(&source, &source, &[]);
+                assert!(rejected.is_empty());
+                engine.set_workspace_roots(roots);
+            }
+
+            let row = |path: &Path, symbol: &str, context: &str| ide::ChunkRow {
+                path: path.canonicalize().unwrap().to_string_lossy().replace('\\', "/"),
+                symbol: symbol.to_owned(),
+                kind: bsl_search::ChunkKind::Procedure,
+                is_export: false,
+                annotations: Vec::new(),
+                line_start: 1,
+                line_end: 2,
+                text: format!("Процедура {symbol}()\nКонецПроцедуры"),
+                graph_context: Some(context.to_owned()),
+            };
+            let rows = [
+                row(&metadata, "MetadataMethod", "metadata context"),
+                row(&epf, "EpfMethod", "path-fallback context"),
+            ];
+            {
+                let mut writer = FusedChunkWriter::new(
+                    &mut engine,
+                    source.clone(),
+                    crate::workspace_lease::WorkspaceLease::unmanaged(),
+                );
+                writer.emit_chunks(&rows).unwrap();
+            }
+
+            let connection = Connection::open(&db_path).unwrap();
+            let mut statement = connection
+                .prepare(
+                    "SELECT f.path,c.graph_context FROM chunks c JOIN files f ON f.id=c.file_id \
+                     ORDER BY f.path",
+                )
+                .unwrap();
+            let stored = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(stored.len(), 2, "rooted={rooted}");
+            let metadata_context = stored
+                .iter()
+                .find(|(path, _)| path.ends_with("CommonModules/Eligible/Ext/Module.bsl"))
+                .unwrap();
+            assert_eq!(metadata_context.1.as_deref(), Some("metadata context"), "rooted={rooted}");
+            let epf_context =
+                stored.iter().find(|(path, _)| path.ends_with("Ext/ObjectModule.bsl")).unwrap();
+            assert_eq!(epf_context.1, None, "rooted={rooted}");
+        }
     }
 
     /// The build parallelises per-module resolution within a batch. A batch holding

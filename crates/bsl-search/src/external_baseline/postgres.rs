@@ -4989,6 +4989,7 @@ mod tests {
                 crate::document::indexed_document_for_chunk(
                     &crate::FileKey::configuration(rel_path),
                     chunk,
+                    content,
                     None,
                 )
                 .0

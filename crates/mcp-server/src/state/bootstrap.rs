@@ -32,6 +32,11 @@ const EMBEDDING_PUBLISH_RETRY_BUDGET_ENV: &str = "EMBEDDING_PUBLISH_RETRY_BUDGET
 #[cfg(test)]
 static EMBEDDING_PUBLISH_RETRY_BUDGET_WARNINGS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+thread_local! {
+    static BOOT_GRAPH_RETRY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 type ReferenceInitError = (String, String, Option<EmbeddingFailure>);
 
@@ -738,6 +743,7 @@ impl SharedState {
         // knows whether this daemon owns the workspace's derived caches or is the superseded
         // generation of a pair that overlaps over them.
         let workspace_lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        workspace_lease.report_external_discovery(&project);
 
         // Said once, here, because this is the only point EVERY boot passes. The engine's own
         // initialization has early exits before it builds a table — an unreachable shared
@@ -835,16 +841,20 @@ impl SharedState {
             change_hub.clone(),
             source_dir.clone(),
             cache.clone(),
+            workspace_lease.clone(),
             owners.clone(),
             scope_transport_stop.clone(),
         );
 
-        // The overlay retry driver exists only where an Embed pass exists: Postgres mode
-        // with an embedder. It is created before the graph hook so a root transition can kick
-        // the SAME owner; no second warmup worker is introduced.
+        // The overlay retry driver owns missing vectors after point refreshes in either
+        // workspace mode, and owns the startup diff warmup in Postgres mode. It is created
+        // before the graph hook so a root transition can kick the SAME owner; no second
+        // warmup worker is introduced.
         let overlay_retry = if !workspace_lease.coordination_failed()
-            && matches!(workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay)
-        {
+            && matches!(
+                workspace_search_mode,
+                WorkspaceSearchMode::PostgresRemoteOverlay | WorkspaceSearchMode::SqliteLocal
+            ) {
             match Self::embedding_config_with_prefixes(Some(&embedding_prefixes)) {
                 Ok(Some(_)) => Some(super::overlay_retry::OverlayRetry::spawn(
                     Arc::clone(&search_engine),
@@ -1011,6 +1021,7 @@ impl SharedState {
         hub: WorkspaceChangeHub,
         root: PathBuf,
         cache: crate::cache::WorkspaceCacheLayout,
+        lease: crate::workspace_lease::WorkspaceLease,
         owners: super::OwnerStop,
         transport_stop: tokio_util::sync::CancellationToken,
     ) {
@@ -1042,6 +1053,7 @@ impl SharedState {
                         let still_same_scope = crate::project::at(&root)
                             .map_err(|error| error.to_string())
                             .and_then(|project| {
+                                lease.report_external_discovery(&project);
                                 cache.verify_project(&project).map_err(|error| error.to_string())
                             });
                         if let Err(error) = still_same_scope {
@@ -1153,6 +1165,7 @@ impl SharedState {
                     &lease,
                     &owners,
                     &embedding_prefixes,
+                    embedding_publish_retry_budget,
                 );
 
                 let mut init = match init {
@@ -1582,6 +1595,81 @@ impl SharedState {
             "invalid embedding publish retry budget; using default"
         );
         DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET
+    }
+
+    fn boot_graph_generation(
+        graph: &GraphState,
+        graph_project: &crate::graph::ProjectSnapshot,
+        lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
+        retry_budget: std::time::Duration,
+    ) -> Result<Option<u64>, bsl_search::SearchError> {
+        let deadline = std::time::Instant::now()
+            .checked_add(retry_budget)
+            .unwrap_or_else(std::time::Instant::now);
+        if stop.is_stopped()
+            || lease.is_released()
+            || lease.is_superseded()
+            || !lease.owns_caches_now()
+        {
+            return Ok(None);
+        }
+        if !graph.validate_workspace_scope() {
+            return Err(bsl_search::SearchError::Index(
+                "workspace cache scope changed before search preparation".to_owned(),
+            ));
+        }
+        let retry_eligible = matches!(graph.status(), crate::graph::GraphStatus::Loading)
+            && graph.graph_db_path().is_some_and(|path| path.is_file())
+            && graph.inspect_unpublished(|_| ()).is_ok();
+        loop {
+            if stop.is_stopped()
+                || lease.is_released()
+                || lease.is_superseded()
+                || !lease.owns_caches_now()
+            {
+                return Ok(None);
+            }
+            if !graph.validate_workspace_scope() {
+                return Err(bsl_search::SearchError::Index(
+                    "workspace cache scope changed before search preparation".to_owned(),
+                ));
+            }
+            let current = graph.store().read_if_available(None, |snapshot| {
+                crate::graph::scan::graph_matches_live_project_strict(
+                    &snapshot.graph,
+                    graph_project,
+                )
+                .then(|| snapshot.generation())
+            });
+            match current {
+                Ok(generation) => return Ok(generation),
+                Err(
+                    crate::graph::GraphReadError::Busy | crate::graph::GraphReadError::Unavailable,
+                ) if retry_eligible
+                    && matches!(graph.status(), crate::graph::GraphStatus::Loading)
+                    && std::time::Instant::now() < deadline =>
+                {
+                    #[cfg(test)]
+                    BOOT_GRAPH_RETRY_HOOK.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().take() {
+                            hook();
+                        }
+                    });
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let delay = remaining.min(std::time::Duration::from_millis(100));
+                    if stop.sleep(delay) {
+                        return Ok(None);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "graph database unavailable; embeddings without graph context: {error}"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
     }
 
     fn open_semantic_search_engine(
@@ -2034,6 +2122,7 @@ impl SharedState {
         lease: &crate::workspace_lease::WorkspaceLease,
         stop: &super::OwnerStop,
         embedding_prefixes: &super::types::EmbeddingPrefixes,
+        graph_retry_budget: std::time::Duration,
     ) -> Result<Option<WorkspaceSearchInit>, bsl_search::SearchError> {
         // The graph carries the resolved cache layout, so this pass reads the tree
         // through the same holes the watch does — the cache and the service directories
@@ -2356,28 +2445,28 @@ impl SharedState {
         // already built; if absent (still building) the embeddings are graph-free this
         // run and pick up context on a later reindex.
         if engine.has_semantic() {
-            // Load the project snapshot once and keep its roots paired with the graph
-            // validation below. Loading topology and roots separately leaves a window in
-            // which a config/root move can make the provider read a different generation
-            // from the one that passed the check.
+            // Keep the validated roots paired with the project comparison through a retry;
+            // loading a second snapshot after the graph read can select another composition.
             let graph_project =
                 crate::graph::ProjectSnapshot::load_excluding(workspace_root, &excluded);
-            let current =
-                graph.store().read(None, crate::graph::BACKGROUND_READ_WAIT, |snapshot| {
-                    crate::graph::scan::graph_matches_live_project_strict(
-                        &snapshot.graph,
-                        &graph_project,
-                    )
-                    .then(|| snapshot.generation())
-                });
+            let current = Self::boot_graph_generation(
+                graph,
+                &graph_project,
+                lease,
+                stop,
+                graph_retry_budget,
+            )?;
+            if stop.is_stopped() || lease.is_released() || lease.is_superseded() {
+                return Ok(None);
+            }
             match current {
-                Ok(None) => {
+                None => {
                     tracing::warn!(
                         "graph database is not current for the live project; \
                          embeddings without graph context"
                     );
                 }
-                Ok(Some(generation)) => {
+                Some(generation) => {
                     engine.set_graph_context_provider(Arc::new(
                         crate::graph_query::GraphDbContextProvider::new(
                             graph.store().clone(),
@@ -2387,11 +2476,6 @@ impl SharedState {
                         ),
                     ));
                     tracing::info!("graph-enriched embeddings enabled");
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "graph database unavailable; embeddings without graph context: {e}"
-                    );
                 }
             }
         }
@@ -2554,6 +2638,7 @@ impl SharedState {
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &super::OwnerStop::default(),
             &super::types::EmbeddingPrefixes::default(),
+            Self::embedding_publish_retry_budget(),
         )
         .ok()
         .flatten()
@@ -2774,7 +2859,7 @@ mod tests {
     use super::super::test_support::{env_lock, write_common_module_tree, EnvVarGuard};
     use super::{
         DiagnosticsState, EmbedFlight, GraphState, OverlayInit, SemanticRuntimeStatus, SharedState,
-        WorkspaceSearchMode, DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+        WorkspaceSearchMode, BOOT_GRAPH_RETRY_HOOK, DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         EMBEDDING_PUBLISH_RETRY_BUDGET_ENV, EMBEDDING_PUBLISH_RETRY_BUDGET_WARNINGS,
     };
     use crate::baseline::{
@@ -5059,6 +5144,7 @@ mod tests {
             hub.clone(),
             root.clone(),
             cache,
+            crate::workspace_lease::WorkspaceLease::unmanaged(),
             owners.clone(),
             transport_stop.clone(),
         );
@@ -5149,6 +5235,7 @@ mod tests {
             hub.clone(),
             root.clone(),
             old_cache.clone(),
+            crate::workspace_lease::WorkspaceLease::unmanaged(),
             owners.clone(),
             transport_stop.clone(),
         );
@@ -5189,6 +5276,7 @@ mod tests {
             reverse_hub.clone(),
             root.clone(),
             new_cache.clone(),
+            crate::workspace_lease::WorkspaceLease::unmanaged(),
             reverse_owners.clone(),
             reverse_stop.clone(),
         );
@@ -5227,6 +5315,7 @@ mod tests {
             explicit_hub.clone(),
             root.clone(),
             legacy_cache.clone(),
+            crate::workspace_lease::WorkspaceLease::unmanaged(),
             explicit_owners.clone(),
             explicit_stop.clone(),
         );
@@ -5262,6 +5351,7 @@ mod tests {
             data_separation_hub.clone(),
             root.clone(),
             info_base_cache.clone(),
+            crate::workspace_lease::WorkspaceLease::unmanaged(),
             data_separation_owners.clone(),
             data_separation_stop.clone(),
         );
@@ -5663,6 +5753,168 @@ mod tests {
             "the prime must serve the while-down edit that no watcher event covered",
         );
     }
+
+    #[test]
+    fn warm_semantic_boot_does_not_embed_reindexed_chunks_without_ready_graph() {
+        use super::super::test_support::spawn_mock_embedding_server;
+
+        let _env_lock = env_lock();
+        let server = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
+        let _url = EnvVarGuard::set("EMBEDDING_URL", &server);
+        let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _dimension = EnvVarGuard::set("EMBEDDING_DIM", "3");
+
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        fs::write(
+            workspace.join("Configuration.xml"),
+            "<Configuration><Name>Конфа</Name></Configuration>",
+        )
+        .unwrap();
+        write_common_module_tree(
+            &workspace,
+            "Сервер",
+            "&НаСервере\nФункция КэшированнаяЦель() Экспорт\n Возврат 1;\nКонецФункции\n\
+             &НаСервере\nФункция КэшированныйВызов() Экспорт\n Возврат КэшированнаяЦель();\nКонецФункции\n",
+        );
+
+        let cached_graph = GraphState::for_workspace(workspace.clone());
+        cached_graph.ensure_loading();
+        wait_until_graph_ready(&cached_graph);
+        let cold = SharedState::init_workspace_search_engine_unmanaged(
+            &workspace,
+            None,
+            WorkspaceSearchMode::SqliteLocal,
+            None,
+            &cached_graph,
+        )
+        .expect("the ready graph enriches the initial semantic index");
+        let rich_documents = cold.engine.load_indexed_documents(Some("code")).unwrap();
+        assert!(!rich_documents.is_empty());
+        assert!(
+            rich_documents.iter().all(|document| document.graph_context.is_some()),
+            "the seed payloads must carry the ready graph context"
+        );
+        let initial_pending = cold.pending_embed.as_ref().expect("cold chunks need vectors");
+        bsl_search::SearchEngine::embed_pending_chunks_standalone(
+            &crate::cache::search_db_path(&workspace),
+            &initial_pending.config,
+            None,
+            None,
+        )
+        .unwrap();
+        let seeded_vectors = cold.engine.embedding_count_by_collection("code").unwrap();
+        assert!(seeded_vectors > 0, "the rich payload vectors must be stored first");
+        cold.engine.clear_file_hashes("code").unwrap();
+        drop(cold);
+
+        // The warm boot owns the same cache, but its graph build is held before the
+        // standalone initializer examines cleared hashes. No wall-clock timing controls
+        // which graph state the indexer observes.
+        let (warm_graph, _held_build) = crate::graph::test_support::holding_the_first_build(|| {
+            let graph = GraphState::for_workspace(workspace.clone());
+            crate::graph::test_support::hold_the_first_build(&graph);
+            graph
+        });
+        warm_graph.ensure_loading();
+        let warm_project = crate::graph::ProjectSnapshot::load_excluding(&workspace, &[]);
+        let warm_lease = crate::workspace_lease::WorkspaceLease::unmanaged();
+        assert_eq!(
+            SharedState::boot_graph_generation(
+                &warm_graph,
+                &warm_project,
+                &warm_lease,
+                &super::super::OwnerStop::default(),
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+            None,
+            "an exhausted startup retry budget must use the existing no-context fallback"
+        );
+        let stopped = super::super::OwnerStop::default();
+        stopped.stop();
+        assert_eq!(
+            SharedState::boot_graph_generation(
+                &warm_graph,
+                &warm_project,
+                &warm_lease,
+                &stopped,
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+            None,
+            "a stopped owner must not wait for the graph"
+        );
+        let released_lease = crate::workspace_lease::WorkspaceLease::unmanaged();
+        released_lease.release();
+        assert_eq!(
+            SharedState::boot_graph_generation(
+                &warm_graph,
+                &warm_project,
+                &released_lease,
+                &super::super::OwnerStop::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+            None,
+            "a released workspace lease must not wait for the graph"
+        );
+        let idle_root = tempdir().unwrap();
+        fs::write(
+            idle_root.path().join("Configuration.xml"),
+            "<Configuration><Name>ПустойГраф</Name></Configuration>",
+        )
+        .unwrap();
+        write_common_module_tree(
+            idle_root.path(),
+            "Сервер",
+            "&НаСервере\nФункция БезГрафа() Экспорт Возврат 1; КонецФункции\n",
+        );
+        let idle_graph = GraphState::for_workspace(idle_root.path().to_path_buf());
+        let idle_project = crate::graph::ProjectSnapshot::load_excluding(idle_root.path(), &[]);
+        assert!(matches!(idle_graph.status(), crate::graph::GraphStatus::Idle));
+        assert_eq!(
+            SharedState::boot_graph_generation(
+                &idle_graph,
+                &idle_project,
+                &crate::workspace_lease::WorkspaceLease::unmanaged(),
+                &super::super::OwnerStop::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+            None,
+            "an idle graph without a database must retain immediate fallback"
+        );
+        let held_build = Arc::new(Mutex::new(Some(_held_build)));
+        let released_graph = warm_graph.clone();
+        BOOT_GRAPH_RETRY_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                drop(held_build.lock().unwrap().take());
+                released_graph.ensure_loading();
+            }));
+        });
+        let warm = SharedState::init_workspace_search_engine_unmanaged(
+            &workspace,
+            None,
+            WorkspaceSearchMode::SqliteLocal,
+            None,
+            &warm_graph,
+        )
+        .expect("warm semantic init should remain available while graph build is held");
+        wait_until_graph_ready(&warm_graph);
+        let warm_documents = warm.engine.load_indexed_documents(Some("code")).unwrap();
+        let lost_contexts =
+            warm_documents.iter().filter(|document| document.graph_context.is_none()).count();
+        let warm_vectors = warm.engine.embedding_count_by_collection("code").unwrap();
+        assert!(
+            lost_contexts == 0 && warm_vectors == seeded_vectors,
+            "warm boot dropped context from {lost_contexts} of {} cached rich documents, has {warm_vectors} vectors versus {seeded_vectors} before reindex, pending={}",
+            warm_documents.len(),
+            warm.pending_embed.is_some(),
+        );
+    }
+
     /// Deleted-while-down through the REAL init path on the STANDALONE (deferred-embedding) branch,
     /// a Clean branch: a semantic engine indexes two modules, the daemon stops, one module is
     /// deleted on disk, and a re-boot re-runs the deferred index — which only re-ingests files that
@@ -5792,6 +6044,7 @@ mod tests {
                 &crate::workspace_lease::WorkspaceLease::unmanaged(),
                 &super::super::OwnerStop::default(),
                 prefixes,
+                SharedState::embedding_publish_retry_budget(),
             )
             .unwrap()
             .unwrap()

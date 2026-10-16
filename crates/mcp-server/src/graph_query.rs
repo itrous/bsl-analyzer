@@ -24,6 +24,12 @@ use crate::graph_db::SCHEMA_VERSION;
 use crate::tools::location as loc;
 use bsl_search::FileKey;
 
+#[cfg(test)]
+thread_local! {
+    static GRAPH_CONTEXT_SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_CONTEXT_LINE_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A node as stored, before projection to a [`NodeRef`].
 struct StoredNode {
     id: String,
@@ -129,7 +135,13 @@ impl<'a> NodeText<'a> {
         let file = self.file?;
         let roots = self.roots?;
         let path = roots.resolve(file)?;
-        self.read.get_or_insert_with(|| std::fs::read_to_string(path).ok()).as_deref()
+        self.read
+            .get_or_insert_with(|| {
+                #[cfg(test)]
+                GRAPH_CONTEXT_SOURCE_READS.with(|count| count.set(count.get() + 1));
+                std::fs::read_to_string(path).ok()
+            })
+            .as_deref()
     }
 }
 
@@ -1011,6 +1023,8 @@ impl GraphDb {
 
         let declared_end = declaration_end_confirmed(text, src_start, src_end);
 
+        #[cfg(test)]
+        GRAPH_CONTEXT_LINE_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
         let index = line_index::LineIndex::new(text);
         let name = index
             .utf16_line_col_range(
@@ -1478,10 +1492,61 @@ impl GraphDb {
             Some(n) if n.kind == "method" => n,
             _ => return Ok(None),
         };
-        // Not serialized as a node: this projection feeds a text renderer for embedding
-        // enrichment, so it needs no place and takes no table.
-        let nref = self.node_ref(&node, GraphDetail::Signatures, roots);
+        // Context enrichment needs a signature, not the node's location projection.
+        let signature = Self::signature_from_roots(&node, roots);
+        self.render_graph_context(id, &node, signature)
+    }
 
+    fn graph_context_with_source(
+        &self,
+        id: &str,
+        source_key: &FileKey,
+        source: &str,
+        roots: Option<&bsl_search::WorkspaceRoots>,
+    ) -> anyhow::Result<Option<String>> {
+        let node = match self.fetch_node(id)? {
+            Some(n) if n.kind == "method" => n,
+            _ => return Ok(None),
+        };
+        let source_matches_node = node.file.as_ref() == Some(source_key)
+            && roots.is_some_and(|roots| roots.resolve(source_key).is_some());
+        let signature = if source_matches_node {
+            Self::signature_from_source(&node, source)
+        } else {
+            Self::signature_from_roots(&node, roots)
+        };
+        self.render_graph_context(id, &node, signature)
+    }
+
+    fn signature_from_roots(
+        node: &StoredNode,
+        roots: Option<&bsl_search::WorkspaceRoots>,
+    ) -> Option<String> {
+        let (Some(file), Some(roots), Some((name_offset, sig_end))) =
+            (node.file.as_ref(), roots, node.name_offset.zip(node.sig_end))
+        else {
+            return None;
+        };
+        let path = roots.resolve(file)?;
+        #[cfg(test)]
+        GRAPH_CONTEXT_SOURCE_READS.with(|count| count.set(count.get() + 1));
+        let source = std::fs::read_to_string(path).ok()?;
+        signature_in(&source, name_offset, sig_end)
+    }
+
+    fn signature_from_source(node: &StoredNode, source: &str) -> Option<String> {
+        let (Some(name_offset), Some(sig_end)) = (node.name_offset, node.sig_end) else {
+            return None;
+        };
+        signature_in(source, name_offset, sig_end)
+    }
+
+    fn render_graph_context(
+        &self,
+        id: &str,
+        node: &StoredNode,
+        signature: Option<String>,
+    ) -> anyhow::Result<Option<String>> {
         // Mirror the in-memory renderer's facts exactly by EDGE kind, not just target
         // kind: calls come only from `call` edges, reads only from a method's
         // metadata-touch edges (`manager_*` / `query_ref`). A method never has
@@ -1514,7 +1579,8 @@ impl GraphDb {
         reads.sort();
         reads.dedup();
 
-        let ctx = GraphContext { dispatch: nref.dispatch, signature: nref.signature, calls, reads };
+        let ctx =
+            GraphContext { dispatch: dispatch_labels(&node.dispatch), signature, calls, reads };
         Ok(Some(ctx.render()))
     }
 
@@ -1712,8 +1778,31 @@ impl bsl_search::GraphContextProvider for GraphDbContextProvider {
         // retries on the next publish, rather than clearing the mark against a render that
         // never ran or ran against another publication's roots.
         self.store
-            .read(Some(self.generation), crate::graph::BACKGROUND_READ_WAIT, |snapshot| {
+            .read_if_available(Some(self.generation), |snapshot| {
                 snapshot.graph.graph_context(&id, self.roots.as_ref())
+            })
+            .map_err(|e| bsl_search::GraphContextError(e.to_string()))?
+            .map_err(|e| bsl_search::GraphContextError(e.to_string()))
+    }
+
+    fn try_graph_context_with_source(
+        &self,
+        source_key: &FileKey,
+        symbol_name: &str,
+        _kind: &str,
+        source: &str,
+    ) -> Result<Option<String>, bsl_search::GraphContextError> {
+        let Some(id) = ide::method_id_for_path(&source_key.path, symbol_name) else {
+            return Ok(None);
+        };
+        self.store
+            .read_if_available(Some(self.generation), |snapshot| {
+                snapshot.graph.graph_context_with_source(
+                    &id,
+                    source_key,
+                    source,
+                    self.roots.as_ref(),
+                )
             })
             .map_err(|e| bsl_search::GraphContextError(e.to_string()))?
             .map_err(|e| bsl_search::GraphContextError(e.to_string()))
@@ -1796,7 +1885,10 @@ fn clamp_source(src: String, max_chars: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{edge_kind, method_id_range, node_category, provenance, GraphDb, GraphNameSource};
+    use super::{
+        edge_kind, method_id_range, node_category, provenance, GraphDb, GraphNameSource,
+        GRAPH_CONTEXT_LINE_INDEX_BUILDS, GRAPH_CONTEXT_SOURCE_READS,
+    };
     use crate::graph_db::{GraphDbWriter, GraphMeta};
     use rusqlite::{params, Connection};
 
@@ -1825,6 +1917,106 @@ mod tests {
 
         // Then: a graph from the prior projection schema is rejected for rebuilding.
         assert!(result.is_err(), "prior projection graphs must be rebuilt");
+    }
+
+    #[test]
+    fn graph_context_does_not_build_method_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = "CommonModules/Контракт/Ext/Module.bsl";
+        let source = "Процедура Метод() Экспорт\nКонецПроцедуры\n";
+        let source_path = dir.path().join(module);
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, source).unwrap();
+
+        let roots = bsl_search::WorkspaceRoots::build(dir.path(), dir.path(), &[]).0;
+        let db_path = dir.path().join("bsl-graph.db");
+        let mut writer = GraphDbWriter::create(&db_path).unwrap();
+        writer.set_workspace_roots(Some(&roots));
+        writer
+            .write_nodes(&[ide::graph_index::NodeRow {
+                id: "method/common/Контракт/Метод".to_owned(),
+                kind: "method",
+                name: "Метод".to_owned(),
+                qualified: "ОбщийМодуль.Контракт.Метод".to_owned(),
+                module: Some("ОбщийМодуль.Контракт".to_owned()),
+                file: Some(module.to_owned()),
+                name_offset: Some(source.find("Метод").unwrap() as u32),
+                sig_end: Some(source.find('\n').unwrap() as u32),
+                src_start: Some(source.find("Процедура").unwrap() as u32),
+                src_end: Some(
+                    (source.find("КонецПроцедуры").unwrap() + "КонецПроцедуры".len()) as u32,
+                ),
+                dispatch: vec!["server"],
+                is_export: Some(true),
+                addressable: true,
+            }])
+            .unwrap();
+        writer
+            .finalize(&GraphMeta {
+                revision: 1,
+                fingerprint: crate::graph_db::GraphFp::default(),
+                files: 1,
+                built_at: "test".to_owned(),
+                publication_id: "graph-context-location-test".to_owned(),
+            })
+            .unwrap();
+
+        let graph = GraphDb::open(&db_path).unwrap();
+        GRAPH_CONTEXT_SOURCE_READS.with(|count| count.set(0));
+        GRAPH_CONTEXT_LINE_INDEX_BUILDS.with(|count| count.set(0));
+        let context =
+            graph.graph_context("method/common/Контракт/Метод", Some(&roots)).unwrap().unwrap();
+
+        assert!(context.contains("Signature: Процедура Метод() Экспорт"), "{context}");
+        GRAPH_CONTEXT_SOURCE_READS.with(|count| {
+            assert_eq!(count.get(), 1, "graph context reads source once for the signature")
+        });
+        GRAPH_CONTEXT_LINE_INDEX_BUILDS.with(|count| {
+            assert_eq!(count.get(), 0, "graph context does not return location ranges")
+        });
+
+        let source_key = roots.key_of_path(&source_path).unwrap();
+        let supplied_source = source.replace("Метод", "Иноее");
+        GRAPH_CONTEXT_SOURCE_READS.with(|count| count.set(0));
+        let supplied = graph
+            .graph_context_with_source(
+                "method/common/Контракт/Метод",
+                &source_key,
+                &supplied_source,
+                Some(&roots),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(supplied.contains("Signature: Процедура Иноее() Экспорт"), "{supplied}");
+        GRAPH_CONTEXT_SOURCE_READS.with(|count| {
+            assert_eq!(count.get(), 0, "the matching source key uses the supplied full text")
+        });
+
+        let other_root_key = bsl_search::FileKey::new("other-root", module);
+        GRAPH_CONTEXT_SOURCE_READS.with(|count| count.set(0));
+        let mismatched = graph
+            .graph_context_with_source(
+                "method/common/Контракт/Метод",
+                &other_root_key,
+                &supplied_source,
+                Some(&roots),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(mismatched.contains("Signature: Процедура Метод() Экспорт"), "{mismatched}");
+        GRAPH_CONTEXT_SOURCE_READS
+            .with(|count| assert_eq!(count.get(), 1, "another root must use the stored file key"));
+
+        let rootless = graph
+            .graph_context_with_source(
+                "method/common/Контракт/Метод",
+                &source_key,
+                &supplied_source,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!rootless.contains("Signature:"), "{rootless}");
     }
 
     /// A database that cannot say which publication it holds is not stamped with an invented

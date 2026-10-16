@@ -78,6 +78,7 @@ pub fn semantic_key_from_parts(
 pub(crate) fn indexed_document_for_chunk(
     key: &FileKey,
     chunk: &Chunk,
+    source: &str,
     provider: Option<&dyn GraphContextProvider>,
 ) -> (IndexedDocument, bool) {
     let kind = chunk.kind.label();
@@ -86,7 +87,7 @@ pub(crate) fn indexed_document_for_chunk(
         // which is the path relative to its own root — an extension repeats that
         // shape, so the root-relative spelling is the one to hand over.
         (ChunkKind::Procedure | ChunkKind::Function, Some(provider)) => {
-            match provider.try_graph_context(&key.path, &chunk.name, kind) {
+            match provider.try_graph_context_with_source(key, &chunk.name, kind, source) {
                 Ok(context) => (context, false),
                 Err(error) => {
                     tracing::debug!(
@@ -149,7 +150,12 @@ pub(crate) fn prepare_file_documents_owing(
         |chunk| {
             Ok(match (chunk.kind, provider) {
                 (ChunkKind::Procedure | ChunkKind::Function, Some(provider)) => {
-                    match provider.try_graph_context(&key.path, &chunk.name, chunk.kind.label()) {
+                    match provider.try_graph_context_with_source(
+                        key,
+                        &chunk.name,
+                        chunk.kind.label(),
+                        source,
+                    ) {
                         Ok(context) => context,
                         Err(error) => {
                             tracing::debug!(
@@ -329,7 +335,7 @@ pub(crate) fn prepare_indexed_documents(
     let documents = Chunker::chunk(source)
         .iter()
         .map(|chunk| {
-            let (document, failed) = indexed_document_for_chunk(key, chunk, provider);
+            let (document, failed) = indexed_document_for_chunk(key, chunk, source, provider);
             context_failed |= failed;
             document
         })
@@ -498,7 +504,8 @@ mod tests {
 
         // A method chunk gets the provider's context, folded into the embed text.
         let method = chunk(ChunkKind::Procedure, "Делать", "Процедура Делать() КонецПроцедуры");
-        let (doc, failed) = indexed_document_for_chunk(&path, &method, Some(&provider));
+        let (doc, failed) =
+            indexed_document_for_chunk(&path, &method, &method.text, Some(&provider));
         assert!(!failed);
         assert!(doc.graph_context.as_deref().unwrap().contains("Dispatch: server"));
         let embed = semantic_text_for_indexed_document(&doc);
@@ -509,12 +516,13 @@ mod tests {
         let (header, _) = indexed_document_for_chunk(
             &path,
             &chunk(ChunkKind::ModuleHeader, "", "Перем А;"),
+            "Перем А;",
             Some(&provider),
         );
         assert_eq!(header.graph_context, None);
 
         // No provider → no context.
-        let (plain, failed) = indexed_document_for_chunk(&path, &method, None);
+        let (plain, failed) = indexed_document_for_chunk(&path, &method, &method.text, None);
         assert_eq!(plain.graph_context, None);
         assert!(!failed, "no provider is no context, not a failed one");
     }
@@ -539,12 +547,13 @@ mod tests {
         }
         let path = FileKey::configuration("CommonModules/Сервер/Ext/Module.bsl");
         let method = chunk(ChunkKind::Procedure, "Делать", "Процедура Делать() КонецПроцедуры");
-        let (doc, failed) = indexed_document_for_chunk(&path, &method, Some(&Unreadable));
+        let (doc, failed) =
+            indexed_document_for_chunk(&path, &method, &method.text, Some(&Unreadable));
         assert_eq!(doc.graph_context, None);
         assert!(failed);
         let header = chunk(ChunkKind::ModuleHeader, "", "Перем А;");
         assert!(
-            !indexed_document_for_chunk(&path, &header, Some(&Unreadable)).1,
+            !indexed_document_for_chunk(&path, &header, &header.text, Some(&Unreadable)).1,
             "a header is never rendered, so it owes nothing"
         );
     }

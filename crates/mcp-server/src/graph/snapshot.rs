@@ -333,6 +333,19 @@ impl GraphStore {
         Ok(op(&snapshot))
     }
 
+    /// Run a background consumer's read only when a handle is immediately available. Context
+    /// renders call this while holding the shared search-engine lock; waiting on replacement
+    /// admission there would multiply one bounded delay by every dirty method in the batch.
+    pub(crate) fn read_if_available<R>(
+        &self,
+        expected: Option<u64>,
+        op: impl FnOnce(&GraphSnapshot) -> R,
+    ) -> Result<R, GraphReadError> {
+        let snapshot =
+            self.checkout_with_admission_wait(expected, Duration::ZERO, Duration::ZERO)?;
+        Ok(op(&snapshot))
+    }
+
     /// The installed generation and whether it reads as stale. Never waits: a pool busy with a
     /// checkout answers `None`.
     pub(crate) fn status(&self) -> Option<GraphStoreStatus> {
@@ -363,6 +376,15 @@ impl GraphStore {
         expected: Option<u64>,
         wait: Duration,
     ) -> Result<GraphSnapshot, GraphReadError> {
+        self.checkout_with_admission_wait(expected, wait, wait.max(ADMISSION_WAIT))
+    }
+
+    fn checkout_with_admission_wait(
+        &self,
+        expected: Option<u64>,
+        handle_wait: Duration,
+        admission_wait: Duration,
+    ) -> Result<GraphSnapshot, GraphReadError> {
         #[cfg(test)]
         SNAPSHOT_CHECKOUT_HOOK.with(|slot| {
             if let Some(hook) = slot.borrow_mut().take() {
@@ -370,8 +392,8 @@ impl GraphStore {
             }
         });
         let started = Instant::now();
-        let handle_deadline = started.checked_add(wait);
-        let admission_deadline = started.checked_add(wait.max(ADMISSION_WAIT));
+        let handle_deadline = started.checked_add(handle_wait);
+        let admission_deadline = started.checked_add(admission_wait);
         let mut pool = lock_recover(&self.shared.pool);
         loop {
             if pool.admission == Admission::Retired {
@@ -1001,7 +1023,7 @@ impl GraphState {
     /// Look at the database on disk before a publication of it is installed — whether a
     /// cached build can be served at all. The handle is closed before this returns, and it is
     /// the only open of the shared path outside the pool this graph prepares and serves.
-    pub(super) fn inspect_unpublished<R>(
+    pub(crate) fn inspect_unpublished<R>(
         &self,
         op: impl FnOnce(&GraphDb) -> R,
     ) -> anyhow::Result<R> {
@@ -2159,6 +2181,86 @@ mod tests {
         graph.register_owed_context_marks();
         assert_eq!(graph.owed_context_marks.load(Ordering::SeqCst), 0, "registered once");
         assert!(!graph.marks_pending(), "an observing publication consumes the marks at once");
+    }
+
+    /// Per-chunk context renders happen while the search engine is held. A replacement pause
+    /// must make each graph lookup fail promptly, rather than spending the background read
+    /// admission window again for every dirty chunk and keeping that engine lock across the
+    /// whole wait. Refused renders must still leave their graph mark owed for the next publish.
+    #[test]
+    fn graph_context_callbacks_do_not_wait_per_chunk_while_replacement_is_paused() {
+        use bsl_search::GraphContextProvider as _;
+        use std::sync::{mpsc, Mutex};
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bsl-graph.db");
+        let module_path = "CommonModules/Контракт/Ext/Module.bsl";
+        assert!(
+            ide::method_id_for_path(module_path, "Метод").is_some(),
+            "the fixture must reach the graph database read path",
+        );
+        crate::graph_db::GraphDbWriter::create(&path)
+            .unwrap()
+            .finalize(&crate::graph_db::GraphMeta {
+                revision: 1,
+                fingerprint: crate::graph_db::GraphFp::default(),
+                files: 0,
+                built_at: "test".to_owned(),
+                publication_id: "paused-read-test".to_owned(),
+            })
+            .unwrap();
+        let store = GraphStore::serving_file_for_test(&path, None).unwrap();
+        let graph = GraphState::disabled();
+        let provider = Arc::new(crate::graph_query::GraphDbContextProvider::new(
+            store.clone(),
+            1,
+            None,
+            Some(graph.owed_context_marks()),
+        ));
+        let pause = match store.pause_for_replacement(Duration::ZERO) {
+            Pausing::Paused(pause) => pause,
+            Pausing::ReadersBusy => panic!("the test graph has no readers to drain"),
+            Pausing::Retired => panic!("the test graph store was unexpectedly retired"),
+        };
+
+        let engine = Arc::new(Mutex::new(()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let worker = {
+            let engine = Arc::clone(&engine);
+            let provider = Arc::clone(&provider);
+            std::thread::spawn(move || {
+                // Production invokes these callbacks from one refresh while holding the shared
+                // SearchEngine mutex; keep that lock over all renders to reproduce its cost.
+                let _engine = engine.lock().unwrap();
+                entered_tx.send(()).unwrap();
+                let started = Instant::now();
+                for _ in 0..3 {
+                    let result = provider.try_graph_context(module_path, "Метод", "procedure");
+                    assert!(result.is_err(), "a paused publication must retain this render");
+                }
+                // SearchEngine reports the failed batch's mark while its lock is still held.
+                // The graph records it cheaply; the watcher registers it after this pass.
+                provider.context_marks_owed(7);
+                started.elapsed()
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the context refresh holds its engine lock before rendering");
+        let elapsed = worker.join().unwrap();
+        drop(pause);
+        graph.register_owed_context_marks();
+        assert!(graph.marks_pending(), "failed renders remain owed to the graph");
+        assert!(
+            provider.try_graph_context(module_path, "Метод", "procedure").is_ok(),
+            "an available matching publication serves the same context read",
+        );
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "three failed graph context renders held the search engine for {elapsed:?} while the graph was paused",
+        );
     }
 
     #[test]

@@ -140,9 +140,8 @@ pub struct GraphMeta {
     pub publication_id: String,
 }
 
-/// Full replacements of the graph database written by this process. A point patch writes into
-/// the published file in one transaction and copies nothing, so it never appears here: an audit
-/// sets these figures against the process's disk writes and the size of the database.
+/// Candidate graph databases materialized by this process, including online backups used by the
+/// bounded incremental path. The audit compares these bytes with process disk writes.
 static CANDIDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CANDIDATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -160,13 +159,12 @@ pub(crate) fn copy_audit() -> CopyAudit {
     CopyAudit { candidates: CANDIDATES.load(SeqCst), candidate_bytes: CANDIDATE_BYTES.load(SeqCst) }
 }
 
-/// Count a full replacement database written for installation. It is new content, not a copy
-/// of the published one.
+/// Count a candidate database materialized for installation.
 pub(crate) fn record_candidate(bytes: u64) {
     use std::sync::atomic::Ordering::SeqCst;
     let candidates = CANDIDATES.fetch_add(1, SeqCst) + 1;
     let total = CANDIDATE_BYTES.fetch_add(bytes, SeqCst) + bytes;
-    tracing::info!(bytes, candidates, total, "full graph replacement written");
+    tracing::info!(bytes, candidates, total, "graph candidate materialized");
 }
 
 /// Read the canonical method-call digest from an existing bounded-build SQLite graph.
@@ -2155,6 +2153,12 @@ fn write_body_patch(
             rows.filter_map(|r| r.ok()).map(|id| (id.to_lowercase(), id)).collect()
         };
 
+        // Keep the reverse index local to endpoints whose incoming edges this patch changes.
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS temp.affected_degree;
+             CREATE TEMP TABLE affected_degree (id TEXT PRIMARY KEY) WITHOUT ROWID;",
+        )?;
+
         // Drop each changed module's outgoing edges, method nodes, AND module-code
         // node. The module-code node is re-emitted by the reprojection only if the
         // module still has a module-level edge — matching a full rebuild, which emits
@@ -2165,6 +2169,14 @@ fn write_body_patch(
         // `mdo`/`form` from-endpoints — never method/module — and the form pass is
         // full-build-only, so the kind filter keeps reprojection from dropping form
         // structure it cannot re-emit.
+        tx.execute(
+            "INSERT OR IGNORE INTO affected_degree (id)
+             SELECT DISTINCT to_id FROM edges WHERE from_id IN
+             (SELECT n.id FROM nodes n JOIN changed_file_keys changed
+              ON changed.root_id = n.file_root_id AND changed.path = n.file_path
+              WHERE n.kind IN ('method', 'module'))",
+            [],
+        )?;
         tx.execute(
             "DELETE FROM edges WHERE from_id IN \
              (SELECT n.id FROM nodes n JOIN changed_file_keys changed \
@@ -2184,6 +2196,7 @@ fn write_body_patch(
         // Dropping all derived rows here makes the last-module transition exact and
         // lets a later first-module patch repopulate the complete projection.
         if *clear_graph {
+            tx.execute("INSERT OR IGNORE INTO affected_degree SELECT to_id FROM edges", [])?;
             tx.execute_batch("DELETE FROM edges; DELETE FROM nodes;")?;
         }
 
@@ -2220,6 +2233,22 @@ fn write_body_patch(
             // and cannot be reconstructed by the metadata-only projector. Drop incoming
             // edges only when the referenced owner node disappeared.
             tx.execute(
+                "INSERT OR IGNORE INTO affected_degree (id)
+                 SELECT DISTINCT edges.to_id FROM edges
+                 WHERE EXISTS (
+                    SELECT 1 FROM metadata_node_prefixes p
+                    WHERE edges.from_id = p.prefix OR substr(edges.from_id, 1, length(p.prefix) + 1) = p.prefix || '/'
+                 ) OR EXISTS (
+                    SELECT 1 FROM metadata_node_prefixes p
+                    WHERE (edges.to_id = p.prefix OR substr(edges.to_id, 1, length(p.prefix) + 1) = p.prefix || '/')
+                      AND (
+                        NOT EXISTS (SELECT 1 FROM metadata_current_nodes n WHERE n.id = edges.to_id)
+                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding')
+                      )
+                 )",
+                [],
+            )?;
+            tx.execute(
                 "DELETE FROM edges WHERE EXISTS (
                     SELECT 1 FROM metadata_node_prefixes p
                     WHERE edges.from_id = p.prefix OR substr(edges.from_id, 1, length(p.prefix) + 1) = p.prefix || '/'
@@ -2255,6 +2284,7 @@ fn write_body_patch(
         // Re-insert the edges, canonicalising aux `to_id`s the same way.
         for edge in &rows.edges {
             let to_id = canonicalize_aux_id(&existing_mdo, &edge.to_id);
+            tx.execute("INSERT OR IGNORE INTO affected_degree (id) VALUES (?1)", params![to_id])?;
             tx.prepare_cached(
                 "INSERT INTO edges \
                  (from_id, to_id, kind, provenance, call_start, call_end, call_absent, crosses) \
@@ -2286,13 +2316,10 @@ fn write_body_patch(
             [],
         )?;
 
-        // Recompute the whole in-degree table — a delta that forgot the deleted edges'
-        // old targets would leave stale degrees.
-        tx.execute("DELETE FROM in_degree", [])?;
-        tx.execute(
-            "INSERT INTO in_degree (id, degree) SELECT to_id, COUNT(*) FROM edges GROUP BY to_id",
-            [],
-        )?;
+        // Old and new edge targets include removed endpoints, metadata/form edges, and
+        // targets that survive through another caller.
+        tx.execute("DELETE FROM in_degree WHERE id IN (SELECT id FROM affected_degree)", [])?;
+        tx.execute(REFRESH_AFFECTED_IN_DEGREE, [])?;
 
         // Merge any casing variants the reprojection observed AMONG the changed
         // modules into the persisted set, so a future reload still refuses the fast
@@ -2506,6 +2533,14 @@ fn write_body_patch(
         unresolved_calls: rows.unresolved_calls.clone(),
     })
 }
+
+const REFRESH_AFFECTED_IN_DEGREE: &str = "INSERT INTO in_degree (id, degree)
+     SELECT id, degree FROM (
+         SELECT affected.id,
+                (SELECT COUNT(*) FROM edges WHERE edges.to_id = affected.id) AS degree
+         FROM affected_degree AS affected
+     )
+     WHERE degree > 0";
 
 /// A changed module's recomputed body-free profile: its signature hash plus the
 /// resolvable-name surface a caller-delta eligibility check needs — the lowercased
@@ -3066,6 +3101,80 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM in_degree WHERE id = 'a'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(a_rows, 0);
+    }
+
+    #[test]
+    fn affected_in_degree_refresh_seeks_only_indexed_targets() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE edges (from_id TEXT NOT NULL, to_id TEXT NOT NULL);
+             CREATE INDEX edges_to ON edges(to_id);
+             CREATE TABLE in_degree (id TEXT PRIMARY KEY, degree INTEGER NOT NULL) WITHOUT ROWID;
+             CREATE TEMP TABLE affected_degree (id TEXT PRIMARY KEY) WITHOUT ROWID;
+             INSERT INTO in_degree VALUES ('target-a', 99), ('target-b', 99), ('untouched', 7);
+             INSERT INTO affected_degree VALUES ('target-a'), ('target-b'), ('target-empty');",
+        )
+        .unwrap();
+        {
+            let transaction = conn.transaction().unwrap();
+            let mut insert = transaction
+                .prepare_cached("INSERT INTO edges (from_id, to_id) VALUES (?1, ?2)")
+                .unwrap();
+            for index in 0..100_000 {
+                insert
+                    .execute(params![format!("source-{index}"), format!("unrelated-{index}")])
+                    .unwrap();
+            }
+            for index in 0..3 {
+                insert.execute(params![format!("affected-a-{index}"), "target-a"]).unwrap();
+            }
+            for index in 0..2 {
+                insert.execute(params![format!("affected-b-{index}"), "target-b"]).unwrap();
+            }
+            drop(insert);
+            transaction.commit().unwrap();
+        }
+
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {REFRESH_AFFECTED_IN_DEGREE}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| {
+                step.contains("SEARCH edges USING COVERING INDEX edges_to (to_id=?)")
+            }),
+            "each affected target must seek the to_id index, not scan all 100000 edges: {plan:?}"
+        );
+
+        conn.execute("DELETE FROM in_degree WHERE id IN (SELECT id FROM affected_degree)", [])
+            .unwrap();
+        let mut refresh = conn.prepare(REFRESH_AFFECTED_IN_DEGREE).unwrap();
+        refresh.execute([]).unwrap();
+        let vm_steps = refresh.get_status(rusqlite::StatementStatus::VmStep);
+        let fullscan_steps = refresh.get_status(rusqlite::StatementStatus::FullscanStep);
+        assert!(
+            vm_steps < 1_000,
+            "two targets must not visit unrelated edges: {vm_steps} SQLite VM steps"
+        );
+        assert!(
+            fullscan_steps <= 3,
+            "the only full scan may visit the three-row affected target set, not edges: {fullscan_steps}"
+        );
+        drop(refresh);
+        let actual = conn
+            .prepare("SELECT id, degree FROM in_degree ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            actual,
+            [("target-a".to_owned(), 3), ("target-b".to_owned(), 2), ("untouched".to_owned(), 7)]
+        );
     }
 
     #[test]

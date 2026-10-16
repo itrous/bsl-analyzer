@@ -706,6 +706,8 @@ impl SharedState {
                             "no workspace root".to_owned(),
                         ));
                     };
+                    let serves_external_baseline = engine.serves_external_baseline();
+                    let baseline_hash_mode = engine.workspace_baseline_hash_mode();
                     let warm_cache = match engine.workspace_overlay_embedding_cache_snapshot() {
                         Ok(cache) => cache,
                         Err(error) => {
@@ -740,6 +742,8 @@ impl SharedState {
                         engine.db_path().to_path_buf(),
                         embedder_config,
                         roots,
+                        serves_external_baseline,
+                        baseline_hash_mode,
                         warm_cache,
                         engine.graph_context_provider(),
                         dirty_before,
@@ -764,8 +768,16 @@ impl SharedState {
                 ));
             }
         };
-        let Some((db_path, embedder_config, roots, warm_cache, graph_provider, dirty_before)) =
-            cloned
+        let Some((
+            db_path,
+            embedder_config,
+            roots,
+            serves_external_baseline,
+            baseline_hash_mode,
+            warm_cache,
+            graph_provider,
+            dirty_before,
+        )) = cloned
         else {
             // Engine was published earlier but is gone now (e.g. shutdown raced the warmup).
             Self::set_overlay_warmup_state(
@@ -787,6 +799,8 @@ impl SharedState {
             &db_path,
             embedder_config,
             &roots,
+            serves_external_baseline,
+            baseline_hash_mode,
             warm_cache,
             graph_provider,
             &should_continue,
@@ -4873,6 +4887,7 @@ mod tests {
             &lease,
             &owners,
             &crate::state::EmbeddingPrefixes::default(),
+            crate::state::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
         assert!(init.is_err(), "a managed but unclaimed lease keeps search offline");
         assert!(!workspace.path().join(".build").exists(), "no source fallback was created");

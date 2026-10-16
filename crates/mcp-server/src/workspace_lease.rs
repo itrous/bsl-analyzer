@@ -149,6 +149,13 @@ pub(crate) enum OwnershipCheck {
 
 type OwnershipObserver = Arc<dyn Fn(OwnershipCheck) + Send + Sync>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExternalDiscoveryChange {
+    Unchanged,
+    Rejected(project_model::ExternalDiscoverySummary),
+    Recovered(usize),
+}
+
 /// The live owner a claim found and would not take the workspace from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BusyOwner {
@@ -257,6 +264,8 @@ struct Inner {
     established: AtomicBool,
     /// The live owner the last refused claim found; `None` once a claim succeeds.
     busy: Mutex<Option<BusyOwner>>,
+    /// Last bounded external-discovery result reported for this workspace.
+    external_discovery: Mutex<Option<project_model::ExternalDiscoverySummary>>,
     /// Told whenever an ownership check finds something other than what the last one found.
     /// Called with lease locks held: an observer records and wakes, it never waits.
     observers: Mutex<Vec<OwnershipObserver>>,
@@ -390,6 +399,7 @@ impl WorkspaceLease {
                 established: AtomicBool::new(false),
                 stamped_at: Mutex::new(None),
                 busy: Mutex::new(None),
+                external_discovery: Mutex::new(None),
                 observers: Mutex::new(Vec::new()),
                 last_check: Mutex::new(None),
                 coordination_failed: false,
@@ -428,6 +438,7 @@ impl WorkspaceLease {
             established: AtomicBool::new(false),
             stamped_at: Mutex::new(None),
             busy: Mutex::new(None),
+            external_discovery: Mutex::new(None),
             observers: Mutex::new(Vec::new()),
             last_check: Mutex::new(None),
             coordination_failed: false,
@@ -1013,7 +1024,51 @@ impl WorkspaceLease {
     pub(crate) fn scope_matches_project(&self) -> bool {
         let Some(cache) = self.inner.cache.as_ref() else { return true };
         let Some(root) = cache.workspace() else { return true };
-        crate::project::at(root).is_ok_and(|project| cache.verify_project(&project).is_ok())
+        crate::project::at(root).is_ok_and(|project| {
+            self.report_external_discovery(&project);
+            cache.verify_project(&project).is_ok()
+        })
+    }
+
+    /// Report changed discovery facts on this workspace's existing log boundary.
+    /// Internal checks keep building a fresh Project; only an identical summary is quiet.
+    pub(crate) fn report_external_discovery(&self, project: &project_model::Project) {
+        match self.note_external_discovery(project.external_discovery_summary()) {
+            ExternalDiscoveryChange::Unchanged => {}
+            ExternalDiscoveryChange::Rejected(summary) => tracing::warn!(
+                target: "mcp_server::external_discovery",
+                rejected = summary.rejected_count,
+                reasons = ?summary.reason_counts.iter().map(|(reason, count)| (reason.code(), count)).collect::<Vec<_>>(),
+                examples = ?summary.examples.iter().map(|rejection| (&rejection.relative_path, rejection.reason.code())).collect::<Vec<_>>(),
+                omitted = summary.omitted_count,
+                "auto-discovered external directories were skipped"
+            ),
+            ExternalDiscoveryChange::Recovered(previously_rejected) => tracing::info!(
+                target: "mcp_server::external_discovery",
+                recovered = previously_rejected,
+                "auto-discovered external directories are valid again"
+            ),
+        }
+    }
+
+    fn note_external_discovery(
+        &self,
+        summary: project_model::ExternalDiscoverySummary,
+    ) -> ExternalDiscoveryChange {
+        let mut last = lock_recover(&self.inner.external_discovery);
+        let previous = last.as_ref();
+        if previous.is_some_and(|previous| previous.fingerprint == summary.fingerprint) {
+            return ExternalDiscoveryChange::Unchanged;
+        }
+        let was_rejected = previous.map(|previous| previous.rejected_count).unwrap_or(0);
+        *last = Some(summary.clone());
+        if summary.rejected_count > 0 {
+            ExternalDiscoveryChange::Rejected(summary)
+        } else if was_rejected > 0 {
+            ExternalDiscoveryChange::Recovered(was_rejected)
+        } else {
+            ExternalDiscoveryChange::Unchanged
+        }
     }
 
     pub(crate) fn is_superseded(&self) -> bool {
@@ -1416,6 +1471,138 @@ mod tests {
         assert!(!lease.scope_matches_project());
     }
 
+    #[test]
+    fn external_discovery_summary_is_bounded_quiet_on_repeats_and_reports_recovery() {
+        use tracing_subscriber::prelude::*;
+
+        let workspace = tempfile::tempdir().unwrap();
+        for index in 0..4 {
+            std::fs::create_dir_all(workspace.path().join(format!("src/epf/invalid-{index}")))
+                .unwrap();
+        }
+        std::fs::write(workspace.path().join("bsl-analyzer.toml"), "[source]\nroot = \"src\"\n")
+            .unwrap();
+        let initial_project = crate::project::at(workspace.path()).unwrap();
+        let cache_parent = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &initial_project,
+            Some(&cache_parent.path().join("cache")),
+            cache_parent.path(),
+            None,
+        )
+        .unwrap();
+        cache.ensure().unwrap();
+        let lease = WorkspaceLease::claim_cache(&cache);
+
+        #[derive(Clone, Debug)]
+        struct CapturedEvent {
+            level: tracing::Level,
+            fields: String,
+        }
+        struct Capture(Arc<Mutex<Vec<CapturedEvent>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "mcp_server::external_discovery" {
+                    return;
+                }
+                struct Visitor(Vec<String>);
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push(format!("{}={value:?}", field.name()));
+                    }
+
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.push(format!("{}={value}", field.name()));
+                    }
+
+                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                        self.0.push(format!("{}={value}", field.name()));
+                    }
+                }
+                let mut visitor = Visitor(Vec::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    fields: visitor.0.join(" "),
+                });
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        test_utils::with_subscriber(
+            tracing_subscriber::registry().with(Capture(events.clone())),
+            || {
+                assert!(
+                    lease.scope_matches_project(),
+                    "initial invalid auto-exports do not alter scope"
+                );
+                let mut repeated_checks = 0;
+                for _ in 0..10_000 {
+                    assert!(
+                        lease.scope_matches_project(),
+                        "rejected auto-exports stay out of scope"
+                    );
+                    repeated_checks += 1;
+                }
+                assert_eq!(repeated_checks, 10_000);
+
+                std::fs::create_dir_all(workspace.path().join("src/epf/another")).unwrap();
+                assert!(
+                    lease.scope_matches_project(),
+                    "a changed rejected set is still out of scope"
+                );
+
+                for name in ["invalid-0", "invalid-1", "invalid-2", "invalid-3", "another"] {
+                    let export = workspace.path().join("src/epf").join(name);
+                    std::fs::create_dir_all(export.join(name)).unwrap();
+                    std::fs::write(
+                        export.join(format!("{name}.xml")),
+                        format!(
+                            "<MetaDataObject><ExternalDataProcessor name=\"{name}\"/></MetaDataObject>"
+                        ),
+                    )
+                    .unwrap();
+                }
+                assert!(
+                    !lease.scope_matches_project(),
+                    "fresh discovery of valid externals invalidates the frozen lease scope",
+                );
+                assert!(
+                    !lease.scope_matches_project(),
+                    "the unchanged recovered set remains out of the old scope",
+                );
+            },
+        );
+
+        let events = events.lock().unwrap();
+        let warnings =
+            events.iter().filter(|event| event.level == tracing::Level::WARN).collect::<Vec<_>>();
+        let recovered =
+            events.iter().filter(|event| event.level == tracing::Level::INFO).collect::<Vec<_>>();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "initial and changed rejected sets each report once: {events:?}"
+        );
+        assert!(warnings[0].fields.contains("rejected=4"), "initial set is captured: {warnings:?}");
+        assert!(warnings[0].fields.contains("invalid-0"), "initial path is captured: {warnings:?}");
+        assert!(warnings[1].fields.contains("rejected=5"), "changed set is captured: {warnings:?}");
+        assert!(warnings[1].fields.contains("another"), "changed path is captured: {warnings:?}");
+        assert_eq!(recovered.len(), 1, "the recovered set reports once: {events:?}");
+        assert!(
+            recovered[0].fields.contains("recovered=5"),
+            "recovery count is captured: {recovered:?}"
+        );
+    }
+
     fn publish_test<T>(
         lease: &WorkspaceLease,
         write: impl FnOnce() -> T,
@@ -1796,6 +1983,7 @@ mod tests {
                 established: AtomicBool::new(false),
                 stamped_at: Mutex::new(None),
                 busy: Mutex::new(None),
+                external_discovery: Mutex::new(None),
                 observers: Mutex::new(Vec::new()),
                 last_check: Mutex::new(None),
                 coordination_failed: false,
@@ -2141,6 +2329,7 @@ mod tests {
                 established: AtomicBool::new(false),
                 stamped_at: Mutex::new(None),
                 busy: Mutex::new(None),
+                external_discovery: Mutex::new(None),
                 observers: Mutex::new(Vec::new()),
                 last_check: Mutex::new(None),
                 coordination_failed: false,

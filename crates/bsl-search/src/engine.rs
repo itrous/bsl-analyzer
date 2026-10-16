@@ -26,7 +26,9 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -1330,8 +1332,29 @@ impl SearchEngine {
             if chunks.is_empty() {
                 continue;
             }
-            let texts: Vec<String> =
-                documents.iter().map(crate::document::semantic_text_for_indexed_document).collect();
+            let reuse_plan = self.store.plan_reusable_embeddings_for_documents(
+                &key.root_id,
+                &key.path,
+                "code",
+                &documents,
+                &model_id,
+                dimension,
+                embedder.token_layout_claim(),
+            )?;
+            lifecycle_batch.reuse_misses(reuse_plan.payload_misses, reuse_plan.pending_misses);
+            let mut embedding_slots = Vec::new();
+            let texts: Vec<String> = documents
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, document)| {
+                    if reuse_plan.sources[slot].is_some() {
+                        None
+                    } else {
+                        embedding_slots.push(slot);
+                        Some(crate::document::semantic_text_for_indexed_document(document))
+                    }
+                })
+                .collect();
 
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             let ranges = embedder.batch_ranges(&refs, self.batch_size)?;
@@ -1342,7 +1365,11 @@ impl SearchEngine {
                 hash: hash.as_bytes().to_vec(),
                 chunks,
                 texts,
+                embedding_slots,
+                reuse_candidates: vec![None; documents.len()],
+                reuse_plan,
                 ranges,
+                preparation_error: None,
                 graph_contexts,
                 context_owed,
                 source_spans,
@@ -1353,6 +1380,10 @@ impl SearchEngine {
             info!("no files need reindexing");
             return Ok(0);
         }
+
+        lifecycle_batch.requested(
+            tasks.iter().map(|task| task.texts.len() as u64).sum(),
+        );
 
         let dim = self.dim;
         let total_batches: usize = tasks.iter().map(|t| t.ranges.len()).sum();
@@ -1384,16 +1415,24 @@ impl SearchEngine {
                 let context = lifecycle_batch.context();
                 std::thread::spawn(move || context.in_scope(|| {
                     while let Ok(task) = rx.recv() {
-                        let mut embeddings = Vec::with_capacity(task.texts.len());
-                        let mut error = None;
+                        let mut embeddings = task
+                            .reuse_candidates
+                            .iter()
+                            .map(|candidate| candidate.as_ref().map(|candidate| candidate.vector.clone()))
+                            .collect::<Vec<_>>();
+                        let mut error = task.preparation_error;
 
                         for range in &task.ranges {
+                            if error.is_some() { break; }
                             let batch = &task.texts[range.clone()];
                             let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
                             match emb.embed_batch(&refs) {
                                 Ok(embs) => {
                                     Self::observe_embedding_dimensions(&embs, dim, prog.as_ref());
-                                    embeddings.extend(embs);
+                                    for (offset, embedding) in embs.into_iter().enumerate() {
+                                        let slot = task.embedding_slots[range.start + offset];
+                                        embeddings[slot] = Some(embedding);
+                                    }
                                     if let Some(p) = &prog {
                                         p.advance(batch.len(), 1);
                                     }
@@ -1413,8 +1452,14 @@ impl SearchEngine {
                             graph_contexts: task.graph_contexts,
                             context_owed: task.context_owed,
                             source_spans: task.source_spans,
+                            reuse_candidates: task.reuse_candidates,
                             embeddings: match error {
-                                None => Ok(embeddings),
+                                None => Ok(embeddings
+                                    .into_iter()
+                                    .map(|embedding| {
+                                        embedding.expect("every chunk has a reused or requested vector")
+                                    })
+                                    .collect()),
                                 Some(e) => Err(e),
                             },
                         });
@@ -1424,10 +1469,84 @@ impl SearchEngine {
             .collect();
 
         drop(task_rx);
+        let producer_result_tx = result_tx.clone();
         drop(result_tx);
 
+        let db_path = self.store.db_path().to_owned();
+        let producer_embedder = embedder.clone();
+        let producer_progress = progress.cloned();
+        let producer_context = lifecycle_batch.context();
+        let token_layout_claim = embedder.token_layout_claim().map(str::to_owned);
+        let model_id_for_producer = model_id.clone();
+        let dimension_for_producer = dimension;
+        let batch_size = self.batch_size;
         let producer = std::thread::spawn(move || {
-            for task in tasks {
+            let reuse_store = match Store::open_existing(&db_path) {
+                Ok(store) => store,
+                Err(error) => {
+                    if let Some(task) = tasks.into_iter().next() {
+                        let _ = producer_result_tx.send(FileResult {
+                            key: task.key,
+                            reason: task.reason,
+                            hash: task.hash,
+                            chunks: task.chunks,
+                            graph_contexts: task.graph_contexts,
+                            context_owed: task.context_owed,
+                            source_spans: task.source_spans,
+                            reuse_candidates: task.reuse_candidates,
+                            embeddings: Err(error),
+                        });
+                    }
+                    return;
+                }
+            };
+            for mut task in tasks {
+                match reuse_store.hydrate_reusable_embedding_plan(
+                    &task.key.root_id,
+                    &task.key.path,
+                    "code",
+                    &task.reuse_plan,
+                    &model_id_for_producer,
+                    dimension_for_producer,
+                    token_layout_claim.as_deref(),
+                ) {
+                    Ok(hydrated) => {
+                        producer_context.reuse_misses(hydrated.payload_misses, 0);
+                        let mut fallback_count = 0_u64;
+                        task.reuse_candidates = hydrated.candidates;
+                        for slot in 0..task.reuse_candidates.len() {
+                            if task.reuse_plan.sources[slot].is_some()
+                                && task.reuse_candidates[slot].is_none()
+                            {
+                                let chunk = &task.chunks[slot];
+                                task.embedding_slots.push(slot);
+                                task.texts.push(crate::document::semantic_text_from_parts(
+                                    &task.key.path,
+                                    chunk.kind.label(),
+                                    &chunk.name,
+                                    task.graph_contexts[slot].as_deref().unwrap_or(""),
+                                    &chunk.text,
+                                ));
+                                fallback_count = fallback_count.saturating_add(1);
+                            }
+                        }
+                        if fallback_count > 0 {
+                            producer_context.requested(fallback_count);
+                            let refs = task.texts.iter().map(String::as_str).collect::<Vec<_>>();
+                            match producer_embedder.batch_ranges(&refs, batch_size) {
+                                Ok(ranges) => {
+                                    let added = ranges.len().saturating_sub(task.ranges.len());
+                                    task.ranges = ranges;
+                                    if let Some(progress) = &producer_progress {
+                                        progress.add_batches(added);
+                                    }
+                                }
+                                Err(error) => task.preparation_error = Some(error),
+                            }
+                        }
+                    }
+                    Err(error) => task.preparation_error = Some(error),
+                }
                 if task_tx.send(task).is_err() {
                     break;
                 }
@@ -1439,7 +1558,7 @@ impl SearchEngine {
         while let Ok(result) = result_rx.recv() {
             match result.embeddings {
                 Ok(embeddings) => {
-                    if let Err(error) = lifecycle::with_reason(result.reason, || self.store.reindex_file_with_identity_and_source_spans(
+                    if let Err(error) = lifecycle::with_reason(result.reason, || self.store.reindex_file_with_identity_reuse_and_source_spans(
                         &result.key.root_id,
                         &result.key.path,
                         &result.hash,
@@ -1450,6 +1569,7 @@ impl SearchEngine {
                         dimension,
                         embedder.token_layout_claim(),
                         &result.source_spans,
+                        Some(&result.reuse_candidates),
                     )) {
                         first_error.get_or_insert(error);
                         continue;
@@ -1539,12 +1659,17 @@ impl SearchEngine {
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> ControlFlow<(), Result<(), SearchError>> {
         self.invalidate_semantic_coverage();
-        match self.store.reindex_file_with_context_checkpointed(
-            key,
+        match self.store.reindex_file_in_collection_checkpointed_with_source_spans(
+            &key.root_id,
+            &key.path,
             hash,
+            "code",
             chunks,
             None,
             Some(graph_contexts),
+            self.embedder.as_ref().map(|embedder| (embedder.model_id(), embedder.dim())),
+            None,
+            &[],
             checkpoint,
         ) {
             Ok(ControlFlow::Continue(_)) => ControlFlow::Continue(Ok(())),
@@ -1721,7 +1846,7 @@ impl SearchEngine {
         embedder: &Embedder,
         dim: usize,
         ranges: &[std::ops::Range<usize>],
-        items: &[(i64, String)],
+        items: &[(i64, String, String)],
         progress: Option<&IndexPassToken>,
         should_continue: Option<&(dyn Fn() -> bool + Sync)>,
         apply: &mut impl FnMut(
@@ -1753,7 +1878,7 @@ impl SearchEngine {
                 }
             }
 
-            let refs: Vec<&str> = batch.iter().map(|(_, text)| text.as_str()).collect();
+            let refs: Vec<&str> = batch.iter().map(|(_, text, _)| text.as_str()).collect();
             let embeddings = match embedder.embed_batch(&refs) {
                 Ok(embeddings) => embeddings,
                 Err(error) => {
@@ -1765,13 +1890,17 @@ impl SearchEngine {
                 progress.advance(batch.len(), 1);
             }
             Self::observe_embedding_dimensions(&embeddings, dim, progress);
-            let pairs: Vec<_> = batch.iter().map(|(id, _)| *id).zip(embeddings).collect();
+            let pairs: Vec<_> = batch
+                .iter()
+                .zip(embeddings)
+                .map(|((id, _, key), embedding)| (*id, key.clone(), embedding))
+                .collect();
             match Self::fenced_value_retrying(
                 apply,
                 || {
-                    store.set_chunk_embeddings_with_token_layout(
+                    store.set_chunk_payload_embeddings_with_token_layout(
                         &pairs,
-                        Some((embedder.model_id(), dim)),
+                        (embedder.model_id(), dim),
                         embedder.token_layout_claim(),
                     )
                 },
@@ -1904,6 +2033,7 @@ impl SearchEngine {
             }
             let pending = store.load_pending_embedding_documents("code")?;
             lifecycle_batch.pending(pending.len() as u64);
+            lifecycle_batch.requested(pending.len() as u64);
             if pending.is_empty() {
                 if let Some(p) = progress {
                     p.phase(IndexPhase::Persisting);
@@ -1941,13 +2071,19 @@ impl SearchEngine {
                 return Ok((index, persisted));
             }
 
-            let items: Vec<(i64, String)> = pending
+            let items: Vec<(i64, String, String)> = pending
                 .into_iter()
-                .map(|(id, doc)| (id, crate::document::semantic_text_for_indexed_document(&doc)))
+                .map(|(id, doc)| {
+                    (
+                        id,
+                        crate::document::semantic_text_for_indexed_document(&doc),
+                        crate::document::semantic_key_for_indexed_document(&doc),
+                    )
+                })
                 .collect();
             let total = items.len();
 
-            let texts: Vec<&str> = items.iter().map(|(_, text)| text.as_str()).collect();
+            let texts: Vec<&str> = items.iter().map(|(_, text, _)| text.as_str()).collect();
             let ranges = embedder.batch_ranges(&texts, batch_size)?;
             let total_batches = ranges.len();
 
@@ -1976,10 +2112,10 @@ impl SearchEngine {
             // applies each batch's vectors (SQLite is single-writer). Nothing larger than
             // one batch is held per worker, so peak RAM stays bounded by the batch size.
             let (task_tx, task_rx) =
-                crossbeam_channel::bounded::<Vec<(i64, String)>>(concurrency * 2);
+                crossbeam_channel::bounded::<Vec<(i64, String, String)>>(concurrency * 2);
             #[allow(clippy::type_complexity)]
             let (result_tx, result_rx) = crossbeam_channel::bounded::<
-                Result<Vec<(i64, Vec<f32>)>, SearchError>,
+                Result<Vec<(i64, String, Vec<f32>)>, SearchError>,
             >(concurrency * 2);
 
             let workers: Vec<std::thread::JoinHandle<()>> = (0..concurrency)
@@ -1993,7 +2129,7 @@ impl SearchEngine {
                         context.in_scope(|| {
                             while let Ok(batch) = rx.recv() {
                                 let refs: Vec<&str> =
-                                    batch.iter().map(|(_, t)| t.as_str()).collect();
+                                    batch.iter().map(|(_, t, _)| t.as_str()).collect();
                                 let out = match emb.embed_batch(&refs) {
                                     Ok(embs) => {
                                         Self::observe_embedding_dimensions(
@@ -2004,7 +2140,12 @@ impl SearchEngine {
                                         if let Some(p) = &prog {
                                             p.advance(batch.len(), 1);
                                         }
-                                        Ok(batch.iter().map(|(id, _)| *id).zip(embs).collect())
+                                        Ok(batch
+                                            .iter()
+                                            .map(|(id, _, key)| (*id, key.clone()))
+                                            .zip(embs)
+                                            .map(|((id, key), embedding)| (id, key, embedding))
+                                            .collect())
                                     }
                                     Err(e) => Err(e),
                                 };
@@ -2045,9 +2186,9 @@ impl SearchEngine {
                     Ok(pairs) => {
                         let batch_len = pairs.len();
                         let outcome = match Self::fenced_value(apply, || {
-                            store.set_chunk_embeddings_with_token_layout(
+                            store.set_chunk_payload_embeddings_with_token_layout(
                                 &pairs,
-                                Some((embedder.model_id(), dim)),
+                                (embedder.model_id(), dim),
                                 embedder.token_layout_claim(),
                             )
                         }) {
@@ -2159,6 +2300,9 @@ impl SearchEngine {
             info!(embedded, errors, total_vectors = index.len(), "fused embedding complete");
             Ok((index, FenceOutcome::Applied(())))
         });
+        if let Ok(pending_after) = store.pending_embedding_count("code") {
+            lifecycle_batch.pending_after(pending_after);
+        }
         let lifecycle_outcome = match &lifecycle_result {
             Ok((_, FenceOutcome::Applied(()))) if embedding_skipped => Outcome::Skipped,
             Ok((_, FenceOutcome::Applied(()))) => Outcome::Completed,
@@ -4618,7 +4762,12 @@ impl SearchEngine {
                         |chunk| match chunk.kind {
                             code_chunk::ChunkKind::Procedure | code_chunk::ChunkKind::Function => {
                                 provider
-                                    .try_graph_context(&key.path, &chunk.name, chunk.kind.label())
+                                    .try_graph_context_with_source(
+                                        &key,
+                                        &chunk.name,
+                                        chunk.kind.label(),
+                                        &content,
+                                    )
                                     .map_err(|error| SearchError::Index(error.to_string()))
                             }
                             code_chunk::ChunkKind::ModuleHeader => Ok(None),
@@ -4661,10 +4810,24 @@ impl SearchEngine {
                     &key.root_id,
                     &key.path,
                 )?;
+                let source = self
+                    .workspace_roots
+                    .as_ref()
+                    .and_then(|roots| roots.resolve(&key))
+                    .and_then(|path| std::fs::read_to_string(path).ok());
                 let mut render_failed = false;
                 let mut updates = Vec::new();
                 for (id, symbol_name, kind, stored) in rows {
-                    match provider.try_graph_context(&key.path, &symbol_name, &kind) {
+                    let rendered = match source.as_deref() {
+                        Some(source) => provider.try_graph_context_with_source(
+                            &key,
+                            &symbol_name,
+                            &kind,
+                            source,
+                        ),
+                        None => provider.try_graph_context(&key.path, &symbol_name, &kind),
+                    };
+                    match rendered {
                         Ok(rendered) => {
                             if rendered.as_deref() != stored.as_deref() {
                                 updates.push(ContextRefreshMutation::Update {
@@ -4805,8 +4968,8 @@ impl SearchEngine {
                 }
             }
             let mut evidence = self.semantic_qualification.get();
-            evidence.context_pending =
-                retained_context || self.store.mark_seq_handle().load(Ordering::SeqCst) > seq_bound;
+            evidence.context_pending = retained_context
+                || self.store.has_context_dirty_after("code", seq_bound)?;
             self.semantic_qualification.set(evidence);
             Ok((stats, FenceOutcome::Applied(())))
         });
@@ -4872,6 +5035,16 @@ impl SearchEngine {
         };
         observation.emit(false);
         result
+    }
+
+    /// Whether workspace overlay priming must treat an external manifest as its baseline.
+    pub fn serves_external_baseline(&self) -> bool {
+        self.serves_external_baseline
+    }
+
+    /// Hash representation currently used for local workspace baseline rows.
+    pub fn workspace_baseline_hash_mode(&self) -> BaselineHashMode {
+        self.workspace_baseline_hash_mode
     }
 
     /// The manifest fingerprints IF this engine serves an external baseline, `None` otherwise.
@@ -5256,6 +5429,8 @@ impl SearchEngine {
             db_path,
             embedder_config,
             roots,
+            true,
+            BaselineHashMode::NormalizedChunks,
             warm_embeddings,
             graph_provider,
             should_continue,
@@ -5270,6 +5445,8 @@ impl SearchEngine {
         db_path: &Path,
         embedder_config: EmbedderConfig,
         roots: &WorkspaceRoots,
+        serves_external_baseline: bool,
+        baseline_hash_mode: BaselineHashMode,
         warm_embeddings: HashMap<String, Vec<f32>>,
         graph_provider: Option<Arc<dyn crate::ports::GraphContextProvider>>,
         should_continue: &dyn Fn() -> bool,
@@ -5310,18 +5487,32 @@ impl SearchEngine {
             }
         }
 
-        let manifest_fingerprints =
-            store.load_baseline_manifest_fingerprints("code")?.unwrap_or_default();
-
-        let plan = WorkspaceOverlayCache::plan_full_refresh_from_manifest_with_embedder(
-            &manifest_fingerprints,
-            roots,
-            &store,
-            &warm_embeddings,
-            graph_provider.as_deref(),
-            distrusted,
-            Some(&embedder),
-        )?;
+        let plan = if serves_external_baseline {
+            let manifest_fingerprints =
+                store.load_baseline_manifest_fingerprints("code")?.unwrap_or_default();
+            WorkspaceOverlayCache::plan_full_refresh_from_manifest_with_embedder(
+                &manifest_fingerprints,
+                roots,
+                &store,
+                &warm_embeddings,
+                graph_provider.as_deref(),
+                distrusted,
+                Some(&embedder),
+            )?
+        } else {
+            let baseline_files =
+                store.all_files_in_collection("code")?.into_iter().collect::<HashMap<_, _>>();
+            WorkspaceOverlayCache::plan_full_refresh_from_local_with_embedder(
+                &baseline_files,
+                roots,
+                &store,
+                &warm_embeddings,
+                graph_provider.as_deref(),
+                distrusted,
+                &embedder,
+                baseline_hash_mode,
+            )?
+        };
 
         let mut new_embeddings = match Self::embed_missing_overlay_chunks(
             &store,
@@ -5337,6 +5528,12 @@ impl SearchEngine {
             FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
             FenceOutcome::Released => return Ok(FenceOutcome::Released),
         };
+
+        // Exact-key local baseline hits were hydrated only for changed files. Include them in
+        // the staged result so a fresh in-memory overlay can publish without another POST.
+        for (embedding_key, embedding) in plan.reused_embeddings() {
+            new_embeddings.entry(embedding_key.clone()).or_insert_with(|| embedding.clone());
+        }
 
         // Include the warm-reused vectors for the plan's chunks in the published set so Phase C
         // builds complete vectors regardless of the live cache's state (it may be empty on a
@@ -6552,7 +6749,11 @@ struct FileTask {
     hash: Vec<u8>,
     chunks: Vec<code_chunk::Chunk>,
     texts: Vec<String>,
+    embedding_slots: Vec<usize>,
+    reuse_candidates: Vec<Option<crate::store::ReusableEmbedding>>,
+    reuse_plan: crate::store::ReusableEmbeddingPlan,
     ranges: Vec<std::ops::Range<usize>>,
+    preparation_error: Option<SearchError>,
     /// Per-chunk graph context (parallel to `chunks`), persisted so a later
     /// reconstruction-from-storage re-embeds with the same enriched text.
     graph_contexts: Vec<Option<String>>,
@@ -6569,6 +6770,7 @@ struct FileResult {
     graph_contexts: Vec<Option<String>>,
     context_owed: bool,
     source_spans: Vec<Option<crate::SourceSpan>>,
+    reuse_candidates: Vec<Option<crate::store::ReusableEmbedding>>,
     embeddings: Result<Vec<Vec<f32>>, SearchError>,
 }
 
@@ -6663,8 +6865,8 @@ mod tests {
         );
     }
     use super::{
-        FenceOutcome, IndexProgress, SearchEngine, CONSTRUCTOR_APPLY_ACTIVE,
-        FORCE_VECTOR_REMOVE_ERROR, WORKSPACE_APPLY_BATCH_ROWS,
+        BaselineHashMode, FenceOutcome, IndexProgress, SearchEngine, WorkspaceRoots,
+        CONSTRUCTOR_APPLY_ACTIVE, FORCE_VECTOR_REMOVE_ERROR, WORKSPACE_APPLY_BATCH_ROWS,
     };
     use crate::key_carriers::KeyCarrier;
     use crate::ports::{SnapshotCatalog, SnapshotContentStore};
@@ -7855,6 +8057,8 @@ mod tests {
             &overlay_db,
             config.embedder.clone(),
             &roots,
+            true,
+            BaselineHashMode::NormalizedChunks,
             std::collections::HashMap::new(),
             None,
             &|| true,
@@ -7921,6 +8125,174 @@ mod tests {
             after_phase_b,
             "retrying the staged Phase C bundle performs no network call"
         );
+    }
+
+    #[test]
+    fn local_overlay_prime_uses_file_hash_and_reuses_exact_base_vectors() {
+        use crate::{EmbedderConfig, EmbeddingExecutionPolicy, Store};
+        use std::io::{Read, Write};
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let submitted_inputs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_calls = std::sync::Arc::clone(&calls);
+        let server_inputs = std::sync::Arc::clone(&submitted_inputs);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let server_calls = std::sync::Arc::clone(&server_calls);
+                let server_inputs = std::sync::Arc::clone(&server_inputs);
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0u8; 2048];
+                    loop {
+                        let read = stream.read(&mut buffer).unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&buffer[..read]);
+                        let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&bytes[..split]).to_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if bytes.len() >= split + 4 + length {
+                            let input_count = serde_json::from_slice::<serde_json::Value>(
+                                &bytes[split + 4..split + 4 + length],
+                            )
+                            .unwrap()["input"]
+                                .as_array()
+                                .unwrap()
+                                .len();
+                            server_inputs
+                                .fetch_add(input_count, std::sync::atomic::Ordering::SeqCst);
+                            server_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let data: Vec<_> = (0..input_count)
+                                .map(|index| {
+                                    serde_json::json!({"index": index, "embedding": [1.0, 0.0, 0.0]})
+                                })
+                                .collect();
+                            let body = serde_json::json!({"data": data}).to_string();
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .unwrap();
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let db_path = workspace.join("search.db");
+        let file_path = workspace.join("Module.bsl");
+        let unchanged_path = workspace.join("Unchanged.bsl");
+        let before =
+            "Процедура Стабильная()\nКонецПроцедуры\nПроцедура Измененная()\nКонецПроцедуры";
+        let after =
+            "Процедура Стабильная()\nКонецПроцедуры\nПроцедура Измененная2()\nКонецПроцедуры";
+        let unchanged = "Процедура ДругойФайл()\nКонецПроцедуры";
+        fs::write(&file_path, before).unwrap();
+        fs::write(&unchanged_path, unchanged).unwrap();
+
+        let mut store = Store::open(&db_path).unwrap();
+        store
+            .reindex_file(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                blake3::hash(before.as_bytes()).as_bytes(),
+                &code_chunk::Chunker::chunk(before),
+                None,
+            )
+            .unwrap();
+        store
+            .reindex_file(
+                CONFIGURATION_ROOT_ID,
+                "Unchanged.bsl",
+                blake3::hash(unchanged.as_bytes()).as_bytes(),
+                &code_chunk::Chunker::chunk(unchanged),
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let config = SearchConfig {
+            embedder: EmbedderConfig {
+                base_url: format!("http://{address}"),
+                model: "test".to_owned(),
+                dim: Some(3),
+                api_key: None,
+                provider: None,
+                ..Default::default()
+            },
+            execution: EmbeddingExecutionPolicy::default(),
+        };
+        SearchEngine::embed_pending_chunks_standalone(&db_path, &config, None, None).unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A stale remote manifest remains in SQLite across a mode switch. Local priming must
+        // compare raw file hashes and may reuse exact base payloads regardless of that manifest.
+        Store::open_existing(&db_path)
+            .unwrap()
+            .save_baseline_manifest(&crate::WorkspaceBaselineManifest {
+                snapshot_id: "retained-remote-snapshot".to_owned(),
+                snapshot_fingerprint: Some("retained-fingerprint".to_owned()),
+                files: vec![crate::BaselineManifestFile {
+                    collection: "code".to_owned(),
+                    root_id: CONFIGURATION_ROOT_ID.to_owned(),
+                    path: "Module.bsl".to_owned(),
+                    file_fingerprint: "stale-remote-file-fingerprint".to_owned(),
+                    document_count: 2,
+                    file_object_id: "retained-object".to_owned(),
+                }],
+            })
+            .unwrap();
+        fs::write(&file_path, after).unwrap();
+        let roots = WorkspaceRoots::build(workspace, workspace, &[]).0;
+        let before_prime = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let inputs_before_prime = submitted_inputs.load(std::sync::atomic::Ordering::SeqCst);
+        let primed = SearchEngine::prime_workspace_overlay_standalone_retrying(
+            &db_path,
+            config.embedder.clone(),
+            &roots,
+            false,
+            BaselineHashMode::RawFileBytes,
+            HashMap::new(),
+            None,
+            &|| true,
+            |operation| FenceOutcome::Applied(operation()),
+            &HashSet::new(),
+            || false,
+        )
+        .unwrap();
+        let FenceOutcome::Applied((plan, embeddings)) = primed else {
+            panic!("local overlay plan should be admitted")
+        };
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) - before_prime,
+            1,
+            "the changed semantic payload should be sent in one HTTP batch"
+        );
+        assert_eq!(
+            submitted_inputs.load(std::sync::atomic::Ordering::SeqCst) - inputs_before_prime,
+            1,
+            "exactly the changed semantic payload should be sent to the provider"
+        );
+        assert_eq!(plan.overlay_file_count(), 1);
+        assert_eq!(plan.missing_embeddings().len(), 1);
+        assert_eq!(plan.reused_embeddings().len(), 1);
+        assert_eq!(embeddings.len(), 2);
     }
 
     #[test]
@@ -8687,6 +9059,180 @@ mod tests {
         let pending = engine.store().load_pending_embedding_documents("code").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].1.symbol_name, "Изменённая");
+    }
+
+    #[test]
+    fn context_pending_tracks_remaining_marks_not_historical_sequence() {
+        struct NoContext;
+        impl crate::ports::GraphContextProvider for NoContext {
+            fn graph_context(&self, _rel: &str, _symbol_name: &str, _kind: &str) -> Option<String> {
+                None
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let first_seq =
+            engine.store().mark_context_dirty("code", CONFIGURATION_ROOT_ID, "M.bsl").unwrap();
+        let (_, outcome) = engine
+            .refresh_dirty_contexts_fenced(&NoContext, first_seq, false, &mut |operation| {
+                let mut checkpoint = || ControlFlow::Continue(());
+                match operation(&mut checkpoint) {
+                    ControlFlow::Break(()) => FenceOutcome::Released,
+                    ControlFlow::Continue(result) => FenceOutcome::Applied(result),
+                }
+            })
+            .unwrap();
+        assert!(matches!(outcome, FenceOutcome::Applied(())));
+        assert!(engine.context_dirty_paths("code").unwrap().is_empty());
+        assert!(!engine.semantic_index_qualification().context_pending);
+
+        // A no-op refresh below the historical allocator high-water must not resurrect
+        // debt after the only row has already been consumed.
+        let (_, outcome) = engine
+            .refresh_dirty_contexts_fenced(&NoContext, 0, false, &mut |operation| {
+                let mut checkpoint = || ControlFlow::Continue(());
+                match operation(&mut checkpoint) {
+                    ControlFlow::Break(()) => FenceOutcome::Released,
+                    ControlFlow::Continue(result) => FenceOutcome::Applied(result),
+                }
+            })
+            .unwrap();
+        assert!(matches!(outcome, FenceOutcome::Applied(())));
+        assert!(engine.store().mark_seq_handle().load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert!(!engine.semantic_index_qualification().context_pending);
+
+        // A genuinely newer mark remains pending when this pass's fence cannot consume it.
+        let newer_seq =
+            engine.store().mark_context_dirty("code", CONFIGURATION_ROOT_ID, "N.bsl").unwrap();
+        let (_, outcome) = engine
+            .refresh_dirty_contexts_fenced(&NoContext, newer_seq - 1, false, &mut |operation| {
+                let mut checkpoint = || ControlFlow::Continue(());
+                match operation(&mut checkpoint) {
+                    ControlFlow::Break(()) => FenceOutcome::Released,
+                    ControlFlow::Continue(result) => FenceOutcome::Applied(result),
+                }
+            })
+            .unwrap();
+        assert!(matches!(outcome, FenceOutcome::Applied(())));
+        assert!(engine.semantic_index_qualification().context_pending);
+
+        let (_, outcome) = engine
+            .refresh_dirty_contexts_fenced(&NoContext, newer_seq, false, &mut |operation| {
+                let mut checkpoint = || ControlFlow::Continue(());
+                match operation(&mut checkpoint) {
+                    ControlFlow::Break(()) => FenceOutcome::Released,
+                    ControlFlow::Continue(result) => FenceOutcome::Applied(result),
+                }
+            })
+            .unwrap();
+        assert!(matches!(outcome, FenceOutcome::Applied(())));
+        assert!(!engine.semantic_index_qualification().context_pending);
+    }
+
+    #[test]
+    fn dirty_context_refresh_forwards_one_source_snapshot_to_each_method() {
+        struct SourceGraph {
+            seen: std::sync::Mutex<Vec<(FileKey, String)>>,
+            fail_on: Option<&'static str>,
+            rewrite_after_first: Option<(PathBuf, String)>,
+        }
+
+        impl crate::ports::GraphContextProvider for SourceGraph {
+            fn graph_context(&self, _rel: &str, _symbol: &str, _kind: &str) -> Option<String> {
+                Some("legacy context".to_owned())
+            }
+
+            fn try_graph_context_with_source(
+                &self,
+                key: &FileKey,
+                symbol: &str,
+                _kind: &str,
+                source: &str,
+            ) -> Result<Option<String>, crate::GraphContextError> {
+                let mut seen = self.seen.lock().unwrap();
+                let first_call = seen.is_empty();
+                seen.push((key.clone(), source.to_owned()));
+                drop(seen);
+                if first_call {
+                    if let Some((path, replacement)) = &self.rewrite_after_first {
+                        fs::write(path, replacement).unwrap();
+                    }
+                }
+                if self.fail_on == Some(symbol) {
+                    return Err(crate::GraphContextError("graph read failed".to_owned()));
+                }
+                Ok(Some(if self.fail_on.is_some() {
+                    format!("unpublished context: {symbol}")
+                } else {
+                    format!("fresh context: {symbol}")
+                }))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let source = "Процедура Первый()\nКонецПроцедуры\nПроцедура Второй()\nКонецПроцедуры";
+        fs::write(workspace.join("M.bsl"), source).unwrap();
+        let key = FileKey::configuration("M.bsl");
+        let chunks = code_chunk::Chunker::chunk(source);
+        assert_eq!(chunks.len(), 2);
+        {
+            let mut store = Store::open(&workspace.join("search.db")).unwrap();
+            let old_contexts = vec![Some("old context".to_owned()); chunks.len()];
+            store
+                .reindex_file_with_context(
+                    &key.root_id,
+                    &key.path,
+                    b"source-snapshot",
+                    &chunks,
+                    None,
+                    Some(&old_contexts),
+                )
+                .unwrap();
+        }
+
+        let mut engine = SearchEngine::fts_only(&workspace.join("search.db")).unwrap();
+        engine.set_workspace_root(workspace);
+        let provider = SourceGraph {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail_on: None,
+            rewrite_after_first: Some((
+                workspace.join("M.bsl"),
+                "Процедура Другая()\nКонецПроцедуры".to_owned(),
+            )),
+        };
+        let seq = engine.store().mark_context_dirty("code", &key.root_id, &key.path).unwrap();
+        let stats = engine.refresh_dirty_contexts(&provider, seq).unwrap();
+        assert_eq!(stats.paths_cleared, 1);
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the provider should receive each method context once");
+        assert!(seen
+            .iter()
+            .all(|(seen_key, seen_source)| { seen_key == &key && seen_source == source }));
+        drop(seen);
+        fs::write(workspace.join("M.bsl"), source).unwrap();
+        let documents = engine.store().load_indexed_documents(Some("code")).unwrap();
+        assert!(documents.iter().all(|document| {
+            document.graph_context.as_deref()
+                == Some(format!("fresh context: {}", document.symbol_name).as_str())
+        }));
+
+        let next_seq = engine.store().mark_context_dirty("code", &key.root_id, &key.path).unwrap();
+        let failing = SourceGraph {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail_on: Some("Второй"),
+            rewrite_after_first: None,
+        };
+        let stats = engine.refresh_dirty_contexts(&failing, next_seq).unwrap();
+        assert_eq!(stats.paths_cleared, 0, "a partial render must not consume the path mark");
+        assert!(engine.context_dirty_paths("code").unwrap().contains(&key));
+        let after_error = engine.store().load_indexed_documents(Some("code")).unwrap();
+        assert_eq!(after_error.len(), documents.len());
+        assert!(after_error.iter().all(|document| {
+            document.graph_context.as_deref()
+                == Some(format!("fresh context: {}", document.symbol_name).as_str())
+        }));
     }
 
     /// github#234: a file the STORE holds no chunks for carries its graph context in its overlay

@@ -555,7 +555,8 @@ mod tests {
         let graph = crate::graph::GraphState::for_workspace_with_cache(root.to_path_buf(), cache)
             .with_lease(lease.clone());
         graph.ensure_first_build();
-        crate::graph::test_support::wait_ready(&graph);
+        // Ready precedes publication cleanup; hold the lease only after the builder lets go.
+        crate::graph::test_support::wait_settled(&graph);
         let held_lease = lease.hold_file_lock_for_test();
         std::fs::remove_file(lease_path).unwrap();
         lease.invalidate_verdict_for_test();

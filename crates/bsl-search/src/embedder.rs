@@ -272,7 +272,7 @@ impl Embedder {
             return Ok(Vec::new());
         }
         for attempt in 0..Self::MAX_RETRIES {
-            match self.send_request(&self.agent, &body, texts.len()) {
+            match self.send_request(&self.agent, &body, texts.len(), true) {
                 Ok(result) => return Ok(result),
                 // Отказ по существу повторять нельзя: полное расписание отсрочек — около
                 // двух минут на партию, и на каждой партии индексации оно платится заново,
@@ -363,7 +363,11 @@ impl Embedder {
         agent: &ureq::Agent,
         body: &[u8],
         input_count: usize,
+        count_as_document_batch: bool,
     ) -> Result<Vec<Vec<f32>>, BatchFailure> {
+        if count_as_document_batch {
+            crate::lifecycle::Context::current_embedding_request(input_count);
+        }
         let url = format!("{}/v1/embeddings", self.config.base_url);
         let mut req = agent.post(&url).header("Content-Type", "application/json");
         if let Some(ref key) = self.config.api_key {
@@ -431,7 +435,7 @@ impl Embedder {
     /// concurrent search. A transient failure is the caller's to retry as a whole search.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, SearchError> {
         let body = self.prepare_request_with_prefix(&[text], &self.config.query_prefix)?;
-        self.send_request(&self.interactive_agent, &body, 1)
+        self.send_request(&self.interactive_agent, &body, 1, false)
             .map_err(BatchFailure::into_error)?
             .pop()
             .ok_or_else(|| failure(EmbeddingFailureCode::EmbeddingInvalidResponse))
@@ -447,7 +451,7 @@ impl Embedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        self.send_request(&self.interactive_agent, &body, texts.len())
+        self.send_request(&self.interactive_agent, &body, texts.len(), false)
             .map_err(BatchFailure::into_error)
     }
 

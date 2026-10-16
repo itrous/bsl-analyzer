@@ -429,6 +429,7 @@ fn analyze_salsa(
     // instead of the raw `-s` dir, so vendored/build copies such as
     // `.build/vendor` are not analyzed as a duplicate configuration.
     let project = project_model::Project::with_config(&source_dir, proj_config.clone())?;
+    project.warn_about_external_discovery_rejections();
     if baseline_command.is_some() && project.diagnostics_baseline()?.is_none() {
         return Err("[diagnostics.baseline].path is not configured".into());
     }

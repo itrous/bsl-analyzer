@@ -63,6 +63,7 @@ pub(super) fn run(args: SearchBaselinePublishArgs) -> Result<(), Box<dyn Error +
     };
 
     let project = project_model::Project::new(&args.source_dir)?;
+    project.warn_about_external_discovery_rejections();
     let embedder = postgres::embedder_config(&project)?.map(Embedder::new);
     let branch = publish_policy::resolve_publish_branch(args.branch.as_deref(), &project.root);
     let commit = publish_policy::resolve_publish_commit(args.commit.as_deref(), &project.root);

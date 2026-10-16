@@ -284,6 +284,9 @@ fn vector_lifecycle_partial_resume_only_submits_pending_then_warm_skip() {
     assert!(inputs.iter().all(|text| !text.contains("Method0")));
     assert_eq!(terminal(&records)["outcome"], "completed");
     assert_eq!(terminal(&records)["committed_totals"]["embeddings_written"], 2);
+    assert_eq!(terminal(&records)["counts"]["embedding_chunks_requested"], 2);
+    assert_eq!(terminal(&records)["counts"]["embedding_chunks_submitted"], 2);
+    assert_eq!(terminal(&records)["counts"]["embedding_http_requests"], 2);
     assert_eq!(terminal(&records)["pending"], 0);
     let generation = Store::open_existing(&path).unwrap().embedding_generation().unwrap();
     let records = capture(|| {
@@ -306,6 +309,25 @@ fn vector_lifecycle_partial_resume_only_submits_pending_then_warm_skip() {
     });
     assert_eq!(terminal(&records)["outcome"], "skipped");
     assert_eq!(terminal(&records)["committed_totals"]["embeddings_written"], 0);
+}
+
+#[test]
+fn interactive_query_embedding_is_not_counted_as_document_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("search.db");
+    let (embedder, requests) = server(1, || {});
+    let batch = Batch::new(&path, Reason::Embedding);
+    let records = capture(|| {
+        batch.context().in_scope(|| {
+            embedder.embed("query only").unwrap();
+        });
+        batch.finish(Outcome::Completed);
+    });
+    assert_eq!(requests.join().unwrap().len(), 1);
+    let terminal = terminal(&records);
+    assert_eq!(terminal["counts"]["embedding_chunks_requested"], 0);
+    assert_eq!(terminal["counts"]["embedding_chunks_submitted"], 0);
+    assert_eq!(terminal["counts"]["embedding_http_requests"], 0);
 }
 
 #[test]
@@ -352,6 +374,86 @@ fn vector_lifecycle_refusal_and_failure_retain_earlier_committed_batch() {
         assert_eq!(terminal["committed_totals"]["embeddings_written"], 1);
         assert_eq!(terminal["pending"], 1);
     }
+}
+
+#[test]
+fn late_embedding_response_cannot_write_after_rowid_reuse_for_new_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("search.db");
+    let mut store = Store::open(&path).unwrap();
+    let old = crate::Chunk {
+        kind: crate::ChunkKind::Procedure,
+        name: "Method".to_owned(),
+        is_export: false,
+        annotations: Vec::new(),
+        line_start: 1,
+        line_end: 2,
+        text: "Процедура Method()\nСообщить(\"old\");\nКонецПроцедуры".to_owned(),
+    };
+    store
+        .reindex_file_with_identity(
+            crate::CONFIGURATION_ROOT_ID,
+            "M.bsl",
+            b"old",
+            &[old],
+            Some(&[vec![0.0, 1.0, 0.0]]),
+            None,
+            "fixture",
+            3,
+        )
+        .unwrap();
+    let row_id = store.load_all_embeddings(3).unwrap()[0].0;
+    store.clear_chunk_embedding(row_id).unwrap();
+
+    let replacement_path = path.clone();
+    let (embedder, requests) = server(1, move || {
+        // Mutate the file after the worker has submitted its payload, but before the
+        // provider response can reach the guarded SQLite write.
+        let replacement = crate::Chunk {
+            kind: crate::ChunkKind::Procedure,
+            name: "Method".to_owned(),
+            is_export: false,
+            annotations: Vec::new(),
+            line_start: 1,
+            line_end: 2,
+            text: "Процедура Method()\nСообщить(\"new\");\nКонецПроцедуры".to_owned(),
+        };
+        let mut concurrent = Store::open_existing(&replacement_path).unwrap();
+        concurrent
+            .reindex_file_with_identity(
+                crate::CONFIGURATION_ROOT_ID,
+                "M.bsl",
+                b"new",
+                &[replacement],
+                None,
+                None,
+                "fixture",
+                3,
+            )
+            .unwrap();
+    });
+    let result = SearchEngine::run_embedding_pass(
+        &store,
+        &embedder,
+        3,
+        1,
+        1,
+        None,
+        None,
+        &mut |operation| FenceOutcome::Applied(operation()),
+        None,
+    );
+    let error = match result {
+        Ok(_) => panic!("stale embedding response must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.to_string(), "index error: embedding target changed during request");
+    assert_eq!(requests.join().unwrap().len(), 1);
+
+    let pending = store.load_pending_embedding_documents("code").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, row_id, "fixture must exercise SQLite rowid reuse");
+    assert!(store.load_all_embeddings(3).unwrap().is_empty());
 }
 
 /// Batch totals the progress record shows while each request is in flight. A finished pass
@@ -522,11 +624,132 @@ fn payload_documents() -> (String, Vec<crate::IndexedDocument>, usize) {
     let key = crate::FileKey::configuration("Module.bsl");
     let docs: Vec<_> = crate::Chunker::chunk(&content)
         .iter()
-        .map(|chunk| crate::document::indexed_document_for_chunk(&key, chunk, None).0)
+        .map(|chunk| crate::document::indexed_document_for_chunk(&key, chunk, &content, None).0)
         .collect();
     assert_eq!(docs.len(), 4);
     let limit = docs.iter().map(|doc| serde_json::json!({"model":"fixture","input":[crate::document::semantic_text_for_indexed_document(doc)],"dimensions":3}).to_string().len()).max().unwrap();
     (content, docs, limit)
+}
+
+#[test]
+fn index_directory_reuses_vectors_for_unchanged_semantic_payloads() {
+    use crate::embedder::payload_tests::{success, vector, PayloadServer};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (content, documents, limit) = payload_documents();
+    let source = dir.path().join("Module.bsl");
+    std::fs::write(&source, &content).unwrap();
+    let server = PayloadServer::new(success);
+    let embedder = server.config(limit);
+    let config = SearchConfig { embedder, execution: crate::EmbeddingExecutionPolicy::default() };
+    let db_path = dir.path().join("search.db");
+    let mut engine = SearchEngine::new(&db_path, config).unwrap();
+
+    assert_eq!(engine.index_directory(dir.path(), None).unwrap(), 1);
+    assert_eq!(server.requests().len(), documents.len());
+    assert!(engine.store.embedding_profile_matches("fixture", 3).unwrap());
+    let original_vectors = engine.store.load_all_embeddings(3).unwrap();
+    let original_target_ids = original_vectors.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let original_by_symbol = original_vectors
+        .into_iter()
+        .map(|(id, embedding)| {
+            let chunk = engine.store.chunk_by_id(id).unwrap().unwrap();
+            (chunk.symbol_name, embedding)
+        })
+        .collect::<HashMap<_, _>>();
+
+    // Keep a later row alive while replacing Module.bsl so SQLite assigns its replacement
+    // chunks new ids. The sidecar must then be rebuilt from those current ids.
+    std::fs::write(
+        dir.path().join("Later.bsl"),
+        "Процедура Позже()\nСообщить(\"later\");\nКонецПроцедуры",
+    )
+    .unwrap();
+    assert_eq!(engine.index_directory(dir.path(), None).unwrap(), 1);
+    assert_eq!(server.requests().len(), documents.len() + 1);
+
+    // Keep request size fixed while changing only Метод2's effective payload.
+    let changed_content = content.replace("данные2", "данные9");
+    assert_eq!(content.len(), changed_content.len());
+    let changed_documents = documents
+        .iter()
+        .cloned()
+        .map(|mut document| {
+            if document.symbol_name == "Метод2" {
+                document.text = document.text.replace("данные2", "данные9");
+            }
+            document
+        })
+        .collect::<Vec<_>>();
+    for (before, after) in documents.iter().zip(&changed_documents) {
+        assert_eq!(
+            semantic_key_for_indexed_document(before) == semantic_key_for_indexed_document(after),
+            before.symbol_name != "Метод2",
+            "only Метод2 should have a different embedding key"
+        );
+    }
+    std::fs::write(&source, changed_content).unwrap();
+    assert_eq!(engine.index_directory(dir.path(), None).unwrap(), 1);
+
+    assert_eq!(
+        server.requests().len(),
+        documents.len() + 2,
+        "unchanged semantic payloads should not be submitted again"
+    );
+    let current = engine.store.load_all_embeddings(3).unwrap();
+    let current_by_symbol = current
+        .iter()
+        .map(|(id, embedding)| {
+            let chunk = engine.store.chunk_by_id(*id).unwrap().unwrap();
+            (chunk.symbol_name, embedding)
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(current_by_symbol.len(), documents.len() + 1);
+    for document in documents.iter().filter(|document| document.symbol_name != "Метод2") {
+        assert_eq!(
+            current_by_symbol.get(&document.symbol_name).copied(),
+            original_by_symbol.get(&document.symbol_name),
+            "unchanged chunk {} should keep its exact vector",
+            document.symbol_name
+        );
+    }
+    for (id, embedding) in current {
+        let chunk = engine.store.chunk_by_id(id).unwrap().unwrap();
+        let text = crate::document::semantic_text_from_parts(
+            &chunk.file_path,
+            &chunk.kind,
+            &chunk.symbol_name,
+            "",
+            &chunk.text,
+        );
+        assert_eq!(embedding, vector(&text));
+    }
+
+    let current = engine.store.load_all_embeddings(3).unwrap();
+    assert_eq!(original_target_ids.len(), documents.len());
+    let current_target_ids = engine
+        .store
+        .chunk_ids_for_file("code", crate::CONFIGURATION_ROOT_ID, "Module.bsl")
+        .unwrap();
+    assert!(
+        current_target_ids.iter().all(|id| !original_target_ids.contains(id)),
+        "fixture must move replacement chunks to current SQLite ids"
+    );
+
+    drop(engine);
+    std::fs::remove_file(db_path.with_extension("db.usearch.json")).unwrap();
+    let config = SearchConfig {
+        embedder: server.config(limit),
+        execution: crate::EmbeddingExecutionPolicy::default(),
+    };
+    let rebuilt = SearchEngine::new(&db_path, config).unwrap();
+    assert_eq!(server.requests().len(), documents.len() + 2, "rebuild must not embed");
+    assert_eq!(rebuilt.index.len(), current.len());
+    for (id, vector) in current {
+        let hit = rebuilt.index.search(&vector, 1).unwrap().remove(0);
+        assert_eq!(hit.chunk_id, id, "rebuilt sidecar must use current SQLite ids");
+        assert!(hit.score > 0.99, "rebuilt sidecar score must match the stored vector");
+    }
 }
 
 #[test]

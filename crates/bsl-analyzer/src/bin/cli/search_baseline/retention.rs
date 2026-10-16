@@ -36,6 +36,7 @@ pub(super) struct SnapshotRetentionAssessment {
 
 pub(super) fn run(args: SearchBaselineRetentionArgs) -> Result<(), Box<dyn Error + Send + Sync>> {
     let project = project_model::Project::new(&args.source_dir)?;
+    project.warn_about_external_discovery_rejections();
     let policy = &project.config.search.baseline.workspace_code.policy;
     if !policy.is_configured() {
         return Err(io::Error::new(
@@ -45,8 +46,8 @@ pub(super) fn run(args: SearchBaselineRetentionArgs) -> Result<(), Box<dyn Error
         .into());
     }
 
-    let adapter = postgres::build_project_adapter(
-        &args.source_dir,
+    let adapter = postgres::build_project_adapter_for_project(
+        &project,
         project_model::PostgresAccessMode::Reader,
     )?;
     let snapshots = adapter.list_snapshots(

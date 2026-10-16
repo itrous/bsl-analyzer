@@ -47,6 +47,9 @@ pub fn check_config(
     let diagnostics =
         mcp_server::resolve_project_baseline_diagnostics(config.parent(), &project_config);
     let project = project_model::Project::with_config(project_root, project_config.clone());
+    if let Ok(project) = &project {
+        project.warn_about_external_discovery_rejections();
+    }
     let diagnostics_baseline = inspect_diagnostics_baseline(&project);
     let report = build_check_config_report(
         &config,

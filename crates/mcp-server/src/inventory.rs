@@ -474,13 +474,13 @@ fn fence_callers_are_exactly_classified() {
     }
 }
 
-/// A graph database is not copied by production code at all: reads use the file itself, a full
-/// build writes its own replacement, and a point patch writes into the file in one transaction.
-/// A copy anywhere would be a full copy of the file the counters and the disk audit do not see.
+/// Incremental recovery may use one bounded SQLite online backup; arbitrary file copies remain
+/// forbidden because the graph copy audit cannot account for them.
 #[test]
-fn production_code_copies_no_graph_database() {
+fn production_graph_backup_has_one_audited_owner() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut copies = Vec::new();
+    let mut backups = Vec::new();
     for path in production_sources() {
         if is_test_only_module(&path) {
             continue;
@@ -490,13 +490,18 @@ fn production_code_copies_no_graph_database() {
         for (index, _) in source.match_indices("fs::copy(") {
             copies.push((path.strip_prefix(&root).unwrap().to_path_buf(), index));
         }
+        for (index, _) in source.match_indices("Backup::new(") {
+            backups.push((path.strip_prefix(&root).unwrap().to_path_buf(), index));
+        }
         assert!(
             !source.contains("NamedTempFile") || !path.starts_with(root.join("graph")),
             "{} makes a temporary copy of graph data",
             path.display()
         );
     }
-    assert!(copies.is_empty(), "graph copies in production code: {copies:?}");
+    assert!(copies.is_empty(), "unaccounted graph file copies in production code: {copies:?}");
+    assert_eq!(backups.len(), 1, "the bounded SQLite backup must have one production owner");
+    assert_eq!(backups[0].0, PathBuf::from("graph/build.rs"));
 }
 
 /// The published graph file is opened only by the graph module that lends its handles: a
@@ -686,9 +691,11 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     // The build watchdog holds a stop of its own and goes with the build.
     ("graph_db.rs", "spawn_build_watchdog", ".wait_timeout(", Waiting::OwnProtocol),
     // A read waiting for a pooled graph handle to come back: bounded by the caller's wait.
-    ("graph/snapshot.rs", "checkout", ".wait_timeout(", Waiting::Bounded),
+    ("graph/snapshot.rs", "checkout_with_admission_wait", ".wait_timeout(", Waiting::Bounded),
     // The budget of a patch's SQL: a watchdog thread that interrupts the statement in flight.
     ("graph_db.rs", "begin_body_patch", ".recv_timeout(", Waiting::Bounded),
+    // SQLite online backup's short retry within the incremental candidate's 60-second deadline.
+    ("graph/build.rs", "apply_patch_candidate_inner", "thread::sleep", Waiting::Bounded),
     // A replacement waits for the reads in flight, bounded by the installation wait.
     ("graph/snapshot.rs", "pause_for_replacement", ".wait_timeout(", Waiting::Bounded),
     // A superseded graph waits for its reads in flight before it closes the file; it ends when
@@ -808,7 +815,13 @@ fn is_test_only_module(path: &Path) -> bool {
     if path == root.join("lib.rs") {
         return false;
     }
-    let declaring = if from == root { root.join("lib.rs") } else { from.join("mod.rs") };
+    let declaring = if from == root {
+        root.join("lib.rs")
+    } else if from.join("mod.rs").is_file() {
+        from.join("mod.rs")
+    } else {
+        from.with_extension("rs")
+    };
     let Ok(source) = std::fs::read_to_string(&declaring) else { return false };
     !production_source(&source).contains(&format!("mod {name};"))
 }
@@ -844,6 +857,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
         exempt,
         [
             "diagnostics_state/test_support.rs",
+            "graph/build/vector_lifecycle_tests.rs",
             "graph/portable_workspace_graph_tests.rs",
             "graph/test_support.rs",
             "indexing_runtime_tests.rs",

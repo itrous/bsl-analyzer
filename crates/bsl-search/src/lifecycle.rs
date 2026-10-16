@@ -55,6 +55,7 @@ pub enum Reason {
     GenerationMissing,
     Startup,
     Embedding,
+    GraphReload,
     Unknown,
 }
 
@@ -88,20 +89,34 @@ pub enum Outcome {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Counts {
     pub sqlite_vectors_removed: Option<u64>,
+    pub sqlite_vectors_transferred: u64,
     pub overlay_vectors_removed: Option<u64>,
     pub overlay_cache_entries_removed: Option<u64>,
     pub hashes_cleared: u64,
     pub embeddings_written: u64,
+    pub embedding_chunks_requested: u64,
+    pub embedding_chunks_submitted: u64,
+    pub embedding_http_requests: u64,
+    pub embedding_results_discarded: u64,
+    pub reuse_misses_payload: Option<u64>,
+    pub reuse_misses_pending: Option<u64>,
 }
 
 impl Default for Counts {
     fn default() -> Self {
         Self {
             sqlite_vectors_removed: Some(0),
+            sqlite_vectors_transferred: 0,
             overlay_vectors_removed: Some(0),
             overlay_cache_entries_removed: Some(0),
             hashes_cleared: 0,
             embeddings_written: 0,
+            embedding_chunks_requested: 0,
+            embedding_chunks_submitted: 0,
+            embedding_http_requests: 0,
+            embedding_results_discarded: 0,
+            reuse_misses_payload: None,
+            reuse_misses_pending: None,
         }
     }
 }
@@ -113,12 +128,39 @@ impl Counts {
         }
         self.sqlite_vectors_removed =
             sum(self.sqlite_vectors_removed, other.sqlite_vectors_removed);
+        self.sqlite_vectors_transferred =
+            self.sqlite_vectors_transferred.saturating_add(other.sqlite_vectors_transferred);
         self.overlay_vectors_removed =
             sum(self.overlay_vectors_removed, other.overlay_vectors_removed);
         self.overlay_cache_entries_removed =
             sum(self.overlay_cache_entries_removed, other.overlay_cache_entries_removed);
         self.hashes_cleared = self.hashes_cleared.saturating_add(other.hashes_cleared);
         self.embeddings_written = self.embeddings_written.saturating_add(other.embeddings_written);
+        self.embedding_chunks_requested =
+            self.embedding_chunks_requested.saturating_add(other.embedding_chunks_requested);
+        self.embedding_chunks_submitted =
+            self.embedding_chunks_submitted.saturating_add(other.embedding_chunks_submitted);
+        self.embedding_http_requests =
+            self.embedding_http_requests.saturating_add(other.embedding_http_requests);
+        self.embedding_results_discarded =
+            self.embedding_results_discarded.saturating_add(other.embedding_results_discarded);
+        self.reuse_misses_payload = sum(self.reuse_misses_payload, other.reuse_misses_payload);
+        self.reuse_misses_pending = sum(self.reuse_misses_pending, other.reuse_misses_pending);
+    }
+
+    fn add_interval(&mut self, other: &Self) {
+        let reuse_misses_payload = self.reuse_misses_payload;
+        let reuse_misses_pending = self.reuse_misses_pending;
+        self.add(other);
+        fn merge(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            }
+        }
+        self.reuse_misses_payload = merge(reuse_misses_payload, other.reuse_misses_payload);
+        self.reuse_misses_pending = merge(reuse_misses_pending, other.reuse_misses_pending);
     }
 
     pub fn unavailable() -> Self {
@@ -152,6 +194,72 @@ pub struct Snapshot {
     pub roots_digest: Option<String>,
 }
 
+/// One bounded graph-owner observation attached to the current lifecycle operation.
+/// Labels are static vocabulary; source paths, payloads and URLs are intentionally absent.
+#[derive(Clone, Debug, Serialize)]
+pub struct GraphObservation {
+    operation: String,
+    reason: String,
+    stage: String,
+    result: String,
+    dirty: Option<u64>,
+    closure: Option<u64>,
+    budget_ms: Option<u64>,
+    elapsed_ms: Option<u64>,
+    categories: Vec<String>,
+    examples: Vec<String>,
+}
+
+impl GraphObservation {
+    pub fn new(
+        operation: &'static str,
+        reason: &'static str,
+        stage: &'static str,
+        result: &'static str,
+    ) -> Self {
+        Self {
+            operation: bounded(operation, 64),
+            reason: bounded(reason, 64),
+            stage: bounded(stage, 64),
+            result: bounded(result, 64),
+            dirty: None,
+            closure: None,
+            budget_ms: None,
+            elapsed_ms: None,
+            categories: Vec::new(),
+            examples: Vec::new(),
+        }
+    }
+
+    pub fn with_counts(
+        mut self,
+        dirty: Option<u64>,
+        closure: Option<u64>,
+        budget_ms: Option<u64>,
+        elapsed_ms: Option<u64>,
+    ) -> Self {
+        self.dirty = dirty;
+        self.closure = closure;
+        self.budget_ms = budget_ms;
+        self.elapsed_ms = elapsed_ms;
+        self
+    }
+
+    pub fn with_category(mut self, category: &'static str) -> Self {
+        if self.categories.len() < MAX_EXAMPLES {
+            self.categories.push(bounded(category, 64));
+        }
+        self
+    }
+
+    pub fn with_example(mut self, example: &'static str) -> Self {
+        if self.examples.len() < MAX_EXAMPLES {
+            self.examples.push(bounded(example, 64));
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
     pub event_version: u8,
@@ -178,6 +286,9 @@ pub struct Record {
     pub examples: Vec<String>,
     pub snapshot: Option<Snapshot>,
     pub pending: Option<u64>,
+    pub pending_before: Option<u64>,
+    pub pending_after: Option<u64>,
+    pub graph: Option<GraphObservation>,
     pub version_kind: Option<&'static str>,
     pub from_version: Option<i64>,
     pub to_version: Option<i64>,
@@ -224,6 +335,9 @@ impl Record {
             examples: Vec::new(),
             snapshot: None,
             pending: None,
+            pending_before: None,
+            pending_after: None,
+            graph: None,
             version_kind: None,
             from_version: None,
             to_version: None,
@@ -260,6 +374,30 @@ impl Record {
             {
                 if text.len() > 256 {
                     *text = bounded(text, 256);
+                    self.truncated = true;
+                }
+            }
+        }
+        if let Some(graph) = self.graph.as_mut() {
+            for text in
+                [&mut graph.operation, &mut graph.reason, &mut graph.stage, &mut graph.result]
+            {
+                if text.len() > 64 {
+                    *text = bounded(text, 64);
+                    self.truncated = true;
+                }
+            }
+            if graph.categories.len() > MAX_EXAMPLES {
+                graph.categories.truncate(MAX_EXAMPLES);
+                self.truncated = true;
+            }
+            if graph.examples.len() > MAX_EXAMPLES {
+                graph.examples.truncate(MAX_EXAMPLES);
+                self.truncated = true;
+            }
+            for text in graph.categories.iter_mut().chain(graph.examples.iter_mut()) {
+                if text.len() > 64 {
+                    *text = bounded(text, 64);
                     self.truncated = true;
                 }
             }
@@ -303,6 +441,7 @@ impl Record {
             self.version_kind = None;
             self.old_hash = None;
             self.new_hash = None;
+            self.graph = None;
         }
     }
 
@@ -413,6 +552,63 @@ impl Context {
             None => f(),
         })
     }
+
+    /// Record one actual HTTP attempt and its bounded input count in the current operation.
+    pub fn embedding_request(&self, chunks: usize) {
+        let mut summary = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        summary.record.counts.embedding_http_requests =
+            summary.record.counts.embedding_http_requests.saturating_add(1);
+        summary.record.counts.embedding_chunks_submitted =
+            summary.record.counts.embedding_chunks_submitted.saturating_add(chunks as u64);
+    }
+
+    /// Record planned inputs that became requestable after a late reuse recheck.
+    pub fn requested(&self, count: u64) {
+        let mut summary = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        summary.record.counts.embedding_chunks_requested =
+            summary.record.counts.embedding_chunks_requested.saturating_add(count);
+    }
+
+    /// Reuse misses are observed needs, not committed writes.
+    pub fn reuse_misses(&self, payload: u64, pending: u64) {
+        let mut summary = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let counts = &mut summary.record.counts;
+        counts.reuse_misses_payload =
+            Some(counts.reuse_misses_payload.unwrap_or(0).saturating_add(payload));
+        counts.reuse_misses_pending =
+            Some(counts.reuse_misses_pending.unwrap_or(0).saturating_add(pending));
+    }
+
+    pub fn current_embedding_request(chunks: usize) {
+        if let Some(context) = Self::current() {
+            context.embedding_request(chunks);
+        }
+    }
+
+    /// Emit one graph-owner observation under the current bounded lifecycle operation.
+    /// The event shares its operation identity and store fields, but never changes the
+    /// operation's counts or terminal outcome.
+    pub fn graph_event(&self, observation: GraphObservation) {
+        let mut record = {
+            let summary = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            let mut record = summary.record.clone();
+            record.kind = "graph_operation";
+            record.reason = Reason::GraphReload;
+            record.outcome = Outcome::Progress;
+            record.counts = Counts::default();
+            record.committed_totals = None;
+            record.outcomes.clear();
+            record.files = 0;
+            record.reasons.clear();
+            record.examples.clear();
+            record.pending = None;
+            record.pending_before = None;
+            record.pending_after = None;
+            record.graph = Some(observation);
+            record
+        };
+        self.in_scope(|| record.emit(false));
+    }
 }
 
 struct Summary {
@@ -424,10 +620,16 @@ impl Summary {
     fn flush(&mut self, outcome: Outcome) -> Record {
         let mut event = self.record.clone();
         event.committed_totals = Some(self.totals.clone());
-        if event.reason == Reason::Embedding {
-            event.pending =
-                event.pending.map(|count| count.saturating_sub(self.totals.embeddings_written));
+        if event.pending_after.is_none() && event.reason == Reason::Embedding {
+            event.pending_after = event.pending.map(|count| {
+                count.saturating_sub(
+                    self.totals
+                        .embeddings_written
+                        .saturating_add(self.totals.sqlite_vectors_transferred),
+                )
+            });
         }
+        event.pending = event.pending_after.or(event.pending);
         event.outcome = outcome;
         self.record.files = 0;
         self.record.counts = Counts::default();
@@ -472,9 +674,29 @@ impl Batch {
         let mut record = {
             let mut summary = self.context.0.lock().unwrap_or_else(|e| e.into_inner());
             summary.record.pending = Some(count);
+            summary.record.pending_before = Some(count);
             summary.record.intent()
         };
         record.emit(false);
+    }
+    pub fn pending_after(&self, count: u64) {
+        let mut summary = self.context.0.lock().unwrap_or_else(|e| e.into_inner());
+        summary.record.pending_after = Some(count);
+    }
+    pub fn requested(&self, count: u64) {
+        let mut summary = self.context.0.lock().unwrap_or_else(|e| e.into_inner());
+        summary.record.counts.embedding_chunks_requested =
+            summary.record.counts.embedding_chunks_requested.saturating_add(count);
+    }
+    /// Record exactly measured reuse misses for this lifecycle interval. These are planned
+    /// needs, not committed writes, so they stay out of committed_totals.
+    pub fn reuse_misses(&self, payload: u64, pending: u64) {
+        let mut summary = self.context.0.lock().unwrap_or_else(|error| error.into_inner());
+        let counts = &mut summary.record.counts;
+        counts.reuse_misses_payload =
+            Some(counts.reuse_misses_payload.unwrap_or(0).saturating_add(payload));
+        counts.reuse_misses_pending =
+            Some(counts.reuse_misses_pending.unwrap_or(0).saturating_add(pending));
     }
     pub fn finish(mut self, outcome: Outcome) {
         self.finish_inner(outcome);
@@ -575,7 +797,7 @@ impl Mutation {
             let event = {
                 let mut summary = parent.0.lock().unwrap_or_else(|e| e.into_inner());
                 if outcome == Outcome::Committed {
-                    summary.record.counts.add(&self.record.counts);
+                    summary.record.counts.add_interval(&self.record.counts);
                     summary.totals.add(&self.record.counts);
                 }
                 *summary.record.outcomes.entry(outcome).or_default() += 1;
@@ -700,6 +922,73 @@ mod tests {
     }
 
     #[test]
+    fn reuse_misses_aggregate_once_and_remain_known_after_unmeasured_mutation() {
+        let records = capture(|| {
+            let batch = Batch::new(Path::new("db"), Reason::ExplicitRebuild);
+            batch.reuse_misses(2, 3);
+            batch.context().in_scope(|| {
+                Mutation::new(Path::new("db"), Reason::HashChanged).finish(
+                    Outcome::Committed,
+                    Counts {
+                        reuse_misses_payload: Some(3),
+                        reuse_misses_pending: Some(4),
+                        ..Counts::default()
+                    },
+                );
+                Mutation::new(Path::new("db"), Reason::HashChanged)
+                    .finish(Outcome::Committed, Counts::default());
+            });
+            batch.finish(Outcome::Completed);
+        });
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["counts"]["reuse_misses_payload"], 5);
+        assert_eq!(terminal["counts"]["reuse_misses_pending"], 7);
+        assert_eq!(terminal["committed_totals"]["reuse_misses_payload"], serde_json::Value::Null);
+        assert_eq!(terminal["committed_totals"]["reuse_misses_pending"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn graph_events_share_operation_identity_and_keep_bounded_summary_unchanged() {
+        const LONG_LABEL: &str =
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let records = capture_with_level(tracing_subscriber::filter::LevelFilter::DEBUG, || {
+            let batch = Batch::new(Path::new("db"), Reason::GraphReload);
+            let context = batch.context();
+            let mut observation =
+                GraphObservation::new(LONG_LABEL, "budget", "catch_up", "retry_budget")
+                    .with_counts(Some(12), Some(7), Some(60_000), Some(5_000));
+            for _ in 0..(MAX_EXAMPLES + 2) {
+                observation = observation.with_category(LONG_LABEL).with_example("changed_input");
+            }
+            let graph_context = context.clone();
+            std::thread::spawn(move || graph_context.graph_event(observation)).join().unwrap();
+            context.in_scope(|| {
+                Mutation::new(Path::new("db"), Reason::ContextChanged)
+                    .finish(Outcome::Committed, Counts::default());
+            });
+            batch.finish(Outcome::Completed);
+        });
+
+        let graph = records.iter().find(|record| record["kind"] == "graph_operation").unwrap();
+        assert_eq!(graph["graph"]["operation"], bounded(LONG_LABEL, 64));
+        assert_eq!(graph["graph"]["result"], "retry_budget");
+        assert_eq!(graph["graph"]["dirty"], 12);
+        assert_eq!(graph["graph"]["closure"], 7);
+        assert_eq!(graph["graph"]["budget_ms"], 60_000);
+        assert_eq!(graph["graph"]["elapsed_ms"], 5_000);
+        assert_eq!(graph["graph"]["categories"].as_array().unwrap().len(), MAX_EXAMPLES);
+        assert_eq!(graph["graph"]["examples"].as_array().unwrap().len(), MAX_EXAMPLES);
+        assert!(graph["graph"]["categories"][0].as_str().unwrap().len() <= 64);
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["outcome"], "completed");
+        assert_eq!(graph["operation_id"], terminal["operation_id"]);
+        let child = records.iter().find(|record| record["kind"] == "mutation").unwrap();
+        assert_eq!(child["parent_operation_id"], terminal["operation_id"]);
+        assert_eq!(terminal["committed_totals"]["embeddings_written"], 0);
+        assert!(records.iter().all(|record| record.to_string().len() <= MAX_RECORD_BYTES));
+    }
+
+    #[test]
     fn subscriber_gets_bounded_summaries_and_terminal_committed_totals() {
         let records = capture(|| {
             let batch = Batch::new(Path::new("db"), Reason::ExplicitRebuild);
@@ -816,6 +1105,13 @@ mod tests {
     }
 
     fn capture(f: impl FnOnce()) -> Vec<serde_json::Value> {
+        capture_with_level(tracing_subscriber::filter::LevelFilter::INFO, f)
+    }
+
+    fn capture_with_level(
+        level: tracing_subscriber::filter::LevelFilter,
+        f: impl FnOnce(),
+    ) -> Vec<serde_json::Value> {
         use tracing_subscriber::prelude::*;
         struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
@@ -840,9 +1136,8 @@ mod tests {
             }
         }
         let records = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(
-            Capture(records.clone()).with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
+        let subscriber =
+            tracing_subscriber::registry().with(Capture(records.clone()).with_filter(level));
         test_with_subscriber(subscriber, f);
         Arc::try_unwrap(records).unwrap().into_inner().unwrap()
     }

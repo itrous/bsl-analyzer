@@ -12,6 +12,14 @@ pub(super) fn build_project_adapter(
     mode: project_model::PostgresAccessMode,
 ) -> Result<bsl_search::ExternalBaselineAdapter, Box<dyn Error + Send + Sync>> {
     let project = project_model::Project::new(source_dir)?;
+    project.warn_about_external_discovery_rejections();
+    build_project_adapter_for_project(&project, mode)
+}
+
+pub(super) fn build_project_adapter_for_project(
+    project: &project_model::Project,
+    mode: project_model::PostgresAccessMode,
+) -> Result<bsl_search::ExternalBaselineAdapter, Box<dyn Error + Send + Sync>> {
     let resolved =
         resolve_project_url(&project.config.search.baseline.postgres, mode).map_err(|error| {
             io::Error::new(

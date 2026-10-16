@@ -145,6 +145,9 @@ pub(super) type PostClaimHook = Arc<dyn Fn(&GraphState) + Send + Sync>;
 #[cfg(test)]
 pub(crate) type BuildCandidateHook = Arc<dyn Fn(&GraphState) + Send + Sync>;
 
+#[cfg(test)]
+pub(crate) type BackupDestinationHook = Arc<dyn Fn(&rusqlite::Connection) + Send + Sync>;
+
 /// The barrier a test runs on the watcher's own thread, between taking the continuation latch
 /// and sampling the alarm counter.
 #[cfg(test)]
@@ -292,6 +295,10 @@ pub(crate) struct GraphState {
     pub(super) change_hub: Option<WorkspaceChangeHub>,
     /// This graph's cursor into the hub. Subscribed lazily on first freshness check.
     pub(super) hub_cursor: Arc<Mutex<ScanCursorSlot>>,
+    /// One full or incremental candidate that yielded its bounded catch-up. The retry alarm
+    /// resumes it under the same graph debt owner; it is process-local so a crash leaves only
+    /// the existing incomplete marker for safe discard.
+    pub(super) pending_candidate: Arc<Mutex<Option<PendingCandidate>>>,
     /// Count of actual fingerprint walks (cache misses), so a test can assert an irrelevant
     /// delivered change did NOT invalidate the throttled cache and re-trigger a scan.
     pub(super) scan_count: Arc<AtomicUsize>,
@@ -319,7 +326,18 @@ pub(crate) struct GraphState {
     #[cfg(test)]
     pub(super) post_claim_hook: Option<PostClaimHook>,
     #[cfg(test)]
-    pub(super) build_candidate_hook: Option<BuildCandidateHook>,
+    pub(super) build_candidate_hook: Arc<Mutex<Option<BuildCandidateHook>>>,
+    /// Delivers a hub event after patch SQL prepares and before its short commit fence.
+    #[cfg(test)]
+    pub(super) patch_precommit_hook: Arc<Mutex<Option<PostClaimHook>>>,
+    #[cfg(test)]
+    pub(super) inject_patch_budget_once: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(super) catchup_stats: Arc<Mutex<(u64, u64, u64)>>,
+    #[cfg(test)]
+    pub(super) catchup_yield_once: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(super) backup_destination_hook: Arc<Mutex<Option<BackupDestinationHook>>>,
     /// Runs on the thread handing a stale publication's catch-up over, after the successor has
     /// been spawned and before the hand-over returns — the window in which two builds hold one
     /// mandate between them.
@@ -502,6 +520,16 @@ pub(crate) struct GraphState {
     pub(super) claim_is_held: Arc<std::sync::atomic::AtomicBool>,
 }
 
+pub(super) struct PendingCandidate {
+    pub(super) path: PathBuf,
+    pub(super) base: Option<String>,
+    pub(super) topology: u64,
+    pub(super) frontier: u64,
+    pub(super) dirty_paths: std::collections::HashSet<PathBuf>,
+    pub(super) cursor: Option<crate::change_hub::CursorLease>,
+    pub(super) resumable: bool,
+}
+
 impl GraphState {
     /// A disabled graph (reference / shared profiles).
     pub(crate) fn disabled() -> Self {
@@ -543,6 +571,7 @@ impl GraphState {
             drift_interval: DRIFT_CHECK_INTERVAL,
             change_hub: None,
             hub_cursor: Arc::new(Mutex::new(ScanCursorSlot::default())),
+            pending_candidate: Arc::new(Mutex::new(None)),
             scan_count: Arc::new(AtomicUsize::new(0)),
             on_published: None,
             debt: Arc::new(Mutex::new(GraphDebt::default())),
@@ -554,7 +583,17 @@ impl GraphState {
             #[cfg(test)]
             post_claim_hook: None,
             #[cfg(test)]
-            build_candidate_hook: None,
+            build_candidate_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            patch_precommit_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            inject_patch_budget_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            catchup_stats: Arc::new(Mutex::new((0, 0, 0))),
+            #[cfg(test)]
+            catchup_yield_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            backup_destination_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             handover_hook: None,
             #[cfg(test)]
@@ -1673,14 +1712,65 @@ impl GraphState {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_build_candidate_hook_for_test(mut self, hook: BuildCandidateHook) -> Self {
-        self.build_candidate_hook = Some(hook);
+    pub(crate) fn with_build_candidate_hook_for_test(self, hook: BuildCandidateHook) -> Self {
+        *lock_recover(&self.build_candidate_hook) = Some(hook);
         self
     }
 
     #[cfg(test)]
+    pub(crate) fn with_patch_precommit_hook_for_test(self, hook: PostClaimHook) -> Self {
+        *lock_recover(&self.patch_precommit_hook) = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_build_candidate_hook_for_test(&self, hook: BuildCandidateHook) {
+        *lock_recover(&self.build_candidate_hook) = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_patch_precommit_hook_for_test(&self, hook: PostClaimHook) {
+        *lock_recover(&self.patch_precommit_hook) = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_next_patch_budget_for_test(&self) {
+        self.inject_patch_budget_once.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catchup_stats_for_test(&self) -> (u64, u64, u64) {
+        *lock_recover(&self.catchup_stats)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn yield_next_catchup_step_for_test(&self) {
+        self.catchup_yield_once.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_backup_destination_hook_for_test(&self, hook: BackupDestinationHook) {
+        *lock_recover(&self.backup_destination_hook) = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepare_backup_destination_for_test(&self, connection: &rusqlite::Connection) {
+        if let Some(hook) = lock_recover(&self.backup_destination_hook).clone() {
+            hook(connection);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn enter_patch_precommit_hook(&self) {
+        let hook = lock_recover(&self.patch_precommit_hook).take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn enter_build_candidate_hook(&self) {
-        if let Some(hook) = self.build_candidate_hook.clone() {
+        if let Some(hook) = lock_recover(&self.build_candidate_hook).clone() {
             hook(self);
         }
     }
@@ -6553,10 +6643,15 @@ mod tests {
         drop(snapshot);
 
         fs::set_permissions(&hidden, open).unwrap();
-        lock_recover(&graph.debt).probe_now(Instant::now());
-        graph.drive();
-
-        wait_until(&graph, "the healed subtree to be rebuilt", || !graph.owes_recovery());
+        wait_until_driving(
+            &graph,
+            "the healed subtree to be rebuilt",
+            || {
+                lock_recover(&graph.debt).probe_now(Instant::now());
+                graph.drive();
+            },
+            || !graph.owes_recovery(),
+        );
         let snapshot = graph.snapshot().expect("the rebuild published");
         assert!(!snapshot.force_stale, "the rebuild over a whole tree is still not faithful");
         assert!(!lock_recover(&graph.debt).stale(), "and nothing is owed once it has published",);

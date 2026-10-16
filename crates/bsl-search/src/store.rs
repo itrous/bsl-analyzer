@@ -65,6 +65,10 @@ const PROFILE_IDENTITY_PREFIX: &str = "profile-v1:";
 const PROFILE_IDENTITY_KEY: &str = "embedding_profile_identity";
 const PROFILE_DIMENSION_KEY: &str = "embedding_profile_dimension";
 const TOKEN_LAYOUT_CLAIM_KEY: &str = "token_layout_claim_v1";
+const HAS_STORED_EMBEDDINGS_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM chunks WHERE embedding IS NOT NULL
+    UNION ALL SELECT 1 FROM overlay_chunks WHERE embedding IS NOT NULL
+    UNION ALL SELECT 1 FROM overlay_embedding_cache)";
 const TOKEN_LAYOUT_VERSION: &str = "token-segments-v1";
 
 /// One file prepared off-lock for an atomic workspace-root transition.
@@ -105,6 +109,37 @@ thread_local! {
 /// re-embeds everything, rather than mixing old- and new-format vectors in one space
 /// (file-hash gating would otherwise keep stale-format embeddings indefinitely).
 pub(crate) const EMBED_TEXT_VERSION: i64 = 1;
+
+/// A vector read from the current file only after its stored profile, text layout, and
+/// effective semantic payload have all been proven to match. Kept in memory for the
+/// replacement transaction; this is not a durable cache.
+#[derive(Debug, Clone)]
+pub(crate) struct ReusableEmbedding {
+    pub semantic_key: String,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReusableEmbeddingSource {
+    pub semantic_key: String,
+    pub chunk_id: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReusableEmbeddingPlan {
+    pub sources: Vec<Option<ReusableEmbeddingSource>>,
+    /// True only when the same-file source had this exact payload but no vector. Used by
+    /// transactional fallback so a cache hit clears the corresponding pending miss honestly.
+    pub pending_slots: Vec<bool>,
+    pub payload_misses: u64,
+    pub pending_misses: u64,
+}
+
+pub(crate) struct ReusableEmbeddingHydration {
+    pub candidates: Vec<Option<ReusableEmbedding>>,
+    pub payload_misses: u64,
+    pub blob_reads: usize,
+}
 
 /// The structural version of the SQLite schema, recorded in the `meta` table — the
 /// search-index counterpart to the call graph's `graph_db::SCHEMA_VERSION`. Bump this
@@ -1791,6 +1826,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// Whether a context-dirty mark newer than `seq_bound` remains unconsumed.
+    pub(crate) fn has_context_dirty_after(
+        &self,
+        collection: &str,
+        seq_bound: i64,
+    ) -> Result<bool, SearchError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM context_dirty WHERE collection = ?1 AND seq > ?2)",
+            params![collection, seq_bound],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Clear one path's context-dirty mark (a reindex/embed pass re-rendered it).
     pub fn clear_context_dirty(
         &self,
@@ -2087,6 +2135,7 @@ impl Store {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reindex_file_with_identity_and_source_spans(
         &mut self,
@@ -2101,8 +2150,38 @@ impl Store {
         token_layout_claim: Option<&str>,
         source_spans: &[Option<SourceSpan>],
     ) -> Result<i64, SearchError> {
+        self.reindex_file_with_identity_reuse_and_source_spans(
+            root_id,
+            path,
+            hash,
+            chunks,
+            embeddings,
+            graph_contexts,
+            model_id,
+            dimension,
+            token_layout_claim,
+            source_spans,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reindex_file_with_identity_reuse_and_source_spans(
+        &mut self,
+        root_id: &str,
+        path: &str,
+        hash: &[u8],
+        chunks: &[Chunk],
+        embeddings: Option<&[Vec<f32>]>,
+        graph_contexts: Option<&[Option<String>]>,
+        model_id: &str,
+        dimension: usize,
+        token_layout_claim: Option<&str>,
+        source_spans: &[Option<SourceSpan>],
+        reuse_candidates: Option<&[Option<ReusableEmbedding>]>,
+    ) -> Result<i64, SearchError> {
         let mut checkpoint = || ControlFlow::Continue(());
-        match self.reindex_file_in_collection_checkpointed_with_source_spans(
+        match self.reindex_file_in_collection_checkpointed_with_reuse(
             root_id,
             path,
             hash,
@@ -2113,6 +2192,7 @@ impl Store {
             Some((model_id, dimension)),
             token_layout_claim,
             source_spans,
+            reuse_candidates,
             &mut checkpoint,
         )? {
             ControlFlow::Continue(file_id) => Ok(file_id),
@@ -2368,28 +2448,6 @@ impl Store {
         )
     }
 
-    pub(crate) fn reindex_file_with_context_checkpointed(
-        &mut self,
-        key: &FileKey,
-        hash: &[u8],
-        chunks: &[Chunk],
-        embeddings: Option<&[Vec<f32>]>,
-        graph_contexts: Option<&[Option<String>]>,
-        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
-    ) -> Result<ControlFlow<(), i64>, SearchError> {
-        self.reindex_file_in_collection_checkpointed(
-            &key.root_id,
-            &key.path,
-            hash,
-            "code",
-            chunks,
-            embeddings,
-            graph_contexts,
-            None,
-            checkpoint,
-        )
-    }
-
     // Every argument is a distinct input of one write — which row, what it now
     // holds, and the optional vectors and rendered contexts that go with it.
     // Bundling them into a context struct would only rename the same fields, so
@@ -2465,6 +2523,38 @@ impl Store {
         source_spans: &[Option<SourceSpan>],
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> Result<ControlFlow<(), i64>, SearchError> {
+        self.reindex_file_in_collection_checkpointed_with_reuse(
+            root_id,
+            path,
+            hash,
+            collection,
+            chunks,
+            embeddings,
+            graph_contexts,
+            embedding_identity,
+            token_layout_claim,
+            source_spans,
+            None,
+            checkpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reindex_file_in_collection_checkpointed_with_reuse(
+        &self,
+        root_id: &str,
+        path: &str,
+        hash: &[u8],
+        collection: &str,
+        chunks: &[Chunk],
+        embeddings: Option<&[Vec<f32>]>,
+        graph_contexts: Option<&[Option<String>]>,
+        embedding_identity: Option<(&str, usize)>,
+        token_layout_claim: Option<&str>,
+        source_spans: &[Option<SourceSpan>],
+        reuse_candidates: Option<&[Option<ReusableEmbedding>]>,
+        checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
+    ) -> Result<ControlFlow<(), i64>, SearchError> {
         validate_source_spans_for_chunks(source_spans, chunks, token_layout_claim.is_some())?;
         if checkpoint().is_break() {
             return Ok(ControlFlow::Break(()));
@@ -2479,10 +2569,112 @@ impl Store {
         ));
         let mut counts = Counts::default();
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        if embeddings.is_some() {
+        if embeddings.is_some() || reuse_candidates.is_some() {
             Self::guard_embedding_write(&tx, embedding_identity)?;
         }
         Self::check_token_layout_claim(&tx, token_layout_claim, source_spans)?;
+
+        let reuse_profile_current = if reuse_candidates.is_some() {
+            match embedding_identity {
+                Some((model_id, dim)) => {
+                    Self::reuse_profile_matches(&tx, model_id, dim, token_layout_claim)?
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        // Fused/pending replacements have no vectors at the call site. Re-read matching rows
+        // while holding this transaction's writer lock, before deleting the old file rows.
+        let transaction_reuse = if embeddings.is_none() && reuse_candidates.is_none() {
+            match embedding_identity {
+                Some((model_id, dim)) => {
+                    let keys = chunks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, chunk)| {
+                            crate::document::semantic_key_from_parts(
+                                path,
+                                chunk.kind.label(),
+                                &chunk.name,
+                                graph_contexts
+                                    .and_then(|contexts| contexts.get(index))
+                                    .and_then(Option::as_deref)
+                                    .unwrap_or(""),
+                                &chunk.text,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let plan = Self::plan_reusable_embeddings_for_keys(
+                        &tx,
+                        root_id,
+                        path,
+                        collection,
+                        &keys,
+                        model_id,
+                        dim,
+                        token_layout_claim,
+                    )?;
+                    let hydrated = Self::hydrate_reusable_embedding_plan_from_conn(
+                        &tx,
+                        root_id,
+                        path,
+                        collection,
+                        &plan,
+                        model_id,
+                        dim,
+                        token_layout_claim,
+                    )?;
+                    let mut reused: HashMap<String, Vec<f32>> = hydrated
+                        .candidates
+                        .into_iter()
+                        .flatten()
+                        .map(|candidate| (candidate.semantic_key, candidate.vector))
+                        .collect();
+
+                    // The workspace overlay cache already contains vectors paid for by a
+                    // previous overlay refresh. Consult it only for semantic keys this file
+                    // actually needs, and only while the current transaction proves the model,
+                    // dimension, token layout, and embedding-text version still match.
+                    let lookup_keys = keys
+                        .iter()
+                        .filter(|key| !reused.contains_key(*key))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    reused.extend(Self::load_overlay_embedding_vectors_for_keys_from_conn(
+                        &tx,
+                        &lookup_keys,
+                        model_id,
+                        dim,
+                        token_layout_claim,
+                    )?);
+
+                    // These counters describe unresolved needs after all safe sources were
+                    // checked. In particular, a cache hit clears either kind of initial miss;
+                    // it must not be reported as pending work merely because a NULL same-file
+                    // row was present before this replacement.
+                    counts.reuse_misses_payload = Some(0);
+                    counts.reuse_misses_pending = Some(0);
+                    for (slot, key) in keys.iter().enumerate() {
+                        if reused.contains_key(key) {
+                            continue;
+                        }
+                        if plan.pending_slots[slot] {
+                            counts.reuse_misses_pending =
+                                Some(counts.reuse_misses_pending.unwrap_or(0).saturating_add(1));
+                        } else {
+                            counts.reuse_misses_payload =
+                                Some(counts.reuse_misses_payload.unwrap_or(0).saturating_add(1));
+                        }
+                    }
+                    reused
+                }
+                None => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2534,11 +2726,35 @@ impl Store {
                 } else {
                     Some(chunk.annotations.join(","))
                 };
-                let embedding_blob: Option<Vec<u8>> = embeddings
-                    .and_then(|embs| embs.get(i))
-                    .map(|e| e.iter().flat_map(|f| f.to_le_bytes()).collect());
                 let graph_context: Option<&str> =
                     graph_contexts.and_then(|gc| gc.get(i)).and_then(|g| g.as_deref());
+                let semantic_key = crate::document::semantic_key_from_parts(
+                    path,
+                    kind_str,
+                    &chunk.name,
+                    graph_context.unwrap_or(""),
+                    &chunk.text,
+                );
+                let candidate = reuse_profile_current
+                    .then(|| reuse_candidates.and_then(|rows| rows.get(i)).and_then(Option::as_ref))
+                    .flatten()
+                    .filter(|candidate| candidate.semantic_key == semantic_key);
+                let has_reuse_candidate =
+                    reuse_candidates.and_then(|rows| rows.get(i)).is_some_and(Option::is_some);
+                let transaction_vector = transaction_reuse.get(&semantic_key);
+                let reused = candidate.map(|candidate| &candidate.vector).or(transaction_vector);
+                let supplied = (!has_reuse_candidate)
+                    .then(|| embeddings.and_then(|values| values.get(i)))
+                    .flatten();
+                let vector = reused.or(supplied);
+                let embedding_blob: Option<Vec<u8>> =
+                    vector.map(|values| values.iter().flat_map(|f| f.to_le_bytes()).collect());
+                if reused.is_some() {
+                    counts.sqlite_vectors_transferred =
+                        counts.sqlite_vectors_transferred.saturating_add(1);
+                } else if supplied.is_some() {
+                    counts.embeddings_written = counts.embeddings_written.saturating_add(1);
+                }
 
                 stmt.execute(params![
                     file_id,
@@ -2577,8 +2793,6 @@ impl Store {
             }
             return Ok(ControlFlow::Break(()));
         }
-        counts.embeddings_written =
-            embeddings.map_or(0, |values| values.len().min(chunks.len())) as u64;
         tx.commit()?;
         observation.finish(Outcome::Committed, counts);
         Ok(ControlFlow::Continue(file_id))
@@ -2975,6 +3189,388 @@ impl Store {
         )
     }
 
+    /// Match target payload keys against one file without selecting embedding BLOBs.
+    /// The returned plan is small and can remain queued while other files are prepared.
+    // These are distinct lookup inputs, not fields of a reusable request object.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_reusable_embeddings_for_documents(
+        &self,
+        root_id: &str,
+        path: &str,
+        collection: &str,
+        documents: &[crate::IndexedDocument],
+        model_id: &str,
+        dim: usize,
+        token_layout_claim: Option<&str>,
+    ) -> Result<ReusableEmbeddingPlan, SearchError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let keys = documents
+            .iter()
+            .map(crate::document::semantic_key_for_indexed_document)
+            .collect::<Vec<_>>();
+        let plan = Self::plan_reusable_embeddings_for_keys(
+            &tx,
+            root_id,
+            path,
+            collection,
+            &keys,
+            model_id,
+            dim,
+            token_layout_claim,
+        )?;
+        tx.commit()?;
+        Ok(plan)
+    }
+
+    /// Fetch vector BLOBs only for candidate source rows and revalidate their payload first.
+    /// This runs just before an ingest task enters the bounded worker queue.
+    // These are distinct lookup and identity inputs, matching the plan operation above.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn hydrate_reusable_embedding_plan(
+        &self,
+        root_id: &str,
+        path: &str,
+        collection: &str,
+        plan: &ReusableEmbeddingPlan,
+        model_id: &str,
+        dim: usize,
+        token_layout_claim: Option<&str>,
+    ) -> Result<ReusableEmbeddingHydration, SearchError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let hydrated = Self::hydrate_reusable_embedding_plan_from_conn(
+            &tx,
+            root_id,
+            path,
+            collection,
+            plan,
+            model_id,
+            dim,
+            token_layout_claim,
+        )?;
+        tx.commit()?;
+        Ok(hydrated)
+    }
+
+    #[cfg(test)]
+    // Keep the test convenience API aligned with the production plan/hydrate inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reusable_embeddings_for_documents(
+        &self,
+        root_id: &str,
+        path: &str,
+        collection: &str,
+        documents: &[crate::IndexedDocument],
+        model_id: &str,
+        dim: usize,
+        token_layout_claim: Option<&str>,
+    ) -> Result<Vec<Option<ReusableEmbedding>>, SearchError> {
+        let plan = self.plan_reusable_embeddings_for_documents(
+            root_id,
+            path,
+            collection,
+            documents,
+            model_id,
+            dim,
+            token_layout_claim,
+        )?;
+        Ok(self
+            .hydrate_reusable_embedding_plan(
+                root_id,
+                path,
+                collection,
+                &plan,
+                model_id,
+                dim,
+                token_layout_claim,
+            )?
+            .candidates)
+    }
+
+    // Each argument is one target identity component or the key set being matched.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_reusable_embeddings_for_keys(
+        conn: &Connection,
+        root_id: &str,
+        path: &str,
+        collection: &str,
+        target_keys: &[String],
+        model_id: &str,
+        dim: usize,
+        token_layout_claim: Option<&str>,
+    ) -> Result<ReusableEmbeddingPlan, SearchError> {
+        let mut plan = ReusableEmbeddingPlan {
+            sources: vec![None; target_keys.len()],
+            pending_slots: vec![false; target_keys.len()],
+            payload_misses: 0,
+            pending_misses: 0,
+        };
+        if target_keys.is_empty() {
+            return Ok(plan);
+        }
+        if dim == 0 || !Self::reuse_profile_matches(conn, model_id, dim, token_layout_claim)? {
+            plan.payload_misses = target_keys.len() as u64;
+            return Ok(plan);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT c.id, f.path, c.kind, c.symbol_name, c.text, c.graph_context,
+                    c.embedding IS NOT NULL
+             FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE f.root_id = ?1 AND f.path = ?2 AND f.collection = ?3",
+        )?;
+        let rows = stmt.query_map(params![root_id, path, collection], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, bool>(6)?,
+            ))
+        })?;
+        struct Prior {
+            source: Option<ReusableEmbeddingSource>,
+            pending: bool,
+        }
+        let mut previous = HashMap::<String, Prior>::new();
+        for row in rows {
+            let (chunk_id, old_path, kind, symbol_name, text, graph_context, ready) = row?;
+            let key = crate::document::semantic_key_from_parts(
+                &old_path,
+                &kind,
+                &symbol_name,
+                graph_context.as_deref().unwrap_or(""),
+                &text,
+            );
+            let state =
+                previous.entry(key.clone()).or_insert(Prior { source: None, pending: false });
+            if ready {
+                state.source.get_or_insert(ReusableEmbeddingSource { semantic_key: key, chunk_id });
+            } else {
+                state.pending = true;
+            }
+        }
+        for (slot, key) in target_keys.iter().enumerate() {
+            match previous.get(key) {
+                Some(Prior { source: Some(source), .. }) => {
+                    plan.sources[slot] = Some(source.clone());
+                }
+                Some(Prior { pending: true, .. }) => {
+                    plan.pending_slots[slot] = true;
+                    plan.pending_misses = plan.pending_misses.saturating_add(1);
+                }
+                _ => plan.payload_misses = plan.payload_misses.saturating_add(1),
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Read only the requested overlay-cache vectors, and only when the current transaction
+    /// still proves their profile, token layout, and embedding-text version. The cache stores
+    /// semantic keys rather than payload rows, so these keys are supplied by the caller from
+    /// the replacement chunks it is about to write.
+    fn load_overlay_embedding_vectors_for_keys_from_conn(
+        conn: &Connection,
+        keys: &[String],
+        model_id: &str,
+        dim: usize,
+        token_layout_claim: Option<&str>,
+    ) -> Result<HashMap<String, Vec<f32>>, SearchError> {
+        if keys.is_empty()
+            || dim == 0
+            || !Self::reuse_profile_matches(conn, model_id, dim, token_layout_claim)?
+        {
+            return Ok(HashMap::new());
+        }
+
+        const KEY_BATCH: usize = 512;
+        let mut unique_keys =
+            keys.iter().collect::<HashSet<_>>().into_iter().cloned().collect::<Vec<_>>();
+        unique_keys.sort_unstable();
+        let mut reusable = HashMap::new();
+
+        for batch in unique_keys.chunks(KEY_BATCH) {
+            let placeholders = (3..3 + batch.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT embedding_key, embedding FROM overlay_embedding_cache
+                 WHERE model_id = ?1 AND dimension = ?2 AND embedding_key IN ({placeholders})"
+            );
+            let mut statement = conn.prepare(&sql)?;
+            let mut values = Vec::with_capacity(batch.len() + 2);
+            values.push(rusqlite::types::Value::Text(model_id.to_owned()));
+            values.push(rusqlite::types::Value::Integer(dim as i64));
+            values.extend(batch.iter().map(|key| rusqlite::types::Value::Text((*key).clone())));
+            let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for row in rows {
+                let (key, blob) = row?;
+                if blob.len() != dim.saturating_mul(4) {
+                    continue;
+                }
+                let vector = blob
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(f32::from_le_bytes)
+                    .collect::<Vec<_>>();
+                if vector.iter().any(|value| !value.is_finite())
+                    || vector.iter().all(|value| *value == 0.0)
+                {
+                    continue;
+                }
+                reusable.insert(key, vector);
+            }
+        }
+        Ok(reusable)
+    }
+
+    // Each argument is needed to revalidate the candidate before reading its BLOB.
+    #[allow(clippy::too_many_arguments)]
+    fn hydrate_reusable_embedding_plan_from_conn(
+        conn: &Connection,
+        root_id: &str,
+        path: &str,
+        collection: &str,
+        plan: &ReusableEmbeddingPlan,
+        model_id: &str,
+        dim: usize,
+        token_layout_claim: Option<&str>,
+    ) -> Result<ReusableEmbeddingHydration, SearchError> {
+        let mut result = ReusableEmbeddingHydration {
+            candidates: vec![None; plan.sources.len()],
+            payload_misses: 0,
+            blob_reads: 0,
+        };
+        let candidate_slots = plan
+            .sources
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, source)| source.as_ref().map(|source| (slot, source)));
+        let slots_by_id = candidate_slots.fold(
+            HashMap::<i64, Vec<(usize, String)>>::new(),
+            |mut slots, (slot, source)| {
+                slots.entry(source.chunk_id).or_default().push((slot, source.semantic_key.clone()));
+                slots
+            },
+        );
+        if slots_by_id.is_empty() {
+            return Ok(result);
+        }
+        if dim == 0 || !Self::reuse_profile_matches(conn, model_id, dim, token_layout_claim)? {
+            result.payload_misses = slots_by_id.values().map(|slots| slots.len() as u64).sum();
+            return Ok(result);
+        }
+
+        let mut valid_ids = Vec::new();
+        let mut metadata = conn.prepare(
+            "SELECT f.path, c.kind, c.symbol_name, c.text, c.graph_context
+             FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE c.id = ?1 AND f.root_id = ?2 AND f.path = ?3 AND f.collection = ?4",
+        )?;
+        for (chunk_id, slots) in &slots_by_id {
+            let current = metadata
+                .query_row(params![chunk_id, root_id, path, collection], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .optional()?;
+            let matches = current.is_some_and(|(old_path, kind, symbol, text, context)| {
+                let key = crate::document::semantic_key_from_parts(
+                    &old_path,
+                    &kind,
+                    &symbol,
+                    context.as_deref().unwrap_or(""),
+                    &text,
+                );
+                slots.iter().all(|(_, expected)| expected == &key)
+            });
+            if matches {
+                valid_ids.push(*chunk_id);
+            } else {
+                result.payload_misses = result.payload_misses.saturating_add(slots.len() as u64);
+            }
+        }
+
+        let mut blob_stmt = conn.prepare("SELECT embedding FROM chunks WHERE id = ?1")?;
+        let mut vectors = HashMap::<i64, Vec<f32>>::new();
+        for chunk_id in valid_ids {
+            let blob = blob_stmt
+                .query_row([chunk_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+                .optional()?
+                .flatten();
+            let Some(blob) = blob else {
+                result.payload_misses = result.payload_misses.saturating_add(
+                    slots_by_id.get(&chunk_id).map_or(0, |slots| slots.len() as u64),
+                );
+                continue;
+            };
+            result.blob_reads = result.blob_reads.saturating_add(1);
+            if blob.len() != dim.saturating_mul(4) {
+                result.payload_misses = result.payload_misses.saturating_add(
+                    slots_by_id.get(&chunk_id).map_or(0, |slots| slots.len() as u64),
+                );
+                continue;
+            }
+            let vector =
+                blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect::<Vec<_>>();
+            if vector.iter().any(|value| !value.is_finite())
+                || vector.iter().all(|value| *value == 0.0)
+            {
+                result.payload_misses = result.payload_misses.saturating_add(
+                    slots_by_id.get(&chunk_id).map_or(0, |slots| slots.len() as u64),
+                );
+                continue;
+            }
+            vectors.insert(chunk_id, vector);
+        }
+        for (chunk_id, slots) in slots_by_id {
+            let Some(vector) = vectors.get(&chunk_id) else { continue };
+            for (slot, semantic_key) in slots {
+                result.candidates[slot] =
+                    Some(ReusableEmbedding { semantic_key, vector: vector.clone() });
+            }
+        }
+        Ok(result)
+    }
+
+    fn reuse_profile_matches(
+        conn: &Connection,
+        model_id: &str,
+        dim: usize,
+        token_layout_claim: Option<&str>,
+    ) -> Result<bool, SearchError> {
+        let identity = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [PROFILE_IDENTITY_KEY], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        let dimension = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [PROFILE_DIMENSION_KEY], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        let stored_token_claim = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [TOKEN_LAYOUT_CLAIM_KEY], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        let text_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok(identity.as_deref() == Some(model_id)
+            && dimension.as_deref().and_then(|value| value.parse::<usize>().ok()) == Some(dim)
+            && stored_token_claim.as_deref() == token_layout_claim
+            && text_version == EMBED_TEXT_VERSION)
+    }
+
     pub(crate) fn token_layout_claim_matches(
         &self,
         token_layout_claim: &str,
@@ -3058,20 +3654,16 @@ impl Store {
             (None, None) => {}
             _ => return Err(SearchError::Index("embedding profile mismatch".to_owned())),
         }
-        if !profiled {
+        let has_vectors: bool = conn.query_row(HAS_STORED_EMBEDDINGS_SQL, [], |row| row.get(0))?;
+        if has_vectors {
+            // A raw model id on an unclaimed database may be a legacy writer. Keep that
+            // path usable, but never claim its unknown vectors for reuse. Profile-v1
+            // identities already have an explicit provenance contract and must reject
+            // unproven vectors.
+            if profiled {
+                return Err(SearchError::Index("embedding profile mismatch".to_owned()));
+            }
             return Ok(());
-        }
-
-        let vectors: i64 = conn.query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL) +
-                (SELECT COUNT(*) FROM overlay_chunks WHERE embedding IS NOT NULL) +
-                (SELECT COUNT(*) FROM overlay_embedding_cache)",
-            [],
-            |row| row.get(0),
-        )?;
-        if vectors != 0 {
-            return Err(SearchError::Index("embedding profile mismatch".to_owned()));
         }
         if claim {
             conn.execute(
@@ -3526,6 +4118,16 @@ impl Store {
         Ok(rows)
     }
 
+    pub(crate) fn pending_embedding_count(&self, collection: &str) -> Result<u64, SearchError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE f.collection = ?1 AND c.embedding IS NULL",
+            [collection],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
     /// Every chunk owned by `path` in `collection`, as `(id, symbol_name, kind,
     /// graph_context)`. Powers the context re-render: the caller re-derives each chunk's
     /// graph context from the freshly published graph and compares it against the stored
@@ -3644,6 +4246,111 @@ impl Store {
                 "UPDATE chunks SET embedding = ?2 WHERE id = ?1",
                 params![chunk_id, blob],
             )? as u64;
+        }
+        tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
+        Ok(())
+    }
+
+    /// Persist one HTTP batch only when each row still represents the exact payload that was
+    /// submitted. Row ids alone are insufficient because SQLite may reuse them after a file
+    /// replacement. The comparison and write share the same IMMEDIATE transaction.
+    pub(crate) fn set_chunk_payload_embeddings_with_token_layout(
+        &self,
+        embeddings: &[(i64, String, Vec<f32>)],
+        embedding_identity: (&str, usize),
+        token_layout_claim: Option<&str>,
+    ) -> Result<(), SearchError> {
+        let observation = Mutation::new(&self.path, Reason::Embedding);
+        let mut counts = Counts::default();
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::guard_embedding_write(&tx, Some(embedding_identity))?;
+        Self::match_token_layout_claim(&tx, token_layout_claim)?;
+        let current_text_version: i64 =
+            tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current_text_version != EMBED_TEXT_VERSION {
+            return Err(SearchError::Index("embedding text version mismatch".to_owned()));
+        }
+        let mut writable = Vec::new();
+        let mut stale_target = false;
+        for (chunk_id, expected_key, embedding) in embeddings {
+            let current = tx
+                .query_row(
+                    "SELECT f.path, c.kind, c.symbol_name, c.text, c.graph_context, c.embedding
+                     FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?1",
+                    [chunk_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<Vec<u8>>>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((path, kind, symbol_name, text, graph_context, ready_blob)) = current else {
+                counts.embedding_results_discarded =
+                    counts.embedding_results_discarded.saturating_add(1);
+                stale_target = true;
+                continue;
+            };
+            let current_key = crate::document::semantic_key_from_parts(
+                &path,
+                &kind,
+                &symbol_name,
+                graph_context.as_deref().unwrap_or(""),
+                &text,
+            );
+            if &current_key != expected_key {
+                counts.embedding_results_discarded =
+                    counts.embedding_results_discarded.saturating_add(1);
+                stale_target = true;
+                continue;
+            }
+            if ready_blob.as_ref().is_some_and(|blob| {
+                blob.len() == embedding_identity.1.saturating_mul(4)
+                    && blob
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(f32::from_le_bytes)
+                        .any(|value| value != 0.0)
+                    && blob
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(f32::from_le_bytes)
+                        .all(f32::is_finite)
+            }) {
+                counts.embedding_results_discarded =
+                    counts.embedding_results_discarded.saturating_add(1);
+                continue;
+            }
+            if embedding.len() != embedding_identity.1
+                || embedding.iter().any(|value| !value.is_finite())
+                || embedding.iter().all(|value| *value == 0.0)
+            {
+                return Err(SearchError::Index("invalid embedding vector".to_owned()));
+            }
+            writable.push((*chunk_id, embedding));
+        }
+        if stale_target {
+            tx.rollback()?;
+            observation.finish(Outcome::Refused, counts);
+            return Err(SearchError::Index("embedding target changed during request".to_owned()));
+        }
+        for (chunk_id, embedding) in writable {
+            let blob: Vec<u8> = embedding.iter().flat_map(|value| value.to_le_bytes()).collect();
+            counts.embeddings_written = counts.embeddings_written.saturating_add(tx.execute(
+                "UPDATE chunks SET embedding = ?2 WHERE id = ?1",
+                params![chunk_id, blob],
+            )?
+                as u64);
         }
         tx.commit()?;
         observation.finish(Outcome::Committed, counts);
@@ -6397,6 +7104,672 @@ mod tests {
         assert!(claimed.load_all_embeddings_with_profile("profile-v1:other", 2).is_err());
     }
 
+    #[test]
+    fn raw_embedding_profile_claims_fresh_vectors_but_not_legacy_vectors() {
+        let raw_model = "fixture-model";
+        let hash = blake3::hash(b"raw-profile-test");
+        let documents = [sample_chunk("Known vector")];
+        let vectors = [vec![0.25_f32, 0.75]];
+
+        let mut fresh = Store::in_memory().unwrap();
+        fresh
+            .reindex_file_with_identity(
+                CONFIGURATION_ROOT_ID,
+                "fresh.bsl",
+                hash.as_bytes(),
+                &documents,
+                Some(&vectors),
+                None,
+                raw_model,
+                2,
+            )
+            .unwrap();
+        assert!(fresh.embedding_profile_matches(raw_model, 2).unwrap());
+        let fresh_documents = fresh.load_indexed_documents(Some("code")).unwrap();
+        let fresh_vectors = fresh
+            .reusable_embeddings_for_documents(
+                CONFIGURATION_ROOT_ID,
+                "fresh.bsl",
+                "code",
+                &fresh_documents,
+                raw_model,
+                2,
+                None,
+            )
+            .unwrap();
+        assert_eq!(fresh_vectors.len(), 1);
+        assert_eq!(fresh_vectors[0].as_ref().unwrap().vector, vectors[0]);
+
+        let mut legacy = Store::in_memory().unwrap();
+        legacy
+            .reindex_file(
+                CONFIGURATION_ROOT_ID,
+                "legacy.bsl",
+                hash.as_bytes(),
+                &documents,
+                Some(&vectors),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key IN (?1, ?2)",
+                    params![PROFILE_IDENTITY_KEY, PROFILE_DIMENSION_KEY],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "identity-blind legacy writes must not claim their vectors"
+        );
+        assert!(
+            legacy
+                .reusable_embeddings_for_documents(
+                    CONFIGURATION_ROOT_ID,
+                    "legacy.bsl",
+                    "code",
+                    &legacy.load_indexed_documents(Some("code")).unwrap(),
+                    raw_model,
+                    2,
+                    None,
+                )
+                .unwrap()
+                .iter()
+                .all(Option::is_none),
+            "legacy vectors without proven identity must not be reused"
+        );
+    }
+
+    #[test]
+    fn legacy_profile_probe_stops_after_finding_one_vector() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .reindex_file(
+                CONFIGURATION_ROOT_ID,
+                "large.bsl",
+                b"large",
+                &[sample_chunk("seed")],
+                Some(&[vec![0.5_f32, 0.25]]),
+            )
+            .unwrap();
+        let file_id = store
+            .conn
+            .query_row(
+                "SELECT id FROM files WHERE root_id = ?1 AND path = ?2 AND collection = 'code'",
+                params![CONFIGURATION_ROOT_ID, "large.bsl"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        store.conn.execute_batch("DROP TRIGGER chunks_gen_ins;").unwrap();
+        store
+            .conn
+            .execute(
+                "WITH digits(x) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)),
+                 numbers(n) AS (
+                    SELECT a.x + 10*b.x + 100*c.x + 1000*d.x + 10000*e.x
+                    FROM digits a, digits b, digits c, digits d, digits e
+                 )
+                 INSERT INTO chunks(file_id, kind, symbol_name, is_export, line_start, line_end, text, embedding)
+                 SELECT ?1, 'procedure', printf('bulk-%d', n), 0, 1, 1, 'x', x'000000000000803f'
+                 FROM numbers",
+                [file_id],
+            )
+            .unwrap();
+
+        let mut statement = store.conn.prepare(HAS_STORED_EMBEDDINGS_SQL).unwrap();
+        assert!(statement.query_row([], |row| row.get::<_, bool>(0)).unwrap());
+        let vm_steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+        assert!(vm_steps < 100, "EXISTS must stop at its first row; VM steps={vm_steps}");
+        assert!(store.embedding_profile_matches("unknown-model", 2).unwrap());
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key IN (?1, ?2)",
+                    params![PROFILE_IDENTITY_KEY, PROFILE_DIMENSION_KEY],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "the fast legacy probe must keep unknown vectors unclaimed"
+        );
+    }
+
+    #[test]
+    fn reuse_plan_reads_vector_blobs_only_for_exact_payload_hits() {
+        let mut store = Store::in_memory().unwrap();
+        let chunk = sample_chunk("Method");
+        let vector = vec![0.25_f32, 0.75, 0.5];
+        store
+            .reindex_file_with_identity(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                b"old",
+                std::slice::from_ref(&chunk),
+                Some(std::slice::from_ref(&vector)),
+                None,
+                "reuse-blob-probe",
+                3,
+            )
+            .unwrap();
+        let document = store.load_indexed_documents(Some("code")).unwrap().remove(0);
+        let plan = store
+            .plan_reusable_embeddings_for_documents(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                "code",
+                std::slice::from_ref(&document),
+                "reuse-blob-probe",
+                3,
+                None,
+            )
+            .unwrap();
+        let hit = store
+            .hydrate_reusable_embedding_plan(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                "code",
+                &plan,
+                "reuse-blob-probe",
+                3,
+                None,
+            )
+            .unwrap();
+        assert_eq!(hit.blob_reads, 1);
+        assert_eq!(hit.candidates[0].as_ref().unwrap().vector, vector);
+
+        let mut changed = document.clone();
+        changed.text.push_str(" changed");
+        let miss_plan = store
+            .plan_reusable_embeddings_for_documents(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                "code",
+                std::slice::from_ref(&changed),
+                "reuse-blob-probe",
+                3,
+                None,
+            )
+            .unwrap();
+        let miss = store
+            .hydrate_reusable_embedding_plan(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                "code",
+                &miss_plan,
+                "reuse-blob-probe",
+                3,
+                None,
+            )
+            .unwrap();
+        assert_eq!(miss.blob_reads, 0);
+        assert_eq!(miss_plan.payload_misses, 1);
+        assert!(miss.candidates[0].is_none());
+
+        let pending = [sample_chunk("Pending")];
+        store
+            .reindex_file_with_identity(
+                CONFIGURATION_ROOT_ID,
+                "Pending.bsl",
+                b"pending",
+                &pending,
+                None,
+                None,
+                "reuse-blob-probe",
+                3,
+            )
+            .unwrap();
+        let pending_doc = store
+            .load_indexed_documents(Some("code"))
+            .unwrap()
+            .into_iter()
+            .find(|document| document.path == "Pending.bsl")
+            .unwrap();
+        let pending_plan = store
+            .plan_reusable_embeddings_for_documents(
+                CONFIGURATION_ROOT_ID,
+                "Pending.bsl",
+                "code",
+                std::slice::from_ref(&pending_doc),
+                "reuse-blob-probe",
+                3,
+                None,
+            )
+            .unwrap();
+        assert_eq!(pending_plan.pending_misses, 1);
+    }
+
+    #[test]
+    fn reuse_lookup_and_replacement_reject_changed_payload_components() {
+        use crate::IndexedDocument;
+
+        let model = "reuse-model";
+        let old_path = "Module.bsl";
+        let old_chunk = sample_chunk("Method");
+        let old_context = Some("Calls: Old\n".to_owned());
+
+        fn indexed(path: &str, chunk: &Chunk, context: Option<String>) -> IndexedDocument {
+            IndexedDocument {
+                collection: "code".to_owned(),
+                root_id: CONFIGURATION_ROOT_ID.to_owned(),
+                path: path.to_owned(),
+                symbol_name: chunk.name.clone(),
+                kind: match chunk.kind {
+                    ChunkKind::ModuleHeader => "header",
+                    ChunkKind::Procedure => "procedure",
+                    ChunkKind::Function => "function",
+                }
+                .to_owned(),
+                line_start: chunk.line_start,
+                line_end: chunk.line_end,
+                text: chunk.text.clone(),
+                content_hash: "fixture".to_owned(),
+                graph_context: context,
+                source_span: None,
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Change {
+            Path,
+            Kind,
+            Symbol,
+            Context,
+            Text,
+        }
+        for change in [Change::Path, Change::Kind, Change::Symbol, Change::Context, Change::Text] {
+            let mut store = Store::in_memory().unwrap();
+            store
+                .reindex_file_with_identity(
+                    CONFIGURATION_ROOT_ID,
+                    old_path,
+                    b"old",
+                    std::slice::from_ref(&old_chunk),
+                    Some(&[vec![0.25_f32, 0.75, 0.5]]),
+                    Some(std::slice::from_ref(&old_context)),
+                    model,
+                    3,
+                )
+                .unwrap();
+            let old_doc = indexed(old_path, &old_chunk, old_context.clone());
+            let candidate = store
+                .reusable_embeddings_for_documents(
+                    CONFIGURATION_ROOT_ID,
+                    old_path,
+                    "code",
+                    std::slice::from_ref(&old_doc),
+                    model,
+                    3,
+                    None,
+                )
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .expect("the exact old payload is reusable");
+            let mut target_path = old_path;
+            let mut target_chunk = old_chunk.clone();
+            let mut target_context = old_context.clone();
+            match change {
+                Change::Path => target_path = "Moved/Other.bsl",
+                Change::Kind => target_chunk.kind = ChunkKind::Function,
+                Change::Symbol => target_chunk = sample_chunk("OtherMethod"),
+                Change::Context => target_context = Some("Calls: New\n".to_owned()),
+                Change::Text => target_chunk.text = target_chunk.text.replace("Method", "Changed"),
+            }
+            let target_doc = indexed(target_path, &target_chunk, target_context.clone());
+            assert_ne!(
+                candidate.semantic_key,
+                crate::document::semantic_key_for_indexed_document(&target_doc),
+                "each negative-control fixture must change the effective payload key"
+            );
+            assert!(store
+                .reusable_embeddings_for_documents(
+                    CONFIGURATION_ROOT_ID,
+                    old_path,
+                    "code",
+                    std::slice::from_ref(&target_doc),
+                    model,
+                    3,
+                    None,
+                )
+                .unwrap()[0]
+                .is_none());
+
+            // Supply the exact old candidate deliberately: the replacement transaction must
+            // compare it against the new path/kind/symbol/context/text before installing it.
+            let candidate_plan = [Some(candidate)];
+            store
+                .reindex_file_with_identity_reuse_and_source_spans(
+                    CONFIGURATION_ROOT_ID,
+                    target_path,
+                    b"new",
+                    std::slice::from_ref(&target_chunk),
+                    None,
+                    Some(std::slice::from_ref(&target_context)),
+                    model,
+                    3,
+                    None,
+                    &[],
+                    Some(&candidate_plan),
+                )
+                .unwrap();
+            let target_id =
+                store.chunk_ids_for_file("code", CONFIGURATION_ROOT_ID, target_path).unwrap()[0];
+            assert!(store
+                .load_pending_embedding_documents("code")
+                .unwrap()
+                .iter()
+                .any(|(id, document)| *id == target_id && document.path == target_path));
+            assert!(
+                !store.load_all_embeddings(3).unwrap().iter().any(|(id, _)| *id == target_id),
+                "changed payload component {change:?} received the old vector"
+            );
+        }
+    }
+
+    #[test]
+    fn reuse_lookup_rejects_model_dimension_text_version_and_token_claim_drift() {
+        use crate::IndexedDocument;
+
+        let model = "reuse-profile";
+        let chunk = sample_chunk("Method");
+        let document = IndexedDocument {
+            collection: "code".to_owned(),
+            root_id: CONFIGURATION_ROOT_ID.to_owned(),
+            path: "Module.bsl".to_owned(),
+            symbol_name: chunk.name.clone(),
+            kind: "procedure".to_owned(),
+            line_start: chunk.line_start,
+            line_end: chunk.line_end,
+            text: chunk.text.clone(),
+            content_hash: "fixture".to_owned(),
+            graph_context: None,
+            source_span: None,
+        };
+        for drift in ["model", "dimension", "text_version", "token_claim"] {
+            let mut store = Store::in_memory().unwrap();
+            store
+                .reindex_file_with_identity(
+                    CONFIGURATION_ROOT_ID,
+                    "Module.bsl",
+                    b"old",
+                    std::slice::from_ref(&chunk),
+                    Some(&[vec![0.5_f32, 0.25, 0.75]]),
+                    None,
+                    model,
+                    3,
+                )
+                .unwrap();
+            let candidate = store
+                .reusable_embeddings_for_documents(
+                    CONFIGURATION_ROOT_ID,
+                    "Module.bsl",
+                    "code",
+                    std::slice::from_ref(&document),
+                    model,
+                    3,
+                    None,
+                )
+                .unwrap()[0]
+                .clone()
+                .expect("exact profile should be reusable");
+            let (lookup_model, lookup_dim, lookup_claim) = match drift {
+                "model" => ("another-model", 3, None),
+                "dimension" => (model, 4, None),
+                "token_claim" => (model, 3, Some("profile-v1:other-tokenizer")),
+                _ => (model, 3, None),
+            };
+            if drift == "text_version" {
+                store.conn.pragma_update(None, "user_version", EMBED_TEXT_VERSION - 1).unwrap();
+            }
+            assert!(
+                store
+                    .reusable_embeddings_for_documents(
+                        CONFIGURATION_ROOT_ID,
+                        "Module.bsl",
+                        "code",
+                        std::slice::from_ref(&document),
+                        lookup_model,
+                        lookup_dim,
+                        lookup_claim,
+                    )
+                    .unwrap()[0]
+                    .is_none(),
+                "{drift} mismatch must be a reuse miss"
+            );
+
+            let candidate_plan = [Some(candidate)];
+            let result = store.reindex_file_with_identity_reuse_and_source_spans(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                b"new",
+                std::slice::from_ref(&chunk),
+                None,
+                None,
+                lookup_model,
+                lookup_dim,
+                lookup_claim,
+                &[],
+                Some(&candidate_plan),
+            );
+            if drift == "text_version" {
+                result.unwrap();
+                assert!(store.load_pending_embedding_documents("code").unwrap().len() == 1);
+                assert!(store.load_all_embeddings(3).unwrap().is_empty());
+            } else {
+                assert!(result.is_err(), "{drift} mismatch must fail closed");
+                assert_eq!(store.load_all_embeddings(3).unwrap().len(), 1);
+                assert!(store.load_pending_embedding_documents("code").unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn reuse_transfer_preserves_source_spans_and_rolls_back_atomically() {
+        let mut store = Store::in_memory().unwrap();
+        let model = "reuse-spans";
+        let old_chunk = sample_chunk("Method");
+        let vector = vec![0.25_f32, 0.75, 0.5];
+        store
+            .reindex_file_with_identity_and_source_spans(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                b"old",
+                std::slice::from_ref(&old_chunk),
+                Some(std::slice::from_ref(&vector)),
+                None,
+                model,
+                3,
+                None,
+                &[Some(source_span())],
+            )
+            .unwrap();
+        let old_doc = store.load_indexed_documents(Some("code")).unwrap().remove(0);
+        let candidate = store
+            .reusable_embeddings_for_documents(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                "code",
+                std::slice::from_ref(&old_doc),
+                model,
+                3,
+                None,
+            )
+            .unwrap();
+        assert!(candidate[0].is_some());
+        let new_span = SourceSpan { parent_symbol: "NewParent".to_owned(), ..source_span() };
+        store
+            .reindex_file_with_identity_reuse_and_source_spans(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                b"new",
+                std::slice::from_ref(&old_chunk),
+                None,
+                None,
+                model,
+                3,
+                None,
+                &[Some(new_span.clone())],
+                Some(&candidate),
+            )
+            .unwrap();
+        let documents = store.load_indexed_documents(Some("code")).unwrap();
+        assert_eq!(documents[0].source_span, Some(new_span.clone()));
+        assert_eq!(store.load_all_embeddings(3).unwrap()[0].1, vector);
+        assert!(store.load_pending_embedding_documents("code").unwrap().is_empty());
+
+        let before_hash = store.file_hash(CONFIGURATION_ROOT_ID, "Module.bsl").unwrap();
+        let before_ids =
+            store.chunk_ids_for_file("code", CONFIGURATION_ROOT_ID, "Module.bsl").unwrap();
+        let before_vectors = store.load_all_embeddings(3).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_reused_source_span BEFORE INSERT ON chunk_source_spans
+                 BEGIN SELECT RAISE(FAIL, 'rollback after planned vector transfer'); END;",
+            )
+            .unwrap();
+        assert!(store
+            .reindex_file_with_identity_reuse_and_source_spans(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                b"rollback",
+                std::slice::from_ref(&old_chunk),
+                None,
+                None,
+                model,
+                3,
+                None,
+                &[Some(source_span())],
+                Some(&candidate),
+            )
+            .is_err());
+        assert_eq!(store.file_hash(CONFIGURATION_ROOT_ID, "Module.bsl").unwrap(), before_hash);
+        assert_eq!(
+            store.chunk_ids_for_file("code", CONFIGURATION_ROOT_ID, "Module.bsl").unwrap(),
+            before_ids
+        );
+        assert_eq!(store.load_all_embeddings(3).unwrap(), before_vectors);
+        assert_eq!(
+            store.load_indexed_documents(Some("code")).unwrap()[0].source_span,
+            Some(new_span)
+        );
+    }
+
+    #[test]
+    fn late_payload_write_does_not_resurrect_deleted_or_reset_rows() {
+        let chunk = sample_chunk("Method");
+        for reset_root in [false, true] {
+            let mut store = Store::in_memory().unwrap();
+            store
+                .reindex_file_with_identity(
+                    CONFIGURATION_ROOT_ID,
+                    "Module.bsl",
+                    b"before",
+                    std::slice::from_ref(&chunk),
+                    Some(&[vec![0.25_f32, 0.75, 0.5]]),
+                    None,
+                    "late-write-profile",
+                    3,
+                )
+                .unwrap();
+            let row_id =
+                store.chunk_ids_for_file("code", CONFIGURATION_ROOT_ID, "Module.bsl").unwrap()[0];
+            store.clear_chunk_embedding(row_id).unwrap();
+            let document = store.load_indexed_documents(Some("code")).unwrap().remove(0);
+            let old_key = crate::document::semantic_key_from_parts(
+                &document.path,
+                &document.kind,
+                &document.symbol_name,
+                document.graph_context.as_deref().unwrap_or(""),
+                &document.text,
+            );
+
+            if reset_root {
+                let changed_root_ids = HashSet::from([CONFIGURATION_ROOT_ID.to_owned()]);
+                let transition = store
+                    .apply_workspace_roots_transition(
+                        WorkspaceStoreTransition {
+                            changed_root_ids: &changed_root_ids,
+                            cleanup: &HashSet::new(),
+                            upserts: &[],
+                            token_layout_claim: None,
+                        },
+                        &mut || ControlFlow::Continue(()),
+                    )
+                    .unwrap();
+                assert!(transition.is_continue());
+            } else {
+                store.remove_file(CONFIGURATION_ROOT_ID, "Module.bsl", "code").unwrap();
+            }
+
+            let late = store.set_chunk_payload_embeddings_with_token_layout(
+                &[(row_id, old_key, vec![0.25, 0.75, 0.5])],
+                ("late-write-profile", 3),
+                None,
+            );
+            assert!(late.is_err(), "a late HTTP result must fail after delete/reset");
+            assert!(store
+                .chunk_ids_for_file("code", CONFIGURATION_ROOT_ID, "Module.bsl")
+                .unwrap()
+                .is_empty());
+            assert!(store.load_all_embeddings(3).unwrap().is_empty());
+            assert!(store.load_pending_embedding_documents("code").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn late_payload_write_rejects_profile_and_text_version_drift() {
+        let chunk = sample_chunk("Method");
+        for drift in ["profile", "text_version"] {
+            let mut store = Store::in_memory().unwrap();
+            store
+                .reindex_file_with_identity(
+                    CONFIGURATION_ROOT_ID,
+                    "Module.bsl",
+                    b"before",
+                    std::slice::from_ref(&chunk),
+                    Some(&[vec![0.25_f32, 0.75, 0.5]]),
+                    None,
+                    "late-write-profile",
+                    3,
+                )
+                .unwrap();
+            let row_id =
+                store.chunk_ids_for_file("code", CONFIGURATION_ROOT_ID, "Module.bsl").unwrap()[0];
+            store.clear_chunk_embedding(row_id).unwrap();
+            let document = store.load_indexed_documents(Some("code")).unwrap().remove(0);
+            let key = crate::document::semantic_key_from_parts(
+                &document.path,
+                &document.kind,
+                &document.symbol_name,
+                document.graph_context.as_deref().unwrap_or(""),
+                &document.text,
+            );
+            if drift == "profile" {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE meta SET value = 'late-write-other-profile' WHERE key = ?1",
+                        [PROFILE_IDENTITY_KEY],
+                    )
+                    .unwrap();
+            } else {
+                store.conn.pragma_update(None, "user_version", EMBED_TEXT_VERSION - 1).unwrap();
+            }
+
+            let result = store.set_chunk_payload_embeddings_with_token_layout(
+                &[(row_id, key, vec![0.25, 0.75, 0.5])],
+                ("late-write-profile", 3),
+                None,
+            );
+            assert!(result.is_err(), "late write must reject {drift} drift");
+            assert!(store.load_all_embeddings(3).unwrap().is_empty());
+            assert_eq!(store.load_pending_embedding_documents("code").unwrap().len(), 1);
+        }
+    }
+
     fn source_span() -> SourceSpan {
         SourceSpan {
             parent_symbol: "A".to_owned(),
@@ -7426,6 +8799,152 @@ mod tests {
         }
         fn assert_count(record: &Value, field: &str, count: u64) {
             assert_eq!(record["counts"][field], count, "{record}");
+        }
+
+        fn replace_with_pending_chunks(store: &Store, chunk: &Chunk, model: &str) {
+            let mut checkpoint = || ControlFlow::Continue(());
+            assert!(matches!(
+                store
+                    .reindex_file_in_collection_checkpointed_with_source_spans(
+                        CONFIGURATION_ROOT_ID,
+                        "Module.bsl",
+                        b"replacement",
+                        "code",
+                        std::slice::from_ref(chunk),
+                        None,
+                        None,
+                        Some((model, 3)),
+                        None,
+                        &[],
+                        &mut checkpoint,
+                    )
+                    .unwrap(),
+                ControlFlow::Continue(_)
+            ));
+        }
+
+        fn seed_profiled_old_chunk(store: &mut Store, model: &str) {
+            let old = sample_chunk("Old method");
+            store
+                .reindex_file_with_identity(
+                    CONFIGURATION_ROOT_ID,
+                    "Module.bsl",
+                    b"old",
+                    std::slice::from_ref(&old),
+                    Some(&[vec![0.25_f32, 0.5, 0.75]]),
+                    None,
+                    model,
+                    3,
+                )
+                .unwrap();
+        }
+
+        fn semantic_key(chunk: &Chunk) -> String {
+            crate::document::semantic_key_from_parts(
+                "Module.bsl",
+                chunk.kind.label(),
+                &chunk.name,
+                "",
+                &chunk.text,
+            )
+        }
+
+        #[test]
+        fn replacement_transfers_overlay_cache_hits_and_clears_resolved_misses() {
+            let model = "overlay-reuse-model";
+            let target = sample_chunk("New method");
+            let key = semantic_key(&target);
+            let vector = vec![0.125_f32, 0.5, 0.875];
+            let mut store = Store::in_memory().unwrap();
+            seed_profiled_old_chunk(&mut store, model);
+            store
+                .save_overlay_embedding_cache(model, 3, &HashMap::from([(key, vector.clone())]))
+                .unwrap();
+
+            let records = capture(|| replace_with_pending_chunks(&store, &target, model));
+            let first = committed(&records);
+            assert_count(first, "sqlite_vectors_transferred", 1);
+            assert_count(first, "embeddings_written", 0);
+            assert_count(first, "reuse_misses_payload", 0);
+            assert_count(first, "reuse_misses_pending", 0);
+            assert!(store.load_pending_embedding_documents("code").unwrap().is_empty());
+            assert_eq!(store.load_all_embeddings(3).unwrap()[0].1, vector);
+
+            // A same-key NULL source is classified as pending before fallback. The cache hit
+            // resolves that debt, so the committed replacement reports neither a pending nor
+            // payload miss and transfers the already-paid vector again.
+            store
+                .conn
+                .execute(
+                    "UPDATE chunks SET embedding = NULL
+                     WHERE file_id = (SELECT id FROM files WHERE root_id = ?1 AND path = ?2)",
+                    params![CONFIGURATION_ROOT_ID, "Module.bsl"],
+                )
+                .unwrap();
+            let records = capture(|| replace_with_pending_chunks(&store, &target, model));
+            let second = committed(&records);
+            assert_count(second, "sqlite_vectors_transferred", 1);
+            assert_count(second, "embeddings_written", 0);
+            assert_count(second, "reuse_misses_payload", 0);
+            assert_count(second, "reuse_misses_pending", 0);
+            assert!(store.load_pending_embedding_documents("code").unwrap().is_empty());
+            assert_eq!(store.load_all_embeddings(3).unwrap()[0].1, vector);
+        }
+
+        #[test]
+        fn replacement_rejects_overlay_cache_profile_and_invalid_vectors() {
+            let model = "overlay-reuse-current";
+            let target = sample_chunk("New method");
+            let key = semantic_key(&target);
+
+            for bad_cache in ["wrong_model", "wrong_dimension", "non_finite"] {
+                let mut store = Store::in_memory().unwrap();
+                seed_profiled_old_chunk(&mut store, model);
+                match bad_cache {
+                    "wrong_model" => {
+                        let blob: Vec<u8> = [0.125_f32, 0.5, 0.875]
+                            .into_iter()
+                            .flat_map(f32::to_le_bytes)
+                            .collect();
+                        store
+                            .conn
+                            .execute(
+                                "INSERT INTO overlay_embedding_cache
+                                 (embedding_key, model_id, dimension, embedding)
+                                 VALUES (?1, 'other-model', 3, ?2)",
+                                params![key, blob],
+                            )
+                            .unwrap();
+                    }
+                    "wrong_dimension" => {
+                        store
+                            .save_overlay_embedding_cache(
+                                model,
+                                3,
+                                &HashMap::from([(key.clone(), vec![0.25_f32, 0.75])]),
+                            )
+                            .unwrap();
+                    }
+                    _ => {
+                        store
+                            .save_overlay_embedding_cache(
+                                model,
+                                3,
+                                &HashMap::from([(key.clone(), vec![f32::NAN, 0.5_f32, 0.75])]),
+                            )
+                            .unwrap();
+                    }
+                }
+
+                let records = capture(|| replace_with_pending_chunks(&store, &target, model));
+                let mutation = committed(&records);
+                assert_count(mutation, "sqlite_vectors_transferred", 0);
+                assert_count(mutation, "embeddings_written", 0);
+                assert_count(mutation, "reuse_misses_payload", 1);
+                assert_count(mutation, "reuse_misses_pending", 0);
+                assert_eq!(store.load_pending_embedding_documents("code").unwrap().len(), 1);
+                assert!(store.load_all_embeddings(3).unwrap().is_empty());
+            }
         }
 
         #[test]

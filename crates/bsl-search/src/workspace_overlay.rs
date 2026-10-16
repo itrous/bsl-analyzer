@@ -47,6 +47,9 @@ impl WorkspaceOverlayIndex {
 pub struct RefreshPlan {
     snapshot_id: String,
     baseline_identity: Option<(String, Option<String>)>,
+    /// External fingerprint rows are meaningful only for the manifest authority that created
+    /// them. Local refreshes compare SQLite file hashes directly and must not publish them.
+    manifest_backed: bool,
     /// Overlay file entries with lexical docs + embedding inputs but no vectors yet; vectors are
     /// assembled in Phase C from the merged embedding cache.
     entries: Vec<(FileKey, PlannedEntry)>,
@@ -55,6 +58,8 @@ pub struct RefreshPlan {
     /// Distinct `embedding_key -> embedding input` pairs that have no warm-cache vector; these are
     /// the inputs Phase B embeds. The key is the hash of the embedding input (the semantic key).
     missing_embeddings: HashMap<String, String>,
+    /// Exact-key baseline vectors hydrated only for changed local documents in Phase A.
+    reused_embeddings: HashMap<String, Vec<f32>>,
     /// See [`ScannedFiles::unreadable`]: how much of the tree the planning scan could not read.
     scan_unreadable: usize,
     /// See [`ScannedFiles::canonical_fallbacks`]: files whose physical spelling is unknown.
@@ -99,6 +104,10 @@ impl RefreshPlan {
     /// The distinct `(embedding_key, embedding_input)` pairs Phase B must embed.
     pub fn missing_embeddings(&self) -> &HashMap<String, String> {
         &self.missing_embeddings
+    }
+
+    pub(crate) fn reused_embeddings(&self) -> &HashMap<String, Vec<f32>> {
+        &self.reused_embeddings
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1776,6 +1785,7 @@ impl WorkspaceOverlayCache {
         let mut updated_persisted = HashMap::new();
         let mut entries: Vec<(FileKey, PlannedEntry)> = Vec::new();
         let mut missing_embeddings: HashMap<String, String> = HashMap::new();
+        let reused_embeddings = HashMap::new();
         let mut read_failures: HashSet<FileKey> = HashSet::new();
         let mut gate_skipped: HashSet<FileKey> = HashSet::new();
 
@@ -1885,16 +1895,174 @@ impl WorkspaceOverlayCache {
         Ok(RefreshPlan {
             snapshot_id,
             baseline_identity,
+            manifest_backed: true,
             entries,
             hidden_paths,
             updated_persisted,
             missing_embeddings,
+            reused_embeddings,
             scan_unreadable,
             scan_canonical_fallbacks,
             seen_keys,
             read_failures,
             gate_skipped,
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the scan, baseline, authority, and embed inputs are independent; a wrapper would only rename them"
+    )]
+    fn plan_full_refresh_from_local_scanned_with_embedder(
+        baseline_files: &HashMap<FileKey, Vec<u8>>,
+        scanned: ScannedFiles,
+        store: &Store,
+        warm_embeddings: &HashMap<String, Vec<f32>>,
+        graph_context: Option<&dyn GraphContextProvider>,
+        _distrusted: &HashSet<FileKey>,
+        embedder: &Embedder,
+        hash_mode: BaselineHashMode,
+    ) -> Result<RefreshPlan, SearchError> {
+        let scan_unreadable = scanned.unreadable;
+        let scan_canonical_fallbacks = scanned.canonical_fallbacks;
+        let workspace_files = scanned.files;
+        let mut seen_keys = HashSet::new();
+        let mut hidden_paths = HashSet::new();
+        let mut entries = Vec::new();
+        let mut missing_embeddings = HashMap::new();
+        let mut reused_embeddings = HashMap::new();
+        let mut read_failures = HashSet::new();
+        let gate_skipped = HashSet::new();
+
+        for file in &workspace_files {
+            seen_keys.insert(file.key.clone());
+            let content = match std::fs::read_to_string(&file.abs_path) {
+                Ok(content) => content,
+                Err(_) => {
+                    read_failures.insert(file.key.clone());
+                    continue;
+                }
+            };
+            let file_hash = compute_file_hash(&content, hash_mode);
+            if baseline_files.get(&file.key).is_some_and(|stored| stored == &file_hash) {
+                continue;
+            }
+
+            let (lexical_documents, embedding_inputs) = match build_overlay_documents_prepared(
+                &file.key,
+                &content,
+                graph_context,
+                None,
+                Some(embedder),
+            ) {
+                Ok(documents) => documents,
+                Err(error) if error.embedding_failure().is_some() => return Err(error),
+                Err(_) => {
+                    read_failures.insert(file.key.clone());
+                    continue;
+                }
+            };
+
+            // Local baseline vectors are eligible only for planned documents from a changed
+            // file. The Store first matches semantic payload/profile metadata, then reads BLOBs
+            // for those exact hits; never clone the complete base vector corpus into memory.
+            let reuse_plan = store.plan_reusable_embeddings_for_documents(
+                &file.key.root_id,
+                &file.key.path,
+                "code",
+                &lexical_documents,
+                embedder.model_id(),
+                embedder.dim(),
+                embedder.token_layout_claim(),
+            )?;
+            let hydrated = store.hydrate_reusable_embedding_plan(
+                &file.key.root_id,
+                &file.key.path,
+                "code",
+                &reuse_plan,
+                embedder.model_id(),
+                embedder.dim(),
+                embedder.token_layout_claim(),
+            )?;
+            for candidate in hydrated.candidates.into_iter().flatten() {
+                // Hydration revalidates the exact payload and profile in its own transaction.
+                // This map is scoped to this planned refresh, not persisted as a cache.
+                if !warm_embeddings.contains_key(&candidate.semantic_key) {
+                    reused_embeddings.insert(candidate.semantic_key, candidate.vector);
+                }
+            }
+
+            for input in &embedding_inputs {
+                let key = overlay_embedding_key(input);
+                if !warm_embeddings.contains_key(&key) && !reused_embeddings.contains_key(&key) {
+                    missing_embeddings.entry(key).or_insert_with(|| input.clone());
+                }
+            }
+            if baseline_files.contains_key(&file.key) {
+                hidden_paths.insert(file.key.clone());
+            }
+            entries.push((
+                file.key.clone(),
+                PlannedEntry {
+                    fingerprint: file.fingerprint.clone(),
+                    file_hash,
+                    lexical_documents,
+                    embedding_inputs,
+                },
+            ));
+        }
+
+        if scan_unreadable == 0 && scan_canonical_fallbacks == 0 {
+            for key in baseline_files.keys() {
+                if !seen_keys.contains(key) {
+                    hidden_paths.insert(key.clone());
+                }
+            }
+        }
+
+        Ok(RefreshPlan {
+            snapshot_id: String::new(),
+            baseline_identity: None,
+            manifest_backed: false,
+            entries,
+            hidden_paths,
+            updated_persisted: HashMap::new(),
+            missing_embeddings,
+            reused_embeddings,
+            scan_unreadable,
+            scan_canonical_fallbacks,
+            seen_keys,
+            read_failures,
+            gate_skipped,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the roots, baseline, store, authority, and embed inputs are independent; a wrapper would only rename them"
+    )]
+    pub(crate) fn plan_full_refresh_from_local_with_embedder(
+        baseline_files: &HashMap<FileKey, Vec<u8>>,
+        roots: &WorkspaceRoots,
+        store: &Store,
+        warm_embeddings: &HashMap<String, Vec<f32>>,
+        graph_context: Option<&dyn GraphContextProvider>,
+        distrusted: &HashSet<FileKey>,
+        embedder: &Embedder,
+        hash_mode: BaselineHashMode,
+    ) -> Result<RefreshPlan, SearchError> {
+        let scanned = scan_workspace_files(roots);
+        record_scanned_spellings(store, &scanned);
+        Self::plan_full_refresh_from_local_scanned_with_embedder(
+            baseline_files,
+            scanned,
+            store,
+            warm_embeddings,
+            graph_context,
+            distrusted,
+            embedder,
+            hash_mode,
+        )
     }
 
     /// Phase C: apply a [`RefreshPlan`] atomically under the inner cache lock.
@@ -2124,7 +2292,7 @@ impl WorkspaceOverlayCache {
                     .count(),
                 unread_keys: self.unread_keys.len(),
             },
-            Some((plan.snapshot_id, rows)),
+            plan.manifest_backed.then_some((plan.snapshot_id, rows)),
         ))
     }
 
@@ -2871,7 +3039,7 @@ fn build_overlay_documents(
 
     for chunk in &chunks {
         let (document, context_failed) =
-            crate::document::indexed_document_for_chunk(key, chunk, graph_context);
+            crate::document::indexed_document_for_chunk(key, chunk, content, graph_context);
         if context_failed {
             return Err(SearchError::Index(format!("graph context unavailable for {}", key.path)));
         }

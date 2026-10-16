@@ -4911,6 +4911,7 @@ fn an_external_depends_on_narrows_what_it_sees_to_the_named_extensions() {
 fn an_external_under_src_epf_is_discovered_unless_opted_out() {
     let dir = workspace();
     workspace_calling_main_configuration(dir.path());
+    std::fs::create_dir_all(dir.path().join("src/epf/not-an-export")).unwrap();
     write_external(
         dir.path(),
         "src/epf/АРМ",
@@ -4921,6 +4922,13 @@ fn an_external_under_src_epf_is_discovered_unless_opted_out() {
     );
     let discovered = analyze(dir.path(), &["--configuration-root", MAIN]);
     assert_eq!(
+        discovered.stderr.matches("auto-discovered external directories were skipped").count(),
+        1,
+        "the CLI load reports its invalid auto-discovery result once: {}",
+        discovered.stderr
+    );
+    assert!(discovered.stderr.contains("src/epf/not-an-export"), "{}", discovered.stderr);
+    assert_eq!(
         discovered.unresolved_modules_at(EPF_FORM_MODULE),
         vec![MISSING_MODULE.to_string()],
         "found without a declaration, and bound to the owner"
@@ -4928,6 +4936,7 @@ fn an_external_under_src_epf_is_discovered_unless_opted_out() {
     assert_eq!(external_notices(&discovered), 0);
 
     let opted_out = analyze(dir.path(), &["--configuration-root", MAIN, "--no-externals"]);
+    assert!(!opted_out.stderr.contains("auto-discovered external directories were skipped"));
     assert!(
         opted_out.file_event_at(EPF_FORM_MODULE).is_none(),
         "control: opted out, the export is not a root and its module is not analyzed"
