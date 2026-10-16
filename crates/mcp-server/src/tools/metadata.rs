@@ -16,8 +16,10 @@ pub async fn get_live_metadata_tree(
 ) -> Result<CallToolResult, McpError> {
     let selected =
         state.onec_connection(connection).map_err(|e| McpError::invalid_params(e, None))?;
-    let result = selected
-        .client()
+    let client = selected
+        .http_client()
+        .ok_or_else(|| McpError::invalid_params("This 1C connection has no HTTP backend", None))?;
+    let result = client
         .list_metadata(&onec_client::MetadataListRequest {
             meta_type: meta_type.to_string(),
             name_mask,
@@ -37,8 +39,10 @@ pub async fn get_live_metadata_object(
 ) -> Result<CallToolResult, McpError> {
     let selected =
         state.onec_connection(connection).map_err(|e| McpError::invalid_params(e, None))?;
-    let value = selected
-        .client()
+    let client = selected
+        .http_client()
+        .ok_or_else(|| McpError::invalid_params("This 1C connection has no HTTP backend", None))?;
+    let value = client
         .metadata_structure(&onec_client::MetadataStructureRequest {
             meta_type: meta_type.to_string(),
             name: name.to_string(),

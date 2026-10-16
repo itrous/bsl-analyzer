@@ -51,10 +51,13 @@ pub async fn event_log(
     let selected = state
         .onec_connection(query.connection.as_deref())
         .map_err(|e| McpError::invalid_params(e, None))?;
+    let client = selected
+        .http_client()
+        .ok_or_else(|| McpError::invalid_params("This 1C connection has no HTTP backend", None))?;
 
     let request = build_request(query);
 
-    let result = selected.client().event_log(&request).await.map_err(|e| {
+    let result = client.event_log(&request).await.map_err(|e| {
         McpError::internal_error(format!("Ошибка чтения журнала регистрации в 1С: {e}"), None)
     })?;
 

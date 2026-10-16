@@ -110,10 +110,14 @@ fn validate_parameters(
     // refuse a request that omitting the field would have served.
     match connection.filter(|name| !name.is_empty()) {
         Some(name) => {
-            state.onec_connection(Some(name)).map_err(|e| McpError::invalid_params(e, None))?;
-            Ok(Some(name.to_string()))
+            let selected =
+                state.onec_connection(Some(name)).map_err(|e| McpError::invalid_params(e, None))?;
+            Ok(selected.http_client().map(|_| name.to_string()))
         }
-        None => Ok(state.onec_connection(None).ok().map(|_| String::new())),
+        None => Ok(state
+            .onec_connection(None)
+            .ok()
+            .and_then(|selected| selected.http_client().map(|_| String::new()))),
     }
 }
 
@@ -256,7 +260,10 @@ async fn platform_block(state: &SharedState, connection: &str, query: &str) -> P
     };
 
     let request = onec_client::ValidateQueryRequest { query: query.to_string() };
-    match selected.client().validate_query(&request).await {
+    let Some(client) = selected.http_client() else {
+        return PlatformBlock { valid: None, errors: Vec::new(), error: None };
+    };
+    match client.validate_query(&request).await {
         Ok(result) => {
             PlatformBlock { valid: Some(result.valid), errors: result.errors, error: None }
         }
@@ -538,6 +545,9 @@ pub async fn execute_query(
     let selected = state
         .onec_connection(connection.filter(|name| !name.is_empty()))
         .map_err(|e| McpError::invalid_params(e, None))?;
+    let client = selected
+        .http_client()
+        .ok_or_else(|| McpError::invalid_params("This 1C connection has no HTTP backend", None))?;
 
     if query.trim().is_empty() {
         return Err(McpError::invalid_params("Пустой запрос", None));
@@ -555,7 +565,7 @@ pub async fn execute_query(
         parameters: parameters.unwrap_or_default(),
     };
 
-    let result = selected.client().execute_query(&request).await.map_err(|e| {
+    let result = client.execute_query(&request).await.map_err(|e| {
         McpError::internal_error(format!("Ошибка выполнения запроса в 1С: {e}"), None)
     })?;
 

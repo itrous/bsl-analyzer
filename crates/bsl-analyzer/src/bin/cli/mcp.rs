@@ -21,13 +21,101 @@ struct OnecConnectionsFile {
 
 #[derive(Debug, Deserialize)]
 struct OnecConnectionConfig {
-    url: String,
+    url: Option<String>,
     #[serde(default)]
     user_env: String,
     #[serde(default)]
     password_env: String,
     #[serde(default)]
     allow_execute: bool,
+    check_executor: Option<CheckExecutorConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckExecutorConfig {
+    program: PathBuf,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default = "default_executor_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_executor_code_bytes")]
+    max_code_bytes: u64,
+    #[serde(default = "default_executor_response_bytes")]
+    max_response_bytes: u64,
+    #[serde(default = "default_executor_stderr_bytes")]
+    max_stderr_bytes: u64,
+    #[serde(default = "default_executor_stop_grace_ms")]
+    stop_grace_ms: u64,
+    #[serde(default = "default_executor_reap_timeout_ms")]
+    reap_timeout_ms: u64,
+    #[serde(default = "default_executor_max_concurrent")]
+    max_concurrent: usize,
+    handles_snippet: bool,
+}
+
+fn default_executor_timeout_ms() -> u64 {
+    120_000
+}
+fn default_executor_code_bytes() -> u64 {
+    2_097_152
+}
+fn default_executor_response_bytes() -> u64 {
+    262_144
+}
+fn default_executor_stderr_bytes() -> u64 {
+    65_536
+}
+fn default_executor_stop_grace_ms() -> u64 {
+    2_000
+}
+fn default_executor_reap_timeout_ms() -> u64 {
+    1_000
+}
+fn default_executor_max_concurrent() -> usize {
+    1
+}
+
+impl CheckExecutorConfig {
+    fn into_profile(self) -> Result<mcp_server::CheckExecutorProfile, io::Error> {
+        if self.timeout_ms < 1_000
+            || self.max_code_bytes == 0
+            || self.max_response_bytes < 16_384
+            || self.max_stderr_bytes == 0
+            || self.stop_grace_ms < 500
+            || self.reap_timeout_ms == 0
+            || self.max_concurrent == 0
+            || self.max_concurrent > tokio::sync::Semaphore::MAX_PERMITS
+            || tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(self.timeout_ms))
+                .is_none()
+            || tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(self.stop_grace_ms))
+                .is_none()
+            || tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(self.reap_timeout_ms))
+                .is_none()
+            || self.max_code_bytes.checked_mul(6).and_then(|n| n.checked_add(65_536)).is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid check_executor limits",
+            ));
+        }
+        Ok(mcp_server::CheckExecutorProfile {
+            program: self.program,
+            args: self.args.into_iter().map(std::ffi::OsString::from).collect(),
+            timeout: Duration::from_millis(self.timeout_ms),
+            max_code_bytes: self.max_code_bytes,
+            max_response_bytes: self.max_response_bytes,
+            max_stderr_bytes: self.max_stderr_bytes,
+            stop_grace: Duration::from_millis(self.stop_grace_ms),
+            reap_timeout: Duration::from_millis(self.reap_timeout_ms),
+            max_concurrent: self.max_concurrent,
+            handles_snippet: self.handles_snippet,
+            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(self.max_concurrent)),
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -1535,38 +1623,49 @@ fn configure_named_onec_connections(
     let text = std::fs::read_to_string(&path)?;
     let config: OnecConnectionsFile = serde_json::from_str(&text)?;
     for (name, connection) in config.connections {
-        if name.trim().is_empty() || connection.url.trim().is_empty() {
+        if name.trim().is_empty()
+            || connection.url.as_deref().is_some_and(|url| url.trim().is_empty())
+            || (connection.url.is_none() && connection.check_executor.is_none())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "1C connection name and url must not be empty",
+                "1C connection name must not be empty and needs url or check_executor",
             )
             .into());
         }
-        let user = if connection.user_env.is_empty() {
-            String::new()
+        let client = if let Some(url) = &connection.url {
+            let user = if connection.user_env.is_empty() {
+                String::new()
+            } else {
+                env::var(&connection.user_env).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("missing environment variable {}", connection.user_env),
+                    )
+                })?
+            };
+            let password = if connection.password_env.is_empty() {
+                String::new()
+            } else {
+                env::var(&connection.password_env).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("missing environment variable {}", connection.password_env),
+                    )
+                })?
+            };
+            Some(onec_client::Client::new(url, &user, &password))
         } else {
-            env::var(&connection.user_env).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("missing environment variable {}", connection.user_env),
-                )
-            })?
+            None
         };
-        let password = if connection.password_env.is_empty() {
-            String::new()
-        } else {
-            env::var(&connection.password_env).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("missing environment variable {}", connection.password_env),
-                )
-            })?
-        };
+        let executor =
+            connection.check_executor.map(CheckExecutorConfig::into_profile).transpose()?;
         state.add_onec_connection(
             name,
-            mcp_server::OnecConnection::new(
-                onec_client::Client::new(&connection.url, &user, &password),
+            mcp_server::OnecConnection::with_optional_http(
+                client,
                 connection.allow_execute,
+                executor,
             ),
         );
     }
@@ -1674,8 +1773,8 @@ mod tests {
         backend_config_fingerprint, daemon_command, decode_password, frozen_embedding_prefixes,
         resolve_embedding_prefix_values, resolve_onec_password, resolve_serve_mode_with_override,
         resolve_token_profile_values, validate_backend_pid, validate_onec_settings,
-        validate_serve_args, warn_on_wildcard_allowlist, HttpServeOptions, McpCommand,
-        McpProfileCli, McpServeArgs, McpServeMode, ServeModeContext,
+        validate_serve_args, warn_on_wildcard_allowlist, CheckExecutorConfig, HttpServeOptions,
+        McpCommand, McpProfileCli, McpServeArgs, McpServeMode, ServeModeContext,
     };
     use clap::Parser;
     use std::io;
@@ -1694,6 +1793,84 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    fn executor_config() -> CheckExecutorConfig {
+        CheckExecutorConfig {
+            program: PathBuf::from("/test/executor"),
+            args: Vec::new(),
+            timeout_ms: 120_000,
+            max_code_bytes: 2_097_152,
+            max_response_bytes: 262_144,
+            max_stderr_bytes: 65_536,
+            stop_grace_ms: 2_000,
+            reap_timeout_ms: 1_000,
+            max_concurrent: 1,
+            handles_snippet: true,
+        }
+    }
+
+    #[test]
+    fn check_executor_profile_accepts_defaults_and_rejects_floors_and_overflow() {
+        let profile = executor_config().into_profile().expect("documented defaults are valid");
+        assert_eq!(profile.timeout.as_millis(), 120_000);
+        assert_eq!(profile.reap_timeout.as_millis(), 1_000);
+        assert!(profile.handles_snippet);
+
+        let mut config = executor_config();
+        config.max_response_bytes = 16_383;
+        assert_eq!(config.into_profile().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let mut config = executor_config();
+        config.stop_grace_ms = 499;
+        assert_eq!(config.into_profile().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let mut config = executor_config();
+        config.reap_timeout_ms = 0;
+        assert_eq!(config.into_profile().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let mut config = executor_config();
+        config.max_concurrent = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        assert_eq!(config.into_profile().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let mut config = executor_config();
+        config.max_concurrent = usize::MAX;
+        assert_eq!(config.into_profile().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let mut config = executor_config();
+        config.max_code_bytes = u64::MAX;
+        assert_eq!(config.into_profile().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn handles_snippet_is_required_in_executor_profile() {
+        let parsed = serde_json::from_str::<CheckExecutorConfig>(r#"{"program":"/test/executor"}"#);
+        assert!(parsed.is_err(), "route must be explicitly selected");
+    }
+
+    #[test]
+    fn executor_only_connections_deserialize_string_args_without_http_environment() {
+        let config = serde_json::from_str::<super::OnecConnectionsFile>(
+            r#"{
+              "connections": {
+                "local": {
+                  "check_executor": {
+                    "program": "/opt/1C tools/check executor",
+                    "args": ["--config", "/tmp/Настройка с пробелом.json", "--profile", "Проверка local"],
+                    "handles_snippet": true
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("ordinary JSON string args are accepted");
+        let connection = config.connections.into_values().next().unwrap();
+        assert!(connection.url.is_none(), "executor-only connection needs no HTTP URL");
+        let profile = connection.check_executor.unwrap().into_profile().unwrap();
+        assert_eq!(
+            profile.args,
+            [
+                std::ffi::OsString::from("--config"),
+                std::ffi::OsString::from("/tmp/Настройка с пробелом.json"),
+                std::ffi::OsString::from("--profile"),
+                std::ffi::OsString::from("Проверка local"),
+            ]
+        );
     }
 
     #[derive(Debug, Parser)]

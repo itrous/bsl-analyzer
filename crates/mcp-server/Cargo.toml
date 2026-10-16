@@ -31,6 +31,7 @@ vfs.workspace = true
 walkdir.workspace = true
 rayon.workspace = true
 stdx.workspace = true
+check-contract = { path = "../check-contract" }
 
 rmcp = { version = "3.1", features = [
     "server",
@@ -55,6 +56,7 @@ tokio = { version = "1", features = [
     "io-util",
     "io-std",
     "time",
+    "process",
 ] }
 notify.workspace = true
 
@@ -78,7 +80,16 @@ libc = "0.2"
 tempfile.workspace = true
 widestring = "1.0"
 win-security-identifier = "0.1.1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 # Safe introspection of a connected named-pipe server: lets us read the
 # server PID's image path and owner SID without project-local unsafe or
 # handwritten Win32 FFI. `system` feature is Process/System/Users only —

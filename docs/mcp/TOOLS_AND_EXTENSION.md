@@ -30,7 +30,7 @@
 | `workspace` | `diagnostics` | диагностики кода: `catalog`/`schema` (без базы), `status` (готовность резидентной базы), `file` (находки по файлу), `workspace` (агрегаты по конфигурации) | `--source-dir` |
 | `workspace` | `outline` | карта одного `.bsl`-файла: дерево `#Область`, процедуры, функции и модульные переменные с экспортом, директивами компиляции, параметрами (`Знач`, умолчания) и диапазонами. Тел методов не отдаёт никогда. Вход — `path` (+ `root_id`, как в хитах `search`), `mode` (`full` \| `regions` — только скелет областей для большого модуля). Отвечает от одного разбора файла: ничего не строит, `loading` не возвращает, ответ одинаков на непрогретой и прогретой рабочей области | `--source-dir` |
 | `workspace` | `query` | `schema` (контракт без базы), `validate` для SDBL, а также `execute` для `SELECT` | `--onec-url` нужен для live-валидации через платформу и для `execute` |
-| `workspace` | `execute` | `check`, `run`, `eval` для BSL-кода | `--onec-url` нужен для `run` и `eval` |
+| `workspace` | `execute` | `check`, `run`, `eval` для BSL-кода | `--onec-url` нужен для `run` и `eval`; `check` использует HTTP или настроенный `check_executor` |
 | `workspace` | `event_log` | чтение журнала регистрации 1С с фильтрами (`date_from`, `date_to`, `level`, `user`, `event`, `metadata`, `contains`, `limit`); свежие записи первыми. `contains` — пост-фильтр по уже усечённому окну из `limit` записей (не по всему журналу); неизвестный `metadata` даёт ошибку, а не тихое расширение выборки | `--onec-url` + право `EventLog` у пользователя сервиса |
 | `workspace` | `debug` | attach, breakpoints, step, stack trace, locals, eval | `--onec-url` и доступ к отладочному контуру |
 
@@ -1109,8 +1109,10 @@ bsl-analyzer mcp serve --profile reference
 
 Один MCP-процесс может работать с несколькими ИБ. Создайте локальный файл по
 образцу `docs/mcp/onec-connections.example.json` и передайте путь через
-`BSL_ONEC_CONNECTIONS_FILE`. Файл хранит только URL и имена переменных окружения;
-учётные данные остаются в окружении. У живых операций укажите `connection`.
+`BSL_ONEC_CONNECTIONS_FILE`. Профиль может задавать HTTP URL, локальный
+`check_executor` или оба backend-а. Аргументы `args` — обычные JSON-строки;
+запуск выполняется без shell. Имена переменных учётных данных хранятся в файле,
+сами значения остаются в окружении. У live-операций укажите `connection`.
 
 Для именованных подключений `execute(action=run|eval)` по умолчанию запрещён.
 Для расходуемой тестовой ИБ нужно одновременно установить `allow_execute: true`
@@ -1118,6 +1120,22 @@ bsl-analyzer mcp serve --profile reference
 подключение через `--onec-url` сохраняет прежнее поведение — выполнение на
 стороне MCP разрешено, доступ определяет роль в ИБ. `execute(action=check)` и
 операции чтения используют `BSL_ОсновнаяРоль`.
+
+`execute(action=check)` принимает `input_kind=snippet|module` (по умолчанию
+`snippet`), а для module — `module_type` и `context`. В профиле подключений
+`check_executor` задаёт локальную команду native-проверки и явный
+`handles_snippet`: `true` направляет snippet исполнителю, `false` — HTTP при
+наличии URL. Module всегда направляется исполнителю. Автоматического перехода
+на другой backend при ошибке нет. Если URL отсутствует, HTTP-пути и
+`run`/`eval`/`event_log` недоступны; отсутствие HTTP-переменных окружения не
+блокирует executor-only профиль. Профиль и значения лимитов приведены в
+`docs/mcp/check-contract/README.md`.
+
+Snippet с AST-объявлением процедуры/функции, аннотацией или директивой получает
+`context_required` с подсказкой повторить вызов как module. Слова в строках и
+комментариях на это не влияют. HTTP-отрицательный результат без доказуемой
+позиции возвращается в `structuredContent` как `position_unavailable`; исходный
+текст ошибки остаётся в текстовом блоке.
 
 Инструмент `metadata` поддерживает `mode=source|infobase|auto`. В режиме
 `infobase` действие `tree` принимает тип коллекции в `meta_type` (и опционально

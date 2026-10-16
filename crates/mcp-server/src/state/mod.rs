@@ -397,20 +397,71 @@ pub struct SharedState {
 }
 
 #[derive(Clone)]
+/// Optional HTTP and native check-executor configuration for one named 1C connection.
 pub struct OnecConnection {
-    client: OnecClient,
+    client: Option<OnecClient>,
     allow_execute: bool,
+    check_executor: Option<CheckExecutorProfile>,
+}
+
+#[derive(Debug, Clone)]
+/// Runtime limits and process settings for a connection's native check executor.
+pub struct CheckExecutorProfile {
+    /// Executable path used to start the check worker.
+    pub program: std::path::PathBuf,
+    /// Arguments passed directly to the executable without shell interpretation.
+    pub args: Vec<std::ffi::OsString>,
+    /// End-to-end request deadline, including time waiting for a concurrency slot.
+    pub timeout: std::time::Duration,
+    /// Maximum accepted source-code size in bytes.
+    pub max_code_bytes: u64,
+    /// Maximum worker response size in bytes.
+    pub max_response_bytes: u64,
+    /// Maximum diagnostic output retained from the worker's stderr, in bytes.
+    pub max_stderr_bytes: u64,
+    /// Grace period between requesting worker shutdown and forcing termination.
+    pub stop_grace: std::time::Duration,
+    /// Maximum time to wait for worker reaping before a background owner takes over.
+    pub reap_timeout: std::time::Duration,
+    /// Maximum number of simultaneous worker processes for this connection.
+    pub max_concurrent: usize,
+    /// Whether the worker accepts source snippets in addition to module context.
+    pub handles_snippet: bool,
+    /// Shared admission control for this connection's worker processes.
+    pub semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl OnecConnection {
+    /// Creates an HTTP-backed connection with the requested execution permission.
     pub fn new(client: OnecClient, allow_execute: bool) -> Self {
-        Self { client, allow_execute }
+        Self { client: Some(client), allow_execute, check_executor: None }
     }
 
-    pub fn client(&self) -> &OnecClient {
-        &self.client
+    /// Returns the configured HTTP client, if this connection has one.
+    pub fn client(&self) -> Option<&OnecClient> {
+        self.client.as_ref()
     }
 
+    /// Returns this connection's HTTP client, if configured.
+    pub fn http_client(&self) -> Option<&OnecClient> {
+        self.client.as_ref()
+    }
+
+    /// Returns the native check executor profile, if configured.
+    pub fn check_executor(&self) -> Option<&CheckExecutorProfile> {
+        self.check_executor.as_ref()
+    }
+
+    /// Creates a connection with independently optional HTTP and native executor routes.
+    pub fn with_optional_http(
+        client: Option<OnecClient>,
+        allow_execute: bool,
+        check_executor: Option<CheckExecutorProfile>,
+    ) -> Self {
+        Self { client, allow_execute, check_executor }
+    }
+
+    /// Reports whether execution tools are enabled for this connection.
     pub fn allow_execute(&self) -> bool {
         self.allow_execute
     }
@@ -973,27 +1024,44 @@ impl SharedState {
     }
 
     pub fn onec_connection(&self, name: Option<&str>) -> Result<OnecConnection, String> {
+        self.onec_connection_named(name).map(|(_, connection)| connection)
+    }
+
+    /// Resolves a named connection, or selects the sole configured connection when omitted.
+    ///
+    /// The legacy default HTTP client is selected when present; otherwise an omitted name
+    /// requires exactly one named connection.
+    pub fn onec_connection_named(
+        &self,
+        name: Option<&str>,
+    ) -> Result<(String, OnecConnection), String> {
         if let Some(name) = name {
-            return self.onec_connections.get(name).cloned().ok_or_else(|| {
-                if self.onec_connections.is_empty() {
-                    format!(
-                        "Unknown 1C connection '{name}'. No named connections are configured; \
+            return self
+                .onec_connections
+                .get(name)
+                .cloned()
+                .map(|connection| (name.to_owned(), connection))
+                .ok_or_else(|| {
+                    if self.onec_connections.is_empty() {
+                        format!(
+                            "Unknown 1C connection '{name}'. No named connections are configured; \
                          omit `connection` to use the --onec-url client."
-                    )
-                } else {
-                    let available =
-                        self.onec_connections.keys().cloned().collect::<Vec<_>>().join(", ");
-                    format!("Unknown 1C connection '{name}'. Available: {available}")
-                }
-            });
+                        )
+                    } else {
+                        let available =
+                            self.onec_connections.keys().cloned().collect::<Vec<_>>().join(", ");
+                        format!("Unknown 1C connection '{name}'. Available: {available}")
+                    }
+                });
         }
         if let Some(client) = &self.onec_client {
             // The legacy `--onec-url` client predates per-connection gating; keep run/eval
             // enabled for it — execution is still guarded by the 1C-side role split.
-            return Ok(OnecConnection::new(client.clone(), true));
+            return Ok(("default".to_owned(), OnecConnection::new(client.clone(), true)));
         }
         if self.onec_connections.len() == 1 {
-            return Ok(self.onec_connections.values().next().expect("one connection").clone());
+            let (name, connection) = self.onec_connections.iter().next().expect("one connection");
+            return Ok((name.clone(), connection.clone()));
         }
         if self.onec_connections.is_empty() {
             return Err(

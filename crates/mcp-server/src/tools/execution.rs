@@ -15,33 +15,90 @@ fn require_onec_connection(
     state.onec_connection(connection).map_err(|e| McpError::invalid_params(e, None))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The check route needs independent source, backend selection, module context, budget, and cancellation inputs"
+)]
 pub async fn check_syntax(
     state: &SharedState,
     code: &str,
     connection: Option<&str>,
     max_output_tokens: usize,
+    input_kind: check_contract::InputKind,
+    module_type: Option<check_contract::ModuleType>,
+    context: Option<check_contract::ModuleContext>,
+    ct: tokio_util::sync::CancellationToken,
 ) -> Result<CallToolResult, McpError> {
-    let selected = require_onec_connection(state, connection)?;
-
     if code.trim().is_empty() {
         return Err(McpError::invalid_params("Пустой код", None));
     }
 
+    let (selected_name, selected) =
+        state.onec_connection_named(connection).map_err(|e| McpError::invalid_params(e, None))?;
+    if input_kind == check_contract::InputKind::Snippet {
+        if module_type.is_some() || context.is_some() {
+            return Err(McpError::invalid_params(
+                "snippet cannot include module_type or context",
+                None,
+            ));
+        }
+        if let Some(profile) = selected.check_executor() {
+            if profile.handles_snippet {
+                return crate::tools::check_executor::check(
+                    profile,
+                    &selected_name,
+                    code,
+                    input_kind,
+                    module_type,
+                    context,
+                    ct,
+                )
+                .await;
+            }
+        }
+        if crate::tools::check_executor::has_module_syntax(code) {
+            return Ok(crate::tools::check_executor::context_required(&selected_name));
+        }
+    }
+    if input_kind == check_contract::InputKind::Module {
+        let Some(profile) = selected.check_executor() else {
+            return Ok(crate::tools::check_executor::unsupported(&selected_name));
+        };
+        return crate::tools::check_executor::check(
+            profile,
+            &selected_name,
+            code,
+            input_kind,
+            module_type,
+            context,
+            ct,
+        )
+        .await;
+    }
+    let Some(client) = selected.http_client() else {
+        return Ok(crate::tools::check_executor::unsupported(&selected_name));
+    };
+
     let request = onec_client::CheckSyntaxRequest { code: code.to_string() };
 
-    let result = selected.client().check_syntax(&request).await.map_err(|e| {
+    let result = client.check_syntax(&request).await.map_err(|e| {
         McpError::internal_error(format!("Ошибка проверки синтаксиса в 1С: {e}"), None)
     })?;
 
+    let request_id = crate::tools::check_executor::new_request_id();
     if result.valid {
-        Ok(CallToolResult::success(vec![ContentBlock::text("✓ Синтаксис корректен")]))
+        Ok(crate::tools::check_executor::http_valid(&request_id, &selected_name))
     } else {
         let error = result.error.unwrap_or_default();
-        Ok(text_within_budget(
-            format!("✗ Ошибка синтаксиса:\n{error}"),
-            max_output_tokens,
-            BUDGET_NOTE,
-        ))
+        let mut response = crate::tools::check_executor::http_position_unavailable(
+            &request_id,
+            &selected_name,
+            &error,
+        );
+        let mut text = format!("✗ Ошибка синтаксиса:\n{error}");
+        crate::tools::response::truncate_text_to_budget(&mut text, max_output_tokens, BUDGET_NOTE);
+        response.content = vec![ContentBlock::text(text)];
+        Ok(response)
     }
 }
 
@@ -52,6 +109,9 @@ pub async fn execute_code(
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     let selected = require_onec_connection(state, connection)?;
+    let client = selected
+        .http_client()
+        .ok_or_else(|| McpError::invalid_params("This 1C connection has no HTTP backend", None))?;
     if !selected.allow_execute() {
         return Err(McpError::invalid_params("BSL run is disabled for this 1C connection", None));
     }
@@ -62,10 +122,10 @@ pub async fn execute_code(
 
     let request = onec_client::ExecuteRequest { code: code.to_string() };
 
-    let result =
-        selected.client().execute_code(&request).await.map_err(|e| {
-            McpError::internal_error(format!("Ошибка выполнения кода в 1С: {e}"), None)
-        })?;
+    let result = client
+        .execute_code(&request)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Ошибка выполнения кода в 1С: {e}"), None))?;
 
     let mut out = if result.success {
         "✓ Код выполнен успешно".to_string()
@@ -101,6 +161,9 @@ pub async fn eval_expression(
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     let selected = require_onec_connection(state, connection)?;
+    let client = selected
+        .http_client()
+        .ok_or_else(|| McpError::invalid_params("This 1C connection has no HTTP backend", None))?;
     if !selected.allow_execute() {
         return Err(McpError::invalid_params("BSL eval is disabled for this 1C connection", None));
     }
@@ -111,7 +174,7 @@ pub async fn eval_expression(
 
     let request = onec_client::EvalRequest { expression: expression.to_string() };
 
-    let result = selected.client().eval_expression(&request).await.map_err(|e| {
+    let result = client.eval_expression(&request).await.map_err(|e| {
         McpError::internal_error(format!("Ошибка вычисления выражения в 1С: {e}"), None)
     })?;
 
@@ -173,23 +236,100 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn optional_http_only_connection_routes_preflight_and_unsupported_without_fallback() {
+        let mut state = test_shared_state();
+        state.add_onec_connection(
+            "http-only".to_owned(),
+            crate::state::OnecConnection::with_optional_http(None, false, None),
+        );
+        let preflight = check_syntax(
+            &state,
+            "&НаСервере\nПроцедура Проверка()\nКонецПроцедуры",
+            Some("http-only"),
+            6000,
+            check_contract::InputKind::Snippet,
+            None,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("preflight returns a structured caller response");
+        let response: check_contract::CheckResponse =
+            serde_json::from_value(preflight.structured_content.unwrap()).unwrap();
+        assert_eq!(response.status, check_contract::Status::ContextRequired);
+        assert_eq!(response.failure.unwrap().code, "context_required");
+
+        for (code, kind) in [
+            ("x = 1;", check_contract::InputKind::Snippet),
+            ("Перем x;", check_contract::InputKind::Module),
+        ] {
+            let result = check_syntax(
+                &state,
+                code,
+                Some("http-only"),
+                6000,
+                kind,
+                None,
+                None,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("missing backend is a structured result");
+            let response: check_contract::CheckResponse =
+                serde_json::from_value(result.structured_content.unwrap()).unwrap();
+            assert_eq!(response.status, check_contract::Status::Unsupported);
+            assert_eq!(response.failure.unwrap().code, "unsupported");
+        }
+    }
+
+    #[tokio::test]
     async fn test_check_syntax_empty_code() {
         let state = test_shared_state();
-        let result = check_syntax(&state, "", None, 6000).await;
+        let result = check_syntax(
+            &state,
+            "",
+            None,
+            6000,
+            check_contract::InputKind::Snippet,
+            None,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_err(), "empty code should fail");
     }
 
     #[tokio::test]
     async fn test_check_syntax_whitespace() {
         let state = test_shared_state();
-        let result = check_syntax(&state, "   ", None, 6000).await;
+        let result = check_syntax(
+            &state,
+            "   ",
+            None,
+            6000,
+            check_contract::InputKind::Snippet,
+            None,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_err(), "whitespace-only code should fail");
     }
 
     #[tokio::test]
     async fn test_check_syntax_no_client() {
         let state = test_shared_state();
-        let result = check_syntax(&state, "а = 1;", None, 6000).await;
+        let result = check_syntax(
+            &state,
+            "а = 1;",
+            None,
+            6000,
+            check_contract::InputKind::Snippet,
+            None,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_err(), "should fail without onec client");
     }
 

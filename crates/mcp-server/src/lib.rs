@@ -5,6 +5,11 @@ mod cache;
 pub mod cache_windows;
 mod cancel;
 mod change_hub;
+#[cfg(test)]
+#[cfg(windows)]
+mod check_executor_windows_tests;
+#[cfg(test)]
+mod check_executor_wire_tests;
 pub mod contract;
 mod diagnostics_state;
 mod drift_classify;
@@ -191,7 +196,9 @@ pub use graph_db::{
 pub use http::{serve_http, wildcard_allowed_hosts, MAX_HTTP_REQUEST_BODY_BYTES};
 use state::WorkspaceSearchMode;
 pub use state::{resolve_embedding_token_profile_values, WorkspaceInitError};
-pub use state::{EmbeddingPrefixes, EmbeddingTokenProfile, OnecConnection, SharedState};
+pub use state::{
+    CheckExecutorProfile, EmbeddingPrefixes, EmbeddingTokenProfile, OnecConnection, SharedState,
+};
 pub use tools::platform::{
     build_reference_documents, reference_documents_fingerprint, REFERENCE_DOCUMENT_SCHEMA_VERSION,
 };
@@ -644,6 +651,12 @@ struct ExecuteParams {
     code: String,
     /// Named live 1C connection (optional when only one/default connection exists).
     connection: Option<String>,
+    /// Source kind for `check`: snippet (default) or complete module.
+    input_kind: Option<check_contract::InputKind>,
+    /// Expected module kind when `input_kind` is `module`.
+    module_type: Option<check_contract::ModuleType>,
+    /// Metadata owner or explicit synthetic context for module checks.
+    context: Option<check_contract::ModuleContext>,
     /// Output budget in tokens (~4 chars each); over-budget output (a `run` context block, an
     /// evaluated value, a long syntax-error listing) is truncated with a note (default 6000).
     max_output_tokens: Option<usize>,
@@ -1756,7 +1769,11 @@ impl McpServer {
     /// single expression in `code`. `run`/`eval` execute code, so this tool is not read-only.
     /// Output is bounded by `max_output_tokens` and appends a truncation note.
     #[tool(name = "execute")]
-    async fn execute(&self, params: Parameters<ExecuteParams>) -> Result<CallToolResult, McpError> {
+    async fn execute(
+        &self,
+        params: Parameters<ExecuteParams>,
+        ct: tokio_util::sync::CancellationToken,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let budget = p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
         match p.action.as_str() {
@@ -1766,6 +1783,10 @@ impl McpServer {
                     &p.code,
                     p.connection.as_deref(),
                     budget,
+                    p.input_kind.unwrap_or_default(),
+                    p.module_type,
+                    p.context,
+                    ct,
                 )
                 .await
             }
@@ -5192,8 +5213,11 @@ mod tool_descriptions {
               - action: check | run | eval.
               - code: BSL source to `check`/`run`, or the single expression to `eval`.
               - connection: Named live 1C connection (optional when only one/default connection exists).
+              - context: Metadata owner or explicit synthetic context for module checks.
+              - input_kind: Source kind for `check`: snippet (default) or complete module.
               - max_output_tokens: Output budget in tokens (~4 chars each); over-budget output (a `run` context block, an
             evaluated value, a long syntax-error listing) is truncated with a note (default 6000).
+              - module_type: Expected module kind when `input_kind` is `module`.
 
             ## graph
             Whole-config semantic call graph: traverse who-calls-whom and object/metadata usage by

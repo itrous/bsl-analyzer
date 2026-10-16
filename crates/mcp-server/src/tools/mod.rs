@@ -1,3 +1,4 @@
+pub(crate) mod check_executor;
 pub mod debug;
 pub mod diagnostics;
 pub mod event_log;

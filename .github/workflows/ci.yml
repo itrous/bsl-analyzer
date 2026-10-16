@@ -365,6 +365,16 @@ jobs:
           run_nonempty -p mcp-server --lib workspace_cache_
           run_nonempty -p bsl-analyzer --bin bsl-analyzer-app workspace_cache_scope_
           run_nonempty -p bsl-analyzer --test source_set_cli workspace_cache_scope_
+      - name: Windows check executor lifecycle tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p mcp-server --lib check_executor_windows_tests
       - name: CLI MCP mode and lifecycle tests
         shell: bash
         run: |

@@ -100,7 +100,7 @@ const QUERY_ACTIONS: &[ActionDecl] =
     &[action("validate", &["query"]), action("execute", &["query"]), action("schema", &[])];
 
 const EXECUTE_ACTIONS: &[ActionDecl] =
-    &[action("check", &[]), action("run", &[]), action("eval", &[])];
+    &[action("check", &["code"]), action("run", &["code"]), action("eval", &["code"])];
 
 const DEBUG_ACTIONS: &[ActionDecl] = &[
     action("attach", &["host", "infobase"]),
@@ -1381,15 +1381,21 @@ mod tests {
                         "actions": [
                           {
                             "name": "check",
-                            "required": []
+                            "required": [
+                              "code"
+                            ]
                           },
                           {
                             "name": "run",
-                            "required": []
+                            "required": [
+                              "code"
+                            ]
                           },
                           {
                             "name": "eval",
-                            "required": []
+                            "required": [
+                              "code"
+                            ]
                           }
                         ],
                         "name": "execute",
@@ -1411,10 +1417,25 @@ mod tests {
                             "type": "string"
                           },
                           {
+                            "name": "context",
+                            "required": false,
+                            "type": "any"
+                          },
+                          {
+                            "name": "input_kind",
+                            "required": false,
+                            "type": "any"
+                          },
+                          {
                             "name": "max_output_tokens",
                             "nullable": true,
                             "required": false,
                             "type": "integer"
+                          },
+                          {
+                            "name": "module_type",
+                            "required": false,
+                            "type": "any"
                           }
                         ]
                       },
