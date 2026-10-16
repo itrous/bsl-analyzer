@@ -3,6 +3,7 @@ mod call_hierarchy;
 mod call_hierarchy_index;
 mod completion;
 pub mod config_finder;
+mod convert_method;
 mod declarations;
 pub mod diagnostics_baseline;
 pub mod diagnostics_catalog;
@@ -263,8 +264,9 @@ impl Analysis {
         document_symbols::file_outline(&self.db, file_id, mode)
     }
 
-    pub fn code_actions(&self, _file_id: FileId, _range: TextRange) -> Vec<Assist> {
-        Vec::new()
+    /// Refactorings offered at the cursor, independent of any diagnostic.
+    pub fn code_actions(&self, file_id: FileId, range: TextRange) -> Vec<Assist> {
+        convert_method::convert_method_assists(&self.db, file_id, range)
     }
 
     pub fn file_dependencies(&self, file_id: FileId) -> Arc<Vec<FileId>> {

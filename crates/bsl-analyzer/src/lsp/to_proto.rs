@@ -337,6 +337,40 @@ pub fn aggregate_code_action(
     })
 }
 
+/// Build a `refactor.rewrite` code action from an assist. An assist is a refactoring at
+/// the cursor, not a fix for a diagnostic: it carries no attached diagnostic and is not
+/// `preferred`. Edits are encoded against this document only, so an assist touching any
+/// other file is not offered rather than applied partially.
+pub fn code_action_from_assist(
+    line_index: &LineIndex,
+    text: &str,
+    uri: &Url,
+    file_id: vfs::FileId,
+    assist: &ide::Assist,
+    encoding: PositionEncoding,
+) -> Option<lsp_types::CodeAction> {
+    let mut edits = Vec::new();
+    for file_edit in &assist.source_change.edits {
+        if file_edit.file_id != file_id {
+            return None;
+        }
+        for edit in &file_edit.edits {
+            let range = range_with_encoding(line_index, text, edit.range, encoding)?;
+            edits.push(lsp_types::TextEdit { range, new_text: edit.new_text.clone() });
+        }
+    }
+    if edits.is_empty() {
+        return None;
+    }
+
+    Some(lsp_types::CodeAction {
+        title: assist.label.clone(),
+        kind: Some(lsp_types::CodeActionKind::REFACTOR_REWRITE),
+        edit: Some(workspace_edit(uri, edits)),
+        ..Default::default()
+    })
+}
+
 pub fn semantic_tokens_legend() -> SemanticTokensLegend {
     let token_types = vec![
         SemanticTokenType::KEYWORD,

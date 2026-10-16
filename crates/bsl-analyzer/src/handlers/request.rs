@@ -1450,6 +1450,22 @@ pub fn handle_code_action(
         }
     }
 
+    // Refactorings at the cursor, offered alongside the fixes and independent of them.
+    if kind_requested(CodeActionKind::REFACTOR_REWRITE.as_str(), only) {
+        for assist in ctx.analysis.code_actions(file_id, range) {
+            if let Some(action) = crate::lsp::to_proto::code_action_from_assist(
+                line_index,
+                text,
+                &uri,
+                file_id,
+                &assist,
+                ctx.position_encoding,
+            ) {
+                actions.push(CodeActionOrCommand::CodeAction(action));
+            }
+        }
+    }
+
     if actions.is_empty() {
         Ok(None)
     } else {

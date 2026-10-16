@@ -1809,6 +1809,7 @@ fn server_capabilities(
                 code_action_kinds: Some(vec![
                     lsp_types::CodeActionKind::QUICKFIX,
                     lsp_types::CodeActionKind::new(crate::lsp::to_proto::FIX_ALL_BSL),
+                    lsp_types::CodeActionKind::REFACTOR_REWRITE,
                 ]),
                 work_done_progress_options: WorkDoneProgressOptions { work_done_progress: None },
                 resolve_provider: None,
