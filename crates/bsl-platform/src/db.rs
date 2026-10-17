@@ -673,8 +673,26 @@ fn apply_docs_gap_member_context_overlay(
         {
             context.web_client = true;
         }
+        if method.type_name == "HTTPConnection"
+            && CLIENT_DEPRECATED_HTTP_CONNECTION_METHODS.contains(&method.english_name.as_str())
+        {
+            context.thin_client = true;
+            context.thick_client = true;
+            context.mobile_client = true;
+        }
     }
 }
+
+/// Synchronous `HTTPСоединение` methods whose pages, since the 8.3.21 help,
+/// list only server environments. The same pages say the call on the client is
+/// *deprecated* in favour of the `*Асинх` counterpart — not removed: the 8.3.17
+/// help lists the thin, thick and mobile clients, and the platform (8.3.17, and
+/// 8.3.27 with and without a compatibility mode) executes these calls in the thin
+/// and thick clients. Deprecation is `DeprecatedPlatformApi`'s business; the
+/// environment check must not turn it into "unavailable". The web client stays
+/// out: the type itself is absent there.
+const CLIENT_DEPRECATED_HTTP_CONNECTION_METHODS: &[&str] =
+    &["Get", "Post", "Put", "Patch", "Delete", "Head", "CallHTTPMethod"];
 
 /// The platform ships manager methods whose pages are missing from the help
 /// archive, so HBK extraction cannot see them. Each entry pairs the manager's
@@ -1233,6 +1251,42 @@ mod tests {
             .expect("error-processing method must exist");
         let ctx = method.context.as_ref().expect("method must carry availability");
         assert!(ctx.web_client, "overlay must add the web client to ПодробноеПредставлениеОшибки");
+    }
+
+    #[test]
+    fn docs_gap_overlay_restores_client_contexts_of_sync_http_connection_methods() {
+        let data = PlatformDataInner::instance();
+        if data.all_methods().is_empty() {
+            return;
+        }
+
+        for name in [
+            "Получить",
+            "ОтправитьДляОбработки",
+            "Записать",
+            "Изменить",
+            "Удалить",
+            "ПолучитьЗаголовки",
+            "ВызватьHTTPМетод",
+        ] {
+            let method = data.get_method("HTTPСоединение", name).expect("sync method must exist");
+            let ctx = method.context.as_ref().expect("sync method must carry availability");
+            assert!(
+                ctx.thin_client && ctx.thick_client,
+                "{name} runs in the thin and thick client"
+            );
+            assert!(ctx.server && ctx.external_connection, "{name} keeps its server contexts");
+            assert!(!ctx.web_client, "HTTPСоединение is absent from the web client: {name}");
+        }
+
+        // Narrow: a synchronous collaboration-system method that the thin client
+        // really lacks keeps its markup.
+        let control = data
+            .get_method("МенеджерСистемыВзаимодействия", "ПолучитьПользователей")
+            .expect("control must exist");
+        let ctx = control.context.as_ref().expect("control must carry availability");
+        assert!(!ctx.thin_client, "the control stays unavailable in the thin client");
+        assert!(ctx.thick_client, "the control keeps the thick client");
     }
 
     #[test]
