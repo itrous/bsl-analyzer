@@ -10,6 +10,12 @@ Global manager collections of configuration objects (`Catalogs`, `Documents`, `E
 
 Preprocessor conditions are understood: inside `#If … #EndIf` only the intersection of the method's environments with the environments the branch compiles for is checked (`#If Not WebClient Then` removes the web client; the `#Else` branch receives the complement). Environments for which the condition stays undecidable (e.g. it involves an OS name and is not resolved by И/ИЛИ absorption) are skipped throughout the branch chain. This also covers preprocessor regions around whole methods: a method declared inside `#If Not WebClient Then` is not checked against the web client.
 
+An ordinary form module runs only in a thick client: the ordinary application's, and the managed application's only when the main configuration enables `UseOrdinaryFormInManagedApplication`. With the property off, such a module is not checked against the managed thick client; without a main configuration (a project of external data processors alone) both thick clients count.
+
+Object, manager, record set and value manager modules run on the server and in the external connection, and — when the main configuration's `DefaultRunMode` is `ManagedApplication` or `Auto` — also in the managed thick client. That client is judged as in the client-server variant: there a common module flagged only "Server" is not visible (one with "Server call" or "Client (managed application)" is) and an `&AtServer` method of the module is not compiled. In the file variant the platform compiles server code in the client process and sees such modules, so a finding there names code that will not compile against a client-server infobase. In an `OrdinaryApplication` configuration and without a main configuration the managed thick client is not added: the platform also compiles these modules there, but such a configuration is normally not run in that client.
+
+The external connection, when listed in `checked_environments`, is judged as in the client-server variant too: `&AtServer` and `&AtServerNoContext` methods of object, manager, record set and value manager modules are not compiled there, so their bodies are checked against the server alone, and calling them from code without a directive is a `ModuleAccessibility` finding for the external connection.
+
 Current limitations (deliberately conservative):
 
 - extension modules (interceptors `&Instead`/`&Before`/`&After`, `&ChangeAndValidate`) are not checked;

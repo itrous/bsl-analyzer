@@ -234,7 +234,7 @@ fn project_diagnostics_config(state: &SharedState) -> Option<ide::DiagnosticsCon
     let root = state.workspace_root()?;
     let project = crate::project::at(root).ok()?;
     Some(ide::DiagnosticsConfig::from_project_json(
-        &project.config.diagnostics.rules_json(),
+        &project.diagnostics_rules_json(),
         project.config.output.resolve_locale().unwrap_or_default(),
     ))
 }

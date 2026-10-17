@@ -50,19 +50,29 @@ impl EnvFilter {
     }
 
     /// Whether a same-module method should be offered — the completion mirror
-    /// of the local `ModuleAccessibility` rule: only the server side is ever a
-    /// violation, a client-side caller reaching a server method is the form's
-    /// regular remote call.
-    pub(super) fn admits_local_method(&self, callee_env: EnvFlags) -> bool {
+    /// of the local `ModuleAccessibility` rule: in a form or command module only
+    /// the server side is a violation, a client-side caller reaching a server
+    /// method is the form's regular remote call; an object-family module has no
+    /// remote call.
+    pub(super) fn admits_local_method(
+        &self,
+        callee_env: EnvFlags,
+        module_type: bsl_metadata::ModuleType,
+    ) -> bool {
         if self.body_env.is_empty() || callee_env.is_empty() {
             return true;
         }
-        (self.body_env.without(callee_env) & self.checked_env & EnvFlags::SERVER_SIDE).is_empty()
+        let mut missing = self.body_env.without(callee_env) & self.checked_env;
+        if execution_env::local_server_call_is_remote(module_type) {
+            missing = missing & EnvFlags::SERVER_SIDE;
+        }
+        missing.is_empty()
     }
 
     /// Whether the common module `name` is callable from the cursor's
     /// environments — the completion mirror of `ModuleAccessibility`:
-    /// `ВызовСервера` modules stay visible to every client environment.
+    /// `ВызовСервера` modules stay visible to every client environment and to
+    /// the external connection.
     /// Judged on the caller-visible flags; an extension that NARROWS an
     /// adopted module hides it here while the diagnostic tolerates that
     /// corner as a miss — the caller-visible model is what completion sells.
@@ -85,7 +95,7 @@ impl EnvFilter {
         }
         let mut missing = self.body_env.without(module_env) & self.checked_env;
         if module.is_server_call() {
-            missing = missing.without(EnvFlags::ALL_CLIENTS);
+            missing = missing.without(EnvFlags::SERVER_CALL_CALLERS);
         }
         missing.is_empty()
     }
