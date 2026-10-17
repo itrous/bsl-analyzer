@@ -362,6 +362,7 @@ mod tests {
     /// Bound of a wait for an event that a regression would never deliver: 60 s under
     /// `timing_contract`, and a century otherwise, so an ordinary run waits for the event
     /// however long a loaded machine takes. A century still fits in an `Instant` sum.
+    #[cfg(unix)]
     const HANG_WATCHDOG: std::time::Duration = if cfg!(timing_contract) {
         std::time::Duration::from_secs(60)
     } else {
