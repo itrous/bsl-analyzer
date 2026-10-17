@@ -261,13 +261,15 @@ fn report_missing_name(p: &mut Parser, expected: &'static str) {
     }
 }
 
-/// `Экспорт` is taken after the whole list, and after a single name.
+/// `Экспорт` is taken after any name of the list.
 ///
 /// Section 4.6.1 states this three ways that do not agree: the production puts
 /// `[Экспорт]` after the first name only, the prose requires it on every
 /// declared variable separately, and the example writes `Перем А, Б Экспорт;`.
-/// The two forms the section's own examples show are what is read here; the
-/// form only its production yields, `Перем А Экспорт, Б;`, is not.
+/// The platform settles it with the prose: `Перем А Экспорт, Б Экспорт;` and
+/// `Перем А Экспорт, Б;` both build on 8.3.17 and 8.3.27, and each `Экспорт`
+/// exports only the name it follows. Every form is read here, so none of them
+/// costs the rest of the module a parse error.
 ///
 /// Provenance: `docs/legal/bsl-clean-room-slice-b3.md`, finding D7.
 pub fn var_declaration_content(p: &mut Parser) {
@@ -278,6 +280,7 @@ pub fn var_declaration_content(p: &mut Parser) {
     } else {
         report_missing_name(p, "ожидалось имя переменной");
     }
+    p.eat(T![KwExport]);
 
     while p.eat(T![Comma]) {
         p.check_iteration_limit();
@@ -286,9 +289,8 @@ pub fn var_declaration_content(p: &mut Parser) {
         } else {
             report_missing_name(p, "ожидалось имя переменной");
         }
+        p.eat(T![KwExport]);
     }
-
-    p.eat(T![KwExport]);
 
     p.eat(T![Semicolon]);
 }

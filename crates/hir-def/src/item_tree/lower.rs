@@ -141,10 +141,9 @@ impl Ctx {
     }
 
     fn lower_variable(&mut self, var: &ast::VarDef) {
-        let is_export = var.export_keyword().is_some();
         let annotations = self.lower_annotations(var.annotations());
         let source_range = var.syntax().text_range();
-        for name_token in var.names() {
+        for (name_token, is_export) in var.names_with_export() {
             let name = Name::new(name_token.text());
             let name_range = name_token.text_range();
 
@@ -777,7 +776,8 @@ EndFunction
 
         assert_eq!(var1.name.as_str(), "Первая");
         assert_eq!(var2.name.as_str(), "Вторая");
-        assert!(var1.is_export);
+        // `Экспорт` stands after `Вторая` only: the platform exports it alone.
+        assert!(!var1.is_export);
         assert!(var2.is_export);
         assert!(var1.annotations.is_empty());
         assert_eq!(var1.annotations, var2.annotations);
@@ -788,6 +788,30 @@ EndFunction
         assert_ne!(var1.name_range, var2.name_range);
     }
 
+    #[test]
+    fn export_after_a_name_exports_that_name_alone() {
+        for (input, expected) in [
+            ("Перем Первая Экспорт, Вторая;", [("Первая", true), ("Вторая", false)]),
+            ("Перем Первая Экспорт, Вторая Экспорт;", [("Первая", true), ("Вторая", true)]),
+            ("Перем Первая, Вторая;", [("Первая", false), ("Вторая", false)]),
+        ] {
+            let tree = lower(input);
+            let lowered: Vec<(String, bool)> = tree
+                .top_level_items()
+                .iter()
+                .map(|item| match item {
+                    ModItem::Variable(idx) => {
+                        let var = tree.variable(*idx);
+                        (var.name.as_str().to_string(), var.is_export)
+                    }
+                    _ => panic!("expected variable"),
+                })
+                .collect();
+            let expected: Vec<(String, bool)> =
+                expected.iter().map(|(name, export)| (name.to_string(), *export)).collect();
+            assert_eq!(lowered, expected, "{input}");
+        }
+    }
     #[test]
     fn module_comma_var_decl_under_pre_if_lowers_each_name() {
         let input = r#"
@@ -856,7 +880,7 @@ Var Alpha, Beta Export;
 
         assert_eq!(var1.name.as_str(), "Alpha");
         assert_eq!(var2.name.as_str(), "Beta");
-        assert!(var1.is_export);
+        assert!(!var1.is_export);
         assert!(var2.is_export);
         assert_eq!(var1.annotations.as_ref(), expected_annotations.as_slice());
         assert_eq!(var2.annotations.as_ref(), expected_annotations.as_slice());

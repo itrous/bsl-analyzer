@@ -1052,3 +1052,37 @@ mod region_directive_bounds {
         assert_eq!(region_dir_texts("#Область   Р\n")[0], "#Область   Р");
     }
 }
+
+#[test]
+fn labels_spelled_as_keywords_parse_clean() {
+    assert_clean_parse(
+        "Функция П()\n\tДля Н = 1 По 3 Цикл\n\t\tЕсли Н = 2 Тогда\n\t\t\tПерейти ~КонецЦикла;\n\t\tКонецЕсли;\n\tКонецЦикла;\n~КонецЦикла:\n\tПерейти ~Возврат;\n~Возврат:\n\tВозврат 1;\nКонецФункции\n",
+        "a label spelled as a keyword is a name behind its tilde",
+    );
+}
+
+#[test]
+fn a_detached_tilde_does_not_take_the_next_construct_word() {
+    // The loop is still closed by its own `КонецЦикла`: the word on the next
+    // line is not read as the label of the unfinished `Перейти ~`.
+    let result =
+        parse("Процедура П()\n\tПока Истина Цикл\n\t\tПерейти ~\n\tКонецЦикла;\nКонецПроцедуры\n");
+    let root = result.syntax_node();
+    let loop_closed = root
+        .descendants_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|tok| tok.kind() == SyntaxKind::KW_END_DO);
+    assert!(loop_closed);
+    assert!(!result.has_errors(), "{:?}", result.errors());
+}
+#[test]
+fn export_may_follow_every_name_of_a_var_list() {
+    for input in [
+        "Перем А Экспорт, Б Экспорт;\n",
+        "Перем А Экспорт, Б;\n",
+        "Перем А, Б Экспорт;\n",
+        "Перем А Экспорт,Б Экспорт;\nПроцедура П()\nКонецПроцедуры\n",
+    ] {
+        assert_clean_parse(input, input);
+    }
+}

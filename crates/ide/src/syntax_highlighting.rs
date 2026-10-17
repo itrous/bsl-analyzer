@@ -378,11 +378,10 @@ fn highlight_def_site_token(token: &SyntaxToken) -> Option<HlRange> {
         }
         SyntaxKind::VAR_DEF => {
             let var_def = ast::VarDef::cast(parent)?;
-            if !var_def.names().any(|n| n.text_range() == range) {
-                return None;
-            }
+            let (_, is_export) =
+                var_def.names_with_export().into_iter().find(|(n, _)| n.text_range() == range)?;
             let mut modifiers = HlMod::new().with(HlMod::DECLARATION);
-            if var_def.export_keyword().is_some() {
+            if is_export {
                 modifiers = modifiers.with(HlMod::EXPORT);
             }
             Some(HlRange { range, tag: HlTag::Variable, modifiers })
@@ -1582,7 +1581,7 @@ EndFunction
 
     #[test]
     fn test_highlight_multi_var_decl_module_export() {
-        let code = "Перем A, B Экспорт;\n";
+        let code = "Перем A Экспорт, B Экспорт;\n";
         let (db, file_id) = create_db_with_file(code);
         let result = highlight(&db, file_id);
         assert_sorted_non_overlapping(&result.highlights);
@@ -1594,9 +1593,22 @@ EndFunction
             assert!(hls[0].modifiers.contains(HlMod::DECLARATION));
             assert!(
                 hls[0].modifiers.contains(HlMod::EXPORT),
-                "module-level VarDef with `Экспорт` keyword must propagate EXPORT to every name"
+                "every name followed by its own `Экспорт` is highlighted as exported"
             );
         }
+    }
+
+    #[test]
+    fn test_highlight_multi_var_decl_exports_only_the_marked_name() {
+        let code = "Перем A, B Экспорт;\n";
+        let (db, file_id) = create_db_with_file(code);
+        let result = highlight(&db, file_id);
+
+        // `Экспорт` exports only the name it follows: the platform exports `B` alone.
+        let a = highlights_for(&result.highlights, code, "A");
+        assert!(!a[0].modifiers.contains(HlMod::EXPORT));
+        let b = highlights_for(&result.highlights, code, "B");
+        assert!(b[0].modifiers.contains(HlMod::EXPORT));
     }
 
     #[test]

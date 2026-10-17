@@ -962,10 +962,7 @@ fn lower_raise_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
 }
 
 fn lower_goto_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
-    let label_token = node
-        .children_with_tokens()
-        .filter_map(|el| el.into_token())
-        .find(|tok| tok.kind() == SyntaxKind::IDENT)?;
+    let label_token = label_name_token(node)?;
 
     let range = TextRange::new(node.text_range().start(), label_token.text_range().end());
     ctx.emit(BodyDiagnostic::UsingGoto { range });
@@ -974,12 +971,25 @@ fn lower_goto_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
 }
 
 fn lower_label_stmt(node: &SyntaxNode) -> Option<Stmt> {
-    let label_token = node
-        .children_with_tokens()
-        .filter_map(|el| el.into_token())
-        .find(|tok| tok.kind() == SyntaxKind::IDENT)?;
+    let label_token = label_name_token(node)?;
 
     Some(Stmt::Label(Name::new(label_token.text())))
+}
+
+/// The label name: an identifier, or a keyword the parser took as the name
+/// right behind the tilde (`~КонецЦикла`).
+fn label_name_token(node: &SyntaxNode) -> Option<syntax::SyntaxToken> {
+    let mut after_tilde = false;
+    for token in node.children_with_tokens().filter_map(|el| el.into_token()) {
+        let kind = token.kind();
+        if kind == SyntaxKind::IDENT || (after_tilde && kind.is_keyword()) {
+            return Some(token);
+        }
+        if !kind.is_trivia() {
+            after_tilde = kind == SyntaxKind::TILDE;
+        }
+    }
+    None
 }
 
 fn lower_execute_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {

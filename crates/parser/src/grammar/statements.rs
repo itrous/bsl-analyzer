@@ -358,11 +358,14 @@ fn goto_stmt(p: &mut Parser) {
     let m = p.start();
     p.bump();
 
-    if p.at(T![Tilde]) {
-        p.bump();
-    }
+    let tilde = p.eat(T![Tilde]);
 
-    if p.at(T![Ident]) {
+    // A word spelled as a keyword is a label name when written flush against
+    // its tilde: `Перейти ~КонецЦикла;` builds on the platform. A tilde left
+    // alone while typing does not take the `КонецЦикла` of the next line.
+    let keyword_name =
+        tilde && p.current().is_some_and(|kind| kind.is_keyword()) && !p.a_gap_precedes();
+    if p.at(T![Ident]) || keyword_name {
         p.bump();
     }
 
@@ -374,7 +377,17 @@ fn goto_stmt(p: &mut Parser) {
 fn label_stmt(p: &mut Parser) {
     let m = p.start();
     p.bump();
-    p.expect(T![Ident]);
+    // `~КонецЦикла:` builds on the platform: the word behind the tilde names the
+    // label even when spelled as a keyword. It is taken only flush against the
+    // tilde and before its colon, so a construct word is never read as a label.
+    let keyword_name = p.current().is_some_and(|kind| kind.is_keyword())
+        && !p.a_gap_precedes()
+        && p.nth(1) == Some(T![Colon]);
+    if keyword_name {
+        p.bump();
+    } else {
+        p.expect(T![Ident]);
+    }
     p.expect(T![Colon]);
     m.complete(p, NodeKind::LabelStmt);
 }

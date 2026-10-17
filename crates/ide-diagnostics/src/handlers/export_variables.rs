@@ -128,4 +128,26 @@ mod tests {
             diagnostics.into_iter().filter(|d| d.code == DiagnosticCode::ExportVariables).collect();
         expect![[r#""#]].assert_eq(&format_diags(code, &export_diags));
     }
+    /// `Экспорт` exports only the name it follows, so only those names are
+    /// global variables: `Б`, `В` and `Е` are not reported.
+    #[test]
+    fn only_names_followed_by_export_are_reported() {
+        let code = "Перем А Экспорт, Б;\nПерем В, Г Экспорт;\nПерем Д Экспорт, Е, Ж Экспорт;\n";
+        let diagnostics = check_hir_diagnostic(code);
+        let export_diags: Vec<_> =
+            diagnostics.into_iter().filter(|d| d.code == DiagnosticCode::ExportVariables).collect();
+        expect![[r#"
+            ExportVariables @ 1:7..1:8
+              message: Не рекомендуется использовать глобальные переменные. Они могут приводить к трудноуловимым ошибкам
+              severity: Warning
+            ExportVariables @ 2:10..2:11
+              message: Не рекомендуется использовать глобальные переменные. Они могут приводить к трудноуловимым ошибкам
+              severity: Warning
+            ExportVariables @ 3:7..3:8
+              message: Не рекомендуется использовать глобальные переменные. Они могут приводить к трудноуловимым ошибкам
+              severity: Warning
+            ExportVariables @ 3:21..3:22
+              message: Не рекомендуется использовать глобальные переменные. Они могут приводить к трудноуловимым ошибкам
+              severity: Warning"#]].assert_eq(&format_diags(code, &export_diags));
+    }
 }

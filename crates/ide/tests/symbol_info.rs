@@ -142,7 +142,7 @@ fn setup_catalog() -> RootDatabaseImpl {
     db.set_file_text(data_processor_xml, DATA_PROCESSOR_XML);
     db.set_file_text(
         catalog_object_module,
-        "Перем ЭкспортнаяПеременная, ТолькоОбъект Экспорт;\n\
+        "Перем ЭкспортнаяПеременная Экспорт, ТолькоОбъект Экспорт;\n\
          Функция ЭкспортныйМетод(Параметр) Экспорт\n\
              Возврат Параметр;\n\
          КонецФункции\n",

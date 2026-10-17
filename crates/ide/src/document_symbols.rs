@@ -518,7 +518,7 @@ mod tests {
 
         expect_test::expect![[r#"
             region Служебные
-              variable А экспорт &at_client
+              variable А &at_client
               variable Б экспорт &at_client
               procedure П экспорт
         "#]]

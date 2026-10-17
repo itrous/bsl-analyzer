@@ -78,7 +78,10 @@ fn compute_variable_diagnostic_range(
 
     for child in node.children_with_tokens() {
         if let Some(token) = child.as_token() {
-            if token.kind() == SyntaxKind::KW_EXPORT {
+            // The `Экспорт` of this name: the first one written after it.
+            if token.kind() == SyntaxKind::KW_EXPORT
+                && token.text_range().start() >= name_range.end()
+            {
                 return TextRange::new(name_range.start(), token.text_range().end());
             }
         }
@@ -365,6 +368,28 @@ mod tests {
                 MissingVariablesDescription @ 2:7..2:15
                   message: Все объявления переменных должны иметь описание
                   severity: Information"#]],
+        );
+    }
+    /// `Экспорт` after every name: each name's range runs to its own `Экспорт`,
+    /// and the second name no longer reaches back to the first one's.
+    #[test]
+    fn export_after_every_name_keeps_each_range() {
+        check_diagnostics_snapshot_for(
+            "Перем А Экспорт, Б Экспорт;\nПерем В, Г Экспорт;\n",
+            DiagnosticCode::MissingVariablesDescription,
+            expect![[r#"
+            MissingVariablesDescription @ 1:7..1:16
+              message: Все объявления переменных должны иметь описание
+              severity: Information
+            MissingVariablesDescription @ 1:18..1:27
+              message: Все объявления переменных должны иметь описание
+              severity: Information
+            MissingVariablesDescription @ 2:7..2:8
+              message: Все объявления переменных должны иметь описание
+              severity: Information
+            MissingVariablesDescription @ 2:10..2:19
+              message: Все объявления переменных должны иметь описание
+              severity: Information"#]],
         );
     }
 }

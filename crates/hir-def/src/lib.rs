@@ -843,21 +843,18 @@ fn collect_module_vars_of_root(root: &syntax::SyntaxNode) -> Vec<ModuleVarDecl> 
 }
 
 fn collect_module_vars(var_def: &syntax::SyntaxNode, vars: &mut Vec<ModuleVarDecl>) {
-    use syntax::SyntaxKind;
+    use syntax::ast::AstNode;
 
-    let has_export = var_def
-        .children_with_tokens()
-        .filter_map(|el| el.into_token())
-        .any(|tok| tok.kind() == SyntaxKind::KW_EXPORT);
-
-    for token in var_def.children_with_tokens().filter_map(|el| el.into_token()) {
-        if token.kind() == SyntaxKind::IDENT {
-            vars.push(ModuleVarDecl {
-                name: token.text().to_string(),
-                range: token.text_range(),
-                is_export: has_export,
-            });
-        }
+    let Some(var_def) = syntax::ast::VarDef::cast(var_def.clone()) else {
+        return;
+    };
+    // `Экспорт` exports only the name it follows (`Перем А Экспорт, Б;`).
+    for (token, is_export) in var_def.names_with_export() {
+        vars.push(ModuleVarDecl {
+            name: token.text().to_string(),
+            range: token.text_range(),
+            is_export,
+        });
     }
 }
 

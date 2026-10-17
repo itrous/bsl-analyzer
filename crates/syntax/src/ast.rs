@@ -199,6 +199,27 @@ impl VarDef {
             .find(|it| it.kind() == SyntaxKind::KW_EXPORT)
     }
 
+    /// Each declared name with whether its own `Экспорт` follows it.
+    ///
+    /// `Экспорт` exports only the name it is written after: in
+    /// `Перем А Экспорт, Б;` the platform exports `А` alone, and in
+    /// `Перем А, Б Экспорт;` — `Б` alone.
+    pub fn names_with_export(&self) -> Vec<(SyntaxToken, bool)> {
+        let mut names: Vec<(SyntaxToken, bool)> = Vec::new();
+        for token in self.0.children_with_tokens().filter_map(|it| it.into_token()) {
+            match token.kind() {
+                SyntaxKind::IDENT => names.push((token, false)),
+                SyntaxKind::KW_EXPORT => {
+                    if let Some(last) = names.last_mut() {
+                        last.1 = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
     pub fn annotations(&self) -> impl Iterator<Item = Annotation> + '_ {
         self.0.children().filter_map(Annotation::cast)
     }

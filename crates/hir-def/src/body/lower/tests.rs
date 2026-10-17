@@ -885,3 +885,30 @@ fn method_size_ignores_file_padding_and_line_ending_width() {
         }
     }
 }
+
+#[test]
+fn labels_spelled_as_keywords_are_lowered_by_name() {
+    let method = parse_method(
+        "Функция Тест()
+            Для Н = 1 По 3 Цикл
+                Перейти ~КонецЦикла;
+            КонецЦикла;
+        ~КонецЦикла:
+            Перейти ~Возврат;
+        ~Возврат:
+            Возврат 1;
+        КонецФункции",
+    );
+    let result = lower_method(&method, true);
+
+    let names: Vec<String> = result
+        .body
+        .stmts_iter()
+        .filter_map(|(_, stmt)| match stmt {
+            Stmt::Goto(name) => Some(format!("goto {}", name.as_str())),
+            Stmt::Label(name) => Some(format!("label {}", name.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["goto КонецЦикла", "label КонецЦикла", "goto Возврат", "label Возврат"]);
+}
