@@ -217,6 +217,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::TypeMismatch => &[],
         DiagnosticCode::TypeMismatchByDocComment => &[],
         DiagnosticCode::UnresolvedField => &[],
+        DiagnosticCode::UnresolvedMetadataPath => &[],
         DiagnosticCode::ReadOnlyPropertyAssignment => &[],
         DiagnosticCode::GlobalPropertyNotWritable => &[],
         DiagnosticCode::UnavailableInEnvironment => &[],

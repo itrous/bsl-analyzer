@@ -363,6 +363,15 @@ pub enum InferenceDiagnostic {
         field_name: Name,
     },
 
+    /// The string literal a platform function takes as a metadata path
+    /// (`Тип("СправочникСсылка.X")`, `ПредопределенноеЗначение("Перечисление.X.Y")`,
+    /// `ОткрытьФорму("Справочник.X.ФормаСписка")`) names an object or a predefined
+    /// value the configuration does not have. `expr` is the literal itself.
+    UnresolvedMetadataPath {
+        expr: ExprId,
+        missing: crate::metadata_path::MissingMetadata,
+    },
+
     ReadOnlyPropertyAssignment {
         lhs: ExprId,
         receiver_ty: TypeId,
@@ -1274,6 +1283,7 @@ impl<'db> InferenceContext<'db> {
             InferenceDiagnostic::MismatchedArgCount { call_expr, .. } => *call_expr,
             InferenceDiagnostic::TypeMismatch { expr, .. } => *expr,
             InferenceDiagnostic::UnresolvedField { expr, .. } => *expr,
+            InferenceDiagnostic::UnresolvedMetadataPath { expr, .. } => *expr,
             InferenceDiagnostic::ReadOnlyPropertyAssignment { lhs, .. } => *lhs,
             InferenceDiagnostic::GlobalPropertyNotWritable { lhs, .. } => *lhs,
             InferenceDiagnostic::DeprecatedPlatformMember { expr, .. } => *expr,
@@ -3779,6 +3789,11 @@ impl<'db> InferenceContext<'db> {
                 for arg in args {
                     self.infer_expr(*arg);
                 }
+                if let Some(function) =
+                    crate::metadata_path::MetadataPathFunction::of(name.as_str())
+                {
+                    self.check_metadata_path_argument(function, &name, args);
+                }
                 let Some(callable) = builtin::builtin_functions().callable_id(name.as_str()) else {
                     return self.db.unknown();
                 };
@@ -3905,6 +3920,51 @@ impl<'db> InferenceContext<'db> {
             }
         }
         self.db.unknown()
+    }
+
+    /// A literal metadata path given to the platform function `name`
+    /// ([`crate::metadata_path`]). Judged only where the configuration is visible and
+    /// the call really reaches the platform function: an external processor or a
+    /// loose module names objects of a configuration it cannot see, and a method of
+    /// the module or a global export of the same name takes the call over.
+    fn check_metadata_path_argument(
+        &mut self,
+        function: crate::metadata_path::MetadataPathFunction,
+        name: &hir_def::Name,
+        args: &[ExprId],
+    ) {
+        let Some(&path_expr) = args.first() else {
+            return;
+        };
+        let Expr::Literal(Literal::String(text)) = self.body.expr(path_expr) else {
+            return;
+        };
+        let text = text.clone();
+        if self.in_uncompiled_branch
+            || self.module_compiles_nowhere()
+            || !self.db.file_has_visible_config(self.context_file_id)
+            || self.bare_module_method_exists(name)
+            || self.is_call_name_shadowed(name)
+        {
+            return;
+        }
+        let resolver = crate::object_resolver::DbObjectResolver::new(self.db, self.context_file_id);
+        let Some(missing) = crate::metadata_path::missing_metadata(function, &text, &resolver)
+        else {
+            return;
+        };
+        // The module sees the base configuration and its own extension only, while at run
+        // time every extension of the infobase is applied: an object or a value another
+        // extension of the workspace adds is there when the call runs.
+        let inventory = self.db.configurations_inventory();
+        let workspace = crate::object_resolver::ConfigsObjectResolver(&inventory);
+        if crate::metadata_path::missing_metadata(function, &text, &workspace).is_none() {
+            return;
+        }
+        self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedMetadataPath {
+            expr: path_expr,
+            missing,
+        });
     }
 
     /// Whether a variable answers `name` as a value: a parameter or `Перем` of the

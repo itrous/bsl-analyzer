@@ -10,6 +10,7 @@ pub use definition::{Definition, ReferenceScope};
 pub use hir_ty::builtin::builtin_functions;
 pub use hir_ty::compat_mode;
 pub use hir_ty::infer::CandidateCallBinding;
+pub use hir_ty::metadata_path::MissingMetadata;
 pub use hir_ty::method_lookup::platform_type_key_id;
 pub use hir_ty::min_platform;
 pub use hir_ty::this_object::coerce_to_metadata_ref_id;

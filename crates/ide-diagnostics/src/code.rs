@@ -175,6 +175,7 @@ pub enum DiagnosticCode {
     TypeMismatch,
     TypeMismatchByDocComment,
     UnresolvedField,
+    UnresolvedMetadataPath,
     ReadOnlyPropertyAssignment,
     GlobalPropertyNotWritable,
     UnavailableInEnvironment,

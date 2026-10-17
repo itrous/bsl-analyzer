@@ -14,6 +14,7 @@ pub mod infer;
 pub mod iteration_lookup;
 pub mod lower;
 pub mod manager_lookup;
+pub mod metadata_path;
 mod method_environment;
 pub mod method_graph;
 pub mod method_lookup;

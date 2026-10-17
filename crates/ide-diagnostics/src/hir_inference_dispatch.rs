@@ -14,6 +14,7 @@ pub(crate) const INFERENCE_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::TypeMismatch,
     DiagnosticCode::TypeMismatchByDocComment,
     DiagnosticCode::UnresolvedField,
+    DiagnosticCode::UnresolvedMetadataPath,
     DiagnosticCode::ReadOnlyPropertyAssignment,
     DiagnosticCode::GlobalPropertyNotWritable,
     DiagnosticCode::DeprecatedPlatformApi,
@@ -111,6 +112,7 @@ fn diagnostic_expr(diag: &InferenceDiagnostic) -> ExprId {
         InferenceDiagnostic::MismatchedArgCount { call_expr, .. } => *call_expr,
         InferenceDiagnostic::TypeMismatch { expr, .. } => *expr,
         InferenceDiagnostic::UnresolvedField { expr, .. } => *expr,
+        InferenceDiagnostic::UnresolvedMetadataPath { expr, .. } => *expr,
         InferenceDiagnostic::ReadOnlyPropertyAssignment { lhs, .. } => *lhs,
         InferenceDiagnostic::GlobalPropertyNotWritable { lhs, .. } => *lhs,
         InferenceDiagnostic::DeprecatedPlatformMember { expr, .. } => *expr,
@@ -177,6 +179,9 @@ fn dispatch_inference_diagnostic(
         }
         InferenceDiagnostic::UnresolvedField { receiver_ty, field_name, .. } => {
             handlers::unresolved_field::from_hir(*receiver_ty, field_name, range, ctx)
+        }
+        InferenceDiagnostic::UnresolvedMetadataPath { missing, .. } => {
+            handlers::unresolved_metadata_path::from_hir(missing, range, ctx)
         }
         InferenceDiagnostic::ReadOnlyPropertyAssignment { receiver_ty, field_name, .. } => {
             handlers::read_only_property::from_hir(*receiver_ty, field_name, range, ctx)

@@ -179,7 +179,7 @@ fn is_defined_type_prefix(prefix: &str) -> bool {
     lower == "определяемыйтип" || lower == "definedtype"
 }
 
-fn metadata_kind_from_prefix(prefix: &str) -> Option<MetadataKind> {
+pub(crate) fn metadata_kind_from_prefix(prefix: &str) -> Option<MetadataKind> {
     match prefix.fold_lower().as_str() {
         "catalogref" | "справочникссылка" => Some(MetadataKind::CatalogRef),
         "catalogobject" | "справочникобъект" => Some(MetadataKind::CatalogObject),

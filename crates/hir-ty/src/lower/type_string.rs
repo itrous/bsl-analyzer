@@ -145,7 +145,7 @@ fn names_a_real_type(name: &str) -> bool {
 /// Форма идентификатора BSL — `[_\p{L}][_\p{L}0-9]*`. Цифры именно ASCII:
 /// `is_alphanumeric` пропустил бы `Товар٢`, которое лексер идентификатором не
 /// считает, и строка снова стала бы номинальным типом ни с чем не совпадающим.
-fn is_identifier_shaped(name: &str) -> bool {
+pub(crate) fn is_identifier_shaped(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;

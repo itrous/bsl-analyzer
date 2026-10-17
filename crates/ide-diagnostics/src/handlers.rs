@@ -170,6 +170,7 @@ pub mod unlimited_length_string_usage_in_query;
 pub mod unreachable_code;
 pub mod unresolved_bare_call;
 pub mod unresolved_field;
+pub mod unresolved_metadata_path;
 pub mod unresolved_method_call;
 pub mod unresolved_name;
 pub mod unsafe_find_by_code;
@@ -500,6 +501,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::TypeMismatch => Some(&type_mismatch::METADATA),
         DiagnosticCode::TypeMismatchByDocComment => Some(&type_mismatch_by_doc_comment::METADATA),
         DiagnosticCode::UnresolvedField => Some(&unresolved_field::METADATA),
+        DiagnosticCode::UnresolvedMetadataPath => Some(&unresolved_metadata_path::METADATA),
         DiagnosticCode::ReadOnlyPropertyAssignment => Some(&read_only_property::METADATA),
         DiagnosticCode::GlobalPropertyNotWritable => Some(&global_property_not_writable::METADATA),
         DiagnosticCode::UnavailableInEnvironment => Some(&unavailable_in_environment::METADATA),
