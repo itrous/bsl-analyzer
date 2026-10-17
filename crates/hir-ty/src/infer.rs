@@ -2709,6 +2709,11 @@ impl<'db> InferenceContext<'db> {
                         &obj_resolver,
                         base_ty,
                     )) || matches!(base_kind, TypeKind::Structure(facet) if facet.closed)
+                        || crate::manager_lookup::manager_members_closed(
+                            self.db,
+                            &obj_resolver,
+                            base_ty,
+                        )
                         || (crate::field_lookup::is_record_manager_form_data(self.db, base_ty)
                             && !crate::field_enum::metadata_fields_open(
                                 self.db,

@@ -114,6 +114,38 @@ pub(crate) fn lookup_predefined(
     })
 }
 
+/// Whether a field read on `receiver` can only name what [`lookup_predefined`]
+/// already knows: an enum manager offers exactly its values, a catalog or chart
+/// manager exactly its predefined items, beside the manager module's exported
+/// variables. A miss there is the platform's «Возможно ошибочное свойство».
+///
+/// An object whose predefined items were not read (no `Ext/Predefined.xml`, or one
+/// that failed to parse) leaves the set unknown, as does an object adopted by an
+/// extension whose base is not visible: the base may hold the missing item.
+pub(crate) fn manager_members_closed(
+    db: &dyn TypeKernelDb,
+    resolver: &dyn ObjectResolver,
+    receiver: TypeId,
+) -> bool {
+    let (kind, name) = match db.lookup_type(receiver) {
+        TypeKind::ObjectManager(facet) => (facet.mdo, facet.name.clone()),
+        _ => return false,
+    };
+    if predefined_ref_kind_for(kind).is_none() {
+        return false;
+    }
+    let Some(mdo) = find_mdo(resolver, kind, &name) else {
+        return false;
+    };
+    if mdo.object_belonging() == bsl_metadata::ObjectBelonging::Adopted {
+        return false;
+    }
+    match kind {
+        MdoType::Enum => true,
+        _ => !mdo.predefined_items.is_empty(),
+    }
+}
+
 fn predefined_ref_kind_for(kind: MdoType) -> Option<MetadataKind> {
     match kind {
         MdoType::Enum => Some(MetadataKind::EnumRef),
@@ -413,6 +445,50 @@ mod tests {
                 db.lookup_type(ty),
             );
         }
+    }
+
+    fn closed(db: &InMemoryDb, configs: &[VisibleConfig], kind: MdoType, name: &str) -> bool {
+        manager_members_closed(
+            db,
+            &ConfigsObjectResolver(configs),
+            db.object_manager(kind, name.to_string(), &RootConfigCtx),
+        )
+    }
+
+    #[test]
+    fn manager_members_are_closed_only_where_the_member_set_was_read() {
+        let mut config = Configuration::new("Test");
+        config.add_metadata_object(enum_mdo("Состояния", vec!["Активен"]));
+        config.add_metadata_object(catalog("Валюты", vec!["Доллар"]));
+        config.add_metadata_object(catalog("Хранилища", vec![]));
+        config.add_metadata_object(chart_of_accounts("Учебный", vec!["Счет01"]));
+        config.add_metadata_object(MetadataObject::new(MdoType::Document, "ПКО"));
+        let configs = wrap(config);
+        let db = InMemoryDb::new();
+
+        assert!(closed(&db, &configs, MdoType::Enum, "Состояния"));
+        assert!(closed(&db, &configs, MdoType::Catalog, "Валюты"));
+        assert!(closed(&db, &configs, MdoType::ChartOfAccounts, "Учебный"));
+        // No predefined items were read: the set is unknown, not empty.
+        assert!(!closed(&db, &configs, MdoType::Catalog, "Хранилища"));
+        assert!(!closed(&db, &configs, MdoType::Document, "ПКО"));
+        assert!(!closed(&db, &configs, MdoType::Catalog, "НетТакого"));
+    }
+
+    #[test]
+    fn an_adopted_object_without_its_base_is_not_closed() {
+        use bsl_metadata::ObjectBelonging;
+
+        let mut ext = Configuration::new("Ext");
+        let mut adopted = enum_mdo("Состояния", vec!["Новое"]);
+        adopted.set_object_belonging(ObjectBelonging::Adopted);
+        adopted.set_extends_uuid(uuid::Uuid::new_v4());
+        ext.add_metadata_object(adopted);
+        let configs =
+            vec![VisibleConfig { name: Some("Ext".into()), configuration: Arc::new(ext) }];
+        let db = InMemoryDb::new();
+
+        assert!(!closed(&db, &configs, MdoType::Enum, "Состояния"));
     }
 
     #[test]
