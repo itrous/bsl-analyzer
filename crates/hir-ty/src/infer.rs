@@ -1752,10 +1752,11 @@ impl<'db> InferenceContext<'db> {
     }
 
     /// Accessibility of a same-module call across compilation directives.
-    /// A client-side caller invoking a server method is the form's regular
-    /// remote server call, so only the server side is ever a violation: code
-    /// compiled for the server cannot reach a method that exists only on the
-    /// client.
+    /// In a form or command module a client-side caller invoking a server method
+    /// is the form's regular remote server call, so only the server side is a
+    /// violation there: code compiled for the server cannot reach a method that
+    /// exists only on the client. An object-family module has no remote call
+    /// (see [`hir_def::execution_env::local_server_call_is_remote`]).
     fn check_local_callee_env(
         &mut self,
         expr: ExprId,
@@ -1785,7 +1786,17 @@ impl<'db> InferenceContext<'db> {
         if callee_env.is_empty() {
             return;
         }
-        let missing = self.body_env.without(callee_env) & self.checked_env & EnvFlags::SERVER_SIDE;
+        let mut missing = self.body_env.without(callee_env) & self.checked_env;
+        if missing.is_empty() {
+            return;
+        }
+        let module_type = self
+            .db
+            .module_metadata(hir_def::ModuleId { file_id: self.context_file_id })
+            .module_type;
+        if hir_def::execution_env::local_server_call_is_remote(module_type) {
+            missing = missing & EnvFlags::SERVER_SIDE;
+        }
         if missing.is_empty() {
             return;
         }

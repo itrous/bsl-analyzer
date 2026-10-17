@@ -755,7 +755,10 @@ fn complete_user_defined_symbols<DB: RootDatabase>(
     let symbol_tree = db.symbol_tree(hir::ModuleId::new(file_id));
     let local_admits = |env: &EnvFilter, name: &hir::Name| {
         let Some(method) = symbol_tree.find_method(name) else { return true };
-        env.admits_local_method(hir::execution_env::body_env(&metadata, &method.directives, &opts))
+        env.admits_local_method(
+            hir::execution_env::body_env(&metadata, &method.directives, &opts),
+            metadata.module_type,
+        )
     };
 
     for procedure in module.procedures() {

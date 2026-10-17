@@ -43,10 +43,15 @@ pub fn check_config(
         &project_config.diagnostics.rules_json(),
         Some(&config),
     );
-    let diagnostics_config = diagnostics_config_from_project(&project_config)?;
+    let mut diagnostics_config = diagnostics_config_from_project(&project_config)?;
     let diagnostics =
         mcp_server::resolve_project_baseline_diagnostics(config.parent(), &project_config);
     let project = project_model::Project::with_config(project_root, project_config.clone());
+    if let Some((value, project_model::OrdinaryAppSupportSource::ConfigurationXml)) =
+        project.as_ref().ok().and_then(project_model::Project::ordinary_app_support)
+    {
+        diagnostics_config.ordinary_app_support = value;
+    }
     let diagnostics_baseline = inspect_diagnostics_baseline(&project);
     let report = build_check_config_report(
         &config,
@@ -397,7 +402,19 @@ fn build_check_config_report(
     }
     let _ = writeln!(out);
     let _ = writeln!(out, "Diagnostics:");
-    let _ = writeln!(out, "  ordinaryAppSupport: {}", diagnostics_config.ordinary_app_support);
+    let ordinary_source =
+        match project.as_ref().ok().and_then(project_model::Project::ordinary_app_support) {
+            Some((_, project_model::OrdinaryAppSupportSource::Setting)) => "",
+            Some((_, project_model::OrdinaryAppSupportSource::ConfigurationXml)) => {
+                " (from DefaultRunMode of Configuration.xml)"
+            }
+            None => " (default)",
+        };
+    let _ = writeln!(
+        out,
+        "  ordinaryAppSupport: {}{ordinary_source}",
+        diagnostics_config.ordinary_app_support
+    );
     let _ =
         writeln!(out, "  dataflowMaxIterations: {}", diagnostics_config.dataflow_max_iterations);
     let _ = writeln!(out, "  Disabled:   {}", diagnostics_config.disabled.len());

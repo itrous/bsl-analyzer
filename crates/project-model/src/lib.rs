@@ -325,6 +325,18 @@ pub enum CompatibilityModeSource {
     ConfigurationXml,
 }
 
+/// Where [`Project::ordinary_app_support`] took its value from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrdinaryAppSupportSource {
+    /// `ordinaryAppSupport` in the `[diagnostics]` section.
+    Setting,
+    /// `<DefaultRunMode>` of the main configuration's `Configuration.xml`.
+    ConfigurationXml,
+}
+
+/// The `[diagnostics]` key that says whether the ordinary application is supported.
+pub const ORDINARY_APP_SUPPORT_KEY: &str = "ordinaryAppSupport";
+
 #[derive(Debug, Clone)]
 pub struct Project {
     pub root: PathBuf,
@@ -495,6 +507,56 @@ impl Project {
         let configuration = self.configuration_path()?;
         configuration_compatibility_mode(configuration)
             .map(|value| (value, CompatibilityModeSource::ConfigurationXml))
+    }
+
+    /// `UseOrdinaryFormInManagedApplication` of the main configuration
+    /// ([`configuration_ordinary_forms_in_managed_app`]). It decides for every root:
+    /// an external data processor opens in the base it is run in. `None` when the
+    /// project has no main configuration or it states nothing.
+    pub fn ordinary_forms_in_managed_app(&self) -> Option<bool> {
+        configuration_ordinary_forms_in_managed_app(self.configuration_path()?)
+    }
+
+    /// `<DefaultRunMode>` of the main configuration ([`configuration_default_run_mode`]),
+    /// as written there. Unlike [`Self::ordinary_app_support`] no setting overrides
+    /// it. `None` when the project has no main configuration or it states nothing.
+    pub fn default_run_mode(&self) -> Option<String> {
+        configuration_default_run_mode(self.configuration_path()?)
+    }
+
+    /// Whether the ordinary application (legacy thick client) is part of the
+    /// project's runtime surface, with where the answer came from: an explicit
+    /// `[diagnostics] ordinaryAppSupport` first, then `<DefaultRunMode>` of the main
+    /// configuration (`OrdinaryApplication` - yes, any other mode - no).
+    ///
+    /// `None` when neither source states it (the analyzer default, `false`, applies),
+    /// and when the setting is present but not a boolean: the diagnostics loader
+    /// rejects such a section as a whole, and deriving a value under it would
+    /// disagree with what that loader reports.
+    pub fn ordinary_app_support(&self) -> Option<(bool, OrdinaryAppSupportSource)> {
+        if let Some(value) = self.config.diagnostics.setting(ORDINARY_APP_SUPPORT_KEY) {
+            return value.as_bool().map(|value| (value, OrdinaryAppSupportSource::Setting));
+        }
+        let configuration = self.configuration_path()?;
+        configuration_default_run_mode(configuration)
+            .map(|mode| (mode == "OrdinaryApplication", OrdinaryAppSupportSource::ConfigurationXml))
+    }
+
+    /// The effective `[diagnostics]` section: the configured one, plus
+    /// `ordinaryAppSupport` derived from the configuration when the section does
+    /// not set it ([`Self::ordinary_app_support`]). The LSP, the CLI and the MCP
+    /// server build their diagnostics config from this, so the derived value is
+    /// the same everywhere.
+    pub fn diagnostics_rules_json(&self) -> serde_json::Value {
+        let mut rules = self.config.diagnostics.rules_json();
+        if let Some((value, OrdinaryAppSupportSource::ConfigurationXml)) =
+            self.ordinary_app_support()
+        {
+            if let Some(map) = rules.as_object_mut() {
+                map.insert(ORDINARY_APP_SUPPORT_KEY.to_owned(), serde_json::Value::Bool(value));
+            }
+        }
+        rules
     }
 
     /// Advisory for a project that is a configuration extension analyzed without
@@ -2136,20 +2198,61 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// without the element. Comments are skipped, the read is bounded by
 /// [`CONFIGURATION_KIND_SCAN_CAP`] like [`configuration_kind`].
 pub fn configuration_compatibility_mode(root: &Path) -> Option<String> {
+    compatibility_mode_in(&configuration_xml_head(root)?)
+}
+
+/// `<UseOrdinaryFormInManagedApplication>` of a MAIN configuration's
+/// `Configuration.xml`: whether its ordinary forms also open in the thick client of
+/// the managed application.
+///
+/// `None` for an extension (its forms open in the configuration it extends), for a
+/// missing or unreadable file, a missing element and a value other than
+/// `true`/`false`. Read the same way as [`configuration_compatibility_mode`].
+pub fn configuration_ordinary_forms_in_managed_app(root: &Path) -> Option<bool> {
+    ordinary_forms_in_managed_app_in(&configuration_xml_head(root)?)
+}
+
+/// `<DefaultRunMode>` of a MAIN configuration's `Configuration.xml`, as written there
+/// (`ManagedApplication`, `OrdinaryApplication`, `Auto`). `None` under the same
+/// conditions as [`configuration_compatibility_mode`].
+pub fn configuration_default_run_mode(root: &Path) -> Option<String> {
+    default_run_mode_in(&configuration_xml_head(root)?)
+}
+
+fn configuration_xml_head(root: &Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
     let path = configuration_xml_in(root)?;
     let file = std::fs::File::open(&path).ok()?;
     let mut head = Vec::new();
     file.take(CONFIGURATION_KIND_SCAN_CAP).read_to_end(&mut head).ok()?;
-    compatibility_mode_in(&head)
+    Some(head)
 }
 
 fn compatibility_mode_in(head: &[u8]) -> Option<String> {
+    main_configuration_property_in(head, b"<CompatibilityMode>")
+}
+
+fn default_run_mode_in(head: &[u8]) -> Option<String> {
+    main_configuration_property_in(head, b"<DefaultRunMode>")
+}
+
+fn ordinary_forms_in_managed_app_in(head: &[u8]) -> Option<bool> {
+    let value = main_configuration_property_in(head, b"<UseOrdinaryFormInManagedApplication>")?;
+    match value.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Text of the root property opened by `open` in a main configuration's
+/// `Configuration.xml` head; `None` for an extension and when `</Properties>`
+/// closes first.
+fn main_configuration_property_in(head: &[u8], open: &[u8]) -> Option<String> {
     const COMMENT_OPEN: &[u8] = b"<!--";
     const COMMENT_CLOSE: &[u8] = b"-->";
     const PROPERTIES_CLOSE: &[u8] = b"</Properties>";
-    const MODE_OPEN: &[u8] = b"<CompatibilityMode>";
 
     let mut i = 0;
     while i < head.len() {
@@ -2162,8 +2265,8 @@ fn compatibility_mode_in(head: &[u8]) -> Option<String> {
         if rest.starts_with(EXTENSION_MARKER) || rest.starts_with(PROPERTIES_CLOSE) {
             return None;
         }
-        if rest.starts_with(MODE_OPEN) {
-            let value = &rest[MODE_OPEN.len()..];
+        if rest.starts_with(open) {
+            let value = &rest[open.len()..];
             let end = find(value, b"<")?;
             let value = std::str::from_utf8(&value[..end]).ok()?.trim();
             return (!value.is_empty()).then(|| value.to_owned());
@@ -2822,6 +2925,11 @@ pub struct ProjectDiagnosticsConfig {
 impl ProjectDiagnosticsConfig {
     pub fn rules_json(&self) -> serde_json::Value {
         serde_json::Value::Object(self.rules.clone())
+    }
+
+    /// The raw value of one top-level `[diagnostics]` key, as configured.
+    pub fn setting(&self, key: &str) -> Option<&serde_json::Value> {
+        self.rules.get(key)
     }
 
     fn is_empty(&self) -> bool {
@@ -4011,7 +4119,9 @@ mod tests {
         WorkspaceDiagnosticsScope,
     };
     use super::{
-        compatibility_mode_in, configuration_kind, CompatibilityModeSource, ConfigurationKind,
+        compatibility_mode_in, configuration_kind, default_run_mode_in,
+        ordinary_forms_in_managed_app_in, CompatibilityModeSource, ConfigurationKind,
+        OrdinaryAppSupportSource,
     };
     use super::{dotenv_value, parse_dotenv_value};
     use super::{PROJECT_ENV_FILE_NAME, SHARED_CONFIGURATIONS_ROOT_ENV};
@@ -4229,6 +4339,142 @@ mod tests {
         let after_properties =
             br#"<Properties></Properties><CompatibilityMode>Version8_2_13</CompatibilityMode>"#;
         assert_eq!(compatibility_mode_in(after_properties), None);
+    }
+
+    #[test]
+    fn ordinary_forms_in_managed_app_is_read_from_a_main_configuration_only() {
+        let main = |value: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\n\
+                 <!-- <UseOrdinaryFormInManagedApplication>true</UseOrdinaryFormInManagedApplication> -->\n\
+                 <UseManagedFormInOrdinaryApplication>true</UseManagedFormInOrdinaryApplication>\n\
+                 <UseOrdinaryFormInManagedApplication>{value}</UseOrdinaryFormInManagedApplication>\n\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        assert_eq!(ordinary_forms_in_managed_app_in(main("false").as_bytes()), Some(false));
+        assert_eq!(ordinary_forms_in_managed_app_in(main("true").as_bytes()), Some(true));
+        assert_eq!(ordinary_forms_in_managed_app_in(main("").as_bytes()), None);
+        assert_eq!(ordinary_forms_in_managed_app_in(main("да").as_bytes()), None);
+
+        let extension = br#"<MetaDataObject><Configuration><Properties>
+<ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>
+<UseOrdinaryFormInManagedApplication>true</UseOrdinaryFormInManagedApplication>
+</Properties></Configuration></MetaDataObject>"#;
+        assert_eq!(ordinary_forms_in_managed_app_in(extension), None);
+
+        let absent = br#"<Properties><Name>X</Name></Properties>"#;
+        assert_eq!(ordinary_forms_in_managed_app_in(absent), None);
+    }
+
+    #[test]
+    fn project_ordinary_forms_in_managed_app_comes_from_the_main_configuration() {
+        let dir = tempdir().unwrap();
+        let project = Project::with_config(dir.path(), ProjectConfig::default()).unwrap();
+        assert_eq!(project.ordinary_forms_in_managed_app(), None, "no configuration");
+
+        let cf = dir.path().join("src").join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(
+            cf.join("Configuration.xml"),
+            "<MetaDataObject><Configuration><Properties><UseOrdinaryFormInManagedApplication>false</UseOrdinaryFormInManagedApplication></Properties></Configuration></MetaDataObject>",
+        )
+        .unwrap();
+        let project = Project::with_config(dir.path(), ProjectConfig::default()).unwrap();
+        assert_eq!(project.ordinary_forms_in_managed_app(), Some(false));
+    }
+
+    /// A project at `dir` whose main configuration declares `run_mode` and whose
+    /// `bsl-analyzer.toml` carries `diagnostics` verbatim.
+    fn run_mode_project(dir: &Path, run_mode: &str, diagnostics: &str) -> Project {
+        let cf = dir.join("src").join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(
+            cf.join("Configuration.xml"),
+            format!(
+                "<MetaDataObject><Configuration><Properties><Name>Тест</Name>\
+                 <DefaultRunMode>{run_mode}</DefaultRunMode></Properties></Configuration></MetaDataObject>"
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("bsl-analyzer.toml"), format!("[diagnostics]\n{diagnostics}")).unwrap();
+        Project::new(dir).unwrap()
+    }
+
+    #[test]
+    fn ordinary_app_support_is_derived_from_default_run_mode_when_absent() {
+        let ordinary = tempdir().unwrap();
+        let project = run_mode_project(ordinary.path(), "OrdinaryApplication", "");
+        assert_eq!(
+            project.ordinary_app_support(),
+            Some((true, OrdinaryAppSupportSource::ConfigurationXml))
+        );
+        assert_eq!(project.diagnostics_rules_json()["ordinaryAppSupport"], true);
+
+        let managed = tempdir().unwrap();
+        let project = run_mode_project(managed.path(), "ManagedApplication", "");
+        assert_eq!(
+            project.ordinary_app_support(),
+            Some((false, OrdinaryAppSupportSource::ConfigurationXml))
+        );
+        assert_eq!(project.diagnostics_rules_json()["ordinaryAppSupport"], false);
+
+        let auto = tempdir().unwrap();
+        let project = run_mode_project(auto.path(), "Auto", "");
+        assert_eq!(
+            project.ordinary_app_support(),
+            Some((false, OrdinaryAppSupportSource::ConfigurationXml))
+        );
+    }
+
+    #[test]
+    fn explicit_ordinary_app_support_wins_over_default_run_mode() {
+        let ordinary = tempdir().unwrap();
+        let project = run_mode_project(
+            ordinary.path(),
+            "OrdinaryApplication",
+            "ordinaryAppSupport = false\n",
+        );
+        assert_eq!(
+            project.ordinary_app_support(),
+            Some((false, OrdinaryAppSupportSource::Setting))
+        );
+        assert_eq!(project.diagnostics_rules_json()["ordinaryAppSupport"], false);
+
+        let managed = tempdir().unwrap();
+        let project =
+            run_mode_project(managed.path(), "ManagedApplication", "ordinaryAppSupport = true\n");
+        assert_eq!(project.ordinary_app_support(), Some((true, OrdinaryAppSupportSource::Setting)));
+        assert_eq!(project.diagnostics_rules_json()["ordinaryAppSupport"], true);
+
+        // A non-boolean setting is the loader's error to report, not a cue to derive.
+        let invalid = tempdir().unwrap();
+        let project = run_mode_project(
+            invalid.path(),
+            "OrdinaryApplication",
+            "ordinaryAppSupport = \"yes\"\n",
+        );
+        assert_eq!(project.ordinary_app_support(), None);
+        assert_eq!(project.diagnostics_rules_json()["ordinaryAppSupport"], "yes");
+    }
+
+    #[test]
+    fn ordinary_app_support_without_a_configuration_stays_unset() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("bsl-analyzer.toml"), "[diagnostics]\n").unwrap();
+        let project = Project::new(dir.path()).unwrap();
+        assert_eq!(project.ordinary_app_support(), None);
+        assert!(project.diagnostics_rules_json().get("ordinaryAppSupport").is_none());
+    }
+
+    #[test]
+    fn default_run_mode_is_read_from_a_main_configuration_only() {
+        let main = br#"<Properties><!-- <DefaultRunMode>OrdinaryApplication</DefaultRunMode> -->
+<DefaultRunMode>ManagedApplication</DefaultRunMode></Properties>"#;
+        assert_eq!(default_run_mode_in(main).as_deref(), Some("ManagedApplication"));
+        let extension = br#"<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>
+<DefaultRunMode>OrdinaryApplication</DefaultRunMode></Properties>"#;
+        assert_eq!(default_run_mode_in(extension), None, "an extension runs under its base");
     }
 
     #[test]

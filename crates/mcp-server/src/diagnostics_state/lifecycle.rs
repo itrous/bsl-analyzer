@@ -1223,7 +1223,7 @@ impl DiagnosticsState {
         // `ProjectSnapshot` already registers canonical roots, matching the
         // canonical `.bsl` universe the scan produces.
         let configs = snapshot.configs.clone();
-        let diagnostics = project.config.diagnostics.rules_json();
+        let diagnostics = project.diagnostics_rules_json();
         let mut config = ide::DiagnosticsConfig::from_project_file(
             &diagnostics,
             project.config.output.resolve_locale().unwrap_or_default(),
