@@ -11,6 +11,8 @@ impl GlobalState {
         let db = self.analysis_host.raw_database_mut();
         apply_project_config_to_db(db, &config);
         apply_compatibility_mode_to_db(db, self.project.as_ref());
+        apply_ordinary_forms_setting_to_db(db, self.project.as_ref());
+        apply_ordinary_app_support_to_db(db, self.project.as_ref());
         if let Some(project) = self.project.as_ref() {
             if let Some(warning) =
                 platform_help::source_change_warning(Some(&project.config), &project.root)
@@ -89,6 +91,58 @@ pub fn apply_compatibility_mode_to_db(
     if db.compatibility_mode().as_deref() != mode.as_deref() {
         tracing::info!(compatibility_mode = ?mode, "updated compatibility mode");
         db.set_compatibility_mode(mode);
+    }
+}
+
+/// `UseOrdinaryFormInManagedApplication` of the main configuration of `project` into
+/// the environment options: whether ordinary forms run in the managed thick client.
+/// Applied after [`apply_project_config_to_db`], which rebuilds the options from the
+/// settings, and again when `Configuration.xml` changes.
+pub fn apply_ordinary_forms_setting_to_db(
+    db: &mut RootDatabaseImpl,
+    project: Option<&project_model::Project>,
+) {
+    let value = project.and_then(|project| project.ordinary_forms_in_managed_app());
+    let mut options = db.env_options();
+    if options.ordinary_forms_in_managed_app != value {
+        tracing::info!(ordinary_forms_in_managed_app = ?value, "updated ordinary-form environments");
+        options.ordinary_forms_in_managed_app = value;
+        db.set_env_options(options);
+    }
+}
+
+/// The execution model's ordinary-application switch from the same effective value
+/// the diagnostics use ([`project_model::Project::ordinary_app_support`]: the
+/// `[diagnostics] ordinaryAppSupport` setting, else `<DefaultRunMode>` of the main
+/// configuration). Naming the legacy thick client in `checked_environments` still
+/// turns it on regardless: an environment that is checked must be modelled.
+///
+/// Recomputed from the features rather than only ever switched on, so a
+/// configuration switched back to the managed application turns the flag off.
+/// Applied after [`apply_project_config_to_db`] and again when `Configuration.xml`
+/// changes, like [`apply_ordinary_forms_setting_to_db`].
+pub fn apply_ordinary_app_support_to_db(
+    db: &mut RootDatabaseImpl,
+    project: Option<&project_model::Project>,
+) {
+    use hir::execution_env::EnvFlags;
+    let checked_by_name = project
+        .and_then(|project| project.config.features.checked_environments.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|name| EnvFlags::from_config_name(name))
+        .any(|flag| flag.contains(EnvFlags::THICK_CLIENT_ORDINARY));
+    let resolved = project.and_then(|project| project.ordinary_app_support());
+    let value = checked_by_name || resolved.is_some_and(|(value, _)| value);
+    let mut options = db.env_options();
+    if options.ordinary_app_support != value {
+        tracing::info!(
+            ordinary_app_support = value,
+            source = ?resolved.map(|(_, source)| source),
+            "updated ordinary-application support"
+        );
+        options.ordinary_app_support = value;
+        db.set_env_options(options);
     }
 }
 
@@ -345,5 +399,69 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
             db.env_options().checked_environments.is_empty(),
             "an explicit empty list is the documented opt-out"
         );
+    }
+
+    /// The execution model takes the same effective `ordinaryAppSupport` as the
+    /// diagnostics: derived from `DefaultRunMode` when unset, the setting otherwise,
+    /// switched off again when the derivation flips, and forced on by naming the
+    /// legacy thick client in `checked_environments`.
+    #[test]
+    fn ordinary_app_support_reaches_the_execution_model() {
+        use super::{apply_ordinary_app_support_to_db, apply_ordinary_forms_setting_to_db};
+
+        fn project_with(run_mode: &str, toml: &str) -> (tempfile::TempDir, Project) {
+            let dir = tempdir().unwrap();
+            let cf = dir.path().join("src").join("cf");
+            fs::create_dir_all(&cf).unwrap();
+            fs::write(
+                cf.join("Configuration.xml"),
+                format!(
+                    "<MetaDataObject><Configuration><Properties><DefaultRunMode>{run_mode}\
+                     </DefaultRunMode><UseOrdinaryFormInManagedApplication>false\
+                     </UseOrdinaryFormInManagedApplication></Properties></Configuration>\
+                     </MetaDataObject>"
+                ),
+            )
+            .unwrap();
+            fs::write(dir.path().join("bsl-analyzer.toml"), toml).unwrap();
+            let project = Project::new(dir.path()).unwrap();
+            (dir, project)
+        }
+        fn apply(db: &mut RootDatabaseImpl, project: &Project) {
+            apply_project_config_to_db(db, &project.config);
+            apply_ordinary_forms_setting_to_db(db, Some(project));
+            apply_ordinary_app_support_to_db(db, Some(project));
+        }
+
+        let mut db = RootDatabaseImpl::new();
+        let (_ordinary, project) = project_with("OrdinaryApplication", "");
+        apply(&mut db, &project);
+        assert!(db.env_options().ordinary_app_support, "derived from OrdinaryApplication");
+        assert_eq!(
+            db.env_options().ordinary_forms_in_managed_app,
+            Some(false),
+            "the ordinary-form setting is kept"
+        );
+
+        let (_managed, project) = project_with("ManagedApplication", "");
+        apply(&mut db, &project);
+        assert!(!db.env_options().ordinary_app_support, "the managed mode turns it back off");
+
+        let (_explicit, project) =
+            project_with("OrdinaryApplication", "[diagnostics]\nordinaryAppSupport = false\n");
+        apply(&mut db, &project);
+        assert!(!db.env_options().ordinary_app_support, "an explicit false wins");
+
+        let (_explicit, project) =
+            project_with("ManagedApplication", "[diagnostics]\nordinaryAppSupport = true\n");
+        apply(&mut db, &project);
+        assert!(db.env_options().ordinary_app_support, "an explicit true wins");
+
+        let (_checked, project) = project_with(
+            "ManagedApplication",
+            "[features]\nchecked_environments = [\"ТолстыйКлиентОбычноеПриложение\"]\n",
+        );
+        apply(&mut db, &project);
+        assert!(db.env_options().ordinary_app_support, "a checked legacy client is modelled");
     }
 }

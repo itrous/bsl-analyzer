@@ -60,7 +60,7 @@ impl GlobalState {
         project: &project_model::Project,
         locale: Locale,
     ) -> DiagnosticsConfigInput {
-        let diagnostics = project.config.diagnostics.rules_json();
+        let diagnostics = project.diagnostics_rules_json();
         let config = ide::DiagnosticsConfig::from_project_file(
             &diagnostics,
             locale,

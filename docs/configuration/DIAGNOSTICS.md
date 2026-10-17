@@ -48,7 +48,8 @@ dataflowMaxIterations = 10000
   «Подавление в коде».
 
 Значение по умолчанию для `dataflowMaxIterations` — `10000`, для
-`bsllsSuppressionCompat` — `true`.
+`bsllsSuppressionCompat` — `true`, для `ordinaryAppSupport` — по `<DefaultRunMode>`
+основной конфигурации (`OrdinaryApplication` — `true`, иначе и без конфигурации — `false`).
 
 ## Базовая линия диагностик
 
@@ -153,6 +154,10 @@ ordinaryAppSupport = true
 
 Нужно только для части диагностик, которые учитывают поддержку обычного
 приложения в общих модулях.
+
+Если ключ не задан, значение берётся из `<DefaultRunMode>` основной
+конфигурации: `OrdinaryApplication` — `true`, иначе `false`. Явное значение
+главнее (подробнее — `PROJECT_CONFIGURATION.md`, раздел про `[diagnostics]`).
 
 ### `dataflowMaxIterations`
 
