@@ -13,7 +13,7 @@ impl LoweringContext<'_> {
             "DIAGNOSTIC LOWERING: lower_binary_expr called"
         );
 
-        for element in node.descendants_with_tokens() {
+        for element in node.children_with_tokens() {
             if let Some(token) = element.as_token() {
                 match token.kind() {
                     SyntaxKind::KW_AND | SyntaxKind::KW_OR | SyntaxKind::KW_NOT => {
@@ -113,8 +113,22 @@ impl LoweringContext<'_> {
             .filter_map(|el| el.into_token())
             .any(|token| token.kind() == syntax::SyntaxKind::MINUS)
         {
+            if let Some(token) = node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .find(|token| token.kind() == syntax::SyntaxKind::MINUS)
+            {
+                self.record_token(&token, crate::source_map::TokenCategory::Operator);
+            }
             (UnaryOp::Neg, SdblType::number())
         } else {
+            if let Some(token) = node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .find(|token| token.kind() == syntax::SyntaxKind::PLUS)
+            {
+                self.record_token(&token, crate::source_map::TokenCategory::Operator);
+            }
             (UnaryOp::Pos, expr.ty().clone())
         };
 

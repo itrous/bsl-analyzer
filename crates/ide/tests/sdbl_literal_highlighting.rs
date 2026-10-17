@@ -174,6 +174,15 @@ fn a_function_and_the_next_qualified_field_across_continuation_lines() {
 }
 
 #[test]
+fn crlf_continuations_keep_exact_unicode_and_operator_ranges() {
+    let source = "Процедура Тест()\r\n    Запрос = Новый Запрос;\r\n    Запрос.Текст = \"ВЫБРАТЬ\r\n    |    Т.Наименование КАК Имя\r\n    |ИЗ Справочник.Товары КАК Т\r\n    |ГДЕ Т.Код = 1 И Т.Наименование = \"\"Готово\"\" И Т.Код = 1\";\r\nКонецПроцедуры\r\n";
+    assert_every_occurrence(source, "Наименование", "Property");
+    assert_every_occurrence(source, "Код", "Property");
+    assert_every_occurrence(source, "=", "Operator");
+    assert_every_occurrence(source, "ИЗ", "Keyword");
+}
+
+#[test]
 fn a_function_in_every_case_branch_is_painted_at_each_occurrence() {
     let source = "Процедура Тест()\n    Запрос = Новый Запрос;\n    Запрос.Текст = \"ВЫБРАТЬ ВЫБОР КОГДА Т.Вид = 1 ТОГДА ПРЕДСТАВЛЕНИЕ(Т.Ссылка) КОГДА Т.Вид = 2 ТОГДА ПРЕДСТАВЛЕНИЕ(Т.Родитель) ИНАЧЕ ПРЕДСТАВЛЕНИЕ(Т.Владелец) КОНЕЦ КАК Имя ИЗ Справочник.Номенклатура КАК Т\";\nКонецПроцедуры\n";
     assert_eq!(occurrences(source, "ПРЕДСТАВЛЕНИЕ").len(), 3);

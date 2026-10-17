@@ -5,7 +5,7 @@
 //! query ranges, nested-query HIRs, alias and field identity, and the semantic token
 //! categories the IDE paints.
 
-use sdbl_hir::{lower_sdbl_to_hir, ExprHir, JoinType, SdblPackage, TokenCategory};
+use sdbl_hir::{lower_sdbl_to_hir, ExprHir, FunctionKind, JoinType, SdblPackage, TokenCategory};
 
 fn lower(input: &str) -> SdblPackage {
     lower_sdbl_to_hir(&parser::parse_sdbl(input), None)
@@ -164,6 +164,296 @@ fn every_token_range_of_the_source_map_lies_on_its_own_text() {
         assert_eq!(slice(input, info.range), info.text.as_str(), "{category:?}");
     }
     assert!(!package.source_map.tokens_by_category(TokenCategory::AggregateFunction).is_empty());
+}
+
+#[test]
+fn operator_source_map_has_one_entry_per_source_occurrence() {
+    let input = "ВЫБРАТЬ Т.Код ИЗ Справочник.Товары КАК Т ГДЕ Т.Код = 1 И Т.Код > 0";
+    let package = lower(input);
+    let operators = package.source_map.tokens_by_category(TokenCategory::Operator);
+    let ranges: Vec<_> = operators.iter().map(|token| token.range).collect();
+    let expected: Vec<_> = [" = ", " И ", " > "]
+        .into_iter()
+        .map(|spaced| {
+            let start = input.find(spaced).unwrap() + 1;
+            let end = start + spaced.trim().len();
+            text_size::TextRange::new((start as u32).into(), (end as u32).into())
+        })
+        .collect();
+    assert_eq!(ranges, expected);
+    for range in expected {
+        let (info, category) = package.source_map.token_at_range(range).unwrap();
+        assert_eq!(category, TokenCategory::Operator);
+        assert_eq!(
+            info.text.as_str(),
+            &input[usize::from(range.start())..usize::from(range.end())]
+        );
+    }
+    assert_eq!(
+        package
+            .source_map
+            .all_tokens()
+            .filter(|(_, category)| *category == TokenCategory::Operator)
+            .count(),
+        3
+    );
+}
+
+fn expected_token_at(
+    input: &str,
+    context: &str,
+    token: &str,
+    category: TokenCategory,
+) -> (text_size::TextRange, String, TokenCategory) {
+    let context_start =
+        input.find(context).unwrap_or_else(|| panic!("missing context {context:?}"));
+    let token_start =
+        context.find(token).unwrap_or_else(|| panic!("missing token {token:?} in {context:?}"));
+    let start = context_start + token_start;
+    let end = start + token.len();
+    (
+        text_size::TextRange::new((start as u32).into(), (end as u32).into()),
+        token.to_string(),
+        category,
+    )
+}
+
+fn predicate_token_mismatch(
+    input: &str,
+    expected: &[(&str, &str, TokenCategory)],
+) -> Option<String> {
+    let package = lower(input);
+    let mut actual: Vec<_> = package
+        .source_map
+        .all_tokens()
+        .filter(|(_, category)| {
+            matches!(category, TokenCategory::Operator | TokenCategory::SpecialKeyword)
+        })
+        .map(|(token, category)| (token.range, token.text.to_string(), category))
+        .collect();
+    let mut expected: Vec<_> = expected
+        .iter()
+        .map(|(context, token, category)| expected_token_at(input, context, token, *category))
+        .collect();
+    actual.sort_by_key(|(range, _, _)| range.start());
+    expected.sort_by_key(|(range, _, _)| range.start());
+    for (range, text, category) in &actual {
+        if slice(input, *range) != text
+            || package.source_map.token_at_range(*range).unwrap().1 != *category
+        {
+            return Some(format!(
+                "invalid source-map entry {text:?} {range:?} {category:?} in {input:?}"
+            ));
+        }
+    }
+    (actual != expected).then(|| format!("{input:?}: actual={actual:?}, expected={expected:?}"))
+}
+
+#[test]
+fn predicate_operators_are_owned_by_their_source_nodes() {
+    let prefix = "ВЫБРАТЬ Т.Код ИЗ Т ГДЕ ";
+    let cases = [
+        (
+            "Т.Код НЕ В (1, 2)",
+            vec![
+                ("Т.Код НЕ В", "НЕ", TokenCategory::Operator),
+                ("Т.Код НЕ В", "В", TokenCategory::SpecialKeyword),
+            ],
+        ),
+        (
+            "Т.Код НЕ МЕЖДУ 1 И 2",
+            vec![
+                ("Т.Код НЕ МЕЖДУ", "НЕ", TokenCategory::Operator),
+                ("Т.Код НЕ МЕЖДУ", "МЕЖДУ", TokenCategory::SpecialKeyword),
+                ("1 И 2", "И", TokenCategory::Operator),
+            ],
+        ),
+        (
+            "Т.Код НЕ ПОДОБНО \"x\"",
+            vec![
+                ("Т.Код НЕ ПОДОБНО", "НЕ", TokenCategory::Operator),
+                ("Т.Код НЕ ПОДОБНО", "ПОДОБНО", TokenCategory::SpecialKeyword),
+            ],
+        ),
+        (
+            "Т.Код ЕСТЬ НЕ NULL",
+            vec![
+                ("Т.Код ЕСТЬ НЕ NULL", "ЕСТЬ", TokenCategory::SpecialKeyword),
+                ("Т.Код ЕСТЬ НЕ NULL", "НЕ", TokenCategory::Operator),
+                ("Т.Код ЕСТЬ НЕ NULL", "NULL", TokenCategory::SpecialKeyword),
+            ],
+        ),
+        (
+            "Т.Код НЕ В ИЕРАРХИИ (&Корень)",
+            vec![
+                ("Т.Код НЕ В ИЕРАРХИИ", "НЕ", TokenCategory::Operator),
+                ("Т.Код НЕ В ИЕРАРХИИ", "В", TokenCategory::SpecialKeyword),
+                ("Т.Код НЕ В ИЕРАРХИИ", "ИЕРАРХИИ", TokenCategory::SpecialKeyword),
+            ],
+        ),
+        (
+            "НЕ (Т.Код = 1)",
+            vec![
+                ("НЕ (Т.Код", "НЕ", TokenCategory::Operator),
+                ("Т.Код = 1", "=", TokenCategory::Operator),
+            ],
+        ),
+        (
+            "НЕ (Т.Код ССЫЛКА Справочник.Номенклатура)",
+            vec![
+                ("НЕ (Т.Код", "НЕ", TokenCategory::Operator),
+                ("Т.Код ССЫЛКА", "ССЫЛКА", TokenCategory::SpecialKeyword),
+            ],
+        ),
+        (
+            "Т.Код В (ВЫБРАТЬ В.Код ИЗ Справочник.В ГДЕ В.Код НЕ МЕЖДУ 1 И 2)",
+            vec![
+                ("Т.Код В (", "В", TokenCategory::SpecialKeyword),
+                ("В.Код НЕ МЕЖДУ", "НЕ", TokenCategory::Operator),
+                ("В.Код НЕ МЕЖДУ", "МЕЖДУ", TokenCategory::SpecialKeyword),
+                ("1 И 2", "И", TokenCategory::Operator),
+            ],
+        ),
+    ];
+
+    let mut mismatches = Vec::new();
+    for (expression, expected) in &cases {
+        let input = format!("{prefix}{expression}");
+        if let Some(mismatch) = predicate_token_mismatch(&input, expected) {
+            mismatches.push(mismatch);
+        }
+    }
+    assert!(mismatches.is_empty(), "predicate token gaps:\n{}", mismatches.join("\n"));
+
+    let nested =
+        format!("{prefix}Т.Код В (ВЫБРАТЬ В.Код ИЗ Справочник.В ГДЕ В.Код НЕ МЕЖДУ 1 И 2)");
+    let package = lower(&nested);
+    assert!(matches!(
+        package.queries()[0].hir.where_clause,
+        Some(ExprHir::In { negated: true, .. })
+    ));
+    assert_eq!(
+        package
+            .source_map
+            .tokens_by_category(TokenCategory::Operator)
+            .iter()
+            .filter(|token| token.text == "НЕ")
+            .count(),
+        1,
+        "nested NOT belongs only to the inner predicate"
+    );
+}
+
+#[test]
+fn equal_operators_keep_distinct_join_having_and_package_ranges() {
+    let input = "ВЫБРАТЬ Т.Код, СУММА(Ц.Цена) ИЗ Справочник.Товары КАК Т СОЕДИНЕНИЕ РегистрСведений.Цены КАК Ц ПО Т.Ссылка = Ц.Товар СГРУППИРОВАТЬ ПО Т.Код ИМЕЮЩИЕ СУММА(Ц.Цена) = 1; ВЫБРАТЬ Т.Код ИЗ Справочник.Товары КАК Т ГДЕ Т.Код = 2";
+    let expected: Vec<_> = input
+        .match_indices('=')
+        .map(|(start, _)| {
+            (
+                text_size::TextRange::new((start as u32).into(), ((start + 1) as u32).into()),
+                "=".to_string(),
+            )
+        })
+        .collect();
+    let package = lower(input);
+    let mut actual: Vec<_> = package
+        .source_map
+        .tokens_by_category(TokenCategory::Operator)
+        .iter()
+        .filter(|token| token.text == "=")
+        .map(|token| (token.range, token.text.to_string()))
+        .collect();
+    actual.sort_by_key(|(range, _)| range.start());
+    assert_eq!(actual, expected);
+    assert_eq!(package.queries().len(), 2);
+    for (range, text) in actual {
+        assert_eq!(slice(input, range), text);
+        assert_eq!(package.source_map.token_at_range(range).unwrap().0.text, text);
+    }
+}
+
+#[test]
+fn long_nested_operator_chain_has_exact_source_ranges() {
+    let terms: Vec<_> = (0..64).map(|index| format!("((Т.Код = {index}))")).collect();
+    let expression = terms.join(" И ");
+    let input = format!("ВЫБРАТЬ Т.Код ИЗ Справочник.Товары КАК Т ГДЕ {expression}");
+    let mut expected: Vec<_> = input
+        .match_indices(" = ")
+        .map(|(start, _)| {
+            let offset = start + 1;
+            (
+                text_size::TextRange::new((offset as u32).into(), ((offset + 1) as u32).into()),
+                "=".to_string(),
+            )
+        })
+        .chain(input.match_indices(" И ").map(|(start, _)| {
+            let offset = start + 1;
+            (
+                text_size::TextRange::new((offset as u32).into(), ((offset + 2) as u32).into()),
+                "И".to_string(),
+            )
+        }))
+        .collect();
+    expected.sort_by_key(|(range, _)| range.start());
+    let package = lower(&input);
+    let mut actual: Vec<_> = package
+        .source_map
+        .tokens_by_category(TokenCategory::Operator)
+        .iter()
+        .map(|token| (token.range, token.text.to_string()))
+        .collect();
+    actual.sort_by_key(|(range, _)| range.start());
+    assert_eq!(actual.len(), 127);
+    assert_eq!(actual, expected);
+    for (range, text) in actual {
+        assert_eq!(slice(&input, range), text);
+    }
+}
+
+#[test]
+fn unary_predicate_count_and_nested_query_operators_keep_their_owners() {
+    let input = "ВЫБРАТЬ COUNT(*), -Т.Код + +1 ИЗ Справочник.Товары КАК Т ГДЕ Т.Код = 1 И Т.Код > 0 И Т.Код НЕ В (ВЫБРАТЬ В.Код ИЗ Справочник.В КАК В ГДЕ В.Код = 2)";
+    let package = lower(input);
+    assert!(matches!(
+        &package.queries()[0].hir.select.fields[0].expr,
+        ExprHir::FunctionCall { function: FunctionKind::Count, .. }
+    ));
+    let operators = package.source_map.tokens_by_category(TokenCategory::Operator);
+    let mut actual_texts: Vec<_> = operators.iter().map(|token| token.text.as_str()).collect();
+    actual_texts.sort();
+    let mut expected_texts = vec!["*", "-", "+", "+", "=", "И", ">", "И", "НЕ", "="];
+    expected_texts.sort();
+    assert_eq!(actual_texts, expected_texts);
+    let ranges: Vec<_> = operators.iter().map(|token| token.range).collect();
+    assert_eq!(ranges.iter().collect::<std::collections::HashSet<_>>().len(), ranges.len());
+    for token in operators {
+        assert_eq!(slice(input, token.range), token.text.as_str());
+    }
+
+    for token in operators {
+        assert_eq!(package.source_map.token_at_range(token.range).unwrap().0, token);
+    }
+    assert_eq!(
+        package
+            .source_map
+            .all_tokens()
+            .filter(|(_, category)| *category == TokenCategory::Operator)
+            .count(),
+        operators.len()
+    );
+
+    let select_star = lower("ВЫБРАТЬ * ИЗ Справочник.Товары");
+    assert!(select_star.source_map.tokens_by_category(TokenCategory::Operator).is_empty());
+
+    let ignored_text = lower("ВЫБРАТЬ Т.Код ИЗ Т КАК Т ГДЕ Т.Код = 1 // = >\nИ Т.Имя = \"= >\"");
+    let painted: Vec<_> = ignored_text
+        .source_map
+        .tokens_by_category(TokenCategory::Operator)
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect();
+    assert_eq!(painted, ["=", "И", "="]);
 }
 
 // --- Second package: nested unions, tabular parts, package ranges, recovery of the

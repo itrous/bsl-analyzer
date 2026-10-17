@@ -144,8 +144,7 @@ fn disjunction_in_join_condition() {
 }
 
 // Expressions mini-spec «String literal — single vs multi»: every double-quoted literal
-// with content is a candidate; the empty literal is not. The query lexer drops the line
-// break inside a literal, so the range of a literal that spans lines is not pinned here.
+// with content is a candidate; the empty literal is not.
 #[test]
 fn string_literal_candidates() {
     check(
@@ -158,11 +157,36 @@ fn string_literal_candidates() {
     );
     let spanning = "ВЫБРАТЬ \"Первая строка\nвторая строка\" КАК Текст";
     let package = lower_sdbl_to_hir(&parser::parse_sdbl(spanning), None);
-    let candidates = package
+    let candidate = package
         .all_diagnostics()
         .filter(|d| matches!(d, SdblDiagnostic::MultilineString { .. }))
-        .count();
-    assert_eq!(candidates, 1);
+        .collect::<Vec<_>>();
+    assert_eq!(candidate.len(), 1);
+    let SdblDiagnostic::MultilineString { range } = candidate[0] else {
+        unreachable!();
+    };
+    assert_eq!(usize::from(range.start()), spanning.find('\"').unwrap());
+    assert_eq!(usize::from(range.end()), spanning.find(" КАК").unwrap());
+    assert_eq!(
+        &spanning[usize::from(range.start())..usize::from(range.end())],
+        "\"Первая строка\nвторая строка\""
+    );
+
+    let escaped = "ВЫБРАТЬ \"Текст с \"\"кавычками\"\"\" КАК Значение";
+    let package = lower_sdbl_to_hir(&parser::parse_sdbl(escaped), None);
+    let candidates = package
+        .all_diagnostics()
+        .filter_map(|d| match d {
+            SdblDiagnostic::MultilineString { range } => {
+                Some((usize::from(range.start()), usize::from(range.end())))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let start = escaped.find('\"').unwrap();
+    let end = escaped.find(" КАК").unwrap();
+    assert_eq!(candidates, vec![(start, end)]);
+    assert_eq!(&escaped[start..end], "\"Текст с \"\"кавычками\"\"\"");
 }
 
 // v8std #437 §2, §2б: a result column needs an explicit name given with КАК.

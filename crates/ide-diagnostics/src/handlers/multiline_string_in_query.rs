@@ -122,10 +122,10 @@ mod tests {
             code,
             DiagnosticCode::MultilineStringInQuery,
             expect![[r#"
-                MultilineStringInQuery @ 6:9..7:32
+                MultilineStringInQuery @ 6:9..8:11
                   message: Проверьте корректность многострочного литерала
                   severity: Critical
-                MultilineStringInQuery @ 17:29..18:26
+                MultilineStringInQuery @ 17:29..18:29
                   message: Проверьте корректность многострочного литерала
                   severity: Critical"#]],
         );

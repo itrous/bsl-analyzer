@@ -79,12 +79,7 @@ impl LoweringContext<'_> {
         );
 
         if negated {
-            self.record_keyword_by_text(
-                node,
-                "NOT",
-                "НЕ",
-                crate::source_map::TokenCategory::Operator,
-            );
+            self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
         }
 
         self.record_keyword_by_text(
@@ -116,14 +111,7 @@ impl LoweringContext<'_> {
         });
 
         if negated {
-            for element in node.descendants_with_tokens() {
-                if let Some(token) = element.as_token() {
-                    if token.kind() == syntax::SyntaxKind::KW_NOT {
-                        self.record_token(token, crate::source_map::TokenCategory::Operator);
-                        break;
-                    }
-                }
-            }
+            self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
         }
 
         for element in node.descendants_with_tokens() {
@@ -189,6 +177,8 @@ impl LoweringContext<'_> {
             .next()
             .map(|n| self.lower_expr(&n))
             .unwrap_or_else(|| ExprHir::Missing { range: node.text_range() });
+
+        self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
 
         for element in node.descendants_with_tokens() {
             if let Some(token) = element.as_token() {
@@ -257,15 +247,10 @@ impl LoweringContext<'_> {
         });
 
         if negated {
-            for element in node.descendants_with_tokens() {
-                if let Some(token) = element.as_token() {
-                    if token.kind() == syntax::SyntaxKind::KW_NOT {
-                        self.record_token(token, crate::source_map::TokenCategory::Operator);
-                        break;
-                    }
-                }
-            }
+            self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
         }
+
+        self.record_direct_token(node, syntax::SyntaxKind::KW_AND);
 
         self.record_keyword_by_text(
             node,
@@ -307,14 +292,7 @@ impl LoweringContext<'_> {
         });
 
         if negated {
-            for element in node.descendants_with_tokens() {
-                if let Some(token) = element.as_token() {
-                    if token.kind() == syntax::SyntaxKind::KW_NOT {
-                        self.record_token(token, crate::source_map::TokenCategory::Operator);
-                        break;
-                    }
-                }
-            }
+            self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
         }
 
         self.record_keyword_by_text(
@@ -399,6 +377,16 @@ impl LoweringContext<'_> {
             rhs: Box::new(ExprHir::Missing { range: node.text_range() }),
             ty: SdblType::Boolean,
             range: node.text_range(),
+        }
+    }
+
+    fn record_direct_token(&mut self, node: &syntax::SyntaxNode, kind: syntax::SyntaxKind) {
+        if let Some(token) = node
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .find(|token| token.kind() == kind)
+        {
+            self.record_token(&token, crate::source_map::TokenCategory::Operator);
         }
     }
 }

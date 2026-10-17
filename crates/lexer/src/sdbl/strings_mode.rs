@@ -20,44 +20,25 @@ pub(super) fn scan(input: &str, start_pos: usize) -> StringsRun {
     tokens.push(make_string_token(input, pos, pos + 1));
     pos += 1;
 
-    loop {
-        let run_start = pos;
-
-        while pos < bytes.len() && bytes[pos] != b'"' && bytes[pos] != b'\n' && bytes[pos] != b'\r'
-        {
-            pos += 1;
-        }
-
-        if pos >= bytes.len() {
-            if run_start < pos {
-                tokens.push(make_string_token(input, run_start, pos));
-            }
-            break;
-        }
-
+    let body_start = pos;
+    let mut closed = false;
+    while pos < bytes.len() {
         match bytes[pos] {
+            b'"' if pos + 1 < bytes.len() && bytes[pos + 1] == b'"' => pos += 2,
             b'"' => {
-                if pos + 1 < bytes.len() && bytes[pos + 1] == b'"' {
-                    pos += 2;
-                    continue;
-                }
-                if run_start < pos {
-                    tokens.push(make_string_token(input, run_start, pos));
+                if body_start < pos {
+                    tokens.push(make_string_token(input, body_start, pos));
                 }
                 tokens.push(make_string_token(input, pos, pos + 1));
                 pos += 1;
+                closed = true;
                 break;
             }
-            b'\n' | b'\r' => {
-                if run_start < pos {
-                    tokens.push(make_string_token(input, run_start, pos));
-                }
-                while pos < bytes.len() && matches!(bytes[pos], b'\n' | b'\r' | b' ' | b'\t') {
-                    pos += 1;
-                }
-            }
-            _ => unreachable!("inner loop exits only on a quote or line break"),
+            _ => pos += 1,
         }
+    }
+    if !closed && body_start < pos {
+        tokens.push(make_string_token(input, body_start, pos));
     }
 
     StringsRun { tokens, end_pos: pos }

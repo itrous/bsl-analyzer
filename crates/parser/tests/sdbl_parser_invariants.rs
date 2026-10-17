@@ -20,15 +20,21 @@ use common::{generate, Rng, FRAGMENTS};
 fn breach(input: &str) -> Option<String> {
     let parse = parse_sdbl(input);
     let root = parse.syntax_node();
+    let shared = parser::parse_sdbl_with_shared_cache(input);
 
-    // The tree must hold everything the lexer handed over. It is compared
-    // against the tokens rather than the input because the lexer itself
-    // drops bytes on a run of quotes — a defect of its own, tracked
-    // separately, and not one the parser can make good.
     let covered = usize::from(root.text_range().len());
-    let handed_over: usize = lexer::sdbl::tokenize_sdbl(input).iter().map(|t| t.text.len()).sum();
-    if covered != handed_over {
-        return Some(format!("tree covers {covered} of the {handed_over} bytes it was given"));
+    if root.text() != input || covered != input.len() {
+        return Some(format!("tree does not reproduce all {} input bytes", input.len()));
+    }
+    for token in lexer::sdbl::tokenize_sdbl(input) {
+        let start = token.offset;
+        let end = start + token.text.len();
+        if end > input.len() || !input.is_char_boundary(start) || !input.is_char_boundary(end) {
+            return Some(format!("token range {start}..{end} is not a valid input slice"));
+        }
+        if input.get(start..end) != Some(token.text.as_str()) {
+            return Some(format!("token at {start} does not equal its source slice"));
+        }
     }
 
     // Every reported range must be inside the input and land between
@@ -40,6 +46,29 @@ fn breach(input: &str) -> Option<String> {
         }
         if !input.is_char_boundary(start) || !input.is_char_boundary(end) {
             return Some(format!("error range {start}..{end} splits a character"));
+        }
+    }
+    for e in shared.errors() {
+        let (start, end) = (usize::from(e.range().start()), usize::from(e.range().end()));
+        if start > end || end > input.len() {
+            return Some(format!("shared-cache error range {start}..{end} outside input"));
+        }
+        if !input.is_char_boundary(start) || !input.is_char_boundary(end) {
+            return Some(format!("shared-cache error range {start}..{end} splits a character"));
+        }
+    }
+    for tree in [root.clone(), shared.syntax_node()] {
+        for token in tree.descendants_with_tokens().filter_map(|element| element.into_token()) {
+            let start = usize::from(token.text_range().start());
+            let end = usize::from(token.text_range().end());
+            let text = token.text().to_string();
+            if end > input.len()
+                || !input.is_char_boundary(start)
+                || !input.is_char_boundary(end)
+                || input.get(start..end) != Some(text.as_str())
+            {
+                return Some(format!("tree token range {start}..{end} differs from input"));
+            }
         }
     }
 
@@ -81,8 +110,11 @@ fn breach(input: &str) -> Option<String> {
     let again = parse_sdbl(input);
     if again.errors().len() != parse.errors().len()
         || usize::from(again.syntax_node().text_range().len()) != covered
+        || shared.syntax_node().text() != input
+        || shared.syntax_node().text_range() != root.text_range()
+        || shared.errors().len() != parse.errors().len()
     {
-        return Some("parsing the same input twice disagreed".to_string());
+        return Some("plain and shared-cache parsing disagreed".to_string());
     }
 
     None
@@ -133,6 +165,7 @@ fn properties_hold_on_every_truncation_of_a_real_query() {
          ВЫБРАТЬ Б ИЗ Врем {ГДЕ Б.Поле} ОБЪЕДИНИТЬ ВСЕ ВЫБРАТЬ В ИЗ W",
         "ВЫБРАТЬ Т.Номенклатура ИЗ РегистрНакопления.Т.Остатки(&Период, \
          Номенклатура В (ВЫБРАТЬ С.Ссылка ИЗ Справочник.Номенклатура КАК С)) КАК Т",
+        "ВЫБРАТЬ \"А\"\"Б\" КАК Имя, \"строка\n    |продолжение\" КАК Текст ИЗ Т ГДЕ Т.Код = 1",
     ];
 
     for query in queries {
