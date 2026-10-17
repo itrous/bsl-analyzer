@@ -497,6 +497,14 @@ impl Project {
             .map(|value| (value, CompatibilityModeSource::ConfigurationXml))
     }
 
+    /// `UseOrdinaryFormInManagedApplication` of the main configuration
+    /// ([`configuration_ordinary_forms_in_managed_app`]). It decides for every root:
+    /// an external data processor opens in the base it is run in. `None` when the
+    /// project has no main configuration or it states nothing.
+    pub fn ordinary_forms_in_managed_app(&self) -> Option<bool> {
+        configuration_ordinary_forms_in_managed_app(self.configuration_path()?)
+    }
+
     /// Advisory for a project that is a configuration extension analyzed without
     /// the main configuration it extends. In that state its calls into the main
     /// configuration cannot resolve, so valid code is reported as broken — saying
@@ -2136,20 +2144,50 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// without the element. Comments are skipped, the read is bounded by
 /// [`CONFIGURATION_KIND_SCAN_CAP`] like [`configuration_kind`].
 pub fn configuration_compatibility_mode(root: &Path) -> Option<String> {
+    compatibility_mode_in(&configuration_xml_head(root)?)
+}
+
+/// `<UseOrdinaryFormInManagedApplication>` of a MAIN configuration's
+/// `Configuration.xml`: whether its ordinary forms also open in the thick client of
+/// the managed application.
+///
+/// `None` for an extension (its forms open in the configuration it extends), for a
+/// missing or unreadable file, a missing element and a value other than
+/// `true`/`false`. Read the same way as [`configuration_compatibility_mode`].
+pub fn configuration_ordinary_forms_in_managed_app(root: &Path) -> Option<bool> {
+    ordinary_forms_in_managed_app_in(&configuration_xml_head(root)?)
+}
+
+fn configuration_xml_head(root: &Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
     let path = configuration_xml_in(root)?;
     let file = std::fs::File::open(&path).ok()?;
     let mut head = Vec::new();
     file.take(CONFIGURATION_KIND_SCAN_CAP).read_to_end(&mut head).ok()?;
-    compatibility_mode_in(&head)
+    Some(head)
 }
 
 fn compatibility_mode_in(head: &[u8]) -> Option<String> {
+    main_configuration_property_in(head, b"<CompatibilityMode>")
+}
+
+fn ordinary_forms_in_managed_app_in(head: &[u8]) -> Option<bool> {
+    let value = main_configuration_property_in(head, b"<UseOrdinaryFormInManagedApplication>")?;
+    match value.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Text of the root property opened by `open` in a main configuration's
+/// `Configuration.xml` head; `None` for an extension and when `</Properties>`
+/// closes first.
+fn main_configuration_property_in(head: &[u8], open: &[u8]) -> Option<String> {
     const COMMENT_OPEN: &[u8] = b"<!--";
     const COMMENT_CLOSE: &[u8] = b"-->";
     const PROPERTIES_CLOSE: &[u8] = b"</Properties>";
-    const MODE_OPEN: &[u8] = b"<CompatibilityMode>";
 
     let mut i = 0;
     while i < head.len() {
@@ -2162,8 +2200,8 @@ fn compatibility_mode_in(head: &[u8]) -> Option<String> {
         if rest.starts_with(EXTENSION_MARKER) || rest.starts_with(PROPERTIES_CLOSE) {
             return None;
         }
-        if rest.starts_with(MODE_OPEN) {
-            let value = &rest[MODE_OPEN.len()..];
+        if rest.starts_with(open) {
+            let value = &rest[open.len()..];
             let end = find(value, b"<")?;
             let value = std::str::from_utf8(&value[..end]).ok()?.trim();
             return (!value.is_empty()).then(|| value.to_owned());
@@ -4011,7 +4049,8 @@ mod tests {
         WorkspaceDiagnosticsScope,
     };
     use super::{
-        compatibility_mode_in, configuration_kind, CompatibilityModeSource, ConfigurationKind,
+        compatibility_mode_in, configuration_kind, ordinary_forms_in_managed_app_in,
+        CompatibilityModeSource, ConfigurationKind,
     };
     use super::{dotenv_value, parse_dotenv_value};
     use super::{PROJECT_ENV_FILE_NAME, SHARED_CONFIGURATIONS_ROOT_ENV};
@@ -4229,6 +4268,49 @@ mod tests {
         let after_properties =
             br#"<Properties></Properties><CompatibilityMode>Version8_2_13</CompatibilityMode>"#;
         assert_eq!(compatibility_mode_in(after_properties), None);
+    }
+
+    #[test]
+    fn ordinary_forms_in_managed_app_is_read_from_a_main_configuration_only() {
+        let main = |value: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\n\
+                 <!-- <UseOrdinaryFormInManagedApplication>true</UseOrdinaryFormInManagedApplication> -->\n\
+                 <UseManagedFormInOrdinaryApplication>true</UseManagedFormInOrdinaryApplication>\n\
+                 <UseOrdinaryFormInManagedApplication>{value}</UseOrdinaryFormInManagedApplication>\n\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        assert_eq!(ordinary_forms_in_managed_app_in(main("false").as_bytes()), Some(false));
+        assert_eq!(ordinary_forms_in_managed_app_in(main("true").as_bytes()), Some(true));
+        assert_eq!(ordinary_forms_in_managed_app_in(main("").as_bytes()), None);
+        assert_eq!(ordinary_forms_in_managed_app_in(main("да").as_bytes()), None);
+
+        let extension = br#"<MetaDataObject><Configuration><Properties>
+<ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>
+<UseOrdinaryFormInManagedApplication>true</UseOrdinaryFormInManagedApplication>
+</Properties></Configuration></MetaDataObject>"#;
+        assert_eq!(ordinary_forms_in_managed_app_in(extension), None);
+
+        let absent = br#"<Properties><Name>X</Name></Properties>"#;
+        assert_eq!(ordinary_forms_in_managed_app_in(absent), None);
+    }
+
+    #[test]
+    fn project_ordinary_forms_in_managed_app_comes_from_the_main_configuration() {
+        let dir = tempdir().unwrap();
+        let project = Project::with_config(dir.path(), ProjectConfig::default()).unwrap();
+        assert_eq!(project.ordinary_forms_in_managed_app(), None, "no configuration");
+
+        let cf = dir.path().join("src").join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(
+            cf.join("Configuration.xml"),
+            "<MetaDataObject><Configuration><Properties><UseOrdinaryFormInManagedApplication>false</UseOrdinaryFormInManagedApplication></Properties></Configuration></MetaDataObject>",
+        )
+        .unwrap();
+        let project = Project::with_config(dir.path(), ProjectConfig::default()).unwrap();
+        assert_eq!(project.ordinary_forms_in_managed_app(), Some(false));
     }
 
     #[test]

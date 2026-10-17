@@ -247,6 +247,11 @@ pub struct EnvOptions {
     /// pedantic noise for configurations that never run there — so external
     /// connection (like the mobile and legacy thick clients) is opt-in.
     pub checked_environments: EnvFlags,
+    /// `UseOrdinaryFormInManagedApplication` of the main configuration: whether
+    /// an ordinary form also opens in the thick client of the managed
+    /// application. `None` — not known (no main configuration, as in a project
+    /// of external data processors alone): both thick clients count.
+    pub ordinary_forms_in_managed_app: Option<bool>,
 }
 
 impl Default for EnvOptions {
@@ -260,6 +265,7 @@ impl Default for EnvOptions {
                 | EnvFlags::WEB_CLIENT
                 | EnvFlags::THICK_CLIENT_MANAGED
                 | EnvFlags::SERVER,
+            ordinary_forms_in_managed_app: None,
         }
     }
 }
@@ -296,10 +302,14 @@ pub fn module_base_env(metadata: &ModuleMetadata, opts: &EnvOptions) -> EnvFlags
         },
         // An ordinary form runs only in a thick client: the ordinary application's,
         // and the managed application's when the configuration allows ordinary forms
-        // there. That property is not known here, and an external data processor's
-        // host configuration is not known at all, so both thick clients count.
+        // there. Where that is not known, both thick clients count.
         ModuleType::FormModule if metadata.is_ordinary_form_module() => {
-            EnvFlags::THICK_CLIENT_ORDINARY | EnvFlags::THICK_CLIENT_MANAGED
+            match opts.ordinary_forms_in_managed_app {
+                Some(false) => EnvFlags::THICK_CLIENT_ORDINARY,
+                Some(true) | None => {
+                    EnvFlags::THICK_CLIENT_ORDINARY | EnvFlags::THICK_CLIENT_MANAGED
+                }
+            }
         }
         // Form and command methods pick client or server per directive; the
         // module as a whole spans both.
@@ -666,6 +676,33 @@ mod tests {
         let unknown = ModuleMetadata::unknown(ModuleType::FormModule);
         assert!(!unknown.is_ordinary_form_module());
         assert_eq!(body_env(&unknown, &[], &opts), EnvFlags::SERVER);
+    }
+
+    /// The managed thick client opens an ordinary form only when the configuration
+    /// allows ordinary forms in the managed application.
+    #[test]
+    fn ordinary_form_in_managed_thick_client_follows_the_configuration() {
+        let mut ordinary = ModuleMetadata::unknown(ModuleType::FormModule);
+        ordinary.form = Some(Arc::new(bsl_metadata::Form::ordinary_without_dialog("Форма")));
+        let with =
+            |flag| EnvOptions { ordinary_forms_in_managed_app: flag, ..EnvOptions::default() };
+        let thick = EnvFlags::THICK_CLIENT_ORDINARY | EnvFlags::THICK_CLIENT_MANAGED;
+
+        assert_eq!(body_env(&ordinary, &[], &with(None)), thick);
+        assert_eq!(body_env(&ordinary, &[], &with(Some(true))), thick);
+        assert_eq!(body_env(&ordinary, &[], &with(Some(false))), EnvFlags::THICK_CLIENT_ORDINARY);
+        assert_eq!(
+            body_env(&ordinary, &[AnnotationKind::AtClient], &with(Some(false))),
+            EnvFlags::THICK_CLIENT_ORDINARY
+        );
+        assert_eq!(module_code_env(&ordinary, &with(Some(false))), EnvFlags::THICK_CLIENT_ORDINARY);
+
+        // A managed form does not depend on the property.
+        let managed = form_metadata();
+        for flag in [None, Some(true), Some(false)] {
+            assert_eq!(body_env(&managed, &[AnnotationKind::AtClient], &with(flag)), CLIENTS);
+            assert_eq!(body_env(&managed, &[], &with(flag)), EnvFlags::SERVER);
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@ impl GlobalState {
         let db = self.analysis_host.raw_database_mut();
         apply_project_config_to_db(db, &config);
         apply_compatibility_mode_to_db(db, self.project.as_ref());
+        apply_ordinary_forms_setting_to_db(db, self.project.as_ref());
         if let Some(project) = self.project.as_ref() {
             if let Some(warning) =
                 platform_help::source_change_warning(Some(&project.config), &project.root)
@@ -89,6 +90,23 @@ pub fn apply_compatibility_mode_to_db(
     if db.compatibility_mode().as_deref() != mode.as_deref() {
         tracing::info!(compatibility_mode = ?mode, "updated compatibility mode");
         db.set_compatibility_mode(mode);
+    }
+}
+
+/// `UseOrdinaryFormInManagedApplication` of the main configuration of `project` into
+/// the environment options: whether ordinary forms run in the managed thick client.
+/// Applied after [`apply_project_config_to_db`], which rebuilds the options from the
+/// settings, and again when `Configuration.xml` changes.
+pub fn apply_ordinary_forms_setting_to_db(
+    db: &mut RootDatabaseImpl,
+    project: Option<&project_model::Project>,
+) {
+    let value = project.and_then(|project| project.ordinary_forms_in_managed_app());
+    let mut options = db.env_options();
+    if options.ordinary_forms_in_managed_app != value {
+        tracing::info!(ordinary_forms_in_managed_app = ?value, "updated ordinary-form environments");
+        options.ordinary_forms_in_managed_app = value;
+        db.set_env_options(options);
     }
 }
 

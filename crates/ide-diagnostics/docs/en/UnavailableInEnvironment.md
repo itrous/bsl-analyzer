@@ -10,6 +10,8 @@ Global manager collections of configuration objects (`Catalogs`, `Documents`, `E
 
 Preprocessor conditions are understood: inside `#If … #EndIf` only the intersection of the method's environments with the environments the branch compiles for is checked (`#If Not WebClient Then` removes the web client; the `#Else` branch receives the complement). Environments for which the condition stays undecidable (e.g. it involves an OS name and is not resolved by И/ИЛИ absorption) are skipped throughout the branch chain. This also covers preprocessor regions around whole methods: a method declared inside `#If Not WebClient Then` is not checked against the web client.
 
+An ordinary form module runs only in a thick client: the ordinary application's, and the managed application's only when the main configuration enables `UseOrdinaryFormInManagedApplication`. With the property off, such a module is not checked against the managed thick client; without a main configuration (a project of external data processors alone) both thick clients count.
+
 Current limitations (deliberately conservative):
 
 - extension modules (interceptors `&Instead`/`&Before`/`&After`, `&ChangeAndValidate`) are not checked;

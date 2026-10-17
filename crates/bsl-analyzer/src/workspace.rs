@@ -376,8 +376,9 @@ impl GlobalState {
                     tracing::info!(path = %path.display(), "bumping config revision after XML change");
                     db.bump_config_for_path(path);
                 }
-                // The compatibility mode is read from the main configuration's
-                // `Configuration.xml`, not derived from the metadata revision.
+                // The compatibility mode and the ordinary-form setting are read from
+                // the main configuration's `Configuration.xml`, not derived from the
+                // metadata revision.
                 if changed_metadata_paths.iter().any(|path| {
                     path.file_name()
                         .and_then(|name| name.to_str())
@@ -385,6 +386,10 @@ impl GlobalState {
                         == Some(bsl_conventions::ConventionalName::ConfigurationXml)
                 }) {
                     crate::features_state::apply_compatibility_mode_to_db(
+                        db,
+                        self.project.as_ref(),
+                    );
+                    crate::features_state::apply_ordinary_forms_setting_to_db(
                         db,
                         self.project.as_ref(),
                     );
@@ -1745,5 +1750,38 @@ mod compatibility_mode_tests {
             state.analysis_host.raw_database().compatibility_mode().as_deref(),
             Some("Version8_3_17")
         );
+    }
+
+    /// `UseOrdinaryFormInManagedApplication` lives there too and is reread the same way.
+    #[test]
+    fn a_configuration_xml_edit_rereads_the_ordinary_form_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        let cf = root.join("src/cf");
+        std::fs::create_dir_all(&cf).unwrap();
+        let xml = |value: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\
+                 <UseOrdinaryFormInManagedApplication>{value}</UseOrdinaryFormInManagedApplication>\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        let xml_path = cf.join("Configuration.xml");
+        std::fs::write(&xml_path, xml("false")).unwrap();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).unwrap();
+        let setting = |state: &GlobalState| {
+            state.analysis_host.raw_database().env_options().ordinary_forms_in_managed_app
+        };
+        assert_eq!(setting(&state), Some(false));
+
+        let changed = xml("true");
+        std::fs::write(&xml_path, &changed).unwrap();
+        state.vfs.write().set_file_contents(VfsPath::new(xml_path), Some(Arc::from(changed)));
+        state.process_changes(false);
+        assert_eq!(setting(&state), Some(true));
     }
 }

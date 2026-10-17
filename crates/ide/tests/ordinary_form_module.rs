@@ -116,8 +116,9 @@ fn managed_form_module_keeps_reporting_the_same_code() {
 }
 
 /// An ordinary form opens in the thick client of the managed application too, when the
-/// configuration allows ordinary forms there (this fixture does): a call no thick
-/// client can make is still reported.
+/// configuration allows ordinary forms there. Without a project that setting is not
+/// known, so both thick clients count: a call no thick client can make is still
+/// reported.
 #[test]
 fn ordinary_form_module_is_checked_for_the_managed_thick_client() {
     const CALL: &str = "\
