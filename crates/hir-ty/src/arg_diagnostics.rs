@@ -116,6 +116,12 @@ fn body_arg_diagnostics(
     let mut narrow: Option<Option<Arc<dataflow::DataflowResult<NarrowState>>>> = None;
     let mut out = Vec::new();
     for binding in bindings {
+        // A branch no environment of this body compiles never reaches the
+        // platform's argument check, so neither arity nor types are judged
+        // there — `#Если Сервер И Не Сервер Тогда` typing hints are the common shape.
+        if binding.in_uncompiled_branch {
+            continue;
+        }
         if narrowing_enabled && narrow.is_none() {
             let any_path_arg =
                 binding.args.iter().any(|arg_id| matches!(body.expr(*arg_id), Expr::Path(_)));

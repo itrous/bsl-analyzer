@@ -59,6 +59,53 @@ mod tests {
         assert!(mismatched[0].message.contains("2") && mismatched[0].message.contains("1"));
     }
 
+    /// The rule's messages for `body` as the whole of the server common module `Проба`.
+    fn in_server_module(body: &str) -> Vec<String> {
+        let mut builder = test_fixture::CfeFixtureBuilder::new("");
+        builder.add_base_module("Проба", body);
+        crate::test_utils::check_cfe_at_with_db_setup(
+            "CommonModules/Проба/Ext/Module.bsl",
+            body,
+            builder.build(),
+            &[],
+            crate::DiagnosticsConfig::default(),
+            |_| {},
+            |_| {},
+            |db, ctx| crate::file_diagnostics(db, ctx.file_id, ctx.config),
+        )
+        .into_iter()
+        .filter(|diag| diag.code == DiagnosticCode::MismatchedArgCount)
+        .map(|diag| diag.message)
+        .collect()
+    }
+
+    /// The platform drops a `#Если` branch the module's environment rules out before
+    /// compiling it, so the call there is never checked: `#Если Сервер И Не Сервер`
+    /// (a typing hint for the editor) and a client branch of a server module compile
+    /// nowhere. The same call in the plain body and in a branch the server does
+    /// compile is still reported.
+    #[test]
+    fn a_branch_no_environment_compiles_is_not_judged() {
+        let module = |call_site: &str| {
+            in_server_module(&format!(
+                "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\n\
+                 Процедура Тест() Экспорт\n{call_site}КонецПроцедуры\n"
+            ))
+        };
+        const CALL: &str = "    Сложение(1);\n";
+
+        let plain = module(CALL);
+        assert_eq!(plain.len(), 1, "the server compiles the plain call: {plain:?}");
+        let compiled = module(&format!("#Если Сервер Тогда\n{CALL}#КонецЕсли\n"));
+        assert_eq!(compiled.len(), 1, "the server compiles this branch: {compiled:?}");
+
+        let contradiction = module(&format!("#Если Сервер И Не Сервер Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(contradiction.is_empty(), "no environment compiles this branch: {contradiction:?}");
+        let client =
+            module(&format!("#Если ТолстыйКлиентОбычноеПриложение Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(client.is_empty(), "a server module never compiles this branch: {client:?}");
+    }
+
     #[test]
     fn does_not_fire_when_optional_args_are_omitted() {
         let fixture = r#"

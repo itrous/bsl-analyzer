@@ -214,3 +214,45 @@ fn user_repro_min_max_okr_intervals() {
         arg_count_diags(&db, file_id)
     );
 }
+
+/// Call forms the platform accepts although the help drops their parameter:
+/// `ЭлементDOM.ПолучитьЭлементыПоИмени(<Имя>)` and the timeout of
+/// `ФоновоеЗадание.ОжидатьЗавершения`. The calls with one argument too many stay
+/// reported.
+#[test]
+fn undocumented_method_parameters_are_accepted() {
+    let fixture = r#"
+//- /test.bsl
+Процедура Тест(Чтение)
+    Построитель = Новый ПостроительDOM;
+    Документ = Построитель.Прочитать(Чтение);
+    Узел = Документ.ПолучитьЭлементыПоИмени("a").Элемент(0);
+    Список = Узел.ПолучитьЭлементыПоИмени("b");
+    Задание = ФоновыеЗадания.Выполнить("Модуль.Процедура");
+    Задание.ОжидатьЗавершения(20);
+КонецПроцедуры
+"#;
+    let (db, file_id) = setup(fixture);
+    assert!(
+        arg_count_diags(&db, file_id).is_empty(),
+        "the one-argument forms must be accepted, got {:?}",
+        arg_count_diags(&db, file_id)
+    );
+
+    let control = r#"
+//- /test.bsl
+Процедура Тест(Чтение)
+    Построитель = Новый ПостроительDOM;
+    Документ = Построитель.Прочитать(Чтение);
+    Узел = Документ.ПолучитьЭлементыПоИмени("a").Элемент(0);
+    Список = Узел.ПолучитьЭлементыПоИмени("a", "b", "c");
+    Задание = ФоновыеЗадания.Выполнить("Модуль.Процедура");
+    Задание.ОжидатьЗавершения(20, 30);
+КонецПроцедуры
+"#;
+    let (db, file_id) = setup(control);
+    let mut found =
+        arg_count_diags(&db, file_id).into_iter().map(|(_, _, found)| found).collect::<Vec<_>>();
+    found.sort_unstable();
+    assert_eq!(found, vec![2, 3], "one argument too many still fires");
+}
