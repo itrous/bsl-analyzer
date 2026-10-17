@@ -1686,14 +1686,6 @@ mod tests {
         restore_mtime(path, before + Duration::from_secs(1));
     }
 
-    /// Whether a full rebuild has been asked for, ever: one asked for marks the reload
-    /// running before its thread starts, and the thread counts itself before it lets the
-    /// mark go, so at any moment after the ask one of the two shows it.
-    fn a_rebuild_was_asked_for(state: &DiagnosticsState) -> bool {
-        lock_recover(&state.inner).reload == super::super::types::ReloadState::Running
-            || state.rebuilds_started.load(std::sync::atomic::Ordering::SeqCst) > 0
-    }
-
     #[test]
     fn an_unreadable_module_leaves_service_and_says_so() {
         let dir = tempfile::tempdir().unwrap();
@@ -4631,6 +4623,14 @@ mod tests {
 
         fn open_dir(path: &std::path::Path) {
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// Whether a full rebuild has been asked for, ever: one asked for marks the reload
+        /// running before its thread starts, and the thread counts itself before it lets the
+        /// mark go, so at any moment after the ask one of the two shows it.
+        fn a_rebuild_was_asked_for(state: &DiagnosticsState) -> bool {
+            lock_recover(&state.inner).reload == ReloadState::Running
+                || state.rebuilds_started.load(std::sync::atomic::Ordering::SeqCst) > 0
         }
 
         fn file_id(state: &DiagnosticsState, path: &std::path::Path) -> Option<vfs::FileId> {
