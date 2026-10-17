@@ -990,6 +990,16 @@ pub fn check_form_with_form_xml(form_source: &str, form_xml: &str) -> Vec<Diagno
     check_form_module_impl(form_source, &[], form_xml)
 }
 
+/// Both at once: a form whose attributes matter, calling common modules whose
+/// metadata flags matter.
+pub fn check_form_with_common_modules_and_form_xml(
+    form_source: &str,
+    modules: &[(&str, &str, &str)],
+    form_xml: &str,
+) -> Vec<Diagnostic> {
+    check_form_module_impl(form_source, modules, form_xml)
+}
+
 fn check_form_module_impl(
     form_source: &str,
     modules: &[(&str, &str, &str)],

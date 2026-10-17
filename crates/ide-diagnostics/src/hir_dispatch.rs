@@ -184,6 +184,7 @@ pub fn dispatch_hir_diagnostic(
                 variable_name,
                 *range,
                 *existing_binding_kind,
+                method_id,
                 ctx,
             )
         }
