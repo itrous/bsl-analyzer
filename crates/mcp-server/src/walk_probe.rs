@@ -6,7 +6,7 @@
 //! cancellation. Any test that reaches `ide::find_references_by_name` takes it.
 
 pub(crate) use test_utils::walk_probe::{
-    await_walk_start, entered, hold_first_span, install, reset,
+    await_walk_start, entered, hold_first_span, hold_walk_start, install, reset,
 };
 
 pub(crate) static WALK_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

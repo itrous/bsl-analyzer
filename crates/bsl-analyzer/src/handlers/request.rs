@@ -2462,7 +2462,12 @@ mod tests {
     /// How long a stand waits for a thread to reach a parked or published state before
     /// calling the test hung. Scheduling latency on a loaded machine is the only thing
     /// it absorbs, so it is generous and nothing is measured against it.
-    const PARK_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+    const PARK_HANG_GUARD: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(30));
+    /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
+    /// not a latency measure.
+    const HANG_WATCHDOG: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
 
     /// A symbol whose range does not project onto the open buffer is the one case where a
     /// map can lie without looking wrong: the answer stays well-formed while a method — or
@@ -3158,7 +3163,7 @@ mod tests {
         RequestDispatcher { req: Some(request), global_state: &mut state }
             .on_waiting_latency::<CallHierarchyIncomingCalls>(handle_call_hierarchy_incoming)
             .finish();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + HANG_WATCHDOG;
         while !lifecycle.has_waiter(source_root, generation) {
             assert!(std::time::Instant::now() < deadline, "incoming request did not park");
             std::thread::yield_now();
@@ -3173,7 +3178,7 @@ mod tests {
             .expect("build completion fits in the shared pool queue");
 
         // Then: the queued completion runs and the incoming request returns callers.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + HANG_WATCHDOG;
         let response = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let task = task_receiver
@@ -3289,7 +3294,9 @@ mod tests {
 
         // Then: it returns promptly, releases the permit, and a later Ready request succeeds.
         assert!(timed_out.unwrap().is_none());
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        if cfg!(timing_contract) {
+            assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        }
         assert!(!state.call_hierarchy_index.has_waiter(source_root, 1));
         assert!(state.call_hierarchy_index.publish(source_root, 1, index));
         let calls = handle_call_hierarchy_incoming(&latency_ctx(&state), incoming_params(item))
@@ -3321,7 +3328,7 @@ mod tests {
                 handle_call_hierarchy_incoming(&ctx, incoming_params(item))
             }))
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        let deadline = std::time::Instant::now() + HANG_WATCHDOG;
         while !state.call_hierarchy_index.has_waiter(source_root, 1) {
             assert!(std::time::Instant::now() < deadline, "incoming request did not park");
             std::thread::yield_now();
@@ -4219,21 +4226,28 @@ mod tests {
     /// A `$/cancelRequest` against a reference walk over many files, through the real
     /// door: dispatcher, task pool, `handle_cancel`, response code. The walk is counted
     /// from the span `ide` emits per file, so the cancel is sent on observing the first
-    /// file rather than after a sleep.
+    /// file rather than after a sleep. Other tests of this binary walk references too —
+    /// rename, highlight, the plain handlers — so the count and the hold are claimed for
+    /// the walks under this stand's anchor, the one URI no other test uses.
     mod cancel_walk_tests {
         use super::*;
         use lsp_types::request::References;
         use std::time::Duration;
         use test_utils::walk_probe;
 
-        /// Serialises the tests of this binary that read the process-global walk
-        /// counter; see `test_utils::walk_probe`.
+        /// Serialises the tests below: they share the process-global hold and attribution
+        /// of `test_utils::walk_probe`.
         static WALK_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-        /// A test that failed while holding the gate poisons it; the gate guards no
-        /// data, so the next test simply takes it.
-        fn serialised() -> std::sync::MutexGuard<'static, ()> {
-            WALK_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        /// Attribution drops before exclusivity: an unlocked gate must not let another test
+        /// claim the probe while the preceding attribution is still active. The gate guards
+        /// no data, so a test that failed while holding it does not block the next one.
+        fn serialised() -> (walk_probe::Attribution, std::sync::MutexGuard<'static, ()>) {
+            let gate = WALK_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            walk_probe::install();
+            let attributed = walk_probe::attribute_to(ROOT);
+            walk_probe::reset();
+            (attributed, gate)
         }
 
         /// Callers of one exported procedure. Enough that an uncancelled walk takes
@@ -4318,7 +4332,8 @@ mod tests {
             client_receiver: &crossbeam_channel::Receiver<lsp_server::Message>,
             id: i32,
         ) -> lsp_server::Response {
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            let deadline =
+                std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
             let task_receiver = state.task_pool.receiver.clone();
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -4335,14 +4350,42 @@ mod tests {
             }
         }
 
+        /// A contender can wake between tuple-field destructors; an open exclusion gate
+        /// must mean that the preceding attribution is already gone.
+        #[test]
+        fn attribution_is_cleared_before_the_serialisation_gate_opens() {
+            let (first, second) = serialised();
+            drop(first);
+            let unlocked = match WALK_GATE.try_lock() {
+                Ok(gate) => {
+                    drop(gate);
+                    true
+                }
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    drop(poisoned.into_inner());
+                    true
+                }
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            };
+            if unlocked {
+                let contender = std::thread::spawn(|| {
+                    let _claimed = serialised();
+                });
+                let result = contender.join();
+                drop(second);
+                assert!(result.is_ok(), "an open gate exposed the preceding walk attribution");
+            } else {
+                drop(second);
+                let _claimed = serialised();
+            }
+        }
+
         /// The uncancelled walk enters every caller: what the counter can reach, so a
         /// smaller number after a cancel means files skipped and not a counter that
         /// never moved.
         #[test]
         fn an_uncancelled_walk_enters_every_caller() {
             let _serialised = serialised();
-            walk_probe::install();
-            walk_probe::reset();
             let (mut state, client_receiver) = stand(None);
 
             dispatch_references(&mut state, 40);
@@ -4359,13 +4402,11 @@ mod tests {
         #[test]
         fn a_client_cancel_stops_the_walk_before_its_end() {
             let _serialised = serialised();
-            walk_probe::install();
-            walk_probe::reset();
             let (mut state, client_receiver) = stand(None);
 
+            let held = walk_probe::hold_walk_start();
             dispatch_references(&mut state, 41);
-            walk_probe::await_walk_start();
-            cancel(&mut state, 41);
+            held.cancel_once_entered(|| cancel(&mut state, 41));
             let response = response(&mut state, &client_receiver, 41);
 
             let err = response.error.expect("a cancelled walk must not answer with locations");
@@ -4383,13 +4424,11 @@ mod tests {
         #[test]
         fn a_cancelled_walk_hands_its_only_worker_to_the_next_request() {
             let _serialised = serialised();
-            walk_probe::install();
-            walk_probe::reset();
             let (mut state, client_receiver) = stand(Some(1));
 
+            let held = walk_probe::hold_walk_start();
             dispatch_references(&mut state, 42);
-            walk_probe::await_walk_start();
-            cancel(&mut state, 42);
+            held.cancel_once_entered(|| cancel(&mut state, 42));
             dispatch_references(&mut state, 43);
             let first = response(&mut state, &client_receiver, 42);
             let second = response(&mut state, &client_receiver, 43);

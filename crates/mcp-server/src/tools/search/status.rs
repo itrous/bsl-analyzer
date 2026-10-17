@@ -1329,14 +1329,16 @@ mod tests {
         // A barrier, not a sleep: the branch under test is the ONLY one that tells "the index
         // is held" from "there is no index", so it must not depend on the holder winning a
         // scheduling race against a fixed window.
+        // The lock is let go only once the read has answered, so the read cannot outlast it.
         let taken = Arc::new(std::sync::Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = {
             let held = Arc::clone(&held);
             let taken = Arc::clone(&taken);
             std::thread::spawn(move || {
                 let guard = held.lock().unwrap();
                 taken.wait();
-                std::thread::sleep(Duration::from_millis(200));
+                let _ = release_rx.recv();
                 drop(guard);
             })
         };
@@ -1355,6 +1357,7 @@ mod tests {
             Duration::from_millis(40),
         )
         .unwrap();
+        release_tx.send(()).unwrap();
         holder.join().unwrap();
         let busy = busy.content[0].as_text().expect("text").text.clone();
         assert!(busy.contains("not read"), "{busy}");
@@ -1772,7 +1775,9 @@ mod tests {
         let text = result.content[0].as_text().expect("expected text content").text.as_str();
         // The answer must not wait for the probe it started: a text check alone would pass a
         // status that waited, and a slow one whose text is unchanged.
-        assert!(started.elapsed() < Duration::from_millis(500), "status blocked on the probe");
+        if cfg!(timing_contract) {
+            assert!(started.elapsed() < Duration::from_millis(500), "status blocked on the probe");
+        }
         assert!(text.contains("probing the shared baseline in the background — retry shortly"));
         assert!(text.contains("first background status probe still running"));
         assert!(!text.contains("(published index)"));
@@ -1982,42 +1987,60 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("bsl-search.db");
         let engine = crate::state::shared_engine(Some(SearchEngine::fts_only(&db_path).unwrap()));
+        // The holder lets the lock go only after the status has answered, so a status that
+        // waited for the lock never answers and the shared watchdog below runs out.
         let gate = Arc::new(Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = {
             let engine = Arc::clone(&engine);
             let gate = Arc::clone(&gate);
             std::thread::spawn(move || {
                 let held = engine.lock().unwrap();
                 gate.wait();
-                std::thread::sleep(Duration::from_millis(300));
+                let _ = release_rx.recv();
                 drop(held);
             })
         };
         gate.wait();
-        let started = Instant::now();
-        let status = search_status_with_cap(
-            crate::McpProfile::Workspace,
-            &engine,
-            &Arc::new(IndexProgress::default()),
-            &Arc::new(Mutex::new(SemanticRuntimeStatus::OverlaySyncing)),
-            WorkspaceSearchMode::PostgresRemoteOverlay,
-            OverlayWarmupState::Pending,
-            Some(ConfiguredBaselineStatus {
-                backend: "postgres",
-                selection: "branch main".to_owned(),
-                issue: None,
-                support: None,
-            }),
-            None,
-            false,
-            EmptyIndex::Idle,
-            Duration::from_millis(40),
-        )
-        .unwrap();
-        let elapsed = started.elapsed();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let caller = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let status = search_status_with_cap(
+                    crate::McpProfile::Workspace,
+                    &engine,
+                    &Arc::new(IndexProgress::default()),
+                    &Arc::new(Mutex::new(SemanticRuntimeStatus::OverlaySyncing)),
+                    WorkspaceSearchMode::PostgresRemoteOverlay,
+                    OverlayWarmupState::Pending,
+                    Some(ConfiguredBaselineStatus {
+                        backend: "postgres",
+                        selection: "branch main".to_owned(),
+                        issue: None,
+                        support: None,
+                    }),
+                    None,
+                    false,
+                    EmptyIndex::Idle,
+                    Duration::from_millis(40),
+                )
+                .unwrap();
+                let elapsed = started.elapsed();
+                let text = status.content[0].as_text().expect("text content").text.clone();
+                let _ = answer_tx.send((text, elapsed));
+            })
+        };
+        let (text, elapsed) = answer_rx
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the status waited for the held engine lock");
+        release_tx.send(()).unwrap();
         holder.join().unwrap();
-        assert!(elapsed < Duration::from_secs(2));
-        let text = status.content[0].as_text().expect("text content").text.as_str();
+        caller.join().unwrap();
+        if cfg!(timing_contract) {
+            assert!(elapsed < Duration::from_secs(2));
+        }
+        let text = text.as_str();
         assert!(text.contains("Configured baseline:"));
         assert!(text.contains("Local index: busy (overlay syncing)"));
         assert!(text.contains("Lexical search: temporarily unavailable"));

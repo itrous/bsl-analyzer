@@ -3615,7 +3615,26 @@ mod tests {
 
     /// Bound on a status answer while the lease lock is held by the test: the call must answer
     /// at once, not after the lock's own wait, so the bound is the latency contract itself.
+    /// Checked only under `timing_contract`; the ordinary run keeps the lock held past the
+    /// calls, so a call that waits for it never answers and trips the shared watchdog.
     const HANG_GUARD: Duration = Duration::from_millis(500);
+
+    /// Awaits `call` under the shared hang watchdog; under `timing_contract` it must also have
+    /// answered within [`HANG_GUARD`].
+    async fn answered_without_the_lock<T>(
+        what: &str,
+        call: impl std::future::Future<Output = T>,
+    ) -> T {
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, call)
+            .await
+            .unwrap_or_else(|_| panic!("{what} must not wait for the lease lock"));
+        if cfg!(timing_contract) {
+            let waited = started.elapsed();
+            assert!(waited < HANG_GUARD, "{what} answered only after {waited:?}");
+        }
+        answer
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_status_requests_are_cached_under_held_lease() {
@@ -3634,8 +3653,8 @@ mod tests {
         lease.invalidate_verdict_for_test();
         let token = || tokio_util::sync::CancellationToken::new();
 
-        tokio::time::timeout(
-            HANG_GUARD,
+        answered_without_the_lock(
+            "metadata status",
             server.metadata(
                 Parameters(MetadataParams {
                     action: "status".to_owned(),
@@ -3655,11 +3674,10 @@ mod tests {
             ),
         )
         .await
-        .expect("metadata status must not wait for the lease lock")
         .expect("metadata status response");
 
-        tokio::time::timeout(
-            HANG_GUARD,
+        answered_without_the_lock(
+            "diagnostics status",
             server.diagnostics(
                 Parameters(DiagnosticsParams {
                     action: "status".to_owned(),
@@ -3680,11 +3698,10 @@ mod tests {
             ),
         )
         .await
-        .expect("diagnostics status must not wait for the lease lock")
         .expect("diagnostics status response");
 
-        tokio::time::timeout(
-            HANG_GUARD,
+        answered_without_the_lock(
+            "graph status",
             server.graph(
                 Parameters(GraphParams {
                     action: "status".to_owned(),
@@ -3706,7 +3723,6 @@ mod tests {
             ),
         )
         .await
-        .expect("graph status must not wait for the lease lock")
         .expect("graph status response");
 
         // The status path answers from what the lease already knows, so it takes no fence. The
@@ -4201,7 +4217,7 @@ mod graph_supersession_contract {
             })
         };
         let body = answered(
-            tokio::time::timeout(Duration::from_millis(500), asked)
+            tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, asked)
                 .await
                 .expect("the status request waited on the claim this test holds the lock against")
                 .expect("the status task did not panic"),
@@ -4292,7 +4308,7 @@ mod graph_supersession_contract {
                     .expect("status answers whatever the background is doing")
             })
         };
-        let answer = tokio::time::timeout(Duration::from_millis(500), asked)
+        let answer = tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, asked)
             .await
             .expect("the status request queued behind the background ownership check")
             .expect("the status task did not panic");
@@ -4516,6 +4532,7 @@ mod graph_supersession_contract {
         let server = McpServer::new(McpProfile::Workspace, state.clone());
 
         let before = state.lease_disk_check_threads().len();
+        let started = std::time::Instant::now();
         let asked = {
             let server = server.clone();
             tokio::spawn(async move {
@@ -4529,11 +4546,20 @@ mod graph_supersession_contract {
                     .expect("status answers whatever the lease is doing")
             })
         };
-        let answer = tokio::time::timeout(Duration::from_millis(500), asked)
+        // The lock stays held until after the answer, so a request that waited on it never
+        // answers and the shared watchdog runs out.
+        let answer = tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, asked)
             .await
             .expect("the status request waited on the held lease lock")
             .expect("the status task did not panic");
+        let waited = started.elapsed();
         assert!(matches!(answer, rmcp::model::CallToolResponse::Complete(_)));
+        if cfg!(timing_contract) {
+            assert!(
+                waited < Duration::from_millis(500),
+                "the status request waited {waited:?} on the held lease lock"
+            );
+        }
         let strangers = lease_reads_off_the_owners(&state, before);
         assert!(
             strangers.is_empty(),
@@ -4719,7 +4745,8 @@ mod graph_supersession_contract {
         // path consume the real workspace event first, while the graph publication remains
         // installed. The subsequent tool assertions then compare each service to its own
         // coherent resident snapshot during graph reload.
-        let resident_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let resident_deadline =
+            std::time::Instant::now() + crate::change_hub::test_support::STATE_CEILING;
         let shifted_resident = loop {
             let observed = diagnostics.read(|resident, _| {
                 let file_id = resident.file_id_for(&changed_path).expect("resident module");
@@ -5942,6 +5969,8 @@ mod search_cancellation_matrix {
 
     /// How long a cancelled call may take to come back. Well above one poll (25 ms) and well
     /// below every wait it must not sit out (a 2 s held lock, a 12 s embed, a latched actor).
+    /// Checked only under `timing_contract`: the ordinary run holds the lock until the call
+    /// has answered, so a call that sat the lock out never answers at all.
     const BOUND: std::time::Duration = std::time::Duration::from_millis(500);
 
     fn assert_cancelled(
@@ -5952,10 +5981,12 @@ mod search_cancellation_matrix {
         let error =
             answer.err().unwrap_or_else(|| panic!("{cell}: a cancelled call produced a body"));
         assert_eq!(error.message, "request cancelled", "{cell}: {error:?}");
-        assert!(
-            elapsed < BOUND,
-            "{cell}: answered only after {elapsed:?}, i.e. after the held lock"
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                elapsed < BOUND,
+                "{cell}: answered only after {elapsed:?}, i.e. after the held lock"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

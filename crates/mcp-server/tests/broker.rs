@@ -75,7 +75,10 @@ async fn connect(key: &BackendKey) -> std::io::Result<TokioStream> {
 
 #[cfg(any(unix, windows))]
 async fn connect_within(key: &BackendKey, budget: Duration) -> TokioStream {
-    let mut deadline = common::Patience::new(budget, std::time::Duration::from_millis(20));
+    let mut deadline = common::Patience::new(
+        test_utils::wait::ceiling(budget),
+        std::time::Duration::from_millis(20),
+    );
     loop {
         if let Ok(s) = connect(key).await {
             return s;
@@ -266,7 +269,9 @@ async fn superseded_backend_lifecycle() {
             ))
         },
         key_for(&src),
-        Duration::from_secs(30),
+        // An orphan grace no ordinary run reaches: the backend waits for this test's client
+        // however late it connects.
+        test_utils::wait::ceiling(Duration::from_secs(30)),
         Duration::from_secs(10),
     ));
     let stream = connect_within(&key_for(&src), Duration::from_secs(10)).await;
@@ -329,13 +334,17 @@ async fn superseded_backend_lifecycle() {
             ))
         },
         key_for(&transient_src),
-        Duration::from_secs(30),
+        test_utils::wait::ceiling(Duration::from_secs(30)),
         Duration::from_secs(10),
     ));
     let probe = connect_within(&key_for(&transient_src), Duration::from_secs(10)).await;
     drop(probe);
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert!(!transient_backend.is_finished(), "temporary UNCLAIMED must not terminate early");
+    if cfg!(timing_contract) {
+        // Five seconds of a ten-second idle TTL: whether the backend is still there then
+        // depends on how fast the stand reached this point.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!transient_backend.is_finished(), "temporary UNCLAIMED must not terminate early");
+    }
     drop(lock);
     transient_backend.abort();
 }

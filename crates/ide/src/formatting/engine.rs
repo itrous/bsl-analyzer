@@ -328,6 +328,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "необязательный тест: formatting speed on real code; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
+    )]
     fn test_format_real_code_performance() {
         // Вход подобран по форме, а не по происхождению: три процедуры со
         // сквозной передачей параметров, комментарии между операторами и вызовы
@@ -386,6 +390,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "необязательный тест: formatting speed on a large file; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
+    )]
     fn test_format_large_file_performance() {
         let mut code = String::new();
         for i in 0..100 {

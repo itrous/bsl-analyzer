@@ -871,8 +871,9 @@ mod tests {
     /// stretch before a deadline can be. A build that fails inside that stretch is a terminal
     /// answer — sticky, so nothing will move it — and a task that reports "still building"
     /// over it hands the caller a diagnosis that will never come true. Fails on a build whose
-    /// deadline arm answers on the spot instead of reading once more.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// deadline arm answers on the spot instead of reading once more. The clock is paused, so
+    /// the failure lands before the deadline however slowly the machine runs.
+    #[tokio::test(start_paused = true)]
     async fn a_deadline_does_not_speak_over_an_answered_lifecycle() {
         let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
         let manager = TaskManager::new();
@@ -912,19 +913,27 @@ mod tests {
     /// The sweeper measures use by reads, and a task that is waiting has nothing to read yet.
     /// Unmarked, the resident it is waiting for is evicted the moment it is published and the
     /// wait watches a build nobody restarts. Measured rather than asserted structurally: the
-    /// gate compares the idle age of an unattended state with the same state under a waiting
-    /// task, and only the marking can make the second smaller.
+    /// resident counts as used more recently than the task was started, and only the marking
+    /// can make it so.
     #[tokio::test]
     async fn a_waiting_task_counts_as_use_of_the_resident() {
         let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
         let dwell = READINESS_POLL * 3;
 
-        tokio::time::sleep(dwell).await;
-        let unattended = diag.access_age();
-        assert!(unattended >= dwell, "nothing has used it yet: {unattended:?}");
+        // The resident's last use is its creation, before the spawn below, so the comparison
+        // in the loop needs no pause to start from; the timing profile also measures one.
+        let unattended = if cfg!(timing_contract) {
+            tokio::time::sleep(dwell).await;
+            let unattended = diag.access_age();
+            assert!(unattended >= dwell, "nothing has used it yet: {unattended:?}");
+            Some(unattended)
+        } else {
+            None
+        };
 
         let manager = TaskManager::new();
         let waited_on = diag.clone();
+        let spawned = std::time::Instant::now();
         let task = manager.spawn(TaskOptions::new(), move |task_ctx| {
             Box::pin(async move {
                 let expires = tokio::time::Instant::now() + UNREACHABLE_DEADLINE;
@@ -932,14 +941,32 @@ mod tests {
                 Ok(CallToolResult::success(vec![]))
             })
         });
-        tokio::time::sleep(dwell).await;
-        let attended = diag.access_age();
+        // The task's age is read before the resident's, so an unmarked resident, last used
+        // before the spawn, always reads older than the task however slowly this loop runs.
+        // The task marks the resident on its first pass, so yielding to it is all the wait.
+        let deadline = std::time::Instant::now() + crate::change_hub::test_support::STATE_CEILING;
+        loop {
+            let waiting_for = spawned.elapsed();
+            let idle = diag.access_age();
+            if idle < waiting_for {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a task has been waiting for {waiting_for:?} and the resident still counts as \
+                 unused for {idle:?}, so the sweeper is free to evict it from under the wait"
+            );
+            tokio::task::yield_now().await;
+        }
+        if let Some(unattended) = unattended {
+            tokio::time::sleep(dwell).await;
+            let attended = diag.access_age();
+            assert!(
+                attended < unattended,
+                "a task has been waiting for {dwell:?} and the resident still counts as unused \
+                 for {attended:?}, so the sweeper is free to evict it from under the wait"
+            );
+        }
         manager.cancel_task(&task.task_id).expect("the waiting task is addressable");
-
-        assert!(
-            attended < unattended,
-            "a task has been waiting for {dwell:?} and the resident still counts as unused \
-             for {attended:?}, so the sweeper is free to evict it from under the wait"
-        );
     }
 }

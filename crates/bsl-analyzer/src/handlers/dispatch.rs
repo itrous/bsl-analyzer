@@ -688,6 +688,10 @@ mod tests {
     use lsp_types::request::{HoverRequest, Request as _, Shutdown};
     use std::time::Duration;
 
+    /// Bound of a wait for a task that a regression would never deliver; a hang watchdog,
+    /// not a latency measure.
+    const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+
     fn response_task(task: Task) -> Response {
         match task {
             Task::LatencyRequestFinished {
@@ -779,9 +783,8 @@ mod tests {
             .on_latency::<HoverRequest>(|_ctx, _p| Ok(None))
             .finish();
 
-        let task = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("task pool did not produce RequestResult");
+        let task =
+            receiver.recv_timeout(HANG_WATCHDOG).expect("task pool did not produce RequestResult");
         let response = response_task(task);
         assert_eq!(response.id, lsp_server::RequestId::from(42));
         assert!(response.error.is_none(), "happy path must not set error");
@@ -806,9 +809,8 @@ mod tests {
             .on_latency::<HoverRequest>(|_ctx, _p| panic!("handler boom"))
             .finish();
 
-        let task = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("task pool did not produce RequestResult");
+        let task =
+            receiver.recv_timeout(HANG_WATCHDOG).expect("task pool did not produce RequestResult");
         let response = response_task(task);
         assert_eq!(response.id, lsp_server::RequestId::from(7));
         let err = response.error.expect("panic must produce error");
@@ -841,7 +843,7 @@ mod tests {
         let task = state
             .task_pool
             .receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(HANG_WATCHDOG)
             .expect("the first job must answer");
         assert!(
             matches!(
@@ -1116,15 +1118,13 @@ mod tests {
             .finish();
 
         // The handler completes once, producing exactly one Ok response.
-        let task = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("task pool did not produce RequestResult");
+        let task =
+            receiver.recv_timeout(HANG_WATCHDOG).expect("task pool did not produce RequestResult");
         let token = state.request_tokens.get(&id).expect("attempt token is registered").clone();
         crate::server::handle_task(&mut state, task)
             .expect("event loop applies request completion");
-        let lsp_server::Message::Response(response) = client_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("event loop sends one response")
+        let lsp_server::Message::Response(response) =
+            client_receiver.recv_timeout(HANG_WATCHDOG).expect("event loop sends one response")
         else {
             panic!("expected request response")
         };

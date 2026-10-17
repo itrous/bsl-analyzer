@@ -531,13 +531,22 @@ mod tests {
             })
         };
         gate.wait();
-        std::thread::sleep(HOLD);
+        assert!(
+            crate::change_hub::test_support::eventually(|| engine.queued() == 1),
+            "probe must queue on the held lock"
+        );
         assert!(entered.load(Ordering::SeqCst), "probe must reach the acquire under contention");
+        assert!(!probe.is_finished(), "acquire returned while the lock was still held");
+        if cfg!(timing_contract) {
+            std::thread::sleep(HOLD);
+        }
         drop(held);
         let (acquired, waited) = probe.join().unwrap();
 
         assert!(acquired, "acquire must succeed once the lock frees");
-        assert!(waited >= HOLD / 2, "acquire returned too fast to have queued: {waited:?}");
+        if cfg!(timing_contract) {
+            assert!(waited >= HOLD / 2, "acquire returned too fast to have queued: {waited:?}");
+        }
     }
 
     #[test]
@@ -570,16 +579,27 @@ mod tests {
             })
         };
         assert!(poisoner.join().is_err());
+        // A cap no ordinary run reaches, so an acquire that waited it out never returns; under
+        // `timing_contract` half a minute, and the clock says it was not waited out.
+        let cap = test_utils::wait::ceiling(Duration::from_secs(30));
         let started = Instant::now();
         let outcome = acquire_engine_within(
             &engine,
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            cap,
             Duration::from_millis(10),
         );
+        let waited = started.elapsed();
 
         assert!(matches!(outcome, Err(AcquireFailure::Poisoned)));
-        assert!(started.elapsed() < Duration::from_secs(1), "poison must not block on the cap");
+        if cfg!(timing_contract) {
+            // Half the cap: an acquire that waited the cap out is caught, a slow machine is not.
+            assert!(waited < cap / 2, "poison must not block on the cap: {waited:?}");
+            assert!(
+                waited < Duration::from_secs(1),
+                "poison must not block on the cap: {waited:?}"
+            );
+        }
     }
 
     /// A request cancelled while queued on a held lock stops waiting at once: it is the
@@ -590,10 +610,15 @@ mod tests {
         let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         let held = engine.lock().unwrap();
         let cancel = CancellationToken::new();
+        // The pause that has the request queued before it is cancelled is the timing profile's;
+        // a cancellation that lands first must end the wait just the same. The cap is one no
+        // ordinary run reaches, so only the cancellation can end the wait.
         let canceller = {
             let cancel = cancel.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                if cfg!(timing_contract) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 cancel.cancel();
             })
         };
@@ -601,7 +626,7 @@ mod tests {
         let outcome = acquire_engine_within(
             &engine,
             &cancel,
-            Duration::from_secs(2),
+            test_utils::wait::ceiling(Duration::from_secs(2)),
             Duration::from_millis(10),
         );
         let waited = started.elapsed();
@@ -612,10 +637,12 @@ mod tests {
             matches!(outcome, Err(AcquireFailure::Cancelled)),
             "a cancelled wait acquires nothing"
         );
-        assert!(
-            waited < Duration::from_millis(500),
-            "the wait must end at the cancellation, not at the cap: {waited:?}"
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                waited < Duration::from_millis(500),
+                "the wait must end at the cancellation, not at the cap: {waited:?}"
+            );
+        }
     }
 
     /// A token already cancelled before the wait begins is answered without a single poll,

@@ -99,10 +99,12 @@ mod tests {
         let ct = CancellationToken::new();
         let seen = Arc::new(AtomicUsize::new(0));
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (stored_tx, stored_rx) = std::sync::mpsc::channel::<()>();
         let probe = Arc::clone(&seen);
         let call = search_call(ct.clone(), move |cancel| {
             release_rx.recv().ok();
             probe.store(usize::from(cancel.is_cancelled()) + 1, Ordering::SeqCst);
+            let _ = stored_tx.send(());
             Err(SearchFailure::Cancelled)
         });
         tokio::pin!(call);
@@ -110,8 +112,10 @@ mod tests {
         let out = (&mut call).await;
         assert!(matches!(out, CallOutcome::Cancelled));
         release_tx.send(()).unwrap();
-        // The detached body runs on; give it a moment to record what it saw.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The detached body runs on; wait until it has recorded what it saw.
+        stored_rx
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the detached body never recorded what it saw");
         assert_eq!(seen.load(Ordering::SeqCst), 2, "the body must see the request's cancel");
     }
 

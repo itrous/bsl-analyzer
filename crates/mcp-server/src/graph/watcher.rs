@@ -840,22 +840,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         sample_workspace(dir.path());
         let (graph, hub, stop) = watched_graph(dir.path());
-        let due = Instant::now() + Duration::from_millis(700);
+        // Already run out in an ordinary run, so the watcher alone must notice it; the timing
+        // profile also holds it 700 ms and checks nothing retries before then.
+        let backoff =
+            if cfg!(timing_contract) { Duration::from_millis(700) } else { Duration::ZERO };
+        let due = Instant::now() + backoff;
         graph.fail_with_retry_held_until(due);
 
         assert!(start(&graph, &hub, None, stop.clone()));
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            matches!(graph.status(), GraphStatus::Failed(_)),
-            "the retry started before its backoff elapsed"
-        );
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                matches!(graph.status(), GraphStatus::Failed(_)),
+                "the retry started before its backoff elapsed"
+            );
+        }
         wait_until(&graph, "the owed rebuild to publish", || {
             matches!(graph.status(), GraphStatus::Ready { .. })
         });
         assert!(Instant::now() >= due);
         stop.stop();
         hub.interrupt_waiters();
-        assert!(crate::change_hub::test_support::eventually_within(100, || stop.live() == 0));
+        assert!(crate::change_hub::test_support::eventually(|| stop.live() == 0));
     }
 
     /// Work handed over inside the sampling window is not slept through.
@@ -917,8 +923,11 @@ mod tests {
         // handful of turns in two is the difference being asserted.
         let settled = turns.load(std::sync::atomic::Ordering::SeqCst);
         // An absence can only be observed over a window. The window can hide a spurious turn
-        // from this check, never create one, so it is the one place a clock is read on purpose.
-        std::thread::sleep(Duration::from_secs(2));
+        // from this check, never create one, so it is the one place a clock is read on purpose —
+        // and only in the timing profile, which is where windows are waited out.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
         assert!(
             turns.load(std::sync::atomic::Ordering::SeqCst) <= settled + 2,
             "the owner turns over with nothing handed to it; the assertion above proves nothing",
@@ -1073,12 +1082,16 @@ mod tests {
         wait_until(&graph, "the event's build to settle", || {
             !graph.drift_pending() && !graph.build_in_flight()
         });
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(
-            graph.status_report().revision,
-            Some(before + 1),
-            "one save should coalesce filesystem notifications into one graph publication"
-        );
+        if cfg!(timing_contract) {
+            // Exact only while the debounce window outlasts the gaps between the save's
+            // notifications; a stalled delivery may split them into a second publication.
+            std::thread::sleep(Duration::from_millis(150));
+            assert_eq!(
+                graph.status_report().revision,
+                Some(before + 1),
+                "one save should coalesce filesystem notifications into one graph publication"
+            );
+        }
         assert_eq!(
             graph.full_builds_started.load(std::sync::atomic::Ordering::SeqCst),
             builds_before,

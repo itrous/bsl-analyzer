@@ -5793,18 +5793,32 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use std::{path::PathBuf, sync::Arc};
 
-    /// Attempts a state wait makes before it gives up. The bound is a count of polls, not a
-    /// span of time: a loaded machine stretches every poll, so a state that is merely late
-    /// still arrives inside the bound, and only a state that never comes exhausts it. It
-    /// guards against a hang and is never the thing a test is asserting about.
+    /// Attempts a state wait makes under `timing_contract` before it gives up: a count of polls,
+    /// not a span of time, so a loaded machine that stretches every poll still fits a merely late
+    /// state inside it. An ordinary run makes no such count — see [`test_utils::wait`].
     const STATE_ATTEMPTS: u32 = 6_000;
 
     /// The ceiling every hand-written state wait is counted against: [`STATE_ATTEMPTS`] polls
-    /// at the ordinary ten-millisecond step.
-    pub(crate) const STATE_CEILING: Duration = Duration::from_secs(60);
+    /// at the ordinary ten-millisecond step under `timing_contract`, and none otherwise.
+    pub(crate) const STATE_CEILING: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
+    /// Whether the hub's thread has left: nobody holds the other end of its control channel any
+    /// more. Probed with a tick, which a thread still there would answer with a poll — so a test
+    /// that reads polls after a stop sees a thread that outlived it either way.
+    pub(crate) fn thread_has_left(hub: &WorkspaceChangeHub) -> bool {
+        matches!(
+            hub.control().try_send(super::HubMsg::Tick),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_))
+        )
+    }
+
+    /// Polls `f` until it holds: a wait for a state the test goes on to assert, bounded by
+    /// [`STATE_CEILING`] only under `timing_contract`.
     pub(crate) fn eventually(f: impl FnMut() -> bool) -> bool {
-        eventually_within(STATE_ATTEMPTS, f)
+        if cfg!(timing_contract) {
+            return eventually_within(STATE_ATTEMPTS, f);
+        }
+        test_utils::wait::poll_until(STATE_CEILING, Duration::from_millis(10), f)
     }
 
     /// The polls a hand-written wait may spend: a ceiling read as "this many polls at one per
@@ -5854,8 +5868,10 @@ pub(crate) mod test_support {
         }
     }
 
-    /// [`eventually`] with a bound of its own, for a wait whose event is scheduled by a
-    /// production retry rather than by the work the test drives.
+    /// [`eventually`] with a bound of its own, in every run: `attempts` polls. For a window a
+    /// test reads either way — a statement given the time to become false before it is
+    /// believed — and for a wait whose event is scheduled by a production retry rather than by
+    /// the work the test drives.
     pub(crate) fn eventually_within(attempts: u32, mut f: impl FnMut() -> bool) -> bool {
         let started = std::time::Instant::now();
         for _ in 0..attempts {
@@ -6648,9 +6664,13 @@ mod tests {
 
         // The answer is the failure itself: a wait that had run out its thirty seconds would say
         // NotYet, so no clock is read to tell the two apart.
+        let budget = Duration::from_secs(30);
         let asked = Instant::now();
-        assert_eq!(hub.watch_readiness(Duration::from_secs(30)), WatchReadiness::Failed);
-        assert!(asked.elapsed() < Duration::from_secs(5), "the failure is answered at once");
+        assert_eq!(hub.watch_readiness(budget), WatchReadiness::Failed);
+        if cfg!(timing_contract) {
+            assert!(asked.elapsed() < budget / 2, "the failure is answered at once");
+            assert!(asked.elapsed() < Duration::from_secs(5), "the failure is answered at once");
+        }
         assert_eq!(hub.health(), Health::Degraded(DegradeReason::WatcherSetup));
     }
 
@@ -6664,11 +6684,11 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
-        assert_eq!(hub.watch_readiness(Duration::from_millis(50)), WatchReadiness::NotYet);
+        assert_eq!(hub.watch_readiness(Duration::ZERO), WatchReadiness::NotYet);
         assert_eq!(hub.health(), Health::Healthy, "nothing has gone wrong yet");
 
         hold.release();
-        assert_eq!(hub.watch_readiness(Duration::from_secs(5)), WatchReadiness::Armed);
+        assert_eq!(hub.watch_readiness(STATE_CEILING), WatchReadiness::Armed);
     }
 
     /// Two aliases of one directory canonicalize the same, so the declaration dropping the
@@ -7912,7 +7932,16 @@ mod tests {
     /// On release the worker carries the debt, drops `acc` and stops on that second read,
     /// holding nothing; this thread waits for the old cursor to leave the map and raises a
     /// fresh window right there, with the worker still in the gap.
+    ///
+    /// The worker is placed past its first read by a pause: nothing it does between that read
+    /// and the accumulator shows outside the hub. A worker the pause has not moved that far
+    /// blocks on the lock this thread then takes, and the two wait on each other, so the stand
+    /// belongs to the timing profile.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "необязательный тест: a pause places the worker past its first read; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
+    )]
     fn resubscribing_captures_the_debt_it_carried_before_a_window_can_replace_it() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
@@ -8228,7 +8257,7 @@ mod tests {
         );
         let cursor = hub.subscribe();
         hold.release();
-        assert_eq!(hub.watch_readiness(Duration::from_secs(5)), WatchReadiness::Failed);
+        assert_eq!(hub.watch_readiness(STATE_CEILING), WatchReadiness::Failed);
         assert!(eventually(|| hub.is_polling() && hub.drain_peek(cursor)));
         (hub, cursor)
     }
@@ -8510,12 +8539,17 @@ mod tests {
             PollConfig { period: Duration::from_millis(20), verify_bytes: VERIFY_BYTES },
         );
         hold.release();
-        assert_eq!(hub.watch_readiness(Duration::from_secs(5)), WatchReadiness::Failed);
+        assert_eq!(hub.watch_readiness(STATE_CEILING), WatchReadiness::Failed);
         assert!(eventually(|| hub.poll_count() >= 2));
+        assert!(!thread_has_left(&hub), "control: a running hub's thread reads as still there");
 
         hub.shutdown();
+        // The poll runs on the hub's thread: once that thread has left, nothing is left to poll.
+        assert!(eventually(|| thread_has_left(&hub)), "the poll outlived the daemon that owned it");
         let stopped = hub.poll_count();
-        std::thread::sleep(Duration::from_millis(120));
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(120));
+        }
         assert_eq!(hub.poll_count(), stopped, "the poll outlived the daemon that owned it");
     }
 
@@ -8693,7 +8727,11 @@ mod tests {
             batch.entries.iter().any(|entry| entry.raw.ends_with("New.bsl"))
         });
         assert!(delivered, "a change under the blind root never reached the cursor");
-        std::thread::sleep(Duration::from_millis(200));
+        // A reconcile no poll should raise is an absence. Only the timing profile waits a
+        // window out for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
         assert_eq!(hub.rescan_request_count(), rescans, "polls raised reconciles of their own");
         hub.shutdown();
     }
@@ -9500,11 +9538,10 @@ mod tests {
         );
         let started = Instant::now();
         hub.shutdown();
-        assert!(
-            eventually_within(500, || !hub.blind_poll_running()),
-            "the blind poll outlived the hub",
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(eventually(|| !hub.blind_poll_running()), "the blind poll outlived the hub",);
+        if cfg!(timing_contract) {
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
     }
 
     /// A hub whose blind root `b` holds two files, with `subscribers` cursors taken before its
@@ -9804,8 +9841,11 @@ mod tests {
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("the declaration was never asked for");
         // The reconcile is held at the barrier, so the join it would announce cannot come yet. A
-        // window can only hide such a join from this check, never invent one, so it is a window.
-        std::thread::sleep(Duration::from_secs(2));
+        // window can only hide such a join from this check, never invent one, so it is a window,
+        // and only the timing profile waits it out.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
         let joined_at_the_barrier = published_blind(&hub).contains(&c);
 
         barrier.release();
@@ -9895,25 +9935,41 @@ mod tests {
     fn interrupted_waiters_return_at_once_and_stay_released() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
+        // Each wait below would sleep its whole budget. An ordinary run gives it one no run
+        // reaches, so a wait that comes back at all was released; under `timing_contract` the
+        // budget is a minute, and half of that tells a released wait from one that slept on.
+        const WAIT: Duration = STATE_CEILING;
         let since = hub.generation();
         let waiter = {
             let hub = hub.clone();
             std::thread::spawn(move || {
                 let started = Instant::now();
-                hub.wait_for_change(since, Duration::from_secs(60));
+                hub.wait_for_change(since, WAIT);
                 started.elapsed()
             })
         };
-        std::thread::sleep(Duration::from_millis(100));
+        // Nothing tells when the waiter has parked, and an interruption that lands before it
+        // does must release it just the same; the timing profile aims at the parked wait.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         hub.interrupt_waiters();
-        assert!(waiter.join().unwrap() < Duration::from_secs(5), "the parked wait slept on");
+        let parked = waiter.join().unwrap();
 
         let started = Instant::now();
-        hub.wait_for_change(hub.generation(), Duration::from_secs(60));
-        assert!(started.elapsed() < Duration::from_secs(1), "a later wait slept on");
+        hub.wait_for_change(hub.generation(), WAIT);
+        let later = started.elapsed();
         let started = Instant::now();
-        hub.watch_readiness(Duration::from_secs(60));
-        assert!(started.elapsed() < Duration::from_secs(1), "a readiness wait slept on");
+        hub.watch_readiness(WAIT);
+        let readiness = started.elapsed();
+        if cfg!(timing_contract) {
+            assert!(parked < WAIT / 2, "the parked wait slept on");
+            assert!(later < WAIT / 2, "a later wait slept on");
+            assert!(readiness < WAIT / 2, "a readiness wait slept on");
+            assert!(parked < Duration::from_secs(5), "the parked wait slept on");
+            assert!(later < Duration::from_secs(1), "a later wait slept on");
+            assert!(readiness < Duration::from_secs(1), "a readiness wait slept on");
+        }
         hub.shutdown();
     }
 
@@ -10685,13 +10741,15 @@ mod tests {
         let (hub, hold) = WorkspaceChangeHub::start_targets_held(vec![WatchTarget::recursive(
             dir.path().to_path_buf(),
         )]);
-        assert_eq!(hub.watch_readiness(Duration::from_millis(50)), WatchReadiness::NotYet);
+        assert_eq!(hub.watch_readiness(Duration::ZERO), WatchReadiness::NotYet);
 
         let started = Instant::now();
         drop(hold);
         drop(hub);
         let waited = started.elapsed();
-        assert!(waited < STOP_BUDGET, "a released hub stops without its budget: {waited:?}");
+        if cfg!(timing_contract) {
+            assert!(waited < STOP_BUDGET, "a released hub stops without its budget: {waited:?}");
+        }
     }
 
     /// An explicit `shutdown` and the last handle's `Drop` reach the same stop, so the two
@@ -10709,7 +10767,12 @@ mod tests {
         let started = Instant::now();
         drop(hub);
         let waited = started.elapsed();
-        assert!(waited < STOP_BUDGET, "a stop with nothing left to stop is immediate: {waited:?}");
+        if cfg!(timing_contract) {
+            assert!(
+                waited < STOP_BUDGET,
+                "a stop with nothing left to stop is immediate: {waited:?}"
+            );
+        }
     }
 
     /// On FSEvents an arm is a whole-stream swap: the running stream is stopped and a

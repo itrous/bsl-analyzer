@@ -555,22 +555,60 @@ mod tests {
         let graph = crate::graph::GraphState::for_workspace_with_cache(root.to_path_buf(), cache)
             .with_lease(lease.clone());
         graph.ensure_first_build();
-        crate::graph::test_support::wait_ready(&graph);
+        // Settled, not merely ready: the publish pass checks ownership too, and one still
+        // running when the verdict is dropped below would pause admission on its own.
+        crate::graph::test_support::wait_settled(&graph);
         let held_lease = lease.hold_file_lock_for_test();
         std::fs::remove_file(lease_path).unwrap();
         lease.invalidate_verdict_for_test();
+        // Every ownership check — the heartbeat's, a pass's — now queues on the lifecycle lock
+        // for the whole window instead of answering "unknown" and pausing admission.
+        let lifecycle = lease.hold_lifecycle_lock_for_test();
 
-        let started = std::time::Instant::now();
-        let first = graph.snapshot().expect("a resident descriptor needs no lease refresh");
-        let descriptors: Vec<_> = (1..crate::graph::SNAPSHOT_POOL_CAP)
-            .map(|_| graph.snapshot().expect("published descriptor"))
-            .collect();
-        assert!(graph.snapshot().is_none());
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
-
+        // Taken off this thread: a descriptor that went to the lease would queue behind the
+        // lock held here and never come back before the watchdog.
+        let (answer_tx, answer) = std::sync::mpsc::channel();
+        let (finish_tx, finish) = std::sync::mpsc::channel::<()>();
+        let reader = {
+            let graph = graph.clone();
+            let lease = lease.clone();
+            std::thread::spawn(move || {
+                let fences = lease.disk_checks_on_this_thread();
+                let started = std::time::Instant::now();
+                let first = graph.snapshot();
+                let descriptors: Vec<_> =
+                    (1..crate::graph::SNAPSHOT_POOL_CAP).map(|_| graph.snapshot()).collect();
+                let over_cap = graph.snapshot().is_none();
+                let waited = started.elapsed();
+                let _ = answer_tx.send((
+                    first.is_some(),
+                    descriptors.iter().all(Option::is_some),
+                    over_cap,
+                    lease.disk_checks_on_this_thread() == fences,
+                    waited,
+                ));
+                let _ = finish.recv();
+                drop(first);
+                drop(descriptors);
+            })
+        };
+        let answered = answer.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
+        drop(lifecycle);
         drop(held_lease);
-        drop(first);
-        drop(descriptors);
+        drop(finish_tx);
+        // Answered before the join: a thread still stuck past the watchdog is left behind
+        // rather than waited on without a bound.
+        let (first, published, over_cap, no_fence, waited) =
+            answered.expect("a descriptor request waited on the lease");
+        reader.join().unwrap();
+
+        assert!(first, "a resident descriptor needs no lease refresh");
+        assert!(published, "published descriptor");
+        assert!(over_cap, "a request past the pool cap gets an immediate miss");
+        assert!(no_fence, "a descriptor request consulted the lease");
+        if cfg!(timing_contract) {
+            assert!(waited < std::time::Duration::from_millis(100));
+        }
         lease.release();
     }
 

@@ -6,18 +6,20 @@ use std::time::Duration;
 use mcp_server::McpServer;
 use serde_json::Value;
 
-/// How many times an answer that depends on a write reaching the resident is asked for. The
-/// bound counts asks, not seconds: a starved watcher thread takes longer to deliver, and a
-/// loaded machine stretches every ask, but neither can turn a delivered answer into a failure.
-/// Only an answer that never comes exhausts it, which is a broken mechanism, not a slow one.
+/// How many times an answer that depends on a write reaching the resident is asked for under
+/// `timing_contract`. The bound counts asks, not seconds: a starved watcher thread takes longer
+/// to deliver, and a loaded machine stretches every ask, but neither can turn a delivered answer
+/// into a failure. Only an answer that never comes exhausts it, which is a broken mechanism, not
+/// a slow one. An ordinary run asks until the answer comes.
 const DELIVERY_ATTEMPTS: u32 = 600;
 
-/// The ceiling every hand-written state wait is counted against: one minute, read as polls.
+/// The ceiling every hand-written state wait is counted against: one minute, read as polls,
+/// under `timing_contract`; none otherwise (see [`test_utils::wait`]).
 ///
 /// A poll budget, not a clock: [`Patience::allows`] spends one poll per call, so a wait that
 /// loops on it gives up after the same number of polls however fast the machine is.
 #[allow(dead_code)]
-pub const STATE_CEILING: Duration = Duration::from_secs(60);
+pub const STATE_CEILING: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
 #[allow(dead_code)]
 pub struct Patience {
@@ -64,16 +66,27 @@ impl std::ops::Deref for Retired {
 
 impl Drop for Retired {
     fn drop(&mut self) {
-        self.0.shutdown_within(RETIRE_BUDGET);
+        // A test that is already failing reports only once it ends, so an owner that never
+        // stops must not keep it from ending; the bound decides nothing the test asserts.
+        let budget = if std::thread::panicking() { UNWIND_RETIRE_BUDGET } else { RETIRE_BUDGET };
+        self.0.shutdown_within(budget);
     }
 }
 
-/// Bound on an owner leaving. An owner always leaves at its next wake, after at most the batch
-/// it has in hand, so this is reached only by an owner that never stops.
+/// Bound on an owner leaving while a failed test unwinds, in every profile. Not every binary
+/// that declares this module uses it, hence the allowance.
 #[allow(dead_code)]
-const RETIRE_BUDGET: Duration = Duration::from_secs(180);
+const UNWIND_RETIRE_BUDGET: Duration = Duration::from_secs(180);
 
-/// Ask until the answer is the one the test asserts, or fail saying it never came.
+/// Bound on an owner leaving under `timing_contract`; none otherwise. An owner always leaves at
+/// its next wake, after at most the batch it has in hand, so this is reached only by an owner
+/// that never stops.
+#[allow(dead_code)]
+const RETIRE_BUDGET: Duration = test_utils::wait::ceiling(Duration::from_secs(180));
+
+/// Ask until the answer is the one the test asserts; under `timing_contract`, fail saying it
+/// never came once [`DELIVERY_ATTEMPTS`] asks are spent. An ordinary run asks until it comes, so
+/// an answer that never does is a hang left to the runner.
 ///
 /// The shape every gate over a post-startup disk write needs. Such a write reaches the
 /// resident by two mechanisms, and BOTH can be late: the change hub's drain runs on a
@@ -82,7 +95,8 @@ const RETIRE_BUDGET: Duration = Duration::from_secs(180);
 /// test that fails for something it does not measure.
 ///
 /// This does not soften anything. `accept` is the test's own claim, so an answer that
-/// never satisfies it still fails, with the last answer quoted; a claim about what must
+/// never satisfies it is never taken for one, and in the timing profile it fails with the last
+/// answer quoted; a claim about what must
 /// STAY absent is not asked this way at all — one call already settles it, and asking
 /// again could only be answered by the thing the control says is not there.
 pub async fn settled<Ask, Fut>(
@@ -95,7 +109,8 @@ where
     Fut: Future<Output = Value>,
 {
     let mut last = Value::Null;
-    for _ in 0..DELIVERY_ATTEMPTS {
+    let asks = test_utils::wait::polls(ASK_AGAIN_EVERY * DELIVERY_ATTEMPTS, ASK_AGAIN_EVERY);
+    for _ in 0..asks {
         let answer = ask().await;
         if accept(&answer) {
             return answer;

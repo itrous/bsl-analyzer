@@ -17,7 +17,7 @@ rust-version = "1.95"
 [workspace.lints.rust]
 # `--cfg corpus_contract` selects the tests that need the platform help corpus;
 # see docs/contributing/DEVELOPMENT_RULES.md.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(corpus_contract)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(corpus_contract)', 'cfg(timing_contract)'] }
 
 [workspace.dependencies]
 bsl-analyzer = { path = "crates/bsl-analyzer" }

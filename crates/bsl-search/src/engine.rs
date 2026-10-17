@@ -6637,6 +6637,10 @@ mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
+    /// not a latency measure.
+    const HANG_WATCHDOG: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
 
     /// A pause is reversible, and that is all it is. Held past the end of the pass it paused —
     /// an ordering nothing reaches today and nothing forbade either — a guard that raised the
@@ -7494,7 +7498,17 @@ mod tests {
                         if let Some(max_active) = max_active.as_ref() {
                             let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                             max_active.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            // Answer only once two requests have been in flight together, so
+                            // the overlap does not depend on how fast the second one arrives.
+                            // A sequential client never gets there: under `timing_contract` it
+                            // is answered at the watchdog and the concurrency assertion rejects
+                            // it, while an ordinary run waits for the second request and hangs.
+                            let give_up = std::time::Instant::now() + HANG_WATCHDOG;
+                            while max_active.load(std::sync::atomic::Ordering::SeqCst) < 2
+                                && std::time::Instant::now() < give_up
+                            {
+                                std::thread::yield_now();
+                            }
                         }
                         let data: Vec<_> = (0..input_count)
                         .map(|index| serde_json::json!({"index": index, "embedding": [1.0, 0.0, 0.0]}))
@@ -12591,7 +12605,7 @@ mod tests {
             // Held until the open has been admitted twice, so the release is caused by the
             // behaviour under test rather than by a clock. The deadline only keeps a failing
             // build from hanging: an open that never comes back releases on it and fails below.
-            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let give_up = std::time::Instant::now() + HANG_WATCHDOG;
             while observed.load(std::sync::atomic::Ordering::SeqCst) < 2
                 && std::time::Instant::now() < give_up
             {

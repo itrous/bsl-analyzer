@@ -1625,14 +1625,18 @@ mod tests {
         )
         .is_ok();
         let waited = started.elapsed();
+        // The read is still parked, so the engine was taken while it was under way.
+        assert!(!preparer.is_finished(), "the stored-key read ended before the request");
+        assert!(acquired, "the request did not get the engine behind the stored-key read");
         release_tx.send(()).unwrap();
         let plan = preparer.join().unwrap();
 
-        assert!(acquired);
-        assert!(
-            waited < crate::tools::search::ACQUIRE_POLL,
-            "the request waited {waited:?} behind the stored-key read"
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                waited < crate::tools::search::ACQUIRE_POLL,
+                "the request waited {waited:?} behind the stored-key read"
+            );
+        }
         assert!(!plan.context_keys.is_empty(), "the mark still covers every stored key");
     }
 
@@ -2032,14 +2036,18 @@ mod tests {
         fs::write(workspace.join("Early.bsl"), "Процедура Ранняя() КонецПроцедуры\n").unwrap();
         // Each probe sleeps 200 ms, so the attempt count is the budget: 100 of them is about
         // 20 s. Counting attempts alone would stretch a failure to the hang guard instead.
-        let mut last = hub.generation();
-        assert!(eventually_within(100, || {
-            std::thread::sleep(Duration::from_millis(200));
-            let now = hub.generation();
-            let quiet = now > 0 && now == last;
-            last = now;
-            quiet
-        }));
+        // Quiet is itself a window, and so is the absence it prepares, so both are the timing
+        // profile's; an ordinary run checks that late work opens the next batch.
+        if cfg!(timing_contract) {
+            let mut last = hub.generation();
+            assert!(eventually_within(100, || {
+                std::thread::sleep(Duration::from_millis(200));
+                let now = hub.generation();
+                let quiet = now > 0 && now == last;
+                last = now;
+                quiet
+            }));
+        }
 
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = {
@@ -2057,10 +2065,12 @@ mod tests {
                 let _ = tx.send(());
             })
         };
-        assert!(
-            rx.recv_timeout(Duration::from_millis(500)).is_err(),
-            "the batch from inside the spent budget opened another one"
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "the batch from inside the spent budget opened another one"
+            );
+        }
 
         fs::write(workspace.join("Late.bsl"), "Процедура Поздняя() КонецПроцедуры\n").unwrap();
         assert!(
@@ -3090,27 +3100,38 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
+        // Read before the releaser starts its sleep, so the release can only come later. The
+        // sleep that makes slices expire first is the timing profile's; an ordinary run
+        // releases whenever the releaser gets there, and the budget is one no run reaches.
+        let started = Instant::now();
         let releaser = {
             let hold = hold.shared();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(100));
+                if cfg!(timing_contract) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
                 hold.release();
             })
         };
-        let started = Instant::now();
         let armed = SharedState::await_watch(
             &hub,
             &crate::state::OwnerStop::default(),
-            super::WatchWaitPolicy::new(Duration::from_millis(5), Duration::from_secs(30)),
+            super::WatchWaitPolicy::new(
+                Duration::from_millis(5),
+                crate::change_hub::test_support::STATE_CEILING,
+            ),
         );
         let waited = started.elapsed();
         releaser.join().unwrap();
 
         assert!(armed, "a hub that is merely slow to start must not be given up on");
-        assert!(
-            waited >= Duration::from_millis(100),
-            "the wait has to have crossed several expired slices to prove it resumed: {waited:?}"
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                waited >= Duration::from_millis(100),
+                "the wait has to have crossed several expired slices to prove it resumed: \
+                 {waited:?}"
+            );
+        }
     }
 
     /// The budget is what bounds the wait — not a count of slices, which is what a naive
@@ -3158,19 +3179,29 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
+        // A slice far longer than the budget: one no ordinary run reaches, so a wait that spent
+        // a whole slice never returns; under `timing_contract` half a minute, caught at half of
+        // it, a bound no slow machine reaches for a twenty-millisecond budget.
+        let slice = test_utils::wait::ceiling(Duration::from_secs(30));
         let started = Instant::now();
         let armed = SharedState::await_watch(
             &hub,
             &crate::state::OwnerStop::default(),
-            super::WatchWaitPolicy::new(Duration::from_millis(400), Duration::from_millis(20)),
+            super::WatchWaitPolicy::new(slice, Duration::from_millis(20)),
         );
         let waited = started.elapsed();
 
         assert!(!armed, "the hub is held short of arming");
-        assert!(
-            waited < Duration::from_millis(200),
-            "a budget of 20ms must not be spent as a 400ms slice: {waited:?}"
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                waited < slice / 2,
+                "a budget of 20ms must not be spent as a {slice:?} slice: {waited:?}"
+            );
+            assert!(
+                waited < Duration::from_millis(200),
+                "a budget of 20ms must not be spent as a {slice:?} slice: {waited:?}"
+            );
+        }
     }
 
     /// A permanent failure is answered at once. Waiting out a ten-minute budget over a hub
@@ -3185,16 +3216,28 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
+        // A budget no ordinary run reaches: a wait that spent it never returns. Under
+        // `timing_contract` ten minutes, and the clock says it was not spent.
         let started = Instant::now();
         assert!(!SharedState::await_watch(
             &hub,
             &crate::state::OwnerStop::default(),
-            super::WatchWaitPolicy::new(Duration::from_millis(50), Duration::from_secs(600))
+            super::WatchWaitPolicy::new(
+                Duration::from_millis(50),
+                test_utils::wait::ceiling(Duration::from_secs(600)),
+            )
         ));
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "a permanent failure is not something to spend a budget on"
-        );
+        let waited = started.elapsed();
+        if cfg!(timing_contract) {
+            assert!(
+                waited < crate::change_hub::test_support::STATE_CEILING,
+                "a permanent failure is not something to spend a budget on: {waited:?}"
+            );
+            assert!(
+                waited < Duration::from_secs(5),
+                "a permanent failure is not something to spend a budget on: {waited:?}"
+            );
+        }
     }
 
     #[test]

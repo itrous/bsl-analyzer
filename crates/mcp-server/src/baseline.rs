@@ -2143,10 +2143,12 @@ mod tests {
         assert!(view.pending);
         assert!(view.external.is_none());
         assert!(view.configured.is_none());
-        assert!(!deferred.wait_ready(Duration::from_millis(30)), "a pending slot times out");
+        assert!(!deferred.wait_ready(Duration::ZERO), "a pending slot is not ready");
 
         let waiter = deferred.clone();
-        let handle = std::thread::spawn(move || waiter.wait_ready(Duration::from_secs(5)));
+        let handle = std::thread::spawn(move || {
+            waiter.wait_ready(crate::change_hub::test_support::STATE_CEILING)
+        });
         deferred.publish(BaselineRuntime {
             configured_baseline: ConfiguredBaselineStatus {
                 backend: "postgres",
@@ -2163,17 +2165,43 @@ mod tests {
     }
 
     #[test]
+    fn deferred_slot_shutdown_ends_a_pending_wait() {
+        // The waiter's budget runs out with the same `false` a wake produces, so it gets a budget
+        // no run reaches: a waiter that comes back at all was ended by the shutdown, whether it
+        // had parked before it or not.
+        let deferred = DeferredBaselineRuntime::pending_for_test();
+        let waiter = deferred.clone();
+        let handle = std::thread::spawn(move || waiter.wait_ready(test_utils::wait::NO_BOUND));
+
+        deferred.shutdown();
+
+        assert!(!handle.join().unwrap(), "a shut-down slot never becomes ready");
+    }
+
+    #[test]
+    #[ignore = "необязательный тест: the waiter must wake within a wall-clock bound; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test -p mcp-server --lib baseline::tests::deferred_slot_shutdown_wakes_a_pending_waiter -- --exact --ignored"]
     fn deferred_slot_shutdown_wakes_a_pending_waiter() {
+        // The waiter's budget runs out with the same `false` a wake produces. An ordinary run
+        // gives it a budget no run reaches, so a waiter that comes back at all was woken; under
+        // `timing_contract` the budget is the shared ceiling, and half of it is a bound that
+        // catches a waiter left to time out and that no slow machine comes near.
+        const BUDGET: Duration = crate::change_hub::test_support::STATE_CEILING;
         let deferred = DeferredBaselineRuntime::pending_for_test();
         let waiter = deferred.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            tx.send(waiter.wait_ready(Duration::from_secs(5))).unwrap();
+            tx.send(waiter.wait_ready(BUDGET)).unwrap();
         });
-        std::thread::sleep(Duration::from_millis(20));
+        // Nothing tells when the waiter has parked, and a shutdown that lands before it does
+        // must end its wait just the same; the timing profile aims at the parked waiter.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
+        let woken = std::time::Instant::now();
         deferred.shutdown();
-        let result = rx.recv_timeout(Duration::from_millis(200));
+        let result = rx.recv_timeout(BUDGET / 2);
+        let waited = woken.elapsed();
         deferred.publish(BaselineRuntime {
             configured_baseline: ConfiguredBaselineStatus {
                 backend: "postgres",
@@ -2185,7 +2213,11 @@ mod tests {
         });
         handle.join().unwrap();
 
-        assert!(!result.unwrap());
+        assert!(!result.expect("the shutdown left the waiter to its budget"));
+        if cfg!(timing_contract) {
+            assert!(waited < BUDGET / 2, "the waiter woke only after {waited:?}");
+            assert!(waited < Duration::from_millis(200), "the waiter woke only after {waited:?}");
+        }
     }
 
     #[test]
@@ -2803,11 +2835,11 @@ mod tests {
             shutdown_service.shutdown();
             let _ = shut_tx.send(());
         });
-        // The gate proves shutdown does not wait for the blocked resolve. The bound is the
-        // The bound is a latency contract: shutdown gives up after its acknowledgement timeout
-        // (100 ms in this build), ten times over that. The resolve's own wait is far longer.
+        // The gate proves shutdown does not wait for the blocked resolve: it opens only after
+        // shutdown has returned, so a shutdown that waited for the resolve never returns and
+        // the bound, a hang watchdog, runs out.
         assert!(
-            shut_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+            shut_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
             "shutdown waited for a resolve that was still blocked"
         );
         gate_tx.send(()).unwrap();
@@ -2931,11 +2963,13 @@ mod tests {
 
         let started = std::time::Instant::now();
         let probe = service.probe_status_cached();
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "probe_status_cached blocked for {:?}",
-            started.elapsed()
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "probe_status_cached blocked for {:?}",
+                started.elapsed()
+            );
+        }
 
         // The cached call leaves the probing to the background thread it kicked, so it has
         // nothing to answer with but Pending. A call that waited for the probe would answer
@@ -3100,19 +3134,30 @@ mod tests {
                 let _ = second_tx.send((out, waited.elapsed()));
             });
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // Nothing tells when B has queued, and a cancellation that reaches B before it does
+        // must withdraw it just the same; the timing profile aims at the queued B.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         cancel.cancel();
-        // Bounded: a B that waits for A's latched query instead of its own cancellation
-        // must fail this gate, not hang it.
+        // A stays latched until B is back, so a B that waits for A's latched query instead of
+        // its own cancellation never comes back: the run hangs, and under `timing_contract`
+        // the watchdog fails it.
         let (out, waited) = second_rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("B never came back from its wait");
         assert!(matches!(out, Err(super::BaselineCall::Withdrawn)), "B must withdraw");
-        assert!(
-            waited < Duration::from_millis(500),
-            "B waited {waited:?} past its cancellation, i.e. for A's query to finish"
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                waited < Duration::from_millis(500),
+                "B waited {waited:?} past its cancellation, i.e. for A's query to finish"
+            );
+        }
         assert_eq!(started.load(Ordering::SeqCst), 1, "A is still the only request started");
+        assert!(
+            !first.is_finished(),
+            "A finished before B came back, so B could have waited for it"
+        );
 
         // Release A: it answers, and the worker moves on to B's request — and skips it.
         release_tx.send(()).unwrap();

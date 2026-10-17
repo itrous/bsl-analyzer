@@ -3173,10 +3173,29 @@ mod ticker_tests {
 
     #[test]
     fn note_stamps_position_and_resets_stall_clock() {
-        let ticker = GraphBuildTicker::default();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Started 30 ms ago by its own clock, rather than slept 30 ms after.
+        let ticker = GraphBuildTicker {
+            started: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(30))
+                .expect("the monotonic clock is older than 30 ms"),
+            ..GraphBuildTicker::default()
+        };
+        let before = ticker.ms_since_progress();
+        assert!(before >= 30, "the stall clock runs from the ticker's start: {before} ms");
+        let noted = std::time::Instant::now();
         ticker.note("call_edges", 4, 59, "src/cfe/Ext/CommonModules/М/Ext/Module.bsl");
-        assert!(ticker.ms_since_progress() < 25);
+        let after = ticker.ms_since_progress();
+        // Counted from the note, so never more than the time since it, however late this read
+        // runs; a clock still counting from the start reads at least `before` more. The extra
+        // millisecond absorbs the two truncations to whole milliseconds.
+        let since_note = noted.elapsed().as_millis() as u64;
+        assert!(
+            after <= since_note + 1,
+            "{after} ms since progress, {since_note} ms since the note"
+        );
+        if cfg!(timing_contract) {
+            assert!(after < 25);
+        }
         let position = ticker.position();
         assert!(position.contains("call_edges batch 5/59"), "{position}");
         assert!(position.contains("Module.bsl"), "{position}");

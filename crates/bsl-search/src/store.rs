@@ -7350,6 +7350,11 @@ mod tests {
         use serde_json::Value;
         use std::sync::{Arc, Mutex};
 
+        /// Bound of a wait for an event that a regression would never deliver; a hang
+        /// watchdog, not a latency measure.
+        const HANG_WATCHDOG: std::time::Duration =
+            test_utils::wait::ceiling(std::time::Duration::from_secs(60));
+
         #[test]
         fn in_memory_generation_initialization_does_not_remove_disk_artifacts() {
             let store = Store::in_memory().unwrap();
@@ -7436,12 +7441,24 @@ mod tests {
                 || store.save_overlay_embedding_cache("model", 1, &entries).unwrap(),
                 tracing_subscriber::filter::LevelFilter::INFO,
             );
-            assert_eq!(records.len(), 4);
             let summaries: Vec<_> =
                 records.iter().filter(|r| r["kind"] == "embedding_pass").collect();
-            assert_eq!(summaries.len(), 4);
             let intents: Vec<_> = summaries.iter().filter(|r| r["outcome"] == "started").collect();
-            assert_eq!(intents.len(), 2);
+            // The one-second summary timer may add flushes on top of the size limit; every
+            // flush is followed by the next interval's intent.
+            let progress = summaries.iter().filter(|r| r["outcome"] == "progress").count();
+            assert_eq!(intents.len(), 1 + progress, "{summaries:?}");
+            let files: u64 = summaries
+                .iter()
+                .filter(|r| r["outcome"] != "started")
+                .map(|r| r["files"].as_u64().unwrap())
+                .sum();
+            assert_eq!(files, 129, "{summaries:?}");
+            if cfg!(timing_contract) {
+                assert_eq!(records.len(), 4);
+                assert_eq!(summaries.len(), 4);
+                assert_eq!(intents.len(), 2);
+            }
             assert!(intents.iter().all(|r| r["counts"]["embeddings_written"] == 0
                 && r["counts"]["sqlite_vectors_removed"] == 0));
             assert_eq!(summaries.last().unwrap()["committed_totals"]["embeddings_written"], 129);
@@ -7806,7 +7823,6 @@ mod tests {
         #[test]
         fn context_observer_matches_original_sql_with_competing_writer_and_rollback() {
             use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-            use std::time::Duration;
 
             thread_local! {
                 static CONTENTION: std::cell::RefCell<Option<(SyncSender<()>, Receiver<()>)>> = const { std::cell::RefCell::new(None) };
@@ -7816,7 +7832,7 @@ mod tests {
                     let Some((blocked, release)) = slot.borrow_mut().take() else {
                         return false;
                     };
-                    blocked.send(()).is_ok() && release.recv_timeout(Duration::from_secs(5)).is_ok()
+                    blocked.send(()).is_ok() && release.recv_timeout(HANG_WATCHDOG).is_ok()
                 })
             }
 
@@ -7889,7 +7905,7 @@ mod tests {
                         )
                     });
                     // This notification comes from SQLite's busy handler, proving overlap.
-                    blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    blocked_rx.recv_timeout(HANG_WATCHDOG).unwrap();
                     tx.commit().unwrap();
                     release_tx.send(()).unwrap();
                     let actual = worker.join().unwrap();

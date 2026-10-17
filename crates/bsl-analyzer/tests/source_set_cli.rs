@@ -45,6 +45,9 @@ const DEP: &str = "a/b/dep";
 #[cfg(unix)]
 const CACHE_ADOPTION_LOG: &str = "reused cached graph database (workspace unchanged)";
 const STDERR_TAIL_LIMIT: usize = 64 * 1024;
+/// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
+/// latency measure.
+const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
 /// Drains child stderr continuously while retaining only a bounded tail. This
 /// keeps native startup diagnostics available without allowing a verbose child
@@ -101,7 +104,7 @@ impl StderrCapture {
 
     #[cfg(unix)]
     fn wait_for_cache_adoption(&self) -> Vec<String> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         loop {
             let evidence = self.cache_adoption_evidence();
             if !evidence.is_empty() || Instant::now() >= deadline {
@@ -376,8 +379,29 @@ struct TreeSnapshot {
 }
 
 fn tree_snapshot(root: &Path) -> TreeSnapshot {
-    fn walk(root: &Path, path: &Path, entries: &mut BTreeMap<String, TreeEntry>) {
-        let metadata = std::fs::symlink_metadata(path).unwrap();
+    tree_snapshot_with_before_stat(root, &mut |_| {})
+}
+
+fn tree_snapshot_with_before_stat(root: &Path, before_stat: &mut dyn FnMut(&Path)) -> TreeSnapshot {
+    // An entry the live server replaces — the heartbeat writes `writer.tmp.<pid>` and renames
+    // it into place — can vanish between `read_dir` listing it and the reads below. It is then
+    // not in the snapshot: the snapshot describes what is there, and a source that disappears
+    // is caught by comparing snapshots, not by a panic here.
+    fn gone(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::NotFound
+    }
+
+    fn walk(
+        root: &Path,
+        path: &Path,
+        entries: &mut BTreeMap<String, TreeEntry>,
+        before_stat: &mut dyn FnMut(&Path),
+    ) {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if gone(&error) => return,
+            Err(error) => panic!("stat snapshot entry {}: {error}", path.display()),
+        };
         let file_type = metadata.file_type();
         let kind = if file_type.is_symlink() {
             "symlink"
@@ -400,30 +424,112 @@ fn tree_snapshot(root: &Path) -> TreeSnapshot {
         };
         #[cfg(not(any(unix, windows)))]
         let permissions = if metadata.permissions().readonly() { 1 } else { 0 };
-        let symlink_target = file_type
-            .is_symlink()
-            .then(|| std::fs::read_link(path).unwrap().to_string_lossy().into_owned());
-        let hash = file_type.is_file().then(|| {
-            let bytes = std::fs::read(path)
-                .unwrap_or_else(|error| panic!("read snapshot file {}: {error}", path.display()));
-            blake3::hash(&bytes).to_hex().to_string()
-        });
+        let symlink_target = match file_type.is_symlink().then(|| std::fs::read_link(path)) {
+            None => None,
+            Some(Ok(target)) => Some(target.to_string_lossy().into_owned()),
+            Some(Err(error)) if gone(&error) => return,
+            Some(Err(error)) => panic!("read snapshot link {}: {error}", path.display()),
+        };
+        let hash = match file_type.is_file().then(|| std::fs::read(path)) {
+            None => None,
+            Some(Ok(bytes)) => Some(blake3::hash(&bytes).to_hex().to_string()),
+            Some(Err(error)) if gone(&error) => return,
+            Some(Err(error)) => panic!("read snapshot file {}: {error}", path.display()),
+        };
+        let children = match file_type.is_dir().then(|| std::fs::read_dir(path)) {
+            None => None,
+            Some(Ok(children)) => Some(children),
+            Some(Err(error)) if gone(&error) => return,
+            Some(Err(error)) => panic!("list snapshot directory {}: {error}", path.display()),
+        };
         let relative = path.strip_prefix(root).unwrap();
         entries.insert(
             relative.to_string_lossy().into_owned(),
             TreeEntry { kind, size: metadata.len(), hash, permissions, symlink_target },
         );
-        if file_type.is_dir() {
-            for child in std::fs::read_dir(path).unwrap() {
-                walk(root, &child.unwrap().path(), entries);
-            }
+        for child in children.into_iter().flatten() {
+            let path = child.unwrap().path();
+            before_stat(&path);
+            walk(root, &path, entries, before_stat);
         }
     }
 
+    // Only entries inside the tree may vanish; a missing root would make an empty snapshot that
+    // equals any other empty one.
+    if let Err(error) = std::fs::symlink_metadata(root) {
+        panic!("stat snapshot root {}: {error}", root.display());
+    }
     let mut entries = BTreeMap::new();
-    walk(root, root, &mut entries);
+    walk(root, root, &mut entries, before_stat);
     let encoded = serde_json::to_vec(&entries).unwrap();
     TreeSnapshot { entries, fingerprint: blake3::hash(&encoded).to_hex().to_string() }
+}
+
+#[test]
+fn snapshot_skips_an_entry_removed_between_listing_and_stat() {
+    let root = tempfile::tempdir().unwrap();
+    let transient = root.path().join("writer.tmp");
+    std::fs::write(&transient, "lease").unwrap();
+    std::fs::write(root.path().join("Module.bsl"), "source").unwrap();
+    let mut removed = false;
+    let snapshot = tree_snapshot_with_before_stat(root.path(), &mut |path| {
+        if path == transient {
+            assert!(!removed, "the listed entry is visited once");
+            std::fs::remove_file(path).unwrap();
+            removed = true;
+        }
+    });
+    assert!(removed, "read_dir must deliver the transient entry before it is removed");
+    assert!(!snapshot.entries.contains_key("writer.tmp"));
+    assert!(snapshot.entries.contains_key(""));
+    assert_eq!(snapshot.entries.len(), 2);
+    let source = &snapshot.entries["Module.bsl"];
+    assert_eq!(source.kind, "file");
+    assert_eq!(source.hash.as_deref(), Some(blake3::hash(b"source").to_hex().as_str()));
+}
+
+#[test]
+fn snapshot_rejects_a_missing_root() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    let result = std::panic::catch_unwind(|| tree_snapshot(&missing));
+    assert!(result.is_err(), "a missing root must not become an empty snapshot");
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "source path disappeared after removal")]
+fn a_tracked_source_removed_after_it_was_recorded_is_reported() {
+    let root = tempfile::tempdir().unwrap();
+    // The legacy namespace permits directory-size changes, but its flat canaries stay tracked.
+    let canary = root.path().join(".build").join("canary.bsl");
+    std::fs::create_dir_all(canary.parent().unwrap()).unwrap();
+    std::fs::write(&canary, "source").unwrap();
+    let before = tree_snapshot(root.path());
+    std::fs::remove_file(&canary).unwrap();
+    assert_tree_unchanged_except_workspace_cache(
+        &before,
+        root.path(),
+        &root.path().join(".build/workspaces/v1/cache"),
+        "after removal",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "source path disappeared after module removal")]
+fn a_tracked_module_removed_after_snapshot_is_reported_as_disappeared() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("Module.bsl");
+    std::fs::write(&module, "source").unwrap();
+    let before = tree_snapshot(root.path());
+    std::fs::remove_file(&module).unwrap();
+    assert_tree_unchanged_except_workspace_cache(
+        &before,
+        root.path(),
+        &root.path().join(".build/workspaces/v1/cache"),
+        "after module removal",
+    );
 }
 
 fn snapshot_report(snapshot: &TreeSnapshot) -> Value {
@@ -448,11 +554,13 @@ fn assert_tree_unchanged_except_workspace_cache(
 ) -> TreeSnapshot {
     let actual = tree_snapshot(root);
     let cache_rel = cache_leaf.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+    // A lost path is named before any changed one: removing a file also changes its directory,
+    // and that change would otherwise hide which source went missing.
+    if let Some(path) = expected.entries.keys().find(|path| !actual.entries.contains_key(*path)) {
+        panic!("source path disappeared {phase}: {path:?}");
+    }
     for (path, before) in &expected.entries {
-        let after = actual
-            .entries
-            .get(path)
-            .unwrap_or_else(|| panic!("source path disappeared {phase}: {path:?}"));
+        let after = &actual.entries[path];
         if path == ".build" {
             assert_eq!(after.kind, before.kind, "legacy namespace type is unchanged {phase}");
             assert_eq!(
@@ -577,7 +685,9 @@ impl EmbeddingStub {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         use std::io::{Read, Write};
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let _ = stream.set_read_timeout(Some(test_utils::wait::ceiling(
+                            Duration::from_secs(2),
+                        )));
                         let mut request = Vec::new();
                         let mut buf = [0u8; 2048];
                         let mut header_end = None;
@@ -881,7 +991,7 @@ fn wait_for_scope_guard_exit(
 ) -> (ExitStatus, usize) {
     const SCOPE_STOP: &str = "workspace source composition changed; restart/reconnect MCP";
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll scope-guarded native child") {
             break status;
@@ -898,14 +1008,13 @@ fn wait_for_scope_guard_exit(
         std::thread::sleep(Duration::from_millis(25));
     };
     stderr.join();
-    let diagnostic =
-        stderr.wait_for_text(SCOPE_STOP, Duration::from_secs(2)).unwrap_or_else(|| {
-            panic!("{phase} emits scope-stop diagnostic; stderr: {}", stderr.snapshot())
-        });
+    let diagnostic = stderr.wait_for_text(SCOPE_STOP, HANG_WATCHDOG).unwrap_or_else(|| {
+        panic!("{phase} emits scope-stop diagnostic; stderr: {}", stderr.snapshot())
+    });
     let occurrences = diagnostic.matches(SCOPE_STOP).count();
     assert_eq!(occurrences, 1, "{phase} emits exactly one scope-stop diagnostic");
     assert!(status.success(), "{phase} exits successfully after scope drift: {status}");
-    let lease_deadline = Instant::now() + Duration::from_secs(2);
+    let lease_deadline = Instant::now() + HANG_WATCHDOG;
     while lease_path.exists() && Instant::now() < lease_deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -986,7 +1095,7 @@ fn wait_for_semantic_scope(
     own_root: &str,
     foreign_root: &str,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let hits = semantic_hits(session, query);
         if hits.iter().any(|hit| hit["modality"] == "S" && hit["root_id"] == own_root) {
@@ -1066,7 +1175,7 @@ fn assert_same_lease_owner(before: &Value, after: &Value, phase: &str) {
 
 #[cfg(unix)]
 fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     while !path.is_file() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1076,7 +1185,7 @@ fn wait_for_file(path: &Path) {
 #[cfg(unix)]
 fn wait_for_embedding(stub: &EmbeddingStub, extension: &str) {
     let count = if extension == "EXT_A" { &stub.seen_a } else { &stub.seen_b };
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     while count.load(std::sync::atomic::Ordering::Relaxed) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1097,8 +1206,10 @@ fn http_exchange(
     body: &Value,
     session_id: Option<&str>,
 ) -> (u16, String, Option<Value>) {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut stream =
+        TcpStream::connect_timeout(&address, test_utils::wait::ceiling(Duration::from_secs(2)))
+            .unwrap();
+    stream.set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(10)))).unwrap();
     let body = body.to_string();
     let session = session_id.map(|id| format!("Mcp-Session-Id: {id}\r\n")).unwrap_or_default();
     use std::io::Write as _;
@@ -1234,7 +1345,7 @@ fn start_http_scope_session(
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("native HTTP scope fixture starts");
     let mut stderr = StderrCapture::attach(child.stderr.take().unwrap());
-    let health_deadline = Instant::now() + Duration::from_secs(30);
+    let health_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     while !http_health(address) && Instant::now() < health_deadline {
         if let Some(status) = child.try_wait().unwrap() {
             stderr.join();
@@ -1265,7 +1376,7 @@ fn start_http_scope_session(
     );
     assert!((200..300).contains(&status));
 
-    let graph_deadline = Instant::now() + Duration::from_secs(30);
+    let graph_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let status =
             http_call(address, &session_id, 2, "graph", serde_json::json!({"action":"status"}));
@@ -1280,7 +1391,7 @@ fn start_http_scope_session(
         http_call(address, &session_id, 3, "graph", serde_json::json!({"action":"overview"}))
             ["result"]
             .clone();
-    let search_deadline = Instant::now() + Duration::from_secs(30);
+    let search_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let status =
             http_call(address, &session_id, 4, "search", serde_json::json!({"action":"status"}));
@@ -1309,10 +1420,12 @@ fn start_http_scope_session(
 
 #[cfg(unix)]
 fn http_health(address: SocketAddr) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(200)) else {
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&address, test_utils::wait::ceiling(Duration::from_millis(200)))
+    else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_millis(300))));
     use std::io::Write as _;
     if write!(stream, "GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
         .is_err()
@@ -1346,7 +1459,7 @@ fn graph_overview(session: &mut McpSession) -> Value {
 
 #[cfg(unix)]
 fn wait_for_graph_nodes(session: &mut McpSession, expected: u64) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let graph = graph_overview(session);
         if graph["nodes"].as_u64() == Some(expected) {
@@ -1361,7 +1474,7 @@ fn wait_for_graph_nodes(session: &mut McpSession, expected: u64) -> Value {
 }
 
 fn wait_for_marker(session: &mut McpSession, marker: &str) -> Vec<String> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let hits = search_marker(session, marker);
         if !hits.is_empty() || Instant::now() >= deadline {
@@ -2018,7 +2131,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("native HTTP MCP process starts");
         let mut stderr = StderrCapture::attach(child.stderr.take().unwrap());
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         while !http_health(address) && Instant::now() < deadline {
             if let Some(status) = child.try_wait().unwrap() {
                 stderr.join();
@@ -2052,7 +2165,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
         );
         assert!((200..300).contains(&status), "HTTP initialized notification succeeds");
 
-        let ready_deadline = Instant::now() + Duration::from_secs(30);
+        let ready_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         let mut graph_status = Value::Null;
         while Instant::now() < ready_deadline {
             graph_status =
@@ -2069,7 +2182,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
                 .clone();
         assert_eq!(graph["nodes"], 2, "HTTP graph sees the extension source: {graph}");
 
-        let search_deadline = Instant::now() + Duration::from_secs(30);
+        let search_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         let mut search_status = Value::Null;
         while Instant::now() < search_deadline {
             search_status = http_call(
@@ -2137,7 +2250,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
         };
         let signal_result = unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGTERM) };
         assert_eq!(signal_result, 0, "SIGTERM reaches the owned HTTP process {child_pid}");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -2152,7 +2265,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
         };
         stderr.join();
         assert!(status.success(), "HTTP child exits cleanly after SIGTERM: {status}");
-        let lease_deadline = Instant::now() + Duration::from_secs(2);
+        let lease_deadline = Instant::now() + HANG_WATCHDOG;
         while layout.lease_path().exists() && Instant::now() < lease_deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -2321,10 +2434,13 @@ fn workspace_cache_scope_optional_journal_overlap_keeps_source_clean() {
         "overlapping journal leaf remains source-clean while live"
     );
     assert!(session.shutdown().unwrap().success(), "overlap fixture shuts down cleanly");
-    let journal_diagnostic = session
-        .stderr
-        .wait_for_text(JOURNAL_UNAVAILABLE, Duration::from_secs(5))
-        .expect("native runtime reports that the optional overlapping journal is unavailable");
+    // The process has exited, so once the reader reaches EOF its tail is complete.
+    session.stderr.join();
+    let journal_diagnostic = session.stderr.snapshot();
+    assert!(
+        journal_diagnostic.contains(JOURNAL_UNAVAILABLE),
+        "native runtime reports that the optional overlapping journal is unavailable: {journal_diagnostic}"
+    );
     assert_tree_unchanged(&before, root.path(), "after optional journal overlap refusal");
     let journal_after = tree_snapshot(&journal_root);
     assert_eq!(
@@ -2695,7 +2811,10 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let mut daemon = daemon_command.spawn().expect("direct native daemon starts");
     let mut daemon_stderr = StderrCapture::attach(daemon.stderr.take().unwrap());
     let daemon_pid = daemon.id();
-    let daemon_lease = wait_for_lease_pid(&layout.lease_path(), Duration::from_secs(30));
+    let daemon_lease = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(30)),
+    );
     assert_eq!(daemon_lease, daemon_pid, "the direct daemon owns the live lease");
 
     let mut required = McpSession::start_transport(
@@ -2714,13 +2833,13 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let marker_required = wait_for_marker(&mut required, "CACHE_LEXICAL_A_235");
     assert!(!marker_required.is_empty(), "broker-required search reaches daemon data");
     let log_fallback = daemon_stderr
-        .wait_for_text("Failed to setup logging:", Duration::from_secs(5))
+        .wait_for_text("Failed to setup logging:", HANG_WATCHDOG)
         .expect("daemon logging IO failure truthfully falls back to stderr");
     assert_leaf_artifacts(&layout);
     let lease_required = lease_receipt(&layout.lease_path(), daemon_pid);
     assert_tree_unchanged(&before, root.path(), "with direct daemon and required proxy alive");
     assert!(required.shutdown().unwrap().success(), "required proxy exits cleanly");
-    let daemon_deadline = Instant::now() + Duration::from_secs(15);
+    let daemon_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(15));
     let daemon_status = loop {
         if let Some(status) = daemon.try_wait().unwrap() {
             break status;
@@ -2740,7 +2859,10 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let mut warm_daemon = daemon_command.spawn().expect("direct native warm daemon starts");
     let mut warm_daemon_stderr = StderrCapture::attach(warm_daemon.stderr.take().unwrap());
     let warm_daemon_pid = warm_daemon.id();
-    let warm_lease_pid = wait_for_lease_pid(&layout.lease_path(), Duration::from_secs(30));
+    let warm_lease_pid = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(30)),
+    );
     assert_eq!(warm_lease_pid, warm_daemon_pid, "warm daemon owns the live lease");
     let mut warm_required = McpSession::start_transport(
         root.path(),
@@ -2757,7 +2879,11 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     assert_eq!(graph_warm_direct, graph_required, "direct warm daemon serves the same graph");
     let marker_warm_direct = wait_for_marker(&mut warm_required, "CACHE_LEXICAL_A_235");
     assert!(!marker_warm_direct.is_empty(), "direct warm daemon serves its search marker");
-    let direct_warm_adoption = wait_for_cache_adoption_log(&daemon_log, 0, Duration::from_secs(10));
+    let direct_warm_adoption = wait_for_cache_adoption_log(
+        &daemon_log,
+        0,
+        test_utils::wait::ceiling(Duration::from_secs(10)),
+    );
     assert!(
         !direct_warm_adoption.is_empty(),
         "direct warm daemon must publish the existing graph from disk; daemon log: {}",
@@ -2766,7 +2892,7 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let lease_direct_warm = lease_receipt(&layout.lease_path(), warm_daemon_pid);
     assert_tree_unchanged(&before, root.path(), "with direct warm daemon and required proxy alive");
     assert!(warm_required.shutdown().unwrap().success(), "warm required proxy exits cleanly");
-    let warm_daemon_deadline = Instant::now() + Duration::from_secs(15);
+    let warm_daemon_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(15));
     let warm_daemon_status = loop {
         if let Some(status) = warm_daemon.try_wait().unwrap() {
             break status;
@@ -2805,21 +2931,24 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let broker_cache_adoption = wait_for_cache_adoption_log(
         &daemon_log,
         direct_warm_adoption.len(),
-        Duration::from_secs(10),
+        test_utils::wait::ceiling(Duration::from_secs(10)),
     );
     assert!(
         !broker_cache_adoption.is_empty(),
         "broker-launched warm daemon must publish the existing graph from disk; daemon log: {}",
         std::fs::read_to_string(&daemon_log).unwrap_or_else(|error| error.to_string())
     );
-    let broker_lease_pid = wait_for_lease_pid(&layout.lease_path(), Duration::from_secs(10));
+    let broker_lease_pid = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(10)),
+    );
     assert_ne!(broker_lease_pid, broker.pid(), "broker proxy and daemon are separate processes");
     let lease_broker = lease_receipt(&layout.lease_path(), broker_lease_pid);
     assert_leaf_artifacts(&layout);
     assert_tree_unchanged(&before, root.path(), "with broker proxy and detached daemon alive");
     assert!(broker.shutdown().unwrap().success(), "broker proxy exits cleanly");
 
-    let cleanup_deadline = Instant::now() + Duration::from_secs(15);
+    let cleanup_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(15));
     while layout.lease_path().exists() && Instant::now() < cleanup_deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -2908,7 +3037,7 @@ fn workspace_cache_scope_s12_proxy_parent_child_composition_mismatch() {
         .stderr(Stdio::from(stderr))
         .spawn()
         .expect("isolated native proxy fixture starts");
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     let status = loop {
         if let Some(status) = driver.try_wait().expect("poll isolated proxy fixture") {
             break status;
@@ -3022,7 +3151,7 @@ fn s12_proxy_scope_mismatch_driver() {
     let gate_for_thread = gate_path.clone();
     let count_for_thread = count_path.clone();
     let barrier = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
         loop {
             let count = std::fs::read_to_string(&count_for_thread)
                 .ok()
@@ -3060,7 +3189,7 @@ fn s12_proxy_scope_mismatch_driver() {
     let child_count = std::fs::read_to_string(&count_path).unwrap().trim().parse::<u32>().unwrap();
     let broker_log = runtime.join("bsl-mcp").join(format!("{}.log", key.digest()));
     let child_failure = {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         loop {
             let log = std::fs::read_to_string(&broker_log).unwrap_or_default();
             if log.contains("workspace cache scope changed between launcher and daemon")
@@ -4015,7 +4144,7 @@ impl McpSession {
         self.send(
             serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
         );
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let line = self.stdout.recv_timeout(remaining).unwrap_or_else(|err| {
@@ -4047,7 +4176,8 @@ impl McpSession {
     /// Poll `tool`'s `status` action until its state settles; the settled status.
     fn wait_ready(&mut self, tool: &str) -> Value {
         let mut status = Value::Null;
-        for _ in 0..300 {
+        let step = std::time::Duration::from_millis(50);
+        for _ in 0..test_utils::wait::polls(step * 300, step) {
             status = self.call(tool, serde_json::json!({"action": "status"}))["result"]
                 ["structuredContent"]
                 .clone();
@@ -4088,7 +4218,7 @@ impl McpSession {
 
     fn shutdown(&mut self) -> std::io::Result<ExitStatus> {
         drop(self.stdin.take());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         loop {
             if let Some(status) = self.child.try_wait()? {
                 return Ok(status);
@@ -4098,7 +4228,7 @@ impl McpSession {
                 let _ = self.child.wait()?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "MCP shutdown exceeded 5 seconds",
+                    "MCP shutdown exceeded its hang watchdog",
                 ));
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -4310,7 +4440,8 @@ fn wait_external_diagnostics(
     path: &Path,
     accept: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline =
+        std::time::Instant::now() + test_utils::wait::ceiling(std::time::Duration::from_secs(30));
     loop {
         let body = external_diagnostics(session, path);
         if body["stale"] == false && accept(&body) {
@@ -4326,7 +4457,8 @@ fn wait_file_diagnostics(
     path: &Path,
     accept: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline =
+        std::time::Instant::now() + test_utils::wait::ceiling(std::time::Duration::from_secs(30));
     loop {
         let body = session.diagnostics(serde_json::json!({
             "action": "file",
@@ -4343,7 +4475,8 @@ fn wait_file_diagnostics(
 }
 
 fn wait_query_semantics(session: &mut McpSession, query: &str, root_id: &str) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline =
+        std::time::Instant::now() + test_utils::wait::ceiling(std::time::Duration::from_secs(30));
     loop {
         let reply = session.call(
             "query",

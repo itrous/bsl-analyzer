@@ -1375,6 +1375,15 @@ mod tests {
     const SERVER_TARGET: &str = "2a887b1e-1151-46c8-ab56-e0078edee53d";
     const CLIENT_TARGET: &str = "950b2b2e-bb8f-4a43-b9bf-1316114df630";
 
+    /// Bound of a wait for an event that a regression would never deliver: 60 s under
+    /// `timing_contract`, and a century otherwise, so an ordinary run waits for the event
+    /// however long a loaded machine takes. A century still fits in an `Instant` sum.
+    const HANG_WATCHDOG: Duration = if cfg!(timing_contract) {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(100 * 365 * 24 * 60 * 60)
+    };
+
     const REGISTERED: &str = concat!(
         r#"<response xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
         "<debugRDBGRequestResponse:result>registered</debugRDBGRequestResponse:result></response>"
@@ -1621,8 +1630,7 @@ mod tests {
     /// input on which only the latest one used to be reported.
     #[test]
     fn two_stops_queued_between_waits_are_both_reported_latest_first() {
-        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = served.clone();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
             "getDbgAllTargetStates" => (200, String::new()),
             "pingDebugUIParams" if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) => (
@@ -1641,12 +1649,9 @@ mod tests {
         }));
         let root = config_root();
         let mut session = connect(&server, root.path(), None).expect("attach");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !served.load(std::sync::atomic::Ordering::SeqCst) {
-            assert!(std::time::Instant::now() < deadline, "the stops were never polled");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::thread::sleep(Duration::from_millis(200));
+        absorb_events_until(&mut session, "both stops were never delivered", |session| {
+            session.stopped_count() == 2
+        });
 
         let first = session.wait_for_stop(Duration::ZERO).unwrap().expect("a stop");
         assert_eq!(first.target_id, SERVER_TARGET, "the latest stop comes first");
@@ -1712,21 +1717,45 @@ mod tests {
         )
     }
 
-    fn wait_until(flag: &std::sync::atomic::AtomicBool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-            assert!(std::time::Instant::now() < deadline, "the event was never polled");
-            std::thread::sleep(Duration::from_millis(10));
+    /// Handles the delivered events the way [`DebugSession::wait_for_stop`] does before it
+    /// reports anything, stops queued unreported, until `done` holds. The events arrive from
+    /// the listener thread one result at a time, so a single drain may see only some of them.
+    fn absorb_events_until(
+        session: &mut DebugSession,
+        what: &str,
+        mut done: impl FnMut(&mut DebugSession) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + HANG_WATCHDOG;
+        loop {
+            while let Ok(event) = session.events.try_recv() {
+                if let Some(stop) = session.handle_event(event).unwrap() {
+                    session.queue_stop(stop);
+                }
+            }
+            if done(session) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::yield_now();
         }
-        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    /// The first stop that is not the announcement of a halt from before the attach. Until
+    /// the server's own stop event is delivered, that announcement is all there is to report.
+    fn wait_for_reported_stop(session: &mut DebugSession) -> StopEvent {
+        loop {
+            let stop = session.wait_for_stop(HANG_WATCHDOG).unwrap().expect("the reported stop");
+            if !matches!(stop.reason, StopReason::Suspended) {
+                return stop;
+            }
+        }
     }
 
     /// The target halted before the attach then reports a stop of its own: the input on which
     /// the leftover announcement used to report the same halt a second time.
     #[test]
     fn a_real_stop_replaces_the_halted_before_attach_announcement() {
-        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = served.clone();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
             "pingDebugUIParams" if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) => {
                 (200, ping_response(&stop_on_line_4()))
@@ -1736,14 +1765,19 @@ mod tests {
         let root = config_root();
         let mut session = connect(&server, root.path(), None).expect("attach");
         assert_eq!(session.suspended_at_attach(), [SERVER_TARGET]);
-        wait_until(&served);
 
+        // Until the server's stop is delivered the announcement is all there is to report, so
+        // the gate waits for that delivery — the stop queued — and only then asks: the first
+        // answer must be the stop, not the announcement it replaces.
+        absorb_events_until(&mut session, "the server's stop is delivered", |session| {
+            !session.unreported_stops.is_empty()
+        });
         let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("the reported stop");
         assert!(!matches!(stop.reason, StopReason::Suspended), "{:?}", stop.reason);
-        assert!(
-            session.wait_for_stop(Duration::from_millis(50)).unwrap().is_none(),
-            "one halt is reported once"
-        );
+        // A second report would come from the announcement the session already holds, so the
+        // answer is there at once; the timing profile also leaves the event stream a window.
+        let window = if cfg!(timing_contract) { Duration::from_millis(50) } else { Duration::ZERO };
+        assert!(session.wait_for_stop(window).unwrap().is_none(), "one halt is reported once");
     }
 
     /// The step lands on the breakpoint line, and a later Continue reaches the same line: the
@@ -1834,18 +1868,35 @@ mod tests {
     /// gets the known halt at once.
     #[test]
     fn a_zero_wait_reports_a_halt_before_the_attach_without_waiting_for_its_stack() {
-        let server = FakeServer::start(Box::new(|cmd: &str, body: &str| {
+        // The stack is answered only once the halt has been reported, so a wait that asked for
+        // it never reports the halt before the watchdog.
+        let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+        let stack_gate = Mutex::new(open_rx);
+        let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| {
             if cmd == "getCallStack" {
-                std::thread::sleep(Duration::from_secs(3));
+                let _ = stack_gate.lock().unwrap().recv_timeout(HANG_WATCHDOG);
             }
             halted_server(cmd, body)
         }));
         let root = config_root();
         let mut session = connect(&server, root.path(), None).expect("attach");
 
-        let started = std::time::Instant::now();
-        let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("the halt is reported");
-        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+        let (answer_tx, answer) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let stop = session.wait_for_stop(Duration::ZERO).unwrap();
+            let _ = answer_tx.send((stop, started.elapsed()));
+        });
+        let answered = answer.recv_timeout(HANG_WATCHDOG);
+        drop(open_tx);
+        // Answered before the join: a thread still stuck past the watchdog is left behind
+        // rather than waited on without a bound.
+        let (stop, waited) = answered.expect("the halt was reported only after its stack");
+        waiter.join().unwrap();
+        let stop = stop.expect("the halt is reported");
+        if cfg!(timing_contract) {
+            assert!(waited < Duration::from_millis(500), "{waited:?}");
+        }
         assert!(matches!(stop.reason, StopReason::Suspended));
         let detail = stop.detail.expect("an unknown position says why");
         assert!(detail.contains("not requested"), "{detail}");
@@ -1992,7 +2043,7 @@ mod tests {
         }));
         let root = config_root();
         let session = connect(&server, root.path(), None).expect("attach");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + HANG_WATCHDOG;
         let error = loop {
             if let Some(e) = session.event_channel_error() {
                 break e;
@@ -2006,8 +2057,7 @@ mod tests {
     /// A locals read whose asynchronous answer never arrives must not look like an empty frame.
     #[test]
     fn locals_without_an_answer_is_an_error_not_an_empty_frame() {
-        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = served.clone();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
             "pingDebugUIParams" if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) => {
                 (200, ping_response(&stop_on_line_4()))
@@ -2020,8 +2070,7 @@ mod tests {
         }));
         let root = config_root();
         let mut session = connect(&server, root.path(), None).expect("attach");
-        wait_until(&served);
-        session.wait_for_stop(Duration::from_secs(1)).unwrap().expect("the stop");
+        wait_for_reported_stop(&mut session);
 
         let err = session.locals(0).unwrap_err();
         assert!(
@@ -2032,8 +2081,7 @@ mod tests {
 
     #[test]
     fn a_message_only_stop_whose_continue_is_refused_does_not_fail_the_wait() {
-        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = served.clone();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
             "pingDebugUIParams" if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) => (
                 200,
@@ -2053,14 +2101,17 @@ mod tests {
         }));
         let root = config_root();
         let mut session = connect(&server, root.path(), None).expect("attach");
-        wait_until(&served);
+        let mut warnings = Vec::new();
+        absorb_events_until(&mut session, "the refused continue was never reported", |session| {
+            warnings.extend(session.take_runtime_warnings());
+            warnings.iter().any(|w| w.contains("message-only") && w.contains("refused"))
+        });
 
-        let stop = session.wait_for_stop(Duration::from_millis(200)).unwrap();
+        // The message-only event has been handled above, so a stop made of it would be queued
+        // already; the timing profile also leaves the event stream a window.
+        let window =
+            if cfg!(timing_contract) { Duration::from_millis(200) } else { Duration::ZERO };
+        let stop = session.wait_for_stop(window).unwrap();
         assert!(stop.is_none(), "a message-only stop is not a stop: {stop:?}");
-        let warnings = session.take_runtime_warnings();
-        assert!(
-            warnings.iter().any(|w| w.contains("message-only") && w.contains("refused")),
-            "{warnings:?}"
-        );
     }
 }

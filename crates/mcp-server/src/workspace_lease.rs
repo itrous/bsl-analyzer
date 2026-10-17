@@ -1538,8 +1538,9 @@ mod tests {
         let lease = WorkspaceLease::claim_cache(&cache);
         assert!(lease.ownership_was_checked());
 
-        // A real check, held inside the lifecycle lock by a lock file it cannot take.
-        let held = WorkspaceLease::hold_cache_lock_for(&cache, Duration::from_secs(3));
+        // A real check, held inside the lifecycle lock by a lock file it cannot take. The file
+        // lock is let go only after the read below has answered.
+        let (held, release_the_lock) = WorkspaceLease::hold_cache_lock_until_released(&cache);
         std::fs::remove_file(cache.lease_path()).expect("the record is this daemon's to remove");
         let checking = {
             let lease = lease.clone();
@@ -1554,15 +1555,30 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let asking = Instant::now();
-        let checked = lease.ownership_was_checked();
-        let published = lease.owns_caches_cached();
-        let waited = asking.elapsed();
+        let (answer_tx, answer) = std::sync::mpsc::channel();
+        let reading = {
+            let lease = lease.clone();
+            std::thread::spawn(move || {
+                let asking = Instant::now();
+                let checked = lease.ownership_was_checked();
+                let published = lease.owns_caches_cached();
+                let _ = answer_tx.send((checked, published, asking.elapsed()));
+            })
+        };
+        let answered = answer.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
+        release_the_lock.send(()).expect("the lock holder is still there to be released");
+        // Answered before the join: a thread still stuck past the watchdog is left behind
+        // rather than waited on without a bound.
+        let (checked, published, waited) =
+            answered.expect("reading the published verdict waited on a check that is doing I/O");
+        reading.join().unwrap();
 
-        assert!(
-            waited < Duration::from_millis(100),
-            "reading the published verdict waited {waited:?} on a check that is doing I/O",
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                waited < Duration::from_millis(100),
+                "reading the published verdict waited {waited:?} on a check that is doing I/O",
+            );
+        }
         assert!(checked, "the verdict established before this check is still established");
         assert!(published, "and it still says what it said");
 
@@ -2244,13 +2260,27 @@ mod tests {
         assert!(matches!(restamp(&lease), LeaseOperationOutcome::Applied(())));
         let first = stamp();
 
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(matches!(restamp(&lease), LeaseOperationOutcome::Applied(())));
-        assert_eq!(stamp(), first, "a second fence inside the window restamped the record");
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(matches!(restamp(&lease), LeaseOperationOutcome::Applied(())));
+            // Inside the window only while the two fences are less than its second apart.
+            assert_eq!(stamp(), first, "a second fence inside the window restamped the record");
+        }
 
-        std::thread::sleep(CHECKPOINT_MIN_INTERVAL + Duration::from_millis(100));
+        // Past the window by the lease's own clock, moved back rather than slept out. The
+        // record's mtime is moved back too, so a restamp shows however fine the file clock.
+        {
+            let mut stamped = lock_recover(&lease.inner.stamped_at);
+            let last = stamped.expect("the first fence stamped the record");
+            *stamped = Some(
+                last.checked_sub(CHECKPOINT_MIN_INTERVAL + Duration::from_millis(100))
+                    .expect("the stamp is younger than the clock"),
+            );
+        }
+        let backdated = first - Duration::from_secs(1);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(backdated).unwrap();
         assert!(matches!(restamp(&lease), LeaseOperationOutcome::Applied(())));
-        assert!(stamp() > first, "a fence past the window did not restamp the record");
+        assert!(stamp() > backdated, "a fence past the window did not restamp the record");
     }
 
     /// Throttling the restamp must not throttle the stop check. The two live in one

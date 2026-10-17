@@ -292,7 +292,9 @@ mod tests {
     use crate::diagnostics_state::test_support::{
         wait_ready, wait_until, write, write_common_module,
     };
-    use crate::walk_probe::{await_walk_start, entered, install, reset, WALK_GATE};
+    use crate::walk_probe::{
+        await_walk_start, entered, hold_walk_start, install, reset, WALK_GATE,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, Instant};
 
@@ -372,14 +374,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         stand(dir.path());
 
+        // The neighbour reports how long it waited and how far the first call's walk had got
+        // by the time the resident was its own.
         let neighbour = |state: DiagnosticsState| async move {
             let started = Instant::now();
             let out = resident_call(state, tokio_util::sync::CancellationToken::new(), |s| {
                 s.read(|resident, _, _| resident.file_count())
             })
             .await;
+            let walked = entered();
             assert!(matches!(out, CallOutcome::Ready(ResidentOutcome::Ready(_, _))));
-            started.elapsed()
+            (started.elapsed(), walked)
         };
 
         // Each phase gets its OWN resident. Reusing one would let the control warm every
@@ -390,7 +395,8 @@ mod tests {
         let ct = tokio_util::sync::CancellationToken::new();
         let first = tokio::spawn(resident_call(control.clone(), ct, walk));
         await_walk_start();
-        let waited_behind_a_live_call = neighbour(control.clone()).await;
+        let (waited_behind_a_live_call, walked_behind_a_live_call) =
+            neighbour(control.clone()).await;
         first.await.expect("the uncancelled call finishes");
 
         // Subject: the same sequence on an equally cold resident, cancelled once the
@@ -398,28 +404,44 @@ mod tests {
         let subject = ready_state(dir.path());
         reset();
         let ct = tokio_util::sync::CancellationToken::new();
+        let held = hold_walk_start();
         let cancelled = tokio::spawn(resident_call(subject.clone(), ct.clone(), walk));
-        await_walk_start();
-        ct.cancel();
-        let waited_behind_a_cancelled_call = neighbour(subject.clone()).await;
+        held.cancel_once_entered(|| ct.cancel());
+        let (waited_behind_a_cancelled_call, walked_behind_a_cancelled_call) =
+            neighbour(subject.clone()).await;
         assert!(
             matches!(cancelled.await.expect("joined"), CallOutcome::Cancelled),
             "the cancelled call must answer as cancelled"
         );
 
-        // The positive control: a neighbour behind a live walk must wait a real second, or the
-        // stand cannot show a cancel freeing the slot. Load only lengthens that wait, so the bound
-        // cannot fail on a busy machine; it can only expose a stand that is too small.
+        // The positive control, by the walk counter: behind a live call the neighbour gets the
+        // resident only once every caller has been entered. Under `timing_contract` the stand
+        // must also be big enough to make that neighbour wait a real second.
+        if cfg!(timing_contract) {
+            assert!(
+                waited_behind_a_live_call > Duration::from_secs(1),
+                "positive control is inert: the neighbour waited only \
+                 {waited_behind_a_live_call:?} behind a LIVE call, so this stand cannot show a \
+                 cancel freeing the slot"
+            );
+        }
         assert!(
-            waited_behind_a_live_call > Duration::from_secs(1),
-            "positive control is inert: the neighbour waited only {waited_behind_a_live_call:?} \
-             behind a LIVE call, so this stand cannot show a cancel freeing the slot"
+            walked_behind_a_live_call >= CALLERS,
+            "positive control is inert: the neighbour answered after the live walk entered only \
+             {walked_behind_a_live_call} of {CALLERS} callers"
         );
         assert!(
-            waited_behind_a_cancelled_call * 3 < waited_behind_a_live_call,
-            "a cancelled call still held the resident: {waited_behind_a_cancelled_call:?} \
-             behind a cancelled call vs {waited_behind_a_live_call:?} behind a live one"
+            walked_behind_a_cancelled_call < CALLERS,
+            "a cancelled call still held the resident: the neighbour answered only after its \
+             walk entered {walked_behind_a_cancelled_call} of {CALLERS} callers"
         );
+        if cfg!(timing_contract) {
+            assert!(
+                waited_behind_a_cancelled_call * 3 < waited_behind_a_live_call,
+                "a cancelled call still held the resident: {waited_behind_a_cancelled_call:?} \
+                 behind a cancelled call vs {waited_behind_a_live_call:?} behind a live one"
+            );
+        }
     }
 
     /// The walk itself stops. Answering quickly proves nothing on its own — the join is
@@ -446,9 +468,9 @@ mod tests {
         let state = ready_state(dir.path());
         reset();
         let ct = tokio_util::sync::CancellationToken::new();
+        let held = hold_walk_start();
         let cancelled = tokio::spawn(resident_call(state.clone(), ct.clone(), walk));
-        await_walk_start();
-        ct.cancel();
+        held.cancel_once_entered(|| ct.cancel());
         assert!(matches!(cancelled.await.expect("joined"), CallOutcome::Cancelled));
 
         // The blocking body is detached: take the resident lock to know it has unwound.
@@ -479,9 +501,9 @@ mod tests {
 
         reset();
         let ct = tokio_util::sync::CancellationToken::new();
+        let held = hold_walk_start();
         let cancelled = tokio::spawn(resident_call(state.clone(), ct.clone(), walk));
-        await_walk_start();
-        ct.cancel();
+        held.cancel_once_entered(|| ct.cancel());
         assert!(matches!(cancelled.await.expect("joined"), CallOutcome::Cancelled));
 
         // Edit a body: the next read polls drift and applies it in place — the write
@@ -519,9 +541,9 @@ mod tests {
 
         reset();
         let ct = tokio_util::sync::CancellationToken::new();
+        let held = hold_walk_start();
         let cancelled = tokio::spawn(resident_call(state.clone(), ct.clone(), walk));
-        await_walk_start();
-        ct.cancel();
+        held.cancel_once_entered(|| ct.cancel());
         assert!(matches!(cancelled.await.expect("joined"), CallOutcome::Cancelled));
 
         let after =
@@ -746,24 +768,14 @@ mod tests {
 
         let cancel = Arc::new(RequestCancel::default());
         let session = ResidentSession { diag: state.clone(), cancel: Arc::clone(&cancel) };
-        // Fired from outside, because a cancel raised by the read itself lands BEFORE the
-        // force and never reaches the window this gate is about — and fired on the EVENT,
-        // not on a clock. The hatch counter rises inside the declined force, which is the
-        // statement immediately before the sleep, so waiting on it puts the cancel after
-        // the force this gate requires to have happened and inside the wait it is about.
-        // A timer would have to land between the two, and a stand that hopes to hit a
-        // window is measuring the scheduler.
-        let armed = state.clone();
-        let ticker = std::thread::spawn(move || {
-            let mut deadline = crate::change_hub::test_support::Patience::new(
-                crate::change_hub::test_support::STATE_CEILING,
-                std::time::Duration::from_millis(1),
-            );
-            while armed.forced_rescans() == 0 && deadline.allows() {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            cancel.cancel_all();
-        });
+        // Fired by the probe just before the force, not by the read itself: a cancel raised
+        // by the read lands before the stale-miss check and never reaches the window this
+        // gate is about. From the probe it lands after that check, so the declined force
+        // still happens and the only thing left to notice the cancel is the check behind
+        // the wait. Fired on the EVENT, not on a clock: a timer would have to land inside
+        // the wait, and a stand that hopes to hit a window is measuring the scheduler.
+        let canceller = Arc::clone(&cancel);
+        state.set_pre_force_probe(move || canceller.cancel_all());
         let reads = AtomicUsize::new(0);
         let _ = session.read_retrying_a_stale_miss(
             || {
@@ -772,7 +784,7 @@ mod tests {
             },
             |answer| *answer == MISS,
         );
-        ticker.join().expect("the canceller");
+        assert!(cancel.is_cancelled(), "the probe never fired, so nothing was cancelled");
         assert_eq!(reads.load(AtomicOrdering::SeqCst), 1, "a caller that left is not read for");
         assert_eq!(
             state.forced_rescans(),

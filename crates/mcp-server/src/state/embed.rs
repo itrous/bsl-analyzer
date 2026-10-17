@@ -2242,19 +2242,16 @@ mod tests {
     }
 
     fn wait_for_root_count(engine: &super::SharedSearchEngine, expected: usize) {
-        for _ in 0..400 {
+        let reached = eventually(|| {
             let count = engine.lock().ok().and_then(|guard| {
                 guard
                     .as_ref()
                     .and_then(SearchEngine::workspace_roots)
                     .map(|roots| roots.entries().count())
             });
-            if count == Some(expected) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("search root table did not reach {expected} entries");
+            count == Some(expected)
+        });
+        assert!(reached, "search root table did not reach {expected} entries");
     }
 
     /// The production publish hook, not a hand-called transition, installs and removes an
@@ -2379,13 +2376,10 @@ mod tests {
 
             let graph = crate::graph::GraphState::for_workspace(workspace.clone());
             graph.ensure_loading();
-            for _ in 0..400 {
-                if matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert!(matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }));
+            assert!(eventually(|| matches!(
+                graph.status(),
+                crate::graph::GraphStatus::Ready { .. }
+            )));
             let store = crate::graph::GraphStore::serving_file_for_test(
                 &crate::cache::graph_db_path(&workspace),
                 None,
@@ -2628,13 +2622,7 @@ mod tests {
 
         let graph = crate::graph::GraphState::for_workspace(workspace.clone());
         graph.ensure_loading();
-        for _ in 0..400 {
-            if matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }));
+        assert!(eventually(|| matches!(graph.status(), crate::graph::GraphStatus::Ready { .. })));
         let signal = crate::graph::GraphPublishSignal {
             drift_pending: false,
             mark_bound: 0,
@@ -2684,13 +2672,7 @@ mod tests {
 
         let graph = crate::graph::GraphState::for_workspace(workspace.clone());
         graph.ensure_loading();
-        for _ in 0..400 {
-            if matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }));
+        assert!(eventually(|| matches!(graph.status(), crate::graph::GraphStatus::Ready { .. })));
         let signal = crate::graph::GraphPublishSignal {
             drift_pending: false,
             mark_bound: 0,
@@ -4897,7 +4879,10 @@ mod tests {
             mock_semantic_config(&server),
             Duration::from_secs(2),
         );
-        assert!(owners.wait_empty(Duration::from_secs(2)), "vector owner exits on denied lease");
+        assert!(
+            owners.wait_empty(crate::change_hub::test_support::STATE_CEILING),
+            "vector owner exits on denied lease"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,

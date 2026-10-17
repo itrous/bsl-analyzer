@@ -9,6 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
+/// not a latency measure.
+const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+
 fn command(root: &std::path::Path, profile: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
     command
@@ -65,7 +69,9 @@ fn vector_journal_failure_keeps_stdout_protocol_only() {
         "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"journal-fixture","version":"1"}
     }})).unwrap();
     stdin.flush().unwrap();
-    let first = receiver.recv_timeout(Duration::from_secs(20)).expect("initialize response");
+    let first = receiver
+        .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(20)))
+        .expect("initialize response");
     let response: serde_json::Value =
         serde_json::from_str(&first).expect("stdout contains protocol JSON only");
     assert_eq!(response["id"], 1);
@@ -83,12 +89,14 @@ fn vector_journal_failure_keeps_stdout_protocol_only() {
     )
     .unwrap();
     stdin.flush().unwrap();
-    let second = receiver.recv_timeout(Duration::from_secs(20)).expect("tools response");
+    let second = receiver
+        .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(20)))
+        .expect("tools response");
     let response: serde_json::Value =
         serde_json::from_str(&second).expect("stdout contains protocol JSON only");
     assert_eq!(response["id"], 2);
     assert!(response["result"]["tools"].is_array());
-    observed.recv_timeout(Duration::from_secs(5)).expect("journal failure diagnostic");
+    observed.recv_timeout(HANG_WATCHDOG).expect("journal failure diagnostic");
     // This fixture tests a live protocol exchange. MCP transport teardown is
     // independent; JournalGuard's bounded graceful drain is exercised in unit tests.
     child.kill().unwrap();
@@ -133,7 +141,7 @@ fn workspace_startup_journal_survives_real_cli_restart() {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(20));
         let observed = loop {
             let mut records = Vec::new();
             for slot in 0..8 {

@@ -716,6 +716,10 @@ mod tests {
     use bsl_search::SearchEngine;
     use tempfile::tempdir;
 
+    /// The shared hang watchdog's bound under `timing_contract`, in the milliseconds
+    /// [`wait_for`] counts.
+    const CEILING_MS: u64 = 60_000;
+
     #[test]
     fn payload_lifecycle_overlay_failure_and_retry_preserve_the_main_owner() {
         let _lock = env_lock();
@@ -808,13 +812,14 @@ mod tests {
         );
 
         state.fresh_epoch = epoch_before;
+        let at = Instant::now();
         dummy.settle_outcome(
             &mut state,
             super::super::WorkspaceSearchApply::TransientRefusal,
             epoch_before,
         );
         assert_eq!(state.streak, 1, "the backoff of a refused pass was cleared");
-        assert!(state.next_allowed > Instant::now(), "the pass may restart immediately");
+        assert!(state.next_allowed >= at + retry_delay(1), "the pass may restart immediately");
     }
 
     #[test]
@@ -938,14 +943,13 @@ mod tests {
         assert!(matches!(&*retry.semantic_runtime.lock().unwrap(), SemanticRuntimeStatus::Ready));
     }
 
-    fn wait_for(deadline_ms: u64, mut check: impl FnMut() -> bool) -> bool {
-        for _ in 0..(deadline_ms / 10) {
-            if check() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        check()
+    /// Polls `check` until it holds; `deadline_ms` bounds the wait only under `timing_contract`.
+    fn wait_for(deadline_ms: u64, check: impl FnMut() -> bool) -> bool {
+        test_utils::wait::poll_until(
+            Duration::from_millis(deadline_ms),
+            Duration::from_millis(10),
+            check,
+        )
     }
 
     /// A stop that lands while the driver is asking whether it has work leaves it at once,
@@ -982,7 +986,12 @@ mod tests {
         let held = shared.lock().unwrap();
         retry.start();
         assert!(wait_for(3_000, || stop.live() >= 1), "the driver never started");
-        std::thread::sleep(Duration::from_millis(200));
+        // Gives the driver time to block on the held engine. A stop that comes before it gets
+        // there is read on the way in and proves nothing, but fails nothing either; the pause
+        // that makes the race likely is the timing profile's.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
 
         // The waker runs to completion here: it takes the free state lock, notifies an empty
         // room and returns. Nothing is waiting to be woken.
@@ -1255,8 +1264,11 @@ mod tests {
         );
         let exhausted_passes = retry.pass_count();
         assert_eq!(exhausted_passes, 2, "a storm of mid-pass facts is one pass, not eight");
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(retry.pass_count(), exhausted_passes, "budget failure does not self-repeat");
+        // A pass that never comes has no event to wait on; only a quiet window can show it.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(retry.pass_count(), exhausted_passes, "budget failure does not self-repeat");
+        }
 
         super::super::embed::FORCE_OVERLAY_PUBLICATION_REFUSALS.store(1, Ordering::SeqCst);
         retry.kick_fresh();
@@ -1293,8 +1305,17 @@ mod tests {
         for kicker in kickers {
             kicker.join().unwrap();
         }
-        assert!(wait_for(5_000, || retry.pass_count() >= 1), "the first pass runs");
-        std::thread::sleep(Duration::from_millis(300));
+        assert!(wait_for(CEILING_MS, || retry.pass_count() >= 1), "the first pass runs");
+        // The driver about to sleep with nothing due is the state in which no further pass is
+        // scheduled; the wake sends it through that decision once more.
+        let (idle_tx, idle_rx) = std::sync::mpsc::channel();
+        *retry.before_idle_wait.lock().unwrap() = Some(Box::new(move || {
+            let _ = idle_tx.send(());
+        }));
+        retry.coalesce();
+        idle_rx
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the driver never settled with no pass due");
         assert_eq!(retry.pass_count(), 1, "a kick storm still yields one pass");
         retry.stop();
     }
@@ -1383,14 +1404,16 @@ mod tests {
                 let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
                 let retry = driver_over(crate::state::shared_engine(None), lease.clone());
                 retry.kick_fresh();
-                std::thread::sleep(Duration::from_millis(100));
-                assert!(retry.pass_count() >= 1, "the workflow owns its admission attempt");
+                assert!(
+                    wait_for(CEILING_MS, || retry.pass_count() >= 1),
+                    "the workflow owns its admission attempt"
+                );
                 assert!(!lease.is_superseded(), "lock contention is not terminal");
                 (retry, lease)
             });
 
         retry.kick_fresh();
-        assert!(wait_for(5_000, || retry.pass_count() >= 1), "the unclaimed lease retries");
+        assert!(wait_for(CEILING_MS, || retry.pass_count() >= 1), "the unclaimed lease retries");
         assert!(!lease.is_superseded());
         assert!(!retry.state.lock().unwrap().disarmed);
         retry.stop();
@@ -1401,6 +1424,9 @@ mod tests {
     /// outcome must not depend on that order: each step releases a different wait, and a
     /// driver whose exit needs them in one particular sequence is one reordering away from
     /// sitting out a half-hour backoff after the daemon has gone.
+    ///
+    /// Only the clock tells an exit on shutdown from a backoff sat out, so an ordinary run checks
+    /// that every order ends every driver, and the timing profile that it ends them at once.
     #[test]
     fn a_paused_driver_leaves_in_every_shutdown_order() {
         use crate::change_hub::WorkspaceChangeHub;
@@ -1422,6 +1448,7 @@ mod tests {
             engine: SharedSearchEngine,
             hub: WorkspaceChangeHub,
             retry: Arc<OverlayRetry>,
+            hold: (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>),
             _dir: tempfile::TempDir,
         }
 
@@ -1460,16 +1487,11 @@ mod tests {
         let daemons: Vec<Daemon> = built
             .into_iter()
             .map(|(dir, cache, engine, stop, hub)| {
-                // Held for far longer than the two refusals need, because this test shares a
-                // machine with the rest of the suite: a hold that expires between the first
-                // refusal and the second lets the pass publish and end instead of parking.
-                // The holder is left to expire on its own — joining it would add its whole
-                // hold to the test, and all it does after this point is release a lock in a
-                // directory the test has finished with.
-                drop(crate::workspace_lease::WorkspaceLease::hold_cache_lock_for(
-                    &cache,
-                    Duration::from_secs(60),
-                ));
+                // Held until the drivers have left, however long the machine takes to get them
+                // parked: a hold that ended between the first refusal and the second would let
+                // the pass publish and end instead of parking.
+                let hold =
+                    crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
                 let retry = OverlayRetry::spawn(
                     Arc::clone(&engine),
                     stop.clone(),
@@ -1478,14 +1500,14 @@ mod tests {
                     crate::workspace_lease::WorkspaceLease::claim_cache(&cache),
                     super::super::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
                 );
-                Daemon { stop, engine, hub, retry, _dir: dir }
+                Daemon { stop, engine, hub, retry, hold, _dir: dir }
             })
             .collect();
 
         // Parked in the backoff: a pass began, has not ended, and is not working.
         for daemon in &daemons {
             assert!(
-                wait_for(30_000, || daemon.retry.passes_started() >= 1
+                wait_for(CEILING_MS, || daemon.retry.passes_started() >= 1
                     && daemon.retry.pass_count() == 0
                     && !daemon.retry.pass_active()),
                 "a driver never reached its backoff (started {}, finished {}, active {})",
@@ -1508,7 +1530,7 @@ mod tests {
 
         for (daemon, order) in daemons.iter().zip(ORDERS) {
             assert!(
-                wait_for(1_000, || daemon.stop.live() == 0),
+                wait_for(CEILING_MS, || daemon.stop.live() == 0),
                 "the driver stayed in its backoff under order {order:?}"
             );
             let owed =
@@ -1518,11 +1540,18 @@ mod tests {
                 "the driver published an overlay after its daemon stopped, order {order:?}"
             );
         }
-        assert!(
-            asked.elapsed() < Duration::from_secs(2),
-            "the six exits took {:?}",
-            asked.elapsed()
-        );
+        // A driver that sat its backoff out would cost a whole tick; half of one is beyond any
+        // slow machine.
+        let exits = asked.elapsed();
+        if cfg!(timing_contract) {
+            assert!(exits < TICK / 2, "the six exits took {exits:?}");
+            assert!(exits < Duration::from_secs(2), "the six exits took {exits:?}");
+        }
+        for daemon in daemons {
+            let (holder, release) = daemon.hold;
+            release.send(()).expect("the holder still holds the lock");
+            holder.join().expect("the holder lets go");
+        }
     }
 
     /// A driver sitting out a publication backoff is waiting, not working: the flag the
@@ -1635,7 +1664,11 @@ mod tests {
         // The newer daemon exits cleanly; the old process remains terminally read-only.
         newer.release();
         retry.kick_fresh();
-        std::thread::sleep(Duration::from_millis(300));
+        // A pass that should never come is an absence. Only the timing profile waits a window
+        // out for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(
             retry.pass_count(),
             terminal_passes,

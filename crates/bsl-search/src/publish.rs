@@ -463,6 +463,11 @@ mod tests {
 
     type SharedEmbeddingMap = Arc<Mutex<HashMap<(String, String, usize), Vec<f32>>>>;
 
+    /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
+    /// not a latency measure.
+    const HANG_WATCHDOG: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
+
     #[derive(Clone, Default)]
     struct FakeEmbeddingStore {
         embeddings: SharedEmbeddingMap,
@@ -1007,7 +1012,7 @@ mod tests {
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(active, Ordering::SeqCst);
                 self.started.send(()).unwrap();
-                let released = self.release.recv_timeout(std::time::Duration::from_secs(2));
+                let released = self.release.recv_timeout(HANG_WATCHDOG);
                 self.active.fetch_sub(1, Ordering::SeqCst);
                 released.map_err(|_| SearchError::Embedder("fixture watchdog".into()))?;
                 Ok(texts.iter().map(|_| vec![1.0, 2.0, 3.0]).collect())
@@ -1034,7 +1039,7 @@ mod tests {
         });
         for _ in 0..2 {
             for _ in 0..2 {
-                started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                started_rx.recv_timeout(HANG_WATCHDOG).unwrap();
             }
             assert!(started_rx.try_recv().is_err());
             for _ in 0..2 {

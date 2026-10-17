@@ -1572,6 +1572,9 @@ mod tests {
     /// The sweeper parks between ticks, and the shutdown wakes it out of that park rather
     /// than leaving it to time out. The tick is half a minute: slept out, a daemon told to
     /// stop keeps a thread walking its workspace for the rest of it.
+    ///
+    /// Only the clock tells a woken sweeper from one that slept its tick out, so an ordinary run
+    /// checks that the shutdown ends it, and the timing profile that it ends it at once.
     #[test]
     fn a_shutdown_wakes_the_idle_sweeper_out_of_its_tick() {
         use crate::change_hub::test_support::eventually;
@@ -1585,8 +1588,11 @@ mod tests {
             "the sweeper never started, so its exit below would prove nothing"
         );
 
-        // Parked: its next tick is SWEEP_INTERVAL away and nothing else wakes it.
-        std::thread::sleep(Duration::from_millis(100));
+        // Parked, in the timing profile: its next tick is SWEEP_INTERVAL away and nothing else
+        // wakes it. A shutdown that lands before it parks must end it just the same.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(state.sweeper_running());
         assert!(
             SWEEP_INTERVAL >= Duration::from_secs(5),
@@ -1597,10 +1603,22 @@ mod tests {
         state.shutdown();
 
         assert!(
-            crate::change_hub::test_support::eventually_within(100, || !state.sweeper_running()),
+            crate::change_hub::test_support::eventually(|| !state.sweeper_running()),
             "the sweeper slept through the shutdown"
         );
-        assert!(asked.elapsed() < Duration::from_secs(1), "the sweeper slept out its interval");
+        // A sweeper that slept its tick out costs a whole interval; half of one is beyond any
+        // slow machine.
+        let stopped = asked.elapsed();
+        if cfg!(timing_contract) {
+            assert!(
+                stopped < SWEEP_INTERVAL / 2,
+                "the sweeper slept out its interval: {stopped:?}"
+            );
+            assert!(
+                stopped < Duration::from_secs(1),
+                "the sweeper slept out its interval: {stopped:?}"
+            );
+        }
     }
 
     /// One resident build is exactly ONE traversal: the file set and the drift
@@ -1781,14 +1799,23 @@ mod tests {
         assert_eq!(failed.error.as_deref(), Some("synthetic first failure"));
         assert_eq!(failed.attempts, 1, "one failure is behind this state");
         assert!(
-            failed.retry_after_ms.is_some_and(|owed| owed > 0),
+            failed.retry_after_ms.is_some(),
             "a failure is retryable, and the caller is told when: {:?}",
             failed.retry_after_ms,
         );
+        if cfg!(timing_contract) {
+            // Read within the 60 ms base, so a pause is still owed.
+            assert!(
+                failed.retry_after_ms.is_some_and(|owed| owed > 0),
+                "a failure is retryable, and the caller is told when: {:?}",
+                failed.retry_after_ms,
+            );
+        }
         assert!(failed.failed_age_ms.is_some(), "the cause has an age: {:?}", failed.failed_age_ms);
         assert!(failed.elapsed_ms.is_none(), "nothing is building");
 
-        std::thread::sleep(Duration::from_millis(80));
+        // The backoff runs out by the failure's own clock, moved past it rather than slept out.
+        shift_failure_back(&state, Duration::from_millis(80));
         state.ensure_loading();
         wait_ready(&state);
 
@@ -1876,12 +1903,15 @@ mod tests {
 
         let state = DiagnosticsState::for_workspace(root.to_path_buf());
         state.with_build_timeout_for_test(Duration::from_millis(1));
+        // A pause no run of this test can outlast, so the owed wait below is never zero.
+        state.with_retry_pacing_for_test(Duration::from_secs(3600), Duration::from_secs(3600));
         {
+            // Started further back than the deadline, by the build's own clock.
             let mut inner = lock_recover(&state.inner);
             inner.status = DiagnosticsStatus::Loading;
-            inner.loading_since = Some(Instant::now());
+            inner.loading_since = Instant::now().checked_sub(Duration::from_millis(8));
+            assert!(inner.loading_since.is_some(), "the monotonic clock is older than 8 ms");
         }
-        std::thread::sleep(Duration::from_millis(8));
 
         assert!(state.expire_stuck_build(), "an overrun build is published as failed");
         let report = state.status_report();
@@ -2039,19 +2069,29 @@ mod tests {
         assert!(!state.sweeper_running(), "and no loader was started");
     }
 
+    /// Move the recorded failure `by` into the past: the time a retry pause measures has passed,
+    /// with no wait for it.
+    fn shift_failure_back(state: &DiagnosticsState, by: Duration) {
+        let mut inner = lock_recover(&state.inner);
+        let at = inner.failed_at.expect("a failure is on record");
+        inner.failed_at = Some(at.checked_sub(by).expect("the failure is younger than the clock"));
+    }
+
     /// The wait counts DOWN: a poller reading `retry_after_ms` twice sees the remaining pause
     /// shrink, which is the difference between a schedule and a number that never moves.
     #[test]
     fn the_retry_wait_counts_down() {
         let dir = tempfile::tempdir().unwrap();
         let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
-        state.with_retry_pacing_for_test(Duration::from_secs(5), Duration::from_secs(60));
+        // An hour-long pause: no run of this test can outlast it, so the wait is still owed
+        // at the second reading however slowly the machine gets there.
+        state.with_retry_pacing_for_test(Duration::from_secs(3600), Duration::from_secs(3600));
         state.fail_for_test("synthetic failure");
 
         let first = state.status_report().retry_after_ms.expect("a failure owes a wait");
-        std::thread::sleep(Duration::from_millis(80));
+        shift_failure_back(&state, Duration::from_millis(80));
         let second = state.status_report().retry_after_ms.expect("still owed");
-        assert!(second > 0, "the pause is not over in 80 ms of a five-second base");
+        assert!(second > 0, "the pause is not over within an hour-long base");
         assert!(second < first, "the remaining wait must shrink: {first} ms then {second} ms",);
         assert!(
             first - second >= 40,

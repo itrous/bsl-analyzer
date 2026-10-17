@@ -72,8 +72,9 @@ pub(crate) fn workspace_hub(root: &Path) -> crate::change_hub::WorkspaceChangeHu
 
 /// How often a bounded wait re-reads the state it is waiting on.
 pub(crate) const WAIT_POLL: Duration = Duration::from_millis(10);
-/// The default ceiling for a bounded wait on graph state.
-pub(crate) const WAIT_CEILING: Duration = Duration::from_secs(30);
+/// The default ceiling for a bounded wait on graph state: thirty seconds under
+/// `timing_contract`, none otherwise (see [`test_utils::wait`]).
+pub(crate) const WAIT_CEILING: Duration = test_utils::wait::ceiling(Duration::from_secs(30));
 
 /// How many polls a bounded wait of nominal length `ceiling` makes. The count bounds the wait,
 /// not the clock: a loaded machine stretches each poll, so the same polls still cover the same

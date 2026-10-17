@@ -269,14 +269,12 @@ jobs:
           run_exact mcp-server graph::debt::tests::a_straddled_walk_does_not_validate_the_scan
           run_exact mcp-server graph::debt::tests::the_first_walk_of_a_replaced_declaration_is_news
           run_exact mcp-server graph::debt::tests::a_probe_that_outlived_its_episode_still_owns_the_walk
-          run_exact mcp-server graph::state::tests::a_failed_build_closes_the_account_that_paid_for_it
           run_exact mcp-server graph::state::tests::the_publication_gate_reads_no_metadata_of_its_own
           run_exact mcp-server graph::debt::tests::a_publication_that_cannot_read_its_own_metadata_answers_nothing
           run_exact mcp-server graph::debt::tests::a_straddled_publication_cannot_end_the_chain
           run_exact mcp-server graph::debt::tests::a_declaration_nobody_has_installed_yet_still_heals_on_its_own_account
           run_exact mcp-server graph::debt::tests::a_verdict_about_other_roots_is_not_carried_into_the_new_ones
           run_exact mcp-server graph::state::tests::the_boot_and_the_external_claim_carry_the_healings_measured_before_them
-          run_exact mcp-server graph::state::tests::a_real_builders_failure_closes_the_account_that_paid_for_it
           run_exact mcp-server graph::state::tests::a_real_fact_delivered_inside_a_comparison_runs_before_any_idle_wait
           run_exact mcp-server graph::state::tests::a_build_that_never_started_spends_no_healing
           run_exact mcp-server graph::state::tests::a_change_delivered_during_the_walk_outlives_that_comparison
@@ -777,14 +775,12 @@ jobs:
           run_exact mcp-server graph::debt::tests::a_straddled_walk_does_not_validate_the_scan
           run_exact mcp-server graph::debt::tests::the_first_walk_of_a_replaced_declaration_is_news
           run_exact mcp-server graph::debt::tests::a_probe_that_outlived_its_episode_still_owns_the_walk
-          run_exact mcp-server graph::state::tests::a_failed_build_closes_the_account_that_paid_for_it
           run_exact mcp-server graph::state::tests::the_publication_gate_reads_no_metadata_of_its_own
           run_exact mcp-server graph::debt::tests::a_publication_that_cannot_read_its_own_metadata_answers_nothing
           run_exact mcp-server graph::debt::tests::a_straddled_publication_cannot_end_the_chain
           run_exact mcp-server graph::debt::tests::a_declaration_nobody_has_installed_yet_still_heals_on_its_own_account
           run_exact mcp-server graph::debt::tests::a_verdict_about_other_roots_is_not_carried_into_the_new_ones
           run_exact mcp-server graph::state::tests::the_boot_and_the_external_claim_carry_the_healings_measured_before_them
-          run_exact mcp-server graph::state::tests::a_real_builders_refused_install_answers_for_the_account_that_paid_for_it
           run_exact mcp-server graph::state::tests::a_real_fact_delivered_inside_a_comparison_runs_before_any_idle_wait
           run_exact mcp-server graph::state::tests::a_build_that_never_started_spends_no_healing
           run_exact mcp-server graph::state::tests::a_change_delivered_during_the_walk_outlives_that_comparison

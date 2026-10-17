@@ -14,6 +14,10 @@ use tokio::task::JoinHandle;
 type Client = RunningService<RoleClient, ()>;
 type ServerTask = JoinHandle<anyhow::Result<()>>;
 
+/// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
+/// latency measure.
+const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+
 const CONSUMER: &str = include_str!(
     "fixtures/shared_workspace_analysis_s6/extensions/consumer/CommonModules/Потребитель/Ext/Module.bsl"
 );
@@ -100,7 +104,7 @@ async fn wait_mcp_target(
         .expect("expected target includes source root and module path");
     let expected_root_id = expected_root_id.split('/').collect::<PathBuf>();
     let expected_path = format!("CommonModules/{expected_path_suffix}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "MCP never resolved {needle}");
@@ -131,7 +135,8 @@ async fn wait_mcp_target(
 }
 
 async fn assert_mcp_missing(client: &Client, path: &Path, needle: &str) {
-    let card = symbol_info(client, path, needle, Duration::from_secs(45)).await;
+    let card =
+        symbol_info(client, path, needle, test_utils::wait::ceiling(Duration::from_secs(45))).await;
     let no_target =
         card["definitions"].is_null() || card["definitions"].as_array().is_some_and(Vec::is_empty);
     assert!(
@@ -184,7 +189,7 @@ fn wait_lsp_target(
     needle: &str,
     target_uri: &lsp_types::Url,
 ) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     let mut id = first_id;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -215,7 +220,7 @@ fn wait_lsp_target(
 }
 
 fn assert_lsp_missing(lsp: &mut Lsp, id: u64, uri: &lsp_types::Url, needle: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     let mut request_id = id;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -310,7 +315,7 @@ async fn source_set_change_retires_mcp_scope_and_reconnects_to_new_semantics() {
     std::fs::write(&config_path, CONFIG_B).expect("switch the configured provider source root");
     send_config_change(&mut lsp, &config_path);
     let updated_diagnostics = lsp
-        .wait_for_within(Duration::from_secs(45), |message| {
+        .wait_for_within(test_utils::wait::ceiling(Duration::from_secs(45)), |message| {
             message["method"] == "textDocument/publishDiagnostics"
                 && message["params"]["uri"] == consumer_uri.as_str()
         })
@@ -334,7 +339,7 @@ async fn source_set_change_retires_mcp_scope_and_reconnects_to_new_semantics() {
         !new_cache.root().exists(),
         "the retired owner has not created or published into the new cache scope"
     );
-    tokio::time::timeout(Duration::from_secs(15), old_task)
+    tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(15)), old_task)
         .await
         .expect("source-set drift retires the old MCP transport")
         .expect("old MCP task joins")
@@ -364,7 +369,7 @@ async fn source_set_change_retires_mcp_scope_and_reconnects_to_new_semantics() {
 
     eprintln!("S6 phase=source-set/lsp-shutdown");
     new_client.cancel().await.expect("new MCP client disconnects");
-    tokio::time::timeout(Duration::from_secs(5), new_task)
+    tokio::time::timeout(HANG_WATCHDOG, new_task)
         .await
         .expect("reconnected MCP session exits")
         .expect("new MCP task joins")
@@ -401,7 +406,7 @@ async fn excluding_and_readmitting_a_provider_tombstones_and_restores_its_defini
     std::fs::write(&config_path, excluded_config).expect("exclude provider source root");
     send_config_change(&mut lsp, &config_path);
     let excluded_diagnostics = lsp
-        .wait_for_within(Duration::from_secs(45), |message| {
+        .wait_for_within(test_utils::wait::ceiling(Duration::from_secs(45)), |message| {
             message["method"] == "textDocument/publishDiagnostics"
                 && message["params"]["uri"] == consumer_uri.as_str()
         })
@@ -413,7 +418,7 @@ async fn excluding_and_readmitting_a_provider_tombstones_and_restores_its_defini
     std::fs::write(&config_path, CONFIG_A).expect("restore provider source root");
     send_config_change(&mut lsp, &config_path);
     let restored_diagnostics = lsp
-        .wait_for_within(Duration::from_secs(45), |message| {
+        .wait_for_within(test_utils::wait::ceiling(Duration::from_secs(45)), |message| {
             message["method"] == "textDocument/publishDiagnostics"
                 && message["params"]["uri"] == consumer_uri.as_str()
         })

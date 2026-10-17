@@ -32,6 +32,8 @@ type SearchCall = Box<
 
 /// How long a cancelled call may take to come back. Well above one poll (25 ms) and well
 /// below every wait it must not sit out (a 2 s held lock, a 12 s embed, a latched actor).
+/// Checked only under `timing_contract`; the ordinary run keeps what the call must not wait
+/// for in place until it has come back, so a call that waited never does.
 const CANCEL_BOUND: Duration = Duration::from_millis(500);
 
 fn fts_engine(dir: &TempDir) -> SharedEngine {
@@ -134,16 +136,23 @@ fn a_search_waiting_for_the_engine_lock_returns_at_its_cancellation() {
             let call = Arc::clone(&call);
             move || call(&engine, &cancel)
         });
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            crate::change_hub::test_support::eventually(|| engine.queued() == 1),
+            "{name}: the call did not queue on the lock"
+        );
         cancel.cancel();
+        // The lock stays held through the control below, so a call that waited for it
+        // instead of its cancellation never comes back before the watchdog.
         let (out, waited) = outcome
-            .recv_timeout(HOLD * 2)
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .unwrap_or_else(|_| panic!("{name}: the cancelled call never came back"));
         assert!(
             matches!(out, Err(SearchFailure::Cancelled)),
             "{name}: expected Cancelled, got {out:?}"
         );
-        assert!(waited < CANCEL_BOUND, "{name}: waited {waited:?} past its cancellation");
+        if cfg!(timing_contract) {
+            assert!(waited < CANCEL_BOUND, "{name}: waited {waited:?} past its cancellation");
+        }
 
         // Positive control: an uncancelled call queues until the lock frees, then answers.
         let outcome = on_thread({
@@ -151,12 +160,23 @@ fn a_search_waiting_for_the_engine_lock_returns_at_its_cancellation() {
             let call = Arc::clone(&call);
             move || call(&engine, &CancellationToken::new())
         });
-        std::thread::sleep(HOLD);
+        assert!(
+            crate::change_hub::test_support::eventually(|| engine.queued() == 1),
+            "{name}: the control did not queue on the lock"
+        );
+        if cfg!(timing_contract) {
+            std::thread::sleep(HOLD);
+        }
         drop(held);
         let (out, waited) =
             outcome.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
         assert!(!matches!(out, Err(SearchFailure::Cancelled)), "{name}: control must be answered");
-        assert!(waited >= HOLD / 2, "{name}: the control did not queue on the lock: {waited:?}");
+        if cfg!(timing_contract) {
+            assert!(
+                waited >= HOLD / 2,
+                "{name}: the control did not queue on the lock: {waited:?}"
+            );
+        }
     }
 }
 
@@ -193,14 +213,22 @@ fn a_cancelled_search_waiting_on_the_actor_releases_the_engine_lock() {
         .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
         .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
-    assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
+    if cfg!(timing_contract) {
+        assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
+    }
 
     // The actor is still latched, and the lock is free for the next caller.
     assert_eq!(latch.executed(), Vec::<&str>::new(), "the latched request has not answered");
     let acquired = Instant::now();
     let guard = try_acquire_engine(&engine, &CancellationToken::new());
     assert!(guard.is_ok(), "the next search must take the engine lock");
-    assert!(acquired.elapsed() < CANCEL_BOUND, "the lock was still held: {:?}", acquired.elapsed());
+    if cfg!(timing_contract) {
+        assert!(
+            acquired.elapsed() < CANCEL_BOUND,
+            "the lock was still held: {:?}",
+            acquired.elapsed()
+        );
+    }
     drop(guard);
 
     latch.release_one();
@@ -241,12 +269,20 @@ fn a_cancelled_identity_gate_releases_the_engine_lock() {
         .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
         .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
-    assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
+    if cfg!(timing_contract) {
+        assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
+    }
 
     let acquired = Instant::now();
     let guard = try_acquire_engine(&engine, &CancellationToken::new());
     assert!(guard.is_ok(), "the next search must take the engine lock");
-    assert!(acquired.elapsed() < CANCEL_BOUND, "the lock was still held: {:?}", acquired.elapsed());
+    if cfg!(timing_contract) {
+        assert!(
+            acquired.elapsed() < CANCEL_BOUND,
+            "the lock was still held: {:?}",
+            acquired.elapsed()
+        );
+    }
     drop(guard);
 
     latch.release_one();
@@ -277,7 +313,9 @@ fn a_cancelled_docs_search_does_not_fall_back_to_the_corpus_view() {
         .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
         .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
-    assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
+    if cfg!(timing_contract) {
+        assert!(waited < CANCEL_BOUND, "waited {waited:?} past the cancellation");
+    }
 
     latch.release_one();
     service.shutdown();
@@ -372,7 +410,11 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
             assert!(deadline.allows(), "{name}: the embed never reached the embedder");
             std::thread::sleep(Duration::from_millis(5));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // A call that took the lock before it embeds holds it already; the timing profile also
+        // gives a call that would take it during the embed a moment to do so.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(engine.try_lock().is_ok(), "{name}: the engine lock is held across the embed");
         assert_eq!(embedder.accepted(), 1, "{name}: exactly one embed per query");
 
@@ -381,7 +423,9 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .unwrap_or_else(|_| panic!("{name}: the cancelled call never came back"));
         assert!(matches!(out, Err(SearchFailure::Cancelled)), "{name}: expected Cancelled");
-        assert!(waited < CANCEL_BOUND, "{name}: waited {waited:?} past its cancellation");
+        if cfg!(timing_contract) {
+            assert!(waited < CANCEL_BOUND, "{name}: waited {waited:?} past its cancellation");
+        }
 
         embedder.hang_up();
         if let Some((service, _)) = service {

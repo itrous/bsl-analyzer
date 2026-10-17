@@ -1,3 +1,4 @@
+pub mod wait;
 pub mod walk_probe;
 
 pub use expect_test::{expect, Expect};

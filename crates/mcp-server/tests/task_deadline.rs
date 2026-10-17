@@ -4,10 +4,11 @@
 //! can wait for, and that knob is read per task: a shorter lifetime leaking into the gates
 //! that expect a task to run to its answer would cut them short instead.
 //!
-//! Only the phase that can be pinned from outside lives here. Catching a deadline while the
-//! index is still building means winning a race against the build, and that race is not
-//! winnable by choosing constants — it is stated as a unit gate instead, where the lifecycle
-//! is set rather than raced.
+//! Catching a deadline while the index is still building means winning a race against the
+//! build, and that race is not winnable by choosing constants — it is stated as a unit gate
+//! instead, where the lifecycle is set rather than raced. The reading phase lives here, under
+//! `timing_contract`: a handle opens only during the build, so its deadline falls after the
+//! build only on a machine fast enough to finish the build first.
 
 use std::path::Path;
 use std::time::Duration;
@@ -23,9 +24,6 @@ mod common;
 use common::Retired;
 
 const TOOL: &str = "references";
-
-/// The symbol every call in this binary asks about: declared by a module the stand lists.
-const STAND_METHOD: &str = "ПервыйОбщийМодуль.НеУстаревшаяФункция";
 
 /// Bound on a single answer. A hang guard: the answer comes on its own when the server is right.
 const HANG_GUARD: Duration = Duration::from_secs(180);
@@ -141,21 +139,6 @@ impl Wire {
         self.request("tools/call", json!({"name": tool, "arguments": arguments})).await
     }
 
-    /// Waits until the analysis index answers without building, so that the gated task below
-    /// starts where its gate means it to: in the reading phase, not racing the build. A
-    /// lifetime shorter than the build would otherwise expire in the waiting phase on a slow
-    /// machine.
-    async fn warm(&mut self) {
-        for _ in 0..POLL_ATTEMPTS {
-            let answer = self.call(TOOL, json!({"symbol": STAND_METHOD})).await;
-            if answer["result"]["structuredContent"]["status"] != "loading" {
-                return;
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-        panic!("the analysis index never finished building");
-    }
-
     /// Poll a handle to its terminal state, refusing to report a swept entry as an outcome.
     async fn settle(&mut self, task_id: &str) -> Value {
         for _ in 0..POLL_ATTEMPTS {
@@ -191,13 +174,20 @@ fn arm(ttl_ms: u64) {
 /// `index_building` would read a diagnosis of a state that did not happen. It also fails on a
 /// build that lends the incompleteness vocabulary to an answer that was never produced —
 /// those codes say why an answer a caller HAS is less than the whole answer.
+///
+/// A handle is opened only while the index is building, so the call has to land in the build
+/// and the deadline after its end: a build that a loaded machine stretches past the deadline
+/// fails the gate in the waiting phase. Nothing outside the server can pin that order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(timing_contract),
+    ignore = "необязательный тест: the deadline must fall after a build the test cannot pin; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
+)]
 async fn a_task_stopped_mid_answer_does_not_blame_the_index() {
     arm(LONG_WORK_TTL_MS);
 
     let dst = stage(LONG_WORK_MODULES, LONG_WORK_BODIES);
     let mut wire = Wire::connect(dst.path()).await;
-    wire.warm().await;
 
     let id = task_id(&wire.call("diagnostics", json!({"action": "workspace"})).await);
     let task = wire.settle(&id).await;

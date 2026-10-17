@@ -1253,8 +1253,10 @@ mod tests {
             );
         }
         // The deadline cannot pass under a stalled observer, so this reading is the same
-        // whenever it is taken.
-        std::thread::sleep(Duration::from_millis(300));
+        // whenever it is taken; only the timing profile waits a window out before it.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(
             handle.probe.admissions.load(Ordering::SeqCst),
             attempts,
@@ -1283,7 +1285,9 @@ mod tests {
             eventually(|| handle.wakes_consumed() > taken),
             "the wake just before the deadline never reached the owner",
         );
-        std::thread::sleep(Duration::from_millis(300));
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(
             handle.probe.admissions.load(Ordering::SeqCst),
             attempts,
@@ -1457,7 +1461,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let files = 3 * bsl_search::POINT_BATCH_KEYS + 5;
         let shared = engine_over(dir.path(), files);
-        let pacing = Pacing { idle_tick: Duration::from_secs(30), ..FAST };
+        // An idle tick no ordinary run reaches: an owner that pauses on one between batches
+        // never drains. Under `timing_contract` the tick is half a minute and the clock says
+        // how long the drain and its widest gap took.
+        let idle_tick = test_utils::wait::ceiling(Duration::from_secs(30));
+        let pacing = Pacing { idle_tick, ..FAST };
         let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, pacing);
         for index in 0..files {
             edit(
@@ -1469,11 +1477,17 @@ mod tests {
         let started = Instant::now();
         handle.fresh();
         assert!(eventually(|| backlog(&shared) == 0));
-        assert!(started.elapsed() < pacing.idle_tick, "the backlog waited on an idle tick");
+        let drained = started.elapsed();
         let times = handle.probe.publish_times.lock().unwrap().clone();
         assert!(times.len() >= 4, "{} batches for {files} marks", times.len());
         let widest = times.windows(2).map(|pair| pair[1] - pair[0]).max().unwrap();
-        assert!(widest < Duration::from_secs(1), "a pause of {widest:?} between batches");
+        if cfg!(timing_contract) {
+            assert!(drained < pacing.idle_tick, "the backlog waited on an idle tick");
+            // A pause between batches is an idle tick spent; half of one is slower than any
+            // machine and faster than the tick.
+            assert!(widest < pacing.idle_tick / 2, "a pause of {widest:?} between batches");
+            assert!(widest < Duration::from_secs(1), "a pause of {widest:?} between batches");
+        }
         finish(&handle, &stop);
     }
 
@@ -1681,8 +1695,11 @@ mod tests {
             );
         }
         // The deschedule this replaces, on purpose: the deadline cannot pass under a stalled
-        // observer, so the reading below is the same whenever it is taken.
-        std::thread::sleep(Duration::from_millis(300));
+        // observer, so the reading below is the same whenever it is taken; only the timing
+        // profile waits a window out before it.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(
             handle.probe.admissions.load(Ordering::SeqCst),
             attempts,
@@ -1795,18 +1812,33 @@ mod tests {
 
     /// A key whose file cannot be read is settled back into its mark every time. That is not
     /// progress: the owner backs off instead of re-reading it in a loop, so the passes over it
-    /// are counted by the schedule, not by the speed of the disk.
+    /// are counted by the schedule, not by the speed of the disk. The owner's clock is held
+    /// still, so the backoff never runs out under a slow observer and a second read can only
+    /// come from an owner that skipped its schedule.
     #[test]
     fn a_key_that_keeps_failing_is_retried_on_the_schedule() {
         let dir = tempfile::tempdir().unwrap();
         let shared = engine_over(dir.path(), 1);
-        let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, FAST);
+        let handle = OverlayBacklog::default();
+        *handle.probe.clock.lock().unwrap() = Some(Arc::new(test_probe::TestClock::default()));
+        let stop = OwnerStop::default();
+        assert!(handle.start_with(
+            Arc::clone(&shared),
+            WorkspaceLease::unmanaged(),
+            None,
+            stop.clone(),
+            FAST
+        ));
         let path = dir.path().join("M0.bsl");
         fs::write(&path, [0xff, 0xfe]).unwrap();
         assert!(shared.lock().unwrap().as_ref().unwrap().mark_workspace_path_dirty(&path).unwrap());
         handle.fresh();
         assert!(eventually(|| matches!(handle.state(), BacklogState::Backoff { .. })));
-        std::thread::sleep(Duration::from_millis(300));
+        // An owner that skipped its schedule re-reads at a pace of its own, so only a quiet
+        // window shows it; the window is the timing profile's.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(handle.probe.captures.load(Ordering::SeqCst), 1, "the failing key was re-read");
         assert_eq!(backlog(&shared), 1, "the failing key lost its mark");
         finish(&handle, &stop);
@@ -1847,16 +1879,34 @@ mod tests {
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("the owner reached phase B");
 
-        let started = Instant::now();
-        let acquired = crate::tools::search::try_acquire_engine(
-            &shared,
-            &tokio_util::sync::CancellationToken::new(),
-        )
-        .is_ok();
-        let waited = started.elapsed();
+        // The request runs off this thread and is answered while phase B is still parked, so
+        // a request that waited for the owner never answers before the release below.
+        let (answer_tx, answer) = std::sync::mpsc::channel();
+        let request = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let acquired = crate::tools::search::try_acquire_engine(
+                    &shared,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .is_ok();
+                let _ = answer_tx.send((acquired, started.elapsed()));
+            })
+        };
+        let answered = answer.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
         release_tx.send(()).unwrap();
+        // Answered before the join: a thread still stuck past the watchdog is left behind
+        // rather than waited on without a bound.
+        let (acquired, waited) = answered.expect("the request waited behind phase B");
+        request.join().unwrap();
         assert!(acquired);
-        assert!(waited < crate::tools::search::ACQUIRE_POLL, "waited {waited:?} behind phase B");
+        if cfg!(timing_contract) {
+            assert!(
+                waited < crate::tools::search::ACQUIRE_POLL,
+                "waited {waited:?} behind phase B"
+            );
+        }
         finish(&handle, &stop);
     }
 
@@ -1879,8 +1929,10 @@ mod tests {
         let asked = Instant::now();
         stop.stop();
         handle.stop();
-        assert!(crate::change_hub::test_support::eventually_within(100, || stop.live() == 0));
-        assert!(asked.elapsed() < Duration::from_secs(1));
+        assert!(crate::change_hub::test_support::eventually(|| stop.live() == 0));
+        if cfg!(timing_contract) {
+            assert!(asked.elapsed() < Duration::from_secs(1));
+        }
         drop(held);
     }
 

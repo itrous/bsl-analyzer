@@ -2685,10 +2685,25 @@ mod tests {
         (candidate, fingerprint)
     }
 
+    /// Until a read that waits for no handle is turned away with `Busy`: from then on the
+    /// replacement's pause holds admission. Each refusal costs the admission wait, so these
+    /// stands fit inside the installation wait only on a machine that keeps pace, which is
+    /// why they are timing-contract tests.
+    fn wait_for_the_pause(graph: &GraphState) {
+        wait_until(graph, "the replacement to pause admission", || {
+            graph.store.read(None, Duration::ZERO, |_| ())
+                == Err(crate::graph::GraphReadError::Busy)
+        });
+    }
+
     /// A replacement waits for the read in flight: that read keeps answering its own
     /// generation, new reads are held back meanwhile, and once it returns the file is replaced
     /// and the next generation is served — from the file itself, with no copy for the reads.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "необязательный тест: the stand must finish inside the installation wait; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
+    )]
     fn a_replacement_waits_for_a_held_read_then_serves_the_next_generation() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2708,7 +2723,7 @@ mod tests {
                 publish_or_discard(&graph, &candidate, &path, Some("test-1"), true)
             })
         };
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for_the_pause(&graph);
         assert!(!publisher.is_finished(), "the replacement waits for the read in flight");
         assert_eq!(
             graph.store.read(None, Duration::from_millis(50), |_| ()),
@@ -2749,6 +2764,10 @@ mod tests {
     /// Four reads in flight, one of them the search-context provider's, all finish against the
     /// old generation before the replacement is renamed in.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "необязательный тест: the stand must finish inside the installation wait; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
+    )]
     fn a_replacement_waits_for_four_concurrent_reads() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2770,6 +2789,7 @@ mod tests {
                 publish_or_discard(&graph, &candidate, &path, Some("test-1"), true)
             })
         };
+        wait_for_the_pause(&graph);
         // The replacement is released only by the last of the four.
         for snapshot in held.drain(..) {
             std::thread::sleep(Duration::from_millis(150));
@@ -2787,6 +2807,10 @@ mod tests {
     /// A request arriving during the pause waits for admission about two seconds, not for the
     /// whole installation wait, and then gets `Busy` while the replacement is still pending.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "необязательный тест: the stand must finish inside the installation wait; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
+    )]
     fn a_read_during_the_pause_is_refused_after_the_admission_wait() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2805,7 +2829,7 @@ mod tests {
                 publish_or_discard(&graph, &candidate, &path, Some("test-1"), true)
             })
         };
-        std::thread::sleep(Duration::from_millis(200));
+        wait_for_the_pause(&graph);
         let started = std::time::Instant::now();
         let outcome = graph.store.read(None, Duration::from_millis(50), |_| ());
         let waited = started.elapsed();
@@ -2913,7 +2937,11 @@ mod tests {
         .expect("nobody else holds the replacement");
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // A build that should not start is an absence. Only the timing profile waits a window
+        // out for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
         assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0, "nothing was built");
         assert!(!candidate.exists(), "the held replacement is left alone");
         drop(held);
@@ -4038,7 +4066,9 @@ mod tests {
         );
 
         assert!(matches!(refused, Err(crate::graph_db::PatchError::Busy)));
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        if cfg!(timing_contract) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        }
         other.execute_batch("ROLLBACK").unwrap();
         assert_eq!(stored_revision(&fixture.db), 1);
     }
@@ -4441,8 +4471,13 @@ mod tests {
         let held = lease.hold_file_lock_for_test();
         graph.drive();
         assert!(!lease.is_superseded(), "the probe took the workspace over");
-        let now = std::time::Instant::now();
-        assert!(graph.wake_at(now).is_some(), "the held retry dropped the debt");
+        assert!(graph.owes_failed(), "the held retry dropped the debt");
+        if cfg!(timing_contract) {
+            // The alarm reads the debt only while the hold is still running, so this view of
+            // it holds only for a read made inside that window.
+            let now = std::time::Instant::now();
+            assert!(graph.wake_at(now).is_some(), "the held retry dropped the debt");
+        }
         drop(held);
     }
 

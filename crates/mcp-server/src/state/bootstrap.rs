@@ -4161,7 +4161,11 @@ mod tests {
         fs::create_dir_all(&sibling).unwrap();
         fs::write(sibling.join("Ignored.bsl"), "Процедура Sibling() КонецПроцедуры\n").unwrap();
         fs::write(sibling.join("writer.lease.lock"), "lock\n").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        // An event that should not come is an absence. Only the timing profile waits a window
+        // out for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
 
         assert_eq!(
             hub.generation(),
@@ -4254,14 +4258,16 @@ mod tests {
             super::super::types::EmbeddingPrefixes::default(),
         );
 
-        for _ in 0..600 {
-            match graph.status() {
-                crate::graph::GraphStatus::Ready { .. } => return,
+        let ready = test_utils::wait::poll_until(
+            std::time::Duration::from_secs(6),
+            std::time::Duration::from_millis(10),
+            || match graph.status() {
+                crate::graph::GraphStatus::Ready { .. } => true,
                 crate::graph::GraphStatus::Failed(msg) => panic!("graph load failed: {msg}"),
-                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
-            }
-        }
-        panic!("the boot left the graph at {:?}; it must not stay lazy", graph.status());
+                _ => false,
+            },
+        );
+        assert!(ready, "the boot left the graph at {:?}; it must not stay lazy", graph.status());
     }
 
     fn local_workspace_for_boot(dir: &std::path::Path) -> (PathBuf, DeferredBaselineRuntime) {
@@ -5066,7 +5072,12 @@ mod tests {
         let before = hub.generation();
         fs::write(root.join("Module.bsl"), "Процедура После() КонецПроцедуры").unwrap();
         assert!(crate::change_hub::test_support::eventually(|| { hub.generation() > before }));
-        std::thread::sleep(Duration::from_millis(100));
+        // Nothing tells when the guard has weighed the delivery, so only a quiet window shows a
+        // wrong stop; the window is the timing profile's. The topology change below is the
+        // control that the guard does stop on what it must.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(!owners.is_stopped(), "a BSL body edit remains a hot update");
         assert!(!transport_stop.is_cancelled());
 
@@ -5077,7 +5088,9 @@ mod tests {
         )
         .unwrap();
         assert!(crate::change_hub::test_support::eventually(|| { hub.generation() > before_xml }));
-        std::thread::sleep(Duration::from_millis(100));
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(
             !owners.is_stopped(),
             "ordinary configuration XML data changes do not retire the scope"
@@ -5096,15 +5109,13 @@ mod tests {
         );
         hub.shutdown();
         assert!(
-            owners.wait_empty(Duration::from_secs(1)),
+            owners.wait_empty(crate::change_hub::test_support::STATE_CEILING),
             "scope guard leaves before shutdown completes"
         );
     }
 
     #[test]
     fn workspace_cache_scope_change_invalidates_frozen_extension_scope() {
-        use std::time::Duration;
-
         let workspace = tempdir().unwrap();
         let cache_parent = tempdir().unwrap();
         let root = workspace.path().to_path_buf();
@@ -5178,7 +5189,7 @@ mod tests {
         assert!(error.to_string().contains("cache scope no longer matches"));
         assert!(!old_leaf.exists(), "the invalidated session never creates its old cache leaf");
         hub.shutdown();
-        assert!(owners.wait_empty(Duration::from_secs(1)));
+        assert!(owners.wait_empty(crate::change_hub::test_support::STATE_CEILING));
 
         let reverse_hub = WorkspaceChangeHub::start(vec![root.clone()]);
         assert!(reverse_hub.wait_until_watching());
@@ -5214,7 +5225,7 @@ mod tests {
             .expect("the explicit frozen session must reconnect after scope drift");
         assert!(error.to_string().contains("cache scope no longer matches"));
         reverse_hub.shutdown();
-        assert!(reverse_owners.wait_empty(Duration::from_secs(1)));
+        assert!(reverse_owners.wait_empty(crate::change_hub::test_support::STATE_CEILING));
 
         // Keep the pre-existing explicit-to-explicit invalidation case as well: scope
         // is a frozen session input even when both snapshots are explicit.
@@ -5251,7 +5262,7 @@ mod tests {
             .expect("legacy session cannot reconnect as InfoBase");
         assert!(error.to_string().contains("cache scope no longer matches"));
         explicit_hub.shutdown();
-        assert!(explicit_owners.wait_empty(Duration::from_secs(1)));
+        assert!(explicit_owners.wait_empty(crate::change_hub::test_support::STATE_CEILING));
 
         let data_separation_hub = WorkspaceChangeHub::start(vec![root.clone()]);
         assert!(data_separation_hub.wait_until_watching());
@@ -5286,7 +5297,7 @@ mod tests {
             .expect("InfoBase session cannot reconnect as DataSeparation");
         assert!(error.to_string().contains("cache scope no longer matches"));
         data_separation_hub.shutdown();
-        assert!(data_separation_owners.wait_empty(Duration::from_secs(1)));
+        assert!(data_separation_owners.wait_empty(crate::change_hub::test_support::STATE_CEILING));
     }
 
     #[test]
@@ -5321,7 +5332,11 @@ mod tests {
         state.baseline = DeferredBaselineRuntime::pending_for_test();
 
         state.ensure_loading_with_wait(std::time::Duration::from_millis(10));
-        std::thread::sleep(std::time::Duration::from_millis(35));
+        // The lifecycle reads `Loading` from the call itself; the pause that lets the loader
+        // spin a few waits first is the timing profile's.
+        if cfg!(timing_contract) {
+            std::thread::sleep(std::time::Duration::from_millis(35));
+        }
 
         assert_eq!(state.lifecycle(), super::ReferenceSearchLifecycle::Loading);
         assert!(state.engine.lock().unwrap().is_none());
@@ -5333,7 +5348,7 @@ mod tests {
             let _ = done_tx.send(());
         });
         assert!(
-            done_rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok(),
+            done_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
             "shutdown never returned while the loader was busy"
         );
         assert!(state.worker.lock().unwrap().is_none());
@@ -5371,10 +5386,13 @@ mod tests {
         let state = super::ReferenceSearchState::new(Some(dir.path()));
 
         state.ensure_loading();
-        for _ in 0..100 {
-            if matches!(state.lifecycle(), super::ReferenceSearchLifecycle::Failed { .. }) {
-                break;
-            }
+        let mut patience = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(10),
+        );
+        while !matches!(state.lifecycle(), super::ReferenceSearchLifecycle::Failed { .. })
+            && patience.allows()
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 

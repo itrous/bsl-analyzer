@@ -14,6 +14,10 @@ use serde_json::{json, Map, Value};
 
 type Client = RunningService<RoleClient, ()>;
 
+/// Bound of a wait for a state that a regression would never reach; a hang watchdog, not a
+/// latency measure.
+const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+
 const CALLER: &str =
     include_str!("fixtures/shared_workspace_analysis/CommonModules/Потребитель/Ext/Module.bsl");
 const STRING_TARGET: &str =
@@ -52,7 +56,8 @@ async fn mcp_client(root: &Path) -> Client {
 }
 
 async fn poll_tool(client: &Client, tool: &'static str, args: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
     loop {
         let result = client
             .call_tool(CallToolRequestParams::new(tool).with_arguments(args.clone()))
@@ -69,7 +74,7 @@ async fn poll_tool(client: &Client, tool: &'static str, args: Map<String, Value>
 }
 
 async fn wait_symbol_status(client: &Client, expected: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let card = poll_tool(
             client,
@@ -89,7 +94,7 @@ async fn wait_symbol_status(client: &Client, expected: &str) -> Value {
 }
 
 async fn wait_symbol_return_type(client: &Client, expected: &str, stale: Option<&str>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "symbol_info never returned type {expected}");
@@ -134,7 +139,7 @@ fn wait_hover_type(
     expected: &str,
     stale: Option<&str>,
 ) -> Value {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     let mut id = first_id;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -435,21 +440,22 @@ async fn watched_bsl_remove_and_recreate_updates_both_protocols() {
         "jsonrpc": "2.0", "method": "workspace/didChangeWatchedFiles",
         "params": {"changes": [{"uri": target_uri.clone(), "type": 3}]}
     }));
-    let mut removed = None;
-    for id in 3..=10 {
+    let mut next_id = 3;
+    let deadline = std::time::Instant::now() + HANG_WATCHDOG;
+    let removed = loop {
         let response = lsp.request(
-            id,
+            next_id,
             "textDocument/definition",
             json!({"textDocument": {"uri": caller_uri.clone()}, "position": {"line": 2, "character": 27}}),
         );
+        next_id += 1;
         assert!(response["error"].is_null(), "missing target is a semantic miss: {response}");
         if response["result"].is_null() {
-            removed = Some(response);
-            break;
+            break response;
         }
+        assert!(std::time::Instant::now() < deadline, "the removed target never disappeared");
         std::thread::sleep(Duration::from_millis(25));
-    }
-    let removed = removed.expect("the removed target disappears within the retry budget");
+    };
     assert!(removed["result"].is_null(), "removed target has no definition: {removed}");
     let missing_card = wait_symbol_status(&client, "not_found").await;
     assert_eq!(missing_card["status"], "not_found");
@@ -463,21 +469,21 @@ async fn watched_bsl_remove_and_recreate_updates_both_protocols() {
         "jsonrpc": "2.0", "method": "workspace/didChangeWatchedFiles",
         "params": {"changes": [{"uri": target_uri.clone(), "type": 1}]}
     }));
-    let mut recreated = None;
-    for id in 11..=18 {
+    let deadline = std::time::Instant::now() + HANG_WATCHDOG;
+    let recreated = loop {
         let response = lsp.request(
-            id,
+            next_id,
             "textDocument/definition",
             json!({"textDocument": {"uri": caller_uri.clone()}, "position": {"line": 2, "character": 27}}),
         );
+        next_id += 1;
         assert!(response["error"].is_null(), "recreated target request: {response}");
         if !response["result"].is_null() {
-            recreated = Some(response);
-            break;
+            break response;
         }
+        assert!(std::time::Instant::now() < deadline, "the recreated target never returned");
         std::thread::sleep(Duration::from_millis(25));
-    }
-    let recreated = recreated.expect("the recreated target returns within the retry budget");
+    };
     assert!(recreated["error"].is_null(), "recreated target request: {recreated}");
     assert!(!recreated["result"].is_null(), "recreated target is resolvable: {recreated}");
     let location =
@@ -486,5 +492,5 @@ async fn watched_bsl_remove_and_recreate_updates_both_protocols() {
     let recreated_card = wait_symbol_status(&client, "ok").await;
     assert_eq!(recreated_card["status"], "ok");
     client.cancel().await.ok();
-    assert!(lsp.shutdown(19).success(), "LSP process exits cleanly");
+    assert!(lsp.shutdown(next_id).success(), "LSP process exits cleanly");
 }

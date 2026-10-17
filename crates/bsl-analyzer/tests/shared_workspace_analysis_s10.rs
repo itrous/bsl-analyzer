@@ -13,6 +13,10 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 use tokio::task::JoinHandle;
 
+/// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
+/// latency measure.
+const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+
 const CONSUMER: &str = include_str!(
     "fixtures/shared_workspace_analysis_s6/extensions/consumer/CommonModules/Потребитель/Ext/Module.bsl"
 );
@@ -89,7 +93,7 @@ async fn mcp_session(
 
 async fn symbol_info(client: &Client, path: &Path, needle: &str) -> Value {
     let (line, column) = position(CONSUMER, needle);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "MCP symbol_info never settled for {needle}");
@@ -120,7 +124,7 @@ async fn rooted_symbol_info(
     needle: &str,
 ) -> Value {
     let (line, column) = position(source_text, needle);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "rooted MCP symbol_info never settled for {needle}");
@@ -183,7 +187,7 @@ async fn mcp_rooted_diagnostic_body(
     root_id: Option<&str>,
     source_path: &Path,
 ) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "MCP diagnostics never settled");
@@ -299,7 +303,7 @@ fn wait_lsp_target(
     needle: &str,
     target_uri: &lsp_types::Url,
 ) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     let mut id = first_id;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -330,7 +334,13 @@ fn wait_lsp_target(
 }
 
 fn assert_lsp_missing(lsp: &mut Lsp, id: u64, uri: &lsp_types::Url) {
-    let response = lsp_definition(lsp, id, uri, "ДатьЧисло", Duration::from_secs(45));
+    let response = lsp_definition(
+        lsp,
+        id,
+        uri,
+        "ДатьЧисло",
+        test_utils::wait::ceiling(Duration::from_secs(45)),
+    );
     assert!(response["error"].is_null(), "LSP negative control failed: {response}");
     assert!(
         response["result"].is_null() || response["result"].as_array().is_some_and(Vec::is_empty),
@@ -396,7 +406,7 @@ async fn invalid_project_config_preserves_lsp_and_rejects_mcp_until_repair() {
     std::fs::write(&config_path, INVALID_CONFIG).expect("write only invalid TOML config");
     send_config_change(&mut lsp, &config_path);
     let error = lsp
-        .wait_for_within(Duration::from_secs(45), |message| {
+        .wait_for_within(test_utils::wait::ceiling(Duration::from_secs(45)), |message| {
             message["method"] == "window/showMessage"
                 && message["params"]["message"]
                     .as_str()
@@ -431,7 +441,7 @@ async fn invalid_project_config_preserves_lsp_and_rejects_mcp_until_repair() {
         "invalid MCP construction creates no cache storage or fallback workspace"
     );
 
-    tokio::time::timeout(Duration::from_secs(15), old_task)
+    tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(15)), old_task)
         .await
         .expect("invalid project input retires the active MCP scope")
         .expect("retired MCP task joins")
@@ -445,7 +455,7 @@ async fn invalid_project_config_preserves_lsp_and_rejects_mcp_until_repair() {
     std::fs::write(&config_path, CONFIG).expect("restore exact known-good TOML config");
     send_config_change(&mut lsp, &config_path);
     let restored_diagnostics = lsp
-        .wait_for_within(Duration::from_secs(45), |message| {
+        .wait_for_within(test_utils::wait::ceiling(Duration::from_secs(45)), |message| {
             message["method"] == "textDocument/publishDiagnostics"
                 && message["params"]["uri"] == consumer_uri.as_str()
         })
@@ -476,7 +486,7 @@ async fn invalid_project_config_preserves_lsp_and_rejects_mcp_until_repair() {
     assert_mcp_diagnostic(&mcp_diagnostic(&new_client, &consumer_path).await);
 
     new_client.cancel().await.expect("restored MCP client disconnects");
-    tokio::time::timeout(Duration::from_secs(5), new_task)
+    tokio::time::timeout(HANG_WATCHDOG, new_task)
         .await
         .expect("restored MCP session exits")
         .expect("restored MCP task joins")
@@ -544,7 +554,7 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
         &excluded_uri,
         &excluded_text,
         "ДатьСтроку",
-        Duration::from_secs(45),
+        test_utils::wait::ceiling(Duration::from_secs(45)),
     );
     assert!(
         excluded_definition["error"].is_object() && excluded_definition["result"].is_null(),
@@ -570,7 +580,7 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
         &unknown_uri,
         &excluded_text,
         "ДатьСтроку",
-        Duration::from_secs(45),
+        test_utils::wait::ceiling(Duration::from_secs(45)),
     );
     assert!(
         unknown_definition["error"].is_object() && unknown_definition["result"].is_null(),
@@ -647,7 +657,7 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
     assert_eq!(unknown_result["error"], "not_in_workspace", "unknown file path: {unknown}");
 
     client.cancel().await.expect("MCP client disconnects");
-    tokio::time::timeout(Duration::from_secs(5), task)
+    tokio::time::timeout(HANG_WATCHDOG, task)
         .await
         .expect("MCP task exits")
         .expect("MCP task joins")
