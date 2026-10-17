@@ -139,7 +139,7 @@ fn check_method(
         module_id: ModuleId,
         local_id: hir::MethodKey,
         is_export: bool,
-        params_empty: bool,
+        callable_without_args: bool,
     }
     let mut non_exported: Option<Resolved> = None;
 
@@ -151,7 +151,10 @@ fn check_method(
             module_id,
             local_id: method.id.local_id,
             is_export: method.is_export,
-            params_empty: method.params.is_empty(),
+            // The platform calls a predefined job's handler with the job's empty
+            // parameter array: a parameter with a default value takes it, and only a
+            // required one fails ("Недостаточно фактических параметров").
+            callable_without_args: method.params.iter().all(|param| param.has_default),
         };
         if candidate.is_export {
             return Some(candidate);
@@ -192,7 +195,7 @@ fn check_method(
         ));
     }
 
-    if job.is_predefined() && !resolved.params_empty {
+    if job.is_predefined() && !resolved.callable_without_args {
         diagnostics.push(create_diagnostic(
             ctx,
             DiagnosticType::MethodWithParameters,
@@ -540,6 +543,72 @@ mod tests {
         assert!(
             unread.iter().all(|d| d.code != DiagnosticCode::ScheduledJobHandler),
             "an unread body may declare the handler, so absence is not provable: {unread:?}"
+        );
+    }
+
+    /// A predefined job runs its handler with no arguments, so only a required
+    /// parameter breaks it; one with a default value takes the default.
+    #[test]
+    fn only_a_required_parameter_breaks_a_predefined_job_handler() {
+        use crate::test_utils::check_cfe_at_with_unreadable;
+        use test_fixture::CfeFixtureBuilder;
+
+        let job_xml = |name: &str, method: &str| {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.4">
+    <ScheduledJob uuid="0de0c839-4427-46d9-be68-302f88ac162c">
+        <Properties>
+            <Name>{name}</Name>
+            <MethodName>CommonModule.Сервер.{method}</MethodName>
+            <Use>true</Use>
+            <Predefined>true</Predefined>
+        </Properties>
+    </ScheduledJob>
+</MetaDataObject>"#
+            )
+        };
+        let base = "Процедура НеОбязательный(Параметр = Неопределено) Экспорт\n\tА = 1;\nКонецПроцедуры\n\n\
+                    Процедура Обязательный(Параметр) Экспорт\n\tА = 1;\nКонецПроцедуры\n";
+
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_base_module("Сервер", base).add_extension("Расш", "").add_extension_module(
+            "Расш",
+            "Сервер",
+            "Процедура Иное() Экспорт КонецПроцедуры",
+        );
+        let fixture = builder.build();
+        let dir = fixture.root().join("ScheduledJobs");
+        std::fs::create_dir_all(&dir).expect("create ScheduledJobs directory");
+        std::fs::write(
+            dir.join("ЗаданиеНеОбязательный.xml"),
+            job_xml("ЗаданиеНеОбязательный", "НеОбязательный"),
+        )
+        .expect("write ScheduledJob");
+        std::fs::write(
+            dir.join("ЗаданиеОбязательный.xml"),
+            job_xml("ЗаданиеОбязательный", "Обязательный"),
+        )
+        .expect("write ScheduledJob");
+
+        let found = check_cfe_at_with_unreadable(
+            "Ext/SessionModule.bsl",
+            "Процедура Маркер()\nКонецПроцедуры\n",
+            fixture,
+            &[],
+            check,
+        );
+        let messages: Vec<&str> = found
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::ScheduledJobHandler)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "Исправьте некорректный обработчик \"Сервер.Обязательный\" предопределенного регламентного задания \"ЗаданиеОбязательный\" - у метода не должно быть параметров"
+            ],
+            "{found:?}"
         );
     }
 }
