@@ -711,6 +711,221 @@ mod tests {
         assert!(diags.is_empty(), "the guard leaves only server environments, got: {diags:?}");
     }
 
+    /// Синхронные методы HTTPСоединение на клиенте с 8.3.21 устарели, но не
+    /// недоступны: платформа выполняет их в тонком и толстом клиенте. Контроль в
+    /// той же ветке — метод, которого в тонком клиенте действительно нет: он
+    /// по-прежнему отмечается, и только в тонком клиенте, значит ветка проверяется.
+    #[test]
+    fn sync_http_connection_methods_available_in_thin_and_thick_client() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&НаКлиенте
+Процедура Отправить()
+    #Если НЕ ВебКлиент Тогда
+    Соединение = Новый HTTPСоединение("example.com");
+    Запрос = Новый HTTPЗапрос("/");
+    Ответ = Соединение.Получить(Запрос);
+    Ответ = Соединение.ОтправитьДляОбработки(Запрос);
+    Ответ = Соединение.Записать(Запрос);
+    Ответ = Соединение.Изменить(Запрос);
+    Ответ = Соединение.Удалить(Запрос);
+    Ответ = Соединение.ПолучитьЗаголовки(Запрос);
+    Ответ = Соединение.ВызватьHTTPМетод("GET", Запрос);
+    Пользователи = СистемаВзаимодействия.ПолучитьПользователей();
+    #КонецЕсли
+КонецПроцедуры
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
+        assert_eq!(
+            diags[0].0, "Метод 'ПолучитьПользователей' недоступен [Тонкий клиент]",
+            "the control must still be flagged on the thin client only"
+        );
+    }
+
+    #[test]
+    fn sync_http_connection_methods_available_in_client_english() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&AtClient
+Procedure Send()
+    #If NOT WebClient Then
+    Connection = New HTTPConnection("example.com");
+    Request = New HTTPRequest("/");
+    Response = Connection.Get(Request);
+    Response = Connection.Post(Request);
+    Response = Connection.Put(Request);
+    Response = Connection.Patch(Request);
+    Response = Connection.Delete(Request);
+    Response = Connection.Head(Request);
+    Response = Connection.CallHTTPMethod("GET", Request);
+    Users = CollaborationSystem.GetUsers();
+    #EndIf
+EndProcedure
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
+        assert!(
+            (diags[0].0.contains("GetUsers") || diags[0].0.contains("ПолучитьПользователей"))
+                && diags[0].0.ends_with("[Тонкий клиент]"),
+            "the control must still be flagged on the thin client only: {}",
+            diags[0].0
+        );
+    }
+
+    /// Справка не называет тонкий клиент у `ФорматированныйДокумент.УстановитьHTML`
+    /// (и толстый у него же), `ДокументPDF.ПреобразоватьВОттенкиСерого`,
+    /// `ДокументPDF.ДобавитьПодпись`, `ЗаписьPDF.ПреобразоватьВОттенкиСерого`, но
+    /// платформа выполняет их в тонком и толстом клиенте. Контроль в той же ветке —
+    /// синхронный метод системы взаимодействия, которого в тонком клиенте нет: он
+    /// по-прежнему отмечается, и только в тонком клиенте.
+    #[test]
+    fn client_executable_pdf_and_formatted_document_methods_available_in_client() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&НаКлиенте
+Процедура Обработать(ИмяФайла)
+    #Если НЕ ВебКлиент Тогда
+    Документ = Новый ФорматированныйДокумент;
+    Документ.УстановитьHTML("<p>x</p>", Новый Структура);
+    ДокументPDF = Новый ДокументPDF;
+    ДокументPDF.Прочитать(ИмяФайла);
+    ДокументPDF.ПреобразоватьВОттенкиСерого();
+    ДокументPDF.ДобавитьПодпись(Неопределено, Неопределено);
+    Запись = Новый ЗаписьPDF;
+    Запись.Открыть(ИмяФайла);
+    Запись.ПреобразоватьВОттенкиСерого();
+    Запись.Закрыть();
+    Пользователи = СистемаВзаимодействия.ПолучитьПользователей();
+    #КонецЕсли
+КонецПроцедуры
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
+        assert_eq!(
+            diags[0].0, "Метод 'ПолучитьПользователей' недоступен [Тонкий клиент]",
+            "the control must still be flagged on the thin client only"
+        );
+    }
+
+    #[test]
+    fn client_executable_pdf_and_formatted_document_methods_available_in_client_english() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&AtClient
+Procedure Process(FileName)
+    #If NOT WebClient Then
+    Document = New FormattedDocument;
+    Document.SetHTML("<p>x</p>", New Structure);
+    PDF = New PDFDocument;
+    PDF.Read(FileName);
+    PDF.ConvertToGrayScale();
+    PDF.AddSignature(Undefined, Undefined);
+    Writer = New PDFWriter;
+    Writer.Open(FileName);
+    Writer.ConvertToGrayScale();
+    Writer.Close();
+    Users = CollaborationSystem.GetUsers();
+    #EndIf
+EndProcedure
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
+        assert!(
+            (diags[0].0.contains("GetUsers") || diags[0].0.contains("ПолучитьПользователей"))
+                && diags[0].0.ends_with("[Тонкий клиент]"),
+            "the control must still be flagged on the thin client only: {}",
+            diags[0].0
+        );
+    }
+
+    /// Страницы методов `COMSafeArray` и членов `РасписаниеРегламентногоЗадания` в
+    /// справке не называют тонкий клиент, хотя страницы самих типов его называют, и
+    /// платформа выполняет эти вызовы в тонком клиенте. Контроль в той же ветке —
+    /// синхронный метод системы взаимодействия, которого в тонком клиенте нет.
+    #[test]
+    fn com_safe_array_and_job_schedule_members_available_in_thin_client() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&НаКлиенте
+Процедура Обработать()
+    #Если НЕ ВебКлиент Тогда
+    Массив = Новый COMSafeArray("VT_VARIANT", 2);
+    Массив.SetValue(0, 5);
+    Значение = Массив.GetValue(0);
+    Размер = Массив.GetLength();
+    Массив.Resize(3);
+    Значения = Массив.Выгрузить();
+    Расписание = Новый РасписаниеРегламентногоЗадания;
+    Расписание.ПериодПовтораДней = 1;
+    Расписание.ДниНедели = Новый Массив;
+    Расписание.ПериодПовтораВТечениеДня = 60;
+    Нужно = Расписание.ТребуетсяВыполнение(ТекущаяДата());
+    Пользователи = СистемаВзаимодействия.ПолучитьПользователей();
+    #КонецЕсли
+КонецПроцедуры
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
+        assert_eq!(
+            diags[0].0, "Метод 'ПолучитьПользователей' недоступен [Тонкий клиент]",
+            "the control must still be flagged on the thin client only"
+        );
+    }
+
+    /// Свойства `РасписаниеРегламентногоЗадания` платформа читает и пишет и в
+    /// веб-клиенте. Контроль — `ЧтениеXML`, которого в веб-клиенте нет.
+    #[test]
+    fn job_schedule_properties_available_in_web_client() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&НаКлиенте
+Процедура Обработать()
+    Расписание = Новый РасписаниеРегламентногоЗадания;
+    Расписание.ПериодПовтораДней = 1;
+    Расписание.Месяцы = Новый Массив;
+    Расписание.ДетальныеРасписанияДня = Новый Массив;
+    Время = Расписание.ВремяНачала;
+    Чтение = Новый ЧтениеXML;
+КонецПроцедуры
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the web-client control may be flagged, got: {diags:?}");
+        assert_eq!(
+            diags[0].0, "Тип 'ЧтениеXML' недоступен [Веб-клиент]",
+            "the control must still be flagged in the web client only"
+        );
+    }
+
+    #[test]
+    fn com_safe_array_and_job_schedule_members_available_in_thin_client_english() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&AtClient
+Procedure Process()
+    #If NOT WebClient Then
+    SafeArray = New COMSafeArray("VT_VARIANT", 2);
+    SafeArray.SetValue(0, 5);
+    Value = SafeArray.GetValue(0);
+    Values = SafeArray.Unload();
+    Schedule = New JobSchedule;
+    Schedule.DaysRepeatPeriod = 1;
+    Schedule.WeekDays = New Array;
+    Required = Schedule.ExecutionRequired(CurrentDate());
+    Users = CollaborationSystem.GetUsers();
+    #EndIf
+EndProcedure
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
+        assert!(
+            (diags[0].0.contains("GetUsers") || diags[0].0.contains("ПолучитьПользователей"))
+                && diags[0].0.ends_with("[Тонкий клиент]"),
+            "the control must still be flagged on the thin client only: {}",
+            diags[0].0
+        );
+    }
+
     #[test]
     fn common_module_without_client_flag_not_checked_against_client() {
         // A server common module calling server API — no diagnostics.

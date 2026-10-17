@@ -138,7 +138,7 @@ impl PlatformDataInner {
             mut methods,
             mut global_functions,
             mut constructors,
-            properties,
+            mut properties,
             method_docs,
             global_function_docs,
             constructor_docs,
@@ -188,6 +188,7 @@ impl PlatformDataInner {
 
         apply_docs_gap_method_overlay(&mut methods, &global_functions);
         apply_docs_gap_member_context_overlay(&mut methods, &mut global_functions, &types);
+        apply_docs_gap_property_context_overlay(&mut properties);
 
         let mut methods_by_name = FxHashMap::default();
         let mut methods_by_type: FxHashMap<SmolStr, Vec<usize>> = FxHashMap::default();
@@ -673,8 +674,85 @@ fn apply_docs_gap_member_context_overlay(
         {
             context.web_client = true;
         }
+        if method.type_name == "HTTPConnection"
+            && CLIENT_DEPRECATED_HTTP_CONNECTION_METHODS.contains(&method.english_name.as_str())
+        {
+            context.thin_client = true;
+            context.thick_client = true;
+            context.mobile_client = true;
+        }
+        if CLIENT_EXECUTABLE_METHODS
+            .iter()
+            .any(|(ty, name)| method.type_name == *ty && method.english_name == *name)
+        {
+            context.thin_client = true;
+            context.thick_client = true;
+        }
+        if THIN_CLIENT_MEMBER_TYPES.contains(&method.type_name.as_str()) {
+            context.thin_client = true;
+        }
     }
 }
+
+/// Types whose type page lists the thin client while every member page (8.3.17
+/// and 8.3.27 help alike) lists only the server, the thick client and the
+/// external connection. The members run in the thin client: a live run in the
+/// thin client on 8.3.17 and on 8.3.27 (with and without a compatibility mode)
+/// completes every call, while a method that is really missing from the thin
+/// client fails there with "Метод объекта не обнаружен". English type names.
+/// - `COMSafeArray`: all methods. The type itself has no web client, so the web
+///   client is left out.
+/// - `JobSchedule` (`РасписаниеРегламентногоЗадания`): all properties and
+///   `ТребуетсяВыполнение`; the web client is added for the properties only, see
+///   [`WEB_CLIENT_PROPERTY_TYPES`].
+const THIN_CLIENT_MEMBER_TYPES: &[&str] = &["COMSafeArray", "JobSchedule"];
+
+/// Types whose properties also run in the web client although their pages omit
+/// it: a live run in the web client (8.3.17 and 8.3.27) sets and reads every
+/// property. English type names.
+const WEB_CLIENT_PROPERTY_TYPES: &[&str] = &["JobSchedule"];
+
+/// Property counterpart of [`apply_docs_gap_member_context_overlay`] for the
+/// types listed in [`THIN_CLIENT_MEMBER_TYPES`] and [`WEB_CLIENT_PROPERTY_TYPES`].
+fn apply_docs_gap_property_context_overlay(properties: &mut [PlatformProperty]) {
+    for property in properties.iter_mut() {
+        let Some(context) = &mut property.context else { continue };
+        let type_name = property.type_name.as_str();
+        if THIN_CLIENT_MEMBER_TYPES.contains(&type_name) {
+            context.thin_client = true;
+        }
+        if WEB_CLIENT_PROPERTY_TYPES.contains(&type_name) {
+            context.web_client = true;
+        }
+    }
+}
+
+/// Methods whose pages (8.3.17 and 8.3.27 help alike) omit the thin client —
+/// and, for `ФорматированныйДокумент.УстановитьHTML`, the thick client too —
+/// although the platform executes them there: a live run in the thin client and
+/// in the thick client (managed application) on 8.3.17 and on 8.3.27 (with and
+/// without a compatibility mode) completes the call, while a method that is
+/// really missing from the thin client fails with "Метод объекта не обнаружен".
+/// The PDF methods appear in 8.3.18–8.3.22 and were checked on 8.3.27 only.
+/// The web and mobile clients were not checked and are left as the help says.
+/// Pairs: English type name, English method name.
+const CLIENT_EXECUTABLE_METHODS: &[(&str, &str)] = &[
+    ("FormattedDocument", "SetHTML"),
+    ("PDFDocument", "ConvertToGrayScale"),
+    ("PDFDocument", "AddSignature"),
+    ("PDFWriter", "ConvertToGrayScale"),
+];
+
+/// Synchronous `HTTPСоединение` methods whose pages, since the 8.3.21 help,
+/// list only server environments. The same pages say the call on the client is
+/// *deprecated* in favour of the `*Асинх` counterpart — not removed: the 8.3.17
+/// help lists the thin, thick and mobile clients, and the platform (8.3.17, and
+/// 8.3.27 with and without a compatibility mode) executes these calls in the thin
+/// and thick clients. Deprecation is `DeprecatedPlatformApi`'s business; the
+/// environment check must not turn it into "unavailable". The web client stays
+/// out: the type itself is absent there.
+const CLIENT_DEPRECATED_HTTP_CONNECTION_METHODS: &[&str] =
+    &["Get", "Post", "Put", "Patch", "Delete", "Head", "CallHTTPMethod"];
 
 /// The platform ships manager methods whose pages are missing from the help
 /// archive, so HBK extraction cannot see them. Each entry pairs the manager's
@@ -1233,6 +1311,147 @@ mod tests {
             .expect("error-processing method must exist");
         let ctx = method.context.as_ref().expect("method must carry availability");
         assert!(ctx.web_client, "overlay must add the web client to ПодробноеПредставлениеОшибки");
+    }
+
+    #[test]
+    fn docs_gap_overlay_restores_client_contexts_of_sync_http_connection_methods() {
+        let data = PlatformDataInner::instance();
+        if data.all_methods().is_empty() {
+            return;
+        }
+
+        for name in [
+            "Получить",
+            "ОтправитьДляОбработки",
+            "Записать",
+            "Изменить",
+            "Удалить",
+            "ПолучитьЗаголовки",
+            "ВызватьHTTPМетод",
+        ] {
+            let method = data.get_method("HTTPСоединение", name).expect("sync method must exist");
+            let ctx = method.context.as_ref().expect("sync method must carry availability");
+            assert!(
+                ctx.thin_client && ctx.thick_client,
+                "{name} runs in the thin and thick client"
+            );
+            assert!(ctx.server && ctx.external_connection, "{name} keeps its server contexts");
+            assert!(!ctx.web_client, "HTTPСоединение is absent from the web client: {name}");
+        }
+
+        // Narrow: a synchronous collaboration-system method that the thin client
+        // really lacks keeps its markup.
+        let control = data
+            .get_method("МенеджерСистемыВзаимодействия", "ПолучитьПользователей")
+            .expect("control must exist");
+        let ctx = control.context.as_ref().expect("control must carry availability");
+        assert!(!ctx.thin_client, "the control stays unavailable in the thin client");
+        assert!(ctx.thick_client, "the control keeps the thick client");
+    }
+
+    #[test]
+    fn docs_gap_overlay_adds_client_contexts_of_client_executable_methods() {
+        let data = PlatformDataInner::instance();
+        if data.all_methods().is_empty() {
+            return;
+        }
+
+        for (ty, name) in [
+            ("ФорматированныйДокумент", "УстановитьHTML"),
+            ("ДокументPDF", "ПреобразоватьВОттенкиСерого"),
+            ("ДокументPDF", "ДобавитьПодпись"),
+            ("ЗаписьPDF", "ПреобразоватьВОттенкиСерого"),
+        ] {
+            let method = data.get_method(ty, name).expect("method must exist");
+            let ctx = method.context.as_ref().expect("method must carry availability");
+            assert!(
+                ctx.thin_client && ctx.thick_client,
+                "{ty}.{name} runs in the thin and thick client"
+            );
+            assert!(ctx.server, "{ty}.{name} keeps the server");
+            assert!(!ctx.web_client, "{ty}.{name}: the web client was not checked and stays out");
+        }
+
+        // Narrow: a synchronous collaboration-system method that the thin client
+        // really lacks keeps its markup.
+        let control = data
+            .get_method("МенеджерСистемыВзаимодействия", "ПолучитьПользователей")
+            .expect("control must exist");
+        let ctx = control.context.as_ref().expect("control must carry availability");
+        assert!(!ctx.thin_client, "the control stays unavailable in the thin client");
+        assert!(ctx.thick_client, "the control keeps the thick client");
+    }
+
+    #[test]
+    fn docs_gap_overlay_adds_thin_client_to_com_safe_array_and_job_schedule_members() {
+        let data = PlatformDataInner::instance();
+        if data.all_methods().is_empty() {
+            return;
+        }
+
+        for name in [
+            "SetValue",
+            "GetValue",
+            "GetDimensions",
+            "GetLength",
+            "GetLowerBound",
+            "GetUpperBound",
+            "GetType",
+            "IsResizable",
+            "Resize",
+            "Выгрузить",
+        ] {
+            let method = data.get_method("COMSafeArray", name).expect("method must exist");
+            let ctx = method.context.as_ref().expect("method must carry availability");
+            assert!(ctx.thin_client, "COMSafeArray.{name} runs in the thin client");
+            assert!(ctx.thick_client && ctx.server, "COMSafeArray.{name} keeps its environments");
+            assert!(!ctx.web_client, "COMSafeArray.{name}: the type has no web client");
+        }
+
+        for name in [
+            "ДатаНачала",
+            "ВремяНачала",
+            "ИнтервалЗавершения",
+            "ВремяЗавершения",
+            "ДеньВМесяце",
+            "ПериодПовтораДней",
+            "ДатаКонца",
+            "ВремяКонца",
+            "Месяцы",
+            "ПаузаПовтора",
+            "ПериодПовтораВТечениеДня",
+            "ДеньНеделиВМесяце",
+            "ДниНедели",
+            "ПериодНедель",
+            "ДетальныеРасписанияДня",
+        ] {
+            let property = data
+                .get_property("РасписаниеРегламентногоЗадания", name)
+                .expect("property must exist");
+            let ctx = property.context.as_ref().expect("property must carry availability");
+            assert!(
+                ctx.thin_client && ctx.web_client,
+                "РасписаниеРегламентногоЗадания.{name} runs in the thin and web client"
+            );
+            assert!(ctx.server, "РасписаниеРегламентногоЗадания.{name} keeps the server");
+        }
+        let method = data
+            .get_method("РасписаниеРегламентногоЗадания", "ТребуетсяВыполнение")
+            .expect("method must exist");
+        let ctx = method.context.as_ref().expect("method must carry availability");
+        assert!(ctx.thin_client, "ТребуетсяВыполнение runs in the thin client");
+        assert!(!ctx.web_client, "ТребуетсяВыполнение: the web client stays as the help says");
+
+        // Narrow: a member that the thin client really lacks, and a property of a
+        // type absent from the web client, keep their markup.
+        let control = data
+            .get_method("МенеджерСистемыВзаимодействия", "ПолучитьПользователей")
+            .expect("control must exist");
+        let ctx = control.context.as_ref().expect("control must carry availability");
+        assert!(!ctx.thin_client, "the control stays unavailable in the thin client");
+        let control = data.get_property("ЧтениеXML", "Имя").expect("control must exist");
+        let ctx = control.context.as_ref().expect("control must carry availability");
+        assert!(!ctx.web_client, "ЧтениеXML.Имя stays unavailable in the web client");
     }
 
     #[test]
