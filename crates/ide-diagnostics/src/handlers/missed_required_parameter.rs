@@ -1,6 +1,7 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::AnalysisContext;
+use crate::BodyContext;
 use crate::{Diagnostic, DiagnosticCode};
 use hir::LocalRange;
 use hir::{ModuleId, Name};
@@ -65,6 +66,22 @@ pub fn from_hir(
         tags: ctx.tags(code),
         fixes: vec![],
     })
+}
+
+/// Whether the call at `range` sits in a statement inference walked inside a `#Если`
+/// branch nothing proves compiled. The lowering that reports a local call does not
+/// know which branches compile, so the answer comes from inference; the qualified
+/// calls are dropped where inference reports them.
+pub(crate) fn in_uncompiled_branch(ctx: &BodyContext, range: LocalRange) -> bool {
+    let infer = ctx.infer();
+    let uncompiled = infer.uncompiled_stmts();
+    if uncompiled.is_empty() {
+        return false;
+    }
+    let source_map = ctx.source_map();
+    uncompiled
+        .iter()
+        .any(|stmt| source_map.stmt_range(*stmt).is_some_and(|stmt| stmt.contains_range(range)))
 }
 
 fn check_local_call(
@@ -450,6 +467,75 @@ mod tests {
         assert!(
             !unread.iter().any(|d| d.code == DiagnosticCode::MissedRequiredParameter),
             "an unread base body leaves the effective signature unknown, got {unread:?}"
+        );
+    }
+
+    /// The rule's messages for `body` as the whole of the server common module `Проба`;
+    /// the module `Другой` exports the same three-parameter function.
+    fn in_server_module(body: &str) -> Vec<String> {
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_base_module("Проба", body).add_base_module(
+            "Другой",
+            "Функция Три(А, Б, В) Экспорт\n    Возврат А;\nКонецФункции\n",
+        );
+        crate::test_utils::check_cfe_at_with_db_setup(
+            "CommonModules/Проба/Ext/Module.bsl",
+            body,
+            builder.build(),
+            &[],
+            crate::DiagnosticsConfig::default(),
+            |_| {},
+            |_| {},
+            |db, ctx| crate::file_diagnostics(db, ctx.file_id, ctx.config),
+        )
+        .into_iter()
+        .filter(|diag| diag.code == DiagnosticCode::MissedRequiredParameter)
+        .map(|diag| diag.message)
+        .collect()
+    }
+
+    /// The module under test: a local `Три` and a procedure whose body is `calls`.
+    fn module_calling(calls: &str) -> Vec<String> {
+        in_server_module(&format!(
+            "Функция Три(А, Б, В) Экспорт\n    Возврат А;\nКонецФункции\n\n\
+             Процедура Тест() Экспорт\n{calls}КонецПроцедуры\n"
+        ))
+    }
+
+    /// The platform drops a `#Если` branch the module's environment rules out before it
+    /// compiles the module, so a call there never passes anything: `#Если Сервер И Не
+    /// Сервер` (a typing hint for the editor) and a client branch of a server module
+    /// compile nowhere. The same calls in the plain body and in a branch the server
+    /// does compile are still reported — a local call and a common-module call alike.
+    #[test]
+    fn a_branch_no_environment_compiles_is_not_judged() {
+        const CALLS: &str = "    Х = Три(1, , 3);\n    Х = Другой.Три(1, , 3);\n";
+        let branch = |condition: &str| {
+            module_calling(&format!("#Если {condition} Тогда\n{CALLS}#КонецЕсли\n"))
+        };
+
+        let plain = module_calling(CALLS);
+        assert_eq!(plain.len(), 2, "the server compiles the plain calls: {plain:?}");
+        let compiled = branch("Сервер");
+        assert_eq!(compiled.len(), 2, "the server compiles this branch: {compiled:?}");
+
+        let contradiction = branch("Сервер И Не Сервер");
+        assert!(contradiction.is_empty(), "no environment compiles this branch: {contradiction:?}");
+        let client = branch("ТолстыйКлиентОбычноеПриложение");
+        assert!(client.is_empty(), "a server module never compiles this branch: {client:?}");
+    }
+
+    /// Only the branch is silent: a call after `#КонецЕсли` in the same procedure is
+    /// compiled and keeps its verdict.
+    #[test]
+    fn a_call_after_an_uncompiled_branch_is_still_judged() {
+        let messages = module_calling(
+            "#Если Сервер И Не Сервер Тогда\n    Х = Три(1, , 3);\n#КонецЕсли\n    Х = Три(, 2, 3);\n",
+        );
+        assert_eq!(
+            messages,
+            vec!["Укажите обязательный параметр 'А'".to_string()],
+            "only the compiled call after the branch is reported"
         );
     }
 

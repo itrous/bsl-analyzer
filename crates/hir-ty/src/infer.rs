@@ -1290,6 +1290,17 @@ impl<'db> InferenceContext<'db> {
         if self.body.is_recovered(key) {
             return;
         }
+        // The platform drops a `#Если` branch nothing compiles before it reads a single
+        // argument there, so a parameter left out of such a call misses nothing.
+        if self.in_uncompiled_branch
+            && matches!(
+                diag,
+                InferenceDiagnostic::MissedRequiredParameterCommonModule { .. }
+                    | InferenceDiagnostic::MissedRequiredParameterManagerModule { .. }
+            )
+        {
+            return;
+        }
         // A call whose target body could not be read gets no "unresolved" verdict from
         // ANY later attempt: resolution continues past the unread module (the platform
         // surface of a manager or object does not live in the user module, and losing

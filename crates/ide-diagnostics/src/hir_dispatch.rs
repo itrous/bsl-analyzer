@@ -161,15 +161,20 @@ pub fn dispatch_hir_diagnostic(
             mdo_name,
             args,
             range,
-        } => handlers::missed_required_parameter::from_hir(
-            callee,
-            module.as_deref(),
-            mdo_type.as_deref(),
-            mdo_name.as_deref(),
-            args,
-            *range,
-            ctx,
-        ),
+        } => {
+            if handlers::missed_required_parameter::in_uncompiled_branch(ctx, *range) {
+                return None;
+            }
+            handlers::missed_required_parameter::from_hir(
+                callee,
+                module.as_deref(),
+                mdo_type.as_deref(),
+                mdo_name.as_deref(),
+                args,
+                *range,
+                ctx,
+            )
+        }
         BodyDiagnostic::IfElseDuplicatedCodeBlock { range } => {
             handlers::if_else_duplicated_code_block::from_hir(*range, ctx)
         }
