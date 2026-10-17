@@ -730,15 +730,12 @@ const NAME_POSITIONS: &[(&str, usize, usize)] = &[
     // The alias separator is a word no name position admits either.
     ("ВЫБРАТЬ А ССЫЛКА КАК Б ИЗ Т", 1, 1),
     ("ВЫБРАТЬ А ПОМЕСТИТЬ КАК ИЗ Т", 1, 1),
-    // A paren does not make a keyword a name. These cost more than one
-    // message, and the last two lose the source clause as well, because an
-    // SDBL bracketed list does not yet state the paren it ends with — the BSL
-    // half of that work is done, this half is not.
-    ("ВЫБРАТЬ (А + ИЗ) ИЗ Т", 4, 1),
-    ("ВЫБРАТЬ ВЫРАЗИТЬ(А КАК ИЗ) ИЗ Т", 4, 1),
-    ("ВЫБРАТЬ А ИЗ Т ГДЕ Б В (ИЗ)", 3, 1),
-    ("ВЫБРАТЬ СУММА(ИЗ) ИЗ Т", 3, 1),
-    ("ВЫБРАТЬ ВЫРАЗИТЬ(А КАК КАК) ИЗ Т", 3, 0),
+    // A rejected name inside a group leaves its closer and outer source intact.
+    ("ВЫБРАТЬ (А + ИЗ) ИЗ Т", 1, 1),
+    ("ВЫБРАТЬ ВЫРАЗИТЬ(А КАК ИЗ) ИЗ Т", 1, 1),
+    ("ВЫБРАТЬ А ИЗ Т ГДЕ Б В (ИЗ)", 1, 1),
+    ("ВЫБРАТЬ СУММА(ИЗ) ИЗ Т", 1, 1),
+    ("ВЫБРАТЬ ВЫРАЗИТЬ(А КАК КАК) ИЗ Т", 1, 1),
     ("ВЫБРАТЬ А ИЗ Т ДЛЯ ИЗМЕНЕНИЯ КАК", 1, 1),
     // `ПО` covers the Russian half of both `ON` and `BY`, so without its
     // English form the same word was a boundary in one language and a table

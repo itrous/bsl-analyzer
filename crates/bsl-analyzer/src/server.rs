@@ -2367,6 +2367,14 @@ mod tests {
         state: &mut crate::global_state::GlobalState,
         receiver: &crossbeam_channel::Receiver<Task>,
     ) -> (usize, usize) {
+        g1_drain_task_pool_to_fixed_point_with(state, receiver, |_| {})
+    }
+
+    fn g1_drain_task_pool_to_fixed_point_with(
+        state: &mut crate::global_state::GlobalState,
+        receiver: &crossbeam_channel::Receiver<Task>,
+        mut check_task: impl FnMut(&Task),
+    ) -> (usize, usize) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut drained_tasks = 0;
         let mut completed_barriers = 0;
@@ -2402,6 +2410,7 @@ mod tests {
                     );
                     let mut handled = false;
                     while let Ok(task) = receiver.try_recv() {
+                        check_task(&task);
                         handle_task(state, task).expect("quiescence drain applies task results");
                         drained_tasks += 1;
                         handled = true;
@@ -2415,6 +2424,7 @@ mod tests {
                     let task = receiver
                         .recv_timeout(remaining)
                         .expect("drain task completions while waiting for pool barrier capacity");
+                    check_task(&task);
                     handle_task(state, task).expect("quiescence drain applies task result");
                     drained_tasks += 1;
                 }

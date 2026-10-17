@@ -481,6 +481,16 @@ impl<'a> Parser<'a> {
         self.current() == Some(T![Error])
     }
 
+    pub(crate) fn error_checkpoint(&self) -> usize {
+        self.events.len()
+    }
+
+    pub(crate) fn has_error_since(&self, checkpoint: usize) -> bool {
+        self.events[checkpoint..]
+            .iter()
+            .any(|event| matches!(event, Event::Error(_) | Event::ErrorWithSpan { .. }))
+    }
+
     /// Подчёркивает уже открытый маркером участок и называет причину.
     ///
     /// Единственный путь грамматики к ошибке с диапазоном. Собирать `ParseError`

@@ -1,5 +1,6 @@
 mod common;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -92,6 +93,14 @@ fn analysis_config(
         "\n[diagnostics.parameters]\nUnresolvedBareCall = {unresolved_bare_call}\n"
     ));
     config
+}
+
+fn replace_config(path: &Path, content: &str) {
+    // Truncating a live config can expose a different source scope and retire MCP.
+    let mut staged = tempfile::NamedTempFile::new_in(path.parent().expect("config directory"))
+        .expect("stage complete config beside the watched file");
+    staged.write_all(content.as_bytes()).expect("write complete staged config");
+    staged.persist(path).expect("atomically replace watched config");
 }
 
 fn send_config_change(lsp: &mut Lsp, config_path: &Path) {
@@ -649,7 +658,7 @@ async fn effective_settings_compatibility_and_execution_context_match_live_adapt
     );
 
     let disabled_config = analysis_config(&original_config, Some("Version8_2_13"), false);
-    std::fs::write(&config_path, &disabled_config).expect("disable one known analysis rule");
+    replace_config(&config_path, &disabled_config);
     send_config_change(&mut lsp, &config_path);
     let disabled_lsp = lsp_diagnostic_state(&mut lsp, &consumer_uri, true, false);
     assert_lsp_finding(
@@ -697,7 +706,7 @@ async fn effective_settings_compatibility_and_execution_context_match_live_adapt
     );
 
     let restored_config = analysis_config(&original_config, Some("Version8_2_13"), true);
-    std::fs::write(&config_path, &restored_config).expect("restore known analysis rule");
+    replace_config(&config_path, &restored_config);
     send_config_change(&mut lsp, &config_path);
     let restored_lsp = lsp_diagnostic_state(&mut lsp, &consumer_uri, true, true);
     assert_lsp_finding(
@@ -720,7 +729,7 @@ async fn effective_settings_compatibility_and_execution_context_match_live_adapt
     // Removing the TOML override exposes the fixed XML 8.3.17 mode: the platform
     // diagnostic disappears while the independent setting and execution context stay.
     let xml_fallback = analysis_config(&original_config, None, true);
-    std::fs::write(&config_path, &xml_fallback).expect("use Configuration.xml compatibility mode");
+    replace_config(&config_path, &xml_fallback);
     send_config_change(&mut lsp, &config_path);
     let fallback_lsp = lsp_diagnostic_state(&mut lsp, &consumer_uri, false, true);
     assert_lsp_finding(

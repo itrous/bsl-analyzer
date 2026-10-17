@@ -161,20 +161,19 @@ fn golden_corpus() {
 
         ---- 013 string with doubled-quote escape
           String @0 "\""
-          String @4 "B"
+          String @1 "A\"\"B"
           String @5 "\""
           Newline @6 "\n"
 
         ---- 014 multiline string with bar
           String @0 "\""
-          String @1 "line1"
-          String @7 "| line2"
+          String @1 "line1\n| line2"
           String @14 "\""
           Newline @15 "\n"
 
         ---- 015 unterminated string at eof
           String @0 "\""
-          String @1 "no end"
+          String @1 "no end\n"
 
         ---- 016 date 8-digit
           Date @0 "'20240101'"

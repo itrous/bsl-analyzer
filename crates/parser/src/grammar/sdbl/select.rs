@@ -390,6 +390,10 @@ fn selected_field_alias(p: &mut Parser) {
 /// already.
 fn alias_name(p: &mut Parser, missing: &'static str, aliased: Aliased) {
     let explicit = eat_sdbl_keyword(p, "AS", "КАК");
+    if explicit && matches!(aliased, Aliased::Totals) && at_sdbl_keyword(p, "BY", "ПО") {
+        p.error_custom_no_bump(missing);
+        return;
+    }
 
     // Behind a dot the word is the part of a name that the dot promised and
     // the name's own rule has refused it already.
@@ -423,6 +427,7 @@ fn alias_name(p: &mut Parser, missing: &'static str, aliased: Aliased) {
 #[derive(Clone, Copy)]
 enum Aliased {
     Field,
+    Totals,
     Source { named: bool },
 }
 
@@ -430,7 +435,7 @@ enum Aliased {
 /// only a source, never a field.
 fn at_a_clause_that_goes_on(p: &Parser, aliased: Aliased) -> bool {
     let opens_here = match aliased {
-        Aliased::Field => !is_join_keyword(p) && !at_sdbl_keyword(p, "ON", "ПО"),
+        Aliased::Field | Aliased::Totals => !is_join_keyword(p) && !at_sdbl_keyword(p, "ON", "ПО"),
         Aliased::Source { .. } => true,
     };
     is_clause_keyword(p)
@@ -569,8 +574,11 @@ fn data_source(p: &mut Parser) {
 
     let named = if p.at(T![LParen]) {
         p.bump();
-        subquery(p);
-        p.expect(T![RParen]);
+        let checkpoint = p.error_checkpoint();
+        p.within_boundary(expressions::at_closing_paren, |p| {
+            subquery(p);
+            expressions::finish_parenthesized(p, checkpoint);
+        });
         true
     } else {
         table_ref(p)
@@ -1100,7 +1108,14 @@ fn totals_by_clause(p: &mut Parser) {
         }
 
         if super::expressions::is_expression_start(p) {
-            super::expressions::expression(p);
+            p.within_boundary(expressions::at_comma, expressions::expression);
+            if at_sdbl_keyword(p, "AS", "КАК")
+                || (at_an_implicit_alias(p) && !at_sdbl_keyword(p, "BY", "ПО"))
+            {
+                let alias = p.start();
+                alias_name(p, "ожидался псевдоним после 'КАК' / 'AS'", Aliased::Totals);
+                alias.complete(p, NodeKind::SdblAlias);
+            }
 
             if !p.at(T![Comma]) {
                 continue;
@@ -1233,41 +1248,44 @@ fn totals_periods_modifier(p: &mut Parser) {
         return;
     }
     p.bump();
-
-    if at_period_name(p) {
-        p.bump();
-    } else if super::at_name(p) && !is_clause_keyword(p) {
-        // A word in the right place that is not one of the ten. Take it,
-        // so the modifier still has a shape, and say what is wrong with it.
-        p.error_custom_no_bump("неизвестный вид периода");
-        p.bump();
-    } else {
-        p.error_custom_no_bump("ожидался вид периода");
-    }
-
-    // The rule allows two boundaries. A third is a mistake the user can
-    // see; counting them here would only cost the rest of the clause.
-    while p.at(T![Comma]) {
-        p.check_iteration_limit();
-        p.bump();
-
-        if super::expressions::is_expression_start(p) {
-            if !at_period_boundary(p) {
-                p.error_custom_no_bump("границей периода может быть литерал даты или параметр");
-            }
-            super::expressions::expression(p);
+    p.within_boundary(expressions::at_list_delimiter, |p| {
+        if at_period_name(p) {
+            p.bump();
+        } else if super::at_name(p) && !is_clause_keyword(p) {
+            // A word in the right place that is not one of the ten. Take it,
+            // so the modifier still has a shape, and say what is wrong with it.
+            p.error_custom_no_bump("неизвестный вид периода");
+            p.bump();
         } else {
-            p.error_custom_no_bump("ожидалась граница периода после запятой");
+            p.error_custom_no_bump("ожидался вид периода");
+            expressions::recover_to_delimiter(p, false, expressions::at_list_delimiter);
         }
-    }
 
-    if p.at(T![RParen]) {
-        p.bump();
-    } else if !p.at_end() {
-        // At end of input this is a query being typed and says nothing;
-        // with a clause still to come the paren is simply unclosed.
-        p.error_custom_no_bump("не закрыта скобка после 'ПЕРИОДАМИ' / 'PERIODS'");
-    }
+        // The rule allows two boundaries. A third is a mistake the user can
+        // see; counting them here would only cost the rest of the clause.
+        while p.at(T![Comma]) {
+            p.check_iteration_limit();
+            p.bump();
+
+            if super::expressions::is_expression_start(p) {
+                if !at_period_boundary(p) {
+                    p.error_custom_no_bump("границей периода может быть литерал даты или параметр");
+                }
+                super::expressions::expression(p);
+            } else {
+                p.error_custom_no_bump("ожидалась граница периода после запятой");
+                expressions::recover_to_delimiter(p, false, expressions::at_list_delimiter);
+            }
+        }
+
+        if p.at(T![RParen]) {
+            p.bump();
+        } else if !p.at_end() {
+            // At end of input this is a query being typed and says nothing;
+            // with a clause still to come the paren is simply unclosed.
+            p.error_custom_no_bump("не закрыта скобка после 'ПЕРИОДАМИ' / 'PERIODS'");
+        }
+    });
 }
 
 /// The trailing `[[КАК] <Псевдоним поля>]` of a control point.
@@ -1340,119 +1358,15 @@ fn top_clause(p: &mut Parser) {
     m.complete(p, NodeKind::SdblTopClause);
 }
 
-// =====================================================================
-// CLEAN-ROOM Slice 12 — virtual-table argument recovery
-//
-// A safety net for malformed argument lists only: clean nested calls and
-// subqueries are consumed by the expression layer and never reach here.
-// Tracks paren depth so that a comma inside a nested call is not
-// mistaken for an argument separator.
-//
-// Provenance: `docs/legal/sdbl-clean-room-slice12.md`, entry A7.
-// =====================================================================
-
-fn recover_to_delimiter_vt(p: &mut Parser) {
-    let recovery = p.start();
-    let mut consumed_any = false;
-    let mut paren_depth: u32 = 0;
-    let mut brace_depth: u32 = 0;
-    let mut nested_query_starts: Vec<u32> = Vec::new();
-
-    loop {
-        p.check_iteration_limit();
-
-        // An extension region is opaque text: the words in it are not this
-        // query's, and neither are its parens.
-        if p.at(T![LBrace]) {
-            brace_depth += 1;
-            p.bump();
-            consumed_any = true;
-            continue;
-        }
-
-        if p.at(T![RBrace]) {
-            brace_depth = brace_depth.saturating_sub(1);
-            p.bump();
-            consumed_any = true;
-            continue;
-        }
-
-        if brace_depth > 0 {
-            if p.at_end() || p.at(T![Semicolon]) {
-                break;
-            }
-            p.bump();
-            consumed_any = true;
-            continue;
-        }
-
-        if p.at(T![LParen]) {
-            paren_depth += 1;
-            p.bump();
-            consumed_any = true;
-            if is_query_starter_or_combiner_keyword(p) {
-                nested_query_starts.push(paren_depth);
-            }
-            continue;
-        }
-        if p.at(T![RParen]) {
-            if paren_depth == 0 {
-                break;
-            }
-            if let Some(&d) = nested_query_starts.last() {
-                if d == paren_depth {
-                    nested_query_starts.pop();
-                }
-            }
-            paren_depth -= 1;
-            p.bump();
-            consumed_any = true;
-            continue;
-        }
-
-        let inside_nested_query = !nested_query_starts.is_empty();
-
-        if is_clause_keyword(p) && p.prev_significant() != Some(T![Dot]) {
-            let stop = if paren_depth == 0 {
-                true
-            } else if inside_nested_query {
-                false
-            } else {
-                !is_query_starter_or_combiner_keyword(p)
-            };
-            if stop {
-                break;
-            }
-        }
-
-        if p.at(T![Semicolon]) {
-            break;
-        }
-
-        if paren_depth == 0 && p.at(T![Comma]) {
-            break;
-        }
-
-        if p.at_end() {
-            break;
-        }
-
-        p.bump();
-        consumed_any = true;
-    }
-
-    if consumed_any {
-        p.error_custom_at_marker(recovery, "пропуск некорректного фрагмента");
-    } else {
-        recovery.abandon(p);
-    }
-}
-
 fn virtual_table_args(p: &mut Parser) {
     if !p.at(T![LParen]) {
         return;
     }
     p.bump();
+    p.within_boundary(expressions::at_list_delimiter, virtual_table_args_body);
+}
+
+fn virtual_table_args_body(p: &mut Parser) {
     eat_query_extensions(p);
 
     if p.at(T![RParen]) {
@@ -1461,10 +1375,11 @@ fn virtual_table_args(p: &mut Parser) {
     }
 
     if super::expressions::is_expression_start(p) && !p.at(T![Comma]) {
+        let checkpoint = p.error_checkpoint();
         super::expressions::expression(p);
         eat_query_extensions(p);
         if !p.at(T![Comma]) && !p.at(T![RParen]) {
-            recover_to_delimiter_vt(p);
+            expressions::recover_expression_tail(p, checkpoint);
         }
     } else {
         let m = p.start();
@@ -1486,10 +1401,11 @@ fn virtual_table_args(p: &mut Parser) {
             continue;
         }
 
+        let checkpoint = p.error_checkpoint();
         super::expressions::expression(p);
         eat_query_extensions(p);
         if !p.at(T![Comma]) && !p.at(T![RParen]) {
-            recover_to_delimiter_vt(p);
+            expressions::recover_expression_tail(p, checkpoint);
         }
     }
 

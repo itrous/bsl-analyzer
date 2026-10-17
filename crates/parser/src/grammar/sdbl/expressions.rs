@@ -79,7 +79,47 @@ fn is_recovery_point(p: &Parser, recovery_set: &crate::parser::token_set::TokenS
     p.at_end()
 }
 
-fn recover_to_delimiter(p: &mut Parser) {
+pub(super) fn at_closing_paren(p: &Parser) -> bool {
+    p.at(T![RParen])
+}
+
+pub(super) fn at_list_delimiter(p: &Parser) -> bool {
+    p.at(T![Comma]) || p.at(T![RParen])
+}
+
+pub(super) fn at_comma(p: &Parser) -> bool {
+    p.at(T![Comma])
+}
+
+fn closing_paren_ahead(p: &Parser) -> bool {
+    let mut parens = 0;
+    let mut braces = 0;
+    let mut offset = 0;
+    while let Some(kind) = p.nth(offset) {
+        match kind {
+            T![Semicolon] => return false,
+            T![LBrace] => braces += 1,
+            T![RBrace] => braces = (braces - 1).max(0),
+            T![LParen] if braces == 0 => parens += 1,
+            T![RParen] if braces == 0 => {
+                if parens == 0 {
+                    return true;
+                }
+                parens -= 1;
+            }
+            _ => {}
+        }
+        offset += 1;
+    }
+    false
+}
+
+pub(super) fn recover_to_delimiter(
+    p: &mut Parser,
+    report: bool,
+    at_delimiter: fn(&Parser) -> bool,
+) {
+    let has_closer = closing_paren_ahead(p);
     let err = p.start();
     let mut consumed_any = false;
     let mut paren_depth = 0i32;
@@ -158,7 +198,9 @@ fn recover_to_delimiter(p: &mut Parser) {
             && p.prev_significant() != Some(T![Dot])
         {
             let stop = if paren_depth == 0 {
-                true
+                // A lone keyword before a delimiter is the bad operand.
+                // With a body after it, the clause still belongs to the query.
+                !has_closer || !matches!(p.nth(1), Some(T![Comma] | T![RParen]))
             } else if inside_nested_query {
                 false
             } else {
@@ -175,7 +217,11 @@ fn recover_to_delimiter(p: &mut Parser) {
             break;
         }
 
-        if paren_depth == 0 && brace_depth == 0 && p.at(T![Comma]) {
+        if paren_depth == 0
+            && brace_depth == 0
+            && p.at(T![Comma])
+            && (at_delimiter(p) || !has_closer)
+        {
             break;
         }
 
@@ -188,7 +234,11 @@ fn recover_to_delimiter(p: &mut Parser) {
     }
 
     if consumed_any {
-        p.error_custom_at_marker(err, "пропуск некорректного фрагмента");
+        if report {
+            p.error_custom_at_marker(err, "пропуск некорректного фрагмента");
+        } else {
+            err.complete(p, NodeKind::SdblError);
+        }
     } else {
         err.abandon(p);
     }
@@ -213,7 +263,7 @@ pub(super) fn parse_delimited_list<F>(
         let err = p.start();
         p.error_custom_at_marker(err, "пропущен элемент списка");
     } else {
-        parse_item(p);
+        p.within_boundary(at_comma, |p| parse_item(p));
     }
 
     loop {
@@ -237,7 +287,7 @@ pub(super) fn parse_delimited_list<F>(
             continue;
         }
 
-        parse_item(p);
+        p.within_boundary(at_comma, |p| parse_item(p));
     }
 }
 
@@ -344,6 +394,10 @@ fn unary_expr(p: &mut Parser) {
 }
 
 fn primary_expr(p: &mut Parser) {
+    if super::select::at_sdbl_keyword(p, "AS", "КАК") && !next_is_a_qualifying_dot(p) {
+        p.error_custom_no_bump("ожидался операнд перед 'КАК' / 'AS'");
+        return;
+    }
     if at_a_keyword_qualifier(p) {
         column_or_function(p);
         return;
@@ -422,12 +476,6 @@ fn primary_expr(p: &mut Parser) {
 /// condition.
 /// A clause keyword standing where only a field name can stand.
 ///
-/// The alias separator is not among them, though `А + КАК Б` has no reading in
-/// which `КАК` is the operand: this rule is also reached where an expression
-/// has legitimately ended and its alias follows, and refusing `КАК` there cost
-/// eight production queries their `ИТОГИ … КАК Имя`. Telling the two apart
-/// needs to know whether the expression behind this position is complete,
-/// which is the caller's knowledge and not this one's.
 fn at_a_keyword_that_cannot_be_a_field(p: &Parser) -> bool {
     p.names_are_fields()
         && (super::select::is_clause_keyword(p) || super::at_a_list_separator(p))
@@ -511,32 +559,53 @@ fn paren_or_subquery_expr(p: &mut Parser) {
     let m = p.start();
 
     p.bump();
+    let mut checkpoint = p.error_checkpoint();
 
-    if p.at_keyword("SELECT") || p.at_keyword("ВЫБРАТЬ") {
-        super::select::subquery(p);
-        p.expect(T![RParen]);
-        m.complete(p, NodeKind::SdblSubqueryExpr);
-    } else {
-        expression(p);
+    let kind = p.within_boundary(at_closing_paren, |p| {
+        if p.at_keyword("SELECT") || p.at_keyword("ВЫБРАТЬ") {
+            super::select::subquery(p);
+            finish_parenthesized(p, checkpoint);
+            NodeKind::SdblSubqueryExpr
+        } else {
+            p.within_boundary(at_list_delimiter, expression);
 
-        if p.at(T![Comma]) {
-            while p.eat(T![Comma]) {
-                p.check_iteration_limit();
+            if p.at(T![Comma]) {
+                while p.eat(T![Comma]) {
+                    p.check_iteration_limit();
+                    checkpoint = p.error_checkpoint();
 
-                if p.at(T![RParen]) || !is_expression_start(p) {
-                    break;
+                    if p.at(T![RParen]) {
+                        break;
+                    }
+                    if !is_expression_start(p) {
+                        p.error_custom_no_bump("ожидался элемент кортежа после запятой");
+                        break;
+                    }
+
+                    p.within_boundary(at_list_delimiter, expression);
                 }
 
-                expression(p);
+                finish_parenthesized(p, checkpoint);
+                NodeKind::SdblTupleExpr
+            } else {
+                finish_parenthesized(p, checkpoint);
+                NodeKind::SdblParenExpr
             }
-
-            p.expect(T![RParen]);
-            m.complete(p, NodeKind::SdblTupleExpr);
-        } else {
-            p.expect(T![RParen]);
-            m.complete(p, NodeKind::SdblParenExpr);
         }
+    });
+    m.complete(p, kind);
+}
+
+pub(super) fn finish_parenthesized(p: &mut Parser, checkpoint: usize) {
+    if !p.at(T![RParen]) {
+        recover_expression_tail(p, checkpoint);
     }
+    p.expect(T![RParen]);
+}
+
+pub(super) fn recover_expression_tail(p: &mut Parser, checkpoint: usize) {
+    let report = !p.has_error_since(checkpoint);
+    recover_to_delimiter(p, report, at_list_delimiter);
 }
 
 fn comparison_expr(p: &mut Parser) {
@@ -562,34 +631,43 @@ fn predicate_expr(p: &mut Parser) {
                 m.complete(p, NodeKind::SdblInHierarchyExpr);
                 return;
             }
+            let checkpoint = p.error_checkpoint();
 
-            if p.at_keyword("SELECT") || p.at_keyword("ВЫБРАТЬ") {
-                super::select::subquery(p);
-            } else {
-                expression(p);
-            }
+            p.within_boundary(at_closing_paren, |p| {
+                if p.at_keyword("SELECT") || p.at_keyword("ВЫБРАТЬ") {
+                    super::select::subquery(p);
+                } else {
+                    expression(p);
+                }
 
-            p.expect(T![RParen]);
+                finish_parenthesized(p, checkpoint);
+            });
             m.complete(p, NodeKind::SdblInHierarchyExpr);
         } else {
             if !p.expect(T![LParen]) {
                 m.complete(p, NodeKind::SdblInExpr);
                 return;
             }
+            let mut checkpoint = p.error_checkpoint();
 
-            if p.at_keyword("SELECT") || p.at_keyword("ВЫБРАТЬ") {
-                super::select::subquery(p);
-            } else {
-                parse_delimited_list(
-                    p,
-                    T![Comma],
-                    &super::LIST_RECOVERY,
-                    is_expression_start,
-                    expression,
-                );
-            }
+            p.within_boundary(at_closing_paren, |p| {
+                if p.at_keyword("SELECT") || p.at_keyword("ВЫБРАТЬ") {
+                    super::select::subquery(p);
+                } else {
+                    parse_delimited_list(
+                        p,
+                        T![Comma],
+                        &super::LIST_RECOVERY,
+                        is_expression_start,
+                        |p| {
+                            checkpoint = p.error_checkpoint();
+                            expression(p);
+                        },
+                    );
+                }
 
-            p.expect(T![RParen]);
+                finish_parenthesized(p, checkpoint);
+            });
             m.complete(p, NodeKind::SdblInExpr);
         }
     } else if p.at_keyword("IS") || p.at_keyword("ЕСТЬ") {
@@ -704,19 +782,28 @@ fn parse_cast_type(p: &mut Parser) {
 
         if p.at(T![LParen]) {
             p.bump();
+            let checkpoint = p.error_checkpoint();
+            p.within_boundary(
+                if is_number_type { at_list_delimiter } else { at_closing_paren },
+                |p| {
+                    if p.at(T![Decimal]) {
+                        p.bump();
 
-            if p.at(T![Decimal]) {
-                p.bump();
+                        if is_number_type && p.eat(T![Comma]) && p.at(T![Decimal]) {
+                            p.bump();
+                        }
+                    }
 
-                if is_number_type && p.eat(T![Comma]) && p.at(T![Decimal]) {
-                    p.bump();
-                }
-            }
-
-            p.expect(T![RParen]);
+                    if !is_number_type && !p.at(T![RParen]) {
+                        recover_to_delimiter(p, true, at_closing_paren);
+                    }
+                    finish_parenthesized(p, checkpoint);
+                },
+            );
         }
     } else {
         report_missing_name(p, "ожидался тип после 'КАК' / 'AS'");
+        recover_to_delimiter(p, false, at_list_delimiter);
     }
 
     m.complete(p, NodeKind::SdblType);
@@ -785,58 +872,63 @@ fn column_or_function(p: &mut Parser) {
         m.complete(p, NodeKind::SdblColumnRef);
     } else if p.at(T![LParen]) {
         p.bump();
-
-        if !p.at(T![RParen]) {
-            if p.at_keyword("DISTINCT") || p.at_keyword("РАЗЛИЧНЫЕ") {
-                p.bump();
-            }
-
-            if is_expression_start(p) && !p.at(T![Comma]) && !super::select::is_clause_keyword(p) {
-                expression(p);
-
-                if is_cast && (p.at_keyword("AS") || p.at_keyword("КАК")) {
+        let mut checkpoint = p.error_checkpoint();
+        p.within_boundary(at_list_delimiter, |p| {
+            if !p.at(T![RParen]) {
+                if p.at_keyword("DISTINCT") || p.at_keyword("РАЗЛИЧНЫЕ") {
                     p.bump();
-                    parse_cast_type(p);
-                } else {
-                    if !p.at(T![Comma]) && !p.at(T![RParen]) {
-                        recover_to_delimiter(p);
-                    }
                 }
-            } else if p.at(T![Comma]) {
-                let err = p.start();
-                p.error_custom_at_marker(err, "пропущен первый аргумент");
-            }
 
-            while p.eat(T![Comma]) {
-                p.check_iteration_limit();
-
-                if p.at(T![Comma])
-                    || p.at(T![RParen])
-                    || !is_expression_start(p)
-                    || super::select::is_clause_keyword(p)
+                if is_expression_start(p)
+                    && !p.at(T![Comma])
+                    && !super::select::is_clause_keyword(p)
                 {
-                    let err = p.start();
-                    p.error_custom_at_marker(err, "пропущен аргумент функции");
+                    expression(p);
 
-                    if !p.at(T![Comma]) {
-                        break;
+                    if is_cast && (p.at_keyword("AS") || p.at_keyword("КАК")) {
+                        p.bump();
+                        parse_cast_type(p);
+                    } else {
+                        if !p.at(T![Comma]) && !p.at(T![RParen]) {
+                            recover_expression_tail(p, checkpoint);
+                        }
                     }
-                    continue;
+                } else if p.at(T![Comma]) {
+                    let err = p.start();
+                    p.error_custom_at_marker(err, "пропущен первый аргумент");
+                } else {
+                    p.error_custom_no_bump("ожидался аргумент функции");
+                    recover_to_delimiter(p, false, at_list_delimiter);
                 }
 
-                expression(p);
+                while p.eat(T![Comma]) {
+                    p.check_iteration_limit();
+                    checkpoint = p.error_checkpoint();
 
-                if !p.at(T![Comma]) && !p.at(T![RParen]) {
-                    recover_to_delimiter(p);
+                    if p.at(T![Comma])
+                        || p.at(T![RParen])
+                        || !is_expression_start(p)
+                        || super::select::is_clause_keyword(p)
+                    {
+                        let err = p.start();
+                        p.error_custom_at_marker(err, "пропущен аргумент функции");
+
+                        if !p.at(T![Comma]) {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    expression(p);
+
+                    if !p.at(T![Comma]) && !p.at(T![RParen]) {
+                        recover_expression_tail(p, checkpoint);
+                    }
                 }
             }
-        }
 
-        if super::select::is_clause_keyword(p) {
-            p.error_expected(T![RParen]);
-        } else {
-            p.expect(T![RParen]);
-        }
+            finish_parenthesized(p, checkpoint);
+        });
 
         while super::eat_qualifying_dot(p) {
             p.check_iteration_limit();
@@ -877,10 +969,12 @@ fn inline_table_fields(p: &mut Parser) {
     let m = p.start();
 
     p.bump();
+    let checkpoint = p.error_checkpoint();
 
-    super::select::selected_fields(p);
-
-    p.expect(T![RParen]);
+    p.within_boundary(at_closing_paren, |p| {
+        super::select::selected_fields(p);
+        finish_parenthesized(p, checkpoint);
+    });
 
     m.complete(p, NodeKind::SdblInlineTableFields);
 }

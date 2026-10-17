@@ -1,0 +1,19 @@
+SELECT A FROM T
+ВЫБРАТЬ Т.Цена + 1 КАК Цена, Т.Количество * 2 Количество ИЗ Справочник.Товары КАК Т ГДЕ Т.Код > 0
+SELECT CAST(A AS NUMBER(10, 2)) AS B FROM T
+ВЫБРАТЬ ВЫРАЗИТЬ(А КАК ЧИСЛО(10, 2)) КАК Б ИЗ Т
+SELECT (A + 1), (A, B) FROM T WHERE A IN (1, 2)
+SELECT A FROM T WHERE A IN HIERARCHY (&Root)
+SELECT SUM(A), COUNT(DISTINCT B), COUNT(*) FROM T
+SELECT T.(A AS B, C), T.Code FROM T
+SELECT A FROM (SELECT A FROM T) AS Q
+SELECT A FROM Register.R.Turnovers(, , &End, , A IN (SELECT A FROM T)) AS R
+SELECT A FROM T TOTALS SUM(A) BY A PERIODS(MONTH, &Start, &End)
+SELECT A FROM T TOTALS SUM(A) BY A PERIODS(MONTH
+SELECT A INTO Temp FROM T INDEX BY A; SELECT A FROM Temp
+SELECT CASE WHEN A > 0 THEN 1 ELSE 0 END AS Flag FROM T
+SELECT A FROM T GROUP BY A HAVING SUM(A) > 0 ORDER BY A DESC
+SELECT A FROM T TOTALS COUNT(A) AS K BY A
+ВЫБРАТЬ А ИЗ Т ИТОГИ КОЛИЧЕСТВО(А) КАК К ПО Б
+SELECT A FROM T TOTALS SUM(A) + 1 Result, COUNT(A) AS Order BY A
+SELECT A FROM T TOTALS SUM(A) BY A AS GroupName

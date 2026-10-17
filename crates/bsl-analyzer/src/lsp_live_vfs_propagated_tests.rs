@@ -228,6 +228,58 @@ fn wait_until_blocked(db: &ide_db::RootDatabaseImpl, baseline: u64) {
     }
 }
 
+fn drain_without_request_completions(
+    state: &mut crate::global_state::GlobalState,
+    receiver: &Receiver<Task>,
+) -> usize {
+    let (drained, _) = g1_drain_task_pool_to_fixed_point_with(state, receiver, |task| {
+        assert!(
+            !matches!(task, Task::LatencyRequestFinished { .. }),
+            "no request completion remains queued"
+        );
+    });
+    drained
+}
+
+#[test]
+fn g1_completion_drain_accepts_background_tasks() {
+    g1_with_tracing(|| {
+        let (sender, _client_receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        let task_receiver = state.task_pool.receiver.clone();
+        state.task_pool.pool.sender.send(Task::AnalysisProgressTick { epoch: u64::MAX }).unwrap();
+        assert_eq!(drain_without_request_completions(&mut state, &task_receiver), 1);
+        g1_wait_for_task_pool_quiescence(&mut state, &task_receiver);
+    });
+}
+
+#[test]
+#[should_panic(expected = "no request completion remains queued")]
+fn g1_completion_drain_rejects_duplicate_after_background_task() {
+    g1_with_tracing(|| {
+        let (sender, _client_receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        let task_receiver = state.task_pool.receiver.clone();
+        let sender = &state.task_pool.pool.sender;
+        sender.send(Task::AnalysisProgressTick { epoch: u64::MAX }).unwrap();
+        let request_id = lsp_server::RequestId::from(731);
+        sender
+            .send(Task::LatencyRequestFinished {
+                key: crate::global_state::RequestAttemptKey {
+                    id: request_id.clone(),
+                    generation: 1,
+                    attempt: 2,
+                },
+                outcome: crate::global_state::LatencyAttemptOutcome::Response(Response::new_ok(
+                    request_id,
+                    serde_json::Value::Null,
+                )),
+            })
+            .unwrap();
+        drain_without_request_completions(&mut state, &task_receiver);
+    });
+}
+
 #[test]
 fn g1_removed_recursive_invalidates_queued_origin_and_preserves_open_buffer() {
     g1_with_tracing(|| {
@@ -594,7 +646,7 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
         assert!(!state.request_lifecycles.contains_key(&request_id));
         assert!(!state.request_tokens.contains_key(&request_id));
         assert!(state.pending_latency_retries.is_empty());
-        assert!(task_receiver.try_recv().is_err(), "no request completion remains queued");
+        drain_without_request_completions(&mut state, &task_receiver);
         assert!(
             client_receiver.try_iter().all(|message| !matches!(message, Message::Response(_))),
             "retry emitted exactly one response"
@@ -707,7 +759,7 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
         assert!(state.request_lifecycles.is_empty());
         assert!(state.request_tokens.is_empty());
         assert!(state.pending_latency_retries.is_empty());
-        assert!(task_receiver.try_recv().is_err(), "no retry task remains queued");
+        drain_without_request_completions(&mut state, &task_receiver);
         assert!(
             client_receiver.try_iter().all(|message| !matches!(message, Message::Response(_))),
             "panic produced exactly one terminal response"

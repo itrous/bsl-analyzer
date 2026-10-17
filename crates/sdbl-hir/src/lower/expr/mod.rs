@@ -187,6 +187,12 @@ impl LoweringContext<'_> {
     fn lower_literal(&mut self, node: &syntax::SyntaxNode) -> ExprHir {
         use crate::hir::LiteralValue;
 
+        for token in node.children_with_tokens().filter_map(|element| element.into_token()) {
+            if token.kind() == syntax::SyntaxKind::STAR {
+                self.record_token(&token, crate::source_map::TokenCategory::Operator);
+            }
+        }
+
         let text: String = syntax::ast_utils::significant_tokens(node)
             .map(|token| token.text().to_string())
             .collect();
@@ -228,11 +234,8 @@ impl LoweringContext<'_> {
     fn lower_multi_string(&mut self, node: &syntax::SyntaxNode) -> ExprHir {
         use crate::hir::LiteralValue;
 
-        // The query lexer splits a double-quoted literal into its quotes and its per-line
-        // content runs and drops the line breaks themselves, so the tree no longer shows
-        // where a line ended. Every literal with content is therefore offered as a
-        // candidate; the IDE layer, which still sees the query text, decides whether the
-        // query really contains a literal that continues on the next line.
+        // Keep every non-empty multi-string as a candidate; the IDE layer checks the full
+        // query text to decide whether the literal actually continues onto another line.
         let fragments = node
             .children_with_tokens()
             .filter(|element| element.kind() == syntax::SyntaxKind::STRING)

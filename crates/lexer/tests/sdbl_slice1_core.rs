@@ -248,15 +248,10 @@ fn string_multiline_with_bar_continuation() {
     let tokens = tokenize_sdbl("\"head\n    | tail\"");
     assert_eq!(
         kinds(&tokens),
-        vec![
-            SdblTokenKind::String,
-            SdblTokenKind::String,
-            SdblTokenKind::String,
-            SdblTokenKind::String,
-        ]
+        vec![SdblTokenKind::String, SdblTokenKind::String, SdblTokenKind::String,]
     );
-    assert_eq!(tokens[1].text.as_str(), "head");
-    assert_eq!(tokens[2].text.as_str(), "| tail");
+    assert_eq!(tokens[1].text.as_str(), "head\n    | tail");
+    assert_eq!(tokens.iter().map(|t| t.text.as_str()).collect::<String>(), "\"head\n    | tail\"");
 }
 
 #[test]
@@ -267,13 +262,70 @@ fn string_body_with_parentheses_is_preserved() {
 }
 
 #[test]
-fn string_doubled_quote_escape_observed_behaviour() {
+fn string_doubled_quote_escape_preserves_the_source_bytes() {
     let tokens = tokenize_sdbl(r#""A""B""#);
     assert_eq!(
         kinds(&tokens),
         vec![SdblTokenKind::String, SdblTokenKind::String, SdblTokenKind::String]
     );
     assert_eq!(tokens[0].text.as_str(), "\"");
-    assert_eq!(tokens[1].text.as_str(), "B");
-    assert_eq!(tokens[2].text.as_str(), "\"");
+    assert_eq!(tokens.iter().map(|t| t.text.as_str()).collect::<String>(), r#""A""B""#);
+}
+
+#[test]
+fn string_tokens_cover_line_endings_and_keep_following_offsets() {
+    for line_ending in ["\n", "\r\n", "\r"] {
+        let input = format!("\"A{line_ending}\tБ\" КАК Поле");
+        let tokens = tokenize_sdbl(&input);
+        assert_eq!(tokens.iter().map(|t| t.text.as_str()).collect::<String>(), input);
+        for token in &tokens {
+            let start = token.offset;
+            let end = start + token.text.len();
+            assert_eq!(&input[start..end], token.text.as_str());
+        }
+        assert!(tokens.iter().any(|t| t.text.as_str() == "КАК"));
+    }
+}
+
+#[test]
+fn string_token_ranges_cover_quote_runs_and_every_utf8_truncation() {
+    let samples = (1..=32)
+        .map(|quotes| "\"".repeat(quotes))
+        .chain([r#""А""Б"#.to_string(), "\"未\n\t知\"后".to_string()]);
+    for input in samples {
+        for end in (0..=input.len()).filter(|end| input.is_char_boundary(*end)) {
+            let prefix = &input[..end];
+            let tokens = tokenize_sdbl(prefix);
+            assert_eq!(tokens.iter().map(|t| t.text.as_str()).collect::<String>(), prefix);
+            let mut next = 0;
+            for token in tokens {
+                assert_eq!(token.offset, next);
+                let end = next + token.text.len();
+                assert_eq!(&prefix[next..end], token.text.as_str());
+                next = end;
+            }
+            assert_eq!(next, prefix.len());
+        }
+    }
+    assert!(tokenize_sdbl("").is_empty());
+}
+
+#[test]
+fn bsl_lexer_control_keeps_multiline_string_source_bytes() {
+    let source = "Процедура Тест()\nЗапрос.Текст = \"ВЫБРАТЬ \"\"А\"\" КАК Имя\n    |ИЗ Справочник.Товары\";\nКонецПроцедуры";
+    let tokens = lexer::tokenize(source);
+    assert_eq!(tokens.iter().map(|token| token.text.as_str()).collect::<String>(), source);
+    for token in tokens {
+        let end = token.offset + token.text.len();
+        assert_eq!(&source[token.offset..end], token.text.as_str());
+    }
+}
+
+#[test]
+fn empty_and_separated_string_literals_keep_their_boundaries() {
+    let empty = tokenize_sdbl("\"\"");
+    assert_eq!(empty.iter().map(|token| token.text.as_str()).collect::<String>(), "\"\"");
+    let separate = tokenize_sdbl("\"А\" \"Б\"");
+    assert_eq!(separate.iter().map(|token| token.text.as_str()).collect::<String>(), "\"А\" \"Б\"");
+    assert_eq!(separate.iter().filter(|token| token.kind == SdblTokenKind::String).count(), 6);
 }

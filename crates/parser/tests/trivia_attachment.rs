@@ -321,6 +321,33 @@ fn ranges_only_narrow_against_the_recorded_baseline() {
     assert!(breaches.is_empty(), "сдвиг не является сужением:\n{}", head(&breaches));
 }
 
+#[test]
+fn multiline_bsl_literal_preserves_tree_text_and_following_identifier_ranges() {
+    for newline in ["\n", "\r\n"] {
+        let input = format!(
+            "Процедура П(){newline}    А = \"начало{newline}    |середина\";{newline}    После = 1;{newline}КонецПроцедуры{newline}"
+        );
+        let root = parse(&input).syntax_node();
+        assert_eq!(root.text().to_string(), input);
+        assert_eq!(u32::from(root.text_range().len()) as usize, input.len());
+
+        let expected_start = input.find("После").unwrap();
+        let token = root
+            .descendants_with_tokens()
+            .filter_map(NodeOrToken::into_token)
+            .find(|token| token.kind() == syntax::SyntaxKind::IDENT && token.text() == "После")
+            .unwrap();
+        assert_eq!(
+            token.text_range(),
+            TextRange::new(
+                (expected_start as u32).into(),
+                ((expected_start + "После".len()) as u32).into()
+            ),
+            "newline={newline:?}"
+        );
+    }
+}
+
 struct NodeShape {
     depth: usize,
     kind: String,

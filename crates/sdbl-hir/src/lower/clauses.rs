@@ -278,6 +278,21 @@ impl LoweringContext<'_> {
 
         for child in totals_clause.children_with_tokens() {
             match child {
+                syntax::NodeOrToken::Node(node)
+                    if node.kind() == syntax::SyntaxKind::SDBL_ALIAS =>
+                {
+                    if let Some(alias) = syntax::ast::SdblAlias::cast(node) {
+                        self.record_keyword_by_text(
+                            alias.syntax(),
+                            "AS",
+                            "КАК",
+                            crate::source_map::TokenCategory::SpecialKeyword,
+                        );
+                        if let Some(token) = alias.identifier() {
+                            self.record_token(&token, crate::source_map::TokenCategory::FieldAlias);
+                        }
+                    }
+                }
                 syntax::NodeOrToken::Token(token) if token.kind() == syntax::SyntaxKind::IDENT => {
                     let text = token.text();
                     if text.eq_ignore_ascii_case("TOTALS") || text.eq_ignore_ascii_case("ИТОГИ")
