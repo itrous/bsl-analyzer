@@ -3747,6 +3747,12 @@ impl<'db> InferenceContext<'db> {
         }
 
         if let Some(name) = &bare_callee_name {
+            if let Some(ret) = self.resolve_bare_receiver_call_over_global(name, args, callee) {
+                return ret;
+            }
+        }
+
+        if let Some(name) = &bare_callee_name {
             let name = name.clone();
             if let Some(sigs) = builtin::builtin_functions().get(name.as_str()) {
                 debug_assert!(
@@ -3905,6 +3911,66 @@ impl<'db> InferenceContext<'db> {
             }
         }
         self.db.unknown()
+    }
+
+    /// A bare call whose name is both a method of this module's implicit receiver
+    /// and a platform global function. The platform binds it to the receiver:
+    /// `ПолучитьФорму()` in an object module and `ПолучитьДанныеВыбора(Параметры)`
+    /// in a manager module compile although the same-named globals require one and
+    /// two arguments, and four arguments to `ПолучитьФорму` in an object module fail
+    /// at the fourth ("Слишком много фактических параметров"), where the global
+    /// accepts six (8.3.17 and 8.3.27). So the call is judged by the receiver's
+    /// signature, exactly as the qualified `ЭтотОбъект.<Имя>(...)`.
+    ///
+    /// One documented exception: `ПолучитьДанныеВыбора` with two arguments in a
+    /// manager module calls the global function (the manager method's help says
+    /// so, and the probe returned the data of the type passed first).
+    ///
+    /// Only the `Receiver` surface: a form or a value manager has no method that
+    /// shares a name with a global function. `None` leaves the call to the cascade.
+    fn resolve_bare_receiver_call_over_global(
+        &mut self,
+        name: &hir_def::Name,
+        args: &[ExprId],
+        callee: ExprId,
+    ) -> Option<TypeId> {
+        if name.is_missing() || self.bare_module_method_exists(name) {
+            return None;
+        }
+        let is_platform_global = builtin::builtin_functions().get(name.as_str()).is_some()
+            || bsl_platform::PlatformGlobalCatalog::instance().lookup(name.as_str()).is_some_and(
+                |symbol| {
+                    symbol.kind == bsl_platform::PlatformGlobalKind::Function
+                        && symbol.capabilities.callable == Some(true)
+                },
+            );
+        if !is_platform_global {
+            return None;
+        }
+        if args.len() == 2
+            && crate::method_lookup::is_platform_name_str(
+                name.as_str(),
+                "ПолучитьДанныеВыбора",
+                "GetChoiceData",
+            )
+        {
+            return None;
+        }
+        let ImplicitSelfSurface::Receiver(receiver_ty) = self.implicit_self_surface() else {
+            return None;
+        };
+        let info =
+            crate::method_lookup::lookup_method_with_refinement(self.db, receiver_ty, name, None)?;
+        for arg in args {
+            self.infer_expr(*arg);
+        }
+        // No availability verdict here: the platform compiles a thick-client-only
+        // receiver method (`ПолучитьФорму` of an ordinary-application object) in the
+        // server context of the same module without complaint, so the method's
+        // availability says nothing about whether this module compiles.
+        let return_ty = self.record_candidate_call_arg_binding(callee, args, info.candidates);
+        self.expr_types.insert(callee, self.db.unknown());
+        Some(return_ty)
     }
 
     /// Whether a variable answers `name` as a value: a parameter or `Перем` of the
