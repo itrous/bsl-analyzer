@@ -78,6 +78,48 @@ fn lookup_form_data_tabular_section_field(
     })
 }
 
+/// An object attribute of type `ТаблицаЗначений` / `ДеревоЗначений` reached through
+/// form data: the form holds it as `ДанныеФормыКоллекция` / `ДанныеФормыДерево`, on
+/// the client and on the server alike, exactly like a form attribute of that type.
+fn lookup_form_data_value_collection_field(
+    db: &dyn TypeKernelDb,
+    resolver: &dyn MetadataResolution,
+    receiver: TypeId,
+    field_name: &Name,
+) -> Option<FieldInfo> {
+    let (mdo_type, mdo_name) = match db.lookup_type(receiver) {
+        TypeKind::FormData {
+            kind: FormDataFacet::Structure | FormDataFacet::StructureWithCollection,
+            underlying: Some(owner),
+        } => (owner.mdo_type, owner.name.clone()),
+        _ => return None,
+    };
+
+    let needle = field_name.as_str();
+    let mdo = resolver.resolve_metadata_object(mdo_type, mdo_name.as_str())?;
+    let attr = mdo.attributes.iter().find(|attr| {
+        stdx::case::eq_ignore_case(&attr.name, needle)
+            || attr.name_en.as_deref().is_some_and(|en| stdx::case::eq_ignore_case(en, needle))
+    })?;
+    let kind = match &attr.attr_type {
+        bsl_metadata::AttributeType::Platform(bsl_metadata::PlatformValueType::ValueTable) => {
+            FormDataFacet::Collection
+        }
+        bsl_metadata::AttributeType::Platform(bsl_metadata::PlatformValueType::ValueTree) => {
+            FormDataFacet::Tree
+        }
+        _ => return None,
+    };
+    Some(FieldInfo {
+        name: Name::new(&attr.name),
+        name_en: attr.name_en.as_deref().filter(|s| !s.is_empty()).map(Name::new),
+        ty: db.mk_form_data(kind, None),
+        value_ty: None,
+        is_readonly: false,
+        origin: crate::field_enum::FieldOrigin::UserAttribute,
+    })
+}
+
 pub fn lookup_field(
     db: &dyn TypeKernelDb,
     resolver: &dyn MetadataResolution,
@@ -121,6 +163,11 @@ fn lookup_field_raw(
     }
 
     if let Some(info) = lookup_form_data_tabular_section_field(db, resolver, receiver, field_name) {
+        return Some(info);
+    }
+
+    if let Some(info) = lookup_form_data_value_collection_field(db, resolver, receiver, field_name)
+    {
         return Some(info);
     }
 

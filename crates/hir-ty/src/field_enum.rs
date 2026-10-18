@@ -720,13 +720,22 @@ fn enumerate_tabular_row_fields(
             "Line of a tabular section",
             &nr_name,
         ) {
+            // The same row facet stands for the form-data row of the section
+            // (ДанныеФормыЭлементКоллекции), which carries НомерСтроки as a column
+            // wherever the item itself is available, the thin and web clients included.
+            let form_row_env = PlatformData::instance()
+                .get_type("FormDataCollectionItem")
+                .map(|ty| {
+                    hir_def::execution_env::EnvFlags::from_platform_context(ty.context.as_ref())
+                })
+                .unwrap_or(hir_def::execution_env::EnvFlags::EMPTY);
             out.push(FieldInfo {
                 name: nr_name,
                 name_en: Some(nr_name_en),
                 ty: prop.return_ty,
                 value_ty: None,
                 is_readonly: prop.is_readonly,
-                origin: FieldOrigin::PlatformProperty { env: prop.env },
+                origin: FieldOrigin::PlatformProperty { env: prop.env | form_row_env },
             });
         }
     }

@@ -447,12 +447,21 @@ fn lookup_on_metadata_ref(
     // (НайтиПоИдентификатору, ПолучитьИдентификатор) called on a real object
     // tabular section is no longer flagged — otherwise the form side drowns in
     // false unresolved-method reports.
+    //
+    // The availability is united the same way. A real tabular section exists only on
+    // the server, in the thick client and in the external connection, so a tabular
+    // section met in thin- or web-client code is always the form collection, where
+    // `Добавить`, `НайтиСтроки`, `Количество` and the like do run.
     if let MetadataKind::TabularSection { parent } = kind {
         let data = PlatformData::instance();
-        let method = data
-            .get_method("Tabular section", method_name.as_str())
-            .or_else(|| data.get_method("FormDataCollection", method_name.as_str()))?;
-        return Some(build_tabular_section_method_info(db, method, parent, name));
+        let object_method = data.get_method("Tabular section", method_name.as_str());
+        let form_method = data.get_method("FormDataCollection", method_name.as_str());
+        let method = object_method.or(form_method)?;
+        let mut info = build_tabular_section_method_info(db, method, parent, name);
+        if let (Some(_), Some(form_method)) = (object_method, form_method) {
+            info.env = info.env | EnvFlags::from_platform_context(form_method.context.as_ref());
+        }
+        return Some(info);
     }
     if let MetadataKind::TabularSectionRow { parent } = kind {
         let method =

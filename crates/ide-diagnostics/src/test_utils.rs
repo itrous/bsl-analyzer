@@ -979,7 +979,7 @@ pub fn check_form_with_common_modules(
     form_source: &str,
     modules: &[(&str, &str, &str)],
 ) -> Vec<Diagnostic> {
-    check_form_module_impl(form_source, modules, minimal_managed_form_xml())
+    check_form_module_impl(form_source, modules, minimal_managed_form_xml(), None)
 }
 
 /// Diagnostics of a managed-form module whose `Ext/Form.xml` content matters
@@ -987,13 +987,26 @@ pub fn check_form_with_common_modules(
 /// the configuration is materialized on disk exactly like in
 /// [`check_form_with_common_modules`].
 pub fn check_form_with_form_xml(form_source: &str, form_xml: &str) -> Vec<Diagnostic> {
-    check_form_module_impl(form_source, &[], form_xml)
+    check_form_module_impl(form_source, &[], form_xml, None)
+}
+
+/// [`check_form_with_form_xml`] for a form whose owner matters as well: the
+/// form belongs to the data processor `Товары`, registered in the configuration and
+/// described by `owner_xml` (its `DataProcessors/Товары.xml`), so an attribute of type
+/// `cfg:DataProcessorObject.Товары` resolves to its attributes and tabular sections.
+pub fn check_form_with_owner_xml(
+    form_source: &str,
+    form_xml: &str,
+    owner_xml: &str,
+) -> Vec<Diagnostic> {
+    check_form_module_impl(form_source, &[], form_xml, Some(owner_xml))
 }
 
 fn check_form_module_impl(
     form_source: &str,
     modules: &[(&str, &str, &str)],
     form_xml: &str,
+    owner_xml: Option<&str>,
 ) -> Vec<Diagnostic> {
     use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
     use ide_db::metadata::intern_configuration_path;
@@ -1011,7 +1024,19 @@ fn check_form_module_impl(
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create fixture root");
     let _guard = TempRootGuard(root.clone());
-    std::fs::write(root.join("Configuration.xml"), minimal_configuration_xml())
+    let (owner_dir, configuration_xml) = match owner_xml {
+        Some(owner_xml) => {
+            std::fs::create_dir_all(root.join("DataProcessors"))
+                .expect("create DataProcessors directory");
+            std::fs::write(root.join("DataProcessors/Товары.xml"), owner_xml)
+                .expect("write DataProcessors/Товары.xml");
+            let children = "</Properties>\n        <ChildObjects>\n            \
+                            <DataProcessor>Товары</DataProcessor>\n        </ChildObjects>";
+            ("DataProcessors", minimal_configuration_xml().replace("</Properties>", children))
+        }
+        None => ("Catalogs", minimal_configuration_xml()),
+    };
+    std::fs::write(root.join("Configuration.xml"), configuration_xml)
         .expect("write Configuration.xml");
     for (name, body, xml) in modules {
         let ext_dir = root.join(format!("CommonModules/{name}/Ext"));
@@ -1021,7 +1046,7 @@ fn check_form_module_impl(
             .expect("write CommonModule XML");
     }
 
-    let form_ext_dir = root.join("Catalogs/Товары/Forms/ФормаЭлемента/Ext");
+    let form_ext_dir = root.join(format!("{owner_dir}/Товары/Forms/ФормаЭлемента/Ext"));
     std::fs::create_dir_all(form_ext_dir.join("Form")).expect("create form Ext/Form directory");
     std::fs::write(form_ext_dir.join("Form.xml"), form_xml).expect("write Ext/Form.xml");
 
@@ -1030,7 +1055,8 @@ fn check_form_module_impl(
 
     let mut file_set = FileSet::default();
     let caller_file_id = FileId(0);
-    let caller_path = root.join("Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl");
+    let caller_path =
+        root.join(format!("{owner_dir}/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl"));
     file_set.insert(caller_file_id, VfsPath::new(caller_path.to_string_lossy().into_owned()));
     let mut module_file_ids = Vec::with_capacity(modules.len());
     for (idx, (name, _, _)) in modules.iter().enumerate() {

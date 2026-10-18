@@ -4704,6 +4704,13 @@ fn receiver_display_name(db: &dyn TypeKernelDb, receiver_ty: TypeId) -> Option<h
             let name = &underlying.name;
             Some(hir_def::Name::new(&format!("{}.{}", plural, name.as_str())))
         }
+        // A value table held by the form (a form attribute or an object attribute of
+        // that type): its methods are the closed set of the form collection on both
+        // sides, so a value-table-only one (`ВыгрузитьКолонку`, `Свернуть`) fails at
+        // run time as on any other known receiver.
+        TypeKind::FormData { kind: FormDataFacet::Collection, underlying: None } => {
+            Some(hir_def::Name::new("ДанныеФормыКоллекция"))
+        }
         _ => None,
     }
 }

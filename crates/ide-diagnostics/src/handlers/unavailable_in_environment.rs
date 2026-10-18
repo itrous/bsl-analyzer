@@ -724,4 +724,151 @@ mod tests {
         let diags = env_diags(fixture);
         assert!(diags.is_empty(), "server module may use server API, got: {diags:?}");
     }
+
+    const FORM_COLLECTIONS_OWNER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
+    <DataProcessor uuid="00000000-0000-0000-0000-000000000101">
+        <Properties><Name>Товары</Name></Properties>
+        <ChildObjects>
+            <Attribute uuid="00000000-0000-0000-0000-000000000104">
+                <Properties><Name>ТаблицаОбъекта</Name><Type><v8:Type>v8:ValueTable</v8:Type></Type></Properties>
+            </Attribute>
+            <TabularSection uuid="00000000-0000-0000-0000-000000000102">
+                <Properties><Name>Состав</Name></Properties>
+                <ChildObjects>
+                    <Attribute uuid="00000000-0000-0000-0000-000000000103">
+                        <Properties><Name>Код</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties>
+                    </Attribute>
+                </ChildObjects>
+            </TabularSection>
+        </ChildObjects>
+    </DataProcessor>
+</MetaDataObject>"#;
+
+    const FORM_COLLECTIONS_FORM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
+    <ChildItems>
+        <Table name="Состав" id="1">
+            <DataPath>Объект.Состав</DataPath>
+        </Table>
+    </ChildItems>
+    <Attributes>
+        <Attribute name="Объект" id="1">
+            <Type><v8:Type>cfg:DataProcessorObject.Товары</v8:Type></Type>
+            <MainAttribute>true</MainAttribute>
+        </Attribute>
+        <Attribute name="Таблица" id="2">
+            <Type><v8:Type>v8:ValueTable</v8:Type></Type>
+        </Attribute>
+        <Attribute name="Второй" id="3">
+            <Type><v8:Type>cfg:DataProcessorObject.Товары</v8:Type></Type>
+        </Attribute>
+    </Attributes>
+</Form>"#;
+
+    fn form_collection_diags(source: &str) -> Vec<(String, String)> {
+        crate::test_utils::check_form_with_owner_xml(
+            source,
+            FORM_COLLECTIONS_FORM_XML,
+            FORM_COLLECTIONS_OWNER_XML,
+        )
+        .into_iter()
+        .filter(|d| {
+            matches!(
+                d.code,
+                DiagnosticCode::UnavailableInEnvironment | DiagnosticCode::UnresolvedMethodCall
+            )
+        })
+        .map(|d| (format!("{:?}", d.code), d.message))
+        .collect()
+    }
+
+    /// На клиенте табличная часть основного и любого другого реквизита-объекта, её
+    /// строка, реквизит объекта и реквизит формы типа `ТаблицаЗначений` - это
+    /// `ДанныеФормыКоллекция` и `ДанныеФормыЭлементКоллекции`: `Добавить`,
+    /// `НайтиСтроки`, `Количество`, `Индекс`, `Удалить`, `Очистить` и `НомерСтроки`
+    /// строки выполняются в тонком и веб-клиенте. Контроли: `ВыгрузитьКолонку` у
+    /// коллекции на клиенте нет вовсе, а `Выгрузить` выполняется только на сервере -
+    /// обе находки остаются.
+    #[test]
+    fn form_data_collections_available_in_thin_and_web_client() {
+        let source = r#"&НаКлиенте
+Процедура Тест()
+    Строка = Объект.Состав.Добавить();
+    Строка.Код = 1;
+    Количество = Объект.Состав.Количество();
+    Найденные = Объект.Состав.НайтиСтроки(Новый Структура("Код", 1));
+    Для Каждого Найденная Из Найденные Цикл
+        Номер = Найденная.НомерСтроки;
+    КонецЦикла;
+    Индекс = Объект.Состав.Индекс(Строка);
+    Объект.Состав.Удалить(Строка);
+    Объект.Состав.Очистить();
+    Текущие = Элементы.Состав.ТекущиеДанные;
+    Номер = Текущие.НомерСтроки;
+    Найденные = Таблица.НайтиСтроки(Новый Структура("Код", 1));
+    Количество = Таблица.Количество();
+    Таблица.Очистить();
+    СтрокаОбъекта = Объект.ТаблицаОбъекта.Добавить();
+    Найденные = Объект.ТаблицаОбъекта.НайтиСтроки(Новый Структура("Код", 1));
+    Количество = Объект.ТаблицаОбъекта.Количество();
+    СтрокаВторого = Второй.Состав.Добавить();
+    Количество = Второй.Состав.Количество();
+    Для Каждого СтрокаВторого Из Второй.Состав Цикл
+        Номер = СтрокаВторого.НомерСтроки;
+    КонецЦикла;
+    Колонка = Объект.Состав.ВыгрузитьКолонку("Код");
+    Выгрузка = Объект.Состав.Выгрузить();
+КонецПроцедуры
+"#;
+        let diags = form_collection_diags(source);
+        let messages: Vec<&str> = diags.iter().map(|(_, message)| message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "Метод 'ВыгрузитьКолонку' не найден у 'Обработки.Товары.Состав'",
+                "Метод 'Выгрузить' недоступен \
+                 [Тонкий клиент, Веб-клиент, Толстый клиент (управляемое приложение)]",
+            ],
+            "only the two controls may be reported, got: {diags:?}"
+        );
+    }
+
+    /// Реквизит формы и реквизит объекта типа `ТаблицаЗначений` - тоже
+    /// `ДанныеФормыКоллекция`, и на сервере тоже: члена `ТаблицаЗначений` у них нет ни
+    /// на клиенте, ни на сервере. Значением таблицы реквизит становится только через
+    /// `РеквизитФормыВЗначение`.
+    #[test]
+    fn value_table_form_attribute_is_form_data_collection_on_both_sides() {
+        let client = r#"&НаКлиенте
+Процедура Тест()
+    Колонка = Таблица.ВыгрузитьКолонку("Код");
+    Колонка = Объект.ТаблицаОбъекта.ВыгрузитьКолонку("Код");
+КонецПроцедуры
+"#;
+        let diags = form_collection_diags(client);
+        let expected = (
+            "UnresolvedMethodCall".to_string(),
+            "Метод 'ВыгрузитьКолонку' не найден у 'ДанныеФормыКоллекция'".to_string(),
+        );
+        assert_eq!(
+            diags,
+            [expected.clone(), expected],
+            "a value-table-only method on either attribute is still reported, as a missing \
+             method of the form collection, got: {diags:?}"
+        );
+
+        let server = r#"&НаСервере
+Процедура Тест()
+    Найденные = Таблица.НайтиСтроки(Новый Структура("Код", 1));
+    Значение = РеквизитФормыВЗначение("Таблица");
+    Колонка = Значение.ВыгрузитьКолонку("Код");
+КонецПроцедуры
+"#;
+        let diags = form_collection_diags(server);
+        assert!(
+            diags.is_empty(),
+            "РеквизитФормыВЗначение still gives the value table, got: {diags:?}"
+        );
+    }
 }

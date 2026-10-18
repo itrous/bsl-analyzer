@@ -56,7 +56,15 @@ pub fn lower_form_attribute_to_typeid(
         return db.mk_form_data(FormDataFacet::Tree, None);
     }
 
-    if has_columns {
+    // A value-table attribute is ДанныеФормыКоллекция on the client and on the
+    // server alike, whether its columns are declared in the form or added at run
+    // time; only РеквизитФормыВЗначение turns it into a ТаблицаЗначений.
+    if has_columns
+        || matches!(
+            &attr.attr_type,
+            AttributeType::Platform(bsl_metadata::PlatformValueType::ValueTable)
+        )
+    {
         return db.mk_form_data(FormDataFacet::Collection, None);
     }
 
@@ -245,6 +253,24 @@ mod tests {
             TypeKind::FormData { kind, .. } => assert_eq!(*kind, FormDataFacet::Tree),
             other => panic!("expected FormData(Tree), got {other:?}"),
         }
+    }
+
+    /// Columns added at run time leave `<Columns>` empty, yet the attribute is the
+    /// same ДанныеФормыКоллекция as one with declared columns.
+    #[test]
+    fn value_table_attribute_without_columns_lowers_to_form_data_collection() {
+        use bsl_metadata::PlatformValueType;
+        let db = InMemoryDb::new();
+        let attr = plain("Таблица", AttributeType::Platform(PlatformValueType::ValueTable));
+        let ty = lower_form_attribute_to_typeid(&db, &attr, &ConfigsObjectResolver(&[]));
+        assert_form_data(&db, ty, FormDataFacet::Collection, None);
+        let value = form_attribute_value_typeid(&db, &attr, &ConfigsObjectResolver(&[]))
+            .expect("a value-table attribute converts");
+        assert!(
+            matches!(db.lookup_type(value), TypeKind::ValueTable(_)),
+            "РеквизитФормыВЗначение still gives the value table, got {:?}",
+            db.lookup_type(value)
+        );
     }
 
     #[test]
