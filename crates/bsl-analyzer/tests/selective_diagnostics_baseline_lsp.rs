@@ -256,7 +256,7 @@ fn selective_lsp_config_reload_applies_selection_and_republishes() {
             message["method"] == "textDocument/publishDiagnostics"
                 && message["params"]["uri"].as_str().is_some_and(|uri| remaining.contains(uri))
         }) else {
-            selected.again();
+            selected.again(&lsp, "diagnostics after the selection change");
             continue;
         };
         let uri = message["params"]["uri"].as_str().unwrap();

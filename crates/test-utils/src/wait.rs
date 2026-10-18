@@ -1,9 +1,11 @@
 //! Bounds on the waits a test makes for a state it goes on to assert.
 //!
-//! A required test must not turn a slow machine into a failure, so in an ordinary run such a
-//! wait has no bound any run reaches: it ends when the awaited state arrives, and a state that
-//! never arrives is a hang left to the runner that runs the suite. The bounds that tell a slow wait
-//! from a hung one are kept, and enforced only under `--cfg timing_contract`.
+//! A required test must not turn a slow machine into a failure, so an ordinary run judges no
+//! wait by a timing: a wait ends when the awaited state arrives. [`ceiling`] keeps the bounds
+//! that tell a slow wait from a hung one, enforced only under `--cfg timing_contract`.
+//! [`hang_guard`] bounds a wait against a state that never arrives: in an ordinary run it is
+//! far past any healthy wait, yet finite, so a hang fails the test with a message instead of
+//! stalling the runner.
 
 use std::time::Duration;
 
@@ -12,6 +14,20 @@ use std::time::Duration;
 /// waiting primitive the tests use, from channel receives and condition variables to
 /// `tokio::time::timeout`, just waits until the value arrives.
 pub const NO_BOUND: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// A finite bound for a wait whose only other way to end is the awaited state: ten minutes.
+pub const HANG_GUARD: Duration = Duration::from_secs(10 * 60);
+
+/// The bound on a wait that would otherwise only end on success: `bound` under
+/// `timing_contract`; in an ordinary run the larger of `bound` and [`HANG_GUARD`] —
+/// never stricter than the timing profile, never unbounded.
+pub const fn hang_guard(bound: Duration) -> Duration {
+    if cfg!(timing_contract) || bound.as_nanos() > HANG_GUARD.as_nanos() {
+        bound
+    } else {
+        HANG_GUARD
+    }
+}
 
 /// The bound a test puts on a wait for a state it is about to assert on: `bound` under
 /// `timing_contract`, and [`NO_BOUND`] otherwise.
@@ -62,6 +78,22 @@ mod tests {
         } else {
             assert_eq!(ceiling(Duration::from_secs(3)), NO_BOUND);
             assert_eq!(polls(Duration::from_secs(3), Duration::from_millis(10)), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn a_hang_guard_is_finite_and_never_stricter_than_the_timing_profile() {
+        const MINUTE: Duration = Duration::from_secs(60);
+        assert!(HANG_GUARD <= 30 * MINUTE);
+        for bound in [Duration::ZERO, Duration::from_secs(1), MINUTE, 10 * MINUTE, 20 * MINUTE] {
+            if cfg!(timing_contract) {
+                assert_eq!(hang_guard(bound), bound);
+            } else {
+                assert_eq!(hang_guard(bound), bound.max(HANG_GUARD), "bound {bound:?}");
+                if bound <= HANG_GUARD {
+                    assert!(hang_guard(bound) <= 30 * MINUTE, "bound {bound:?}");
+                }
+            }
         }
     }
 

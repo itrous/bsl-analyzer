@@ -17,18 +17,28 @@ use serde_json::{json, Value};
 pub const BROKEN: &str = "Процедура Тест(\n";
 
 /// Silence a server at rest is allowed before a wait is judged lost: a minute under
-/// `timing_contract`. An ordinary run judges no wait by the clock — a server descheduled on a
-/// loaded machine is as quiet and as idle as a lost one — and waits for the answer itself
-/// (see [`test_utils::wait`]).
-pub const SILENCE: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+/// `timing_contract`. An ordinary run does not judge a slow server by the clock — a server
+/// descheduled on a loaded machine is as quiet and as idle as a lost one — so there the window
+/// is the hang guard, far past any healthy answer (see [`test_utils::wait::hang_guard`]).
+pub const SILENCE: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
-/// Total bound for one wait, even while unrelated messages keep arriving: ten minutes under
-/// `timing_contract`, none otherwise.
-pub const BUSY_CEILING: Duration = test_utils::wait::ceiling(Duration::from_secs(10 * 60));
+/// Total bound for one wait, even while unrelated messages keep arriving: ten minutes in
+/// either profile.
+pub const BUSY_CEILING: Duration = test_utils::wait::hang_guard(Duration::from_secs(10 * 60));
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
-const PROCESS_SHUTDOWN_TIMEOUT: Duration = test_utils::wait::ceiling(Duration::from_secs(10));
+const PROCESS_SHUTDOWN_TIMEOUT: Duration = test_utils::wait::hang_guard(Duration::from_secs(10));
+
+/// How long [`Provocation::start`] goes on repeating its act before the wait is judged lost: a
+/// minute under `timing_contract`, the hang guard otherwise.
+pub const PROVOCATION_BOUND: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
+
+const _: () = assert!(SILENCE.as_nanos() <= test_utils::wait::HANG_GUARD.as_nanos());
+const _: () = assert!(BUSY_CEILING.as_nanos() <= test_utils::wait::HANG_GUARD.as_nanos());
+const _: () =
+    assert!(PROCESS_SHUTDOWN_TIMEOUT.as_nanos() <= test_utils::wait::HANG_GUARD.as_nanos());
+const _: () = assert!(PROVOCATION_BOUND.as_nanos() <= test_utils::wait::HANG_GUARD.as_nanos());
 
 /// Match a closed LSP definition by the file it names, not by its serialized URI spelling.
 /// The result may be a `Location`, an array of `Location`s, or `LocationLink`s.
@@ -75,24 +85,27 @@ pub fn project() -> tempfile::TempDir {
 /// fails the test with a message rather than spinning.
 pub struct Provocation<F> {
     act: F,
+    bound: Duration,
     deadline: std::time::Instant,
 }
 
 impl<F: Fn()> Provocation<F> {
     pub fn start(act: F) -> Self {
-        act();
-        Self {
-            act,
-            deadline: std::time::Instant::now()
-                + test_utils::wait::ceiling(Duration::from_secs(60)),
-        }
+        Self::start_within(act, PROVOCATION_BOUND)
     }
 
-    pub fn again(&self) {
-        assert!(
-            std::time::Instant::now() < self.deadline,
-            "the server never reacted to the provocation",
-        );
+    /// [`Self::start`] that gives up after `bound` instead of [`PROVOCATION_BOUND`].
+    pub fn start_within(act: F, bound: Duration) -> Self {
+        act();
+        Self { act, bound, deadline: std::time::Instant::now() + bound }
+    }
+
+    /// Acts again, or fails the wait for `phase` once the bound has run out.
+    #[track_caller]
+    pub fn again(&self, lsp: &Lsp, phase: &str) {
+        if std::time::Instant::now() >= self.deadline {
+            lsp.hung(phase, self.bound);
+        }
         (self.act)();
     }
 }
@@ -138,6 +151,17 @@ impl Lsp {
         if let Some(mode) = mode {
             command.args(["--mode", mode]);
         }
+        Self::start_command(command, root, capabilities, SILENCE)
+    }
+
+    /// Starts `command` as the LSP child in `root` and waits up to `initialize_within` for its
+    /// answer to `initialize`.
+    pub fn start_command(
+        mut command: Command,
+        root: &Path,
+        capabilities: Value,
+        initialize_within: Duration,
+    ) -> Self {
         let mut child = command
             .current_dir(root)
             .stdin(Stdio::piped())
@@ -208,11 +232,11 @@ impl Lsp {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"rootUri": root_uri, "capabilities": capabilities}
         }));
-        let deadline = std::time::Instant::now() + SILENCE;
+        let deadline = std::time::Instant::now() + initialize_within;
         loop {
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 panic!(
-                    "LSP child {} phase initialize exceeded {SILENCE:?}; recent messages: {}",
+                    "LSP child {} phase initialize exceeded {initialize_within:?}; recent messages: {}",
                     lsp.child.id(),
                     lsp.recent_methods()
                 );
@@ -220,12 +244,12 @@ impl Lsp {
             let message = match lsp.messages.recv_timeout(remaining) {
                 Ok(message) if std::time::Instant::now() < deadline => message,
                 Ok(_) => panic!(
-                    "LSP child {} phase initialize exceeded {SILENCE:?}; recent messages: {}",
+                    "LSP child {} phase initialize exceeded {initialize_within:?}; recent messages: {}",
                     lsp.child.id(),
                     lsp.recent_methods()
                 ),
                 Err(error) => panic!(
-                    "LSP child {} phase initialize failed after {SILENCE:?}: {error}; recent messages: {}",
+                    "LSP child {} phase initialize failed after {initialize_within:?}: {error}; recent messages: {}",
                     lsp.child.id(),
                     lsp.recent_methods()
                 ),
@@ -251,6 +275,23 @@ impl Lsp {
         String::from_utf8_lossy(&self.stderr_output.lock().unwrap()).into_owned()
     }
 
+    /// Fails a wait for `phase` that `waited` without seeing what it waited for, with what the
+    /// server last said and the tail of its stderr.
+    #[track_caller]
+    pub fn hung(&self, phase: &str, waited: Duration) -> ! {
+        const TAIL: usize = 4 * 1024;
+        let caller = std::panic::Location::caller();
+        let stderr_tail = {
+            let output = self.stderr_output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            String::from_utf8_lossy(&output[output.len().saturating_sub(TAIL)..]).into_owned()
+        };
+        panic!(
+            "LSP child {} phase {phase}: nothing matching arrived within {waited:?} at {caller}; recent messages: {}; stderr tail: {stderr_tail}",
+            self.child.id(),
+            self.recent_methods(),
+        )
+    }
+
     /// Wait for a message, telling a server that is busy from one that is done.
     ///
     /// Silence is judged per message, not per wait: a server that is working says so —
@@ -263,9 +304,10 @@ impl Lsp {
     /// which it used none fails at once — with where the wait stood and what it last saw,
     /// so the failure names the condition instead of "Timeout".
     ///
-    /// Both verdicts read the clock, so only the timing profile gives them: an ordinary run
-    /// waits for the message itself, and a wait that can never be met is a hang left to the
-    /// runner.
+    /// Both verdicts read the clock. Under `timing_contract` they are the timing contract; an
+    /// ordinary run stretches both windows to the hang guard, so a slow server is waited for
+    /// while a wait that can never be met still fails, saying where it stood, instead of
+    /// hanging the runner.
     #[track_caller]
     pub fn wait_for(&self, predicate: impl Fn(&Value) -> bool) -> Value {
         self.wait_for_judging(SILENCE, BUSY_CEILING, predicate)
