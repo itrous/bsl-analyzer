@@ -945,6 +945,8 @@ async fn run_attach_order(mcp_first: bool, race: bool) {
         ),
     )
     .expect("add a saved positive-control marker to the disposable workspace");
+    let expected_disk =
+        std::fs::read(&target).expect("saved target with the positive-control marker");
 
     let (mut mcp, mut mcp_process, mut editor_a) = if race {
         let lsp_root = root.path().to_path_buf();
@@ -1041,9 +1043,8 @@ async fn run_attach_order(mcp_first: bool, race: bool) {
         "MCP resolves the saved definition: {disk}"
     );
     assert_eq!(
-        std::fs::read_to_string(&target).unwrap(),
-        "Функция ЧисловоеЗначение() Экспорт\n    Возврат 42;\nКонецФункции\n\n\
-         Функция DiskPersistentMarker420() Экспорт\n    Возврат 420;\nКонецФункции\n",
+        std::fs::read(&target).unwrap(),
+        expected_disk,
         "attaching editors never writes their buffers to disk"
     );
     let saved_search = search_code_hits(mcp_ref, "DiskPersistentMarker420").await;
@@ -1527,6 +1528,7 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
 
     let caller = root.path().join("CommonModules/Потребитель/Ext/Module.bsl");
     let target = root.path().join("CommonModules/ОбщийМодуль/Ext/Module.bsl");
+    let expected_disk = std::fs::read(&target).expect("fixture target before any editor attaches");
     let caller_buffer = "Функция Проверить() Экспорт\n    Локальная = ОбщийМодуль.ЧисловоеЗначение();\n    Возврат Локальная;\nКонецФункции\n";
     let target_buffer = "Функция ЧисловоеЗначение() Экспорт\n    НеизвестныйВызов();\n    Возврат Истина;\nКонецФункции\n";
     let caps = json!({
@@ -1760,8 +1762,8 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
         "unexclude uses the latest open target buffer, not the numeric disk contents: {rebound_hover}"
     );
     assert_eq!(
-        std::fs::read_to_string(&target).unwrap(),
-        "Функция ЧисловоеЗначение() Экспорт\n    Возврат 42;\nКонецФункции\n",
+        std::fs::read(&target).unwrap(),
+        expected_disk,
         "editor rebind never writes the buffer to disk"
     );
 
