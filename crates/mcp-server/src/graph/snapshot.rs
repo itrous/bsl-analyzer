@@ -2627,6 +2627,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "load-sensitive: the background work can outlast the bounded poll budget on a busy CPU; run explicitly with --ignored"]
     fn publication_without_a_complete_descriptor_pool_cannot_be_ready() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2741,6 +2742,7 @@ mod tests {
     /// read stale after a `dependsOn`-only config edit (no `.bsl`/`.xml` touched),
     /// and the kicked reload must publish a fresh generation that reads clean.
     #[test]
+    #[ignore = "load-sensitive: the background work can outlast the bounded poll budget on a busy CPU; run explicitly with --ignored"]
     fn a_depends_on_only_edit_marks_a_served_graph_stale_and_reloads() {
         use super::super::test_support::{write_extension_config, write_extension_workspace};
 

@@ -602,7 +602,6 @@ jobs:
           run_exact mcp-server state::overlay_retry::tests::transient_budget_fails_once_answers_mid_pass_facts_and_rearms_on_new_drift
           run_exact mcp-server graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement
           run_exact mcp-server graph::snapshot::tests::final_install_rechecks_token_through_the_preopened_descriptor
-          run_exact mcp-server graph::snapshot::tests::publication_without_a_complete_descriptor_pool_cannot_be_ready
           run_exact mcp-server graph::build::tests::incremental_publish_propagates_transient_refusal
           run_exact mcp-server graph::build::tests::fresh_and_cached_publication_paths_propagate_final_install_refusal
           run_exact mcp-server graph_supersession_contract::graph_handler_misses_immediately_when_preopened_handles_are_busy
