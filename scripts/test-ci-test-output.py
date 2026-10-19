@@ -33,6 +33,42 @@ for block in wrappers:
         )
         assert (result.returncode == 0) == (passed > 0 and status == 0), result
         assert output in result.stdout, result
+# A step the runner cancels is killed before its command exits; what the command already
+# printed must have reached the log by then, or a hung step leaves no trace of where it hung.
+shared_step = re.search(
+    r"^      - name: Shared LSP and MCP owner and editor lifecycle\n.*?(?=^      - name:)",
+    workflow.read_text(),
+    re.MULTILINE | re.DOTALL,
+)
+assert shared_step, "no Shared LSP and MCP owner and editor lifecycle step in the workflow"
+shared_wrapper = next((block for block in wrappers if block in shared_step.group(0)), None)
+assert shared_wrapper, "no CI test wrapper in the Shared LSP and MCP owner and editor lifecycle step"
+shared_name = shared_wrapper.strip().split("(", 1)[0]
+
+
+def run_shared(cargo_body):
+    return subprocess.run(
+        ["bash", "-c", "set -euo pipefail\n"
+         + f"cargo() {{ {cargo_body}; }}\n"
+         + textwrap.dedent(shared_wrapper) + f"\n{shared_name} -p x"],
+        capture_output=True, text=True, check=False,
+    )
+
+
+result = run_shared("echo 'test result: ok. 1 passed; streamed marker'; kill -KILL $$")
+assert result.returncode == -9, result
+assert "streamed marker" in result.stdout, result
+# A command that never ends is the last start line without an end line.
+assert ">>> cargo test -p x" in result.stdout.splitlines(), result
+assert "<<<" not in result.stdout, result
+# Whatever the outcome, the log names the command before its output and its exit after it.
+for passed, status in [(1, 0), (0, 0), (1, 101)]:
+    output = f"test result: ok. {passed} passed; diagnostic marker"
+    result = run_shared(f"echo '{output}' >&2; return {status}")
+    lines = result.stdout.splitlines()
+    started, finished = ">>> cargo test -p x", f"<<< cargo test -p x: exit {status}"
+    assert lines.count(started) == 1 and lines.count(finished) == 1, result
+    assert lines.index(started) < lines.index(output) < lines.index(finished), result
 # The windows-mcp job is the only place the code runs under Windows, and its coverage
 # is a hand-written list of names. A bare `cargo test` there can select nothing and
 # stay green; every invocation in the job must go through a checked wrapper.
@@ -47,4 +83,4 @@ for block in wrappers:
     unwrapped = unwrapped.replace(block, "")
 bare_test = re.search(r'cargo\s+["\']?\s*test\b', unwrapped)
 assert not bare_test, "windows-mcp runs cargo test outside a wrapper"
-print(f"PASS: {len(wrappers)} CI wrappers, success/empty/failure output; windows-mcp wraps every cargo test")
+print(f"PASS: {len(wrappers)} CI wrappers, success/empty/failure output; shared LSP step streams output; windows-mcp wraps every cargo test")

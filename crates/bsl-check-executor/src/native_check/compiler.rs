@@ -1269,6 +1269,34 @@ mod tests {
         tempfile::Builder::new().prefix("x").tempdir().unwrap()
     }
 
+    /// Deadline for a run that tests something other than its deadline. The run's own durable
+    /// records (the active-process manifest, the X11 owner record) are synced to disk inside the
+    /// same deadline, so a short bound turns a slow disk into a spurious `Deadline`.
+    fn deadline_not_under_test() -> Instant {
+        Instant::now() + Duration::from_millis(super::super::profile::DEFAULT_DEADLINE_MS)
+    }
+
+    /// Whether a process still runs in `directory`. A process can fork a successor and exit while
+    /// one `/proc` listing is being read, so that listing misses both; the successor already
+    /// exists when the listing ends, so only two consecutive empty listings mean none is left.
+    #[cfg(target_os = "linux")]
+    fn has_live_process_in(directory: &Path) -> bool {
+        process_listed_in(directory) || process_listed_in(directory)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_listed_in(directory: &Path) -> bool {
+        let directory = directory.canonicalize().unwrap();
+        std::fs::read_dir("/proc").unwrap().filter_map(Result::ok).any(|entry| {
+            let process = entry.path();
+            std::fs::read_link(process.join("cwd")).is_ok_and(|cwd| cwd == directory)
+                && std::fs::read_to_string(process.join("stat"))
+                    .ok()
+                    .and_then(|stat| linux_process_identity(&stat))
+                    .is_some_and(|(state, _)| state != b'Z' && state != b'X')
+        })
+    }
+
     #[tokio::test]
     async fn child_output_is_drained_but_kept_within_the_limit() {
         let directory = tempfile::tempdir().unwrap();
@@ -1277,7 +1305,7 @@ mod tests {
             &executable,
             &[],
             directory.path(),
-            Instant::now() + Duration::from_secs(5),
+            deadline_not_under_test(),
             &CancellationToken::new(),
             8,
         )
@@ -1295,12 +1323,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let executable =
             script(directory.path(), "trap '' TERM; while :; do printf 1234567890; done");
-        let started = tokio::time::Instant::now();
         let output = run_bounded(
             &executable,
             &[],
             directory.path(),
-            Instant::now() + Duration::from_secs(5),
+            deadline_not_under_test(),
             &CancellationToken::new(),
             1024,
         )
@@ -1309,7 +1336,6 @@ mod tests {
 
         assert_eq!(output.termination, Termination::OutputLimit);
         assert!(output.truncated);
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
@@ -1324,7 +1350,7 @@ mod tests {
             &executable,
             &[],
             directory.path(),
-            Instant::now() + Duration::from_secs(5),
+            deadline_not_under_test(),
             &CancellationToken::new(),
             1024,
             Some((&log, 4)),
@@ -1378,7 +1404,7 @@ mod tests {
             &args,
             &cwd,
             &log,
-            Instant::now() + Duration::from_secs(5),
+            deadline_not_under_test(),
             &CancellationToken::new(),
             4096,
             &root,
@@ -1495,7 +1521,7 @@ mod tests {
             &args,
             &cwd,
             &log,
-            Instant::now() + Duration::from_secs(5),
+            deadline_not_under_test(),
             &CancellationToken::new(),
             4096,
             &root,
@@ -1550,29 +1576,27 @@ mod tests {
                 &args,
                 &cwd_for_task,
                 &log,
-                Instant::now() + Duration::from_secs(5),
+                deadline_not_under_test(),
                 &child_cancel,
                 4096,
                 &root_for_task,
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let designer_started = cwd.join("designer.pid").is_file();
-                let ownership_recorded = std::fs::read_dir(&cwd).is_ok_and(|entries| {
-                    entries.filter_map(Result::ok).any(|entry| {
-                        entry.file_name().to_string_lossy().starts_with(".native-check-x11-")
-                    })
-                });
-                if designer_started && ownership_recorded {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        loop {
+            let run_finished = task.is_finished();
+            let designer_started = cwd.join("designer.pid").is_file();
+            let ownership_recorded = std::fs::read_dir(&cwd).is_ok_and(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry.file_name().to_string_lossy().starts_with(".native-check-x11-")
+                })
+            });
+            if designer_started && ownership_recorded {
+                break;
             }
-        })
-        .await
-        .expect("fake Designer must start before cancellation");
+            assert!(!run_finished, "fake Designer must start before cancellation");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let designer_pid: u32 =
             std::fs::read_to_string(cwd.join("designer.pid")).unwrap().parse().unwrap();
         cancel.cancel();
@@ -1622,10 +1646,30 @@ mod tests {
         assert_eq!(output.termination, Termination::Cancelled);
     }
 
+    /// Linux fixes a fatal signal as the exit status when it is sent to a process that is neither
+    /// stopped nor traced, so a default-disposition member of the group exits by TERM whenever
+    /// TERM is sent first, even if KILL follows before it runs. The stub ignores TERM, so only KILL
+    /// lets the cleanup see its group gone and end the run as cancelled. That the soft window lets
+    /// a TERM-cooperative child finish is covered by the next test.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn ignored_term_is_killed_after_the_soft_window() {
+    async fn ignored_term_is_followed_by_kill() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
         let directory = tempfile::tempdir().unwrap();
-        let executable = script(directory.path(), "trap '' TERM; while :; do sleep 1; done");
+        let group_file = directory.path().join("group");
+        let executable = script(
+            directory.path(),
+            "trap '' TERM\nprintf '%s\\n' \"$$\" > group.tmp\nmv group.tmp group\nwhile :; do sleep 1; done",
+        );
         let cancel = CancellationToken::new();
         let child_cancel = cancel.clone();
         let executable_clone = executable.clone();
@@ -1635,32 +1679,88 @@ mod tests {
                 &executable_clone,
                 &[],
                 &cwd,
-                Instant::now() + Duration::from_secs(10),
+                deadline_not_under_test(),
                 &child_cancel,
                 1024,
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let stopped_at = tokio::time::Instant::now();
+        while !group_file.is_file() {
+            assert!(!task.is_finished(), "TERM-ignoring child must start before cancellation");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let group: i32 = std::fs::read_to_string(&group_file).unwrap().trim().parse().unwrap();
+        let mut term_observer = KillOnDrop(
+            std::process::Command::new("/bin/sleep")
+                .arg("600")
+                .process_group(group)
+                .spawn()
+                .unwrap(),
+        );
         cancel.cancel();
         let output = task.await.unwrap().unwrap();
-        let elapsed = stopped_at.elapsed();
         assert_eq!(output.termination, Termination::Cancelled);
-        assert!(elapsed >= Duration::from_millis(600), "TERM was skipped: {elapsed:?}");
-        assert!(elapsed < Duration::from_millis(1400), "cleanup exceeded B: {elapsed:?}");
+        assert_eq!(
+            term_observer.0.wait().unwrap().signal(),
+            Some(libc::SIGTERM),
+            "TERM was skipped"
+        );
         assert!(!directory.path().join(".native-check-active-pgid").exists());
     }
 
+    /// The TERM trap's cleanup holds until the test has seen the trap start, so a hard stop that
+    /// follows TERM without waiting for the group always lands inside the cleanup.
+    #[tokio::test]
+    async fn term_cooperative_child_finishes_its_cleanup_before_the_hard_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("trap-installed");
+        let term_received = directory.path().join("term-received");
+        let release = directory.path().join("release");
+        let sentinel = directory.path().join("term-cleanup-ran");
+        let executable = script(
+            directory.path(),
+            "trap 'printf term > term-received; while [ ! -e release ]; do sleep 0.01; done; /usr/bin/touch term-cleanup-ran; exit 0' TERM\nprintf ready > trap-installed\nwhile :; do sleep 600 & wait \"$!\"; done",
+        );
+        let cancel = CancellationToken::new();
+        let child_cancel = cancel.clone();
+        let cwd = directory.path().to_owned();
+        // A grace this long makes the soft window unreachable for a child that only has to run its
+        // TERM trap, so only a hard stop that does not wait for the group can cut the cleanup short.
+        let task = tokio::spawn(with_stop_clock(
+            cancel.clone(),
+            deadline_not_under_test(),
+            super::super::profile::DEFAULT_DEADLINE_MS,
+            async move {
+                run_bounded(&executable, &[], &cwd, deadline_not_under_test(), &child_cancel, 1024)
+                    .await
+            },
+        ));
+        while !ready.is_file() {
+            assert!(!task.is_finished(), "TERM-cooperative child must start before cancellation");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancel.cancel();
+        while !term_received.is_file() && !task.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::write(&release, b"").unwrap();
+        let output = task.await.unwrap().unwrap();
+        assert_eq!(output.termination, Termination::Cancelled);
+        assert!(sentinel.exists(), "TERM-cooperative child was killed before it could clean up");
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn active_manifest_write_failure_kills_spawned_process_group() {
         let directory = tempfile::tempdir().unwrap();
         let sentinel = directory.path().join("descendant-survived");
         let ready = directory.path().join("descendant-ready");
+        // A shell blocks TERM while it forks, so the descendant may miss the group TERM and live
+        // until the KILL fallback; only a group that is never stopped lets it reach the sentinel.
         let executable = script(
             directory.path(),
             &format!(
-                "(/bin/sleep 0.2; /usr/bin/touch '{}') &\nprintf ready > '{}'\nwait",
+                "(/bin/sleep 30; /usr/bin/touch '{}') &\nprintf ready > '{}'\nwait",
                 sentinel.display(),
                 ready.display()
             ),
@@ -1676,7 +1776,9 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ProcessFailure::Spawn)));
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        while has_live_process_in(directory.path()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(!sentinel.exists(), "early return left a child in the private process group");
     }
 

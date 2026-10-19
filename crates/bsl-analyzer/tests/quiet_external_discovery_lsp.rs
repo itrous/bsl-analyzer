@@ -36,10 +36,10 @@ fn initial_lsp_load_reports_invalid_discovery_once_across_internal_requests() {
     let status = lsp.shutdown(5);
     assert!(status.success(), "LSP subprocess exited with {status}");
 
-    // shutdown joins the stderr reader after the child closes its pipe, and the output stays
-    // under the capture's tail bound, so this count covers the complete process lifetime and
-    // cannot miss a delayed internal warning.
-    let stderr = lsp.stderr_text();
+    // finish_stderr returns once the pipe is closed, and the output stays under the capture's
+    // tail bound, so this count covers the complete process lifetime and cannot miss a delayed
+    // internal warning.
+    let stderr = lsp.finish_stderr();
     assert!(
         stderr.len() < common::STDERR_TAIL,
         "stderr reached the capture bound, so its head may be lost:\n{stderr}"

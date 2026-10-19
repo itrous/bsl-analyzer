@@ -10491,9 +10491,10 @@ mod tests {
 
         // The provider's report remains deferred while another hub event arrives. Registration
         // must retain the fact at which it reported the mark, not rebind it to this later seq.
-        fs::write(&path, &same_bytes).unwrap();
+        let before_later_touch = hub.seq();
+        hub.deliver_modified_for_test(&path);
         assert!(
-            crate::change_hub::test_support::eventually(|| { hub.seq() > reported_fact }),
+            hub.seq() > before_later_touch.max(reported_fact),
             "the later same-byte touch did not advance the hub"
         );
         graph.register_owed_context_marks();
@@ -10511,12 +10512,12 @@ mod tests {
             "the prior no-op comparison cannot claim a later provider mark"
         );
 
-        fs::write(&path, &same_bytes).unwrap();
+        hub.deliver_modified_for_test(&path);
+        let comparison_fact = hub.seq();
         assert!(
-            crate::change_hub::test_support::eventually(|| { hub.seq() > newer_fact }),
+            comparison_fact > newer_fact,
             "the comparison touch for the newer provider mark did not reach the hub"
         );
-        let comparison_fact = hub.seq();
         graph.record_change_quietly(comparison_fact);
         graph.check_against_disk();
         assert!(!graph.marks_pending(), "a complete later comparison should consume the mark");

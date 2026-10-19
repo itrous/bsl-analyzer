@@ -9,7 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
-const DEFAULT_DEADLINE_MS: u64 = 120_000;
+pub(super) const DEFAULT_DEADLINE_MS: u64 = 120_000;
 const MAX_DEADLINE_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_MAX_LOG_BYTES: usize = 256 * 1024;
 const MIN_MAX_LOG_BYTES: usize = 4096;
@@ -4115,7 +4115,7 @@ mod tests {
             file_properties: Some(source_properties),
             cfe_path: None,
         }];
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_millis(DEFAULT_DEADLINE_MS);
         let cancel = CancellationToken::new();
 
         update_extension_properties(

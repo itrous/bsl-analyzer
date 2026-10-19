@@ -3031,6 +3031,23 @@ impl WorkspaceChangeHub {
         }));
     }
 
+    /// Report a content write to `path`, exactly as the backend would, and take it in before
+    /// returning: `seq()` has moved past every fact read earlier when this comes back.
+    ///
+    /// For a stand that needs a fact NEWER than a given read. Waiting on a real write cannot
+    /// say which of the write's backend events satisfied the wait, and a late event of an
+    /// earlier write would stand in for it.
+    #[cfg(test)]
+    pub(crate) fn deliver_modified_for_test(&self, path: &Path) {
+        self.ingest_for_test(Ok(Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![path.to_path_buf()],
+            attrs: Default::default(),
+        }));
+    }
+
     /// Report a backend error, exactly as the backend would: the stream lapsed, and every
     /// cursor then listening shares the one window that opens.
     #[cfg(test)]

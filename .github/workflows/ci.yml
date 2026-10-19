@@ -509,9 +509,16 @@ jobs:
         run: |
           set -euo pipefail
           run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+            local log status
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "$*"
+            cargo test "$@" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "$*" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$log" \
+              || { echo "::error::cargo test $* selected no test"; return 1; }
           }
           run_nonempty -p bsl-analyzer --test shared_workspace_backend
           run_nonempty -p bsl-analyzer --test shared_workspace_backpressure

@@ -309,10 +309,16 @@ impl Lsp {
         String::from_utf8_lossy(&self.stderr_output.lock().unwrap()).into_owned()
     }
 
-    fn join_stderr_reader(&mut self) {
+    /// The child's complete stderr, once every process holding the pipe has closed it.
+    ///
+    /// Waits for that close without a bound, so call it only for a server that starts no
+    /// process of its own (`--mode stdio`): a process the server started can inherit the
+    /// pipe and keep it open after the server has exited.
+    pub fn finish_stderr(&mut self) -> String {
         if let Some(reader) = self.stderr_reader.take() {
             reader.join().expect("LSP stderr reader thread");
         }
+        self.stderr_text()
     }
 
     /// Fails a wait for `phase` that `waited` without seeing what it waited for, with what the
@@ -601,18 +607,16 @@ impl Lsp {
                 panic!("{error}; forced cleanup: {cleanup:?}");
             }
         };
-        self.join_stderr_reader();
         status
     }
 }
 
 impl Drop for Lsp {
     fn drop(&mut self) {
-        match self.stop_child("Drop", PROCESS_CLEANUP_TIMEOUT) {
-            Ok(_) => self.join_stderr_reader(),
-            // A child that outlived its cleanup still holds its stderr open, so the reader
-            // would never reach EOF: leave it detached and report instead of hanging.
-            Err(error) => eprintln!("{error}"),
+        // The stderr reader stays detached: a process the child started, such as the shared
+        // daemon, can hold a copy of the pipe long after the child itself has exited.
+        if let Err(error) = self.stop_child("Drop", PROCESS_CLEANUP_TIMEOUT) {
+            eprintln!("{error}");
         }
     }
 }
