@@ -214,6 +214,7 @@ impl StderrCapture {
         }
     }
 
+    #[cfg(unix)]
     fn wait_for_text(&self, needle: &str, timeout: Duration) -> Option<String> {
         let deadline = Instant::now() + timeout;
         loop {

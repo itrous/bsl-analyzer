@@ -144,12 +144,26 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
     let hover_params = json!({
         "textDocument": {"uri": main_uri}, "position": {"line": 0, "character": 10}
     });
+    // `Lsp::request` drops what arrives before the reply, so the wait notes any
+    // `showMessage` itself: one sent ahead of the reply is a repeated warning too.
+    let shown_before_reply = std::cell::Cell::new(false);
     for id in [2, 3] {
-        let response = lsp.request(id, "textDocument/hover", hover_params.clone());
+        lsp.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
+            "params": hover_params.clone()
+        }));
+        let response = lsp.wait_for(|message| {
+            if message["method"] == "window/showMessage" {
+                shown_before_reply.set(true);
+            }
+            message["id"] == id
+                && message["method"].is_null()
+                && (message.get("result").is_some() || message.get("error").is_some())
+        });
         assert!(response.get("result").is_some(), "hover is answered: {response}");
     }
     assert!(
-        !drained_a_show_message(&lsp),
+        !shown_before_reply.get() && !drained_a_show_message(&lsp),
         "ordinary document requests do not repeat the snapshot warning"
     );
     if cfg!(timing_contract) {
@@ -175,15 +189,22 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
     // any other error remains a test failure.
     let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     let mut response = Value::Null;
+    let shown_before_reply = std::cell::Cell::new(false);
     for id in 4.. {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         assert!(!remaining.is_zero(), "explicit snapshot never became ready: {response}");
+        // Only the attempt that succeeds counts: the save itself may still be settling in
+        // the attempts it cancels.
+        shown_before_reply.set(false);
         lsp.send(json!({
             "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
             "params": hover_params.clone()
         }));
         response = lsp
             .wait_for_within(remaining, |message| {
+                if message["method"] == "window/showMessage" {
+                    shown_before_reply.set(true);
+                }
                 message["id"] == id
                     && message["method"].is_null()
                     && (message.get("result").is_some() || message.get("error").is_some())
@@ -204,7 +225,7 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
     }
     assert!(response.get("result").is_some(), "explicit snapshot serves hover: {response}");
     assert!(
-        !drained_a_show_message(&lsp),
+        !shown_before_reply.get() && !drained_a_show_message(&lsp),
         "the explicit snapshot removes the compatibility warning"
     );
     if cfg!(timing_contract) {
