@@ -4,21 +4,12 @@ mod rules;
 
 use common::Lsp;
 use serde_json::{json, Value};
-use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// A key the analyzer does not know: its warning comes only from loading the reloaded
-/// config, since the startup config never names it.
-const RELOAD_KEY: &str = "ReloadMarker = true\n";
-const RELOAD_WARNING: &str = "unknown diagnostic code `ReloadMarker`";
-
-/// Each config load logs its warning once, and a backend that is starting (or replaced by a
-/// reload) still loads the config a few times after it answers its first pull, so the count
-/// has no stable sampling point. A load per pull cannot hide in that noise: it grows by at
-/// least one for every pull, so this many pulls outgrow any startup sequence (at most 5 loads
-/// per backend, 8 with an in-place reload before a replacement).
-const PULLS_PER_LOAD_BOUND: usize = 16;
+/// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
+/// latency measure.
+const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
 #[test]
 fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
@@ -51,7 +42,7 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
     // Outside the project root: the server watches that root recursively, so a log
     // inside it makes every log line a file change that reloads the project and logs again.
     let log_dir = tempfile::tempdir().unwrap();
-    let log_file = log_dir.path().join("lsp-{pid}.log");
+    let log_file = rules::log_template(log_dir.path());
     // In-process: under auto mode the project may load in a shared backend whose log is
     // not in this directory, depending on whether the backend answers in time.
     let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
@@ -97,34 +88,35 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
         );
     };
     assert_eq!(
-        pull(&mut lsp, Instant::now() + Duration::from_secs(60)),
+        pull(&mut lsp, Instant::now() + HANG_WATCHDOG),
         rules::expected(&source, true, true)
     );
-    let before = rules::warning_count(&session_log(log_dir.path()));
+    let before = rules::warning_count(&rules::session_log(log_dir.path()));
     assert!(before > 0);
-    assert!(!session_log(log_dir.path()).contains(RELOAD_WARNING));
-    for _ in 0..PULLS_PER_LOAD_BOUND {
+    assert!(!rules::session_log(log_dir.path()).contains(rules::RELOAD_WARNING));
+    for _ in 0..rules::PULLS_PER_LOAD_BOUND {
         assert_eq!(
-            pull(&mut lsp, Instant::now() + Duration::from_secs(60)),
+            pull(&mut lsp, Instant::now() + HANG_WATCHDOG),
             rules::expected(&source, true, true)
         );
     }
-    let grown = rules::warning_count(&session_log(log_dir.path())) - before;
-    assert!(grown < PULLS_PER_LOAD_BOUND, "pulls reloaded the startup config: {grown} loads");
+    let grown = rules::warning_count(&rules::session_log(log_dir.path())) - before;
+    assert!(
+        grown < rules::PULLS_PER_LOAD_BOUND,
+        "pulls reloaded the startup config: {grown} loads"
+    );
 
-    let next = dir.path().join("bsl-analyzer.toml.next");
-    std::fs::write(&next, format!("{}{RELOAD_KEY}", rules::config(7))).unwrap();
-    std::fs::rename(next, dir.path().join("bsl-analyzer.toml")).unwrap();
+    rules::replace_config_marked(dir.path(), 7);
     let config_uri = lsp_types::Url::from_file_path(dir.path().join("bsl-analyzer.toml")).unwrap();
     lsp.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":config_uri,"type":2}]}}));
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + HANG_WATCHDOG;
     // The reloaded diagnostics and the reload's load-time warning are published
     // independently, so wait for both instead of assuming an order.
     let log = loop {
         let diagnostics_reloaded =
             pull(&mut lsp, deadline) == rules::expected(&source, true, false);
-        let log = session_log(log_dir.path());
-        let warned = log.contains(RELOAD_WARNING);
+        let log = rules::session_log(log_dir.path());
+        let warned = log.contains(rules::RELOAD_WARNING);
         if diagnostics_reloaded && warned {
             break log;
         }
@@ -136,33 +128,18 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(!log.contains(rules::PRIVATE_VALUE));
-    let before = log.matches(RELOAD_WARNING).count();
-    for _ in 0..PULLS_PER_LOAD_BOUND {
+    let before = log.matches(rules::RELOAD_WARNING).count();
+    for _ in 0..rules::PULLS_PER_LOAD_BOUND {
         assert_eq!(
-            pull(&mut lsp, Instant::now() + Duration::from_secs(60)),
+            pull(&mut lsp, Instant::now() + HANG_WATCHDOG),
             rules::expected(&source, true, false)
         );
     }
-    let grown = session_log(log_dir.path()).matches(RELOAD_WARNING).count() - before;
-    assert!(grown < PULLS_PER_LOAD_BOUND, "pulls reloaded the changed config: {grown} loads");
+    let grown = rules::session_log(log_dir.path()).matches(rules::RELOAD_WARNING).count() - before;
+    assert!(
+        grown < rules::PULLS_PER_LOAD_BOUND,
+        "pulls reloaded the changed config: {grown} loads"
+    );
     assert!(lsp.shutdown(1000).success());
     lsp.assert_protocol_clean();
-}
-
-/// The warnings of every process that logged into `root`. A config change can replace the
-/// backend daemon, which inherits `BSL_LOG_FILE`; an explicit file is truncated on start, so
-/// the replacement would erase what the old backend had logged. `{pid}` gives each process
-/// its own file.
-fn session_log(root: &Path) -> String {
-    let mut logs: Vec<_> = std::fs::read_dir(root)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("lsp-") && name.ends_with(".log"))
-        })
-        .collect();
-    logs.sort();
-    logs.iter().map(|path| std::fs::read_to_string(path).unwrap()).collect::<Vec<_>>().join("\n")
 }
