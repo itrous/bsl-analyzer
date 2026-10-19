@@ -2035,7 +2035,8 @@ mod tests {
     use super::super::scan::workspace_fingerprint;
     use super::super::state::{lock_recover, GraphState};
     use super::super::test_support::{
-        sample_workspace, seed_cache, wait_ready, wait_until, wait_until_within, write,
+        graph_state_summary, sample_workspace, seed_cache, wait_ready, wait_serving, wait_until,
+        wait_until_within, write,
     };
     use super::*;
     use std::time::Duration;
@@ -2628,6 +2629,8 @@ mod tests {
 
     #[test]
     fn publication_without_a_complete_descriptor_pool_cannot_be_ready() {
+        use std::sync::atomic::Ordering;
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
@@ -2636,14 +2639,31 @@ mod tests {
             BackgroundSnapshotFailure::PrepareSecondChanged,
         ));
         graph.ensure_loading();
-        wait_until_within(&graph, Duration::from_secs(5), "the publication to fail", || {
-            matches!(graph.status(), GraphStatus::Failed { .. })
+        assert_eq!(
+            graph.builders_started.load(Ordering::SeqCst),
+            1,
+            "the first build was admitted"
+        );
+        // The status turns before the builder leaves its slot, and a retry asked in between is
+        // refused as a second build; so the wait is for the slot, whatever the build ended in.
+        wait_until(&graph, "the first build to end and free its slot", || {
+            !matches!(graph.status(), GraphStatus::Loading) && !graph.build_in_flight()
         });
+        assert!(
+            matches!(graph.status(), GraphStatus::Failed(_)),
+            "a publication whose descriptor pool could not be prepared became ready; {}",
+            graph_state_summary(&graph)
+        );
         assert!(graph.snapshot().is_none());
         graph.set_background_snapshot_failure_for_test(None);
         graph.ensure_loading();
-        wait_ready(&graph);
-        assert!(graph.snapshot().is_some(), "the failed publication remains retryable");
+        assert_eq!(
+            graph.builders_started.load(Ordering::SeqCst),
+            2,
+            "the failed publication is retried at once; {}",
+            graph_state_summary(&graph)
+        );
+        wait_serving(&graph, 1);
     }
 
     #[test]
@@ -2751,9 +2771,7 @@ mod tests {
         let mut graph = GraphState::for_workspace(root.to_path_buf());
         graph.drift_interval = Duration::ZERO;
         graph.ensure_loading();
-        wait_ready(&graph);
-
-        let snap = graph.snapshot().expect("ready graph snapshots");
+        let snap = wait_serving(&graph, 1);
         assert!(!graph.freshness(&snap).stale, "a freshly built graph is not stale");
 
         write_extension_config(root, true);
@@ -2763,13 +2781,8 @@ mod tests {
         // Returned, so the reload's installation need not wait for it.
         drop(snap);
 
-        wait_until_within(
-            &graph,
-            Duration::from_secs(5),
-            "the topology-triggered reload to publish generation 2",
-            || graph.snapshot().is_some_and(|snap| snap.generation == 2),
-        );
-        let settled = graph.freshness(&graph.snapshot().expect("the reload published"));
+        let reloaded = wait_serving(&graph, 2);
+        let settled = graph.freshness(&reloaded);
         assert!(!settled.stale, "the reloaded graph reflects the new topology");
     }
 

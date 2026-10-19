@@ -246,6 +246,49 @@ pub(crate) fn published_report(graph: &GraphState) -> super::GraphStatusReport {
     sample.expect("the wait captured a published report")
 }
 
+/// The snapshot of `generation`, taken once the publication of it serves reads.
+///
+/// A publication turns the status and the published record before the replacement's pause on
+/// reads is let go, so a checkout right after either may still be refused. The wait is for the
+/// checkout itself. It fails at once on what it does not wait out: a failed build, a failed
+/// reload, and a newer generation served instead. Only the drift watcher's schedule retries a
+/// failure, so this is the wait of a stand that runs no watcher.
+#[track_caller]
+pub(crate) fn wait_serving(graph: &GraphState, generation: u64) -> super::GraphSnapshot {
+    let mut served = None;
+    wait_until(graph, &format!("generation {generation} to be served"), || {
+        let failed = {
+            let inner = lock_recover(&graph.inner);
+            matches!(inner.status, GraphStatus::Failed(_))
+                || inner.published.as_ref().is_some_and(|published| {
+                    matches!(published.reload, super::state::ReloadState::Failed(_))
+                })
+        };
+        if failed {
+            panic!(
+                "the publication of generation {generation} failed; {}",
+                graph_state_summary(graph)
+            );
+        }
+        let Some(snapshot) = graph.snapshot() else {
+            return false;
+        };
+        if snapshot.generation > generation {
+            panic!(
+                "generation {} was served instead of {generation}; {}",
+                snapshot.generation,
+                graph_state_summary(graph)
+            );
+        }
+        if snapshot.generation < generation {
+            return false;
+        }
+        served = Some(snapshot);
+        true
+    });
+    served.expect("the wait captured the served snapshot")
+}
+
 /// Wait until at least `passes` completed publish passes have been counted.
 ///
 /// The barrier for everything `notify_published` leaves behind, including the part that
