@@ -297,7 +297,7 @@ fn mdo_plural_completion_set_matches_frozen_baseline() {
 "#,
     );
     let emitted = collect_mdo_plural_labels(&items);
-    let baseline_txt = include_str!("fixtures/expected_mdo_plurals.txt");
+    let baseline_txt = include_str!("../fixtures/expected_mdo_plurals.txt");
     let expected: BTreeSet<String> = baseline_txt
         .lines()
         .map(str::trim)

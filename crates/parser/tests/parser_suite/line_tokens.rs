@@ -7,7 +7,7 @@
 
 use syntax::{LineToken, NodeOrToken, SyntaxKind, TextRange, TextSize};
 
-const MODULE: &str = include_str!("fixtures/Module.bsl");
+const MODULE: &str = include_str!("../fixtures/Module.bsl");
 
 /// Входы, на которых лексер мог бы зависеть от контекста: BOM не в начале,
 /// `\r` без `\n`, незакрытые строки и голые продолжения, `//` внутри

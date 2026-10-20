@@ -1245,7 +1245,7 @@ fn an_unfinished_join_condition_keeps_sources_and_the_next_item() {
 // «Использовать параметры виртуальных таблиц» (empty argument positions, a condition
 // with a membership query) and the SELECT mini-spec «Virtual table argument behavior». ---
 
-const PACKAGE_FIXTURE: &str = include_str!("fixtures/sdbl_independent_package.sdbl");
+const PACKAGE_FIXTURE: &str = include_str!("../fixtures/sdbl_independent_package.sdbl");
 
 fn kind_outline(input: &str) -> Vec<(usize, SyntaxKind)> {
     fn walk(node: &SyntaxNode, depth: usize, out: &mut Vec<(usize, SyntaxKind)>) {

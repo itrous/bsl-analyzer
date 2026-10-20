@@ -1,7 +1,8 @@
 use syntax::sdbl_query::{collect_query_parse_errors, extract_torn_literal};
 use syntax::{SyntaxKind, TextRange, TextSize};
 
-const ISSUE_SOURCE: &str = include_str!("../../parser/tests/fixtures/issue150_ext_directives.bsl");
+const ISSUE_SOURCE: &str =
+    include_str!("../../../parser/tests/fixtures/issue150_ext_directives.bsl");
 
 fn torn_literal(source: &str) -> syntax::SyntaxNode {
     let parsed = parser::parse(source);

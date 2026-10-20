@@ -6,7 +6,7 @@ use std::fs;
 use bsl_platform::{PlatformData, PlatformHelpRequest};
 use platform_help::{load_with, prepare_package, LoadContext, PackageInput, PACKAGE_NOTICE};
 
-const FIXTURE: &[u8] = include_bytes!("../../bsl-platform/tests/fixtures/help/corpus.json");
+const FIXTURE: &[u8] = include_bytes!("../../../bsl-platform/tests/fixtures/help/corpus.json");
 
 #[test]
 fn imported_corpus_stays_unmodified_and_carries_its_content_notice() {

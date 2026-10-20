@@ -3,7 +3,8 @@ use ide_db::RootDatabaseImpl;
 use ide_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig};
 use vfs::{FileId, FileSet, VfsPath};
 
-const ISSUE_SOURCE: &str = include_str!("../../parser/tests/fixtures/issue150_ext_directives.bsl");
+const ISSUE_SOURCE: &str =
+    include_str!("../../../parser/tests/fixtures/issue150_ext_directives.bsl");
 
 fn diagnostics(source: &str) -> Vec<Diagnostic> {
     let mut db = RootDatabaseImpl::new();

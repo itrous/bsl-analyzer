@@ -214,12 +214,16 @@ macro_rules! contract {
         #[test]
         fn $name() {
             let actual = observation(include_str!(concat!(
-                "fixtures/cfg_contract/",
+                "../fixtures/cfg_contract/",
                 stringify!($name),
                 ".bsl"
             )));
-            expect_test::expect_file![concat!("fixtures/cfg_contract/", stringify!($name), ".txt")]
-                .assert_eq(&actual);
+            expect_test::expect_file![concat!(
+                "../fixtures/cfg_contract/",
+                stringify!($name),
+                ".txt"
+            )]
+            .assert_eq(&actual);
         }
     };
 }
@@ -242,8 +246,8 @@ contract!(limited_labels);
 
 #[test]
 fn observations_distinguish_security_open_and_closed() {
-    let open = observation(include_str!("fixtures/cfg_contract/security_open.bsl"));
-    let closed = observation(include_str!("fixtures/cfg_contract/security_balanced.bsl"));
+    let open = observation(include_str!("../fixtures/cfg_contract/security_open.bsl"));
+    let closed = observation(include_str!("../fixtures/cfg_contract/security_balanced.bsl"));
     assert!(open
         .lines()
         .last()
@@ -259,9 +263,9 @@ fn observations_distinguish_security_open_and_closed() {
 
 #[test]
 fn observations_distinguish_live_dead_and_branching_inputs() {
-    let linear = observation(include_str!("fixtures/cfg_contract/linear.bsl"));
-    let dead = observation(include_str!("fixtures/cfg_contract/return_dead_branch.bsl"));
-    let branch = observation(include_str!("fixtures/cfg_contract/live_branch.bsl"));
+    let linear = observation(include_str!("../fixtures/cfg_contract/linear.bsl"));
+    let dead = observation(include_str!("../fixtures/cfg_contract/return_dead_branch.bsl"));
+    let branch = observation(include_str!("../fixtures/cfg_contract/live_branch.bsl"));
     assert!(linear.starts_with("complexity: 1\n"));
     assert!(linear.contains("dead: []\n"));
     assert!(dead.starts_with("complexity: 1\n"));

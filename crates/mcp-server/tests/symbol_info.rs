@@ -4,7 +4,7 @@
 //! budget, and workspace-only availability — across serialization and tool dispatch.
 //!
 //! The card-resolution logic itself is unit-tested in `ide::symbol_info` (see
-//! `crates/ide/tests/symbol_info.rs`); this suite covers the MCP layer those tests do
+//! `crates/ide/tests/ide_suite/symbol_info.rs`); this suite covers the MCP layer those tests do
 //! not exercise: the resident lifecycle (loading envelope → ready), the JSON shaping,
 //! and the profile gating, driven through a genuine `serve_stream` handshake.
 

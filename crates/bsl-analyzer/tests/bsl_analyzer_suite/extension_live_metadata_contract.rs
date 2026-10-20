@@ -50,7 +50,7 @@ fn metadata_structure_exposes_locale_independent_type_variants() {
     assert!(!module.contains("ТехническоеИмя = Строка(ТипВарианта)"));
 
     let fixture: Value =
-        serde_json::from_str(include_str!("fixtures/live_metadata_type_variants.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/live_metadata_type_variants.json")).unwrap();
     let attributes = |locale| fixture[locale]["Реквизиты"].as_array().unwrap();
     let find = |locale, name| attributes(locale).iter().find(|item| item["name"] == name).unwrap();
 

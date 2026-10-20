@@ -392,7 +392,7 @@ fn rendered_mismatches(db: &RootDatabaseImpl, file_id: FileId) -> Vec<(String, S
         .collect()
 }
 
-const ISSUE80_DOM_FIXTURE: &str = include_str!("fixtures/issue80/dom.fixture");
+const ISSUE80_DOM_FIXTURE: &str = include_str!("../fixtures/issue80/dom.fixture");
 const ISSUE80_DOM_EXPECTED: &str =
     "АтрибутDOM | АтрибутHTML | ДокументDOM | НотацияDOM | ОпределениеТипаДокументаDOM | ЭлементDOM | ЭлементHTML | ЭлементВводаHTML | ЭлементЗаголовокHTML | ЭлементКнопкаHTML";
 const ISSUE80_DOM_VALID_ACTUAL: &str = "ЭлементDOM | ЭлементHTML";

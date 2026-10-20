@@ -12,7 +12,7 @@ use parser::reparse::{
 };
 use syntax::{SyntaxNode, TextRange};
 
-const MODULE: &str = include_str!("fixtures/Module.bsl");
+const MODULE: &str = include_str!("../fixtures/Module.bsl");
 
 const SNIPPETS: &[&str] = &[
     "Процедура А()\n\tХ = 1;\nКонецПроцедуры\n\nФункция Б()\n\tВозврат 1;\nКонецФункции\n",

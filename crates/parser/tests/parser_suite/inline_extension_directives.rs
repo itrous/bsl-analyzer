@@ -1,7 +1,7 @@
 use expect_test::expect_file;
 use syntax::{SyntaxKind, TextRange};
 
-const ISSUE_SOURCE: &str = include_str!("fixtures/issue150_ext_directives.bsl");
+const ISSUE_SOURCE: &str = include_str!("../fixtures/issue150_ext_directives.bsl");
 
 fn canonical_issue_source() -> &'static str {
     r#"Функция ЕстьТакойМетод() Экспорт
@@ -75,7 +75,7 @@ fn issue_example_is_lossless_and_has_one_complete_literal() {
         "the active closing line must supply the only STRING_TAIL"
     );
 
-    expect_file!["fixtures/issue150_ext_directives.cst"].assert_eq(&format!("{root:#?}"));
+    expect_file!["../fixtures/issue150_ext_directives.cst"].assert_eq(&format!("{root:#?}"));
 }
 
 #[test]

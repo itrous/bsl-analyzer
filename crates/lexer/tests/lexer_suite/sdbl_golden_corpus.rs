@@ -1,7 +1,7 @@
 use expect_test::{expect, Expect};
 use lexer::sdbl::tokenize_sdbl;
 
-const CORPUS: &str = include_str!("fixtures/sdbl_golden_corpus.txt");
+const CORPUS: &str = include_str!("../fixtures/sdbl_golden_corpus.txt");
 
 #[test]
 fn golden_corpus() {

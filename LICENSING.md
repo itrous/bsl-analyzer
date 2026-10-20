@@ -297,7 +297,7 @@ CC BY 4.0 asks that modifications be indicated. The file's own header records
 the adaptation made before we received it. This repository changed two further
 lines in `f1fc00ff` (2026-05-13), correcting an event-handler statement to the
 syntax section 4.6.11.1 gives. The licence header itself has never been touched:
-`crates/parser/tests/fixture_licence.rs` fails if it is removed or altered.
+`crates/parser/tests/parser_suite/fixture_licence.rs` fails if it is removed or altered.
 
 ### XML metadata fixtures
 

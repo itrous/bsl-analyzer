@@ -799,7 +799,7 @@ fn test_small_file_performance() {
 fn test_lexer_performance_large_file() {
     use lexer::tokenize;
 
-    let input = include_str!("fixtures/Module.bsl");
+    let input = include_str!("../fixtures/Module.bsl");
 
     println!("\nLexer performance test:");
     println!("File size: {} bytes", input.len());
@@ -819,7 +819,7 @@ fn test_lexer_performance_large_file() {
 
 #[test]
 fn benchmark_parser_performance() {
-    let input = include_str!("fixtures/Module.bsl");
+    let input = include_str!("../fixtures/Module.bsl");
 
     let file_size_bytes = input.len();
     let file_size_mb = file_size_bytes as f64 / 1_000_000.0;
@@ -852,7 +852,7 @@ fn benchmark_parser_performance() {
 #[test]
 fn debug_tokens_around_1905() {
     use lexer::tokenize;
-    let input = include_str!("fixtures/Module.bsl");
+    let input = include_str!("../fixtures/Module.bsl");
 
     let tokens = tokenize(input);
 
@@ -868,7 +868,7 @@ fn debug_tokens_around_1905() {
 #[test]
 fn debug_tokens_around_14467() {
     use lexer::tokenize;
-    let input = include_str!("fixtures/Module.bsl");
+    let input = include_str!("../fixtures/Module.bsl");
 
     let tokens = tokenize(input);
 
@@ -883,7 +883,7 @@ fn debug_tokens_around_14467() {
 #[test]
 fn debug_tokens_around_68041() {
     use lexer::tokenize;
-    let input = include_str!("fixtures/Module.bsl");
+    let input = include_str!("../fixtures/Module.bsl");
 
     let tokens = tokenize(input);
 
@@ -991,7 +991,7 @@ fn test_partial_dot_preserves_orphaned_function_declaration() {
 
 #[test]
 fn test_large_file_performance() {
-    let input = include_str!("fixtures/Module.bsl");
+    let input = include_str!("../fixtures/Module.bsl");
 
     println!("\nLarge file performance:");
     println!("File size: {} bytes ({:.2} MB)", input.len(), input.len() as f64 / 1_048_576.0);

@@ -190,8 +190,8 @@ impl Input {
     }
 }
 
-const MODULE_FIXTURE: &str = include_str!("fixtures/Module.bsl");
-const QUERY_FIXTURE: &str = include_str!("fixtures/sdbl_independent_package.sdbl");
+const MODULE_FIXTURE: &str = include_str!("../fixtures/Module.bsl");
+const QUERY_FIXTURE: &str = include_str!("../fixtures/sdbl_independent_package.sdbl");
 
 /// Числа сняты замером при авторстве и меняются только вместе с фикстурой.
 /// Они и есть положительный контроль корпуса: преобразование, тихо переставшее

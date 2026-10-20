@@ -557,7 +557,7 @@ fn aliased_register_manager_workspace_method_resolves() {
     );
 }
 
-const ISSUE80_REGISTER_FIXTURE: &str = include_str!("fixtures/issue80/register.fixture");
+const ISSUE80_REGISTER_FIXTURE: &str = include_str!("../fixtures/issue80/register.fixture");
 
 #[test]
 fn issue80_select_filter_uses_structure_overload() {

@@ -465,7 +465,7 @@ fn test_multiple_functions_with_empty_parameters() {
 
 #[test]
 fn test_independent_query_from_fixture() {
-    let query = include_str!("fixtures/sdbl_independent_package.sdbl");
+    let query = include_str!("../fixtures/sdbl_independent_package.sdbl");
 
     let parse = parse_sdbl(query);
 

@@ -148,7 +148,7 @@ fn indented_comments_own_their_lines() {
 mod string_text {
     use syntax::{comment_runs, comment_runs_of};
 
-    const MODULE: &str = include_str!("../../parser/tests/fixtures/Module.bsl");
+    const MODULE: &str = include_str!("../../../parser/tests/fixtures/Module.bsl");
 
     fn line_at(code: &str, offset: usize) -> usize {
         code[..offset].matches('\n').count()

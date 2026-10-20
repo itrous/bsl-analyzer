@@ -206,7 +206,7 @@ fn a_shared_english_name_leaves_the_gate_shut_for_both_records() {
 /// have, and their rejection is what the crate's own corpus tests cover.
 fn curated_new_sections() -> String {
     let document: Value =
-        serde_json::from_str(include_str!("../data/platform_overlays.json")).unwrap();
+        serde_json::from_str(include_str!("../../data/platform_overlays.json")).unwrap();
     json!({
         "schema_version": document["schema_version"].clone(),
         "method_parameter_overrides": [],

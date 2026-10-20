@@ -32,8 +32,8 @@
 
 use std::collections::HashSet;
 
-const MODULE: &str = include_str!("fixtures/Module.bsl");
-const QUERY: &str = include_str!("fixtures/sdbl_independent_package.sdbl");
+const MODULE: &str = include_str!("../fixtures/Module.bsl");
+const QUERY: &str = include_str!("../fixtures/sdbl_independent_package.sdbl");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lang {
