@@ -578,14 +578,6 @@ impl Store {
     }
 
     /// Apply every schema/open mutation as atomic groups under a cooperative fence.
-    /// Put the connection back on the operational contention budget.
-    ///
-    /// The short budget a fenced open runs under belongs to that open alone: it exists so one
-    /// admission cannot sit under the ownership fence waiting for a peer's bootstrap. The store
-    /// that open produces then lives for the whole daemon and shares its database with the
-    /// background embedding pass, which holds the WAL writer for far longer than the admission
-    /// budget — a live write that gave up after it would return `SQLITE_BUSY` where it used to
-    /// wait and succeed.
     /// Shorten this connection's contention budget, for a test that holds the writer itself
     /// and has steps of its own to take meanwhile: under the default budget each of them would
     /// wait the whole budget out before carrying on. It lasts until the connection's next point
@@ -599,6 +591,14 @@ impl Store {
         Ok(())
     }
 
+    /// Put the connection back on the operational contention budget.
+    ///
+    /// The short budget a fenced open runs under belongs to that open alone: it exists so one
+    /// admission cannot sit under the ownership fence waiting for a peer's bootstrap. The store
+    /// that open produces then lives for the whole daemon and shares its database with the
+    /// background embedding pass, which holds the WAL writer for far longer than the admission
+    /// budget — a live write that gave up after it would return `SQLITE_BUSY` where it used to
+    /// wait and succeed.
     pub(crate) fn restore_operational_busy_timeout(&self) -> Result<(), SearchError> {
         self.conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
         Ok(())

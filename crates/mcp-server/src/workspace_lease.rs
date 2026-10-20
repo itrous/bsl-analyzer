@@ -314,6 +314,34 @@ struct Inner {
 #[cfg(test)]
 const TEST_LOCK_WAIT: Duration = test_utils::wait::ceiling(LOCK_WAIT);
 
+#[cfg(test)]
+thread_local! {
+    /// Set while this test thread itself holds a lease lock file: every wait for that lock a
+    /// claim makes on this thread fails whatever its length, so it gives up after 50 ms.
+    static LOCK_HELD_BY_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A lease lock file held by the test thread, with [`LOCK_HELD_BY_THIS_THREAD`] raised until it
+/// is let go.
+#[cfg(test)]
+struct LockHeldByThisThread(#[allow(dead_code, reason = "held for its drop")] LockGuard);
+
+#[cfg(test)]
+impl LockHeldByThisThread {
+    fn acquire(path: &Path) -> Self {
+        let guard = LockGuard::acquire(path, TEST_LOCK_WAIT).unwrap();
+        LOCK_HELD_BY_THIS_THREAD.with(|held| held.set(true));
+        Self(guard)
+    }
+}
+
+#[cfg(test)]
+impl Drop for LockHeldByThisThread {
+    fn drop(&mut self) {
+        LOCK_HELD_BY_THIS_THREAD.with(|held| held.set(false));
+    }
+}
+
 impl WorkspaceLease {
     /// Claim `workspace_root`'s derived caches for this process, taking the generation above
     /// whatever the last owner recorded. A fixture whose lease directory cannot be prepared
@@ -330,7 +358,7 @@ impl WorkspaceLease {
         run: impl FnOnce() -> T,
     ) -> T {
         cache.ensure().unwrap();
-        let _guard = LockGuard::acquire(&cache.lease_lock_path(), TEST_LOCK_WAIT).unwrap();
+        let _held = LockHeldByThisThread::acquire(&cache.lease_lock_path());
         run()
     }
 
@@ -1130,7 +1158,9 @@ impl WorkspaceLease {
     /// How long this lease waits for its lock file.
     fn lock_wait(&self) -> Duration {
         #[cfg(test)]
-        if self.inner.lock_held_by_test.load(Ordering::SeqCst) {
+        if self.inner.lock_held_by_test.load(Ordering::SeqCst)
+            || LOCK_HELD_BY_THIS_THREAD.with(std::cell::Cell::get)
+        {
             return Duration::from_millis(50);
         }
         LOCK_WAIT
@@ -2691,7 +2721,7 @@ mod tests {
     fn transient_unclaimed_is_not_superseded() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = crate::cache::ensure_workspace_cache_dir(dir.path()).unwrap();
-        let held = LockGuard::acquire(&cache_dir.join(LEASE_LOCK_FILE), LOCK_WAIT).unwrap();
+        let held = LockHeldByThisThread::acquire(&cache_dir.join(LEASE_LOCK_FILE));
 
         let lease = WorkspaceLease::claim(dir.path());
         assert_eq!(lease.generation(), Some(UNCLAIMED), "the claim could not be written");
@@ -2791,7 +2821,7 @@ mod tests {
     fn a_claim_does_not_complete_after_the_process_has_released() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = crate::cache::ensure_workspace_cache_dir(dir.path()).unwrap();
-        let held = LockGuard::acquire(&cache_dir.join(LEASE_LOCK_FILE), LOCK_WAIT).unwrap();
+        let held = LockHeldByThisThread::acquire(&cache_dir.join(LEASE_LOCK_FILE));
 
         // The claim cannot get the lock, so the lease starts out owning nothing.
         let lease = WorkspaceLease::claim(dir.path());

@@ -133,7 +133,8 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
     // Broken ONCE: the write may land before the watcher is armed and raise no event, and
     // the server has to notice it anyway, the next time the client asks it for anything.
     replace_object(b"{broken");
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
     let main_uri = lsp_types::Url::from_file_path(root.join("src/cf/Main.bsl")).unwrap();
     let ext_uri = lsp_types::Url::from_file_path(root.join("src/cfe/Ext/Ext.bsl")).unwrap();
     let (mut notified, mut main_seen, mut ext_seen) = (false, false, false);
@@ -182,7 +183,8 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
     replace_object(&valid);
     let mut main_seen = false;
     let mut ext_seen = false;
-    let repaired = std::time::Instant::now() + Duration::from_secs(60);
+    let repaired =
+        std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
     while !main_seen || !ext_seen {
         // Poked for the reason the first provocation is: the repair may have landed
         // before the watcher was re-armed and raised no event, and the server notices
@@ -206,7 +208,7 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
     }
 
     replace_object(b"{broken-again");
-    let again = std::time::Instant::now() + Duration::from_secs(60);
+    let again = std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
     let notified = loop {
         if let Some(message) = lsp.wait_for_within(Duration::from_secs(1), |message| {
             message["method"] == "window/showMessage"
@@ -281,6 +283,10 @@ fn selective_lsp_config_reload_applies_selection_and_republishes() {
 }
 
 #[test]
+#[cfg_attr(
+    not(timing_contract),
+    ignore = "timing contract: the only statement is a window with no LSP activity"
+)]
 fn selective_lsp_does_not_watch_unsuppressed_objects() {
     let dir = full_manifest_selective_project();
     let root = dir.path();
@@ -300,18 +306,16 @@ fn selective_lsp_does_not_watch_unsuppressed_objects() {
         .unwrap();
     std::fs::write(root.join("baselines").join(dormant), b"{broken").unwrap();
     // No activity is a window: nothing marks the moment the server has passed over the write.
-    if cfg!(timing_contract) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while std::time::Instant::now() < deadline {
-            match lsp.messages.recv_timeout(Duration::from_millis(50)) {
-                Ok(message) => assert!(
-                    message["method"] != "window/showMessage"
-                        && message["method"] != "textDocument/publishDiagnostics",
-                    "dormant object caused LSP activity: {message}"
-                ),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        match lsp.messages.recv_timeout(Duration::from_millis(50)) {
+            Ok(message) => assert!(
+                message["method"] != "window/showMessage"
+                    && message["method"] != "textDocument/publishDiagnostics",
+                "dormant object caused LSP activity: {message}"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }

@@ -48,7 +48,9 @@ impl CountingEmbeddingServer {
                         }
                         // Windows hands the listener's non-blocking mode to the accepted stream.
                         let _ = stream.set_nonblocking(false);
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let _ = stream.set_read_timeout(Some(test_utils::wait::ceiling(
+                            Duration::from_secs(1),
+                        )));
                         let mut request = Vec::new();
                         let mut chunk = [0_u8; 2048];
                         let mut header_end = None;

@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const DEADLINE: Duration = Duration::from_secs(30);
+/// A hang watchdog for one case, enforced only by the timing profile.
+const DEADLINE: Duration = test_utils::wait::ceiling(Duration::from_secs(30));
 const INPUT_MARKER: &str = "IndexingRuntimeFixtureOnly";
 
 // Like vector_lifecycle_tests, isolate process-global configuration. Other parallel
@@ -81,8 +82,12 @@ impl Provider {
                 };
                 // Windows hands the listener's non-blocking mode to the accepted stream.
                 stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                stream
+                    .set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(2))))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(2))))
+                    .unwrap();
                 let mut bytes = Vec::new();
                 let (header_end, length) = loop {
                     let mut buf = [0; 2048];

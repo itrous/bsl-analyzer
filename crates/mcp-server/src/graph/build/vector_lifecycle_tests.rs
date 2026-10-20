@@ -52,8 +52,12 @@ impl ScaleEmbeddingServer {
                 };
                 // Windows hands the listener's non-blocking mode to the accepted stream.
                 stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-                stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+                stream
+                    .set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(30))))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(30))))
+                    .unwrap();
                 let body = read_scale_http_body(&mut stream);
                 let request: Value = serde_json::from_slice(&body).expect("embedding JSON body");
                 let inputs = request["input"].as_array().expect("OpenAI input array");

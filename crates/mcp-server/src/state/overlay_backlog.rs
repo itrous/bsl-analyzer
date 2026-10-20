@@ -1792,9 +1792,15 @@ mod tests {
         assert!(eventually(|| matches!(handle.state(), BacklogState::Exhausted { .. })));
         holder.execute_batch("ROLLBACK").unwrap();
         let attempts = handle.probe.publishes.load(Ordering::SeqCst);
+        // Each wake is waited for at the owner's own wait, so the reading below follows ten
+        // rounds the owner has actually turned, not ten intervals it may not have reached.
         for _ in 0..10 {
+            let taken = handle.wakes_consumed();
             handle.wake();
-            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                eventually(|| handle.wakes_consumed() > taken),
+                "a wake never reached the owner"
+            );
         }
         assert_eq!(handle.probe.publishes.load(Ordering::SeqCst), attempts, "a wake revived it");
         assert!(matches!(handle.state(), BacklogState::Exhausted { .. }));

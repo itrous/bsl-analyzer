@@ -1524,7 +1524,8 @@ if mode == 'exit1': sys.exit(1)
         write_executable(&queued_program, FAKE_EXECUTOR);
         let mut queued_profile = test_profile();
         queued_profile.program = queued_program;
-        queued_profile.timeout = Duration::from_millis(1_000);
+        // Far past the scheduling of the permit below, so the queue cannot run out first.
+        queued_profile.timeout = Duration::from_secs(600);
         queued_profile.args = vec!["record-timeout".into(), queued_limits.clone().into_os_string()];
         queued_profile.semaphore = Arc::new(tokio::sync::Semaphore::new(0));
         let semaphore = queued_profile.semaphore.clone();
@@ -1549,7 +1550,7 @@ if mode == 'exit1': sys.exit(1)
         assert_eq!(result_code(&result), None);
         let forwarded = std::fs::read_to_string(queued_limits).unwrap().parse::<u64>().unwrap();
         assert!(
-            forwarded > 0 && forwarded < 1_000,
+            forwarded > 0 && forwarded < 600_000,
             "queued request receives only the remaining deadline: {forwarded}ms"
         );
 
