@@ -1154,17 +1154,45 @@ jobs:
           path: target/release/bsl-native-check.exe
 
   partitioned-baseline-scale:
-    name: Partitioned baseline 1.6M release gate
     # Four release runs that each materialise a 1.6M-entry object: minutes of CPU and
     # hundreds of megabytes of disk. Kept off pull requests, where it would run on every
     # push to every branch, and still guarding `develop` after a merge (plus on demand).
+    #
+    # The tests themselves take seconds; the time is the release build (`lto`, one
+    # codegen unit) of the workspace crates, which no cache carries between runs. Each
+    # test therefore gets its own runner and the legs build in parallel, so the run lasts
+    # as long as its heaviest leg. The legs wait for nothing: a pre-build job could cache
+    # only the third-party crates, which the cache below already serves.
+    name: Partitioned baseline 1.6M release gate (${{ matrix.shard }})
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: ide-partitioned
+            cache: ide
+            command: cargo test -p ide --release --test partitioned_baseline_scale -- --ignored
+          - shard: ide-selective
+            cache: ide
+            command: cargo test -p ide --release --test selective_baseline_scale large_selective_baseline_load_skips_unsuppressed_objects -- --ignored --exact
+          - shard: app-partitioned
+            cache: app
+            command: cargo test -p bsl-analyzer --release --test partitioned_baseline_scale -- --ignored
+          - shard: app-selective
+            cache: app
+            command: cargo test -p bsl-analyzer --release --test selective_baseline_scale large_selective_v1_migration_streams_skipped_entries_with_bounded_rss -- --ignored --exact
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ide --release --test partitioned_baseline_scale -- --ignored
-      - run: cargo test -p ide --release --test selective_baseline_scale large_selective_baseline_load_skips_unsuppressed_objects -- --ignored --exact
-      - run: cargo test -p bsl-analyzer --release --test partitioned_baseline_scale -- --ignored
-      - run: cargo test -p bsl-analyzer --release --test selective_baseline_scale large_selective_v1_migration_streams_skipped_entries_with_bounded_rss -- --ignored --exact
+        with:
+          # One release cache per package (`-p ide` and `-p bsl-analyzer` unify features
+          # differently, so their third-party builds differ), shared by the legs that
+          # test it. The `*-partitioned` leg is the only one that saves: the legs would
+          # otherwise race to store the same key, and a leg that fails on its test must
+          # not be the one that decides whether the cache exists.
+          shared-key: release-gate-${{ matrix.cache }}
+          save-if: ${{ endsWith(matrix.shard, '-partitioned') }}
+      - run: ${{ matrix.command }}
