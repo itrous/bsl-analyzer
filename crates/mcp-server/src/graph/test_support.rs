@@ -354,8 +354,9 @@ pub(crate) fn wait_for_hub_seq_above(
     hub: &crate::change_hub::WorkspaceChangeHub,
     floor: u64,
 ) -> u64 {
+    // A hang guard: a write the watch never delivers fails here instead of holding the runner.
     let mut deadline = crate::change_hub::test_support::Patience::new(
-        crate::change_hub::test_support::STATE_CEILING,
+        test_utils::wait::hang_guard(std::time::Duration::from_secs(60)),
         std::time::Duration::from_millis(10),
     );
     loop {
