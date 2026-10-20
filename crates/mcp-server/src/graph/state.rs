@@ -4983,9 +4983,11 @@ mod tests {
         sample_workspace(root);
 
         let lease = crate::workspace_lease::WorkspaceLease::claim(root);
-        let graph = GraphState::for_workspace(root.to_path_buf()).with_lease(lease);
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_lease(lease.clone());
         // A newer daemon generation claims the same workspace.
         let _newer = crate::workspace_lease::WorkspaceLease::claim(root);
+        // The cached verdict would hold for its TTL; age it so the next check reads the record.
+        lease.invalidate_verdict_for_test();
         wait_until_within(
             &graph,
             test_utils::wait::ceiling(Duration::from_secs(10)),
@@ -5576,8 +5578,11 @@ mod tests {
         graph.ensure_loading();
 
         // Long enough for a loader spawned by that call to build this two-module workspace and
-        // publish: `publish_hook_fires_after_a_build_publishes` waits for the same build.
-        std::thread::sleep(Duration::from_secs(2));
+        // publish: `publish_hook_fires_after_a_build_publishes` waits for the same build. Nothing
+        // marks a builder that was never spawned, so only the timing profile waits the window out.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
         assert_eq!(published.load(Ordering::SeqCst), 0, "no second builder may publish");
         assert_eq!(
             graph.status(),

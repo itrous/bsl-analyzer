@@ -302,6 +302,10 @@ struct Inner {
     /// checkpoints before the one under test, and a one-shot flag burns on the first.
     #[cfg(test)]
     fail_checkpoint_lock_countdown: std::sync::atomic::AtomicU64,
+    /// Set while a test holds this lease's lock file itself: every wait this lease makes for the
+    /// lock then fails whatever its length, so it gives up after 50 ms instead of [`LOCK_WAIT`].
+    #[cfg(test)]
+    lock_held_by_test: AtomicBool,
 }
 
 /// How long a test fixture waits to take the lease lock from whoever holds it: the product's
@@ -414,6 +418,8 @@ impl WorkspaceLease {
                 #[cfg(test)]
                 fail_managed_lock: AtomicBool::new(false),
                 #[cfg(test)]
+                lock_held_by_test: AtomicBool::new(false),
+                #[cfg(test)]
                 fail_managed_read: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_managed_restamp: AtomicBool::new(false),
@@ -452,6 +458,8 @@ impl WorkspaceLease {
             disk_check_threads: Mutex::new(Vec::new()),
             #[cfg(test)]
             fail_managed_lock: AtomicBool::new(false),
+            #[cfg(test)]
+            lock_held_by_test: AtomicBool::new(false),
             #[cfg(test)]
             fail_managed_read: AtomicBool::new(false),
             #[cfg(test)]
@@ -529,7 +537,7 @@ impl WorkspaceLease {
         if std::fs::create_dir_all(dir).is_err() {
             return false;
         }
-        let Ok(_guard) = LockGuard::acquire(&dir.join(LEASE_LOCK_FILE), LOCK_WAIT) else {
+        let Ok(_guard) = LockGuard::acquire(&dir.join(LEASE_LOCK_FILE), self.lock_wait()) else {
             return false;
         };
         // Re-read UNDER the lock, where `release` also runs: a claim that started before this
@@ -846,7 +854,7 @@ impl WorkspaceLease {
         // not a hang that a timeout would catch.
         #[cfg(test)]
         self.note_disk_check();
-        let guard = match LockGuard::acquire(&lock_path, LOCK_WAIT) {
+        let guard = match LockGuard::acquire(&lock_path, self.lock_wait()) {
             Ok(guard) => guard,
             Err(error) if is_lock_contention(&error) => {
                 return LeaseOperationOutcome::TransientRefusal
@@ -916,7 +924,7 @@ impl WorkspaceLease {
                 stopped = Some(LeaseOperationOutcome::TransientRefusal);
                 return ControlFlow::Break(());
             }
-            guard = match LockGuard::acquire(&lock_path, LOCK_WAIT) {
+            guard = match LockGuard::acquire(&lock_path, self.lock_wait()) {
                 Ok(guard) => Some(guard),
                 Err(error) if is_lock_contention(&error) => {
                     stopped = Some(LeaseOperationOutcome::TransientRefusal);
@@ -1092,11 +1100,24 @@ impl WorkspaceLease {
     /// asked for. The attempts are a hang guard: a holder that never lets go is the failure.
     #[cfg(test)]
     pub(crate) fn hold_file_lock_for_test(&self) -> impl Send {
+        /// Hands the lease its full lock wait back once the test lets the lock go.
+        struct HeldByTest {
+            _guard: LockGuard,
+            inner: Arc<Inner>,
+        }
+        impl Drop for HeldByTest {
+            fn drop(&mut self) {
+                self.inner.lock_held_by_test.store(false, Ordering::SeqCst);
+            }
+        }
         let path = self.inner.path.as_deref().expect("test lease is managed");
         let lock_path = path.parent().expect("lease path has a parent").join(LEASE_LOCK_FILE);
         for _ in 0..6_000 {
             match LockGuard::try_acquire(&lock_path) {
-                Ok(guard) => return guard,
+                Ok(guard) => {
+                    self.inner.lock_held_by_test.store(true, Ordering::SeqCst);
+                    return HeldByTest { _guard: guard, inner: Arc::clone(&self.inner) };
+                }
                 Err(error) if is_lock_contention(&error) => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1104,6 +1125,15 @@ impl WorkspaceLease {
             }
         }
         panic!("the lease file lock was never released by its other holders")
+    }
+
+    /// How long this lease waits for its lock file.
+    fn lock_wait(&self) -> Duration {
+        #[cfg(test)]
+        if self.inner.lock_held_by_test.load(Ordering::SeqCst) {
+            return Duration::from_millis(50);
+        }
+        LOCK_WAIT
     }
 
     #[cfg(test)]
@@ -1161,7 +1191,7 @@ impl WorkspaceLease {
         // an abandoned workspace during shutdown and start writing caches on the way out.
         let guard = path
             .parent()
-            .and_then(|dir| LockGuard::acquire(&dir.join(LEASE_LOCK_FILE), LOCK_WAIT).ok());
+            .and_then(|dir| LockGuard::acquire(&dir.join(LEASE_LOCK_FILE), self.lock_wait()).ok());
         let Some(_guard) = guard else { return };
         let mine = self.inner.token.load(Ordering::SeqCst);
         if read_record(path).is_some_and(|record| record.token == mine) {
@@ -2012,6 +2042,8 @@ mod tests {
                 #[cfg(test)]
                 disk_check_threads: Mutex::new(Vec::new()),
                 fail_managed_lock: AtomicBool::new(false),
+                #[cfg(test)]
+                lock_held_by_test: AtomicBool::new(false),
                 fail_managed_read: AtomicBool::new(false),
                 fail_managed_restamp: AtomicBool::new(false),
                 fail_checkpoint_lock: AtomicBool::new(false),
@@ -2285,7 +2317,8 @@ mod tests {
         assert!(second.owns_caches(), "the newest claim owns the caches");
 
         // The verdict is cached, so the demotion lands on the first re-read.
-        std::thread::sleep(VERDICT_TTL);
+        first.invalidate_verdict_for_test();
+        second.invalidate_verdict_for_test();
         assert!(!first.owns_caches(), "the superseded generation stops writing");
         assert!(second.owns_caches());
     }
@@ -2358,6 +2391,8 @@ mod tests {
                 #[cfg(test)]
                 disk_check_threads: Mutex::new(Vec::new()),
                 fail_managed_lock: AtomicBool::new(false),
+                #[cfg(test)]
+                lock_held_by_test: AtomicBool::new(false),
                 fail_managed_read: AtomicBool::new(false),
                 fail_managed_restamp: AtomicBool::new(false),
                 fail_checkpoint_lock: AtomicBool::new(false),
@@ -2613,10 +2648,12 @@ mod tests {
         let third = WorkspaceLease::claim(dir.path()); // generation 3
         assert_eq!(first.generation(), Some(1), "the numbering this scenario turns on");
 
-        let first_heartbeat = first.hold_lifecycle_lock_for_test();
-        let third_heartbeat = third.hold_lifecycle_lock_for_test();
+        let mut first_heartbeat = first.hold_lifecycle_lock_for_test();
+        let mut third_heartbeat = third.hold_lifecycle_lock_for_test();
         std::fs::remove_file(lease_path(dir.path())).unwrap();
-        std::thread::sleep(VERDICT_TTL);
+        *first_heartbeat = None;
+        *third_heartbeat = None;
+        second.invalidate_verdict_for_test();
 
         // The middle daemon reclaims first and is handed generation 1 — the number the FIRST
         // daemon is still running under.
@@ -2642,7 +2679,7 @@ mod tests {
         let lease = WorkspaceLease::claim(dir.path());
         std::fs::remove_dir_all(crate::cache::workspace_cache_dir(dir.path())).unwrap();
 
-        std::thread::sleep(VERDICT_TTL);
+        lease.invalidate_verdict_for_test();
         assert!(lease.owns_caches(), "the daemon recreates what it needs and carries on");
         assert!(lease_path(dir.path()).exists(), "and the record is back on disk");
     }
@@ -2662,7 +2699,7 @@ mod tests {
         assert!(!lease.is_superseded(), "temporary lock contention is not supersession");
 
         drop(held);
-        std::thread::sleep(VERDICT_TTL);
+        lease.invalidate_verdict_for_test();
         assert!(lease.owns_caches(), "the retry claims the workspace once the lock frees");
         assert_eq!(record_at(&lease_path(dir.path())).generation, lease.generation().unwrap());
         lease.release();
@@ -2678,7 +2715,8 @@ mod tests {
         let daemon = WorkspaceLease::claim(dir.path());
         let short_lived = WorkspaceLease::claim(dir.path());
 
-        std::thread::sleep(VERDICT_TTL);
+        daemon.invalidate_verdict_for_test();
+        short_lived.invalidate_verdict_for_test();
         assert!(!daemon.owns_caches(), "the newer claim demoted the daemon");
         assert!(daemon.is_superseded());
 
@@ -2737,7 +2775,7 @@ mod tests {
         let lease = WorkspaceLease::claim(dir.path());
         lease.release();
 
-        std::thread::sleep(VERDICT_TTL);
+        lease.invalidate_verdict_for_test();
         assert!(!lease.owns_caches(), "a released lease stays released");
         assert!(
             read_record(&lease_path(dir.path())).is_none(),
@@ -2762,7 +2800,7 @@ mod tests {
         lease.release();
         drop(held);
 
-        std::thread::sleep(VERDICT_TTL);
+        lease.invalidate_verdict_for_test();
         assert!(!lease.owns_caches(), "a released lease does not go on to claim");
         assert!(
             read_record(&lease_path(dir.path())).is_none(),
@@ -2880,9 +2918,9 @@ mod tests {
         };
         std::fs::write(&path, serde_json::to_string(&owner).unwrap()).unwrap();
 
-        std::thread::sleep(VERDICT_TTL);
+        lease.invalidate_verdict_for_test();
         assert!(!lease.owns_caches());
-        std::thread::sleep(VERDICT_TTL);
+        lease.invalidate_verdict_for_test();
         assert!(!lease.owns_caches(), "a live owner keeps the workspace");
         assert_eq!(record_at(&path).generation, owner.generation, "its record is untouched");
     }
@@ -2896,7 +2934,7 @@ mod tests {
         let path = lease_path(dir.path());
         std::fs::remove_file(&path).unwrap();
 
-        std::thread::sleep(VERDICT_TTL);
+        lease.invalidate_verdict_for_test();
         assert!(lease.owns_caches());
         assert_eq!(record_at(&path).generation, lease.generation().unwrap());
     }
@@ -2910,11 +2948,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let older = WorkspaceLease::claim(dir.path());
         let newer = WorkspaceLease::claim(dir.path());
-        std::thread::sleep(VERDICT_TTL);
+        older.invalidate_verdict_for_test();
+        newer.invalidate_verdict_for_test();
         assert!(!older.owns_caches() && newer.owns_caches(), "the newest claim owns it");
 
         std::fs::remove_file(lease_path(dir.path())).unwrap();
-        std::thread::sleep(VERDICT_TTL);
+        older.invalidate_verdict_for_test();
+        newer.invalidate_verdict_for_test();
 
         // Whoever gets there first takes it; the point is that the other one gives it up.
         let older_owns = older.owns_caches();

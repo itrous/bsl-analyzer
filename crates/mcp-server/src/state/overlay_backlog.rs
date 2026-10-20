@@ -827,6 +827,22 @@ mod tests {
         slow_hold: SLOW_HOLD,
     };
 
+    /// [`engine_over`] for a test that holds SQLite's writer itself: the engine's connection
+    /// gives up on it after 50 ms instead of the operational 30 s, so the steps the test takes
+    /// with the writer held answer at once rather than after the whole budget.
+    fn engine_over_held_writer(workspace: &Path, files: usize) -> SharedSearchEngine {
+        let shared = engine_over(workspace, files);
+        shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .store()
+            .set_busy_timeout_for_test(Duration::from_millis(50))
+            .unwrap();
+        shared
+    }
+
     fn engine_over(workspace: &Path, files: usize) -> SharedSearchEngine {
         for index in 0..files {
             fs::write(
@@ -1657,7 +1673,7 @@ mod tests {
     #[test]
     fn wakes_do_not_step_around_the_backoff() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = engine_over(dir.path(), 1);
+        let shared = engine_over_held_writer(dir.path(), 1);
         let holder = rusqlite::Connection::open(dir.path().join("search.db")).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         let handle = OverlayBacklog::default();
@@ -1729,7 +1745,7 @@ mod tests {
     #[test]
     fn a_refused_commit_is_backed_off_and_returned_to_on_the_system_clock() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = engine_over(dir.path(), 1);
+        let shared = engine_over_held_writer(dir.path(), 1);
         let holder = rusqlite::Connection::open(dir.path().join("search.db")).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         let handle = OverlayBacklog::default();
@@ -1760,7 +1776,7 @@ mod tests {
     #[test]
     fn an_exhausted_owner_is_revived_by_a_fresh_fact_only() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = engine_over(dir.path(), 1);
+        let shared = engine_over_held_writer(dir.path(), 1);
         let holder = rusqlite::Connection::open(dir.path().join("search.db")).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         let pacing = Pacing { retry_budget: Duration::from_millis(1), ..FAST };
@@ -1942,7 +1958,7 @@ mod tests {
     #[test]
     fn a_busy_commit_is_offered_again_soon() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = engine_over(dir.path(), 1);
+        let shared = engine_over_held_writer(dir.path(), 1);
         let held = rusqlite::Connection::open(dir.path().join("search.db")).unwrap();
         held.execute_batch("BEGIN IMMEDIATE").unwrap();
         let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, FAST);
@@ -1964,7 +1980,7 @@ mod tests {
     #[test]
     fn a_revived_owner_starts_its_busy_schedule_over() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = engine_over(dir.path(), 1);
+        let shared = engine_over_held_writer(dir.path(), 1);
         let holder = rusqlite::Connection::open(dir.path().join("search.db")).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         // Long enough for the doubling to climb before the budget runs out: a delay is capped

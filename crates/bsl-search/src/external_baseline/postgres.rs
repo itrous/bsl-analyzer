@@ -93,6 +93,22 @@ const SEMANTIC_PUBLICATION_COMPLETE_PREFIX: &str = "semantic_publication_complet
 /// branch on those exact error kinds and never treat them as retryable.
 const STORAGE_READINESS_TTL: Duration = Duration::from_secs(60);
 
+/// How long the pool waits for a connection before a call fails.
+///
+/// Test builds give a pool aimed at port 1 50 ms: that is the endpoint the fixtures use for
+/// "nothing listens", the pool retries its refusals for the whole budget, and the failure a
+/// test waits for arrives after it either way. A pool aimed anywhere else — a fixture's own
+/// listener included — keeps the production budget.
+fn connection_timeout(config: &postgres::Config) -> std::time::Duration {
+    #[cfg(any(test, feature = "test-seams"))]
+    if config.get_ports().contains(&1) {
+        return std::time::Duration::from_millis(50);
+    }
+    #[cfg(not(any(test, feature = "test-seams")))]
+    let _ = config;
+    std::time::Duration::from_secs(5)
+}
+
 #[derive(Debug, Clone)]
 pub struct PostgresBaselineAdapter {
     config: ExternalBaselineConfig,
@@ -109,10 +125,11 @@ impl PostgresBaselineAdapter {
         let pg_config = config.connection.parse().map_err(|err: postgres::Error| {
             SearchError::ExternalBaseline(format!("invalid connection string: {err}"))
         })?;
+        let connection_timeout = connection_timeout(&pg_config);
         let manager = PostgresConnectionManager::new(pg_config, NoTls);
         let pool = Pool::builder()
             .max_size(4)
-            .connection_timeout(std::time::Duration::from_secs(5))
+            .connection_timeout(connection_timeout)
             .build_unchecked(manager);
         Ok(Self {
             config,

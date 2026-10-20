@@ -531,8 +531,8 @@ root = "src/cf"
 backend = "postgres"
 
 [search.baseline.postgres]
-host = "localhost"
-port = 5432
+host = "127.0.0.1"
+port = 1
 dbname = "bsl_search"
 schema = "bsl_search"
 vault_role_base = "prod/search/bsl-analyzer"
@@ -542,7 +542,7 @@ program = "python3"
 args = [
   "-c",
   "import sys; sys.stdin.readline(); sys.stdout.write(sys.argv[1])",
-  '{"protocol":"bsl-analyzer.postgres-helper.v1","ok":true,"url":"postgres://user:pass@localhost:5432/bsl_search"}'
+  '{"protocol":"bsl-analyzer.postgres-helper.v1","ok":true,"url":"postgres://user:pass@127.0.0.1:1/bsl_search"}'
 ]
 
 [search.baseline.workspace_code.policy]
@@ -569,8 +569,8 @@ select_branch = "develop"
                     "baseline": {
                         "backend": "postgres",
                         "postgres": {
-                            "host": "localhost",
-                            "port": 5432,
+                            "host": "127.0.0.1",
+                            "port": 1,
                             "dbname": "bsl_search",
                             "schema": "bsl_search",
                             "vaultRoleBase": "prod/search/bsl-analyzer",
@@ -579,7 +579,7 @@ select_branch = "develop"
                                 "args": [
                                     "-c",
                                     "import sys; sys.stdin.readline(); sys.stdout.write(sys.argv[1])",
-                                    "{\"protocol\":\"bsl-analyzer.postgres-helper.v1\",\"ok\":true,\"url\":\"postgres://user:pass@localhost:5432/bsl_search\"}"
+                                    "{\"protocol\":\"bsl-analyzer.postgres-helper.v1\",\"ok\":true,\"url\":\"postgres://user:pass@127.0.0.1:1/bsl_search\"}"
                                 ]
                             }
                         },

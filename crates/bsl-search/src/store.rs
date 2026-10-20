@@ -586,6 +586,18 @@ impl Store {
     /// background embedding pass, which holds the WAL writer for far longer than the admission
     /// budget — a live write that gave up after it would return `SQLITE_BUSY` where it used to
     /// wait and succeed.
+    /// Shorten this connection's contention budget, for a test that holds the writer itself
+    /// and has steps of its own to take meanwhile: under the default budget each of them would
+    /// wait the whole budget out before carrying on.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn set_busy_timeout_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), SearchError> {
+        self.conn.busy_timeout(timeout)?;
+        Ok(())
+    }
+
     pub(crate) fn restore_operational_busy_timeout(&self) -> Result<(), SearchError> {
         self.conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
         Ok(())
