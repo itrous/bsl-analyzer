@@ -576,7 +576,7 @@ fn byte_window_detects_embedded_material_and_rejects_changed_bytes() {
 /// однажды сменил форму — из `.bsl`-фикстуры он переехал в `.rs`, — и ничто не
 /// мешает ему вернуться третьей. В крейте лежат ещё и `xml`, и `json`, и
 /// словари, а текст, спрятанный в комментарии разметки, остаётся тем же
-/// текстом. Нечитаемое как UTF-8 отсеется само при чтении.
+/// текстом. Сравнение идёт по байтам, так что и файл не в UTF-8 читается целиком.
 ///
 /// Зато отбор по отслеживаемости обязателен: в поддереве крейта живут
 /// игнорируемые каталоги состояния агентских сессий (`.omc/`), и процитированный
@@ -614,6 +614,12 @@ fn tracked_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     every_file(root, &mut paths);
     paths
+}
+
+/// The bytes the gate scans, one entry per file that can be read. Bytes, not text: one stray
+/// byte that is not UTF-8 would otherwise drop a whole file, material and all, from the scan.
+fn tracked_contents(files: &[std::path::PathBuf]) -> Vec<(&std::path::PathBuf, Vec<u8>)> {
+    files.iter().filter_map(|path| std::fs::read(path).ok().map(|bytes| (path, bytes))).collect()
 }
 
 fn every_file(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -709,6 +715,21 @@ fn tracked_files_ignore_inherited_git_environment() {
 }
 
 #[test]
+fn a_file_that_is_not_utf8_is_still_scanned() {
+    let material = "синтетический контроль\n".as_bytes();
+    let fingerprint = material
+        .iter()
+        .fold(0u64, |hash, byte| hash.wrapping_mul(BASE).wrapping_add(u64::from(*byte)));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.md");
+    std::fs::write(&path, [b"\xff\n".as_slice(), material].concat()).unwrap();
+
+    let contents = tracked_contents(std::slice::from_ref(&path));
+    assert_eq!(contents.len(), 1, "a file with one stray byte drops out of the scan");
+    assert!(window_matches(&contents[0].1, material.len(), fingerprint));
+}
+
+#[test]
 fn byte_windows_find_last_utf8_window_and_deduplicate_repetitions() {
     let material = "синтетический контроль\n".as_bytes();
     let fingerprint = material
@@ -753,10 +774,7 @@ fn retired_material_did_not_come_back() {
     // Every file is scanned once per distinct span. Each (file, span) pair is a unit of
     // work taken by the next free thread, so one large file (the dictionaries) does not
     // serialize the gate as the list of retired fingerprints grows.
-    let texts: Vec<(&std::path::PathBuf, String)> = files
-        .iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok().map(|text| (path, text)))
-        .collect();
+    let texts = tracked_contents(&files);
     let spans: Vec<(&usize, &Vec<u64>)> = by_span.iter().collect();
     let units = texts.len() * spans.len();
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -774,7 +792,7 @@ fn retired_material_did_not_come_back() {
                         }
                         let (path, text) = &texts[unit / spans.len()];
                         let (span, fingerprints) = spans[unit % spans.len()];
-                        for hit in matching_windows(text.as_bytes(), *span, fingerprints) {
+                        for hit in matching_windows(text, *span, fingerprints) {
                             for (name, _, _) in
                                 RETIRED.iter().filter(|(_, fp, len)| *fp == hit && len == span)
                             {
