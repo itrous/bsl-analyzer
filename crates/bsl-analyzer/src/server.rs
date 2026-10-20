@@ -6985,7 +6985,13 @@ mod tests {
     /// be rescheduled by the event that applied it: the input is an owner publication
     /// from a closed file that lands before the event on an unrelated open document,
     /// with no diagnostics in flight.
+    ///
+    /// `the_event_catches_up_in_place` asks for the event to apply the publication to the
+    /// view it has. A close cannot always: the owner also delivers the same write to
+    /// itself, and when that lands during the close the close reseeds the view instead.
+    /// Without the flag the view only has to reach the publication by either route.
     fn assert_owner_publication_reschedules_open_documents(
+        the_event_catches_up_in_place: bool,
         apply: impl FnOnce(&mut GlobalState, lsp_types::Url),
     ) {
         let root = tempfile::tempdir().expect("create shared workspace");
@@ -7080,6 +7086,16 @@ mod tests {
         assert!(published.generation > seeded, "the owner is ahead of the view");
 
         apply(&mut state, touched_uri);
+        if !the_event_catches_up_in_place {
+            while !state.shared_view_seeded {
+                let task = state
+                    .task_pool
+                    .receiver
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(20)))
+                    .expect("the reseeded editor view");
+                handle_task(&mut state, task).unwrap();
+            }
+        }
         assert_eq!(
             state.analysis_host.view().expect("open editor view").generation(),
             published.generation,
@@ -7103,7 +7119,7 @@ mod tests {
 
     #[test]
     fn a_save_that_applies_owner_changes_reschedules_open_documents() {
-        assert_owner_publication_reschedules_open_documents(|state, uri| {
+        assert_owner_publication_reschedules_open_documents(true, |state, uri| {
             crate::handlers::handle_did_save(
                 state,
                 lsp_types::DidSaveTextDocumentParams {
@@ -7115,17 +7131,25 @@ mod tests {
         });
     }
 
+    fn close_document(state: &mut GlobalState, uri: lsp_types::Url) {
+        crate::handlers::notification::handle_did_close(
+            state,
+            lsp_types::DidCloseTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+            },
+        )
+        .expect("close the open document");
+    }
+
     #[test]
     fn a_close_that_applies_owner_changes_reschedules_open_documents() {
-        assert_owner_publication_reschedules_open_documents(|state, uri| {
-            crate::handlers::notification::handle_did_close(
-                state,
-                lsp_types::DidCloseTextDocumentParams {
-                    text_document: lsp_types::TextDocumentIdentifier { uri },
-                },
-            )
-            .expect("close the open document");
-        });
+        assert_owner_publication_reschedules_open_documents(false, close_document);
+    }
+
+    #[test]
+    #[ignore = "необязательный тест: быстрый путь закрытия зависит от того, успеет ли владелец разобрать собственную доставку той же записи до закрытия, событийной замены нет; запуск: cargo test -p bsl-analyzer --lib -- --ignored --exact server::tests::a_close_that_applies_owner_changes_catches_the_view_up_in_place"]
+    fn a_close_that_applies_owner_changes_catches_the_view_up_in_place() {
+        assert_owner_publication_reschedules_open_documents(true, close_document);
     }
 
     /// The vendor-diff scope is computed against the working tree, so every disk change a
