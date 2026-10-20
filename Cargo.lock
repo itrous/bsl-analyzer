@@ -4351,6 +4351,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "retired-material-gate"
+version = "0.3.2"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

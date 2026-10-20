@@ -1,4 +1,4 @@
-//! Изъятый тестовый материал в крейт не вернулся.
+//! Изъятый тестовый материал в крейт `ide-diagnostics` не вернулся.
 //!
 //! Материал, перенесённый из чужого проекта, однажды уже переехал внутри
 //! крейта — из `test_data/` в тело теста, — и удаление файла его не вывело из
@@ -737,7 +737,7 @@ fn byte_windows_find_last_utf8_window_and_deduplicate_repetitions() {
 /// что произошло на самом деле: перенос знак в знак при смене формы тестов.
 #[test]
 fn retired_material_did_not_come_back() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../ide-diagnostics"));
     let files = tracked_files(root);
 
     assert!(

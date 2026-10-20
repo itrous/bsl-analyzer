@@ -287,7 +287,7 @@ replaced on 2026-08-21 with material derived from section 4.8.1.2 of the 1C
 Developer's Guide, so it is not an entry in the table above: the table lists
 third-party content that is still bundled. See
 `docs/legal/bsl-clean-room-slice-b2.md`;
-`crates/ide-diagnostics/tests/retired_material.rs` fails if the retired
+`crates/retired-material-gate/tests/retired_material.rs` fails if the retired
 material reappears verbatim in any Git-tracked file of that crate, whatever
 its extension.
 
@@ -411,7 +411,7 @@ replaced by inputs composed from the normative sections of this repository's
 own diagnostic documentation and the current rules. Every old scenario of those
 carriers is mapped to a new test, the new tests were shown to fail on mutations
 of their own inputs (the two exceptions are recorded there), and
-`crates/ide-diagnostics/tests/retired_material.rs` fails if a retired literal of
+`crates/retired-material-gate/tests/retired_material.rs` fails if a retired literal of
 those carriers reappears byte for byte anywhere in the crate — four generic
 blocks that also occur in files outside the queue are recorded there instead of
 being fingerprinted. The paragraphs above remain the historical record of the import and are
