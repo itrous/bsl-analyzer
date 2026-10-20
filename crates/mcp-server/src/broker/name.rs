@@ -507,9 +507,13 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
             match std::fs::DirBuilder::new().mode(0o700).create(dir) {
                 // Another launcher made it between the check and the create — an editor and
                 // an MCP client starting together. What it made is held to the same bar as
-                // any dir found in place.
+                // any dir found in place; a path that exists but cannot be followed — a
+                // dangling link — keeps the create's own error.
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    check_private_dir(dir, &std::fs::metadata(dir)?)
+                    match std::fs::metadata(dir) {
+                        Ok(meta) => check_private_dir(dir, &meta),
+                        Err(_) => Err(e),
+                    }
                 }
                 created => created,
             }
@@ -1003,6 +1007,18 @@ mod tests {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "round {round}: the dir both launchers use is private");
         }
+    }
+
+    /// A dangling link where the runtime dir should be fails the create, and the re-check of
+    /// what another launcher made cannot follow it: the error stays the create's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_at_the_runtime_dir_is_reported_as_existing() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(SOCKET_DIR_LEAF);
+        std::os::unix::fs::symlink(root.path().join("missing"), &dir).unwrap();
+        let error = create_private_dir(&dir).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
     }
 
     /// The privacy check must see the path it was given, not what the path points at.
