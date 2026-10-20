@@ -785,6 +785,8 @@ impl EmbeddingStub {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         use std::io::{Read, Write};
+                        // Windows hands the listener's non-blocking mode to the accepted stream.
+                        let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(test_utils::wait::ceiling(
                             Duration::from_secs(2),
                         )));

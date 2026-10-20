@@ -2636,9 +2636,12 @@ mod tests {
             BackgroundSnapshotFailure::PrepareSecondChanged,
         ));
         graph.ensure_loading();
-        wait_until_within(&graph, Duration::from_secs(5), "the publication to fail", || {
-            matches!(graph.status(), GraphStatus::Failed { .. })
-        });
+        wait_until_within(
+            &graph,
+            test_utils::wait::ceiling(Duration::from_secs(5)),
+            "the publication to fail",
+            || matches!(graph.status(), GraphStatus::Failed { .. }),
+        );
         assert!(graph.snapshot().is_none());
         graph.set_background_snapshot_failure_for_test(None);
         graph.ensure_loading();
@@ -2680,7 +2683,7 @@ mod tests {
 
         wait_until_within(
             &graph,
-            Duration::from_secs(2),
+            test_utils::wait::ceiling(Duration::from_secs(2)),
             "the reload to publish generation 2",
             || graph.snapshot().is_some_and(|snap| snap.generation == 2),
         );
@@ -2765,7 +2768,7 @@ mod tests {
 
         wait_until_within(
             &graph,
-            Duration::from_secs(5),
+            test_utils::wait::ceiling(Duration::from_secs(5)),
             "the topology-triggered reload to publish generation 2",
             || graph.snapshot().is_some_and(|snap| snap.generation == 2),
         );
@@ -2811,7 +2814,7 @@ mod tests {
         // fast path deliberately serves the cached topology until then).
         wait_until_within(
             &graph,
-            Duration::from_secs(5),
+            test_utils::wait::ceiling(Duration::from_secs(5)),
             "the new extension root to read as drift",
             || graph.freshness(&snap).stale,
         );

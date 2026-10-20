@@ -960,9 +960,9 @@ fn the_wait_inventory_fails_on_an_injected_sleep() {
     );
 }
 
-/// Every exact filter the Windows gate runs must name a test that exists on Windows.
+/// Every exact name the Windows gate runs must name a test that exists on Windows.
 ///
-/// `run_exact` fails a filter that executes no test — that is what makes a renamed or moved
+/// `run_tests` fails a name that executes no test — that is what makes a renamed or moved
 /// test visible instead of silently passing. A `#[cfg(unix)]` test copied into the Windows
 /// list is exactly that empty answer: the step fails over a case that cannot exist there,
 /// and it fails for a reason that has nothing to do with the code under review.
@@ -972,9 +972,10 @@ fn the_windows_gate_names_no_test_that_only_unix_builds() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
     )
     .expect("the workflow is readable");
-    let blocks: Vec<&str> = workflow.split("- name: Drift contract").collect();
-    assert_eq!(blocks.len(), 3, "the two Drift contract steps moved");
-    let windows = blocks[2];
+    let steps: Vec<&str> =
+        workflow.split("- name: Drift contract and workspace lease regressions").collect();
+    assert_eq!(steps.len(), 2, "the Windows drift contract step moved");
+    let windows = steps[1].split("\n      - name:").next().expect("the step text");
 
     let sources: Vec<String> = production_sources()
         .into_iter()
@@ -989,12 +990,87 @@ fn the_windows_gate_names_no_test_that_only_unix_builds() {
     );
 }
 
-/// Which of the Windows step's filters name a test that does not build on Windows.
+/// The gate above is shown the real Windows step with a name that cannot run there put into its
+/// array. A gate that read nothing of the real step — the step's shape changed, the arrays moved
+/// — passes the test above for the wrong reason; here it fails then, and it fails when the gate
+/// stops refusing such a name.
+#[test]
+fn the_windows_gate_refuses_a_unix_only_name_put_into_the_real_step() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
+    )
+    .expect("the workflow is readable");
+    let steps: Vec<&str> =
+        workflow.split("- name: Drift contract and workspace lease regressions").collect();
+    assert_eq!(steps.len(), 2, "the Windows drift contract step moved");
+    let windows = steps[1].split("\n      - name:").next().expect("the step text");
+
+    let sources: Vec<String> = production_sources()
+        .into_iter()
+        .map(|path| std::fs::read_to_string(&path).expect("Rust source is readable"))
+        .collect();
+    let name = a_test_that_builds_on_unix_only(&sources)
+        .expect("this crate has a test that exists on Unix only");
+    let injected = format!("m::{name}");
+    let marker = "mcp_server_names=(\n";
+    let at = windows.find(marker).expect("the step lists the mcp-server names") + marker.len();
+    let mutated = format!("{}            {injected}\n{}", &windows[..at], &windows[at..]);
+
+    assert_eq!(
+        windows_filters_that_do_not_build_there(&mutated, &sources),
+        [injected],
+        "the real Windows step accepts a name that exists on Unix only",
+    );
+}
+
+/// The name of a test of `sources` that is gated `#[cfg(unix)]` and is the first definition of
+/// its name, so that the gate attributes the name to the source it was found in.
+#[cfg(test)]
+fn a_test_that_builds_on_unix_only(sources: &[String]) -> Option<String> {
+    for source in sources {
+        for (at, attribute) in source.match_indices("#[cfg(unix)]") {
+            let rest = &source[at + attribute.len()..];
+            let Some(test_at) = rest.find("#[test]") else { continue };
+            if !rest[..test_at].trim().is_empty() {
+                continue;
+            }
+            let after = &rest[test_at + "#[test]".len()..];
+            let Some(fn_at) = after.find("fn ") else { continue };
+            if !after[..fn_at].trim().is_empty() {
+                continue;
+            }
+            let name: String = after[fn_at + "fn ".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let needle = format!("fn {name}(");
+            let first = sources.iter().find(|candidate| candidate.contains(&needle));
+            if !name.is_empty() && first.is_some_and(|first| std::ptr::eq(first, source)) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Which of the names listed in the Windows step's arrays name a test that does not build on
+/// Windows.
 #[cfg(test)]
 fn windows_filters_that_do_not_build_there(windows: &str, sources: &[String]) -> Vec<String> {
     let mut platform_only = Vec::new();
-    for line in windows.lines().map(str::trim).filter(|line| line.starts_with("run_exact ")) {
-        let filter = line.split_whitespace().last().expect("a filter");
+    let mut listed = false;
+    for line in windows.lines().map(str::trim) {
+        if line.ends_with("=(") {
+            listed = true;
+            continue;
+        }
+        if line == ")" {
+            listed = false;
+        }
+        if !listed || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let filter = line;
         let Some(name) = filter.rsplit("::").next() else { continue };
         let needle = format!("fn {name}(");
         for source in sources {
@@ -1045,10 +1121,9 @@ fn the_windows_gate_sees_every_spelling_of_a_fixture_that_is_not_there() {
     .iter()
     .map(|source| (*source).to_owned())
     .collect();
-    let windows = "          run_exact mcp-server m::only_on_unix\n          \
-                   run_exact mcp-server m::not_on_windows\n          \
-                   run_exact mcp-server m::not_on_that_target\n          \
-                   run_exact mcp-server m::everywhere\n";
+    let windows = "          mcp_server_names=(\n            m::only_on_unix\n            \
+                   m::not_on_windows\n            m::not_on_that_target\n            \
+                   m::everywhere\n          )\n";
 
     assert_eq!(
         windows_filters_that_do_not_build_there(windows, &sources),
@@ -1070,10 +1145,9 @@ fn the_windows_gate_accepts_a_fixture_that_builds_there() {
     .iter()
     .map(|source| (*source).to_owned())
     .collect();
-    let windows = "          run_exact mcp-server m::only_on_windows\n          \
-                   run_exact mcp-server m::windows_spelled_short\n          \
-                   run_exact mcp-server m::not_on_linux\n          \
-                   run_exact mcp-server m::only_on_linux\n";
+    let windows = "          mcp_server_names=(\n            m::only_on_windows\n            \
+                   m::windows_spelled_short\n            m::not_on_linux\n            \
+                   m::only_on_linux\n          )\n";
 
     assert_eq!(
         windows_filters_that_do_not_build_there(windows, &sources),

@@ -135,6 +135,15 @@ cargo test --all
 UPDATE_EXPECT=1 cargo test  # Обновить snapshots после анализа
 ```
 
+Интеграционный тест, который не трогает состояние процесса (переменные окружения,
+текущий каталог, глобальный аллокатор, установку справки платформы, процессные
+переопределения) и не перезапускает свой бинарник, кладётся модулем в общую цель
+крейта `tests/<крейт>_suite/` (`mod <имя>;` в её `main.rs`, по алфавиту): каждая
+отдельная цель — своя линковка и свой запуск процесса. Отдельным файлом
+`tests/<имя>.rs` остаются тесты, которым нужен свой процесс, и цели, которые CI
+зовёт по имени (`--test <имя>`). Файл общей цели выбирается фильтром:
+`cargo test -p ide --test ide_suite -- hover_baseline::`.
+
 ### 2. Качество кода
 
 ```bash
@@ -231,7 +240,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic>                      /
 
 Инвариант per-method мемо — позиционная независимость: `check_body` не должен
 доставать файловое состояние окольным путём (через провайдер, `symbol_tree`,
-`module_bodies`). Утечку ловит гейт I1 (`crates/ide/tests/method_increment_churn.rs`:
+`module_bodies`). Утечку ловит гейт I1 (`crates/ide/tests/ide_suite/method_increment_churn.rs`:
 `execute == 1` на правку тела) — прогонять его при добавлении нового чтения в
 `BodyContext`/`AnalysisContext`.
 
@@ -359,7 +368,7 @@ corpus-contract: `RUSTFLAGS` пересобирает всё.
 пакет справки (см. «Пакет справки для публикации» ниже) и публикуется
 владельцем хранилища; закреплённый вход corpus-contract меняется осознанно —
 вместе с `PINNED_CORPUS_SHA256` и дайджестом наблюдаемой поверхности в
-`crates/bsl-platform/tests/help_corpus_equivalence.rs`.
+`crates/bsl-platform/tests/bsl_platform_suite/help_corpus_equivalence.rs`.
 
 ### Входы из Docker-платформы и реальный smoke
 
@@ -377,7 +386,7 @@ docker exec "$container" sha256sum "$platform_dir/shcntx_ru.hbk" "$platform_dir/
 sha256sum "$hbk_dir/shcntx_ru.hbk" "$hbk_dir/shlang_ru.hbk"
 
 BSL_PLATFORM_HELP_SMOKE_DIR="$hbk_dir" \
-  cargo test --release -p platform-help --test real_hbk_smoke -- --ignored --nocapture
+  cargo test --release -p platform-help --test platform_help_suite -- real_hbk_smoke:: --ignored --nocapture
 ```
 
 Smoke читает оба реальных HBK собственным reader'ом, проверяет режим

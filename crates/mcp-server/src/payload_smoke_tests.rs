@@ -19,7 +19,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-const CASE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A hang watchdog for one smoke case, enforced only by the timing profile: a loaded machine
+/// may take longer, and an ordinary run waits for the case itself.
+const CASE_TIMEOUT: Duration = test_utils::wait::ceiling(Duration::from_secs(30));
 const UNSAFE_PROVIDER_BODY: &str = "RAW_PROVIDER_SENTINEL: пароль 🚫 UTF-8 тело запроса";
 
 #[derive(Clone)]

@@ -8,6 +8,11 @@ rust-version.workspace = true
 [lib]
 doctest = false
 
+[features]
+# Test-only knobs that shorten production waits for the tests of dependent crates; enabled
+# by those crates' dev-dependencies alone, so no ordinary build carries them.
+test-seams = []
+
 [dependencies]
 bsl-conventions.workspace = true
 code-chunk.workspace = true

@@ -831,7 +831,23 @@ pub(crate) fn has_module_syntax(code: &str) -> bool {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    use std::sync::Arc;
+
+    /// Writes an executable through a child process. A file some process still holds open for
+    /// writing cannot be executed (`ETXTBSY`), and a child that another test thread forks while
+    /// this one writes holds the descriptor until it execs: a program written here and spawned
+    /// at once would start or not depending on what the other threads were doing.
+    fn write_executable(path: &std::path::Path, text: &str) {
+        let staged = path.with_extension("staged");
+        std::fs::write(&staged, text).unwrap();
+        let installed = std::process::Command::new("install")
+            .args(["-m", "700"])
+            .arg(&staged)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(installed.success(), "install {}", path.display());
+    }
 
     #[test]
     fn reaper_stops_when_the_child_was_collected_elsewhere() {
@@ -994,8 +1010,7 @@ if mode == 'exit1': sys.exit(1)
     ) -> CallToolResult {
         let temp = tempfile::tempdir().unwrap();
         let program = temp.path().join("executor.py");
-        std::fs::write(&program, FAKE_EXECUTOR).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&program, FAKE_EXECUTOR);
         let mut profile = test_profile();
         profile.program = program;
         profile.args = vec![mode.into()];
@@ -1059,8 +1074,7 @@ if mode == 'exit1': sys.exit(1)
     async fn input_bounds_reject_before_ast_preflight_or_executor_spawn() {
         let temp = tempfile::tempdir().unwrap();
         let program = temp.path().join("executor.py");
-        std::fs::write(&program, FAKE_EXECUTOR).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&program, FAKE_EXECUTOR);
         let marker = temp.path().join("spawned");
         let profile = routing_profile(&program, &marker, "route-valid", true);
 
@@ -1092,8 +1106,7 @@ if mode == 'exit1': sys.exit(1)
     async fn check_syntax_routes_snippets_and_modules_by_profile_without_fallback() {
         let temp = tempfile::tempdir().unwrap();
         let program = temp.path().join("route-executor.py");
-        std::fs::write(&program, FAKE_EXECUTOR).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&program, FAKE_EXECUTOR);
         let marker = temp.path().join("routes.log");
 
         // Snippet routing follows handles_snippet, while module input always selects the
@@ -1375,8 +1388,7 @@ if mode == 'exit1': sys.exit(1)
             let recovery_path = temp.path().join("recovery-required");
             let identity_path = temp.path().join("child-identity");
             let ready_path = temp.path().join("child-ready");
-            std::fs::write(&program, FAKE_EXECUTOR).unwrap();
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            write_executable(&program, FAKE_EXECUTOR);
             let mut profile = test_profile();
             profile.program = program;
             profile.args = vec![
@@ -1482,15 +1494,13 @@ if mode == 'exit1': sys.exit(1)
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("spawned");
         let program = temp.path().join("executor.py");
-        std::fs::write(
+        write_executable(
             &program,
-            format!(
+            &format!(
                 "#!/usr/bin/env python3\nimport pathlib,sys\npathlib.Path({:?}).touch()\n",
                 marker.to_string_lossy()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let mut profile = test_profile();
         profile.program = program;
         profile.timeout = Duration::from_millis(40);
@@ -1511,11 +1521,11 @@ if mode == 'exit1': sys.exit(1)
 
         let queued_limits = temp.path().join("queued-timeout-ms");
         let queued_program = temp.path().join("queued-executor.py");
-        std::fs::write(&queued_program, FAKE_EXECUTOR).unwrap();
-        std::fs::set_permissions(&queued_program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&queued_program, FAKE_EXECUTOR);
         let mut queued_profile = test_profile();
         queued_profile.program = queued_program;
-        queued_profile.timeout = Duration::from_millis(1_000);
+        // Far past the scheduling of the permit below, so the queue cannot run out first.
+        queued_profile.timeout = Duration::from_secs(600);
         queued_profile.args = vec!["record-timeout".into(), queued_limits.clone().into_os_string()];
         queued_profile.semaphore = Arc::new(tokio::sync::Semaphore::new(0));
         let semaphore = queued_profile.semaphore.clone();
@@ -1540,7 +1550,7 @@ if mode == 'exit1': sys.exit(1)
         assert_eq!(result_code(&result), None);
         let forwarded = std::fs::read_to_string(queued_limits).unwrap().parse::<u64>().unwrap();
         assert!(
-            forwarded > 0 && forwarded < 1_000,
+            forwarded > 0 && forwarded < 600_000,
             "queued request receives only the remaining deadline: {forwarded}ms"
         );
 

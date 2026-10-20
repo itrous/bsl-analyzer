@@ -352,7 +352,7 @@ Feature flag `type_narrowing` в `bsl-analyzer.toml` даёт off-switch
 
 | # | Статус | Подтверждающие тесты / артефакты |
 |---|---|---|
-| 1 | ✅ | `Expr::Path` → `Resolver::resolve_name`; `Expr::New`, `Expr::Call(QualifiedPath)` (2 и 3 сегмента) → `TyLoweringContext` + `Resolver::resolve_qualified_method` / `resolve_three_level_method`. Регрессии: `crates/ide/tests/type_system_invariants.rs::single_resolver_cascade_*`. |
+| 1 | ✅ | `Expr::Path` → `Resolver::resolve_name`; `Expr::New`, `Expr::Call(QualifiedPath)` (2 и 3 сегмента) → `TyLoweringContext` + `Resolver::resolve_qualified_method` / `resolve_three_level_method`. Регрессии: `crates/ide/tests/ide_suite/type_system_invariants.rs::single_resolver_cascade_*`. |
 | 2 | ✅ | `TypeRef` и варианты `Ty` — plain data (`crates/hir-def/src/type_ref.rs`, `crates/hir-def/src/ty.rs`). |
 | 3 | ✅ | Фасад `hir::Type` (`crates/hir/src/type_facade.rs`). `Semantics::type_of_expr(file_id, &SyntaxNode) → Ty` поверх `InferenceResult::expr_types_by_body`. Consumers мигрированы (`platform_completion`, `mdo_completion`). CI-гейт: `scripts/check-invariants.sh`. |
 | 4 | ✅ | `ConfigsDatabase`, bridge `AttributeType → TypeRef`, `hir_ty::method_lookup::lookup_method`, `hir_ty::field_lookup::lookup_field`. `bsl_platform::manager_methods_query` вынесла последний IDE-side `PlatformData::instance()` за Salsa-gate. |
