@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Check the CI test wrappers preserve failures and reject filters that select nothing,
-that every Windows job routes each `cargo test` through one, and that the legs of the
-`check` matrix together cover the workspace once."""
+that every Windows job routes each `cargo test` through one, that the legs of the
+`check` matrix together cover the workspace once, and that the test-only seams reach a
+build through dev-dependencies alone."""
 
 from pathlib import Path
 import fnmatch
@@ -193,9 +194,45 @@ for name in sorted(targets | set(alphabet) | {c + "x" for c in alphabet}):
     matched = [mask for mask in masks if fnmatch.fnmatchcase(name, mask)]
     assert len(matched) == 1, f"integration target {name!r} falls under {matched}"
 
+def seam_leaks(packages):
+    """Every way a `test-seams` feature can reach a build other than through a
+    dev-dependency: a normal or build dependency that turns one on, a feature of any
+    package that lists one, or a `default` that includes one. The seams shorten waits
+    of the product, so a build that carries them is not the product."""
+    leaks = []
+    for package in packages:
+        for dependency in package["dependencies"]:
+            if any(feature.endswith("test-seams") for feature in dependency["features"]):
+                if dependency["kind"] != "dev":
+                    leaks.append(f"{package['name']} -> {dependency['name']}: {dependency['kind'] or 'normal'} dependency")
+        for feature, enables in package["features"].items():
+            if any(item.endswith("test-seams") for item in enables):
+                leaks.append(f"{package['name']}: feature {feature!r} enables {enables}")
+    return leaks
+
+
+synthetic = [
+    {"name": "user", "features": {}, "dependencies": [
+        {"name": "lib", "kind": None, "features": ["test-seams"]},
+        {"name": "lib", "kind": "build", "features": ["test-seams"]},
+        {"name": "lib", "kind": "dev", "features": ["test-seams"]},
+    ]},
+    {"name": "lib", "dependencies": [], "features": {"test-seams": [], "default": ["test-seams"], "full": ["other/test-seams"]}},
+]
+assert len(seam_leaks(synthetic)) == 4, seam_leaks(synthetic)
+assert not seam_leaks([{"name": "ok", "features": {"test-seams": []}, "dependencies": [
+    {"name": "lib", "kind": "dev", "features": ["test-seams"]}]}])
+assert not seam_leaks(metadata["packages"]), seam_leaks(metadata["packages"])
+assert any(
+    dependency["kind"] == "dev" and "test-seams" in dependency["features"]
+    for package in metadata["packages"] for dependency in package["dependencies"]
+), "no dev-dependency uses a test seam: the check above looked at nothing"
+
+
 print(
     f"PASS: {len(wrappers)} CI wrappers (run_nonempty success/empty/failure; run_tests filters, "
     "exactness, failures and streamed output; list_tests runnable names without running); "
     f"shared LSP step wraps its tests; {len(windows)} Windows jobs wrap every cargo test; "
-    f"{len(legs)} check legs split the unit filters and {len(targets)} integration targets once"
+    f"{len(legs)} check legs split the unit filters and {len(targets)} integration targets once; "
+    "test seams only in dev-dependencies"
 )
