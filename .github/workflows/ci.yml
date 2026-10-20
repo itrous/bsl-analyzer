@@ -33,7 +33,7 @@ jobs:
   check:
     # Every leg runs its share of `cargo test --workspace` under the same feature
     # unification, so the legs together run exactly what one full run would: the
-    # library filters of `unit-a` are the `--skip`s of `unit-b`, and the integration
+    # `--skip`s of `unit-a` are the library filters of `unit-b`, and the integration
     # target masks cover every name once.
     name: Check (${{ matrix.shard }})
     runs-on: ubuntu-latest
@@ -59,7 +59,8 @@ jobs:
           # test, so every dev-dependency, and its cache serves the other legs.
           save-if: ${{ matrix.shard == 'unit-a' }}
       - run: cargo test --locked --workspace --no-fail-fast ${{ matrix.select }}
-      - if: matrix.shard == 'unit-b'
+      # Run even when the library tests above failed, so one run reports both.
+      - if: ${{ !cancelled() && matrix.shard == 'unit-b' }}
         run: cargo test --locked --workspace --no-fail-fast --doc
       - name: Named library and CLI regressions exist
         if: matrix.shard == 'unit-a'

@@ -169,7 +169,8 @@ assert not any("-p" in leg for leg in words.values()), "a check leg selects a pa
 assert all(legs[shard].startswith("--lib --bins --") for shard in ("unit-a", "unit-b")), legs
 assert sum("--examples" in leg for leg in words.values()) == 1, "examples must be built by one leg"
 assert re.search(
-    r"^      - if: matrix\.shard == 'unit-b'\n        run: cargo test --locked --workspace --no-fail-fast --doc$",
+    r"^      - if: \$\{\{ !cancelled\(\) && matrix\.shard == 'unit-b' \}\}\n"
+    r"        run: cargo test --locked --workspace --no-fail-fast --doc$",
     check, re.MULTILINE,
 ), "no doc-test step on the unit-b leg"
 assert re.search(
