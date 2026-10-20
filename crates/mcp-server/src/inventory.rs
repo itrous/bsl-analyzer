@@ -960,9 +960,9 @@ fn the_wait_inventory_fails_on_an_injected_sleep() {
     );
 }
 
-/// Every exact filter the Windows gate runs must name a test that exists on Windows.
+/// Every exact name the Windows gate runs must name a test that exists on Windows.
 ///
-/// `run_exact` fails a filter that executes no test — that is what makes a renamed or moved
+/// `run_tests` fails a name that executes no test — that is what makes a renamed or moved
 /// test visible instead of silently passing. A `#[cfg(unix)]` test copied into the Windows
 /// list is exactly that empty answer: the step fails over a case that cannot exist there,
 /// and it fails for a reason that has nothing to do with the code under review.
@@ -972,9 +972,10 @@ fn the_windows_gate_names_no_test_that_only_unix_builds() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
     )
     .expect("the workflow is readable");
-    let blocks: Vec<&str> = workflow.split("- name: Drift contract").collect();
-    assert_eq!(blocks.len(), 3, "the two Drift contract steps moved");
-    let windows = blocks[2];
+    let steps: Vec<&str> =
+        workflow.split("- name: Drift contract and workspace lease regressions").collect();
+    assert_eq!(steps.len(), 2, "the Windows drift contract step moved");
+    let windows = steps[1].split("\n      - name:").next().expect("the step text");
 
     let sources: Vec<String> = production_sources()
         .into_iter()
@@ -989,12 +990,24 @@ fn the_windows_gate_names_no_test_that_only_unix_builds() {
     );
 }
 
-/// Which of the Windows step's filters name a test that does not build on Windows.
+/// Which of the names listed in the Windows step's arrays name a test that does not build on
+/// Windows.
 #[cfg(test)]
 fn windows_filters_that_do_not_build_there(windows: &str, sources: &[String]) -> Vec<String> {
     let mut platform_only = Vec::new();
-    for line in windows.lines().map(str::trim).filter(|line| line.starts_with("run_exact ")) {
-        let filter = line.split_whitespace().last().expect("a filter");
+    let mut listed = false;
+    for line in windows.lines().map(str::trim) {
+        if line.ends_with("=(") {
+            listed = true;
+            continue;
+        }
+        if line == ")" {
+            listed = false;
+        }
+        if !listed || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let filter = line;
         let Some(name) = filter.rsplit("::").next() else { continue };
         let needle = format!("fn {name}(");
         for source in sources {
@@ -1045,10 +1058,9 @@ fn the_windows_gate_sees_every_spelling_of_a_fixture_that_is_not_there() {
     .iter()
     .map(|source| (*source).to_owned())
     .collect();
-    let windows = "          run_exact mcp-server m::only_on_unix\n          \
-                   run_exact mcp-server m::not_on_windows\n          \
-                   run_exact mcp-server m::not_on_that_target\n          \
-                   run_exact mcp-server m::everywhere\n";
+    let windows = "          mcp_server_names=(\n            m::only_on_unix\n            \
+                   m::not_on_windows\n            m::not_on_that_target\n            \
+                   m::everywhere\n          )\n";
 
     assert_eq!(
         windows_filters_that_do_not_build_there(windows, &sources),
@@ -1070,10 +1082,9 @@ fn the_windows_gate_accepts_a_fixture_that_builds_there() {
     .iter()
     .map(|source| (*source).to_owned())
     .collect();
-    let windows = "          run_exact mcp-server m::only_on_windows\n          \
-                   run_exact mcp-server m::windows_spelled_short\n          \
-                   run_exact mcp-server m::not_on_linux\n          \
-                   run_exact mcp-server m::only_on_linux\n";
+    let windows = "          mcp_server_names=(\n            m::only_on_windows\n            \
+                   m::windows_spelled_short\n            m::not_on_linux\n            \
+                   m::only_on_linux\n          )\n";
 
     assert_eq!(
         windows_filters_that_do_not_build_there(windows, &sources),
