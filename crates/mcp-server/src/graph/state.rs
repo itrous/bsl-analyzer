@@ -3617,6 +3617,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             sample_workspace(root);
+            // The late write lands in this directory. Created only by that write, it would be a
+            // directory the watch has to pick up first, and under load the write inside it can
+            // go undelivered: the barrier would then wait for a fact the hub never sees.
+            std::fs::create_dir_all(root.join("CommonModules/Поздний/Ext")).unwrap();
             let hub = crate::graph::test_support::workspace_hub(root);
             assert!(hub.wait_until_watching());
 
@@ -3737,7 +3741,7 @@ mod tests {
             graph.drive();
             wait_until_within(
                 &graph,
-                test_utils::wait::ceiling(Duration::from_secs(60)),
+                test_utils::wait::hang_guard(Duration::from_secs(60)),
                 "the build admitted at the barrier to publish",
                 || lock_recover(&sampled).is_some(),
             );

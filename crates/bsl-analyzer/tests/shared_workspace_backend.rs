@@ -408,7 +408,20 @@ fn isolated_backend_env(cache: &Path, runtime: &Path) -> EnvGuard {
     env.set("TMP", runtime);
     env.set("TEMP", runtime);
     env.set("TMPDIR", runtime);
+    precreate_broker_socket_dir(runtime);
     env
+}
+
+/// The broker socket dir an adapter makes on first launch. Two adapters started together both
+/// see it missing, and the one whose `mkdir` loses gets `EEXIST`, gives up on the shared backend
+/// and serves stdio in-process: the scenario then waits for an attach that never comes. Made
+/// here, the dir is one both adapters only validate, and the scenario is the attach order alone.
+fn precreate_broker_socket_dir(runtime: &Path) {
+    let dir = runtime.join("bsl-mcp");
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&dir).expect("broker socket dir in the disposable runtime tree");
 }
 
 async fn wait_for_owner_initializers(runtime: &Path, count: usize) -> Vec<String> {
@@ -741,7 +754,10 @@ fn request_until_ready(
 }
 
 async fn wait_for_backend_markers(runtime: &Path) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
+    // A hang guard, not a latency bound: an adapter that never attaches fails with the markers
+    // it left instead of holding the runner.
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(30));
     loop {
         let markers = backend_markers(runtime);
         if markers.iter().filter(|line| line.contains("session_attached")).count() >= 3
