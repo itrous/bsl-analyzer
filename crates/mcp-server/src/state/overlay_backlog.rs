@@ -829,7 +829,9 @@ mod tests {
 
     /// [`engine_over`] for a test that holds SQLite's writer itself: the engine's connection
     /// gives up on it after 50 ms instead of the operational 30 s, so the steps the test takes
-    /// with the writer held answer at once rather than after the whole budget.
+    /// with the writer held answer at once rather than after the whole budget. The owner's
+    /// first point commit puts the 30 s back; every step these tests take on the connection
+    /// with the writer held comes before it.
     fn engine_over_held_writer(workspace: &Path, files: usize) -> SharedSearchEngine {
         let shared = engine_over(workspace, files);
         shared

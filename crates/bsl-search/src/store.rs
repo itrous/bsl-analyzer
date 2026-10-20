@@ -588,7 +588,8 @@ impl Store {
     /// wait and succeed.
     /// Shorten this connection's contention budget, for a test that holds the writer itself
     /// and has steps of its own to take meanwhile: under the default budget each of them would
-    /// wait the whole budget out before carrying on.
+    /// wait the whole budget out before carrying on. It lasts until the connection's next point
+    /// commit or fenced open, which put the operational budget back.
     #[cfg(any(test, feature = "test-seams"))]
     pub fn set_busy_timeout_for_test(
         &self,
