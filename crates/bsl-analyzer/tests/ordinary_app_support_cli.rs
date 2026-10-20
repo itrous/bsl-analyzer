@@ -1,7 +1,7 @@
 //! `ordinaryAppSupport` left out of the project config is taken from the main
-//! configuration's `<DefaultRunMode>`, and `analyze` uses that one value both for
-//! the diagnostics settings and for the execution model. An explicit setting still
-//! wins.
+//! configuration's `<DefaultRunMode>`, and an explicit setting still wins. The
+//! setting decides what the diagnostics rules check; where a common module
+//! compiles is a fact of its metadata and does not depend on it.
 
 use std::path::Path;
 use std::process::Command;
@@ -109,17 +109,20 @@ fn findings(root: &Path) -> Vec<(String, String)> {
     found
 }
 
+/// The client module compiles only into the ordinary thick client, so the call to
+/// it from the server is reported whatever the setting says.
+fn managed_findings() -> Vec<(String, String)> {
+    vec![("ModuleAccessibility".to_owned(), "CommonModules/Серверный/Ext/Module.bsl".to_owned())]
+}
+
 fn ordinary_findings() -> Vec<(String, String)> {
-    vec![
-        ("ModuleAccessibility".to_owned(), "CommonModules/Серверный/Ext/Module.bsl".to_owned()),
-        ("OrdinaryAppSupport".to_owned(), "Ext/SessionModule.bsl".to_owned()),
-    ]
+    let mut found = managed_findings();
+    found.push(("OrdinaryAppSupport".to_owned(), "Ext/SessionModule.bsl".to_owned()));
+    found
 }
 
 /// Under the ordinary application the session-module rule checks the form-kind
-/// properties (diagnostics settings), and the client module compiles into the
-/// ordinary thick client, so the call from the server is reported (execution
-/// model) - with no `[diagnostics]` or `[features]` setting at all.
+/// properties - with no `[diagnostics]` or `[features]` setting at all.
 #[test]
 fn ordinary_run_mode_turns_ordinary_app_support_on() {
     let dir = tempfile::tempdir().unwrap();
@@ -131,14 +134,14 @@ fn ordinary_run_mode_turns_ordinary_app_support_on() {
 fn managed_run_mode_leaves_ordinary_app_support_off() {
     let dir = tempfile::tempdir().unwrap();
     project(dir.path(), "ManagedApplication", "");
-    assert_eq!(findings(dir.path()), Vec::new());
+    assert_eq!(findings(dir.path()), managed_findings());
 }
 
 #[test]
 fn an_explicit_setting_overrides_the_run_mode() {
     let dir = tempfile::tempdir().unwrap();
     project(dir.path(), "OrdinaryApplication", "[diagnostics]\nordinaryAppSupport = false\n");
-    assert_eq!(findings(dir.path()), Vec::new());
+    assert_eq!(findings(dir.path()), managed_findings());
 
     let dir = tempfile::tempdir().unwrap();
     project(dir.path(), "ManagedApplication", "[diagnostics]\nordinaryAppSupport = true\n");

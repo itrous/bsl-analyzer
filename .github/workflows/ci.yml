@@ -7,14 +7,21 @@ on:
     branches: [develop]
   workflow_dispatch:
 
+concurrency:
+  # A newer push to a pull request supersedes its running check; push runs on
+  # develop each get their own group and are never cancelled.
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
-    name: Check
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -22,294 +29,368 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: python3 scripts/test-ci-test-output.py
       - run: cargo clippy --all-targets --all-features
-      - name: Native check executor tests without 1C
-        run: cargo test --locked -p bsl-check-executor
-      - name: Workspace cache paths and scopes
+
+  check:
+    # Every leg runs its share of `cargo test --workspace` under the same feature
+    # unification, so the legs together run exactly what one full run would: the
+    # `--skip`s of `unit-a` are the library filters of `unit-b`, and the integration
+    # target masks cover every name once.
+    name: Check (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: unit-a
+            select: "--lib --bins -- --skip state::overlay_ --skip state::bootstrap:: --skip state::embed:: --skip state::sync::"
+          - shard: unit-b
+            select: "--lib --bins -- state::overlay_ state::bootstrap:: state::embed:: state::sync::"
+          - shard: tests-a-m
+            select: "--test '[a-m]*'"
+          - shard: tests-n-z
+            select: "--test '[!a-m]*' --examples"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The legs share this job's cache key; the unit-a leg builds every library
+          # test, so every dev-dependency, and its cache serves the other legs.
+          save-if: ${{ matrix.shard == 'unit-a' }}
+      - run: cargo test --locked --workspace --no-fail-fast ${{ matrix.select }}
+      # Run even when the library tests above failed, so one run reports both.
+      - if: ${{ !cancelled() && matrix.shard == 'unit-b' }}
+        run: cargo test --locked --workspace --no-fail-fast --doc
+      - name: Named library and CLI regressions exist
+        if: matrix.shard == 'unit-a'
         shell: bash
         run: |
           set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p mcp-server --lib workspace_cache_
-          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app workspace_cache_scope_
-          run_nonempty -p bsl-analyzer --test source_set_cli workspace_cache_scope_
-      - name: Portable workspace lease profiles
-        run: |
-          set -euo pipefail
-          run_exact() {
-            # `set -e` aborts the function on the ASSIGNMENT when cargo fails, before the
-            # print below — so the failing test's output never reaches the log. Take the
-            # status by hand, print, and only then decide.
-            local output status
-            output=$(cargo test -p mcp-server --lib "$1" -- --exact 2>&1) && status=0 || status=$?
-            printf '%s\n' "$output"
+          list_tests() {
+            # list_tests [--exact] <test binary> <cargo test selection>... [-- <filter>...]
+            # Lists without running: every filter must name a listed, non-ignored test of
+            # the binary (`mcp_server`, `source_set_cli`, ...); with no filter the binary
+            # must list one. The selection is the one the leg already built, so nothing
+            # compiles. The workflow forces colour on cargo, and a coloured `Running` line
+            # would hide every section from the pattern, so these listings ask for none.
+            local exact=() binary selection=() filters=() listed ignored runnable status filter missing=0
+            local pick='/ Running /{b=$0; sub(/.*deps\//,"",b); sub(/-[0-9a-f]+\)$/,"",b); cur=b; next} cur==want && /: test$/{sub(/: test$/,""); print}'
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            binary=$1; shift
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            listed=$(cargo test --color never "${selection[@]}" -- --list "${exact[@]}" "${filters[@]}" 2>&1) && status=0 || status=$?
+            printf '%s\n' "$listed"
             if [ "$status" -ne 0 ]; then
-              echo "::error::$1 failed with status $status"
               return "$status"
             fi
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_exact workspace_lease::tests::contention_unclaimed_and_missing_are_transient
-          run_exact workspace_lease::tests::a_throttled_checkpoint_still_reports_a_release
-          run_exact graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement
-          run_exact tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease
-          run_exact tools::search::tests::all_search_modes_are_resident_only_under_held_lease
-          run_exact tests::all_status_requests_are_cached_under_held_lease
-          run_exact inventory::no_generic_or_unclassified_production_lease_callers
-          run_exact inventory::fence_callers_are_exactly_classified
-          run_exact inventory::request_paths_do_not_call_lease_or_mutation_helpers
-          run_exact inventory::production_source_handles_checkout_line_endings
-          run_exact inventory::production_source_keeps_the_request_handlers_of_lib_rs
-          run_exact inventory::production_source_drops_the_test_modules_of_real_sources
-          run_exact inventory::the_request_path_gate_fails_on_an_injected_lease_call
-          run_exact state::embed::tests::prepared_index_survives_transient_swap_without_rebuild
-      - name: Drift contract
-        run: |
-          set -euo pipefail
-          # Exact names, each required to run at least one test: a renamed or moved test
-          # would otherwise match nothing and pass.
-          run_exact() {
-            local output status
-            output=$(cargo test -p "$1" --lib "$2" -- --exact 2>&1) && status=0 || status=$?
-            printf '%s\n' "$output"
+            ignored=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1) && status=0 || status=$?
             if [ "$status" -ne 0 ]; then
-              echo "::error::$2 failed with status $status"
+              printf '%s\n' "$ignored"
               return "$status"
             fi
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+            runnable=$(comm -23 <(awk -v want="$binary" "$pick" <<<"$listed" | sort -u) <(awk -v want="$binary" "$pick" <<<"$ignored" | sort -u))
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$runnable" ]; then
+              echo "::error::$binary lists no runnable test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$runnable" || { echo "::error::$binary has no runnable test $filter"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$runnable" || { echo "::error::$binary has no runnable test matching $filter"; missing=1; }
+              fi
+            done
+            return "$missing"
           }
-          run_exact mcp-server state::background_lifetime_tests::shutdown_stops_every_owner_within_a_second
-          run_exact mcp-server change_hub::tests::interrupted_waiters_return_at_once_and_stay_released
-          run_exact mcp-server change_hub::tests::a_hub_without_a_watch_polls_after_one_reconcile
-          run_exact mcp-server change_hub::tests::a_same_stat_edit_is_found_by_the_content_check_once
-          run_exact mcp-server graph::state::tests::marks_are_consumed_by_an_observing_publication_in_every_order
-          run_exact mcp-server graph::watcher::tests::marks_placed_after_the_graph_caught_up_on_its_own_are_consumed_at_once
-          run_exact mcp-server graph::watcher::tests::owed_marks_force_a_rebuild_of_an_unchanged_graph
-          run_exact mcp-server graph::watcher::tests::a_stalled_search_cursor_costs_the_hub_its_capacity_at_most_and_the_graph_nothing
-          run_exact mcp-server state::bootstrap::tests::a_quiet_healthy_boot_asks_for_no_reconcile_mark_or_reload
-          run_exact mcp-server state::bootstrap::tests::the_graph_follows_edits_after_search_init_failed
-          run_exact mcp-server state::bootstrap::tests::a_workspace_without_a_watch_follows_edits_through_the_poll
-          run_exact mcp-server state::bootstrap::tests::a_superseded_daemon_applies_nothing_more_and_releases_its_cursors
-          run_exact mcp-server state::bootstrap::tests::the_search_and_the_graph_say_who_watches_them
-          run_exact mcp-server state::overlay_backlog::tests::a_large_backlog_drains_without_pauses_between_batches
-          run_exact mcp-server state::overlay_backlog::tests::a_held_writer_lock_refuses_the_commit_and_a_stop_is_answered_during_the_backoff
-          run_exact mcp-server state::overlay_backlog::tests::point_batches_and_full_plans_do_not_roll_each_other_back
-          run_exact mcp-server tools::search::acquire::tests::acquisitions_are_served_in_ticket_order_with_one_raw_waiter
-          run_exact mcp-server inventory::the_search_engine_is_held_only_through_its_admission
-          run_exact mcp-server inventory::production_source_ends_a_gated_variant_or_arm_at_its_comma
-          run_exact mcp-server inventory::production_source_keeps_the_tail_of_a_gated_statement_with_generic_arguments
-          run_exact mcp-server tools::search::render::tests::answers_pass_the_schema_their_profile_publishes
-          run_exact mcp-server contract::tests::mcp_surface_snapshot
-          run_exact mcp-server graph::state::tests::freshness_rests_on_the_drift_watch
-          run_exact mcp-server graph::state::tests::owed_marks_stop_rebuilding_when_their_budget_is_spent
-          run_exact mcp-server graph::build::tests::a_failed_reload_is_owed_behind_its_backoff
-          run_exact mcp-server graph::watcher::tests::a_failed_reload_is_retried_without_another_event
-          run_exact mcp-server graph::watcher::tests::a_reconcile_owes_a_project_reload_in_every_live_state
-          run_exact mcp-server change_hub::tests::the_content_check_keeps_its_budget_for_a_large_file
-          run_exact mcp-server change_hub::tests::a_same_stat_edit_before_the_first_read_is_found
-          run_exact mcp-server state::overlay_backlog::tests::a_stop_during_preparation_is_answered_between_keys
-          run_exact mcp-server state::overlay_backlog::tests::a_busy_commit_is_offered_again_soon
-          run_exact mcp-server state::overlay_retry::tests::a_wake_between_the_check_and_the_sleep_is_not_lost
-          run_exact mcp-server state::sync::tests::a_consumer_blocked_on_its_first_fence_is_not_yet_watching
-          run_exact mcp-server state::consumer_phase_tests::a_consumer_whose_thread_never_ran_is_abandoned
-          run_exact mcp-server graph::build::tests::a_failed_reload_whose_retry_is_held_stays_owed
-          run_exact mcp-server graph::build::tests::a_refused_first_build_is_owed_a_retry
-          run_exact mcp-server graph::state::tests::marks_that_revive_a_spent_obligation_wake_the_watcher
-          run_exact mcp-server tools::search::render::tests::an_index_whose_watch_is_starting_is_not_complete
-          run_exact mcp-server state::overlay_backlog::tests::a_drained_backlog_stops_counting_as_work_at_once
-          run_exact mcp-server state::overlay_backlog::tests::a_revived_owner_starts_its_busy_schedule_over
-          run_exact mcp-server state::background_lifetime_tests::shutdown_does_not_wait_out_an_engine_hold
-          run_exact bsl-search point_refresh::structure::the_point_path_keeps_its_shape
-          run_exact bsl-search point_refresh::structure::the_point_path_gate_reads_a_crlf_checkout
-          run_exact bsl-search point_refresh::tests::a_cancelled_preparation_reads_no_further_key
-          run_exact bsl-search engine::retry_signal_ownership::marks_alone_demand_no_embedding_pass
-          run_exact bsl-search engine::tests::a_local_drift_removal_hides_nothing
-          run_exact bsl-search point_refresh::tests::a_bounded_publication_refuses_whole_baseline_loads_and_phase_c_needs_none
-          run_exact bsl-search point_refresh::tests::a_busy_store_gives_the_batch_back_and_the_retry_reads_nothing
-          run_exact bsl-search store::tests::every_baseline_write_moves_the_baseline_version
-          run_exact mcp-server change_hub::tests::a_repeated_declaration_costs_the_fallback_poll_nothing
-          run_exact mcp-server change_hub::tests::a_declaration_naming_a_missing_root_is_reported_once
-          run_exact mcp-server change_hub::tests::two_owners_declaring_one_set_declare_it_once
-          run_exact mcp-server change_hub::tests::shutdown_stops_the_fallback_poll
-          run_exact mcp-server graph::debt::tests::two_owners_recording_one_reconcile_owe_one_build
-          run_exact mcp-server graph::debt::tests::a_quiet_graph_starts_no_build_of_its_own
-          run_exact mcp-server graph::debt::tests::an_unsound_publication_is_probed_and_only_a_healing_rebuilds
-          run_exact mcp-server graph::state::tests::a_loader_that_cannot_start_is_owed_a_retry
-          run_exact mcp-server graph::state::tests::a_publication_cannot_be_installed_while_marks_are_being_consumed
-          run_exact mcp-server graph::state::tests::marks_survive_a_lease_that_cannot_be_confirmed
-          run_exact mcp-server graph::state::tests::a_request_spends_neither_the_budget_nor_a_debt
-          run_exact mcp-server state::tests::an_owner_told_to_leave_answers_stopping_even_with_the_engine_held
-          run_exact mcp-server state::sync::tests::a_preparation_refused_by_a_stop_is_stopping_not_a_poisoned_lock
-          run_exact mcp-server state::overlay_retry::tests::a_paused_driver_leaves_in_every_shutdown_order
-          run_exact mcp-server state::retry_window::tests::one_refusal_moves_the_schedule_one_step
-          run_exact mcp-server state::embed::tests::an_embed_pass_in_its_retry_pause_is_not_live_work
-          run_exact mcp-server state::overlay_retry::tests::a_driver_in_its_retry_pause_is_not_a_running_pass
-          run_exact mcp-server state::background_lifetime_tests::shutdown_stops_a_polling_hub
-          run_exact mcp-server state::background_lifetime_tests::a_stop_releases_an_owner_asleep_in_a_hub_wait
-          run_exact mcp-server diagnostics_state::lifecycle::tests::a_shutdown_wakes_the_idle_sweeper_out_of_its_tick
-          run_exact mcp-server tools::search::lexical::tests::only_an_initialized_overlay_can_vouch_for_its_own_debt
-          run_exact mcp-server inventory::every_production_wait_is_classified
-          run_exact mcp-server inventory::the_wait_inventory_fails_on_an_injected_sleep
-          run_exact mcp-server inventory::the_test_only_modules_are_the_ones_the_parent_gates
-          run_exact mcp-server inventory::no_request_path_holds_an_owner_wait
-          run_exact bsl-search engine::tests::an_uninitialized_overlay_owes_what_its_counts_cannot_say
-          run_exact mcp-server graph::debt::tests::every_short_order_keeps_the_contract_and_settles
-          run_exact mcp-server graph::debt::tests::every_four_deep_order_keeps_the_contract
-          run_exact mcp-server graph::debt::tests::marks_in_their_grace_start_no_build
-          run_exact mcp-server graph::debt::tests::marks_whose_budget_is_spent_start_no_more_builds
-          run_exact mcp-server graph::debt::tests::marks_behind_a_spent_failure_are_not_starved
-          run_exact mcp-server graph::debt::tests::marks_left_behind_a_live_retry_name_no_stale_alarm
-          run_exact mcp-server graph::debt::tests::a_spent_retry_holds_nothing_and_the_standing_says_so
-          run_exact mcp-server graph::debt::tests::a_stopped_graph_decides_no_work_however_it_is_driven
-          run_exact mcp-server graph::debt::tests::an_unsound_publication_settles_into_a_watch
-          run_exact mcp-server graph::state::tests::a_stopped_graph_starts_nothing_however_it_is_driven
-          run_exact mcp-server graph::state::tests::a_stop_during_the_claims_own_walk_is_refused_at_the_claim
-          run_exact mcp-server graph::watcher::tests::the_watcher_records_an_idle_graphs_debt_without_taking_its_build
-          run_exact mcp-server graph::state::tests::a_claimed_slot_is_never_abandoned
-          run_exact mcp-server graph::state::tests::a_stopped_graph_admits_no_fused_cold_build
-          run_exact mcp-server graph::state::tests::the_boots_own_call_respects_a_spent_retry_budget
-          run_exact mcp-server graph::watcher::the_watcher_records_and_does_not_decide::the_watcher_never_calls_a_recording_that_decides
-          run_exact mcp-server graph::watcher::tests::an_advisory_nobody_keeps_current_says_so
-          run_exact mcp-server graph::watcher::tests::advisory_refresh_before_scope_guard_preserves_the_boot_project_on_drift
-          run_exact mcp-server state::overlay_retry::every_wait_reads_the_stop::no_branch_of_the_loop_sleeps_without_reading_the_stop
-          run_exact mcp-server state::overlay_retry::tests::a_stop_while_the_driver_is_asking_the_engine_is_not_slept_off
-          run_exact mcp-server state::embed::embed_exit_status::every_exit_of_the_pass_says_how_it_ended
-          run_exact mcp-server workspace_lease::tests::a_cached_ownership_verdict_before_any_check_succeeded_is_not_an_answer
-          run_exact bsl-search point_refresh::tests::a_baseline_mode_change_discards_a_prepared_point_batch
-          # Linux only, and kept out of the Windows copy below: every one of these arranges
-          # its subject through unix permissions — a watch refused for one root, a directory
-          # or a module made unreadable — so on Windows the filter would name no test at all
-          # and the gate would fail over a case that cannot exist there.
-          run_exact mcp-server state::background_lifetime_tests::shutdown_stops_the_poll_of_a_blind_root
-          run_exact mcp-server change_hub::tests::a_blind_root_is_polled_while_the_rest_is_watched
-          run_exact mcp-server change_hub::tests::a_repeated_declaration_costs_a_blind_root_nothing
-          run_exact mcp-server change_hub::tests::a_blind_root_whose_poll_cannot_start_reads_overdue
-          run_exact mcp-server graph::state::tests::a_healed_subtree_is_found_by_the_probe_and_rebuilt
-          run_exact mcp-server graph::state::tests::a_module_that_becomes_readable_again_is_rebuilt
-          run_exact mcp-server graph::state::tests::a_chronically_unreadable_subtree_is_probed_but_never_rebuilt
-          run_exact mcp-server graph::debt::tests::a_spent_budget_starts_no_more_builds
-          run_exact mcp-server graph::debt::tests::a_workspace_that_cannot_build_stops_trying
-          run_exact mcp-server graph::debt::tests::a_request_pulls_the_probe_forward_but_never_resets_its_backoff
-          run_exact mcp-server graph::state::tests::every_hold_wakes_the_watcher
-          run_exact mcp-server graph::state::tests::a_request_runs_a_retry_that_is_due_and_none_that_is_not
-          run_exact mcp-server state::bootstrap::tests::the_engine_is_free_while_a_publication_waits_out_a_foreign_lease_hold
-          run_exact mcp-server state::overlay_backlog::tests::a_discarded_batch_is_paced_because_it_settled_nothing
-          run_exact mcp-server change_hub::tests::a_root_turning_blind_does_not_report_its_untouched_files
-          run_exact mcp-server change_hub::tests::a_large_file_resumes_across_ticks_with_other_files_beside_it
-          run_exact mcp-server change_hub::tests::the_blind_poll_never_reads_a_whole_budget_under_the_poller_lock
-          run_exact mcp-server inventory::the_reason_codes_clients_see_are_the_frozen_set
-          run_exact mcp-server inventory::the_gate_window_never_splits_a_character
-          run_exact bsl-search engine::tests::a_pause_outliving_its_pass_leaves_the_flag_down
-          run_exact mcp-server graph::state::tests::post_claim_fact_survives_publication
-          run_exact mcp-server graph::debt::tests::answered_credit_cannot_finance_a_later_failure
-          run_exact mcp-server graph::debt::tests::comparison_answer_retires_only_covered_credits
-          run_exact mcp-server graph::debt::tests::pending_work_pays_for_its_next_claim_only_once
-          run_exact mcp-server graph::debt::tests::expired_marks_do_not_force_a_live_retry
-          run_exact mcp-server graph::debt::tests::a_new_fact_revives_spent_marks_without_reusing_old_credit
-          run_exact mcp-server graph::debt::tests::repeated_recovery_level_never_reopens_an_epoch
-          run_exact mcp-server graph::debt::tests::unsound_recovery_keeps_its_witness_and_backoff
-          run_exact mcp-server graph::debt::tests::a_live_forced_owner_suppresses_redundant_probes
-          run_exact mcp-server graph::state::tests::one_comparison_turn_flushes_each_hook_revision_once
-          run_exact mcp-server graph::state::tests::a_new_fact_during_comparison_runs_before_idle_wait
-          run_exact mcp-server graph::watcher::tests::initial_observation_is_not_a_new_failure_credit
-          run_exact mcp-server graph::snapshot::tests::closing_a_scan_cursor_prevents_resubscription_and_stale_writeback
-          run_exact mcp-server state::overlay_backlog::tests::terminal_lease_exit_preserves_its_reason
-          run_exact mcp-server change_hub::tests::an_untouched_file_is_reported_at_most_once_and_a_same_stat_edit_is_still_found
-          run_exact mcp-server graph::debt::tests::a_measured_healing_revives_a_spent_budget_without_a_new_fact
-          run_exact mcp-server graph::debt::tests::a_measured_healing_keeps_the_pace_the_probing_earned
-          run_exact mcp-server graph::debt::tests::a_delivery_already_answered_buys_nothing_when_it_repeats
-          run_exact mcp-server graph::debt::tests::marks_operation_closes_its_sponsor
-          run_exact mcp-server graph::debt::tests::expired_marks_outcome_does_not_mint_primary
-          run_exact mcp-server graph::debt::tests::marks_attached_in_grace_pay_on_claim
-          run_exact mcp-server graph::debt::tests::a_claim_after_a_long_walk_revalidates_its_sponsor
-          run_exact mcp-server graph::state::tests::a_refusing_hook_is_paced_and_does_not_spin_the_executor
-          run_exact mcp-server graph::state::tests::an_observed_level_is_not_authority_for_a_later_failure
-          run_exact mcp-server graph::state::tests::an_initial_claim_keeps_the_marks_sponsored_mode
-          run_exact mcp-server graph::snapshot::tests::a_closing_cursor_races_its_own_drain_and_a_second_comparison
-          run_exact mcp-server graph::state::tests::the_debt_lock_is_never_taken_before_the_lifecycle_lock
-          run_exact mcp-server graph::state::tests::two_executor_turns_offer_one_hook_revision_once
-          run_exact mcp-server graph::state::tests::a_revision_raised_during_an_offer_survives_that_offers_reply
-          run_exact mcp-server graph::state::tests::a_hook_that_drives_the_graph_back_is_not_offered_the_same_revision_again
-          run_exact mcp-server graph::state::tests::a_publication_whose_hook_refuses_paces_the_next_offer
-          run_exact mcp-server graph::state::tests::an_offer_nobody_owes_is_not_made
-          run_exact mcp-server graph::watcher::tests::a_latch_raised_inside_the_sampling_window_is_not_slept_through
-          run_exact mcp-server graph::state::tests::the_graphs_own_owners_all_finish_within_a_watchdog
-          run_exact mcp-server graph::debt::tests::recovery_tracks_cap_minus_one_cap_and_cap_plus_one
-          run_exact mcp-server graph::debt::tests::saturated_unread_does_not_hide_scan_recovery
-          run_exact mcp-server graph::debt::tests::every_obsolete_basis_rejects_all_names
-          run_exact mcp-server graph::debt::tests::repaired_paths_retire_while_another_path_remains_unread
-          run_exact mcp-server graph::debt::tests::retired_paths_leave_no_trace_behind_them
-          run_exact mcp-server graph::debt::tests::omission_from_incomplete_unread_is_not_retirement
-          run_exact mcp-server graph::debt::tests::recovery_credits_are_claim_bound_not_bankable
-          run_exact mcp-server graph::snapshot::tests::only_three_positives_retire_an_obligation
-          run_exact mcp-server graph::snapshot::tests::strict_unread_errors_never_become_an_empty_answer
-          run_exact mcp-server graph::state::tests::actual_roots_a_b_a_retire_only_answered_scope
-          run_exact mcp-server graph::state::tests::invalid_project_fallback_is_not_root_retirement
-          run_exact mcp-server graph::state::tests::native_memory_and_probe_costs_are_proportional_to_the_outstanding_set
-          run_exact mcp-server graph::state::tests::an_executor_turn_during_a_publish_pass_offers_nothing
-          run_exact mcp-server graph::state::tests::only_an_actual_open_failure_is_a_negative
-          # Unix only: the fixtures take a permission away, which Windows does not model.
-          run_exact mcp-server graph::state::tests::concurrent_probe_callers_share_one_reservation
-          run_exact mcp-server graph::state::tests::a_publication_during_a_walk_rejects_the_receipt_it_outran
-          run_exact mcp-server graph::state::tests::same_observation_new_healing_drives_without_hub
-          run_exact mcp-server graph::debt::tests::a_removed_unread_path_is_news_once
-          run_exact mcp-server graph::debt::tests::a_straddled_publication_validates_its_scan_once_per_episode
-          run_exact mcp-server graph::debt::tests::a_healing_already_measured_survives_a_failure_and_a_new_publication
-          run_exact mcp-server graph::debt::tests::a_look_older_than_what_is_remembered_measures_nothing
-          run_exact mcp-server graph::debt::tests::a_marks_demand_placed_after_the_claim_survives_its_outcome
-          # Unix only: the fixtures take a permission away, which Windows does not model.
-          run_exact mcp-server graph::state::tests::each_unread_path_heals_on_its_own_account
-          run_exact mcp-server graph::state::tests::a_removed_unread_path_is_measured_as_absent
-          run_exact mcp-server graph::state::tests::the_walks_capability_is_named_by_the_scope_it_walked
-          run_exact mcp-server graph::debt::tests::a_covered_answer_closes_the_credit_that_paid_for_it
-          run_exact mcp-server graph::debt::tests::a_coherent_answer_closes_the_credits_it_covered
-          run_exact mcp-server graph::debt::tests::an_uncovered_healing_outlives_the_publication_that_missed_it
-          run_exact mcp-server graph::debt::tests::an_address_the_publication_declares_unread_is_never_retired
-          run_exact mcp-server graph::debt::tests::a_straddled_walk_does_not_validate_the_scan
-          run_exact mcp-server graph::debt::tests::the_first_walk_of_a_replaced_declaration_is_news
-          run_exact mcp-server graph::debt::tests::a_probe_that_outlived_its_episode_still_owns_the_walk
-          run_exact mcp-server graph::state::tests::the_publication_gate_reads_no_metadata_of_its_own
-          run_exact mcp-server graph::debt::tests::a_publication_that_cannot_read_its_own_metadata_answers_nothing
-          run_exact mcp-server graph::debt::tests::a_straddled_publication_cannot_end_the_chain
-          run_exact mcp-server graph::debt::tests::a_declaration_nobody_has_installed_yet_still_heals_on_its_own_account
-          run_exact mcp-server graph::debt::tests::a_verdict_about_other_roots_is_not_carried_into_the_new_ones
-          run_exact mcp-server graph::state::tests::the_boot_and_the_external_claim_carry_the_healings_measured_before_them
-          run_exact mcp-server graph::state::tests::a_real_fact_delivered_inside_a_comparison_runs_before_any_idle_wait
-          run_exact mcp-server graph::state::tests::a_build_that_never_started_spends_no_healing
-          run_exact mcp-server graph::state::tests::a_change_delivered_during_the_walk_outlives_that_comparison
-          run_exact mcp-server graph::state::tests::a_saturated_mark_ledger_and_a_retiring_recovery_set_bound_each_other_not_at_all
-          # Unix only: the fixtures take a permission away, which Windows does not model.
-          run_exact mcp-server graph::state::tests::a_walk_is_not_reserved_beside_an_admitted_build
-          run_exact mcp-server graph::state::tests::a_stop_during_the_walk_refuses_what_it_measured
-          run_exact mcp-server graph::state::tests::a_walk_that_outlived_its_episode_is_still_the_only_walk
-          run_exact mcp-server graph::state::tests::every_admission_carries_the_healings_measured_before_it
-          run_exact mcp-server graph::state::tests::a_second_healing_drives_its_own_build_without_any_event
-          run_exact mcp-server graph::state::tests::a_real_publication_frees_what_it_retired_after_its_locks
-          run_exact mcp-server graph::state::tests::scan_verdict_and_scope_are_one_receipt
-          run_exact mcp-server graph::state::tests::strict_metadata_failures_never_become_an_empty_answer
-          run_exact mcp-server graph::state::tests::a_refused_install_retires_nothing
-          run_exact mcp-server graph::state::tests::actual_roots_churn_installs_each_declaration_and_answers_only_what_it_served
-          run_exact mcp-server graph::state::tests::a_module_reached_through_a_symlink_is_not_a_root_that_went_away
-          run_exact mcp-server graph::state::tests::a_walk_refuses_a_snapshot_of_another_publication
-          run_exact mcp-server graph::state::tests::a_complete_build_answers_an_address_that_is_gone
-          run_exact mcp-server graph::state::tests::a_point_patch_answers_what_it_rewrote_and_nothing_else
-      - name: Vector lifecycle and bounded journal regressions
+          # Each name must stay a listed, non-ignored test on Linux: a renamed or deleted
+          # test would otherwise leave the coverage without anyone noticing. The legs
+          # above run them.
+          mcp_server_names=(
+            workspace_lease::tests::contention_unclaimed_and_missing_are_transient
+            workspace_lease::tests::a_throttled_checkpoint_still_reports_a_release
+            graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement
+            tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease
+            tools::search::tests::all_search_modes_are_resident_only_under_held_lease
+            tests::all_status_requests_are_cached_under_held_lease
+            inventory::no_generic_or_unclassified_production_lease_callers
+            inventory::fence_callers_are_exactly_classified
+            inventory::request_paths_do_not_call_lease_or_mutation_helpers
+            inventory::production_source_handles_checkout_line_endings
+            inventory::production_source_keeps_the_request_handlers_of_lib_rs
+            inventory::production_source_drops_the_test_modules_of_real_sources
+            inventory::the_request_path_gate_fails_on_an_injected_lease_call
+            state::embed::tests::prepared_index_survives_transient_swap_without_rebuild
+            # Exact names, each required to run at least one test: a renamed or moved test
+            # would otherwise match nothing and pass.
+            state::background_lifetime_tests::shutdown_stops_every_owner_within_a_second
+            change_hub::tests::interrupted_waiters_return_at_once_and_stay_released
+            change_hub::tests::a_hub_without_a_watch_polls_after_one_reconcile
+            change_hub::tests::a_same_stat_edit_is_found_by_the_content_check_once
+            graph::state::tests::marks_are_consumed_by_an_observing_publication_in_every_order
+            graph::watcher::tests::marks_placed_after_the_graph_caught_up_on_its_own_are_consumed_at_once
+            graph::watcher::tests::owed_marks_force_a_rebuild_of_an_unchanged_graph
+            graph::watcher::tests::a_stalled_search_cursor_costs_the_hub_its_capacity_at_most_and_the_graph_nothing
+            state::bootstrap::tests::a_quiet_healthy_boot_asks_for_no_reconcile_mark_or_reload
+            state::bootstrap::tests::the_graph_follows_edits_after_search_init_failed
+            state::bootstrap::tests::a_workspace_without_a_watch_follows_edits_through_the_poll
+            state::bootstrap::tests::a_superseded_daemon_applies_nothing_more_and_releases_its_cursors
+            state::bootstrap::tests::the_search_and_the_graph_say_who_watches_them
+            state::overlay_backlog::tests::a_large_backlog_drains_without_pauses_between_batches
+            state::overlay_backlog::tests::a_held_writer_lock_refuses_the_commit_and_a_stop_is_answered_during_the_backoff
+            state::overlay_backlog::tests::point_batches_and_full_plans_do_not_roll_each_other_back
+            tools::search::acquire::tests::acquisitions_are_served_in_ticket_order_with_one_raw_waiter
+            inventory::the_search_engine_is_held_only_through_its_admission
+            inventory::production_source_ends_a_gated_variant_or_arm_at_its_comma
+            inventory::production_source_keeps_the_tail_of_a_gated_statement_with_generic_arguments
+            tools::search::render::tests::answers_pass_the_schema_their_profile_publishes
+            contract::tests::mcp_surface_snapshot
+            graph::state::tests::freshness_rests_on_the_drift_watch
+            graph::state::tests::owed_marks_stop_rebuilding_when_their_budget_is_spent
+            graph::build::tests::a_failed_reload_is_owed_behind_its_backoff
+            graph::watcher::tests::a_failed_reload_is_retried_without_another_event
+            graph::watcher::tests::a_reconcile_owes_a_project_reload_in_every_live_state
+            change_hub::tests::the_content_check_keeps_its_budget_for_a_large_file
+            change_hub::tests::a_same_stat_edit_before_the_first_read_is_found
+            state::overlay_backlog::tests::a_stop_during_preparation_is_answered_between_keys
+            state::overlay_backlog::tests::a_busy_commit_is_offered_again_soon
+            state::overlay_retry::tests::a_wake_between_the_check_and_the_sleep_is_not_lost
+            state::sync::tests::a_consumer_blocked_on_its_first_fence_is_not_yet_watching
+            state::consumer_phase_tests::a_consumer_whose_thread_never_ran_is_abandoned
+            graph::build::tests::a_failed_reload_whose_retry_is_held_stays_owed
+            graph::build::tests::a_refused_first_build_is_owed_a_retry
+            graph::state::tests::marks_that_revive_a_spent_obligation_wake_the_watcher
+            tools::search::render::tests::an_index_whose_watch_is_starting_is_not_complete
+            state::overlay_backlog::tests::a_drained_backlog_stops_counting_as_work_at_once
+            state::overlay_backlog::tests::a_revived_owner_starts_its_busy_schedule_over
+            state::background_lifetime_tests::shutdown_does_not_wait_out_an_engine_hold
+            change_hub::tests::a_repeated_declaration_costs_the_fallback_poll_nothing
+            change_hub::tests::a_declaration_naming_a_missing_root_is_reported_once
+            change_hub::tests::two_owners_declaring_one_set_declare_it_once
+            change_hub::tests::shutdown_stops_the_fallback_poll
+            graph::debt::tests::two_owners_recording_one_reconcile_owe_one_build
+            graph::debt::tests::a_quiet_graph_starts_no_build_of_its_own
+            graph::debt::tests::an_unsound_publication_is_probed_and_only_a_healing_rebuilds
+            graph::state::tests::a_loader_that_cannot_start_is_owed_a_retry
+            graph::state::tests::a_publication_cannot_be_installed_while_marks_are_being_consumed
+            graph::state::tests::marks_survive_a_lease_that_cannot_be_confirmed
+            graph::state::tests::a_request_spends_neither_the_budget_nor_a_debt
+            state::tests::an_owner_told_to_leave_answers_stopping_even_with_the_engine_held
+            state::sync::tests::a_preparation_refused_by_a_stop_is_stopping_not_a_poisoned_lock
+            state::overlay_retry::tests::a_paused_driver_leaves_in_every_shutdown_order
+            state::retry_window::tests::one_refusal_moves_the_schedule_one_step
+            state::embed::tests::an_embed_pass_in_its_retry_pause_is_not_live_work
+            state::overlay_retry::tests::a_driver_in_its_retry_pause_is_not_a_running_pass
+            state::background_lifetime_tests::shutdown_stops_a_polling_hub
+            state::background_lifetime_tests::a_stop_releases_an_owner_asleep_in_a_hub_wait
+            diagnostics_state::lifecycle::tests::a_shutdown_wakes_the_idle_sweeper_out_of_its_tick
+            tools::search::lexical::tests::only_an_initialized_overlay_can_vouch_for_its_own_debt
+            inventory::every_production_wait_is_classified
+            inventory::the_wait_inventory_fails_on_an_injected_sleep
+            inventory::the_test_only_modules_are_the_ones_the_parent_gates
+            inventory::no_request_path_holds_an_owner_wait
+            graph::debt::tests::every_short_order_keeps_the_contract_and_settles
+            graph::debt::tests::every_four_deep_order_keeps_the_contract
+            graph::debt::tests::marks_in_their_grace_start_no_build
+            graph::debt::tests::marks_whose_budget_is_spent_start_no_more_builds
+            graph::debt::tests::marks_behind_a_spent_failure_are_not_starved
+            graph::debt::tests::marks_left_behind_a_live_retry_name_no_stale_alarm
+            graph::debt::tests::a_spent_retry_holds_nothing_and_the_standing_says_so
+            graph::debt::tests::a_stopped_graph_decides_no_work_however_it_is_driven
+            graph::debt::tests::an_unsound_publication_settles_into_a_watch
+            graph::state::tests::a_stopped_graph_starts_nothing_however_it_is_driven
+            graph::state::tests::a_stop_during_the_claims_own_walk_is_refused_at_the_claim
+            graph::watcher::tests::the_watcher_records_an_idle_graphs_debt_without_taking_its_build
+            graph::state::tests::a_claimed_slot_is_never_abandoned
+            graph::state::tests::a_stopped_graph_admits_no_fused_cold_build
+            graph::state::tests::the_boots_own_call_respects_a_spent_retry_budget
+            graph::watcher::the_watcher_records_and_does_not_decide::the_watcher_never_calls_a_recording_that_decides
+            graph::watcher::tests::an_advisory_nobody_keeps_current_says_so
+            graph::watcher::tests::advisory_refresh_before_scope_guard_preserves_the_boot_project_on_drift
+            state::overlay_retry::every_wait_reads_the_stop::no_branch_of_the_loop_sleeps_without_reading_the_stop
+            state::overlay_retry::tests::a_stop_while_the_driver_is_asking_the_engine_is_not_slept_off
+            state::embed::embed_exit_status::every_exit_of_the_pass_says_how_it_ended
+            workspace_lease::tests::a_cached_ownership_verdict_before_any_check_succeeded_is_not_an_answer
+            # Linux only, and kept out of the Windows copy below: every one of these arranges
+            # its subject through unix permissions — a watch refused for one root, a directory
+            # or a module made unreadable — so on Windows the filter would name no test at all
+            # and the gate would fail over a case that cannot exist there.
+            state::background_lifetime_tests::shutdown_stops_the_poll_of_a_blind_root
+            change_hub::tests::a_blind_root_is_polled_while_the_rest_is_watched
+            change_hub::tests::a_repeated_declaration_costs_a_blind_root_nothing
+            change_hub::tests::a_blind_root_whose_poll_cannot_start_reads_overdue
+            graph::state::tests::a_healed_subtree_is_found_by_the_probe_and_rebuilt
+            graph::state::tests::a_module_that_becomes_readable_again_is_rebuilt
+            graph::state::tests::a_chronically_unreadable_subtree_is_probed_but_never_rebuilt
+            graph::debt::tests::a_spent_budget_starts_no_more_builds
+            graph::debt::tests::a_workspace_that_cannot_build_stops_trying
+            graph::debt::tests::a_request_pulls_the_probe_forward_but_never_resets_its_backoff
+            graph::state::tests::every_hold_wakes_the_watcher
+            graph::state::tests::a_request_runs_a_retry_that_is_due_and_none_that_is_not
+            state::bootstrap::tests::the_engine_is_free_while_a_publication_waits_out_a_foreign_lease_hold
+            state::overlay_backlog::tests::a_discarded_batch_is_paced_because_it_settled_nothing
+            change_hub::tests::a_root_turning_blind_does_not_report_its_untouched_files
+            change_hub::tests::a_large_file_resumes_across_ticks_with_other_files_beside_it
+            change_hub::tests::the_blind_poll_never_reads_a_whole_budget_under_the_poller_lock
+            inventory::the_reason_codes_clients_see_are_the_frozen_set
+            inventory::the_gate_window_never_splits_a_character
+            graph::state::tests::post_claim_fact_survives_publication
+            graph::debt::tests::answered_credit_cannot_finance_a_later_failure
+            graph::debt::tests::comparison_answer_retires_only_covered_credits
+            graph::debt::tests::pending_work_pays_for_its_next_claim_only_once
+            graph::debt::tests::expired_marks_do_not_force_a_live_retry
+            graph::debt::tests::a_new_fact_revives_spent_marks_without_reusing_old_credit
+            graph::debt::tests::repeated_recovery_level_never_reopens_an_epoch
+            graph::debt::tests::unsound_recovery_keeps_its_witness_and_backoff
+            graph::debt::tests::a_live_forced_owner_suppresses_redundant_probes
+            graph::state::tests::one_comparison_turn_flushes_each_hook_revision_once
+            graph::state::tests::a_new_fact_during_comparison_runs_before_idle_wait
+            graph::watcher::tests::initial_observation_is_not_a_new_failure_credit
+            graph::snapshot::tests::closing_a_scan_cursor_prevents_resubscription_and_stale_writeback
+            state::overlay_backlog::tests::terminal_lease_exit_preserves_its_reason
+            change_hub::tests::an_untouched_file_is_reported_at_most_once_and_a_same_stat_edit_is_still_found
+            graph::debt::tests::a_measured_healing_revives_a_spent_budget_without_a_new_fact
+            graph::debt::tests::a_measured_healing_keeps_the_pace_the_probing_earned
+            graph::debt::tests::a_delivery_already_answered_buys_nothing_when_it_repeats
+            graph::debt::tests::marks_operation_closes_its_sponsor
+            graph::debt::tests::expired_marks_outcome_does_not_mint_primary
+            graph::debt::tests::marks_attached_in_grace_pay_on_claim
+            graph::debt::tests::a_claim_after_a_long_walk_revalidates_its_sponsor
+            graph::state::tests::a_refusing_hook_is_paced_and_does_not_spin_the_executor
+            graph::state::tests::an_observed_level_is_not_authority_for_a_later_failure
+            graph::state::tests::an_initial_claim_keeps_the_marks_sponsored_mode
+            graph::snapshot::tests::a_closing_cursor_races_its_own_drain_and_a_second_comparison
+            graph::state::tests::the_debt_lock_is_never_taken_before_the_lifecycle_lock
+            graph::state::tests::two_executor_turns_offer_one_hook_revision_once
+            graph::state::tests::a_revision_raised_during_an_offer_survives_that_offers_reply
+            graph::state::tests::a_hook_that_drives_the_graph_back_is_not_offered_the_same_revision_again
+            graph::state::tests::a_publication_whose_hook_refuses_paces_the_next_offer
+            graph::state::tests::an_offer_nobody_owes_is_not_made
+            graph::watcher::tests::a_latch_raised_inside_the_sampling_window_is_not_slept_through
+            graph::state::tests::the_graphs_own_owners_all_finish_within_a_watchdog
+            graph::debt::tests::recovery_tracks_cap_minus_one_cap_and_cap_plus_one
+            graph::debt::tests::saturated_unread_does_not_hide_scan_recovery
+            graph::debt::tests::every_obsolete_basis_rejects_all_names
+            graph::debt::tests::repaired_paths_retire_while_another_path_remains_unread
+            graph::debt::tests::retired_paths_leave_no_trace_behind_them
+            graph::debt::tests::omission_from_incomplete_unread_is_not_retirement
+            graph::debt::tests::recovery_credits_are_claim_bound_not_bankable
+            graph::snapshot::tests::only_three_positives_retire_an_obligation
+            graph::snapshot::tests::strict_unread_errors_never_become_an_empty_answer
+            graph::state::tests::actual_roots_a_b_a_retire_only_answered_scope
+            graph::state::tests::invalid_project_fallback_is_not_root_retirement
+            graph::state::tests::native_memory_and_probe_costs_are_proportional_to_the_outstanding_set
+            graph::state::tests::an_executor_turn_during_a_publish_pass_offers_nothing
+            graph::state::tests::only_an_actual_open_failure_is_a_negative
+            # Unix only: the fixtures take a permission away, which Windows does not model.
+            graph::state::tests::concurrent_probe_callers_share_one_reservation
+            graph::state::tests::a_publication_during_a_walk_rejects_the_receipt_it_outran
+            graph::state::tests::same_observation_new_healing_drives_without_hub
+            graph::debt::tests::a_removed_unread_path_is_news_once
+            graph::debt::tests::a_straddled_publication_validates_its_scan_once_per_episode
+            graph::debt::tests::a_healing_already_measured_survives_a_failure_and_a_new_publication
+            graph::debt::tests::a_look_older_than_what_is_remembered_measures_nothing
+            graph::debt::tests::a_marks_demand_placed_after_the_claim_survives_its_outcome
+            # Unix only: the fixtures take a permission away, which Windows does not model.
+            graph::state::tests::each_unread_path_heals_on_its_own_account
+            graph::state::tests::a_removed_unread_path_is_measured_as_absent
+            graph::state::tests::the_walks_capability_is_named_by_the_scope_it_walked
+            graph::debt::tests::a_covered_answer_closes_the_credit_that_paid_for_it
+            graph::debt::tests::a_coherent_answer_closes_the_credits_it_covered
+            graph::debt::tests::an_uncovered_healing_outlives_the_publication_that_missed_it
+            graph::debt::tests::an_address_the_publication_declares_unread_is_never_retired
+            graph::debt::tests::a_straddled_walk_does_not_validate_the_scan
+            graph::debt::tests::the_first_walk_of_a_replaced_declaration_is_news
+            graph::debt::tests::a_probe_that_outlived_its_episode_still_owns_the_walk
+            graph::state::tests::the_publication_gate_reads_no_metadata_of_its_own
+            graph::debt::tests::a_publication_that_cannot_read_its_own_metadata_answers_nothing
+            graph::debt::tests::a_straddled_publication_cannot_end_the_chain
+            graph::debt::tests::a_declaration_nobody_has_installed_yet_still_heals_on_its_own_account
+            graph::debt::tests::a_verdict_about_other_roots_is_not_carried_into_the_new_ones
+            graph::state::tests::the_boot_and_the_external_claim_carry_the_healings_measured_before_them
+            graph::state::tests::a_real_fact_delivered_inside_a_comparison_runs_before_any_idle_wait
+            graph::state::tests::a_build_that_never_started_spends_no_healing
+            graph::state::tests::a_change_delivered_during_the_walk_outlives_that_comparison
+            graph::state::tests::a_saturated_mark_ledger_and_a_retiring_recovery_set_bound_each_other_not_at_all
+            # Unix only: the fixtures take a permission away, which Windows does not model.
+            graph::state::tests::a_walk_is_not_reserved_beside_an_admitted_build
+            graph::state::tests::a_stop_during_the_walk_refuses_what_it_measured
+            graph::state::tests::a_walk_that_outlived_its_episode_is_still_the_only_walk
+            graph::state::tests::every_admission_carries_the_healings_measured_before_it
+            graph::state::tests::a_second_healing_drives_its_own_build_without_any_event
+            graph::state::tests::a_real_publication_frees_what_it_retired_after_its_locks
+            graph::state::tests::scan_verdict_and_scope_are_one_receipt
+            graph::state::tests::strict_metadata_failures_never_become_an_empty_answer
+            graph::state::tests::a_refused_install_retires_nothing
+            graph::state::tests::actual_roots_churn_installs_each_declaration_and_answers_only_what_it_served
+            graph::state::tests::a_module_reached_through_a_symlink_is_not_a_root_that_went_away
+            graph::state::tests::a_walk_refuses_a_snapshot_of_another_publication
+            graph::state::tests::a_complete_build_answers_an_address_that_is_gone
+            graph::state::tests::a_point_patch_answers_what_it_rewrote_and_nothing_else
+          )
+          bsl_search_names=(
+            point_refresh::structure::the_point_path_keeps_its_shape
+            point_refresh::structure::the_point_path_gate_reads_a_crlf_checkout
+            point_refresh::tests::a_cancelled_preparation_reads_no_further_key
+            engine::retry_signal_ownership::marks_alone_demand_no_embedding_pass
+            engine::tests::a_local_drift_removal_hides_nothing
+            point_refresh::tests::a_bounded_publication_refuses_whole_baseline_loads_and_phase_c_needs_none
+            point_refresh::tests::a_busy_store_gives_the_batch_back_and_the_retry_reads_nothing
+            store::tests::every_baseline_write_moves_the_baseline_version
+            engine::tests::an_uninitialized_overlay_owes_what_its_counts_cannot_say
+            point_refresh::tests::a_baseline_mode_change_discards_a_prepared_point_batch
+            engine::tests::a_pause_outliving_its_pass_leaves_the_flag_down
+          )
+          list_tests --exact mcp_server --workspace --lib -- "${mcp_server_names[@]}"
+          list_tests --exact bsl_search --workspace --lib -- "${bsl_search_names[@]}"
+          list_tests mcp_server --workspace --lib -- workspace_cache_ vector_lifecycle
+          list_tests bsl_search --workspace --lib -- lifecycle
+          list_tests bsl_analyzer_app --workspace --bin bsl-analyzer-app -- workspace_cache_scope_ cli::logging
+      - name: Named integration regressions exist
+        if: matrix.shard == 'tests-n-z'
         shell: bash
         run: |
           set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          list_tests() {
+            # list_tests [--exact] <test binary> <cargo test selection>... [-- <filter>...]
+            # Lists without running: every filter must name a listed, non-ignored test of
+            # the binary (`mcp_server`, `source_set_cli`, ...); with no filter the binary
+            # must list one. The selection is the one the leg already built, so nothing
+            # compiles. The workflow forces colour on cargo, and a coloured `Running` line
+            # would hide every section from the pattern, so these listings ask for none.
+            local exact=() binary selection=() filters=() listed ignored runnable status filter missing=0
+            local pick='/ Running /{b=$0; sub(/.*deps\//,"",b); sub(/-[0-9a-f]+\)$/,"",b); cur=b; next} cur==want && /: test$/{sub(/: test$/,""); print}'
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            binary=$1; shift
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            listed=$(cargo test --color never "${selection[@]}" -- --list "${exact[@]}" "${filters[@]}" 2>&1) && status=0 || status=$?
+            printf '%s\n' "$listed"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            ignored=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1) && status=0 || status=$?
+            if [ "$status" -ne 0 ]; then
+              printf '%s\n' "$ignored"
+              return "$status"
+            fi
+            runnable=$(comm -23 <(awk -v want="$binary" "$pick" <<<"$listed" | sort -u) <(awk -v want="$binary" "$pick" <<<"$ignored" | sort -u))
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$runnable" ]; then
+              echo "::error::$binary lists no runnable test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$runnable" || { echo "::error::$binary has no runnable test $filter"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$runnable" || { echo "::error::$binary has no runnable test matching $filter"; missing=1; }
+              fi
+            done
+            return "$missing"
           }
-          run_nonempty -p bsl-search --lib lifecycle
-          run_nonempty -p mcp-server --lib vector_lifecycle
-          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging
-          run_nonempty -p bsl-analyzer --test vector_journal_cli
-      - run: cargo test --all --no-fail-fast
+          list_tests source_set_cli --workspace --test source_set_cli -- workspace_cache_scope_
+          list_tests vector_journal_cli --workspace --test vector_journal_cli
 
   corpus-contract:
     # The platform help corpus is not in the repository (#312) and CI does not
@@ -345,540 +426,732 @@ jobs:
           run_nonempty -p ide --test platform_help_fixture
           run_nonempty -p bsl-analyzer --test platform_help_process
 
+  # The Windows jobs are split by the packages they select: each `-p` set unifies
+  # features its own way and rebuilds the tree, so one job builds one tree once.
+  windows-mcp-contract:
+    name: Windows MCP drift contract
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Drift contract and workspace lease regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          mcp_server_names=(
+            graph::snapshot::tests::drift_marks_stale_and_async_reload_bumps_generation
+            state::bootstrap::tests::a_workspace_without_a_watch_follows_edits_through_the_poll
+            workspace_lease::tests::release_during_checkpointed_callback_rolls_back_as_terminal
+            workspace_lease::tests::release_waits_for_only_the_admitted_batch_and_refuses_the_next
+            workspace_lease::tests::takeover_between_batches_preserves_the_first_and_terminates_the_next
+            state::bootstrap::tests::startup_constructor_fence_distinguishes_retry_terminal_and_error
+            state::sync::tests::background_snapshot_failures_require_rescan_instead_of_empty_xml_success
+            state::embed::tests::embedding_fence_distinguishes_retry_from_supersession
+            state::overlay_retry::tests::transient_budget_fails_once_answers_mid_pass_facts_and_rearms_on_new_drift
+            graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement
+            graph::snapshot::tests::final_install_rechecks_token_through_the_preopened_descriptor
+            graph::snapshot::tests::publication_without_a_complete_descriptor_pool_cannot_be_ready
+            graph::build::tests::incremental_publish_propagates_transient_refusal
+            graph::build::tests::fresh_and_cached_publication_paths_propagate_final_install_refusal
+            graph_supersession_contract::graph_handler_misses_immediately_when_preopened_handles_are_busy
+            graph_supersession_contract::resolve_names_misses_immediately_when_preopened_handles_are_busy
+            graph_supersession_contract::symbol_info_misses_immediately_when_preopened_handles_are_busy
+            graph_supersession_contract::references_misses_immediately_when_preopened_handles_are_busy
+            workspace_lease::tests::contention_unclaimed_and_missing_are_transient
+            workspace_lease::tests::a_throttled_checkpoint_still_reports_a_release
+            tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease
+            tools::search::tests::all_search_modes_are_resident_only_under_held_lease
+            tests::all_status_requests_are_cached_under_held_lease
+            inventory::no_generic_or_unclassified_production_lease_callers
+            inventory::fence_callers_are_exactly_classified
+            inventory::request_paths_do_not_call_lease_or_mutation_helpers
+            inventory::production_source_handles_checkout_line_endings
+            inventory::production_source_keeps_the_request_handlers_of_lib_rs
+            inventory::production_source_drops_the_test_modules_of_real_sources
+            inventory::the_request_path_gate_fails_on_an_injected_lease_call
+            state::embed::tests::prepared_index_survives_transient_swap_without_rebuild
+            state::background_lifetime_tests::shutdown_stops_every_owner_within_a_second
+            change_hub::tests::interrupted_waiters_return_at_once_and_stay_released
+            change_hub::tests::a_hub_without_a_watch_polls_after_one_reconcile
+            change_hub::tests::a_same_stat_edit_is_found_by_the_content_check_once
+            graph::state::tests::marks_are_consumed_by_an_observing_publication_in_every_order
+            graph::watcher::tests::marks_placed_after_the_graph_caught_up_on_its_own_are_consumed_at_once
+            graph::watcher::tests::owed_marks_force_a_rebuild_of_an_unchanged_graph
+            graph::watcher::tests::a_stalled_search_cursor_costs_the_hub_its_capacity_at_most_and_the_graph_nothing
+            state::bootstrap::tests::a_quiet_healthy_boot_asks_for_no_reconcile_mark_or_reload
+            state::bootstrap::tests::the_graph_follows_edits_after_search_init_failed
+            state::bootstrap::tests::a_superseded_daemon_applies_nothing_more_and_releases_its_cursors
+            state::bootstrap::tests::the_search_and_the_graph_say_who_watches_them
+            state::overlay_backlog::tests::a_large_backlog_drains_without_pauses_between_batches
+            state::overlay_backlog::tests::a_held_writer_lock_refuses_the_commit_and_a_stop_is_answered_during_the_backoff
+            state::overlay_backlog::tests::point_batches_and_full_plans_do_not_roll_each_other_back
+            tools::search::acquire::tests::acquisitions_are_served_in_ticket_order_with_one_raw_waiter
+            inventory::the_search_engine_is_held_only_through_its_admission
+            inventory::production_source_ends_a_gated_variant_or_arm_at_its_comma
+            inventory::production_source_keeps_the_tail_of_a_gated_statement_with_generic_arguments
+            tools::search::render::tests::answers_pass_the_schema_their_profile_publishes
+            contract::tests::mcp_surface_snapshot
+            graph::state::tests::freshness_rests_on_the_drift_watch
+            graph::state::tests::owed_marks_stop_rebuilding_when_their_budget_is_spent
+            graph::build::tests::a_failed_reload_is_owed_behind_its_backoff
+            graph::watcher::tests::a_failed_reload_is_retried_without_another_event
+            graph::watcher::tests::a_reconcile_owes_a_project_reload_in_every_live_state
+            change_hub::tests::the_content_check_keeps_its_budget_for_a_large_file
+            change_hub::tests::a_same_stat_edit_before_the_first_read_is_found
+            state::overlay_backlog::tests::a_stop_during_preparation_is_answered_between_keys
+            state::overlay_backlog::tests::a_busy_commit_is_offered_again_soon
+            state::overlay_retry::tests::a_wake_between_the_check_and_the_sleep_is_not_lost
+            state::sync::tests::a_consumer_blocked_on_its_first_fence_is_not_yet_watching
+            state::consumer_phase_tests::a_consumer_whose_thread_never_ran_is_abandoned
+            graph::build::tests::a_failed_reload_whose_retry_is_held_stays_owed
+            graph::build::tests::a_refused_first_build_is_owed_a_retry
+            graph::state::tests::marks_that_revive_a_spent_obligation_wake_the_watcher
+            tools::search::render::tests::an_index_whose_watch_is_starting_is_not_complete
+            state::overlay_backlog::tests::a_drained_backlog_stops_counting_as_work_at_once
+            state::overlay_backlog::tests::a_revived_owner_starts_its_busy_schedule_over
+            state::background_lifetime_tests::shutdown_does_not_wait_out_an_engine_hold
+            change_hub::tests::a_repeated_declaration_costs_the_fallback_poll_nothing
+            change_hub::tests::a_declaration_naming_a_missing_root_is_reported_once
+            change_hub::tests::two_owners_declaring_one_set_declare_it_once
+            change_hub::tests::shutdown_stops_the_fallback_poll
+            graph::state::tests::a_loader_that_cannot_start_is_owed_a_retry
+            graph::state::tests::a_publication_cannot_be_installed_while_marks_are_being_consumed
+            graph::state::tests::marks_survive_a_lease_that_cannot_be_confirmed
+            graph::state::tests::a_request_spends_neither_the_budget_nor_a_debt
+            state::tests::an_owner_told_to_leave_answers_stopping_even_with_the_engine_held
+            state::sync::tests::a_preparation_refused_by_a_stop_is_stopping_not_a_poisoned_lock
+            state::overlay_retry::tests::a_paused_driver_leaves_in_every_shutdown_order
+            state::retry_window::tests::one_refusal_moves_the_schedule_one_step
+            state::embed::tests::an_embed_pass_in_its_retry_pause_is_not_live_work
+            state::overlay_retry::tests::a_driver_in_its_retry_pause_is_not_a_running_pass
+            state::background_lifetime_tests::shutdown_stops_a_polling_hub
+            state::background_lifetime_tests::a_stop_releases_an_owner_asleep_in_a_hub_wait
+            diagnostics_state::lifecycle::tests::a_shutdown_wakes_the_idle_sweeper_out_of_its_tick
+            tools::search::lexical::tests::only_an_initialized_overlay_can_vouch_for_its_own_debt
+            inventory::every_production_wait_is_classified
+            inventory::the_wait_inventory_fails_on_an_injected_sleep
+            inventory::the_test_only_modules_are_the_ones_the_parent_gates
+            inventory::no_request_path_holds_an_owner_wait
+            graph::debt::tests::every_short_order_keeps_the_contract_and_settles
+            graph::debt::tests::every_four_deep_order_keeps_the_contract
+            graph::debt::tests::an_unsound_publication_is_probed_and_only_a_healing_rebuilds
+            graph::debt::tests::a_quiet_graph_starts_no_build_of_its_own
+            graph::debt::tests::two_owners_recording_one_reconcile_owe_one_build
+            graph::debt::tests::marks_in_their_grace_start_no_build
+            graph::debt::tests::marks_whose_budget_is_spent_start_no_more_builds
+            graph::debt::tests::marks_behind_a_spent_failure_are_not_starved
+            graph::debt::tests::marks_left_behind_a_live_retry_name_no_stale_alarm
+            graph::debt::tests::a_spent_retry_holds_nothing_and_the_standing_says_so
+            graph::debt::tests::a_stopped_graph_decides_no_work_however_it_is_driven
+            graph::debt::tests::an_unsound_publication_settles_into_a_watch
+            graph::state::tests::a_stopped_graph_starts_nothing_however_it_is_driven
+            graph::state::tests::a_stop_during_the_claims_own_walk_is_refused_at_the_claim
+            graph::watcher::tests::the_watcher_records_an_idle_graphs_debt_without_taking_its_build
+            graph::state::tests::a_claimed_slot_is_never_abandoned
+            graph::state::tests::a_stopped_graph_admits_no_fused_cold_build
+            graph::state::tests::the_boots_own_call_respects_a_spent_retry_budget
+            graph::watcher::the_watcher_records_and_does_not_decide::the_watcher_never_calls_a_recording_that_decides
+            graph::watcher::tests::an_advisory_nobody_keeps_current_says_so
+            graph::watcher::tests::advisory_refresh_before_scope_guard_preserves_the_boot_project_on_drift
+            state::overlay_retry::every_wait_reads_the_stop::no_branch_of_the_loop_sleeps_without_reading_the_stop
+            state::overlay_retry::tests::a_stop_while_the_driver_is_asking_the_engine_is_not_slept_off
+            state::embed::embed_exit_status::every_exit_of_the_pass_says_how_it_ended
+            workspace_lease::tests::a_cached_ownership_verdict_before_any_check_succeeded_is_not_an_answer
+            graph::debt::tests::a_spent_budget_starts_no_more_builds
+            graph::debt::tests::a_workspace_that_cannot_build_stops_trying
+            graph::debt::tests::a_request_pulls_the_probe_forward_but_never_resets_its_backoff
+            graph::state::tests::every_hold_wakes_the_watcher
+            graph::state::tests::a_request_runs_a_retry_that_is_due_and_none_that_is_not
+            state::bootstrap::tests::the_engine_is_free_while_a_publication_waits_out_a_foreign_lease_hold
+            state::overlay_backlog::tests::a_discarded_batch_is_paced_because_it_settled_nothing
+            change_hub::tests::a_large_file_resumes_across_ticks_with_other_files_beside_it
+            change_hub::tests::the_blind_poll_never_reads_a_whole_budget_under_the_poller_lock
+            inventory::the_reason_codes_clients_see_are_the_frozen_set
+            inventory::the_gate_window_never_splits_a_character
+            graph::state::tests::post_claim_fact_survives_publication
+            graph::debt::tests::answered_credit_cannot_finance_a_later_failure
+            graph::debt::tests::comparison_answer_retires_only_covered_credits
+            graph::debt::tests::pending_work_pays_for_its_next_claim_only_once
+            graph::debt::tests::expired_marks_do_not_force_a_live_retry
+            graph::debt::tests::a_new_fact_revives_spent_marks_without_reusing_old_credit
+            graph::debt::tests::repeated_recovery_level_never_reopens_an_epoch
+            graph::debt::tests::unsound_recovery_keeps_its_witness_and_backoff
+            graph::debt::tests::a_live_forced_owner_suppresses_redundant_probes
+            graph::state::tests::one_comparison_turn_flushes_each_hook_revision_once
+            graph::state::tests::a_new_fact_during_comparison_runs_before_idle_wait
+            graph::watcher::tests::initial_observation_is_not_a_new_failure_credit
+            graph::snapshot::tests::closing_a_scan_cursor_prevents_resubscription_and_stale_writeback
+            state::overlay_backlog::tests::terminal_lease_exit_preserves_its_reason
+            change_hub::tests::an_untouched_file_is_reported_at_most_once_and_a_same_stat_edit_is_still_found
+            graph::debt::tests::a_measured_healing_revives_a_spent_budget_without_a_new_fact
+            graph::debt::tests::a_measured_healing_keeps_the_pace_the_probing_earned
+            graph::debt::tests::a_delivery_already_answered_buys_nothing_when_it_repeats
+            graph::debt::tests::marks_operation_closes_its_sponsor
+            graph::debt::tests::expired_marks_outcome_does_not_mint_primary
+            graph::debt::tests::marks_attached_in_grace_pay_on_claim
+            graph::debt::tests::a_claim_after_a_long_walk_revalidates_its_sponsor
+            graph::state::tests::a_refusing_hook_is_paced_and_does_not_spin_the_executor
+            graph::state::tests::an_observed_level_is_not_authority_for_a_later_failure
+            graph::state::tests::an_initial_claim_keeps_the_marks_sponsored_mode
+            graph::snapshot::tests::a_closing_cursor_races_its_own_drain_and_a_second_comparison
+            graph::state::tests::the_debt_lock_is_never_taken_before_the_lifecycle_lock
+            graph::state::tests::two_executor_turns_offer_one_hook_revision_once
+            graph::state::tests::a_revision_raised_during_an_offer_survives_that_offers_reply
+            graph::state::tests::a_hook_that_drives_the_graph_back_is_not_offered_the_same_revision_again
+            graph::state::tests::a_publication_whose_hook_refuses_paces_the_next_offer
+            graph::state::tests::an_offer_nobody_owes_is_not_made
+            graph::watcher::tests::a_latch_raised_inside_the_sampling_window_is_not_slept_through
+            graph::state::tests::the_graphs_own_owners_all_finish_within_a_watchdog
+            graph::debt::tests::recovery_tracks_cap_minus_one_cap_and_cap_plus_one
+            graph::debt::tests::saturated_unread_does_not_hide_scan_recovery
+            graph::debt::tests::every_obsolete_basis_rejects_all_names
+            graph::debt::tests::repaired_paths_retire_while_another_path_remains_unread
+            graph::debt::tests::retired_paths_leave_no_trace_behind_them
+            graph::debt::tests::omission_from_incomplete_unread_is_not_retirement
+            graph::debt::tests::recovery_credits_are_claim_bound_not_bankable
+            graph::snapshot::tests::only_three_positives_retire_an_obligation
+            graph::snapshot::tests::strict_unread_errors_never_become_an_empty_answer
+            graph::state::tests::actual_roots_a_b_a_retire_only_answered_scope
+            graph::state::tests::invalid_project_fallback_is_not_root_retirement
+            graph::state::tests::native_memory_and_probe_costs_are_proportional_to_the_outstanding_set
+            graph::state::tests::an_executor_turn_during_a_publish_pass_offers_nothing
+            graph::state::tests::only_an_actual_open_failure_is_a_negative
+            graph::debt::tests::a_removed_unread_path_is_news_once
+            graph::debt::tests::a_straddled_publication_validates_its_scan_once_per_episode
+            graph::debt::tests::a_healing_already_measured_survives_a_failure_and_a_new_publication
+            graph::debt::tests::a_look_older_than_what_is_remembered_measures_nothing
+            graph::debt::tests::a_marks_demand_placed_after_the_claim_survives_its_outcome
+            graph::debt::tests::a_covered_answer_closes_the_credit_that_paid_for_it
+            graph::debt::tests::a_coherent_answer_closes_the_credits_it_covered
+            graph::debt::tests::an_uncovered_healing_outlives_the_publication_that_missed_it
+            graph::debt::tests::an_address_the_publication_declares_unread_is_never_retired
+            graph::debt::tests::a_straddled_walk_does_not_validate_the_scan
+            graph::debt::tests::the_first_walk_of_a_replaced_declaration_is_news
+            graph::debt::tests::a_probe_that_outlived_its_episode_still_owns_the_walk
+            graph::state::tests::the_publication_gate_reads_no_metadata_of_its_own
+            graph::debt::tests::a_publication_that_cannot_read_its_own_metadata_answers_nothing
+            graph::debt::tests::a_straddled_publication_cannot_end_the_chain
+            graph::debt::tests::a_declaration_nobody_has_installed_yet_still_heals_on_its_own_account
+            graph::debt::tests::a_verdict_about_other_roots_is_not_carried_into_the_new_ones
+            graph::state::tests::the_boot_and_the_external_claim_carry_the_healings_measured_before_them
+            graph::state::tests::a_real_fact_delivered_inside_a_comparison_runs_before_any_idle_wait
+            graph::state::tests::a_build_that_never_started_spends_no_healing
+            graph::state::tests::a_change_delivered_during_the_walk_outlives_that_comparison
+            graph::state::tests::a_saturated_mark_ledger_and_a_retiring_recovery_set_bound_each_other_not_at_all
+          )
+          bsl_search_names=(
+            point_refresh::structure::the_point_path_keeps_its_shape
+            point_refresh::structure::the_point_path_gate_reads_a_crlf_checkout
+            point_refresh::tests::a_cancelled_preparation_reads_no_further_key
+            engine::retry_signal_ownership::marks_alone_demand_no_embedding_pass
+            engine::tests::a_local_drift_removal_hides_nothing
+            point_refresh::tests::a_bounded_publication_refuses_whole_baseline_loads_and_phase_c_needs_none
+            point_refresh::tests::a_busy_store_gives_the_batch_back_and_the_retry_reads_nothing
+            store::tests::every_baseline_write_moves_the_baseline_version
+            engine::tests::an_uninitialized_overlay_owes_what_its_counts_cannot_say
+            point_refresh::tests::a_baseline_mode_change_discards_a_prepared_point_batch
+            engine::tests::a_pause_outliving_its_pass_leaves_the_flag_down
+          )
+          run_tests --exact -p mcp-server --lib -- "${mcp_server_names[@]}"
+          run_tests --exact -p bsl-search --lib -- "${bsl_search_names[@]}"
+      - name: Vector lifecycle and fenced search construction
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          run_tests -p bsl-search --lib -- lifecycle
+          run_tests -p bsl-search -- engine::tests::workspace_constructor_publish_fence engine::tests::embedding_publish_fence
+
   windows-mcp:
     name: Windows MCP transports + secure broker
     runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: MCP library lifecycle, workspace cache and editor regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          mcp_server_filters=(
+            workspace_cache_
+            check_executor_windows_tests
+            vector_lifecycle
+            saved_path_refresh_
+            queued_source_writer_
+            editor_path_hints_
+            lru_trim_waits_for_analysis_clone_without_publishing_generation
+            shared_backend_sessions_keep_tool_gates_and_native_dispatch_local
+            invalid_project_freezes_disk_publications_but_keeps_last_good_resident_readable
+            invalid_project_closes_mcp_before_retiring_last_good_backend
+            pending_baseline_connects_only_after_start
+            shared_workspace_defers_workspace_and_reference_credentials_until_activation
+            broker::transport::
+            broker::daemon::shared_tests::
+          )
+          run_tests -p mcp-server --lib -- "${mcp_server_filters[@]}"
+      - name: MCP transports, broker and baselines
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          run_tests -p mcp-server --test diagnostics_baseline
+          run_tests -p mcp-server --test http
+          run_tests -p mcp-server --test broker
+          run_tests -p mcp-server --test broker -- superseded_backend_lifecycle
+          run_tests -p mcp-server --test name_dictionary
+      - name: Superseded owner lifecycle across MCP targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          superseded_filters=(
+            workspace_lease::tests::observed_foreign_owner_is_permanent
+            workspace_lease::tests::publish_fence_latches_supersession
+            workspace_lease::tests::observed_owner_race_cannot_reclaim
+            workspace_lease::tests::transient_unclaimed_is_not_superseded
+            workspace_lease::tests::non_witness_states_remain_reclaimable
+            state::bootstrap::tests::startup_constructor_fence_distinguishes_retry_terminal_and_error
+            state::bootstrap::tests::startup_metadata_fence_stops_after_takeover
+            state::bootstrap::tests::startup_ingest_fence_does_not_repeat_preparation
+            state::bootstrap::tests::superseded_bootstrap_stops_mutating
+            state::sync::tests::superseded_daemon_cannot_mutate_shared_search
+            graph::state::tests::superseded_graph_never_adopts_or_reloads
+            graph::state::tests::superseded_late_publish_is_fenced
+            graph::build::tests::superseded_fused_writer_stops_mutating
+            graph::build::tests::superseded_build_is_discarded_after_owner_release
+            graph::state::tests::a_superseded_owner_lets_the_file_go_once_its_reads_finish
+            graph::state::tests::superseded_status_truth_table
+            graph_actions_fail_when_superseded_snapshot_is_gone
+            state::overlay_retry::tests::observed_supersession_never_resumes
+            state::embed::tests::embedding_fence_distinguishes_retry_from_supersession
+            state::tests::terminal_supersession_is_not_transient_nonownership
+          )
+          run_tests -p mcp-server -- "${superseded_filters[@]}"
+
+  windows-analyzer:
+    name: Windows analyzer CLI + shared LSP
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Analyzer CLI, diagnostics configuration and baselines
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          run_tests -p bsl-analyzer --test diagnostics_config_cli
+          run_tests -p bsl-analyzer --test diagnostic_rules_protocol
+          run_tests -p bsl-analyzer --test source_set_cli -- diagnostics_rules_ workspace_cache_scope_
+          run_tests -p bsl-analyzer --bin bsl-analyzer-app -- workspace_cache_scope_ cli::mcp cli::logging cli::lsp cli::mcp::tests::
+          run_tests -p bsl-analyzer -- diagnostics_baseline_create diagnostics_baseline_update partitioned_baseline_transaction selective_baseline_transaction
+      - name: Shared LSP and MCP owner and editor lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          lib_filters=(
+            panic_watch::
+            shared_admission_
+            mem_docs::tests::
+            diagnostics_keep_wire_version_and_reject_results_from_before_an_edit
+            diagnostics_cancelled_by_writer_requeue_only_current_open_version
+            g1_origin_guard_
+          )
+          run_tests -p bsl-analyzer --test shared_workspace_backend
+          run_tests -p bsl-analyzer --test shared_workspace_backpressure
+          run_tests -p bsl-analyzer --lib -- "${lib_filters[@]}"
+
+  windows-core:
+    name: Windows core crates
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Native check executor tests without 1C
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          run_tests --locked -p bsl-check-executor
+      - name: Diagnostic occurrences, parameter rewrites and configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          run_tests -p ide-diagnostics --lib -- handlers::typo::tests:: single_pass::tests:: handlers::rewrite_method_parameter::tests:: config::tests::
+      - name: Selective baseline path security
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          run_tests -p project-model -- partitioned_baseline_path_security
+          run_tests -p ide -- selective_loader_rejects_unsafe_enabled_paths_and_links
+      - name: Shared workspace host
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out; with
+            # no filter the selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then
+                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              else
+                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              fi
+            done
+            return "$missing"
+          }
+          run_tests -p ide-host-core --lib -- workspace:: editor_view_builds_configuration_from_owner_inputs_and_refreshes_xml
+
+  windows-build:
+    name: Windows build artifacts
+    # The release build of the native executor and its artifact take minutes and
+    # nothing on a pull request consumes them; push runs on develop keep both.
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build binary
         run: cargo build -p bsl-analyzer --bin bsl-analyzer-app
-      - name: Native check executor tests without 1C
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty --locked -p bsl-check-executor
       - name: Build native check executor
         run: cargo build --locked --release -p bsl-check-executor --bin bsl-native-check
       - uses: actions/upload-artifact@v7
         with:
           name: native-check-windows-amd64
           path: target/release/bsl-native-check.exe
-      - name: Diagnostic occurrences, parameter rewrites and configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p ide-diagnostics --lib handlers::typo::tests::
-          run_nonempty -p ide-diagnostics --lib single_pass::tests::
-          run_nonempty -p ide-diagnostics --lib handlers::rewrite_method_parameter::tests::
-          run_nonempty -p ide-diagnostics --lib config::tests::
-          run_nonempty -p bsl-analyzer --test diagnostics_config_cli
-          run_nonempty -p bsl-analyzer --test diagnostic_rules_protocol
-          run_nonempty -p bsl-analyzer --test source_set_cli diagnostics_rules_
-          run_nonempty -p mcp-server --test diagnostics_baseline
-      - name: Workspace cache paths and scopes
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p mcp-server --lib workspace_cache_
-          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app workspace_cache_scope_
-          run_nonempty -p bsl-analyzer --test source_set_cli workspace_cache_scope_
-      - name: Windows check executor lifecycle tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p mcp-server --lib check_executor_windows_tests
-      - name: CLI MCP mode and lifecycle tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::mcp
-      - name: Vector lifecycle and bounded journal regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p bsl-search --lib lifecycle
-          run_nonempty -p mcp-server --lib vector_lifecycle
-          run_nonempty -p mcp-server --lib graph::snapshot::tests::drift_marks_stale_and_async_reload_bumps_generation -- --exact
-          run_nonempty -p mcp-server --lib state::bootstrap::tests::a_workspace_without_a_watch_follows_edits_through_the_poll -- --exact
-          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging
-      - name: Diagnostics baseline atomic create
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p bsl-analyzer diagnostics_baseline_create
-      - name: Diagnostics baseline atomic update
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p bsl-analyzer diagnostics_baseline_update
-      - name: Partitioned diagnostics baseline transaction
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p bsl-analyzer partitioned_baseline_transaction
-      - name: Selective diagnostics baseline transaction
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p bsl-analyzer selective_baseline_transaction
-      - name: Selective baseline path security
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p project-model partitioned_baseline_path_security
-          run_nonempty -p ide selective_loader_rejects_unsafe_enabled_paths_and_links
-      - name: HTTP transport tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p mcp-server --test http
-      - name: Broker runtime tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p mcp-server --test broker
-      - name: Shared LSP and MCP owner and editor lifecycle
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            local log status
-            log=$(mktemp)
-            printf '>>> cargo test %s\n' "$*"
-            cargo test "$@" 2>&1 | tee "$log" && status=0 || status=$?
-            printf '<<< cargo test %s: exit %s\n' "$*" "$status"
-            if [ "$status" -ne 0 ]; then
-              return "$status"
-            fi
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$log" \
-              || { echo "::error::cargo test $* selected no test"; return 1; }
-          }
-          run_nonempty -p bsl-analyzer --test shared_workspace_backend
-          run_nonempty -p bsl-analyzer --test shared_workspace_backpressure
-          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::lsp
-          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::mcp::tests::
-          run_nonempty -p bsl-analyzer --lib panic_watch::
-          run_nonempty -p bsl-analyzer --lib shared_admission_
-          run_nonempty -p bsl-analyzer --lib mem_docs::tests::
-          run_nonempty -p bsl-analyzer --lib diagnostics_keep_wire_version_and_reject_results_from_before_an_edit
-          run_nonempty -p bsl-analyzer --lib diagnostics_cancelled_by_writer_requeue_only_current_open_version
-          run_nonempty -p ide-host-core --lib workspace::
-          run_nonempty -p ide-host-core --lib editor_view_builds_configuration_from_owner_inputs_and_refreshes_xml
-          run_nonempty -p mcp-server --lib saved_path_refresh_
-          run_nonempty -p mcp-server --lib queued_source_writer_
-          run_nonempty -p mcp-server --lib editor_path_hints_
-          run_nonempty -p mcp-server --lib lru_trim_waits_for_analysis_clone_without_publishing_generation
-          run_nonempty -p mcp-server --lib shared_backend_sessions_keep_tool_gates_and_native_dispatch_local
-          run_nonempty -p mcp-server --lib invalid_project_freezes_disk_publications_but_keeps_last_good_resident_readable
-          run_nonempty -p mcp-server --lib invalid_project_closes_mcp_before_retiring_last_good_backend
-          run_nonempty -p mcp-server --lib pending_baseline_connects_only_after_start
-          run_nonempty -p mcp-server --lib shared_workspace_defers_workspace_and_reference_credentials_until_activation
-          run_nonempty -p mcp-server --lib broker::transport::
-          run_nonempty -p mcp-server --lib broker::daemon::shared_tests::
-      - name: Name dictionary before graph publication
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p mcp-server --test name_dictionary
-      - name: Superseded workspace lease lifecycle
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p mcp-server workspace_lease::tests::observed_foreign_owner_is_permanent
-          run_nonempty -p mcp-server workspace_lease::tests::publish_fence_latches_supersession
-          run_nonempty -p mcp-server workspace_lease::tests::observed_owner_race_cannot_reclaim
-          run_nonempty -p mcp-server workspace_lease::tests::transient_unclaimed_is_not_superseded
-          run_nonempty -p mcp-server workspace_lease::tests::non_witness_states_remain_reclaimable
-      - name: Fenced search construction and apply
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p bsl-search engine::tests::workspace_constructor_publish_fence
-          run_nonempty -p mcp-server state::bootstrap::tests::startup_constructor_fence_distinguishes_retry_terminal_and_error
-          run_nonempty -p mcp-server state::bootstrap::tests::startup_metadata_fence_stops_after_takeover
-          run_nonempty -p mcp-server state::bootstrap::tests::startup_ingest_fence_does_not_repeat_preparation
-          run_nonempty -p mcp-server state::bootstrap::tests::superseded_bootstrap_stops_mutating
-          run_nonempty -p mcp-server state::sync::tests::superseded_daemon_cannot_mutate_shared_search
-      - name: Terminal graph snapshot lifecycle
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p mcp-server graph::state::tests::superseded_graph_never_adopts_or_reloads
-          run_nonempty -p mcp-server graph::state::tests::superseded_late_publish_is_fenced
-          run_nonempty -p mcp-server graph::build::tests::superseded_fused_writer_stops_mutating
-          run_nonempty -p mcp-server graph::build::tests::superseded_build_is_discarded_after_owner_release
-          run_nonempty -p mcp-server graph::state::tests::a_superseded_owner_lets_the_file_go_once_its_reads_finish
-          run_nonempty -p mcp-server graph::state::tests::superseded_status_truth_table
-          run_nonempty -p mcp-server graph_actions_fail_when_superseded_snapshot_is_gone
-      - name: Terminal retry embedding and broker lifecycle
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p mcp-server state::overlay_retry::tests::observed_supersession_never_resumes
-          run_nonempty -p bsl-search engine::tests::embedding_publish_fence
-          run_nonempty -p mcp-server state::embed::tests::embedding_fence_distinguishes_retry_from_supersession
-          run_nonempty -p mcp-server state::tests::terminal_supersession_is_not_transient_nonownership
-          run_nonempty -p mcp-server --test broker superseded_backend_lifecycle
-      - name: Workspace lease operation semantics portable regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Exact names, each required to run at least one test: a renamed or moved test
-          # would otherwise match nothing and pass.
-          run_exact() {
-            local output status
-            output=$(cargo test -p "$1" --lib "$2" -- --exact 2>&1) && status=0 || status=$?
-            printf '%s\n' "$output"
-            if [ "$status" -ne 0 ]; then
-              echo "::error::$2 failed with status $status"
-              return "$status"
-            fi
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_exact mcp-server workspace_lease::tests::release_during_checkpointed_callback_rolls_back_as_terminal
-          run_exact mcp-server workspace_lease::tests::release_waits_for_only_the_admitted_batch_and_refuses_the_next
-          run_exact mcp-server workspace_lease::tests::takeover_between_batches_preserves_the_first_and_terminates_the_next
-          run_exact mcp-server state::bootstrap::tests::startup_constructor_fence_distinguishes_retry_terminal_and_error
-          run_exact mcp-server state::sync::tests::background_snapshot_failures_require_rescan_instead_of_empty_xml_success
-          run_exact mcp-server state::embed::tests::embedding_fence_distinguishes_retry_from_supersession
-          run_exact mcp-server state::overlay_retry::tests::transient_budget_fails_once_answers_mid_pass_facts_and_rearms_on_new_drift
-          run_exact mcp-server graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement
-          run_exact mcp-server graph::snapshot::tests::final_install_rechecks_token_through_the_preopened_descriptor
-          run_exact mcp-server graph::snapshot::tests::publication_without_a_complete_descriptor_pool_cannot_be_ready
-          run_exact mcp-server graph::build::tests::incremental_publish_propagates_transient_refusal
-          run_exact mcp-server graph::build::tests::fresh_and_cached_publication_paths_propagate_final_install_refusal
-          run_exact mcp-server graph_supersession_contract::graph_handler_misses_immediately_when_preopened_handles_are_busy
-          run_exact mcp-server graph_supersession_contract::resolve_names_misses_immediately_when_preopened_handles_are_busy
-          run_exact mcp-server graph_supersession_contract::symbol_info_misses_immediately_when_preopened_handles_are_busy
-          run_exact mcp-server graph_supersession_contract::references_misses_immediately_when_preopened_handles_are_busy
-      - name: Portable workspace lease profiles
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_exact() {
-            # `set -e` aborts the function on the ASSIGNMENT when cargo fails, before the
-            # print below — so the failing test's output never reaches the log. Take the
-            # status by hand, print, and only then decide.
-            local output status
-            output=$(cargo test -p mcp-server --lib "$1" -- --exact 2>&1) && status=0 || status=$?
-            printf '%s\n' "$output"
-            if [ "$status" -ne 0 ]; then
-              echo "::error::$1 failed with status $status"
-              return "$status"
-            fi
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_exact workspace_lease::tests::contention_unclaimed_and_missing_are_transient
-          run_exact workspace_lease::tests::a_throttled_checkpoint_still_reports_a_release
-          run_exact graph::snapshot::tests::path_identity_detects_equal_size_and_time_replacement
-          run_exact tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease
-          run_exact tools::search::tests::all_search_modes_are_resident_only_under_held_lease
-          run_exact tests::all_status_requests_are_cached_under_held_lease
-          run_exact inventory::no_generic_or_unclassified_production_lease_callers
-          run_exact inventory::fence_callers_are_exactly_classified
-          run_exact inventory::request_paths_do_not_call_lease_or_mutation_helpers
-          run_exact inventory::production_source_handles_checkout_line_endings
-          run_exact inventory::production_source_keeps_the_request_handlers_of_lib_rs
-          run_exact inventory::production_source_drops_the_test_modules_of_real_sources
-          run_exact inventory::the_request_path_gate_fails_on_an_injected_lease_call
-          run_exact state::embed::tests::prepared_index_survives_transient_swap_without_rebuild
-      - name: Drift contract
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Exact names, each required to run at least one test: a renamed or moved test
-          # would otherwise match nothing and pass.
-          run_exact() {
-            local output status
-            output=$(cargo test -p "$1" --lib "$2" -- --exact 2>&1) && status=0 || status=$?
-            printf '%s\n' "$output"
-            if [ "$status" -ne 0 ]; then
-              echo "::error::$2 failed with status $status"
-              return "$status"
-            fi
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_exact mcp-server state::background_lifetime_tests::shutdown_stops_every_owner_within_a_second
-          run_exact mcp-server change_hub::tests::interrupted_waiters_return_at_once_and_stay_released
-          run_exact mcp-server change_hub::tests::a_hub_without_a_watch_polls_after_one_reconcile
-          run_exact mcp-server change_hub::tests::a_same_stat_edit_is_found_by_the_content_check_once
-          run_exact mcp-server graph::state::tests::marks_are_consumed_by_an_observing_publication_in_every_order
-          run_exact mcp-server graph::watcher::tests::marks_placed_after_the_graph_caught_up_on_its_own_are_consumed_at_once
-          run_exact mcp-server graph::watcher::tests::owed_marks_force_a_rebuild_of_an_unchanged_graph
-          run_exact mcp-server graph::watcher::tests::a_stalled_search_cursor_costs_the_hub_its_capacity_at_most_and_the_graph_nothing
-          run_exact mcp-server state::bootstrap::tests::a_quiet_healthy_boot_asks_for_no_reconcile_mark_or_reload
-          run_exact mcp-server state::bootstrap::tests::the_graph_follows_edits_after_search_init_failed
-          run_exact mcp-server state::bootstrap::tests::a_superseded_daemon_applies_nothing_more_and_releases_its_cursors
-          run_exact mcp-server state::bootstrap::tests::the_search_and_the_graph_say_who_watches_them
-          run_exact mcp-server state::overlay_backlog::tests::a_large_backlog_drains_without_pauses_between_batches
-          run_exact mcp-server state::overlay_backlog::tests::a_held_writer_lock_refuses_the_commit_and_a_stop_is_answered_during_the_backoff
-          run_exact mcp-server state::overlay_backlog::tests::point_batches_and_full_plans_do_not_roll_each_other_back
-          run_exact mcp-server tools::search::acquire::tests::acquisitions_are_served_in_ticket_order_with_one_raw_waiter
-          run_exact mcp-server inventory::the_search_engine_is_held_only_through_its_admission
-          run_exact mcp-server inventory::production_source_ends_a_gated_variant_or_arm_at_its_comma
-          run_exact mcp-server inventory::production_source_keeps_the_tail_of_a_gated_statement_with_generic_arguments
-          run_exact mcp-server tools::search::render::tests::answers_pass_the_schema_their_profile_publishes
-          run_exact mcp-server contract::tests::mcp_surface_snapshot
-          run_exact mcp-server graph::state::tests::freshness_rests_on_the_drift_watch
-          run_exact mcp-server graph::state::tests::owed_marks_stop_rebuilding_when_their_budget_is_spent
-          run_exact mcp-server graph::build::tests::a_failed_reload_is_owed_behind_its_backoff
-          run_exact mcp-server graph::watcher::tests::a_failed_reload_is_retried_without_another_event
-          run_exact mcp-server graph::watcher::tests::a_reconcile_owes_a_project_reload_in_every_live_state
-          run_exact mcp-server change_hub::tests::the_content_check_keeps_its_budget_for_a_large_file
-          run_exact mcp-server change_hub::tests::a_same_stat_edit_before_the_first_read_is_found
-          run_exact mcp-server state::overlay_backlog::tests::a_stop_during_preparation_is_answered_between_keys
-          run_exact mcp-server state::overlay_backlog::tests::a_busy_commit_is_offered_again_soon
-          run_exact mcp-server state::overlay_retry::tests::a_wake_between_the_check_and_the_sleep_is_not_lost
-          run_exact mcp-server state::sync::tests::a_consumer_blocked_on_its_first_fence_is_not_yet_watching
-          run_exact mcp-server state::consumer_phase_tests::a_consumer_whose_thread_never_ran_is_abandoned
-          run_exact mcp-server graph::build::tests::a_failed_reload_whose_retry_is_held_stays_owed
-          run_exact mcp-server graph::build::tests::a_refused_first_build_is_owed_a_retry
-          run_exact mcp-server graph::state::tests::marks_that_revive_a_spent_obligation_wake_the_watcher
-          run_exact mcp-server tools::search::render::tests::an_index_whose_watch_is_starting_is_not_complete
-          run_exact mcp-server state::overlay_backlog::tests::a_drained_backlog_stops_counting_as_work_at_once
-          run_exact mcp-server state::overlay_backlog::tests::a_revived_owner_starts_its_busy_schedule_over
-          run_exact mcp-server state::background_lifetime_tests::shutdown_does_not_wait_out_an_engine_hold
-          run_exact bsl-search point_refresh::structure::the_point_path_keeps_its_shape
-          run_exact bsl-search point_refresh::structure::the_point_path_gate_reads_a_crlf_checkout
-          run_exact bsl-search point_refresh::tests::a_cancelled_preparation_reads_no_further_key
-          run_exact bsl-search engine::retry_signal_ownership::marks_alone_demand_no_embedding_pass
-          run_exact bsl-search engine::tests::a_local_drift_removal_hides_nothing
-          run_exact bsl-search point_refresh::tests::a_bounded_publication_refuses_whole_baseline_loads_and_phase_c_needs_none
-          run_exact bsl-search point_refresh::tests::a_busy_store_gives_the_batch_back_and_the_retry_reads_nothing
-          run_exact bsl-search store::tests::every_baseline_write_moves_the_baseline_version
-          run_exact mcp-server change_hub::tests::a_repeated_declaration_costs_the_fallback_poll_nothing
-          run_exact mcp-server change_hub::tests::a_declaration_naming_a_missing_root_is_reported_once
-          run_exact mcp-server change_hub::tests::two_owners_declaring_one_set_declare_it_once
-          run_exact mcp-server change_hub::tests::shutdown_stops_the_fallback_poll
-          run_exact mcp-server graph::state::tests::a_loader_that_cannot_start_is_owed_a_retry
-          run_exact mcp-server graph::state::tests::a_publication_cannot_be_installed_while_marks_are_being_consumed
-          run_exact mcp-server graph::state::tests::marks_survive_a_lease_that_cannot_be_confirmed
-          run_exact mcp-server graph::state::tests::a_request_spends_neither_the_budget_nor_a_debt
-          run_exact mcp-server state::tests::an_owner_told_to_leave_answers_stopping_even_with_the_engine_held
-          run_exact mcp-server state::sync::tests::a_preparation_refused_by_a_stop_is_stopping_not_a_poisoned_lock
-          run_exact mcp-server state::overlay_retry::tests::a_paused_driver_leaves_in_every_shutdown_order
-          run_exact mcp-server state::retry_window::tests::one_refusal_moves_the_schedule_one_step
-          run_exact mcp-server state::embed::tests::an_embed_pass_in_its_retry_pause_is_not_live_work
-          run_exact mcp-server state::overlay_retry::tests::a_driver_in_its_retry_pause_is_not_a_running_pass
-          run_exact mcp-server state::background_lifetime_tests::shutdown_stops_a_polling_hub
-          run_exact mcp-server state::background_lifetime_tests::a_stop_releases_an_owner_asleep_in_a_hub_wait
-          run_exact mcp-server diagnostics_state::lifecycle::tests::a_shutdown_wakes_the_idle_sweeper_out_of_its_tick
-          run_exact mcp-server tools::search::lexical::tests::only_an_initialized_overlay_can_vouch_for_its_own_debt
-          run_exact mcp-server inventory::every_production_wait_is_classified
-          run_exact mcp-server inventory::the_wait_inventory_fails_on_an_injected_sleep
-          run_exact mcp-server inventory::the_test_only_modules_are_the_ones_the_parent_gates
-          run_exact mcp-server inventory::no_request_path_holds_an_owner_wait
-          run_exact bsl-search engine::tests::an_uninitialized_overlay_owes_what_its_counts_cannot_say
-          run_exact mcp-server graph::debt::tests::every_short_order_keeps_the_contract_and_settles
-          run_exact mcp-server graph::debt::tests::every_four_deep_order_keeps_the_contract
-          run_exact mcp-server graph::debt::tests::an_unsound_publication_is_probed_and_only_a_healing_rebuilds
-          run_exact mcp-server graph::debt::tests::a_quiet_graph_starts_no_build_of_its_own
-          run_exact mcp-server graph::debt::tests::two_owners_recording_one_reconcile_owe_one_build
-          run_exact mcp-server graph::debt::tests::marks_in_their_grace_start_no_build
-          run_exact mcp-server graph::debt::tests::marks_whose_budget_is_spent_start_no_more_builds
-          run_exact mcp-server graph::debt::tests::marks_behind_a_spent_failure_are_not_starved
-          run_exact mcp-server graph::debt::tests::marks_left_behind_a_live_retry_name_no_stale_alarm
-          run_exact mcp-server graph::debt::tests::a_spent_retry_holds_nothing_and_the_standing_says_so
-          run_exact mcp-server graph::debt::tests::a_stopped_graph_decides_no_work_however_it_is_driven
-          run_exact mcp-server graph::debt::tests::an_unsound_publication_settles_into_a_watch
-          run_exact mcp-server graph::state::tests::a_stopped_graph_starts_nothing_however_it_is_driven
-          run_exact mcp-server graph::state::tests::a_stop_during_the_claims_own_walk_is_refused_at_the_claim
-          run_exact mcp-server graph::watcher::tests::the_watcher_records_an_idle_graphs_debt_without_taking_its_build
-          run_exact mcp-server graph::state::tests::a_claimed_slot_is_never_abandoned
-          run_exact mcp-server graph::state::tests::a_stopped_graph_admits_no_fused_cold_build
-          run_exact mcp-server graph::state::tests::the_boots_own_call_respects_a_spent_retry_budget
-          run_exact mcp-server graph::watcher::the_watcher_records_and_does_not_decide::the_watcher_never_calls_a_recording_that_decides
-          run_exact mcp-server graph::watcher::tests::an_advisory_nobody_keeps_current_says_so
-          run_exact mcp-server graph::watcher::tests::advisory_refresh_before_scope_guard_preserves_the_boot_project_on_drift
-          run_exact mcp-server state::overlay_retry::every_wait_reads_the_stop::no_branch_of_the_loop_sleeps_without_reading_the_stop
-          run_exact mcp-server state::overlay_retry::tests::a_stop_while_the_driver_is_asking_the_engine_is_not_slept_off
-          run_exact mcp-server state::embed::embed_exit_status::every_exit_of_the_pass_says_how_it_ended
-          run_exact mcp-server workspace_lease::tests::a_cached_ownership_verdict_before_any_check_succeeded_is_not_an_answer
-          run_exact bsl-search point_refresh::tests::a_baseline_mode_change_discards_a_prepared_point_batch
-          run_exact mcp-server graph::debt::tests::a_spent_budget_starts_no_more_builds
-          run_exact mcp-server graph::debt::tests::a_workspace_that_cannot_build_stops_trying
-          run_exact mcp-server graph::debt::tests::a_request_pulls_the_probe_forward_but_never_resets_its_backoff
-          run_exact mcp-server graph::state::tests::every_hold_wakes_the_watcher
-          run_exact mcp-server graph::state::tests::a_request_runs_a_retry_that_is_due_and_none_that_is_not
-          run_exact mcp-server state::bootstrap::tests::the_engine_is_free_while_a_publication_waits_out_a_foreign_lease_hold
-          run_exact mcp-server state::overlay_backlog::tests::a_discarded_batch_is_paced_because_it_settled_nothing
-          run_exact mcp-server change_hub::tests::a_large_file_resumes_across_ticks_with_other_files_beside_it
-          run_exact mcp-server change_hub::tests::the_blind_poll_never_reads_a_whole_budget_under_the_poller_lock
-          run_exact mcp-server inventory::the_reason_codes_clients_see_are_the_frozen_set
-          run_exact mcp-server inventory::the_gate_window_never_splits_a_character
-          run_exact bsl-search engine::tests::a_pause_outliving_its_pass_leaves_the_flag_down
-          run_exact mcp-server graph::state::tests::post_claim_fact_survives_publication
-          run_exact mcp-server graph::debt::tests::answered_credit_cannot_finance_a_later_failure
-          run_exact mcp-server graph::debt::tests::comparison_answer_retires_only_covered_credits
-          run_exact mcp-server graph::debt::tests::pending_work_pays_for_its_next_claim_only_once
-          run_exact mcp-server graph::debt::tests::expired_marks_do_not_force_a_live_retry
-          run_exact mcp-server graph::debt::tests::a_new_fact_revives_spent_marks_without_reusing_old_credit
-          run_exact mcp-server graph::debt::tests::repeated_recovery_level_never_reopens_an_epoch
-          run_exact mcp-server graph::debt::tests::unsound_recovery_keeps_its_witness_and_backoff
-          run_exact mcp-server graph::debt::tests::a_live_forced_owner_suppresses_redundant_probes
-          run_exact mcp-server graph::state::tests::one_comparison_turn_flushes_each_hook_revision_once
-          run_exact mcp-server graph::state::tests::a_new_fact_during_comparison_runs_before_idle_wait
-          run_exact mcp-server graph::watcher::tests::initial_observation_is_not_a_new_failure_credit
-          run_exact mcp-server graph::snapshot::tests::closing_a_scan_cursor_prevents_resubscription_and_stale_writeback
-          run_exact mcp-server state::overlay_backlog::tests::terminal_lease_exit_preserves_its_reason
-          run_exact mcp-server change_hub::tests::an_untouched_file_is_reported_at_most_once_and_a_same_stat_edit_is_still_found
-          run_exact mcp-server graph::debt::tests::a_measured_healing_revives_a_spent_budget_without_a_new_fact
-          run_exact mcp-server graph::debt::tests::a_measured_healing_keeps_the_pace_the_probing_earned
-          run_exact mcp-server graph::debt::tests::a_delivery_already_answered_buys_nothing_when_it_repeats
-          run_exact mcp-server graph::debt::tests::marks_operation_closes_its_sponsor
-          run_exact mcp-server graph::debt::tests::expired_marks_outcome_does_not_mint_primary
-          run_exact mcp-server graph::debt::tests::marks_attached_in_grace_pay_on_claim
-          run_exact mcp-server graph::debt::tests::a_claim_after_a_long_walk_revalidates_its_sponsor
-          run_exact mcp-server graph::state::tests::a_refusing_hook_is_paced_and_does_not_spin_the_executor
-          run_exact mcp-server graph::state::tests::an_observed_level_is_not_authority_for_a_later_failure
-          run_exact mcp-server graph::state::tests::an_initial_claim_keeps_the_marks_sponsored_mode
-          run_exact mcp-server graph::snapshot::tests::a_closing_cursor_races_its_own_drain_and_a_second_comparison
-          run_exact mcp-server graph::state::tests::the_debt_lock_is_never_taken_before_the_lifecycle_lock
-          run_exact mcp-server graph::state::tests::two_executor_turns_offer_one_hook_revision_once
-          run_exact mcp-server graph::state::tests::a_revision_raised_during_an_offer_survives_that_offers_reply
-          run_exact mcp-server graph::state::tests::a_hook_that_drives_the_graph_back_is_not_offered_the_same_revision_again
-          run_exact mcp-server graph::state::tests::a_publication_whose_hook_refuses_paces_the_next_offer
-          run_exact mcp-server graph::state::tests::an_offer_nobody_owes_is_not_made
-          run_exact mcp-server graph::watcher::tests::a_latch_raised_inside_the_sampling_window_is_not_slept_through
-          run_exact mcp-server graph::state::tests::the_graphs_own_owners_all_finish_within_a_watchdog
-          run_exact mcp-server graph::debt::tests::recovery_tracks_cap_minus_one_cap_and_cap_plus_one
-          run_exact mcp-server graph::debt::tests::saturated_unread_does_not_hide_scan_recovery
-          run_exact mcp-server graph::debt::tests::every_obsolete_basis_rejects_all_names
-          run_exact mcp-server graph::debt::tests::repaired_paths_retire_while_another_path_remains_unread
-          run_exact mcp-server graph::debt::tests::retired_paths_leave_no_trace_behind_them
-          run_exact mcp-server graph::debt::tests::omission_from_incomplete_unread_is_not_retirement
-          run_exact mcp-server graph::debt::tests::recovery_credits_are_claim_bound_not_bankable
-          run_exact mcp-server graph::snapshot::tests::only_three_positives_retire_an_obligation
-          run_exact mcp-server graph::snapshot::tests::strict_unread_errors_never_become_an_empty_answer
-          run_exact mcp-server graph::state::tests::actual_roots_a_b_a_retire_only_answered_scope
-          run_exact mcp-server graph::state::tests::invalid_project_fallback_is_not_root_retirement
-          run_exact mcp-server graph::state::tests::native_memory_and_probe_costs_are_proportional_to_the_outstanding_set
-          run_exact mcp-server graph::state::tests::an_executor_turn_during_a_publish_pass_offers_nothing
-          run_exact mcp-server graph::state::tests::only_an_actual_open_failure_is_a_negative
-          run_exact mcp-server graph::debt::tests::a_removed_unread_path_is_news_once
-          run_exact mcp-server graph::debt::tests::a_straddled_publication_validates_its_scan_once_per_episode
-          run_exact mcp-server graph::debt::tests::a_healing_already_measured_survives_a_failure_and_a_new_publication
-          run_exact mcp-server graph::debt::tests::a_look_older_than_what_is_remembered_measures_nothing
-          run_exact mcp-server graph::debt::tests::a_marks_demand_placed_after_the_claim_survives_its_outcome
-          run_exact mcp-server graph::debt::tests::a_covered_answer_closes_the_credit_that_paid_for_it
-          run_exact mcp-server graph::debt::tests::a_coherent_answer_closes_the_credits_it_covered
-          run_exact mcp-server graph::debt::tests::an_uncovered_healing_outlives_the_publication_that_missed_it
-          run_exact mcp-server graph::debt::tests::an_address_the_publication_declares_unread_is_never_retired
-          run_exact mcp-server graph::debt::tests::a_straddled_walk_does_not_validate_the_scan
-          run_exact mcp-server graph::debt::tests::the_first_walk_of_a_replaced_declaration_is_news
-          run_exact mcp-server graph::debt::tests::a_probe_that_outlived_its_episode_still_owns_the_walk
-          run_exact mcp-server graph::state::tests::the_publication_gate_reads_no_metadata_of_its_own
-          run_exact mcp-server graph::debt::tests::a_publication_that_cannot_read_its_own_metadata_answers_nothing
-          run_exact mcp-server graph::debt::tests::a_straddled_publication_cannot_end_the_chain
-          run_exact mcp-server graph::debt::tests::a_declaration_nobody_has_installed_yet_still_heals_on_its_own_account
-          run_exact mcp-server graph::debt::tests::a_verdict_about_other_roots_is_not_carried_into_the_new_ones
-          run_exact mcp-server graph::state::tests::the_boot_and_the_external_claim_carry_the_healings_measured_before_them
-          run_exact mcp-server graph::state::tests::a_real_fact_delivered_inside_a_comparison_runs_before_any_idle_wait
-          run_exact mcp-server graph::state::tests::a_build_that_never_started_spends_no_healing
-          run_exact mcp-server graph::state::tests::a_change_delivered_during_the_walk_outlives_that_comparison
-          run_exact mcp-server graph::state::tests::a_saturated_mark_ledger_and_a_retiring_recovery_set_bound_each_other_not_at_all
-      - name: LSP retry origin guards
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_nonempty() {
-            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
-            printf '%s\n' "$output"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
-          }
-          run_nonempty -p bsl-analyzer --lib g1_origin_guard_
 
   partitioned-baseline-scale:
     name: Partitioned baseline 1.6M release gate

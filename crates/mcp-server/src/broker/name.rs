@@ -497,48 +497,63 @@ pub(crate) fn current_euid() -> u32 {
 
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     match std::fs::metadata(dir) {
-        Ok(meta) if meta.is_dir() => {
-            // A pre-existing dir must be private AND owned by us; otherwise a co-tenant
-            // could have pre-created a 0700 dir they own to host (and observe or
-            // pre-empt) our socket. This matters for the shared-/tmp fallback;
-            // `$XDG_RUNTIME_DIR` is already kernel-private to our uid.
-            let mode = meta.permissions().mode() & 0o777;
-            if mode != 0o700 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "broker runtime dir {} has mode {mode:#o}, expected 0o700",
-                        dir.display()
-                    ),
-                ));
-            }
-            if meta.uid() != current_euid() {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "broker runtime dir {} is owned by uid {}, not the current user {}",
-                        dir.display(),
-                        meta.uid(),
-                        current_euid()
-                    ),
-                ));
-            }
-            Ok(())
-        }
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("broker runtime path {} exists and is not a directory", dir.display()),
-        )),
+        Ok(meta) => check_private_dir(dir, &meta),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // Non-recursive: the parent must already exist and be trusted (the caller
             // validates each level top-down), so we never create or descend through an
             // unvalidated ancestor.
-            std::fs::DirBuilder::new().mode(0o700).create(dir)
+            match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+                // Another launcher made it between the check and the create — an editor and
+                // an MCP client starting together. What it made is held to the same bar as
+                // any dir found in place; a path that exists but cannot be followed — a
+                // dangling link — keeps the create's own error.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    match std::fs::metadata(dir) {
+                        Ok(meta) => check_private_dir(dir, &meta),
+                        Err(_) => Err(e),
+                    }
+                }
+                created => created,
+            }
         }
         Err(e) => Err(e),
     }
+}
+
+/// An existing broker runtime dir is usable only as a directory that is private AND owned by
+/// us; otherwise a co-tenant could have pre-created a 0700 dir they own to host (and observe
+/// or pre-empt) our socket. This matters for the shared-/tmp fallback; `$XDG_RUNTIME_DIR` is
+/// already kernel-private to our uid.
+#[cfg(unix)]
+fn check_private_dir(dir: &Path, meta: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("broker runtime path {} exists and is not a directory", dir.display()),
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("broker runtime dir {} has mode {mode:#o}, expected 0o700", dir.display()),
+        ));
+    }
+    if meta.uid() != current_euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "broker runtime dir {} is owned by uid {}, not the current user {}",
+                dir.display(),
+                meta.uid(),
+                current_euid()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -961,6 +976,49 @@ mod tests {
         // The tag is what overflowed: the same temp dir treated as shared does not fit.
         let tagged = socket_dir_layout(SocketDirSource::SharedTemp(tmp), "user");
         assert!(tagged.dir.join(&leaf).as_os_str().as_encoded_bytes().len() >= DARWIN_SUN_PATH_MAX);
+    }
+
+    /// Two launchers starting together — an editor and an MCP client — both find the runtime
+    /// dir missing and both create it; the one whose create loses must still get the dir, or
+    /// it gives up on the shared backend. The barrier lines the two up on a fresh dir every
+    /// round, so the creates collide in nearly every round; the outcome asserted is the same
+    /// whichever one wins.
+    #[cfg(unix)]
+    #[test]
+    fn launchers_creating_the_runtime_dir_together_both_get_it() {
+        use std::os::unix::fs::PermissionsExt;
+        for round in 0..64 {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join(SOCKET_DIR_LEAF);
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let launchers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (dir, start) = (dir.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        create_private_dir(&dir)
+                    })
+                })
+                .collect();
+            for launcher in launchers {
+                let outcome = launcher.join().unwrap();
+                assert!(outcome.is_ok(), "round {round}: a launcher lost the dir: {outcome:?}");
+            }
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "round {round}: the dir both launchers use is private");
+        }
+    }
+
+    /// A dangling link where the runtime dir should be fails the create, and the re-check of
+    /// what another launcher made cannot follow it: the error stays the create's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_at_the_runtime_dir_is_reported_as_existing() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(SOCKET_DIR_LEAF);
+        std::os::unix::fs::symlink(root.path().join("missing"), &dir).unwrap();
+        let error = create_private_dir(&dir).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
     }
 
     /// The privacy check must see the path it was given, not what the path points at.

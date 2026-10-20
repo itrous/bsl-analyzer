@@ -4,7 +4,7 @@
 //! The internal tree has every excluded path, so such an `include_str!` compiles and
 //! passes here and breaks only the mirror, after the sync has already been pushed.
 //! Optional material from an excluded path is read at run time and skipped when its
-//! directory is absent, as `crates/parser/tests/grammar_attestation.rs` does.
+//! directory is absent, as `crates/parser/tests/parser_suite/grammar_attestation.rs` does.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};

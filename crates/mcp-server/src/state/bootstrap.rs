@@ -6044,17 +6044,29 @@ mod tests {
         assert!(fed >= 1, "the edited file was reindexed from the resident's shared parse");
 
         // Fresh bytes are served: the new symbol is found through the overlay (the lexical path the
-        // search tool drives), though it is absent from the v1 store baseline.
-        let (hits, _hidden) = {
-            let guard = state.search_engine().lock().unwrap();
-            let engine = guard.as_ref().unwrap();
-            engine.workspace_overlay_lexical_hits("СвежаяПроцедура", 10).unwrap()
+        // search tool drives), though it is absent from the v1 store baseline. The first feed can
+        // be of a batch delivered while the write was still landing, so the final bytes may take
+        // one more batch: the wait is for the served answer, bounded only against a hang.
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            test_utils::wait::hang_guard(Duration::from_secs(60)),
+            std::time::Duration::from_millis(20),
+        );
+        let served = loop {
+            let (hits, _hidden) = {
+                let guard = state.search_engine().lock().unwrap();
+                let engine = guard.as_ref().unwrap();
+                engine.workspace_overlay_lexical_hits("СвежаяПроцедура", 10).unwrap()
+            };
+            if hits.iter().any(|hit| hit.file_path.ends_with("Module.bsl")) {
+                break true;
+            }
+            if !deadline.allows() {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         };
         state.shutdown();
-        assert!(
-            hits.iter().any(|hit| hit.file_path.ends_with("Module.bsl")),
-            "the overlay must serve the fresh working-tree bytes for the edited file",
-        );
+        assert!(served, "the overlay must serve the fresh working-tree bytes for the edited file");
     }
     /// Warm boot of a local FTS-only workspace: the store is reused from a prior run and its
     /// re-index is skipped (chunks already exist), so a file changed WHILE THE DAEMON WAS DOWN is
@@ -6893,7 +6905,7 @@ mod tests {
         let mut revision = None;
         crate::graph::test_support::wait_until_within(
             graph,
-            std::time::Duration::from_secs(60),
+            test_utils::wait::ceiling(std::time::Duration::from_secs(60)),
             "a readable graph revision",
             || {
                 revision = graph.status_report().revision;

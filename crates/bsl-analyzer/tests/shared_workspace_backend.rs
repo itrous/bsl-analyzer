@@ -215,7 +215,7 @@ async fn mcp_client_with_args(root: &Path, mode: &str, extra: &[&str]) -> (Clien
     let stdin = child.stdin.take().expect("MCP stdin");
     let pid = child.id().unwrap_or_default();
     let client = match tokio::time::timeout(
-        test_utils::wait::ceiling(Duration::from_secs(60)),
+        test_utils::wait::hang_guard(Duration::from_secs(60)),
         ().serve((stdout, stdin)),
     )
     .await
@@ -259,6 +259,8 @@ fn onec_validation_mock(valid: bool) -> (String, Receiver<String>, JoinHandle<()
                 Err(error) => panic!("accept native validation request: {error}"),
             }
         };
+        // Windows hands the listener's non-blocking mode to the accepted stream.
+        stream.set_nonblocking(false).expect("blocking mock request read");
         stream
             .set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(10))))
             .expect("bound mock request read");
@@ -410,7 +412,8 @@ fn isolated_backend_env(cache: &Path, runtime: &Path) -> EnvGuard {
 }
 
 async fn wait_for_owner_initializers(runtime: &Path, count: usize) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(60));
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
     loop {
         let markers = backend_markers(runtime);
         let starts = markers.iter().filter(|line| line.contains("owner_init_start")).count();
@@ -426,7 +429,8 @@ async fn wait_for_owner_initializers(runtime: &Path, count: usize) -> Vec<String
 }
 
 async fn wait_for_lsp_attach_in_epoch(runtime: &Path, epoch: &str) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(30));
     loop {
         let markers = backend_markers(runtime);
         if markers.iter().any(|line| {
@@ -457,7 +461,7 @@ fn owner_epochs(markers: &[String]) -> Vec<&str> {
 
 async fn wait_for_resident_bootstrap(runtime: &Path) -> Vec<String> {
     let deadline =
-        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(120));
     loop {
         let markers = backend_markers(runtime);
         if markers.iter().any(|line| line.contains("resident_bootstrap_complete")) {
@@ -486,7 +490,7 @@ fn kill_exact_test_daemon(pid: u32) {
 
 async fn disk_symbol(client: &Client) -> Value {
     let deadline =
-        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(120));
     loop {
         let response = tokio::time::timeout(
             deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -509,7 +513,8 @@ async fn disk_symbol(client: &Client) -> Value {
 }
 
 async fn wait_disk_type(client: &Client, expected: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(90));
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(90));
     loop {
         let card = disk_symbol(client).await;
         if card["status"] == "ok" && card["return_type"] == expected {
@@ -524,7 +529,8 @@ async fn wait_disk_type(client: &Client, expected: &str) -> Value {
 }
 
 async fn wait_disk_status(client: &Client, expected: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(90));
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(90));
     loop {
         let card = disk_symbol(client).await;
         if card["status"] == expected {
@@ -708,7 +714,8 @@ fn request_until_ready(
     params: Value,
     operation: &str,
 ) -> (Value, u64) {
-    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
+    let deadline =
+        std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(45));
     let mut id = first_id;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -739,7 +746,10 @@ fn request_until_ready(
 }
 
 async fn wait_for_backend_markers(runtime: &Path) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
+    // A hang guard, not a latency bound: an adapter that never attaches fails with the markers
+    // it left instead of holding the runner.
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(30));
     loop {
         let markers = backend_markers(runtime);
         if markers.iter().filter(|line| line.contains("session_attached")).count() >= 3
@@ -812,7 +822,7 @@ fn assert_owner_counts(markers: &[String], mcp_count: usize, lsp_count: usize) {
 
 async fn search_code_hits(client: &Client, query: &str) -> Value {
     let deadline =
-        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(120));
     loop {
         let response = client
             .call_tool(CallToolRequestParams::new("search").with_arguments(Map::from_iter([
@@ -836,7 +846,7 @@ async fn search_code_hits(client: &Client, query: &str) -> Value {
 
 async fn graph_resolve_answer(client: &Client, query: &str) -> Value {
     let deadline =
-        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
+        tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(120));
     loop {
         let response = client
             .call_tool(CallToolRequestParams::new("graph").with_arguments(Map::from_iter([
@@ -871,7 +881,8 @@ fn hover_type(
     stale: &str,
 ) {
     let uri = lsp_types::Url::from_file_path(caller).expect("caller URI");
-    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(60));
+    let deadline =
+        std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
     loop {
         let request_id = *next_request_id;
         *next_request_id += 1;

@@ -97,6 +97,7 @@ windows-sys = { version = "0.61", features = [
 sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 
 [dev-dependencies]
+bsl-search = { workspace = true, features = ["test-seams"] }
 # Paused time keeps the task-finishing grace independent of blocking-thread scheduling.
 tokio = { version = "1", features = ["test-util"] }
 test-utils.workspace = true

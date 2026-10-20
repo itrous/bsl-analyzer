@@ -66,7 +66,7 @@ LSP напрямую (`crates/ide-diagnostics/src/handlers/parse_error.rs`), а 
   падающими: `2..2` вместо `5..5` у `MissingToken`, `2..5` вместо `3..5` у
   начала спана, `2..5` вместо `0..2` у `BumpToken` и `0..0` вместо `2..2` у
   `Custom` на пустом дереве;
-- `crates/parser/tests/error_ranges.rs`: соответствие «вид восстановления →
+- `crates/parser/tests/parser_suite/error_ranges.rs`: соответствие «вид восстановления →
   форма диапазона» на корпусе из фикстур и враждебных входов.
 
 ## Текущие ограничения

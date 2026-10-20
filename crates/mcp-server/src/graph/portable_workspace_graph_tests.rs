@@ -46,7 +46,11 @@ impl CountingEmbeddingServer {
                         if stopped.load(Ordering::SeqCst) {
                             break;
                         }
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        // Windows hands the listener's non-blocking mode to the accepted stream.
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(test_utils::wait::ceiling(
+                            Duration::from_secs(1),
+                        )));
                         let mut request = Vec::new();
                         let mut chunk = [0_u8; 2048];
                         let mut header_end = None;
@@ -326,6 +330,29 @@ fn search_vectors_and_hit(
 
 #[test]
 fn moved_cached_graph_reuses_revision_reads_new_sources_and_preserves_search_vectors() {
+    // The embedding settings below are process environment, and workspaces other tests build
+    // at the same time read them without the lock: their embeddings would reach this test's
+    // counting server. A process of its own has nobody else to read them.
+    const CHILD: &str = "BSL_MCP_PORTABLE_GRAPH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let _env_lock = crate::state::test_support::env_lock();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "graph::portable_workspace_graph_tests::moved_cached_graph_reuses_revision_reads_new_sources_and_preserves_search_vectors",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // A drifted name would select no test and still exit successfully.
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let _env_lock = crate::state::test_support::env_lock();
     let old_dir = tempfile::tempdir().expect("old workspace tempdir");
     let old_root = old_dir.path().join("old-workspace");

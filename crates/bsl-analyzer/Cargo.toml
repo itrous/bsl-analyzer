@@ -98,6 +98,7 @@ win-security-identifier = "0.1.1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
+bsl-search = { workspace = true, features = ["test-seams"] }
 test-utils.workspace = true
 expect-test.workspace = true
 rmcp = { version = "3.1", features = ["client"] }

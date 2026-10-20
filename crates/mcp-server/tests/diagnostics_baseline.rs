@@ -23,25 +23,46 @@ async fn diagnostic_rules_resident_preserves_occurrence_ranges_and_reloads_param
     let mut arguments = args("file");
     arguments.insert("path".to_owned(), json!("src/Module.bsl"));
     arguments.insert("min_severity".to_owned(), json!("hint"));
+    let mut revision = 0;
     for _ in 0..2 {
         let body = diagnostics(&client, arguments.clone()).await;
         assert_eq!(
             diagnostic_rules::legacy_ranges(body["result"]["findings"].as_array().unwrap()),
             diagnostic_rules::expected(&source, false, true)
         );
+        revision = body["revision"].as_u64().expect("revision");
     }
     diagnostic_rules::replace_config(dir.path(), 7);
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
+    // A config load rebuilds the resident and so raises its revision: the reloaded answer is
+    // the first one that is both newer than every answer before the change and carries the
+    // changed parameter.
+    let mut patience = common::Patience::new(common::STATE_CEILING, Duration::from_millis(20));
+    let reloaded = loop {
         let body = diagnostics(&client, arguments.clone()).await;
-        if diagnostic_rules::legacy_ranges(body["result"]["findings"].as_array().unwrap())
-            == diagnostic_rules::expected(&source, false, false)
+        if body["revision"].as_u64().expect("revision") > revision
+            && diagnostic_rules::legacy_ranges(body["result"]["findings"].as_array().unwrap())
+                == diagnostic_rules::expected(&source, false, false)
         {
-            break;
+            break body["revision"].as_u64().unwrap();
         }
-        assert!(std::time::Instant::now() < deadline, "resident config was not reloaded: {body}");
+        assert!(patience.allows(), "resident config was not reloaded: {body}");
         tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    // A request that reloaded the config would raise the revision by one each time, so this
+    // many outgrow the rebuilds still settling after the first reloaded answer.
+    let mut last = reloaded;
+    for _ in 0..diagnostic_rules::PULLS_PER_LOAD_BOUND {
+        let body = diagnostics(&client, arguments.clone()).await;
+        assert_eq!(
+            diagnostic_rules::legacy_ranges(body["result"]["findings"].as_array().unwrap()),
+            diagnostic_rules::expected(&source, false, false)
+        );
+        last = body["revision"].as_u64().unwrap();
     }
+    assert!(
+        last - reloaded < diagnostic_rules::PULLS_PER_LOAD_BOUND as u64,
+        "requests reloaded the changed config: revision {reloaded} -> {last}"
+    );
     client.cancel().await.unwrap();
 }
 

@@ -578,6 +578,19 @@ impl Store {
     }
 
     /// Apply every schema/open mutation as atomic groups under a cooperative fence.
+    /// Shorten this connection's contention budget, for a test that holds the writer itself
+    /// and has steps of its own to take meanwhile: under the default budget each of them would
+    /// wait the whole budget out before carrying on. It lasts until the connection's next point
+    /// commit or fenced open, which put the operational budget back.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn set_busy_timeout_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), SearchError> {
+        self.conn.busy_timeout(timeout)?;
+        Ok(())
+    }
+
     /// Put the connection back on the operational contention budget.
     ///
     /// The short budget a fenced open runs under belongs to that open alone: it exists so one

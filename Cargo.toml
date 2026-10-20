@@ -165,6 +165,11 @@ debug = 0
 [profile.dev.package."*"]
 opt-level = 3
 
+# The retired-material gate hashes every tracked file of `ide-diagnostics` over hundreds of
+# window lengths; unoptimised it is the longest test of the workspace.
+[profile.dev.package.retired-material-gate]
+opt-level = 3
+
 # Salsa fork (v0.28.0 + fix): an LRU-evicted fixpoint memo re-verified in a later
 # revision must re-execute instead of being mistaken for a poisoned cycle head
 # (bogus Cancelled::PropagatedPanic that poisons the module until the next write).

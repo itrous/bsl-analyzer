@@ -2700,7 +2700,7 @@ mod tests {
 
         wait_until_within(
             &graph,
-            Duration::from_secs(2),
+            test_utils::wait::ceiling(Duration::from_secs(2)),
             "the reload to publish generation 2",
             || graph.snapshot().is_some_and(|snap| snap.generation == 2),
         );
@@ -2824,7 +2824,7 @@ mod tests {
         // fast path deliberately serves the cached topology until then).
         wait_until_within(
             &graph,
-            Duration::from_secs(5),
+            test_utils::wait::ceiling(Duration::from_secs(5)),
             "the new extension root to read as drift",
             || graph.freshness(&snap).stale,
         );
