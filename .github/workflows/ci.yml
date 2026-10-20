@@ -1195,5 +1195,4 @@ jobs:
           # not be the one that decides whether the cache exists.
           shared-key: release-gate-${{ matrix.cache }}
           save-if: ${{ endsWith(matrix.shard, '-partitioned') }}
-          cache-on-failure: true
       - run: ${{ matrix.command }}
