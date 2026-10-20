@@ -312,7 +312,7 @@ async fn source_set_change_retires_mcp_scope_and_reconnects_to_new_semantics() {
     assert_mcp_missing(&old_client, &consumer_path, "ДатьЧисло").await;
 
     eprintln!("S6 phase=source-set/change-config");
-    std::fs::write(&config_path, CONFIG_B).expect("switch the configured provider source root");
+    replace_config(&config_path, CONFIG_B);
     send_config_change(&mut lsp, &config_path);
     let updated_diagnostics = lsp
         .wait_for_within(test_utils::wait::ceiling(Duration::from_secs(45)), |message| {
@@ -403,7 +403,7 @@ async fn excluding_and_readmitting_a_provider_tombstones_and_restores_its_defini
         .replace("root = \"base\"", "root = \"base\"\nexclude = [\"extensions/provider-a\"]");
     assert_ne!(excluded_config, CONFIG_A, "the exclusion edit was applied");
     eprintln!("S6 phase=exclude/write-and-notify");
-    std::fs::write(&config_path, excluded_config).expect("exclude provider source root");
+    replace_config(&config_path, &excluded_config);
     send_config_change(&mut lsp, &config_path);
     let excluded_diagnostics = lsp
         .wait_for_within(test_utils::wait::ceiling(Duration::from_secs(45)), |message| {
@@ -415,7 +415,7 @@ async fn excluding_and_readmitting_a_provider_tombstones_and_restores_its_defini
     assert_lsp_missing(&mut lsp, 3, &consumer_uri, "ДатьСтроку");
 
     eprintln!("S6 phase=exclude/restore-config");
-    std::fs::write(&config_path, CONFIG_A).expect("restore provider source root");
+    replace_config(&config_path, CONFIG_A);
     send_config_change(&mut lsp, &config_path);
     let restored_diagnostics = lsp
         .wait_for_within(test_utils::wait::ceiling(Duration::from_secs(45)), |message| {
@@ -429,4 +429,12 @@ async fn excluding_and_readmitting_a_provider_tombstones_and_restores_its_defini
     eprintln!("S6 phase=exclude/lsp-shutdown");
     assert!(lsp.shutdown(6).success(), "LSP exits cleanly");
     eprintln!("S6 phase=exclude/complete");
+}
+
+/// Swap the config in one step: the running server watches it, and a plain write lets it read
+/// the file half-written and rebind the workspace to a project that never existed.
+fn replace_config(path: &Path, text: &str) {
+    let next = path.with_extension("toml.next");
+    std::fs::write(&next, text).expect("write the next config");
+    std::fs::rename(&next, path).expect("swap the config in");
 }
