@@ -418,10 +418,14 @@ fn isolated_backend_env(cache: &Path, runtime: &Path) -> EnvGuard {
 /// here, the dir is one both adapters only validate, and the scenario is the attach order alone.
 fn precreate_broker_socket_dir(runtime: &Path) {
     let dir = runtime.join("bsl-mcp");
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(&dir).expect("broker socket dir in the disposable runtime tree");
+    let created = {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)
+    };
+    #[cfg(not(unix))]
+    let created = std::fs::create_dir(&dir);
+    created.expect("broker socket dir in the disposable runtime tree");
 }
 
 async fn wait_for_owner_initializers(runtime: &Path, count: usize) -> Vec<String> {
