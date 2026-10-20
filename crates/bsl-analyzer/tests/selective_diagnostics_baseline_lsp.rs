@@ -285,7 +285,7 @@ fn selective_lsp_config_reload_applies_selection_and_republishes() {
 #[test]
 #[cfg_attr(
     not(timing_contract),
-    ignore = "timing contract: the only statement is a window with no LSP activity"
+    ignore = "необязательный тест: единственное утверждение — окно без активности LSP после записи в неотслеживаемый объект; событийной замены нет: наблюдатель сервера взводится без извещения, а реакция на последующую запись в отслеживаемый объект не доказывает, что сервер уже разобрал эту — порядок реакций контракт не обещает; запуск: cargo test -p bsl-analyzer --test selective_diagnostics_baseline_lsp -- --ignored --exact selective_lsp_does_not_watch_unsuppressed_objects"
 )]
 fn selective_lsp_does_not_watch_unsuppressed_objects() {
     let dir = full_manifest_selective_project();
