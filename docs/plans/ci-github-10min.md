@@ -407,8 +407,13 @@ push — 13: ещё release gate и `windows-build`. Раньше было 3 и 
   У `windows-mcp-contract`, `windows-analyzer`, `windows-core`, `windows-build` и
   `lint` ключи новые: первый запуск каждого холодный.
 - Оценка размера на develop: check ~1.1 GB, lint ~0.4, corpus 0.66, release 0.61,
-  четыре Windows-кэша ~0.8–1.2 каждый, `windows-build` ~0.5. Итого ~6.5–7 GB из
-  10 GB.
+  четыре Windows-кэша ~0.8–1.2 каждый, `windows-build` ~0.5. Итого ~6.5–7 GB.
+  Сверху идут кэши веток и PR: сейчас каждый PR-кэш весит ~1.2 GB, после правки
+  ветка с 6 ключами весит ~5–6 GB. Сумма выходит за 10 GB. Уже сейчас
+  `gh api repos/itrous/bsl-analyzer/actions/cache/usage` даёт 11 579 033 860
+  байт в 11 кэшах, больше лимита, и GitHub вытесняет давно не использованные
+  кэши. Поэтому кэш замера проверяется явно (шаг 6.5): job, который не
+  восстановил свой ключ, в зачёт тёплого замера не идёт.
 
 ## Ускорение самих тестов
 
@@ -630,15 +635,15 @@ job не меняется.
       matrix:
         include:
           - shard: unit-a
-            select: --lib --bins -- --skip state::overlay_ --skip state::bootstrap:: --skip state::embed:: --skip state::sync::
+            select: "--lib --bins -- --skip state::overlay_ --skip state::bootstrap:: --skip state::embed:: --skip state::sync::"
           - shard: unit-b
-            select: --lib --bins -- state::overlay_ state::bootstrap:: state::embed:: state::sync::
+            select: "--lib --bins -- state::overlay_ state::bootstrap:: state::embed:: state::sync::"
           - shard: tests-a-m
-            select: --test '[a-m]*'
+            select: "--test '[a-m]*'"
           - shard: tests-n-r
-            select: --test '[n-r]*' --examples
+            select: "--test '[n-r]*' --examples"
           - shard: tests-rest
-            select: --test '[!a-r]*'
+            select: "--test '[!a-r]*'"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -843,6 +848,10 @@ Windows — 32 767. Если список когда-нибудь вырасте
    вырезания блоков обёрток в тексте job'а не находится `cargo\s+["']?\s*test\b`.
    Таких job'ов не меньше четырёх.
 6. Matrix job'а `check`:
+   - каждое значение `select` записано в двойных кавычках
+     (`^\s+select: "[^"]*"$`). Без кавычек `::` перед пробелом ломает YAML: проба
+     `yaml.safe_load` на строке `unit-a` без кавычек дала «mapping values are not
+     allowed here». Дальше скрипт работает с содержимым кавычек;
    - множество аргументов после `--skip` в `select` ноги `unit-a` равно множеству
      фильтров после `--` в ноге `unit-b`, причём оба непусты;
    - ни один `select` не содержит `-p`;
@@ -902,6 +911,9 @@ concurrency:
      <(python3 -I <scratch>/ci_selections.py .github/workflows/ci.yml windows)` —
      пусто;
    - то же в режиме `linux-gates` — пусто;
+   - `python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/ci.yml",
+     encoding="utf-8"))'` — без ошибки. Положительный контроль: снять кавычки
+     с `select` ноги `unit-a` — `ScannerError`; откатить;
    - положительный контроль сверки: удалить из нового файла одно имя массива
      `mcp_server_names` у `windows-mcp-contract` — `diff` показывает ровно одну
      строку; откатить;
@@ -946,7 +958,13 @@ concurrency:
    job'а и `startedAt − createdAt`) и строки `Finished … in` из логов
    `gh api --allow-escape-sequences repos/itrous/bsl-analyzer/actions/jobs/<id>/logs`.
    Числа заносятся в сообщение коммита итоговой правки или в отчёт этапа:
-   компиляция, прогон и итог по каждому job'у.
+   компиляция, прогон и итог по каждому job'у. В логе шага `Swatinem/rust-cache@v2`
+   каждого job'а ищется строка восстановления. Job, у которого ключ не
+   восстановлен (`No cache found` или восстановление по префиксу без
+   lockhash), считается холодным. Тогда R2 не идёт в зачёт: делается ещё один
+   запуск по тому же правилу, не больше двух повторов. Если и он холодный,
+   остановка `Нужно решение` с перечнем вытесненных ключей
+   (`gh cache list --repo itrous/bsl-analyzer`).
 6. Приёмка замера. Каждый job пути PR (`lint`, пять ног `check`,
    `corpus-contract`, `windows-mcp-contract`, `windows-mcp`, `windows-analyzer`,
    `windows-core`) завершился зелёным, его длительность ≤ 9:00, а
@@ -964,7 +982,7 @@ concurrency:
 | `check (unit-a)` | Фильтр `graph::state::` добавляется в фильтры `unit-b` и в `--skip` `unit-a` (локально 132 с суммы, на CI ~22 с) |
 | `check (unit-b)` | `state::sync::` убирается из фильтров `unit-b` и из `--skip` `unit-a` (121 с, ~20 с) |
 | `check (tests-a-m)` | Переезжает `m` (32 с): у `tests-a-m` маска `'[a-m]*'` → `'[a-l]*'`, у `tests-n-r` нижняя граница первой маски `n` → `m`, верхняя остаётся какой есть |
-| `check (tests-rest)` | Переезжает `s*` (171 с) в новую ногу: добавляется нога `tests-s` с `select: --test 's*'`, у `tests-rest` маска `'[!a-r]*'` → `'[!a-s]*'` (+1 job) |
+| `check (tests-rest)` | Переезжает `s*` (171 с) в новую ногу: добавляется нога `tests-s` с `select: "--test 's*'"`, у `tests-rest` маска `'[!a-r]*'` → `'[!a-s]*'` (+1 job) |
 | `check (tests-n-r)` | Переезжает `r` (88 с): у `tests-n-r` в первой маске верхняя граница `r` → `q`, у `tests-rest` добавляется `--test 'r*'` |
 | `windows-analyzer` | Шаг «Shared LSP and MCP owner and editor lifecycle» уходит в новый job `windows-shared-lsp` с тем же заголовком |
 | `windows-mcp` | Шаг «Superseded owner lifecycle across MCP targets» уходит в новый job `windows-mcp-lifecycle` |
@@ -997,11 +1015,17 @@ concurrency:
    и `FORCE_RESCAN_DEBT_DUE`. Другие тесты ставят эти флаги, держа `env_lock()`
    (`sync.rs:2463`, `:2676`). Сам тест блокировку не берёт. При 16 потоках он упал
    на «the first retry is immediate» (запуск при составлении плана). Правка —
-   первой строкой теста `let _env_lock = env_lock();`. Проверка: до правки
-   прогон `mcp_server` lib при `--test-threads 16` повторяется до падения этого
-   теста, но не больше 5 раз. После правки — 5 зелёных прогонов подряд. Если до
-   правки за 5 прогонов падения нет, это записывается, и правка всё равно
-   делается: причина установлена по коду.
+   первой строкой теста `let _env_lock = env_lock();`. Проверка:
+   - причина воспроизводится детерминированно, без таймеров. Временный тест держит
+     `env_lock()`, ставит `FORCE_RESCAN_DEBT_WAITING = true` и в том же потоке
+     выполняет тело исследуемого теста без блокировки. Тело падает на «the first
+     retry is immediate». Временный тест удаляется до коммита;
+   - флаги ставятся только под блокировкой: каждая строка
+     `FORCE_RESCAN_DEBT_(WAITING|DUE).store(true` в `sync.rs` стоит в тесте,
+     который берёт `env_lock()` раньше неё. Это проверяется чтением каждого
+     места, перечень мест — в отчёте;
+   - после правки прогон `mcp_server` lib при `--test-threads 16` пять раз
+     зелёный. Это дополнительная проба, а не основное доказательство.
 1б. Вторая известная зависимость от скорости. При `opt-level 1` (проба T4)
    упал `native_check::compiler::tests::child_output_is_drained_but_kept_within_the_limit`
    (`crates/bsl-check-executor/src/native_check/compiler.rs:1301`): `stdout`
@@ -1051,6 +1075,14 @@ concurrency:
    причины. Тест, который зависит от нагрузки, чинится в коде теста. Если это
    невозможно, он получает ignore по пункту 2, а для тестов из поимённых
    списков CI действует правило раздела.
+
+   Положительный контроль пробы. До T3 в одну временную цель кладутся два теста
+   с общим `static`. Оба ждут друг друга на `std::sync::Barrier::new(2)`: так
+   они гарантированно идут одновременно, без таймеров. Первый пишет в `static`
+   значение 1 до барьера и после барьера ожидает 1. Второй после барьера пишет 2.
+   Проба с настройками п. 3 обязана упасть на первом тесте. Это доказывает, что
+   проба гоняет тесты одной цели параллельно и видит общее состояние. Цель
+   удаляется до коммита. Повтор пробы после T3 (I14) идёт на тех же настройках.
 
 **Исход T1:** в отчёте коммита — таблица всех мест п. 2 (место, разряд, что
 сделано) и список тестов, переведённых в timing-contract. Стресс-проба зелёная.
@@ -1127,7 +1159,11 @@ concurrency:
 
 **Исход T3:** 104 интеграционные цели. Сверка п. 3 пуста, её контроль
 срабатывает. Сборка `cargo test --workspace --no-run -j 4`
-(`CARGO_INCREMENTAL=0`) и прогон записаны до и после.
+(`CARGO_INCREMENTAL=0`) и прогон записаны до и после. Приёмка: CPU-время
+сборки после T3 ≤ 60 % исходного (оценка по пробе `ide` — ~40 %). Если порог не
+взят, слияние всё равно остаётся (I13 зелёный, вреда нет). В отчёт идёт разбор
+`cargo test --workspace --no-run -j 4 --timings`: какие цели дают остаток. Оценки
+T6 пересчитываются по фактическим числам.
 
 #### T4. CPU-тяжёлые тесты (класс C), В2 решён «да»
 
@@ -1148,7 +1184,10 @@ concurrency:
    `crates/retired-material-gate` (`publish = false`, только `[dev-dependencies]
    tempfile`). Корень обхода — `concat!(env!("CARGO_MANIFEST_DIR"),
    "/../ide-diagnostics")`. В корневом `Cargo.toml` появляется
-   `[profile.dev.package.retired-material-gate] opt-level = 3`. Две ссылки
+   `[profile.dev.package.retired-material-gate] opt-level = 3`. `Cargo.lock`
+   получает запись нового члена (`cargo metadata` после добавления крейта
+   обновляет его, затем `cargo test --locked --workspace --no-run` проходит).
+   Коммит T4 содержит `Cargo.lock`. Две ссылки
    `LICENSING.md:290` и `:414` получают новый путь. Проверки: все пять тестов
    файла переезжают вместе и проходят, включая синтетические контроли окна и
    обхода git. Положительный контроль корня — временно направить корень на пустой
@@ -1170,9 +1209,9 @@ concurrency:
    6.4–6.6. Кэши уже есть.
 2. Слитая нога оценивается по R4 так: подготовка + большая из двух компиляций
    + сумма двух прогонов. Если оценка ≤ 7:30 (запас 1:30 до порога 9:00), ноги
-   сливаются: `unit-a` + `unit-b` → `unit` (`select: --lib --bins`, doc-тесты
-   в ней же), `tests-n-r` + `tests-rest` → `tests-n-z` (`select: --test '[!a-m]*'
-   --examples`). Новое разбиение снова проверяется I1 и I2. Гейты «Named …»
+   сливаются: `unit-a` + `unit-b` → `unit` (`select: "--lib --bins"`, doc-тесты
+   в ней же), `tests-n-r` + `tests-rest` → `tests-n-z` (`select: "--test '[!a-m]*'
+   --examples"`). Новое разбиение снова проверяется I1 и I2. Гейты «Named …»
    переезжают в `unit` и `tests-n-z`. Затем ещё один запуск (R5) и приёмка шага
    6.6.
 3. При слиянии обеих пар на PR идёт 9 job'ов вместо 11. На Free два
@@ -1184,7 +1223,8 @@ concurrency:
 ### Шаг 8. Сдача
 
 Итоговые числа R2 (или R3), а после T-шагов R4 (R5) приводятся в отчёте этапа. Сдача — через `pio_merge`,
-как обычно. Запуск CI этого PR — событие `pull_request` до влития. По нему
+как обычно. Пока идёт первый `pull_request`-запуск PR сдачи, в PR делается второй
+обычный push — наблюдение I8. Запуск CI этого PR — событие `pull_request` до влития. По нему
 наблюдаются I7 (`partitioned-baseline-scale` и `windows-build` — `skipped`) и
 длительность PR-пути (I6, вторично к R2). Job'ы `lint`, `windows-mcp-contract`,
 `windows-analyzer` и `windows-core` в этом запуске холодные, если PR-запуск не
@@ -1214,7 +1254,9 @@ concurrency:
   ненулевой код и не запускает cargo без `--list`.
 - **I4. Покрытие Windows не меняется.** Множество кортежей (выбор cargo, фильтр,
   точность) во всех job'ах `windows-*` после правки равно множеству job'а
-  `windows-mcp` до неё: 282 строки, `diff` пуст.
+  `windows-mcp` до неё: 282 строки, `diff` пуст. Единственное исключение —
+  при В1-б кортежи, снятые в T2.3. Тогда `diff` содержит ровно их, со знаком
+  `<`, и их перечень есть в отчёте T2.
 - **I5. Каждый фильтр каждого вызова Windows обязан выбрать прошедший тест.**
   `run_tests` с фильтром, не давшим ни одной строки `test … ok`, или с
   ненулевым кодом cargo даёт ненулевой код.
@@ -1225,7 +1267,12 @@ concurrency:
   push и `workflow_dispatch` они выполняются. Текст `partitioned-baseline-scale`
   совпадает с `ci.yml:883-897` базы.
 - **I8. Очередь PR.** Новый запуск того же PR отменяет идущий. Запуски на push
-  друг друга не отменяют: группа содержит `run_id`.
+  друг друга не отменяют: группа содержит `run_id`. Наблюдение до сдачи: в PR
+  сдачи, пока идёт его первый `pull_request`-запуск, делается второй обычный
+  push (коммит с итоговыми числами R2/R4 в отчёт этапа). Если pio_merge
+  открывает и вливает PR одним действием и второго push быть не может, отчёт
+  прямо пишет: I8 подтверждён только статически (выражение группы),
+  наблюдение — первый PR с двумя push после влития.
 - **I9. Таймауты.** У `lint`, `check`, четырёх `windows-*` и `windows-build` на
   уровне job'а стоит `timeout-minutes: 60`.
 - **I10. Кэш.** Все пять ног `check` восстанавливают ключ с префиксом
@@ -1254,7 +1301,7 @@ concurrency:
 | обещание / инвариант | проверка | наблюдаемый исход |
 |---|---|---|
 | PR-запуск ≤ 10 мин (I6) | шаг 6.4–6.6: `gh run view <R2> --json jobs` | каждый job пути PR ≤ 9:00, `startedAt − createdAt` ≤ 0:30 |
-| Обязательные проверки зелёные, поведение продукта не меняется (I11) | `gh run view <R2>`; после влития — `gh run list --workflow ci.yml --branch develop --limit 1` | `conclusion: success` у всех job'ов. В `git diff --stat 22146bb3` вне `.github/workflows/ci.yml`, `scripts/test-ci-test-output.py` и `docs/plans/` есть только `crates/*/tests/**`, модули `#[cfg(test)]`, `docs/contributing/DEVELOPMENT_RULES.md`, крейт `crates/retired-material-gate/**`, строки `Cargo.toml` и `LICENSING.md` по В2 и швы по В1-а. Для швов `git diff -U0 22146bb3 -- 'crates/*/src/**'` вне модулей `#[cfg(test)]` содержит только определения под `#[cfg(test)]` или `#[cfg(feature = "test-seams")]` и строки фичи |
+| Обязательные проверки зелёные, поведение продукта не меняется (I11) | `gh run view <R2>`; после влития — `gh run list --workflow ci.yml --branch develop --limit 1` | `conclusion: success` у всех job'ов. В `git diff --stat 22146bb3` вне `.github/workflows/ci.yml`, `scripts/test-ci-test-output.py` и `docs/plans/` есть только `crates/*/tests/**`, модули `#[cfg(test)]`, `docs/contributing/DEVELOPMENT_RULES.md`, крейт `crates/retired-material-gate/**`, строки `Cargo.toml`, `Cargo.lock` и `LICENSING.md` по В2 и швы по В1-а. Для швов `git diff -U0 22146bb3 -- 'crates/*/src/**'` вне модулей `#[cfg(test)]` содержит только определения под `#[cfg(test)]` или `#[cfg(feature = "test-seams")]` и строки фичи |
 | I1 покрытие Linux | шаг 6.1: счета `--list` и `Executable tests/` | 9450 = 235 + 9215; 170 + 55 + 69 = 294 (на момент правки — фактические числа) |
 | I2 сборка Linux та же | шаг 6.1: `--no-run` по каждой ноге после базы `--workspace --no-run` и `--workspace --examples --no-run`; проверка 6 скрипта | `Compiling` 0; в `select` нет `-p` |
 | I3 гейты имён Linux | шаг 6.1: `diff` приложения A в режиме `linux-gates` и отрицательные случаи `list_tests` на настоящем cargo; случаи `list_tests` в скрипте (шаг 4.3) | `diff` пуст; игнорируемый, чужой и отсутствующий случаи дают не 0; код 99 заглушки не встречается |
@@ -1262,7 +1309,7 @@ concurrency:
 | I5 гейт фильтров Windows | шаг 4.2: случаи `run_tests` в скрипте | все ожидаемые коды совпали |
 | I7 разделение PR и push, перенос «Build binary» и native-сборки | блок `partitioned-baseline-scale` в `git diff 22146bb3 -- .github/workflows/ci.yml`; `gh run view <R2> --json jobs` (R2 — `workflow_dispatch`); до влития — `gh run view <id> --json jobs` запуска `pull_request` PR сдачи (шаг 8); после влития — первый push-запуск | блок не изменён; `windows-build` и `partitioned-baseline-scale` — success в R2 и на push, skipped в запуске `pull_request`; артефакт `native-check-windows-amd64` есть у R2 и push-запуска (`gh api repos/itrous/bsl-analyzer/actions/runs/<id>/artifacts`) |
 | Push-запуск ~13–15 мин | `gh run view <R2> --json jobs` | release gate — 12–16 мин, остальные job'ы ≤ 9:00; после влития push-запуск по `createdAt`/`updatedAt` — 13–16 мин (кроме первого, холодного) |
-| I8 очередь PR | блок `concurrency` в `ci.yml` (шаг 5); первый случай двух push подряд в один PR — PR сдачи, если в него будет второй push, иначе первый такой PR после влития | выражение группы совпадает с шагом 5; первый из двух PR-запусков получил `conclusion: cancelled`, второй дошёл до конца; push-запуски develop `cancelled` не получают |
+| I8 очередь PR | блок `concurrency` в `ci.yml` (шаг 5); второй push в PR сдачи во время его первого запуска (шаг 8). Если он невозможен — статус «подтверждён статически» в отчёте и первый такой PR после влития | выражение группы совпадает с шагом 5; первый из двух PR-запусков получил `conclusion: cancelled`, второй дошёл до конца; push-запуски develop `cancelled` не получают |
 | I9 таймауты | `grep -c '^    timeout-minutes: 60$' .github/workflows/ci.yml` | 7 |
 | I10 кэш | логи R2: шаг `Swatinem/rust-cache@v2` каждой ноги `check` | строка восстановления с ключом `v0-rust-check-Linux-x64-…`; у ног кроме `unit-a` пост-шаг не сохраняет (`save-if` false) |
 | I12 скрипт ловит нарушения | шаг 4, пять внедрённых нарушений | каждое — ненулевой код, после отката — `PASS` |
@@ -1271,7 +1318,7 @@ concurrency:
 | I15 ignore названы | `comm` списков `--list --ignored` до T1 и после T2 против отчётов | совпадает; гейты «Named …» и Windows в R4 зелёные |
 | I16 швы не в обычной сборке | `cargo tree` из T2.2 | 0 без `dev`, не 0 с `dev` |
 | I17 время тестов | nextest до и после T2 | у тестов W < 1 с; `mcp_server` lib при 4 потоках — по исходу T2 |
-| Полный прогон короче | `cargo test --workspace --no-run -j 4` и прогон с `--test-threads 4`, локально, до T1 и после T4 | числа в отчёте T6; сборка ≤ 60 % исходной после T3 |
+| Полный прогон короче | `cargo test --workspace --no-run -j 4` и прогон с `--test-threads 4`, локально, до T1 и после T4 | числа в отчёте T6; CPU-время сборки после T3 ≤ 60 % исходного, иначе разбор `--timings` по исходу T3 |
 | Оценка параллельности при нескольких PR | наблюдение после влития: `gh run view <id> --json jobs` у одновременных запусков | ждущие job'ы видны как `startedAt − createdAt` > 0:30; при ≤2 одновременных запусках итог ≤ 10:00 |
 
 ## Открытые вопросы
