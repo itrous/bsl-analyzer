@@ -316,29 +316,40 @@ const TEST_LOCK_WAIT: Duration = test_utils::wait::ceiling(LOCK_WAIT);
 
 #[cfg(test)]
 thread_local! {
-    /// Set while this test thread itself holds a lease lock file: every wait for that lock a
-    /// claim makes on this thread fails whatever its length, so it gives up after 50 ms.
-    static LOCK_HELD_BY_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The lease lock files this test thread itself holds: a wait for one of them that a lease
+    /// makes on this thread fails whatever its length, so it gives up after 50 ms. A wait for
+    /// any other lock keeps its full length.
+    static LOCKS_HELD_BY_THIS_THREAD: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// A lease lock file held by the test thread, with [`LOCK_HELD_BY_THIS_THREAD`] raised until it
+/// A lease lock file held by the test thread, listed in [`LOCKS_HELD_BY_THIS_THREAD`] until it
 /// is let go.
 #[cfg(test)]
-struct LockHeldByThisThread(#[allow(dead_code, reason = "held for its drop")] LockGuard);
+struct LockHeldByThisThread {
+    #[allow(dead_code, reason = "held for its drop")]
+    guard: LockGuard,
+    path: PathBuf,
+}
 
 #[cfg(test)]
 impl LockHeldByThisThread {
     fn acquire(path: &Path) -> Self {
         let guard = LockGuard::acquire(path, TEST_LOCK_WAIT).unwrap();
-        LOCK_HELD_BY_THIS_THREAD.with(|held| held.set(true));
-        Self(guard)
+        LOCKS_HELD_BY_THIS_THREAD.with(|held| held.borrow_mut().push(path.to_path_buf()));
+        Self { guard, path: path.to_path_buf() }
     }
 }
 
 #[cfg(test)]
 impl Drop for LockHeldByThisThread {
     fn drop(&mut self) {
-        LOCK_HELD_BY_THIS_THREAD.with(|held| held.set(false));
+        LOCKS_HELD_BY_THIS_THREAD.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(at) = held.iter().position(|path| *path == self.path) {
+                held.swap_remove(at);
+            }
+        });
     }
 }
 
@@ -565,7 +576,8 @@ impl WorkspaceLease {
         if std::fs::create_dir_all(dir).is_err() {
             return false;
         }
-        let Ok(_guard) = LockGuard::acquire(&dir.join(LEASE_LOCK_FILE), self.lock_wait()) else {
+        let lock = dir.join(LEASE_LOCK_FILE);
+        let Ok(_guard) = LockGuard::acquire(&lock, self.lock_wait(&lock)) else {
             return false;
         };
         // Re-read UNDER the lock, where `release` also runs: a claim that started before this
@@ -882,7 +894,7 @@ impl WorkspaceLease {
         // not a hang that a timeout would catch.
         #[cfg(test)]
         self.note_disk_check();
-        let guard = match LockGuard::acquire(&lock_path, self.lock_wait()) {
+        let guard = match LockGuard::acquire(&lock_path, self.lock_wait(&lock_path)) {
             Ok(guard) => guard,
             Err(error) if is_lock_contention(&error) => {
                 return LeaseOperationOutcome::TransientRefusal
@@ -952,7 +964,7 @@ impl WorkspaceLease {
                 stopped = Some(LeaseOperationOutcome::TransientRefusal);
                 return ControlFlow::Break(());
             }
-            guard = match LockGuard::acquire(&lock_path, self.lock_wait()) {
+            guard = match LockGuard::acquire(&lock_path, self.lock_wait(&lock_path)) {
                 Ok(guard) => Some(guard),
                 Err(error) if is_lock_contention(&error) => {
                     stopped = Some(LeaseOperationOutcome::TransientRefusal);
@@ -1155,14 +1167,16 @@ impl WorkspaceLease {
         panic!("the lease file lock was never released by its other holders")
     }
 
-    /// How long this lease waits for its lock file.
-    fn lock_wait(&self) -> Duration {
+    /// How long this lease waits for the lock file at `lock`.
+    fn lock_wait(&self, lock: &Path) -> Duration {
         #[cfg(test)]
         if self.inner.lock_held_by_test.load(Ordering::SeqCst)
-            || LOCK_HELD_BY_THIS_THREAD.with(std::cell::Cell::get)
+            || LOCKS_HELD_BY_THIS_THREAD.with(|held| held.borrow().iter().any(|path| path == lock))
         {
             return Duration::from_millis(50);
         }
+        #[cfg(not(test))]
+        let _ = lock;
         LOCK_WAIT
     }
 
@@ -1219,9 +1233,10 @@ impl WorkspaceLease {
         // The flag itself is set unconditionally — "this process is leaving" holds whether or
         // not the workspace was still ours, and a demoted lease that skipped it could reclaim
         // an abandoned workspace during shutdown and start writing caches on the way out.
-        let guard = path
-            .parent()
-            .and_then(|dir| LockGuard::acquire(&dir.join(LEASE_LOCK_FILE), self.lock_wait()).ok());
+        let guard = path.parent().and_then(|dir| {
+            let lock = dir.join(LEASE_LOCK_FILE);
+            LockGuard::acquire(&lock, self.lock_wait(&lock)).ok()
+        });
         let Some(_guard) = guard else { return };
         let mine = self.inner.token.load(Ordering::SeqCst);
         if read_record(path).is_some_and(|record| record.token == mine) {
