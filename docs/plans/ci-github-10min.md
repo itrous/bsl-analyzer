@@ -53,8 +53,10 @@ larger runners и смена провайдера CI исключены, пов�
    (40) оценки только улучшаются.
 2. **Обязательных status checks на develop нет.** `gh api
    repos/itrous/bsl-analyzer/branches/develop/protection` возвращает объект без
-   ключа `required_status_checks`. Поэтому id и имена job'ов можно менять, не
-   трогая настройки защиты ветки.
+   ключа `required_status_checks`. Rulesets этот эндпоинт не показывает, они
+   проверены отдельно: `gh api repos/itrous/bsl-analyzer/rulesets` → `[]`,
+   `gh api repos/itrous/bsl-analyzer/rules/branches/develop` → `[]`. Поэтому id
+   и имена job'ов можно менять, не трогая настройки защиты ветки.
 3. **Числа берутся из эталонных запусков.** PR-запуск 39331071546 (2026-10-19,
    зелёный, 26:37, `headSha 9785b9e5`) и push-запуск 39293825917 (зелёный, 28:09).
    Логи job'ов скачаны через `gh api repos/itrous/bsl-analyzer/actions/jobs/<id>/logs`.
@@ -248,9 +250,12 @@ state::bootstrap::tests::a_workspace_without_a_watch_follows_edits_through_the_p
    - `run_tests -p mcp-server --test http -- no_such_filter_xyz` — код 1;
    - `list_tests --exact bsl_search … -- workspace_lease::tests::…` (чужой бинарник) —
      код 1;
-   - `list_tests --exact ide --workspace --test partitioned_baseline_scale --
-     loads_and_classifies_1_6m_entries_with_bounded_rss` (тест `#[ignore]`) —
-     код 1;
+   - `list_tests --exact partitioned_baseline_scale -p ide --test
+     partitioned_baseline_scale -- loads_and_classifies_1_6m_entries_with_bounded_rss`
+     (тест `#[ignore]`, `crates/ide/tests/partitioned_baseline_scale.rs:55`) — код 1,
+     `::error::partitioned_baseline_scale has no runnable …`. Имя при этом стоит
+     в выводе `--list` (строка `…: test` найдена 1 раз), то есть отказ дало
+     вычитание игнорируемых;
    - `list_tests source_set_cli …`, `list_tests bsl_analyzer_app … -- workspace_cache_scope_
      cli::logging`, `list_tests vector_journal_cli --workspace --test vector_journal_cli` —
      код 0.
@@ -338,7 +343,9 @@ unit-бинарники — 55 с (264 − 209).
 2. Серии `run_exact` сжаты. Windows: 179 + 16 + 14 + 2 вызова превращаются в 2.
    Это ~5:45 последовательного времени («Drift» 4:54, «WL» 0:30, «Portable» 0:21)
    против оценки ~1:00. Linux: 222 вызова (3:40 в шагах `ci.yml:39-298`)
-   заменены четырьмя вызовами cargo `--list` (по два на `list_tests`), ~5 с каждый.
+   заменены семью вызовами `list_tests` (пять в `unit-a`, два в `tests-rest`).
+   Каждый делает два вызова cargo `--list`, итого 14 вызовов по ~1–3 с:
+   ~20 с в `unit-a` и ~5 с в `tests-rest`.
 3. «Build binary» и native-сборка вынесены с пути PR: −2:06 и −1:28.
 4. Шардинг: Linux 24:30 превращается в ≤7:01 на ногу, Windows 26:34 — в ≤7:14
    на job. Это главный выигрыш.
@@ -409,8 +416,9 @@ push — 13: ещё release gate и `windows-build`. Раньше было 3 и 
 ### Шаг 1. Обёртки `run_tests` и `list_tests`
 
 Обе обёртки вставляются в начало `run:` каждого bash-шага, где вызываются. Отступ
-определения — 10 пробелов, как у нынешних обёрток. Имена `run_exact` и
-`run_nonempty` из файла исчезают.
+определения — 10 пробелов, как у нынешних обёрток. `run_exact` из файла
+исчезает. `run_nonempty` остаётся только в `corpus-contract` (`ci.yml:336`): этот
+job не меняется.
 
 ```bash
           run_tests() {
@@ -687,10 +695,12 @@ Windows — 32 767. Если список когда-нибудь вырасте
 
 Скрипт переписывается под новое устройство, его назначение то же. Проверки:
 
-1. Обёртки ищутся регуляркой `^          (?:run|list)_tests\(\) \{\n.*?^          \}`
+1. Обёртки ищутся регуляркой `^          (?:run_tests|list_tests|run_nonempty)\(\) \{\n.*?^          \}`
    (re.M | re.S). Число найденных равно числу определений
-   `^\s*(?:function\s+)?(?:run|list)_\w+\s*\(\s*\)\s*\{`, найдено хотя бы по
-   одной обёртке каждого вида.
+   `^\s*(?:function\s+)?(?:run|list)_\w+\s*\(\s*\)\s*\{`. Найдено хотя бы по
+   одной обёртке `run_tests` и `list_tests`. Блоки `run_nonempty` (сейчас один,
+   `corpus-contract`) проверяются прежними тремя случаями: успех, пусто, падение
+   (нынешние строки 25-36 скрипта).
 2. Каждый блок `run_tests` прогоняется в `bash -c` с `set -euo pipefail`
    и заглушкой `cargo() { …; }`, которая печатает заданный текст и возвращает
    заданный код. Случаи и ожидаемый исход:
@@ -733,13 +743,18 @@ Windows — 32 767. Если список когда-нибудь вырасте
    - множество аргументов после `--skip` в `select` ноги `unit-a` равно множеству
      фильтров после `--` в ноге `unit-b`, причём оба непусты;
    - ни один `select` не содержит `-p`;
+   - `select` обеих ног `unit-*` начинается с `--lib --bins --`;
+   - `--examples` стоит ровно в одном `select`;
+   - в job'е есть шаг с `if: matrix.shard == 'unit-b'` и строкой `run: cargo test
+     --locked --workspace --no-fail-fast --doc`;
    - в job'е есть строка `run: cargo test --locked --workspace --no-fail-fast ${{
      matrix.select }}`;
    - маски `--test '<маска>'` из всех `select` разбивают имена ровно на одну
      маску на имя, по `fnmatch.fnmatchcase`. Это проверяется на каждом имени
      цели вида `test` из `cargo metadata --no-deps --format-version 1` и на
      синтетических именах `c + "x"` для каждого символа `c` из
-     `string.ascii_letters + string.digits + "_"`.
+     `string.ascii_letters + string.digits + "_"`, а также на однобуквенных
+     именах `c`.
 7. Последняя строка `PASS: …` перечисляет проверенное.
 
 **Исход:** `python3 scripts/test-ci-test-output.py` на новом `ci.yml` печатает
@@ -787,8 +802,19 @@ concurrency:
    - положительный контроль сверки: удалить из нового файла одно имя массива
      `mcp_server_names` у `windows-mcp-contract` — `diff` показывает ровно одну
      строку; откатить;
-   - `cargo test --workspace --no-run`, затем для каждого `select` ноги (часть до
-     `--`) `cargo test --workspace <select> --no-run` → строк `Compiling` 0 (I2);
+   - база: `cargo test --workspace --no-run` и `cargo test --workspace --examples
+     --no-run`. Вторая команда нужна, потому что `--examples` собирает примеры
+     в тестовом режиме, а первая — в обычном (проба 5). Затем для каждого `select`
+     ноги (часть до `--`) `cargo test --workspace <select> --no-run` → строк
+     `Compiling` 0 (I2). Проба при составлении плана: после такой базы `cargo test
+     --workspace --test '[n-r]*' --examples --no-run` собрал 0;
+   - отрицательные случаи `list_tests` на настоящем cargo, каждый → код не 0:
+     игнорируемый тест (`list_tests --exact partitioned_baseline_scale --workspace
+     --test partitioned_baseline_scale -- loads_and_classifies_1_6m_entries_with_bounded_rss`),
+     чужой бинарник (`list_tests --exact bsl_search --workspace --lib --
+     workspace_lease::tests::contention_unclaimed_and_missing_are_transient`) и
+     отсутствующее имя (`list_tests --exact mcp_server --workspace --lib --
+     no_such::test`);
    - `cargo test --workspace --lib --bins -- --list | grep -c ': test$'` равно
      сумме того же счёта с фильтрами `unit-b` и со `--skip` из `unit-a` (I1);
    - сумма `grep -c 'Executable tests/'` по трём маскам равна счёту для `--tests`
@@ -800,12 +826,19 @@ concurrency:
 3. Коммит `ci: shard the PR check to finish within ten minutes` по Conventional
    Commits, обычный, с хуками. Затем `git push origin pio/ci-github-10min`.
 4. Замер. Запуски R1 и R2 занимают по 13 слотов, на время замера они могут
-   задержать чужие PR. Первый запуск — `gh workflow run ci.yml --repo itrous/bsl-analyzer --ref
-   pio/ci-github-10min`, затем `gh run list --workflow ci.yml --branch
-   pio/ci-github-10min --limit 1`, это R1. Новые ключи кэша в нём холодные,
-   в зачёт он не идёт, но должен быть зелёным. После завершения R1 — вторая
-   такая же команда, это R2. Он восстанавливает кэши, сохранённые R1 в области
-   ветки.
+   задержать чужие PR. Каждый запуск делается так:
+   - запомнить `T=$(date -u +%Y-%m-%dT%H:%M:%SZ)` и `H=$(git rev-parse HEAD)`;
+   - `gh workflow run ci.yml --repo itrous/bsl-analyzer --ref pio/ci-github-10min`;
+   - id запуска — `gh run list --repo itrous/bsl-analyzer --workflow ci.yml --branch
+     pio/ci-github-10min --event workflow_dispatch --json
+     databaseId,createdAt,headSha --jq "[.[] | select(.headSha == \"$H\" and
+     .createdAt >= \"$T\")] | .[0].databaseId"`. Пустой ответ значит, что запуск ещё
+     не появился: команда повторяется, пока id не появится. Найденный id
+     записывается и дальше используется только он.
+
+   Первый запуск — R1. Новые ключи кэша в нём холодные, в зачёт он не идёт, но
+   должен быть зелёным. После завершения R1 делается второй запуск, R2. Он
+   восстанавливает кэши, сохранённые R1 в области ветки.
 5. По R2 снимаются числа: `gh run view <R2> --json jobs` (длительность каждого
    job'а и `startedAt − createdAt`) и строки `Finished … in` из логов
    `gh api --allow-escape-sequences repos/itrous/bsl-analyzer/actions/jobs/<id>/logs`.
@@ -827,8 +860,8 @@ concurrency:
 |---|---|
 | `check (unit-a)` | Фильтр `graph::state::` добавляется в фильтры `unit-b` и в `--skip` `unit-a` (локально 132 с суммы, на CI ~22 с) |
 | `check (unit-b)` | `state::sync::` убирается из фильтров `unit-b` и из `--skip` `unit-a` (121 с, ~20 с) |
-| `check (tests-a-m)` | Переезжает `m` (32 с): у `tests-a-m` маска `'[a-m]*'` → `'[a-l]*'`, у `tests-n-r` в первой маске нижняя граница `n` → `m` (`'[n-r]*'` → `'[m-r]*'`, `'[n-q]*'` → `'[m-q]*'`) |
-| `check (tests-rest)` | Переезжает `sh*` (86 с): у `tests-n-r` добавляется `--test 'sh*'`, у `tests-rest` маска `'[!a-r]*'` → две маски `--test 's[!h]*' --test '[!a-s]*'` |
+| `check (tests-a-m)` | Переезжает `m` (32 с): у `tests-a-m` маска `'[a-m]*'` → `'[a-l]*'`, у `tests-n-r` нижняя граница первой маски `n` → `m`, верхняя остаётся какой есть |
+| `check (tests-rest)` | Переезжает `s*` (171 с) в новую ногу: добавляется нога `tests-s` с `select: --test 's*'`, у `tests-rest` маска `'[!a-r]*'` → `'[!a-s]*'` (+1 job) |
 | `check (tests-n-r)` | Переезжает `r` (88 с): у `tests-n-r` в первой маске верхняя граница `r` → `q`, у `tests-rest` добавляется `--test 'r*'` |
 | `windows-analyzer` | Шаг «Shared LSP and MCP owner and editor lifecycle» уходит в новый job `windows-shared-lsp` с тем же заголовком |
 | `windows-mcp` | Шаг «Superseded owner lifecycle across MCP targets» уходит в новый job `windows-mcp-lifecycle` |
@@ -841,7 +874,12 @@ concurrency:
 ### Шаг 8. Сдача
 
 Итоговые числа R2 (или R3) приводятся в отчёте этапа. Сдача — через `pio_merge`,
-как обычно. После влития первый push в develop холодный для новых ключей
+как обычно. Запуск CI этого PR — событие `pull_request` до влития. По нему
+наблюдаются I7 (`partitioned-baseline-scale` и `windows-build` — `skipped`) и
+длительность PR-пути (I6, вторично к R2). Job'ы `lint`, `windows-mcp-contract`,
+`windows-analyzer` и `windows-core` в этом запуске холодные, если PR-запуск не
+находит кэшей ветки. Его длительность в зачёт I6 не идёт, в отчёте она
+называется отдельно. После влития первый push в develop холодный для новых ключей
 (`lint`, `windows-mcp-contract`, `windows-analyzer`, `windows-core`,
 `windows-build`): ожидается до ~30–40 мин, это разовая цена. PR, запущенные до
 окончания этого push, тоже идут холодными по этим job'ам.
@@ -857,8 +895,9 @@ concurrency:
     (сейчас 170 + 55 + 69 = 294);
   - doc-тесты есть в `unit-b`, примеры собираются в `tests-n-r`.
 - **I2. Сборка Linux та же.** Все команды `cargo test` в `check` используют
-  `--workspace` и не содержат `-p`. После `cargo test --workspace --no-run` каждая
-  команда ноги с `--no-run` собирает 0 крейтов.
+  `--workspace` и не содержат `-p`. После базы `cargo test --workspace --no-run`
+  и `cargo test --workspace --examples --no-run` каждая команда ноги с `--no-run`
+  собирает 0 крейтов.
 - **I3. Гейты имён Linux сохранены и ничего не выполняют.** Множество кортежей
   гейтов после правки равно множеству точечных шагов до неё: 229 строк, `diff`
   пуст. `list_tests` на отсутствующем, игнорируемом или чужом имени даёт
@@ -893,13 +932,13 @@ concurrency:
 | PR-запуск ≤ 10 мин (I6) | шаг 6.4–6.6: `gh run view <R2> --json jobs` | каждый job пути PR ≤ 9:00, `startedAt − createdAt` ≤ 0:30 |
 | Обязательные проверки зелёные, поведение продукта не меняется (I11) | `gh run view <R2>`; после влития — `gh run list --workflow ci.yml --branch develop --limit 1` | `conclusion: success` у всех job'ов; правок вне `.github/workflows/ci.yml`, `scripts/test-ci-test-output.py` и `docs/plans/` нет (`git diff --stat 22146bb3`) |
 | I1 покрытие Linux | шаг 6.1: счета `--list` и `Executable tests/` | 9450 = 235 + 9215; 170 + 55 + 69 = 294 (на момент правки — фактические числа) |
-| I2 сборка Linux та же | шаг 6.1: `--no-run` по каждой ноге после `--workspace --no-run`; проверка 6 скрипта | `Compiling` 0; в `select` нет `-p` |
-| I3 гейты имён Linux | шаг 6.1: `diff` приложения A в режиме `linux-gates`; случаи `list_tests` в скрипте (шаг 4.3) | `diff` пуст; код 99 заглушки не встречается; отрицательные случаи дают не 0 |
+| I2 сборка Linux та же | шаг 6.1: `--no-run` по каждой ноге после базы `--workspace --no-run` и `--workspace --examples --no-run`; проверка 6 скрипта | `Compiling` 0; в `select` нет `-p` |
+| I3 гейты имён Linux | шаг 6.1: `diff` приложения A в режиме `linux-gates` и отрицательные случаи `list_tests` на настоящем cargo; случаи `list_tests` в скрипте (шаг 4.3) | `diff` пуст; игнорируемый, чужой и отсутствующий случаи дают не 0; код 99 заглушки не встречается |
 | I4 покрытие Windows | шаг 6.1: `diff` приложения A в режиме `windows` и его положительный контроль | `diff` пуст; удалённое имя даёт ровно одну строку |
 | I5 гейт фильтров Windows | шаг 4.2: случаи `run_tests` в скрипте | все ожидаемые коды совпали |
-| I7 разделение PR и push, перенос «Build binary» и native-сборки | блок `partitioned-baseline-scale` в `git diff 22146bb3 -- .github/workflows/ci.yml`; `gh run view <R2> --json jobs` (R2 — `workflow_dispatch`); после влития — первый PR-запуск и первый push-запуск | блок не изменён; `windows-build` и `partitioned-baseline-scale` — success в R2 и на push, skipped на PR; артефакт `native-check-windows-amd64` есть у push-запуска (`gh api repos/itrous/bsl-analyzer/actions/runs/<id>/artifacts`) |
+| I7 разделение PR и push, перенос «Build binary» и native-сборки | блок `partitioned-baseline-scale` в `git diff 22146bb3 -- .github/workflows/ci.yml`; `gh run view <R2> --json jobs` (R2 — `workflow_dispatch`); до влития — `gh run view <id> --json jobs` запуска `pull_request` PR сдачи (шаг 8); после влития — первый push-запуск | блок не изменён; `windows-build` и `partitioned-baseline-scale` — success в R2 и на push, skipped в запуске `pull_request`; артефакт `native-check-windows-amd64` есть у R2 и push-запуска (`gh api repos/itrous/bsl-analyzer/actions/runs/<id>/artifacts`) |
 | Push-запуск ~13–15 мин | `gh run view <R2> --json jobs` | release gate — 12–16 мин, остальные job'ы ≤ 9:00; после влития push-запуск по `createdAt`/`updatedAt` — 13–16 мин (кроме первого, холодного) |
-| I8 очередь PR | блок `concurrency` в `ci.yml` (шаг 5); после влития — два push подряд в один PR | выражение группы совпадает с шагом 5; первый из двух PR-запусков получил `conclusion: cancelled`, второй дошёл до конца; push-запуски develop `cancelled` не получают |
+| I8 очередь PR | блок `concurrency` в `ci.yml` (шаг 5); первый случай двух push подряд в один PR — PR сдачи, если в него будет второй push, иначе первый такой PR после влития | выражение группы совпадает с шагом 5; первый из двух PR-запусков получил `conclusion: cancelled`, второй дошёл до конца; push-запуски develop `cancelled` не получают |
 | I9 таймауты | `grep -c '^    timeout-minutes: 60$' .github/workflows/ci.yml` | 7 |
 | I10 кэш | логи R2: шаг `Swatinem/rust-cache@v2` каждой ноги `check` | строка восстановления с ключом `v0-rust-check-Linux-x64-…`; у ног кроме `unit-a` пост-шаг не сохраняет (`save-if` false) |
 | I12 скрипт ловит нарушения | шаг 4, пять внедрённых нарушений | каждое — ненулевой код, после отката — `PASS` |
