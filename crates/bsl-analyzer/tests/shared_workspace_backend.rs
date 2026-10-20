@@ -408,24 +408,7 @@ fn isolated_backend_env(cache: &Path, runtime: &Path) -> EnvGuard {
     env.set("TMP", runtime);
     env.set("TEMP", runtime);
     env.set("TMPDIR", runtime);
-    precreate_broker_socket_dir(runtime);
     env
-}
-
-/// The broker socket dir an adapter makes on first launch. Two adapters started together both
-/// see it missing, and the one whose `mkdir` loses gets `EEXIST`, gives up on the shared backend
-/// and serves stdio in-process: the scenario then waits for an attach that never comes. Made
-/// here, the dir is one both adapters only validate, and the scenario is the attach order alone.
-fn precreate_broker_socket_dir(runtime: &Path) {
-    let dir = runtime.join("bsl-mcp");
-    #[cfg(unix)]
-    let created = {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(&dir)
-    };
-    #[cfg(not(unix))]
-    let created = std::fs::create_dir(&dir);
-    created.expect("broker socket dir in the disposable runtime tree");
 }
 
 async fn wait_for_owner_initializers(runtime: &Path, count: usize) -> Vec<String> {
