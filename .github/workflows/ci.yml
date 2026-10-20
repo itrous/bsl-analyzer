@@ -48,10 +48,8 @@ jobs:
             select: "--lib --bins -- state::overlay_ state::bootstrap:: state::embed:: state::sync::"
           - shard: tests-a-m
             select: "--test '[a-m]*'"
-          - shard: tests-n-r
-            select: "--test '[n-r]*' --examples"
-          - shard: tests-rest
-            select: "--test '[!a-r]*'"
+          - shard: tests-n-z
+            select: "--test '[!a-m]*' --examples"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -349,7 +347,7 @@ jobs:
           list_tests bsl_search --workspace --lib -- lifecycle
           list_tests bsl_analyzer_app --workspace --bin bsl-analyzer-app -- workspace_cache_scope_ cli::logging
       - name: Named integration regressions exist
-        if: matrix.shard == 'tests-rest'
+        if: matrix.shard == 'tests-n-z'
         shell: bash
         run: |
           set -euo pipefail
