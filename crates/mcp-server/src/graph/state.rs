@@ -3714,7 +3714,7 @@ mod tests {
             graph.drive();
             wait_until_within(
                 &graph,
-                Duration::from_secs(60),
+                test_utils::wait::ceiling(Duration::from_secs(60)),
                 "the build admitted at the barrier to publish",
                 || lock_recover(&sampled).is_some(),
             );
@@ -4988,7 +4988,7 @@ mod tests {
         let _newer = crate::workspace_lease::WorkspaceLease::claim(root);
         wait_until_within(
             &graph,
-            Duration::from_secs(10),
+            test_utils::wait::ceiling(Duration::from_secs(10)),
             "the lease verdict to stop allowing this graph to build",
             || !graph.may_build(),
         );
@@ -5369,7 +5369,7 @@ mod tests {
         let newer = crate::workspace_lease::WorkspaceLease::claim(root);
         wait_until_within(
             &graph,
-            Duration::from_secs(10),
+            test_utils::wait::ceiling(Duration::from_secs(10)),
             "the lease verdict to stop allowing this graph to build",
             || !graph.may_build(),
         );
@@ -11095,9 +11095,12 @@ mod tests {
             "the fixture needs the second ask to find the kick still taken",
         );
         release.store(true, Ordering::SeqCst);
-        wait_until_within(&graph, Duration::from_secs(10), "the ask to be answered", || {
-            !matches!(graph.status(), GraphStatus::Failed(_))
-        });
+        wait_until_within(
+            &graph,
+            test_utils::wait::ceiling(Duration::from_secs(10)),
+            "the ask to be answered",
+            || !matches!(graph.status(), GraphStatus::Failed(_)),
+        );
         wait_ready(&graph);
     }
 

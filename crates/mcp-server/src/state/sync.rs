@@ -1642,6 +1642,8 @@ mod tests {
 
     #[test]
     fn continuous_events_do_not_reset_rescan_debt_backoff() {
+        // `waiting` reads the forced-debt flags other tests raise under this lock.
+        let _env_lock = env_lock();
         let start = std::time::Instant::now();
         let mut debt = super::RescanDebt::default();
         debt.record_failure(start);

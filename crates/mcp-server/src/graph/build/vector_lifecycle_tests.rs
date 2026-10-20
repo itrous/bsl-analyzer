@@ -50,6 +50,8 @@ impl ScaleEmbeddingServer {
                     }
                     Err(error) => panic!("scale embedding accept: {error}"),
                 };
+                // Windows hands the listener's non-blocking mode to the accepted stream.
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
                 stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
                 let body = read_scale_http_body(&mut stream);

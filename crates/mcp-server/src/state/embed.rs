@@ -4293,7 +4293,11 @@ mod tests {
         // The boot build's publish PASS, not its status: the pass ends with the same
         // `leftover_bound.swap(0)` … `fetch_max` the assertion below reads, so a wait that
         // stops at `Ready` lets the background tail steal the bound this test arms.
-        crate::graph::test_support::wait_publish_pass_within(&graph, Duration::from_secs(120), 1);
+        crate::graph::test_support::wait_publish_pass_within(
+            &graph,
+            test_utils::wait::ceiling(Duration::from_secs(120)),
+            1,
+        );
 
         // Take the rendered-from database away, so the pickup below can only skip. The graph
         // stays `Ready`, so the pickup does fire — it just cannot do anything.
@@ -4360,7 +4364,11 @@ mod tests {
         // The boot build's publish PASS, not its status: the pass ends with the same
         // `leftover_bound.swap(0)` … `fetch_max` the assertion below reads, so a wait that
         // stops at `Ready` lets the background tail steal the bound this test arms.
-        crate::graph::test_support::wait_publish_pass_within(&graph, Duration::from_secs(120), 1);
+        crate::graph::test_support::wait_publish_pass_within(
+            &graph,
+            test_utils::wait::ceiling(Duration::from_secs(120)),
+            1,
+        );
 
         let graph_db = crate::cache::graph_db_path(&workspace);
         let taken = graph_db.with_extension("db.taken");

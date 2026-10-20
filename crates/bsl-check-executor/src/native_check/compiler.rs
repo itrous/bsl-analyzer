@@ -1300,7 +1300,9 @@ mod tests {
     #[tokio::test]
     async fn child_output_is_drained_but_kept_within_the_limit() {
         let directory = tempfile::tempdir().unwrap();
-        let executable = script(directory.path(), "printf error >&2; printf 1234567890");
+        // stderr stays within its half of the limit: overflowing it first would stop the child
+        // before stdout is written, and how much of stdout made it out would depend on timing.
+        let executable = script(directory.path(), "printf err >&2; printf 1234567890");
         let output = run_bounded(
             &executable,
             &[],
@@ -1314,7 +1316,7 @@ mod tests {
 
         assert_eq!(output.termination, Termination::OutputLimit);
         assert_eq!(output.stdout, b"1234");
-        assert_eq!(output.stderr, b"erro");
+        assert_eq!(output.stderr, b"err");
         assert!(output.truncated);
     }
 

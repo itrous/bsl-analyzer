@@ -6893,7 +6893,7 @@ mod tests {
         let mut revision = None;
         crate::graph::test_support::wait_until_within(
             graph,
-            std::time::Duration::from_secs(60),
+            test_utils::wait::ceiling(std::time::Duration::from_secs(60)),
             "a readable graph revision",
             || {
                 revision = graph.status_report().revision;

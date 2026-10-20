@@ -259,6 +259,8 @@ fn onec_validation_mock(valid: bool) -> (String, Receiver<String>, JoinHandle<()
                 Err(error) => panic!("accept native validation request: {error}"),
             }
         };
+        // Windows hands the listener's non-blocking mode to the accepted stream.
+        stream.set_nonblocking(false).expect("blocking mock request read");
         stream
             .set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(10))))
             .expect("bound mock request read");

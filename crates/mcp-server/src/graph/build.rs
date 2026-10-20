@@ -6965,7 +6965,7 @@ mod tests {
         assert!(claimed, "recovery must schedule the clean rebuild the marker was waiting for");
         wait_until_within(
             &graph,
-            Duration::from_secs(3),
+            test_utils::wait::ceiling(Duration::from_secs(3)),
             "the recovery rebuild to publish a snapshot no longer marked force_stale",
             || meta_string(&graph_db_path(root), "force_stale") == "0",
         );
@@ -7324,7 +7324,7 @@ mod tests {
         // The catch-up publishes past the cached revision and rewrites the file.
         wait_until_within(
             &graph,
-            Duration::from_secs(5),
+            test_utils::wait::ceiling(Duration::from_secs(5)),
             "the catch-up reload to publish past the cached revision",
             || graph.snapshot().map(|s| s.generation) == Some(8),
         );
@@ -11467,7 +11467,7 @@ mod tests {
         // The caller-delta reload publishes generation 2 with the method gone.
         wait_until_within(
             &graph,
-            Duration::from_secs(2),
+            test_utils::wait::ceiling(Duration::from_secs(2)),
             "the caller-delta reload to publish generation 2",
             || graph.snapshot().is_some_and(|snap| snap.generation == 2),
         );

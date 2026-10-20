@@ -24,17 +24,16 @@ fn isolated(test: &str) -> bool {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // The two fixture watchdogs together fit the 180-second acceptance budget.
+    // The two fixture watchdogs together fit the 180-second acceptance budget. The budget is a
+    // timing statement, held only by the timing profile; an ordinary run keeps a hang guard.
     let seconds = if test == "indexing_polling_smoke" { 150 } else { 30 };
-    // A wall-clock budget on purpose: this is the acceptance budget of the fixture, not a state
-    // wait, and the message names it in seconds.
     let started = std::time::Instant::now();
-    let budget = Duration::from_secs(seconds);
+    let budget = test_utils::wait::hang_guard(Duration::from_secs(seconds));
     while child.try_wait().unwrap().is_none() {
         if started.elapsed() >= budget {
             child.kill().unwrap();
             child.wait().unwrap();
-            panic!("isolated runtime fixture exceeded {seconds} seconds");
+            panic!("isolated runtime fixture exceeded {budget:?}");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -80,6 +79,8 @@ impl Provider {
                     }
                     Err(e) => panic!("fixture accept: {e}"),
                 };
+                // Windows hands the listener's non-blocking mode to the accepted stream.
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                 let mut bytes = Vec::new();
@@ -336,7 +337,9 @@ async fn indexing_polling_smoke() {
         })
         .await;
     }
-    assert!(started.elapsed() <= Duration::from_secs(180));
+    if cfg!(timing_contract) {
+        assert!(started.elapsed() <= Duration::from_secs(180));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
