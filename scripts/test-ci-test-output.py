@@ -14,6 +14,7 @@ import signal
 import string
 import subprocess
 import textwrap
+import threading
 
 
 root = Path(__file__).resolve().parents[1]
@@ -93,15 +94,20 @@ for block in blocks("run_tests"):
          + textwrap.dedent(block) + "\nrun_tests --exact -p x -- fixture::name"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True,
     )
+    # A wrapper that holds the output back never prints the line; the guard turns that
+    # into a failure that says so instead of a lint job held to its timeout.
+    guard = threading.Timer(600, os.killpg, (stalled.pid, signal.SIGKILL))
+    guard.start()
     seen = []
     for line in stalled.stdout:
         seen.append(line.rstrip("\n"))
         if seen[-1] == passed_line:
             break
+    guard.cancel()
     os.killpg(stalled.pid, signal.SIGKILL)
     seen += stalled.stdout.read().splitlines()
     assert stalled.wait() == -signal.SIGKILL, seen
-    assert passed_line in seen, seen
+    assert passed_line in seen, f"run_tests held cargo's output until cargo exited: {seen}"
     assert any(line.startswith(">>> cargo test -p x") for line in seen), seen
     assert not any(line.startswith("<<<") for line in seen), seen
 
@@ -148,13 +154,48 @@ jobs = dict(re.findall(
 # The Windows jobs are the only place the code runs under Windows, and their coverage
 # is a hand-written list of names. A bare `cargo test` there can select nothing and
 # stay green; every invocation must go through a checked wrapper.
+# Options and a toolchain may stand between `cargo` and `test`.
+CARGO_TEST = re.compile(
+    r"""(?<![\w./-])cargo(?:\.exe)?["']?(?:\s+(?:\+\S+|-\S+))*\s+["']?test\b"""
+)
+# Inside a wrapper, cargo runs only on the selection the wrapper was called with: a
+# fixed selection added to a body would be a bare `cargo test` that the wrapper check
+# cannot see, since the body is the checked part.
+WRAPPED_CARGO = re.compile(
+    r"""cargo test (?:--color never )?(?:"\$\{selection\[@\]\}"|"\$@")(?:\s|\)|$)"""
+)
+
+
+def bare_cargo_tests(job, wrappers):
+    found = []
+    for block in wrappers:
+        if block not in job:
+            continue
+        job = job.replace(block, "")
+        for line in block.splitlines()[1:]:
+            words = line.split()
+            if not words or words[0] in ("#", "printf", "echo"):
+                continue
+            for cargo in re.finditer(r"(?<![\w./-])cargo(?:\.exe)?\b", line):
+                if not WRAPPED_CARGO.match(line, cargo.start()):
+                    found.append(line.strip())
+    return found + [match.group(0) for match in CARGO_TEST.finditer(job)]
+
+
+# The guard is only as good as the inputs it can be seen to reject.
+for bypass in ["cargo --locked test -p x", "cargo +stable test -p x", "cargo.exe test -p x"]:
+    assert bare_cargo_tests(f"      run: {bypass}\n", []), bypass
+for injected in ["cargo test -p x --lib", "cargo test -p x --lib || true", "cargo build -p x"]:
+    block = blocks("run_tests")[0]
+    lines = block.splitlines()
+    tampered = "\n".join(lines[:-1] + [f"            {injected}", lines[-1]])
+    assert bare_cargo_tests(tampered, [tampered]), injected
+
 windows = [name for name, body in jobs.items() if re.search(r"^    runs-on: windows", body, re.MULTILINE)]
 assert len(windows) >= 4, f"expected at least four Windows jobs, found {windows}"
 for name in windows:
-    unwrapped = jobs[name]
-    for block in wrappers:
-        unwrapped = unwrapped.replace(block, "")
-    assert not re.search(r'cargo\s+["\']?\s*test\b', unwrapped), f"{name} runs cargo test outside a wrapper"
+    found = bare_cargo_tests(jobs[name], wrappers)
+    assert not found, f"{name} runs cargo test outside a wrapper: {found}"
 
 check = jobs["check"]
 # Unquoted, the `::` of a filter followed by a space reads as a YAML mapping.
