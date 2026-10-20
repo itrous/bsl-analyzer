@@ -1,12 +1,25 @@
 #![allow(dead_code)] // Shared by process and resident tests, which use different adapters.
 
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const MODULE: &str = include_str!("Module.bsl");
 pub const WARNING: &str = "invalid value for diagnostic code";
 pub const PRIVATE_VALUE: &str = "shape-value-must-stay-private";
 pub type Finding = (String, u64, u64, u64, u64);
+
+/// A key the analyzer does not know: its warning comes only from loading a config that carries
+/// it, so the warning tells the load of the reloaded config from every load before it.
+pub const RELOAD_KEY: &str = "ReloadMarker = true\n";
+pub const RELOAD_WARNING: &str = "unknown diagnostic code `ReloadMarker`";
+
+/// Each config load logs its warning once, and a backend that is starting (or replaced by a
+/// reload) still loads the config a few times after it answers its first request, so the
+/// counts of loads and of resident revisions have no stable sampling point. A load per request
+/// cannot hide in that noise: it grows them by at least one for every request, so this many
+/// requests outgrow any startup sequence (at most 5 loads per backend, 8 with an in-place
+/// reload before a replacement).
+pub const PULLS_PER_LOAD_BOUND: usize = 16;
 
 pub fn config(min_word_length: usize) -> String {
     format!(
@@ -34,6 +47,39 @@ pub fn replace_config(root: &Path, min_word_length: usize) {
     let next = root.join("bsl-analyzer.toml.next");
     std::fs::write(&next, config(min_word_length)).unwrap();
     std::fs::rename(next, root.join("bsl-analyzer.toml")).unwrap();
+}
+
+/// [`replace_config`] with a key the analyzer does not know, which makes the load of this
+/// config log [`RELOAD_WARNING`].
+pub fn replace_config_marked(root: &Path, min_word_length: usize) {
+    let next = root.join("bsl-analyzer.toml.next");
+    std::fs::write(&next, format!("{}{RELOAD_KEY}", config(min_word_length))).unwrap();
+    std::fs::rename(next, root.join("bsl-analyzer.toml")).unwrap();
+}
+
+/// The `BSL_LOG_FILE` value that gives every analyzer process its own log in `dir`. A config
+/// change can replace the backend, which inherits the variable; an explicit file is truncated
+/// on start, so a shared name would let the replacement erase what the old backend logged.
+/// Keep `dir` outside the project root, which the server watches: a log inside it turns every
+/// log line into a file change that reloads the project and logs again.
+pub fn log_template(dir: &Path) -> PathBuf {
+    dir.join("analyzer-{pid}.log")
+}
+
+/// Everything every process that logged into `dir` through [`log_template`] has written. The
+/// logs only grow, so a count over them never goes down.
+pub fn session_log(dir: &Path) -> String {
+    let mut logs: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("analyzer-") && name.ends_with(".log"))
+        })
+        .collect();
+    logs.sort();
+    logs.iter().map(|path| std::fs::read_to_string(path).unwrap()).collect::<Vec<_>>().join("\n")
 }
 
 pub fn selected(code: &str) -> bool {
