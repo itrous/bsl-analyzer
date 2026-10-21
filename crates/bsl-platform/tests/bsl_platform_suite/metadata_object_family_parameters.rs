@@ -65,9 +65,12 @@ fn metadata_collection_membership_takes_any_metadata_object() {
 #[test]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn global_functions_take_any_metadata_object() {
-    assert_eq!(global_param("ПравоДоступа", 1), family());
-    assert_eq!(global_param("AccessRight", 1), family());
-    assert_eq!(global_param("ВыполнитьПроверкуПравДоступа", 1), family());
+    // The rights of the configuration as a whole are asked of the global
+    // `Метаданные`, which is no member of the family.
+    let with_configuration = format!("{}, ОбъектМетаданныхКонфигурация", family());
+    assert_eq!(global_param("ПравоДоступа", 1), with_configuration);
+    assert_eq!(global_param("AccessRight", 1), with_configuration);
+    assert_eq!(global_param("ВыполнитьПроверкуПравДоступа", 1), with_configuration);
     assert_eq!(global_param("ЗаписьЖурналаРегистрации", 2), family());
     assert_eq!(global_param("ОткрытьСправку", 0), family());
 }

@@ -405,6 +405,15 @@ pub fn is_coercible_to(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool 
     {
         return true;
     }
+    // A form item whose kind is unknown (`ЭлементФормы`: an item of a tag the form
+    // reader does not map, a value documented so) may be an item of any kind.
+    // Where the slot admits some item kind, the author chose it; flagging the call
+    // reports the analyzer's ignorance, not a bug. A slot that admits no item (a
+    // `Строка`, a `Число`) still reports it. Argument-position policy only: in the
+    // lattice the base type stays wider than each concrete kind.
+    if is_unknown_kind_form_item(db.lookup_type(from)) && slot_admits_form_item(db, to) {
+        return true;
+    }
     // An argument of a union type is an over-approximation: at runtime exactly
     // one member flows in. Yet a blanket "any member fits" rule would mask
     // real bugs (a dynamic РезультатЗапроса.Выгрузить yields ТаблицаЗначений |
@@ -473,6 +482,28 @@ fn to_admits_bare_value_table(db: &dyn TypeKernelDb, to: TypeId) -> bool {
 fn is_binary_data(kind: &TypeKind) -> bool {
     matches!(kind, TypeKind::PlatformObject(facet)
         if platform_name_eq_ci(&facet.name, "ДвоичныеДанные", "BinaryData"))
+}
+
+/// The slot itself, or one member of a documented union, admits a form item.
+fn slot_admits_form_item(db: &dyn TypeKernelDb, to: TypeId) -> bool {
+    match db.lookup_type(to) {
+        TypeKind::Union(parts) => parts.iter().any(|p| slot_admits_form_item(db, *p)),
+        kind => is_form_item_kind(kind) || is_unknown_kind_form_item(kind),
+    }
+}
+
+/// A form item whose kind is not known: a control of a tag the form reader does
+/// not map, or the platform base type `ЭлементФормы` named in a doc comment.
+fn is_unknown_kind_form_item(kind: &TypeKind) -> bool {
+    match kind {
+        TypeKind::FormControl { kind, .. } => {
+            crate::platform_type_name::form_control_name_for(*kind).is_none()
+        }
+        TypeKind::PlatformObject(facet) => {
+            platform_name_eq_ci(&facet.name, "ЭлементФормы", "FormControl")
+        }
+        _ => false,
+    }
 }
 
 fn is_form_item_kind(kind: &TypeKind) -> bool {
@@ -1280,6 +1311,46 @@ mod tests {
         assert!(
             !is_coercible_to(&db, maybe_absent, parent_slot),
             "a possibly absent item still fails a slot that does not admit Неопределено"
+        );
+    }
+
+    #[test]
+    fn form_item_of_unknown_kind_is_accepted_where_some_item_kind_is() {
+        use bsl_types::facet::FormElementFacet as K;
+        let db = InMemoryDb::new();
+        let item = |name: &str| db.platform_object(name.to_string());
+        let parent_slot = db.union(vec![
+            item("ГруппаФормы"),
+            item("ТаблицаФормы"),
+            item("ФормаКлиентскогоПриложения"),
+        ]);
+        for unknown in
+            [db.mk_form_control(K::Other, None), item("ЭлементФормы"), item("FormControl")]
+        {
+            assert!(is_coercible_to(&db, unknown, parent_slot), "{:?}", db.lookup_type(unknown));
+            assert!(is_coercible_to(&db, unknown, item("ДекорацияФормы")));
+            for base in [item("ЭлементФормы"), item("FormControl")] {
+                assert!(is_coercible_to(&db, unknown, base));
+                let optional_base = db.union(vec![base, db.undefined()]);
+                assert!(is_coercible_to(&db, unknown, optional_base));
+            }
+            assert!(
+                !is_assignable(&db, unknown, parent_slot),
+                "the lattice keeps the base type wider than each kind"
+            );
+            assert!(
+                !is_coercible_to(&db, unknown, db.number(None, None)),
+                "a slot that admits no item still reports it"
+            );
+            assert!(!is_coercible_to(&db, unknown, item("ТаблицаЗначений")));
+        }
+        assert!(
+            !is_coercible_to(&db, db.string(None, false), parent_slot),
+            "a string is no item of any kind"
+        );
+        assert!(
+            !is_coercible_to(&db, db.mk_form_control(K::Field, None), parent_slot),
+            "a field of known kind still cannot be a parent"
         );
     }
 

@@ -200,22 +200,37 @@ fn tag_to_kind(tag: &str) -> FormElementKind {
         "Page" => FormElementKind::Page,
         "CommandBar" => FormElementKind::CommandBar,
         "ButtonGroup" => FormElementKind::ButtonGroup,
+        // A submenu and a column group are `ГруппаФормы` at run time (kinds
+        // `ВидГруппыФормы.Подменю` / `.ГруппаКолонок`) and serve as parents.
+        "Popup" | "ColumnGroup" => FormElementKind::Group,
         "InputField"
         | "LabelField"
         | "CheckBoxField"
         | "RadioButtonField"
         | "HTMLField"
+        | "HTMLDocumentField"
         | "PictureField"
         | "SpreadSheetDocumentField"
         | "SpreadsheetDocumentField"
         | "TextField"
+        | "TextDocumentField"
+        | "FormattedDocumentField"
+        | "PDFDocumentField"
+        | "ChartField"
+        | "GanttChartField"
+        | "DendrogramField"
+        | "PlannerField"
+        | "PeriodField"
+        | "GraphicalSchemaField"
+        | "GeographicalSchemaField"
         | "ProgressBarField"
         | "TrackBarField"
         | "CalendarField"
         | "TabField"
         | "Switch" => FormElementKind::Field,
         "Button" => FormElementKind::Button,
-        "Decoration" => FormElementKind::Decoration,
+        // The dump spells a decoration by its kind, never as a bare `Decoration`.
+        "Decoration" | "LabelDecoration" | "PictureDecoration" => FormElementKind::Decoration,
         "ContextMenu"
         | "ExtendedTooltip"
         | "SearchStringAddition"
@@ -1166,6 +1181,15 @@ mod tests {
             ("Switch", FormElementKind::Field),
             ("Button", FormElementKind::Button),
             ("Decoration", FormElementKind::Decoration),
+            ("LabelDecoration", FormElementKind::Decoration),
+            ("PictureDecoration", FormElementKind::Decoration),
+            ("Popup", FormElementKind::Group),
+            ("ColumnGroup", FormElementKind::Group),
+            ("HTMLDocumentField", FormElementKind::Field),
+            ("TextDocumentField", FormElementKind::Field),
+            ("FormattedDocumentField", FormElementKind::Field),
+            ("PlannerField", FormElementKind::Field),
+            ("PeriodField", FormElementKind::Field),
             ("ContextMenu", FormElementKind::Addition),
             ("ExtendedTooltip", FormElementKind::Addition),
             ("SearchStringAddition", FormElementKind::Addition),

@@ -162,10 +162,11 @@
       "min_version": "8.0",
       "parameter_index": 1,
       "replacement_type_list": [
-        "ОбъектМетаданных: *"
+        "ОбъектМетаданных: *",
+        "ОбъектМетаданныхКонфигурация"
       ],
-      "evidence_source": "platform_data.json: AccessRight (global function id 459), parameter «ОбъектМетаданных»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
-      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+      "evidence_source": "platform_data.json: AccessRight (global function id 459), parameter «ОбъектМетаданных»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list. Live run on 8.3.17.1549 and 8.3.27.2214: `ПравоДоступа(\"Администрирование\", Метаданные)`, `ПравоДоступа(\"Вывод\", Метаданные)` and `ПравоДоступа(\"Вывод\", Метаданные, ПользователиИнформационнойБазы.ТекущийПользователь())` return Булево; `ПравоДоступа(\"Вывод\", \"Метаданные\")` fails «Несоответствие типов (параметр номер '2')»",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place. The rights of the configuration as a whole (`Администрирование`, `Вывод`, `МобильныйКлиент`, …) are asked of the global `Метаданные`, an `ОбъектМетаданныхКонфигурация` that is no member of that family, so it is named on its own."
     },
     {
       "russian_name": "ВыполнитьПроверкуПравДоступа",
@@ -173,10 +174,11 @@
       "min_version": "8.2",
       "parameter_index": 1,
       "replacement_type_list": [
-        "ОбъектМетаданных: *"
+        "ОбъектМетаданных: *",
+        "ОбъектМетаданныхКонфигурация"
       ],
-      "evidence_source": "platform_data.json: VerifyAccessRights (global function id 492), parameter «ОбъектМетаданных»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
-      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+      "evidence_source": "platform_data.json: VerifyAccessRights (global function id 492), parameter «ОбъектМетаданных»: param_type «ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица, ОбъектМетаданных: HTTPСервис»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list. Live run on 8.3.17.1549 and 8.3.27.2214: `ВыполнитьПроверкуПравДоступа(\"Администрирование\", Метаданные)` completes",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place. The rights of the configuration as a whole are checked on the global `Метаданные`, an `ОбъектМетаданныхКонфигурация` that is no member of that family, so it is named on its own."
     },
     {
       "russian_name": "ЗаписьЖурналаРегистрации",
