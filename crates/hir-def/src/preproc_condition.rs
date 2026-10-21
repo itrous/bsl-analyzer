@@ -71,9 +71,10 @@ impl PreprocSymbol {
         }
     }
 
-    /// Whether the symbol holds in environment `env` (a single flag).
-    /// `None` — cannot be decided from the environment alone.
-    fn eval(self, env: EnvFlags) -> Option<bool> {
+    /// Whether the symbol holds in environment `env` (a single flag), with an
+    /// undecided `Сервер` taken as `server`. `None` — cannot be decided from
+    /// the environment alone.
+    fn eval(self, env: EnvFlags, server: Option<bool>) -> Option<bool> {
         use PreprocSymbol::*;
         match self {
             Client => {
@@ -87,7 +88,7 @@ impl PreprocSymbol {
                 EnvFlags::SERVER => Some(true),
                 EnvFlags::THICK_CLIENT_MANAGED
                 | EnvFlags::THICK_CLIENT_ORDINARY
-                | EnvFlags::EXTERNAL_CONNECTION => None,
+                | EnvFlags::EXTERNAL_CONNECTION => server,
                 _ => Some(false),
             },
             ThinClient => Some(env == EnvFlags::THIN_CLIENT),
@@ -144,21 +145,40 @@ impl PreprocCondition {
 
     /// Tri-state truth of the condition in environment `env` (single flag):
     /// `Some(true)` — the branch is compiled in `env`; `Some(false)` — it is
-    /// not; `None` — undecidable (unrecognized symbol involved).
+    /// not; `None` — undecidable (unrecognized symbol involved, or `Сервер`
+    /// in an environment that compiles "server" code locally).
+    ///
+    /// The three-valued evaluation cannot see that `Сервер И Не Сервер` is
+    /// false whatever `Сервер` holds, so an undecided `Сервер` is tried both
+    /// ways: a verdict both agree on holds in either infobase mode.
     pub fn eval(&self, env: EnvFlags) -> Option<bool> {
+        match self.eval_with(env, None) {
+            Some(value) => Some(value),
+            None => match (self.eval_with(env, Some(true)), self.eval_with(env, Some(false))) {
+                (Some(when_server), Some(when_not)) if when_server == when_not => Some(when_server),
+                _ => None,
+            },
+        }
+    }
+
+    fn eval_with(&self, env: EnvFlags, server: Option<bool>) -> Option<bool> {
         match self {
-            PreprocCondition::Symbol(sym) => sym.eval(env),
-            PreprocCondition::Not(inner) => inner.eval(env).map(|v| !v),
-            PreprocCondition::And(lhs, rhs) => match (lhs.eval(env), rhs.eval(env)) {
-                (Some(false), _) | (_, Some(false)) => Some(false),
-                (Some(true), Some(true)) => Some(true),
-                _ => None,
-            },
-            PreprocCondition::Or(lhs, rhs) => match (lhs.eval(env), rhs.eval(env)) {
-                (Some(true), _) | (_, Some(true)) => Some(true),
-                (Some(false), Some(false)) => Some(false),
-                _ => None,
-            },
+            PreprocCondition::Symbol(sym) => sym.eval(env, server),
+            PreprocCondition::Not(inner) => inner.eval_with(env, server).map(|v| !v),
+            PreprocCondition::And(lhs, rhs) => {
+                match (lhs.eval_with(env, server), rhs.eval_with(env, server)) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
+            PreprocCondition::Or(lhs, rhs) => {
+                match (lhs.eval_with(env, server), rhs.eval_with(env, server)) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
             PreprocCondition::Unknown => None,
         }
     }
@@ -173,6 +193,18 @@ impl PreprocCondition {
     /// chain, including `#Иначе` (which receives whatever is left in
     /// `remaining`).
     pub fn narrow_branch(&self, remaining: &mut EnvFlags) -> EnvFlags {
+        let mut undecided = EnvFlags::EMPTY;
+        self.narrow_branch_tracking(remaining, &mut undecided)
+    }
+
+    /// [`Self::narrow_branch`] that also adds the environments it could not
+    /// decide to `undecided`: an empty mask means "compiled nowhere" only
+    /// while the chain has decided every environment it started with.
+    pub fn narrow_branch_tracking(
+        &self,
+        remaining: &mut EnvFlags,
+        undecided: &mut EnvFlags,
+    ) -> EnvFlags {
         let mut mask = EnvFlags::EMPTY;
         for env in remaining.iter() {
             match self.eval(env) {
@@ -183,6 +215,7 @@ impl PreprocCondition {
                 Some(false) => {}
                 None => {
                     *remaining = remaining.without(env);
+                    *undecided = *undecided | env;
                 }
             }
         }
@@ -445,6 +478,18 @@ mod tests {
         let mask = PreprocCondition::parse("Линукс").narrow_branch(&mut remaining);
         assert!(mask.is_empty(), "undecidable branch checks nothing");
         assert!(remaining.is_empty(), "undecidable envs leave the chain entirely");
+    }
+
+    /// `Сервер` is the one symbol undecided by the environment, so a condition
+    /// that holds alike for both of its values is decided.
+    #[test]
+    fn a_condition_independent_of_an_undecided_server_is_decided() {
+        let env = EnvFlags::THICK_CLIENT_MANAGED;
+        assert_eq!(t("Сервер И Не Сервер", env), Some(false));
+        assert_eq!(t("Сервер ИЛИ НЕ Сервер", env), Some(true));
+        assert_eq!(t("(Сервер И Не Сервер) ИЛИ Линукс", env), None);
+        assert_eq!(t("Сервер И Не Сервер И Линукс", env), Some(false));
+        assert_eq!(t("Сервер И Линукс", env), None);
     }
 
     #[test]

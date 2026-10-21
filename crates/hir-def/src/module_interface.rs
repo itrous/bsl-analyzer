@@ -19,7 +19,7 @@ use text_size::TextRange;
 
 use crate::conditional_tree::ConditionalTree;
 use crate::docs::{compute_variable_docs_with_node, MethodDocs, VariableDocs};
-use crate::execution_env::{conditional_env, EnvFlags};
+use crate::execution_env::{conditional_env_tracking, EnvFlags};
 use crate::item_tree::{AnnotationKind, ItemTree, ModItem, Param};
 use crate::ty::doc_types::{parse_method_doc_types, MethodTypeHints};
 use crate::type_ref::TypeRef;
@@ -58,6 +58,9 @@ pub struct MethodDecl {
     /// Environments admitted by the module-level `#Если` regions around the
     /// method; [`EnvFlags::ALL`] outside any region.
     pub preproc_env: EnvFlags,
+    /// Environments those regions could not decide, so neither admitted nor
+    /// ruled out; [`EnvFlags::EMPTY`] outside any region.
+    pub preproc_undecided: EnvFlags,
     pub docs: Option<Arc<MethodDocs>>,
     pub return_type_ref: Option<TypeRef>,
 }
@@ -178,7 +181,7 @@ impl ModuleInterface {
         is_export: bool,
         params: &[Param],
         directives: Box<[AnnotationKind]>,
-        preproc_env: EnvFlags,
+        (preproc_env, preproc_undecided): (EnvFlags, EnvFlags),
         docs: Option<Arc<MethodDocs>>,
     ) -> MethodDecl {
         let hints = docs.as_deref().and_then(|d| parse_method_doc_types(&d.raw));
@@ -190,6 +193,7 @@ impl ModuleInterface {
             params: params_with_hints(params, hints.as_ref()),
             directives,
             preproc_env,
+            preproc_undecided,
             return_type_ref: hints.as_ref().map(|h| h.ret.clone()),
             docs,
         }
@@ -305,7 +309,7 @@ impl ModuleInterface {
                         method.is_export(),
                         method.params(),
                         method.annotations().iter().map(|a| a.kind).collect(),
-                        EnvFlags::ALL,
+                        (EnvFlags::ALL, EnvFlags::EMPTY),
                         None,
                     );
                     interface.push_method(decl);
@@ -340,10 +344,11 @@ impl ModuleInterface {
     }
 }
 
-fn preproc_env(conditionals: Option<&ConditionalTree>, range: TextRange) -> EnvFlags {
+/// [`MethodDecl::preproc_env`] and [`MethodDecl::preproc_undecided`].
+fn preproc_env(conditionals: Option<&ConditionalTree>, range: TextRange) -> (EnvFlags, EnvFlags) {
     match conditionals {
-        Some(tree) if !tree.is_empty() => conditional_env(tree, range),
-        _ => EnvFlags::ALL,
+        Some(tree) if !tree.is_empty() => conditional_env_tracking(tree, range),
+        _ => (EnvFlags::ALL, EnvFlags::EMPTY),
     }
 }
 

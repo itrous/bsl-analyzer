@@ -557,6 +557,7 @@ mod tests {
                 .collect(),
             directives: Box::new([]),
             preproc_env: hir_def::execution_env::EnvFlags::ALL,
+            preproc_undecided: hir_def::execution_env::EnvFlags::EMPTY,
             docs: Some(std::sync::Arc::new(docs)),
             return_type_ref: None,
         }

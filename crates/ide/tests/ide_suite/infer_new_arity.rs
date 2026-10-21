@@ -87,6 +87,50 @@ fn array_no_parens_accepts() {
     );
 }
 
+/// The platform compiles and runs these without arguments although the help
+/// lists only constructors with a required parameter.
+#[test]
+fn undocumented_parameterless_constructors_accept() {
+    let fixture = r#"
+//- /test.bsl
+Процедура Тест()
+    Х = Новый Файл;
+    Х = Новый Файл();
+    Х = Новый ДокументDOM;
+    Х = Новый ДокументHTML;
+КонецПроцедуры
+"#;
+    let (db, file_id) = setup(fixture);
+    assert!(
+        arg_count_diags(&db, file_id).is_empty(),
+        "a parameterless Файл / ДокументDOM / ДокументHTML must be accepted, got {:?}",
+        arg_count_diags(&db, file_id)
+    );
+}
+
+/// Control: the bare form the platform rejects ("Конструктор не найден") and an
+/// extra argument keep the diagnostic.
+#[test]
+fn constructors_without_a_parameterless_form_still_fire() {
+    let fixture = r#"
+//- /test.bsl
+Процедура Тест()
+    Х = Новый HTTPСоединение;
+    Х = Новый ДвоичныеДанные;
+    Х = Новый Файл("а", "б");
+КонецПроцедуры
+"#;
+    let (db, file_id) = setup(fixture);
+    let diags = arg_count_diags(&db, file_id);
+    let mut found = diags.iter().map(|(_, _, found)| *found).collect::<Vec<_>>();
+    found.sort_unstable();
+    assert_eq!(
+        found,
+        vec![0, 0, 2],
+        "expected HTTPСоединение, ДвоичныеДанные and the two-argument Файл, got {diags:?}"
+    );
+}
+
 #[test]
 fn structure_keys_and_values_accepts_variadic() {
     let fixture = r#"

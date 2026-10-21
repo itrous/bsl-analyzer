@@ -530,6 +530,16 @@ pub fn conditional_env(
     tree: &crate::conditional_tree::ConditionalTree,
     range: text_size::TextRange,
 ) -> EnvFlags {
+    conditional_env_where(tree, |node| node.contains_range(range)).0
+}
+
+/// [`conditional_env`] together with the environments the enclosing chains
+/// could not decide (see
+/// [`crate::preproc_condition::PreprocCondition::narrow_branch_tracking`]).
+pub fn conditional_env_tracking(
+    tree: &crate::conditional_tree::ConditionalTree,
+    range: text_size::TextRange,
+) -> (EnvFlags, EnvFlags) {
     conditional_env_where(tree, |node| node.contains_range(range))
 }
 
@@ -539,13 +549,13 @@ pub fn conditional_env_at(
     tree: &crate::conditional_tree::ConditionalTree,
     offset: text_size::TextSize,
 ) -> EnvFlags {
-    conditional_env_where(tree, |node| node.contains(offset))
+    conditional_env_where(tree, |node| node.contains(offset)).0
 }
 
 fn conditional_env_where(
     tree: &crate::conditional_tree::ConditionalTree,
     encloses: impl Fn(&text_size::TextRange) -> bool,
-) -> EnvFlags {
+) -> (EnvFlags, EnvFlags) {
     use crate::conditional_tree::ConditionalKind;
     use crate::preproc_condition::PreprocCondition;
 
@@ -565,6 +575,7 @@ fn conditional_env_where(
     }
 
     let mut env = EnvFlags::ALL;
+    let mut undecided = EnvFlags::EMPTY;
     let mut cur = node;
     while let Some(idx) = cur {
         let chain_if = match tree.conditional(idx).kind {
@@ -572,7 +583,7 @@ fn conditional_env_where(
             // ElsIf/Else clauses always point at their chain's `If`.
             ConditionalKind::ElsIf | ConditionalKind::Else => match tree.parent(idx) {
                 Some(parent) => parent,
-                None => return EnvFlags::EMPTY,
+                None => return (EnvFlags::EMPTY, EnvFlags::ALL),
             },
         };
 
@@ -585,7 +596,7 @@ fn conditional_env_where(
                     .condition_text
                     .as_deref()
                     .map_or(PreprocCondition::Unknown, PreprocCondition::parse)
-                    .narrow_branch(&mut remaining),
+                    .narrow_branch_tracking(&mut remaining, &mut undecided),
                 ConditionalKind::Else => std::mem::take(&mut remaining),
             };
             if branch == idx {
@@ -596,7 +607,7 @@ fn conditional_env_where(
         env = env & claimed;
         cur = tree.parent(chain_if);
     }
-    env
+    (env, undecided)
 }
 
 fn is_compilation_directive(kind: &AnnotationKind) -> bool {

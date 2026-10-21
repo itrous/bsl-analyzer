@@ -552,6 +552,12 @@ pub struct CallArgBinding {
     pub args: Vec<ExprId>,
 
     pub candidate: CandidateCallBinding,
+
+    /// The call sits in a `#Если` branch no environment of the body compiles
+    /// (`InferenceContext::in_dead_branch`). The binding still answers
+    /// resolution readers; the argument judgement leaves it alone, because the
+    /// platform drops such a branch before it could check a single argument.
+    pub in_dead_branch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,6 +695,17 @@ pub struct InferenceContext<'db> {
     /// is unknown (an empty [`Self::body_env`], as in effective and weaving bodies),
     /// so the branch may be compiled nowhere.
     in_uncompiled_branch: bool,
+
+    /// Environments that may compile the statement walk's position: unlike
+    /// [`Self::body_env`], those an enclosing condition could not decide stay
+    /// in. Empty = unknown, unless [`Self::in_dead_branch`] holds.
+    possible_env: hir_def::execution_env::EnvFlags,
+
+    /// The statement walk is inside a `#Если` branch, or a method under a
+    /// module-level one, that every environment of a known body decidably
+    /// skips. Narrower than [`Self::in_uncompiled_branch`]: an unknown body
+    /// environment or an undecidable condition may still compile the branch.
+    in_dead_branch: bool,
 
     /// Statements walked while [`Self::in_uncompiled_branch`] held.
     uncompiled_stmts: Vec<StmtId>,
@@ -942,6 +959,22 @@ impl<'db> InferenceContext<'db> {
                 implicit_assignment_name(body, ExprId::from_idx(*target))
             })
             .collect();
+        let possible_env = if !with_body_env {
+            None
+        } else {
+            match owner {
+                DefWithBodyId::Method(local_id) => crate::method_environment::possible_method_env(
+                    db,
+                    hir_def::MethodId { module: hir_def::ModuleId { file_id }, local_id },
+                    &opts,
+                ),
+                DefWithBodyId::ModuleCode => {
+                    let metadata = db.module_metadata(hir_def::ModuleId { file_id });
+                    Some(hir_def::execution_env::module_code_env(&metadata, &opts))
+                        .filter(|env| !env.is_empty())
+                }
+            }
+        };
         let body_env = if !with_body_env {
             hir_def::execution_env::EnvFlags::EMPTY
         } else {
@@ -984,6 +1017,8 @@ impl<'db> InferenceContext<'db> {
             body_env,
             checked_env: opts.checked_environments,
             in_uncompiled_branch: false,
+            possible_env: possible_env.unwrap_or(hir_def::execution_env::EnvFlags::EMPTY),
+            in_dead_branch: possible_env.is_some_and(|env| env.is_empty()),
             uncompiled_stmts: Vec::new(),
             min_platform: db
                 .min_platform_version()
@@ -1910,6 +1945,7 @@ impl<'db> InferenceContext<'db> {
                 call_expr,
                 args: args.to_vec(),
                 candidate: projection.semantic,
+                in_dead_branch: self.in_dead_branch,
             });
         }
         return_ty
@@ -2832,33 +2868,58 @@ impl<'db> InferenceContext<'db> {
                 // Availability checks inside a branch see only the
                 // environments its condition compiles for; nesting works
                 // because each frame restores its own parent mask.
+                // The possible environments of a branch keep those a
+                // condition of the chain could not decide: they may take any
+                // branch from there on. A branch is dead only when a known
+                // body leaves it none.
+                use hir_def::execution_env::EnvFlags;
                 let parent = self.body_env;
+                let parent_possible = self.possible_env;
                 let parent_uncompiled = self.in_uncompiled_branch;
+                let parent_dead = self.in_dead_branch;
                 let mut remaining = parent;
-                self.body_env = preproc.condition.narrow_branch(&mut remaining);
-                self.in_uncompiled_branch = parent_uncompiled || self.body_env.is_empty();
+                let mut possible_remaining = parent_possible;
+                let mut undecided = EnvFlags::EMPTY;
+                let enter = |this: &mut Self, mask: EnvFlags, possible: EnvFlags| {
+                    this.body_env = mask;
+                    this.possible_env = possible;
+                    this.in_uncompiled_branch = parent_uncompiled || mask.is_empty();
+                    this.in_dead_branch =
+                        parent_dead || (!parent_possible.is_empty() && possible.is_empty());
+                };
+                let mask = preproc.condition.narrow_branch(&mut remaining);
+                let taken = preproc
+                    .condition
+                    .narrow_branch_tracking(&mut possible_remaining, &mut undecided);
+                enter(self, mask, taken | undecided);
                 self.infer_stmts(&preproc.then_branch);
                 for (idx, (_, _, branch)) in preproc.elsif_branches.iter().enumerate() {
-                    self.body_env = match preproc.elsif_conditions.get(idx) {
-                        Some(cond) => cond.narrow_branch(&mut remaining),
+                    let (mask, taken) = match preproc.elsif_conditions.get(idx) {
+                        Some(cond) => (
+                            cond.narrow_branch(&mut remaining),
+                            cond.narrow_branch_tracking(&mut possible_remaining, &mut undecided),
+                        ),
                         // A branch without a lowered condition (broken
                         // alignment) poisons the rest of the chain,
                         // including #Иначе.
                         None => {
-                            remaining = hir_def::execution_env::EnvFlags::EMPTY;
-                            remaining
+                            remaining = EnvFlags::EMPTY;
+                            undecided = undecided | possible_remaining;
+                            possible_remaining = EnvFlags::EMPTY;
+                            (EnvFlags::EMPTY, EnvFlags::EMPTY)
                         }
                     };
-                    self.in_uncompiled_branch = parent_uncompiled || self.body_env.is_empty();
+                    enter(self, mask, taken | undecided);
                     self.infer_stmts(branch);
                 }
                 if let Some(else_branch) = &preproc.else_branch {
-                    self.body_env = remaining;
-                    self.in_uncompiled_branch = parent_uncompiled || self.body_env.is_empty();
+                    enter(self, remaining, possible_remaining | undecided);
                     self.infer_stmts(else_branch);
                 }
                 self.body_env = parent;
+                self.possible_env = parent_possible;
                 self.in_uncompiled_branch = parent_uncompiled;
+                self.in_dead_branch = parent_dead;
             }
 
             Stmt::While { condition, body } => {
@@ -3194,6 +3255,7 @@ impl<'db> InferenceContext<'db> {
                                     call_expr: expr_id,
                                     args: arg_ids,
                                     candidate: projection.semantic,
+                                    in_dead_branch: self.in_dead_branch,
                                 });
                             }
                         }

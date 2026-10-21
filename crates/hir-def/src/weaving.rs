@@ -259,6 +259,7 @@ mod tests {
                     .collect(),
                 directives: Box::new([]),
                 preproc_env: crate::execution_env::EnvFlags::ALL,
+                preproc_undecided: crate::execution_env::EnvFlags::EMPTY,
                 docs: None,
                 return_type_ref: None,
             },

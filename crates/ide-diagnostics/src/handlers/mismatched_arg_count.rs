@@ -59,6 +59,149 @@ mod tests {
         assert!(mismatched[0].message.contains("2") && mismatched[0].message.contains("1"));
     }
 
+    /// The rule's messages for `body` as the whole of the server common module `Проба`.
+    fn in_server_module(body: &str) -> Vec<String> {
+        let mut builder = test_fixture::CfeFixtureBuilder::new("");
+        builder.add_base_module("Проба", body);
+        crate::test_utils::check_cfe_at_with_db_setup(
+            "CommonModules/Проба/Ext/Module.bsl",
+            body,
+            builder.build(),
+            &[],
+            crate::DiagnosticsConfig::default(),
+            |_| {},
+            |_| {},
+            |db, ctx| crate::file_diagnostics(db, ctx.file_id, ctx.config),
+        )
+        .into_iter()
+        .filter(|diag| diag.code == DiagnosticCode::MismatchedArgCount)
+        .map(|diag| diag.message)
+        .collect()
+    }
+
+    /// The platform drops a `#Если` branch the module's environment rules out before
+    /// compiling it, so the call there is never checked: `#Если Сервер И Не Сервер`
+    /// (a typing hint for the editor) and a client branch of a server module compile
+    /// nowhere. The same call in the plain body and in a branch the server does
+    /// compile is still reported.
+    #[test]
+    fn a_branch_no_environment_compiles_is_not_judged() {
+        let module = |call_site: &str| {
+            in_server_module(&format!(
+                "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\n\
+                 Процедура Тест() Экспорт\n{call_site}КонецПроцедуры\n"
+            ))
+        };
+        const CALL: &str = "    Сложение(1);\n";
+
+        let plain = module(CALL);
+        assert_eq!(plain.len(), 1, "the server compiles the plain call: {plain:?}");
+        let compiled = module(&format!("#Если Сервер Тогда\n{CALL}#КонецЕсли\n"));
+        assert_eq!(compiled.len(), 1, "the server compiles this branch: {compiled:?}");
+
+        let contradiction = module(&format!("#Если Сервер И Не Сервер Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(contradiction.is_empty(), "no environment compiles this branch: {contradiction:?}");
+        let client =
+            module(&format!("#Если ТолстыйКлиентОбычноеПриложение Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(client.is_empty(), "a server module never compiles this branch: {client:?}");
+    }
+
+    /// A branch the condition cannot decide may be compiled, so its calls are
+    /// judged: `Линукс` is no symbol of the help, and an `#Иначе` after such a
+    /// branch is no more decided than the branch itself.
+    #[test]
+    fn an_undecided_branch_is_judged() {
+        let module = |call_site: &str| {
+            in_server_module(&format!(
+                "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\n\
+                 Процедура Тест() Экспорт\n{call_site}КонецПроцедуры\n"
+            ))
+        };
+        const CALL: &str = "    Сложение(1);\n";
+
+        let then_branch = module(&format!("#Если Линукс Тогда\n{CALL}#КонецЕсли\n"));
+        assert_eq!(then_branch.len(), 1, "the condition is undecided: {then_branch:?}");
+        let else_branch = module(&format!("#Если Линукс Тогда\n#Иначе\n{CALL}#КонецЕсли\n"));
+        assert_eq!(else_branch.len(), 1, "the chain is undecided: {else_branch:?}");
+        let after_taken = module(&format!("#Если Сервер Тогда\n#Иначе\n{CALL}#КонецЕсли\n"));
+        assert!(after_taken.is_empty(), "the server takes the first branch: {after_taken:?}");
+    }
+
+    /// The session module runs on the server and in the external connection, where
+    /// `Сервер` is undecided: a branch nested under `#Если Сервер` may still be
+    /// compiled there, while a contradiction is false whatever `Сервер` holds.
+    #[test]
+    fn a_branch_is_dead_only_when_every_environment_rules_it_out() {
+        let module = |call_site: &str| {
+            let fixture = format!(
+                "//- /Ext/SessionModule.bsl\n\
+                 Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\n\
+                 Процедура Тест() Экспорт\n{call_site}КонецПроцедуры\n"
+            );
+            check_hir_diagnostic_with_fixtures(&fixture)
+                .into_iter()
+                .filter(|diag| diag.code == DiagnosticCode::MismatchedArgCount)
+                .map(|diag| diag.message)
+                .collect::<Vec<_>>()
+        };
+        const CALL: &str = "    Сложение(1);\n";
+
+        let plain = module(CALL);
+        assert_eq!(plain.len(), 1, "the session module compiles the plain call: {plain:?}");
+        let nested = module(&format!(
+            "#Если Сервер Тогда\n#Если Не Сервер Тогда\n{CALL}#КонецЕсли\n#КонецЕсли\n"
+        ));
+        assert_eq!(nested.len(), 1, "the external connection may compile it: {nested:?}");
+
+        let contradiction = module(&format!("#Если Сервер И Не Сервер Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(contradiction.is_empty(), "no environment compiles this branch: {contradiction:?}");
+        let client = module(&format!("#Если ТонкийКлиент Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(client.is_empty(), "neither environment is a thin client: {client:?}");
+    }
+
+    /// A module of unknown environment may compile any of its branches.
+    #[test]
+    fn a_branch_of_a_module_of_unknown_environment_is_judged() {
+        let fixture = r#"
+//- /test.bsl
+Процедура Сложение(Левый, Правый) Экспорт
+КонецПроцедуры
+
+Процедура Тест()
+#Если Сервер Тогда
+    Сложение(1);
+#КонецЕсли
+КонецПроцедуры
+"#;
+        let diags = check_hir_diagnostic_with_fixtures(fixture);
+        let mismatched: Vec<_> =
+            diags.iter().filter(|d| d.code == DiagnosticCode::MismatchedArgCount).collect();
+        assert_eq!(mismatched.len(), 1, "expected one MismatchedArgCount, got: {diags:?}");
+    }
+
+    /// A method declared in a module-level branch no environment compiles is
+    /// dropped with the branch; one under an undecided region may be compiled.
+    #[test]
+    fn a_method_in_a_module_level_branch_no_environment_compiles_is_not_judged() {
+        let module = |condition: &str| {
+            in_server_module(&format!(
+                "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\n\
+                 #Если {condition} Тогда\n\
+                 Процедура Тест() Экспорт\n    Сложение(1);\nКонецПроцедуры\n\
+                 #КонецЕсли\n"
+            ))
+        };
+
+        let dead = module("Сервер И Не Сервер");
+        assert!(dead.is_empty(), "no environment compiles the method: {dead:?}");
+        let client = module("ТолстыйКлиентОбычноеПриложение");
+        assert!(client.is_empty(), "a server module never compiles the method: {client:?}");
+        let compiled = module("Сервер");
+        assert_eq!(compiled.len(), 1, "the server compiles the method: {compiled:?}");
+        let undecided = module("Линукс");
+        assert_eq!(undecided.len(), 1, "the region is undecided: {undecided:?}");
+    }
+
     #[test]
     fn does_not_fire_when_optional_args_are_omitted() {
         let fixture = r#"

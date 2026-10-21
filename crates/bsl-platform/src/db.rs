@@ -228,6 +228,7 @@ impl PlatformDataInner {
         }
 
         apply_docs_gap_method_overlay(&mut methods, &global_functions);
+        apply_docs_gap_method_variant_overlay(&mut methods);
         apply_docs_gap_member_context_overlay(&mut methods, &mut global_functions, &types);
 
         let mut methods_by_name = FxHashMap::default();
@@ -288,6 +289,7 @@ impl PlatformDataInner {
         }
 
         apply_docs_only_variadic_overlay(&mut constructors);
+        apply_docs_gap_default_constructor_overlay(&mut constructors);
 
         let mut constructors_by_type: FxHashMap<SmolStr, Vec<usize>> = FxHashMap::default();
         for (idx, ctor) in constructors.iter().enumerate() {
@@ -858,6 +860,59 @@ fn apply_docs_gap_method_overlay(
     }
 }
 
+/// Call forms the platform accepts (compiled by `/CheckConfig` and run on
+/// 8.3.17 and 8.3.27) whose parameters the help archive drops. Each entry is
+/// (owner type, method, variant name, parameters as name / type / optional):
+/// - `ЭлементDOM.ПолучитьЭлементыПоИмени`: the page names the "По имени" variant
+///   but extracts it without its `Имя` — the same variant of
+///   `ДокументDOM.ПолучитьЭлементыПоИмени` carries it;
+/// - `ФоновоеЗадание.ОжидатьЗавершения`: since 8.3.15 the page shows the call
+///   without arguments while its text still describes the timeout, and the
+///   manager's `ОжидатьЗавершения(<Таймаут>)` keeps it documented.
+///
+/// An existing variant of that name that already has parameters means the
+/// archive documents the form itself, and the entry steps aside.
+const DOCS_GAP_METHOD_VARIANTS: &[(&str, &str, &str, &[DocsGapParam])] = &[
+    ("DOMElement", "ПолучитьЭлементыПоИмени", "По имени", &[("Имя", "Строка", false)]),
+    ("BackgroundJob", "ОжидатьЗавершения", "С таймаутом", &[("Таймаут", "Число", true)]),
+];
+
+/// Name, type and optionality of one restored parameter.
+type DocsGapParam = (&'static str, &'static str, bool);
+
+fn apply_docs_gap_method_variant_overlay(methods: &mut [PlatformMethod]) {
+    use crate::types::{MethodParam, MethodVariant};
+
+    for (type_name, method_name, variant_name, parameters) in DOCS_GAP_METHOD_VARIANTS {
+        let Some(method) = methods.iter_mut().find(|method| {
+            method.type_name == *type_name && method.name.fold_lower() == method_name.fold_lower()
+        }) else {
+            continue;
+        };
+        let parameters: Vec<MethodParam> = parameters
+            .iter()
+            .map(|(name, param_type, is_optional)| MethodParam {
+                name: SmolStr::new(*name),
+                param_type: Some(SmolStr::new(*param_type)),
+                is_optional: *is_optional,
+                is_variadic: false,
+            })
+            .collect();
+        match method
+            .variants
+            .iter_mut()
+            .find(|variant| variant.variant_name.as_deref() == Some(*variant_name))
+        {
+            Some(variant) if variant.parameters.is_empty() => variant.parameters = parameters,
+            Some(_) => {}
+            None => method.variants.push(MethodVariant {
+                variant_name: Some(SmolStr::new(*variant_name)),
+                parameters,
+            }),
+        }
+    }
+}
+
 fn apply_docs_only_variadic_overlay(constructors: &mut [PlatformConstructor]) {
     const OVERLAY: &[(&str, &str)] = &[
         ("Structure", "По ключам и значениям"),
@@ -873,6 +928,46 @@ fn apply_docs_only_variadic_overlay(constructors: &mut [PlatformConstructor]) {
         if let Some(last) = ctor.parameters.last_mut() {
             last.is_variadic = true;
         }
+    }
+}
+
+/// Types the platform constructs without arguments although their help pages
+/// list only constructors with a required parameter: `Новый Файл`,
+/// `Новый ДокументDOM` and `Новый ДокументHTML` compile (`/CheckConfig`) and run
+/// on 8.3.17 and 8.3.27, with or without empty parentheses, while the same
+/// check rejects the bare form of `HTTPСоединение`, `ДвоичныеДанные` and the
+/// rest with "Конструктор не найден". Each listed type gains a parameterless
+/// variant that takes its availability from the documented constructors; the
+/// entry is skipped once the archive documents such a variant itself.
+const DOCS_GAP_DEFAULT_CONSTRUCTORS: &[&str] = &["File", "DOMDocument", "HTMLDocument"];
+
+fn apply_docs_gap_default_constructor_overlay(constructors: &mut Vec<PlatformConstructor>) {
+    for type_name in DOCS_GAP_DEFAULT_CONSTRUCTORS {
+        let documented: Vec<&PlatformConstructor> =
+            constructors.iter().filter(|ctor| ctor.type_name == *type_name).collect();
+        let Some(source) = documented.first() else {
+            continue;
+        };
+        let has_default =
+            documented.iter().any(|ctor| ctor.parameters.iter().all(|param| param.is_optional));
+        if has_default {
+            continue;
+        }
+        // As with synthesized methods: no free id, no synthesized variant.
+        let Some(next_id) =
+            constructors.iter().map(|ctor| ctor.id).max().unwrap_or(0).checked_add(1)
+        else {
+            continue;
+        };
+        let default = PlatformConstructor {
+            id: next_id,
+            type_name: source.type_name.clone(),
+            variant_name: Some(SmolStr::new("По умолчанию")),
+            parameters: Vec::new(),
+            min_version: source.min_version.clone(),
+            context: source.context,
+        };
+        constructors.push(default);
     }
 }
 
@@ -1321,6 +1416,63 @@ mod tests {
             let ctx = ty.context.as_ref().expect("type must carry availability");
             assert!(ctx.web_client, "overlay must add the web-client context to {name}");
         }
+    }
+
+    #[test]
+    fn docs_gap_overlay_adds_parameterless_constructors() {
+        let data = PlatformDataInner::instance();
+        if data.all_constructors().is_empty() {
+            return;
+        }
+        let parameterless = |name: &str| {
+            data.get_constructors(name)
+                .iter()
+                .any(|ctor| ctor.parameters.iter().all(|param| param.is_optional))
+        };
+
+        for name in ["Файл", "ДокументDOM", "ДокументHTML", "File", "DOMDocument", "HTMLDocument"]
+        {
+            assert!(parameterless(name), "{name} is constructed without arguments");
+        }
+        // Control: the platform rejects the bare form of these, the overlay must not add it.
+        for name in ["HTTPСоединение", "ДвоичныеДанные", "ФиксированныйМассив"]
+        {
+            assert!(!parameterless(name), "{name} has no parameterless constructor");
+        }
+        let documented = data
+            .get_constructors("Файл")
+            .into_iter()
+            .find(|ctor| !ctor.parameters.is_empty())
+            .expect("the documented constructor of Файл stays");
+        assert_eq!(documented.parameters.len(), 1, "the documented variant is not changed");
+    }
+
+    #[test]
+    fn docs_gap_overlay_restores_dropped_method_parameters() {
+        let data = PlatformDataInner::instance();
+        if data.all_methods().is_empty() {
+            return;
+        }
+        let arities = |type_name: &str, method_name: &str| {
+            let method = data.get_method(type_name, method_name).expect("method must exist");
+            std::iter::once(&method.parameters)
+                .chain(method.variants.iter().map(|variant| &variant.parameters))
+                .map(|params| (params.iter().filter(|p| !p.is_optional).count(), params.len()))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            arities("ЭлементDOM", "ПолучитьЭлементыПоИмени").contains(&(1, 1)),
+            "ЭлементDOM.ПолучитьЭлементыПоИмени takes one name"
+        );
+        assert!(
+            arities("ЭлементDOM", "ПолучитьЭлементыПоИмени").contains(&(2, 2)),
+            "the namespace form stays"
+        );
+        assert!(
+            arities("ФоновоеЗадание", "ОжидатьЗавершения").contains(&(0, 1)),
+            "ФоновоеЗадание.ОжидатьЗавершения takes an optional timeout"
+        );
     }
 
     #[test]

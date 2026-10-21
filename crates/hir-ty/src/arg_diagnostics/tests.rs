@@ -57,6 +57,7 @@ fn binding(db: &InMemoryDb, parameter_sets: &[&[TypeId]], pre_types: &[TypeId]) 
         call_expr: expr(0),
         args: (0..pre_types.len()).map(|index| expr(index as u32 + 1)).collect(),
         candidate: CandidateCallBinding { candidates, resolution },
+        in_dead_branch: false,
     }
 }
 
