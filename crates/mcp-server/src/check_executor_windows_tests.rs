@@ -1,7 +1,10 @@
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -13,7 +16,7 @@ use check_contract::{CheckResponse, InputKind, Status};
 use tokio_util::sync::CancellationToken;
 
 const FAKE_EXECUTOR: &str = r#"
-import ctypes, json, os, subprocess, sys, time
+import ctypes, json, os, subprocess, sys, threading, time
 mode, marker = sys.argv[1:3]
 kernel = ctypes.WinDLL('kernel32', use_last_error=True)
 kernel.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
@@ -44,14 +47,15 @@ if mode == 'no-spawn-marker':
 
 request = json.loads(sys.stdin.buffer.read())
 if mode == 'event-exit':
-    with open(marker, 'w') as out:
+    with open(marker + '.tmp', 'w') as out:
         out.write(f'{os.getpid()} {in_job.value}')
+    os.replace(marker + '.tmp', marker)
     event_name = os.environ['BSL_CHECK_STOP_EVENT']
     kernel.OpenEventW.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_wchar_p]
     kernel.OpenEventW.restype = ctypes.c_void_p
     event = kernel.OpenEventW(0x00100000, False, event_name)
     assert event
-    assert kernel.WaitForSingleObject(event, 30_000) == 0
+    assert kernel.WaitForSingleObject(event, 0xFFFFFFFF) == 0
     assert kernel.CloseHandle(event)
     time.sleep(0.05)
     print(response(), flush=True)
@@ -59,24 +63,26 @@ if mode == 'event-exit':
 
 if mode == 'job-hang':
     child_code = (
-        "import ctypes,os,sys,time; "
+        "import ctypes,os,sys,threading; "
         "k=ctypes.WinDLL('kernel32'); k.GetCurrentProcess.restype=ctypes.c_void_p; "
         "k.IsProcessInJob.argtypes=[ctypes.c_void_p,ctypes.c_void_p,ctypes.POINTER(ctypes.c_int)]; "
         "k.IsProcessInJob.restype=ctypes.c_int; p=ctypes.c_int(); "
         "assert k.IsProcessInJob(k.GetCurrentProcess(),None,ctypes.byref(p)); "
-        "open(sys.argv[1],'w').write(str(os.getpid())+' '+str(p.value)); time.sleep(30)"
+        "f=open(sys.argv[1]+'.tmp','w'); f.write(str(os.getpid())+' '+str(p.value)); f.close(); "
+        "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); threading.Event().wait()"
     )
     child = subprocess.Popen([sys.executable, '-c', child_code, marker + '.child'])
-    with open(marker, 'w') as out:
+    with open(marker + '.tmp', 'w') as out:
         out.write(f'{os.getpid()} {in_job.value} {child.pid}')
+    os.replace(marker + '.tmp', marker)
     event_name = os.environ['BSL_CHECK_STOP_EVENT']
     kernel.OpenEventW.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_wchar_p]
     kernel.OpenEventW.restype = ctypes.c_void_p
     event = kernel.OpenEventW(0x00100000, False, event_name)
     assert event
-    assert kernel.WaitForSingleObject(event, 30_000) == 0
+    assert kernel.WaitForSingleObject(event, 0xFFFFFFFF) == 0
     assert kernel.CloseHandle(event)
-    time.sleep(30)
+    threading.Event().wait()
 
 if mode == 'exit1-valid':
     print(response(), flush=True)
@@ -87,7 +93,7 @@ if mode == 'malformed':
 if mode == 'overflow':
     sys.stdout.buffer.write(b'x' * 4096)
     sys.stdout.flush()
-    time.sleep(30)
+    threading.Event().wait()
 if mode == 'valid':
     print(response(), flush=True)
 "#;
@@ -100,7 +106,7 @@ fn profile(script: &Path, mode: &str, marker: &Path) -> CheckExecutorProfile {
     CheckExecutorProfile {
         program: python().into(),
         args: vec![script.as_os_str().to_owned(), mode.into(), marker.as_os_str().to_owned()],
-        timeout: Duration::from_secs(3),
+        timeout: Duration::from_secs(60 * 60),
         max_code_bytes: 1024,
         max_response_bytes: 16 * 1024,
         max_stderr_bytes: 1024,
@@ -119,13 +125,59 @@ fn fake(temp: &tempfile::TempDir) -> PathBuf {
 }
 
 async fn wait_for_file(path: &Path) -> bool {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(5)), async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .is_ok()
+}
+
+/// Waits on a blocking thread until every marker exists. While a blocking task runs, a
+/// paused Tokio clock does not auto-advance, so no product deadline or grace window can
+/// expire while the executor is still starting.
+struct Readiness {
+    stop: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<bool>,
+}
+
+impl Readiness {
+    fn spawn(paths: Vec<PathBuf>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = tokio::task::spawn_blocking({
+            let stop = stop.clone();
+            move || {
+                let bound = test_utils::wait::hang_guard(Duration::from_secs(5));
+                let started = std::time::Instant::now();
+                loop {
+                    if paths.iter().all(|path| path.exists()) {
+                        return true;
+                    }
+                    if stop.load(Ordering::Relaxed) || started.elapsed() >= bound {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+        Self { stop, handle }
+    }
+
+    async fn wait<T: std::fmt::Debug>(mut self, task: &mut tokio::task::JoinHandle<T>, what: &str) {
+        tokio::select! {
+            biased;
+            ready = &mut self.handle => assert!(ready.unwrap(), "{what}"),
+            early = &mut *task => panic!("{what}: check ended before the executor was ready: {early:?}"),
+        }
+    }
+}
+
+impl Drop for Readiness {
+    // Runtime shutdown waits for blocking tasks; a failed test must not keep polling.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 fn open_process(pid: u32) -> windows_sys::Win32::Foundation::HANDLE {
@@ -145,49 +197,58 @@ fn wait_for_process_exit(process: windows_sys::Win32::Foundation::HANDLE) -> u32
         System::Threading::{GetExitCodeProcess, WaitForSingleObject},
     };
 
-    assert_eq!(unsafe { WaitForSingleObject(process, 3_000) }, WAIT_OBJECT_0);
+    let bound =
+        u32::try_from(test_utils::wait::hang_guard(Duration::from_secs(3)).as_millis()).unwrap();
+    assert_eq!(unsafe { WaitForSingleObject(process, bound) }, WAIT_OBJECT_0);
     let mut code = u32::MAX;
     assert_ne!(unsafe { GetExitCodeProcess(process, &mut code) }, 0);
     unsafe { CloseHandle(process) };
     code
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn event_is_signaled_and_cooperative_child_finishes_within_grace() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("event.txt");
     let script = fake(&temp);
     let mut profile = profile(&script, "event-exit", &marker);
     profile.stop_grace = Duration::from_millis(300);
+    let grace = profile.stop_grace;
     let token = CancellationToken::new();
-    let task = tokio::spawn({
+    let ready = Readiness::spawn(vec![marker.clone()]);
+    let mut task = tokio::spawn({
         let token = token.clone();
         async move {
             check(&profile, "windows-test", "x = 1;", InputKind::Snippet, None, None, token).await
         }
     });
-    assert!(wait_for_file(&marker).await, "fake executor should create its marker");
+    ready.wait(&mut task, "fake executor should create its marker").await;
     let values = std::fs::read_to_string(&marker).unwrap();
     let mut values = values.split_whitespace();
     let parent: u32 = values.next().unwrap().parse().unwrap();
     assert_eq!(values.next(), Some("1"), "executor started inside its Job");
-    let process = open_process(parent);
-    let started = std::time::Instant::now();
+    let process = open_process(parent) as usize;
+    let exit = tokio::task::spawn_blocking(move || {
+        wait_for_process_exit(process as windows_sys::Win32::Foundation::HANDLE)
+    });
+    let started = tokio::time::Instant::now();
     token.cancel();
     assert!(task.await.unwrap().is_err(), "cancellation takes precedence over JSON");
-    assert!(started.elapsed() >= Duration::from_millis(250), "caller observes full stop grace");
-    assert_eq!(wait_for_process_exit(process), 0, "Event stop exited without Job termination");
+    assert!(started.elapsed() >= grace, "caller observes full stop grace");
+    assert_eq!(exit.await.unwrap(), 0, "Event stop exited without Job termination");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_hard_stops_job_and_reaps_its_descendant() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("processes.txt");
     let script = fake(&temp);
     let mut profile = profile(&script, "job-hang", &marker);
-    profile.timeout = Duration::from_secs(5);
+    profile.timeout = Duration::from_millis(500);
     profile.stop_grace = Duration::from_millis(250);
-    let task = tokio::spawn(async move {
+    let ready =
+        Readiness::spawn(vec![marker.clone(), marker.with_file_name("processes.txt.child")]);
+    let mut task = tokio::spawn(async move {
         check(
             &profile,
             "windows-test",
@@ -199,11 +260,7 @@ async fn timeout_hard_stops_job_and_reaps_its_descendant() {
         )
         .await
     });
-    assert!(wait_for_file(&marker).await, "executor should create its marker");
-    assert!(
-        wait_for_file(&marker.with_file_name("processes.txt.child")).await,
-        "executor should create its child marker"
-    );
+    ready.wait(&mut task, "executor should create its marker and its child marker").await;
     let pids = std::fs::read_to_string(&marker).unwrap();
     let mut pids = pids.split_whitespace();
     let parent: u32 = pids.next().unwrap().parse().unwrap();
@@ -211,6 +268,7 @@ async fn timeout_hard_stops_job_and_reaps_its_descendant() {
     let child: u32 = pids.next().unwrap().parse().unwrap();
     let parent_process = open_process(parent);
     let child_process = open_process(child);
+    tokio::time::resume();
     let result = task.await.unwrap().unwrap();
     let value = result.structured_content.unwrap();
     let response: CheckResponse = serde_json::from_value(value).unwrap();
@@ -234,17 +292,15 @@ async fn cancellation_hard_stops_the_live_job_and_its_descendant() {
     let script = fake(&temp);
     let profile = profile(&script, "job-hang", &marker);
     let token = CancellationToken::new();
-    let task = tokio::spawn({
+    let ready =
+        Readiness::spawn(vec![marker.clone(), marker.with_file_name("processes.txt.child")]);
+    let mut task = tokio::spawn({
         let token = token.clone();
         async move {
             check(&profile, "windows-test", "x = 1;", InputKind::Snippet, None, None, token).await
         }
     });
-    assert!(wait_for_file(&marker).await, "executor should create its marker");
-    assert!(
-        wait_for_file(&marker.with_file_name("processes.txt.child")).await,
-        "executor should create its child marker"
-    );
+    ready.wait(&mut task, "executor should create its marker and its child marker").await;
     let pids = std::fs::read_to_string(&marker).unwrap();
     let mut pids = pids.split_whitespace();
     let parent: u32 = pids.next().unwrap().parse().unwrap();
@@ -373,11 +429,13 @@ async fn nested_ui_job_rejects_caller_job_admission_before_executor_resume() {
 
         // Admission failure transfers the permit to the background reaper; it
         // becomes available only after the suspended process has been waited.
-        let permit =
-            tokio::time::timeout(Duration::from_secs(3), profile.semaphore.clone().acquire_owned())
-                .await
-                .expect("reaper returns the caller permit after process exit")
-                .expect("test semaphore remains open");
+        let permit = tokio::time::timeout(
+            test_utils::wait::hang_guard(Duration::from_secs(3)),
+            profile.semaphore.clone().acquire_owned(),
+        )
+        .await
+        .expect("reaper returns the caller permit after process exit")
+        .expect("test semaphore remains open");
         drop(permit);
         std::fs::write(
             &result_path,
@@ -406,7 +464,7 @@ async fn nested_ui_job_rejects_caller_job_admission_before_executor_resume() {
     async fn wait_for_child(
         child: &mut std::process::Child,
     ) -> std::io::Result<std::process::ExitStatus> {
-        tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(8)), async {
             loop {
                 if let Some(status) = child.try_wait()? {
                     return Ok(status);
