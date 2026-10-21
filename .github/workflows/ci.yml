@@ -741,6 +741,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/develop' }}
+      - name: MCP clippy
+        run: cargo clippy -p mcp-server --lib --tests -- -D warnings
       - name: MCP library lifecycle, workspace cache and editor regressions
         shell: bash
         run: |
