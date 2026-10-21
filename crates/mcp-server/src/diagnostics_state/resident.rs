@@ -2961,7 +2961,9 @@ mod trim_tests {
             });
             let _ = done.send(matches!(out, ResidentOutcome::Ready(0, _)));
         });
-        match finished.recv_timeout(std::time::Duration::from_secs(120)) {
+        match finished
+            .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(120)))
+        {
             Ok(returned) => assert!(returned, "the empty sweep reports zero files swept"),
             Err(_) => {
                 panic!("the empty sweep did not return: its final trim waits on a live db handle")

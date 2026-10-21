@@ -336,11 +336,14 @@ mod tests {
         ));
 
         state.scope_transport_stop().cancel();
-        tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, task)
-            .await
-            .expect("scope retirement closes HTTP within a finite grace")
-            .expect("HTTP task joins")
-            .expect("HTTP shutdown succeeds");
+        tokio::time::timeout(
+            test_utils::wait::hang_guard(std::time::Duration::from_secs(60)),
+            task,
+        )
+        .await
+        .expect("scope retirement closes HTTP within a finite grace")
+        .expect("HTTP task joins")
+        .expect("HTTP shutdown succeeds");
     }
 
     fn address(ip: &str, port: u16) -> SocketAddr {

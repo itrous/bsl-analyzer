@@ -233,36 +233,55 @@ mod tests {
         // Distinct raw spellings of the same folded form interned from many
         // threads at once must resolve to a single id: the vacant-entry
         // protocol, not luck, is what this exercises.
-        let pool = Pool::new(usize::MAX);
+        let pool = std::sync::Arc::new(Pool::new(usize::MAX));
         let base = "ПараллельноеИмяДляГонки";
-        let barrier = std::sync::Barrier::new(8);
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..8)
-                .map(|i| {
-                    let pool = &pool;
-                    let barrier = &barrier;
-                    s.spawn(move || {
-                        // Each thread flips a different char to upper-case so
-                        // every raw spelling is distinct but folds the same.
-                        let spelling: String = base
-                            .chars()
-                            .enumerate()
-                            .map(|(j, c)| {
-                                if j % 8 == i {
-                                    c.to_uppercase().next().unwrap()
-                                } else {
-                                    c.to_lowercase().next().unwrap()
-                                }
-                            })
-                            .collect();
-                        barrier.wait();
-                        pool.intern(&spelling)
+        let hang_guard = test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let mut starts = Vec::new();
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let pool = std::sync::Arc::clone(&pool);
+            let ready_tx = ready_tx.clone();
+            let result_tx = result_tx.clone();
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            starts.push(start_tx);
+            handles.push(std::thread::spawn(move || {
+                // Each thread flips a different char to upper-case so
+                // every raw spelling is distinct but folds the same.
+                let spelling: String = base
+                    .chars()
+                    .enumerate()
+                    .map(|(j, c)| {
+                        if j % 8 == i {
+                            c.to_uppercase().next().unwrap()
+                        } else {
+                            c.to_lowercase().next().unwrap()
+                        }
                     })
-                })
-                .collect();
-            let ids: Vec<NormName> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            assert!(ids.windows(2).all(|w| w[0] == w[1]), "ids diverged: {:?}", ids.len());
-        });
+                    .collect();
+                ready_tx.send(()).expect("test receives interning worker readiness");
+                start_rx
+                    .recv_timeout(hang_guard)
+                    .expect("test releases concurrent interning workers");
+                result_tx.send(pool.intern(&spelling)).expect("test receives interned id");
+            }));
+        }
+        drop(ready_tx);
+        drop(result_tx);
+        for _ in 0..8 {
+            ready_rx.recv_timeout(hang_guard).expect("all interning workers are ready");
+        }
+        for start in starts {
+            start.send(()).expect("interning worker waits for release");
+        }
+        let ids: Vec<NormName> = (0..8)
+            .map(|_| result_rx.recv_timeout(hang_guard).expect("interning worker completes"))
+            .collect();
+        for handle in handles {
+            handle.join().expect("interning worker exits");
+        }
+        assert!(ids.windows(2).all(|w| w[0] == w[1]), "ids diverged: {:?}", ids.len());
         assert_eq!(pool.stats().norm_count, 1);
     }
 

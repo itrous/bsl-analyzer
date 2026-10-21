@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// A hang watchdog for one case, enforced only by the timing profile.
-const DEADLINE: Duration = test_utils::wait::ceiling(Duration::from_secs(30));
+const DEADLINE: Duration = test_utils::wait::hang_guard(Duration::from_secs(30));
 const INPUT_MARKER: &str = "IndexingRuntimeFixtureOnly";
 
 // Like vector_lifecycle_tests, isolate process-global configuration. Other parallel
@@ -83,10 +83,10 @@ impl Provider {
                 // Windows hands the listener's non-blocking mode to the accepted stream.
                 stream.set_nonblocking(false).unwrap();
                 stream
-                    .set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(2))))
+                    .set_read_timeout(Some(test_utils::wait::hang_guard(Duration::from_secs(2))))
                     .unwrap();
                 stream
-                    .set_write_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(2))))
+                    .set_write_timeout(Some(test_utils::wait::hang_guard(Duration::from_secs(2))))
                     .unwrap();
                 let mut bytes = Vec::new();
                 let (header_end, length) = loop {
@@ -142,7 +142,7 @@ impl Drop for Provider {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.release();
-        self.thread.take().unwrap().join().unwrap();
+        crate::test_wait::join(self.thread.take().unwrap(), "indexing provider exits").unwrap();
     }
 }
 

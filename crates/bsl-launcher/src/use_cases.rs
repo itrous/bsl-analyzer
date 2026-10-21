@@ -648,6 +648,8 @@ mod tests {
     use std::thread::sleep;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    const HANG_GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
+
     #[test]
     fn bare_launcher_name_maps_to_the_running_platform() {
         let mappings = launcher_mappings();
@@ -877,7 +879,6 @@ mod tests {
     #[test]
     fn update_current_link_is_concurrency_safe() {
         use std::sync::Arc;
-        use std::sync::Barrier;
         use std::thread;
 
         let dir = Arc::new(TestDir::new());
@@ -886,22 +887,40 @@ mod tests {
         let targets = Arc::new(vec![v1, v2]);
 
         const THREADS: usize = 8;
-        let barrier = Arc::new(Barrier::new(THREADS));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut starts = Vec::new();
         let mut handles = Vec::new();
         for i in 0..THREADS {
             let dir = Arc::clone(&dir);
-            let barrier = Arc::clone(&barrier);
             let targets = Arc::clone(&targets);
+            let ready_tx = ready_tx.clone();
+            let done_tx = done_tx.clone();
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            starts.push(start_tx);
             handles.push(thread::spawn(move || {
-                barrier.wait();
+                ready_tx.send(()).expect("test receives relink worker readiness");
+                start_rx.recv_timeout(HANG_GUARD).expect("test releases relink worker");
                 let target = &targets[i % targets.len()];
                 for _ in 0..32 {
                     update_current_link(dir.path(), target).expect("atomic relink");
                 }
+                done_tx.send(()).expect("test receives relink worker completion");
             }));
         }
-        for h in handles {
-            h.join().expect("join");
+        drop(ready_tx);
+        drop(done_tx);
+        for _ in 0..THREADS {
+            ready_rx.recv_timeout(HANG_GUARD).expect("all relink workers are ready");
+        }
+        for start in starts {
+            start.send(()).expect("relink worker waits for release");
+        }
+        for _ in 0..THREADS {
+            done_rx.recv_timeout(HANG_GUARD).expect("relink worker completes");
+        }
+        for handle in handles {
+            handle.join().expect("relink worker exits");
         }
 
         let ver = get_current_version(dir.path()).expect("current readable");
@@ -911,7 +930,6 @@ mod tests {
     #[test]
     fn swap_stable_concurrent_writes_stay_consistent() {
         use std::sync::Arc;
-        use std::sync::Barrier;
         use std::thread;
 
         let dir = Arc::new(TestDir::new());
@@ -919,21 +937,38 @@ mod tests {
         update_current_link(dir.path(), &current).expect("link");
 
         const THREADS: usize = 8;
-        let barrier = Arc::new(Barrier::new(THREADS));
-
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut starts = Vec::new();
         let mut handles = Vec::new();
         for _ in 0..THREADS {
             let dir = Arc::clone(&dir);
-            let barrier = Arc::clone(&barrier);
+            let ready_tx = ready_tx.clone();
+            let done_tx = done_tx.clone();
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            starts.push(start_tx);
             handles.push(thread::spawn(move || {
-                barrier.wait();
+                ready_tx.send(()).expect("test receives swap worker readiness");
+                start_rx.recv_timeout(HANG_GUARD).expect("test releases swap worker");
                 for _ in 0..16 {
                     swap_and_resolve(dir.path()).expect("swap under lock");
                 }
+                done_tx.send(()).expect("test receives swap worker completion");
             }));
         }
-        for h in handles {
-            h.join().expect("join");
+        drop(ready_tx);
+        drop(done_tx);
+        for _ in 0..THREADS {
+            ready_rx.recv_timeout(HANG_GUARD).expect("all swap workers are ready");
+        }
+        for start in starts {
+            start.send(()).expect("swap worker waits for release");
+        }
+        for _ in 0..THREADS {
+            done_rx.recv_timeout(HANG_GUARD).expect("swap worker completes");
+        }
+        for handle in handles {
+            handle.join().expect("swap worker exits");
         }
 
         let stable_ver = read_stable_version(dir.path()).expect("sidecar present");

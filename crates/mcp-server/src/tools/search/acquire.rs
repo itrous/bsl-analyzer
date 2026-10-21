@@ -405,7 +405,7 @@ mod tests {
 
     use super::{acquire_engine_within, try_acquire_engine, AcquireFailure};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio_util::sync::CancellationToken;
 
@@ -476,7 +476,7 @@ mod tests {
         }
         drop(held);
         for waiter in waiters {
-            waiter.join().unwrap();
+            crate::test_wait::join(waiter, "queued acquisition finishes").unwrap();
         }
         let (served, most_raw_waiters) = engine.admission_record();
         let mut ordered = served.clone();
@@ -503,9 +503,12 @@ mod tests {
         };
         assert!(crate::change_hub::test_support::eventually(|| { engine.queued() == 2 }));
         cancel.cancel();
-        assert!(quitter.join().unwrap(), "the cancelled request acquired the engine");
+        assert!(
+            crate::test_wait::join(quitter, "cancelled acquisition leaves the queue").unwrap(),
+            "the cancelled request acquired the engine"
+        );
         drop(held);
-        follower.join().unwrap();
+        crate::test_wait::join(follower, "following acquisition completes").unwrap();
         assert_eq!(engine.queued(), 0);
     }
 
@@ -516,21 +519,17 @@ mod tests {
 
         const HOLD: Duration = Duration::from_millis(300);
         let held = engine.lock().unwrap();
-        let gate = Arc::new(Barrier::new(2));
         let entered = Arc::new(AtomicBool::new(false));
         let probe = {
             let engine = Arc::clone(&engine);
-            let gate = Arc::clone(&gate);
             let entered = Arc::clone(&entered);
             std::thread::spawn(move || {
-                gate.wait();
                 entered.store(true, Ordering::SeqCst);
                 let started = Instant::now();
                 let acquired = try_acquire_engine(&engine, &CancellationToken::new()).is_ok();
                 (acquired, started.elapsed())
             })
         };
-        gate.wait();
         assert!(
             crate::change_hub::test_support::eventually(|| engine.queued() == 1),
             "probe must queue on the held lock"
@@ -541,7 +540,8 @@ mod tests {
             std::thread::sleep(HOLD);
         }
         drop(held);
-        let (acquired, waited) = probe.join().unwrap();
+        let (acquired, waited) =
+            crate::test_wait::join(probe, "queued acquisition completes").unwrap();
 
         assert!(acquired, "acquire must succeed once the lock frees");
         if cfg!(timing_contract) {
@@ -578,10 +578,10 @@ mod tests {
                 panic!("poison the engine lock");
             })
         };
-        assert!(poisoner.join().is_err());
-        // A cap no ordinary run reaches, so an acquire that waited it out never returns; under
-        // `timing_contract` half a minute, and the clock says it was not waited out.
-        let cap = test_utils::wait::ceiling(Duration::from_secs(30));
+        assert!(crate::test_wait::join(poisoner, "poisoning thread panics").is_err());
+        // The thirty-second timing bound is a finite ten-minute hang guard in ordinary runs;
+        // a poisoned lock must answer immediately in both profiles.
+        let cap = test_utils::wait::hang_guard(Duration::from_secs(30));
         let started = Instant::now();
         let outcome = acquire_engine_within(
             &engine,
@@ -612,7 +612,7 @@ mod tests {
         let cancel = CancellationToken::new();
         // The pause that has the request queued before it is cancelled is the timing profile's;
         // a cancellation that lands first must end the wait just the same. The cap is one no
-        // ordinary run reaches, so only the cancellation can end the wait.
+        // ordinary run waits until cancellation, with the finite guard only as a backstop.
         let canceller = {
             let cancel = cancel.clone();
             std::thread::spawn(move || {
@@ -626,12 +626,12 @@ mod tests {
         let outcome = acquire_engine_within(
             &engine,
             &cancel,
-            test_utils::wait::ceiling(Duration::from_secs(2)),
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
             Duration::from_millis(10),
         );
         let waited = started.elapsed();
         drop(held);
-        canceller.join().unwrap();
+        crate::test_wait::join(canceller, "cancellation thread exits").unwrap();
 
         assert!(
             matches!(outcome, Err(AcquireFailure::Cancelled)),

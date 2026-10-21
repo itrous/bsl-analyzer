@@ -144,7 +144,7 @@ fn a_search_waiting_for_the_engine_lock_returns_at_its_cancellation() {
         // The lock stays held through the control below, so a call that waited for it
         // instead of its cancellation never comes back before the watchdog.
         let (out, waited) = outcome
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
             .unwrap_or_else(|_| panic!("{name}: the cancelled call never came back"));
         assert!(
             matches!(out, Err(SearchFailure::Cancelled)),
@@ -169,7 +169,7 @@ fn a_search_waiting_for_the_engine_lock_returns_at_its_cancellation() {
         }
         drop(held);
         let (out, waited) =
-            outcome.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
+            outcome.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))).unwrap();
         assert!(!matches!(out, Err(SearchFailure::Cancelled)), "{name}: control must be answered");
         if cfg!(timing_contract) {
             assert!(
@@ -210,7 +210,7 @@ fn a_cancelled_search_waiting_on_the_actor_releases_the_engine_lock() {
 
     cancel.cancel();
     let (out, waited) = first
-        .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+        .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
         .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
     if cfg!(timing_contract) {
@@ -266,7 +266,7 @@ fn a_cancelled_identity_gate_releases_the_engine_lock() {
 
     cancel.cancel();
     let (out, waited) = first
-        .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+        .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
         .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
     if cfg!(timing_contract) {
@@ -310,7 +310,7 @@ fn a_cancelled_docs_search_does_not_fall_back_to_the_corpus_view() {
 
     cancel.cancel();
     let (out, waited) = outcome
-        .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+        .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
         .expect("the cancelled search returns");
     assert!(matches!(out, Err(SearchFailure::Cancelled)), "got {:?}", out.map(|_| ()));
     if cfg!(timing_contract) {
@@ -402,12 +402,9 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
         });
 
         // Let the call reach the embed, then look at what it holds while it waits there.
-        let mut deadline = crate::change_hub::test_support::Patience::new(
-            crate::change_hub::test_support::STATE_CEILING,
-            std::time::Duration::from_millis(5),
-        );
+        let deadline = Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
         while embedder.accepted() == 0 {
-            assert!(deadline.allows(), "{name}: the embed never reached the embedder");
+            assert!(Instant::now() < deadline, "{name}: the embed never reached the embedder");
             std::thread::sleep(Duration::from_millis(5));
         }
         // A call that took the lock before it embeds holds it already; the timing profile also
@@ -420,7 +417,7 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
 
         cancel.cancel();
         let (out, waited) = outcome
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
             .unwrap_or_else(|_| panic!("{name}: the cancelled call never came back"));
         assert!(matches!(out, Err(SearchFailure::Cancelled)), "{name}: expected Cancelled");
         if cfg!(timing_contract) {

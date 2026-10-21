@@ -382,9 +382,9 @@ impl WorkspaceLease {
             let _guard = LockGuard::acquire_for_stand(&path).unwrap();
             ready_tx.send(()).unwrap();
             // Either the stand releases it, or the stand is gone and the sender with it.
-            let _ = release_rx.recv();
+            let _ = release_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)));
         });
-        ready_rx.recv().unwrap();
+        crate::test_wait::recv(&ready_rx, "cache lock holder starts");
         (handle, release_tx)
     }
 
@@ -401,7 +401,7 @@ impl WorkspaceLease {
             ready_tx.send(()).unwrap();
             std::thread::sleep(duration);
         });
-        ready_rx.recv().unwrap();
+        crate::test_wait::recv(&ready_rx, "cache lock holder starts");
         handle
     }
 
@@ -1868,14 +1868,9 @@ mod tests {
             let lease = lease.clone();
             std::thread::spawn(move || lease.owns_caches_now())
         };
-        let mut deadline = crate::change_hub::test_support::Patience::new(
-            crate::change_hub::test_support::STATE_CEILING,
-            std::time::Duration::from_millis(10),
-        );
-        while !lease.lifecycle_is_busy() {
-            assert!(deadline.allows(), "the check never reached the lifecycle lock");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        crate::test_wait::wait_until("the check reaches the lifecycle lock", || {
+            lease.lifecycle_is_busy()
+        });
 
         let (answer_tx, answer) = std::sync::mpsc::channel();
         let reading = {
@@ -1887,13 +1882,13 @@ mod tests {
                 let _ = answer_tx.send((checked, published, asking.elapsed()));
             })
         };
-        let answered = answer.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
+        let answered = answer.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)));
         release_the_lock.send(()).expect("the lock holder is still there to be released");
         // Answered before the join: a thread still stuck past the watchdog is left behind
         // rather than waited on without a bound.
         let (checked, published, waited) =
             answered.expect("reading the published verdict waited on a check that is doing I/O");
-        reading.join().unwrap();
+        crate::test_wait::join(reading, "reading the published verdict returns").unwrap();
 
         if cfg!(timing_contract) {
             assert!(
@@ -1904,8 +1899,8 @@ mod tests {
         assert!(checked, "the verdict established before this check is still established");
         assert!(published, "and it still says what it said");
 
-        held.join().unwrap();
-        let _ = checking.join();
+        crate::test_wait::join(held, "released cache lock holder exits").unwrap();
+        let _ = crate::test_wait::join(checking, "ownership check finishes");
         // Whatever that check ended up doing — it either re-claimed the record it found gone,
         // or ran out its wait and answered nothing — the published verdict is still a verdict
         // somebody answered. An attempt is not one.
@@ -2299,7 +2294,7 @@ mod tests {
             worker_lease.publish_checkpointed(|checkpoint| {
                 let mut pending = vec!["row"];
                 entered_tx.send(()).unwrap();
-                continue_rx.recv().unwrap();
+                crate::test_wait::recv(&continue_rx, "checkpoint test continues");
                 if checkpoint().is_break() {
                     pending.clear();
                     return ControlFlow::Break(());
@@ -2307,14 +2302,15 @@ mod tests {
                 ControlFlow::Continue(Ok::<_, ()>(pending))
             })
         });
-        entered_rx.recv().unwrap();
+        crate::test_wait::recv(&entered_rx, "checkpoint worker enters");
         let releaser = std::thread::spawn(move || releaser_lease.release());
-        while !observer.is_released() {
-            std::thread::yield_now();
-        }
+        crate::test_wait::wait_until("lease release is published", || observer.is_released());
         continue_tx.send(()).unwrap();
-        assert!(matches!(worker.join().unwrap(), LeaseOperationOutcome::Released));
-        releaser.join().unwrap();
+        assert!(matches!(
+            crate::test_wait::join(worker, "checkpoint worker returns").unwrap(),
+            LeaseOperationOutcome::Released
+        ));
+        crate::test_wait::join(releaser, "lease release completes").unwrap();
     }
 
     #[test]
@@ -2630,9 +2626,7 @@ mod tests {
             // so waiting on the flag costs nothing while waiting on the call would block
             // for the whole lock timeout.
             std::thread::spawn(move || releaser.release());
-            while !observer.is_released() {
-                std::thread::yield_now();
-            }
+            crate::test_wait::wait_until("lease release is published", || observer.is_released());
             if checkpoint().is_break() {
                 return ControlFlow::Break(());
             }
@@ -2657,7 +2651,7 @@ mod tests {
             checkpoint_test(&worker_lease, |checkpoint| {
                 let mut transaction = vec!["pending"];
                 entered_tx.send(()).unwrap();
-                check_rx.recv().unwrap();
+                crate::test_wait::recv(&check_rx, "checkpoint worker continues");
                 if checkpoint().is_break() {
                     transaction.clear();
                     worker_rolled_back.store(true, Ordering::SeqCst);
@@ -2666,16 +2660,17 @@ mod tests {
                 ControlFlow::Continue(transaction)
             })
         });
-        entered_rx.recv().unwrap();
+        crate::test_wait::recv(&entered_rx, "checkpoint worker enters");
         let releaser = std::thread::spawn(move || releaser_lease.release());
-        while !lease.is_released() {
-            std::thread::yield_now();
-        }
+        crate::test_wait::wait_until("lease release is published", || lease.is_released());
         check_tx.send(()).unwrap();
 
-        assert!(matches!(worker.join().unwrap(), LeaseOperationOutcome::Released));
+        assert!(matches!(
+            crate::test_wait::join(worker, "checkpoint worker returns").unwrap(),
+            LeaseOperationOutcome::Released
+        ));
         assert!(rolled_back.load(Ordering::SeqCst));
-        releaser.join().unwrap();
+        crate::test_wait::join(releaser, "lease release completes").unwrap();
     }
 
     #[test]
@@ -2690,23 +2685,24 @@ mod tests {
         let worker = std::thread::spawn(move || {
             publish_test(&worker_lease, || {
                 entered_tx.send(()).unwrap();
-                finish_rx.recv().unwrap();
+                crate::test_wait::recv(&finish_rx, "admitted batch finishes");
                 "first batch"
             })
         });
-        entered_rx.recv().unwrap();
+        crate::test_wait::recv(&entered_rx, "admitted batch starts");
         let releaser = std::thread::spawn(move || {
             releaser_lease.release();
             released_tx.send(()).unwrap();
         });
-        while !lease.is_released() {
-            std::thread::yield_now();
-        }
+        crate::test_wait::wait_until("lease release is published", || lease.is_released());
         assert!(released_rx.try_recv().is_err(), "release waits for the admitted batch");
         finish_tx.send(()).unwrap();
-        assert!(matches!(worker.join().unwrap(), LeaseOperationOutcome::Applied("first batch")));
-        released_rx.recv().unwrap();
-        releaser.join().unwrap();
+        assert!(matches!(
+            crate::test_wait::join(worker, "admitted batch returns").unwrap(),
+            LeaseOperationOutcome::Applied("first batch")
+        ));
+        crate::test_wait::recv(&released_rx, "lease release completes");
+        crate::test_wait::join(releaser, "lease release thread returns").unwrap();
         let calls = AtomicU64::new(0);
         assert!(matches!(
             publish_test(&lease, || calls.fetch_add(1, Ordering::SeqCst)),
@@ -2845,7 +2841,7 @@ mod tests {
             started_tx.send(()).unwrap();
             done_tx.send(contender.take_generation(|_| true)).unwrap();
         });
-        started_rx.recv().unwrap();
+        crate::test_wait::recv(&started_rx, "reclaim worker starts");
         // Nothing marks a thread parked on the lock; the latch below decides the race either way.
         if cfg!(timing_contract) {
             assert!(
@@ -2858,8 +2854,11 @@ mod tests {
         drop(lifecycle);
         newer.release();
 
-        assert!(!done_rx.recv().unwrap(), "a clone cannot race the terminal latch");
-        reclaim.join().unwrap();
+        assert!(
+            !crate::test_wait::recv(&done_rx, "reclaim attempt returns"),
+            "a clone cannot race the terminal latch"
+        );
+        crate::test_wait::join(reclaim, "reclaim worker exits").unwrap();
         assert!(lease.is_superseded());
         assert!(read_record(&lease_path(dir.path())).is_none());
     }
@@ -3097,11 +3096,26 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
-        let mut line = String::new();
-        while !line.contains("held") {
-            line.clear();
-            assert_ne!(std::io::BufRead::read_line(&mut reader, &mut line).unwrap(), 0);
+        let stdout = child.stdout.take().unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line.contains("held") {
+                    let _ = held_tx.send(());
+                    return;
+                }
+            }
+        });
+        if held_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child never reported that it held the access lock");
         }
         assert!(ExclusiveFileLock::try_acquire(&path).unwrap().is_none(), "held by the child");
 

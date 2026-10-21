@@ -1217,7 +1217,6 @@ mod tests {
     fn repeated_stop_observations_keep_the_original_cleanup_deadline() {
         let clock = StopClock::new(DEFAULT_STOP_GRACE_MS);
         let first = clock.mark();
-        std::thread::sleep(Duration::from_millis(2));
         assert_eq!(clock.mark(), first);
         assert_eq!(clock.cleanup_deadline(), first + clock.budget);
     }
@@ -1303,13 +1302,16 @@ mod tests {
         // stderr stays within its half of the limit: overflowing it first would stop the child
         // before stdout is written, and how much of stdout made it out would depend on timing.
         let executable = script(directory.path(), "printf err >&2; printf 1234567890");
-        let output = run_bounded(
-            &executable,
-            &[],
-            directory.path(),
-            deadline_not_under_test(),
-            &CancellationToken::new(),
-            8,
+        let output = super::super::tests::guard_future(
+            run_bounded(
+                &executable,
+                &[],
+                directory.path(),
+                deadline_not_under_test(),
+                &CancellationToken::new(),
+                8,
+            ),
+            "bounded child output test",
         )
         .await
         .unwrap();
@@ -1325,13 +1327,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let executable =
             script(directory.path(), "trap '' TERM; while :; do printf 1234567890; done");
-        let output = run_bounded(
-            &executable,
-            &[],
-            directory.path(),
-            deadline_not_under_test(),
-            &CancellationToken::new(),
-            1024,
+        let output = super::super::tests::guard_future(
+            run_bounded(
+                &executable,
+                &[],
+                directory.path(),
+                deadline_not_under_test(),
+                &CancellationToken::new(),
+                1024,
+            ),
+            "chatty child output-limit test",
         )
         .await
         .unwrap();
@@ -1348,15 +1353,18 @@ mod tests {
             "while :; do printf 1234567890 > native.log; sleep 0.01; done",
         );
         let log = directory.path().join("native.log");
-        let output = run_bounded_with_log(
-            &executable,
-            &[],
-            directory.path(),
-            deadline_not_under_test(),
-            &CancellationToken::new(),
-            1024,
-            Some((&log, 4)),
-            None,
+        let output = super::super::tests::guard_future(
+            run_bounded_with_log(
+                &executable,
+                &[],
+                directory.path(),
+                deadline_not_under_test(),
+                &CancellationToken::new(),
+                1024,
+                Some((&log, 4)),
+                None,
+            ),
+            "native log output-limit test",
         )
         .await
         .unwrap();
@@ -1400,16 +1408,19 @@ mod tests {
         };
         let log = cwd.join("native.log");
         let args = [OsString::from("DESIGNER"), OsString::from("/Out"), log.as_os_str().to_owned()];
-        let output = run_designer_xvfb(
-            &wrapper,
-            &profile,
-            &args,
-            &cwd,
-            &log,
-            deadline_not_under_test(),
-            &CancellationToken::new(),
-            4096,
-            &root,
+        let output = super::super::tests::guard_future(
+            run_designer_xvfb(
+                &wrapper,
+                &profile,
+                &args,
+                &cwd,
+                &log,
+                deadline_not_under_test(),
+                &CancellationToken::new(),
+                4096,
+                &root,
+            ),
+            "fake Xvfb Designer run",
         )
         .await
         .unwrap();
@@ -1464,16 +1475,19 @@ mod tests {
         };
         let log = cwd.join("native.log");
         let args = [OsString::from("DESIGNER"), OsString::from("/Out"), log.as_os_str().to_owned()];
-        let output = run_designer_xvfb(
-            &wrapper,
-            &profile,
-            &args,
-            &cwd,
-            &log,
-            Instant::now() + Duration::from_secs(60),
-            &CancellationToken::new(),
-            4096,
-            &root,
+        let output = super::super::tests::guard_future(
+            run_designer_xvfb(
+                &wrapper,
+                &profile,
+                &args,
+                &cwd,
+                &log,
+                Instant::now() + Duration::from_secs(60),
+                &CancellationToken::new(),
+                4096,
+                &root,
+            ),
+            "display-conflict retry run",
         )
         .await
         .unwrap();
@@ -1517,16 +1531,19 @@ mod tests {
         };
         let log = cwd.join("native.log");
         let args = [OsString::from("DESIGNER"), OsString::from("/Out"), log.as_os_str().to_owned()];
-        let output = run_designer_xvfb(
-            &wrapper,
-            &profile,
-            &args,
-            &cwd,
-            &log,
-            deadline_not_under_test(),
-            &CancellationToken::new(),
-            4096,
-            &root,
+        let output = super::super::tests::guard_future(
+            run_designer_xvfb(
+                &wrapper,
+                &profile,
+                &args,
+                &cwd,
+                &log,
+                deadline_not_under_test(),
+                &CancellationToken::new(),
+                4096,
+                &root,
+            ),
+            "documented startup-conflict retry run",
         )
         .await
         .unwrap();
@@ -1585,24 +1602,31 @@ mod tests {
             )
             .await
         });
-        loop {
-            let run_finished = task.is_finished();
-            let designer_started = cwd.join("designer.pid").is_file();
-            let ownership_recorded = std::fs::read_dir(&cwd).is_ok_and(|entries| {
-                entries.filter_map(Result::ok).any(|entry| {
-                    entry.file_name().to_string_lossy().starts_with(".native-check-x11-")
-                })
-            });
-            if designer_started && ownership_recorded {
-                break;
-            }
-            assert!(!run_finished, "fake Designer must start before cancellation");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        super::super::tests::guard_future(
+            async {
+                loop {
+                    let run_finished = task.is_finished();
+                    let designer_started = cwd.join("designer.pid").is_file();
+                    let ownership_recorded = std::fs::read_dir(&cwd).is_ok_and(|entries| {
+                        entries.filter_map(Result::ok).any(|entry| {
+                            entry.file_name().to_string_lossy().starts_with(".native-check-x11-")
+                        })
+                    });
+                    if designer_started && ownership_recorded {
+                        break;
+                    }
+                    assert!(!run_finished, "fake Designer must start before cancellation");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            "fake Designer startup and X11 ownership",
+        )
+        .await;
         let designer_pid: u32 =
             std::fs::read_to_string(cwd.join("designer.pid")).unwrap().parse().unwrap();
         cancel.cancel();
-        let output = task.await.unwrap().unwrap();
+        let output =
+            super::super::tests::guard_task(task, "cancelled fake Xvfb run").await.unwrap();
         assert_eq!(output.termination, Termination::Cancelled);
         let designer_stat = std::fs::read_to_string(format!("/proc/{designer_pid}/stat"));
         assert!(
@@ -1625,7 +1649,9 @@ mod tests {
     #[tokio::test]
     async fn cancellation_kills_the_owned_process_group() {
         let directory = tempfile::tempdir().unwrap();
-        let executable = script(directory.path(), "while :; do sleep 1; done");
+        let ready = directory.path().join("process-ready");
+        let executable =
+            script(directory.path(), "printf ready > process-ready\nwhile :; do sleep 1; done");
         let cancel = CancellationToken::new();
         let child_cancel = cancel.clone();
         let executable_clone = executable.clone();
@@ -1641,10 +1667,16 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        super::super::tests::wait_until(
+            "owned process-group child startup",
+            Duration::from_secs(60),
+            || ready.is_file(),
+        )
+        .await;
         cancel.cancel();
 
-        let output = task.await.unwrap().unwrap();
+        let output =
+            super::super::tests::guard_task(task, "cancelled process-group run").await.unwrap();
         assert_eq!(output.termination, Termination::Cancelled);
     }
 
@@ -1658,11 +1690,13 @@ mod tests {
     async fn ignored_term_is_followed_by_kill() {
         use std::os::unix::process::{CommandExt, ExitStatusExt};
 
-        struct KillOnDrop(std::process::Child);
+        struct KillOnDrop(Option<std::process::Child>);
         impl Drop for KillOnDrop {
             fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = super::super::tests::wait_child(child, "TERM observer cleanup");
+                }
             }
         }
 
@@ -1687,23 +1721,38 @@ mod tests {
             )
             .await
         });
-        while !group_file.is_file() {
-            assert!(!task.is_finished(), "TERM-ignoring child must start before cancellation");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        super::super::tests::guard_future(
+            async {
+                while !group_file.is_file() {
+                    assert!(
+                        !task.is_finished(),
+                        "TERM-ignoring child must start before cancellation"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            "TERM-ignoring child startup",
+        )
+        .await;
         let group: i32 = std::fs::read_to_string(&group_file).unwrap().trim().parse().unwrap();
-        let mut term_observer = KillOnDrop(
+        let mut term_observer = KillOnDrop(Some(
             std::process::Command::new("/bin/sleep")
                 .arg("600")
                 .process_group(group)
                 .spawn()
                 .unwrap(),
-        );
+        ));
         cancel.cancel();
-        let output = task.await.unwrap().unwrap();
+        let output =
+            super::super::tests::guard_task(task, "TERM-ignoring child run").await.unwrap();
         assert_eq!(output.termination, Termination::Cancelled);
         assert_eq!(
-            term_observer.0.wait().unwrap().signal(),
+            super::super::tests::wait_child(
+                term_observer.0.take().expect("TERM observer remains owned"),
+                "TERM observer exit",
+            )
+            .unwrap()
+            .signal(),
             Some(libc::SIGTERM),
             "TERM was skipped"
         );
@@ -1737,16 +1786,32 @@ mod tests {
                     .await
             },
         ));
-        while !ready.is_file() {
-            assert!(!task.is_finished(), "TERM-cooperative child must start before cancellation");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        super::super::tests::guard_future(
+            async {
+                while !ready.is_file() {
+                    assert!(
+                        !task.is_finished(),
+                        "TERM-cooperative child must start before cancellation"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            "TERM-cooperative child startup",
+        )
+        .await;
         cancel.cancel();
-        while !term_received.is_file() && !task.is_finished() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        super::super::tests::guard_future(
+            async {
+                while !term_received.is_file() && !task.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            "TERM trap observation",
+        )
+        .await;
         std::fs::write(&release, b"").unwrap();
-        let output = task.await.unwrap().unwrap();
+        let output =
+            super::super::tests::guard_task(task, "TERM-cooperative child run").await.unwrap();
         assert_eq!(output.termination, Termination::Cancelled);
         assert!(sentinel.exists(), "TERM-cooperative child was killed before it could clean up");
     }
@@ -1768,19 +1833,25 @@ mod tests {
             ),
         );
         std::fs::write(directory.path().join(".native-check-active-pgid"), b"occupied\n").unwrap();
-        let result = run_bounded(
-            &executable,
-            &[],
-            directory.path(),
-            Instant::now() + Duration::from_secs(5),
-            &CancellationToken::new(),
-            1024,
+        let result = super::super::tests::guard_future(
+            run_bounded(
+                &executable,
+                &[],
+                directory.path(),
+                Instant::now() + Duration::from_secs(5),
+                &CancellationToken::new(),
+                1024,
+            ),
+            "spawn-failure process-group cleanup",
         )
         .await;
         assert!(matches!(result, Err(ProcessFailure::Spawn)));
-        while has_live_process_in(directory.path()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        super::super::tests::wait_until(
+            "spawn-failure process cleanup",
+            Duration::from_secs(60),
+            || !has_live_process_in(directory.path()),
+        )
+        .await;
         assert!(!sentinel.exists(), "early return left a child in the private process group");
     }
 
@@ -1810,22 +1881,23 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !ready.is_file() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+        super::super::tests::wait_until(
+            "TERM-cooperative descendant startup",
+            Duration::from_secs(3),
+            || ready.is_file(),
+        )
+        .await;
         task.abort();
-        let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !sentinel.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("TERM-cooperative child was killed before it could clean up");
+        let joined = tokio::time::timeout(super::super::tests::HANG_GUARD, task)
+            .await
+            .expect("aborted process supervisor must finish");
+        assert!(joined.is_err(), "aborted process supervisor must report cancellation");
+        super::super::tests::wait_until(
+            "TERM-cooperative child cleanup",
+            Duration::from_secs(1),
+            || sentinel.exists(),
+        )
+        .await;
     }
 
     #[test]
@@ -1860,7 +1932,6 @@ mod tests {
 mod windows_tests {
     use super::*;
     use std::path::PathBuf;
-    use std::time::Duration;
 
     async fn echoed_arguments(args: &[OsString]) -> String {
         let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
@@ -1869,9 +1940,8 @@ mod windows_tests {
         command.args(["/d", "/u", "/c", "echo"]);
         append_designer_args(&mut command, args).unwrap();
         command.kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        let output = super::super::tests::guard_future(command.output(), "cmd.exe argument echo")
             .await
-            .expect("cmd echo should finish promptly")
             .expect("cmd.exe should start");
         assert!(output.status.success());
         let units =

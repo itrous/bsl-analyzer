@@ -54,14 +54,24 @@ pub const fn polls(bound: Duration, step: Duration) -> u64 {
     }
 }
 
-/// Polls `condition` every `step` until it holds and returns `true`; under `timing_contract`
-/// gives up after [`polls`]`(bound, step)` and returns what one last look says.
+/// Polls `condition` every `step` until it holds and returns `true`; gives up at
+/// [`hang_guard`]`(bound)` in ordinary runs, or the timing profile's poll count,
+/// and takes one last look.
 pub fn poll_until(bound: Duration, step: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + hang_guard(bound);
     for _ in 0..polls(bound, step) {
         if condition() {
             return true;
         }
-        std::thread::sleep(step);
+        if cfg!(timing_contract) {
+            std::thread::sleep(step);
+        } else {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(step.min(remaining));
+        }
     }
     condition()
 }
@@ -97,11 +107,22 @@ mod tests {
         }
     }
 
+    #[cfg(timing_contract)]
     #[test]
-    fn an_unbounded_receive_still_returns_what_arrives() {
+    #[should_panic(expected = "hang guard: unreachable state never arrived")]
+    fn an_unreachable_state_fails_with_a_message() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+        assert!(
+            receiver.recv_timeout(hang_guard(Duration::ZERO)).is_ok(),
+            "hang guard: unreachable state never arrived"
+        );
+    }
+
+    #[test]
+    fn a_guarded_receive_still_returns_what_arrives() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || tx.send(7).unwrap());
-        assert_eq!(rx.recv_timeout(ceiling(Duration::from_secs(60))), Ok(7));
+        assert_eq!(rx.recv_timeout(hang_guard(Duration::from_secs(60))), Ok(7));
     }
 
     #[test]

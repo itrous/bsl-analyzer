@@ -48,7 +48,7 @@ impl CountingEmbeddingServer {
                         }
                         // Windows hands the listener's non-blocking mode to the accepted stream.
                         let _ = stream.set_nonblocking(false);
-                        let _ = stream.set_read_timeout(Some(test_utils::wait::ceiling(
+                        let _ = stream.set_read_timeout(Some(test_utils::wait::hang_guard(
                             Duration::from_secs(1),
                         )));
                         let mut request = Vec::new();
@@ -125,7 +125,7 @@ impl Drop for CountingEmbeddingServer {
         self.stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.addr);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let _ = crate::test_wait::join(thread, "portable graph HTTP fixture exits");
         }
     }
 }
@@ -336,14 +336,21 @@ fn moved_cached_graph_reuses_revision_reads_new_sources_and_preserves_search_vec
     const CHILD: &str = "BSL_MCP_PORTABLE_GRAPH_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let _env_lock = crate::state::test_support::env_lock();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "graph::portable_workspace_graph_tests::moved_cached_graph_reuses_revision_reads_new_sources_and_preserves_search_vectors",
             ])
             .env(CHILD, "1")
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        let output = crate::graph::test_support::child_output(
+            child,
+            test_utils::wait::hang_guard(std::time::Duration::from_secs(60)),
+            "portable graph child",
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         // A drifted name would select no test and still exit successfully.
         assert!(

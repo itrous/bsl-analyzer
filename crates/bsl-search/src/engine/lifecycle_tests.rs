@@ -2,6 +2,9 @@ use super::*;
 use serde_json::Value;
 use std::io::{Read, Write};
 
+const HANG_WATCHDOG: std::time::Duration =
+    test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
+
 #[test]
 fn profiled_constructor_blocks_unproven_vectors_but_keeps_lexical_search() {
     let dir = tempfile::tempdir().unwrap();
@@ -160,11 +163,31 @@ fn server(
     mut observe: impl FnMut() + Send + 'static,
 ) -> (Embedder, std::thread::JoinHandle<Vec<String>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let thread = std::thread::spawn(move || {
         let mut submitted = Vec::new();
-        for stream in listener.incoming().take(requests) {
-            let mut stream = stream.unwrap();
+        let mut received = 0;
+        let deadline = std::time::Instant::now() + HANG_WATCHDOG;
+        while received < requests {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fake embedding server timed out"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fake embedding server accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            let io_timeout = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!io_timeout.is_zero(), "fake embedding server timed out");
+            stream.set_read_timeout(Some(io_timeout)).unwrap();
+            stream.set_write_timeout(Some(io_timeout)).unwrap();
             let body = read_request_body(&mut stream);
             observe();
             let inputs = body["input"].as_array().unwrap();
@@ -174,6 +197,7 @@ fn server(
                 .collect();
             let body = serde_json::json!({"data":data}).to_string();
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            received += 1;
         }
         submitted
     });
@@ -1294,9 +1318,25 @@ fn vector_lifecycle_full_index_that_skipped_a_rejected_file_is_failed() {
     // with the typed cause, exactly as a failed batch in the embedding pass does; both must end
     // the same way in the journal.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let refusals = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let deadline = std::time::Instant::now() + HANG_WATCHDOG;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "refusal request was never sent");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("refusal server accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        let io_timeout = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!io_timeout.is_zero(), "refusal request timed out");
+        stream.set_read_timeout(Some(io_timeout)).unwrap();
+        stream.set_write_timeout(Some(io_timeout)).unwrap();
         let request = read_request_body(&mut stream);
         assert!(request["input"].as_array().is_some_and(|input| !input.is_empty()));
         let body = r#"{"error":"rejected"}"#;

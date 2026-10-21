@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// A hang watchdog for every wait in this file, not a latency budget.
-const SHUTDOWN_TIMEOUT: Duration = crate::change_hub::test_support::STATE_CEILING;
+const SHUTDOWN_TIMEOUT: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
 struct WorkspaceStreamCleanup {
     state: SharedState,
@@ -45,7 +45,10 @@ async fn initialized_session(
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let server = McpServer::new(McpProfile::Reference, SharedState::shared());
     let task = tokio::spawn(serve_stream_with_shutdown(server, server_io, shutdown.clone()));
-    let client = ().serve(client_io).await.expect("client initializes");
+    let client = tokio::time::timeout(SHUTDOWN_TIMEOUT, ().serve(client_io))
+        .await
+        .expect("client initialization is bounded")
+        .expect("client initializes");
     (client, task)
 }
 
@@ -57,7 +60,10 @@ async fn initialized_workspace_session(
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let server = McpServer::new(profile, state);
     let task = tokio::spawn(serve_stream_with_shutdown(server, server_io, shutdown.clone()));
-    let client = ().serve(client_io).await.expect("workspace client initializes");
+    let client = tokio::time::timeout(SHUTDOWN_TIMEOUT, ().serve(client_io))
+        .await
+        .expect("workspace client initialization is bounded")
+        .expect("workspace client initializes");
     (client, task)
 }
 
@@ -67,7 +73,10 @@ async fn initialized_server_session(
 ) -> (RunningService<RoleClient, ()>, JoinHandle<anyhow::Result<()>>) {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let task = tokio::spawn(serve_stream_with_shutdown(server, server_io, shutdown.clone()));
-    let client = ().serve(client_io).await.expect("client initializes");
+    let client = tokio::time::timeout(SHUTDOWN_TIMEOUT, ().serve(client_io))
+        .await
+        .expect("client initialization is bounded")
+        .expect("client initializes");
     (client, task)
 }
 
@@ -123,10 +132,16 @@ async fn stream_shutdown_closes_transport_without_cancelling_sibling_sessions() 
     let (first_client, first_task) = initialized_session(&shutdown).await;
     let (second_client, second_task) = initialized_session(&shutdown).await;
 
-    first_client.cancel().await.expect("first client disconnects");
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, first_client.cancel())
+        .await
+        .expect("first client disconnect is bounded")
+        .expect("first client disconnects");
     session_finished(first_task).await;
     let request = ClientRequest::PingRequest(PingRequest::default());
-    second_client.send_request(request.clone()).await.expect("sibling remains connected");
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, second_client.send_request(request.clone()))
+        .await
+        .expect("sibling request is bounded")
+        .expect("sibling remains connected");
 
     shutdown.cancel();
     session_finished(second_task).await;
@@ -220,8 +235,14 @@ async fn shared_backend_sessions_keep_tool_gates_and_native_dispatch_local() {
     assert_eq!(native_a.requests.lock().unwrap().len(), 1);
     assert_eq!(native_b.requests.lock().unwrap().len(), 1);
 
-    first.cancel().await.expect("first client disconnects");
-    second.cancel().await.expect("second client disconnects");
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, first.cancel())
+        .await
+        .expect("first client disconnect is bounded")
+        .expect("first client disconnects");
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, second.cancel())
+        .await
+        .expect("second client disconnect is bounded")
+        .expect("second client disconnects");
     session_finished(first_task).await;
     session_finished(second_task).await;
     backend.shutdown();
@@ -261,30 +282,48 @@ async fn workspace_cache_scope_stops_all_session_transports() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let task =
             tokio::spawn(serve_stream_with_shutdown(first, server_io, daemon_shutdown.clone()));
-        (().serve(client_io).await.expect("first client initializes"), task)
+        (
+            tokio::time::timeout(SHUTDOWN_TIMEOUT, ().serve(client_io))
+                .await
+                .expect("first client initialization is bounded")
+                .expect("first client initializes"),
+            task,
+        )
     };
     let (second_client, second_task) = {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let task =
             tokio::spawn(serve_stream_with_shutdown(second, server_io, daemon_shutdown.clone()));
-        (().serve(client_io).await.expect("second client initializes"), task)
+        (
+            tokio::time::timeout(SHUTDOWN_TIMEOUT, ().serve(client_io))
+                .await
+                .expect("second client initialization is bounded")
+                .expect("second client initializes"),
+            task,
+        )
     };
 
     state.scope_transport_stop().cancel();
     session_finished(first_task).await;
     session_finished(second_task).await;
     assert!(
-        first_client
-            .send_request(ClientRequest::PingRequest(PingRequest::default()))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            SHUTDOWN_TIMEOUT,
+            first_client.send_request(ClientRequest::PingRequest(PingRequest::default()))
+        )
+        .await
+        .expect("closed first client answers within the hang guard")
+        .is_err(),
         "scope retirement closes the first session"
     );
     assert!(
-        second_client
-            .send_request(ClientRequest::PingRequest(PingRequest::default()))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            SHUTDOWN_TIMEOUT,
+            second_client.send_request(ClientRequest::PingRequest(PingRequest::default()))
+        )
+        .await
+        .expect("closed second client answers within the hang guard")
+        .is_err(),
         "scope retirement closes the second session"
     );
     assert!(!daemon_shutdown.is_cancelled(), "scope retirement leaves broker shutdown distinct");
@@ -336,7 +375,10 @@ async fn legacy_workspace_warning_stays_out_of_repeated_mcp_tool_responses() {
         );
     }
 
-    client.cancel().await.expect("client disconnects");
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, client.cancel())
+        .await
+        .expect("client disconnect is bounded")
+        .expect("client disconnects");
     session_finished(task).await;
     state.shutdown();
 }
@@ -394,12 +436,18 @@ async fn legacy_scope_change_retires_mcp_stream_and_reconnects_with_explicit_cac
     assert!(serde_json::to_string(&before).unwrap().contains("schema"));
 
     std::fs::write(&project_file, config_for_scope(Some("InfoBase"))).unwrap();
-    tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, old_stop.cancelled())
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, old_stop.cancelled())
         .await
         .expect("scope-only project drift retires the old transport");
     session_finished(old_task).await;
     assert!(
-        old_client.send_request(ClientRequest::PingRequest(PingRequest::default())).await.is_err(),
+        tokio::time::timeout(
+            SHUTDOWN_TIMEOUT,
+            old_client.send_request(ClientRequest::PingRequest(PingRequest::default()))
+        )
+        .await
+        .expect("retired client request is bounded")
+        .is_err(),
         "the frozen legacy session does not answer after retirement"
     );
     old_state.shutdown();
@@ -430,7 +478,10 @@ async fn legacy_scope_change_retires_mcp_stream_and_reconnects_with_explicit_cac
             .await
             .expect("reconnected explicit scope serves a real tool call");
     assert!(serde_json::to_string(&after).unwrap().contains("schema"));
-    explicit_client.cancel().await.expect("explicit-scope client disconnects");
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, explicit_client.cancel())
+        .await
+        .expect("explicit-scope client disconnect is bounded")
+        .expect("explicit-scope client disconnects");
     session_finished(explicit_task).await;
     explicit_state.shutdown();
 }
@@ -565,7 +616,10 @@ async fn workspace_catalog_schema_and_platform_calls_do_not_build_resident_or_gr
     );
     assert_lazy_state();
 
-    client.cancel().await.expect("client disconnects");
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, client.cancel())
+        .await
+        .expect("client disconnect is bounded")
+        .expect("client disconnects");
     session_finished(task).await;
     state.shutdown();
 }
@@ -658,7 +712,7 @@ async fn workspace_references_cancel_unwinds_first_walk_span_before_a_writer() {
         .clone()
     };
     let positive = tokio::time::timeout(
-        Duration::from_secs(60),
+        test_utils::wait::hang_guard(Duration::from_secs(60)),
         client.call_tool(
             CallToolRequestParams::new("references").with_arguments(reference_arguments()),
         ),
@@ -738,7 +792,7 @@ async fn workspace_references_cancel_unwinds_first_walk_span_before_a_writer() {
     );
     span_hold.release();
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(30));
     let mut diagnostic = serde_json::Value::Null;
     while Instant::now() < deadline {
         let response = tokio::time::timeout(

@@ -3812,7 +3812,11 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let workspace = JobWorkspace { path: root.path().join("already-removed-owned-job") };
-        let result = finish_with_cleanup(result, workspace).await;
+        let result = super::super::tests::guard_future(
+            finish_with_cleanup(result, workspace),
+            "failed-workspace cleanup result",
+        )
+        .await;
         assert_eq!(result.status, crate::native_check::types::CheckStatus::Error);
         assert_eq!(result.valid, None);
         assert_eq!(result.cleanup_status, crate::native_check::types::CleanupStatus::Pending);
@@ -4118,40 +4122,49 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(DEFAULT_DEADLINE_MS);
         let cancel = CancellationToken::new();
 
-        update_extension_properties(
-            &profile,
-            &workspace.join("ib"),
-            &data_dir,
-            &workspace,
-            &expected[0],
-            deadline,
-            &cancel,
+        super::super::tests::guard_future(
+            update_extension_properties(
+                &profile,
+                &workspace.join("ib"),
+                &data_dir,
+                &workspace,
+                &expected[0],
+                deadline,
+                &cancel,
+            ),
+            "extension property update process",
         )
         .await
         .unwrap();
         let mut mismatched_expected = expected.clone();
         mismatched_expected[0].file_properties.as_mut().unwrap().purpose =
             "different-purpose".to_owned();
-        let mismatch = verify_copy_extensions(
-            &profile,
-            &workspace.join("ib"),
-            &data_dir,
-            &workspace,
-            &mismatched_expected,
-            deadline,
-            &cancel,
+        let mismatch = super::super::tests::guard_future(
+            verify_copy_extensions(
+                &profile,
+                &workspace.join("ib"),
+                &data_dir,
+                &workspace,
+                &mismatched_expected,
+                deadline,
+                &cancel,
+            ),
+            "extension mismatch verification process",
         )
         .await
         .unwrap_err();
         assert_eq!(mismatch.code, "extension_properties_unavailable");
-        verify_copy_extensions(
-            &profile,
-            &workspace.join("ib"),
-            &data_dir,
-            &workspace,
-            &expected,
-            deadline,
-            &cancel,
+        super::super::tests::guard_future(
+            verify_copy_extensions(
+                &profile,
+                &workspace.join("ib"),
+                &data_dir,
+                &workspace,
+                &expected,
+                deadline,
+                &cancel,
+            ),
+            "extension copy verification process",
         )
         .await
         .unwrap();
@@ -4501,7 +4514,7 @@ mod tests {
         let mut dead_creator = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let creator_pid = dead_creator.id();
         dead_creator.kill().unwrap();
-        dead_creator.wait().unwrap();
+        super::super::tests::wait_child(dead_creator, "dead job creator exit").unwrap();
         let owned_id = format!("{creator_pid}-456-0");
         let owned = jobs.join(&owned_id);
         fs::create_dir(&owned).unwrap();
@@ -4515,7 +4528,12 @@ mod tests {
         let link = jobs.join("foreign-link");
         symlink(&foreign, &link).unwrap();
 
-        cleanup_owned_jobs(&jobs, &super::super::compiler::current_stop_clock()).await.unwrap();
+        super::super::tests::guard_future(
+            cleanup_owned_jobs(&jobs, &super::super::compiler::current_stop_clock()),
+            "startup cleanup of dead owned job",
+        )
+        .await
+        .unwrap();
 
         assert!(!owned.exists());
         assert!(foreign.join("keep").exists());
@@ -4541,10 +4559,15 @@ mod tests {
         fs::write(&marker, test_owner_marker(&id)).unwrap();
         fs::set_permissions(marker, fs::Permissions::from_mode(0o600)).unwrap();
 
-        cleanup_owned_jobs(&jobs, &super::super::compiler::current_stop_clock()).await.unwrap();
+        super::super::tests::guard_future(
+            cleanup_owned_jobs(&jobs, &super::super::compiler::current_stop_clock()),
+            "startup cleanup with live creator",
+        )
+        .await
+        .unwrap();
         let preserved = owned.is_dir();
         let _ = creator.kill();
-        let _ = creator.wait();
+        let _ = super::super::tests::wait_child(creator, "live job creator cleanup");
         assert!(preserved, "startup cleanup removed a live foreign worker's job");
     }
 
@@ -4585,7 +4608,14 @@ mod tests {
         let marker = path.join(OWNER_MARKER);
         let deadline = Instant::now() - std::time::Duration::from_millis(1);
 
-        assert_eq!(workspace.cleanup(deadline).await, Err(NativeProfileError::CleanupFailed));
+        assert_eq!(
+            super::super::tests::guard_future(
+                workspace.cleanup(deadline),
+                "expired workspace cleanup",
+            )
+            .await,
+            Err(NativeProfileError::CleanupFailed)
+        );
         assert!(path.is_dir());
         assert!(marker.is_file());
     }
@@ -4608,18 +4638,18 @@ mod tests {
         command.process_group(0).arg("-c").arg(body);
         let mut leader = command.spawn().unwrap();
         let pid = leader.id();
-        for _ in 0..200 {
-            if ready.is_file() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        super::super::tests::wait_until_sync(
+            "unverified process-group fixture",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(5),
+            || ready.is_file(),
+        );
         let ready_seen = ready.is_file();
         let start_time = fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
             .and_then(|stat| parse_proc_identity(&stat).map(|(_, start)| start));
         let _ = leader.kill();
-        let _ = leader.wait();
+        let _ = super::super::tests::wait_child(leader, "unverified process-group leader exit");
         let descendant_pid = fs::read_to_string(&child_pid_path)
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok());
@@ -4648,14 +4678,15 @@ mod tests {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }
         }
-        for _ in 0..100 {
-            if unsafe { libc::kill(-(pid as i32), 0) } != 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        super::super::tests::wait_until_sync(
+            "killed unverified process group",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(10),
+            || unsafe {
+                libc::kill(-(pid as i32), 0) != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            },
+        );
         assert!(ready_seen);
         assert_eq!(recovery, Err(NativeProfileError::CleanupFailed));
         assert!(descendant_survived, "recovery killed an unverified surviving process group");
@@ -4676,7 +4707,7 @@ mod tests {
         let mut dead_creator = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let job_id = format!("{}-456-0", dead_creator.id());
         dead_creator.kill().unwrap();
-        dead_creator.wait().unwrap();
+        super::super::tests::wait_child(dead_creator, "leaderless-group job creator exit").unwrap();
 
         let job = jobs.join(&job_id);
         fs::create_dir(&job).unwrap();
@@ -4699,12 +4730,12 @@ mod tests {
         command.current_dir(&attempt).process_group(0).arg("-c").arg(body);
         let mut leader = command.spawn().unwrap();
         let pgid = leader.id();
-        for _ in 0..200 {
-            if ready.is_file() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        super::super::tests::wait_until_sync(
+            "leaderless process-group fixture",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(5),
+            || ready.is_file(),
+        );
         assert!(ready.is_file());
         let start_time = fs::read_to_string(format!("/proc/{pgid}/stat"))
             .ok()
@@ -4724,13 +4755,18 @@ mod tests {
         writeln!(manifest, "{pgid}:{start_time}").unwrap();
         drop(manifest);
         leader.kill().unwrap();
-        leader.wait().unwrap();
+        super::super::tests::wait_child(leader, "owned process-group leader exit").unwrap();
         assert_eq!(
             leaderless_group_members(pgid, descendant_start, &attempt).unwrap().0,
             [(descendant_pid, descendant_start)]
         );
 
-        cleanup_owned_jobs(&jobs, &super::super::compiler::current_stop_clock()).await.unwrap();
+        super::super::tests::guard_future(
+            cleanup_owned_jobs(&jobs, &super::super::compiler::current_stop_clock()),
+            "leaderless owned-group startup cleanup",
+        )
+        .await
+        .unwrap();
 
         assert!(!job.exists(), "startup cleanup retained a proven owned orphan job");
         let still_running = fs::read_to_string(format!("/proc/{descendant_pid}/stat"))

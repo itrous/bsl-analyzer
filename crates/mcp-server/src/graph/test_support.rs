@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::graph_db::build_graph_database;
 
@@ -70,33 +70,118 @@ pub(crate) fn workspace_hub(root: &Path) -> crate::change_hub::WorkspaceChangeHu
     )
 }
 
-/// How often a bounded wait re-reads the state it is waiting on.
+/// How often a guarded wait re-reads the state it is waiting on.
 pub(crate) const WAIT_POLL: Duration = Duration::from_millis(10);
-/// The default ceiling for a bounded wait on graph state: thirty seconds under
-/// `timing_contract`, none otherwise (see [`test_utils::wait`]).
-pub(crate) const WAIT_CEILING: Duration = test_utils::wait::ceiling(Duration::from_secs(30));
 
-/// How many polls a bounded wait of nominal length `ceiling` makes. The count bounds the wait,
-/// not the clock: a loaded machine stretches each poll, so the same polls still cover the same
-/// work, and only a condition that never holds uses them all up.
-fn polls_for(ceiling: Duration) -> u128 {
-    ceiling.as_millis() / WAIT_POLL.as_millis()
+/// Wait for a test subprocess without letting an unresponsive child hold the test runner.
+#[track_caller]
+pub(crate) fn wait_for_child(
+    child: &mut std::process::Child,
+    guard: Duration,
+    what: &str,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + guard;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("could not wait for {what}: {error}");
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} exceeded its hang guard of {guard:?}");
+        }
+        std::thread::sleep(WAIT_POLL.min(remaining));
+    }
 }
+/// Capture both pipes concurrently while the child is supervised by its hang guard.
+#[track_caller]
+pub(crate) fn child_output(
+    mut child: std::process::Child,
+    guard: Duration,
+    what: &str,
+) -> std::process::Output {
+    use std::io::Read;
+
+    let mut stdout = child.stdout.take().expect("child stdout must be piped");
+    let mut stderr = child.stderr.take().expect("child stderr must be piped");
+    let stdout = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).expect("read child stdout");
+        bytes
+    });
+    let stderr = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).expect("read child stderr");
+        bytes
+    });
+    let status = wait_for_child(&mut child, guard, what);
+    std::process::Output {
+        status,
+        stdout: crate::test_wait::join(stdout, "child stdout is drained").expect("stdout reader"),
+        stderr: crate::test_wait::join(stderr, "child stderr is drained").expect("stderr reader"),
+    }
+}
+
+#[test]
+fn child_output_drains_both_full_pipes() {
+    use std::io::Write;
+    const CHILD: &str = "BSL_TEST_FULL_OUTPUT_PIPES";
+    const SIZE: usize = 1024 * 1024;
+    if std::env::var_os(CHILD).is_some() {
+        std::io::stdout().write_all(&vec![b'x'; SIZE]).unwrap();
+        std::io::stderr().write_all(&vec![b'y'; SIZE]).unwrap();
+        return;
+    }
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "graph::test_support::child_output_drains_both_full_pipes",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = child_output(child, WAIT_GUARD, "full-pipe child");
+    assert!(output.status.success());
+    assert!(output.stdout.iter().filter(|&&byte| byte == b'x').count() >= SIZE);
+    assert!(output.stderr.iter().filter(|&&byte| byte == b'y').count() >= SIZE);
+}
+
+/// The graph-state wait guard: thirty seconds under `timing_contract`, ten minutes otherwise.
+pub(crate) const WAIT_GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(30));
+/// Compatibility name used by existing test call sites; this is a finite hang guard.
+pub(crate) const WAIT_CEILING: Duration = WAIT_GUARD;
 
 /// Every pooled handle of `graph`, taken once none is lent. A consumer of a fresh publication —
 /// the search hook confirming which generation it serves — borrows one for a moment right after
 /// the graph reads as ready, so a stand that must hold them all waits for that to pass.
 pub(crate) fn hold_every_handle(graph: &GraphState) -> Vec<super::GraphSnapshot> {
-    for _ in 0..polls_for(WAIT_CEILING) {
-        let held: Vec<_> =
-            std::iter::from_fn(|| graph.snapshot()).take(super::SNAPSHOT_POOL_CAP).collect();
-        if held.len() == super::SNAPSHOT_POOL_CAP {
-            return held;
-        }
-        drop(held);
-        std::thread::sleep(WAIT_POLL);
-    }
-    panic!("the pool never had every handle idle: {}", graph_state_summary(graph));
+    let mut held = None;
+    assert!(
+        test_utils::wait::poll_until(WAIT_GUARD, WAIT_POLL, || {
+            let snapshots: Vec<_> =
+                std::iter::from_fn(|| graph.snapshot()).take(super::SNAPSHOT_POOL_CAP).collect();
+            if snapshots.len() == super::SNAPSHOT_POOL_CAP {
+                held = Some(snapshots);
+                true
+            } else {
+                drop(snapshots);
+                false
+            }
+        }),
+        "the pool never had every handle idle: {}",
+        graph_state_summary(graph),
+    );
+    held.expect("the poll captured every idle handle")
 }
 
 /// Everything a timed-out wait needs to say to be diagnosable: which condition it
@@ -135,29 +220,28 @@ pub(crate) fn graph_state_summary(graph: &GraphState) -> String {
 /// from a torn publication.
 #[track_caller]
 pub(crate) fn wait_until(graph: &GraphState, what: &str, condition: impl FnMut() -> bool) {
-    wait_until_within(graph, WAIT_CEILING, what, condition);
+    wait_until_within(graph, WAIT_GUARD, what, condition);
 }
 
-/// [`wait_until`] with an explicit ceiling, for waits that legitimately need a
-/// different one. The ceiling is a property of the wait, never of the assertion.
+/// [`wait_until`] with an explicit hang guard, for waits that legitimately need a
+/// different timing-contract bound. The guard belongs to the wait, never the assertion.
 #[track_caller]
 pub(crate) fn wait_until_within(
     graph: &GraphState,
-    ceiling: Duration,
+    guard: Duration,
     what: &str,
     mut condition: impl FnMut() -> bool,
 ) {
-    for _ in 0..polls_for(ceiling) {
-        if condition() {
-            return;
-        }
-        std::thread::sleep(WAIT_POLL);
+    let deadline = Instant::now() + guard;
+    while !condition() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out after {guard:?} waiting for {what}; {}",
+            graph_state_summary(graph)
+        );
+        std::thread::sleep(WAIT_POLL.min(remaining));
     }
-    assert!(
-        condition(),
-        "timed out after {ceiling:?} waiting for {what}; {}",
-        graph_state_summary(graph)
-    );
 }
 
 /// [`wait_until`] for a stand that has no watcher: `drive` plays it, before every look.

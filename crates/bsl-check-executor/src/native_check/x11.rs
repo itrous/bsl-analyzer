@@ -419,12 +419,12 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let pid = child.id();
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        super::super::tests::wait_until_sync(
+            "fake X server socket",
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            || socket.exists(),
+        );
         assert!(
             socket.exists(),
             "fake X server did not create its pathname socket: {:?}",
@@ -437,7 +437,7 @@ mod tests {
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
         }
-        let _ = child.wait();
+        super::super::tests::wait_child(child, "fake X server exit").unwrap();
         owner.cleanup().unwrap();
         assert!(!socket.exists());
         assert!(!lock.exists());
@@ -474,12 +474,12 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let pid = child.id();
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        super::super::tests::wait_until_sync(
+            "fake X server socket",
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            || socket.exists(),
+        );
         assert!(
             socket.exists(),
             "fake X server did not create its pathname socket: {:?}",
@@ -491,9 +491,9 @@ mod tests {
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
         }
-        let _ = child.wait();
+        super::super::tests::wait_child(child, "fake X server exit").unwrap();
         fs::remove_file(&socket).unwrap();
-        let mut foreign = Command::new("python3")
+        let foreign = Command::new("python3")
             .arg("-c")
             .arg("import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(); time.sleep(60)")
             .arg(&socket)
@@ -502,18 +502,18 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        for _ in 0..100 {
-            if listener_exists(&root, display).unwrap_or(false) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        super::super::tests::wait_until_sync(
+            "replacement fake X server listener",
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            || listener_exists(&root, display).unwrap_or(false),
+        );
         assert!(listener_exists(&root, display).unwrap());
         assert!(owner.cleanup().is_err());
         unsafe {
             libc::kill(foreign.id() as i32, libc::SIGKILL);
         }
-        let _ = foreign.wait();
+        super::super::tests::wait_child(foreign, "replacement fake X server exit").unwrap();
         fs::remove_file(&socket).unwrap();
         fs::write(&socket, b"replacement").unwrap();
         assert!(owner.cleanup().is_err());
@@ -560,12 +560,24 @@ mod tests {
         let job = temp.path().join("job");
         fs::create_dir(root.join(".X11-unix")).unwrap();
         fs::create_dir(&job).unwrap();
-        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        let child = Command::new("true").process_group(0).spawn().unwrap();
         let pid = child.id();
-        // WNOWAIT blocks until the child exits and leaves it unreaped, so it stays a zombie.
+        // Keep the completed child unreaped so cleanup observes its zombie identity.
+        super::super::tests::wait_until_sync(
+            "test child exit",
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+            || {
+                fs::read_to_string(format!("/proc/{pid}/stat")).ok().is_some_and(|stat| {
+                    let close = stat.rfind(')').unwrap_or(0);
+                    stat[close.saturating_add(1)..].split_whitespace().next() == Some("Z")
+                })
+            },
+        );
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let waited =
-            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        let waited = unsafe {
+            libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT | libc::WNOHANG)
+        };
         assert_eq!(waited, 0);
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
         let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 1..].split_whitespace().collect();
@@ -589,7 +601,7 @@ mod tests {
         };
 
         let cleaned = owner.cleanup();
-        child.wait().unwrap();
+        super::super::tests::wait_child(child, "unreaped zombie child").unwrap();
         cleaned.unwrap();
         assert!(!record.exists());
     }

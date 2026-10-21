@@ -497,7 +497,7 @@ mod shared_owner_tests {
 
     fn wait_for_owner_analysis(owner: &WorkspaceHandle) -> Analysis {
         let deadline =
-            Instant::now() + test_utils::wait::ceiling(std::time::Duration::from_secs(20));
+            Instant::now() + test_utils::wait::hang_guard(std::time::Duration::from_secs(20));
         loop {
             match owner.request_analysis() {
                 WorkspaceRead::Ready(analysis) => return analysis,

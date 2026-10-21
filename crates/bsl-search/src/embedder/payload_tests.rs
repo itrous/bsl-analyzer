@@ -34,7 +34,7 @@ impl PayloadServer {
                 break;
             }
             {
-                let exchange = test_utils::wait::ceiling(Duration::from_secs(2));
+                let exchange = test_utils::wait::hang_guard(Duration::from_secs(2));
                 stream.set_read_timeout(Some(exchange)).unwrap();
                 stream.set_write_timeout(Some(exchange)).unwrap();
                 let mut bytes = Vec::new();

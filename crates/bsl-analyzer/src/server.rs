@@ -530,7 +530,9 @@ mod shared_backend_tests {
                 serde_json::json!({"stale": true}),
             ));
             handle_latency_request_finished(&mut state, key.clone(), outcome).unwrap();
-            let Message::Response(response) = receiver.recv().unwrap() else {
+            let Message::Response(response) =
+                receiver.try_recv().expect("handler sends synchronously")
+            else {
                 panic!("expected response")
             };
             assert_eq!(
@@ -2627,7 +2629,7 @@ mod tests {
         for attempt in 1..=3 {
             assert_eq!(
                 entered
-                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("production attempt reaches controlled test gate"),
                 attempt
             );
@@ -2655,7 +2657,7 @@ mod tests {
 
             loop {
                 let task = task_receiver
-                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("cancelled attempt must return a production task");
                 handle_task(state, task).expect("production event loop handles the attempt task");
                 let retry_queued = state
@@ -2695,7 +2697,9 @@ mod tests {
                         })
                         .expect("one-worker pool accepts blocker");
                     pool_entered_rx
-                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(
+                            10,
+                        )))
                         .expect("capacity blocker occupies the only worker");
                     let mut blockers = Vec::new();
                     for _ in 0..state.task_pool.pool.capacity().unwrap() {
@@ -2726,7 +2730,9 @@ mod tests {
                     pool_release.store(true, Ordering::Release);
                     for _ in 0..=blockers.len() {
                         let task = task_receiver
-                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .recv_timeout(test_utils::wait::hang_guard(
+                                std::time::Duration::from_secs(10),
+                            ))
                             .expect("released blocker emits its task");
                         handle_task(state, task).expect("apply capacity-probe task result");
                     }
@@ -2770,7 +2776,7 @@ mod tests {
                 panic!("unexpected response {:?} while checking retry exhaustion", response.id);
             }
             let task = task_receiver
-                .recv_timeout(std::time::Duration::from_secs(10))
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                 .expect("terminal ContentModified response was not sent");
             handle_task(state, task).expect("production event loop drains final attempt");
         }
@@ -2793,7 +2799,7 @@ mod tests {
                 }
             }
             let task = receiver
-                .recv_timeout(std::time::Duration::from_secs(10))
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                 .unwrap_or_else(|error| {
                     let lifecycle = state.request_lifecycles.get(&id);
                     let owner = state.request_token_owners.get(&id);
@@ -2820,12 +2826,12 @@ mod tests {
     /// Not an expected wait: notifications may precede the response, so the
     /// reader must not sleep for a particular arrival order.
     const CLIENT_RESPONSE_HANG_GUARD: std::time::Duration =
-        test_utils::wait::ceiling(std::time::Duration::from_secs(10));
+        test_utils::wait::hang_guard(std::time::Duration::from_secs(10));
 
     /// Bound of a wait for an event that a regression would never deliver. A watchdog
     /// against hangs, not a latency measure: a slow machine must never reach it.
     const HANG_WATCHDOG: std::time::Duration =
-        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
+        test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
 
     /// Read client messages until the `Response` for `id`.
     ///
@@ -2905,7 +2911,7 @@ mod tests {
     /// Kept so the notification-first order can keep proving this assertion panics.
     fn legacy_next_message_must_be_response(receiver: &crossbeam_channel::Receiver<Message>) {
         let lsp_server::Message::Response(_response) = receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(2)))
             .expect("queued cancellation must answer once")
         else {
             panic!("queued cancellation produced a non-response")
@@ -3507,7 +3513,7 @@ mod tests {
 
             let completion = loop {
                 let task = queued_cancel_receiver
-                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("queued-cancel request did not finish its real attempt");
                 if matches!(
                     &task,
@@ -3557,7 +3563,7 @@ mod tests {
                 })
                 .unwrap();
             blocker_entered_rx
-                .recv_timeout(std::time::Duration::from_secs(10))
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                 .expect("one-worker pool blocker starts");
             let queued_blockers = state.task_pool.pool.capacity().unwrap();
             let _release_pool_on_unwind = G1ReleasePoolProbe(Arc::clone(&release_pool));
@@ -3626,7 +3632,7 @@ mod tests {
             release_pool.store(true, Ordering::Release);
             for _ in 0..=queued_blockers {
                 let task = saturated_receiver
-                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("all pool blockers finish after release");
                 handle_task(&mut state, task).expect("apply queued-cancel capacity probe result");
             }
@@ -3658,7 +3664,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                reader_entered.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+                reader_entered
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
+                    .unwrap(),
                 1,
                 "real dispatched handler reaches the controlled query checkpoint"
             );
@@ -3708,7 +3716,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                origin_reader_entered.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+                origin_reader_entered
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
+                    .unwrap(),
                 1
             );
             let origin_writer_text = "Процедура Other()\n    Значение = 3;\nКонецПроцедуры\n";
@@ -3723,7 +3733,7 @@ mod tests {
             crate::handlers::dispatch::g1_disarm_pending_write_gate(&origin_change_id);
             let completion = loop {
                 let task = origin_task_receiver
-                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("origin-change attempt returns its real task");
                 if matches!(
                     &task,
@@ -4366,7 +4376,7 @@ mod tests {
                 })
                 .unwrap();
             let first_package = loader_receiver_test
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(2)))
                 .expect("first production loader package is queued");
             assert!(matches!(first_package, vfs::loader::Message::Changed { .. }));
             handle_loader_msg(&mut state, first_package).unwrap();
@@ -4398,7 +4408,7 @@ mod tests {
                 semantic_parity = true
             );
             let second_package = loader_receiver_test
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(2)))
                 .expect("second production loader package remains available after the request");
             handle_loader_msg(&mut state, second_package).unwrap();
             let batch_file_id =
@@ -4731,7 +4741,7 @@ mod tests {
                 let task = state
                     .task_pool
                     .receiver
-                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("cancelled batch task timed out");
                 match &task {
                     Task::WorkspaceBatchChunk {
@@ -4829,7 +4839,7 @@ mod tests {
                 let task = state
                     .task_pool
                     .receiver
-                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("active batch completion task timed out");
                 let completed_chunk = matches!(task, Task::WorkspaceBatchChunk { .. });
                 handle_task(&mut state, task).unwrap();
@@ -5396,7 +5406,7 @@ mod tests {
             .expect("production dispatcher admits workspace diagnostic request");
 
             let (done, emitted_items) = entered
-                .recv_timeout(std::time::Duration::from_secs(60))
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(60)))
                 .expect("real handler sends its first partial then reaches test gate");
             assert_eq!(done, 64);
             assert!(emitted_items > 0, "partial contains real diagnostics");
@@ -5519,8 +5529,8 @@ mod tests {
             }
 
             let response = loop {
-                if let Ok(message) =
-                    client_receiver.recv_timeout(std::time::Duration::from_secs(10))
+                if let Ok(message) = client_receiver
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                 {
                     match message {
                         Message::Response(response) if response.id == request_id => break response,
@@ -7158,7 +7168,7 @@ mod tests {
         .expect("create disk-only owner for test workspace");
         let owner = backend.workspace_handle();
         let deadline = std::time::Instant::now()
-            + test_utils::wait::ceiling(std::time::Duration::from_secs(20));
+            + test_utils::wait::hang_guard(std::time::Duration::from_secs(20));
         while !matches!(owner.readiness(), mcp_server::WorkspaceReadiness::Ready { .. }) {
             assert!(std::time::Instant::now() < deadline, "shared owner did not become ready");
             std::thread::yield_now();
@@ -7189,7 +7199,7 @@ mod tests {
             let task = state
                 .task_pool
                 .receiver
-                .recv_timeout(test_utils::wait::ceiling(std::time::Duration::from_secs(20)))
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(20)))
                 .expect("the editor view is seeded");
             handle_task(&mut state, task).unwrap();
         }
@@ -7328,7 +7338,7 @@ mod tests {
             let task = state
                 .task_pool
                 .receiver
-                .recv_timeout(test_utils::wait::ceiling(std::time::Duration::from_secs(20)))
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(20)))
                 .expect("the first scope build finishes");
             if matches!(task, crate::global_state::Task::AnalysisScopeReady { .. }) {
                 handle_task(&mut state, task).unwrap();

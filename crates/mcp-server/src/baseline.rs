@@ -2331,7 +2331,7 @@ mod tests {
         // The adapter's r2d2 pool retries failed connects until its 5s connection_timeout;
         // allow that configured bound plus worker scheduling, not an arbitrary longer wait.
         let deadline =
-            std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(8));
+            std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(8));
         let mut accepted = 0;
         let mut protocol_error = None;
         while std::time::Instant::now() < deadline && deferred.view().pending {
@@ -2392,7 +2392,7 @@ mod tests {
 
         let waiter = deferred.clone();
         let handle = std::thread::spawn(move || {
-            waiter.wait_ready(crate::change_hub::test_support::STATE_CEILING)
+            waiter.wait_ready(test_utils::wait::hang_guard(Duration::from_secs(60)))
         });
         deferred.publish(BaselineRuntime {
             configured_baseline: ConfiguredBaselineStatus {
@@ -2403,7 +2403,10 @@ mod tests {
             },
             external_baseline: None,
         });
-        assert!(handle.join().unwrap(), "publish must wake the condvar waiter");
+        assert!(
+            crate::test_wait::join(handle, "published baseline slot wakes waiter").unwrap(),
+            "publish must wake the condvar waiter"
+        );
         let view = deferred.view();
         assert!(!view.pending);
         assert_eq!(view.configured.map(|status| status.backend), Some("postgres"));
@@ -2411,26 +2414,26 @@ mod tests {
 
     #[test]
     fn deferred_slot_shutdown_ends_a_pending_wait() {
-        // The waiter's budget runs out with the same `false` a wake produces, so it gets a budget
-        // no run reaches: a waiter that comes back at all was ended by the shutdown, whether it
-        // had parked before it or not.
+        // A budget expiry also returns false, so only the outer completion guard may expire.
+        // Missing the shutdown wake must fail the test rather than imitate a closed slot.
         let deferred = DeferredBaselineRuntime::pending_for_test();
         let waiter = deferred.clone();
         let handle = std::thread::spawn(move || waiter.wait_ready(test_utils::wait::NO_BOUND));
 
         deferred.shutdown();
 
-        assert!(!handle.join().unwrap(), "a shut-down slot never becomes ready");
+        assert!(
+            !crate::test_wait::join(handle, "shutdown wakes baseline waiter").unwrap(),
+            "a shut-down slot never becomes ready"
+        );
     }
 
     #[test]
     #[ignore = "необязательный тест: the waiter must wake within a wall-clock bound; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test -p mcp-server --lib baseline::tests::deferred_slot_shutdown_wakes_a_pending_waiter -- --exact --ignored"]
     fn deferred_slot_shutdown_wakes_a_pending_waiter() {
         // The waiter's budget runs out with the same `false` a wake produces. An ordinary run
-        // gives it a budget no run reaches, so a waiter that comes back at all was woken; under
-        // `timing_contract` the budget is the shared ceiling, and half of it is a bound that
-        // catches a waiter left to time out and that no slow machine comes near.
-        const BUDGET: Duration = crate::change_hub::test_support::STATE_CEILING;
+        // gives it the same sixty-second timing bound and a ten-minute hang guard otherwise.
+        const BUDGET: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
         let deferred = DeferredBaselineRuntime::pending_for_test();
         let waiter = deferred.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2456,7 +2459,7 @@ mod tests {
             },
             external_baseline: None,
         });
-        handle.join().unwrap();
+        crate::test_wait::join(handle, "shutdown waiter reports its result").unwrap();
 
         assert!(!result.expect("the shutdown left the waiter to its budget"));
         if cfg!(timing_contract) {
@@ -3028,7 +3031,9 @@ mod tests {
                             // Held until the test has seen shutdown return: the resolve is
                             // still running when it does, and a shutdown that waited for it
                             // would never return here.
-                            let _ = gate_rx.recv();
+                            let _ = gate_rx.recv_timeout(test_utils::wait::hang_guard(
+                                Duration::from_secs(60),
+                            ));
                             let _ = reply.send(Ok(None));
                         }
                         BaselineRequestKind::Shutdown { reply } => {
@@ -3071,7 +3076,7 @@ mod tests {
             let _ = probe_service.resolve_snapshot(&uncancellable());
         });
         entered_rx
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
             .expect("the resolve reached the worker");
 
         let shutdown_service = Arc::clone(&service);
@@ -3084,7 +3089,7 @@ mod tests {
         // shutdown has returned, so a shutdown that waited for the resolve never returns and
         // the bound, a hang watchdog, runs out.
         assert!(
-            shut_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
+            shut_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))).is_ok(),
             "shutdown waited for a resolve that was still blocked"
         );
         gate_tx.send(()).unwrap();
@@ -3097,7 +3102,7 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        probe_thread.join().unwrap();
+        crate::test_wait::join(probe_thread, "baseline resolve exits after release").unwrap();
     }
 
     fn unreachable_workspace_service() -> Arc<ExternalBaselineService> {
@@ -3342,7 +3347,8 @@ mod tests {
                 match kind {
                     BaselineRequestKind::LexicalSearch { query, reply, .. } => {
                         // Every lexical query is latched until the test releases it.
-                        release_rx.recv().ok();
+                        let _ = release_rx
+                            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)));
                         executed.lock().unwrap().push(query.clone());
                         let _ = reply.send(Ok(vec![]));
                     }
@@ -3363,9 +3369,9 @@ mod tests {
                 service.lexical_search(&uncancellable(), "snap", "first", None, 5)
             })
         };
-        while started.load(Ordering::SeqCst) < 1 {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        crate::test_wait::wait_until("the first baseline request starts", || {
+            started.load(Ordering::SeqCst) >= 1
+        });
 
         // B: queued behind A, then cancelled while it waits.
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -3386,10 +3392,9 @@ mod tests {
         }
         cancel.cancel();
         // A stays latched until B is back, so a B that waits for A's latched query instead of
-        // its own cancellation never comes back: the run hangs, and under `timing_contract`
-        // the watchdog fails it.
+        // its own cancellation never comes back: the hang guard fails the test.
         let (out, waited) = second_rx
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
             .expect("B never came back from its wait");
         assert!(matches!(out, Err(super::BaselineCall::Withdrawn)), "B must withdraw");
         if cfg!(timing_contract) {
@@ -3406,7 +3411,7 @@ mod tests {
 
         // Release A: it answers, and the worker moves on to B's request — and skips it.
         release_tx.send(()).unwrap();
-        let first = first.join().unwrap();
+        let first = crate::test_wait::join(first, "released baseline query returns").unwrap();
         assert!(
             matches!(first, Ok(ref hits) if hits.is_empty()),
             "A's answer is untouched: {first:?}"

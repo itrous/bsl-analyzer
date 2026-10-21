@@ -462,24 +462,54 @@ mod tests {
         let source = expected.clone();
         let writer = tokio::spawn(async move { client_io.write_all(&source).await.unwrap() });
         let mut actual = vec![0; expected.len()];
-        server.io.read_exact(&mut actual).await.unwrap();
-        writer.await.unwrap();
+        tokio::time::timeout(
+            test_utils::wait::hang_guard(Duration::from_secs(10)),
+            server.io.read_exact(&mut actual),
+        )
+        .await
+        .expect("chunked data reaches the reader before the hang guard")
+        .unwrap();
+        tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(10)), writer)
+            .await
+            .expect("chunk writer finishes before the hang guard")
+            .unwrap();
         assert_eq!(actual, expected);
 
-        server
-            .send_control(LspControl::ScopeRetired { epoch: 17, reason: "scope".into() })
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
+            server.send_control(LspControl::ScopeRetired { epoch: 17, reason: "scope".into() }),
+        )
+        .await
+        .expect("scope-retired control send is bounded")
+        .unwrap();
+        let control = tokio::time::timeout(
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
+            client_controls.recv(),
+        )
+        .await
+        .expect("scope-retired control reaches the peer");
         assert!(matches!(
-            client_controls.recv().await,
+            control,
             Some(LspControl::ScopeRetired { epoch: 17, reason }) if reason == "scope"
         ));
 
         let resume = vec![0x3c; MAX_DATA_CHUNK * 7 + 3];
         let expected_resume = resume.clone();
-        server.send_control(LspControl::ResumeLsp(resume)).await.unwrap();
+        tokio::time::timeout(
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
+            server.send_control(LspControl::ResumeLsp(resume)),
+        )
+        .await
+        .expect("resume control send is bounded")
+        .unwrap();
+        let control = tokio::time::timeout(
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
+            client_controls.recv(),
+        )
+        .await
+        .expect("resume control reaches the peer");
         assert!(matches!(
-            client_controls.recv().await,
+            control,
             Some(LspControl::ResumeLsp(context)) if context == expected_resume
         ));
     }
@@ -494,7 +524,7 @@ mod tests {
         drop(channel);
 
         let (kind, payload) = tokio::time::timeout(
-            test_utils::wait::ceiling(Duration::from_secs(2)),
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
             read_frame(&mut peer),
         )
         .await
@@ -504,7 +534,7 @@ mod tests {
         assert_eq!(payload, response);
         assert_eq!(
             tokio::time::timeout(
-                test_utils::wait::ceiling(Duration::from_secs(2)),
+                test_utils::wait::hang_guard(Duration::from_secs(2)),
                 read_frame(&mut peer)
             )
             .await
@@ -535,14 +565,14 @@ mod tests {
         let context = vec![0x2a; MAX_DATA_CHUNK + 7];
         let expected = context.clone();
         tokio::time::timeout(
-            test_utils::wait::ceiling(Duration::from_secs(2)),
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
             client_controls.send(LspControl::ResumeLsp(context)),
         )
         .await
         .unwrap()
         .unwrap();
         let control = tokio::time::timeout(
-            test_utils::wait::ceiling(Duration::from_secs(2)),
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
             server_controls.recv(),
         )
         .await
@@ -551,8 +581,11 @@ mod tests {
         assert!(!producer.is_finished(), "producer should still be writing when control arrives");
 
         producer.abort();
-        let _ = producer.await;
-        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(2)), drain)
+        let _ =
+            tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(2)), producer)
+                .await
+                .expect("aborted producer stops");
+        tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(2)), drain)
             .await
             .unwrap()
             .unwrap();

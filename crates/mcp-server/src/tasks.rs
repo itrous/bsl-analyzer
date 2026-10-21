@@ -506,7 +506,7 @@ mod tests {
         });
 
         tokio::time::timeout(
-            crate::change_hub::test_support::STATE_CEILING,
+            test_utils::wait::hang_guard(Duration::from_secs(60)),
             wait_for_terminal(&manager, &task.task_id),
         )
         .await
@@ -536,7 +536,7 @@ mod tests {
         });
 
         tokio::time::timeout(
-            crate::change_hub::test_support::STATE_CEILING,
+            test_utils::wait::hang_guard(Duration::from_secs(60)),
             wait_for_terminal(&manager, &task.task_id),
         )
         .await
@@ -568,12 +568,10 @@ mod tests {
     /// a runtime that always has this task to run is never idle. Bounded in REAL time, as a hang
     /// guard only: nothing is decided by how long this takes.
     async fn yield_until(what: &str, mut done: impl FnMut() -> bool) {
-        let mut patience = crate::change_hub::test_support::Patience::new(
-            crate::change_hub::test_support::STATE_CEILING,
-            Duration::from_micros(100),
-        );
+        let deadline =
+            std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
         while !done() {
-            assert!(patience.allows(), "never happened: {what}");
+            assert!(std::time::Instant::now() < deadline, "never happened: {what}");
             tokio::task::yield_now().await;
             std::thread::sleep(Duration::from_micros(100));
         }
@@ -598,7 +596,8 @@ mod tests {
                 move |_session| {
                     let _ = entered_tx.send(());
                     // Bounded in real time, so a stand that fails cannot strand the thread.
-                    let _ = answer_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
+                    let _ = answer_rx
+                        .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)));
                     Ok(CallToolResult::success(vec![]))
                 },
                 || CallToolResult::success(vec![]),
@@ -647,7 +646,7 @@ mod tests {
                     UNREACHABLE_DEADLINE,
                     move |_session| {
                         body_entered.store(true, Ordering::SeqCst);
-                        held.recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+                        held.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
                             .expect("the driver releases the finishing body");
                         Ok(answer)
                     },
@@ -894,7 +893,7 @@ mod tests {
         });
 
         tokio::time::timeout(
-            crate::change_hub::test_support::STATE_CEILING,
+            test_utils::wait::hang_guard(Duration::from_secs(60)),
             wait_for_terminal(&manager, &task.task_id),
         )
         .await
@@ -944,7 +943,8 @@ mod tests {
         // The task's age is read before the resident's, so an unmarked resident, last used
         // before the spawn, always reads older than the task however slowly this loop runs.
         // The task marks the resident on its first pass, so yielding to it is all the wait.
-        let deadline = std::time::Instant::now() + crate::change_hub::test_support::STATE_CEILING;
+        let deadline =
+            std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
         loop {
             let waiting_for = spawned.elapsed();
             let idle = diag.access_age();

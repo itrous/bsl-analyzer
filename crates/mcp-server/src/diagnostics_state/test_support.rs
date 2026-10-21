@@ -167,12 +167,8 @@ pub(crate) fn workspace_with_a_nested_configuration() -> (tempfile::TempDir, Pat
     (dir, workspace)
 }
 
-/// Потолок любого ожидания в тестовом харнессе под `timing_contract`.
-///
-/// Щедрый намеренно: под нагрузкой и сборка резидента, и доставка событий
-/// растягиваются, а в зелёном прогоне большой потолок не стоит ничего — срок
-/// расходуется только там, где ожидаемое так и не наступило. Обычный прогон потолка
-/// не ставит: ожидание кончается наступлением события (см. [`test_utils::wait`]).
+/// Номинальный бюджет ожиданий тестового harness; обычный профиль применяет к нему
+/// конечный `hang_guard`, а `timing_contract` использует его как временную границу.
 fn wait_budget() -> Duration {
     std::env::var("BSL_TEST_WAIT_SECS")
         .ok()
@@ -180,32 +176,32 @@ fn wait_budget() -> Duration {
         .map_or(Duration::from_secs(30), Duration::from_secs)
 }
 
-/// Ждать наступления события, отсчитывая опросы, а не часы.
+/// Ждать наступления события до конечного wall-clock deadline.
 ///
-/// Под `timing_contract` бюджет задан числом опросов с шагом 10 мс: под нагрузкой каждый
-/// опрос растягивается, и то же число опросов покрывает ту же работу, а не выходит из срока
-/// раньше времени. Обычный прогон опрашивает, пока проба не даст результат. Проба возвращает
-/// либо результат, либо наблюдение, объясняющее, почему ещё рано; исчерпав бюджет, помощник
-/// называет предмет ожидания, последнее наблюдение и потраченное время.
+/// Шаг опроса задаёт частоту проб, а `hang_guard` сохраняет указанный срок под
+/// `timing_contract` и даёт обычному прогону конечный guard, не зависящий от числа опросов.
+/// Проба возвращает либо результат, либо наблюдение, объясняющее, почему ещё рано; после
+/// истечения срока помощник называет предмет ожидания, последнее наблюдение и потраченное время.
 pub(crate) fn wait_until<T, S: std::fmt::Debug>(
     what: &str,
     mut probe: impl FnMut() -> Result<T, S>,
 ) -> T {
     let started = std::time::Instant::now();
-    let polls = test_utils::wait::polls(wait_budget(), Duration::from_millis(10));
+    let budget = test_utils::wait::hang_guard(wait_budget());
+    let budget =
+        if cfg!(timing_contract) { budget.min(Duration::from_secs(20 * 60)) } else { budget };
+    let deadline = started.checked_add(budget).expect("diagnostics wait budget fits Instant");
     let mut observation = match probe() {
         Ok(value) => return value,
         Err(observation) => observation,
     };
     let mut spent = 0;
-    for _ in 0..polls {
-        if cfg!(timing_contract) && started.elapsed() > Duration::from_secs(20 * 60) {
-            panic!(
-                "{what}: not satisfied in {:?}, past the wall-clock backstop; last observation {observation:?}",
-                started.elapsed()
-            );
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10).min(remaining));
         spent += 1;
         observation = match probe() {
             Ok(value) => return value,

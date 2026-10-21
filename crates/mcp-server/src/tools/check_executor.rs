@@ -1589,7 +1589,7 @@ if mode == 'exit1': sys.exit(1)
         assert_eq!(semaphore.available_permits(), 0, "permit remains held while child is unreaped");
         // SAFETY: this test resumes cleanup of the same owned child.
         assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(2)), async {
             while semaphore.available_permits() == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

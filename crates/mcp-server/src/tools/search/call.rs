@@ -102,19 +102,27 @@ mod tests {
         let (stored_tx, stored_rx) = std::sync::mpsc::channel::<()>();
         let probe = Arc::clone(&seen);
         let call = search_call(ct.clone(), move |cancel| {
-            release_rx.recv().ok();
+            let _ = release_rx
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(60)));
             probe.store(usize::from(cancel.is_cancelled()) + 1, Ordering::SeqCst);
             let _ = stored_tx.send(());
             Err(SearchFailure::Cancelled)
         });
         tokio::pin!(call);
         ct.cancel();
-        let out = (&mut call).await;
+        // Keep this on an unpaused runtime: the body runs on `spawn_blocking`, so Tokio's
+        // paused-time auto-advance could expire the async guard before that thread runs.
+        let out = tokio::time::timeout(
+            test_utils::wait::hang_guard(std::time::Duration::from_secs(60)),
+            &mut call,
+        )
+        .await
+        .expect("cancelled search returns within the hang guard");
         assert!(matches!(out, CallOutcome::Cancelled));
         release_tx.send(()).unwrap();
         // The detached body runs on; wait until it has recorded what it saw.
         stored_rx
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(60)))
             .expect("the detached body never recorded what it saw");
         assert_eq!(seen.load(Ordering::SeqCst), 2, "the body must see the request's cancel");
     }
