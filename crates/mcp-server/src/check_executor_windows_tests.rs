@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 const FAKE_EXECUTOR: &str = r#"
 import ctypes, json, os, subprocess, sys, time
 mode, marker = sys.argv[1:3]
+time.sleep(float(os.environ.get('BSL_DIAG_STARTUP_DELAY', '0')))
 kernel = ctypes.WinDLL('kernel32', use_last_error=True)
 kernel.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
 kernel.IsProcessInJob.restype = ctypes.c_int
@@ -119,6 +120,13 @@ fn fake(temp: &tempfile::TempDir) -> PathBuf {
 }
 
 async fn wait_for_file(path: &Path) -> bool {
+    let started = std::time::Instant::now();
+    let found = wait_for_file_inner(path).await;
+    eprintln!("DIAG marker {} found={found} after {:?}", path.display(), started.elapsed());
+    found
+}
+
+async fn wait_for_file_inner(path: &Path) -> bool {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -284,6 +292,7 @@ async fn queued_cancellation_does_not_spawn_the_executor() {
 async fn valid_bad_wire_nonzero_exit_and_output_limit_keep_caller_priority() {
     let temp = tempfile::tempdir().unwrap();
     let script = fake(&temp);
+    let valid_started = std::time::Instant::now();
     let valid = check(
         &profile(&script, "valid", &temp.path().join("valid")),
         "windows-test",
@@ -295,10 +304,14 @@ async fn valid_bad_wire_nonzero_exit_and_output_limit_keep_caller_priority() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        serde_json::from_value::<CheckResponse>(valid.structured_content.unwrap()).unwrap().status,
-        Status::Valid
+    let valid = serde_json::from_value::<CheckResponse>(valid.structured_content.unwrap()).unwrap();
+    eprintln!(
+        "DIAG valid status={:?} failure={:?} after {:?}",
+        valid.status,
+        valid.failure.as_ref().map(|failure| failure.code.clone()),
+        valid_started.elapsed()
     );
+    assert_eq!(valid.status, Status::Valid, "failure={:?}", valid.failure.map(|failure| failure.code));
 
     for (mode, limit, expected) in [
         ("malformed", 16 * 1024, "transport_malformed_response"),
