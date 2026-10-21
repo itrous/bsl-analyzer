@@ -224,17 +224,21 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
 }
 
 fn select_both(root: &std::path::Path) {
-    std::fs::write(
-        root.join("bsl-analyzer.toml"),
-        r#"[source]
+    // Rebind reads the config more than once; never expose a truncated TOML that
+    // describes a different source topology between cache scope validations.
+    let mut replacement = tempfile::NamedTempFile::new_in(root).unwrap();
+    replacement
+        .write_all(
+            br#"[source]
 root = "src/cf"
 extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }]
 [diagnostics.baseline]
 directory = "baselines"
 include = ["main", "extension:Ext"]
 "#,
-    )
-    .unwrap();
+        )
+        .unwrap();
+    replacement.persist(root.join("bsl-analyzer.toml")).unwrap();
 }
 
 #[test]
