@@ -4638,9 +4638,12 @@ mod tests {
         command.process_group(0).arg("-c").arg(body);
         let mut leader = command.spawn().unwrap();
         let pid = leader.id();
-        super::super::tests::wait_until_sync("unverified process-group fixture", || {
-            ready.is_file()
-        });
+        super::super::tests::wait_until_sync(
+            "unverified process-group fixture",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(5),
+            || ready.is_file(),
+        );
         let ready_seen = ready.is_file();
         let start_time = fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
@@ -4675,10 +4678,15 @@ mod tests {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }
         }
-        super::super::tests::wait_until_sync("killed unverified process group", || unsafe {
-            libc::kill(-(pid as i32), 0) != 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        });
+        super::super::tests::wait_until_sync(
+            "killed unverified process group",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(10),
+            || unsafe {
+                libc::kill(-(pid as i32), 0) != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            },
+        );
         assert!(ready_seen);
         assert_eq!(recovery, Err(NativeProfileError::CleanupFailed));
         assert!(descendant_survived, "recovery killed an unverified surviving process group");
@@ -4722,9 +4730,12 @@ mod tests {
         command.current_dir(&attempt).process_group(0).arg("-c").arg(body);
         let mut leader = command.spawn().unwrap();
         let pgid = leader.id();
-        super::super::tests::wait_until_sync("leaderless process-group fixture", || {
-            ready.is_file()
-        });
+        super::super::tests::wait_until_sync(
+            "leaderless process-group fixture",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(5),
+            || ready.is_file(),
+        );
         assert!(ready.is_file());
         let start_time = fs::read_to_string(format!("/proc/{pgid}/stat"))
             .ok()

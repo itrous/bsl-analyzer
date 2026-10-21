@@ -377,6 +377,7 @@ mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    use std::time::Duration;
 
     #[test]
     fn listener_path_active_reads_path_after_inode_column() {
@@ -418,7 +419,12 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let pid = child.id();
-        super::super::tests::wait_until_sync("fake X server socket", || socket.exists());
+        super::super::tests::wait_until_sync(
+            "fake X server socket",
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            || socket.exists(),
+        );
         assert!(
             socket.exists(),
             "fake X server did not create its pathname socket: {:?}",
@@ -468,7 +474,12 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let pid = child.id();
-        super::super::tests::wait_until_sync("fake X server socket", || socket.exists());
+        super::super::tests::wait_until_sync(
+            "fake X server socket",
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            || socket.exists(),
+        );
         assert!(
             socket.exists(),
             "fake X server did not create its pathname socket: {:?}",
@@ -491,9 +502,12 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        super::super::tests::wait_until_sync("replacement fake X server listener", || {
-            listener_exists(&root, display).unwrap_or(false)
-        });
+        super::super::tests::wait_until_sync(
+            "replacement fake X server listener",
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            || listener_exists(&root, display).unwrap_or(false),
+        );
         assert!(listener_exists(&root, display).unwrap());
         assert!(owner.cleanup().is_err());
         unsafe {
@@ -549,12 +563,17 @@ mod tests {
         let child = Command::new("true").process_group(0).spawn().unwrap();
         let pid = child.id();
         // Keep the completed child unreaped so cleanup observes its zombie identity.
-        super::super::tests::wait_until_sync("test child exit", || {
-            fs::read_to_string(format!("/proc/{pid}/stat")).ok().is_some_and(|stat| {
-                let close = stat.rfind(')').unwrap_or(0);
-                stat[close.saturating_add(1)..].split_whitespace().next() == Some("Z")
-            })
-        });
+        super::super::tests::wait_until_sync(
+            "test child exit",
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+            || {
+                fs::read_to_string(format!("/proc/{pid}/stat")).ok().is_some_and(|stat| {
+                    let close = stat.rfind(')').unwrap_or(0);
+                    stat[close.saturating_add(1)..].split_whitespace().next() == Some("Z")
+                })
+            },
+        );
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let waited = unsafe {
             libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT | libc::WNOHANG)

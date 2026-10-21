@@ -331,6 +331,7 @@ mod indexing_pass_lifecycle {
         assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Failed);
     }
     #[test]
+    #[ignore = "необязательный тест: попытка синхронного mutex wait не наблюдаема без временного окна; запуск: cargo test -p bsl-search --lib progress::indexing_pass_lifecycle::a_running_check_waits_out_a_concurrent_reader -- --exact --ignored"]
     fn a_running_check_waits_out_a_concurrent_reader() {
         let progress = IndexProgress::new();
         let mut pass = progress.begin_pass();

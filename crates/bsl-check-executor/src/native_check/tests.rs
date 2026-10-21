@@ -1,8 +1,11 @@
 use super::*;
 use std::future::Future;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Child, ExitStatus};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 pub(super) const HANG_GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
@@ -12,14 +15,20 @@ pub(super) async fn guard_future<F: Future>(future: F, description: &'static str
         .unwrap_or_else(|_| panic!("timed out waiting for {description}"))
 }
 
-pub(super) async fn wait_until(description: &'static str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + HANG_GUARD;
+#[cfg(unix)]
+pub(super) async fn wait_until(
+    description: &'static str,
+    bound: Duration,
+    mut condition: impl FnMut() -> bool,
+) {
+    let deadline = Instant::now() + test_utils::wait::hang_guard(bound);
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {description}");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
+#[cfg(unix)]
 pub(super) async fn guard_task<T: Send + 'static>(
     mut task: tokio::task::JoinHandle<T>,
     description: &'static str,
@@ -34,14 +43,20 @@ pub(super) async fn guard_task<T: Send + 'static>(
     }
 }
 
-pub(super) fn wait_until_sync(description: &'static str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + HANG_GUARD;
-    while !condition() {
-        assert!(Instant::now() < deadline, "timed out waiting for {description}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+#[cfg(target_os = "linux")]
+pub(super) fn wait_until_sync(
+    description: &'static str,
+    bound: Duration,
+    step: Duration,
+    condition: impl FnMut() -> bool,
+) {
+    assert!(
+        test_utils::wait::poll_until(bound, step, condition),
+        "timed out waiting for {description}"
+    );
 }
 
+#[cfg(unix)]
 pub(super) fn wait_child(
     mut child: Child,
     description: &'static str,

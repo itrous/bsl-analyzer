@@ -183,6 +183,7 @@ fn server(
                     Err(error) => panic!("fake embedding server accept failed: {error}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             let io_timeout = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!io_timeout.is_zero(), "fake embedding server timed out");
             stream.set_read_timeout(Some(io_timeout)).unwrap();
@@ -1331,6 +1332,7 @@ fn vector_lifecycle_full_index_that_skipped_a_rejected_file_is_failed() {
                 Err(error) => panic!("refusal server accept failed: {error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         let io_timeout = deadline.saturating_duration_since(std::time::Instant::now());
         assert!(!io_timeout.is_zero(), "refusal request timed out");
         stream.set_read_timeout(Some(io_timeout)).unwrap();

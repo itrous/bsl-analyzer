@@ -1667,8 +1667,12 @@ mod tests {
             )
             .await
         });
-        super::super::tests::wait_until("owned process-group child startup", || ready.is_file())
-            .await;
+        super::super::tests::wait_until(
+            "owned process-group child startup",
+            Duration::from_secs(60),
+            || ready.is_file(),
+        )
+        .await;
         cancel.cancel();
 
         let output =
@@ -1842,9 +1846,11 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ProcessFailure::Spawn)));
-        super::super::tests::wait_until("spawn-failure process cleanup", || {
-            !has_live_process_in(directory.path())
-        })
+        super::super::tests::wait_until(
+            "spawn-failure process cleanup",
+            Duration::from_secs(60),
+            || !has_live_process_in(directory.path()),
+        )
         .await;
         assert!(!sentinel.exists(), "early return left a child in the private process group");
     }
@@ -1875,15 +1881,23 @@ mod tests {
             )
             .await
         });
-        super::super::tests::wait_until("TERM-cooperative descendant startup", || ready.is_file())
-            .await;
+        super::super::tests::wait_until(
+            "TERM-cooperative descendant startup",
+            Duration::from_secs(3),
+            || ready.is_file(),
+        )
+        .await;
         task.abort();
         let joined = tokio::time::timeout(super::super::tests::HANG_GUARD, task)
             .await
             .expect("aborted process supervisor must finish");
         assert!(joined.is_err(), "aborted process supervisor must report cancellation");
-        super::super::tests::wait_until("TERM-cooperative child cleanup", || sentinel.exists())
-            .await;
+        super::super::tests::wait_until(
+            "TERM-cooperative child cleanup",
+            Duration::from_secs(1),
+            || sentinel.exists(),
+        )
+        .await;
     }
 
     #[test]

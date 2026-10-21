@@ -581,9 +581,10 @@ mod tests {
         assert!(!producer.is_finished(), "producer should still be writing when control arrives");
 
         producer.abort();
-        tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(2)), producer)
-            .await
-            .expect("aborted producer stops");
+        let _ =
+            tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(2)), producer)
+                .await
+                .expect("aborted producer stops");
         tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(2)), drain)
             .await
             .unwrap()

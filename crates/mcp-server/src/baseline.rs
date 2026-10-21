@@ -2414,13 +2414,11 @@ mod tests {
 
     #[test]
     fn deferred_slot_shutdown_ends_a_pending_wait() {
-        // The shutdown should wake the waiter immediately; the finite budget is only a backstop
-        // if the notification is lost.
+        // A budget expiry also returns false, so only the outer completion guard may expire.
+        // Missing the shutdown wake must fail the test rather than imitate a closed slot.
         let deferred = DeferredBaselineRuntime::pending_for_test();
         let waiter = deferred.clone();
-        let handle = std::thread::spawn(move || {
-            waiter.wait_ready(test_utils::wait::hang_guard(Duration::from_secs(60)))
-        });
+        let handle = std::thread::spawn(move || waiter.wait_ready(test_utils::wait::NO_BOUND));
 
         deferred.shutdown();
 
