@@ -27,6 +27,8 @@ pub mod project;
 mod serve_stream_tests;
 mod state;
 mod tasks;
+#[cfg(test)]
+mod test_wait;
 mod tools;
 #[cfg(test)]
 mod walk_probe;
@@ -3729,9 +3731,10 @@ mod tests {
         call: impl std::future::Future<Output = T>,
     ) -> T {
         let started = std::time::Instant::now();
-        let answer = tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, call)
-            .await
-            .unwrap_or_else(|_| panic!("{what} must not wait for the lease lock"));
+        let answer =
+            tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(60)), call)
+                .await
+                .unwrap_or_else(|_| panic!("{what} must not wait for the lease lock"));
         if cfg!(timing_contract) {
             let waited = started.elapsed();
             assert!(waited < HANG_GUARD, "{what} answered only after {waited:?}");
@@ -4033,10 +4036,11 @@ mod graph_supersession_contract {
         // the release — slower, not stuck. The bound below is only a hang guard, not the
         // discriminator: a budget in the hundreds of milliseconds measured the runtime's
         // scheduling as much as the handler, and a loaded suite fails it for neither reason.
-        let answer = tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, call)
-            .await
-            .expect("the handler never answered while the lease lock was held")
-            .expect("the handler did not panic");
+        let answer =
+            tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(60)), call)
+                .await
+                .expect("the handler never answered while the lease lock was held")
+                .expect("the handler did not panic");
         assert!(answer.structured_content.is_some());
         // The discriminator, which no clock can make untrue: the handler took neither of the two
         // lease paths that note the thread asking — an ownership check or a publication fence.
@@ -4051,7 +4055,7 @@ mod graph_supersession_contract {
 
         drop(held);
         release_the_lock.send(()).expect("the lock holder is still there to be released");
-        lock.join().unwrap();
+        crate::test_wait::join(lock, "lease lock holder exits").unwrap();
         server.shutdown();
     }
 
@@ -4252,11 +4256,13 @@ mod graph_supersession_contract {
                         server.graph(asked, tokio_util::sync::CancellationToken::new()).await
                     })
                 };
-                let answered =
-                    tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, calling)
-                        .await
-                        .unwrap_or_else(|_| panic!("{what}: graph {action} never came back"))
-                        .expect("the request task did not panic");
+                let answered = tokio::time::timeout(
+                    test_utils::wait::hang_guard(Duration::from_secs(60)),
+                    calling,
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{what}: graph {action} never came back"))
+                .expect("the request task did not panic");
                 // A failed graph answers some actions with an error, and that IS the answer:
                 // what this test is about is the thread it came back on, not its shape.
                 let _ = answered;
@@ -4321,7 +4327,7 @@ mod graph_supersession_contract {
             })
         };
         let body = answered(
-            tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, asked)
+            tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(60)), asked)
                 .await
                 .expect("the status request waited on the claim this test holds the lock against")
                 .expect("the status task did not panic"),
@@ -4338,7 +4344,7 @@ mod graph_supersession_contract {
         // And the control: once the lock is free and a background check has run, the field is
         // there — the absence above is the unknown window, not the field going away.
         release_the_lock.send(()).expect("the lock holder is still there to be released");
-        lock.join().unwrap();
+        crate::test_wait::join(lock, "lease lock holder exits").unwrap();
         assert!(
             crate::change_hub::test_support::eventually(|| state.ownership_verdict_established()),
             "no background check ever established the verdict",
@@ -4412,17 +4418,18 @@ mod graph_supersession_contract {
                     .expect("status answers whatever the background is doing")
             })
         };
-        let answer = tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, asked)
-            .await
-            .expect("the status request queued behind the background ownership check")
-            .expect("the status task did not panic");
+        let answer =
+            tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(60)), asked)
+                .await
+                .expect("the status request queued behind the background ownership check")
+                .expect("the status task did not panic");
         assert!(matches!(answer, rmcp::model::CallToolResponse::Complete(_)));
         let strangers = lease_reads_off_the_owners(&state, before);
         assert!(strangers.is_empty(), "the status request went to the lease: {strangers:?}");
 
         release_the_lock.send(()).expect("the lock holder is still there to be released");
-        lock.join().unwrap();
-        let _ = checking.join();
+        crate::test_wait::join(lock, "lease lock holder exits").unwrap();
+        let _ = crate::test_wait::join(checking, "background ownership check finishes");
         server.shutdown();
     }
 
@@ -4473,12 +4480,12 @@ mod graph_supersession_contract {
         let before = state.lease_disk_check_threads().len();
         for _ in 0..2 {
             let state = state.clone();
-            std::thread::Builder::new()
+            let check = std::thread::Builder::new()
                 .name("bsl-cache-lease".to_owned())
                 .spawn(move || state.owns_caches())
-                .expect("the background check starts")
-                .join()
-                .expect("the background check returns");
+                .expect("the background check starts");
+            crate::test_wait::join(check, "background ownership check returns")
+                .expect("the background check did not panic");
         }
         let attempted: Vec<String> = state
             .lease_disk_check_threads()
@@ -4503,7 +4510,7 @@ mod graph_supersession_contract {
 
         // And the transition out of unknown, once a check can actually answer.
         release_the_lock.send(()).expect("the lock holder is still there to be released");
-        lock.join().unwrap();
+        crate::test_wait::join(lock, "lease lock holder exits").unwrap();
         assert!(
             crate::change_hub::test_support::eventually(|| state.ownership_verdict_established()),
             "no background check ever established the verdict",
@@ -4579,12 +4586,12 @@ mod graph_supersession_contract {
         );
         let refreshed = {
             let state = state.clone();
-            std::thread::Builder::new()
+            let check = std::thread::Builder::new()
                 .name("bsl-graph-reload".to_owned())
                 .spawn(move || state.refresh_ownership_now())
-                .expect("the background check starts")
-                .join()
-                .expect("the background check returns")
+                .expect("the background check starts");
+            crate::test_wait::join(check, "background ownership check returns")
+                .expect("the background check did not panic")
         };
         assert!(
             !refreshed,
@@ -4610,7 +4617,7 @@ mod graph_supersession_contract {
             "a refresh that answered nothing replaced the verdict a check established: {body}",
         );
         release_the_lock.send(()).expect("the lock holder is still there to be released");
-        lock.join().unwrap();
+        crate::test_wait::join(lock, "lease lock holder exits").unwrap();
         server.shutdown();
     }
 
@@ -4652,10 +4659,11 @@ mod graph_supersession_contract {
         };
         // The lock stays held until after the answer, so a request that waited on it never
         // answers and the shared watchdog runs out.
-        let answer = tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, asked)
-            .await
-            .expect("the status request waited on the held lease lock")
-            .expect("the status task did not panic");
+        let answer =
+            tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(60)), asked)
+                .await
+                .expect("the status request waited on the held lease lock")
+                .expect("the status task did not panic");
         let waited = started.elapsed();
         assert!(matches!(answer, rmcp::model::CallToolResponse::Complete(_)));
         if cfg!(timing_contract) {
@@ -4671,7 +4679,7 @@ mod graph_supersession_contract {
         );
 
         release_the_lock.send(()).expect("the lock holder is still there to be released");
-        lock.join().unwrap();
+        crate::test_wait::join(lock, "lease lock holder exits").unwrap();
         server.shutdown();
     }
 
@@ -4894,7 +4902,7 @@ mod graph_supersession_contract {
         // installed. The subsequent tool assertions then compare each service to its own
         // coherent resident snapshot during graph reload.
         let resident_deadline =
-            std::time::Instant::now() + crate::change_hub::test_support::STATE_CEILING;
+            std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
         let shifted_resident = loop {
             let observed = diagnostics.read(|resident, _| {
                 let file_id = resident.file_id_for(&changed_path).expect("resident module");
@@ -5645,6 +5653,7 @@ mod tool_descriptions {
 #[cfg(test)]
 mod resolve_envelope {
     use super::*;
+    use std::time::Duration;
 
     fn resolve_params(query: &str) -> Parameters<GraphParams> {
         Parameters(GraphParams {
@@ -5790,7 +5799,8 @@ mod resolve_envelope {
             crate::graph::GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
                 .with_build_candidate_hook_for_test(std::sync::Arc::new(move |_| {
                     entered_tx.send(()).expect("test is waiting for the producer boundary");
-                    release_rx.lock().unwrap().recv().expect("test releases the producer boundary");
+                    let release = release_rx.lock().unwrap();
+                    crate::test_wait::recv(&release, "test releases the producer boundary");
                 }));
 
         let (state, _old_graph_hold) = crate::graph::test_support::holding_the_first_build(|| {
@@ -5805,7 +5815,7 @@ mod resolve_envelope {
         graph.ensure_loading();
 
         entered_rx
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
             .expect("real graph producer reached the post-persistence boundary");
         assert_eq!(graph.status(), crate::graph::GraphStatus::Loading);
         assert!(!graph.has_installed_snapshot());
@@ -6109,6 +6119,7 @@ mod rescan_hatch_consultations {
 mod search_cancellation_matrix {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     fn cancelled_token() -> tokio_util::sync::CancellationToken {
         let token = tokio_util::sync::CancellationToken::new();
@@ -6126,9 +6137,15 @@ mod search_cancellation_matrix {
         std::thread::spawn(move || {
             let _guard = engine.lock().unwrap();
             let _ = held_tx.send(());
-            let _ = release_rx.recv();
+            assert!(
+                !matches!(
+                    release_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "hang guard: search lock holder was not released"
+            );
         });
-        held_rx.recv().expect("the holder took the lock");
+        crate::test_wait::recv(&held_rx, "search lock holder takes the lock");
         release_tx
     }
 
@@ -6176,7 +6193,7 @@ mod search_cancellation_matrix {
                 Parameters(serde_json::from_value::<WorkspaceSearchParams>(arguments).unwrap());
             let started = std::time::Instant::now();
             let answer = tokio::time::timeout(
-                crate::change_hub::test_support::STATE_CEILING,
+                test_utils::wait::hang_guard(Duration::from_secs(60)),
                 server.workspace_search(params, cancelled_token()),
             )
             .await
@@ -6203,7 +6220,7 @@ mod search_cancellation_matrix {
             );
             let started = std::time::Instant::now();
             let answer = tokio::time::timeout(
-                crate::change_hub::test_support::STATE_CEILING,
+                test_utils::wait::hang_guard(Duration::from_secs(60)),
                 server.reference_search(params, cancelled_token()),
             )
             .await

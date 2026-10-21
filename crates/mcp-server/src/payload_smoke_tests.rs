@@ -19,9 +19,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// A hang watchdog for one smoke case, enforced only by the timing profile: a loaded machine
-/// may take longer, and an ordinary run waits for the case itself.
-const CASE_TIMEOUT: Duration = test_utils::wait::ceiling(Duration::from_secs(30));
+/// A hang watchdog for one smoke case: the timing profile keeps the nominal bound, while an
+/// ordinary run gets a finite ten-minute guard and still returns as soon as the case is done.
+const CASE_TIMEOUT: Duration = test_utils::wait::hang_guard(Duration::from_secs(30));
 const UNSAFE_PROVIDER_BODY: &str = "RAW_PROVIDER_SENTINEL: пароль 🚫 UTF-8 тело запроса";
 
 #[derive(Clone)]
@@ -56,8 +56,16 @@ impl Endpoint {
                         break;
                     }
                     let mut stream = stream.unwrap();
-                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                    stream
+                        .set_read_timeout(Some(test_utils::wait::hang_guard(Duration::from_secs(
+                            2,
+                        ))))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(test_utils::wait::hang_guard(Duration::from_secs(
+                            2,
+                        ))))
+                        .unwrap();
                     let mut received = Vec::new();
                     let mut buffer = [0; 2048];
                     let (header_end, length) = loop {
@@ -146,7 +154,7 @@ impl Drop for Endpoint {
         self.stop.store(true, Ordering::Release);
         let _ = TcpStream::connect(self.address);
         if let Some(worker) = self.worker.take() {
-            let result = worker.join();
+            let result = crate::test_wait::join(worker, "payload endpoint exits");
             if !std::thread::panicking() {
                 result.unwrap();
             }

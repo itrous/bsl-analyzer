@@ -1539,7 +1539,7 @@ mod tests {
             drop(live);
             done_tx.send(()).unwrap();
         });
-        started_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
+        started_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))).unwrap();
         // The exit is blocked on the mutex this test holds, so it cannot have finished however
         // long one looks; the timing profile also gives it a window to try.
         let overtaken = if cfg!(timing_contract) {
@@ -1552,7 +1552,7 @@ mod tests {
         let (held, result) = owners
             .0
             .wake
-            .wait_timeout_while(held, crate::change_hub::test_support::STATE_CEILING, |_| {
+            .wait_timeout_while(held, test_utils::wait::hang_guard(Duration::from_secs(60)), |_| {
                 owners.live() != 0
             })
             .unwrap();
@@ -1561,8 +1561,8 @@ mod tests {
             "the last owner wakes the waiter without losing its notification"
         );
         drop(held);
-        done_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
-        owner.join().unwrap();
+        done_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))).unwrap();
+        crate::test_wait::join(owner, "last owner exits").unwrap();
         assert!(owners.wait_empty(Duration::ZERO));
     }
 
@@ -1574,11 +1574,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             drop(live);
         });
+        let waiting_owners = owners.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let ended =
+                waiting_owners.wait_empty_in_slices(Duration::MAX, Duration::from_millis(10));
+            let _ = done_tx.send(ended);
+        });
         assert!(
-            owners.wait_empty_in_slices(Duration::MAX, Duration::from_millis(10)),
+            done_rx
+                .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
+                .expect("unbounded product wait must finish after its owner leaves"),
             "a budget off the clock ends when the owners leave, not at its first slice"
         );
-        leaving.join().unwrap();
+        crate::test_wait::join(waiter, "owner wait completes").unwrap();
+        crate::test_wait::join(leaving, "owner leaves").unwrap();
     }
 
     #[test]
@@ -1596,8 +1606,8 @@ mod tests {
         let live = owners.enter();
         let owner = std::thread::spawn(move || {
             let _live = live;
-            stop_rx.recv().unwrap();
-            finish_rx.recv().unwrap();
+            crate::test_wait::recv(&stop_rx, "shutdown reaches owner");
+            crate::test_wait::recv(&finish_rx, "owner is released");
         });
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let shutdown = std::thread::spawn(move || {
@@ -1615,11 +1625,11 @@ mod tests {
         assert!(!finished, "shutdown must await its owner");
         assert!(lease.owns_caches(), "the lease remains held while the owner may still write");
         finish_tx.send(()).unwrap();
-        owner.join().unwrap();
+        crate::test_wait::join(owner, "cache owner exits").unwrap();
         done_rx
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
             .expect("shutdown completes after owner exit");
-        shutdown.join().unwrap();
+        crate::test_wait::join(shutdown, "cache shutdown completes").unwrap();
         assert!(!lease.owns_caches(), "lease release follows the last owner exit");
     }
 
@@ -1657,9 +1667,9 @@ mod tests {
         let holder = std::thread::spawn(move || {
             let _guard = held.lock().unwrap();
             holding_tx.send(()).unwrap();
-            release.recv().unwrap();
+            crate::test_wait::recv(&release, "held engine lock is released");
         });
-        holding.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
+        holding.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))).unwrap();
 
         stop.stop();
 
@@ -1683,9 +1693,9 @@ mod tests {
             );
             let _ = done_tx.send(first && second);
         });
-        let answered = done_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
+        let answered = done_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)));
         release_tx.send(()).unwrap();
-        holder.join().unwrap();
+        crate::test_wait::join(holder, "held engine lock is released").unwrap();
         assert!(
             answered.is_ok_and(|stopping| stopping),
             "the owner waited out someone else's hold instead of leaving"
@@ -1696,11 +1706,11 @@ mod tests {
     fn workspace_search_poisoned_mutex_is_an_operation_error() {
         let shared: SharedSearchEngine = crate::state::shared_engine(None);
         let poison = Arc::clone(&shared);
-        let _ = std::thread::spawn(move || {
+        let poisoner = std::thread::spawn(move || {
             let _guard = poison.lock().unwrap();
             panic!("poison the search engine mutex");
-        })
-        .join();
+        });
+        let _ = crate::test_wait::join(poisoner, "poisoning thread panics");
 
         let outcome = SharedState::apply_workspace_search(
             &shared,
@@ -1755,7 +1765,7 @@ mod tests {
         state.workspace_lease = transient.clone();
         assert!(!state.superseded(), "temporary UNCLAIMED is not terminal");
         assert!(!transient.is_superseded());
-        holder.join().unwrap();
+        crate::test_wait::join(holder, "cache lock holder exits").unwrap();
 
         let released_dir = tempfile::tempdir().unwrap();
         let released = crate::workspace_lease::WorkspaceLease::claim(released_dir.path());
@@ -1788,7 +1798,7 @@ mod tests {
 
         std::thread::spawn(move || tx.send(state.superseded()).unwrap());
 
-        assert!(!rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap());
+        assert!(!rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))).unwrap());
         drop(held);
     }
 }
@@ -2141,9 +2151,9 @@ mod background_lifetime_tests {
         use crate::change_hub::WorkspaceChangeHub;
         use std::time::{Duration, Instant};
 
-        // Under `timing_contract` a minute, and half of it is the bound below; an ordinary run
-        // asks for a wait no run reaches, so an owner that slept through its stop never leaves.
-        const HUB_WAIT: Duration = crate::change_hub::test_support::STATE_CEILING;
+        // Under `timing_contract` a minute, and half of it is the bound below; ordinary runs
+        // retain a ten-minute hang guard in case an owner sleeps through its stop.
+        const HUB_WAIT: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
         let dir = tempfile::tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
         assert!(hub.wait_until_watching());

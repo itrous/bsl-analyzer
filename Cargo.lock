@@ -429,6 +429,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test-utils",
  "tokio",
  "tokio-util",
  "win-security-identifier",
@@ -483,6 +484,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sys-locale",
+ "test-utils",
  "webpki-root-certs",
  "windows-sys 0.61.2",
  "winresource",
@@ -2632,6 +2634,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "smol_str",
  "stdx",
+ "test-utils",
 ]
 
 [[package]]

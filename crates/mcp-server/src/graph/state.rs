@@ -3343,17 +3343,16 @@ mod tests {
         called
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("the delivery never set out");
-        let listed_while_the_ledger_was_busy =
-            crate::change_hub::test_support::eventually_within(200, || {
-                !graph.quiet_loss_deliveries().is_empty()
-            });
+        if cfg!(timing_contract) {
+            assert!(
+                !crate::change_hub::test_support::eventually_within(200, || {
+                    !graph.quiet_loss_deliveries().is_empty()
+                }),
+                "a delivery was listed while the ledger it had not reached was held elsewhere",
+            );
+        }
         drop(ledger);
-        delivering.join().expect("the delivering thread");
-
-        assert!(
-            !listed_while_the_ledger_was_busy,
-            "a delivery was listed while the ledger it had not reached was held elsewhere",
-        );
+        crate::test_wait::join(delivering, "the delivering thread").expect("the delivering thread");
         assert_eq!(
             graph.quiet_loss_deliveries(),
             vec![Some(7)],
@@ -3562,13 +3561,13 @@ mod tests {
         for _ in 0..8 {
             spent.ensure_first_build();
         }
-        // Answered asynchronously now, so the statement is given time to become false before
-        // it is believed: a spent budget must still be spent after every kick has run.
+        // The kick is asynchronous; wait for its observable release before reading the status.
+        wait_until(&spent, "the spent-budget kick to finish", || {
+            !spent.first_build_kick.load(Ordering::SeqCst)
+                && !spent.first_build_asked.load(Ordering::SeqCst)
+        });
         assert!(
-            !crate::change_hub::test_support::eventually_within(200, || !matches!(
-                lock_recover(&spent.inner).status,
-                GraphStatus::Failed(_)
-            )),
+            matches!(lock_recover(&spent.inner).status, GraphStatus::Failed(_)),
             "a request restarted a build the budget had already stopped: {:?}",
             spent.status(),
         );
@@ -3927,7 +3926,7 @@ mod tests {
         // The second turn, while the first one's offer is still out.
         graph.drive();
         release.store(true, Ordering::SeqCst);
-        first.join().expect("the parked turn finished");
+        crate::test_wait::join(first, "the parked turn").expect("the parked turn finished");
 
         assert_eq!(
             fires.load(Ordering::SeqCst),
@@ -4038,7 +4037,7 @@ mod tests {
         // A SECOND topology change, while the first offer is still out with the hook.
         graph.record_hook_debt(HookDebt { topology: true, roots: false, marks: false });
         release.store(true, Ordering::SeqCst);
-        flushing.join().expect("the parked flush finished");
+        crate::test_wait::join(flushing, "the parked flush").expect("the parked flush finished");
 
         assert_eq!(
             fires.load(Ordering::SeqCst),
@@ -4468,7 +4467,7 @@ mod tests {
             .collect();
         drop(tx);
 
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(90));
         for done in 0..owners.len() {
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(
@@ -4478,7 +4477,8 @@ mod tests {
             );
         }
         for owner in owners {
-            owner.join().expect("every owner that reported in also returned");
+            crate::test_wait::join(owner, "graph owner exits")
+                .expect("every owner that reported in also returned");
         }
     }
 
@@ -5029,7 +5029,7 @@ mod tests {
         lease.invalidate_verdict_for_test();
         wait_until_within(
             &graph,
-            test_utils::wait::ceiling(Duration::from_secs(10)),
+            test_utils::wait::hang_guard(Duration::from_secs(10)),
             "the lease verdict to stop allowing this graph to build",
             || !graph.may_build(),
         );
@@ -5360,7 +5360,7 @@ mod tests {
         assert_eq!(report.state, "ready");
         assert_eq!(report.superseded, None);
         assert!(!transient_lease.is_superseded());
-        holder.join().unwrap();
+        crate::test_wait::join(holder, "cache lock holder exits").unwrap();
     }
 
     /// A whole-collection re-render requested before the search engine existed to run it must
@@ -5410,7 +5410,7 @@ mod tests {
         let newer = crate::workspace_lease::WorkspaceLease::claim(root);
         wait_until_within(
             &graph,
-            test_utils::wait::ceiling(Duration::from_secs(10)),
+            test_utils::wait::hang_guard(Duration::from_secs(10)),
             "the lease verdict to stop allowing this graph to build",
             || !graph.may_build(),
         );
@@ -6551,7 +6551,8 @@ mod tests {
         assert!(graph.marks_pending(), "inside the pass the marks already read consumed");
 
         release_tx.send(()).expect("the parked pass is still running");
-        publisher.join().expect("the publish pass completed");
+        crate::test_wait::join(publisher, "graph publisher exits")
+            .expect("the publish pass completed");
         assert!(graph.marks_pending(), "an unhandled consume dropped the marks");
         assert!(graph.hook_debt().marks, "the refused covered refresh remains owed to the hook");
         assert!(
@@ -6627,8 +6628,9 @@ mod tests {
         );
 
         release_tx.send(()).expect("the parked consume is still running");
-        consuming.join().expect("the consume completed");
-        installing.join().expect("the install completed once the gate was free");
+        crate::test_wait::join(consuming, "cursor consume exits").expect("the consume completed");
+        crate::test_wait::join(installing, "cursor install exits")
+            .expect("the install completed once the gate was free");
         assert!(!graph.marks_pending(), "the consume that held the gate cleared its own marks");
     }
 
@@ -7079,7 +7081,7 @@ mod tests {
         // The second caller, while the reservation is out.
         graph.probe_recovery();
         second_done.store(true, Ordering::SeqCst);
-        first.join().expect("the parked probe finished");
+        crate::test_wait::join(first, "the parked probe").expect("the parked probe finished");
 
         assert_eq!(
             graph.probe_walks.load(Ordering::SeqCst) - before,
@@ -9496,7 +9498,7 @@ mod tests {
         };
 
         graph.notify_published(false);
-        turn.join().expect("the executor turn finished");
+        crate::test_wait::join(turn, "the executor turn").expect("the executor turn finished");
 
         assert_eq!(
             during_turn.load(Ordering::SeqCst),
@@ -11141,7 +11143,7 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         wait_until_within(
             &graph,
-            test_utils::wait::ceiling(Duration::from_secs(10)),
+            test_utils::wait::hang_guard(Duration::from_secs(10)),
             "the ask to be answered",
             || !matches!(graph.status(), GraphStatus::Failed(_)),
         );

@@ -334,16 +334,17 @@ mod tests {
         let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
         state.drift_interval = Duration::from_millis(0);
         state.ensure_loading();
-        let mut deadline = crate::change_hub::test_support::Patience::new(
-            crate::change_hub::test_support::STATE_CEILING,
-            std::time::Duration::from_millis(10),
-        );
+        let deadline =
+            std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
         loop {
             match state.status() {
                 super::super::types::DiagnosticsStatus::Ready { .. } => return state,
                 super::super::types::DiagnosticsStatus::Failed(msg) => panic!("resident: {msg}"),
                 other => {
-                    assert!(deadline.allows(), "resident never became ready: {other:?}");
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "resident never became ready: {other:?}"
+                    );
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
@@ -522,10 +523,11 @@ mod tests {
             let out = applying.read(|resident, _| resident.file_count());
             let _ = tx.send(matches!(out, ResidentOutcome::Ready(_, _)));
         });
-        let applied = rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).expect(
-            "the incremental apply must not block: a handle from the cancelled call \
+        let applied =
+            rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))).expect(
+                "the incremental apply must not block: a handle from the cancelled call \
                      is still alive and salsa is waiting for it to drop",
-        );
+            );
         assert!(applied, "the resident must still serve after the apply");
     }
 
@@ -731,7 +733,7 @@ mod tests {
                 move |session| {
                     session.read(|_, analysis, _| {
                         entered_tx.send(()).expect("test is waiting for the query gate");
-                        release_rx.recv().expect("test releases the query gate");
+                        crate::test_wait::recv(&release_rx, "test releases the query gate");
                         counted_reads.fetch_add(1, AtomicOrdering::SeqCst);
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             analysis.file_text(file_id).to_string()
@@ -757,12 +759,12 @@ mod tests {
         });
 
         entered_rx
-            .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(30)))
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(30)))
             .expect("request cloned the resident analysis before the first text query");
         std::fs::write(&path, saved_text).unwrap();
         release_tx.send(()).expect("the blocked request still owns its query gate");
         let outcome =
-            tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(30)), request)
+            tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(30)), request)
                 .await
                 .expect("the revision-mismatch request must terminate")
                 .expect("resident call task joins");
@@ -779,7 +781,7 @@ mod tests {
         let refresh_state = state.clone();
         let refresh_path = path.clone();
         let refreshed = tokio::time::timeout(
-            test_utils::wait::ceiling(Duration::from_secs(30)),
+            test_utils::wait::hang_guard(Duration::from_secs(30)),
             tokio::task::spawn_blocking(move || refresh_state.refresh_saved_path(&refresh_path)),
         )
         .await
@@ -798,7 +800,7 @@ mod tests {
 
         let next_state = state.clone();
         let next = tokio::time::timeout(
-            test_utils::wait::ceiling(Duration::from_secs(30)),
+            test_utils::wait::hang_guard(Duration::from_secs(30)),
             tokio::task::spawn_blocking(move || {
                 next_state.read(|resident, _| resident.analysis().file_text(file_id).to_string())
             }),

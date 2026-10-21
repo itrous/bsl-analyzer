@@ -1966,9 +1966,9 @@ mod tests {
                     graph.invalidate_scan_on_hub_drift();
                 })
             };
-            drainer.join().unwrap();
-            releaser.join().unwrap();
-            second.join().unwrap();
+            crate::test_wait::join(drainer, "cursor drainer exits").unwrap();
+            crate::test_wait::join(releaser, "cursor releaser exits").unwrap();
+            crate::test_wait::join(second, "second cursor observer exits").unwrap();
 
             let slot = lock_recover(&graph.hub_cursor);
             assert!(slot.is_closed(), "round {round}: close is final");
@@ -2111,7 +2111,7 @@ mod tests {
             Ok(held[0].generation),
             "a background read is served by the handle that came back"
         );
-        giver.join().unwrap();
+        crate::test_wait::join(giver, "graph reader is returned").unwrap();
     }
 
     #[test]
@@ -2247,9 +2247,9 @@ mod tests {
             })
         };
         entered_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(1)))
             .expect("the context refresh holds its engine lock before rendering");
-        let elapsed = worker.join().unwrap();
+        let elapsed = crate::test_wait::join(worker, "graph waiter exits").unwrap();
         drop(pause);
         graph.register_owed_context_marks();
         assert!(graph.marks_pending(), "failed renders remain owed to the graph");
@@ -2700,7 +2700,7 @@ mod tests {
 
         wait_until_within(
             &graph,
-            test_utils::wait::ceiling(Duration::from_secs(2)),
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
             "the reload to publish generation 2",
             || graph.snapshot().is_some_and(|snap| snap.generation == 2),
         );
@@ -2824,7 +2824,7 @@ mod tests {
         // fast path deliberately serves the cached topology until then).
         wait_until_within(
             &graph,
-            test_utils::wait::ceiling(Duration::from_secs(5)),
+            test_utils::wait::hang_guard(Duration::from_secs(5)),
             "the new extension root to read as drift",
             || graph.freshness(&snap).stale,
         );

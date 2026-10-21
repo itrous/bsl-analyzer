@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Bound of a wait for an event a regression would never deliver: the shared sixty-second
-/// ceiling under `timing_contract`, none otherwise (see [`test_utils::wait`]).
-const HANG_GUARD: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+/// Bound of a wait for an event a regression would never deliver: sixty seconds under
+/// `timing_contract` and ten minutes otherwise (see [`test_utils::wait::hang_guard`]).
+const HANG_GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
 #[derive(Clone, Copy)]
 enum OwnerExit {
@@ -53,7 +53,7 @@ fn shared_blocking_query<'db>(
 
     if gate.calls.fetch_add(1, Ordering::AcqRel) == 0 {
         gate.entered.send(()).expect("test is waiting for query owner");
-        gate.release.recv().expect("test releases query owner");
+        gate.release.recv_timeout(HANG_GUARD).expect("test releases query owner");
         match gate.exit {
             OwnerExit::PendingWrite => db.unwind_if_revision_cancelled(),
             OwnerExit::Panic => panic!("controlled query owner panic"),
@@ -544,9 +544,8 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
 
         let request_id = lsp_server::RequestId::from(731);
         let first_attempt = loop {
-            let task = task_receiver
-                .recv_timeout(HANG_GUARD)
-                .expect("first LSP attempt did not complete");
+            let task =
+                task_receiver.recv_timeout(HANG_GUARD).expect("first LSP attempt did not complete");
             if matches!(
                 &task,
                 crate::global_state::Task::LatencyRequestFinished { key, .. } if key.id == request_id
@@ -586,9 +585,8 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
         admit_pending_latency_retries(&mut state)
             .expect("admit original request through production router");
         let retry_task = loop {
-            let task = task_receiver
-                .recv_timeout(HANG_GUARD)
-                .expect("production retry did not complete");
+            let task =
+                task_receiver.recv_timeout(HANG_GUARD).expect("production retry did not complete");
             if matches!(
                 &task,
                 crate::global_state::Task::LatencyRequestFinished { key, .. } if key.id == request_id

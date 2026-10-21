@@ -4087,14 +4087,12 @@ impl PollGate {
             test_support::STATE_CEILING,
             std::time::Duration::from_millis(20),
         );
-        let mut wakes = 0;
         while counts.0 == 0 && !stop.is_raised() {
             let (next, go) = test_support::wait_step(
                 &self.moved,
                 counts,
                 Duration::from_millis(20),
                 &mut patience,
-                &mut wakes,
             );
             counts = next;
             if !go {
@@ -4112,14 +4110,12 @@ impl PollGate {
             test_support::STATE_CEILING,
             std::time::Duration::from_millis(20),
         );
-        let mut wakes = 0;
         while counts.1 < arrivals {
             let (next, go) = test_support::wait_step(
                 &self.moved,
                 counts,
                 Duration::from_millis(20),
                 &mut patience,
-                &mut wakes,
             );
             counts = next;
             if !go {
@@ -4189,14 +4185,12 @@ impl AnnounceBarrier {
             test_support::STATE_CEILING,
             std::time::Duration::from_millis(20),
         );
-        let mut wakes = 0;
         while !state.2 && !stop.is_raised() {
             let (next, go) = test_support::wait_step(
                 &self.moved,
                 state,
                 Duration::from_millis(20),
                 &mut patience,
-                &mut wakes,
             );
             state = next;
             if !go {
@@ -4214,14 +4208,12 @@ impl AnnounceBarrier {
             test_support::STATE_CEILING,
             std::time::Duration::from_millis(20),
         );
-        let mut wakes = 0;
         while !state.1 {
             let (next, go) = test_support::wait_step(
                 &self.moved,
                 state,
                 Duration::from_millis(20),
                 &mut patience,
-                &mut wakes,
             );
             state = next;
             if !go {
@@ -5864,14 +5856,9 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use std::{path::PathBuf, sync::Arc};
 
-    /// Attempts a state wait makes under `timing_contract` before it gives up: a count of polls,
-    /// not a span of time, so a loaded machine that stretches every poll still fits a merely late
-    /// state inside it. An ordinary run makes no such count — see [`test_utils::wait`].
-    const STATE_ATTEMPTS: u32 = 6_000;
-
-    /// The ceiling every hand-written state wait is counted against: [`STATE_ATTEMPTS`] polls
-    /// at the ordinary ten-millisecond step under `timing_contract`, and none otherwise.
-    pub(crate) const STATE_CEILING: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+    /// State wait guard: sixty seconds under `timing_contract`, ten minutes otherwise.
+    pub(crate) const STATE_CEILING: Duration =
+        test_utils::wait::hang_guard(Duration::from_secs(60));
 
     /// Whether the hub's thread has left: nobody holds the other end of its control channel any
     /// more. Probed with a tick, which a thread still there would answer with a poll — so a test
@@ -5884,58 +5871,42 @@ pub(crate) mod test_support {
     }
 
     /// Polls `f` until it holds: a wait for a state the test goes on to assert, bounded by
-    /// [`STATE_CEILING`] only under `timing_contract`.
+    /// [`STATE_CEILING`] under both profiles.
     pub(crate) fn eventually(f: impl FnMut() -> bool) -> bool {
-        if cfg!(timing_contract) {
-            return eventually_within(STATE_ATTEMPTS, f);
-        }
         test_utils::wait::poll_until(STATE_CEILING, Duration::from_millis(10), f)
     }
 
-    /// The polls a hand-written wait may spend: a ceiling read as "this many polls at one per
-    /// `step`", counted rather than timed. Each [`Patience::allows`] spends one poll, so a wait
-    /// that loops on it gives up after the same number of polls whatever the machine's speed.
+    /// A deadline for a hand-written wait, so a slow poll stretches the wait but never the guard.
     pub(crate) struct Patience {
-        left: u64,
+        deadline: std::time::Instant,
     }
 
-    /// Wakes a condition-variable wait may take before it gives up. A cap against a notify storm
-    /// that would keep the wait alive forever; ordinary runs take a handful.
-    const WAKE_CAP: u32 = 100_000;
-
-    /// One step of a bounded condition-variable wait. Waits up to `step` for a wake and spends a
-    /// poll only when the step runs out unwoken, so the budget counts time spent waiting rather
-    /// than wakeups. Returns the guard and whether the wait may go on.
+    /// One step of a guarded condition-variable wait. The timeout does not extend past the
+    /// deadline, even when notifications keep arriving before `step` elapses.
     pub(crate) fn wait_step<'a, T>(
         moved: &std::sync::Condvar,
         guard: std::sync::MutexGuard<'a, T>,
         step: Duration,
         patience: &mut Patience,
-        wakes: &mut u32,
     ) -> (std::sync::MutexGuard<'a, T>, bool) {
-        let (guard, outcome) =
-            moved.wait_timeout(guard, step).unwrap_or_else(std::sync::PoisonError::into_inner);
-        if outcome.timed_out() {
-            let go = patience.allows();
-            return (guard, go);
+        let remaining = patience.deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return (guard, false);
         }
-        *wakes += 1;
-        (guard, *wakes <= WAKE_CAP)
+        let (guard, _) = moved
+            .wait_timeout(guard, step.min(remaining))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (guard, patience.allows())
     }
 
     impl Patience {
-        pub(crate) fn new(ceiling: Duration, step: Duration) -> Self {
-            let polls = ceiling.as_nanos() / step.as_nanos().max(1);
-            Self { left: u64::try_from(polls).unwrap_or(u64::MAX) }
+        pub(crate) fn new(guard: Duration, _step: Duration) -> Self {
+            Self { deadline: std::time::Instant::now() + guard }
         }
 
-        /// Spends one poll; `false` once the allowance is gone.
+        /// Whether the wait's deadline remains open.
         pub(crate) fn allows(&mut self) -> bool {
-            if self.left == 0 {
-                return false;
-            }
-            self.left -= 1;
-            true
+            std::time::Instant::now() < self.deadline
         }
     }
 
@@ -6194,7 +6165,7 @@ mod tests {
         project.retarget(&project.second);
         let noticed = eventually(|| hub.self_rearm_count() > 0);
         stop.store(true, Ordering::Relaxed);
-        noise.join().unwrap();
+        crate::test_wait::join(noise, "hub noise worker exits").unwrap();
         assert!(noticed, "a busy queue must not starve the coverage tick");
     }
 
@@ -8050,7 +8021,7 @@ mod tests {
             std::thread::sleep(Duration::from_micros(100));
         }
         drop(blind);
-        let (replaced, token) = worker.join().unwrap();
+        let (replaced, token) = crate::test_wait::join(worker, "resubscribe worker exits").unwrap();
         let token = token.expect("the carry reported a token");
         assert_eq!(token.loss, carried_loss, "the token named a loss the carry did not write");
         hub.unsubscribe(replaced);
@@ -9589,9 +9560,7 @@ mod tests {
         let owed = hub.materialize(cursor).rescan_required;
         // The hub's own record of an announcement still to come is settled too: left standing,
         // it would hold back the reconcile a newcomer is handed the next time a root goes blind.
-        let settled = crate::change_hub::test_support::eventually_within(200, || {
-            !hub.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst)
-        });
+        let settled = eventually(|| !hub.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst));
         hub.shutdown();
         assert!(owed, "the reconcile a blind root owed was forgotten when the root went away");
         assert!(settled, "an announcement nobody will make was left pending");
@@ -9922,7 +9891,8 @@ mod tests {
         barrier.release();
         // The declaration is acknowledged as NOT wholly armed: `c` is refused on purpose, which
         // is what puts it in the blind set at all.
-        let wholly_armed = declaring.join().expect("the declaring thread");
+        let wholly_armed = crate::test_wait::join(declaring, "declaration finishes")
+            .expect("the declaring thread");
         let joined = eventually(|| unread_blind_files(&hub) == 2);
         let after_join = issued();
 
@@ -10025,7 +9995,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         hub.interrupt_waiters();
-        let parked = waiter.join().unwrap();
+        let parked = crate::test_wait::join(waiter, "interrupted hub waiter exits").unwrap();
 
         let started = Instant::now();
         hub.wait_for_change(hub.generation(), WAIT);
@@ -10866,7 +10836,7 @@ mod tests {
             let _ = done_tx.send(());
         });
         assert!(
-            done_rx.recv_timeout(STOP_BUDGET * 3).is_ok(),
+            done_rx.recv_timeout(test_utils::wait::hang_guard(STOP_BUDGET * 3)).is_ok(),
             "the drop of a hub nobody can join must end on its own budget"
         );
         // Only now: the thread is free to run out, and the temporary directory to go.

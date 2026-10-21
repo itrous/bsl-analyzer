@@ -111,12 +111,15 @@ where
                     state.claimed = true;
                     state.entered = true;
                     gate.changed.notify_all();
-                    while !state.released {
-                        state = gate
-                            .changed
-                            .wait(state)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    }
+                    let (state, _) = gate
+                        .changed
+                        .wait_timeout_while(
+                            state,
+                            crate::wait::hang_guard(Duration::from_secs(60)),
+                            |state| !state.released,
+                        )
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    assert!(state.released, "hang guard: the held walk was never released");
                 }
             }
         }
@@ -255,7 +258,7 @@ impl HeldWalk {
     /// so the walk can only meet the cancel with files still ahead of it.
     pub fn cancel_once_entered(self, cancel: impl FnOnce()) {
         assert!(
-            self.entered.wait_entered(crate::wait::ceiling(Duration::from_secs(60))),
+            self.entered.wait_entered(crate::wait::hang_guard(Duration::from_secs(60))),
             "the walk never started"
         );
         cancel();
@@ -265,8 +268,7 @@ impl HeldWalk {
 
 /// Block until the walk has entered its first file. It is not held there: a cancel that must
 /// land mid-flight goes through [`hold_walk_start`]. A fixed sleep would race the build of
-/// whatever the walk reads first. The bound counts polls, and only under `timing_contract`,
-/// so a slow machine waits longer for the walk to start instead of failing on it.
+/// whatever the walk reads first. Only the hang guard limits an ordinary wait.
 pub fn await_walk_start() {
     let started =
         crate::wait::poll_until(Duration::from_secs(60), Duration::from_millis(1), || {
@@ -293,9 +295,12 @@ mod tests {
         reset();
         let selecting_gate = lock_recover(&FIRST_SPAN_GATE);
         let entering = std::thread::spawn(|| walk_under("file:///unattributed/Module.bsl"));
-        while entered() == 0 {
-            std::thread::yield_now();
-        }
+        assert!(
+            crate::wait::poll_until(Duration::from_secs(60), Duration::from_millis(1), || {
+                entered() > 0
+            }),
+            "hang guard: the walk never started"
+        );
         let attribution_is_locked =
             matches!(ATTRIBUTED_TO.try_lock(), Err(std::sync::TryLockError::WouldBlock));
         drop(selecting_gate);

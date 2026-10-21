@@ -8738,7 +8738,7 @@ mod tests {
         /// Bound of a wait for an event that a regression would never deliver; a hang
         /// watchdog, not a latency measure.
         const HANG_WATCHDOG: std::time::Duration =
-            test_utils::wait::ceiling(std::time::Duration::from_secs(60));
+            test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
 
         #[test]
         fn in_memory_generation_initialization_does_not_remove_disk_artifacts() {

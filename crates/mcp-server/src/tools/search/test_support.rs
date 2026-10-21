@@ -46,14 +46,7 @@ impl Latch {
 
     /// Block until the worker has begun at least `count` requests.
     pub(super) fn wait_started(&self, count: usize) {
-        let mut deadline = crate::change_hub::test_support::Patience::new(
-            crate::change_hub::test_support::STATE_CEILING,
-            std::time::Duration::from_millis(5),
-        );
-        while self.started() < count {
-            assert!(deadline.allows(), "the worker never began request {count}");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        crate::test_wait::wait_until("the worker begins its request", || self.started() >= count);
     }
 }
 
@@ -75,7 +68,8 @@ pub(super) fn latched_service(
         let name = request_name(&kind);
         worker_latch.started.fetch_add(1, Ordering::SeqCst);
         if latched.contains(name) {
-            release_rx.recv().ok();
+            let _ = release_rx
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(60)));
         }
         worker_latch.executed.lock().unwrap().push(name);
         match kind {

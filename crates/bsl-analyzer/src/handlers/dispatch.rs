@@ -754,7 +754,7 @@ mod tests {
 
     /// Bound of a wait for a task that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
-    const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+    const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
     fn response_task(task: Task) -> Response {
         match task {
@@ -889,7 +889,9 @@ mod tests {
                 panic!("a saturated session must not launch")
             })
             .finish();
-        let lsp_server::Message::Response(response) = receiver.recv().unwrap() else {
+        let lsp_server::Message::Response(response) =
+            receiver.try_recv().expect("busy admission returns a response synchronously")
+        else {
             panic!("busy admission returns a response");
         };
         assert_eq!(response.id, id);

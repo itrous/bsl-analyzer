@@ -56,7 +56,9 @@ async fn cancelled_check_has_no_wire_response_after_cleanup() -> anyhow::Result<
         }),
     )
     .await?;
-    let initialized = collect_until_id(&mut reader, 1, Duration::from_secs(10)).await?;
+    let initialized =
+        collect_until_id(&mut reader, 1, test_utils::wait::hang_guard(Duration::from_secs(10)))
+            .await?;
     assert!(initialized.contains(&1));
     send_json(&mut writer, &json!({"jsonrpc":"2.0", "method":"notifications/initialized"})).await?;
     send_json(
@@ -67,7 +69,7 @@ async fn cancelled_check_has_no_wire_response_after_cleanup() -> anyhow::Result<
         }),
     )
     .await?;
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(10)), async {
         while !marker.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -83,7 +85,9 @@ async fn cancelled_check_has_no_wire_response_after_cleanup() -> anyhow::Result<
     .await?;
     send_json(&mut writer, &json!({"jsonrpc":"2.0", "id":3, "method":"ping"})).await?;
 
-    let seen = collect_until_id(&mut reader, 3, Duration::from_secs(10)).await?;
+    let seen =
+        collect_until_id(&mut reader, 3, test_utils::wait::hang_guard(Duration::from_secs(10)))
+            .await?;
     assert!(
         response_marker.exists(),
         "fake executor produced valid JSON during cancellation grace"
@@ -157,7 +161,9 @@ async fn collect_until_id_reads_later_jsonrpc_lines_independently() -> anyhow::R
     drop(writer);
 
     let mut reader = BufReader::new(read_half);
-    let seen = collect_until_id(&mut reader, 3, Duration::from_secs(2)).await?;
+    let seen =
+        collect_until_id(&mut reader, 3, test_utils::wait::hang_guard(Duration::from_secs(2)))
+            .await?;
 
     assert_eq!(seen, BTreeSet::from([2, 3]));
     Ok(())

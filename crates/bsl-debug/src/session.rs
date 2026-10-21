@@ -1376,13 +1376,9 @@ mod tests {
     const CLIENT_TARGET: &str = "950b2b2e-bb8f-4a43-b9bf-1316114df630";
 
     /// Bound of a wait for an event that a regression would never deliver: 60 s under
-    /// `timing_contract`, and a century otherwise, so an ordinary run waits for the event
-    /// however long a loaded machine takes. A century still fits in an `Instant` sum.
-    const HANG_WATCHDOG: Duration = if cfg!(timing_contract) {
-        Duration::from_secs(60)
-    } else {
-        Duration::from_secs(100 * 365 * 24 * 60 * 60)
-    };
+    /// `timing_contract`, and ten minutes otherwise.
+    const HANG_WATCHDOG: Duration =
+        if cfg!(timing_contract) { Duration::from_secs(60) } else { Duration::from_secs(10 * 60) };
 
     const REGISTERED: &str = concat!(
         r#"<response xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,

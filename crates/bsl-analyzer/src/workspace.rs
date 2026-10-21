@@ -1694,14 +1694,24 @@ directory = "baselines"
         let mut state = GlobalState::new(sender);
         state.init_empty_source_root();
         state.set_workspace_root(root.to_path_buf()).unwrap();
-        assert!(matches!(receiver.recv().unwrap(), lsp_server::Message::Notification(_)));
+        assert!(matches!(
+            receiver
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(30)))
+                .unwrap(),
+            lsp_server::Message::Notification(_)
+        ));
 
         state.reload_diagnostics_baseline();
         assert!(receiver.try_recv().is_err(), "same fingerprint must not notify twice");
 
         std::fs::write(&baseline_path, "{different").unwrap();
         state.reload_diagnostics_baseline();
-        assert!(matches!(receiver.recv().unwrap(), lsp_server::Message::Notification(_)));
+        assert!(matches!(
+            receiver
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(30)))
+                .unwrap(),
+            lsp_server::Message::Notification(_)
+        ));
 
         let valid = diagnostics_baseline_json(&DiagnosticsBaseline {
             schema_version: DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
@@ -1752,7 +1762,10 @@ directory = "baselines"
     }
 
     fn shown_message(receiver: &crossbeam_channel::Receiver<lsp_server::Message>) -> String {
-        let lsp_server::Message::Notification(notification) = receiver.recv().unwrap() else {
+        let lsp_server::Message::Notification(notification) = receiver
+            .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(30)))
+            .unwrap()
+        else {
             panic!("a window/showMessage notification");
         };
         assert_eq!(notification.method, "window/showMessage");
@@ -1764,7 +1777,7 @@ directory = "baselines"
         let task = state
             .task_pool
             .receiver
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(30)))
             .expect("the hold puts a recheck on the loop");
         let Task::DiagnosticsBaselineRecheck { hold } = task else { panic!("got {task:?}") };
         hold

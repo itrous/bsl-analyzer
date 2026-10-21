@@ -1062,7 +1062,7 @@ mod tests {
     use bsl_search::{Document, IndexProgress, SearchEngine};
     use rmcp::model::ErrorCode;
     use std::fs;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
@@ -1176,7 +1176,7 @@ mod tests {
                 panic!("poison the semantic runtime lock");
             })
         };
-        assert!(poisoner.join().is_err());
+        assert!(crate::test_wait::join(poisoner, "semantic lock poisoning thread panics").is_err());
 
         let result = search_status(
             crate::McpProfile::Workspace,
@@ -1326,23 +1326,23 @@ mod tests {
         // prime would. The roots are unchanged all the while — saying "none" here would be a
         // statement about the workspace, when the only true statement is about the read.
         let held: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
-        // A barrier, not a sleep: the branch under test is the ONLY one that tells "the index
+        // A readiness signal, not a sleep: the branch under test is the ONLY one that tells "the index
         // is held" from "there is no index", so it must not depend on the holder winning a
         // scheduling race against a fixed window.
         // The lock is let go only once the read has answered, so the read cannot outlast it.
-        let taken = Arc::new(std::sync::Barrier::new(2));
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = {
             let held = Arc::clone(&held);
-            let taken = Arc::clone(&taken);
             std::thread::spawn(move || {
                 let guard = held.lock().unwrap();
-                taken.wait();
-                let _ = release_rx.recv();
+                taken_tx.send(()).unwrap();
+                let _ =
+                    release_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)));
                 drop(guard);
             })
         };
-        taken.wait();
+        crate::test_wait::recv(&taken_rx, "engine lock is held");
         let busy = search_status_with_cap(
             crate::McpProfile::Workspace,
             &held,
@@ -1358,7 +1358,7 @@ mod tests {
         )
         .unwrap();
         release_tx.send(()).unwrap();
-        holder.join().unwrap();
+        crate::test_wait::join(holder, "engine lock holder exits").unwrap();
         let busy = busy.content[0].as_text().expect("text").text.clone();
         assert!(busy.contains("not read"), "{busy}");
         assert!(!busy.contains("not published yet"), "a held index is not an unbuilt one: {busy}",);
@@ -1989,19 +1989,19 @@ mod tests {
         let engine = crate::state::shared_engine(Some(SearchEngine::fts_only(&db_path).unwrap()));
         // The holder lets the lock go only after the status has answered, so a status that
         // waited for the lock never answers and the shared watchdog below runs out.
-        let gate = Arc::new(Barrier::new(2));
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = {
             let engine = Arc::clone(&engine);
-            let gate = Arc::clone(&gate);
             std::thread::spawn(move || {
                 let held = engine.lock().unwrap();
-                gate.wait();
-                let _ = release_rx.recv();
+                taken_tx.send(()).unwrap();
+                let _ =
+                    release_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)));
                 drop(held);
             })
         };
-        gate.wait();
+        crate::test_wait::recv(&taken_rx, "engine lock is held");
         let (answer_tx, answer_rx) = std::sync::mpsc::channel();
         let caller = {
             let engine = Arc::clone(&engine);
@@ -2032,11 +2032,11 @@ mod tests {
             })
         };
         let (text, elapsed) = answer_rx
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
             .expect("the status waited for the held engine lock");
         release_tx.send(()).unwrap();
-        holder.join().unwrap();
-        caller.join().unwrap();
+        crate::test_wait::join(holder, "engine lock holder exits").unwrap();
+        crate::test_wait::join(caller, "status caller exits").unwrap();
         if cfg!(timing_contract) {
             assert!(elapsed < Duration::from_secs(2));
         }

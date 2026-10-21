@@ -1,5 +1,71 @@
 use super::*;
+use std::future::Future;
 use std::path::PathBuf;
+use std::process::{Child, ExitStatus};
+use std::time::{Duration, Instant};
+
+pub(super) const HANG_GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
+
+pub(super) async fn guard_future<F: Future>(future: F, description: &'static str) -> F::Output {
+    tokio::time::timeout(HANG_GUARD, future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {description}"))
+}
+
+pub(super) async fn wait_until(description: &'static str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + HANG_GUARD;
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {description}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+pub(super) async fn guard_task<T: Send + 'static>(
+    mut task: tokio::task::JoinHandle<T>,
+    description: &'static str,
+) -> T {
+    match tokio::time::timeout(HANG_GUARD, &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => panic!("{description} task failed: {error}"),
+        Err(_) => {
+            task.abort();
+            panic!("timed out waiting for {description} task");
+        }
+    }
+}
+
+pub(super) fn wait_until_sync(description: &'static str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + HANG_GUARD;
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {description}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub(super) fn wait_child(
+    mut child: Child,
+    description: &'static str,
+) -> std::io::Result<ExitStatus> {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = std::thread::Builder::new().name("native-check-test-reaper".to_owned()).spawn(
+                move || {
+                    let _ = child.wait();
+                },
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("timed out waiting for {description}"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 pub(super) fn canonical_tempdir() -> tempfile::TempDir {
     #[cfg(windows)]
@@ -42,17 +108,17 @@ fn profile() -> NativeProfile {
 
 #[tokio::test]
 async fn cancelling_a_queued_check_does_not_take_the_active_slot() {
-    let guard = ACTIVE_CHECK.lock().await;
+    let guard = guard_future(ACTIVE_CHECK.lock(), "active native-check slot").await;
     let cancel = CancellationToken::new();
     let waiter_cancel = cancel.clone();
     let task = tokio::spawn(async move {
         let client = onec_client::Client::new("http://localhost", "", "");
         check(&client, &profile(), &CheckRequest::default(), "x = 1;", 2_000, waiter_cancel).await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    tokio::task::yield_now().await;
     cancel.cancel();
 
-    let result = task.await.unwrap();
+    let result = guard_task(task, "cancelled queued check").await;
     assert_eq!(result.status, CheckStatus::Error);
     assert_eq!(result.failure.unwrap().code, "cancelled");
     assert!(ACTIVE_CHECK.try_lock().is_err());
@@ -61,18 +127,21 @@ async fn cancelling_a_queued_check_does_not_take_the_active_slot() {
 
 #[tokio::test]
 async fn queued_check_deadline_includes_waiting_for_the_native_slot() {
-    let guard = ACTIVE_CHECK.lock().await;
+    let guard = guard_future(ACTIVE_CHECK.lock(), "active native-check slot").await;
     let mut short_profile = profile();
     short_profile.deadline_ms = 10;
 
     let client = onec_client::Client::new("http://localhost", "", "");
-    let result = check(
-        &client,
-        &short_profile,
-        &CheckRequest::default(),
-        "x = 1;",
-        2_000,
-        CancellationToken::new(),
+    let result = guard_future(
+        check(
+            &client,
+            &short_profile,
+            &CheckRequest::default(),
+            "x = 1;",
+            2_000,
+            CancellationToken::new(),
+        ),
+        "deadline-bounded queued check",
     )
     .await;
 
@@ -86,13 +155,16 @@ async fn queued_check_deadline_includes_waiting_for_the_native_slot() {
 async fn module_without_an_explicit_context_is_not_reported_as_invalid_code() {
     let request = CheckRequest { input_kind: InputKind::Module, ..CheckRequest::default() };
     let client = onec_client::Client::new("http://localhost", "", "");
-    let result = check(
-        &client,
-        &profile(),
-        &request,
-        "Процедура Тест()\nКонецПроцедуры",
-        2_000,
-        CancellationToken::new(),
+    let result = guard_future(
+        check(
+            &client,
+            &profile(),
+            &request,
+            "Процедура Тест()\nКонецПроцедуры",
+            2_000,
+            CancellationToken::new(),
+        ),
+        "context-required check",
     )
     .await;
 
@@ -124,13 +196,16 @@ async fn public_check_reports_dirty_owned_root_as_error_without_starting_a_platf
     let mut configured = profile();
     configured.work_root = work_root;
     let client = onec_client::Client::new("http://localhost", "", "");
-    let result = check(
-        &client,
-        &configured,
-        &CheckRequest::default(),
-        "x = 1;",
-        2_000,
-        CancellationToken::new(),
+    let result = guard_future(
+        check(
+            &client,
+            &configured,
+            &CheckRequest::default(),
+            "x = 1;",
+            2_000,
+            CancellationToken::new(),
+        ),
+        "dirty-owned-root check",
     )
     .await;
 

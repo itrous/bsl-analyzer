@@ -120,7 +120,7 @@ mod tests {
         let started = Instant::now();
         let out = await_reply(&rx, &cancel, Duration::from_millis(10));
         let waited = started.elapsed();
-        canceller.join().unwrap();
+        crate::test_wait::join(canceller, "request canceller exits").unwrap();
 
         assert_eq!(out, Err(Withdrawn));
         if cfg!(timing_contract) {

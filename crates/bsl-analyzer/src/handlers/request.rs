@@ -1715,7 +1715,9 @@ fn g1_wait_at_workspace_diagnostic_chunk(
     // propagated-cancellation test running alongside.
     if let Some(gate) = gate {
         if gate.entered.send((done, emitted_items)).is_ok() {
-            let _ = gate.release.recv_timeout(std::time::Duration::from_secs(60));
+            let _ = gate
+                .release
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(60)));
         }
     }
 }
@@ -2479,11 +2481,11 @@ mod tests {
     /// calling the test hung. Scheduling latency on a loaded machine is the only thing
     /// it absorbs, so it is generous and nothing is measured against it.
     const PARK_HANG_GUARD: std::time::Duration =
-        test_utils::wait::ceiling(std::time::Duration::from_secs(30));
+        test_utils::wait::hang_guard(std::time::Duration::from_secs(30));
     /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
     const HANG_WATCHDOG: std::time::Duration =
-        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
+        test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
 
     /// A symbol whose range does not project onto the open buffer is the one case where a
     /// map can lie without looking wrong: the answer stays well-formed while a method — or
@@ -3403,61 +3405,81 @@ mod tests {
             .collect();
         let hover_ctx = latency_ctx(&state);
 
-        std::thread::scope(|scope| {
-            let waiting_item = item.clone();
-            let waiting_request = scope.spawn(move || {
-                handle_call_hierarchy_incoming(&waiting_ctx, incoming_params(waiting_item))
-            });
-            let deadline = std::time::Instant::now() + PARK_HANG_GUARD;
-            while !state.call_hierarchy_index.has_waiter(source_root, 1) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "first incoming request did not park"
-                );
-                std::thread::yield_now();
-            }
-
-            // When: concurrent incoming requests and an unrelated hover arrive.
-            let followers_started = std::time::Instant::now();
-            let followers: Vec<_> = follower_contexts
-                .into_iter()
-                .map(|ctx| {
-                    let item = item.clone();
-                    scope.spawn(move || handle_call_hierarchy_incoming(&ctx, incoming_params(item)))
-                })
-                .collect();
-            let hover_uri = uri.clone();
-            let hover = scope.spawn(move || {
-                handle_hover(
-                    &hover_ctx,
-                    HoverParams {
-                        text_document_position_params: TextDocumentPositionParams {
-                            text_document: TextDocumentIdentifier { uri: hover_uri },
-                            position: Position { line: 0, character: 10 },
-                        },
-                        work_done_progress_params: Default::default(),
-                    },
-                )
-            });
-            for follower in followers {
-                assert!(
-                    follower.join().expect("follower request must finish").unwrap().is_none(),
-                    "only the first Building request may wait"
-                );
-            }
-            let followers_took = followers_started.elapsed();
-            assert!(
-                followers_took < wait_bound,
-                "a follower waited out the bound instead of answering at once: {followers_took:?}",
-            );
-            assert!(hover.join().expect("hover request must finish").unwrap().is_some());
-            assert!(state.call_hierarchy_index.publish(source_root, 1, index));
-
-            // Then: the sole waiter receives callers after publication.
-            let calls =
-                waiting_request.join().expect("waiting request must finish").unwrap().unwrap();
-            assert_eq!(calls.len(), 1);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let waiting_item = item.clone();
+        let waiting_request = std::thread::spawn(move || {
+            let result =
+                handle_call_hierarchy_incoming(&waiting_ctx, incoming_params(waiting_item));
+            waiting_tx.send(result).expect("test receives first incoming response");
         });
+        let deadline = std::time::Instant::now() + PARK_HANG_GUARD;
+        while !state.call_hierarchy_index.has_waiter(source_root, 1) {
+            assert!(std::time::Instant::now() < deadline, "first incoming request did not park");
+            std::thread::yield_now();
+        }
+
+        // When: concurrent incoming requests and an unrelated hover arrive.
+        let followers_started = std::time::Instant::now();
+        let (followers_tx, followers_rx) = std::sync::mpsc::channel();
+        let mut followers = Vec::new();
+        for ctx in follower_contexts {
+            let item = item.clone();
+            let followers_tx = followers_tx.clone();
+            followers.push(std::thread::spawn(move || {
+                let result = handle_call_hierarchy_incoming(&ctx, incoming_params(item));
+                followers_tx.send(result).expect("test receives follower response");
+            }));
+        }
+        drop(followers_tx);
+        let (hover_tx, hover_rx) = std::sync::mpsc::channel();
+        let hover_uri = uri.clone();
+        let hover = std::thread::spawn(move || {
+            let result = handle_hover(
+                &hover_ctx,
+                HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: hover_uri },
+                        position: Position { line: 0, character: 10 },
+                    },
+                    work_done_progress_params: Default::default(),
+                },
+            );
+            hover_tx.send(result).expect("test receives hover response");
+        });
+        for _ in 0..followers.len() {
+            assert!(
+                followers_rx
+                    .recv_timeout(wait_bound)
+                    .expect("follower request must finish")
+                    .unwrap()
+                    .is_none(),
+                "only the first Building request may wait"
+            );
+        }
+        let followers_took = followers_started.elapsed();
+        assert!(
+            followers_took < wait_bound,
+            "a follower waited out the bound instead of answering at once: {followers_took:?}",
+        );
+        for follower in followers {
+            follower.join().expect("follower worker exits");
+        }
+        assert!(hover_rx
+            .recv_timeout(HANG_WATCHDOG)
+            .expect("hover request must finish")
+            .unwrap()
+            .is_some());
+        hover.join().expect("hover worker exits");
+        assert!(state.call_hierarchy_index.publish(source_root, 1, index));
+
+        // Then: the sole waiter receives callers after publication.
+        let calls = waiting_rx
+            .recv_timeout(HANG_WATCHDOG)
+            .expect("waiting request must finish")
+            .unwrap()
+            .unwrap();
+        waiting_request.join().expect("waiting request worker exits");
+        assert_eq!(calls.len(), 1);
     }
 
     #[test]
@@ -4349,7 +4371,7 @@ mod tests {
             id: i32,
         ) -> lsp_server::Response {
             let deadline =
-                std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
+                std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(120));
             let task_receiver = state.task_pool.receiver.clone();
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());

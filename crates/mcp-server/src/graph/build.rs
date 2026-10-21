@@ -6237,19 +6237,36 @@ mod tests {
             .unwrap();
         let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
         let child = PatchChild(child);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            assert_ne!(
-                std::io::BufRead::read_line(&mut reader, &mut line).unwrap(),
-                0,
-                "the child ended before announcing"
-            );
-            // The harness's own "test ... " prefix is on the same line: nothing ends it first.
-            if let Some((_, announcement)) = line.split_once("READY ") {
-                return (child, announcement.trim().to_owned());
+        let (announced_tx, announced_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::BufRead::read_line(&mut reader, &mut line) {
+                    Ok(0) => {
+                        let _ = announced_tx.send(Err("the child ended before announcing"));
+                        return;
+                    }
+                    Ok(_) => {
+                        // The harness's own "test ... " prefix is on the same line.
+                        if let Some((_, announcement)) = line.split_once("READY ") {
+                            let _ = announced_tx.send(Ok(announcement.trim().to_owned()));
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = announced_tx.send(Err("could not read the child's announcement"));
+                        tracing::debug!(%error, "patch child announcement read failed");
+                        return;
+                    }
+                }
             }
-        }
+        });
+        let announcement = announced_rx
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
+            .expect("the child did not announce before the hang guard expired")
+            .unwrap_or_else(|message| panic!("{message}"));
+        (child, announcement)
     }
 
     fn kill(mut child: PatchChild) {
@@ -6965,7 +6982,7 @@ mod tests {
         assert!(claimed, "recovery must schedule the clean rebuild the marker was waiting for");
         wait_until_within(
             &graph,
-            test_utils::wait::ceiling(Duration::from_secs(3)),
+            test_utils::wait::hang_guard(Duration::from_secs(3)),
             "the recovery rebuild to publish a snapshot no longer marked force_stale",
             || meta_string(&graph_db_path(root), "force_stale") == "0",
         );
@@ -7324,7 +7341,7 @@ mod tests {
         // The catch-up publishes past the cached revision and rewrites the file.
         wait_until_within(
             &graph,
-            test_utils::wait::ceiling(Duration::from_secs(5)),
+            test_utils::wait::hang_guard(Duration::from_secs(5)),
             "the catch-up reload to publish past the cached revision",
             || graph.snapshot().map(|s| s.generation) == Some(8),
         );
@@ -7952,10 +7969,15 @@ mod tests {
         for module in ["Клиент", "Сервер"] {
             let path = root.join(format!("CommonModules/{module}/Ext/Module.bsl"));
             fs::remove_file(&path).unwrap();
-            let made = std::process::Command::new("mkfifo")
+            let mut mkfifo = std::process::Command::new("mkfifo")
                 .arg(&path)
-                .status()
+                .spawn()
                 .expect("mkfifo runs on this platform");
+            let made = crate::graph::test_support::wait_for_child(
+                &mut mkfifo,
+                test_utils::wait::hang_guard(Duration::from_secs(30)),
+                "mkfifo",
+            );
             assert!(made.success(), "a FIFO stands in for {module}'s module");
         }
 
@@ -11467,7 +11489,7 @@ mod tests {
         // The caller-delta reload publishes generation 2 with the method gone.
         wait_until_within(
             &graph,
-            test_utils::wait::ceiling(Duration::from_secs(2)),
+            test_utils::wait::hang_guard(Duration::from_secs(2)),
             "the caller-delta reload to publish generation 2",
             || graph.snapshot().is_some_and(|snap| snap.generation == 2),
         );

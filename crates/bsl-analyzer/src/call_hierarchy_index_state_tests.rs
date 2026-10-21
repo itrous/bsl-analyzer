@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -11,6 +11,8 @@ use super::{
     CallHierarchyIndexCompletion, CallHierarchyIndexPrepareAction, CallHierarchyIndexSnapshotId,
     CallHierarchyIndexState,
 };
+
+const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
 fn root() -> SourceRootId {
     SourceRootId(7)
@@ -59,7 +61,7 @@ fn coalesces_idempotent_starts_and_allows_one_waiter() {
     assert_eq!(state.drain_journal(root(), 1), Some(vec![FileId(9)]));
     assert!(state.publish(root(), 1, index()));
     assert!(matches!(
-        waiter.recv_timeout(Duration::from_millis(50)),
+        waiter.recv_timeout(test_utils::wait::hang_guard(Duration::from_millis(50))),
         Ok(CallHierarchyIndexCompletion::Ready(_))
     ));
 }
@@ -161,13 +163,13 @@ fn body_edit_after_worker_publication_invalidates_ready_index() {
     });
     let editor_state = state.clone();
     let editor = thread::spawn(move || {
-        published_rx.recv().expect("worker publication completes");
+        published_rx.recv_timeout(HANG_WATCHDOG).expect("worker publication completes");
         assert!(editor_state.record_body_edit_or_supersede_ready(root(), 1, FileId(9)));
         edited_tx.send(()).expect("test waits for edit processing");
     });
 
     // When: the edit reaches the lifecycle immediately after the worker publishes.
-    edited_rx.recv().expect("body edit is processed");
+    edited_rx.recv_timeout(HANG_WATCHDOG).expect("body edit is processed");
     worker.join().expect("worker completes");
     editor.join().expect("editor completes");
 
@@ -192,7 +194,7 @@ fn transitions_to_failed_and_wakes_waiter() {
     assert!(state.current(root()).is_none());
     assert_eq!(state.failure_reason(root(), 1).as_deref(), Some("batch opener failed"));
     assert!(matches!(
-        waiter.recv_timeout(Duration::from_millis(50)),
+        waiter.recv_timeout(test_utils::wait::hang_guard(Duration::from_millis(50))),
         Ok(CallHierarchyIndexCompletion::Failed(reason)) if reason == "batch opener failed"
     ));
 }
@@ -252,7 +254,7 @@ fn structural_supersession_cancels_and_discards_the_old_build() {
     // Then: the worker is cancelled, the old result is discarded, and a replacement may start.
     assert!(cancellation.is_cancelled());
     assert!(matches!(
-        waiter.recv_timeout(Duration::from_millis(50)),
+        waiter.recv_timeout(test_utils::wait::hang_guard(Duration::from_millis(50))),
         Ok(CallHierarchyIndexCompletion::Superseded)
     ));
     assert!(!state.publish(root(), 1, index()));
@@ -273,7 +275,7 @@ fn shutdown_cancels_builds_wakes_waiters_and_rejects_new_starts() {
     // Then: work is cancelled, the waiter is released, and no replacement can start.
     assert!(cancellation.is_cancelled());
     assert!(matches!(
-        waiter.recv_timeout(Duration::from_millis(50)),
+        waiter.recv_timeout(test_utils::wait::hang_guard(Duration::from_millis(50))),
         Ok(CallHierarchyIndexCompletion::Shutdown)
     ));
     assert!(!state.start_build(root(), 2, snapshot(2)));
@@ -294,22 +296,27 @@ fn concurrent_readers_observe_only_complete_old_or_new_indexes() {
         &state.current(root()).expect("building keeps the prior ready value"),
         &old
     ));
-    let barrier = Arc::new(Barrier::new(2));
     let done = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
     let reader_state = state.clone();
-    let reader_barrier = Arc::clone(&barrier);
     let reader_done = Arc::clone(&done);
     let reader_old = Arc::clone(&old);
     let reader_new = Arc::clone(&new);
     let reader = thread::spawn(move || {
-        reader_barrier.wait();
+        ready_tx.send(()).expect("test receives reader readiness");
+        start_rx.recv_timeout(HANG_WATCHDOG).expect("test releases concurrent reader");
         while !reader_done.load(Ordering::Acquire) {
             let current = reader_state.current(root()).expect("a ready value remains available");
             assert!(Arc::ptr_eq(&current, &reader_old) || Arc::ptr_eq(&current, &reader_new));
         }
+        reader_done_tx.send(()).expect("test receives reader completion");
     });
-    barrier.wait();
+    ready_rx.recv_timeout(HANG_WATCHDOG).expect("reader is ready to observe publication");
+    start_tx.send(()).expect("reader waits for the start signal");
     assert!(state.publish(root(), 2, Arc::clone(&new)));
     done.store(true, Ordering::Release);
+    reader_done_rx.recv_timeout(HANG_WATCHDOG).expect("reader exits after publication");
     reader.join().expect("reader must not observe a partial publication");
 }

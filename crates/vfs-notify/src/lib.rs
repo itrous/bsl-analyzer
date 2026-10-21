@@ -1199,13 +1199,9 @@ mod tests {
     use vfs::loader::Handle;
 
     /// Bound of a wait for an event that a regression would never deliver: 60 s under
-    /// `timing_contract`, and a century otherwise, so an ordinary run waits for the event
-    /// however long a loaded machine takes. A century still fits in an `Instant` sum.
-    const HANG_WATCHDOG: Duration = if cfg!(timing_contract) {
-        Duration::from_secs(60)
-    } else {
-        Duration::from_secs(100 * 365 * 24 * 60 * 60)
-    };
+    /// `timing_contract`, and ten minutes otherwise.
+    const HANG_WATCHDOG: Duration =
+        if cfg!(timing_contract) { Duration::from_secs(60) } else { Duration::from_secs(10 * 60) };
 
     fn fixture(count: usize, bytes_per_file: usize) -> (tempfile::TempDir, loader::Directories) {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -3980,7 +3980,13 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         state.set_pre_drain_probe(move || {
             entered_tx.send(()).expect("the test is still waiting");
-            let _ = release_rx.recv();
+            assert!(
+                !matches!(
+                    release_rx.recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60))),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "hang guard: drain test did not release the parked cursor"
+            );
         });
 
         // The drain path is entered directly. Going through `poll_pending_drift` would
@@ -3994,14 +4000,14 @@ mod tests {
             std::thread::spawn(move || state.poll_drift_via_drain(&hub, &root))
         };
         entered_rx
-            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .recv_timeout(test_utils::wait::hang_guard(Duration::from_secs(60)))
             .expect("the drain reaches the point where it holds the cursor");
 
         state.drop_cursor();
         assert!(!state.has_hub_cursor(), "the release lands while the drain is parked");
 
         release_tx.send(()).expect("the drain is still parked");
-        drainer.join().expect("the drain finishes");
+        crate::test_wait::join(drainer, "released drain finishes").expect("the drain finishes");
         assert!(!state.has_hub_cursor(), "an in-flight drain does not resurrect the cursor");
         // What the write-back can resurrect is the state's own handle, not the hub's
         // registration: `unsubscribe` removed the subscription and draining a cursor the
@@ -5765,15 +5771,12 @@ mod tests {
         }
     }
 
-    /// Poll until the resident carries `path`, or the poll budget runs out. A fixed sleep
-    /// cannot replace this: the work being waited for is a full rebuild, whose duration
+    /// Poll until the resident carries `path`, with a hang guard for a missing update. A fixed
+    /// sleep cannot replace this: the work being waited for is a full rebuild, whose duration
     /// is the machine's to decide.
     fn resident_gains_file(state: &DiagnosticsState, path: &std::path::Path) -> bool {
-        let mut deadline = crate::change_hub::test_support::Patience::new(
-            crate::change_hub::test_support::STATE_CEILING,
-            std::time::Duration::from_millis(20),
-        );
-        while deadline.allows() {
+        let deadline = Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
+        while Instant::now() < deadline {
             if resident_has_file(state, path) {
                 return true;
             }

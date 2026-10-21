@@ -590,12 +590,14 @@ mod tests {
                     lease.disk_checks_on_this_thread() == fences,
                     waited,
                 ));
-                let _ = finish.recv();
+                let _ = finish
+                    .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(60)));
                 drop(first);
                 drop(descriptors);
             })
         };
-        let answered = answer.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
+        let answered =
+            answer.recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(60)));
         drop(held_lease);
         drop(verdict);
         drop(finish_tx);
@@ -603,7 +605,7 @@ mod tests {
         // rather than waited on without a bound.
         let (first, published, over_cap, no_fence, waited) =
             answered.expect("a descriptor request waited on the lease");
-        reader.join().unwrap();
+        crate::test_wait::join(reader, "descriptor reader exits after release").unwrap();
 
         assert!(first, "a resident descriptor needs no lease refresh");
         assert!(published, "published descriptor");

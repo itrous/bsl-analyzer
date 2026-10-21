@@ -6842,7 +6842,31 @@ mod tests {
     /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
     const HANG_WATCHDOG: std::time::Duration =
-        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
+        test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
+
+    fn wait_test_child(
+        mut child: std::process::Child,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = std::thread::Builder::new()
+                    .name("bsl-search-test-reaper".to_owned())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    });
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "reference writer child did not exit",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     /// A pause is reversible, and that is all it is. Held past the end of the pass it paused —
     /// an ordering nothing reaches today and nothing forbade either — a guard that raised the
@@ -13102,11 +13126,13 @@ mod tests {
             locked.send(()).unwrap();
             // Held until the control has run — otherwise a release that slipped in first would
             // let the control succeed and the test would pass on an idle database.
-            wait_for_control.recv().unwrap();
+            wait_for_control
+                .recv_timeout(HANG_WATCHDOG)
+                .expect("test releases the held database lock");
             std::thread::sleep(std::time::Duration::from_millis(300));
             conn.execute_batch("COMMIT").unwrap();
         });
-        wait_for_lock.recv().unwrap();
+        wait_for_lock.recv_timeout(HANG_WATCHDOG).expect("the lock holder has started");
 
         let impatient = rusqlite::Connection::open(&db_path).unwrap();
         impatient.busy_timeout(crate::store::FENCED_OPEN_BUSY_TIMEOUT).unwrap();
@@ -13161,7 +13187,7 @@ mod tests {
             }
             conn.execute_batch("COMMIT").unwrap();
         });
-        wait_for_lock.recv().unwrap();
+        wait_for_lock.recv_timeout(HANG_WATCHDOG).expect("the lock holder has started");
 
         let opened = {
             let mut apply = |operation: FencedOperation<'_>| {
@@ -13804,19 +13830,30 @@ mod tests {
     fn concurrent_reference_writers_commit_one_generation() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("reference-search.db");
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let mut handles = Vec::new();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (start_a_tx, start_a_rx) = std::sync::mpsc::channel();
+        let (start_b_tx, start_b_rx) = std::sync::mpsc::channel();
+        let (result_a_tx, result_a_rx) = std::sync::mpsc::channel();
+        let (result_b_tx, result_b_rx) = std::sync::mpsc::channel();
         let engines =
             [SearchEngine::fts_only(&db_path).unwrap(), SearchEngine::fts_only(&db_path).unwrap()];
-        for mut engine in engines {
-            let barrier = Arc::clone(&barrier);
+        let mut engines = engines.into_iter();
+        let mut handles = Vec::new();
+        for (mut engine, start_rx, result_tx) in [
+            (engines.next().unwrap(), start_a_rx, result_a_tx),
+            (engines.next().unwrap(), start_b_rx, result_b_tx),
+        ] {
+            let ready_tx = ready_tx.clone();
             handles.push(std::thread::spawn(move || {
                 let documents = [Document {
                     title: "Shared".to_owned(),
                     body: "shared generation marker".to_owned(),
                     kind: "type".to_owned(),
                 }];
-                barrier.wait();
+                ready_tx.send(()).expect("test receives reference writer readiness");
+                start_rx
+                    .recv_timeout(HANG_WATCHDOG)
+                    .expect("test releases concurrent reference writer");
                 let outcome = engine
                     .replace_reference_collection_if_stale(
                         "platform",
@@ -13828,10 +13865,23 @@ mod tests {
                     .unwrap();
                 let hits =
                     engine.text_search("shared generation marker", 10, Some("platform")).unwrap();
-                (outcome, hits.len(), engine.loaded_reference_fingerprint.clone())
+                result_tx
+                    .send((outcome, hits.len(), engine.loaded_reference_fingerprint.clone()))
+                    .expect("test receives reference writer result");
             }));
         }
-        let outcomes: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        drop(ready_tx);
+        ready_rx.recv_timeout(HANG_WATCHDOG).expect("first reference writer is ready");
+        ready_rx.recv_timeout(HANG_WATCHDOG).expect("second reference writer is ready");
+        start_a_tx.send(()).expect("first writer waits for release");
+        start_b_tx.send(()).expect("second writer waits for release");
+        let outcomes = [
+            result_a_rx.recv_timeout(HANG_WATCHDOG).expect("first reference writer completes"),
+            result_b_rx.recv_timeout(HANG_WATCHDOG).expect("second reference writer completes"),
+        ];
+        for handle in handles {
+            handle.join().expect("reference writer exits");
+        }
         let stamp = SearchEngine::reference_stamp("fp-shared", None, None);
         assert_eq!(outcomes.iter().filter(|(outcome, _, _)| outcome.written).count(), 1);
         assert!(outcomes.iter().all(|(outcome, hits, loaded)| {
@@ -13851,9 +13901,9 @@ mod tests {
             let ready = root.join(format!("ready-{worker}"));
             fs::write(&ready, b"ready").unwrap();
             let start = root.join("start");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + HANG_WATCHDOG;
             while !start.exists() {
-                assert!(std::time::Instant::now() < deadline, "parent never released barrier");
+                assert!(std::time::Instant::now() < deadline, "parent never released start gate");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             let documents = [Document {
@@ -13914,14 +13964,15 @@ mod tests {
                         .unwrap(),
                 );
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + HANG_WATCHDOG;
             while !(root.join("ready-a").exists() && root.join("ready-b").exists()) {
-                assert!(std::time::Instant::now() < deadline, "writers never reached barrier");
+                assert!(std::time::Instant::now() < deadline, "reference writers are not ready");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             fs::write(root.join("start"), b"start").unwrap();
-            for child in &mut children {
-                assert!(child.wait().unwrap().success());
+            let child_deadline = std::time::Instant::now() + HANG_WATCHDOG;
+            for child in children {
+                assert!(wait_test_child(child, child_deadline).unwrap().success());
             }
             let results: Vec<_> = ["a", "b"]
                 .map(|worker| fs::read_to_string(root.join(format!("result-{worker}"))).unwrap())

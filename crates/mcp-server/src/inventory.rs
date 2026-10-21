@@ -879,6 +879,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
             "serve_stream_tests.rs",
             "state/indexing_tests.rs",
             "state/test_support.rs",
+            "test_wait.rs",
             "tools/search/cancel_tests.rs",
             "tools/search/test_support.rs",
             "walk_probe.rs",

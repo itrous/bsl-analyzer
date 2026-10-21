@@ -381,7 +381,11 @@ mod tests {
             drop(default_file);
             if !default_owner_is_current {
                 assert!(matches!(
-                    RootLock::acquire(&root, deadline, &CancellationToken::new()).await,
+                    super::super::tests::guard_future(
+                        RootLock::acquire(&root, deadline, &CancellationToken::new()),
+                        "root-lock acquisition",
+                    )
+                    .await,
                     Err(LockWaitError::Unsafe)
                 ));
                 let existing = open_lock_file(&lock_path, false)
@@ -394,7 +398,12 @@ mod tests {
                 fs::remove_file(&lock_path).expect("remove only the test-owned fixture lock");
             }
         }
-        let first = RootLock::acquire(&root, deadline, &CancellationToken::new()).await.unwrap();
+        let first = super::super::tests::guard_future(
+            RootLock::acquire(&root, deadline, &CancellationToken::new()),
+            "first root-lock acquisition",
+        )
+        .await
+        .unwrap();
         let cancel = CancellationToken::new();
         let cancel_wait = cancel.clone();
         let root_path = root.to_owned();
@@ -406,15 +415,21 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::task::yield_now().await;
         cancel.cancel();
-        assert!(matches!(waiter.await.unwrap(), Err(LockWaitError::Cancelled)));
+        assert!(matches!(
+            super::super::tests::guard_task(waiter, "cancelled root-lock waiter").await,
+            Err(LockWaitError::Cancelled)
+        ));
         first.verify_path().unwrap();
         drop(first);
-        RootLock::acquire(
-            &root,
-            Instant::now() + std::time::Duration::from_secs(1),
-            &CancellationToken::new(),
+        super::super::tests::guard_future(
+            RootLock::acquire(
+                &root,
+                Instant::now() + std::time::Duration::from_secs(1),
+                &CancellationToken::new(),
+            ),
+            "root-lock reacquisition after release",
         )
         .await
         .unwrap();
@@ -428,10 +443,13 @@ mod tests {
         let root = temp.path().join("private-root");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let lock = RootLock::acquire(
-            &root,
-            Instant::now() + std::time::Duration::from_secs(1),
-            &CancellationToken::new(),
+        let lock = super::super::tests::guard_future(
+            RootLock::acquire(
+                &root,
+                Instant::now() + std::time::Duration::from_secs(1),
+                &CancellationToken::new(),
+            ),
+            "root-lock acquisition before path replacement",
         )
         .await
         .unwrap();

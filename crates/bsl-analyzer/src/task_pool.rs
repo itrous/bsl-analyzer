@@ -197,7 +197,7 @@ mod tests {
 
     /// Bound of a wait for a result that a regression would never deliver; a hang
     /// watchdog, not a latency measure.
-    const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+    const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
     #[test]
     fn bounded_pool_executes_more_jobs_than_workers() {
@@ -258,7 +258,7 @@ mod tests {
 
         let ids: std::collections::HashSet<_> = (0..workers)
             .map(|_| {
-                rx.recv_timeout(std::time::Duration::from_secs(10))
+                rx.recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10)))
                     .expect("every worker runs its copy")
             })
             .collect();
@@ -267,7 +267,9 @@ mod tests {
         // The rendezvous released: the pool still serves ordinary jobs.
         handle.pool.try_spawn(|| 7).expect("pool alive after broadcast");
         assert_eq!(
-            handle.receiver.recv_timeout(std::time::Duration::from_secs(10)),
+            handle
+                .receiver
+                .recv_timeout(test_utils::wait::hang_guard(std::time::Duration::from_secs(10))),
             Ok(7),
             "workers must be released after the rendezvous"
         );

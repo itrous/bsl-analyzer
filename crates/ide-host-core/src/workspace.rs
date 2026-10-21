@@ -871,6 +871,7 @@ mod tests {
         b.open(FileId(0), path, Arc::from(SELF_ASSIGN));
 
         let config = ide::DiagnosticsConfig::all_enabled().to_input();
+        let hang_guard = test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
         let pool_a = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
         let pool_b = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
 
@@ -880,15 +881,19 @@ mod tests {
         let independent_pool = Arc::clone(&pool_b);
         local.attached(|analysis| {
             local_token.cancel();
-            let result = std::thread::spawn(move || {
-                independent.workspace_diagnostics_parallel(
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = independent.workspace_diagnostics_parallel(
                     &[FileId(0)],
                     ide::DiagnosticsConfig::all_enabled().to_input(),
                     &independent_pool,
-                )
-            })
-            .join()
-            .unwrap();
+                );
+                result_tx.send(result).expect("test receives independent analysis result");
+            });
+            let result = result_rx
+                .recv_timeout(hang_guard)
+                .expect("independent workspace diagnostics complete");
+            worker.join().expect("independent analysis worker exits");
             assert!(result[0]
                 .1
                 .iter()
@@ -903,33 +908,34 @@ mod tests {
         drop(local);
 
         // Hold A's reader until its writer is pending; B must remain usable.
-        let admitted = Arc::new(std::sync::Barrier::new(2));
-        let continue_request = Arc::new(std::sync::Barrier::new(2));
-        let request_admitted = Arc::clone(&admitted);
-        let request_continue = Arc::clone(&continue_request);
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (request_done_tx, request_done_rx) = std::sync::mpsc::channel();
         let analysis_a = a.analysis();
         let observer = a.analysis();
         let request_pool = Arc::clone(&pool_a);
         let cancelled_request = std::thread::spawn(move || {
-            salsa::Cancelled::catch(AssertUnwindSafe(|| {
+            let result = salsa::Cancelled::catch(AssertUnwindSafe(|| {
                 analysis_a.attached(|analysis| {
-                    request_admitted.wait();
-                    request_continue.wait();
+                    admitted_tx.send(()).expect("test receives reader admission");
+                    let _ = continue_rx.recv_timeout(hang_guard);
                     analysis.workspace_diagnostics_parallel(&[FileId(0)], config, &request_pool)
                 })
-            }))
+            }));
+            request_done_tx.send(result).expect("test receives reader completion");
         });
 
-        admitted.wait();
-        let (writer_started, writer_entering) = std::sync::mpsc::sync_channel(0);
+        admitted_rx.recv_timeout(hang_guard).expect("reader reaches the gate");
+        let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
-            writer_started.send(()).unwrap();
+            writer_started_tx.send(()).expect("test receives writer start");
             assert!(a.change(FileId(0), Arc::from(CLEAN)));
-            a
+            writer_done_tx.send(a).expect("test receives writer completion");
         });
-        writer_entering.recv().unwrap();
+        writer_started_rx.recv_timeout(hang_guard).expect("writer thread starts");
         let deadline = std::time::Instant::now()
-            + test_utils::wait::ceiling(std::time::Duration::from_secs(10));
+            + test_utils::wait::hang_guard(std::time::Duration::from_secs(10));
         loop {
             let cancelled = salsa::Cancelled::catch(AssertUnwindSafe(|| {
                 salsa::Database::unwind_if_revision_cancelled(observer.database());
@@ -949,33 +955,50 @@ mod tests {
             .1
             .iter()
             .any(|diagnostic| diagnostic.code == DiagnosticCode::SelfAssign));
-        continue_request.wait();
-        assert!(matches!(cancelled_request.join().unwrap(), Err(salsa::Cancelled::PendingWrite)));
+        continue_tx.send(()).expect("reader is waiting for release");
+        let request_result = request_done_rx
+            .recv_timeout(hang_guard)
+            .expect("cancelled diagnostics request completes");
+        cancelled_request.join().expect("request worker exits");
+        assert!(matches!(request_result, Err(salsa::Cancelled::PendingWrite)));
         drop(observer);
-        let a = writer.join().unwrap();
+        let a = writer_done_rx.recv_timeout(hang_guard).expect("writer finishes after release");
+        writer.join().expect("writer thread exits");
 
         // The same FileId means different files in these independent Salsa storages.
         // Run both views through the LSP batch's actual bounded parallel API at once;
         // A sees its just-written clean text and B retains its self-assignment diagnostic.
-        let start = Arc::new(std::sync::Barrier::new(3));
-        let start_a = Arc::clone(&start);
-        let start_b = Arc::clone(&start);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (start_a_tx, start_a_rx) = std::sync::mpsc::channel();
+        let (start_b_tx, start_b_rx) = std::sync::mpsc::channel();
+        let (result_a_tx, result_a_rx) = std::sync::mpsc::channel();
+        let (result_b_tx, result_b_rx) = std::sync::mpsc::channel();
         let analysis_a = a.analysis();
         let analysis_b = b.analysis();
         let config_a = ide::DiagnosticsConfig::all_enabled().to_input();
         let config_b = config_a.clone();
+        let ready_a_tx = ready_tx.clone();
         let sweep_a = std::thread::spawn(move || {
-            start_a.wait();
-            analysis_a.workspace_diagnostics_parallel(&[FileId(0)], config_a, &pool_a)
+            ready_a_tx.send(()).expect("test receives A readiness");
+            start_a_rx.recv_timeout(hang_guard).expect("test releases A diagnostics sweep");
+            let result = analysis_a.workspace_diagnostics_parallel(&[FileId(0)], config_a, &pool_a);
+            result_a_tx.send(result).expect("test receives A diagnostics");
         });
         let sweep_b = std::thread::spawn(move || {
-            start_b.wait();
-            analysis_b.workspace_diagnostics_parallel(&[FileId(0)], config_b, &pool_b)
+            ready_tx.send(()).expect("test receives B readiness");
+            start_b_rx.recv_timeout(hang_guard).expect("test releases B diagnostics sweep");
+            let result = analysis_b.workspace_diagnostics_parallel(&[FileId(0)], config_b, &pool_b);
+            result_b_tx.send(result).expect("test receives B diagnostics");
         });
-        start.wait();
+        ready_rx.recv_timeout(hang_guard).expect("A diagnostics worker is ready");
+        ready_rx.recv_timeout(hang_guard).expect("B diagnostics worker is ready");
+        start_a_tx.send(()).expect("A diagnostics worker waits for release");
+        start_b_tx.send(()).expect("B diagnostics worker waits for release");
 
-        let result_a = sweep_a.join().unwrap();
-        let result_b = sweep_b.join().unwrap();
+        let result_a = result_a_rx.recv_timeout(hang_guard).expect("A diagnostics sweep completes");
+        let result_b = result_b_rx.recv_timeout(hang_guard).expect("B diagnostics sweep completes");
+        sweep_a.join().expect("A diagnostics worker exits");
+        sweep_b.join().expect("B diagnostics worker exits");
         assert_eq!(result_a.len(), 1);
         assert_eq!(result_b.len(), 1);
         assert!(

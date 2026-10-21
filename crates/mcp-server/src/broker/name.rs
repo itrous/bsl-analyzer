@@ -1001,7 +1001,8 @@ mod tests {
                 })
                 .collect();
             for launcher in launchers {
-                let outcome = launcher.join().unwrap();
+                let outcome =
+                    crate::test_wait::join(launcher, "runtime directory launcher exits").unwrap();
                 assert!(outcome.is_ok(), "round {round}: a launcher lost the dir: {outcome:?}");
             }
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
