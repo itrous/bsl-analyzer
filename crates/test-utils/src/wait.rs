@@ -55,18 +55,23 @@ pub const fn polls(bound: Duration, step: Duration) -> u64 {
 }
 
 /// Polls `condition` every `step` until it holds and returns `true`; gives up at
-/// [`hang_guard`]`(bound)` (or the timing profile's poll count) and takes one last look.
+/// [`hang_guard`]`(bound)` in ordinary runs, or the timing profile's poll count,
+/// and takes one last look.
 pub fn poll_until(bound: Duration, step: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = std::time::Instant::now() + hang_guard(bound);
     for _ in 0..polls(bound, step) {
         if condition() {
             return true;
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
+        if cfg!(timing_contract) {
+            std::thread::sleep(step);
+        } else {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(step.min(remaining));
         }
-        std::thread::sleep(step.min(remaining));
     }
     condition()
 }

@@ -3327,6 +3327,10 @@ mod tests {
     /// follows is then of a ledger the delivery has not reached, and a stand asserting "this
     /// loss was already acted on" would be asserting it against the state before the fact.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "необязательный тест: отсутствие публикации проверяется временным окном; запуск: RUSTFLAGS='--cfg timing_contract' cargo test -p mcp-server --lib graph::state::tests::a_quiet_delivery_is_listed_only_once_the_ledger_has_it -- --exact"
+    )]
     fn a_quiet_delivery_is_listed_only_once_the_ledger_has_it() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphState::for_workspace(dir.path().to_path_buf());
@@ -3343,14 +3347,12 @@ mod tests {
         called
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("the delivery never set out");
-        if cfg!(timing_contract) {
-            assert!(
-                !crate::change_hub::test_support::eventually_within(200, || {
-                    !graph.quiet_loss_deliveries().is_empty()
-                }),
-                "a delivery was listed while the ledger it had not reached was held elsewhere",
-            );
-        }
+        assert!(
+            !crate::change_hub::test_support::eventually_within(200, || {
+                !graph.quiet_loss_deliveries().is_empty()
+            }),
+            "a delivery was listed while the ledger it had not reached was held elsewhere",
+        );
         drop(ledger);
         crate::test_wait::join(delivering, "the delivering thread").expect("the delivering thread");
         assert_eq!(

@@ -100,6 +100,62 @@ pub(crate) fn wait_for_child(
         std::thread::sleep(WAIT_POLL.min(remaining));
     }
 }
+/// Capture both pipes concurrently while the child is supervised by its hang guard.
+#[track_caller]
+pub(crate) fn child_output(
+    mut child: std::process::Child,
+    guard: Duration,
+    what: &str,
+) -> std::process::Output {
+    use std::io::Read;
+
+    let mut stdout = child.stdout.take().expect("child stdout must be piped");
+    let mut stderr = child.stderr.take().expect("child stderr must be piped");
+    let stdout = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).expect("read child stdout");
+        bytes
+    });
+    let stderr = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).expect("read child stderr");
+        bytes
+    });
+    let status = wait_for_child(&mut child, guard, what);
+    std::process::Output {
+        status,
+        stdout: crate::test_wait::join(stdout, "child stdout is drained").expect("stdout reader"),
+        stderr: crate::test_wait::join(stderr, "child stderr is drained").expect("stderr reader"),
+    }
+}
+
+#[test]
+fn child_output_drains_both_full_pipes() {
+    use std::io::Write;
+    const CHILD: &str = "BSL_TEST_FULL_OUTPUT_PIPES";
+    const SIZE: usize = 1024 * 1024;
+    if std::env::var_os(CHILD).is_some() {
+        std::io::stdout().write_all(&vec![b'x'; SIZE]).unwrap();
+        std::io::stderr().write_all(&vec![b'y'; SIZE]).unwrap();
+        return;
+    }
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "graph::test_support::child_output_drains_both_full_pipes",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = child_output(child, WAIT_GUARD, "full-pipe child");
+    assert!(output.status.success());
+    assert!(output.stdout.iter().filter(|&&byte| byte == b'x').count() >= SIZE);
+    assert!(output.stderr.iter().filter(|&&byte| byte == b'y').count() >= SIZE);
+}
+
 /// The graph-state wait guard: thirty seconds under `timing_contract`, ten minutes otherwise.
 pub(crate) const WAIT_GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(30));
 /// Compatibility name used by existing test call sites; this is a finite hang guard.

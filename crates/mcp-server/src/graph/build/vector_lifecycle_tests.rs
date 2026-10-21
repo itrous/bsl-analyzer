@@ -2075,20 +2075,18 @@ fn capture(f: impl FnOnce()) -> Vec<Value> {
 fn vector_lifecycle_capture_survives_first_callsite_on_unsubscribed_thread() {
     const CHILD: &str = "BSL_MCP_LIFECYCLE_CAPTURE_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "graph::build::vector_lifecycle_tests::vector_lifecycle_capture_survives_first_callsite_on_unsubscribed_thread"])
             .env(CHILD, "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let status = crate::graph::test_support::wait_for_child(
-            &mut child,
+        let output = crate::graph::test_support::child_output(
+            child,
             test_utils::wait::hang_guard(std::time::Duration::from_secs(60)),
             "lifecycle capture child",
         );
-        let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status, status);
         let stdout = String::from_utf8_lossy(&output.stdout);
         // A drifted name would select no test and still exit successfully.
         assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}");

@@ -336,7 +336,7 @@ fn moved_cached_graph_reuses_revision_reads_new_sources_and_preserves_search_vec
     const CHILD: &str = "BSL_MCP_PORTABLE_GRAPH_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let _env_lock = crate::state::test_support::env_lock();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "graph::portable_workspace_graph_tests::moved_cached_graph_reuses_revision_reads_new_sources_and_preserves_search_vectors",
@@ -346,13 +346,11 @@ fn moved_cached_graph_reuses_revision_reads_new_sources_and_preserves_search_vec
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let status = crate::graph::test_support::wait_for_child(
-            &mut child,
+        let output = crate::graph::test_support::child_output(
+            child,
             test_utils::wait::hang_guard(std::time::Duration::from_secs(60)),
             "portable graph child",
         );
-        let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status, status);
         let stdout = String::from_utf8_lossy(&output.stdout);
         // A drifted name would select no test and still exit successfully.
         assert!(
