@@ -29,7 +29,7 @@ Filters are substring exclusions across all library/binary test harnesses, not p
 
 ## Inventory
 
-The accompanying inventories enumerate test wait sites, shared budgets and dependent release/join paths:
+The accompanying inventories enumerate test wait sites, shared budgets and dependent release/join paths. Their local validation disclaimers describe the inventory authors' static-only handoff; the later aggregate validation below supersedes those disclaimers:
 
 - [MCP except graph/change hub](unit-a-mcp-inventory.md)
 - [Graph and change hub](unit-a-graph-inventory.md)
@@ -90,7 +90,7 @@ R1 and R2 ran concurrently on Linux (normal cargo/libtest parallelism plus two i
 | R1 | `cargo test -p mcp-server --lib` — exit 101; 1725 passed, 3 failed, 31 ignored; 610.14s | New test-only module inventory entry missing; two cancellation matrix tests poisoned their held mutex because channel-close release was incorrectly changed into an error. All corrected. |
 | R2 | Exact unit-a command above — exit 101; MCP 1490 passed, same 3 failed, 31 ignored, 235 filtered; other targets green | Same patch regressions as R1, not a reproduction of the historical hang. |
 | R3 | `cargo test -p mcp-server --lib` — **exit 0; 1728 passed, 0 failed, 31 ignored; 151.45s** | All Linux MCP library tests green after corrections. |
-| R4 | CI `workflow_dispatch` on the task branch | Pending; final permitted diagnostic execution. |
+| R4 | [CI workflow_dispatch 39674927214](https://github.com/itrous/bsl-analyzer/actions/runs/39674927214), branch `pio/fix-unit-a-hang`, code commit `d09345c40db10b69f99bbb936ac1e28bfaffccb2` | Final permitted diagnostic execution; its completed outcome is checked before stage handoff and reported there. |
 
 R1/R2 also exposed a needless ten-minute delay in `graph::state::tests::a_wait_that_times_out_reports_the_state_it_observed`: an intentional zero-budget negative control was re-wrapped in `hang_guard` by the shared polling helper. `graph/test_support.rs::wait_until_within` now honours its explicit, already-guarded caller budget directly; normal state callers pass `hang_guard`, and the deterministic negative control can keep zero. The test remains required, not ignored. Release-on-channel-close semantics are also retained for the diagnostics drain fixture.
 
