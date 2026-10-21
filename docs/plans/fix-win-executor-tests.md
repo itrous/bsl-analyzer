@@ -80,7 +80,8 @@ regressions`, `cargo test -p mcp-server --lib`, `test result: FAILED. 66 passed;
 - `wait_for_file` ждёт появления маркера не дольше 5 с, опрос шагом 10 мс
   (`:121-129`). Маркер fake пишет только после старта интерпретатора, импорта
   `ctypes/json/subprocess`, проверки `IsProcessInJob` и чтения stdin до EOF
-  (`:16-27`, `:45`, `:47-48`, `:69-71`).
+  (`:16-27`, `:45`, `:47-48`, `:69-71`); файл создаётся `open(marker, 'w')`
+  раньше, чем в него записано содержимое.
 - `event_…` (`:155-180`): ждёт маркер (`:169`), отменяет, требует `Err`
   (`:177`), `elapsed >= 250 мс` по `std::time::Instant` (`:178`) и код выхода 0
   (`:179`) — fake выходит сам после события, `sleep(0.05)` и печати ответа
@@ -201,6 +202,17 @@ fake'а на свежем Windows-раннере непостоянно и ин�
      (`KILL_ON_JOB_CLOSE`, `check_executor.rs:416-417`).
    - `time.sleep(0.05)` в `event-exit` (`:56`) не трогать — это не срок, а
      задержка ответа после отмены.
+   - Маркеры пишутся атомарно, чтобы появление файла означало полное
+     содержимое: сейчас `open(marker, 'w')` создаёт файл раньше записи
+     (`:47-48`, `:70-71`, в `child_code` `:67`), а тест читает и разбирает
+     маркер сразу после появления (`:170-172`, `:207-211`, `:248-252`).
+     В `event-exit` (`:47-48`) и `job-hang` (`:70-71`) — запись в
+     `marker + '.tmp'` блоком `with open(...) as out: out.write(...)`, затем
+     `os.replace(marker + '.tmp', marker)`. В `child_code` (`:67`) хвост
+     `open(sys.argv[1],'w').write(str(os.getpid())+' '+str(p.value))` →
+     `f=open(sys.argv[1]+'.tmp','w'); f.write(str(os.getpid())+' '+str(p.value)); f.close(); os.replace(sys.argv[1]+'.tmp',sys.argv[1])`.
+     Режим `no-spawn-marker` (`:41-43`) не трогать: там проверяется только
+     отсутствие файла.
 2. `profile()`: `timeout: Duration::from_secs(3)` (`:103`) →
    `timeout: Duration::from_secs(60 * 60)` — дедлайн продукта не гоняется со
    стартом исполнителя (как `tools/check_executor.rs:1403`).
