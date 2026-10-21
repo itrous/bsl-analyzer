@@ -569,9 +569,9 @@ mod tests {
     /// guard only: nothing is decided by how long this takes.
     async fn yield_until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline =
-            tokio::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
+            std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
         while !done() {
-            assert!(tokio::time::Instant::now() < deadline, "never happened: {what}");
+            assert!(std::time::Instant::now() < deadline, "never happened: {what}");
             tokio::task::yield_now().await;
             std::thread::sleep(Duration::from_micros(100));
         }

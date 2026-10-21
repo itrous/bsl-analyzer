@@ -118,4 +118,12 @@ Subject: `10069d562464e9c43981bbe0f8c1196b68a02baa`, same original base. One fur
 
 CI compile findings: aborted producer JoinError is explicitly discarded after successful bounded cancellation; native test helpers unused on Windows are cfg-gated, not lint-suppressed. `cargo clippy --all-targets --all-features -- -D warnings` passed after corrections (2m32s). No new historical-hang reproduction/stress run is requested. The corrective branch CI and final review outcome are linked in stage handoff.
 
+## Review 944: low follow-up
+
+The corrected slice at `88a875142fb0fd3846e5d33e710ba52f6e4fc77f` closed review944 by lenses: `closed=true`, `nextAction=ready`, `exitCode=0`; subject SHA-256 `563ae4a970f8d2fbd877e63bbb8a9837014d688b4b6c46edebdcdbc2c75fd492`, original base unchanged.
+
+`da9fb2d5620da51fc299de28207d1250c16fad4c63fe4e522b17b149414aef67` — **low, upheld, fixed**. `tasks.rs::yield_until` now uses `std::time::Instant` both for creating and checking its deadline. A standalone control linked to the checkout's Tokio rlib reproduced the clock distinction: a paused current-thread runtime completed100 yield/sleep iterations with nonzero wall elapsed while Tokio Instant remained frozen (exit0). The frozen-clock functional assertions are unchanged; only the watchdog's clock is corrected. This follow-up requires no new review or test rerun under the stage contract.
+
+The same reviewed code passed [corrective CI39679618729](https://github.com/itrous/bsl-analyzer/actions/runs/39679618729), including [unit-a job119498381696](https://github.com/itrous/bsl-analyzer/actions/runs/39679618729/job/119498381696): **8980 passed, 0 failed, 321 ignored, 57 harness results**; all Windows legs and Lint also succeeded. This is corrective acceptance after R4's compilation failures, not another historical-hang diagnostic experiment. The only code change after that accepted/reviewed revision is the low clock follow-up above.
+
 The two optional scenarios above (ledger negative window and unobservable sync-mutex contention) are not blamed for the historical hang. Their opt-in reason and command are in source. All other tests remain enabled. On blocked old rounds939/941, `pio_checks_followup` cannot accept outcomes: it requires a closed check. Their upheld verdicts and fix commits are recorded here; the entire corrected slice is presented to the next round, rather than bypassing its gate.
