@@ -26,6 +26,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - run: cargo fmt --all -- --check
       - run: python3 scripts/test-ci-test-output.py
       - run: cargo clippy --all-targets --all-features
@@ -57,7 +59,7 @@ jobs:
         with:
           # The legs share this job's cache key; the unit-a leg builds every library
           # test, so every dev-dependency, and its cache serves the other legs.
-          save-if: ${{ matrix.shard == 'unit-a' }}
+          save-if: ${{ github.ref == 'refs/heads/develop' && matrix.shard == 'unit-a' }}
       - run: cargo test --locked --workspace --no-fail-fast ${{ matrix.select }}
       # Run even when the library tests above failed, so one run reports both.
       - if: ${{ !cancelled() && matrix.shard == 'unit-b' }}
@@ -409,6 +411,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: Help loader text path and built-in facts
         timeout-minutes: 60
         shell: bash
@@ -436,6 +440,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: Drift contract and workspace lease regressions
         shell: bash
         run: |
@@ -733,6 +739,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: MCP library lifecycle, workspace cache and editor regressions
         shell: bash
         run: |
@@ -892,6 +900,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: Analyzer CLI, diagnostics configuration and baselines
         shell: bash
         run: |
@@ -987,6 +997,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: Native check executor tests without 1C
         shell: bash
         run: |
@@ -1144,6 +1156,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: Build binary
         run: cargo build -p bsl-analyzer --bin bsl-analyzer-app
       - name: Build native check executor
@@ -1194,5 +1208,5 @@ jobs:
           # otherwise race to store the same key, and a leg that fails on its test must
           # not be the one that decides whether the cache exists.
           shared-key: release-gate-${{ matrix.cache }}
-          save-if: ${{ endsWith(matrix.shard, '-partitioned') }}
+          save-if: ${{ github.ref == 'refs/heads/develop' && endsWith(matrix.shard, '-partitioned') }}
       - run: ${{ matrix.command }}
