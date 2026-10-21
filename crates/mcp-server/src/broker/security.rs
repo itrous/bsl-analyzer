@@ -253,11 +253,9 @@ pub(crate) fn verify_supervised_backend(
     conn: &TokioStream,
     expected_pid: u32,
 ) -> Result<(), SupervisedMismatch> {
-    let actual_pid = conn
-        .peer_creds()
-        .ok()
-        .and_then(|creds| creds.pid())
-        .and_then(|pid| u32::try_from(pid).ok());
+    let actual_pid = conn.peer_creds().ok().and_then(|creds| creds.pid());
+    #[cfg(unix)]
+    let actual_pid = actual_pid.and_then(|pid| u32::try_from(pid).ok());
     if actual_pid != Some(expected_pid) {
         tracing::warn!(
             expected_pid,

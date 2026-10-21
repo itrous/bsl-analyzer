@@ -622,7 +622,7 @@ fn listener_options_shared(key: &SharedBackendKey) -> io::Result<ListenerOptions
     #[cfg(windows)]
     {
         use interprocess::os::windows::local_socket::ListenerOptionsExt;
-        return Ok(options.security_descriptor(pipe_security_descriptor_for_current_user()?));
+        Ok(options.security_descriptor(pipe_security_descriptor_for_current_user()?))
     }
     #[cfg(not(windows))]
     {
@@ -677,7 +677,7 @@ fn listener_options(key: &BackendKey) -> io::Result<ListenerOptions<'static>> {
     {
         use interprocess::os::windows::local_socket::ListenerOptionsExt;
 
-        return Ok(options.security_descriptor(pipe_security_descriptor_for_current_user()?));
+        Ok(options.security_descriptor(pipe_security_descriptor_for_current_user()?))
     }
     #[cfg(not(windows))]
     {
