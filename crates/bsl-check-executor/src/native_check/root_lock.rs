@@ -354,6 +354,7 @@ impl Drop for RootLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
 
     #[tokio::test]
     async fn independent_root_lock_wait_is_cancelled_and_releases_after_owner_drop() {
@@ -407,18 +408,20 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_wait = cancel.clone();
         let root_path = root.to_owned();
-        let waiter = tokio::spawn(async move {
-            RootLock::acquire(
-                &root_path,
-                Instant::now() + std::time::Duration::from_secs(5),
-                &cancel_wait,
-            )
-            .await
-        });
-        tokio::task::yield_now().await;
+        let waiter = RootLock::acquire(
+            &root_path,
+            Instant::now() + test_utils::wait::hang_guard(std::time::Duration::from_secs(5)),
+            &cancel_wait,
+        );
+        let mut waiter = std::pin::pin!(waiter);
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending(), "held root lock must park its waiter");
+            std::task::Poll::Ready(())
+        })
+        .await;
         cancel.cancel();
         assert!(matches!(
-            super::super::tests::guard_task(waiter, "cancelled root-lock waiter").await,
+            super::super::tests::guard_future(waiter, "cancelled root-lock waiter").await,
             Err(LockWaitError::Cancelled)
         ));
         first.verify_path().unwrap();

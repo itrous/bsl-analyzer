@@ -111,14 +111,19 @@ async fn cancelling_a_queued_check_does_not_take_the_active_slot() {
     let guard = guard_future(ACTIVE_CHECK.lock(), "active native-check slot").await;
     let cancel = CancellationToken::new();
     let waiter_cancel = cancel.clone();
-    let task = tokio::spawn(async move {
+    let task = async move {
         let client = onec_client::Client::new("http://localhost", "", "");
         check(&client, &profile(), &CheckRequest::default(), "x = 1;", 2_000, waiter_cancel).await
-    });
-    tokio::task::yield_now().await;
+    };
+    let mut task = std::pin::pin!(task);
+    std::future::poll_fn(|cx| {
+        assert!(task.as_mut().poll(cx).is_pending(), "held native slot must park the queued check");
+        std::task::Poll::Ready(())
+    })
+    .await;
     cancel.cancel();
 
-    let result = guard_task(task, "cancelled queued check").await;
+    let result = guard_future(task, "cancelled queued check").await;
     assert_eq!(result.status, CheckStatus::Error);
     assert_eq!(result.failure.unwrap().code, "cancelled");
     assert!(ACTIVE_CHECK.try_lock().is_err());
