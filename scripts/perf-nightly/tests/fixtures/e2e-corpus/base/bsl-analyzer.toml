@@ -1,0 +1,5 @@
+[source]
+root = "."
+
+[analysis]
+diff_base = "vendor"
