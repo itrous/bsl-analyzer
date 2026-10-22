@@ -5386,6 +5386,7 @@ mod tests {
             }
             let mut observer = hub.subscribe();
             write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
+            hub.deliver_modified_for_test(&root.join("bsl-analyzer.toml"));
             // Without this the test could pass having never triggered a rebuild at all.
             wait_for_delivery(
                 &hub,
@@ -5451,7 +5452,7 @@ mod tests {
             if !close_dir(&closed) {
                 return;
             }
-            let mut observer = hub.subscribe();
+            let observer = hub.subscribe();
             // One window carrying both: the config edit asks for the rebuild that will be
             // declined, and the body edit is the bystander whose delivery it consumes.
             write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
@@ -5460,25 +5461,16 @@ mod tests {
                 "CommonModules/Сервер/Ext/Module.bsl",
                 "&НаСервере\nФункция Считать() Экспорт Возврат 42; КонецФункции\n",
             );
-            // Both needles are counted across one draining loop rather than by two calls
-            // to `wait_for_delivery`: that helper advances the cursor past everything it
-            // drained, so the first call would consume the delivery the second is waiting
-            // for and the setup would fail for a reason that is not the subject.
-            let (mut config_seen, mut body_seen) = (false, false);
-            wait_until("the hub delivered the config edit and the body edit", || {
-                let batch = hub.drain(observer);
-                observer = batch.cursor;
-                for entry in &batch.entries {
-                    let path = entry.raw.to_string_lossy();
-                    config_seen |= path.contains("bsl-analyzer.toml");
-                    body_seen |= path.contains("Module.bsl");
-                }
-                if config_seen && body_seen {
-                    Ok(())
-                } else {
-                    Err((config_seen, body_seen))
-                }
-            });
+            hub.deliver_modified_for_test(&root.join("bsl-analyzer.toml"));
+            hub.deliver_modified_for_test(&root.join("CommonModules/Сервер/Ext/Module.bsl"));
+            // One drain checks both deliveries: separate drains would consume each other's entries.
+            let batch = hub.drain(observer);
+            for needle in ["bsl-analyzer.toml", "Module.bsl"] {
+                assert!(
+                    batch.entries.iter().any(|entry| entry.raw.to_string_lossy().contains(needle)),
+                    "the hub delivered {needle}",
+                );
+            }
 
             // Observed through the generation, not through the file text: a resident whose
             // recorded revision no longer matches disk refuses to hand its text over at all
@@ -5612,6 +5604,7 @@ mod tests {
             }
             let mut observer = hub.subscribe();
             write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
+            hub.deliver_modified_for_test(&root.join("bsl-analyzer.toml"));
             wait_for_delivery(
                 &hub,
                 &mut observer,
@@ -5636,6 +5629,7 @@ mod tests {
                 "Catalogs/Товары/Ext/ObjectModule.bsl",
                 "Процедура ПередЗаписью(Отказ) КонецПроцедуры",
             );
+            hub.deliver_modified_for_test(&object_module);
             wait_for_delivery(
                 &hub,
                 &mut observer,
@@ -5682,6 +5676,7 @@ mod tests {
             }
             let mut observer = hub.subscribe();
             write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
+            hub.deliver_modified_for_test(&root.join("bsl-analyzer.toml"));
             wait_for_delivery(
                 &hub,
                 &mut observer,
@@ -5699,6 +5694,7 @@ mod tests {
             });
 
             write_catalog(root, "Товары", 9);
+            hub.deliver_modified_for_test(&root.join("Catalogs/Товары.xml"));
             wait_for_delivery(
                 &hub,
                 &mut observer,
