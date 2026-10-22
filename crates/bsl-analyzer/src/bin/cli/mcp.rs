@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     env,
     error::Error,
+    future::Future,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -1323,11 +1324,22 @@ fn run_mcp_server(
         "Starting MCP server (stdio)"
     );
 
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    // A signal between taking the workspace lease and serving must still run `shutdown`,
+    // which releases the lease; otherwise the record looks live to the next process.
+    let signal = {
+        let _runtime = rt.enter();
+        shutdown_signal()?
+    };
     let server = build_server(profile, inputs)?;
     let shutdown_guard = server.clone();
 
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let serve_result = rt.block_on(mcp_server::serve_stdio(server));
+    let serve_result = rt.block_on(async {
+        tokio::select! {
+            result = mcp_server::serve_stdio(server) => result,
+            result = signal => result.map_err(anyhow::Error::from),
+        }
+    });
 
     shutdown_guard.shutdown();
     drop(shutdown_guard);
@@ -1362,6 +1374,10 @@ fn run_mcp_http(
         ProcessRecordGuard::acquire(profile, source_dir.clone(), requested_address)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let signal = {
+        let _runtime = rt.enter();
+        shutdown_signal()?
+    };
     let listener =
         rt.block_on(tokio::net::TcpListener::bind(requested_address)).map_err(|error| {
             io::Error::new(
@@ -1398,6 +1414,7 @@ fn run_mcp_http(
                 options.allowed_hosts,
                 cancellation,
                 &mut process_record,
+                signal,
             ))
         }
         Err(error) => Err(error.into()),
@@ -1415,6 +1432,7 @@ fn run_mcp_http(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // The caller registers the signal before taking the lease.
 async fn serve_http_until_signal(
     listener: tokio::net::TcpListener,
     server: mcp_server::McpServer,
@@ -1423,6 +1441,7 @@ async fn serve_http_until_signal(
     allowed_hosts: Vec<String>,
     cancellation: tokio_util::sync::CancellationToken,
     process_record: &mut ProcessRecordGuard,
+    signal: impl Future<Output = io::Result<()>>,
 ) -> anyhow::Result<()> {
     let serve = mcp_server::serve_http(
         listener,
@@ -1436,7 +1455,7 @@ async fn serve_http_until_signal(
 
     tokio::select! {
         result = &mut serve => result,
-        signal_result = shutdown_signal() => {
+        signal_result = signal => {
             let record_result = process_record.mark_stopping();
             cancellation.cancel();
             let serve_result = serve.await;
@@ -1447,20 +1466,32 @@ async fn serve_http_until_signal(
     }
 }
 
-async fn shutdown_signal() -> io::Result<()> {
+/// Install the stop-signal handlers now and return a future that resolves on the first
+/// SIGTERM or SIGINT (Ctrl-C off Unix). Registration is synchronous so a signal that arrives
+/// before the future is first polled is not handled by the default action, which would kill
+/// the process without releasing its workspace lease. Must be called inside a runtime.
+fn shutdown_signal() -> io::Result<impl Future<Output = io::Result<()>> + Send> {
     #[cfg(unix)]
     {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
-        }
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
+            }
+            Ok(())
+        })
     }
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await
+        let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+        Ok(async move {
+            ctrl_c.recv().await;
+            Ok(())
+        })
     }
 }
 

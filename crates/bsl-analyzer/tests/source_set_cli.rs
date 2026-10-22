@@ -3119,6 +3119,329 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     println!("BA235_NATIVE_RECEIPT={report}");
 }
 
+/// A stdio server on a private cache, once its writer lease names it.
+///
+/// The server claims the cache while it builds its state and answers `initialize` only after
+/// that, so the reply `start_transport` waits for is what says the record is on disk.
+#[cfg(unix)]
+fn stdio_server_holding_its_lease(
+    root: &Path,
+    flags: &[&str],
+    paths: &Path,
+) -> (McpSession, mcp_server::WorkspaceCacheLayout) {
+    let cache_base = paths.join("cache");
+    let state = paths.join("state");
+    let layout = cache_layout(root, "EXT_A", Some(&cache_base));
+    let session = McpSession::start_transport(
+        root,
+        flags,
+        "stdio",
+        Some(&cache_base),
+        None,
+        Some(&state),
+        None,
+        Some("0"),
+        None,
+    );
+    lease_receipt(&layout.lease_path(), session.pid());
+    (session, layout)
+}
+
+/// The lines a child writes to stderr, delivered as it writes them. The reader keeps draining
+/// after the last line is wanted, so a chatty child never blocks on a full pipe.
+#[cfg(unix)]
+fn stderr_lines(stderr: std::process::ChildStderr) -> Receiver<String> {
+    let (lines, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = lines.send(line);
+        }
+    });
+    received
+}
+
+/// Blocks until `child` exits. The guard past which a child still running is killed is far
+/// beyond any healthy exit: it exists so a process that ignores its signal fails the test
+/// with its status instead of stalling the runner, and never decides a healthy run.
+#[cfg(unix)]
+fn wait_for_exit(child: &mut Child) -> ExitStatus {
+    let pid = child.id() as libc::pid_t;
+    let (exited, guard) = mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if guard.recv_timeout(HANG_WATCHDOG) == Err(mpsc::RecvTimeoutError::Timeout) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    });
+    let status = child.wait().expect("wait for the child to exit");
+    drop(exited);
+    watchdog.join().expect("exit watchdog");
+    status
+}
+
+/// Blocks until a line containing `needle` arrives; the end of the stream before it means
+/// the child left without logging it.
+#[cfg(unix)]
+fn wait_for_stderr_line(lines: &Receiver<String>, needle: &str) {
+    let mut seen = Vec::new();
+    loop {
+        match lines.recv() {
+            Ok(line) if line.contains(needle) => return,
+            Ok(line) => seen.push(line),
+            Err(_) => {
+                panic!("the child exited before logging {needle:?}; stderr:\n{}", seen.join("\n"))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_signalled_stdio_server_hands_the_workspace_lease_back() {
+    let root = workspace();
+    source_composition(root.path());
+    let flags_owned = composition_flags(root.path(), "EXT_A");
+    let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
+    for (name, signal) in [("SIGTERM", libc::SIGTERM), ("SIGINT", libc::SIGINT)] {
+        let paths = tempfile::tempdir().unwrap();
+        let (mut session, layout) =
+            stdio_server_holding_its_lease(root.path(), &flags, paths.path());
+        let pid = session.pid();
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0, "{name} reaches {pid}");
+        let status = wait_for_exit(&mut session.child);
+        assert!(
+            status.success(),
+            "stdio server exits cleanly after {name}: {status}; stderr tail: {}",
+            session.stderr_snapshot()
+        );
+        assert!(!layout.lease_path().exists(), "stdio server releases its lease after {name}");
+    }
+}
+
+/// The server logs the claim right after it writes the record, long before it answers
+/// anything, so a signal sent on that line lands while the server is still building its state.
+/// The stop must be registered before the claim for this to end cleanly, whenever the signal
+/// is delivered.
+#[cfg(unix)]
+#[test]
+fn a_stdio_server_signalled_as_it_claims_its_lease_hands_it_back() {
+    let root = workspace();
+    source_composition(root.path());
+    let flags_owned = composition_flags(root.path(), "EXT_A");
+    let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
+    for (name, signal) in [("SIGTERM", libc::SIGTERM), ("SIGINT", libc::SIGINT)] {
+        let paths = tempfile::tempdir().unwrap();
+        let cache_base = paths.path().join("cache");
+        let state = paths.path().join("state");
+        let runtime = state.join("runtime");
+        assert_private_test_dir(&runtime);
+        let layout = cache_layout(root.path(), "EXT_A", Some(&cache_base));
+        let mut server = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+            .args(["mcp", "serve", "--profile", "workspace", "--mode", "stdio", "-s"])
+            .arg(root.path())
+            .args(&flags)
+            .env("BSL_MCP_BROKER", "0")
+            .env("BSL_LOG", "info")
+            .env("BSL_CACHE_DIR", &cache_base)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("EMBEDDING_URL")
+            .env_remove("EMBEDDING_MODEL")
+            .env_remove("EMBEDDING_DIM")
+            .env_remove("EMBEDDING_API_KEY")
+            .env_remove("EMBEDDING_PROVIDER")
+            .env_remove("EMBEDDING_QUERY_PREFIX")
+            .env_remove("EMBEDDING_DOCUMENT_PREFIX")
+            .env_remove("BSL_LOG_FILE")
+            .env_remove("BSL_MCP_DAEMON_LOG")
+            .current_dir(root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start the MCP server");
+        // Held open: the end of its input is not what must stop it.
+        let _stdin = server.stdin.take();
+        let stderr = stderr_lines(server.stderr.take().unwrap());
+        wait_for_stderr_line(&stderr, "claimed the workspace derived-cache lease");
+        let pid = server.id();
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0, "{name} reaches {pid}");
+        let status = wait_for_exit(&mut server);
+        let log: Vec<_> = stderr.try_iter().collect();
+        assert!(
+            status.success(),
+            "stdio server exits cleanly after {name} at its claim: {status}; stderr tail: {}",
+            log.join("\n")
+        );
+        assert!(
+            !layout.lease_path().exists(),
+            "stdio server releases its lease after {name} at its claim"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_killed_stdio_server_leaves_its_lease_record() {
+    let root = workspace();
+    source_composition(root.path());
+    let flags_owned = composition_flags(root.path(), "EXT_A");
+    let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
+    let paths = tempfile::tempdir().unwrap();
+    let (mut session, layout) = stdio_server_holding_its_lease(root.path(), &flags, paths.path());
+    let pid = session.pid();
+    session.child.kill().unwrap();
+    session.child.wait().unwrap();
+    lease_receipt(&layout.lease_path(), pid);
+}
+
+/// A direct daemon that can leave only by a signal, once a session it serves has an answer
+/// (its owner is built) and its writer lease names it.
+#[cfg(unix)]
+struct OwnedDaemon {
+    daemon: Child,
+    pid: u32,
+    stderr: Receiver<String>,
+    _session: McpSession,
+    layout: mcp_server::WorkspaceCacheLayout,
+    cache_base: PathBuf,
+    state: PathBuf,
+}
+
+#[cfg(unix)]
+impl OwnedDaemon {
+    /// What the daemon has written to stderr so far, for a failure message.
+    fn stderr_so_far(&self) -> String {
+        self.stderr.try_iter().collect::<Vec<_>>().join("\n")
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedDaemon {
+    fn drop(&mut self) {
+        if self.daemon.try_wait().ok().flatten().is_none() {
+            let _ = self.daemon.kill();
+            let _ = self.daemon.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn daemon_holding_its_lease(root: &Path, flags: &[&str], paths: &Path) -> OwnedDaemon {
+    let cache_home = paths.join("xdg-cache");
+    let cache_base = cache_home.join("bsl-analyzer");
+    let state = paths.join("state");
+    let runtime = state.join("runtime");
+    assert_private_test_dir(&cache_home);
+    assert_private_test_dir(&state);
+    assert_private_test_dir(&runtime);
+    let layout = cache_layout(root, "EXT_A", Some(&cache_base));
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .args(["mcp", "serve", "--profile", "workspace", "--mode", "daemon", "-s"])
+        .arg(root)
+        .args(flags)
+        .env("BSL_MCP_BROKER", "0")
+        .env("BSL_MCP_IDLE_TTL_SECS", "3600")
+        .env("BSL_MCP_ORPHAN_GRACE_SECS", "3600")
+        .env("BSL_LOG", "info")
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("BSL_MCP_DAEMON_LOG")
+        .env_remove("BSL_CACHE_DIR")
+        .env_remove("EMBEDDING_URL")
+        .env_remove("EMBEDDING_MODEL")
+        .env_remove("EMBEDDING_DIM")
+        .env_remove("EMBEDDING_API_KEY")
+        .env_remove("EMBEDDING_PROVIDER")
+        .env_remove("EMBEDDING_QUERY_PREFIX")
+        .env_remove("EMBEDDING_DOCUMENT_PREFIX")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("direct native daemon starts");
+    let pid = daemon.id();
+    let stderr = stderr_lines(daemon.stderr.take().unwrap());
+    // The required proxy makes one attempt, so the listener must be bound before it starts.
+    wait_for_stderr_line(&stderr, "shared broker listening");
+    let mut session = McpSession::start_transport(
+        root,
+        flags,
+        "broker-required",
+        None,
+        Some(&cache_home),
+        Some(&state),
+        None,
+        None,
+        Some(pid),
+    );
+    // The daemon builds its owner, and with it claims the cache, before it serves any session,
+    // so an answer to this session says the record is on disk.
+    let status = session.call("graph", serde_json::json!({"action": "status"}));
+    assert!(status["error"].is_null(), "the daemon answers its session: {status}");
+    lease_receipt(&layout.lease_path(), pid);
+    OwnedDaemon { daemon, pid, stderr, _session: session, layout, cache_base, state }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_signalled_daemon_hands_the_workspace_lease_back() {
+    let root = workspace();
+    source_composition(root.path());
+    let flags_owned = composition_flags(root.path(), "EXT_A");
+    let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
+    for (name, signal) in [("SIGTERM", libc::SIGTERM), ("SIGINT", libc::SIGINT)] {
+        let paths = tempfile::tempdir().unwrap();
+        let mut owned = daemon_holding_its_lease(root.path(), &flags, paths.path());
+        let pid = owned.pid;
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0, "{name} reaches {pid}");
+        let status = wait_for_exit(&mut owned.daemon);
+        assert!(
+            status.success(),
+            "daemon exits cleanly after {name}: {status}; stderr: {}",
+            owned.stderr_so_far()
+        );
+        assert!(!owned.layout.lease_path().exists(), "daemon releases its lease after {name}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_server_started_after_a_signalled_daemon_gets_the_graph() {
+    let root = workspace();
+    source_composition(root.path());
+    let flags_owned = composition_flags(root.path(), "EXT_A");
+    let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
+    let paths = tempfile::tempdir().unwrap();
+    let mut owned = daemon_holding_its_lease(root.path(), &flags, paths.path());
+    assert_eq!(unsafe { libc::kill(owned.pid as libc::pid_t, libc::SIGTERM) }, 0);
+    wait_for_exit(&mut owned.daemon);
+    let mut next = McpSession::start_transport(
+        root.path(),
+        &flags,
+        "stdio",
+        Some(&owned.cache_base),
+        None,
+        Some(&owned.state),
+        None,
+        Some("0"),
+        None,
+    );
+    let status = next.call("graph", serde_json::json!({"action": "status"}))["result"]
+        ["structuredContent"]
+        .clone();
+    assert!(
+        matches!(status["state"].as_str(), Some("loading" | "ready")),
+        "the next server gets the graph: {status}"
+    );
+    assert!(
+        !status["error"].as_str().unwrap_or_default().contains("graph busy"),
+        "the stopped daemon no longer holds the graph: {status}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn workspace_cache_scope_s12_proxy_parent_child_composition_mismatch() {

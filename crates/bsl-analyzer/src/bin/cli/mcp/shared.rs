@@ -409,6 +409,9 @@ where
 }
 
 pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
+    // Registered before the endpoint and the owner exist, so a stop signal never takes the
+    // default action that would leave the writer lease looking live.
+    let signal = super::shutdown_signal()?;
     let source = inputs.source_dir.clone().context("workspace daemon requires source")?;
     let cache = inputs.workspace_cache.clone().context("workspace daemon requires cache")?;
     prepare_platform_identity(&source)?;
@@ -552,10 +555,19 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
             }
         }
     };
+    let stop = CancellationToken::new();
+    let signalled = stop.clone();
+    tokio::spawn(async move {
+        match signal.await {
+            Ok(()) => signalled.cancel(),
+            Err(error) => tracing::warn!(%error, "waiting for a stop signal failed"),
+        }
+    });
     daemon::run_shared(
         key,
         on_session,
         retired,
+        stop,
         broker_orphan_grace(),
         broker_idle_ttl(),
         move || {

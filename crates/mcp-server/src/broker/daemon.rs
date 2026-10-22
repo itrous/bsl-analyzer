@@ -129,10 +129,13 @@ pub enum SharedSession {
 }
 
 /// Bind and serve adapter sessions as soon as the lightweight owner callback exists.
+/// `stop` ends serving the way idleness does, so the owner still shuts down.
+#[allow(clippy::too_many_arguments)] // Each callback belongs to the upper adapter owner.
 pub async fn run_shared<F, Fut>(
     key: SharedBackendKey,
     on_session: F,
     scope_retired: CancellationToken,
+    stop: CancellationToken,
     orphan_grace: Duration,
     idle_ttl: Duration,
     lease_state: impl Fn() -> (bool, bool) + Send + 'static,
@@ -154,6 +157,7 @@ where
         listener,
         Arc::new(on_session),
         scope_retired,
+        stop,
         orphan_grace,
         idle_ttl,
         lease_state,
@@ -168,6 +172,7 @@ async fn serve_shared<F, Fut>(
     listener: TokioListener,
     on_session: Arc<F>,
     scope_retired: CancellationToken,
+    stop: CancellationToken,
     orphan_grace: Duration,
     idle_ttl: Duration,
     lease_state: impl Fn() -> (bool, bool) + Send + 'static,
@@ -201,6 +206,10 @@ where
             biased;
             _ = scope_retired.cancelled() => {
                 tracing::info!("shared workspace scope retired; closing broker endpoint");
+                break;
+            }
+            _ = stop.cancelled() => {
+                tracing::info!("shared backend stopped; closing broker endpoint");
                 break;
             }
             accepted = listener.accept() => {
@@ -281,10 +290,14 @@ where
     let retired = scope_retired.is_cancelled();
     drop(listener);
     if superseded {
-        while !lease_state().1 {
+        // A stop cuts graph reads short, as dying by the signal would, but the owner
+        // still shuts down and releases the workspace lease.
+        while !lease_state().1 && !stop.is_cancelled() {
             tokio::time::sleep(poll.min(Duration::from_millis(200))).await;
         }
-        tokio::time::sleep(SUPERSEDED_DRAIN).await;
+        if !stop.is_cancelled() {
+            tokio::time::sleep(SUPERSEDED_DRAIN).await;
+        }
     }
     if retired {
         let drain = async { while sessions.join_next().await.is_some() {} };
@@ -862,6 +875,7 @@ mod shared_tests {
                 },
             ),
             CancellationToken::new(),
+            CancellationToken::new(),
             Duration::from_secs(3),
             // An idle TTL no run reaches: only the orphan grace can end this daemon, so a
             // private-only attach that counted as a warm session would keep it running.
@@ -990,6 +1004,7 @@ mod shared_tests {
                 },
             ),
             daemon_retired,
+            CancellationToken::new(),
             Duration::from_secs(30),
             Duration::from_secs(30),
             || (false, false),
@@ -1161,6 +1176,7 @@ mod shared_tests {
                 },
             ),
             retired.clone(),
+            CancellationToken::new(),
             Duration::from_millis(400),
             Duration::from_secs(60),
             move || (lease.load(Ordering::SeqCst), graph.load(Ordering::SeqCst)),
@@ -1243,6 +1259,99 @@ mod shared_tests {
     }
 
     #[tokio::test]
+    async fn a_stop_ends_the_superseded_wait_for_graph_reads() {
+        let source = tempfile::tempdir().unwrap();
+        let identity = SharedBackendIdentity::new(
+            source.path(),
+            crate::WorkspaceCacheLayout::for_workspace(source.path()).root(),
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        );
+        let key = SharedBackendKey::new(identity.clone());
+        let listener = bind_shared(&key).await.unwrap().unwrap();
+        let superseded = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (attached_tx, mut attached_rx) = tokio::sync::mpsc::channel(1);
+        let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (lease, shutdown_seen) = (superseded.clone(), stopped.clone());
+        let calls_since_supersession = Arc::new(AtomicU64::new(0));
+        let stop = CancellationToken::new();
+        let daemon = tokio::spawn(serve_shared(
+            key.clone(),
+            listener,
+            Arc::new(
+                move |_hello, _context, mut session, shutdown: CancellationToken, _retired| {
+                    let attached = attached_tx.clone();
+                    async move {
+                        let SharedSession::Mcp(stream) = &mut session else {
+                            panic!("MCP session")
+                        };
+                        attached.send(()).await.unwrap();
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {},
+                            _ = stream.read_u8() => {},
+                        }
+                        Ok(())
+                    }
+                },
+            ),
+            CancellationToken::new(),
+            stop.clone(),
+            Duration::from_millis(400),
+            Duration::from_secs(60),
+            // The graph is never released, so only the stop can end the superseded wait. Once
+            // supersession is raised, the first call is the serving loop's own, which leaves
+            // on it; the second is the wait for graph reads asking for the first time.
+            move || {
+                let raised = lease.load(Ordering::SeqCst);
+                if raised && calls_since_supersession.fetch_add(1, Ordering::SeqCst) == 1 {
+                    let _ = waiting_tx.send(());
+                }
+                (raised, false)
+            },
+            move || {
+                shutdown_seen.store(true, Ordering::SeqCst);
+            },
+        ));
+        let mut client =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        client_handshake(&mut client, &Handshake { identity, adapter: AdapterKind::Mcp })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            test_utils::wait::hang_guard(HANDSHAKE_TIMEOUT),
+            write_session_context(&mut client, &[]),
+        )
+        .await
+        .expect("test session context write is bounded")
+        .unwrap();
+        tokio::time::timeout(test_utils::wait::hang_guard(HANDSHAKE_TIMEOUT), attached_rx.recv())
+            .await
+            .expect("adapter admission is bounded")
+            .expect("the session attached");
+        superseded.store(true, Ordering::SeqCst);
+        // The wait for graph reads has asked once, so the loop has left through supersession
+        // and the stop below reaches that wait rather than the loop.
+        tokio::time::timeout(
+            test_utils::wait::hang_guard(Duration::from_secs(3)),
+            waiting_rx.recv(),
+        )
+        .await
+        .expect("supersession reaches the wait for graph reads while the client remains attached")
+        .expect("the wait for graph reads asked");
+        assert!(!daemon.is_finished(), "the superseded daemon waits for graph reads");
+        stop.cancel();
+        tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(5)), daemon)
+            .await
+            .expect("a stop ends the superseded wait")
+            .unwrap()
+            .unwrap();
+        assert!(stopped.load(Ordering::SeqCst), "the stopped daemon runs its owner shutdown");
+    }
+
+    #[tokio::test]
     async fn mixed_sessions_are_admitted_and_one_can_disconnect_independently() {
         let source = tempfile::tempdir().unwrap();
         let identity = SharedBackendIdentity::new(
@@ -1295,6 +1404,7 @@ mod shared_tests {
                 },
             ),
             server_retired,
+            CancellationToken::new(),
             Duration::from_secs(30),
             Duration::from_secs(30),
             || (false, false),
