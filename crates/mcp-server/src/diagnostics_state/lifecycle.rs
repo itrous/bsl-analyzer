@@ -178,6 +178,11 @@ impl DiagnosticsState {
     /// in one place so a first build and a reload cannot publish different states. A reload
     /// that forgot to clear the failure bookkeeping, say, would leave a `Ready` resident still
     /// reporting the cause it answered.
+    ///
+    /// A resident published now counts as used now. Idle eviction measures the time since the
+    /// last use, and a rebuild started by a `status` call has no read behind it: left alone,
+    /// `last_access` still dates from before the previous eviction and the sweeper drops the
+    /// fresh resident on its next tick.
     fn publish_build_success(&self, inner: &mut Inner, mut built: ResidentBuild) -> PublishTail {
         let files = built.resident.file_count();
         let project = Arc::new(built.resident.project().clone());
@@ -196,6 +201,7 @@ impl DiagnosticsState {
         inner.failed_at = None;
         inner.failed_attempts = 0;
         inner.status = DiagnosticsStatus::Ready { files };
+        *lock_recover(&self.last_access) = Instant::now();
         crate::workspace_handle::notify_generation(self, inner.generation);
         PublishTail {
             files,
@@ -505,10 +511,11 @@ impl DiagnosticsState {
     /// Count the resident as in use without reading it.
     ///
     /// Idle eviction measures the time since the last READ, which is the right measure for
-    /// callers that read and leave. A caller waiting for the build to finish is using the
-    /// resident just as much, and has nothing to read yet: without this, the sweeper sees an
-    /// untouched resident, evicts it the moment it is published, and the waiter goes on
-    /// waiting for a build nobody will start again.
+    /// callers that read and leave. A caller holding or waiting for the resident is using it
+    /// just as much while it has nothing to read: without this, the sweeper sees an untouched
+    /// resident and evicts it under the caller. Publishing a build stamps the same time
+    /// itself (see `publish_build_success`), so a waiter's resident is not evicted the moment
+    /// it arrives.
     pub(crate) fn mark_in_use(&self) {
         *lock_recover(&self.last_access) = Instant::now();
     }
@@ -2631,6 +2638,68 @@ mod tests {
         assert_eq!(report.reload, "running", "with its reload still in flight");
         state.shutdown();
         ready.shutdown();
+    }
+
+    /// Make the resident look last used `by` ago, without waiting for it.
+    fn age_last_access(state: &DiagnosticsState, by: Duration) {
+        *lock_recover(&state.last_access) =
+            Instant::now().checked_sub(by).expect("test age under process uptime");
+    }
+
+    /// A build started by `status` has no read behind it, so the idle clock has to start at its
+    /// publication: stamped from the use before the previous eviction, the fresh resident is
+    /// already past `eviction_after` and the sweeper drops it on its next tick.
+    #[test]
+    fn a_first_build_is_not_evicted_right_after_it_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_workspace(dir.path());
+
+        let mut state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        state.without_idle_sweeper();
+        state.eviction_after = Duration::from_secs(60);
+        age_last_access(&state, state.eviction_after * 2);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        assert!(!state.evict_if_idle(), "a resident published just now has not idled yet");
+        assert!(matches!(state.status(), DiagnosticsStatus::Ready { .. }));
+
+        age_last_access(&state, state.eviction_after * 2);
+        assert!(state.evict_if_idle(), "idling for `eviction_after` after publication evicts");
+        assert_eq!(state.status(), DiagnosticsStatus::Idle);
+    }
+
+    /// The same for a reload: it swaps in a resident the sweeper would otherwise judge by the
+    /// use that preceded the rebuild.
+    #[test]
+    fn a_reload_is_not_evicted_right_after_it_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_workspace(dir.path());
+
+        let mut state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        state.without_idle_sweeper();
+        state.eviction_after = Duration::from_secs(60);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        let epoch = lock_inner(&state.inner).baseline_epoch;
+        age_last_access(&state, state.eviction_after * 2);
+        state.kick_full_reload();
+        wait_until("the reload is published", || {
+            let inner = lock_inner(&state.inner);
+            if inner.baseline_epoch > epoch && inner.reload == ReloadState::Idle {
+                Ok(())
+            } else {
+                Err((inner.baseline_epoch, inner.reload.clone()))
+            }
+        });
+
+        assert!(!state.evict_if_idle(), "a resident swapped in just now has not idled yet");
+        assert!(matches!(state.status(), DiagnosticsStatus::Ready { .. }));
+
+        age_last_access(&state, state.eviction_after * 2);
+        assert!(state.evict_if_idle(), "idling for `eviction_after` after the swap evicts");
+        assert_eq!(state.status(), DiagnosticsStatus::Idle);
     }
 
     /// The same deadline, driven by the clock it actually runs on: the sweeper's tick is the
