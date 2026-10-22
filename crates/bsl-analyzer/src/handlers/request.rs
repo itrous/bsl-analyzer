@@ -4139,6 +4139,67 @@ mod tests {
         assert_eq!(symbols[0].name, "ДрейфТестМетод");
     }
 
+    /// A shared session freezes its paths from the database, not from a VFS that
+    /// holds every file. A metadata object is a name-search candidate placed in
+    /// its XML, which lives in the metadata root: a snapshot that knows only the
+    /// BSL root cannot locate it, and the request fails on every query that
+    /// reaches a metadata object.
+    #[test]
+    fn workspace_symbol_locates_a_metadata_object_from_a_database_snapshot() {
+        use base_db::{SourceDatabase as _, SourceRoot, METADATA_SOURCE_ROOT};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xml_path = tmp.path().join("Номенклатура.xml");
+        let xml_text = "<MetaDataObject/>";
+        std::fs::write(&xml_path, xml_text).expect("write xml");
+        let xml_uri = lsp_types::Url::from_file_path(&xml_path).expect("xml url");
+
+        let mut state = create_test_state();
+        state.init_empty_source_root();
+        let xml_id = state.vfs.write().alloc_file_id(VfsPath::new(xml_path.clone()));
+        {
+            let db = state.analysis_host.raw_database_mut();
+            let mut metadata_files = vfs::file_set::FileSet::new();
+            metadata_files.insert(xml_id, VfsPath::new(xml_path.clone()));
+            db.set_source_root(METADATA_SOURCE_ROOT, SourceRoot::new_metadata(metadata_files));
+            db.set_file_source_root(xml_id, METADATA_SOURCE_ROOT);
+            db.set_file_revision_from_disk(xml_id, base_db::content_revision(xml_text));
+            db.set_all_config_paths(vec![(None, tmp.path().to_path_buf())], None);
+            db.set_metadata_listing(
+                &tmp.path().to_string_lossy(),
+                ide_db::metadata::MetadataListingData {
+                    entries: vec![ide_db::metadata::MdoEntry {
+                        kind: bsl_metadata::MdoType::Catalog,
+                        name: "Номенклатура".to_string(),
+                        main: xml_id,
+                        predefined: None,
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+
+        let mut ctx = latency_ctx(&state);
+        ctx.file_paths = FrozenFilePaths::freeze_database(ctx.analysis.database());
+        let response = handle_workspace_symbol(
+            &ctx,
+            WorkspaceSymbolParams {
+                query: "Номенклатура".to_string(), ..Default::default()
+            },
+        )
+        .expect("a metadata object is located through the database snapshot");
+
+        let Some(WorkspaceSymbolResponse::Nested(symbols)) = response else {
+            panic!("the metadata object is an answer: {response:?}");
+        };
+        assert_eq!(symbols.len(), 1, "{symbols:?}");
+        assert_eq!(symbols[0].kind, SymbolKind::CLASS);
+        match &symbols[0].location {
+            OneOf::Left(location) => assert_eq!(location.uri, xml_uri),
+            OneOf::Right(_) => panic!("expected a full location with range"),
+        }
+    }
+
     #[test]
     fn reference_location_converter_uses_target_file_uri_and_text() {
         let mut state = create_test_state();

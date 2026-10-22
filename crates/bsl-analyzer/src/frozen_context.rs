@@ -25,10 +25,14 @@ pub struct FrozenFilePaths {
 }
 
 impl FrozenFilePaths {
+    /// Paths of every file the database holds, BSL and metadata XML alike: answers
+    /// place metadata objects in their XML, so a snapshot without the metadata root
+    /// cannot locate them.
     pub fn freeze_database(db: &ide::RootDatabaseImpl) -> Self {
         let mut forward = FxHashMap::default();
         let mut reverse = FxHashMap::default();
-        if let Some(input) = db.try_source_root_input(base_db::BSL_SOURCE_ROOT) {
+        for id in [base_db::BSL_SOURCE_ROOT, base_db::METADATA_SOURCE_ROOT] {
+            let Some(input) = db.try_source_root_input(id) else { continue };
             let root = input.root(db);
             for file_id in root.iter() {
                 let Some(path) = root.file_set().path_for_file(&file_id) else { continue };
