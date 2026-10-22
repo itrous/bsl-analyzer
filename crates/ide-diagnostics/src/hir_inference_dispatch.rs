@@ -24,6 +24,7 @@ pub(crate) const INFERENCE_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::PlatformMemberNewerThanMinVersion,
     DiagnosticCode::PlatformMemberHiddenByCompatibilityMode,
     DiagnosticCode::ModuleAccessibility,
+    DiagnosticCode::ImplicitDatabaseReadInCycle,
     DiagnosticCode::ExternalAppStarting,
     DiagnosticCode::FileSystemAccess,
 ];
@@ -125,6 +126,7 @@ fn diagnostic_expr(diag: &InferenceDiagnostic) -> ExprId {
         InferenceDiagnostic::PlatformMemberHiddenByCompatibilityMode { expr, .. } => *expr,
         InferenceDiagnostic::ModuleAccessibility { expr, .. } => *expr,
         InferenceDiagnostic::GuardedCall { expr, .. } => *expr,
+        InferenceDiagnostic::ImplicitDatabaseRead { expr, .. } => *expr,
     }
 }
 
@@ -273,5 +275,8 @@ fn dispatch_inference_diagnostic(
             SecurityCategory::FileSystem => handlers::file_system_access::from_hir(range, ctx),
             _ => None,
         },
+        InferenceDiagnostic::ImplicitDatabaseRead { kind, .. } => {
+            handlers::implicit_database_read_in_cycle::from_hir(kind, range, ctx)
+        }
     }
 }

@@ -238,10 +238,32 @@ enum EmbedFencePoint {
 type EmbedFenceHook = Box<dyn FnMut(EmbedFencePoint) + Send>;
 #[cfg(test)]
 static EMBED_FENCE_HOOK: Mutex<Option<EmbedFenceHook>> = Mutex::new(None);
+// Keyed by the database a pass writes to. The counters are process-wide, and a pass that a
+// parallel test starts would otherwise spend a refusal armed for another test's workspace.
 #[cfg(test)]
-static FORCE_EMBED_PREFLIGHT_REFUSALS: AtomicU64 = AtomicU64::new(0);
+#[derive(Clone, Copy, Default)]
+struct ForcedEmbedRefusals {
+    preflight: u64,
+    publication: u64,
+}
 #[cfg(test)]
-static FORCE_EMBED_PUBLICATION_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static FORCE_EMBED_REFUSALS: Mutex<std::collections::BTreeMap<PathBuf, ForcedEmbedRefusals>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn take_forced_embed_refusal(db_path: &Path, apply_count: usize) -> bool {
+    let mut forced = FORCE_EMBED_REFUSALS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(remaining) = forced.get_mut(db_path) else {
+        return false;
+    };
+    let counter =
+        if apply_count == 1 { &mut remaining.preflight } else { &mut remaining.publication };
+    if *counter == 0 {
+        return false;
+    }
+    *counter -= 1;
+    true
+}
 #[cfg(test)]
 pub(super) static FORCE_OVERLAY_PUBLICATION_REFUSALS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1251,6 +1273,10 @@ impl SharedState {
     /// store on every iteration and the `set_vector_index` swap happens per iteration, the LAST
     /// iteration installs an index reflecting the latest store state — an older caller can never
     /// install a stale index over a newer one.
+    ///
+    /// The returned handle lets a test wait for the pass to end by joining it. Production drops
+    /// it, which detaches the thread as before. `None` means no pass started: it was skipped, or
+    /// the spawn failed.
     #[allow(
         clippy::too_many_arguments,
         reason = "the host passes one retry budget to the existing worker contract; a wrapper would only rename these inputs"
@@ -1265,7 +1291,7 @@ impl SharedState {
         db_path: PathBuf,
         config: bsl_search::SearchConfig,
         publish_retry_budget: std::time::Duration,
-    ) {
+    ) -> Option<std::thread::JoinHandle<()>> {
         // The one search write a superseded daemon must NOT make. A chunk's embedding is stored
         // as a bare blob against its id, with no record of the model that produced it, and the
         // embedding configuration is one of the axes that forks a daemon generation in the first
@@ -1289,13 +1315,13 @@ impl SharedState {
                 "another daemon generation owns this workspace's derived caches; \
                  skipping the embedding pass"
             );
-            return;
+            return None;
         }
         if !embed_flight.claim() {
             record.outcome = LifecycleOutcome::Skipped;
             record.emit(false);
             // A pass is already running; it will loop again and absorb these NULL chunks.
-            return;
+            return None;
         }
 
         let progress_pass = index_progress.begin_pass();
@@ -1387,18 +1413,7 @@ impl SharedState {
                                 {
                                     hook(EmbedFencePoint::Apply(apply_count));
                                 }
-                                let forced = if apply_count == 1 {
-                                    &FORCE_EMBED_PREFLIGHT_REFUSALS
-                                } else {
-                                    &FORCE_EMBED_PUBLICATION_REFUSALS
-                                };
-                                #[allow(deprecated, reason = "test fault injection retains Rust 1.91 compatibility")]
-                                if forced
-                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                                        remaining.checked_sub(1)
-                                    })
-                                    .is_ok()
-                                {
+                                if take_forced_embed_refusal(&db_path, apply_count) {
                                     return bsl_search::FenceOutcome::TransientRefusal;
                                 }
                             }
@@ -1717,15 +1732,19 @@ impl SharedState {
                     None => run(),
                 }
             });
-        if let Err(e) = spawned {
-            record.outcome = LifecycleOutcome::Failed;
-            record.emit(false);
-            tracing::warn!("failed to spawn embedding thread: {e}");
-            embed_flight.release();
-            Self::set_semantic_runtime_status(
-                &semantic_runtime,
-                SemanticRuntimeStatus::Failed(format!("could not spawn embedding thread: {e}")),
-            );
+        match spawned {
+            Ok(pass) => Some(pass),
+            Err(e) => {
+                record.outcome = LifecycleOutcome::Failed;
+                record.emit(false);
+                tracing::warn!("failed to spawn embedding thread: {e}");
+                embed_flight.release();
+                Self::set_semantic_runtime_status(
+                    &semantic_runtime,
+                    SemanticRuntimeStatus::Failed(format!("could not spawn embedding thread: {e}")),
+                );
+                None
+            }
         }
     }
 
@@ -1997,15 +2016,15 @@ mod tests {
                     );
                     let _reset = ResetEmbeddingRefusals;
                     if fail {
-                        super::FORCE_EMBED_PREFLIGHT_REFUSALS.store(1, Ordering::SeqCst);
+                        force_embed_refusals(&cache.search_db_path(), 1, 0);
                     }
                     parent.context().in_scope(|| {
-                        let (_, _, flight) = start_test_embed(
+                        let (_, _, flight, pass) = start_test_embed(
                             &cache,
                             &mock,
-                            if fail { Duration::ZERO } else { Duration::from_secs(2) },
+                            if fail { Duration::ZERO } else { PUBLISH_RETRY_BUDGET },
                         );
-                        wait_for_embed_flight(&flight);
+                        join_embed_pass(pass, &flight);
                     });
                     parent.finish(Outcome::Completed);
                 }
@@ -2050,10 +2069,16 @@ mod tests {
 
     impl Drop for ResetEmbeddingRefusals {
         fn drop(&mut self) {
-            super::FORCE_EMBED_PREFLIGHT_REFUSALS.store(0, Ordering::SeqCst);
-            super::FORCE_EMBED_PUBLICATION_REFUSALS.store(0, Ordering::SeqCst);
+            super::FORCE_EMBED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner()).clear();
             *super::EMBED_FENCE_HOOK.lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
+    }
+
+    fn force_embed_refusals(db_path: &std::path::Path, preflight: u64, publication: u64) {
+        super::FORCE_EMBED_REFUSALS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(db_path.to_path_buf(), super::ForcedEmbedRefusals { preflight, publication });
     }
 
     fn seed_pending_embedding(path: &std::path::Path) {
@@ -2089,6 +2114,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!flight.is_in_flight(), "embedding pass did not finish");
+    }
+
+    /// The retry budget of a pass a test expects to publish after a refusal. The window opens
+    /// at the first refusal, so the budget bounds a refusal loop that never ends; it is far past
+    /// any healthy pass, which keeps the outcome from depending on how long the machine took.
+    const PUBLISH_RETRY_BUDGET: Duration = test_utils::wait::HANG_GUARD;
+
+    /// Waits for a pass by joining its thread, which ends only after the pass has released its
+    /// flight, so no clock is involved.
+    fn join_embed_pass(pass: Option<std::thread::JoinHandle<()>>, flight: &super::EmbedFlight) {
+        pass.expect("the pass was claimed, so its thread was started")
+            .join()
+            .expect("the embedding pass panicked");
+        assert!(!flight.is_in_flight(), "the pass ended without releasing its flight");
     }
 
     fn spawn_counting_embedding_server() -> (String, Arc<AtomicUsize>) {
@@ -2148,15 +2187,19 @@ mod tests {
         (format!("http://{addr}"), calls)
     }
 
+    /// The `None` is the handle of a pass that did not start; joining it is how a test waits.
+    type TestEmbedPass = (
+        super::SharedSearchEngine,
+        Arc<Mutex<crate::state::SemanticRuntimeStatus>>,
+        Arc<super::EmbedFlight>,
+        Option<std::thread::JoinHandle<()>>,
+    );
+
     fn start_test_embed(
         cache: &crate::cache::WorkspaceCacheLayout,
         server: &str,
         budget: Duration,
-    ) -> (
-        super::SharedSearchEngine,
-        Arc<Mutex<crate::state::SemanticRuntimeStatus>>,
-        Arc<super::EmbedFlight>,
-    ) {
+    ) -> TestEmbedPass {
         cache.ensure().unwrap();
         let db_path = cache.search_db_path();
         seed_pending_embedding(&db_path);
@@ -2165,7 +2208,7 @@ mod tests {
         ));
         let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
         let flight = super::EmbedFlight::new();
-        SharedState::spawn_embed_pass(
+        let pass = SharedState::spawn_embed_pass(
             Arc::clone(&engine),
             crate::state::OwnerStop::default(),
             Arc::clone(&runtime),
@@ -2176,7 +2219,7 @@ mod tests {
             mock_semantic_config(server),
             budget,
         );
-        (engine, runtime, flight)
+        (engine, runtime, flight, pass)
     }
 
     /// The graph freshness token recorded in the database a test just built — what a real
@@ -4684,10 +4727,10 @@ mod tests {
         let (server, calls) = spawn_counting_embedding_server();
         let dir = tempdir().unwrap();
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
-        super::FORCE_EMBED_PREFLIGHT_REFUSALS.store(1, Ordering::SeqCst);
+        force_embed_refusals(&cache.search_db_path(), 1, 0);
 
-        let (_, runtime, flight) = start_test_embed(&cache, &server, Duration::ZERO);
-        wait_for_embed_flight(&flight);
+        let (_, runtime, flight, pass) = start_test_embed(&cache, &server, Duration::ZERO);
+        join_embed_pass(pass, &flight);
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
@@ -4698,16 +4741,45 @@ mod tests {
     }
 
     #[test]
+    fn armed_preflight_refusal_is_not_spent_by_an_unrelated_pass() {
+        let _lock = env_lock();
+        let _reset = ResetEmbeddingRefusals;
+        let (bystander_server, _) = spawn_counting_embedding_server();
+        let (victim_server, victim_calls) = spawn_counting_embedding_server();
+        let bystander_dir = tempdir().unwrap();
+        let victim_dir = tempdir().unwrap();
+        let bystander_cache =
+            crate::cache::WorkspaceCacheLayout::for_workspace(bystander_dir.path());
+        let victim_cache = crate::cache::WorkspaceCacheLayout::for_workspace(victim_dir.path());
+        force_embed_refusals(&victim_cache.search_db_path(), 1, 0);
+
+        let (_, _, bystander_flight, bystander_pass) =
+            start_test_embed(&bystander_cache, &bystander_server, Duration::ZERO);
+        join_embed_pass(bystander_pass, &bystander_flight);
+
+        let (_, _, victim_flight, victim_pass) =
+            start_test_embed(&victim_cache, &victim_server, Duration::ZERO);
+        join_embed_pass(victim_pass, &victim_flight);
+
+        assert_eq!(
+            victim_calls.load(Ordering::SeqCst),
+            0,
+            "a refusal armed for one workspace was spent by a pass on another workspace",
+        );
+    }
+
+    #[test]
     fn prepared_vectors_survive_transient_publish_without_second_call() {
         let _lock = env_lock();
         let _reset = ResetEmbeddingRefusals;
         let (server, calls) = spawn_counting_embedding_server();
         let dir = tempdir().unwrap();
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
-        super::FORCE_EMBED_PUBLICATION_REFUSALS.store(1, Ordering::SeqCst);
+        force_embed_refusals(&cache.search_db_path(), 0, 1);
 
-        let (engine, runtime, flight) = start_test_embed(&cache, &server, Duration::from_secs(1));
-        wait_for_embed_flight(&flight);
+        let (engine, runtime, flight, pass) =
+            start_test_embed(&cache, &server, PUBLISH_RETRY_BUDGET);
+        join_embed_pass(pass, &flight);
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let status = runtime.lock().unwrap().clone();
@@ -5019,10 +5091,10 @@ mod tests {
         // The PUBLICATION, which is what this test is named for. Forcing the preflight instead
         // exercised the admission check and left the publish path — the one the deadline is
         // supposed to bound — completely uncovered.
-        super::FORCE_EMBED_PUBLICATION_REFUSALS.store(u64::MAX, Ordering::SeqCst);
+        force_embed_refusals(&cache.search_db_path(), 0, u64::MAX);
 
-        let (_, runtime, flight) = start_test_embed(&cache, &server, Duration::ZERO);
-        wait_for_embed_flight(&flight);
+        let (_, runtime, flight, pass) = start_test_embed(&cache, &server, Duration::ZERO);
+        join_embed_pass(pass, &flight);
 
         assert!(matches!(
             &*runtime.lock().unwrap(),

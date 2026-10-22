@@ -913,10 +913,11 @@ impl DiagnosticsState {
     /// live on (a build that is merely slow finishes its walk) — what it loses is the right to
     /// say anything: its outcome is discarded, and the state keeps what the attempt that
     /// replaced it published.
-    pub(crate) fn ensure_loading(&self) {
-        if self.workspace_root.is_none() {
-            return;
-        }
+    ///
+    /// The loader's handle comes back when this call started a build: joining it waits for
+    /// publication or for a superseded attempt to discard its outcome, without polling status.
+    pub(crate) fn ensure_loading(&self) -> Option<std::thread::JoinHandle<()>> {
+        self.workspace_root.as_ref()?;
         let attempt = {
             let mut inner = lock_inner(&self.inner);
             match inner.status {
@@ -924,10 +925,10 @@ impl DiagnosticsState {
                 DiagnosticsStatus::Failed(_) => {
                     let now = Instant::now();
                     if retry_wait(&inner, now).is_some() {
-                        return;
+                        return None;
                     }
                 }
-                _ => return,
+                _ => return None,
             }
             inner.build_attempt = inner.build_attempt.wrapping_add(1);
             inner.status = DiagnosticsStatus::Loading;
@@ -942,12 +943,16 @@ impl DiagnosticsState {
         let spawned = std::thread::Builder::new()
             .name("bsl-diag-init".to_owned())
             .spawn(move || state.run_load(attempt));
-        if let Err(e) = spawned {
-            let mut inner = lock_inner(&self.inner);
-            // The loader never started, so this attempt is over: its failure is published by
-            // the caller that started it, under the token it was given.
-            if inner.build_attempt == attempt {
-                publish_build_failure(&mut inner, format!("could not spawn loader: {e}"));
+        match spawned {
+            Ok(loader) => Some(loader),
+            Err(e) => {
+                let mut inner = lock_inner(&self.inner);
+                // The loader never started, so this attempt is over: its failure is published by
+                // the caller that started it, under the token it was given.
+                if inner.build_attempt == attempt {
+                    publish_build_failure(&mut inner, format!("could not spawn loader: {e}"));
+                }
+                None
             }
         }
     }

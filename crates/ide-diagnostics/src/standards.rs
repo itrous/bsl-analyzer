@@ -124,6 +124,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::CompilationDirectiveLost => &[439],
         DiagnosticCode::CompilationDirectiveNeedLess => &[439],
         DiagnosticCode::CreateQueryInCycle => &[436],
+        DiagnosticCode::ImplicitDatabaseReadInCycle => &[436, 496],
         // Проверяемое требование — std773 «Использование признака ОбменДанными.Загрузка в обработчиках событий объекта»; остальные поясняют контекст.
         DiagnosticCode::DataExchangeLoading => &[773, 465, 464, 752],
         DiagnosticCode::DeletingCollectionItem => &[],

@@ -1159,6 +1159,17 @@ fn check_form_module_impl(
 /// `Configuration.xml`. Every `.bsl` among them is a workspace file, so a form,
 /// its object and the object's other forms can be checked side by side.
 pub fn check_config_files(files: &[(&str, &str)], checked: &str) -> Vec<Diagnostic> {
+    check_config_files_with_unreadable(files, checked, &[])
+}
+
+/// [`check_config_files`], with the named `.bsl` files registered as bodies that exist but
+/// could not be read. The state is set through the database, not through file permissions,
+/// which root ignores and which would leave the stand green in a container whatever the code did.
+pub fn check_config_files_with_unreadable(
+    files: &[(&str, &str)],
+    checked: &str,
+    unreadable: &[&str],
+) -> Vec<Diagnostic> {
     use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
     use ide_db::metadata::intern_configuration_path;
     use ide_db::RootDatabaseImpl;
@@ -1203,10 +1214,21 @@ pub fn check_config_files(files: &[(&str, &str)], checked: &str) -> Vec<Diagnost
         file_set.insert(*fid, VfsPath::new(path.to_string_lossy().into_owned()));
     }
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
-    for (fid, _, content) in &modules {
+    let mut marked = 0usize;
+    for (fid, relative, content) in &modules {
         db.set_file_source_root(*fid, SourceRootId(0));
-        db.set_file_text(*fid, content);
+        if unreadable.contains(relative) {
+            db.set_file_unreadable(*fid);
+            marked += 1;
+        } else {
+            db.set_file_text(*fid, content);
+        }
     }
+    assert_eq!(
+        marked,
+        unreadable.len(),
+        "every named body must be a .bsl fixture file, or the stand proves nothing"
+    );
 
     let config_path = root.to_string_lossy();
     let config_path_input = intern_configuration_path(

@@ -63,9 +63,9 @@ pub use hir_def::type_ref::{BuiltinTypeRef, TypeRef};
 pub use hir_def::ConfigsDatabase;
 pub use infer::{
     BareNameGap, BareNameOrigin, BareNameResolution, BareNameUse, BodyInferenceResult,
-    CallArgBinding, CandidateCallBinding, EnvCalleeKind, EnvMemberKind, ImplicitLocalAssignment,
-    ImplicitLocalInfo, InferOwnerResult, InferenceContext, InferenceDiagnostic, InferenceResult,
-    ModuleCodeInferenceResult, UnresolvedMethodKind,
+    CallArgBinding, CandidateCallBinding, EnvCalleeKind, EnvMemberKind, ImplicitDatabaseReadKind,
+    ImplicitLocalAssignment, ImplicitLocalInfo, InferOwnerResult, InferenceContext,
+    InferenceDiagnostic, InferenceResult, ModuleCodeInferenceResult, UnresolvedMethodKind,
 };
 pub use lower::TyLoweringContext;
 pub use manager_lookup::{lookup_manager_field, ManagerMemberInfo};

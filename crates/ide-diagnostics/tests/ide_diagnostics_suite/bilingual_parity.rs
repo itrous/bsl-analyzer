@@ -9,6 +9,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::BeginTransactionBeforeTryCatch,
     DiagnosticCode::CommitTransactionOutsideTryCatch,
     DiagnosticCode::CreateQueryInCycle,
+    DiagnosticCode::ImplicitDatabaseReadInCycle,
     DiagnosticCode::DataExchangeLoading,
     DiagnosticCode::DisableSafeMode,
     DiagnosticCode::ExecuteExternalCode,
@@ -424,6 +425,31 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        DiagnosticCode::ImplicitDatabaseReadInCycle,
+        r#"// Возвращаемое значение:
+//   Массив из СправочникСсылка.Товары
+Функция Ссылки() Экспорт
+    Возврат Новый Массив;
+КонецФункции
+
+Процедура Тест()
+    Для Каждого Ссылка Из Ссылки() Цикл
+        Представление = Строка(Ссылка);
+    КонецЦикла;
+КонецПроцедуры"#,
+        r#"// Returns:
+//   Array of CatalogRef.Товары
+Function Refs() Export
+    Return New Array;
+EndFunction
+
+Procedure Test()
+    For Each Ref In Refs() Do
+        View = String(Ref);
+    EndDo;
+EndProcedure"#,
+    ),
+    (
         DiagnosticCode::DataExchangeLoading,
         r#"Процедура ПередЗаписью(Отказ)
     Значение = 1;
@@ -642,7 +668,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 204, "update the Track 3 Phase E inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 205, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

@@ -5767,20 +5767,6 @@ mod tests {
         }
     }
 
-    /// Poll until the resident carries `path`, with a hang guard for a missing update. A fixed
-    /// sleep cannot replace this: the work being waited for is a full rebuild, whose duration
-    /// is the machine's to decide.
-    fn resident_gains_file(state: &DiagnosticsState, path: &std::path::Path) -> bool {
-        let deadline = Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
-        while Instant::now() < deadline {
-            if resident_has_file(state, path) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        resident_has_file(state, path)
-    }
-
     /// A NAME lookup rather than a path one: resolve a metadata object by its name from
     /// the module that lives beside it. `None` while that module is not resident.
     fn catalog_resolves_from(
@@ -5836,18 +5822,23 @@ mod tests {
             targets,
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(), "the hub must arm");
+        assert!(hub.wait_until_watching_unbounded(), "the hub must arm");
 
         let mut state =
             DiagnosticsState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         state.drift_interval = Duration::from_millis(0);
-        state.ensure_loading();
-        wait_ready(&state);
+        let loader = state.ensure_loading().expect("the first load starts a build");
+        loader.join().expect("the loader thread does not panic");
         assert!(
-            hub.rearm(
-                crate::change_hub::watch_targets_for(root, std::slice::from_ref(&cf)),
-                Duration::from_secs(5),
-            ),
+            matches!(state.status(), DiagnosticsStatus::Ready { .. }),
+            "the load ended without publishing a resident: {:?}",
+            state.status(),
+        );
+        assert!(
+            hub.rearm_unbounded(crate::change_hub::watch_targets_for(
+                root,
+                std::slice::from_ref(&cf)
+            )),
             "the fixture hub stays healthy while omitting the scoped extension root",
         );
         // Rearming changes coverage and marks this cursor for reconciliation. Consume that
@@ -5858,9 +5849,14 @@ mod tests {
         // Positive control, same stand: a new module INSIDE the recursive scan root must
         // arrive without any force, and through the event path (no scan).
         write_common_module(&cf, "Ковбой", true, "&НаСервере\nФункция Ф() Экспорт КонецФункции");
+        let watched_xml = cf.join("CommonModules/Ковбой.xml");
         let watched = cf.join("CommonModules/Ковбой/Ext/Module.bsl");
+        // Deliver the exact paths synchronously through the hub's event-ingest seam. The
+        // stand checks event-driven reconciliation, not OS watcher scheduling under load.
+        hub.deliver_modified_for_test(&watched_xml);
+        hub.deliver_modified_for_test(&watched);
         assert!(
-            resident_gains_file(&state, &watched),
+            resident_has_file(&state, &watched),
             "control: a change inside the watch must arrive with no force at all"
         );
         assert_eq!(
@@ -5880,12 +5876,10 @@ mod tests {
         let ext_module = ext.join("CommonModules/РасшМодуль/Ext/Module.bsl");
         let never_written = ext.join("CommonModules/Призрак/Ext/Module.bsl");
 
-        // A settle window: a negative observation needs time in which the event could
-        // have arrived and did not. Only the timing profile waits it out; the readings
-        // themselves hold at any moment.
-        if cfg!(timing_contract) {
-            std::thread::sleep(Duration::from_millis(500));
-        }
+        assert!(
+            !hub.notify_path_changed(&ext_module),
+            "the hub does not accept event hints from the omitted scoped root"
+        );
 
         let cursor = *lock_recover(&state.hub_cursor);
         assert_eq!(hub.health_for(cursor), Health::Healthy, "the hub is healthy and right");
@@ -5899,7 +5893,7 @@ mod tests {
         state.force_rescan();
         // The forced scan surfaces files from the declared extension root.
         assert!(
-            resident_gains_file(&state, &ext_module),
+            resident_has_file(&state, &ext_module),
             "the forced re-scan must surface files under the root the hub omitted"
         );
         assert!(

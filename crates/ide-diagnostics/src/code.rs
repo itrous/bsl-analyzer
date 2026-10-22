@@ -90,6 +90,7 @@ pub enum DiagnosticCode {
     CompilationDirectiveLost,
     CompilationDirectiveNeedLess,
     CreateQueryInCycle,
+    ImplicitDatabaseReadInCycle,
     DataExchangeLoading,
     DeletingCollectionItem,
     SelfInsertion,

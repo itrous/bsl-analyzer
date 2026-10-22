@@ -73,6 +73,7 @@ pub mod if_condition_complexity;
 pub mod if_else_duplicated_code_block;
 pub mod if_else_duplicated_condition;
 pub mod if_else_if_ends_with_else;
+pub mod implicit_database_read_in_cycle;
 pub mod incorrect_line_break;
 pub mod incorrect_use_like_in_query;
 pub mod incorrect_use_of_str_template;
@@ -345,6 +346,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
             Some(&compilation_directive_need_less::METADATA)
         }
         DiagnosticCode::CreateQueryInCycle => Some(&create_query_in_cycle::METADATA),
+        DiagnosticCode::ImplicitDatabaseReadInCycle => {
+            Some(&implicit_database_read_in_cycle::METADATA)
+        }
         DiagnosticCode::DeletingCollectionItem => Some(&deleting_collection_item::METADATA),
         DiagnosticCode::SelfInsertion => Some(&self_insertion::METADATA),
         DiagnosticCode::SeveralCompilerDirectives => Some(&several_compiler_directives::METADATA),
@@ -529,6 +533,10 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
 }
 
 #[cfg(test)]
+#[path = "handlers/implicit_database_read_in_cycle_tests.rs"]
+mod implicit_database_read_in_cycle_tests;
+
+#[cfg(test)]
 mod metadata_tests {
     use super::*;
 
@@ -699,6 +707,10 @@ mod metadata_tests {
         assert!(unused.tags.contains(&MetadataTag::Unused));
         assert!(unused.tags.contains(&MetadataTag::Brainoverload));
         assert!(unused.tags.contains(&MetadataTag::Badpractice));
+
+        let implicit_database_read =
+            get_metadata(DiagnosticCode::ImplicitDatabaseReadInCycle).unwrap();
+        assert!(implicit_database_read.tags.contains(&MetadataTag::Performance));
     }
 
     #[test]
@@ -727,6 +739,7 @@ mod metadata_tests {
         let enabled_codes = [
             DiagnosticCode::DataExchangeLoading,
             DiagnosticCode::ExecuteExternalCode,
+            DiagnosticCode::ImplicitDatabaseReadInCycle,
             DiagnosticCode::RedundantAccessToObject,
             DiagnosticCode::SameMetadataObjectAndChildNames,
             DiagnosticCode::UnusedLocalVariable,

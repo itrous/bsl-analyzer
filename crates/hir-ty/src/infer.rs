@@ -339,8 +339,22 @@ fn classify_bare_name_miss(
     }
 }
 
+/// The implicit database operation a typed expression may perform in a loop body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImplicitDatabaseReadKind {
+    RefAttribute { field: Name },
+    RefPresentation,
+    ManagerFind { method: Name },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InferenceDiagnostic {
+    /// A static performance candidate, not a count of SQL queries at runtime.
+    ImplicitDatabaseRead {
+        expr: ExprId,
+        kind: ImplicitDatabaseReadKind,
+    },
+
     UnresolvedName {
         expr: ExprId,
         name: Name,
@@ -662,6 +676,9 @@ pub struct InferenceContext<'db> {
     expr_types: FxHashMap<ExprId, TypeId>,
 
     diagnostics: Vec<InferenceDiagnostic>,
+
+    loop_depth: u32,
+    implicit_database_reads: rustc_hash::FxHashSet<ExprId>,
 
     /// Bare path expressions used as assignment targets. They keep normal type
     /// inference, but an absent name in this position is never diagnostic.
@@ -1029,6 +1046,8 @@ impl<'db> InferenceContext<'db> {
             binding_types: FxHashMap::default(),
             expr_types: FxHashMap::default(),
             diagnostics: Vec::new(),
+            loop_depth: 0,
+            implicit_database_reads: rustc_hash::FxHashSet::default(),
             assignment_targets: rustc_hash::FxHashSet::default(),
             bare_name_verdicts: FxHashMap::default(),
             calls_with_unread_target: rustc_hash::FxHashSet::default(),
@@ -1356,6 +1375,7 @@ impl<'db> InferenceContext<'db> {
 
     fn push_inference_diagnostic(&mut self, diag: InferenceDiagnostic) {
         let key = match &diag {
+            InferenceDiagnostic::ImplicitDatabaseRead { expr, .. } => *expr,
             InferenceDiagnostic::UnresolvedName { expr, .. } => *expr,
             InferenceDiagnostic::UnresolvedMethodCall { expr, .. } => *expr,
             InferenceDiagnostic::UnresolvedBareCall { expr, .. } => *expr,
@@ -1401,7 +1421,54 @@ impl<'db> InferenceContext<'db> {
         {
             return;
         }
+        if matches!(diag, InferenceDiagnostic::ImplicitDatabaseRead { .. })
+            && !self.implicit_database_reads.insert(key)
+        {
+            return;
+        }
         self.diagnostics.push(diag);
+    }
+
+    fn is_object_reference(&self, ty: TypeId) -> bool {
+        use bsl_metadata::MdoType;
+
+        let mdo = match self.db.lookup_type(ty) {
+            TypeKind::MetadataRef(facet) => facet.kind.ref_mdo_type(),
+            TypeKind::AnyMetadataRef { mdo_type } => Some(*mdo_type),
+            TypeKind::Union(arms) => {
+                return arms.iter().all(|arm| self.is_object_reference(*arm));
+            }
+            _ => None,
+        };
+        matches!(
+            mdo,
+            Some(
+                MdoType::Catalog
+                    | MdoType::Document
+                    | MdoType::ExchangePlan
+                    | MdoType::ChartOfAccounts
+                    | MdoType::ChartOfCharacteristicTypes
+                    | MdoType::ChartOfCalculationTypes
+                    | MdoType::BusinessProcess
+                    | MdoType::Task
+            )
+        )
+    }
+
+    fn platform_read_call_is_resolved(&self, callee: ExprId, allow_builtin: bool) -> bool {
+        use crate::call_resolution::CallSelection;
+
+        let Some(binding) = self.call_arg_bindings.last().filter(|b| b.call_expr == callee) else {
+            return false;
+        };
+        let accepted = |id: &crate::call_resolution::CandidateId| {
+            id.is_platform() || (allow_builtin && id.is_builtin())
+        };
+        match &binding.candidate.resolution.selection {
+            CallSelection::Unique { candidate } => accepted(candidate),
+            CallSelection::Ambiguous { candidates } => candidates.iter().all(accepted),
+            CallSelection::Rejected(_) => false,
+        }
     }
 
     fn is_unknown(&self, id: TypeId) -> bool {
@@ -2977,7 +3044,9 @@ impl<'db> InferenceContext<'db> {
 
             Stmt::While { condition, body } => {
                 self.infer_expr(ExprId::from_idx(*condition));
+                self.loop_depth += 1;
                 self.infer_stmts(body);
+                self.loop_depth -= 1;
             }
 
             Stmt::For { var, from, to, body } => {
@@ -2987,7 +3056,9 @@ impl<'db> InferenceContext<'db> {
                 let number = self.db.number(None, None);
                 self.record_local_type(var_name, number);
                 self.binding_types.insert(BindingId::from_idx(*var), number);
+                self.loop_depth += 1;
                 self.infer_stmts(body);
+                self.loop_depth -= 1;
             }
 
             Stmt::ForEach { var, collection, body } => {
@@ -3004,7 +3075,9 @@ impl<'db> InferenceContext<'db> {
                     // left by an earlier loop or assignment of the same name is stale here.
                     None => self.reset_local_type(var_name),
                 }
+                self.loop_depth += 1;
                 self.infer_stmts(body);
+                self.loop_depth -= 1;
             }
 
             Stmt::Try { body, except } => {
@@ -3145,6 +3218,26 @@ impl<'db> InferenceContext<'db> {
                 } else if let Some(info) =
                     crate::field_lookup::lookup_field(self.db, &obj_resolver, base_ty, field)
                 {
+                    if self.loop_depth > 0 && self.is_object_reference(base_ty) {
+                        let predefined = match self.body.expr(ExprId::from_idx(*base)) {
+                            Expr::Field { base, .. } => {
+                                self.expr_types.get(&ExprId::from_idx(*base)).is_some_and(|ty| {
+                                    matches!(self.db.lookup_type(*ty), TypeKind::ObjectManager(_))
+                                })
+                            }
+                            _ => false,
+                        };
+                        if !predefined {
+                            self.push_inference_diagnostic(
+                                InferenceDiagnostic::ImplicitDatabaseRead {
+                                    expr: expr_id,
+                                    kind: ImplicitDatabaseReadKind::RefAttribute {
+                                        field: field.clone(),
+                                    },
+                                },
+                            );
+                        }
+                    }
                     self.push_deprecated_platform_member_diagnostic(expr_id, base_ty, field, true);
                     if let crate::field_enum::FieldOrigin::PlatformProperty { env } = info.origin {
                         self.check_member_env(expr_id, field, env, EnvMemberKind::Property);
@@ -4146,7 +4239,30 @@ impl<'db> InferenceContext<'db> {
                             );
                         }
                     }
-                    self.record_candidate_call_arg_binding(callee, args, candidates)
+                    let ret = self.record_candidate_call_arg_binding(callee, args, candidates);
+                    if self.loop_depth > 0
+                        && !self.calls_with_unread_target.contains(&callee)
+                        && matches!(self.db.lookup_type(receiver_ty), TypeKind::ObjectManager(_))
+                        && [
+                            ("НайтиПоКоду", "FindByCode"),
+                            ("НайтиПоНаименованию", "FindByDescription"),
+                            ("НайтиПоНомеру", "FindByNumber"),
+                            ("НайтиПоРеквизиту", "FindByAttribute"),
+                        ]
+                        .iter()
+                        .any(|(ru, en)| {
+                            crate::method_lookup::is_platform_name_str(method_name.as_str(), ru, en)
+                        })
+                        && self.platform_read_call_is_resolved(callee, false)
+                    {
+                        self.push_inference_diagnostic(InferenceDiagnostic::ImplicitDatabaseRead {
+                            expr: call_expr,
+                            kind: ImplicitDatabaseReadKind::ManagerFind {
+                                method: method_name.clone(),
+                            },
+                        });
+                    }
+                    ret
                 }
                 None => {
                     // `ЭтотОбъект.Метод()` in a managed form module. The form type
@@ -4372,6 +4488,18 @@ impl<'db> InferenceContext<'db> {
                     }
                 }
                 let ret = self.record_candidate_call_arg_binding(callee, args, candidates);
+                if self.loop_depth > 0
+                    && crate::method_lookup::is_platform_name_str(name.as_str(), "Строка", "String")
+                    && args.len() == 1
+                    && !self.is_call_name_shadowed(&name)
+                    && self.platform_read_call_is_resolved(callee, true)
+                    && self.expr_types.get(&args[0]).is_some_and(|ty| self.is_object_reference(*ty))
+                {
+                    self.push_inference_diagnostic(InferenceDiagnostic::ImplicitDatabaseRead {
+                        expr: call_expr,
+                        kind: ImplicitDatabaseReadKind::RefPresentation,
+                    });
+                }
                 let ret = self.refine_first_argument_return(&name, args, ret);
                 if is_proceed_with_call_name(&name) {
                     if let Some((required, total)) = self.proceed_arity {

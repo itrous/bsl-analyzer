@@ -2394,6 +2394,16 @@ impl WorkspaceChangeHub {
         self.handshake(|ack| HubMsg::Rearm { targets, epoch, ack }, timeout)
     }
 
+    /// [`Self::rearm`] with no bound on the wait. The hub answers every declaration it reads,
+    /// and an answer that is never sent is dropped together with its channel, so the wait ends
+    /// on an event either way and never on a clock.
+    #[cfg(test)]
+    pub(crate) fn rearm_unbounded(&self, targets: Vec<WatchTarget>) -> bool {
+        let (ack, answer) = std::sync::mpsc::sync_channel(1);
+        self.control().send(HubMsg::Rearm { targets, epoch: next_topology_epoch(), ack }).is_ok()
+            && answer.recv().unwrap_or(false)
+    }
+
     /// Send the message `build` makes around an acknowledgement channel and wait for the
     /// hub thread's answer; `timeout` bounds the enqueue and the wait together.
     fn handshake(
@@ -2947,6 +2957,22 @@ impl WorkspaceChangeHub {
     #[cfg(test)]
     pub(crate) fn wait_until_watching(&self) -> bool {
         self.watch_readiness(test_support::STATE_CEILING) == WatchReadiness::Armed
+    }
+
+    /// [`Self::wait_until_watching`] with no bound on the wait. Setup settles by an event
+    /// (armed, failed or closing), and each of those wakes this loop.
+    #[cfg(test)]
+    pub(crate) fn wait_until_watching_unbounded(&self) -> bool {
+        let mut acc = self.inner.lock_acc();
+        loop {
+            if self.inner.watching.load(Ordering::SeqCst) {
+                return true;
+            }
+            if acc.setup_failed || acc.closing {
+                return false;
+            }
+            acc = self.inner.wake.wait(acc).unwrap_or_else(|poison| poison.into_inner());
+        }
     }
 
     /// The accumulator's generation right now.
