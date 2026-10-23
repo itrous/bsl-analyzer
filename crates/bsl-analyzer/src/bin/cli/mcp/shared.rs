@@ -714,6 +714,16 @@ const LSP_HEADER_LIMIT: usize = 8192;
 pub(crate) async fn read_lsp_message<R: AsyncBufRead + Unpin>(
     read: &mut R,
 ) -> Result<Option<lsp_server::Message>> {
+    match read_lsp_body(read).await? {
+        Some(body) => decode_lsp_message(&body).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The JSON body of the next LSP message, as its writer framed it.
+pub(crate) async fn read_lsp_body<R: AsyncBufRead + Unpin>(
+    read: &mut R,
+) -> Result<Option<Vec<u8>>> {
     let mut length = None;
     let mut header_size = 0usize;
     loop {
@@ -743,10 +753,13 @@ pub(crate) async fn read_lsp_message<R: AsyncBufRead + Unpin>(
     let mut bytes = Vec::new();
     let received = (&mut *read).take(u64::try_from(length)?).read_to_end(&mut bytes).await?;
     anyhow::ensure!(received == length, "truncated LSP body");
-    let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+    Ok(Some(bytes))
+}
+
+pub(crate) fn decode_lsp_message(body: &[u8]) -> Result<lsp_server::Message> {
+    let raw: serde_json::Value = serde_json::from_slice(body)?;
     // lsp-server represents both a missing result and JSON-RPC's valid `result: null`
-    // as `None`. Restore the wire distinction before this response is forwarded to the
-    // public stdio writer, which may bypass `write_lsp_message` entirely.
+    // as `None`. Restore the wire distinction, so a message written out again keeps it.
     let null_result = raw
         .as_object()
         .is_some_and(|object| object.get("result").is_some_and(serde_json::Value::is_null));
@@ -757,30 +770,43 @@ pub(crate) async fn read_lsp_message<R: AsyncBufRead + Unpin>(
             response.result = Some(serde_json::Value::Null);
         }
     }
-    Ok(Some(message))
+    Ok(message)
 }
 
 pub(crate) async fn write_lsp_message<W: AsyncWrite + Unpin>(
     write: &mut W,
     message: &lsp_server::Message,
 ) -> Result<()> {
-    // A successful JSON-RPC response must carry `result`, even when its value is null.
-    // lsp-server's typed Response cannot distinguish that from an absent result. Every
-    // other message is written straight from its own tree, without a copy of it.
-    let bytes = if matches!(message, lsp_server::Message::Response(response) if response.error.is_none() && response.result.is_none())
-    {
-        let mut value = serde_json::to_value(message)?;
-        if let Some(object) = value.as_object_mut() {
-            object.insert("result".to_owned(), serde_json::Value::Null);
-        }
-        serde_json::to_vec(&value)?
-    } else {
-        serde_json::to_vec(message)?
-    };
+    let bytes = encode_lsp_message(message)?;
     write.write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes()).await?;
     write.write_all(&bytes).await?;
     write.flush().await?;
     Ok(())
+}
+
+/// The body of `message` as the editor receives it: a complete JSON-RPC message, so the
+/// LSP relay passes the backend's bodies on without parsing and writing them again.
+pub(crate) fn encode_lsp_message(message: &lsp_server::Message) -> Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct JsonRpc<'a> {
+        jsonrpc: &'static str,
+        #[serde(flatten)]
+        message: &'a lsp_server::Message,
+    }
+    let wire = JsonRpc { jsonrpc: "2.0", message };
+    // A successful JSON-RPC response must carry `result`, even when its value is null.
+    // lsp-server's typed Response cannot distinguish that from an absent result. Every
+    // other message is written straight from its own tree, without a copy of it.
+    if matches!(message, lsp_server::Message::Response(response) if response.error.is_none() && response.result.is_none())
+    {
+        let mut value = serde_json::to_value(&wire)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("result".to_owned(), serde_json::Value::Null);
+        }
+        Ok(serde_json::to_vec(&value)?)
+    } else {
+        Ok(serde_json::to_vec(&wire)?)
+    }
 }
 
 #[cfg(test)]
@@ -1036,5 +1062,36 @@ mod tests {
         reader.read_to_end(&mut wire).await.unwrap();
         let json = framed_json(&wire);
         assert!(json.get("result").is_some_and(serde_json::Value::is_null));
+        assert_eq!(json["jsonrpc"], "2.0");
+    }
+
+    /// The LSP relay hands the backend's bodies to the editor as they are, so each one
+    /// must already be the complete JSON-RPC message the editor expects.
+    #[test]
+    fn encoded_messages_carry_the_json_rpc_version() {
+        let messages = [
+            lsp_server::Message::Response(lsp_server::Response::new_ok(
+                lsp_server::RequestId::from(3),
+                serde_json::json!([{"label": "Имя:"}]),
+            )),
+            lsp_server::Message::Notification(lsp_server::Notification::new(
+                "$/progress".into(),
+                serde_json::json!({"token": 1}),
+            )),
+            lsp_server::Message::Request(lsp_server::Request::new(
+                lsp_server::RequestId::from(4),
+                "workspace/semanticTokens/refresh".into(),
+                serde_json::Value::Null,
+            )),
+        ];
+        for message in messages {
+            let body = encode_lsp_message(&message).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["jsonrpc"], "2.0", "{json}");
+            assert_eq!(
+                serde_json::to_value(decode_lsp_message(&body).unwrap()).unwrap(),
+                serde_json::to_value(&message).unwrap()
+            );
+        }
     }
 }
