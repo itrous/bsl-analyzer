@@ -455,6 +455,7 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<(), Box<dyn Error + Send + Sync>>
             },
         ),
         McpServeMode::Broker => {
+            mcp_server::broker::SharedBackendIdentity::prefetch_build_fingerprint();
             run_mcp_broker(profile, &args, source_dir, workspace_cache, &password)
         }
         McpServeMode::BrokerRequired => {

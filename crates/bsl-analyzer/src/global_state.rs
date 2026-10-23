@@ -85,6 +85,9 @@ pub enum Task {
     SharedWorkspaceSeedReady {
         epoch: u64,
     },
+    SharedMetadataWarmed {
+        warmed: bool,
+    },
     DiagnosticsReady {
         uri: Url,
         diagnostics: Vec<lsp_types::Diagnostic>,
@@ -389,6 +392,11 @@ pub struct GlobalState {
     pub(crate) shared_seed_snapshot: Arc<std::sync::Mutex<Option<(u64, EditorView)>>>,
     pub(crate) shared_seed_running: bool,
     pub(crate) shared_seed_queued: bool,
+    /// Metadata warm-ups dispatched for a seeded editor storage.
+    pub(crate) shared_metadata_warmups: u64,
+    pub(crate) shared_metadata_warm_in_flight: bool,
+    /// The current editor storage still wants a metadata warm-up started.
+    pub(crate) shared_metadata_warm_pending: bool,
     pub(crate) shared_request_generation: u64,
     pub(crate) shared_owner_generation: Option<u64>,
     pub(crate) shared_configuration_error: Option<String>,
@@ -675,6 +683,9 @@ impl GlobalState {
             shared_seed_snapshot: Arc::new(std::sync::Mutex::new(None)),
             shared_seed_running: false,
             shared_seed_queued: false,
+            shared_metadata_warmups: 0,
+            shared_metadata_warm_in_flight: false,
+            shared_metadata_warm_pending: false,
             shared_request_generation: 0,
             shared_owner_generation: None,
             shared_configuration_error: None,
@@ -851,6 +862,23 @@ impl GlobalState {
     }
 
     pub fn clear_batch_push_for(&mut self, uri: &Url) {
+        self.retire_batch_push_for(uri, true);
+    }
+
+    /// Hand a file the batch published over to the interactive stream of the document the
+    /// editor opened as `uri`.
+    ///
+    /// The batch entry goes, so the two streams never both report the file. A client
+    /// that takes pushed reports keeps the one published under `uri` itself on screen:
+    /// the open document's own report, already scheduled, replaces it, while clearing it
+    /// first blanked the file for the seconds a large module takes to analyse. A report
+    /// under another spelling of the file, or one a pulling client gets no pushed
+    /// replacement for, is cleared.
+    pub fn hand_batch_push_to_open_document(&mut self, uri: &Url) {
+        self.retire_batch_push_for(uri, self.pull_diagnostics_active);
+    }
+
+    fn retire_batch_push_for(&mut self, uri: &Url, clear_uri: bool) {
         let file_id = crate::lsp::file_id(self, uri).ok();
         let published_uris: Vec<_> = self
             .batch_pushed
@@ -861,7 +889,9 @@ impl GlobalState {
             .map(|(published_uri, _)| published_uri.clone())
             .collect();
         for published_uri in published_uris {
-            if self.batch_pushed.remove(&published_uri).is_none() {
+            if self.batch_pushed.remove(&published_uri).is_none()
+                || (!clear_uri && &published_uri == uri)
+            {
                 continue;
             }
             let params =
@@ -1067,8 +1097,72 @@ impl GlobalState {
         }
     }
 
+    /// Give a shared session its editor storage, empty until a seed fills it from the
+    /// owner's snapshot.
+    ///
+    /// The session keeps this one storage for its whole life and reads every request
+    /// from it, open documents or not. What one answer computed is then there for the
+    /// next, and opening a file is one more input change to a warm storage. Answering
+    /// from the owner until the first open would leave that work in the owner's storage
+    /// and make the first open start a second, cold one: the next workspace-wide
+    /// request would recompute the whole workspace and hold its results twice.
+    ///
+    /// The project settings go into the new storage here, once; a seed that replaces
+    /// it applies them again.
+    pub(crate) fn ensure_shared_view(&mut self) {
+        if !self.analysis_host.is_shared() || self.analysis_host.view().is_some() {
+            return;
+        }
+        self.analysis_host.prepare_view();
+        self.shared_view_epoch = self.shared_view_epoch.wrapping_add(1);
+        self.shared_view_seeded = false;
+        self.shared_seed_queued = true;
+        self.update_diagnostics_config();
+        self.update_features_config();
+    }
+
+    /// Load every configuration root into a newly seeded editor storage, off the event
+    /// loop.
+    ///
+    /// The standalone server loads the metadata when its workspace finishes loading. A
+    /// seed brings the owner's listings and nothing parsed from them, so without this the
+    /// first document opened pays for parsing every object its diagnostics reach.
+    ///
+    /// The request stands until a warm-up starts on the storage that wants it: one still
+    /// running on a storage this one replaced, or a full task pool, only delays it; the
+    /// event loop starts it once neither holds ([`Self::start_shared_metadata_warmup`]).
+    pub(crate) fn warm_shared_view_metadata(&mut self) {
+        self.shared_metadata_warm_pending = true;
+        self.start_shared_metadata_warmup();
+    }
+
+    pub(crate) fn start_shared_metadata_warmup(&mut self) {
+        if !self.shared_metadata_warm_pending
+            || self.shared_metadata_warm_in_flight
+            || !self.shared_view_seeded
+            || !self.task_pool.pool.has_capacity()
+        {
+            return;
+        }
+        let analysis = self.analysis_host.analysis();
+        let analysis_guard = self.note_analysis_spawned();
+        let spawned = self.task_pool.pool.try_spawn(move || {
+            let _analysis_guard = analysis_guard;
+            let warmed = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+                analysis.warm_configuration_inventory()
+            }))
+            .is_ok();
+            Task::SharedMetadataWarmed { warmed }
+        });
+        if spawned.is_ok() {
+            self.shared_metadata_warmups += 1;
+            self.shared_metadata_warm_in_flight = true;
+            self.shared_metadata_warm_pending = false;
+        }
+    }
+
     pub(crate) fn schedule_shared_seed(&mut self) {
-        if !self.shared_seed_queued || self.shared_seed_running || self.open_files.is_empty() {
+        if !self.shared_seed_queued || self.shared_seed_running {
             return;
         }
         let Some(owner) = self.analysis_host.owner().cloned() else { return };
@@ -1104,7 +1198,20 @@ impl GlobalState {
         }
     }
 
+    /// The shared view changed in a way closed files can see: a disk publication, a new
+    /// seed, a document closed or saved. Besides what [`Self::mark_shared_buffers_changed`]
+    /// does, the whole-project batch runs again.
     pub(crate) fn mark_shared_view_changed(&mut self) {
+        self.mark_shared_buffers_changed();
+        self.mark_workspace_batch_dirty();
+    }
+
+    /// An editor buffer was opened or edited. The open documents are analysed again, but
+    /// the whole-project batch is not re-run, as the standalone server does not re-run it
+    /// on an edit: a sweep of every closed file on each keystroke competes with the open
+    /// document's own analysis for the same storage, and its trims between chunks cancel
+    /// that analysis.
+    pub(crate) fn mark_shared_buffers_changed(&mut self) {
         self.shared_request_generation = self.shared_request_generation.wrapping_add(1);
         self.supersede_call_hierarchy_index(base_db::BSL_SOURCE_ROOT);
         for uri in self.opened_document_uris() {
@@ -1117,7 +1224,6 @@ impl GlobalState {
                 self.enqueue_pending_diagnostics(uri);
             }
         }
-        self.mark_workspace_batch_dirty();
     }
 }
 

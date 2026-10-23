@@ -412,9 +412,17 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
     // Registered before the endpoint and the owner exist, so a stop signal never takes the
     // default action that would leave the writer lease looking live.
     let signal = super::shutdown_signal()?;
+    SharedBackendIdentity::prefetch_build_fingerprint();
     let source = inputs.source_dir.clone().context("workspace daemon requires source")?;
     let cache = inputs.workspace_cache.clone().context("workspace daemon requires cache")?;
     prepare_platform_identity(&source)?;
+    // The launching client waits for its `initialize` answer through the whole daemon
+    // start, and loading the help is the longest part of it: it runs while the daemon
+    // derives its identity, binds the endpoint and takes the first session.
+    let help_preload = Arc::new(std::sync::Mutex::new(Some(std::thread::spawn({
+        let source = source.clone();
+        move || bsl_analyzer::help_bootstrap::bootstrap_for_root(&source, None)
+    }))));
     let expected = identity(&source, &cache)?;
     let key = SharedBackendKey::new(expected.clone());
     let preset = if std::env::var_os(AUTO_DAEMON_ENV).is_none() {
@@ -443,6 +451,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
         let preset = preset.clone();
         let executor_slots = executor_slots.clone();
         let retiring = retiring.clone();
+        let help_preload = help_preload.clone();
         let epoch = epoch;
         if markers_enabled {
             tracing::info!(
@@ -457,70 +466,79 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
             );
         }
         async move {
-            let server = owner
-                .get_or_try_init(|| async {
-                    if markers_enabled {
-                        tracing::info!(
-                            target: "bsl_analyzer::shared_backend",
-                            event = "owner_init_start",
-                            owner_epoch = epoch,
-                            owner_init_id = epoch,
-                            daemon_pid = std::process::id(),
-                            "shared backend state initialization started"
-                        );
-                    }
-                    let owner = tokio::task::spawn_blocking(move || {
-                        anyhow::ensure!(
-                            identity(&source, &cache)? == expected,
-                            "workspace settings changed before daemon attach"
-                        );
-                        bsl_analyzer::help_bootstrap::bootstrap_for_root(&source, None);
-                        anyhow::ensure!(
-                            identity(&source, &cache)? == expected,
-                            "platform or workspace identity changed during daemon bootstrap"
-                        );
-                        let prefixes = resolve_embedding_prefixes(Some(&source))
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        let identity_root = source.clone();
-                        let identity_cache = cache.clone();
-                        let state =
-                            mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
-                                source,
-                                cache,
-                                Some(prefixes),
-                            )?;
-                        anyhow::ensure!(
-                            state.set_backend_identity_check(move || {
-                                identity(&identity_root, &identity_cache)
-                                    .is_ok_and(|current| current == expected)
-                            }),
-                            "workspace identity changed before adapter attach"
-                        );
-                        anyhow::Ok(mcp_server::McpServer::new(
-                            mcp_server::McpProfile::Workspace,
-                            state,
-                        ))
+            let initialized = async move {
+                owner
+                    .get_or_try_init(|| async {
+                        if markers_enabled {
+                            tracing::info!(
+                                target: "bsl_analyzer::shared_backend",
+                                event = "owner_init_start",
+                                owner_epoch = epoch,
+                                owner_init_id = epoch,
+                                daemon_pid = std::process::id(),
+                                "shared backend state initialization started"
+                            );
+                        }
+                        let owner = tokio::task::spawn_blocking(move || {
+                            anyhow::ensure!(
+                                identity(&source, &cache)? == expected,
+                                "workspace settings changed before daemon attach"
+                            );
+                            let preload =
+                                help_preload.lock().unwrap_or_else(|p| p.into_inner()).take();
+                            if let Some(preload) = preload {
+                                let _ = preload.join();
+                            }
+                            bsl_analyzer::help_bootstrap::bootstrap_for_root(&source, None);
+                            anyhow::ensure!(
+                                identity(&source, &cache)? == expected,
+                                "platform or workspace identity changed during daemon bootstrap"
+                            );
+                            let prefixes = resolve_embedding_prefixes(Some(&source))
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            let identity_root = source.clone();
+                            let identity_cache = cache.clone();
+                            let state =
+                                mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+                                    source,
+                                    cache,
+                                    Some(prefixes),
+                                )?;
+                            anyhow::ensure!(
+                                state.set_backend_identity_check(move || {
+                                    identity(&identity_root, &identity_cache)
+                                        .is_ok_and(|current| current == expected)
+                                }),
+                                "workspace identity changed before adapter attach"
+                            );
+                            anyhow::Ok(mcp_server::McpServer::new(
+                                mcp_server::McpProfile::Workspace,
+                                state,
+                            ))
+                        })
+                        .await??;
+                        if markers_enabled {
+                            tracing::info!(
+                                target: "bsl_analyzer::shared_backend",
+                                event = "owner_init_complete",
+                                owner_epoch = epoch,
+                                owner_init_id = epoch,
+                                "shared backend state initialized"
+                            );
+                        }
+                        let scope_stop = owner.shared_state().backend_retired();
+                        tokio::spawn(async move {
+                            scope_stop.cancelled().await;
+                            retiring.cancel();
+                        });
+                        anyhow::Ok(owner)
                     })
-                    .await??;
-                    if markers_enabled {
-                        tracing::info!(
-                            target: "bsl_analyzer::shared_backend",
-                            event = "owner_init_complete",
-                            owner_epoch = epoch,
-                            owner_init_id = epoch,
-                            "shared backend state initialized"
-                        );
-                    }
-                    let scope_stop = owner.shared_state().backend_retired();
-                    tokio::spawn(async move {
-                        scope_stop.cancelled().await;
-                        retiring.cancel();
-                    });
-                    anyhow::Ok(owner)
-                })
-                .await?;
+                    .await
+                    .cloned()
+            };
             match session {
                 SharedSession::Mcp(stream) => {
+                    let server = initialized.await?;
                     let context: McpContext = serde_json::from_slice(&bytes)?;
                     mcp_server::contract::validate_enabled_tools(
                         mcp_server::McpProfile::Workspace,
@@ -549,7 +567,14 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
                 }
                 SharedSession::Lsp(channel) => {
                     let context: LspContext = serde_json::from_slice(&bytes)?;
-                    let workspace = server.shared_state().workspace_handle();
+                    // The editor's `initialize` is answered from the project settings alone,
+                    // so the session takes it before the owner exists: loading the platform
+                    // help and the owner state is the longest part of a daemon start, and
+                    // every later request waits for the owner anyway.
+                    let runtime = tokio::runtime::Handle::current();
+                    let workspace = move || -> anyhow::Result<mcp_server::WorkspaceHandle> {
+                        Ok(runtime.block_on(initialized)?.shared_state().workspace_handle())
+                    };
                     serve_lsp(channel, workspace, context, stop, _retired, epoch).await
                 }
             }
@@ -586,7 +611,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
 
 async fn serve_lsp(
     channel: LspChannel,
-    workspace: mcp_server::WorkspaceHandle,
+    workspace: impl FnOnce() -> anyhow::Result<mcp_server::WorkspaceHandle> + Send + 'static,
     context: LspContext,
     stop: CancellationToken,
     retired: CancellationToken,
@@ -719,14 +744,15 @@ pub(crate) async fn read_lsp_message<R: AsyncBufRead + Unpin>(
     let received = (&mut *read).take(u64::try_from(length)?).read_to_end(&mut bytes).await?;
     anyhow::ensure!(received == length, "truncated LSP body");
     let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let mut message: lsp_server::Message = serde_json::from_value(raw.clone())?;
     // lsp-server represents both a missing result and JSON-RPC's valid `result: null`
     // as `None`. Restore the wire distinction before this response is forwarded to the
     // public stdio writer, which may bypass `write_lsp_message` entirely.
-    if raw
+    let null_result = raw
         .as_object()
-        .is_some_and(|object| object.get("result").is_some_and(serde_json::Value::is_null))
-    {
+        .is_some_and(|object| object.get("result").is_some_and(serde_json::Value::is_null));
+    // Moved, not cloned: a response carries a whole document's hints or diagnostics.
+    let mut message: lsp_server::Message = serde_json::from_value(raw)?;
+    if null_result {
         if let lsp_server::Message::Response(response) = &mut message {
             response.result = Some(serde_json::Value::Null);
         }
@@ -738,16 +764,19 @@ pub(crate) async fn write_lsp_message<W: AsyncWrite + Unpin>(
     write: &mut W,
     message: &lsp_server::Message,
 ) -> Result<()> {
-    let mut value = serde_json::to_value(message)?;
     // A successful JSON-RPC response must carry `result`, even when its value is null.
-    // lsp-server's typed Response cannot distinguish that from an absent result.
-    if matches!(message, lsp_server::Message::Response(response) if response.error.is_none() && response.result.is_none())
+    // lsp-server's typed Response cannot distinguish that from an absent result. Every
+    // other message is written straight from its own tree, without a copy of it.
+    let bytes = if matches!(message, lsp_server::Message::Response(response) if response.error.is_none() && response.result.is_none())
     {
+        let mut value = serde_json::to_value(message)?;
         if let Some(object) = value.as_object_mut() {
             object.insert("result".to_owned(), serde_json::Value::Null);
         }
-    }
-    let bytes = serde_json::to_vec(&value)?;
+        serde_json::to_vec(&value)?
+    } else {
+        serde_json::to_vec(message)?
+    };
     write.write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes()).await?;
     write.write_all(&bytes).await?;
     write.flush().await?;

@@ -230,21 +230,13 @@ pub(crate) fn open_shared_document(
 ) {
     let Some(owner) = state.analysis_host.owner().cloned() else { return };
     state.open_file_uri_ids.insert(uri.clone(), file_id);
-    let start_seed = state.analysis_host.view().is_none();
-    state.analysis_host.prepare_view_for_open();
-    if start_seed {
-        state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
-        state.shared_view_seeded = false;
-        state.shared_seed_queued = true;
-    }
-    state.update_diagnostics_config();
-    state.update_features_config();
+    state.ensure_shared_view();
     let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
     state.open_files.insert(file_id);
     if let Some(view) = state.analysis_host.view_mut() {
         view.open(file_id, path.clone(), Arc::from(text));
     }
-    state.mark_shared_view_changed();
+    state.mark_shared_buffers_changed();
     state.schedule_shared_seed();
     let vfs_path = vfs::VfsPath::new(path);
     let mut vfs = state.vfs.write();
@@ -256,7 +248,7 @@ pub(crate) fn open_shared_document(
         mcp_server::WorkspaceReadiness::Ready { .. }
             | mcp_server::WorkspaceReadiness::Frozen { .. }
     ) && state.shared_view_seeded;
-    state.clear_batch_push_for(uri);
+    state.hand_batch_push_to_open_document(uri);
     if state.vfs_done {
         preload_dependencies(state, file_id);
     }
@@ -338,10 +330,9 @@ pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParam
     }
     let preload_dispatch_ms = preload_start.elapsed().as_millis() as u64;
 
-    // Hand the file off from the deferred batch (Stream B) to the interactive stream:
-    // if the batch had pushed diagnostics for it, clear them so the open document is
-    // the sole owner and the two streams never double-report it.
-    state.clear_batch_push_for(&uri);
+    // Hand the file off from the deferred batch (Stream B) to the interactive stream, so
+    // the open document is the sole owner and the two streams never double-report it.
+    state.hand_batch_push_to_open_document(&uri);
 
     schedule_diagnostics(state, &uri);
 
@@ -483,7 +474,7 @@ pub fn handle_did_change(
         if let Some(view) = state.analysis_host.view_mut() {
             view.change(file_id, Arc::from(text.as_str()));
         }
-        state.mark_shared_view_changed();
+        state.mark_shared_buffers_changed();
         let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
         let mut vfs = state.vfs.write();
         vfs.set_file_contents(vfs::VfsPath::new(path), Some(Arc::from(text.as_str())));
@@ -569,22 +560,17 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
             } else {
                 // A close must not expose a disk revision captured before the save.
                 state.analysis_host.take_view();
-                state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
-                state.shared_view_seeded = false;
-                state.shared_seed_queued = !state.open_files.is_empty();
+                state.ensure_shared_view();
                 state.vfs_done = false;
-                if !state.open_files.is_empty() {
-                    state.analysis_host.prepare_view_for_open();
-                    for uri in state.opened_document_uris() {
-                        let Ok(remaining) = crate::lsp::file_id(state, &uri) else { continue };
-                        if !state.open_files.contains(&remaining) {
-                            continue;
-                        }
-                        let path = state.vfs.read().file_path(remaining).as_path().to_path_buf();
-                        if let Some(text) = state.mem_docs.get(&uri) {
-                            if let Some(view) = state.analysis_host.view_mut() {
-                                view.open(remaining, path, Arc::from(text.as_str()));
-                            }
+                for uri in state.opened_document_uris() {
+                    let Ok(remaining) = crate::lsp::file_id(state, &uri) else { continue };
+                    if !state.open_files.contains(&remaining) {
+                        continue;
+                    }
+                    let path = state.vfs.read().file_path(remaining).as_path().to_path_buf();
+                    if let Some(text) = state.mem_docs.get(&uri) {
+                        if let Some(view) = state.analysis_host.view_mut() {
+                            view.open(remaining, path, Arc::from(text.as_str()));
                         }
                     }
                 }
@@ -600,19 +586,6 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
         state.mark_shared_view_changed();
         if caught_up {
             refresh_after_shared_catch_up(state);
-        }
-        if state.open_files.is_empty() {
-            state.analysis_host.take_view();
-            state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
-            state.shared_view_seeded = false;
-            state.shared_seed_queued = false;
-            state.vfs_done = state.analysis_host.owner().is_some_and(|owner| {
-                matches!(
-                    owner.readiness(),
-                    mcp_server::WorkspaceReadiness::Ready { .. }
-                        | mcp_server::WorkspaceReadiness::Frozen { .. }
-                )
-            });
         }
         state.schedule_shared_seed();
         let notification = Notification::new(
@@ -1585,9 +1558,22 @@ mod tests {
         assert!(state.request_tokens.contains_key(&id));
     }
 
+    /// The empty reports published for `uri` since the receiver was last drained.
+    fn empty_reports_for(receiver: &Receiver<Message>, uri: &Url) -> usize {
+        std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|message| match message {
+                Message::Notification(n) if n.method == "textDocument/publishDiagnostics" => {
+                    serde_json::from_value::<PublishDiagnosticsParams>(n.params).ok()
+                }
+                _ => None,
+            })
+            .filter(|params| &params.uri == uri && params.diagnostics.is_empty())
+            .count()
+    }
+
     #[test]
     fn did_open_hands_file_off_from_batch_push() {
-        let (mut state, _receiver) = create_test_state();
+        let (mut state, receiver) = create_test_state();
         let uri = crate::test_uri::file_uri("mod.bsl");
 
         // The deferred batch had pushed diagnostics for this (then closed) file.
@@ -1615,6 +1601,40 @@ mod tests {
             !state.batch_pushed.contains_key(&uri),
             "opening a batch-pushed file must clear its batch entry"
         );
+        assert_eq!(
+            empty_reports_for(&receiver, &uri),
+            0,
+            "the batch's report stays until the open document's own report replaces it"
+        );
+    }
+
+    /// A pulling client gets no pushed report for the open document, so nothing would
+    /// replace the batch's: it is cleared on open.
+    #[test]
+    fn did_open_clears_a_batch_push_a_pulling_client_would_keep() {
+        let (mut state, receiver) = create_test_state();
+        state.pull_diagnostics_active = true;
+        let uri = crate::test_uri::file_uri("mod.bsl");
+        state.batch_pushed.insert(
+            uri.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
+
+        handle_did_open(
+            &mut state,
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".to_string(),
+                    version: 1,
+                    text: "Процедура Тест() КонецПроцедуры".to_string(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(!state.batch_pushed.contains_key(&uri));
+        assert_eq!(empty_reports_for(&receiver, &uri), 1);
     }
 
     /// The batch may have published a file under another spelling than the one the editor
@@ -1622,7 +1642,7 @@ mod tests {
     /// entry for another file stays.
     #[test]
     fn did_open_hands_off_a_batch_push_made_under_another_spelling() {
-        let (mut state, _receiver) = create_test_state();
+        let (mut state, receiver) = create_test_state();
         let uri = crate::test_uri::file_uri("mod.bsl");
         let file_id = state.vfs_file_for_url(&uri).unwrap();
         let other_id = state.vfs_file_for_url(&crate::test_uri::file_uri("other.bsl")).unwrap();
@@ -1653,6 +1673,11 @@ mod tests {
 
         assert!(!state.batch_pushed.contains_key(&alias), "the same file's entry is cleared");
         assert!(state.batch_pushed.contains_key(&unrelated), "another file's entry stays");
+        assert_eq!(
+            empty_reports_for(&receiver, &alias),
+            1,
+            "nothing replaces a report published under another spelling"
+        );
     }
 
     #[test]

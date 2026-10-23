@@ -10,8 +10,8 @@ use salsa::Database as _;
 use std::path::PathBuf;
 
 /// Storage used by one LSP session. Standalone sessions keep the traditional host;
-/// shared sessions own an independent editor storage and borrow disk analyses only
-/// for requests that have no open documents.
+/// shared sessions own an independent editor storage from the moment the owner has a
+/// workspace to seed it with, and borrow the owner's disk analysis only before that.
 pub enum SessionAnalysisHost {
     Standalone(AnalysisHost),
     Shared {
@@ -63,7 +63,7 @@ impl SessionAnalysisHost {
         }
     }
 
-    pub fn prepare_view_for_open(&mut self) {
+    pub fn prepare_view(&mut self) {
         if !self.is_shared() || self.view().is_some() {
             return;
         }

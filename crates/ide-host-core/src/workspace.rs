@@ -697,7 +697,11 @@ impl EditorView {
         for (root, listing) in &snapshot.metadata {
             self.db.set_metadata_listing_snapshot(&root.to_string_lossy(), listing.clone());
         }
-        self.db.set_workspace_load_complete(snapshot.metadata_ready);
+        // The whole-configuration loader reads the flag: rewriting the same value with
+        // every publication would send each configuration back to be parsed.
+        if self.db.workspace_load_complete() != snapshot.metadata_ready {
+            self.db.set_workspace_load_complete(snapshot.metadata_ready);
+        }
         self.generation = snapshot.generation;
         self.disk = snapshot;
         for file_id in changed {

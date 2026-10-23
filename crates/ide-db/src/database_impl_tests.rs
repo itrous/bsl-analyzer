@@ -8578,3 +8578,40 @@ fn vendor_support_answers_for_main_configuration_files_only() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A storage that follows an owner gets the whole listing with every publication. An
+/// unchanged listing writes nothing, so nothing resolved against it is recomputed; the
+/// input carries one entry of each kind of field the comparison has to cover, and a
+/// control publication that changes one field still reaches the storage.
+#[test]
+fn re_publishing_an_unchanged_metadata_listing_writes_nothing() {
+    use crate::metadata::{CommonModuleEntry, MdoEntry, MetadataListingSnapshot};
+    use bsl_metadata::MdoType;
+
+    let mut db = RootDatabaseImpl::new();
+    let listing = |name: &str| MetadataListingSnapshot {
+        entries: Arc::new(vec![MdoEntry {
+            kind: MdoType::Catalog,
+            name: name.to_string(),
+            main: FileId(1),
+            predefined: None,
+        }]),
+        common_modules: Arc::new(vec![CommonModuleEntry {
+            name: "Общий".to_string(),
+            main: FileId(2),
+            module_file: None,
+            unread_module_file: None,
+        }]),
+        ..MetadataListingSnapshot::default()
+    };
+    db.set_metadata_listing_snapshot("/cfg", listing("Товары"));
+    let published = salsa::plumbing::current_revision(&db);
+
+    db.set_metadata_listing_snapshot("/cfg", listing("Товары"));
+    assert_eq!(salsa::plumbing::current_revision(&db), published);
+
+    db.set_metadata_listing_snapshot("/cfg", listing("Услуги"));
+    assert_ne!(salsa::plumbing::current_revision(&db), published);
+    let entries = db.metadata_listing("/cfg").unwrap().entries(&db);
+    assert_eq!(entries[0].name, "Услуги");
+}

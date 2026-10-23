@@ -923,6 +923,11 @@ impl RootDatabaseImpl {
 
     /// Install owner-prepared listing data while creating this storage's own
     /// Salsa input IDs. The Arc payloads can remain shared across storages.
+    ///
+    /// A field is written only when its value changes: a storage that follows an owner
+    /// gets the whole listing again with every publication, and a write sends every
+    /// query that read the field back to recompute — the whole configuration's parse
+    /// among them.
     pub fn set_metadata_listing_snapshot(
         &mut self,
         root: &str,
@@ -945,17 +950,26 @@ impl RootDatabaseImpl {
         } = listing;
         match self.metadata_listings.get(&key).map(|e| *e.value()) {
             Some(input) => {
-                input.set_entries(self).to(entries);
-                input.set_defined_types(self).to(defined_types);
-                input.set_common_modules(self).to(common_modules);
-                input.set_event_subscriptions(self).to(event_subscriptions);
-                input.set_scheduled_jobs(self).to(scheduled_jobs);
-                input.set_roles(self).to(roles);
-                input.set_http_services(self).to(http_services);
-                input.set_web_services(self).to(web_services);
-                input.set_integration_services(self).to(integration_services);
-                input.set_subsystems(self).to(subsystems);
-                input.set_common_attributes(self).to(common_attributes);
+                macro_rules! set_changed {
+                    ($($field:ident => $setter:ident),* $(,)?) => {$(
+                        if *input.$field(self) != $field {
+                            input.$setter(self).to($field);
+                        }
+                    )*};
+                }
+                set_changed!(
+                    entries => set_entries,
+                    defined_types => set_defined_types,
+                    common_modules => set_common_modules,
+                    event_subscriptions => set_event_subscriptions,
+                    scheduled_jobs => set_scheduled_jobs,
+                    roles => set_roles,
+                    http_services => set_http_services,
+                    web_services => set_web_services,
+                    integration_services => set_integration_services,
+                    subsystems => set_subsystems,
+                    common_attributes => set_common_attributes,
+                );
             }
             None => {
                 let input = metadata::MetadataListingInput::builder(

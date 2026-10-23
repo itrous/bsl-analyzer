@@ -154,12 +154,13 @@ pub fn main_loop(connection: Connection) -> Result<()> {
     Ok(())
 }
 
-/// Start an LSP session backed by an already-owned MCP workspace. The owner is
-/// responsible for disk loading and metadata; this session creates an editor
-/// storage only when the first admissible document opens.
+/// Start an LSP session backed by an MCP workspace owner. The owner is responsible
+/// for disk loading and metadata; this session keeps an editor storage of its own,
+/// seeded from the owner. `workspace` yields the owner once it exists: `initialize`
+/// is answered before that, every other message after.
 pub fn main_loop_shared(
     connection: Connection,
-    workspace: mcp_server::WorkspaceHandle,
+    workspace: impl FnOnce() -> Result<mcp_server::WorkspaceHandle>,
 ) -> Result<()> {
     crate::panic_watch::install();
     let (initialize_id, initialize_value) =
@@ -170,7 +171,7 @@ pub fn main_loop_shared(
 /// Resume a private proxy-rebound session without sending another `initialize`.
 pub fn main_loop_resumed(
     connection: Connection,
-    workspace: mcp_server::WorkspaceHandle,
+    workspace: impl FnOnce() -> Result<mcp_server::WorkspaceHandle>,
     initialize_params: serde_json::Value,
     announced_capabilities: Option<serde_json::Value>,
     next_server_request_id: i32,
@@ -190,7 +191,7 @@ pub fn main_loop_resumed(
 
 fn run_shared_initialized(
     connection: Connection,
-    workspace: mcp_server::WorkspaceHandle,
+    workspace: impl FnOnce() -> Result<mcp_server::WorkspaceHandle>,
     initialize_value: serde_json::Value,
     initialize_id: Option<lsp_server::RequestId>,
     next_server_request_id: i32,
@@ -212,9 +213,10 @@ fn run_shared_initialized(
         });
     let help_root =
         workspace_root.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
-    platform_help::bootstrap(early_config.as_ref(), &help_root);
-    let diagnostics_scope =
-        early_config.map(|config| config.features.workspace_diagnostics).unwrap_or_default();
+    let diagnostics_scope = early_config
+        .as_ref()
+        .map(|config| config.features.workspace_diagnostics)
+        .unwrap_or_default();
     let pull_provider_announced =
         announced_capabilities.as_ref().map_or(diagnostics_scope.is_enabled(), |capabilities| {
             !capabilities["diagnosticProvider"].is_null()
@@ -240,6 +242,10 @@ fn run_shared_initialized(
             .context("Failed to finish initialization")?;
     }
 
+    // Before any request can reach a platform lookup. The owner loads the help as it starts;
+    // asking again here only confirms the active source.
+    let workspace = workspace()?;
+    platform_help::bootstrap(early_config.as_ref(), &help_root);
     let mut state = GlobalState::new_shared(connection.sender.clone(), workspace.clone());
     state.next_request_id.store(next_server_request_id.max(1), std::sync::atomic::Ordering::SeqCst);
     state.progress_generation = progress_generation;
@@ -620,6 +626,7 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
 
         admit_pending_latency_retries(state)?;
         state.schedule_shared_seed();
+        state.start_shared_metadata_warmup();
         if state.shared_seed_running {
             hold_shared_test_gate("BSL_TEST_SHARED_LSP_EVENT_GATE");
         }
@@ -1117,11 +1124,12 @@ fn refresh_shared_readiness(state: &mut GlobalState) -> bool {
                 state.shared_owner_generation = Some(generation);
                 state.mark_shared_view_changed();
             }
+            state.ensure_shared_view();
             if let Some(view) = state.analysis_host.view() {
                 state.shared_seed_queued =
                     !(state.shared_view_seeded && view.generation() == generation);
             }
-            state.vfs_done = state.open_files.is_empty() || state.shared_view_seeded;
+            state.vfs_done = state.shared_view_seeded;
         }
         Some(mcp_server::WorkspaceReadiness::Frozen { generation, error }) => {
             if state.shared_configuration_error.as_ref() != Some(&error) {
@@ -1129,13 +1137,10 @@ fn refresh_shared_readiness(state: &mut GlobalState) -> bool {
                 state.shared_configuration_error = Some(error);
             }
             state.shared_owner_generation = Some(generation);
-            state.shared_seed_queued = state.analysis_host.view().is_some()
-                && (!state.shared_view_seeded
-                    || state
-                        .analysis_host
-                        .view()
-                        .is_some_and(|view| view.generation() != generation));
-            state.vfs_done = state.open_files.is_empty() || state.shared_view_seeded;
+            state.ensure_shared_view();
+            state.shared_seed_queued = !state.shared_view_seeded
+                || state.analysis_host.view().is_some_and(|view| view.generation() != generation);
+            state.vfs_done = state.shared_view_seeded;
         }
         Some(mcp_server::WorkspaceReadiness::RejectedScope(message)) => {
             if !state.project_rejected {
@@ -1178,10 +1183,6 @@ fn apply_shared_project(
         crate::handlers::notification::withdraw_document_diagnostics(state, &uri);
     }
     readmit_shared_documents(state);
-    if state.open_files.is_empty() {
-        state.analysis_host.take_view();
-        state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
-    }
 }
 
 /// Put back into the view the open documents the exclusions no longer cover, with the
@@ -1245,12 +1246,15 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take()
             };
-            if epoch == state.shared_view_epoch && !state.open_files.is_empty() {
+            if epoch == state.shared_view_epoch {
+                let mut published = false;
+                let owner_had_no_snapshot = prepared.is_none();
                 if let Some((prepared_epoch, view)) = prepared {
                     if prepared_epoch == epoch {
                         state.analysis_host.request_cancellation();
                         if let Some(current) = state.analysis_host.view_mut() {
                             if current.replace_from_prepared(view) {
+                                published = true;
                                 state.shared_view_seeded = true;
                                 state.mark_shared_view_changed();
                                 if std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_some() {
@@ -1269,11 +1273,26 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 }
                 state.analysis_host.catch_up();
                 refresh_shared_readiness(state);
+                // A frozen owner — kept on its last good configuration while a broken one
+                // is in place — can have no snapshot to give while it reloads. Asking again
+                // at once would start a seed thread on every turn of the loop; its next
+                // publication asks instead.
+                let frozen = state.analysis_host.owner().is_some_and(|owner| {
+                    matches!(owner.readiness(), mcp_server::WorkspaceReadiness::Frozen { .. })
+                });
+                if owner_had_no_snapshot && frozen && !state.shared_view_seeded {
+                    state.shared_seed_queued = false;
+                }
                 if state.vfs_done {
                     for uri in state.opened_document_uris() {
                         crate::handlers::schedule_diagnostics(state, &uri);
                     }
                     state.request_semantic_tokens_refresh();
+                }
+                // After the settings and the catch-up above: each is a write to the new
+                // storage and would cancel a warm-up already running.
+                if published {
+                    state.warm_shared_view_metadata();
                 }
             }
         }
@@ -1327,6 +1346,16 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
             {
                 state.enqueue_pending_diagnostics(uri);
             }
+        }
+        Task::SharedMetadataWarmed { warmed } => {
+            tracing::debug!(warmed, "shared editor storage metadata warmed");
+            state.shared_metadata_warm_in_flight = false;
+            // A write cancelled it. What it had parsed stays memoised, so another run
+            // continues from there.
+            if !warmed {
+                state.shared_metadata_warm_pending = true;
+            }
+            state.start_shared_metadata_warmup();
         }
         Task::DependenciesPreloaded { file_id, count } => {
             tracing::debug!(file_id = file_id.0, count, "dependencies preloaded");
@@ -7124,6 +7153,149 @@ mod tests {
         drop(backend);
     }
 
+    /// A shared session answers from one editor storage from the owner's first
+    /// publication on. Opening a file and closing the last document are input changes to
+    /// that storage: a fresh one would recompute the whole workspace on the next
+    /// workspace-wide request and hold every result a second time. The input opens a file
+    /// with its disk text, the case where nothing but the switch of storage costs anything,
+    /// then closes it, the last open document.
+    #[test]
+    fn a_shared_session_keeps_one_editor_storage_across_open_and_close() {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(
+            root.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\n\n[features]\nworkspace_diagnostics = \"all\"\n",
+        )
+        .expect("write project config");
+        let opened = root.path().join("Opened.bsl");
+        let opened_text = "Процедура Открытая() Экспорт КонецПроцедуры\n";
+        std::fs::write(&opened, opened_text).expect("write source");
+        std::fs::write(
+            root.path().join("Other.bsl"),
+            "Процедура Соседняя() Экспорт КонецПроцедуры\n",
+        )
+        .expect("write source");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+        let publications = owner.subscribe();
+        loop {
+            match owner.readiness() {
+                mcp_server::WorkspaceReadiness::Ready { .. } => break,
+                mcp_server::WorkspaceReadiness::Loading => {
+                    publications.recv().expect("the owner publishes its workspace");
+                }
+                other => panic!("the test workspace does not load: {other:?}"),
+            }
+        }
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
+        refresh_shared_readiness(&mut state);
+        assert!(
+            state.analysis_host.view().is_some() && state.shared_seed_queued,
+            "a ready owner gives the session its storage before any document is opened"
+        );
+        let seed = |state: &mut GlobalState| {
+            state.schedule_shared_seed();
+            while !state.shared_view_seeded {
+                let task = state.task_pool.receiver.recv().expect("the editor view is seeded");
+                handle_task(state, task).unwrap();
+            }
+        };
+        seed(&mut state);
+        assert!(state.vfs_done, "the seeded storage serves requests");
+        assert_eq!(
+            state.shared_metadata_warmups, 1,
+            "a seeded storage gets the metadata loaded, as the standalone server loads it"
+        );
+        let epoch = state.shared_view_epoch;
+        let found = state
+            .analysis_host
+            .serving_analysis()
+            .expect("the seeded storage serves requests")
+            .workspace_symbols("Соседняя");
+        assert!(!found.candidates.is_empty(), "the workspace-wide request is answered");
+        // The seed armed the batch; the event loop would have launched it by now.
+        state.workspace_batch_dirty = false;
+
+        let uri = lsp_types::Url::from_file_path(&opened).unwrap();
+        crate::handlers::notification::handle_did_open(
+            &mut state,
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "bsl".to_owned(),
+                    version: 1,
+                    text: opened_text.to_owned(),
+                },
+            },
+        )
+        .expect("open the document");
+        assert_eq!(state.shared_view_epoch, epoch, "opening a file keeps the session's storage");
+        assert!(
+            !state.workspace_batch_dirty,
+            "opening a file does not sweep every closed file again, as the standalone server \
+             does not"
+        );
+        assert!(
+            state.shared_view_seeded && state.vfs_done,
+            "the open document needs no new seed before requests are served"
+        );
+
+        crate::handlers::notification::handle_did_close(
+            &mut state,
+            lsp_types::DidCloseTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+            },
+        )
+        .expect("close the document");
+        assert!(state.workspace_batch_dirty, "the closed file goes back to the batch");
+        seed(&mut state);
+        assert_eq!(
+            state.shared_view_epoch, epoch,
+            "closing the last document keeps the session's storage"
+        );
+        assert!(state.vfs_done, "the session still serves requests with nothing open");
+
+        // A storage replaced while its warm-up still runs: that warm-up finishing well
+        // does not stand for the warm-up the replacing storage wants.
+        while state.shared_metadata_warm_in_flight {
+            let task = state.task_pool.receiver.recv().expect("the warm-up reports");
+            handle_task(&mut state, task).unwrap();
+        }
+        let warmups = state.shared_metadata_warmups;
+        state.shared_metadata_warm_in_flight = true;
+        state.analysis_host.take_view();
+        state.ensure_shared_view();
+        seed(&mut state);
+        handle_task(&mut state, crate::global_state::Task::SharedMetadataWarmed { warmed: true })
+            .unwrap();
+        assert_eq!(
+            state.shared_metadata_warmups,
+            warmups + 1,
+            "the replacing storage gets its own warm-up"
+        );
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
+
     /// Saving or closing a document catches the view up with whatever the owner
     /// published since the last workspace change, so the `SharedWorkspaceChanged` queued
     /// for that publication later finds the view current. The other open documents must
@@ -7547,6 +7719,121 @@ mod tests {
             Some(lsp_server::ErrorCode::ContentModified as i32),
             "declined as not ready: {:?}",
             response.error
+        );
+    }
+
+    /// A shared session answers `initialize` before it asks for its owner: the owner's
+    /// start — the platform help and the owner state — is the longest part of a daemon
+    /// start, and the answer needs neither. The owner is asked for only once the answer
+    /// waits in the client's channel.
+    #[test]
+    fn a_shared_session_answers_initialize_before_asking_for_its_owner() {
+        let backend = mcp_server::SharedState::shared();
+        let handle = backend.workspace_handle();
+        let (server, client) = lsp_server::Connection::memory();
+        let answers = client.receiver.clone();
+        let answer_when_asked = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = std::sync::Arc::clone(&answer_when_asked);
+        let session = std::thread::spawn(move || {
+            crate::main_loop_shared(server, move || {
+                *seen.lock().unwrap() = Some(answers.try_recv().ok());
+                Ok(handle)
+            })
+        });
+        let root = tempfile::tempdir().expect("create workspace");
+        let messages = [
+            Message::Request(Request::new(
+                1.into(),
+                "initialize".to_owned(),
+                serde_json::json!({
+                    "capabilities": {},
+                    "rootUri": lsp_types::Url::from_directory_path(root.path()).unwrap(),
+                }),
+            )),
+            Message::Notification(lsp_server::Notification::new(
+                "initialized".to_owned(),
+                serde_json::json!({}),
+            )),
+            Message::Request(Request::new(
+                2.into(),
+                "shutdown".to_owned(),
+                serde_json::Value::Null,
+            )),
+            Message::Notification(lsp_server::Notification::new(
+                "exit".to_owned(),
+                serde_json::Value::Null,
+            )),
+        ];
+        for message in messages {
+            client.sender.send(message).unwrap();
+        }
+        session.join().expect("the session thread").expect("the session ends cleanly");
+
+        let answer = answer_when_asked.lock().unwrap().take().expect("the owner was asked for");
+        assert!(
+            matches!(answer, Some(Message::Response(ref r)) if r.id == 1.into() && r.error.is_none()),
+            "the answer to initialize was already sent when the owner was asked for: {answer:?}"
+        );
+        drop(backend);
+    }
+
+    /// An editor view still waiting for its seed holds the open documents and nothing
+    /// else: a syntax request for a closed file is declined as not ready, while one for an
+    /// open document is answered from its buffer. The input sends both to one view.
+    #[test]
+    fn an_unseeded_shared_view_answers_only_its_open_documents() {
+        let backend = mcp_server::SharedState::shared();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, backend.workspace_handle());
+        state.analysis_host.prepare_view();
+        state.vfs_done = false;
+        let root = tempfile::tempdir().expect("create workspace");
+        let opened = lsp_types::Url::from_file_path(root.path().join("Opened.bsl")).unwrap();
+        let closed = lsp_types::Url::from_file_path(root.path().join("Closed.bsl")).unwrap();
+        let text = "Процедура Открытая() КонецПроцедуры";
+        state.mem_docs.insert(opened.clone(), text.to_owned(), 1);
+        let file_id = state.vfs_file_for_url(&opened).unwrap();
+        state.analysis_host.view_mut().expect("the prepared view").open(
+            file_id,
+            root.path().join("Opened.bsl"),
+            std::sync::Arc::from(text),
+        );
+
+        let answer = |state: &mut GlobalState, id: i32, uri: &lsp_types::Url| {
+            handle_request(
+                state,
+                Request::new(
+                    id.into(),
+                    lsp_types::request::DocumentSymbolRequest::METHOD.to_string(),
+                    serde_json::json!({ "textDocument": { "uri": uri } }),
+                ),
+            )
+            .unwrap();
+            std::iter::from_fn(|| receiver.try_recv().ok())
+                .find_map(|message| match message {
+                    Message::Response(response) if response.id == id.into() => Some(response),
+                    _ => None,
+                })
+                .expect("the request is answered at dispatch")
+        };
+
+        let declined = answer(&mut state, 1, &closed);
+        assert_eq!(
+            declined.error.as_ref().map(|error| error.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32),
+            "a closed file is not in the view yet: {:?}",
+            declined.result
+        );
+        let answered = answer(&mut state, 2, &opened);
+        assert!(answered.error.is_none(), "an open document is answered: {:?}", answered.error);
+        assert!(
+            answered
+                .result
+                .as_ref()
+                .and_then(|result| result.as_array())
+                .is_some_and(|symbols| { !symbols.is_empty() }),
+            "the open document's symbols come from its buffer: {:?}",
+            answered.result
         );
     }
 

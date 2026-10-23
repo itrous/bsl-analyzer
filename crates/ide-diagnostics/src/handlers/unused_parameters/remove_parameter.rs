@@ -27,16 +27,24 @@
 use crate::handlers::unused_local_method::{mentions_identifier, string_literal_texts};
 use crate::{Diagnostic, DiagnosticsContext, Fix, TextEdit};
 use ide_db::TextRange;
+use rustc_hash::FxHashMap;
 use stdx::case::CaseExt;
 use syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
 
 /// What every fix of the file checks against, gathered once.
+///
+/// A file reports an unused parameter per method, and a large module reports
+/// hundreds; walking the whole file and its extensions' bodies again for each of them
+/// made the fixes cost the size of the module times the number of reports.
 struct ModuleFacts {
     root: SyntaxNode,
+    /// Every identifier token of this body by its lower-cased text, in file order.
+    identifiers: FxHashMap<String, Vec<SyntaxToken>>,
     /// Lower-cased string literals of this body and of the module's other bodies.
     string_literals: Vec<String>,
-    /// The other bodies of the module (an extension's), which this fix cannot edit.
-    sibling_roots: Vec<SyntaxNode>,
+    /// Lower-cased texts of the tokens other than comments of the module's other
+    /// bodies (an extension's), which this fix cannot edit.
+    sibling_texts: Vec<String>,
     /// Some body of the module runs code known only at run time.
     runs_dynamic_code: bool,
     /// Some body of the module hands the platform a callback whose name is known only at
@@ -78,10 +86,12 @@ pub(super) fn attach_fixes(ctx: &DiagnosticsContext, diagnostics: &mut [Diagnost
     for sibling in &sibling_roots {
         string_literals.extend(string_literal_texts(sibling));
     }
+    let sibling_texts = sibling_roots.iter().flat_map(lower_cased_texts).collect();
     let facts = ModuleFacts {
+        identifiers: identifiers_of(&root),
         root,
         string_literals,
-        sibling_roots,
+        sibling_texts,
         runs_dynamic_code,
         binds_computed_callback,
     };
@@ -131,7 +141,7 @@ fn remove_parameter_fix(facts: &ModuleFacts, name_range: TextRange) -> Result<Fi
 
     let method_lower = method_name.text().fold_lower();
     if facts.string_literals.iter().any(|literal| mentions_identifier(literal, &method_lower))
-        || facts.sibling_roots.iter().any(|sibling| mentions_name(sibling, &method_lower))
+        || facts.sibling_texts.iter().any(|text| mentions_identifier(text, &method_lower))
     {
         return Err(MethodNamedOutsideCalls);
     }
@@ -148,7 +158,7 @@ fn remove_parameter_fix(facts: &ModuleFacts, name_range: TextRange) -> Result<Fi
         .collect();
 
     let mut call_edits = 0usize;
-    for call in calls_of(&facts.root, &method_name, &method_lower).ok_or(NotACall)? {
+    for call in calls_of(facts, &method_name, &method_lower).ok_or(NotACall)? {
         let arg_list =
             call.children().find(|node| node.kind() == SyntaxKind::ARG_LIST).ok_or(NotACall)?;
         let args = list_slots(&arg_list).ok_or(UnsupportedList)?;
@@ -196,22 +206,32 @@ fn mentioned_elsewhere(method: &SyntaxNode, declaration: &SyntaxToken, name: &st
         .any(|token| mentions_identifier(&token.text().fold_lower(), name))
 }
 
-fn mentions_name(root: &SyntaxNode, name: &str) -> bool {
+fn lower_cased_texts(root: &SyntaxNode) -> Vec<String> {
     root.descendants_with_tokens()
         .filter_map(|element| element.into_token())
         .filter(|token| token.kind() != SyntaxKind::COMMENT)
-        .any(|token| mentions_identifier(&token.text().fold_lower(), name))
+        .map(|token| token.text().fold_lower())
+        .collect()
+}
+
+fn identifiers_of(root: &SyntaxNode) -> FxHashMap<String, Vec<SyntaxToken>> {
+    #[cfg(test)]
+    tests::IDENTIFIER_INDEXES.with(|count| count.set(count.get() + 1));
+    let mut identifiers: FxHashMap<String, Vec<SyntaxToken>> = FxHashMap::default();
+    for token in root.descendants_with_tokens().filter_map(|element| element.into_token()) {
+        if token.kind() == SyntaxKind::IDENT {
+            identifiers.entry(token.text().fold_lower()).or_default().push(token);
+        }
+    }
+    identifiers
 }
 
 /// The calls of the method in the module, or `None` when the name is read in a way that
 /// is not a call of it this fix can rewrite.
-fn calls_of(root: &SyntaxNode, declaration: &SyntaxToken, name: &str) -> Option<Vec<SyntaxNode>> {
+fn calls_of(facts: &ModuleFacts, declaration: &SyntaxToken, name: &str) -> Option<Vec<SyntaxNode>> {
     let mut calls = Vec::new();
-    for token in root.descendants_with_tokens().filter_map(|element| element.into_token()) {
-        if token.kind() != SyntaxKind::IDENT
-            || &token == declaration
-            || token.text().fold_lower() != name
-        {
+    for token in facts.identifiers.get(name).into_iter().flatten() {
+        if token == declaration {
             continue;
         }
         let parent = token.parent()?;
@@ -504,4 +524,57 @@ fn removal_ranges(slots: &[Slot], index: usize) -> Option<Vec<TextRange>> {
         Some(line_start) => vec![slot.before, TextRange::new(line_start, slot.end())],
         None => vec![TextRange::new(slot.before.start(), slot.end())],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use crate::DiagnosticCode;
+
+    thread_local! {
+        pub(super) static IDENTIFIER_INDEXES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The fixes of a file index its identifiers once, whatever the number of parameters
+    /// it reports: a walk of the file per report made a large module cost its size times
+    /// its reports. Every report of the input gets a fix, so the index serves them all.
+    #[test]
+    fn the_fixes_of_a_file_index_its_identifiers_once() {
+        let methods = 8;
+        let code: String = (0..methods)
+            .map(|i| {
+                format!(
+                    "Процедура Метод{i}(Нужный, Лишний)\n    Сообщить(Нужный);\nКонецПроцедуры\n\n\
+                     Процедура Вызов{i}()\n    Метод{i}(1, 2);\nКонецПроцедуры\n\n"
+                )
+            })
+            .collect();
+        let before = IDENTIFIER_INDEXES.with(Cell::get);
+
+        let diagnostics = crate::test_utils::check_metadata_diagnostic(
+            hir::ModuleMetadata {
+                module_type: bsl_metadata::ModuleType::CommonModule,
+                execution_context: None,
+                common_module: None,
+                mdo: None,
+                register: None,
+                command: None,
+                http_service: None,
+                web_service: None,
+                integration_service: None,
+                form: None,
+            },
+            &code,
+            |_metadata, ctx| super::super::check(ctx),
+        );
+
+        let reported: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect();
+        assert_eq!(reported.len(), methods);
+        assert!(reported.iter().all(|diagnostic| !diagnostic.fixes.is_empty()));
+        assert_eq!(IDENTIFIER_INDEXES.with(Cell::get) - before, 1);
+    }
 }

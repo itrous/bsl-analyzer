@@ -43,6 +43,7 @@ pub fn run_lsp_server(args: LspArgs) -> Result<(), Box<dyn Error + Send + Sync>>
 }
 
 fn run_auto(connection: Connection) -> Result<()> {
+    mcp_server::broker::SharedBackendIdentity::prefetch_build_fingerprint();
     let initial = connection.receiver.recv().context("LSP closed before initialize")?;
     let params = match &initial {
         Message::Request(request) if request.method == "initialize" => request.params.clone(),

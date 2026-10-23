@@ -8,9 +8,7 @@
 //! on a different name by construction.
 
 use std::collections::BTreeSet;
-use std::fs::File;
 use std::io;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -183,18 +181,28 @@ impl SharedBackendIdentity {
         Self { source_dir, cache_dir, scope, config, platform, build }
     }
 
-    /// Hash the running executable once, reading it incrementally.
+    /// Hash the running executable once per process.
+    ///
+    /// Every launch derives its identity before it can answer `initialize`, the
+    /// daemon re-derives it around its bootstrap, and the executable is tens of
+    /// megabytes: hashing it on each derivation put several full reads on the
+    /// path of the editor's first answer. The process keeps running the code it
+    /// was started from, so the first hash stays its build identity.
+    ///
+    /// Callers that ask while the hash is being computed wait for it rather than hash
+    /// again. Only a hash is kept: a failed read is tried again by the next caller.
     pub fn current_exe_build_fingerprint() -> io::Result<[u8; 32]> {
-        let mut file = File::open(std::env::current_exe()?)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = [0; 64 * 1024];
-        loop {
-            let read = file.read(&mut buf)?;
-            if read == 0 {
-                return Ok(*hasher.finalize().as_bytes());
-            }
-            hasher.update(&buf[..read]);
-        }
+        static BUILD: std::sync::Mutex<Option<[u8; 32]>> = std::sync::Mutex::new(None);
+        remembered(&BUILD, || file_fingerprint(&std::env::current_exe()?))
+    }
+
+    /// Start hashing the running executable on a thread of its own, so the hash is ready,
+    /// or under way, by the time the launch derives its identity: until then the launch
+    /// loads its project and parses the client's request.
+    pub fn prefetch_build_fingerprint() {
+        std::thread::spawn(|| {
+            let _ = Self::current_exe_build_fingerprint();
+        });
     }
 
     pub(crate) fn digest(&self) -> [u8; 32] {
@@ -644,6 +652,66 @@ pub fn embedding_endpoint_identity(url: &str) -> String {
     }
 }
 
+/// The hash in `slot`, or the one `hash` computes, kept in `slot` if it succeeds.
+fn remembered(
+    slot: &std::sync::Mutex<Option<[u8; 32]>>,
+    hash: impl FnOnce() -> io::Result<[u8; 32]>,
+) -> io::Result<[u8; 32]> {
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(kept) = *slot {
+        return Ok(kept);
+    }
+    let hashed = hash()?;
+    *slot = Some(hashed);
+    Ok(hashed)
+}
+
+/// The digest of the file's fixed-size chunks, each read and hashed by one of a few
+/// threads, then of their digests in order. The chunk size is fixed, so the value
+/// depends on the content alone and not on how many threads hashed it: a proxy and the
+/// daemon it launched agree.
+fn file_fingerprint(path: &Path) -> io::Result<[u8; 32]> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const CHUNK: u64 = 4 << 20;
+    #[cfg(test)]
+    tests::FILE_FINGERPRINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let len = std::fs::metadata(path)?.len();
+    let chunks = len.div_ceil(CHUNK).max(1) as usize;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(chunks);
+    let mut digests = vec![None; chunks];
+    std::thread::scope(|scope| -> io::Result<()> {
+        let hashed: Vec<_> = (0..workers)
+            .map(|worker| {
+                scope.spawn(move || -> io::Result<Vec<(usize, blake3::Hash)>> {
+                    let mut file = std::fs::File::open(path)?;
+                    let mut buf = Vec::with_capacity(CHUNK as usize);
+                    let mut out = Vec::new();
+                    for index in (worker..chunks).step_by(workers) {
+                        file.seek(SeekFrom::Start(index as u64 * CHUNK))?;
+                        buf.clear();
+                        (&mut file).take(CHUNK).read_to_end(&mut buf)?;
+                        out.push((index, blake3::hash(&buf)));
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        for worker in hashed {
+            for (index, digest) in worker.join().expect("a hashing thread panicked")? {
+                digests[index] = Some(digest);
+            }
+        }
+        Ok(())
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&len.to_le_bytes());
+    for digest in digests.into_iter().flatten() {
+        hasher.update(digest.as_bytes());
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
 /// Stable 64-bit identity of the project's extension topology at `source_dir`, for
 /// backend keying: a daemon whose graph/search/diagnostics caches were built for
 /// one dependency graph must not be reused by a client whose config now declares
@@ -704,6 +772,36 @@ pub fn shared_backend_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) static FILE_FINGERPRINTS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn the_executable_is_hashed_once_per_process() {
+        let first = SharedBackendIdentity::current_exe_build_fingerprint().unwrap();
+        for _ in 0..3 {
+            assert_eq!(SharedBackendIdentity::current_exe_build_fingerprint().unwrap(), first);
+        }
+        assert_eq!(
+            FILE_FINGERPRINTS.load(Ordering::Relaxed),
+            1,
+            "a launch derives its identity several times before its first answer; \
+             each derivation must not read the whole executable again",
+        );
+    }
+
+    /// A failed read is not the build's identity: the next caller hashes again, and only
+    /// a hash that succeeded is kept.
+    #[test]
+    fn a_failed_executable_hash_is_tried_again() {
+        let slot = std::sync::Mutex::new(None);
+        assert!(remembered(&slot, || Err(io::Error::other("too many open files"))).is_err());
+        assert_eq!(remembered(&slot, || Ok([7; 32])).unwrap(), [7; 32]);
+        assert_eq!(
+            remembered(&slot, || panic!("a kept hash is not computed again")).unwrap(),
+            [7; 32]
+        );
+    }
 
     fn key(dir: &str, profile: McpProfile, fp: u64) -> BackendKey {
         keyed(dir, profile, fp, BTreeSet::new())

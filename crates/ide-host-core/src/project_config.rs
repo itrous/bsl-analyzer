@@ -11,9 +11,46 @@ use ide_db::RootDatabaseImpl;
 use project_model::{FeaturesConfig, ProjectConfig};
 
 pub fn apply_features_to_db(db: &mut RootDatabaseImpl, features: &FeaturesConfig) {
-    tracing::info!(type_narrowing = features.type_narrowing, "updated feature flags");
-    db.set_type_narrowing_enabled(features.type_narrowing);
-    db.set_env_options(env_options_from_features(features));
+    set_type_narrowing(db, features.type_narrowing);
+    set_env_options(db, env_options_from_features(features));
+}
+
+/// [`apply_project_config_to_db`] and then [`apply_configuration_xml_settings_to_db`],
+/// in one step that writes each input once and only when its value changes.
+///
+/// A write sends every query that read the input back to recompute, even when it
+/// stores the value already there. The two steps in sequence rebuild the environment
+/// options from the settings and only then put back what `Configuration.xml` states,
+/// so re-applying an unchanged project rewrote them three times. A host that applies
+/// its project again on every workspace publication or opened document threw away
+/// the inference it had already warmed.
+pub fn apply_project_settings_to_db(
+    db: &mut RootDatabaseImpl,
+    config: &ProjectConfig,
+    project: Option<&project_model::Project>,
+) {
+    set_type_narrowing(db, config.features.type_narrowing);
+    let mut options = env_options_from_features(&config.features);
+    options.ordinary_forms_in_managed_app = crate::ordinary_forms_in_managed_app(project);
+    options.ordinary_app_support = ordinary_app_support(project);
+    options.managed_run_mode = crate::managed_run_mode(project);
+    set_env_options(db, options);
+    apply_platform_versions_to_db(db, config);
+    apply_compatibility_mode_to_db(db, project);
+}
+
+fn set_type_narrowing(db: &mut RootDatabaseImpl, enabled: bool) {
+    if db.type_narrowing_enabled() != enabled {
+        tracing::info!(type_narrowing = enabled, "updated feature flags");
+        db.set_type_narrowing_enabled(enabled);
+    }
+}
+
+fn set_env_options(db: &mut RootDatabaseImpl, options: hir::execution_env::EnvOptions) {
+    if db.env_options() != options {
+        tracing::info!(?options, "updated environment options");
+        db.set_env_options(options);
+    }
 }
 
 /// The `bsl-analyzer.toml` settings shared by LSP, MCP and batch analysis.
@@ -24,6 +61,10 @@ pub fn apply_features_to_db(db: &mut RootDatabaseImpl, features: &FeaturesConfig
 /// order.
 pub fn apply_project_config_to_db(db: &mut RootDatabaseImpl, config: &ProjectConfig) {
     apply_features_to_db(db, &config.features);
+    apply_platform_versions_to_db(db, config);
+}
+
+fn apply_platform_versions_to_db(db: &mut RootDatabaseImpl, config: &ProjectConfig) {
     let target = config.target_platform_version.as_deref().map(Arc::<str>::from);
     let target_changed = db.target_platform_version().as_deref() != target.as_deref();
     let catalog = bsl_platform::PlatformGlobalCatalog::instance();
@@ -37,8 +78,10 @@ pub fn apply_project_config_to_db(db: &mut RootDatabaseImpl, config: &ProjectCon
             "bundled platform-global catalog does not cover the configured target; absence diagnostics are suppressed"
         );
     }
-    tracing::info!(target_platform_version = ?target, "updated platform target");
-    db.set_target_platform_version(target);
+    if target_changed {
+        tracing::info!(target_platform_version = ?target, "updated platform target");
+        db.set_target_platform_version(target);
+    }
     let min = config.min_platform_version.as_deref().map(Arc::<str>::from);
     if min
         .as_deref()
@@ -94,14 +137,7 @@ pub fn apply_ordinary_app_support_to_db(
     db: &mut RootDatabaseImpl,
     project: Option<&project_model::Project>,
 ) {
-    use hir::execution_env::EnvFlags;
-    let checked_by_name = project
-        .and_then(|project| project.config.features.checked_environments.as_deref())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|name| EnvFlags::from_config_name(name))
-        .any(|flag| flag.contains(EnvFlags::THICK_CLIENT_ORDINARY));
-    let value = checked_by_name || project.is_some_and(crate::effective_ordinary_app_support);
+    let value = ordinary_app_support(project);
     let mut options = db.env_options();
     if options.ordinary_app_support != value {
         tracing::info!(
@@ -112,6 +148,17 @@ pub fn apply_ordinary_app_support_to_db(
         options.ordinary_app_support = value;
         db.set_env_options(options);
     }
+}
+
+fn ordinary_app_support(project: Option<&project_model::Project>) -> bool {
+    use hir::execution_env::EnvFlags;
+    let checked_by_name = project
+        .and_then(|project| project.config.features.checked_environments.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|name| EnvFlags::from_config_name(name))
+        .any(|flag| flag.contains(EnvFlags::THICK_CLIENT_ORDINARY));
+    checked_by_name || project.is_some_and(crate::effective_ordinary_app_support)
 }
 
 /// The settings the main configuration's `Configuration.xml` states, read into the
@@ -153,8 +200,7 @@ pub fn apply_vendor_support_to_db(
 /// the MCP resident build their database through this; the LSP server applies the
 /// same three steps.
 pub fn apply_project_to_db(db: &mut RootDatabaseImpl, project: &project_model::Project) {
-    apply_project_config_to_db(db, &project.config);
-    apply_configuration_xml_settings_to_db(db, Some(project));
+    apply_project_settings_to_db(db, &project.config, Some(project));
     apply_vendor_support_to_db(db, Some(project));
 }
 
@@ -486,6 +532,76 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
             project_with("OrdinaryApplication", "[diagnostics]\ndataflowMaxIterations = \"abc\"\n");
         apply(&mut db, &project);
         assert!(!db.env_options().ordinary_app_support, "a rejected section derives nothing");
+    }
+
+    fn project_with_configuration(run_mode: &str, toml: &str) -> (tempfile::TempDir, Project) {
+        let dir = tempdir().unwrap();
+        let cf = dir.path().join("src").join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(
+            cf.join("Configuration.xml"),
+            format!(
+                "<MetaDataObject><Configuration><Properties><DefaultRunMode>{run_mode}\
+                 </DefaultRunMode><UseOrdinaryFormInManagedApplication>true\
+                 </UseOrdinaryFormInManagedApplication><CompatibilityMode>8.3.20\
+                 </CompatibilityMode></Properties></Configuration></MetaDataObject>"
+            ),
+        )
+        .unwrap();
+        fs::write(dir.path().join("bsl-analyzer.toml"), toml).unwrap();
+        let project = Project::new(dir.path()).unwrap();
+        (dir, project)
+    }
+
+    /// The one-step application stores what the two steps it replaces store, for
+    /// settings that touch every input it writes.
+    #[test]
+    fn project_settings_store_what_the_two_steps_store() {
+        use super::{apply_configuration_xml_settings_to_db, apply_project_settings_to_db};
+
+        for (run_mode, toml) in [
+            ("ManagedApplication", ""),
+            ("OrdinaryApplication", "target_platform_version = \"8.3.24\"\n"),
+            (
+                "Auto",
+                "min_platform_version = \"8.3.20\"\n[features]\ntype_narrowing = false\n\
+                 checked_environments = [\"ТолстыйКлиентОбычноеПриложение\", \"МобильныйКлиент\"]\n",
+            ),
+            ("OrdinaryApplication", "[diagnostics]\nordinaryAppSupport = false\n"),
+        ] {
+            let (_dir, project) = project_with_configuration(run_mode, toml);
+            let mut two_steps = RootDatabaseImpl::new();
+            apply_project_config_to_db(&mut two_steps, &project.config);
+            apply_configuration_xml_settings_to_db(&mut two_steps, Some(&project));
+            let mut one_step = RootDatabaseImpl::new();
+            apply_project_settings_to_db(&mut one_step, &project.config, Some(&project));
+
+            assert_eq!(one_step.env_options(), two_steps.env_options(), "{run_mode} {toml}");
+            assert_eq!(one_step.type_narrowing_enabled(), two_steps.type_narrowing_enabled());
+            assert_eq!(one_step.target_platform_version(), two_steps.target_platform_version());
+            assert_eq!(one_step.min_platform_version(), two_steps.min_platform_version());
+            assert_eq!(one_step.compatibility_mode(), two_steps.compatibility_mode());
+        }
+    }
+
+    /// Re-applying an unchanged project writes nothing: a write would send every query
+    /// that read the input back to recompute. The project states run-mode settings in
+    /// `Configuration.xml`, the values the settings step used to reset and put back.
+    #[test]
+    fn re_applying_an_unchanged_project_writes_nothing() {
+        use super::apply_project_settings_to_db;
+
+        let (_dir, project) = project_with_configuration(
+            "OrdinaryApplication",
+            "target_platform_version = \"8.3.24\"\n",
+        );
+        let mut db = RootDatabaseImpl::new();
+        apply_project_settings_to_db(&mut db, &project.config, Some(&project));
+        let applied = salsa::plumbing::current_revision(&db);
+
+        apply_project_settings_to_db(&mut db, &project.config, Some(&project));
+
+        assert_eq!(salsa::plumbing::current_revision(&db), applied);
     }
 
     /// `managed_run_mode` follows `<DefaultRunMode>` alone: `Auto` counts as the

@@ -18,8 +18,8 @@ pub use load::{
 pub use metadata::{bootstrap_metadata_substrate, refresh_metadata_substrate, VfsWrite};
 pub use project_config::{
     apply_compatibility_mode_to_db, apply_configuration_xml_settings_to_db, apply_features_to_db,
-    apply_ordinary_app_support_to_db, apply_project_config_to_db, apply_project_to_db,
-    apply_vendor_support_to_db,
+    apply_ordinary_app_support_to_db, apply_project_config_to_db, apply_project_settings_to_db,
+    apply_project_to_db, apply_vendor_support_to_db,
 };
 pub use workspace::{
     CatalogFile, CatchUp, DiskFileState, EditorView, PublishedChange, SnapshotFile,
@@ -37,13 +37,22 @@ pub fn apply_ordinary_forms_setting(
     db: &mut RootDatabaseImpl,
     project: Option<&project_model::Project>,
 ) {
-    let value = project.and_then(|project| project.ordinary_forms_in_managed_app());
+    let value = ordinary_forms_in_managed_app(project);
     let mut options = db.env_options();
     if options.ordinary_forms_in_managed_app != value {
         tracing::info!(ordinary_forms_in_managed_app = ?value, "updated ordinary-form environments");
         options.ordinary_forms_in_managed_app = value;
         db.set_env_options(options);
     }
+}
+
+fn ordinary_forms_in_managed_app(project: Option<&project_model::Project>) -> Option<bool> {
+    project.and_then(|project| project.ordinary_forms_in_managed_app())
+}
+
+fn managed_run_mode(project: Option<&project_model::Project>) -> bool {
+    let mode = project.and_then(project_model::Project::default_run_mode);
+    matches!(mode.as_deref(), Some("ManagedApplication" | "Auto"))
 }
 
 /// `<DefaultRunMode>` of the main configuration of `project` into the environment
@@ -54,7 +63,7 @@ pub fn apply_ordinary_forms_setting(
 /// [`apply_ordinary_forms_setting`].
 pub fn apply_default_run_mode(db: &mut RootDatabaseImpl, project: Option<&project_model::Project>) {
     let mode = project.and_then(project_model::Project::default_run_mode);
-    let value = matches!(mode.as_deref(), Some("ManagedApplication" | "Auto"));
+    let value = managed_run_mode(project);
     let mut options = db.env_options();
     if options.managed_run_mode != value {
         tracing::info!(managed_run_mode = value, default_run_mode = ?mode, "updated run mode");

@@ -267,13 +267,15 @@ impl RequestDispatcher<'_> {
         };
         let Some(analysis) = serving else {
             // A shared session without an editor view has no store holding the file a
-            // syntax request names, only its empty fallback.
+            // syntax request names, only its empty fallback; an editor view still waiting
+            // for its seed holds the open documents and nothing else.
             let host = &self.global_state.analysis_host;
-            let while_loading = if host.is_shared() && host.view().is_none() {
-                WhileLoading::Decline
-            } else {
-                while_loading
-            };
+            let store_lacks_file = host.is_shared()
+                && (host.view().is_none()
+                    || (!self.global_state.shared_view_seeded
+                        && !names_open_document(&req, self.global_state)));
+            let while_loading =
+                if store_lacks_file { WhileLoading::Decline } else { while_loading };
             match while_loading {
                 WhileLoading::Decline => {
                     tracing::debug!(
@@ -743,6 +745,15 @@ where
             ))
         }
     }
+}
+
+/// The request names, as `textDocument`, a document the editor has open.
+fn names_open_document(req: &Request, state: &GlobalState) -> bool {
+    req.params
+        .get("textDocument")
+        .and_then(|document| document.get("uri"))
+        .and_then(|uri| serde_json::from_value::<lsp_types::Url>(uri.clone()).ok())
+        .is_some_and(|uri| state.mem_docs.contains(&uri))
 }
 
 #[cfg(test)]
