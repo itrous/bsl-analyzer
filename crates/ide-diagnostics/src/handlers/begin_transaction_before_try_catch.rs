@@ -55,6 +55,126 @@ mod tests {
     }
 
     #[test]
+    fn conditional_begin_closing_if_before_try() {
+        let code = r#"Процедура Тест(СвояТранзакция) Экспорт
+    Если СвояТранзакция Тогда
+        НачатьТранзакцию();
+    КонецЕсли;
+    Попытка
+        Действие();
+        Если СвояТранзакция Тогда
+            ЗафиксироватьТранзакцию();
+        КонецЕсли;
+    Исключение
+        Если СвояТранзакция Тогда
+            ОтменитьТранзакцию();
+        КонецЕсли;
+        ВызватьИсключение;
+    КонецПопытки;
+КонецПроцедуры"#;
+
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::BeginTransactionBeforeTryCatch,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn conditional_begin_before_preproc_try() {
+        check_diagnostics_snapshot_for(
+            include_str!("fixtures/conditional_begin_before_preproc_try.bsl"),
+            DiagnosticCode::BeginTransactionBeforeTryCatch,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn conditional_begin_in_else_and_nested_if_before_try() {
+        let code = r#"Процедура Тест(ВнешняяТранзакция, Режим) Экспорт
+    Если ВнешняяТранзакция Тогда
+        Возврат;
+    Иначе
+        ПодготовитьДанные();
+        НачатьТранзакцию();
+    КонецЕсли;
+    Попытка
+        Действие();
+        ЗафиксироватьТранзакцию();
+    Исключение
+        ОтменитьТранзакцию();
+        ВызватьИсключение;
+    КонецПопытки;
+
+    Если Режим = 1 Тогда
+        Если Не ТранзакцияАктивна() Тогда
+            НачатьТранзакцию();
+        КонецЕсли;
+    ИначеЕсли Режим = 2 Тогда
+        НачатьТранзакцию();
+    КонецЕсли;
+    Попытка
+        Действие();
+        ЗафиксироватьТранзакцию();
+    Исключение
+        ОтменитьТранзакцию();
+        ВызватьИсключение;
+    КонецПопытки;
+КонецПроцедуры"#;
+
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::BeginTransactionBeforeTryCatch,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn conditional_begin_without_try_right_after_if_is_flagged() {
+        let code = r#"Процедура Тест(СвояТранзакция) Экспорт
+    Если СвояТранзакция Тогда
+        НачатьТранзакцию();
+    КонецЕсли;
+    ПодготовитьДанные();
+    Попытка
+        Действие();
+    Исключение
+        ОтменитьТранзакцию();
+    КонецПопытки;
+
+    Если СвояТранзакция Тогда
+        НачатьТранзакцию();
+        ПодготовитьДанные();
+    КонецЕсли;
+    Попытка
+        Действие();
+    Исключение
+        ОтменитьТранзакцию();
+    КонецПопытки;
+
+    Если СвояТранзакция Тогда
+        НачатьТранзакцию();
+    КонецЕсли;
+КонецПроцедуры"#;
+
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::BeginTransactionBeforeTryCatch,
+            expect![[r#"
+                BeginTransactionBeforeTryCatch @ 3:9..3:28
+                  message: Метод 'НачатьТранзакцию' должен быть за пределами блока 'Попытка-Исключение' непосредственно перед оператором 'Попытка'
+                  severity: Major
+                BeginTransactionBeforeTryCatch @ 13:9..13:28
+                  message: Метод 'НачатьТранзакцию' должен быть за пределами блока 'Попытка-Исключение' непосредственно перед оператором 'Попытка'
+                  severity: Major
+                BeginTransactionBeforeTryCatch @ 23:9..23:28
+                  message: Метод 'НачатьТранзакцию' должен быть за пределами блока 'Попытка-Исключение' непосредственно перед оператором 'Попытка'
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
     #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_code_between() {
         let code = r#"Процедура Тест()

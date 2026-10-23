@@ -38,6 +38,27 @@ Except
 EndTry;
 ```
 
+The transaction may be started conditionally when `BeginTransaction()` ends a
+branch of `If` and `Try` follows `EndIf` directly: nothing runs between the
+start of the transaction and `Try`.
+
+```bsl
+If OwnTransaction Then
+    BeginTransaction();
+EndIf;
+Try
+    SaveDocument();
+    If OwnTransaction Then
+        CommitTransaction();
+    EndIf;
+Except
+    If OwnTransaction Then
+        RollbackTransaction();
+    EndIf;
+    Raise;
+EndTry;
+```
+
 ## Sources
 
 Primary source: [Transactions: Rules of Use (RU)](https://its.1c.ru/db/v8std/content/783/hdoc/_top/)

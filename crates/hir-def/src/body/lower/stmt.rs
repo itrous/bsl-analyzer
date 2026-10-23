@@ -349,13 +349,55 @@ pub(super) fn lower_stmt_list_with_unreachable(
 
     if emit_diagnostics {
         if let Some(pending_node) = pending_begin_transaction {
-            let extended_range =
-                extend_range_with_semicolon(&pending_node, pending_node.text_range());
-            ctx.emit(BodyDiagnostic::BeginTransactionBeforeTryCatch { range: extended_range });
+            if !branch_end_is_followed_by_try(stmt_list) {
+                let extended_range =
+                    extend_range_with_semicolon(&pending_node, pending_node.text_range());
+                ctx.emit(BodyDiagnostic::BeginTransactionBeforeTryCatch { range: extended_range });
+            }
         }
     }
 
     stmts
+}
+
+/// `НачатьТранзакцию()` that closes a branch of `Если` hands control straight to the
+/// statement after `КонецЕсли`: in `Если СвояТранзакция Тогда НачатьТранзакцию(); КонецЕсли;
+/// Попытка` nothing runs between the begin and its `Попытка`. A nested `Если` whose
+/// `КонецЕсли` also closes the enclosing branch is followed outward.
+fn branch_end_is_followed_by_try(stmt_list: &SyntaxNode) -> bool {
+    let mut list = stmt_list.clone();
+    loop {
+        let Some(parent) = list.parent() else {
+            return false;
+        };
+        let if_stmt = match parent.kind() {
+            SyntaxKind::IF_STMT => parent,
+            SyntaxKind::ELSIF_CLAUSE | SyntaxKind::ELSE_CLAUSE => match parent.parent() {
+                Some(grand) if grand.kind() == SyntaxKind::IF_STMT => grand,
+                _ => return false,
+            },
+            _ => return false,
+        };
+
+        let mut next = if_stmt.next_sibling();
+        while let Some(node) = &next {
+            if is_statement_node(node) || node.kind() == SyntaxKind::PRE_IF_DIR {
+                break;
+            }
+            next = node.next_sibling();
+        }
+        match next {
+            Some(node) => {
+                return node.kind() == SyntaxKind::TRY_STMT
+                    || (node.kind() == SyntaxKind::PRE_IF_DIR
+                        && pre_if_all_branches_open_with_try(&node));
+            }
+            None => match if_stmt.parent() {
+                Some(outer) if outer.kind() == SyntaxKind::STMT_LIST => list = outer,
+                _ => return false,
+            },
+        }
+    }
 }
 
 pub(crate) fn pre_if_all_branches_open_with_try(node: &SyntaxNode) -> bool {
