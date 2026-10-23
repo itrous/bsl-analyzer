@@ -762,7 +762,13 @@ mod shared_owner_tests {
         .expect("close the alias URI");
         assert!(!state.mem_docs.contains(&alias_uri));
         assert!(!state.open_file_uri_ids.contains_key(&alias_uri));
-        assert!(state.analysis_host.view().is_none(), "closed overlay is released");
+        // The session keeps its editor storage after the last document closes; the buffer's
+        // overlay is what the close releases.
+        let view = state.analysis_host.view().expect("the session keeps its editor storage");
+        assert!(
+            base_db::SourceDatabase::try_file_text_input(view.database(), file_id).is_none(),
+            "closed overlay is released"
+        );
         assert!(
             state.snapshot().file_id_for_url(&alias_uri).is_err(),
             "the closed URI no longer has an active alias binding"

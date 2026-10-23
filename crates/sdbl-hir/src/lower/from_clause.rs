@@ -1374,6 +1374,19 @@ impl LoweringContext<'_> {
             return;
         }
 
+        // An argument list cut off before its `)` or holding text the query language
+        // does not accept is not what the platform will receive: the module completes it
+        // at run time (`"…Остатки(" + Условие + ")…"`, a `//УСЛОВИЕ` or `%1` placeholder
+        // replaced through СтрЗаменить / СтрШаблон). Its arguments are unknown, not absent.
+        let arguments_intact = table_ref_node.children_with_tokens().any(|child| {
+            matches!(child, syntax::NodeOrToken::Token(t) if t.kind() == syntax::SyntaxKind::R_PAREN)
+        }) && !table_ref_node
+            .descendants()
+            .any(|node| node.kind() == syntax::SyntaxKind::ERROR);
+        if !arguments_intact {
+            return;
+        }
+
         // "Without parameters" means no argument was actually passed: a call
         // like СрезПоследних(&Период, ) names the period and already addresses
         // the diagnostic's concern; only all-blank argument lists are flagged.

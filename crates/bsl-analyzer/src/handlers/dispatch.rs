@@ -747,13 +747,16 @@ where
     }
 }
 
-/// The request names, as `textDocument`, a document the editor has open.
+/// The request names, as `textDocument`, an open document the editor storage holds. A
+/// buffer the editor has open is not enough: one under `[source].exclude` keeps its text
+/// but never enters the storage.
 fn names_open_document(req: &Request, state: &GlobalState) -> bool {
     req.params
         .get("textDocument")
         .and_then(|document| document.get("uri"))
         .and_then(|uri| serde_json::from_value::<lsp_types::Url>(uri.clone()).ok())
-        .is_some_and(|uri| state.mem_docs.contains(&uri))
+        .and_then(|uri| state.open_file_uri_ids.get(&uri).copied())
+        .is_some_and(|file_id| state.open_files.contains(&file_id))
 }
 
 #[cfg(test)]

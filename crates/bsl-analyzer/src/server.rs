@@ -1347,12 +1347,12 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 state.enqueue_pending_diagnostics(uri);
             }
         }
-        Task::SharedMetadataWarmed { warmed } => {
-            tracing::debug!(warmed, "shared editor storage metadata warmed");
+        Task::SharedMetadataWarmed { cancelled } => {
+            tracing::debug!(cancelled, "shared editor storage metadata warm-up ended");
             state.shared_metadata_warm_in_flight = false;
-            // A write cancelled it. What it had parsed stays memoised, so another run
-            // continues from there.
-            if !warmed {
+            // What it had parsed before the write stays memoised, so another run continues
+            // from there.
+            if cancelled {
                 state.shared_metadata_warm_pending = true;
             }
             state.start_shared_metadata_warmup();
@@ -7248,6 +7248,15 @@ mod tests {
         )
         .expect("open the document");
         assert_eq!(state.shared_view_epoch, epoch, "opening a file keeps the session's storage");
+        let opened_id = crate::lsp::file_id(&state, &uri).expect("resolve the opened URI");
+        assert!(
+            base_db::SourceDatabase::try_file_text_input(
+                state.analysis_host.view().expect("the session's storage").database(),
+                opened_id,
+            )
+            .is_some(),
+            "the open buffer is an overlay of the storage"
+        );
         assert!(
             !state.workspace_batch_dirty,
             "opening a file does not sweep every closed file again, as the standalone server \
@@ -7266,6 +7275,14 @@ mod tests {
         )
         .expect("close the document");
         assert!(state.workspace_batch_dirty, "the closed file goes back to the batch");
+        assert!(
+            base_db::SourceDatabase::try_file_text_input(
+                state.analysis_host.view().expect("the session's storage").database(),
+                opened_id,
+            )
+            .is_none(),
+            "closing the document releases its overlay"
+        );
         seed(&mut state);
         assert_eq!(
             state.shared_view_epoch, epoch,
@@ -7284,8 +7301,11 @@ mod tests {
         state.analysis_host.take_view();
         state.ensure_shared_view();
         seed(&mut state);
-        handle_task(&mut state, crate::global_state::Task::SharedMetadataWarmed { warmed: true })
-            .unwrap();
+        handle_task(
+            &mut state,
+            crate::global_state::Task::SharedMetadataWarmed { cancelled: false },
+        )
+        .unwrap();
         assert_eq!(
             state.shared_metadata_warmups,
             warmups + 1,
@@ -7722,6 +7742,30 @@ mod tests {
         );
     }
 
+    /// A metadata warm-up reports how it ended whatever it ended with: the event loop keeps
+    /// one in flight and learns that it ended only from this report. Only a cancellation
+    /// asks for another run. The input ends one normally, one by a cancellation and one
+    /// by an unrelated panic, which the task pool would otherwise swallow without a report.
+    #[test]
+    fn a_metadata_warmup_reports_every_ending() {
+        use crate::global_state::{shared_metadata_warmup, Task};
+
+        assert!(matches!(
+            shared_metadata_warmup(|| {}),
+            Task::SharedMetadataWarmed { cancelled: false }
+        ));
+        assert!(matches!(
+            shared_metadata_warmup(|| std::panic::resume_unwind(Box::new(
+                salsa::Cancelled::PendingWrite
+            ))),
+            Task::SharedMetadataWarmed { cancelled: true }
+        ));
+        assert!(matches!(
+            shared_metadata_warmup(|| std::panic::resume_unwind(Box::new("a parser bug"))),
+            Task::SharedMetadataWarmed { cancelled: false }
+        ));
+    }
+
     /// A shared session answers `initialize` before it asks for its owner: the owner's
     /// start — the platform help and the owner state — is the longest part of a daemon
     /// start, and the answer needs neither. The owner is asked for only once the answer
@@ -7778,8 +7822,9 @@ mod tests {
     }
 
     /// An editor view still waiting for its seed holds the open documents and nothing
-    /// else: a syntax request for a closed file is declined as not ready, while one for an
-    /// open document is answered from its buffer. The input sends both to one view.
+    /// else: a syntax request for a closed file, or for a buffer the storage never took in
+    /// (one under `[source].exclude`), is declined as not ready, while one for an open
+    /// document is answered from its buffer. The input sends all three to one view.
     #[test]
     fn an_unseeded_shared_view_answers_only_its_open_documents() {
         let backend = mcp_server::SharedState::shared();
@@ -7790,9 +7835,13 @@ mod tests {
         let root = tempfile::tempdir().expect("create workspace");
         let opened = lsp_types::Url::from_file_path(root.path().join("Opened.bsl")).unwrap();
         let closed = lsp_types::Url::from_file_path(root.path().join("Closed.bsl")).unwrap();
+        let excluded = lsp_types::Url::from_file_path(root.path().join("Excluded.bsl")).unwrap();
         let text = "Процедура Открытая() КонецПроцедуры";
+        state.mem_docs.insert(excluded.clone(), text.to_owned(), 1);
         state.mem_docs.insert(opened.clone(), text.to_owned(), 1);
         let file_id = state.vfs_file_for_url(&opened).unwrap();
+        state.open_file_uri_ids.insert(opened.clone(), file_id);
+        state.open_files.insert(file_id);
         state.analysis_host.view_mut().expect("the prepared view").open(
             file_id,
             root.path().join("Opened.bsl"),
@@ -7823,6 +7872,13 @@ mod tests {
             Some(lsp_server::ErrorCode::ContentModified as i32),
             "a closed file is not in the view yet: {:?}",
             declined.result
+        );
+        let kept_out = answer(&mut state, 3, &excluded);
+        assert_eq!(
+            kept_out.error.as_ref().map(|error| error.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32),
+            "a buffer the storage never took in is not answered from it: {:?}",
+            kept_out.error
         );
         let answered = answer(&mut state, 2, &opened);
         assert!(answered.error.is_none(), "an open document is answered: {:?}", answered.error);

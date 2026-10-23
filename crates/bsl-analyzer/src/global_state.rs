@@ -86,7 +86,8 @@ pub enum Task {
         epoch: u64,
     },
     SharedMetadataWarmed {
-        warmed: bool,
+        /// A write cancelled it, and it is worth running again.
+        cancelled: bool,
     },
     DiagnosticsReady {
         uri: Url,
@@ -1148,11 +1149,7 @@ impl GlobalState {
         let analysis_guard = self.note_analysis_spawned();
         let spawned = self.task_pool.pool.try_spawn(move || {
             let _analysis_guard = analysis_guard;
-            let warmed = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
-                analysis.warm_configuration_inventory()
-            }))
-            .is_ok();
-            Task::SharedMetadataWarmed { warmed }
+            shared_metadata_warmup(|| analysis.warm_configuration_inventory())
         });
         if spawned.is_ok() {
             self.shared_metadata_warmups += 1;
@@ -1223,6 +1220,25 @@ impl GlobalState {
                 token.cancel();
                 self.enqueue_pending_diagnostics(uri);
             }
+        }
+    }
+}
+
+/// Run a metadata warm-up and report how it ended, whatever it ended with.
+///
+/// The event loop keeps one warm-up in flight and learns that it ended only from this
+/// report: a warm-up that unwound without one would hold every later warm-up back for the
+/// rest of the session. Only a cancellation asks for another run; a warm-up that failed
+/// otherwise would fail the same way again, and the analysis loads what it needs itself.
+pub(crate) fn shared_metadata_warmup(warm: impl FnOnce()) -> Task {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(warm)) {
+        Ok(()) => Task::SharedMetadataWarmed { cancelled: false },
+        Err(payload) if payload.is::<salsa::Cancelled>() => {
+            Task::SharedMetadataWarmed { cancelled: true }
+        }
+        Err(_) => {
+            tracing::warn!("shared editor storage metadata warm-up failed; not retried");
+            Task::SharedMetadataWarmed { cancelled: false }
         }
     }
 }
