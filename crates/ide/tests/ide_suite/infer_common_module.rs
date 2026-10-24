@@ -204,3 +204,96 @@ fn unknown_module_name_is_not_narrowed() {
         );
     }
 }
+
+fn declared_common_module_xml(name: &str, uuid_tail: u32) -> String {
+    format!(
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonModule uuid="00000000-0000-0000-0000-{uuid_tail:012}">
+        <Properties>
+            <Name>{name}</Name>
+            <Server>true</Server>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#
+    )
+}
+
+/// A configuration on disk whose `БезКаталога` common module is declared by its XML alone,
+/// so no `Module.bsl` of it reaches the path index; `/test.bsl` is the caller's body.
+fn setup_declared_without_body(code: &str) -> (tempfile::TempDir, RootDatabaseImpl, FileId) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let configuration = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Configuration uuid="00000000-0000-0000-0000-000000000000">
+        <Properties>
+            <Name>TestConfiguration</Name>
+        </Properties>
+        <ChildObjects>
+            <CommonModule>ОбщегоНазначения</CommonModule>
+            <CommonModule>Вызывающий</CommonModule>
+            <CommonModule>БезКаталога</CommonModule>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+    let locator = "Функция ОбщийМодуль(Имя) Экспорт\n    Возврат Имя;\nКонецФункции\n";
+    let files = [
+        ("Configuration.xml".to_string(), configuration.to_string()),
+        (
+            "CommonModules/ОбщегоНазначения.xml".into(),
+            declared_common_module_xml("ОбщегоНазначения", 1),
+        ),
+        ("CommonModules/ОбщегоНазначения/Ext/Module.bsl".into(), locator.to_string()),
+        ("CommonModules/Вызывающий.xml".into(), declared_common_module_xml("Вызывающий", 2)),
+        ("CommonModules/Вызывающий/Ext/Module.bsl".into(), code.to_string()),
+        ("CommonModules/БезКаталога.xml".into(), declared_common_module_xml("БезКаталога", 3)),
+    ];
+    for (relative, content) in &files {
+        let path = root.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("a parent directory")).expect("directory");
+        std::fs::write(&path, content).expect("fixture file");
+    }
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(vec![(None, root.path().to_path_buf())], None);
+    let modules: Vec<_> = files
+        .iter()
+        .filter(|(relative, _)| relative.ends_with(".bsl"))
+        .enumerate()
+        .map(|(idx, (relative, content))| (FileId(idx as u32), relative, content))
+        .collect();
+    let mut file_set = vfs::FileSet::default();
+    for (file_id, relative, _) in &modules {
+        let path = root.path().join(relative);
+        file_set.insert(*file_id, vfs::VfsPath::new(path.to_string_lossy().into_owned()));
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for (file_id, _, content) in &modules {
+        db.set_file_source_root(*file_id, SourceRootId(0));
+        db.set_file_text(*file_id, content);
+    }
+    let caller = modules
+        .iter()
+        .find(|(_, relative, _)| relative.contains("Вызывающий"))
+        .map(|(file_id, _, _)| *file_id)
+        .expect("the caller module");
+    (root, db, caller)
+}
+
+/// The by-name locator admits a module the configuration declares without a body, so it
+/// must type it exactly as the bare name does, under the declaration's spelling.
+#[test]
+fn by_name_call_types_a_module_declared_without_a_body() {
+    let (_root, db, file_id) = setup_declared_without_body(
+        "Процедура Тест() Экспорт\n    \
+         М = ОбщегоНазначения.ОбщийМодуль(\"безкаталога\");\n    \
+         Н = БезКаталога;\nКонецПроцедуры\n",
+    );
+    for var in ["м", "н"] {
+        let ty = var_ty(&db, file_id, var);
+        assert!(
+            matches!(db.lookup_type(ty), TypeKind::CommonModule(facet) if facet.name == "БезКаталога"),
+            "{var}: expected CommonModule(БезКаталога), got {:?}",
+            db.lookup_type(ty)
+        );
+    }
+}

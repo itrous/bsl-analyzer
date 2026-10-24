@@ -3834,14 +3834,10 @@ impl<'db> InferenceContext<'db> {
             && !body_binding_shadows
             && !self.assigned_var_names.contains(&NormName::intern(name.as_str()))
         {
-            let source_root_id =
-                self.db.file_source_root_input(self.context_file_id).source_root_id(self.db);
-            if let Some(canonical) =
-                self.db.module_index(source_root_id).canonical_common_module_name(name)
-            {
+            if let Some(canonical) = self.canonical_common_module_name(name) {
                 trace!("resolved {} as common module type", name);
                 return found(
-                    self.db.common_module(canonical.to_string(), ConfigId::Root),
+                    self.db.common_module(canonical, ConfigId::Root),
                     BareNameOrigin::CommonModule,
                     all_env,
                 );
@@ -4102,6 +4098,13 @@ impl<'db> InferenceContext<'db> {
         (!self.manager_collection_shadowed(&plural)).then_some(plural)
     }
 
+    /// A common module named like the manager whose module this is still denotes
+    /// the common module (it extends the global context), so a call through it is
+    /// not the self-qualified access that verdict names (itrous/bsl-analyzer#225).
+    fn in_manager_module(&self) -> bool {
+        crate::this_object::resolve_this_manager_owner(self.db, &self.get_resolver()).is_some()
+    }
+
     fn report_self_qualified_manager_diagnostic(
         &mut self,
         call_expr: ExprId,
@@ -4232,12 +4235,14 @@ impl<'db> InferenceContext<'db> {
                             .iter()
                             .map(|arg_id| !matches!(self.body.expr(*arg_id), Expr::Missing))
                             .collect();
-                        self.push_inference_diagnostic(
-                            InferenceDiagnostic::RedundantAccessToObjectTwoLevel {
-                                expr: callee,
-                                module: module.clone(),
-                            },
-                        );
+                        if !self.in_manager_module() {
+                            self.push_inference_diagnostic(
+                                InferenceDiagnostic::RedundantAccessToObjectTwoLevel {
+                                    expr: callee,
+                                    module: module.clone(),
+                                },
+                            );
+                        }
                         self.push_inference_diagnostic(
                             InferenceDiagnostic::MissedRequiredParameterCommonModule {
                                 expr: callee,
@@ -5355,11 +5360,24 @@ impl<'db> InferenceContext<'db> {
         if !self.get_resolver().user_common_module_exists(self.db, &name) {
             return None;
         }
+        let canonical = self.canonical_common_module_name(&name)?;
+        Some(self.db.common_module(canonical, ConfigId::Root))
+    }
+
+    /// The declared spelling of the common module `name`. A module declared without
+    /// `Module.bsl` is absent from the path index; its declaration still carries it.
+    fn canonical_common_module_name(&self, name: &Name) -> Option<String> {
         let source_root_id =
             self.db.file_source_root_input(self.context_file_id).source_root_id(self.db);
-        let module_index = self.db.module_index(source_root_id);
-        let canonical = module_index.canonical_common_module_name(&name)?;
-        Some(self.db.common_module(canonical.to_string(), ConfigId::Root))
+        self.db
+            .module_index(source_root_id)
+            .canonical_common_module_name(name)
+            .map(str::to_string)
+            .or_else(|| {
+                self.db
+                    .resolve_common_module(self.context_file_id, name.as_str())
+                    .map(|cm| bsl_metadata::MdObject::name(cm.as_ref()).to_string())
+            })
     }
 
     fn dispatch_bare_ident_field_call(
@@ -5448,10 +5466,14 @@ impl<'db> InferenceContext<'db> {
                 .map(|arg_id| !matches!(self.body.expr(*arg_id), Expr::Missing))
                 .collect();
 
-            self.push_inference_diagnostic(InferenceDiagnostic::RedundantAccessToObjectTwoLevel {
-                expr: call_expr,
-                module: module_name.clone(),
-            });
+            if !self.in_manager_module() {
+                self.push_inference_diagnostic(
+                    InferenceDiagnostic::RedundantAccessToObjectTwoLevel {
+                        expr: call_expr,
+                        module: module_name.clone(),
+                    },
+                );
+            }
 
             self.push_inference_diagnostic(
                 InferenceDiagnostic::MissedRequiredParameterCommonModule {

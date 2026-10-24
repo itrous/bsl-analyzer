@@ -341,8 +341,9 @@ fn root_xml_flags_and_identity_remain_distinct_from_disk_loader_defaults() {
     assert_eq!(loaded.uuid().get_version_num(), 4);
     assert!(!loaded.use_managed_form_in_ordinary_application());
     assert!(!loaded.use_ordinary_form_in_managed_application());
-    // Full loading requires the companion directory; discovery can list XML alone.
-    assert!(loaded.find_common_module("ёЖmODULE").is_none());
+    // Full loading keys on the XML like discovery does; the directory only
+    // accompanies a body.
+    assert!(loaded.find_common_module("ёЖmODULE").is_some_and(|m| m.is_server()));
     std::fs::create_dir(dir.path().join("CommonModules/ЁжModule")).unwrap();
     let with_directory = load_from_directory(dir.path()).unwrap();
     let module = with_directory.find_common_module("ёЖmODULE").unwrap();

@@ -648,6 +648,136 @@ mod tests {
         );
     }
 
+    const SOURCELESS_MODULES_CONFIGURATION: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Configuration uuid="00000000-0000-0000-0000-000000000000">
+        <Properties>
+            <Name>TestConfiguration</Name>
+        </Properties>
+        <ChildObjects>
+            <CommonModule>Вызывающий</CommonModule>
+            <CommonModule>Закрытый</CommonModule>
+            <CommonModule>БезКаталога</CommonModule>
+            <CommonModule>Открытый</CommonModule>
+            <CommonModule>Присваивающий</CommonModule>
+            <DataProcessor>Закрытый</DataProcessor>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+
+    fn declared_common_module_xml(name: &str, uuid_tail: u32) -> String {
+        format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonModule uuid="00000000-0000-0000-0000-{uuid_tail:012}">
+        <Properties>
+            <Name>{name}</Name>
+            <Server>true</Server>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#
+        )
+    }
+
+    const SOURCELESS_DATA_PROCESSOR_XML: &str = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <DataProcessor uuid="00000000-0000-0000-0000-000000000301">
+        <Properties>
+            <Name>Закрытый</Name>
+        </Properties>
+    </DataProcessor>
+</MetaDataObject>"#;
+
+    const CALLER_MODULE: &str = "CommonModules/Вызывающий/Ext/Module.bsl";
+    const OPEN_MODULE: &str = "CommonModules/Открытый/Ext/Module.bsl";
+    const MANAGER_MODULE: &str = "DataProcessors/Закрытый/Ext/ManagerModule.bsl";
+    const ASSIGNING_MODULE: &str = "CommonModules/Присваивающий/Ext/Module.bsl";
+
+    /// The configuration declares common modules whose text the workspace does not
+    /// have: `Закрытый` ships only `Ext/Module.bin` (a password-protected module) and
+    /// `БезКаталога` only its XML, without a directory. The platform itself never dumps
+    /// a module that way — even an empty module comes back as a `Module.bsl` holding
+    /// just the BOM — so a missing body is missing text, not an empty module.
+    /// `Открытый` is an ordinary module, and a data processor shares its name with the
+    /// protected one.
+    fn sourceless_module_diags(checked: &str) -> Vec<crate::Diagnostic> {
+        let caller = "Процедура Тест() Экспорт\n    Закрытый.Метод(1);\n    БезКаталога.Метод();\n    Открытый.Метод();\nКонецПроцедуры\n";
+        let open = "Процедура Другой() Экспорт\nКонецПроцедуры\n";
+        let assigning = "Процедура Тест() Экспорт\n#Если Сервер И Не Сервер Тогда\n    Закрытый = Неопределено;\n    Открытый = Неопределено;\n#КонецЕсли\nКонецПроцедуры\n\nПроцедура Живая() Экспорт\n    Открытый = 1;\nКонецПроцедуры\n";
+        let manager = "Процедура Тест() Экспорт\n    Закрытый.Метод(1);\nКонецПроцедуры\n";
+        let caller_xml = declared_common_module_xml("Вызывающий", 201);
+        let closed_xml = declared_common_module_xml("Закрытый", 202);
+        let no_dir_xml = declared_common_module_xml("БезКаталога", 203);
+        let open_xml = declared_common_module_xml("Открытый", 204);
+        let assigning_xml = declared_common_module_xml("Присваивающий", 205);
+        let files = [
+            ("Configuration.xml", SOURCELESS_MODULES_CONFIGURATION),
+            ("CommonModules/Вызывающий.xml", caller_xml.as_str()),
+            ("CommonModules/Закрытый.xml", closed_xml.as_str()),
+            ("CommonModules/Закрытый/Ext/Module.bin", "\u{1}"),
+            ("CommonModules/БезКаталога.xml", no_dir_xml.as_str()),
+            ("CommonModules/Открытый.xml", open_xml.as_str()),
+            ("CommonModules/Присваивающий.xml", assigning_xml.as_str()),
+            ("DataProcessors/Закрытый.xml", SOURCELESS_DATA_PROCESSOR_XML),
+            (CALLER_MODULE, caller),
+            (OPEN_MODULE, open),
+            (ASSIGNING_MODULE, assigning),
+            (MANAGER_MODULE, manager),
+        ];
+        crate::test_utils::check_config_files(&files, checked)
+    }
+
+    /// Every finding that names `receiver`: an unknown receiver may surface as an
+    /// unresolved call or as an undefined name, and both accuse the same token.
+    fn findings_naming(diags: &[crate::Diagnostic], receiver: &str) -> Vec<String> {
+        diags
+            .iter()
+            .filter(|d| d.message.contains(receiver))
+            .map(|d| format!("{:?}: {}", d.code, d.message))
+            .collect()
+    }
+
+    /// A module whose text the workspace cannot read is a module all the same: its name
+    /// denotes it, and what it exports is unknown, so a call into it is no verdict.
+    /// The ordinary module next to it is the control — its missing method is reported.
+    #[test]
+    fn a_common_module_without_module_bsl_is_a_module_with_an_unknown_surface() {
+        let diags = sourceless_module_diags(CALLER_MODULE);
+        assert!(findings_naming(&diags, "Закрытый").is_empty(), "Module.bin only: {diags:?}");
+        assert!(findings_naming(&diags, "БезКаталога").is_empty(), "XML only: {diags:?}");
+        let open = findings_naming(&diags, "Открытый");
+        assert_eq!(open.len(), 1, "a readable module really lacks the method: {diags:?}");
+        assert!(!open[0].contains("Не удалось разрешить получателя"), "got: {}", open[0]);
+    }
+
+    /// itrous/bsl-analyzer#225: in the manager module of a data processor named like the
+    /// protected module, the bare name still denotes the common module — it extends the
+    /// global context, the data processor's name does not.
+    #[test]
+    fn a_protected_common_module_wins_over_a_same_named_manager() {
+        let diags = sourceless_module_diags(MANAGER_MODULE);
+        let wrong: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code,
+                    DiagnosticCode::UnresolvedMethodCall | DiagnosticCode::RedundantAccessToObject
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "the call goes to the protected common module: {wrong:?}");
+    }
+
+    /// Code that resolves a module now meets the assignment check too. A branch no
+    /// environment compiles (`#Если Сервер И Не Сервер`) only spells a type out for the
+    /// reader, so its assignment is no verdict; the live one below it still is.
+    #[test]
+    fn an_assignment_in_a_branch_no_environment_compiles_is_not_judged() {
+        let diags = sourceless_module_diags(ASSIGNING_MODULE);
+        let assigns: Vec<_> =
+            diags.iter().filter(|d| d.code == DiagnosticCode::CommonModuleAssign).collect();
+        assert_eq!(assigns.len(), 1, "only the live assignment: {assigns:?}");
+        assert!(assigns[0].message.contains("Открытый"), "got: {}", assigns[0].message);
+    }
+
     /// A managed form whose main attribute `Объект` has the type `main_type`.
     fn form_xml_with_main_attribute(main_type: &str) -> String {
         format!(

@@ -230,10 +230,11 @@ impl Resolver {
         let Some(module_id) = self.module_id() else { return false };
         let file_id = module_id.file_id;
 
-        if db.has_config_root(file_id)
-            && db.resolve_common_module(file_id, module_name.as_str()).is_none()
-        {
-            return false;
+        // The configuration's declaration is the module: one shipped without
+        // `Module.bsl` (only `Ext/Module.bin`, or no text at all) never reaches the
+        // path index, yet its name denotes it all the same.
+        if db.has_config_root(file_id) {
+            return db.resolve_common_module(file_id, module_name.as_str()).is_some();
         }
 
         let source_root_id = db.file_source_root_input(file_id).source_root_id(db);
@@ -543,8 +544,9 @@ impl Resolver {
         })?;
 
         let file_id = module_id.file_id;
+        let declared_by_configs = db.has_config_root(file_id);
 
-        if db.has_config_root(file_id) {
+        if declared_by_configs {
             if db.resolve_common_module(file_id, module_name.as_str()).is_none() {
                 return Err(QualifiedMethodError::NotVisibleInConfigs);
             }
@@ -572,9 +574,16 @@ impl Resolver {
         let source_root_id = db.file_source_root_input(file_id).source_root_id(db);
         let module_index = db.module_index(source_root_id);
 
-        let target_file_id = module_index
-            .resolve_common_module(module_name)
-            .ok_or(QualifiedMethodError::NotFound)?;
+        // A module the configuration declares but no `Module.bsl` backs anywhere has
+        // text nobody can read: protected by a password (only `Ext/Module.bin` is
+        // dumped) or missing from the checkout. The platform dumps even an empty
+        // module as a `Module.bsl`, so an absent body is not an empty surface.
+        let target_file_id =
+            module_index.resolve_common_module(module_name).ok_or(if declared_by_configs {
+                QualifiedMethodError::BodyUnread
+            } else {
+                QualifiedMethodError::NotFound
+            })?;
 
         // The path index is built from source-root paths, which hold an unread body
         // exactly like any other file — its entry cannot be dropped, because the first

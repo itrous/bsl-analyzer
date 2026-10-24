@@ -499,21 +499,18 @@ fn load_common_modules_parallel(
         return Vec::new();
     }
 
-    let entries: Vec<_> = match scope.read_dir(dir) {
-        Ok(entries) => entries.filter_map(|e| e.ok()).collect(),
-        Err(_) => return Vec::new(),
-    };
-
-    entries
+    // The XML declares the module and the directory only accompanies a body, the
+    // rule `discover_common_module_structure` keys the structure listing on: a
+    // module checked out without its directory is still a module of the configuration.
+    loose_xml_children(scope, dir)
         .into_par_iter()
-        .filter_map(|entry| {
-            let module_dir = entry.path();
-            if !module_dir.is_dir() {
+        .filter_map(|(name, xml_path)| {
+            let name = name.as_str();
+            let module_dir = dir.join(name);
+            // Excluding the module's directory from the sources excludes the module.
+            if scope.is_excluded(&module_dir) {
                 return None;
             }
-
-            let name = module_dir.file_name()?.to_str()?;
-            let xml_path = probe_sibling_xml(scope, dir, name)?;
             let module_bsl_path =
                 probe_ext_child(scope, &module_dir, bsl_conventions::ConventionalName::Module);
             let module_bin_path =

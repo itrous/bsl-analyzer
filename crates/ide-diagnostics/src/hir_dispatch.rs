@@ -185,6 +185,11 @@ pub fn dispatch_hir_diagnostic(
             handlers::commit_transaction_outside_try_catch::from_hir(*range, ctx)
         }
         BodyDiagnostic::CommonModuleAssign { variable_name, range, existing_binding_kind } => {
+            // A branch no environment compiles (`#Если Сервер И Не Сервер`) is where code
+            // spells out a type for the reader; the platform never sees the assignment.
+            if handlers::missed_required_parameter::in_dead_branch(ctx, *range) {
+                return None;
+            }
             handlers::common_module_assign::from_hir(
                 variable_name,
                 *range,
