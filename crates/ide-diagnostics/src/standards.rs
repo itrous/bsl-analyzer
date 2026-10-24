@@ -117,6 +117,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::MissingTemporaryFileDeletion => &[542],
         DiagnosticCode::MisplacedLoopControl => &[],
         DiagnosticCode::UseLessForEach => &[],
+        DiagnosticCode::IteratorCollidesCollection => &[],
         DiagnosticCode::UsingGoto => &[547],
         DiagnosticCode::BeginTransactionBeforeTryCatch => &[783],
         DiagnosticCode::CodeAfterAsyncCall => &[],

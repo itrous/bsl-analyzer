@@ -815,6 +815,11 @@ pub enum BodyDiagnostic<R = TextRange> {
         range: R,
     },
 
+    IteratorCollidesCollection {
+        iterator_name: String,
+        range: R,
+    },
+
     UnsafeFindByCode {
         manager_name: String,
         object_name: String,
@@ -1052,6 +1057,9 @@ impl<R> BodyDiagnostic<R> {
             }
             BodyDiagnostic::UselessForEach { iterator_name, range } => {
                 BodyDiagnostic::UselessForEach { iterator_name, range: f(range) }
+            }
+            BodyDiagnostic::IteratorCollidesCollection { iterator_name, range } => {
+                BodyDiagnostic::IteratorCollidesCollection { iterator_name, range: f(range) }
             }
             BodyDiagnostic::UnsafeFindByCode { manager_name, object_name, range } => {
                 BodyDiagnostic::UnsafeFindByCode { manager_name, object_name, range: f(range) }
@@ -1341,6 +1349,7 @@ impl<R: Copy> BodyDiagnostic<R> {
             BodyDiagnostic::UsingObjectNotAvailableUnix { range, .. } => *range,
             BodyDiagnostic::UnsafeSafeModeMethodCall { range } => *range,
             BodyDiagnostic::UselessForEach { range, .. } => *range,
+            BodyDiagnostic::IteratorCollidesCollection { range, .. } => *range,
             BodyDiagnostic::UnsafeFindByCode { range, .. } => *range,
             BodyDiagnostic::UsageWriteLogEvent { range, .. } => *range,
         }

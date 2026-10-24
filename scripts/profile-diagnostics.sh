@@ -169,6 +169,7 @@ DIAGNOSTICS=(
     UnusedParameters
     UsageWriteLogEvent
     UseLessForEach
+    IteratorCollidesCollection
     UselessTernaryOperator
     UseSystemInformation
     UsingCancelParameter

@@ -919,6 +919,17 @@ fn lower_for_each_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt>
         .map(|n| n.text().to_string())
         .unwrap_or_else(|| String::from("<unknown>"));
 
+    // A local's identity is (owner, folded name), so equal folded names within one
+    // body are the same symbol; no resolver is needed here.
+    if let Expr::Path(collection_name) = ctx.body.expr_idx(collection) {
+        if collection_name.eq_ignore_case(&Name::new(var_token.text())) {
+            ctx.emit(BodyDiagnostic::IteratorCollidesCollection {
+                iterator_name: var_token.text().to_string(),
+                range,
+            });
+        }
+    }
+
     ctx.enter_loop();
 
     ctx.enter_foreach(collection, collection_text);

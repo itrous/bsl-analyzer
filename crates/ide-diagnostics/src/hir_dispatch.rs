@@ -51,6 +51,7 @@ pub(crate) const HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::UnsafeSafeModeMethodCall,
     DiagnosticCode::UsageWriteLogEvent,
     DiagnosticCode::UseLessForEach,
+    DiagnosticCode::IteratorCollidesCollection,
     DiagnosticCode::UseSystemInformation,
     DiagnosticCode::UsingCancelParameter,
     DiagnosticCode::UsingExternalCodeTools,
@@ -340,6 +341,9 @@ pub fn dispatch_hir_diagnostic(
         }
         BodyDiagnostic::UselessForEach { iterator_name, range } => {
             handlers::useless_for_each::from_hir(iterator_name, *range, ctx)
+        }
+        BodyDiagnostic::IteratorCollidesCollection { iterator_name, range } => {
+            handlers::iterator_collides_collection::from_hir(iterator_name, *range, ctx)
         }
         BodyDiagnostic::UnsafeFindByCode { manager_name, object_name, range } => {
             handlers::unsafe_find_by_code::from_hir(manager_name, object_name, *range, ctx)

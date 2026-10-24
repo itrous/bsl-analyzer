@@ -18,6 +18,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::FormDataToValue,
     DiagnosticCode::InternetAccess,
     DiagnosticCode::IsInRoleMethod,
+    DiagnosticCode::IteratorCollidesCollection,
     DiagnosticCode::MissingTempStorageDeletion,
     DiagnosticCode::MissingTemporaryFileDeletion,
     DiagnosticCode::NestedConstructorsInStructureDeclaration,
@@ -628,6 +629,21 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        DiagnosticCode::IteratorCollidesCollection,
+        r#"Процедура Тест()
+    Items = Новый Массив;
+    Для Каждого Items Из Items Цикл
+        Сообщить(Items);
+    КонецЦикла;
+КонецПроцедуры"#,
+        r#"Procedure Test()
+    Items = New Array;
+    For Each Items In Items Do
+        Message(Items);
+    EndDo;
+EndProcedure"#,
+    ),
+    (
         DiagnosticCode::UsingFindElementByString,
         r#"Процедура Тест()
     Значение = Справочники.Товары.НайтиПоКоду("1");
@@ -668,7 +684,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 205, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 206, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

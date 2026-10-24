@@ -81,6 +81,7 @@ pub mod internet_access;
 pub mod invalid_character_in_file;
 pub mod invalid_virtual_table_parameters;
 pub mod is_in_role_method;
+pub mod iterator_collides_collection;
 pub mod join_with_sub_query;
 pub mod join_with_virtual_table;
 pub mod latin_and_cyrillic_symbol_in_word;
@@ -334,6 +335,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::MisplacedLoopControl => Some(&misplaced_loop_control::METADATA),
         DiagnosticCode::UseLessForEach => Some(&useless_for_each::METADATA),
+        DiagnosticCode::IteratorCollidesCollection => Some(&iterator_collides_collection::METADATA),
         DiagnosticCode::UsingGoto => Some(&using_goto::METADATA),
         DiagnosticCode::BeginTransactionBeforeTryCatch => {
             Some(&begin_transaction_before_try_catch::METADATA)
