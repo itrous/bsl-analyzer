@@ -15,6 +15,8 @@ The current implementation is conservative. It reports only cases where type inf
 
 A function's documented return type ("Возвращаемое значение") that names a metadata object, alone or as the element of `Массив из`, is checked against the function body. If the body returns a value of another type (for example, a `Структура`), the result of a call has both types and its fields are not reported. A documented object missing from a visible configuration is ignored. If the body returns the documented object or nothing definite, the documented type stays closed and a missing field is still reported.
 
+A field read through a local variable is reported only if every write reaching the read gives the variable a metadata object without that field (or `Undefined`). A variable assigned objects of different kinds in `Если`/`ИначеЕсли` branches is silent for a field one of them has; a parameter, a declaration or an element of a loop over an unknown collection among the writes also keeps it silent.
+
 
 Metadata collections are checked the same way:
 

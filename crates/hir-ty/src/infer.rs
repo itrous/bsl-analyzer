@@ -2479,6 +2479,67 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
+    /// False when a write reaching the local `receiver_expr` may hold a value with `field`.
+    ///
+    /// Each write is judged by the type inferred for its own right-hand side, so a local written
+    /// once keeps its verdict whatever that right-hand side is: unlike
+    /// [`Self::miss_holds_on_every_path`] this does not require every value to be vouched for,
+    /// only that none of the writes reaching the read be of another type that may own the field.
+    /// A receiver that is not a local written in this body answers true. A parameter or a
+    /// declaration reaching the read, a loop element of an unknown collection and an untyped
+    /// write may hold anything.
+    fn metadata_miss_holds_on_every_write(
+        &self,
+        receiver_expr: ExprId,
+        field: &hir_def::Name,
+    ) -> bool {
+        let Expr::Path(name) = self.body.expr(receiver_expr) else {
+            return true;
+        };
+        let key = name.as_str().fold_lower();
+        if !self.body_writes_name(name, &key) {
+            return true;
+        }
+        let Some(use_stmt) = self.body.enclosing_stmt(receiver_expr) else {
+            return true;
+        };
+        let Some(reaching) = self
+            .read_point(use_stmt)
+            .and_then(|point| self.reaching_assignment_types_at(point, &key))
+        else {
+            return true;
+        };
+        let Some(sources) = self.loop_aware_definitions(&key, use_stmt.to_idx(), reaching) else {
+            return true;
+        };
+        let lacks =
+            |ty: Option<TypeId>| ty.is_some_and(|ty| self.value_certainly_lacks_field(ty, field));
+        sources.iter().all(|source| match *source {
+            DefinitionSource::Value(value) => lacks(self.expr_types.get(&value).copied()),
+            DefinitionSource::LoopElement(collection) => {
+                lacks(self.expr_types.get(&collection).copied().and_then(|collection_ty| {
+                    crate::iteration_lookup::resolve_iter_element_ty(self.db, collection_ty)
+                }))
+            }
+            DefinitionSource::Opaque => false,
+        })
+    }
+
+    /// Whether a value of `ty` cannot answer `field`: an empty value, or a metadata object whose
+    /// field set is closed and lacks it.
+    fn value_certainly_lacks_field(&self, ty: TypeId, field: &hir_def::Name) -> bool {
+        match self.db.lookup_type(ty) {
+            TypeKind::Undefined | TypeKind::Null => true,
+            TypeKind::MetadataRef(_) | TypeKind::ThisObject { .. } => {
+                let obj_resolver =
+                    crate::object_resolver::DbObjectResolver::new(self.db, self.context_file_id);
+                !crate::field_enum::metadata_fields_open(self.db, &obj_resolver, ty)
+                    && self.lacks_field(ty, field)
+            }
+            _ => false,
+        }
+    }
+
     /// True when every type `receiver_expr` can hold on the paths reaching it is a closed
     /// receiver lacking the member; false when that set cannot be vouched for.
     fn miss_holds_on_every_path(
@@ -3410,6 +3471,16 @@ impl<'db> InferenceContext<'db> {
                     let base_id = ExprId::from_idx(*base);
                     let closed_platform_object = self.is_closed_platform_object(base_ty)
                         && self.platform_field_miss_holds_on_every_path(base_id, field);
+                    // A metadata object read through a local is typed by the local's textually
+                    // latest write; after `Если … ИначеЕсли` another branch may have written an
+                    // object of another kind that owns the field, so the miss must hold for
+                    // every write reaching the read.
+                    let closed_metadata_object = match base_kind {
+                        TypeKind::MetadataRef(_) | TypeKind::ThisObject { .. } => {
+                            self.metadata_miss_holds_on_every_write(base_id, field)
+                        }
+                        _ => true,
+                    };
                     let closed_receiver = (matches!(
                         base_kind,
                         TypeKind::MetadataRef(_)
@@ -3419,7 +3490,8 @@ impl<'db> InferenceContext<'db> {
                         self.db,
                         &obj_resolver,
                         base_ty,
-                    )) || matches!(base_kind, TypeKind::Structure(facet) if facet.closed)
+                    ) && closed_metadata_object)
+                        || matches!(base_kind, TypeKind::Structure(facet) if facet.closed)
                         || crate::manager_lookup::manager_members_closed(
                             self.db,
                             &obj_resolver,

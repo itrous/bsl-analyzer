@@ -60,6 +60,7 @@ mod infer_manager_members;
 mod infer_manager_value_members;
 mod infer_metadata_collection_members;
 mod infer_metadata_description_members;
+mod infer_metadata_object_branch_writes;
 mod infer_metadata_object_family_argument;
 mod infer_method;
 mod infer_method_cache;
