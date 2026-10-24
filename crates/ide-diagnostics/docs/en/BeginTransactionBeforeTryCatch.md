@@ -11,6 +11,11 @@ may leave the transaction open before the rollback handler is reached. Starting
 the transaction inside `Try` is also unsafe: the exception handler may then work
 with a transaction state different from the one the code expects.
 
+The `Try` that matters is the transaction's own one. A `BeginTransaction()`
+followed directly by its own `Try` is correct even when the whole pair sits
+inside an outer `Try` (for example, one that releases a lock for editing): the
+pair is the same as a call of a method that contains it.
+
 ## Examples
 
 ### Incorrect

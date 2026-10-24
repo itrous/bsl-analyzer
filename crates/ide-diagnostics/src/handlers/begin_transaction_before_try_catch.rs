@@ -221,6 +221,62 @@ mod tests {
     }
 
     #[test]
+    fn begin_with_its_own_try_inside_an_outer_try() {
+        let code = r#"Процедура Тест(Ссылка)
+    Попытка
+        ЗаблокироватьДанныеДляРедактирования(Ссылка);
+        НачатьТранзакцию();
+        Попытка
+            ЗаписатьДанные();
+            ЗафиксироватьТранзакцию();
+        Исключение
+            ОтменитьТранзакцию();
+            ВызватьИсключение;
+        КонецПопытки;
+    Исключение
+        РазблокироватьДанныеДляРедактирования(Ссылка);
+        ВызватьИсключение;
+    КонецПопытки;
+КонецПроцедуры"#;
+
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::BeginTransactionBeforeTryCatch,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn begin_inside_an_outer_try_without_its_own_try_is_flagged() {
+        let code = r#"Процедура Тест(Ссылка)
+    Попытка
+        ЗаблокироватьДанныеДляРедактирования(Ссылка);
+        НачатьТранзакцию();
+        ЗаписатьДанные();
+        Попытка
+            ЗафиксироватьТранзакцию();
+        Исключение
+            ОтменитьТранзакцию();
+            ВызватьИсключение;
+        КонецПопытки;
+    Исключение
+        РазблокироватьДанныеДляРедактирования(Ссылка);
+        ВызватьИсключение;
+    КонецПопытки;
+КонецПроцедуры"#;
+
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::BeginTransactionBeforeTryCatch,
+            expect![[r#"
+                BeginTransactionBeforeTryCatch @ 4:9..4:28
+                  message: Метод 'НачатьТранзакцию' должен быть за пределами блока 'Попытка-Исключение' непосредственно перед оператором 'Попытка'
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
     #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn test_no_try_after() {
         let code = r#"Процедура Тест()
