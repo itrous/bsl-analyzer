@@ -59,7 +59,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let item_tree = ctx.item_tree();
     let module_bodies = ctx.module_bodies();
-    let root = ctx.parse().syntax_node();
+    let root = ctx.config.quick_fixes.then(|| ctx.parse().syntax_node());
 
     let mut diagnostics = Vec::new();
 
@@ -77,7 +77,9 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 severity: ctx.severity(code),
                 range: proc.name_range(),
                 tags: ctx.tags(code),
-                fixes: insert_guard_fix(&root, proc.source_range()),
+                fixes: root
+                    .as_ref()
+                    .map_or_else(Vec::new, |root| insert_guard_fix(root, proc.source_range())),
             });
         }
     }
@@ -383,6 +385,15 @@ mod tests {
     use crate::test_utils::{check_ast_diagnostic, check_ast_diagnostic_with_config, format_diags};
     use crate::{DiagnosticCode, DiagnosticsConfig};
     use expect_test::expect;
+    #[test]
+    fn without_quick_fixes_the_finding_stays_and_no_fix_is_built() {
+        let code = "Процедура ПередЗаписью(Отказ)\n    ВыполнитьЧтоТо();\nКонецПроцедуры\n";
+        crate::test_utils::assert_quick_fixes_follow_config(
+            DiagnosticsConfig::default(),
+            |config| check_ast_diagnostic_with_config(code, config, check),
+        );
+    }
+
     #[test]
     fn test_basic_missing_guard() {
         let code = r#"

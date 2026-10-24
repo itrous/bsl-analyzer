@@ -166,8 +166,13 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         mdo_type: metadata.mdo.as_ref().map(|mdo| mdo.mdo_type),
     };
 
-    let root = ctx.parse().syntax_node();
-    let string_literals = string_literal_texts(&root);
+    // What the fix needs - the tree and every string literal of the module - is
+    // gathered only for a surface that shows fixes: it walks the whole module.
+    let fix_facts = ctx.config.quick_fixes.then(|| {
+        let root = ctx.parse().syntax_node();
+        let string_literals = string_literal_texts(&root);
+        (root, string_literals)
+    });
 
     for (_, proc) in item_tree.procedures() {
         if let Some(mut diag) = check_method_unused(
@@ -181,7 +186,10 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             code,
             ctx,
         ) {
-            diag.fixes = remove_method_fix(&root, proc.source_range, &proc.name, &string_literals);
+            if let Some((root, string_literals)) = &fix_facts {
+                diag.fixes =
+                    remove_method_fix(root, proc.source_range, &proc.name, string_literals);
+            }
             diagnostics.push(diag);
         }
     }
@@ -198,7 +206,10 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             code,
             ctx,
         ) {
-            diag.fixes = remove_method_fix(&root, func.source_range, &func.name, &string_literals);
+            if let Some((root, string_literals)) = &fix_facts {
+                diag.fixes =
+                    remove_method_fix(root, func.source_range, &func.name, string_literals);
+            }
             diagnostics.push(diag);
         }
     }
@@ -668,6 +679,29 @@ mod tests {
         crate::test_utils::assert_diagnostic_range(code, unused_diags[0], 1, 10, 24);
         crate::test_utils::assert_diagnostic_range(code, unused_diags[1], 60, 10, 40);
         crate::test_utils::assert_diagnostic_range(code, unused_diags[2], 63, 10, 39);
+    }
+
+    #[test]
+    fn without_quick_fixes_the_finding_stays_and_no_fix_is_built() {
+        use crate::test_utils::{
+            assert_quick_fixes_follow_config, check_metadata_diagnostic_with_config,
+            make_non_common_module_metadata,
+        };
+
+        let code = "Процедура НикемНеВызывается()\n    Возврат;\nКонецПроцедуры\n";
+        let mut config = DiagnosticsConfig::default();
+        config.parameters.insert(
+            DiagnosticCode::UnusedLocalMethod,
+            serde_json::json!({ "checkObjectModule": true }),
+        );
+        assert_quick_fixes_follow_config(config, |config| {
+            check_metadata_diagnostic_with_config(
+                make_non_common_module_metadata(bsl_metadata::ModuleType::ObjectModule),
+                code,
+                config,
+                |_meta, ctx| super::check(ctx),
+            )
+        });
     }
 
     #[test]

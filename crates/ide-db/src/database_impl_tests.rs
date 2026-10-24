@@ -7721,6 +7721,52 @@ fn a_case_variant_configuration_xml_names_the_configuration_root() {
     );
 }
 
+/// One pass over many modules settles each directory once and answers every module as
+/// the walk of that module alone would: a nested configuration below a root, an
+/// extension beside it, a directory between them that is no root, and a file outside
+/// every configuration.
+#[test]
+fn the_pass_walk_answers_every_module_as_its_own_walk_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let cf = dir.path().join("src/cf");
+    let nested = cf.join("Catalogs/Вложенная");
+    let cfe = dir.path().join("src/cfe/Расширение");
+    for path in [
+        cf.join("CommonModules/Модуль/Ext"),
+        cf.join("Catalogs/X/Ext"),
+        cf.join("Catalogs/Y/Forms/Форма/Ext/Form"),
+        nested.join("CommonModules/Вложенный/Ext"),
+        cfe.join("Catalogs/X/Ext"),
+        dir.path().join("loose"),
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::fs::write(cfe.join("Configuration.xml"), "<Configuration/>").unwrap();
+    let modules = [
+        cf.join("CommonModules/Модуль/Ext/Module.bsl"),
+        cf.join("Catalogs/X/Ext/ObjectModule.bsl"),
+        cf.join("Catalogs/Y/Forms/Форма/Ext/Form/Module.bsl"),
+        cf.join("Catalogs/X/Ext/ManagerModule.bsl"),
+        nested.join("CommonModules/Вложенный/Ext/Module.bsl"),
+        cfe.join("Catalogs/X/Ext/ObjectModule.bsl"),
+        dir.path().join("loose/Module.bsl"),
+    ];
+    let db = crate::RootDatabaseImpl::default();
+
+    let mut known = rustc_hash::FxHashMap::default();
+    for module in &modules {
+        assert_eq!(
+            super::find_configuration_root_in_pass(module, &mut known),
+            db.find_configuration_root(module),
+            "{}",
+            module.display()
+        );
+    }
+    assert_eq!(known.get(&cf.join("Catalogs")), Some(&Some(cf.clone())));
+    assert_eq!(known.get(&nested), Some(&Some(nested.clone())));
+    assert_eq!(known.get(&dir.path().join("loose")), Some(&None));
+}
+
 /// A defined type composes differently from an object or a register, and the difference is
 /// the point: an extension does not overlay a defined type, it REPLACES its underlying type
 /// wholesale. Copying the neighbours' fold here would silently keep the base's type.

@@ -228,6 +228,10 @@ pub struct DiagnosticsConfigInput {
     /// the key because they change a diagnostic's tags and severity — two
     /// configurations that differ only here must not share a memo.
     pub metadata_overrides: Vec<(String, String)>,
+
+    /// Whether findings carry their quick fixes. Part of the key: the fixes are
+    /// part of the memoised answer.
+    pub quick_fixes: bool,
 }
 
 impl DiagnosticsConfigInput {
@@ -263,6 +267,7 @@ impl DiagnosticsConfigInput {
             scope: None,
             only_enabled: None,
             metadata_overrides: Vec::new(),
+            quick_fixes: true,
         }
     }
 
@@ -286,6 +291,11 @@ impl DiagnosticsConfigInput {
 
     pub fn with_scope(mut self, scope: Option<std::sync::Arc<crate::AnalysisScope>>) -> Self {
         self.scope = scope;
+        self
+    }
+
+    pub fn with_quick_fixes(mut self, quick_fixes: bool) -> Self {
+        self.quick_fixes = quick_fixes;
         self
     }
 

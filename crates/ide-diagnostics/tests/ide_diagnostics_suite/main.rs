@@ -6,6 +6,7 @@ mod bilingual_parity;
 mod common_attributes_in_query;
 mod data_exchange_and_unused_method_fixes;
 mod diagnostic_quick_fixes;
+mod foreign_handler_bindings_scan;
 mod handlers_bound_from_another_module;
 mod inline_extension_directives;
 mod lone_cr_ends_comment;

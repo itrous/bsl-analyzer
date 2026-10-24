@@ -577,4 +577,57 @@ mod tests {
         assert!(reported.iter().all(|diagnostic| !diagnostic.fixes.is_empty()));
         assert_eq!(IDENTIFIER_INDEXES.with(Cell::get) - before, 1);
     }
+
+    /// A surface that shows no fixes does not pay for them: the module-wide facts behind
+    /// the fix are not gathered, and the findings are the ones the fixes were attached to.
+    #[test]
+    fn without_quick_fixes_the_module_is_not_indexed() {
+        let code = "Процедура Метод(Нужный, Лишний)\n    Сообщить(Нужный);\nКонецПроцедуры\n\n\
+                    Процедура Вызов()\n    Метод(1, 2);\nКонецПроцедуры\n";
+        let metadata = || hir::ModuleMetadata {
+            module_type: bsl_metadata::ModuleType::CommonModule,
+            execution_context: None,
+            common_module: None,
+            mdo: None,
+            register: None,
+            command: None,
+            http_service: None,
+            web_service: None,
+            integration_service: None,
+            form: None,
+        };
+        let run = |quick_fixes: bool| {
+            let config =
+                crate::DiagnosticsConfig { quick_fixes, ..crate::DiagnosticsConfig::all_enabled() };
+            let before = IDENTIFIER_INDEXES.with(Cell::get);
+            let diagnostics = crate::test_utils::check_metadata_diagnostic_with_config(
+                metadata(),
+                code,
+                config,
+                |_metadata, ctx| super::super::check(ctx),
+            );
+            let reported: Vec<_> = diagnostics
+                .into_iter()
+                .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+                .collect();
+            (reported, IDENTIFIER_INDEXES.with(Cell::get) - before)
+        };
+
+        let (with_fixes, indexed) = run(true);
+        assert_eq!(indexed, 1);
+        assert!(with_fixes.iter().all(|diagnostic| !diagnostic.fixes.is_empty()));
+
+        let (without_fixes, indexed) = run(false);
+        assert_eq!(indexed, 0, "no fix is built, so nothing is indexed for one");
+        assert_eq!(without_fixes.len(), 1);
+        let strip = |mut d: crate::Diagnostic| {
+            d.fixes.clear();
+            d
+        };
+        assert_eq!(
+            without_fixes,
+            with_fixes.into_iter().map(strip).collect::<Vec<_>>(),
+            "the findings do not depend on whether their fixes are built"
+        );
+    }
 }

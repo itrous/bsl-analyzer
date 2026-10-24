@@ -254,18 +254,20 @@ pub fn file_foreign_handler_bindings_query<'db>(
     file_id_input: FileIdInput<'db>,
 ) -> Arc<[crate::call_graph::ForeignHandlerBinding]> {
     let file_id = file_id_input.file_id(db);
-    let name_offsets = db.file_name_offsets_ref(file_id);
-    let mut offsets: Vec<u32> = HANDLER_BINDING_TOKENS
-        .iter()
-        .flat_map(|token| {
-            name_offsets.offsets(&crate::normalize_match_name(&crate::Name::new(token))).iter()
-        })
-        .copied()
+    // The tree's own tokens rather than the file's name-offset index: building that
+    // index for a candidate the batch never analyses would leave a memo of every name
+    // of the file resident, for the sake of six.
+    let offsets: Vec<u32> = db
+        .parse_ref(file_id)
+        .syntax_node()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| token.kind().is_name_token() && is_handler_binding_token(token.text()))
+        .map(|token| u32::from(token.text_range().start()))
         .collect();
     if offsets.is_empty() {
         return Arc::from([]);
     }
-    offsets.sort_unstable();
 
     let module_id = ModuleId::new(file_id);
     let item_tree = db.item_tree_ref(file_id);
@@ -292,6 +294,12 @@ pub fn file_foreign_handler_bindings_query<'db>(
     bindings.sort_unstable();
     bindings.dedup();
     Arc::from(bindings)
+}
+
+/// Whether a name token spells one of [`HANDLER_BINDING_TOKENS`], in any letter case.
+fn is_handler_binding_token(text: &str) -> bool {
+    HANDLER_BINDING_TOKENS.iter().any(|token| stdx::case::starts_with_ignore_case(text, token))
+        && HANDLER_BINDING_TOKENS.contains(&stdx::case::fold_lower_per_char(text).as_str())
 }
 
 /// Method names that can bind a handler collected by
@@ -326,9 +334,8 @@ pub fn workspace_foreign_handler_bindings_query(
     // A text scan, not the source root's name-usage index: that index parses every
     // file of the root inside this one query, serially, while the fold needs only the
     // few files that call a binding method on a receiver.
-    let files: Vec<FileId> = source_root
-        .iter()
-        .filter(|&file_id| crate::workspace::is_bsl_source(file_set, file_id))
+    let files: Vec<FileId> = foreign_handler_binding_scan_files(db, source_root_input)
+        .into_iter()
         .filter(|&file_id| {
             db.unwind_if_revision_cancelled();
             *file_mentions_handler_binding_query(db, FileIdInput::new(db, file_id))
@@ -362,20 +369,52 @@ pub fn workspace_foreign_handler_bindings_query(
     Arc::new(crate::call_graph::ForeignHandlerBindings::new(names))
 }
 
+/// The files [`workspace_foreign_handler_bindings_query`] scans: every BSL source of
+/// the root.
+pub fn foreign_handler_binding_scan_files(
+    db: &dyn DefDatabase,
+    source_root_input: base_db::SourceRootInput,
+) -> Vec<FileId> {
+    let source_root = source_root_input.root(db);
+    let file_set = source_root.file_set();
+    source_root
+        .iter()
+        .filter(|&file_id| crate::workspace::is_bsl_source(file_set, file_id))
+        .collect()
+}
+
+/// One file's share of [`workspace_foreign_handler_bindings_query`]: its pre-filter and,
+/// for a candidate, its bindings. The fold runs these one file after another; a batch
+/// computes them across its worker pool first, so that the fold only reads memos.
+pub fn prime_file_foreign_handler_bindings(db: &dyn DefDatabase, file_id: FileId) {
+    let input = FileIdInput::new(db, file_id);
+    if *file_mentions_handler_binding_query(db, input) {
+        let _ = file_foreign_handler_bindings_query(db, input);
+    }
+}
+
 /// Whether the file's text calls a [`HANDLER_BINDING_TOKENS`] method on a receiver
 /// (`.ПодключитьОбработчикОжидания`, any letter case) - a pre-filter that reads the
 /// text without parsing it. A bare call binds the current module, which the
 /// same-module summary facts already cover, so it does not make a file a candidate.
+/// The text is read unmemoised: the fold scans every file of the root, and only the
+/// few candidates need their text again.
 #[salsa::tracked]
 pub fn file_mentions_handler_binding_query<'db>(
     db: &'db dyn DefDatabase,
     file_id_input: FileIdInput<'db>,
 ) -> bool {
     let _span = tracing::info_span!("file_mentions_handler_binding").entered();
-    let text = stdx::case::fold_lower_per_char(db.file_text_ref(file_id_input.file_id(db)));
+    mentions_handler_binding(&base_db::file_text_unmemoized(db, file_id_input.file_id(db)))
+}
+
+/// The text test behind [`file_mentions_handler_binding_query`], folding case one char at
+/// a time at each dot rather than lowering a copy of the whole text: the scan visits
+/// every file of the root, and nearly every file fails it.
+fn mentions_handler_binding(text: &str) -> bool {
     text.match_indices('.').any(|(dot, _)| {
         let after = skip_trivia(&text[dot + 1..]);
-        HANDLER_BINDING_TOKENS.iter().any(|token| after.starts_with(token))
+        HANDLER_BINDING_TOKENS.iter().any(|token| stdx::case::starts_with_ignore_case(after, token))
     })
 }
 
@@ -1282,5 +1321,40 @@ mod tests {
             Some(m_a),
             "the same method via two names is one method, not an ambiguous pair"
         );
+    }
+}
+
+#[cfg(test)]
+mod handler_binding_prefilter_tests {
+    use super::{mentions_handler_binding, skip_trivia, HANDLER_BINDING_TOKENS};
+
+    /// The pre-filter over a lowercased copy of the whole text.
+    fn over_folded_copy(text: &str) -> bool {
+        let text = stdx::case::fold_lower_per_char(text);
+        text.match_indices('.').any(|(dot, _)| {
+            let after = skip_trivia(&text[dot + 1..]);
+            HANDLER_BINDING_TOKENS.iter().any(|token| after.starts_with(token))
+        })
+    }
+
+    #[test]
+    fn folding_at_each_dot_answers_what_the_folded_copy_answers() {
+        for text in [
+            "Форма.ПодключитьОбработчикОжидания(\"Имя\", 1);",
+            "Форма.ПОДКЛЮЧИТЬОБРАБОТЧИКОЖИДАНИЯ(\"Имя\", 1);",
+            "Form.AttachIdleHandler(\"Name\", 1);",
+            "Элементы.Поле.\n    // поле\n    УстановитьДействие(\"ПриИзменении\", \"Имя\");",
+            "Форма .\tПодключитьОбработчикИзмененияДанных(\"Р\", \"Имя\");",
+            "ПодключитьОбработчикОжидания(\"Имя\", 1);",
+            "// Форма.ПодключитьОбработчикОжидания\nСообщить(\"УстановитьДействие\");",
+            "Сообщить(\"Форма.УстановитьДействие\");",
+            "А.Б.В.Подключить(1);",
+            "İ.SETACTİON(1); К.Setaction",
+            "Объект.SetActİon(1);",
+            "Конец.",
+            "",
+        ] {
+            assert_eq!(mentions_handler_binding(text), over_folded_copy(text), "{text:?}");
+        }
     }
 }

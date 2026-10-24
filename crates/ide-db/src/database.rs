@@ -585,6 +585,22 @@ impl RootDatabaseImpl {
         n
     }
 
+    /// Compute the source root's foreign handler bindings with the per-file work spread
+    /// over the rayon pool. The query itself scans every file of the root one after
+    /// another; asked first from inside a batch, it holds the asking worker - and every
+    /// form module that asks next - for the whole scan.
+    pub fn prime_foreign_handler_bindings(&self, source_root_id: base_db::SourceRootId) {
+        use rayon::prelude::*;
+
+        let source_root_input = self.source_root_input(source_root_id);
+        hir::foreign_handler_binding_scan_files(self, source_root_input)
+            .par_iter()
+            .for_each_with(self.clone(), |db, &file_id| {
+                hir::prime_file_foreign_handler_bindings(&*db, file_id)
+            });
+        let _ = hir::DefDatabase::workspace_foreign_handler_bindings(self, source_root_id);
+    }
+
     fn workspace_configs(&self) -> metadata::WorkspaceConfigsInput {
         metadata::WorkspaceConfigsInput::try_get(self)
             .expect("WorkspaceConfigsInput is created in RootDatabaseImpl::new")
@@ -2880,11 +2896,20 @@ impl RootDatabaseImpl {
         // configuration nothing declared still owns its files by its own markers.
         // An external object's root carries no marker, so the walk passes it by
         // and the registered root is the only answer.
+        self.configuration_input_with_walk(file_path, self.find_configuration_root(file_path))
+    }
+
+    /// [`Self::configuration_input_for_path`] given the answer of the marker walk
+    /// ([`Self::find_configuration_root`]) for `file_path`.
+    fn configuration_input_with_walk<'db>(
+        &'db self,
+        file_path: &Path,
+        walked: Option<PathBuf>,
+    ) -> Option<metadata::ConfigurationPathInput<'db>> {
         let snapshot = self.workspace_configs_snapshot();
         let registered = snapshot
             .owner_of_path(file_path)
             .map(|idx| (snapshot.paths[idx].1.clone(), snapshot.canonical_paths[idx].clone()));
-        let walked = self.find_configuration_root(file_path);
         let config_root = match (registered, walked) {
             (Some((configured, canonical)), Some(walked)) => {
                 let strictly_inside = |root: &Path| walked.starts_with(root) && walked != root;
@@ -2908,28 +2933,65 @@ impl RootDatabaseImpl {
         let mut current = file_path.parent()?;
 
         loop {
-            let common_modules = current.join("CommonModules");
-            if common_modules.is_dir() {
-                tracing::debug!(?current, "Found configuration root via CommonModules/");
+            if is_configuration_root(current) {
                 return Some(current.to_path_buf());
             }
-
-            let config_xml = bsl_conventions::find_child_ci(
-                current,
-                bsl_conventions::ConventionalName::ConfigurationXml.canonical(),
-            )
-            .filter(|p| p.is_file());
-            if config_xml.is_some() {
-                tracing::debug!(?current, "Found configuration root via Configuration.xml");
-                return Some(current.to_path_buf());
-            }
-
             current = match current.parent() {
                 Some(parent) if parent != current => parent,
                 _ => return None,
             };
         }
     }
+}
+
+/// Whether `dir` holds a configuration's markers: a `CommonModules/` directory or a
+/// `Configuration.xml` in any letter case.
+fn is_configuration_root(dir: &Path) -> bool {
+    if dir.join("CommonModules").is_dir() {
+        tracing::debug!(?dir, "Found configuration root via CommonModules/");
+        return true;
+    }
+    let config_xml = bsl_conventions::find_child_ci(
+        dir,
+        bsl_conventions::ConventionalName::ConfigurationXml.canonical(),
+    )
+    .filter(|p| p.is_file());
+    if config_xml.is_some() {
+        tracing::debug!(?dir, "Found configuration root via Configuration.xml");
+        return true;
+    }
+    false
+}
+
+/// [`RootDatabaseImpl::find_configuration_root`] for many files in one pass: each
+/// directory the walk climbs is settled once and answered from `known` afterwards.
+/// The modules of one configuration climb the same directories - a type directory
+/// holds thousands of objects, and reading its listing for each of them made the
+/// pass cost the configuration's size times that listing. Valid while the tree
+/// does not change, which is why `known` lives no longer than the pass.
+fn find_configuration_root_in_pass(
+    file_path: &Path,
+    known: &mut rustc_hash::FxHashMap<PathBuf, Option<PathBuf>>,
+) -> Option<PathBuf> {
+    let mut climbed = Vec::new();
+    let mut current = file_path.parent()?;
+    let found = loop {
+        if let Some(answer) = known.get(current) {
+            break answer.clone();
+        }
+        climbed.push(current.to_path_buf());
+        if is_configuration_root(current) {
+            break Some(current.to_path_buf());
+        }
+        current = match current.parent() {
+            Some(parent) if parent != current => parent,
+            _ => break None,
+        };
+    };
+    for dir in climbed {
+        known.insert(dir, found.clone());
+    }
+    found
 }
 
 #[salsa::db]
@@ -3250,11 +3312,13 @@ impl hir::ConfigsDatabase for RootDatabaseImpl {
         // under different declared roots carry different revisions, and it is
         // the key that the loader memoises.
         let mut warmed = rustc_hash::FxHashSet::default();
+        let mut walked = rustc_hash::FxHashMap::default();
         for module in modules {
             let Some(path) = vfs_helpers::get_file_path(self, module.file_id) else {
                 continue;
             };
-            let Some(path_input) = self.configuration_input_for_path(&path) else {
+            let root = find_configuration_root_in_pass(&path, &mut walked);
+            let Some(path_input) = self.configuration_input_with_walk(&path, root) else {
                 continue;
             };
             if warmed.insert(path_input) {

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -184,13 +185,22 @@ pub fn set_parse_lru_sweep_mode(db: &mut dyn SourceDatabase, sweep: bool) {
 #[salsa::tracked(lru = 512, heap_size = crate::queries::heap_estimate::file_text_heap, returns(ref))]
 pub fn file_text_query<'db>(db: &'db dyn SourceDatabase, input: FileIdInput<'db>) -> Arc<str> {
     let _span = tracing::info_span!("file_text").entered();
-    let file_id = input.file_id(db);
+    Arc::from(file_text_unmemoized(db, input.file_id(db)))
+}
+
+/// The text [`file_text_query`] returns, read without leaving a memo behind: the
+/// overlay when one is registered, otherwise the disk bytes verified against the
+/// file's content revision. The inputs it reads become dependencies of the calling
+/// query. For a query that scans every file of a source root once: routed through
+/// [`file_text_query`], each scanned text stays pinned until the next LRU trim, so
+/// the scan alone holds the whole root's source in memory.
+pub fn file_text_unmemoized(db: &dyn SourceDatabase, file_id: FileId) -> Cow<'_, str> {
     let want = db.file_revision_input(file_id).revision(db);
 
     if let Some(text_input) = db.try_file_text_input(file_id) {
         let text = text_input.text(db);
         assert_revision(file_id, text, want);
-        return Arc::from(text.as_str());
+        return Cow::Borrowed(text.as_str());
     }
 
     let path = disk_path(db, file_id);
@@ -199,7 +209,7 @@ pub fn file_text_query<'db>(db: &'db dyn SourceDatabase, input: FileIdInput<'db>
         panic!("file_text: cannot read {path:?} for {file_id:?}: {err}")
     });
     assert_revision(file_id, &text, want);
-    Arc::from(text)
+    Cow::Owned(text)
 }
 
 fn assert_revision(file_id: FileId, text: &str, want: u64) {

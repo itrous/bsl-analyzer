@@ -203,6 +203,19 @@ pub fn find_ignore_case(haystack: &str, needle_lower: &str) -> Option<std::ops::
     None
 }
 
+/// Whether `fold_lower_per_char(haystack)` starts with `needle_lower`, without folding a copy.
+///
+/// `needle_lower` must already be per-char-lowercase, the same contract
+/// [`contains_ignore_case`] has.
+pub fn starts_with_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    debug_assert_eq!(
+        needle_lower,
+        fold_lower_per_char(needle_lower),
+        "needle_lower must already be per-char-lowercase"
+    );
+    match_len_ignore_case(haystack, needle_lower).is_some()
+}
+
 /// The number of haystack bytes matching `needle` from the start, if it matches at all.
 ///
 /// The count is in haystack bytes, never in folded ones, so a char whose lowercase mapping is
@@ -530,5 +543,30 @@ mod find_ignore_case_tests {
             find_ignore_case("хвост в конце из ", " из "),
             Some(("хвост в конце".len())..("хвост в конце из ".len()))
         );
+    }
+}
+
+#[cfg(test)]
+mod starts_with_ignore_case_tests {
+    use super::{fold_lower_per_char, starts_with_ignore_case};
+
+    #[test]
+    fn answers_what_a_folded_copy_answers() {
+        for (haystack, needle) in [
+            ("ПодключитьОбработчикОжидания(\"Имя\")", "подключитьобработчикожидания"),
+            ("ATTACHIDLEHANDLER", "attachidlehandler"),
+            ("Подключить", "подключитьобработчикожидания"),
+            ("İx", "i\u{307}x"),
+            ("İx", "ix"),
+            ("ẞ", "ß"),
+            ("", "a"),
+            ("что угодно", ""),
+        ] {
+            assert_eq!(
+                starts_with_ignore_case(haystack, needle),
+                fold_lower_per_char(haystack).starts_with(needle),
+                "разошлись на {haystack:?} / {needle:?}"
+            );
+        }
     }
 }

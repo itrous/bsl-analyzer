@@ -836,6 +836,29 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
     }
 }
 
+/// One handler run under `base` with quick fixes on and off: the input must yield
+/// findings that carry fixes, and without quick fixes the handler reports the same
+/// findings with none attached.
+pub fn assert_quick_fixes_follow_config(
+    base: crate::DiagnosticsConfig,
+    run: impl Fn(crate::DiagnosticsConfig) -> Vec<Diagnostic>,
+) {
+    let with_fixes = run(crate::DiagnosticsConfig { quick_fixes: true, ..base.clone() });
+    assert!(
+        !with_fixes.is_empty() && with_fixes.iter().all(|d| !d.fixes.is_empty()),
+        "the input must produce findings with fixes: {with_fixes:#?}"
+    );
+    let without_fixes = run(crate::DiagnosticsConfig { quick_fixes: false, ..base });
+    let stripped: Vec<Diagnostic> = with_fixes
+        .into_iter()
+        .map(|mut d| {
+            d.fixes.clear();
+            d
+        })
+        .collect();
+    assert_eq!(without_fixes, stripped);
+}
+
 pub fn check_metadata_diagnostic<F>(
     metadata: hir::ModuleMetadata,
     file_text: &str,

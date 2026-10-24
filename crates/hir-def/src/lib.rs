@@ -90,9 +90,10 @@ pub use method_body::{lower_detached_method, method_body_query, method_lower_que
 pub use method_syntax::{method_syntax_query, MethodSyntax};
 pub use queries::{
     conditional_tree_query, file_dependencies_query, file_external_refs_query,
-    file_foreign_handler_bindings_query, item_tree_query, method_outbound_facts,
-    module_bodies_query, module_call_summary_query, module_code_lower_query, module_data_query,
-    module_index_query, module_members_query, region_tree_query, resolved_module_summary_query,
+    file_foreign_handler_bindings_query, foreign_handler_binding_scan_files, item_tree_query,
+    method_outbound_facts, module_bodies_query, module_call_summary_query, module_code_lower_query,
+    module_data_query, module_index_query, module_members_query,
+    prime_file_foreign_handler_bindings, region_tree_query, resolved_module_summary_query,
     set_lowering_lru_sweep_mode, symbol_tree_query, workspace_call_graph_query,
     workspace_foreign_handler_bindings_query, workspace_index_query, ManagerRef,
     MethodOutboundFacts,

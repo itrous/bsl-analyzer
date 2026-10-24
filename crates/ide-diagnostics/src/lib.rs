@@ -301,6 +301,9 @@ pub fn apply_extension_merge<'db>(
 ///    an unchanged line again, and `scope_gate::tests` pins that.
 /// 4. [`normalize_diagnostics`] — the deterministic order. Last, so it sees every
 ///    producer's output, including the metas added in step 3.
+///
+/// A configuration without quick fixes then drops the fixes producers still attached;
+/// none of the steps reads them, so the findings themselves stay as they are.
 fn finalize_diagnostics(
     db: &dyn ide_db::RootDatabase,
     file_id: vfs::FileId,
@@ -318,6 +321,9 @@ fn finalize_diagnostics(
     scope_gate::apply(db, file_set, file_id, config, diagnostics);
     suppression::apply(db, file_id, config, diagnostics);
     normalize_diagnostics(diagnostics);
+    if !config.quick_fixes {
+        diagnostics.iter_mut().for_each(|diagnostic| diagnostic.fixes.clear());
+    }
 }
 
 /// The layer a paired base module can overturn, and therefore the layer every

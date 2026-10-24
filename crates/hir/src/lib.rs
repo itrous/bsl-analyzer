@@ -169,12 +169,13 @@ pub use hir_def::{MethodIdInput, ModuleNameInput};
 
 pub use hir_def::{
     conditional_tree_query, file_dependencies_query, file_external_refs_query,
-    file_name_offsets_query, file_name_usage_query, interface_method_query,
-    interface_variable_named_query, item_tree_query, method_body_query, method_lower_query,
-    module_bodies_query, module_call_summary_query, module_code_lower_query, module_data_query,
-    module_index_query, module_interface_query, module_members_query, region_tree_query,
-    set_lowering_lru_sweep_mode, source_root_name_usage_query, symbol_tree_query,
-    workspace_foreign_handler_bindings_query, workspace_index_query,
+    file_name_offsets_query, file_name_usage_query, foreign_handler_binding_scan_files,
+    interface_method_query, interface_variable_named_query, item_tree_query, method_body_query,
+    method_lower_query, module_bodies_query, module_call_summary_query, module_code_lower_query,
+    module_data_query, module_index_query, module_interface_query, module_members_query,
+    prime_file_foreign_handler_bindings, region_tree_query, set_lowering_lru_sweep_mode,
+    source_root_name_usage_query, symbol_tree_query, workspace_foreign_handler_bindings_query,
+    workspace_index_query,
 };
 
 pub use bsl_config::VisibleConfig;

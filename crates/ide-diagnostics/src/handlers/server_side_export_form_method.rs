@@ -41,19 +41,22 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     }
 
     let item_tree = ctx.item_tree();
-    let root = ctx.parse().syntax_node();
+    let root = ctx.config.quick_fixes.then(|| ctx.parse().syntax_node());
+    let fixes_for = |source_range| {
+        root.as_ref().map_or_else(Vec::new, |root| remove_export_fix(root, source_range))
+    };
     let mut diagnostics = Vec::new();
 
     for (_, proc) in item_tree.procedures() {
         if proc.is_export && !has_client_annotation(&proc.annotations) {
-            let fixes = remove_export_fix(&root, proc.source_range);
+            let fixes = fixes_for(proc.source_range);
             diagnostics.push(make_diagnostic(proc.name_range, fixes, code, ctx));
         }
     }
 
     for (_, func) in item_tree.functions() {
         if func.is_export && !has_client_annotation(&func.annotations) {
-            let fixes = remove_export_fix(&root, func.source_range);
+            let fixes = fixes_for(func.source_range);
             diagnostics.push(make_diagnostic(func.name_range, fixes, code, ctx));
         }
     }
@@ -159,6 +162,22 @@ mod tests {
             .into_iter()
             .filter(|d| d.code == DiagnosticCode::ServerSideExportFormMethod)
             .collect()
+    }
+
+    #[test]
+    fn without_quick_fixes_the_finding_stays_and_no_fix_is_built() {
+        let code = "&НаСервере\nПроцедура СерверныйМетод() Экспорт\nКонецПроцедуры\n";
+        crate::test_utils::assert_quick_fixes_follow_config(
+            crate::DiagnosticsConfig::all_enabled(),
+            |config| {
+                crate::test_utils::check_metadata_diagnostic_with_config(
+                    managed_form_metadata(),
+                    code,
+                    config,
+                    |_, ctx| super::check(ctx),
+                )
+            },
+        );
     }
 
     #[test]

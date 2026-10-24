@@ -174,7 +174,9 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         ));
     }
 
-    remove_parameter::attach_fixes(ctx, &mut diagnostics);
+    if ctx.config.quick_fixes {
+        remove_parameter::attach_fixes(ctx, &mut diagnostics);
+    }
     diagnostics
 }
 

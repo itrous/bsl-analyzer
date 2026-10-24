@@ -578,6 +578,8 @@ fn analyze_salsa(
     }
 
     config.scope = scope.clone();
+    // No reporter of this run shows a fix.
+    config.quick_fixes = false;
 
     tracing::info!(
         disabled = config.disabled.len(),
@@ -649,6 +651,26 @@ fn analyze_salsa(
         Err(_) => Some(700),
     };
     let num_chunks = chunks.len();
+
+    // Form modules check method use against the handler names other modules bind by
+    // string - a fold over every file of the source root. Built inside a chunk, that
+    // fold runs on one worker while the chunk's form modules wait for it; built here,
+    // its per-file work spreads over the pool. The candidates' trees fit the interactive
+    // parse window, so only a deep trim drops them before the first chunk grows its own
+    // working set.
+    let prime_bindings = !config.is_disabled(ide::DiagnosticCode::UnusedLocalMethod)
+        || !config.is_disabled(ide::DiagnosticCode::UnusedParameters);
+    // A panic here (a file changed under the run) resurfaces in the chunk, where the
+    // asking file's own boundary reports it, as it would without the warm-up.
+    if prime_bindings
+        && catch_unwind(AssertUnwindSafe(|| db.prime_foreign_handler_bindings(source_root_id)))
+            .is_ok()
+    {
+        db.enforce_lru_deep();
+        syntax::clear_shared_node_cache();
+        rayon::broadcast(|_| syntax::clear_shared_node_cache());
+        profile::purge_allocator();
+    }
 
     // The JSONL contract opens with a `start` event before any analysis. Salsa
     // emits the `file`/`done` events as a batch once the chunked run finishes

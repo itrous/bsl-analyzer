@@ -1,0 +1,545 @@
+{
+ "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+ "version": "2.1.0",
+ "runs": [
+  {
+   "tool": {
+    "driver": {
+     "name": "bsl-analyzer",
+     "semanticVersion": "<version>",
+     "rules": [
+      {
+       "id": "CodeOutOfRegion",
+       "name": "CodeOutOfRegion",
+       "shortDescription": {
+        "text": "CodeOutOfRegion"
+       },
+       "helpUri": "https://v8std.ru/std/455/"
+      },
+      {
+       "id": "CommonModuleMissingAPI",
+       "name": "CommonModuleMissingAPI",
+       "shortDescription": {
+        "text": "CommonModuleMissingAPI"
+       },
+       "helpUri": "https://v8std.ru/std/455/"
+      },
+      {
+       "id": "DeprecatedPlatformApi",
+       "name": "DeprecatedPlatformApi",
+       "shortDescription": {
+        "text": "DeprecatedPlatformApi"
+       }
+      },
+      {
+       "id": "MagicNumber",
+       "name": "MagicNumber",
+       "shortDescription": {
+        "text": "MagicNumber"
+       }
+      },
+      {
+       "id": "ReservedWordAsMethodName",
+       "name": "ReservedWordAsMethodName",
+       "shortDescription": {
+        "text": "ReservedWordAsMethodName"
+       }
+      },
+      {
+       "id": "UnresolvedMethodCall",
+       "name": "UnresolvedMethodCall",
+       "shortDescription": {
+        "text": "UnresolvedMethodCall"
+       }
+      },
+      {
+       "id": "UnusedLocalMethod",
+       "name": "UnusedLocalMethod",
+       "shortDescription": {
+        "text": "UnusedLocalMethod"
+       },
+       "helpUri": "https://v8std.ru/std/456/"
+      },
+      {
+       "id": "UnusedParameters",
+       "name": "UnusedParameters",
+       "shortDescription": {
+        "text": "UnusedParameters"
+       }
+      }
+     ]
+    }
+   },
+   "results": [
+    {
+     "ruleId": "CommonModuleMissingAPI",
+     "level": "note",
+     "message": {
+      "text": "Общий модуль должен содержать экспортные методы и области API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/CommonModules/ОбщийМодуль1/Ext/Module.bsl"
+        },
+        "region": {
+         "startLine": 1,
+         "startColumn": 1,
+         "endLine": 1,
+         "endColumn": 1
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "CodeOutOfRegion",
+     "level": "note",
+     "message": {
+      "text": "Процедура находится вне области (#Область/#Region). Весь код модуля должен быть организован в области для лучшей структуры."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/CommonModules/ОбщийМодуль1/Ext/Module.bsl"
+        },
+        "region": {
+         "startLine": 1,
+         "startColumn": 11,
+         "endLine": 1,
+         "endColumn": 21
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "MagicNumber",
+     "level": "note",
+     "message": {
+      "text": "Магическое число 0.1. Замените число на константу с понятным названием."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/CommonModules/ОбщийМодуль1/Ext/Module.bsl"
+        },
+        "region": {
+         "startLine": 2,
+         "startColumn": 63,
+         "endLine": 2,
+         "endColumn": 66
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "CommonModuleMissingAPI",
+     "level": "note",
+     "message": {
+      "text": "Общий модуль должен содержать экспортные методы и области API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/CommonModules/ОбщийМодуль2/Ext/Module.bsl"
+        },
+        "region": {
+         "startLine": 1,
+         "startColumn": 1,
+         "endLine": 1,
+         "endColumn": 1
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "CodeOutOfRegion",
+     "level": "note",
+     "message": {
+      "text": "Процедура находится вне области (#Область/#Region). Весь код модуля должен быть организован в области для лучшей структуры."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/CommonModules/ОбщийМодуль2/Ext/Module.bsl"
+        },
+        "region": {
+         "startLine": 1,
+         "startColumn": 11,
+         "endLine": 1,
+         "endColumn": 39
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "UnusedParameters",
+     "level": "warning",
+     "message": {
+      "text": "Уберите неиспользуемый параметр \"Интервал\""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/CommonModules/ОбщийМодуль2/Ext/Module.bsl"
+        },
+        "region": {
+         "startLine": 1,
+         "startColumn": 45,
+         "endLine": 1,
+         "endColumn": 53
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "DeprecatedPlatformApi",
+     "level": "warning",
+     "message": {
+      "text": "Используйте \"ОбщегоНазначения.СообщитьПользователю\" вместо устаревшего \"Сообщить\""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/CommonModules/ОбщийМодуль2/Ext/Module.bsl"
+        },
+        "region": {
+         "startLine": 2,
+         "startColumn": 5,
+         "endLine": 2,
+         "endColumn": 13
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "CodeOutOfRegion",
+     "level": "note",
+     "message": {
+      "text": "Процедура находится вне области (#Область/#Region). Весь код модуля должен быть организован в области для лучшей структуры."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/DataProcessors/Обработка1/Ext/ObjectModule.bsl"
+        },
+        "region": {
+         "startLine": 1,
+         "startColumn": 1,
+         "endLine": 7,
+         "endColumn": 15
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "ReservedWordAsMethodName",
+     "level": "error",
+     "message": {
+      "text": "Имя \"Выполнить\" является зарезервированным словом и не может использоваться как имя процедуры/функции"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/DataProcessors/Обработка1/Ext/ObjectModule.bsl"
+        },
+        "region": {
+         "startLine": 1,
+         "startColumn": 11,
+         "endLine": 1,
+         "endColumn": 20
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "UnresolvedMethodCall",
+     "level": "error",
+     "message": {
+      "text": "Не удалось разрешить получателя вызова 'ОбщийМодуль2'"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/DataProcessors/Обработка1/Ext/ObjectModule.bsl"
+        },
+        "region": {
+         "startLine": 2,
+         "startColumn": 5,
+         "endLine": 2,
+         "endColumn": 46
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "DeprecatedPlatformApi",
+     "level": "warning",
+     "message": {
+      "text": "Используйте \"ОбщегоНазначения.СообщитьПользователю\" вместо устаревшего \"Сообщить\""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/DataProcessors/Обработка1/Ext/ObjectModule.bsl"
+        },
+        "region": {
+         "startLine": 3,
+         "startColumn": 5,
+         "endLine": 3,
+         "endColumn": 13
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "CodeOutOfRegion",
+     "level": "note",
+     "message": {
+      "text": "Процедура находится вне области (#Область/#Region). Весь код модуля должен быть организован в области для лучшей структуры."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 2,
+         "startColumn": 11,
+         "endLine": 2,
+         "endColumn": 30
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "DeprecatedPlatformApi",
+     "level": "warning",
+     "message": {
+      "text": "Используйте \"ОбщегоНазначения.СообщитьПользователю\" вместо устаревшего \"Сообщить\""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 3,
+         "startColumn": 5,
+         "endLine": 3,
+         "endColumn": 13
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "DeprecatedPlatformApi",
+     "level": "warning",
+     "message": {
+      "text": "Используйте \"ОбщегоНазначения.СообщитьПользователю\" вместо устаревшего \"Сообщить\""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 8,
+         "startColumn": 5,
+         "endLine": 8,
+         "endColumn": 13
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "MagicNumber",
+     "level": "note",
+     "message": {
+      "text": "Магическое число 2. Замените число на константу с понятным названием."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 8,
+         "startColumn": 14,
+         "endLine": 8,
+         "endColumn": 15
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "DeprecatedPlatformApi",
+     "level": "warning",
+     "message": {
+      "text": "Используйте \"ОбщегоНазначения.СообщитьПользователю\" вместо устаревшего \"Сообщить\""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 13,
+         "startColumn": 5,
+         "endLine": 13,
+         "endColumn": 13
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "MagicNumber",
+     "level": "note",
+     "message": {
+      "text": "Магическое число 3. Замените число на константу с понятным названием."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 13,
+         "startColumn": 14,
+         "endLine": 13,
+         "endColumn": 15
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "UnusedLocalMethod",
+     "level": "warning",
+     "message": {
+      "text": "Неиспользуемый локальный метод \"ДействительноНеИспользуется\""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 11,
+         "endLine": 17,
+         "endColumn": 38
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "UnusedParameters",
+     "level": "warning",
+     "message": {
+      "text": "Уберите неиспользуемый параметр \"Параметр\""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 39,
+         "endLine": 17,
+         "endColumn": 47
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "DeprecatedPlatformApi",
+     "level": "warning",
+     "message": {
+      "text": "Используйте \"ОбщегоНазначения.СообщитьПользователю\" вместо устаревшего \"Сообщить\""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 18,
+         "startColumn": 5,
+         "endLine": 18,
+         "endColumn": 13
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "MagicNumber",
+     "level": "note",
+     "message": {
+      "text": "Магическое число 4. Замените число на константу с понятным названием."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"
+        },
+        "region": {
+         "startLine": 18,
+         "startColumn": 14,
+         "endLine": 18,
+         "endColumn": 15
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "properties": {
+    "baseline": {
+     "complete": true,
+     "state": "disabled"
+    }
+   }
+  }
+ ]
+}

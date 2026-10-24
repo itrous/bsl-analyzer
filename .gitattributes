@@ -6,3 +6,6 @@ crates/bsl-platform/data/platform_data.json -diff
 crates/bsl-platform/data/platform_facts.json -diff
 # Preserve byte-for-byte Designer XML exports, including CRLF, across checkouts.
 crates/bsl-metadata/fixtures/extension_common_attributes/**/*.xml -text whitespace=trailing-space,space-before-tab,cr-at-eol
+# Expected analyze output pins line and column numbers of these sources; keep their
+# bytes identical on every checkout.
+crates/bsl-analyzer/tests/fixtures/foreign_handler_bindings/** -text

@@ -20,8 +20,8 @@ pub use input::{
 };
 pub use locale::{Locale, UnknownLocale};
 pub use queries::{
-    decode_disk_bytes, file_text_query, method_regions_query, parse_query, read_disk_text,
-    resolve_vfs_path_ci_query, resolve_vfs_path_query, set_parse_lru_sweep_mode,
+    decode_disk_bytes, file_text_query, file_text_unmemoized, method_regions_query, parse_query,
+    read_disk_text, resolve_vfs_path_ci_query, resolve_vfs_path_query, set_parse_lru_sweep_mode,
 };
 pub use scope::AnalysisScope;
 

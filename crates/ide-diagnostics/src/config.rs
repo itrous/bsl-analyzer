@@ -66,6 +66,11 @@ pub struct DiagnosticsConfig {
     /// (vendor-diff filter). Set programmatically by the driving surface, never
     /// from the `[diagnostics]` project config.
     pub scope: Option<std::sync::Arc<base_db::AnalysisScope>>,
+    /// Whether findings carry their quick fixes. On by default; a surface that never
+    /// offers them (the batch `analyze`) turns it off, so that no fix is built - some
+    /// prepare facts of the whole module for it. Set programmatically by the driving
+    /// surface, never from the `[diagnostics]` project config.
+    pub quick_fixes: bool,
 }
 
 /// `serde_json::Value` is only `PartialEq` (floats); a configuration is still
@@ -85,6 +90,7 @@ impl Default for DiagnosticsConfig {
             locale: Locale::default(),
             bslls_suppression_compat: true,
             scope: None,
+            quick_fixes: true,
         }
     }
 }
@@ -218,6 +224,7 @@ impl DiagnosticsConfig {
             locale: Locale::default(),
             bslls_suppression_compat: true,
             scope: None,
+            quick_fixes: true,
         }
     }
 
@@ -385,6 +392,7 @@ impl<'de> serde::Deserialize<'de> for DiagnosticsConfig {
                     locale: Locale::default(),
                     bslls_suppression_compat,
                     scope: None,
+                    quick_fixes: true,
                 })
             }
         }
@@ -491,6 +499,7 @@ impl DiagnosticsConfig {
             locale: input.locale,
             bslls_suppression_compat: input.bslls_suppression_compat,
             scope: input.scope.clone(),
+            quick_fixes: input.quick_fixes,
         }
     }
 
@@ -515,6 +524,7 @@ impl DiagnosticsConfig {
             }),
         )
         .with_scope(self.scope.clone())
+        .with_quick_fixes(self.quick_fixes)
     }
 
     pub fn apply_cli_filters(&mut self, only_diagnostic: &[String], disable_diagnostic: &[String]) {
@@ -1136,6 +1146,7 @@ mod interned_round_trip {
         );
         config.dataflow_max_iterations = 7;
         config.bslls_suppression_compat = false;
+        config.quick_fixes = false;
 
         let restored = DiagnosticsConfig::from_input(&config.to_input());
         assert_eq!(restored, config);
@@ -1145,5 +1156,8 @@ mod interned_round_trip {
         let mut other = config.clone();
         other.only_enabled = None;
         assert_ne!(other.to_input(), config.to_input());
+        let mut with_fixes = config.clone();
+        with_fixes.quick_fixes = true;
+        assert_ne!(with_fixes.to_input(), config.to_input());
     }
 }
