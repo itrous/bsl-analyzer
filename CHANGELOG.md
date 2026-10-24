@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-24
+
+### BREAKING
+
+- `lsp` без `--mode` теперь работает в режиме `auto`: при наличии корня проекта
+  подключается к общему backend, раньше — прямой stdio. Для редактора это значит,
+  что несколько окон одного проекта делят один backend.
+- `mcp --mode` для workspace-профиля по умолчанию `broker`, раньше `stdio`. Для
+  MCP-клиентов это значит общий демон вместо отдельного процесса на клиента.
+- `[diagnostics] ordinaryAppSupport` без значения берётся из `<DefaultRunMode>`
+  основной конфигурации, раньше — значение по умолчанию.
+
 ### Added
 
 - config: `[source].exclude_globs` — глоб-шаблоны файлов и каталогов, исключаемых из
