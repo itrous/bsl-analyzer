@@ -139,7 +139,8 @@ fn split_balance_spellings(member: &Member, prefix_en: &str, out: &mut Vec<Field
         let mut field = FieldDef::new(
             format!("{base_en}{prefix_en}{other}Balance{side_en}"),
             member.ty.clone(),
-        );
+        )
+        .derived_from(member.name.clone());
         field.provisional = true;
         out.push(field);
     }

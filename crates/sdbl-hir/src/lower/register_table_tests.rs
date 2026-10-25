@@ -779,3 +779,37 @@ fn an_implausible_ext_dimension_count_leaves_the_table_unjudged() {
     );
     assert_eq!(unknown_fields_in(Arc::new(config), &query), Vec::<String>::new());
 }
+
+/// Every field an accounting virtual table derives from a resource is a read of that resource,
+/// the unattested English split-balance spellings included: the graph links the read to
+/// `Ресурс1`, which the register declares, not to a name built from it.
+#[test]
+fn derived_accounting_fields_are_reads_of_their_resource() {
+    use crate::hir::SdblHir;
+
+    for (source, field) in [
+        ("РегистрБухгалтерии.Бухгалтерия1", "Ресурс2Дт"),
+        ("РегистрБухгалтерии.Бухгалтерия1.Остатки(&Период, , , )", "Ресурс1ОстатокДт"),
+        ("РегистрБухгалтерии.Бухгалтерия1.Остатки(&Период, , , )", "Ресурс1SplittedBalanceDr"),
+        (
+            "РегистрБухгалтерии.Бухгалтерия1.ОстаткиИОбороты(&Начало, &Конец, , , , , )",
+            "Ресурс1OpeningExtendedBalanceCr",
+        ),
+        (
+            "РегистрБухгалтерии.Бухгалтерия1.ОстаткиИОбороты(&Начало, &Конец, , , , , )",
+            "Ресурс1ClosingExtendedBalanceDr",
+        ),
+        ("РегистрБухгалтерии.Бухгалтерия1.Обороты(&Начало, &Конец, , , , , , )", "Ресурс1ОборотДт"),
+    ] {
+        let query = select_from(source, &[field]);
+        let package = lower_sdbl_to_hir(&parser::parse_sdbl(&query), Some(configuration(true)));
+        let mut attrs = Vec::new();
+        for q in package.queries() {
+            SdblHir::collect_resolved_attributes(&q.hir, &mut attrs);
+        }
+        let names: Vec<&str> = attrs.iter().map(|(_, _, a)| a.as_str()).collect();
+        let expected =
+            if field.starts_with("Ресурс2") { "Ресурс2" } else { "Ресурс1" };
+        assert_eq!(names, vec![expected], "{query}");
+    }
+}
