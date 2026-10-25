@@ -2591,6 +2591,202 @@ fn infer_effective_resolves_base_sibling_in_insertion() {
     );
 }
 
+/// A call inside a `#Вставка` runs in the extension module, so a method the extension
+/// declares itself is callable there. It resolves after the base's own methods, takes its
+/// type from its own body, and a name found in neither module stays unresolved.
+#[test]
+fn infer_effective_resolves_extension_method_in_insertion() {
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("src/cf");
+    let ext_root = temp.path().join("src/cfe/X");
+    std::fs::create_dir_all(&main_root).unwrap();
+    std::fs::create_dir_all(&ext_root).unwrap();
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+
+    let main_file = FileId(0);
+    let ext_file = FileId(1);
+    let mut file_set = FileSet::new();
+    let main_path = main_root.join("CommonModules/М/Ext/Module.bsl");
+    let ext_path = ext_root.join("CommonModules/М/Ext/Module.bsl");
+    file_set.insert(main_file, VfsPath::new(main_path.to_string_lossy().as_ref()));
+    file_set.insert(ext_file, VfsPath::new(ext_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(main_file, SourceRootId(0));
+    db.set_file_source_root(ext_file, SourceRootId(0));
+
+    db.set_file_text(main_file, "Функция Цель() Экспорт\n\tВозврат 0;\nКонецФункции");
+    db.set_file_text(
+        ext_file,
+        "&ИзменениеИКонтроль(\"Цель\")\n\
+         Функция Расш1_Цель()\n\
+         #Вставка\n\
+         \tЗначение1 = Расш1_Дополнить();\n\
+         \tЗначение2 = НетТакого();\n\
+         #КонецВставки\n\
+         \tВозврат 0;\n\
+         КонецФункции\n\
+         \n\
+         Функция Расш1_Дополнить()\n\
+         \tВозврат 1;\n\
+         КонецФункции",
+    );
+
+    let eid = hir::EffectiveModuleId::new(&db, main_file, ext_file);
+    let result = hir::infer_effective(&db, eid);
+
+    use bsl_types::builders::Builders;
+    use stdx::case::CaseExt;
+    let number = db.number(None, None);
+
+    assert_eq!(
+        result.var_types.get(&"Значение1".fold_lower()).copied(),
+        Some(number),
+        "the extension's own `Расш1_Дополнить()` (returns 1) called from `#Вставка` must \
+         resolve and type `Значение1` as Число; var_types = {:?}",
+        result.var_types.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !result.var_types.contains_key(&"Значение2".fold_lower()),
+        "a method neither module declares must stay unresolved; var_types = {:?}",
+        result.var_types.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Module-level statements of the base are not compiled in the extension, so they must not
+/// see a method only the extension declares.
+#[test]
+fn infer_effective_keeps_extension_names_out_of_base_module_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("src/cf");
+    let ext_root = temp.path().join("src/cfe/X");
+    std::fs::create_dir_all(&main_root).unwrap();
+    std::fs::create_dir_all(&ext_root).unwrap();
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+
+    let main_file = FileId(0);
+    let ext_file = FileId(1);
+    let mut file_set = FileSet::new();
+    let main_path = main_root.join("CommonModules/М/Ext/Module.bsl");
+    let ext_path = ext_root.join("CommonModules/М/Ext/Module.bsl");
+    file_set.insert(main_file, VfsPath::new(main_path.to_string_lossy().as_ref()));
+    file_set.insert(ext_file, VfsPath::new(ext_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(main_file, SourceRootId(0));
+    db.set_file_source_root(ext_file, SourceRootId(0));
+
+    db.set_file_text(
+        main_file,
+        "Знач = Расш1_Дополнить();\n\n\
+         Функция Цель() Экспорт\n\tВозврат 0;\nКонецФункции",
+    );
+    db.set_file_text(
+        ext_file,
+        "&ИзменениеИКонтроль(\"Цель\")\n\
+         Функция Расш1_Цель()\n\
+         #Вставка\n\
+         #КонецВставки\n\
+         \tВозврат 0;\n\
+         КонецФункции\n\
+         \n\
+         Функция Расш1_Дополнить()\n\
+         \tВозврат 1;\n\
+         КонецФункции",
+    );
+
+    let eid = hir::EffectiveModuleId::new(&db, main_file, ext_file);
+    let result = hir::infer_effective(&db, eid);
+
+    use bsl_types::builders::Builders;
+    let number = db.number(None, None);
+    let module_code = hir::DefWithBodyId::ModuleCode;
+    let types = &result.expr_types_by_body[&module_code];
+    assert!(
+        !types.values().any(|ty| *ty == number),
+        "module code of the base must not resolve an extension-only method; types = {types:?}"
+    );
+}
+
+/// The effective-module resolver retries a miss in the base's symbols against the
+/// extension: methods and module variables alike, base first.
+#[test]
+fn effective_resolver_falls_back_to_extension_symbols() {
+    use hir::{ModuleId, Name, Resolver};
+
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("src/cf");
+    let ext_root = temp.path().join("src/cfe/X");
+    std::fs::create_dir_all(&main_root).unwrap();
+    std::fs::create_dir_all(&ext_root).unwrap();
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+
+    let main_file = FileId(0);
+    let ext_file = FileId(1);
+    let mut file_set = FileSet::new();
+    let main_path = main_root.join("CommonModules/М/Ext/Module.bsl");
+    let ext_path = ext_root.join("CommonModules/М/Ext/Module.bsl");
+    file_set.insert(main_file, VfsPath::new(main_path.to_string_lossy().as_ref()));
+    file_set.insert(ext_file, VfsPath::new(ext_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(main_file, SourceRootId(0));
+    db.set_file_source_root(ext_file, SourceRootId(0));
+
+    db.set_file_text(
+        main_file,
+        "Перем БазоваяПеременная;\n\
+         Функция Цель() Экспорт\n\tВозврат 0;\nКонецФункции",
+    );
+    db.set_file_text(
+        ext_file,
+        "Перем РасширениеПеременная;\n\
+         &ИзменениеИКонтроль(\"Цель\")\n\
+         Функция Расш1_Цель()\n\
+         #Вставка\n\
+         #КонецВставки\n\
+         \tВозврат 0;\n\
+         КонецФункции\n\
+         \n\
+         Функция Расш1_Дополнить()\n\
+         \tВозврат 1;\n\
+         КонецФункции",
+    );
+
+    let eid = hir::EffectiveModuleId::new(&db, main_file, ext_file);
+    let interface = hir::module_interface_effective(&db, eid);
+    let resolver = Resolver::with_builtins_and_workspace_effective(
+        ModuleId::new(main_file),
+        interface,
+        Some(ModuleId::new(ext_file)),
+    );
+
+    let base_method = resolver.resolve_module_method(&db, &Name::new("Цель")).unwrap();
+    assert_eq!(base_method.module, ModuleId::new(main_file), "the base's own method wins");
+    let ext_method = resolver.resolve_module_method(&db, &Name::new("Расш1_Дополнить")).unwrap();
+    assert_eq!(ext_method.module, ModuleId::new(ext_file));
+    assert!(resolver.resolve_module_method(&db, &Name::new("НетТакого")).is_none());
+
+    let base_var = resolver.resolve_module_variable(&db, &Name::new("БазоваяПеременная")).unwrap();
+    assert_eq!(base_var.module, ModuleId::new(main_file));
+    let ext_var =
+        resolver.resolve_module_variable(&db, &Name::new("РасширениеПеременная")).unwrap();
+    assert_eq!(ext_var.module, ModuleId::new(ext_file));
+    assert!(resolver.resolve_module_variable(&db, &Name::new("НетТакой")).is_none());
+}
+
 /// [high] #2 regression: a `&ИзменениеИКонтроль` method's return type is inferred from
 /// its CHANGED body, and a sibling that calls it in the effective module must see that
 /// changed return — not the base body's. Base `Цель` returns a string; the extension

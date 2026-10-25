@@ -208,6 +208,43 @@ mod tests {
         assert!(branch.is_empty(), "an unproven branch cannot fail the module: {branch:?}");
     }
 
+    /// `#Вставка` code runs in the extension module, so a call to a method the extension
+    /// declares itself resolves there; the base's own methods stay callable, and a name
+    /// neither module declares is still reported (the effective pass is alive).
+    #[test]
+    fn a_change_and_validate_insertion_sees_the_extension_methods() {
+        fn run(insert: &str) -> Vec<String> {
+            let mut builder = test_fixture::CfeFixtureBuilder::new("");
+            builder.add_base_module(
+                "Сервер",
+                "Процедура Цель() Экспорт\nКонецПроцедуры\n\nПроцедура Проверить()\nКонецПроцедуры\n",
+            );
+            let ext = format!(
+                "&ИзменениеИКонтроль(\"Цель\")\nПроцедура Расш_Цель()\n#Вставка\n{insert}#КонецВставки\nКонецПроцедуры\n\nПроцедура Расш_Дополнить()\nКонецПроцедуры\n"
+            );
+            builder.add_extension("Расш", "");
+            crate::test_utils::check_cfe_at_with_db(
+                "CommonModules/Сервер/Ext/Module.bsl",
+                &ext,
+                builder.build(),
+                &[],
+                DiagnosticsConfig::default(),
+                |_| {},
+                |db, ctx| crate::file_diagnostics(db, ctx.file_id, ctx.config),
+            )
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnresolvedBareCall)
+            .map(|diag| diag.message)
+            .collect()
+        }
+        let own = run("\tРасш_Дополнить();\n");
+        assert!(own.is_empty(), "a method of the extension is callable: {own:?}");
+        let base = run("\tПроверить();\n");
+        assert!(base.is_empty(), "a method of the base is callable: {base:?}");
+        let both = run("\tРасш_Дополнить();\n\tНетТакойПроцедуры();\n");
+        assert_eq!(both.len(), 1, "only the unknown name is reported: {both:?}");
+    }
+
     /// An export variable of the application module is a value, not a method: calling
     /// it by name is still a call of nothing.
     #[test]

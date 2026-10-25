@@ -625,6 +625,15 @@ pub struct InferenceContext<'db> {
     /// name, one memo per declaration.
     local_symbols: Option<Arc<ModuleInterface>>,
 
+    /// The extension module an effective `&ИзменениеИКонтроль` module was spliced from,
+    /// present for the bodies the extension compiles — the `&ИзменениеИКонтроль` methods,
+    /// whose `#Вставка` code and kept base lines both run in the extension — and `None` for
+    /// the base module's top-level code, which the extension does not contain. A same-module
+    /// name that misses in `local_symbols` (the base's methods) retries against this
+    /// module's own declarations. Distinct from `weaving_base`, whose
+    /// meaning is "the base module" and which gates base-only behaviour.
+    effective_extension: Option<hir_def::ModuleId>,
+
     /// Effective return types of the module's own methods, keyed by `MethodId.local_id`,
     /// present only on the SECOND pass of effective inference. A bare same-module call to
     /// a `&ИзменениеИКонтроль` target must see its *changed* body's return, not the base
@@ -1043,6 +1052,7 @@ impl<'db> InferenceContext<'db> {
             db,
             context_file_id: file_id,
             local_symbols: None,
+            effective_extension: None,
             local_effective_returns: None,
             weaving_base: None,
             proceed_return: None,
@@ -1099,10 +1109,13 @@ impl<'db> InferenceContext<'db> {
     /// Inference over an effective `&ИзменениеИКонтроль` module: local bodies/symbols come
     /// from the spliced effective text (`local_symbols`), while configuration / metadata /
     /// cross-module resolution keeps `context_file_id = base_file`. Identical to [`Self::new`]
-    /// apart from same-module method/variable lookups, which route to `local_symbols`.
+    /// apart from same-module method/variable lookups, which route to `local_symbols` and,
+    /// on a miss, to the declarations of the extension file `ext_file_id`. Pass `None` for a
+    /// body the extension does not compile: the base module's own top-level code.
     pub fn new_effective(
         db: &'db dyn HirDatabase,
         base_file_id: FileId,
+        ext_file_id: Option<FileId>,
         local_symbols: Arc<ModuleInterface>,
         owner: DefWithBodyId,
         body: &Arc<Body>,
@@ -1113,6 +1126,7 @@ impl<'db> InferenceContext<'db> {
         // checks rather than misattribute them.
         let mut ctx = Self::new_impl(db, base_file_id, owner, body, false);
         ctx.local_symbols = Some(local_symbols);
+        ctx.effective_extension = ext_file_id.map(hir_def::ModuleId::new);
         ctx
     }
 
@@ -1297,7 +1311,12 @@ impl<'db> InferenceContext<'db> {
     /// `TypeKind::Unknown` call arm performs.
     fn bare_module_method_exists(&self, name: &Name) -> bool {
         let declared = match &self.local_symbols {
-            Some(symbols) => symbols.find_method(name).is_some(),
+            Some(symbols) => {
+                symbols.find_method(name).is_some()
+                    || self
+                        .effective_extension
+                        .is_some_and(|ext| self.db.interface_method_named(ext, name).is_some())
+            }
             None => {
                 let module_id = hir_def::ModuleId::new(self.context_file_id);
                 self.db.interface_method_named(module_id, name).is_some()
@@ -2146,9 +2165,11 @@ impl<'db> InferenceContext<'db> {
     fn get_resolver(&self) -> Resolver {
         let module_id = hir_def::ModuleId { file_id: self.context_file_id };
         match &self.local_symbols {
-            Some(symbols) => {
-                Resolver::with_builtins_and_workspace_effective(module_id, Arc::clone(symbols))
-            }
+            Some(symbols) => Resolver::with_builtins_and_workspace_effective(
+                module_id,
+                Arc::clone(symbols),
+                self.effective_extension,
+            ),
             None => match self.weaving_base {
                 Some(base) => Resolver::with_builtins_and_workspace_weaving(module_id, base),
                 None => Resolver::with_builtins_and_workspace(module_id),
@@ -5282,6 +5303,7 @@ impl<'db> InferenceContext<'db> {
         let effective_ret = self
             .local_effective_returns
             .as_ref()
+            .filter(|_| method.id.module.file_id == self.context_file_id)
             .and_then(|m| m.get(&method.id.local_id).copied())
             .filter(|ret| !self.is_unknown(*ret));
         let sig =
@@ -5330,7 +5352,12 @@ impl<'db> InferenceContext<'db> {
         // sibling that the extension does not define falls back to the paired
         // base module's declarations (the extension shadows the base).
         match &self.local_symbols {
-            Some(symbols) => symbols.find_method_shared(NormName::intern(name.as_str())).cloned(),
+            Some(symbols) => {
+                symbols.find_method_shared(NormName::intern(name.as_str())).cloned().or_else(|| {
+                    self.effective_extension
+                        .and_then(|ext| self.db.interface_method_named(ext, name))
+                })
+            }
             None => {
                 let module_id = hir_def::ModuleId::new(self.context_file_id);
                 self.db.interface_method_named(module_id, name)
@@ -6060,8 +6087,8 @@ pub fn infer_effective<'db>(
     eid: EffectiveModuleId<'db>,
 ) -> Arc<InferenceResult> {
     let base_file = eid.base_file(db);
-    let _p =
-        tracing::info_span!("infer_effective", ?base_file, ext_file = ?eid.ext_file(db)).entered();
+    let ext_file = eid.ext_file(db);
+    let _p = tracing::info_span!("infer_effective", ?base_file, ?ext_file).entered();
 
     let module_bodies = hir_def::effective_module::module_bodies_effective(db, eid);
     let interface = hir_def::effective_module::module_interface_effective(db, eid);
@@ -6074,7 +6101,7 @@ pub fn infer_effective<'db>(
     // therefore output-identical, while avoiding a re-inference of the whole — often large —
     // base module twice per extension file (the dominant cost on heavily-extended configs).
     let changed_ids: rustc_hash::FxHashSet<hir_def::MethodKey> = {
-        let ext_parse = db.parse(eid.ext_file(db));
+        let ext_parse = db.parse(ext_file);
         let changed_targets: rustc_hash::FxHashSet<String> = ext_parse
             .syntax_node()
             .children()
@@ -6107,6 +6134,7 @@ pub fn infer_effective<'db>(
         let mut ctx = InferenceContext::new_effective(
             db,
             base_file,
+            Some(ext_file),
             interface.clone(),
             DefWithBodyId::Method(local_id),
             &Arc::new(body.clone()),
@@ -6137,6 +6165,7 @@ pub fn infer_effective<'db>(
         let mut ctx = InferenceContext::new_effective(
             db,
             base_file,
+            None,
             interface.clone(),
             DefWithBodyId::ModuleCode,
             &Arc::new(body.clone()),
@@ -6153,6 +6182,7 @@ pub fn infer_effective<'db>(
         let mut ctx = InferenceContext::new_effective(
             db,
             base_file,
+            Some(ext_file),
             interface.clone(),
             DefWithBodyId::Method(local_id),
             &Arc::new(body.clone()),

@@ -27,10 +27,17 @@ pub enum Scope {
     /// symbols are tried FIRST (extension shadows base); the fallback only fills misses, so
     /// it can never turn a resolved name unresolved. Mutually exclusive with `local_symbols`
     /// (the `&ИзменениеИКонтроль` effective module already contains the merged base body).
+    ///
+    /// `extension_fallback` is the extension module an effective module was spliced from:
+    /// code inserted by `#Вставка` runs in the extension, so a lookup that misses in
+    /// `local_symbols` (the base's methods) retries against the extension's own
+    /// declarations. Set only together with `local_symbols`, and not for the base module's
+    /// top-level code, which the extension does not contain.
     ModuleScope {
         module_id: ModuleId,
         local_symbols: Option<Arc<ModuleInterface>>,
         base_fallback: Option<ModuleId>,
+        extension_fallback: Option<ModuleId>,
     },
 
     ExprScope {
@@ -50,6 +57,7 @@ impl Resolver {
                 module_id,
                 local_symbols: None,
                 base_fallback: None,
+                extension_fallback: None,
             }],
         }
     }
@@ -58,7 +66,12 @@ impl Resolver {
         Resolver {
             scopes: vec![
                 Scope::WorkspaceScope,
-                Scope::ModuleScope { module_id, local_symbols: None, base_fallback: None },
+                Scope::ModuleScope {
+                    module_id,
+                    local_symbols: None,
+                    base_fallback: None,
+                    extension_fallback: None,
+                },
             ],
         }
     }
@@ -68,7 +81,12 @@ impl Resolver {
             scopes: vec![
                 Scope::Builtins,
                 Scope::WorkspaceScope,
-                Scope::ModuleScope { module_id, local_symbols: None, base_fallback: None },
+                Scope::ModuleScope {
+                    module_id,
+                    local_symbols: None,
+                    base_fallback: None,
+                    extension_fallback: None,
+                },
             ],
         }
     }
@@ -78,9 +96,13 @@ impl Resolver {
     /// instead of the module's declarations by name. Cross-module / metadata resolution still
     /// keys on `module_id.file_id`, which is the base file — correct, because the
     /// effective module *is* the base module with the extension's edits applied.
+    /// A name that misses in `local_symbols` retries against `extension_module`, the
+    /// extension the effective module was spliced from (base shadows extension); `None`
+    /// for a body the extension does not compile.
     pub fn with_builtins_and_workspace_effective(
         module_id: ModuleId,
         local_symbols: Arc<ModuleInterface>,
+        extension_module: Option<ModuleId>,
     ) -> Self {
         Resolver {
             scopes: vec![
@@ -90,6 +112,7 @@ impl Resolver {
                     module_id,
                     local_symbols: Some(local_symbols),
                     base_fallback: None,
+                    extension_fallback: extension_module,
                 },
             ],
         }
@@ -113,6 +136,7 @@ impl Resolver {
                     module_id,
                     local_symbols: None,
                     base_fallback: Some(base_module_id),
+                    extension_fallback: None,
                 },
             ],
         }
@@ -184,6 +208,17 @@ impl Resolver {
         None
     }
 
+    /// The extension module to retry same-module lookups against after a miss in the
+    /// effective module's symbols ([`Self::with_builtins_and_workspace_effective`]).
+    fn module_extension_fallback(&self) -> Option<ModuleId> {
+        for scope in &self.scopes {
+            if let Scope::ModuleScope { extension_fallback, .. } = scope {
+                return *extension_fallback;
+            }
+        }
+        None
+    }
+
     pub fn resolve_local(&self, name: &Name) -> Option<ResolvedLocal> {
         for scope in self.scopes.iter().rev() {
             if let Scope::ExprScope { scopes, scope_id } = scope {
@@ -198,7 +233,11 @@ impl Resolver {
 
     pub fn resolve_module_method(&self, db: &dyn DefDatabase, name: &Name) -> Option<MethodId> {
         if let Some(symbols) = self.module_local_symbols() {
-            return symbols.find_method(name).map(|m| m.id);
+            if let Some(m) = symbols.find_method(name) {
+                return Some(m.id);
+            }
+            let extension = self.module_extension_fallback()?;
+            return db.interface_method_named(extension, name).map(|m| m.id);
         }
         let module_id = self.module_id()?;
         if let Some(m) = db.interface_method_named(module_id, name) {
@@ -213,7 +252,11 @@ impl Resolver {
 
     pub fn resolve_module_variable(&self, db: &dyn DefDatabase, name: &Name) -> Option<VariableId> {
         if let Some(symbols) = self.module_local_symbols() {
-            return symbols.find_variable(name).map(|v| v.id);
+            if let Some(v) = symbols.find_variable(name) {
+                return Some(v.id);
+            }
+            let extension = self.module_extension_fallback()?;
+            return db.interface_variable_named(extension, name).map(|v| v.id);
         }
         let module_id = self.module_id()?;
         if let Some(v) = db.interface_variable_named(module_id, name) {
