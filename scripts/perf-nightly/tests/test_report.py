@@ -71,6 +71,12 @@ class Report(unittest.TestCase):
         self.assertIn("| rss_ready_kb | 20 |", out)
         self.assertNotIn("999", out)
 
+    def test_memory_in_the_fingerprint_survives_a_reboot(self):
+        # Seen on the stand: 32 746 720 kB before a reboot, 32 746 712 kB after.
+        self.assertEqual(perf_nightly.mem_total_gib("32746720 kB"), "31 GiB")
+        self.assertEqual(perf_nightly.mem_total_gib("32746712 kB"), "31 GiB")
+        self.assertNotEqual(perf_nightly.mem_total_gib("65493424 kB"), "31 GiB")
+
     def test_measure_records_the_harness_schema_in_its_fingerprint(self):
         fingerprint = perf_nightly.env_fingerprint({"rustc": "rustc test"},
                                                    {"commit": "b" * 40, "mode": "full"}, "points")

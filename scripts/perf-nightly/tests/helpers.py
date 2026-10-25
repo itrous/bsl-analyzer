@@ -189,15 +189,15 @@ class Workspace(unittest.TestCase):
         write_json(self.data.points("crm"), doc)
         return doc
 
-    def fake_binary(self, has_help=True, label="fake"):
+    def fake_binary(self, has_help=True, label="fake", sha="a" * 40):
         bin_dir = os.path.join(self.data_dir, "bin", label)
         os.makedirs(bin_dir, exist_ok=True)
         path = os.path.join(bin_dir, "bsl-analyzer-app")
         with open(path, "w") as fh:
-            fh.write(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_APP}" "$@"\n')
+            fh.write(f'#!/bin/sh\nFAKE_LABEL=\'{label}\' exec "{sys.executable}" "{FAKE_APP}" "$@"\n')
         os.chmod(path, 0o755)
         write_json(os.path.join(bin_dir, "build.json"), {
-            "label": label, "sha": "a" * 40, "rustc": "rustc test", "has_platform_help": has_help,
+            "label": label, "sha": sha, "rustc": "rustc test", "has_platform_help": has_help,
             "sha256": sha256_file(path)})
         return path
 

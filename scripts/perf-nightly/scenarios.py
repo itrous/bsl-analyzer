@@ -64,7 +64,23 @@ class Ctx:
     points: dict
     snap_meta: dict
     clients: int = 1
+    # Positive controls: a latency relay in front of the server, and a hook run
+    # once readiness and its memory are taken (plan §13, slice 2).
+    relay: list | None = None
+    after_ready: object = None
+    applied: set = field(default_factory=set)
     out: dict = field(default_factory=lambda: {"metrics": {}, "calls": [], "errors": []})
+
+    def server_argv(self, argv: list, framing: str) -> list:
+        if not self.relay:
+            return argv
+        self.applied.add("inject_latency_ms")
+        return [*self.relay, "--framing", framing, "--", *argv]
+
+    def ready_hook(self) -> None:
+        if self.after_ready is not None:
+            self.applied.add("ballast_after_ready_mb")
+            self.after_ready()
 
     def call(self, entry: dict) -> None:
         self.out["calls"].append(entry)
@@ -365,7 +381,7 @@ class LspRun:
         self.stderr_path = os.path.join(ctx.run_dir, "stderr.txt")
         self._stderr = open(self.stderr_path, "wb")
         self.spawned_at = ctx.clock.now()
-        self.client = HarnessLsp([ctx.binary, "lsp"], ctx.root, ctx.env, self._stderr, ctx.clock)
+        self.client = HarnessLsp(ctx.server_argv([ctx.binary, "lsp"], "lsp"), ctx.root, ctx.env, self._stderr, ctx.clock)
         self.sampler = procs.Sampler(ctx.run_id)
 
     def uri(self, relative_path: str) -> str:
@@ -501,6 +517,7 @@ def run_lsp_session(ctx: Ctx) -> dict:
         m["rss_ready_kb"] = snap["rss_kb"]
         m["rss_ready_by_pid"] = snap["rss_by_pid"]
         m["cpu_start_s"] = round(snap["cpu_s"], 3)
+        ctx.ready_hook()
         for call_id, push_key, file_key in (("L5", "L5", "F"), ("L5s", "L5s", "F_small")):
             if push_key in p and file_key in p:
                 run.publish(call_id, p[file_key])
@@ -691,7 +708,8 @@ class McpRun:
         self._stderr = open(self.stderr_path, "wb")
         self.spawned_at = ctx.clock.now()
         self.client = McpClient(
-            [ctx.binary, "mcp", "serve", "--profile", "workspace", "--source-dir", ctx.root],
+            ctx.server_argv([ctx.binary, "mcp", "serve", "--profile", "workspace", "--source-dir", ctx.root],
+                            "lines"),
             ctx.root, ctx.env, self._stderr, ctx.clock)
         self.actions: dict = {}
 
@@ -850,6 +868,7 @@ def run_mcp_memory(ctx: Ctx) -> dict:
         m["rss_start_kb"] = procs.snapshot(ctx.run_id)["rss_kb"]
         m["ready_s"] = run.wait_ready()
         m["rss_ready_kb"] = procs.snapshot(ctx.run_id)["rss_kb"]
+        ctx.ready_hook()
         by_call: dict[str, list] = {}
         for index in range(MCP_MEMORY_ROUNDS):
             for sample in run.round(index):

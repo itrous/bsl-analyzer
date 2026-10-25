@@ -43,10 +43,34 @@ python3 $P helpcheck --data-dir $D --binary $B
 python3 $P measure --data-dir $D --corpus crm --binary $B \
   --scenario lsp-session --temp warm --series s1 --runs 3
 python3 $P report --data-dir $D --corpus crm --series s1
+python3 $P suite --data-dir $D --binary $B --series night-2026-10-21  # ночной набор одного бинаря
+python3 $P calibrate --data-dir $D --binary $B --series 5   # cal-<i> и $D/noise.json
+python3 $P compare --data-dir $D --base v0.3.2/cal-1 --candidate v0.3.2/cal-2 --trend
+python3 $P night --data-dir $D --deadline 08:45            # → $D/nights/<дата>/
+python3 $P night --data-dir $D --candidate v0.3.3          # гейт тега → $D/gates/v0.3.3/
 python3 -m unittest discover -s scripts/perf-nightly/tests
 ```
 
+`night` собирает develop (или тег-кандидат) и последний релиз-предок, меряет ночной
+набор обоих в одном окне и пишет `summary.json`, `report.md` и `compare.json` с
+вердиктом `ok`, `issue`, `block` или `incomplete`. Прогон, который не успевает к
+дедлайну по оценке прошлой ночи, пропускается с `window_exhausted`, и ночь не может
+быть `ok`. Без актуального `noise.json` ночь вместо набора меряет две серии
+калибровки последнего релиза, а после пятой пишет `noise.json`. Калибровку и
+сравнимость сбрасывают смена CPU, числа потоков, снимка корпуса, его режима, файла
+точек или схемы харнеса; версии ядра и `rustc` и объём памяти пишутся в каждый
+прогон, но обновление системы калибровку не сбрасывает. Положительные
+контроли `measure`: `--ballast-mb`, `--ballast-after-ready-mb`, `--inject-latency-ms`;
+контроль времени — запуск `measure` под `taskset -c 0-3`.
+
+Корпус, чей закоммиченный `bsl-analyzer.toml` проверяемые версии отвергают, получает
+в `corpora.toml` поле `config` — путь к приватной копии конфига в каталоге данных;
+рабочий конфиг снимка строится от неё, репозиторий корпуса не меняется.
+
 Сценарии: `analyze`, `lsp-session`, `lsp-workspace-diag`, `mcp-memory`, `mcp-start`,
 `mcp-load`. Warm-серия сценария идёт раньше cold, `mcp-memory` — раньше `mcp-start`
-и `mcp-load` той же серии. Если на машине работает чужой `bsl-analyzer*`, прогоны
-отменяются с `foreign_process`.
+и `mcp-load` той же серии. Ручной `measure` отменяет прогоны с `foreign_process`, если
+на машине работает чужой `bsl-analyzer*`. `night`, `calibrate` и `suite` чужие процессы
+не проверяют и не ждут: их нагрузка входит в замеры и в калибровку шума.
+Процесс своего прогона, переживший останов, проверяется всегда: пока он жив, следующие прогоны
+не запускаются и пишутся с `survivor_running`.

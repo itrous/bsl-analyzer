@@ -77,6 +77,26 @@ class JsonlValidity(unittest.TestCase):
                 with self.subTest(violation=number), self.assertRaisesRegex(scenarios.NotHeld, "invalid_jsonl"):
                     validate(value)
 
+    def test_a_byte_that_is_not_utf8_is_named_even_when_every_count_agrees(self):
+        # Decoding with replacement turns the byte into U+FFFD and leaves a stream that is consistent
+        # in every count, so only the bytes themselves tell the two readings apart.
+        import tempfile
+        stream = (b'{"type": "start", "total_files": 1}\n'
+                  b'{"type": "file", "path": "%s", "diagnostics": []}\n'
+                  b'{"type": "done", "total_files": 1, "total_diagnostics": 0, "failed_files": 0}\n')
+        with tempfile.NamedTemporaryFile("wb") as fh:
+            def validate(path: bytes):
+                fh.seek(0)
+                fh.truncate()
+                fh.write(stream % path)
+                fh.flush()
+                return scenarios.validate_jsonl(fh.name)
+
+            self.assertEqual(validate(b"a.bsl")["paths"], ["a.bsl"])
+            with self.assertRaises(scenarios.NotHeld) as caught:
+                validate(b"\xff.bsl")
+        self.assertEqual((caught.exception.reason, caught.exception.detail), ("invalid_jsonl", "line 2 is not UTF-8"))
+
 
 class Scope(unittest.TestCase):
     """Invariant И50 on a git corpus: base `vendor`, a commit changes two modules."""

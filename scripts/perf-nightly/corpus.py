@@ -187,7 +187,10 @@ def make_snapshot(data, manifest: dict, corpus_id: str) -> dict:
         raise HarnessError("snapshot_mismatch", f"{CONFIG_NAME} is missing in the snapshot root")
     # The checked-out text, not the blob: checkout may convert line endings.
     git("checkout", "--", CONFIG_NAME, cwd=snap)
-    with open(os.path.join(snap, CONFIG_NAME), "rb") as fh:
+    # `config` names a private copy of the corpus config to start from, for a
+    # corpus whose committed config the measured versions refuse; the corpus
+    # repository itself is never edited.
+    with open(corpus.get("config") or os.path.join(snap, CONFIG_NAME), "rb") as fh:
         original = fh.read().decode("utf-8")
     variants = {}
     for name, help_section in (("help", manifest["platform_help"]), ("builtin", None)):
@@ -202,6 +205,8 @@ def make_snapshot(data, manifest: dict, corpus_id: str) -> dict:
         "diff_base_ref": ref,
         "diff_base_sha": corpus.get("diff_base_sha") if ref else None,
         "variants": variants,
+        "config_origin": {"override": bool(corpus.get("config")),
+                          "sha256": sha256_bytes(original.encode())},
         "files_total": count_sources(snap),
     }
     write_json(data.snapshot_meta(corpus_id), meta)

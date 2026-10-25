@@ -1,19 +1,23 @@
 """`measure` orchestration on the fake binary: temperature, cache map,
 foreign processes, help check and refusals (plan §7, §8)."""
 
+import contextlib
 import fcntl
+import io
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import unittest
 
-from helpers import FOREIGN_PREFIX, FakeClock, Workspace, set_mode
+from helpers import FOREIGN_PREFIX, FakeClock, Workspace, run_git, set_mode
 
+import common
 import corpus
 import perf_nightly
 import procs
-from common import HarnessError, repo_root
+from common import HarnessError
 
 
 class Temperature(Workspace):
@@ -160,6 +164,67 @@ class Foreign(Workspace):
         self.assertEqual(len([l for l in self.launches() if l["argv"][:1] == ["analyze"]
                               and "BSL_LOG" not in l["env"]]), 2)
 
+    def test_the_measure_command_looks_for_bsl_analyzer_processes_by_default(self):
+        # The nightly set passes no prefix and never asks; the debugging command keeps the check.
+        from unittest.mock import patch
+        found = [{"pid": 4242, "name": "bsl-analyzer-app"}]
+        with patch.object(procs, "foreign", return_value=found) as foreign, \
+                contextlib.redirect_stdout(io.StringIO()):
+            perf_nightly.cmd_measure(self.args(scenario="analyze", temp="warm"), FakeClock())
+        self.assertEqual({call.kwargs["prefix"] for call in foreign.call_args_list}, {"bsl-analyzer"})
+        for k in (1, 2, 3):
+            record = self.record("analyze", f"r{k}")
+            self.assertEqual((record["held"], record["reason"]), (False, "foreign_process"))
+            self.assertIn("4242", record["errors"][0])
+        self.assertEqual([l for l in self.launches() if "BSL_LOG" not in l["env"]], [])
+
+
+class Survivors(Workspace):
+    """A process a run could not stop holds the group's cache and CPU: while it lives, no run starts."""
+
+    def setUp(self):
+        super().setUp()
+        self.helpcheck()
+
+    def survivor(self, run_id):
+        proc = subprocess.Popen([sys.executable, "-c", "import signal\nprint(flush=True)\nsignal.pause()"],
+                                env={**os.environ, procs.MARKER: run_id}, stdout=subprocess.PIPE)
+        proc.stdout.readline()
+        return proc
+
+    def run_beside(self, survivors):
+        with contextlib.redirect_stdout(io.StringIO()):
+            perf_nightly.Measure(self.args(scenario="analyze", temp="warm"), FakeClock(), self.data,
+                                 foreign_prefix=None, survivors=survivors).run()
+
+    def test_a_live_survivor_stops_every_run(self):
+        proc = self.survivor("earlier-run")
+        survivors = {proc.pid: "earlier-run"}
+        try:
+            self.run_beside(survivors)
+        finally:
+            proc.kill()
+            proc.wait()
+            proc.stdout.close()
+        for k in (1, 2, 3):
+            record = self.record("analyze", f"r{k}")
+            self.assertEqual((record["held"], record["reason"]), (False, "survivor_running"))
+            self.assertIn(str(proc.pid), record["errors"][0])
+        self.assertEqual([l for l in self.launches() if "BSL_LOG" not in l["env"]], [])
+        self.assertEqual(survivors, {proc.pid: "earlier-run"})
+
+    def test_a_survivor_that_has_exited_stops_nothing(self):
+        proc = self.survivor("earlier-run")
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        survivors = {proc.pid: "earlier-run"}
+        self.run_beside(survivors)
+        for k in (1, 2, 3):
+            record = self.record("analyze", f"r{k}")
+            self.assertEqual((record["held"], record["reason"]), (True, None))
+        self.assertEqual(survivors, {})
+
 
 class Refusals(Workspace):
     def test_failed_helpcheck_marks_every_run_without_launching(self):
@@ -222,9 +287,23 @@ class Refusals(Workspace):
         code = perf_nightly.main(["snapshot", "--data-dir", self.data_dir, "--corpus", "crm"])
         self.assertEqual(code, 2)
 
+    @unittest.skipIf(shutil.which("git") is None, "git is not installed")
     def test_data_dir_inside_the_repository_is_refused(self):
-        inside = os.path.join(repo_root(), "scripts", "perf-nightly", "no-such-data")
-        code = perf_nightly.main(["report", "--data-dir", inside, "--corpus", "crm"])
+        from unittest.mock import patch
+        # The harness here lives in a fresh git work tree of its own, so the check does not depend on
+        # where the tests run from (a checkout, a worktree or an exported copy) or on GIT_* variables.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        repo = os.path.join(self.tmp, "harness-repo")
+        harness = os.path.join(repo, "scripts", "perf-nightly")
+        os.makedirs(harness)
+        inside = os.path.join(harness, "no-such-data")
+        with patch.dict(os.environ, env, clear=True):
+            run_git("init", "-q", cwd=repo)
+            with patch.object(common, "HERE", harness):
+                code = perf_nightly.main(["report", "--data-dir", inside, "--corpus", "crm"])
+                with self.assertRaisesRegex(HarnessError, "data_dir_in_repo"):
+                    common.Data(inside)
+                common.Data(self.data_dir)
         self.assertEqual(code, 2)
         self.assertFalse(os.path.exists(inside))
 

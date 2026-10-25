@@ -1,6 +1,7 @@
 """Working config, snapshot verification (И7) and call points (И8)."""
 
 import os
+import shutil
 import subprocess
 import tomllib
 import unittest
@@ -137,6 +138,23 @@ class SnapshotVerify(Workspace):
         snap = self.data.snapshot("ut")
         corpus.prepare_snapshot(snap, meta, "help")
         return snap, meta
+
+    def test_a_private_config_replaces_the_committed_one(self):
+        # The committed config of a corpus can be one the measured versions refuse
+        # (an unknown key); the snapshot then starts from a private copy instead.
+        override = os.path.join(self.tmp, "override.toml")
+        with open(override, "w", encoding="utf-8") as fh:
+            fh.write('[source]\nroot = "."\n\n[analysis]\ndiff_base = "vendor"\n')
+        crm = {**self.manifest["corpora"]["crm"], "config": override}
+        shutil.rmtree(self.snap)
+        meta = corpus.make_snapshot(self.data, {**self.manifest, "corpora": {"crm": crm}}, "crm")
+        text = meta["variants"]["help"]["text"]
+        self.assertIn('root = "."', text)
+        self.assertNotIn("checked_environments", text)
+        self.assertNotIn("diff_base", text, "full mode still drops it")
+        self.assertTrue(meta["config_origin"]["override"])
+        corpus.prepare_snapshot(self.snap, meta, "help")
+        corpus.verify_snapshot(self.snap, meta, "help")
 
     def test_moved_diff_base_ref_is_refused(self):
         snap, meta = self.diff_snapshot()

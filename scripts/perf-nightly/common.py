@@ -10,6 +10,8 @@ import subprocess
 
 # Grows whenever the way a metric is measured changes (plan §8.5).
 HARNESS_SCHEMA = 1
+# Runs not measured for a reason outside the binary: the side is `missing`, not `failed`.
+MISSING_REASONS = ("foreign_process", "window_exhausted", "survivor_running")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 

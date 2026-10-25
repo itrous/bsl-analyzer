@@ -2,7 +2,7 @@
 
 Behaviour is chosen by environment variables (the harness strips only `BSL_*`):
   FAKE_LOG     directory for logs (argv, cwd, environment, launch counter)
-  FAKE_MODE    comma-separated switches, see below
+  FAKE_MODE    comma-separated switches, see below; `<label>=<switch>` only for that binary
 Every launch appends `{"argv", "cwd", "env", "cache"}` to FAKE_LOG/launches.jsonl.
 
 Switches:
@@ -29,7 +29,9 @@ import sys
 import tomllib
 import urllib.parse
 
-MODE = set(filter(None, os.environ.get("FAKE_MODE", "").split(",")))
+# `<label>=<switch>` applies the switch only to the fake binary with that label.
+MODE = {m.split("=", 1)[-1] for m in filter(None, os.environ.get("FAKE_MODE", "").split(","))
+        if "=" not in m or m.split("=", 1)[0] == os.environ.get("FAKE_LABEL")}
 LOG = os.environ.get("FAKE_LOG")
 
 
