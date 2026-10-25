@@ -38,98 +38,134 @@ pub(super) fn run(args: SearchBaselineRetentionArgs) -> Result<(), Box<dyn Error
     let project = project_model::Project::new(&args.source_dir)?;
     project.warn_about_external_discovery_rejections();
     let policy = &project.config.search.baseline.workspace_code.policy;
-    if !policy.is_configured() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "workspace baseline policy is not configured in .bsl-analyzer.json",
-        )
-        .into());
-    }
+    require_configured(policy)?;
 
     let adapter = postgres::build_project_adapter_for_project(
         &project,
         project_model::PostgresAccessMode::Reader,
     )?;
-    let snapshots = adapter.list_snapshots(
-        Some(bsl_search::CorpusId::WorkspaceCode.as_str()),
-        args.branch.as_deref(),
-        None,
-        args.limit,
-    )?;
+    let catalog = adapter.snapshot_catalog()?;
+    let snapshots = records_from_catalog(&catalog, branch_filter(args.branch.as_deref()));
 
     if snapshots.is_empty() {
         println!("No workspace-code snapshots found.");
         return Ok(());
     }
 
-    let assessments = analyze(policy, &snapshots, Utc::now());
-    let active_heads = assessments
+    print!("{}", render(policy, &snapshots, args.limit, Utc::now()));
+    Ok(())
+}
+
+fn require_configured(
+    policy: &project_model::SearchBaselinePolicyConfig,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if policy.is_configured() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "workspace baseline policy is not configured in .bsl-analyzer.json",
+    )
+    .into())
+}
+
+/// The `--branch` value as the listing it replaces read it: surrounding blanks dropped, blank
+/// means every branch.
+fn branch_filter(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|branch| !branch.is_empty())
+}
+
+/// The `workspace-code` snapshots of the catalogue, optionally of one branch, in the shape
+/// `analyze` reads. Totals are not part of the catalogue and stay zero: retention never looks at
+/// them.
+pub(super) fn records_from_catalog(
+    catalog: &bsl_search::BaselineSnapshotCatalog,
+    branch: Option<&str>,
+) -> Vec<bsl_search::BaselineSnapshotRecord> {
+    catalog
+        .snapshots
         .iter()
-        .filter(|assessment| matches!(assessment.status, SnapshotRetentionStatus::ActiveHead))
-        .count();
-    let safety_heads = assessments
-        .iter()
-        .filter(|assessment| matches!(assessment.status, SnapshotRetentionStatus::SafetyHead))
-        .count();
-    let within_window = assessments
-        .iter()
-        .filter(|assessment| matches!(assessment.status, SnapshotRetentionStatus::WithinWindow))
-        .count();
-    let expired_candidates = assessments
-        .iter()
-        .filter(|assessment| matches!(assessment.status, SnapshotRetentionStatus::ExpiredCandidate))
-        .count();
-    let protected_by_min = assessments
-        .iter()
-        .filter(|assessment| {
-            assessment.protections.iter().any(|value| value == "minimum-preservation")
+        .filter(|snapshot| snapshot.corpus == bsl_search::CorpusId::WorkspaceCode.as_str())
+        .filter(|snapshot| branch.is_none_or(|branch| snapshot.branch.as_deref() == Some(branch)))
+        .map(|snapshot| bsl_search::BaselineSnapshotRecord {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            corpus: snapshot.corpus.clone(),
+            fingerprint: None,
+            parent_snapshot_id: snapshot.parent_snapshot_id.clone(),
+            branch: snapshot.branch.clone(),
+            commit: None,
+            created_at: snapshot.created_at.clone(),
+            files: 0,
+            documents: 0,
         })
-        .count();
-    let protected_by_ancestry = assessments
-        .iter()
-        .filter(|assessment| assessment.protections.iter().any(|value| value == "has-descendants"))
-        .count();
+        .collect()
+}
 
-    println!("Shared baseline retention analysis:");
-    println!("  Corpus:                     workspace-code");
-    println!("  Develop retention:          {} days", policy.retention.develop_retention_days);
-    println!("  Vendor heads kept:          {}", policy.retention.vendor_keep_heads);
-    println!("  Min snapshots per branch:   {}", policy.retention.min_snapshots_per_branch);
-    println!("  Note:                       destructive snapshot cleanup is not implemented; candidates are advisory only.");
-    println!();
-    println!("Summary:");
-    println!("  Active heads:               {}", active_heads);
-    println!("  Safety heads:               {}", safety_heads);
-    println!("  Within window:              {}", within_window);
-    println!("  Expired candidates:         {}", expired_candidates);
-    println!("  Protected by min rule:      {}", protected_by_min);
-    println!("  Protected by ancestry:      {}", protected_by_ancestry);
+/// The retention report: the summary counts every snapshot, `limit` only bounds the listing.
+pub(super) fn render(
+    policy: &project_model::SearchBaselinePolicyConfig,
+    snapshots: &[bsl_search::BaselineSnapshotRecord],
+    limit: usize,
+    now: DateTime<Utc>,
+) -> String {
+    let assessments = analyze(policy, snapshots, now);
+    let count = |status: SnapshotRetentionStatus| {
+        assessments.iter().filter(|assessment| assessment.status == status).count()
+    };
+    let protected_by = |protection: &str| {
+        assessments
+            .iter()
+            .filter(|assessment| assessment.protections.iter().any(|value| value == protection))
+            .count()
+    };
 
-    for assessment in assessments {
-        println!();
-        println!("  Snapshot:     {}", assessment.snapshot_id);
-        println!("  Branch:       {}", assessment.branch);
-        println!("  Created:      {}", assessment.created_at);
-        println!(
+    let mut out = String::new();
+    let mut line = |text: String| {
+        out.push_str(&text);
+        out.push('\n');
+    };
+    line("Shared baseline retention analysis:".to_owned());
+    line("  Corpus:                     workspace-code".to_owned());
+    line(format!("  Develop retention:          {} days", policy.retention.develop_retention_days));
+    line(format!("  Vendor heads kept:          {}", policy.retention.vendor_keep_heads));
+    line(format!("  Min snapshots per branch:   {}", policy.retention.min_snapshots_per_branch));
+    line("  Note:                       delete expired candidates with `search baseline admin prune` (dry-run first); a retained snapshot whose parent is deleted is made standalone first.".to_owned());
+    line(String::new());
+    line("Summary:".to_owned());
+    line(format!("  Active heads:               {}", count(SnapshotRetentionStatus::ActiveHead)));
+    line(format!("  Safety heads:               {}", count(SnapshotRetentionStatus::SafetyHead)));
+    line(format!("  Within window:              {}", count(SnapshotRetentionStatus::WithinWindow)));
+    line(format!(
+        "  Expired candidates:         {}",
+        count(SnapshotRetentionStatus::ExpiredCandidate)
+    ));
+    line(format!("  Protected by min rule:      {}", protected_by("minimum-preservation")));
+    line(format!("  Protected by ancestry:      {}", protected_by("has-descendants")));
+
+    for assessment in assessments.into_iter().take(limit) {
+        line(String::new());
+        line(format!("  Snapshot:     {}", assessment.snapshot_id));
+        line(format!("  Branch:       {}", assessment.branch));
+        line(format!("  Created:      {}", assessment.created_at));
+        line(format!(
             "  Age:          {}",
             assessment
                 .age_days
                 .map(|days| format!("{days} days"))
                 .unwrap_or_else(|| "unknown".to_owned())
-        );
-        println!("  Retention:    {}", assessment.status.as_str());
-        println!("  Reason:       {}", assessment.reason);
-        println!(
+        ));
+        line(format!("  Retention:    {}", assessment.status.as_str()));
+        line(format!("  Reason:       {}", assessment.reason));
+        line(format!(
             "  Protections:  {}",
             if assessment.protections.is_empty() {
                 "-".to_owned()
             } else {
                 assessment.protections.join(", ")
             }
-        );
+        ));
     }
-
-    Ok(())
+    out
 }
 
 pub(super) fn analyze(
@@ -225,7 +261,32 @@ mod tests {
     use bsl_search::BaselineSnapshotRecord;
     use chrono::{TimeZone, Utc};
 
-    use super::{analyze, SnapshotRetentionStatus};
+    use super::{
+        analyze, branch_filter, records_from_catalog, render, require_configured,
+        SnapshotRetentionStatus,
+    };
+
+    #[test]
+    fn the_branch_flag_drops_blanks_and_a_blank_one_means_every_branch() {
+        assert_eq!(branch_filter(Some(" develop ")), Some("develop"));
+        assert_eq!(branch_filter(Some("develop")), Some("develop"));
+        assert_eq!(branch_filter(Some("   ")), None);
+        assert_eq!(branch_filter(Some("")), None);
+        assert_eq!(branch_filter(None), None);
+    }
+
+    #[test]
+    fn retention_without_a_policy_is_refused_by_name() {
+        let error = require_configured(&project_model::SearchBaselinePolicyConfig::default())
+            .expect_err("an unconfigured policy is refused");
+        assert_eq!(
+            error.to_string(),
+            "workspace baseline policy is not configured in .bsl-analyzer.json"
+        );
+        let configured: project_model::SearchBaselinePolicyConfig =
+            serde_json::from_value(serde_json::json!({ "publishBranches": ["develop"] })).unwrap();
+        assert!(require_configured(&configured).is_ok());
+    }
 
     #[test]
     fn analyze_marks_vendor_safety_and_descendant_protection() {
@@ -322,6 +383,59 @@ mod tests {
             .find(|item| item.snapshot_id == "workspace-code:develop@old")
             .unwrap();
         assert_eq!(old.status, SnapshotRetentionStatus::ExpiredCandidate);
+    }
+
+    #[test]
+    fn retention_assesses_the_whole_catalog() {
+        let policy: project_model::SearchBaselinePolicyConfig = serde_json::from_value(serde_json::json!({
+            "publishBranches": ["vendor", "develop"],
+            "branches": [{ "match": "*", "selectBranch": "develop", "fallbackBranch": "vendor" }],
+            "retention": { "developRetentionDays": 30, "vendorKeepHeads": 2, "minSnapshotsPerBranch": 1 }
+        }))
+        .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 25, 12, 0, 0).unwrap();
+        let at = |days: i64| {
+            (now - chrono::Duration::days(days) - chrono::Duration::hours(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        };
+        // One more than the listing limit of 200, so a reader bounded by it cannot pass.
+        let mut snapshots: Vec<bsl_search::BaselineCatalogSnapshot> = (0..201)
+            .map(|day| bsl_search::BaselineCatalogSnapshot {
+                snapshot_id: format!("d{day:03}"),
+                corpus: "workspace-code".to_owned(),
+                branch: Some("develop".to_owned()),
+                parent_snapshot_id: None,
+                created_at: at(day),
+            })
+            .collect();
+        snapshots.push(bsl_search::BaselineCatalogSnapshot {
+            snapshot_id: "ref".to_owned(),
+            corpus: "reference".to_owned(),
+            branch: Some("develop".to_owned()),
+            parent_snapshot_id: None,
+            created_at: at(1),
+        });
+        let catalog = bsl_search::BaselineSnapshotCatalog { snapshots, heads: vec![] };
+
+        let records = records_from_catalog(&catalog, None);
+        assert_eq!(records.len(), 201, "only workspace-code is assessed");
+        let report = render(&policy, &records, 5, now);
+        for line in [
+            "  Active heads:               1",
+            "  Within window:              30",
+            "  Expired candidates:         170",
+        ] {
+            assert!(report.contains(line), "{line} missing from:\n{report}");
+        }
+        assert_eq!(report.matches("  Snapshot:     ").count(), 5, "the limit bounds the listing");
+        assert!(report.contains("search baseline admin prune"), "{report}");
+
+        let yesterday = analyze(&policy, &records, now)
+            .into_iter()
+            .find(|assessment| assessment.snapshot_id == "d001")
+            .unwrap();
+        assert_eq!(yesterday.status, SnapshotRetentionStatus::WithinWindow);
+        assert!(records_from_catalog(&catalog, Some("vendor")).is_empty());
     }
 
     fn snapshot_with_branch(

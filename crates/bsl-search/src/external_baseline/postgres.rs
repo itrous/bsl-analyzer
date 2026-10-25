@@ -4,10 +4,12 @@ use crate::domain::{
 };
 use crate::error::{reason, ReasonCode, SearchError};
 use crate::external_baseline::{
-    BaselineCollectionRecord, BaselineEmbeddingCoverageRecord, BaselineEmbeddingModelRecord,
-    BaselineEmbeddingStats, BaselineFileObjectDetails, BaselineFileObjectRecord,
-    BaselineFileObjectReference, BaselineGcReport, BaselineSemanticPublication,
-    BaselineSnapshotDetails, BaselineSnapshotRecord, SemanticPublishPhase, SemanticPublishProgress,
+    BaselineCatalogSnapshot, BaselineCollectionRecord, BaselineEmbeddingCoverageRecord,
+    BaselineEmbeddingModelRecord, BaselineEmbeddingStats, BaselineFileObjectDetails,
+    BaselineFileObjectRecord, BaselineFileObjectReference, BaselineGcReport, BaselineHeadRecord,
+    BaselineSemanticPublication, BaselineServingFootprint, BaselineSnapshotCatalog,
+    BaselineSnapshotDetails, BaselineSnapshotRecord, BaselineTableFootprint, DeleteOutcome,
+    FlattenOutcome, SemanticPublishPhase, SemanticPublishProgress,
 };
 use crate::ports::{
     BaselineLexicalSearch, BaselineSemanticSearch, SnapshotCatalog, SnapshotContentStore,
@@ -610,28 +612,7 @@ impl PostgresBaselineAdapter {
 
     pub fn read_embedding_identity(&self) -> Result<Option<(String, usize)>, SearchError> {
         let mut client = self.connect()?;
-        let model = client
-            .query_opt(
-                &format!(
-                    "SELECT value FROM {} WHERE setting = $1 LIMIT 1",
-                    self.table(SCHEMA_METADATA_TABLE)
-                ),
-                &[&EMBEDDING_MODEL_SETTING],
-            )?
-            .map(|row| row.get::<_, String>(0));
-        let dimension = client
-            .query_opt(
-                &format!(
-                    "SELECT value::INTEGER FROM {} WHERE setting = $1 LIMIT 1",
-                    self.table(SCHEMA_METADATA_TABLE)
-                ),
-                &[&EMBEDDING_DIMENSION_SETTING],
-            )?
-            .map(|row| row.get::<_, i32>(0));
-        match (model, dimension) {
-            (Some(model), Some(dimension)) => Ok(Some((model, dimension as usize))),
-            _ => Ok(None),
-        }
+        read_embedding_identity_in(&mut *client, self)
     }
 
     pub fn ensure_embedding_identity(
@@ -837,6 +818,55 @@ impl PostgresBaselineAdapter {
         )
     }
 
+    /// Forbids deleting a snapshot that another snapshot still names as its parent.
+    ///
+    /// `NOT VALID` because a schema may already hold a row whose parent is gone: a validating
+    /// add fails on it and would roll the whole migration back, while the unvalidated key still
+    /// refuses every new dangling link and every delete of a live parent. Added by name only when
+    /// absent, so re-running the migration takes no new lock on `snapshots`.
+    fn enforce_parent_link(&self) -> String {
+        let qualified = self.table("snapshots");
+        format!(
+            "DO $$
+             BEGIN
+                 IF NOT EXISTS (
+                     SELECT 1 FROM pg_constraint
+                      WHERE conname = 'snapshots_parent_fk'
+                        AND conrelid = to_regclass('{qualified}')
+                 ) THEN
+                     ALTER TABLE {qualified} ADD CONSTRAINT snapshots_parent_fk
+                         FOREIGN KEY (parent_snapshot_id) REFERENCES {qualified}(id)
+                         ON DELETE RESTRICT NOT VALID;
+                 END IF;
+             END $$"
+        )
+    }
+
+    /// Whether this schema refuses to delete a snapshot that is still somebody's parent.
+    ///
+    /// Asked by the catalog rather than by the constraint's name: what compaction relies on is
+    /// the behaviour — a self-referencing `RESTRICT` key on `parent_snapshot_id` — whoever
+    /// created it.
+    pub fn parent_link_enforced(&self) -> Result<bool, SearchError> {
+        self.check_storage_readiness()?;
+        let mut client = self.connect()?;
+        Ok(client
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_constraint c
+                     JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                     WHERE c.conrelid = to_regclass($1)
+                       AND c.contype = 'f'
+                       AND c.confrelid = c.conrelid
+                       AND c.confdeltype = 'r'
+                       AND cardinality(c.conkey) = 1
+                       AND a.attname = 'parent_snapshot_id'
+                 )",
+                &[&self.table("snapshots")],
+            )?
+            .get(0))
+    }
+
     fn ensure_schema_statements(&self) -> Vec<String> {
         // One statement per carrier operation, never one script holding them all: the gate that
         // answers for a carrier picks its statements out by the carrier's own name, and a single
@@ -870,6 +900,7 @@ impl PostgresBaselineAdapter {
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS parent_snapshot_id TEXT NULL",
                 self.table("snapshots")
             ),
+            self.enforce_parent_link(),
             format!(
                 "CREATE TABLE IF NOT EXISTS {} (
                     content_hash TEXT PRIMARY KEY,
@@ -1188,6 +1219,209 @@ impl PostgresBaselineAdapter {
         Ok(Some(BaselineSnapshotDetails { snapshot, collections, semantic_publication }))
     }
 
+    /// Every snapshot and head, without a limit and without counting files.
+    ///
+    /// One REPEATABLE READ transaction, so the heads describe the same catalogue the snapshots
+    /// do: a plan built from the two must not see a head pointing at a snapshot it never listed.
+    pub fn snapshot_catalog(&self) -> Result<BaselineSnapshotCatalog, SearchError> {
+        self.check_storage_readiness()?;
+        let mut client = self.connect()?;
+        let mut tx = client
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()?;
+        let catalog = load_snapshot_catalog(&mut tx, self)?;
+        tx.commit()?;
+        Ok(catalog)
+    }
+
+    /// Size and rows per snapshot of the tables compaction frees space in.
+    ///
+    /// `pg_total_relation_size`, not `pg_relation_size`: the GIN and `snapshot_id` indexes of
+    /// `serving_lexical` are freed with its rows and are a large share of what it occupies.
+    /// Counting reads every row, so the cost grows with the tables.
+    pub fn serving_footprint(&self) -> Result<BaselineServingFootprint, SearchError> {
+        self.check_storage_readiness()?;
+        let mut client = self.connect()?;
+        let mut footprint = BaselineServingFootprint { tables: Vec::new(), missing: Vec::new() };
+        for table in ["serving_lexical", "serving_semantic", "snapshot_files", "snapshot_deletions"]
+        {
+            if !self.storage_table_exists(&mut *client, table)? {
+                footprint.missing.push(table.to_owned());
+                continue;
+            }
+            let total_bytes: i64 = client
+                .query_one(
+                    "SELECT pg_total_relation_size(to_regclass($1::TEXT))",
+                    &[&self.table(table)],
+                )?
+                .get(0);
+            let rows_by_snapshot = client
+                .query(
+                    &format!(
+                        "SELECT snapshot_id, count(*)::BIGINT FROM {} GROUP BY snapshot_id",
+                        self.table(table)
+                    ),
+                    &[],
+                )?
+                .into_iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1).max(0) as u64))
+                .collect();
+            footprint.tables.push(BaselineTableFootprint {
+                table: table.to_owned(),
+                total_bytes: total_bytes.max(0) as u64,
+                rows_by_snapshot,
+            });
+        }
+        Ok(footprint)
+    }
+
+    /// Makes a snapshot standalone: its file rows become its whole visible map, its parent link
+    /// goes, and nothing it serves changes.
+    ///
+    /// REPEATABLE READ with the row locked first: the map is read from one state of the chain,
+    /// and a snapshot republished or flattened since that state is a serialization failure —
+    /// reported by name, with nothing written — rather than a copy of a chain that no longer
+    /// exists. Deletions, serving rows, completeness marks and heads stay as they are: the
+    /// deletions of a root shadow nothing outside it, and still shadow its own files as before.
+    pub fn flatten_snapshot(&self, snapshot_id: &str) -> Result<FlattenOutcome, SearchError> {
+        self.check_storage_readiness()?;
+        let mut client = self.connect()?;
+        let flattened = (|| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                .start()?;
+            let Some(row) = tx.query_opt(
+                &format!(
+                    "SELECT parent_snapshot_id FROM {} WHERE id = $1 FOR UPDATE",
+                    self.table("snapshots")
+                ),
+                &[&snapshot_id],
+            )?
+            else {
+                return Ok(FlattenOutcome::Missing);
+            };
+            if row.get::<_, Option<String>>(0).is_none() {
+                return Ok(FlattenOutcome::AlreadyStandalone);
+            }
+            let visible = materialize_visible_snapshot_file_map(&mut tx, self, snapshot_id)?;
+            let own: HashSet<VisibleFileKey> = load_snapshot_file_rows(&mut tx, self, snapshot_id)?
+                .iter()
+                .map(VisibleSnapshotFile::key)
+                .collect();
+            let inherited: Vec<SnapshotFileRow> = visible
+                .into_values()
+                .filter(|file| !own.contains(&file.key()))
+                .map(|file| SnapshotFileRow {
+                    snapshot_id: snapshot_id.to_owned(),
+                    collection: file.collection,
+                    root_id: file.root_id,
+                    path: file.path,
+                    file_fingerprint: file.file_fingerprint,
+                    document_count: file.document_count as i32,
+                    file_object_id: file.file_object_id,
+                })
+                .collect();
+            insert_snapshot_file_rows(&mut tx, self, &inherited)?;
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET parent_snapshot_id = NULL WHERE id = $1",
+                    self.table("snapshots")
+                ),
+                &[&snapshot_id],
+            )?;
+            tx.commit()?;
+            Ok(FlattenOutcome::Flattened { inherited_files: inherited.len() })
+        })();
+        flattened.map_err(|error: SearchError| {
+            if has_sql_state(&error, "40001") {
+                SearchError::named(
+                    reason::SNAPSHOT_CHANGED_WHILE_COMPACTING,
+                    format!(
+                        "snapshot '{snapshot_id}' changed while being made standalone; nothing \
+                         was changed for it; run prune again"
+                    ),
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    /// Deletes a snapshot and, by cascade, every row it owns — unless a head points at it.
+    ///
+    /// The head is checked under the snapshot's row lock, so a head that moved onto it after
+    /// planning keeps it. Only its own completeness mark goes, by its exact key: a pattern would
+    /// also take the mark of an id that differs by a `_`. A child published after planning is
+    /// caught by the parent link and reported by name; nothing of this snapshot is deleted then.
+    pub fn delete_snapshot(&self, snapshot_id: &str) -> Result<DeleteOutcome, SearchError> {
+        self.check_storage_readiness()?;
+        let mut client = self.connect()?;
+        let deleted = (|| {
+            let mut tx = client.transaction()?;
+            let locked = tx.query_opt(
+                &format!("SELECT 1 FROM {} WHERE id = $1 FOR UPDATE", self.table("snapshots")),
+                &[&snapshot_id],
+            )?;
+            if locked.is_none() {
+                return Ok(DeleteOutcome::Missing);
+            }
+            let head = tx.query_opt(
+                &format!("SELECT 1 FROM {} WHERE snapshot_id = $1", self.table("snapshot_heads")),
+                &[&snapshot_id],
+            )?;
+            if head.is_some() {
+                return Ok(DeleteOutcome::IsHead);
+            }
+            if let Some((model_id, dimension)) = read_embedding_identity_in(&mut tx, self)? {
+                tx.execute(
+                    &format!(
+                        "DELETE FROM {} WHERE setting = $1",
+                        self.table(SCHEMA_METADATA_TABLE)
+                    ),
+                    &[&semantic_publication_setting(snapshot_id, &model_id, dimension)],
+                )?;
+            }
+            tx.execute(
+                &format!("DELETE FROM {} WHERE id = $1", self.table("snapshots")),
+                &[&snapshot_id],
+            )?;
+            tx.commit()?;
+            Ok(DeleteOutcome::Deleted)
+        })();
+        deleted.map_err(|error: SearchError| {
+            if has_sql_state(&error, "23503") {
+                SearchError::named(
+                    reason::SNAPSHOT_STILL_REFERENCED,
+                    format!(
+                        "snapshot '{snapshot_id}' is still the parent of a snapshot published \
+                         after planning; nothing more was deleted; run prune again"
+                    ),
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub fn execute_sql_for_test(&self, sql: &str) -> Result<(), SearchError> {
+        self.connect()?.batch_execute(sql)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub fn query_text_for_test(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, SearchError> {
+        Ok(self
+            .connect()?
+            .query(sql, &[])?
+            .into_iter()
+            .map(|row| (0..row.len()).map(|column| row.get::<_, Option<String>>(column)).collect())
+            .collect())
+    }
+
     pub fn list_file_objects(
         &self,
         collection: Option<&str>,
@@ -1483,13 +1717,32 @@ impl PostgresBaselineAdapter {
             .into_iter()
             .collect::<Vec<_>>();
 
+        let orphan_content_objects: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM {} co
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM {} foi
+                         JOIN {} sf ON sf.file_object_id = foi.file_object_id
+                         WHERE foi.content_hash = co.content_hash
+                     )",
+                    self.table("content_objects"),
+                    self.table("file_object_items"),
+                    self.table("snapshot_files"),
+                ),
+                &[],
+            )?
+            .get(0);
+
         let mut report = BaselineGcReport {
             orphan_file_objects: orphan_file_object_ids.len(),
             orphan_file_object_items,
             orphan_semantic_embeddings,
+            orphan_content_objects: orphan_content_objects.max(0) as usize,
             deleted_file_objects: 0,
             deleted_file_object_items: 0,
             deleted_semantic_embeddings: 0,
+            deleted_content_objects: 0,
         };
 
         if !execute {
@@ -1514,6 +1767,20 @@ impl PostgresBaselineAdapter {
             );
             report.deleted_file_objects = tx.execute(&delete, &[&orphan_file_object_ids])? as usize;
         }
+        // After the file objects, whose items held the content: decided inside the transaction,
+        // and a publish that has just reused a content object holds it through `RESTRICT` on
+        // its item — this delete then fails and the collection is run again.
+        report.deleted_content_objects = tx.execute(
+            &format!(
+                "DELETE FROM {} co
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM {} foi WHERE foi.content_hash = co.content_hash
+                 )",
+                self.table("content_objects"),
+                self.table("file_object_items"),
+            ),
+            &[],
+        )? as usize;
         if !orphan_semantic_embedding_keys.is_empty() {
             let delete = format!(
                 "DELETE FROM {}
@@ -2571,17 +2838,35 @@ impl SnapshotPublisher for PostgresBaselineAdapter {
                 commit_sha = EXCLUDED.commit_sha",
             self.table("snapshots")
         );
+        let parent_id = snapshot.parent_id.as_ref().map(|value| value.0.as_str());
         tx.execute(
             &upsert_snapshot,
             &[
                 &snapshot.id.0,
                 &snapshot.corpus.as_str(),
                 &snapshot.fingerprint,
-                &snapshot.parent_id.as_ref().map(|value| value.0.as_str()),
+                &parent_id,
                 &metadata.branch.as_deref(),
                 &metadata.commit.as_deref(),
             ],
-        )?;
+        )
+        .map_err(|error| {
+            let parent_gone = error.as_db_error().is_some_and(|db| {
+                db.code().code() == "23503" && db.constraint() == Some("snapshots_parent_fk")
+            });
+            if parent_gone {
+                SearchError::named(
+                    reason::PARENT_SNAPSHOT_MISSING,
+                    format!(
+                        "parent snapshot '{}' does not exist; it may have been deleted by \
+                         `search baseline admin prune`; publish again to pick the current parent",
+                        parent_id.unwrap_or_default()
+                    ),
+                )
+            } else {
+                SearchError::from(error)
+            }
+        })?;
 
         let delete_snapshot_files =
             format!("DELETE FROM {} WHERE snapshot_id = $1", self.table("snapshot_files"));
@@ -2942,6 +3227,39 @@ fn load_embeddings_from_client(
     Ok(result)
 }
 
+fn read_embedding_identity_in(
+    client: &mut impl GenericClient,
+    adapter: &PostgresBaselineAdapter,
+) -> Result<Option<(String, usize)>, SearchError> {
+    let model = client
+        .query_opt(
+            &format!(
+                "SELECT value FROM {} WHERE setting = $1 LIMIT 1",
+                adapter.table(SCHEMA_METADATA_TABLE)
+            ),
+            &[&EMBEDDING_MODEL_SETTING],
+        )?
+        .map(|row| row.get::<_, String>(0));
+    let dimension = client
+        .query_opt(
+            &format!(
+                "SELECT value::INTEGER FROM {} WHERE setting = $1 LIMIT 1",
+                adapter.table(SCHEMA_METADATA_TABLE)
+            ),
+            &[&EMBEDDING_DIMENSION_SETTING],
+        )?
+        .map(|row| row.get::<_, i32>(0));
+    match (model, dimension) {
+        (Some(model), Some(dimension)) => Ok(Some((model, dimension as usize))),
+        _ => Ok(None),
+    }
+}
+
+fn has_sql_state(error: &SearchError, code: &str) -> bool {
+    matches!(error, SearchError::Postgres(error)
+        if error.as_db_error().is_some_and(|db| db.code().code() == code))
+}
+
 fn semantic_publication_setting(snapshot_id: &str, model_id: &str, dimension: usize) -> String {
     format!("{SEMANTIC_PUBLICATION_COMPLETE_PREFIX}{snapshot_id}:{model_id}:{dimension}")
 }
@@ -3065,6 +3383,47 @@ fn snapshot_parent_id(
     Ok(row.get("parent_snapshot_id"))
 }
 
+/// `created_at` is formatted on the server in UTC, not cast to text: the cast follows the
+/// session's `TimeZone` and `DateStyle`, and `+00`, `+03` or `16/10/2026 … MSK` are not what
+/// `parse_timestamp_utc` reads — a snapshot whose age cannot be read looks expired.
+fn load_snapshot_catalog(
+    client: &mut impl GenericClient,
+    adapter: &PostgresBaselineAdapter,
+) -> Result<BaselineSnapshotCatalog, SearchError> {
+    let snapshots = client
+        .query(
+            &format!(
+                "SELECT id, corpus, branch, parent_snapshot_id,
+                        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+                 FROM {}",
+                adapter.table("snapshots")
+            ),
+            &[],
+        )?
+        .into_iter()
+        .map(|row| BaselineCatalogSnapshot {
+            snapshot_id: row.get(0),
+            corpus: row.get(1),
+            branch: row.get(2),
+            parent_snapshot_id: row.get(3),
+            created_at: row.get(4),
+        })
+        .collect();
+    let heads = client
+        .query(
+            &format!("SELECT corpus, branch, snapshot_id FROM {}", adapter.table("snapshot_heads")),
+            &[],
+        )?
+        .into_iter()
+        .map(|row| BaselineHeadRecord {
+            corpus: row.get(0),
+            branch: row.get(1),
+            snapshot_id: row.get(2),
+        })
+        .collect();
+    Ok(BaselineSnapshotCatalog { snapshots, heads })
+}
+
 fn semantic_publish_phase_count(strategy: &SemanticPublishStrategy) -> usize {
     match strategy {
         SemanticPublishStrategy::IncrementalFromParent { .. } => 3,
@@ -3173,6 +3532,21 @@ fn observe_planning_isolation(client: &mut impl GenericClient) -> Result<(), Sea
     let level: String = client.query_one("SHOW transaction_isolation", &[])?.get(0);
     OBSERVED_PLANNING_ISOLATION.with(|cell| *cell.borrow_mut() = Some(level));
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many statements reading the visible map has sent on this thread.
+    ///
+    /// Counted from production's own calls: one statement is the property that makes the map one
+    /// committed state of the data, and the source alone cannot show how many round-trips a
+    /// helper hides.
+    static MAP_READ_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_map_read_statement() {
+    MAP_READ_STATEMENTS.with(|cell| cell.set(cell.get() + 1));
 }
 
 /// An identifier as PostgreSQL will store it: cut to `limit` BYTES, never mid-character.
@@ -4051,30 +4425,39 @@ fn effective_snapshot_summary(
     adapter: &PostgresBaselineAdapter,
     snapshot_id: &str,
 ) -> Result<EffectiveSnapshotSummary, SearchError> {
-    let ancestry = snapshot_ancestry_ids(client, adapter, snapshot_id)?;
     let query = format!(
-        "WITH entries AS (
-             SELECT collection, root_id, path, document_count, FALSE AS is_deletion,
-                    array_position($1::TEXT[], snapshot_id) AS ancestry_position
-             FROM {files}
-             WHERE snapshot_id = ANY($1)
+        "{chain},
+         entries AS (
+             SELECT f.collection, f.root_id, f.path, f.document_count, FALSE AS is_deletion,
+                    c.depth AS ancestry_position
+             FROM chain c
+             JOIN {files} f ON f.snapshot_id = c.snapshot_id
+             WHERE NOT c.is_cycle AND NOT c.missing
              UNION ALL
-             SELECT collection, root_id, path, 0 AS document_count, TRUE AS is_deletion,
-                    array_position($1::TEXT[], snapshot_id) AS ancestry_position
-             FROM {deletions}
-             WHERE snapshot_id = ANY($1)
+             SELECT d.collection, d.root_id, d.path, 0 AS document_count, TRUE AS is_deletion,
+                    c.depth AS ancestry_position
+             FROM chain c
+             JOIN {deletions} d ON d.snapshot_id = c.snapshot_id
+             WHERE NOT c.is_cycle AND NOT c.missing
          ),
          winners AS (
              SELECT DISTINCT ON (collection, root_id, path) collection, document_count, is_deletion
              FROM entries
              ORDER BY collection, root_id, path, ancestry_position, is_deletion DESC
          )
-         SELECT collection,
+         SELECT 'total'::TEXT AS row_kind, collection,
                 COUNT(*)::BIGINT AS files,
-                COALESCE(SUM(document_count), 0)::BIGINT AS documents
+                COALESCE(SUM(document_count), 0)::BIGINT AS documents,
+                NULL::INTEGER AS depth, NULL::TEXT AS snapshot_id
          FROM winners
          WHERE NOT is_deletion
-         GROUP BY collection",
+         GROUP BY collection
+         UNION ALL
+         SELECT CASE WHEN c.is_cycle THEN 'cycle' ELSE 'missing' END, NULL::TEXT,
+                NULL::BIGINT, NULL::BIGINT, c.depth, c.snapshot_id
+         FROM chain c
+         WHERE c.is_cycle OR c.missing",
+        chain = single_snapshot_chain(adapter),
         files = adapter.table("snapshot_files"),
         deletions = adapter.table("snapshot_deletions"),
     );
@@ -4082,7 +4465,13 @@ fn effective_snapshot_summary(
     let mut total_files = 0usize;
     let mut total_documents = 0usize;
     let mut collections = Vec::new();
-    for row in client.query(&query, &[&ancestry])? {
+    let mut failure = ChainFailure::default();
+    for row in client.query(&query, &[&snapshot_id])? {
+        let row_kind: String = row.get("row_kind");
+        if row_kind != "total" {
+            failure.note(row.get("depth"), row_kind, row.get("snapshot_id"));
+            continue;
+        }
         let files = row.get::<_, i64>("files").max(0) as usize;
         let documents = row.get::<_, i64>("documents").max(0) as usize;
         total_files += files;
@@ -4093,11 +4482,56 @@ fn effective_snapshot_summary(
             documents,
         });
     }
+    failure.into_result()?;
     // Byte-order sort in Rust, not SQL ORDER BY: the materialized path grouped through a
     // BTreeMap and SQL collation order can disagree with it on non-ASCII names.
     collections.sort_by(|left, right| left.collection.cmp(&right.collection));
 
     Ok(EffectiveSnapshotSummary { total_files, total_documents, collections })
+}
+
+/// The ancestry of one snapshot as a recursive CTE named `chain`, seeded from `$1`.
+///
+/// Seeded from the parameter rather than from `snapshots`, so an absent seed is a `missing` row
+/// instead of no rows at all — which a reader would otherwise take for an empty snapshot. A
+/// parent that is not there is a `missing` row at its depth, a repeated id an `is_cycle` row;
+/// neither is expanded further.
+fn single_snapshot_chain(adapter: &PostgresBaselineAdapter) -> String {
+    format!(
+        "WITH RECURSIVE chain(snapshot_id, next_parent, depth, missing) AS (
+             SELECT seed.id, s.parent_snapshot_id, 0, s.id IS NULL
+             FROM (SELECT $1::TEXT AS id) seed
+             LEFT JOIN {snapshots} s ON s.id = seed.id
+             UNION ALL
+             SELECT c.next_parent, s.parent_snapshot_id, c.depth + 1, s.id IS NULL
+             FROM chain c
+             LEFT JOIN {snapshots} s ON s.id = c.next_parent
+             WHERE c.next_parent IS NOT NULL
+         ) CYCLE snapshot_id SET is_cycle USING cycle_path",
+        snapshots = adapter.table("snapshots"),
+    )
+}
+
+/// The damage a `chain` read reports, closest to the seed first.
+#[derive(Default)]
+struct ChainFailure(Option<(i32, String, String)>);
+
+impl ChainFailure {
+    fn note(&mut self, depth: i32, kind: String, snapshot_id: String) {
+        if self.0.as_ref().is_none_or(|(known, _, _)| depth < *known) {
+            self.0 = Some((depth, kind, snapshot_id));
+        }
+    }
+
+    fn into_result(self) -> Result<(), SearchError> {
+        let Some((_, kind, snapshot_id)) = self.0 else {
+            return Ok(());
+        };
+        Err(SearchError::ExternalBaseline(match kind.as_str() {
+            "cycle" => format!("snapshot parent chain contains cycle at '{snapshot_id}'"),
+            _ => format!("snapshot '{snapshot_id}' was not found"),
+        }))
+    }
 }
 
 /// Per-seed effective (visible) file/document totals for a batch of snapshots, computed in one
@@ -4206,47 +4640,77 @@ fn effective_snapshot_totals_batch(
     Ok(totals)
 }
 
+/// The files a snapshot serves, read in ONE statement.
+///
+/// One statement sees one committed state of the whole chain. Read link by link, a reader could
+/// take an ancestor's files before compaction made a descendant standalone and deleted the
+/// ancestor, and that ancestor's deletions after — and a file deleted in it would come back.
 fn materialize_visible_snapshot_file_map(
     client: &mut impl GenericClient,
     adapter: &PostgresBaselineAdapter,
     snapshot_id: &str,
 ) -> Result<BTreeMap<VisibleFileKey, VisibleSnapshotFile>, SearchError> {
-    let ancestry = snapshot_ancestry_ids(client, adapter, snapshot_id)?;
-    let file_query = format!(
-        "SELECT snapshot_id, collection, root_id, path,
-                file_fingerprint, document_count, file_object_id
-         FROM {}
-         WHERE snapshot_id = ANY($1)",
-        adapter.table("snapshot_files")
-    );
-    let deletion_query = format!(
-        "SELECT snapshot_id, collection, root_id, path
-         FROM {}
-         WHERE snapshot_id = ANY($1)",
-        adapter.table("snapshot_deletions")
+    let query = format!(
+        "{chain}
+         SELECT 'link'::TEXT AS row_kind, c.depth, c.snapshot_id,
+                NULL::TEXT AS collection, NULL::TEXT AS root_id, NULL::TEXT AS path,
+                NULL::TEXT AS file_fingerprint, NULL::INTEGER AS document_count,
+                NULL::TEXT AS file_object_id
+         FROM chain c
+         WHERE NOT c.is_cycle AND NOT c.missing
+         UNION ALL
+         SELECT 'file', c.depth, c.snapshot_id, f.collection, f.root_id, f.path,
+                f.file_fingerprint, f.document_count, f.file_object_id
+         FROM chain c
+         JOIN {files} f ON f.snapshot_id = c.snapshot_id
+         WHERE NOT c.is_cycle AND NOT c.missing
+         UNION ALL
+         SELECT 'deletion', c.depth, c.snapshot_id, d.collection, d.root_id, d.path,
+                NULL, NULL, NULL
+         FROM chain c
+         JOIN {deletions} d ON d.snapshot_id = c.snapshot_id
+         WHERE NOT c.is_cycle AND NOT c.missing
+         UNION ALL
+         SELECT CASE WHEN c.is_cycle THEN 'cycle' ELSE 'missing' END, c.depth, c.snapshot_id,
+                NULL, NULL, NULL, NULL, NULL, NULL
+         FROM chain c
+         WHERE c.is_cycle OR c.missing",
+        chain = single_snapshot_chain(adapter),
+        files = adapter.table("snapshot_files"),
+        deletions = adapter.table("snapshot_deletions"),
     );
 
+    #[cfg(test)]
+    note_map_read_statement();
+    let mut links = Vec::<(i32, String)>::new();
+    let mut failure = ChainFailure::default();
     let mut files_by_snapshot = HashMap::<String, Vec<VisibleSnapshotFile>>::new();
-    for row in client.query(&file_query, &[&ancestry])? {
-        let snapshot_id: String = row.get("snapshot_id");
-        files_by_snapshot.entry(snapshot_id).or_default().push(VisibleSnapshotFile {
-            collection: row.get("collection"),
-            root_id: row.get("root_id"),
-            path: row.get("path"),
-            file_fingerprint: row.get("file_fingerprint"),
-            document_count: row.get::<_, i32>("document_count") as usize,
-            file_object_id: row.get("file_object_id"),
-        });
-    }
     let mut deletions_by_snapshot = HashMap::<String, Vec<VisibleFileKey>>::new();
-    for row in client.query(&deletion_query, &[&ancestry])? {
+    for row in client.query(&query, &[&snapshot_id])? {
+        let row_kind: String = row.get("row_kind");
+        let depth: i32 = row.get("depth");
         let snapshot_id: String = row.get("snapshot_id");
-        deletions_by_snapshot.entry(snapshot_id).or_default().push((
-            row.get("collection"),
-            row.get("root_id"),
-            row.get("path"),
-        ));
+        match row_kind.as_str() {
+            "link" => links.push((depth, snapshot_id)),
+            "file" => files_by_snapshot.entry(snapshot_id).or_default().push(VisibleSnapshotFile {
+                collection: row.get("collection"),
+                root_id: row.get("root_id"),
+                path: row.get("path"),
+                file_fingerprint: row.get("file_fingerprint"),
+                document_count: row.get::<_, i32>("document_count") as usize,
+                file_object_id: row.get("file_object_id"),
+            }),
+            "deletion" => deletions_by_snapshot.entry(snapshot_id).or_default().push((
+                row.get("collection"),
+                row.get("root_id"),
+                row.get("path"),
+            )),
+            _ => failure.note(depth, row_kind, snapshot_id),
+        }
     }
+    failure.into_result()?;
+    links.sort();
+    let ancestry: Vec<String> = links.into_iter().map(|(_, snapshot_id)| snapshot_id).collect();
 
     Ok(fold_visible_files(&ancestry, &mut files_by_snapshot, &mut deletions_by_snapshot))
 }
@@ -4353,12 +4817,14 @@ fn query_string_column(
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_snapshot_totals_batch, file_object_id_for, fingerprint_file_documents,
-        fold_visible_files, group_documents_by_file, materialize_visible_snapshot_files,
-        semantic_publication_complete, semantic_publish_phase_count, semantic_publish_plan,
-        semantic_publish_strategy, unique_content_object_rows, CarrierObligation, ContentObjectRow,
-        EffectiveSnapshotSummary, PostgresBaselineAdapter, SemanticPublishPlan,
-        SemanticPublishStrategy, VisibleFileKey, VisibleSnapshotFile, ROOTED_CARRIER_KEYS,
+        effective_snapshot_summary, effective_snapshot_totals_batch, file_object_id_for,
+        fingerprint_file_documents, fold_visible_files, group_documents_by_file,
+        load_snapshot_catalog, materialize_visible_snapshot_file_map,
+        materialize_visible_snapshot_files, semantic_publication_complete,
+        semantic_publish_phase_count, semantic_publish_plan, semantic_publish_strategy,
+        unique_content_object_rows, CarrierObligation, ContentObjectRow, EffectiveSnapshotSummary,
+        PgPooledConnection, PostgresBaselineAdapter, SemanticPublishPlan, SemanticPublishStrategy,
+        VisibleFileKey, VisibleSnapshotFile, MAP_READ_STATEMENTS, ROOTED_CARRIER_KEYS,
         TOKEN_LAYOUT_PARTS_TABLE,
     };
     use crate::domain::{
@@ -6400,12 +6866,15 @@ mod tests {
             )
             .unwrap();
         adapter.populate_serving_semantic("parent", "model", 4).unwrap();
-        // Raw SQL because nothing in the crate deletes a snapshot: the state is reachable only
-        // from outside, which is why this is a guard rather than a scenario.
+        // The parent link forbids deleting the parent of a live child, so this state is
+        // reachable only with the key taken off: a guard against damage, not a scenario.
         adapter
             .connect()
             .unwrap()
-            .batch_execute(&format!("DELETE FROM {schema}.snapshots WHERE id = 'parent'"))
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.snapshots DROP CONSTRAINT snapshots_parent_fk;
+                 DELETE FROM {schema}.snapshots WHERE id = 'parent'"
+            ))
             .unwrap();
 
         let error = adapter
@@ -7694,6 +8163,13 @@ mod tests {
             .unwrap();
         {
             let mut client = adapter.connect().unwrap();
+            // A dangling parent is refused by the parent link; only damage done with the key
+            // taken off produces one.
+            client
+                .batch_execute(&format!(
+                    "ALTER TABLE {schema}.snapshots DROP CONSTRAINT snapshots_parent_fk"
+                ))
+                .unwrap();
             let insert = format!(
                 "INSERT INTO {} (id, corpus, parent_snapshot_id) VALUES ($1, $2, $3)",
                 adapter.table("snapshots")
@@ -7743,5 +8219,1068 @@ mod tests {
             effective_snapshot_totals_batch(&mut *client, &adapter, &seed(&["good", "dang"]))
                 .expect_err("healthy + corrupt must error");
         assert!(mixed.to_string().contains("'ghost' was not found"), "good+dang: {mixed}");
+
+        // The single-snapshot readers answer the same damage with the same words.
+        for (seed_id, expected) in [("cyc", cycle.to_string()), ("dang", missing.to_string())] {
+            let map = materialize_visible_snapshot_file_map(&mut *client, &adapter, seed_id)
+                .expect_err("a corrupt chain must not yield a map");
+            assert_eq!(map.to_string(), expected, "map of {seed_id}");
+            let summary = effective_snapshot_summary(&mut *client, &adapter, seed_id)
+                .expect_err("a corrupt chain must not yield a summary");
+            assert_eq!(summary.to_string(), expected, "summary of {seed_id}");
+        }
+    }
+
+    /// A throwaway migrated schema on the live database, dropped when the guard goes.
+    fn live_adapter(prefix: &str) -> (PostgresBaselineAdapter, TestSchemaGuard, String) {
+        let url = std::env::var("BSL_TEST_PG_URL")
+            .expect("BSL_TEST_PG_URL must point to a live Postgres to run this test");
+        let schema = unique_schema(prefix);
+        let adapter = PostgresBaselineAdapter::new(
+            ExternalBaselineConfig::postgres(url).with_schema(&schema),
+        )
+        .unwrap();
+        let guard = TestSchemaGuard { adapter: adapter.clone(), schema: schema.clone() };
+        adapter.migrate_storage().unwrap();
+        (adapter, guard, schema)
+    }
+
+    fn sql_state(error: &postgres::Error) -> Option<String> {
+        error.as_db_error().map(|db| db.code().code().to_owned())
+    }
+
+    /// Rows whose parent is not in the catalogue: the dangling links compaction must never leave.
+    fn dangling_parents(adapter: &PostgresBaselineAdapter) -> i64 {
+        let snapshots = adapter.table("snapshots");
+        adapter
+            .connect()
+            .unwrap()
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM {snapshots} s
+                      WHERE s.parent_snapshot_id IS NOT NULL
+                        AND NOT EXISTS (SELECT 1 FROM {snapshots} p WHERE p.id = s.parent_snapshot_id)"
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0)
+    }
+
+    fn publish_plain(
+        adapter: &PostgresBaselineAdapter,
+        snapshot: Snapshot,
+        documents: &[IndexedDocument],
+    ) {
+        adapter
+            .publish_snapshot(&snapshot, &SnapshotPublishMetadata::default(), documents)
+            .unwrap();
+    }
+
+    /// The parent link goes on a schema that already holds a dangling row, and still bites.
+    ///
+    /// The validating form of the same `ALTER` is tried first as the control: it fails on the very
+    /// row the migration must tolerate, so a migration that dropped `NOT VALID` would roll back.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn migrating_adds_the_parent_link_without_validating_old_rows() {
+        let (adapter, _guard, schema) = live_adapter("pfk");
+        let mut client = adapter.connect().unwrap();
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.snapshots DROP CONSTRAINT snapshots_parent_fk;
+                 INSERT INTO {schema}.snapshots (id, corpus, parent_snapshot_id)
+                     VALUES ('dang', 'workspace-code', 'ghost')"
+            ))
+            .unwrap();
+        assert_eq!(dangling_parents(&adapter), 1, "control: the dangling row is counted");
+
+        let validated = client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.snapshots ADD CONSTRAINT snapshots_parent_fk_v
+                     FOREIGN KEY (parent_snapshot_id) REFERENCES {schema}.snapshots(id)
+                     ON DELETE RESTRICT"
+            ))
+            .expect_err("control: a validating add must fail on the dangling row");
+        assert_eq!(sql_state(&validated).as_deref(), Some("23503"), "{validated}");
+
+        adapter.migrate_storage().expect("the migration tolerates the dangling row");
+        let row = client
+            .query_one(
+                "SELECT convalidated, confdeltype::TEXT FROM pg_constraint
+                  WHERE conname = 'snapshots_parent_fk' AND conrelid = to_regclass($1)",
+                &[&adapter.table("snapshots")],
+            )
+            .unwrap();
+        assert!(!row.get::<_, bool>(0), "the key must be added without validating old rows");
+        assert_eq!(row.get::<_, String>(1), "r", "the key must restrict deletes");
+
+        let dangling = client
+            .execute(
+                &format!(
+                    "INSERT INTO {schema}.snapshots (id, corpus, parent_snapshot_id)
+                     VALUES ('x', 'workspace-code', 'ghost2')"
+                ),
+                &[],
+            )
+            .expect_err("a new dangling link must be refused");
+        assert_eq!(sql_state(&dangling).as_deref(), Some("23503"), "{dangling}");
+
+        let document = indexed_document("code", "src/A.bsl", "A", 1, "hash-a", "text-a");
+        publish_plain(
+            &adapter,
+            Snapshot::new("p", CorpusId::WorkspaceCode),
+            std::slice::from_ref(&document),
+        );
+        publish_plain(
+            &adapter,
+            Snapshot::new("c", CorpusId::WorkspaceCode).with_parent("p"),
+            std::slice::from_ref(&document),
+        );
+        let parent_delete = client
+            .execute(&format!("DELETE FROM {schema}.snapshots WHERE id = 'p'"), &[])
+            .expect_err("the parent of a live child must not be deletable");
+        assert_eq!(sql_state(&parent_delete).as_deref(), Some("23503"), "{parent_delete}");
+
+        assert_eq!(adapter.get_schema_version().unwrap(), Some(3));
+        assert!(adapter.parent_link_enforced().unwrap());
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.snapshots DROP CONSTRAINT snapshots_parent_fk"
+            ))
+            .unwrap();
+        assert!(!adapter.parent_link_enforced().unwrap(), "a schema without the key must say so");
+    }
+
+    /// A publish naming a parent deleted before it is refused by name and writes nothing.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn a_publish_after_the_delete_is_refused_by_name() {
+        let (adapter, _guard, schema) = live_adapter("pubdel");
+        let document = indexed_document("code", "src/A.bsl", "A", 1, "hash-a", "text-a");
+        publish_plain(
+            &adapter,
+            Snapshot::new("d", CorpusId::WorkspaceCode),
+            std::slice::from_ref(&document),
+        );
+        adapter
+            .connect()
+            .unwrap()
+            .batch_execute(&format!("DELETE FROM {schema}.snapshots WHERE id = 'd'"))
+            .expect("a snapshot without children is deletable");
+
+        let error = adapter
+            .publish_snapshot(
+                &Snapshot::new("c", CorpusId::WorkspaceCode).with_parent("d"),
+                &SnapshotPublishMetadata::default(),
+                std::slice::from_ref(&document),
+            )
+            .expect_err("a publish over a deleted parent must be refused");
+        assert_eq!(error.reason_code(), Some("parent_snapshot_missing"), "{error}");
+        assert!(error.to_string().contains("'d'"), "the refusal names the parent: {error}");
+        let rows: i64 = adapter
+            .connect()
+            .unwrap()
+            .query_one(&format!("SELECT count(*) FROM {schema}.snapshots WHERE id = 'c'"), &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, 0, "the refused publish must leave no row behind");
+    }
+
+    /// `m1←m2←m3←m4`: `m2` deletes a file of `m1`, `m4` deletes a file of `m3`, and `src/X.bsl`
+    /// lives under two roots, one of them changed in `m3`.
+    fn publish_four_link_chain(adapter: &PostgresBaselineAdapter) {
+        let configuration =
+            |path: &str, hash: &str| indexed_document("code", path, "S", 1, hash, hash);
+        let extension = |path: &str, hash: &str| IndexedDocument {
+            root_id: "Расш".to_owned(),
+            ..indexed_document("code", path, "S", 1, hash, hash)
+        };
+        let x_cfg = configuration("src/X.bsl", "x-cfg-1");
+        let x_ext = extension("src/X.bsl", "x-ext-1");
+        let a = configuration("src/A.bsl", "a-1");
+        let b = configuration("src/B.bsl", "b-1");
+        let c = configuration("src/C.bsl", "c-1");
+        let x_cfg_2 = configuration("src/X.bsl", "x-cfg-2");
+        publish_plain(
+            adapter,
+            Snapshot::new("m1", CorpusId::WorkspaceCode),
+            &[x_cfg.clone(), x_ext.clone(), a, b.clone()],
+        );
+        publish_plain(
+            adapter,
+            Snapshot::new("m2", CorpusId::WorkspaceCode).with_parent("m1"),
+            &[x_cfg, x_ext.clone(), b.clone()],
+        );
+        publish_plain(
+            adapter,
+            Snapshot::new("m3", CorpusId::WorkspaceCode).with_parent("m2"),
+            &[x_cfg_2.clone(), x_ext.clone(), b.clone(), c],
+        );
+        publish_plain(
+            adapter,
+            Snapshot::new("m4", CorpusId::WorkspaceCode).with_parent("m3"),
+            &[x_cfg_2, x_ext, b],
+        );
+    }
+
+    /// The visible map rebuilt from one-snapshot-at-a-time reads, folded by the same rule.
+    fn fold_of_simple_reads(
+        adapter: &PostgresBaselineAdapter,
+        snapshot_id: &str,
+    ) -> std::collections::BTreeMap<VisibleFileKey, VisibleSnapshotFile> {
+        let mut client = adapter.connect().unwrap();
+        let mut ancestry = Vec::new();
+        let mut current = Some(snapshot_id.to_owned());
+        while let Some(id) = current.take() {
+            current = client
+                .query_one(
+                    &format!(
+                        "SELECT parent_snapshot_id FROM {} WHERE id = $1",
+                        adapter.table("snapshots")
+                    ),
+                    &[&id],
+                )
+                .unwrap()
+                .get(0);
+            ancestry.push(id);
+        }
+        let mut files = HashMap::new();
+        let mut deletions = HashMap::new();
+        for id in &ancestry {
+            let own_files: Vec<VisibleSnapshotFile> = client
+                .query(
+                    &format!(
+                        "SELECT collection, root_id, path, file_fingerprint, document_count,
+                                file_object_id
+                           FROM {} WHERE snapshot_id = $1",
+                        adapter.table("snapshot_files")
+                    ),
+                    &[id],
+                )
+                .unwrap()
+                .into_iter()
+                .map(|row| VisibleSnapshotFile {
+                    collection: row.get(0),
+                    root_id: row.get(1),
+                    path: row.get(2),
+                    file_fingerprint: row.get(3),
+                    document_count: row.get::<_, i32>(4) as usize,
+                    file_object_id: row.get(5),
+                })
+                .collect();
+            files.insert(id.clone(), own_files);
+            let own_deletions: Vec<VisibleFileKey> = client
+                .query(
+                    &format!(
+                        "SELECT collection, root_id, path FROM {} WHERE snapshot_id = $1",
+                        adapter.table("snapshot_deletions")
+                    ),
+                    &[id],
+                )
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect();
+            deletions.insert(id.clone(), own_deletions);
+        }
+        fold_visible_files(&ancestry, &mut files, &mut deletions)
+    }
+
+    type MapView = Vec<(VisibleFileKey, String, usize, String)>;
+
+    fn map_view(map: &std::collections::BTreeMap<VisibleFileKey, VisibleSnapshotFile>) -> MapView {
+        map.iter()
+            .map(|(key, file)| {
+                (
+                    key.clone(),
+                    file.file_fingerprint.clone(),
+                    file.document_count,
+                    file.file_object_id.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The map read in one statement is the fold of the rows, and damage is reported, not hidden.
+    ///
+    /// The deletion two levels up and the path under two roots are what a fold reading ancestors'
+    /// files without their deletions, or keying without the root, gets wrong; `ghost-seed` is what
+    /// a recursion seeded from `snapshots` turns into an empty map.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn the_single_statement_map_equals_the_fold_of_the_rows() {
+        let (adapter, _guard, schema) = live_adapter("onemap");
+        publish_four_link_chain(&adapter);
+        let mut client = adapter.connect().unwrap();
+        let deletions: Vec<(String, String)> = client
+            .query(
+                &format!(
+                    "SELECT snapshot_id, path FROM {schema}.snapshot_deletions ORDER BY snapshot_id"
+                ),
+                &[],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            deletions,
+            vec![
+                ("m2".to_owned(), "src/A.bsl".to_owned()),
+                ("m4".to_owned(), "src/C.bsl".to_owned())
+            ],
+            "the fixture must delete on two levels"
+        );
+
+        for snapshot_id in ["m4", "m2"] {
+            let map =
+                materialize_visible_snapshot_file_map(&mut *client, &adapter, snapshot_id).unwrap();
+            assert_eq!(
+                map_view(&map),
+                map_view(&fold_of_simple_reads(&adapter, snapshot_id)),
+                "{snapshot_id}"
+            );
+        }
+        let m4 = materialize_visible_snapshot_file_map(&mut *client, &adapter, "m4").unwrap();
+        let roots: Vec<&str> = m4
+            .keys()
+            .filter(|(_, _, path)| path == "src/X.bsl")
+            .map(|(_, root, _)| root.as_str())
+            .collect();
+        assert_eq!(roots, vec!["", "Расш"], "one path under two roots is two files");
+        assert!(!m4.keys().any(|(_, _, path)| path == "src/A.bsl" || path == "src/C.bsl"));
+
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {schema}.snapshots DROP CONSTRAINT snapshots_parent_fk;
+                 INSERT INTO {schema}.snapshots (id, corpus, parent_snapshot_id)
+                     VALUES ('cyc', 'workspace-code', 'cyc'), ('dang', 'workspace-code', 'ghost')"
+            ))
+            .unwrap();
+        for (seed, expected) in [
+            ("cyc", "snapshot parent chain contains cycle at 'cyc'"),
+            ("dang", "snapshot 'ghost' was not found"),
+            ("ghost-seed", "snapshot 'ghost-seed' was not found"),
+        ] {
+            let error = materialize_visible_snapshot_file_map(&mut *client, &adapter, seed)
+                .expect_err("damage must be reported, not read as an empty map");
+            assert_eq!(error.to_string(), format!("external baseline error: {expected}"), "{seed}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn reading_the_map_takes_one_statement() {
+        let (adapter, _guard, _schema) = live_adapter("onestmt");
+        publish_four_link_chain(&adapter);
+        let mut client = adapter.connect().unwrap();
+        MAP_READ_STATEMENTS.with(|cell| cell.set(0));
+        let map = materialize_visible_snapshot_file_map(&mut *client, &adapter, "m4").unwrap();
+        assert!(!map.is_empty());
+        assert_eq!(
+            MAP_READ_STATEMENTS.with(|cell| cell.get()),
+            1,
+            "a map read in several statements can mix committed states of the chain"
+        );
+    }
+
+    /// The catalogue's `created_at` reads back as the row's instant whatever the session says.
+    ///
+    /// The control is `::TEXT` in the very same session, which comes out as
+    /// `16/10/2026 12:34:56.789012 MSK` and parses to nothing — the reading that makes every
+    /// snapshot of a branch but its newest look expired.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn the_catalog_reports_created_at_in_rfc3339_utc_under_any_session_settings() {
+        let (adapter, _guard, schema) = live_adapter("catalog");
+        let document = indexed_document("code", "src/A.bsl", "A", 1, "hash-a", "text-a");
+        adapter
+            .publish_snapshot(
+                &Snapshot::new("dated", CorpusId::WorkspaceCode),
+                &SnapshotPublishMetadata {
+                    branch: Some("develop".to_owned()),
+                    ..Default::default()
+                },
+                std::slice::from_ref(&document),
+            )
+            .unwrap();
+        let mut client = adapter.connect().unwrap();
+        client
+            .batch_execute(&format!(
+                "UPDATE {schema}.snapshots
+                    SET created_at = '2026-10-16 09:34:56.789012+00'::TIMESTAMPTZ"
+            ))
+            .unwrap();
+
+        let mut tx = client.transaction().unwrap();
+        tx.batch_execute("SET LOCAL TimeZone = 'Europe/Moscow'; SET LOCAL DateStyle = 'SQL, DMY'")
+            .unwrap();
+        let catalog = load_snapshot_catalog(&mut tx, &adapter).unwrap();
+        let (micros, as_text): (i64, String) = {
+            let row = tx
+                .query_one(
+                    &format!(
+                        "SELECT (extract(epoch FROM created_at) * 1000000)::BIGINT,
+                                created_at::TEXT
+                           FROM {schema}.snapshots WHERE id = 'dated'"
+                    ),
+                    &[],
+                )
+                .unwrap();
+            (row.get(0), row.get(1))
+        };
+        tx.commit().unwrap();
+
+        assert_eq!(catalog.snapshots.len(), 1);
+        let created_at = &catalog.snapshots[0].created_at;
+        assert_eq!(created_at, "2026-10-16T09:34:56.789012Z");
+        let parsed = project_model::parse_timestamp_utc(created_at)
+            .unwrap_or_else(|| panic!("the catalogue's time must parse: {created_at}"));
+        assert_eq!(parsed.timestamp_micros(), micros, "the same instant as the row");
+        assert_eq!(
+            project_model::parse_timestamp_utc(&as_text),
+            None,
+            "control: the session's own text form must not parse, or this proves nothing: {as_text}"
+        );
+        assert_eq!(catalog.heads.len(), 1);
+        assert_eq!(catalog.heads[0].snapshot_id, "dated");
+        assert_eq!(catalog.snapshots[0].branch.as_deref(), Some("develop"));
+    }
+
+    /// The catalogue is every snapshot, not a page of them: a schema with more than the listing's
+    /// ceiling of 200 is exactly the one that needs compacting.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn the_catalog_is_not_bounded_by_the_listing_limit() {
+        let (adapter, _guard, schema) = live_adapter("catalog201");
+        adapter
+            .connect()
+            .unwrap()
+            .batch_execute(&format!(
+                "INSERT INTO {schema}.snapshots (id, corpus, branch)
+                 SELECT 's' || lpad(n::TEXT, 3, '0'), 'workspace-code', 'develop'
+                   FROM generate_series(1, 201) AS n"
+            ))
+            .unwrap();
+
+        assert_eq!(
+            adapter.list_snapshots(None, None, None, 1000).unwrap().len(),
+            200,
+            "control: the listing stops at 200, so a catalogue read through it would miss one"
+        );
+        let catalog = adapter.snapshot_catalog().unwrap();
+        assert_eq!(catalog.snapshots.len(), 201);
+        assert!(catalog.snapshots.iter().any(|snapshot| snapshot.snapshot_id == "s201"));
+    }
+
+    /// A schema without `serving_semantic` (no `vector` extension) is measured over the tables it
+    /// has and names the one it lacks.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn a_footprint_names_the_tables_that_are_absent() {
+        let (adapter, _guard, schema) = live_adapter("footabs");
+        let document = indexed_document("code", "src/A.bsl", "A", 1, "hash-a", "text-a");
+        publish_plain(
+            &adapter,
+            Snapshot::new("a", CorpusId::WorkspaceCode),
+            std::slice::from_ref(&document),
+        );
+        let names =
+            |footprint: &crate::external_baseline::BaselineServingFootprint| -> Vec<String> {
+                footprint.tables.iter().map(|table| table.table.clone()).collect()
+            };
+
+        let complete = adapter.serving_footprint().unwrap();
+        assert!(complete.missing.is_empty(), "control: with the table nothing is missing");
+        assert_eq!(
+            names(&complete),
+            ["serving_lexical", "serving_semantic", "snapshot_files", "snapshot_deletions"]
+        );
+        assert_eq!(complete.tables[0].rows_by_snapshot.get("a"), Some(&1));
+
+        adapter
+            .connect()
+            .unwrap()
+            .batch_execute(&format!("DROP TABLE {schema}.serving_semantic"))
+            .unwrap();
+        let without = adapter.serving_footprint().unwrap();
+        assert_eq!(without.missing, vec!["serving_semantic"]);
+        assert_eq!(names(&without), ["serving_lexical", "snapshot_files", "snapshot_deletions"]);
+    }
+
+    fn embed_all(adapter: &PostgresBaselineAdapter, documents: &[&IndexedDocument]) {
+        let mut embeddings: Vec<(String, Vec<f32>)> = Vec::new();
+        for document in documents {
+            let key = crate::document::semantic_key_from_parts(
+                &document.path,
+                &document.kind,
+                &document.symbol_name,
+                "",
+                &document.text,
+            );
+            if !embeddings.iter().any(|(known, _)| *known == key) {
+                let seed = embeddings.len() as f32;
+                embeddings.push((key, vec![1.0, seed, 0.5, -seed]));
+            }
+        }
+        adapter.store_embeddings("model", 4, &embeddings).unwrap();
+    }
+
+    /// Everything a reader of one snapshot can observe, in a comparable form.
+    fn observe_snapshot(adapter: &PostgresBaselineAdapter, snapshot_id: &str) -> Vec<String> {
+        let mut client = adapter.connect().unwrap();
+        let map =
+            materialize_visible_snapshot_file_map(&mut *client, adapter, snapshot_id).unwrap();
+        let sorted = |mut items: Vec<String>| {
+            items.sort();
+            items
+        };
+        let documents = adapter
+            .load_snapshot_documents(&Snapshot::new(snapshot_id, CorpusId::WorkspaceCode))
+            .unwrap();
+        let manifest = adapter.load_baseline_manifest(snapshot_id).unwrap();
+        let lexical = adapter.lexical_search_baseline(snapshot_id, "text", None, 100).unwrap();
+        let semantic = adapter
+            .semantic_search_baseline(snapshot_id, &[1.0, 0.0, 0.5, 0.0], "model", 4, None, 100)
+            .unwrap();
+        assert!(!lexical.is_empty() && !semantic.is_empty(), "{snapshot_id} must be searchable");
+        vec![
+            format!("{:?}", map_view(&map)),
+            format!("{:?}", sorted(documents.iter().map(|d| format!("{d:?}")).collect())),
+            format!(
+                "{:?} {:?}",
+                manifest.snapshot_fingerprint,
+                sorted(manifest.files.iter().map(|f| format!("{f:?}")).collect())
+            ),
+            format!("{:?}", sorted(lexical.iter().map(|h| format!("{h:?}")).collect())),
+            format!("{:?}", sorted(semantic.iter().map(|h| format!("{h:?}")).collect())),
+        ]
+    }
+
+    fn query_strings(adapter: &PostgresBaselineAdapter, sql: &str) -> Vec<String> {
+        adapter
+            .connect()
+            .unwrap()
+            .query(sql, &[])
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect()
+    }
+
+    /// `r1←r2←q`: `q` overrides `A` and deletes `B` of its ancestors, `r2` deletes `C` of `r1`,
+    /// and `X` lives under two roots.
+    ///
+    /// The two deletions are the controls: a copy of the ancestors' rows that ignored `r2`'s
+    /// deletions would bring `C` back into `q`, and one that ignored `q`'s own would count one
+    /// inherited file more and add a row under a key `q` deletes.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn making_a_snapshot_standalone_keeps_it_observably_equal() {
+        let (adapter, _guard, schema) = live_adapter("flatten");
+        let doc = |path: &str, content: &str| {
+            indexed_document("code", path, "S", 1, content, &format!("text {content}"))
+        };
+        let a1 = doc("src/A.bsl", "a1");
+        let a2 = doc("src/A.bsl", "a2");
+        let b = doc("src/B.bsl", "b1");
+        let c = doc("src/C.bsl", "c1");
+        let x = doc("src/X.bsl", "x1");
+        let xe = IndexedDocument { root_id: "Расш".to_owned(), ..doc("src/X.bsl", "x-ext") };
+        embed_all(&adapter, &[&a1, &a2, &b, &c, &x, &xe]);
+        let chain = [
+            ("r1", None, vec![a1.clone(), b.clone(), c, x.clone(), xe.clone()]),
+            ("r2", Some("r1"), vec![a1, b, x.clone(), xe.clone()]),
+            ("q", Some("r2"), vec![a2, x, xe]),
+        ];
+        for (id, parent, documents) in &chain {
+            let mut snapshot = Snapshot::new(*id, CorpusId::WorkspaceCode);
+            if let Some(parent) = parent {
+                snapshot = snapshot.with_parent(*parent);
+            }
+            publish_plain(&adapter, snapshot, documents);
+            adapter.populate_serving_semantic(id, "model", 4).unwrap();
+        }
+        let q_deletions = query_strings(
+            &adapter,
+            &format!("SELECT path FROM {schema}.snapshot_deletions WHERE snapshot_id = 'q'"),
+        );
+        assert_eq!(q_deletions, vec!["src/B.bsl"], "q must delete an ancestor's file");
+
+        let others = |adapter: &PostgresBaselineAdapter| {
+            query_strings(
+                adapter,
+                &format!(
+                    "SELECT s.id || ' ' || s.xmin::TEXT || ' '
+                            || (SELECT count(*) FROM {schema}.serving_lexical l WHERE l.snapshot_id = s.id)
+                            || ' '
+                            || (SELECT count(*) FROM {schema}.serving_semantic m WHERE m.snapshot_id = s.id)
+                       FROM {schema}.snapshots s WHERE s.id <> 'q' ORDER BY s.id"
+                ),
+            )
+        };
+        let own_before = query_strings(
+            &adapter,
+            &format!("SELECT path FROM {schema}.snapshot_files WHERE snapshot_id = 'q'"),
+        )
+        .len();
+        let map_before = {
+            let mut client = adapter.connect().unwrap();
+            materialize_visible_snapshot_file_map(&mut *client, &adapter, "q").unwrap().len()
+        };
+        let observed = observe_snapshot(&adapter, "q");
+        let others_before = others(&adapter);
+
+        let outcome = adapter.flatten_snapshot("q").unwrap();
+        assert_eq!(
+            outcome,
+            crate::external_baseline::FlattenOutcome::Flattened {
+                inherited_files: map_before - own_before
+            }
+        );
+        assert_eq!(map_before - own_before, 2, "X under both roots is inherited, B and C are not");
+        let parent = query_strings(
+            &adapter,
+            &format!(
+                "SELECT coalesce(parent_snapshot_id, '-') FROM {schema}.snapshots WHERE id = 'q'"
+            ),
+        );
+        assert_eq!(parent, vec!["-"]);
+        assert_eq!(observe_snapshot(&adapter, "q"), observed, "q must serve what it served");
+        let resurrected = query_strings(
+            &adapter,
+            &format!(
+                "SELECT f.path FROM {schema}.snapshot_files f
+                   JOIN {schema}.snapshot_deletions d
+                     ON d.snapshot_id = f.snapshot_id AND d.collection = f.collection
+                    AND d.root_id = f.root_id AND d.path = f.path
+                  WHERE f.snapshot_id = 'q'"
+            ),
+        );
+        assert!(resurrected.is_empty(), "no row under a key q deletes: {resurrected:?}");
+        assert_eq!(others(&adapter), others_before, "nothing else is touched");
+        assert_eq!(
+            adapter.flatten_snapshot("q").unwrap(),
+            crate::external_baseline::FlattenOutcome::AlreadyStandalone
+        );
+        assert_eq!(
+            adapter.flatten_snapshot("nobody").unwrap(),
+            crate::external_baseline::FlattenOutcome::Missing
+        );
+    }
+
+    /// Deleting `x_y` takes every row it owns and its own completeness mark — and not the mark
+    /// of `x-y`, which a `LIKE` on the id would also match.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn deleting_a_snapshot_removes_only_its_own_marker() {
+        let (adapter, _guard, schema) = live_adapter("delmark");
+        let a = indexed_document("code", "src/A.bsl", "A", 1, "a", "text a");
+        let b = indexed_document("code", "src/B.bsl", "B", 1, "b", "text b");
+        embed_all(&adapter, &[&a, &b]);
+        // The publisher claims the identity before it writes semantics; the exact key of a
+        // completeness mark is built from it.
+        adapter.ensure_embedding_identity("model", 4).unwrap();
+        publish_plain(&adapter, Snapshot::new("p", CorpusId::WorkspaceCode), &[a.clone(), b]);
+        for id in ["x_y", "x-y"] {
+            publish_plain(
+                &adapter,
+                Snapshot::new(id, CorpusId::WorkspaceCode).with_parent("p"),
+                std::slice::from_ref(&a),
+            );
+        }
+        for id in ["p", "x_y", "x-y"] {
+            adapter.populate_serving_semantic(id, "model", 4).unwrap();
+        }
+        let like = query_strings(
+            &adapter,
+            &format!(
+                "SELECT setting FROM {schema}._schema_metadata_
+                  WHERE setting LIKE 'semantic_publication_complete:x_y:%'"
+            ),
+        );
+        assert_eq!(like.len(), 2, "control: a pattern on x_y matches x-y too: {like:?}");
+        let owned = |id: &str| -> Vec<String> {
+            [
+                "snapshot_files",
+                "snapshot_deletions",
+                "serving_lexical",
+                "serving_semantic",
+                "snapshot_heads",
+            ]
+            .iter()
+            .map(|table| {
+                let count: i64 = adapter
+                    .connect()
+                    .unwrap()
+                    .query_one(
+                        &format!("SELECT count(*) FROM {schema}.{table} WHERE snapshot_id = $1"),
+                        &[&id],
+                    )
+                    .unwrap()
+                    .get(0);
+                format!("{table}={count}")
+            })
+            .collect()
+        };
+        assert_eq!(
+            owned("x_y"),
+            vec![
+                "snapshot_files=0",
+                "snapshot_deletions=1",
+                "serving_lexical=1",
+                "serving_semantic=1",
+                "snapshot_heads=0"
+            ],
+            "the snapshot must own rows for the deletion to remove"
+        );
+
+        assert_eq!(
+            adapter.delete_snapshot("x_y").unwrap(),
+            crate::external_baseline::DeleteOutcome::Deleted
+        );
+        assert!(owned("x_y").iter().all(|entry| entry.ends_with("=0")), "{:?}", owned("x_y"));
+        let mut client = adapter.connect().unwrap();
+        assert!(!semantic_publication_complete(&mut *client, &adapter, "x_y", "model", 4).unwrap());
+        assert!(
+            semantic_publication_complete(&mut *client, &adapter, "x-y", "model", 4).unwrap(),
+            "the mark of a different snapshot must stay"
+        );
+        assert_eq!(
+            adapter.delete_snapshot("x_y").unwrap(),
+            crate::external_baseline::DeleteOutcome::Missing
+        );
+    }
+
+    /// A parent made standalone while its child's semantics are being computed fails that
+    /// publish loudly instead of letting it copy from a changed parent.
+    ///
+    /// The control flattens an unrelated snapshot from the same callback: that publish goes
+    /// through and marks itself complete, so the refusal comes from the parent's change alone.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn making_a_parent_standalone_during_a_child_semantic_publish_is_refused() {
+        let (adapter, _guard, _schema) = live_adapter("flatsem");
+        let config = adapter.config().clone();
+        let a = indexed_document("code", "src/A.bsl", "A", 1, "a", "text a");
+        let b = indexed_document("code", "src/B.bsl", "B", 1, "b", "text b");
+        let c = indexed_document("code", "src/C.bsl", "C", 1, "c", "text c");
+        embed_all(&adapter, &[&a, &b, &c]);
+        publish_plain(
+            &adapter,
+            Snapshot::new("r", CorpusId::WorkspaceCode),
+            std::slice::from_ref(&a),
+        );
+        publish_plain(
+            &adapter,
+            Snapshot::new("q", CorpusId::WorkspaceCode).with_parent("r"),
+            &[a.clone(), b.clone()],
+        );
+        for id in ["c", "c2"] {
+            publish_plain(
+                &adapter,
+                Snapshot::new(id, CorpusId::WorkspaceCode).with_parent("q"),
+                &[a.clone(), b.clone(), c.clone()],
+            );
+        }
+        publish_plain(
+            &adapter,
+            Snapshot::new("u", CorpusId::WorkspaceCode),
+            std::slice::from_ref(&a),
+        );
+        publish_plain(
+            &adapter,
+            Snapshot::new("w", CorpusId::WorkspaceCode).with_parent("u"),
+            std::slice::from_ref(&b),
+        );
+        for id in ["r", "q"] {
+            adapter.populate_serving_semantic(id, "model", 4).unwrap();
+        }
+
+        let compactor = PostgresBaselineAdapter::new(config).unwrap();
+        let flatten_on_plan = |target: &'static str| {
+            let compactor = compactor.clone();
+            let once = std::cell::Cell::new(true);
+            move |event: crate::external_baseline::SemanticPublishProgress| {
+                if matches!(event, crate::external_baseline::SemanticPublishProgress::Plan { .. })
+                    && once.replace(false)
+                {
+                    assert!(matches!(
+                        compactor.flatten_snapshot(target).unwrap(),
+                        crate::external_baseline::FlattenOutcome::Flattened { .. }
+                    ));
+                }
+            }
+        };
+
+        let unrelated = flatten_on_plan("w");
+        adapter
+            .populate_serving_semantic_with_progress("c2", "model", 4, Some(&unrelated))
+            .expect("control: flattening an unrelated snapshot does not disturb the publish");
+        let mut client = adapter.connect().unwrap();
+        assert!(semantic_publication_complete(&mut *client, &adapter, "c2", "model", 4).unwrap());
+
+        let parent = flatten_on_plan("q");
+        let error = adapter
+            .populate_serving_semantic_with_progress("c", "model", 4, Some(&parent))
+            .expect_err("a plan copied from a parent changed since must not be served");
+        assert_eq!(error.reason_code(), Some("snapshot_republished_while_publishing"), "{error}");
+        assert!(!semantic_publication_complete(&mut *client, &adapter, "c", "model", 4).unwrap());
+    }
+
+    /// A snapshot row another session changed after the standalone copy took its view is
+    /// refused by name, and nothing of the copy stays.
+    ///
+    /// The other session holds the row before the copy starts, so the copy's view predates the
+    /// change by construction: it waits on the row lock, which the test observes in
+    /// `pg_stat_activity` rather than by time. The control rolls the other session back instead
+    /// of committing: the same copy then goes through, so the refusal comes from the committed
+    /// change alone.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn a_snapshot_changed_while_being_made_standalone_is_refused_by_name() {
+        let (adapter, _guard, schema) = live_adapter("flatconf");
+        let a = indexed_document("code", "src/A.bsl", "A", 1, "a", "text a");
+        let b = indexed_document("code", "src/B.bsl", "B", 1, "b", "text b");
+        publish_plain(
+            &adapter,
+            Snapshot::new("r", CorpusId::WorkspaceCode),
+            std::slice::from_ref(&a),
+        );
+        for id in ["q", "q2"] {
+            publish_plain(
+                &adapter,
+                Snapshot::new(id, CorpusId::WorkspaceCode).with_parent("r"),
+                &[a.clone(), b.clone()],
+            );
+        }
+        let snapshots = adapter.table("snapshots");
+        let snapshot_files = adapter.table("snapshot_files");
+        let own_rows = |client: &mut postgres::Client, id: &str| -> i64 {
+            client
+                .query_one(
+                    &format!("SELECT count(*) FROM {snapshot_files} WHERE snapshot_id = $1"),
+                    &[&id],
+                )
+                .unwrap()
+                .get(0)
+        };
+        let mut observer = adapter.connect().unwrap();
+        let rows_before = own_rows(&mut observer, "q");
+
+        let mut flatten_while_held = |id: &'static str, commit: bool| {
+            let mut holder = adapter.connect().unwrap();
+            let mut hold = holder.transaction().unwrap();
+            hold.execute(
+                &format!("UPDATE {snapshots} SET created_at = created_at WHERE id = $1"),
+                &[&id],
+            )
+            .unwrap();
+            let compactor = adapter.clone();
+            let flatten = std::thread::spawn(move || compactor.flatten_snapshot(id));
+            loop {
+                let waiting: i64 = observer
+                    .query_one(
+                        "SELECT count(*) FROM pg_stat_activity
+                         WHERE wait_event_type = 'Lock'
+                           AND position($1 in query) > 0
+                           AND position('FOR UPDATE' in query) > 0",
+                        &[&schema],
+                    )
+                    .unwrap()
+                    .get(0);
+                if waiting > 0 {
+                    break;
+                }
+                assert!(!flatten.is_finished(), "the copy must wait on the held row");
+            }
+            if commit {
+                hold.commit().unwrap();
+            } else {
+                hold.rollback().unwrap();
+            }
+            flatten.join().unwrap()
+        };
+
+        assert!(matches!(
+            flatten_while_held("q2", false).expect("control: a rolled-back change is no conflict"),
+            crate::external_baseline::FlattenOutcome::Flattened { .. }
+        ));
+
+        let error = flatten_while_held("q", true)
+            .expect_err("a copy whose view predates a committed change must not land");
+        assert_eq!(error.reason_code(), Some("snapshot_changed_while_compacting"), "{error}");
+        let parent: Option<String> = observer
+            .query_one(&format!("SELECT parent_snapshot_id FROM {snapshots} WHERE id = 'q'"), &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(parent.as_deref(), Some("r"), "the refused snapshot keeps its parent");
+        assert_eq!(own_rows(&mut observer, "q"), rows_before, "no inherited row stays");
+    }
+
+    /// A head that moved onto a snapshot after planning keeps it.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn a_snapshot_that_became_a_head_is_not_deleted() {
+        let (adapter, _guard, schema) = live_adapter("delhead");
+        let a = indexed_document("code", "src/A.bsl", "A", 1, "a", "text a");
+        publish_plain(
+            &adapter,
+            Snapshot::new("d", CorpusId::WorkspaceCode),
+            std::slice::from_ref(&a),
+        );
+        let mut client = adapter.connect().unwrap();
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {schema}.snapshot_heads (corpus, branch, snapshot_id)
+                 VALUES ('workspace-code', 'develop', 'd')"
+            ))
+            .unwrap();
+
+        assert_eq!(
+            adapter.delete_snapshot("d").unwrap(),
+            crate::external_baseline::DeleteOutcome::IsHead
+        );
+        let count = |client: &mut PgPooledConnection, table: &str, column: &str| -> i64 {
+            client
+                .query_one(
+                    &format!("SELECT count(*) FROM {schema}.{table} WHERE {column} = 'd'"),
+                    &[],
+                )
+                .unwrap()
+                .get(0)
+        };
+        assert_eq!(count(&mut client, "snapshots", "id"), 1);
+        assert_eq!(count(&mut client, "snapshot_heads", "snapshot_id"), 1);
+
+        // Control: a delete that does not look at the heads takes the head with it.
+        client.batch_execute(&format!("DELETE FROM {schema}.snapshots WHERE id = 'd'")).unwrap();
+        assert_eq!(count(&mut client, "snapshot_heads", "snapshot_id"), 0);
+    }
+
+    /// After compaction, `gc` takes the content only deleted snapshots used and nothing else.
+    ///
+    /// `C` of the deleted `d1` and `D` of the kept `h` share one content object: the
+    /// collector must keep it, while the content of `A` and `B` as `d1` had them goes.
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn gc_removes_content_objects_only_the_deleted_snapshots_used() {
+        let (adapter, _guard, schema) = live_adapter("gccontent");
+        let doc = |path: &str, hash: &str| {
+            indexed_document("code", path, "S", 1, hash, &format!("text {hash}"))
+        };
+        let x = doc("src/X.bsl", "x-cfg");
+        let xe = IndexedDocument { root_id: "Расш".to_owned(), ..doc("src/X.bsl", "x-ext") };
+        let chain = [
+            (
+                "d1",
+                None,
+                "develop",
+                vec![
+                    doc("src/A.bsl", "a1"),
+                    doc("src/B.bsl", "b1"),
+                    doc("src/C.bsl", "shared"),
+                    x.clone(),
+                    xe.clone(),
+                ],
+            ),
+            (
+                "d2",
+                Some("d1"),
+                "develop",
+                vec![doc("src/A.bsl", "a1"), doc("src/B.bsl", "b2"), x.clone(), xe.clone()],
+            ),
+            (
+                "k1",
+                Some("d2"),
+                "develop",
+                vec![doc("src/A.bsl", "a2"), doc("src/B.bsl", "b2"), x.clone(), xe.clone()],
+            ),
+            (
+                "h",
+                Some("k1"),
+                "develop",
+                vec![
+                    doc("src/A.bsl", "a2"),
+                    doc("src/B.bsl", "b2"),
+                    x.clone(),
+                    xe.clone(),
+                    doc("src/D.bsl", "shared"),
+                ],
+            ),
+            ("v1", None, "vendor", vec![doc("src/V.bsl", "v1")]),
+            ("v2", Some("v1"), "vendor", vec![doc("src/V.bsl", "v2"), doc("src/W.bsl", "w1")]),
+        ];
+        let all: Vec<&IndexedDocument> =
+            chain.iter().flat_map(|(_, _, _, docs)| docs.iter()).collect();
+        embed_all(&adapter, &all);
+        adapter.ensure_embedding_identity("model", 4).unwrap();
+        for (id, parent, branch, documents) in &chain {
+            let mut snapshot = Snapshot::new(*id, CorpusId::WorkspaceCode);
+            if let Some(parent) = parent {
+                snapshot = snapshot.with_parent(*parent);
+            }
+            adapter
+                .publish_snapshot(
+                    &snapshot,
+                    &SnapshotPublishMetadata { branch: Some((*branch).to_owned()), commit: None },
+                    documents,
+                )
+                .unwrap();
+            adapter.populate_serving_semantic(id, "model", 4).unwrap();
+        }
+        let kept = ["k1", "h", "v1", "v2"];
+        let documents = |adapter: &PostgresBaselineAdapter| -> Vec<String> {
+            kept.iter()
+                .map(|id| {
+                    let mut docs: Vec<String> = adapter
+                        .load_snapshot_documents(&Snapshot::new(*id, CorpusId::WorkspaceCode))
+                        .unwrap()
+                        .iter()
+                        .map(|document| format!("{document:?}"))
+                        .collect();
+                    docs.sort();
+                    format!("{id}: {docs:?}")
+                })
+                .collect()
+        };
+
+        assert!(matches!(
+            adapter.flatten_snapshot("k1").unwrap(),
+            crate::external_baseline::FlattenOutcome::Flattened { .. }
+        ));
+        for id in ["d2", "d1"] {
+            assert_eq!(
+                adapter.delete_snapshot(id).unwrap(),
+                crate::external_baseline::DeleteOutcome::Deleted
+            );
+        }
+        let before = documents(&adapter);
+        let content = || {
+            query_strings(
+                &adapter,
+                &format!("SELECT content_hash FROM {schema}.content_objects ORDER BY 1"),
+            )
+        };
+        let content_before = content();
+
+        let dry = adapter.garbage_collect(false).unwrap();
+        // Items of an orphaned file object are not counted apart: they go with it by cascade.
+        assert!(
+            dry.orphan_file_objects > 0 && dry.orphan_semantic_embeddings > 0,
+            "the deletion must leave orphaned file objects and embeddings: {dry:?}"
+        );
+        assert_eq!(dry.orphan_content_objects, 2, "{dry:?}");
+        assert_eq!(content(), content_before, "a dry-run deletes nothing");
+
+        let executed = adapter.garbage_collect(true).unwrap();
+        assert_eq!(executed.deleted_content_objects, 2, "{executed:?}");
+        let gone: Vec<&String> =
+            content_before.iter().filter(|hash| !content().contains(hash)).collect();
+        assert_eq!(gone, vec!["a1", "b1"], "only the deleted snapshots' content goes");
+        assert!(content().contains(&"shared".to_owned()), "content shared with h stays");
+        assert_eq!(documents(&adapter), before, "the kept snapshots read back the same");
+        assert_eq!(adapter.garbage_collect(false).unwrap().orphan_content_objects, 0);
     }
 }

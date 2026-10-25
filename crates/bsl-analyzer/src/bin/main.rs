@@ -701,6 +701,9 @@ mod contract_surface {
                     gc
                       execute
                       source-dir (-s)
+                    prune
+                      execute
+                      source-dir (-s)
               rules
                 export
                   format = sonarqube | json

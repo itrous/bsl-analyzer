@@ -57,9 +57,11 @@ pub use error::{EmbeddingFailure, EmbeddingFailureCode, SearchError};
 pub use external_baseline::ensure_the_roots_mean_the_same_elsewhere;
 pub use external_baseline::ExternalBaselineAdapter;
 pub use external_baseline::{
-    BaselineCollectionRecord, BaselineEmbeddingCoverageRecord, BaselineEmbeddingModelRecord,
-    BaselineFileObjectDetails, BaselineFileObjectRecord, BaselineFileObjectReference,
-    BaselineGcReport, BaselineSemanticPublication, BaselineSnapshotDetails, BaselineSnapshotRecord,
+    BaselineCatalogSnapshot, BaselineCollectionRecord, BaselineEmbeddingCoverageRecord,
+    BaselineEmbeddingModelRecord, BaselineFileObjectDetails, BaselineFileObjectRecord,
+    BaselineFileObjectReference, BaselineGcReport, BaselineHeadRecord, BaselineSemanticPublication,
+    BaselineServingFootprint, BaselineSnapshotCatalog, BaselineSnapshotDetails,
+    BaselineSnapshotRecord, BaselineTableFootprint, DeleteOutcome, FlattenOutcome,
     SemanticPublishPhase, SemanticPublishProgress,
 };
 pub use fingerprint::{fingerprint_documents, fingerprint_indexed_documents};

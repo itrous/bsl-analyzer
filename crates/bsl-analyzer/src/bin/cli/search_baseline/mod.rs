@@ -6,6 +6,7 @@ mod admin;
 mod documents;
 mod inspect;
 mod postgres;
+mod prune;
 mod publish;
 mod publish_policy;
 mod retention;
@@ -56,6 +57,8 @@ pub enum SearchBaselineAdminCommand {
     Migrate(SearchBaselineAdminMigrateArgs),
 
     Gc(SearchBaselineAdminGcArgs),
+
+    Prune(SearchBaselineAdminPruneArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -170,6 +173,15 @@ pub struct SearchBaselineAdminGcArgs {
 }
 
 #[derive(Args, Clone)]
+pub struct SearchBaselineAdminPruneArgs {
+    #[arg(short = 's', long = "source-dir", default_value = ".")]
+    pub(super) source_dir: PathBuf,
+
+    #[arg(long)]
+    pub(super) execute: bool,
+}
+
+#[derive(Args, Clone)]
 pub struct SearchBaselineRetentionArgs {
     #[arg(short = 's', long = "source-dir", default_value = ".")]
     pub(super) source_dir: PathBuf,
@@ -214,6 +226,7 @@ pub fn run(command: SearchCommand) -> Result<(), Box<dyn Error + Send + Sync>> {
             SearchBaselineCommand::Admin { command } => match command {
                 SearchBaselineAdminCommand::Migrate(args) => admin::migrate(args),
                 SearchBaselineAdminCommand::Gc(args) => admin::gc(args),
+                SearchBaselineAdminCommand::Prune(args) => prune::run(args),
             },
         },
     }

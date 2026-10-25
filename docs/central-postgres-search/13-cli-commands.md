@@ -48,15 +48,19 @@ snapshot_id = "reference:0.1.104"
 `docs/configuration/PROJECT_CONFIGURATION.md`. Здесь остаются только примеры,
 связанные с search baseline.
 
+Адрес PostgreSQL и схема берутся из конфигурации проекта (`url_env`, `schema`),
+отдельных флагов для них у команд нет. Каталог проекта задаётся
+`-s/--source-dir` (по умолчанию — текущий).
+
 ## Публикация снимков
 
-### `sync-pg`
+### `publish`
 
 Публикует snapshot в PostgreSQL.
 
 ```bash
 BSL_SEARCH_BASELINE_PG_URL=postgres://shared-search \
-bsl-analyzer search baseline sync-pg \
+bsl-analyzer search baseline publish \
   --source-dir ./my-project \
   --branch develop \
   --commit "$CI_COMMIT_SHA"
@@ -66,92 +70,126 @@ bsl-analyzer search baseline sync-pg \
 
 ```bash
 BSL_SEARCH_BASELINE_PG_URL=postgres://shared-search \
-bsl-analyzer search baseline sync-pg \
+bsl-analyzer search baseline publish \
   --corpus reference
 ```
 
 Поддерживаемые полезные флаги:
 
+- `--corpus workspace-code|reference`
 - `--snapshot-id`
 - `--branch`
 - `--commit`
 - `--parent-snapshot-id`
 - `--allow-non-policy-branch`
-- `--pg-url`
-- `--pg-schema`
 
 ## Просмотр и аудит
 
-### `list-pg`
+Команды просмотра собраны под `search baseline inspect`.
+
+### `inspect list-snapshots`
 
 Показать опубликованные snapshot'ы:
 
 ```bash
-bsl-analyzer search baseline list-pg --limit 20
+bsl-analyzer search baseline inspect list-snapshots --limit 20
 ```
 
-### `show-pg`
+Фильтры: `--corpus`, `--branch`, `--commit`.
+
+### `inspect show-snapshot`
 
 Показать один snapshot:
 
 ```bash
-bsl-analyzer search baseline show-pg --snapshot-id workspace-code:develop@abcdef
+bsl-analyzer search baseline inspect show-snapshot --snapshot-id workspace-code:develop@abcdef
 ```
 
-### `list-file-objects-pg`
+### `inspect list-file-objects`
 
 Показать общие file objects:
 
 ```bash
-bsl-analyzer search baseline list-file-objects-pg --limit 20
+bsl-analyzer search baseline inspect list-file-objects --limit 20
 ```
 
-### `show-file-object-pg`
+### `inspect show-file-object`
 
 Показать один file object:
 
 ```bash
-bsl-analyzer search baseline show-file-object-pg --file-object-id abcdef
+bsl-analyzer search baseline inspect show-file-object --file-object-id abcdef
 ```
 
-### `list-embeddings-pg`
+### `inspect list-embeddings`
 
 Показать список эмбеддингов:
 
 ```bash
-bsl-analyzer search baseline list-embeddings-pg
+bsl-analyzer search baseline inspect list-embeddings
 ```
 
-### `show-embedding-coverage-pg`
+### `inspect show-embedding-coverage`
 
 Показать покрытие embeddings:
 
 ```bash
-bsl-analyzer search baseline show-embedding-coverage-pg
+bsl-analyzer search baseline inspect show-embedding-coverage
+```
+
+## Администрирование
+
+Команды под `search baseline admin` работают под ролью migrator.
+
+### `admin migrate`
+
+Создать или обновить схему хранения:
+
+```bash
+bsl-analyzer search baseline admin migrate --source-dir ./my-project
 ```
 
 ## Retention и GC
 
-### `retention-pg`
+Порядок, блокировки, права и физическое освобождение места описаны в
+[09-operations.md](09-operations.md#retention-компактация-и-освобождение-места).
 
-Проверить retention policy:
+### `inspect retention`
+
+Проверить retention policy по всему каталогу snapshot'ов; `--limit` ограничивает
+только число напечатанных снимков, сводка считается по всем:
 
 ```bash
-bsl-analyzer search baseline retention-pg --source-dir ./my-project
+bsl-analyzer search baseline inspect retention --source-dir ./my-project
 ```
 
-### `gc-pg`
+### `admin prune`
 
-Сначала dry-run:
+Компактация цепочки и удаление просроченных snapshot'ов. Сначала dry-run — план и
+оценка освобождаемого места, база не меняется:
 
 ```bash
-bsl-analyzer search baseline gc-pg
+bsl-analyzer search baseline admin prune --source-dir ./my-project
+```
+
+Затем выполнение:
+
+```bash
+bsl-analyzer search baseline admin prune --source-dir ./my-project --execute
+```
+
+### `admin gc`
+
+Сборка осиротевших file objects, content objects и эмбеддингов. Сначала dry-run:
+
+```bash
+bsl-analyzer search baseline admin gc --source-dir ./my-project
 ```
 
 Затем реальное удаление:
 
 ```bash
-bsl-analyzer search baseline gc-pg --execute
+bsl-analyzer search baseline admin gc --source-dir ./my-project --execute
 ```
 
 ## Проверка конфигурации

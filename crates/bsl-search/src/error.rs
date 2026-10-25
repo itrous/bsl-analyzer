@@ -211,6 +211,12 @@ pub(crate) mod reason {
     pub(crate) const TOKEN_LAYOUT_PROVENANCE_MISSING: ReasonCode =
         ReasonCode("token_layout_provenance_missing");
     pub(crate) const SOURCE_SPAN_INVALID: ReasonCode = ReasonCode("source_span_invalid");
+    pub(crate) const PARENT_SNAPSHOT_MISSING: ReasonCode = ReasonCode("parent_snapshot_missing");
+    pub(crate) const SNAPSHOT_STILL_REFERENCED: ReasonCode =
+        ReasonCode("snapshot_still_referenced");
+    pub(crate) const PARENT_LINK_NOT_ENFORCED: ReasonCode = ReasonCode("parent_link_not_enforced");
+    pub(crate) const SNAPSHOT_CHANGED_WHILE_COMPACTING: ReasonCode =
+        ReasonCode("snapshot_changed_while_compacting");
 }
 
 /// The whole vocabulary. A code missing from here is not a named refusal at all.
@@ -234,6 +240,10 @@ const KNOWN_REASON_CODES: &[ReasonCode] = &[
     reason::TOKEN_LAYOUT_CLAIM_REQUIRED,
     reason::TOKEN_LAYOUT_PROVENANCE_MISSING,
     reason::SOURCE_SPAN_INVALID,
+    reason::PARENT_SNAPSHOT_MISSING,
+    reason::SNAPSHOT_STILL_REFERENCED,
+    reason::PARENT_LINK_NOT_ENFORCED,
+    reason::SNAPSHOT_CHANGED_WHILE_COMPACTING,
 ];
 
 /// Refusals the caller may retry: the corpus is intact, the way to it was not.

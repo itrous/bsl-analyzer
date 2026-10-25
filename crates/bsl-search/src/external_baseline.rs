@@ -8,7 +8,7 @@ use crate::ports::{
     SnapshotContentStore, SnapshotPublisher, WorkspaceBaselineManifest,
     WorkspaceBaselineManifestStore,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 mod postgres;
@@ -25,6 +25,30 @@ pub struct BaselineSnapshotRecord {
     pub created_at: String,
     pub files: usize,
     pub documents: usize,
+}
+
+/// Every snapshot and every branch head of a schema, read in one snapshot of the data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineSnapshotCatalog {
+    pub snapshots: Vec<BaselineCatalogSnapshot>,
+    pub heads: Vec<BaselineHeadRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineCatalogSnapshot {
+    pub snapshot_id: String,
+    pub corpus: String,
+    pub branch: Option<String>,
+    pub parent_snapshot_id: Option<String>,
+    /// RFC 3339 in UTC (`…T…Z`), whatever the session's time zone and date style.
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineHeadRecord {
+    pub corpus: String,
+    pub branch: String,
+    pub snapshot_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,14 +121,60 @@ pub struct BaselineEmbeddingCoverageRecord {
     pub embeddings: usize,
 }
 
+/// One serving table: its size on disk with indexes and TOAST, and its rows per snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineTableFootprint {
+    pub table: String,
+    pub total_bytes: u64,
+    pub rows_by_snapshot: BTreeMap<String, u64>,
+}
+
+impl BaselineTableFootprint {
+    pub fn total_rows(&self) -> u64 {
+        self.rows_by_snapshot.values().sum()
+    }
+}
+
+/// The tables that hold nearly all of a schema's space, and those of them this schema lacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineServingFootprint {
+    pub tables: Vec<BaselineTableFootprint>,
+    /// Tables that are not there at all — `serving_semantic` without the `vector` extension.
+    pub missing: Vec<String>,
+}
+
+/// What making a snapshot standalone did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlattenOutcome {
+    /// The snapshot now holds its whole visible map; `inherited_files` rows were copied in.
+    Flattened {
+        inherited_files: usize,
+    },
+    AlreadyStandalone,
+    Missing,
+}
+
+/// What deleting a snapshot did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    /// A branch head points at it, so it stays.
+    IsHead,
+    Missing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineGcReport {
     pub orphan_file_objects: usize,
     pub orphan_file_object_items: usize,
     pub orphan_semantic_embeddings: usize,
+    /// Content no file object of any snapshot uses — the ones `--execute` removes, counting the
+    /// content of the file objects it removes in the same run.
+    pub orphan_content_objects: usize,
     pub deleted_file_objects: usize,
     pub deleted_file_object_items: usize,
     pub deleted_semantic_embeddings: usize,
+    pub deleted_content_objects: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +361,52 @@ impl ExternalBaselineAdapter {
     pub fn garbage_collect(&self, execute: bool) -> Result<BaselineGcReport, SearchError> {
         match self {
             Self::Postgres(adapter) => adapter.garbage_collect(execute),
+        }
+    }
+
+    pub fn snapshot_catalog(&self) -> Result<BaselineSnapshotCatalog, SearchError> {
+        match self {
+            Self::Postgres(adapter) => adapter.snapshot_catalog(),
+        }
+    }
+
+    pub fn serving_footprint(&self) -> Result<BaselineServingFootprint, SearchError> {
+        match self {
+            Self::Postgres(adapter) => adapter.serving_footprint(),
+        }
+    }
+
+    /// Runs raw SQL against the schema, for tests that must set up states no command produces.
+    #[cfg(feature = "test-seams")]
+    pub fn execute_sql_for_test(&self, sql: &str) -> Result<(), SearchError> {
+        match self {
+            Self::Postgres(adapter) => adapter.execute_sql_for_test(sql),
+        }
+    }
+
+    /// Reads raw SQL back with every column as optional text; the query casts its columns.
+    #[cfg(feature = "test-seams")]
+    pub fn query_text_for_test(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, SearchError> {
+        match self {
+            Self::Postgres(adapter) => adapter.query_text_for_test(sql),
+        }
+    }
+
+    pub fn flatten_snapshot(&self, snapshot_id: &str) -> Result<FlattenOutcome, SearchError> {
+        match self {
+            Self::Postgres(adapter) => adapter.flatten_snapshot(snapshot_id),
+        }
+    }
+
+    pub fn delete_snapshot(&self, snapshot_id: &str) -> Result<DeleteOutcome, SearchError> {
+        match self {
+            Self::Postgres(adapter) => adapter.delete_snapshot(snapshot_id),
+        }
+    }
+
+    pub fn parent_link_enforced(&self) -> Result<bool, SearchError> {
+        match self {
+            Self::Postgres(adapter) => adapter.parent_link_enforced(),
         }
     }
 

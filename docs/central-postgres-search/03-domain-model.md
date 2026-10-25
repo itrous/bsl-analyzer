@@ -18,7 +18,8 @@
 - идентифицируется через `snapshot_id`;
 - принадлежит одному `corpus`;
 - может быть связан с `branch`, `commit` и `parent_snapshot_id`;
-- не меняется после публикации.
+- видимое содержимое не меняется после публикации; компактация может сменить
+  представление на самостоятельное и удаляет просроченные снимки.
 
 ### Branch head
 
@@ -76,7 +77,8 @@ logical workspace view = selected baseline snapshot + local overlay delta
 
 ## Инварианты модели
 
-- snapshot immutable;
+- видимое содержимое snapshot не меняется (компактация может сменить представление
+  на самостоятельное и удаляет просроченные снимки);
 - branch head mutable;
 - file content переиспользуется между snapshot'ами;
 - overlay не меняет shared baseline, а только скрывает/замещает его на уровне runtime.

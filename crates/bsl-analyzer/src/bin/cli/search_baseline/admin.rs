@@ -8,21 +8,27 @@ pub(super) fn gc(args: SearchBaselineAdminGcArgs) -> Result<(), Box<dyn Error + 
         project_model::PostgresAccessMode::Migrator,
     )?;
     let report = adapter.garbage_collect(args.execute)?;
-
-    if args.execute {
-        println!("Shared baseline garbage collection finished.");
-        println!("  Deleted file objects:       {}", report.deleted_file_objects);
-        println!("  Deleted file object items:  {}", report.deleted_file_object_items);
-        println!("  Deleted semantic rows:      {}", report.deleted_semantic_embeddings);
-    } else {
-        println!("Shared baseline garbage collection dry-run.");
-        println!("  Use --execute to apply deletions.");
-    }
-    println!("  Orphan file objects:        {}", report.orphan_file_objects);
-    println!("  Orphan file object items:   {}", report.orphan_file_object_items);
-    println!("  Orphan semantic rows:       {}", report.orphan_semantic_embeddings);
-
+    print!("{}", render_gc(&report, args.execute));
     Ok(())
+}
+
+fn render_gc(report: &bsl_search::BaselineGcReport, executed: bool) -> String {
+    let mut lines = Vec::new();
+    if executed {
+        lines.push("Shared baseline garbage collection finished.".to_owned());
+        lines.push(format!("  Deleted file objects:       {}", report.deleted_file_objects));
+        lines.push(format!("  Deleted file object items:  {}", report.deleted_file_object_items));
+        lines.push(format!("  Deleted semantic rows:      {}", report.deleted_semantic_embeddings));
+        lines.push(format!("  Deleted content objects:    {}", report.deleted_content_objects));
+    } else {
+        lines.push("Shared baseline garbage collection dry-run.".to_owned());
+        lines.push("  Use --execute to apply deletions.".to_owned());
+    }
+    lines.push(format!("  Orphan file objects:        {}", report.orphan_file_objects));
+    lines.push(format!("  Orphan file object items:   {}", report.orphan_file_object_items));
+    lines.push(format!("  Orphan semantic rows:       {}", report.orphan_semantic_embeddings));
+    lines.push(format!("  Orphan content objects:     {}", report.orphan_content_objects));
+    lines.iter().map(|line| format!("{line}\n")).collect()
 }
 
 pub(super) fn migrate(
@@ -59,4 +65,51 @@ pub(super) fn migrate(
     println!("  Schema: {}", schema_label);
     println!("  Role:   migrator");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_gc;
+
+    fn report() -> bsl_search::BaselineGcReport {
+        bsl_search::BaselineGcReport {
+            orphan_file_objects: 1,
+            orphan_file_object_items: 2,
+            orphan_semantic_embeddings: 3,
+            orphan_content_objects: 4,
+            deleted_file_objects: 5,
+            deleted_file_object_items: 6,
+            deleted_semantic_embeddings: 7,
+            deleted_content_objects: 8,
+        }
+    }
+
+    #[test]
+    fn gc_reports_every_count_it_deleted() {
+        expect_test::expect![[r#"
+            Shared baseline garbage collection finished.
+              Deleted file objects:       5
+              Deleted file object items:  6
+              Deleted semantic rows:      7
+              Deleted content objects:    8
+              Orphan file objects:        1
+              Orphan file object items:   2
+              Orphan semantic rows:       3
+              Orphan content objects:     4
+        "#]]
+        .assert_eq(&render_gc(&report(), true));
+    }
+
+    #[test]
+    fn a_gc_dry_run_reports_the_orphans_and_deletes_nothing() {
+        expect_test::expect![[r#"
+            Shared baseline garbage collection dry-run.
+              Use --execute to apply deletions.
+              Orphan file objects:        1
+              Orphan file object items:   2
+              Orphan semantic rows:       3
+              Orphan content objects:     4
+        "#]]
+        .assert_eq(&render_gc(&report(), false));
+    }
 }
