@@ -106,6 +106,26 @@ fn lower_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> ExprIdx {
     expr_id
 }
 
+/// The parser keeps a unary `-`/`+` as a token of the `EXPR` holding the operand,
+/// and lowering steps over that wrapper, so the sign of a number literal is
+/// recovered here: one factor of -1 per `-` on the wrappers and parentheses
+/// directly around the literal.
+fn unary_sign(literal: &SyntaxNode) -> f64 {
+    let minuses = literal
+        .ancestors()
+        .skip(1)
+        .take_while(|node| matches!(node.kind(), SyntaxKind::EXPR | SyntaxKind::PAREN_EXPR))
+        .filter(|node| node.kind() == SyntaxKind::EXPR)
+        .flat_map(|node| node.children_with_tokens().filter_map(|el| el.into_token()))
+        .filter(|token| token.kind() == SyntaxKind::MINUS)
+        .count();
+    if minuses % 2 == 1 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
 fn lower_literal(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
     let token = node.children_with_tokens().filter_map(|el| el.into_token()).find(|tok| {
         matches!(
@@ -129,7 +149,7 @@ fn lower_literal(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
     let literal = match token.kind() {
         SyntaxKind::DECIMAL | SyntaxKind::FLOAT => {
             let text = token.text().replace(' ', "");
-            let value = text.parse::<f64>().unwrap_or(0.0);
+            let value = text.parse::<f64>().unwrap_or(0.0) * unary_sign(node);
 
             let value = ordered_float::NotNan::new(value)
                 .unwrap_or_else(|_| ordered_float::NotNan::new(0.0).unwrap());

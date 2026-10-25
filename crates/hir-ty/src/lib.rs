@@ -4,6 +4,7 @@ mod call_binding;
 pub mod call_resolution;
 pub mod compat_mode;
 pub mod db;
+mod definite_init;
 pub mod doc_see;
 pub mod field_enum;
 pub mod field_lookup;
@@ -65,7 +66,8 @@ pub use infer::{
     BareNameGap, BareNameOrigin, BareNameResolution, BareNameUse, BodyInferenceResult,
     CallArgBinding, CandidateCallBinding, EnvCalleeKind, EnvMemberKind, ImplicitDatabaseReadKind,
     ImplicitLocalAssignment, ImplicitLocalInfo, InferOwnerResult, InferenceContext,
-    InferenceDiagnostic, InferenceResult, ModuleCodeInferenceResult, UnresolvedMethodKind,
+    InferenceDiagnostic, InferenceResult, ModuleCodeInferenceResult, UninitializedPath,
+    UnresolvedMethodKind,
 };
 pub use lower::TyLoweringContext;
 pub use manager_lookup::{lookup_manager_field, ManagerMemberInfo};

@@ -24,6 +24,9 @@ pub struct Body {
     pub(crate) sdbl_exprs: Vec<(ExprIdx, LocalRange, syntax::SdblQuery)>,
 
     pub(crate) recovered_exprs: FxHashSet<ExprIdx>,
+
+    /// Lowering dropped or could not place some syntax of the body.
+    pub(crate) lowering_incomplete: bool,
 }
 
 impl Default for Body {
@@ -42,6 +45,7 @@ impl Body {
             body_stmts: Box::new([]),
             sdbl_exprs: Vec::new(),
             recovered_exprs: FxHashSet::default(),
+            lowering_incomplete: false,
         }
     }
 
@@ -141,6 +145,12 @@ impl Body {
     pub fn is_recovered(&self, id: ExprId) -> bool {
         let typed_id: ExprIdx = id.to_idx();
         self.recovered_exprs.contains(&typed_id)
+    }
+
+    /// The body syntax holds an `ERROR` node or a statement lowering dropped, so
+    /// statements may be missing from the body.
+    pub fn is_lowering_incomplete(&self) -> bool {
+        self.lowering_incomplete
     }
 
     pub fn params(&self) -> impl Iterator<Item = BindingId> + '_ {

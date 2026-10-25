@@ -186,6 +186,7 @@ pub enum DiagnosticCode {
     PlatformMemberNewerThanMinVersion,
     PlatformMemberHiddenByCompatibilityMode,
     ModuleAccessibility,
+    UninitializedLocalVariable,
 
     AmbiguousFieldInQuery,
     AssignAliasFieldsInQuery,

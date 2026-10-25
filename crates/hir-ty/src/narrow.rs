@@ -971,7 +971,7 @@ fn containing_vertex(
 /// Expression roots a statement contributes to its basic block, i.e. the
 /// trees [`stmt_covers_expr`] searches. Control statements contribute none:
 /// their conditions live on dedicated CFG vertices.
-fn for_each_stmt_expr_root(body: &Body, stmt_idx: StmtIdx, f: &mut impl FnMut(ExprIdx)) {
+pub(crate) fn for_each_stmt_expr_root(body: &Body, stmt_idx: StmtIdx, f: &mut impl FnMut(ExprIdx)) {
     match body.stmt_idx(stmt_idx) {
         Stmt::Expr(e) => f(*e),
         Stmt::Assign { target: lhs, value } => {

@@ -322,6 +322,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "message embeds the module/method name and environment qualifiers by design",
     ),
     (
+        DiagnosticCode::UninitializedLocalVariable,
+        "message names the variable exactly as the source spells it, by design",
+    ),
+    (
         DiagnosticCode::AmbiguousFieldInQuery,
         "SDBL name-resolution diagnostic; requires configuration metadata fixture",
     ),
@@ -688,7 +692,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 207, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 208, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

@@ -954,3 +954,157 @@ fn labels_spelled_as_keywords_are_lowered_by_name() {
         .collect();
     assert_eq!(names, ["goto КонецЦикла", "label КонецЦикла", "goto Возврат", "label Возврат"]);
 }
+
+fn method_lowering_incomplete(code: &str) -> bool {
+    let method = parse_method(code);
+    lower_method(&method, false).body.is_lowering_incomplete()
+}
+
+fn module_lowering_incomplete(code: &str) -> bool {
+    let mut db = RootDatabaseImpl::new();
+    let file_id = FileId::from_raw(0);
+    db.set_file_text(file_id, code);
+    let root = db.parse(file_id).syntax_node();
+    super::super::lower_module_code(&root, None).body.is_lowering_incomplete()
+}
+
+#[test]
+fn lowering_complete_for_well_formed_method() {
+    assert!(!method_lowering_incomplete(
+        "Процедура Т(А)
+            Если А Тогда Х = 1; КонецЕсли;
+            Б = Х;
+        КонецПроцедуры"
+    ));
+}
+
+#[test]
+fn lowering_incomplete_for_recovered_statement() {
+    assert!(method_lowering_incomplete(
+        "Процедура Т(А)
+            Если А Тогда Х = 1; КонецЕсли;
+            Б = Х;
+            А.Свойство
+        КонецПроцедуры"
+    ));
+}
+
+#[test]
+fn lowering_incomplete_for_error_inside_if_header() {
+    assert!(method_lowering_incomplete(
+        "Процедура Т(А)
+            Если А Х = 1; КонецЕсли;
+            Б = Х;
+        КонецПроцедуры"
+    ));
+}
+
+#[test]
+fn lowering_incomplete_for_for_each_without_variable() {
+    assert!(method_lowering_incomplete(
+        "Процедура Т(А)
+            Для Каждого Из А Цикл Х = 1; КонецЦикла;
+            Б = Х;
+        КонецПроцедуры"
+    ));
+}
+
+#[test]
+fn lowering_incomplete_for_for_without_variable() {
+    assert!(method_lowering_incomplete(
+        "Процедура Т(А)
+            Для = 1 По 2 Цикл Х = 1; КонецЦикла;
+            Б = Х;
+        КонецПроцедуры"
+    ));
+}
+
+#[test]
+fn module_code_lowering_incomplete_for_dropped_loop() {
+    assert!(module_lowering_incomplete("Для Каждого Из А Цикл КонецЦикла;\n"));
+    assert!(!module_lowering_incomplete("А = 1;\n"));
+}
+
+#[test]
+fn number_literal_keeps_its_unary_sign() {
+    let method = parse_method(
+        "Процедура Т()
+            Х = -1;
+            Х = 2 - 1;
+            Х = - -1;
+            Х = -(1);
+            Х = +1;
+            Х = -1 + 2;
+        КонецПроцедуры",
+    );
+    let result = lower_method(&method, false);
+    let numbers: Vec<f64> = result
+        .body
+        .exprs
+        .iter()
+        .filter_map(|(_, expr)| match expr {
+            Expr::Literal(Literal::Number(value)) => Some(value.into_inner()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers, [-1.0, 2.0, 1.0, 1.0, -1.0, 1.0, -1.0, 2.0]);
+}
+
+#[test]
+fn number_literal_sign_in_operand_positions() {
+    let numbers_of = |statement: &str| {
+        let method = parse_method(&format!("Процедура Т(А)\n    {statement}\nКонецПроцедуры"));
+        let result = lower_method(&method, false);
+        let mut numbers: Vec<f64> = result
+            .body
+            .exprs
+            .iter()
+            .filter_map(|(_, expr)| match expr {
+                Expr::Literal(Literal::Number(value)) => Some(value.into_inner()),
+                _ => None,
+            })
+            .collect();
+        numbers.sort_by(f64::total_cmp);
+        numbers
+    };
+    assert_eq!(numbers_of("Х = А - -2;"), [-2.0]);
+    assert_eq!(numbers_of("Х = 3 * -2;"), [-2.0, 3.0]);
+    assert_eq!(numbers_of("Х = -1.5;"), [-1.5]);
+    assert_eq!(numbers_of("Х = (-1);"), [-1.0]);
+    assert_eq!(numbers_of("Х = -(-1);"), [1.0]);
+    assert_eq!(numbers_of("Х = 10 - 5 - 2;"), [2.0, 5.0, 10.0]);
+    assert_eq!(numbers_of("Ф(-1);"), [-1.0]);
+    assert_eq!(numbers_of("Х = А[-1];"), [-1.0]);
+}
+
+#[test]
+fn module_code_lowering_incomplete_for_error_inside_statement() {
+    assert!(module_lowering_incomplete("Если А Х = 1; КонецЕсли;\n"));
+}
+
+#[test]
+fn module_code_lowering_incomplete_for_recovered_statement() {
+    assert!(module_lowering_incomplete("А = 1;\nБ.Свойство\n"));
+}
+
+#[test]
+fn lowering_incomplete_for_error_in_preprocessor_branch() {
+    assert!(module_lowering_incomplete(
+        "#Если Сервер Тогда\nЕсли А Х = 1; КонецЕсли;\n#КонецЕсли\n"
+    ));
+    assert!(!module_lowering_incomplete("#Если Сервер Тогда\nА = 1;\n#КонецЕсли\n"));
+    assert!(method_lowering_incomplete(
+        "Процедура Т(А)
+#Если Сервер Тогда
+            Если А Х = 1; КонецЕсли;
+#КонецЕсли
+        КонецПроцедуры"
+    ));
+    assert!(!method_lowering_incomplete(
+        "Процедура Т(А)
+#Если Сервер Тогда
+            Х = 1;
+#КонецЕсли
+        КонецПроцедуры"
+    ));
+}

@@ -100,6 +100,30 @@ mod tests {
     }
 
     #[test]
+    fn module_code_loop_backedge_reports_first_iteration_read() {
+        use crate::test_utils::check_with_cfe;
+
+        let source = r#"
+Контроль = СовсемНеизвестноеИмя;
+Пока Истина Цикл
+    Чтение = ПоздняяВЦикле;
+    ПоздняяВЦикле = 1;
+КонецЦикла;
+"#;
+        let diagnostics = check_with_cfe(source, test_fixture::CfeFixtureBuilder::new("").build());
+        let uninitialized = diagnostics
+            .iter()
+            .filter(|diag| diag.code == DiagnosticCode::UninitializedLocalVariable)
+            .map(|diag| diag.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uninitialized,
+            ["Переменная 'ПоздняяВЦикле' может быть не инициализирована: на первой итерации цикла значение ей ещё не присвоено, присваивание в цикле действует только на следующих итерациях"],
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn unknown_typed_assignment_still_declares_an_implicit_local() {
         use crate::test_utils::check_with_cfe;
 
