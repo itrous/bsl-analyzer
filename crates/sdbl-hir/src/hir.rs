@@ -192,7 +192,8 @@ fn find_attr_field<'a>(table: &'a ResolvedTable, col: &str) -> Option<&'a FieldD
 }
 
 /// The (mdo_type, declared object name, declared attribute name) for a resolved
-/// field, or `None` for temp tables (no metadata object) and standard fields.
+/// field, or `None` for temp tables (no metadata object) and standard fields. A
+/// virtual-table field names the declared member it is derived from.
 fn attribute_of(table: &ResolvedTable, field: &FieldDef) -> Option<(MdoType, String, String)> {
     if field.is_standard {
         return None;
@@ -202,7 +203,7 @@ fn attribute_of(table: &ResolvedTable, field: &FieldDef) -> Option<(MdoType, Str
         | ResolvedTable::Register { mdo_type, name, .. } => (*mdo_type, name),
         ResolvedTable::TempTable { .. } => return None,
     };
-    Some((mdo_type, name.clone(), field.name.clone()))
+    Some((mdo_type, name.clone(), field.source.clone().unwrap_or_else(|| field.name.clone())))
 }
 
 /// Resolve a column reference to a metadata attribute, first hop only. Qualified
@@ -577,11 +578,24 @@ pub struct FieldDef {
     /// gets the opposite: an over-listed field invents a collision that the platform does not
     /// see. Such rules must not count a provisional field as an occurrence.
     pub provisional: bool,
+
+    /// The declared register member a virtual-table field is derived from: `КоличествоОстаток`
+    /// of `Остатки(...)` comes from the resource `Количество`. `None` for every field that is
+    /// itself declared or standard. A query reading the derived field reads that member, so
+    /// the graph links the read to it rather than to a name the configuration never declares.
+    pub source: Option<String>,
 }
 
 impl FieldDef {
     pub fn new(name: impl Into<String>, ty: SdblType) -> Self {
-        Self { name: name.into(), name_en: None, ty, is_standard: false, provisional: false }
+        Self {
+            name: name.into(),
+            name_en: None,
+            ty,
+            is_standard: false,
+            provisional: false,
+            source: None,
+        }
     }
 
     pub fn standard(name: impl Into<String>, name_en: impl Into<String>, ty: SdblType) -> Self {
@@ -591,6 +605,7 @@ impl FieldDef {
             ty,
             is_standard: true,
             provisional: false,
+            source: None,
         }
     }
 
@@ -610,7 +625,13 @@ impl FieldDef {
         ty: SdblType,
         is_standard: bool,
     ) -> Self {
-        Self { name, name_en, ty, is_standard, provisional: false }
+        Self { name, name_en, ty, is_standard, provisional: false, source: None }
+    }
+
+    /// A field a virtual table derives from the declared member `source`.
+    pub fn derived_from(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 
     pub fn matches_name(&self, name: &str) -> bool {
