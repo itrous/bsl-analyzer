@@ -2338,6 +2338,66 @@ fn collect_resolved_attributes_first_hop_skips_standard() {
     );
 }
 
+/// A virtual-table field reads the resource it is derived from. The shape is the one a
+/// typical warehouse configuration writes (`ТоварыНаСкладах.Остатки(...).ВНаличииОстаток`):
+/// the read must link to the declared resource `ВНаличии`, not to a `ВНаличииОстаток` the
+/// configuration never declares.
+#[test]
+fn collect_resolved_attributes_maps_virtual_table_fields_to_their_resources() {
+    use crate::hir::SdblHir;
+    use bsl_metadata::{
+        dimension::DimensionBuilder, register::RegisterResource, MdoType, Register,
+    };
+
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    let register = Register::builder()
+        .name("ТоварыНаСкладах")
+        .mdo_type(MdoType::AccumulationRegister)
+        .dimensions(vec![DimensionBuilder::default().name("Склад").build()])
+        .resources(vec![
+            RegisterResource::new(Default::default(), "ВНаличии"),
+            RegisterResource::new(Default::default(), "КОтгрузке"),
+        ])
+        .build();
+    config.add_register(register);
+    let config = std::sync::Arc::new(config);
+
+    for (code, expected) in [
+        (
+            "ВЫБРАТЬ Т.Склад, Т.ВНаличииОстаток - Т.КОтгрузкеОстаток КАК Свободно \
+             ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, Склад = &Склад) КАК Т",
+            vec!["Склад", "ВНаличии", "КОтгрузке"],
+        ),
+        (
+            "ВЫБРАТЬ Т.ВНаличииНачальныйОстаток, Т.ВНаличииПриход, Т.ВНаличииКонечныйОстаток \
+             ИЗ РегистрНакопления.ТоварыНаСкладах.ОстаткиИОбороты(,,) КАК Т",
+            vec!["ВНаличии"],
+        ),
+        (
+            "ВЫБРАТЬ Т.ВНаличииОборот ИЗ РегистрНакопления.ТоварыНаСкладах.Обороты(,,) КАК Т",
+            vec!["ВНаличии"],
+        ),
+    ] {
+        let package = lower_sdbl_to_hir(&parser::parse_sdbl(code), Some(config.clone()));
+        let mut attrs: Vec<(MdoType, String, String)> = Vec::new();
+        for query in package.queries() {
+            SdblHir::collect_resolved_attributes(&query.hir, &mut attrs);
+        }
+        let mut names: Vec<&str> = attrs
+            .iter()
+            .inspect(|(t, o, _)| {
+                assert_eq!((*t, o.as_str()), (MdoType::AccumulationRegister, "ТоварыНаСкладах"))
+            })
+            .map(|(_, _, a)| a.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(names, expected, "{code}");
+    }
+}
+
 fn unknown_fields(package: &crate::SdblPackage) -> Vec<String> {
     package
         .all_diagnostics()

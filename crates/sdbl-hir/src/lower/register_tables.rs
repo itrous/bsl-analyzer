@@ -66,6 +66,7 @@ impl Member {
             ty,
             is_standard: false,
             provisional,
+            source: Some(self.name.clone()),
         }
     }
 
@@ -76,6 +77,7 @@ impl Member {
             ty: self.ty.clone(),
             is_standard: false,
             provisional,
+            source: None,
         }
     }
 

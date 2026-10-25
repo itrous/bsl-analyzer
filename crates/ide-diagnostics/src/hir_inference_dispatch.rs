@@ -28,6 +28,7 @@ pub(crate) const INFERENCE_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::ImplicitDatabaseReadInCycle,
     DiagnosticCode::ExternalAppStarting,
     DiagnosticCode::FileSystemAccess,
+    DiagnosticCode::UninitializedLocalVariable,
 ];
 
 /// The body's own inference diagnostics, in the body's coordinates.
@@ -129,6 +130,7 @@ fn diagnostic_expr(diag: &InferenceDiagnostic) -> ExprId {
         InferenceDiagnostic::ModuleAccessibility { expr, .. } => *expr,
         InferenceDiagnostic::GuardedCall { expr, .. } => *expr,
         InferenceDiagnostic::ImplicitDatabaseRead { expr, .. } => *expr,
+        InferenceDiagnostic::UninitializedRead { expr, .. } => *expr,
     }
 }
 
@@ -282,6 +284,9 @@ fn dispatch_inference_diagnostic(
         },
         InferenceDiagnostic::ImplicitDatabaseRead { kind, .. } => {
             handlers::implicit_database_read_in_cycle::from_hir(kind, range, ctx)
+        }
+        InferenceDiagnostic::UninitializedRead { name, path, .. } => {
+            handlers::uninitialized_local_variable::from_hir(name, *path, range, ctx)
         }
     }
 }

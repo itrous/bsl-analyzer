@@ -168,6 +168,7 @@ pub mod type_mismatch_by_doc_comment;
 pub mod typo;
 pub mod unary_plus_in_concatenation;
 pub mod unavailable_in_environment;
+pub mod uninitialized_local_variable;
 pub mod union_all;
 pub mod unknown_field_in_query;
 pub mod unknown_preprocessor_symbol;
@@ -530,6 +531,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
             Some(&platform_member_hidden_by_compatibility_mode::METADATA)
         }
         DiagnosticCode::ModuleAccessibility => Some(&module_accessibility::METADATA),
+        DiagnosticCode::UninitializedLocalVariable => Some(&uninitialized_local_variable::METADATA),
 
         DiagnosticCode::UnknownSuppressionCode => Some(&crate::suppression::UNKNOWN_CODE_METADATA),
         DiagnosticCode::SuppressionWithoutCode => Some(&crate::suppression::WITHOUT_CODE_METADATA),
@@ -539,6 +541,10 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
 #[cfg(test)]
 #[path = "handlers/implicit_database_read_in_cycle_tests.rs"]
 mod implicit_database_read_in_cycle_tests;
+
+#[cfg(test)]
+#[path = "handlers/uninitialized_local_variable_tests.rs"]
+mod uninitialized_local_variable_tests;
 
 #[cfg(test)]
 mod metadata_tests {

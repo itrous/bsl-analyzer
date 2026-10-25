@@ -1,3 +1,4 @@
+pub mod definite_init;
 pub mod effect_summary;
 pub mod guard_predicates;
 pub mod path_terminates;
@@ -171,6 +172,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         let mut worklist_set: FxHashSet<NodeIndex> = worklist.iter().copied().collect();
 
         let mut iterations = 0;
+        let mut converged = true;
 
         while let Some(block_idx) = worklist.pop_front() {
             worklist_set.remove(&block_idx);
@@ -181,6 +183,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                     "Dataflow analysis exceeded max iterations ({}), returning partial solution",
                     self.max_iterations
                 );
+                converged = false;
                 break;
             }
 
@@ -232,7 +235,12 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
 
         tracing::debug!("Forward dataflow analysis converged in {} iterations", iterations);
 
-        Some(DataflowResult { block_in: self.block_in, block_out: self.block_out, cfg: self.cfg })
+        Some(DataflowResult {
+            block_in: self.block_in,
+            block_out: self.block_out,
+            cfg: self.cfg,
+            converged,
+        })
     }
 
     fn solve_backward(mut self) -> Option<DataflowResult<L>> {
@@ -255,6 +263,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         let mut worklist_set: FxHashSet<NodeIndex> = worklist.iter().copied().collect();
 
         let mut iterations = 0;
+        let mut converged = true;
         let mut block_visit_count: rustc_hash::FxHashMap<NodeIndex, usize> =
             rustc_hash::FxHashMap::default();
 
@@ -285,6 +294,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                     }
                 }
 
+                converged = false;
                 break;
             }
 
@@ -356,7 +366,12 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             );
         }
 
-        Some(DataflowResult { block_in: self.block_in, block_out: self.block_out, cfg: self.cfg })
+        Some(DataflowResult {
+            block_in: self.block_in,
+            block_out: self.block_out,
+            cfg: self.cfg,
+            converged,
+        })
     }
 
     fn transfer_block(&self, block_idx: NodeIndex, in_state: &L) -> L {
@@ -442,6 +457,8 @@ pub struct DataflowResult<L: Lattice> {
     block_out: FxHashMap<NodeIndex, L>,
 
     cfg: Arc<ControlFlowGraph>,
+
+    converged: bool,
 }
 
 impl<L: Lattice> DataflowResult<L> {
@@ -455,6 +472,11 @@ impl<L: Lattice> DataflowResult<L> {
 
     pub fn cfg(&self) -> &ControlFlowGraph {
         &self.cfg
+    }
+
+    /// `false` when the iteration budget ran out and the states are a partial solution.
+    pub fn converged(&self) -> bool {
+        self.converged
     }
 
     pub fn blocks(&self) -> impl Iterator<Item = (NodeIndex, &L, &L)> {

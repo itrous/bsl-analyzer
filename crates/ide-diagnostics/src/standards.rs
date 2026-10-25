@@ -228,6 +228,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::PlatformMemberNewerThanMinVersion => &[],
         DiagnosticCode::PlatformMemberHiddenByCompatibilityMode => &[],
         DiagnosticCode::ModuleAccessibility => &[469],
+        DiagnosticCode::UninitializedLocalVariable => &[494],
         DiagnosticCode::AmbiguousFieldInQuery => &[],
         DiagnosticCode::AssignAliasFieldsInQuery => &[437],
         DiagnosticCode::DuplicateAliasInQuery => &[],

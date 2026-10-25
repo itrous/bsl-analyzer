@@ -853,6 +853,7 @@ impl LoweringContext<'_> {
                         r.ty.clone(),
                         false,
                     )
+                    .derived_from(r.source.clone().unwrap_or_else(|| r.name.clone()))
                 })
                 .collect()
         };

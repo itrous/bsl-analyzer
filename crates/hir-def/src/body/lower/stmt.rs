@@ -271,6 +271,8 @@ pub(super) fn lower_stmt_list_with_unreachable(
             if let Some(stmt) = lower_preproc_if(ctx, &child) {
                 let stmt_id = ctx.alloc_stmt(stmt, child.text_range());
                 stmts.push(stmt_id);
+            } else {
+                ctx.body.lowering_incomplete = true;
             }
             continue;
         }
@@ -477,8 +479,12 @@ pub(crate) fn lower_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stm
         }
         SyntaxKind::ERROR => try_lower_recovered_expr_stmt(ctx, node),
         _ => return None,
-    }?;
+    };
 
+    let Some(stmt) = stmt else {
+        ctx.body.lowering_incomplete = true;
+        return None;
+    };
     Some(ctx.alloc_stmt(stmt, range))
 }
 

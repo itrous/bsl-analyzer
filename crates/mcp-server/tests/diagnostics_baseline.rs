@@ -166,6 +166,7 @@ async fn workspace_until_both_modules(client: &Client) {
 /// holding the full text. The rename is the only event on the target path, and the target
 /// appears whole; both temporary directories live under the system temp dir, so the rename
 /// stays on one file system.
+#[cfg(unix)]
 fn replace_module(path: &Path, text: &str) {
     let staging = tempfile::tempdir().unwrap();
     let staged = staging.path().join("Module.bsl");
@@ -173,6 +174,7 @@ fn replace_module(path: &Path, text: &str) {
     std::fs::rename(&staged, path).unwrap();
 }
 
+#[cfg(unix)]
 fn result_id(body: &Value) -> String {
     body["result"]["result_id"].as_str().expect("a result id").to_owned()
 }

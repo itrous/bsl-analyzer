@@ -435,6 +435,10 @@ pub fn lower_method_with_externals(
         ctx.set_line_index(li);
     }
 
+    if has_error_node(method_node) {
+        ctx.body.lowering_incomplete = true;
+    }
+
     ctx.is_client_only = is_client_only_method(method_node);
     ctx.has_no_context_annotation = has_no_context_annotation_method(method_node);
     ctx.is_instead_method = is_around_annotation_method(method_node);
@@ -553,6 +557,12 @@ fn compute_method_size_lines(method_node: &SyntaxNode, line_index: Option<&LineI
     end_line.saturating_sub(start_line) as u32
 }
 
+/// The parser recovered somewhere inside `node` (itself included), so some of its
+/// statements may not be lowered.
+fn has_error_node(node: &SyntaxNode) -> bool {
+    node.descendants().any(|n| n.kind() == SyntaxKind::ERROR)
+}
+
 fn is_compound_block_stmt(node: &SyntaxNode) -> bool {
     matches!(
         node.kind(),
@@ -574,10 +584,18 @@ pub fn lower_module_code(root: &SyntaxNode, line_index: Option<Arc<LineIndex>>) 
     let mut stmts = Vec::new();
 
     for node in root.children() {
+        if node.kind() == SyntaxKind::ERROR {
+            ctx.body.lowering_incomplete = true;
+        }
         if node.kind() == SyntaxKind::PRE_IF_DIR {
+            if has_error_node(&node) {
+                ctx.body.lowering_incomplete = true;
+            }
             if let Some(stmt) = preproc::lower_preproc_if(&mut ctx, &node) {
                 let stmt_id = ctx.alloc_stmt(stmt, node.text_range());
                 stmts.push(stmt_id);
+            } else {
+                ctx.body.lowering_incomplete = true;
             }
             continue;
         }
@@ -591,6 +609,9 @@ pub fn lower_module_code(root: &SyntaxNode, line_index: Option<Arc<LineIndex>>) 
             continue;
         }
 
+        if has_error_node(&node) {
+            ctx.body.lowering_incomplete = true;
+        }
         if let Some(stmt_id) = stmt::lower_stmt(&mut ctx, &node) {
             stmts.push(stmt_id);
 

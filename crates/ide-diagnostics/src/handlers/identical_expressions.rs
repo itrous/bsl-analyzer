@@ -1040,4 +1040,16 @@ mod tests {
 
         let _diagnostics = check_body_diagnostic(code, check_body);
     }
+
+    #[test]
+    fn a_negative_number_literal_is_not_the_positive_one() {
+        let different = "Функция Тест(Х)\n    Возврат Х = 1 ИЛИ Х = -1;\nКонецФункции\n";
+        let diagnostics = check_body_diagnostic(different, check_body);
+        assert!(diagnostics.is_empty(), "1 and -1 are different literals: {diagnostics:#?}");
+
+        // Контроль: одинаковые отрицательные литералы по-прежнему одинаковы, иначе
+        // проверка выше зелена сама по себе.
+        let same = "Функция Тест(Х)\n    Возврат Х = -1 ИЛИ Х = -1;\nКонецФункции\n";
+        assert_eq!(check_body_diagnostic(same, check_body).len(), 1);
+    }
 }
