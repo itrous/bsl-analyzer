@@ -5,6 +5,7 @@
 //! answers an empty list for everything would pass a suite of "no false hits"
 //! assertions, so each one is paired with an input where the hit is required.
 
+use hir::{DefDatabase, ModuleId};
 use ide::{
     anchor_references, find_references_by_name, finish_references, lookup_names,
     resolve_declarations, symbol_info, walk_reference_file, Anchored, NameQuery, ReferenceAnchor,
@@ -21,7 +22,10 @@ use vfs::{FileId, FileSet, VfsPath};
 const MAX_FILES: usize = 2000;
 
 fn db_with(files: &[(&str, &str)]) -> (RootDatabaseImpl, Vec<FileId>) {
-    let mut db = RootDatabaseImpl::new();
+    db_into(RootDatabaseImpl::new(), files)
+}
+
+fn db_into(mut db: RootDatabaseImpl, files: &[(&str, &str)]) -> (RootDatabaseImpl, Vec<FileId>) {
     let mut file_set = FileSet::default();
     let ids: Vec<FileId> = (0..files.len()).map(|i| FileId(i as u32)).collect();
     for (id, (path, _)) in ids.iter().zip(files) {
@@ -401,6 +405,121 @@ fn the_three_steps_compose_to_the_serial_walk_in_either_order() {
         assert_eq!(result.declarations, serial.declarations, "{order}: declarations");
         assert_eq!(result.outcome, serial.outcome, "{order}: outcome");
     }
+}
+
+/// A walk over files whose tokens all stand in method bodies lowers only the bodies it
+/// enters: each file's module code and the enclosing method of each token (and whatever
+/// type inference pulls in), never the whole-file fold. Eight filler methods make the
+/// difference visible: an eager lowering of the client file would run
+/// `method_lower_query` ten times here, not two.
+#[test]
+fn a_reference_walk_lowers_only_the_bodies_it_enters() {
+    const CLIENT_WITH_FILLERS: &str = "\
+Процедура Вызвать() Экспорт
+    Продажи.Расчёт();
+КонецПроцедуры
+
+Процедура Фон1()
+    Х = 1;
+КонецПроцедуры
+
+Процедура Фон2()
+    Х = 2;
+КонецПроцедуры
+
+Процедура Фон3()
+    Х = 3;
+КонецПроцедуры
+
+Процедура Фон4()
+    Х = 4;
+КонецПроцедуры
+
+Процедура Фон5()
+    Х = 5;
+КонецПроцедуры
+
+Процедура Фон6()
+    Х = 6;
+КонецПроцедуры
+
+Процедура Фон7()
+    Х = 7;
+КонецПроцедуры
+
+Процедура Фон8()
+    Х = 8;
+КонецПроцедуры
+";
+    const FILLERS: u64 = 8;
+    let (db, files) = db_into(
+        RootDatabaseImpl::new_with_salsa_events(),
+        &[
+            ("/ws/src/cf/CommonModules/Продажи/Ext/Module.bsl", SALES),
+            ("/ws/src/cf/CommonModules/Клиент/Ext/Module.bsl", CLIENT_WITH_FILLERS),
+        ],
+    );
+    let client = files[1];
+    assert!(db.salsa_events_reset(), "the stand database must count salsa events");
+
+    let result =
+        find_references_by_name(&db, &request(ReferenceAnchor::Name("Продажи.Расчёт".into())), &[]);
+    assert_eq!(result.outcome, ReferencesOutcome::Resolved);
+    assert_eq!(result.hits.len(), 2, "the control: the walk entered both files");
+
+    let (module_bodies_runs, _) = db.salsa_family_churn("module_bodies_query").unwrap();
+    assert_eq!(module_bodies_runs, 0, "the walk never folds a whole file's bodies");
+    let (lowered, _) = db.salsa_family_churn("method_lower_query").unwrap();
+    assert_eq!(lowered, 2, "only `Расчёт` and `Вызвать` are lowered, not the fillers");
+
+    // The positive control: the counter is live, and the fillers were indeed not
+    // lowered before — folding the client file lowers exactly them now.
+    let _ = db.module_bodies(ModuleId::new(client));
+    let (lowered, _) = db.salsa_family_churn("method_lower_query").unwrap();
+    assert_eq!(lowered, 2 + FILLERS, "the fold lowers the fillers, and only now");
+}
+
+/// The `module_bodies_query` counter that the lazy-walk test reads for zero is live:
+/// folding a file's bodies moves it. Without this, a renamed query would leave that
+/// zero standing for any implementation.
+#[test]
+fn folding_a_file_moves_the_module_bodies_counter_the_lazy_walk_reads() {
+    let (db, files) = db_into(
+        RootDatabaseImpl::new_with_salsa_events(),
+        &[("/ws/src/cf/CommonModules/Клиент/Ext/Module.bsl", CLIENT)],
+    );
+    assert!(db.salsa_events_reset(), "the stand database must count salsa events");
+    assert_eq!(db.salsa_family_churn("module_bodies_query"), Some((0, 0)));
+
+    let _ = db.module_bodies(ModuleId::new(files[0]));
+
+    let (folds, _) = db.salsa_family_churn("module_bodies_query").unwrap();
+    assert_eq!(folds, 1, "the fold of one file runs `module_bodies_query` once");
+}
+
+/// A reference standing in a module's own code, outside every method, is found as one
+/// standing in a method body is: the module code is the first body a token resolves in,
+/// so an answer that read only method bodies would lose exactly these.
+#[test]
+fn a_reference_standing_in_module_code_is_found() {
+    const MODULE_CODE: &str = "\
+Процедура Вызвать() Экспорт
+КонецПроцедуры
+
+Накопитель = 1;
+Сообщить(Накопитель);
+";
+    let (db, files) = db_with(&[("/ws/src/cf/CommonModules/Клиент/Ext/Module.bsl", MODULE_CODE)]);
+
+    let result = find_references_by_name(
+        &db,
+        &request(ReferenceAnchor::Position { file_id: files[0], line: 3, column: 2 }),
+        &[],
+    );
+
+    assert_eq!(result.outcome, ReferencesOutcome::Resolved);
+    assert_eq!(result.hits.len(), 2, "the write and the read: {:?}", result.hits);
+    assert!(result.hits.iter().all(|hit| hit.enclosing_range.is_none()));
 }
 
 /// The kind filter selects, and `include_declaration` is a separate switch —

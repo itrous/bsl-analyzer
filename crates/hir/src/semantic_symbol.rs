@@ -6,8 +6,8 @@ use bsl_types::builders::Builders;
 use bsl_types::kind::{TypeId, TypeKind};
 use hir_def::scope::{ExprScopes, ScopeDef};
 use hir_def::{
-    BindingId, DefDatabase, DefWithBodyId, ExprId, MethodId, MethodKey, ModuleBodies, ModuleId,
-    VariableId,
+    BindingId, DefDatabase, DefWithBodyId, ExprId, LowerResultAt, MethodId, MethodIdInput,
+    MethodKey, MethodOffset, ModuleId, VariableId,
 };
 use hir_ty::narrow::{NarrowExprIndex, NarrowState};
 use hir_ty::{db::HirDatabase, ImplicitLocalInfo};
@@ -130,7 +130,6 @@ pub struct FileSymbolCtx<'db, DB: HirDatabase + base_db::RootQueryDb> {
     sema: Semantics<'db, DB>,
     file_id: FileId,
     module_id: ModuleId,
-    module_bodies: Arc<ModuleBodies>,
     /// Method-def syntax range → the method's key, under which the lowered
     /// body is filed.
     method_ranges: FxHashMap<TextRange, MethodKey>,
@@ -174,7 +173,6 @@ fn receiver_name_token(receiver: &syntax::SyntaxNode) -> Option<syntax::SyntaxTo
 impl<'db, DB: HirDatabase + base_db::RootQueryDb> FileSymbolCtx<'db, DB> {
     pub fn new(db: &'db DB, file_id: FileId) -> Self {
         let module_id = ModuleId::new(file_id);
-        let module_bodies = db.module_bodies(module_id);
         let tree = db.item_tree(file_id);
         let mut method_ranges = FxHashMap::default();
         for method in tree.methods() {
@@ -184,7 +182,6 @@ impl<'db, DB: HirDatabase + base_db::RootQueryDb> FileSymbolCtx<'db, DB> {
             sema: Semantics::new(db),
             file_id,
             module_id,
-            module_bodies,
             method_ranges,
             binding_types: true,
             owner_bindings: RefCell::new(FxHashMap::default()),
@@ -761,25 +758,36 @@ impl<'db, DB: HirDatabase + base_db::RootQueryDb> FileSymbolCtx<'db, DB> {
     /// the range). A range that participates in no body — a callee name, a
     /// token in a dead preprocessor branch — resolves to `None`, as it did
     /// when every body was scanned.
+    ///
+    /// The module code (one memo per file) is read first for every range;
+    /// beyond it, only the method the range falls into is lowered, straight
+    /// from the per-method memos. The whole-file fold (`module_bodies`) is not
+    /// read here, or resolving one token would lower every method of the file.
     fn body_for(
         &self,
         range: TextRange,
         start: syntax::SyntaxNode,
     ) -> Option<(DefWithBodyId, &hir_def::Body, hir_def::body::SourceMapAt<'_>)> {
-        if let Some(result) = self.module_bodies.module_code_result() {
-            let source_map = result.source_map();
-            if source_map.expr_at_range(range).is_some()
-                || source_map.binding_at_range(range).is_some()
-            {
-                return Some((DefWithBodyId::ModuleCode, result.body(), source_map));
-            }
+        let db: &'db dyn DefDatabase = self.db();
+        let module_code =
+            hir_def::module_code_lower_query(db, base_db::FileIdInput::new(db, self.file_id));
+        let result = LowerResultAt { result: module_code, base: MethodOffset::ZERO };
+        let source_map = result.source_map();
+        if source_map.expr_at_range(range).is_some() || source_map.binding_at_range(range).is_some()
+        {
+            return Some((DefWithBodyId::ModuleCode, result.body(), source_map));
         }
 
         let mut node = Some(start);
         while let Some(current) = node {
             if matches!(current.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF) {
                 if let Some(local_id) = self.method_ranges.get(&current.text_range()) {
-                    if let Some(result) = self.module_bodies.lower_result(*local_id) {
+                    let method = MethodId { module: self.module_id, local_id: *local_id };
+                    if let Some(lower) =
+                        hir_def::method_lower_query(db, MethodIdInput::new(db, method))
+                    {
+                        let base = MethodOffset::new(current.text_range().start());
+                        let result = LowerResultAt { result: lower, base };
                         let source_map = result.source_map();
                         if source_map.expr_at_range(range).is_some()
                             || source_map.binding_at_range(range).is_some()

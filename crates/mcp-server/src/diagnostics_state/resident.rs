@@ -3271,13 +3271,12 @@ mod trim_tests {
     }
 
     /// Inside the chunked walk, never more than the interactive window plus one chunk of
-    /// syntax trees and of lowered bodies is held. Sampled INSIDE the walk, after every
-    /// file: the walk trims after its last chunk too, and a reading taken after it could
-    /// not tell a trim between chunks from one trim at the end — or from one chunk.
+    /// syntax trees is held. Sampled INSIDE the walk, after every file: the walk trims
+    /// after its last chunk too, and a reading taken after it could not tell a trim
+    /// between chunks from one trim at the end — or from one chunk.
     #[test]
     fn references_walk_keeps_at_most_the_interactive_window_of_syntax_trees() {
         const PARSE_WINDOW: usize = 512;
-        const BODIES_WINDOW: usize = 128;
         // Walking references moves the process-global span counter the cancellation
         // gates measure with; taking their gate keeps this test out of their numbers.
         let _serialised = crate::walk_probe::WALK_GATE.blocking_lock();
@@ -3285,22 +3284,17 @@ mod trim_tests {
         workspace_with_n_callers(dir.path(), CALLERS);
         let request = callers_request();
 
-        // The control: the serial walk inside one read holds every tree and every
-        // file's bodies until the read ends.
+        // The control: the serial walk inside one read holds every tree until the read
+        // ends.
         let state = joined_state(dir.path());
-        let (scanned, parse_all, bodies_all) = ready(state.read(|resident, _| {
+        let (scanned, parse_all) = ready(state.read(|resident, _| {
             let result = resident.analysis().attached(|analysis| {
                 ide::find_references_by_name(analysis.database(), &request, &[])
             });
-            (
-                result.files_scanned,
-                heap_bytes(resident.db(), "syntax::Parse<"),
-                heap_bytes(resident.db(), "ModuleBodies>"),
-            )
+            (result.files_scanned, heap_bytes(resident.db(), "syntax::Parse<"))
         }));
         assert_eq!(scanned, CANDIDATES, "the control: every caller and the declaration");
         assert!(parse_all > 0, "the control: the trees hold heap");
-        assert!(bodies_all > 0, "the control: the bodies hold heap");
 
         // A fresh resident, or the serial walk's memos would make the chunked one parse
         // nothing. Its name indexes are warmed first, as the handler warms them before
@@ -3310,14 +3304,11 @@ mod trim_tests {
         let cancel = RequestCancel::default();
         let (result, samples) = ready(state.read_mut(|resident, _| {
             resident.warm_name_indexes(&cancel);
-            chunked_walk(resident, &cancel, &request, |db| {
-                (heap_bytes(db, "syntax::Parse<"), heap_bytes(db, "ModuleBodies>"))
-            })
+            chunked_walk(resident, &cancel, &request, |db| heap_bytes(db, "syntax::Parse<"))
         }));
         assert_eq!(result.files_scanned, CANDIDATES);
         assert_eq!(samples.len(), CANDIDATES, "one sample per file entered");
-        let parse_peak = samples.iter().map(|(parse, _)| *parse).max().unwrap();
-        let bodies_peak = samples.iter().map(|(_, bodies)| *bodies).max().unwrap();
+        let parse_peak = samples.iter().copied().max().unwrap();
         // The modules are alike, so the memos weigh alike: the peak stands at the end
         // of a chunk, when the window kept by the previous trim and the whole chunk are
         // live — within one memo of slack.
@@ -3325,11 +3316,6 @@ mod trim_tests {
             parse_peak <= parse_all * (PARSE_WINDOW + CHUNK + 1) / CANDIDATES,
             "the walk keeps at most the window plus one chunk of syntax trees: \
              {parse_peak} of {parse_all} bytes"
-        );
-        assert!(
-            bodies_peak <= bodies_all * (BODIES_WINDOW + CHUNK + 1) / CANDIDATES,
-            "the walk keeps at most the window plus one chunk of lowered bodies: \
-             {bodies_peak} of {bodies_all} bytes"
         );
     }
 
