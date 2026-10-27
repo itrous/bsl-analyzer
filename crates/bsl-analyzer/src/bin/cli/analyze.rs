@@ -12,6 +12,8 @@ use ide_db::metadata;
 pub enum OutputFormat {
     #[default]
     Console,
+    /// One JSON event per line. Finding coordinates are 0-based (lines and columns, columns
+    /// in characters, range end exclusive); see docs/CI_REPORTERS.md.
     Jsonl,
 }
 

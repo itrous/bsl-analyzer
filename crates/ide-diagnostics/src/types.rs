@@ -38,12 +38,18 @@ pub struct DiagnosticOutput {
 
     pub severity: String,
 
+    /// Zero-based line of the range start. Reporters that print 1-based numbers (SARIF,
+    /// JUnit, Code Quality) add 1 themselves; `--format jsonl` emits this value as is.
     pub start_line: usize,
 
+    /// Zero-based column of the range start, counted in Unicode code points (not bytes,
+    /// not UTF-16 units).
     pub start_column: usize,
 
+    /// Zero-based line of the range end.
     pub end_line: usize,
 
+    /// Zero-based column of the range end in Unicode code points; the end is exclusive.
     pub end_column: usize,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
