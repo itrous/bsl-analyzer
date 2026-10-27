@@ -4977,6 +4977,10 @@ mod graph_supersession_contract {
         let state = SharedState::workspace(dir.path().to_path_buf()).unwrap();
         let graph = state.graph().clone();
         let diagnostics = state.diagnostics().clone();
+        let hub = state.change_hub().expect("workspace installs its watcher").clone();
+        // A resident built before the watch arms reads drift by a throttled scan on a clock,
+        // not from the event stream this test waits on. Arm the watch before anything is built.
+        assert!(hub.wait_until_watching(), "the hub must arm before the residents are built");
         graph.ensure_loading();
         crate::graph::test_support::wait_ready(&graph);
         state.diagnostics().ensure_loading();
@@ -5068,13 +5072,13 @@ mod graph_supersession_contract {
         let old_text = std::fs::read_to_string(&changed_path).unwrap();
         std::fs::write(&changed_path, format!("// сдвиг координат\n{old_text}")).unwrap();
         // `file_text` is revision-guarded: an un-applied disk edit must be refused rather
-        // than combined with the resident's old ranges. Let the normal diagnostics drift
-        // path consume the real workspace event first, while the graph publication remains
-        // installed. The subsequent tool assertions then compare each service to its own
+        // than combined with the resident's old ranges. Each read runs the normal diagnostics
+        // drift path, and a read that still sees the old text waits for the hub to take in
+        // another event before it tries again. The graph publication stays installed
+        // meanwhile, and the subsequent tool assertions compare each service to its own
         // coherent resident snapshot during graph reload.
-        let resident_deadline =
-            std::time::Instant::now() + test_utils::wait::hang_guard(Duration::from_secs(60));
         let shifted_resident = loop {
+            let seen = hub.generation();
             let observed = diagnostics.read(|resident, _| {
                 let file_id = resident.file_id_for(&changed_path).expect("resident module");
                 resident.analysis().file_text(file_id).to_string()
@@ -5084,11 +5088,12 @@ mod graph_supersession_contract {
                     break text;
                 }
             }
+            let after =
+                hub.wait_for_change(seen, test_utils::wait::hang_guard(Duration::from_secs(60)));
             assert!(
-                std::time::Instant::now() < resident_deadline,
-                "the normal diagnostics drift path did not apply the delivered disk edit"
+                after > seen,
+                "the watcher delivered no event for the disk edit within the hang guard"
             );
-            std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(shifted_resident, format!("// сдвиг координат\n{old_text}"));
         let graph_snapshot = graph.snapshot().expect("published graph handle");
