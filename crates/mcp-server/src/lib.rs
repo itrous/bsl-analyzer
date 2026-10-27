@@ -2036,6 +2036,15 @@ impl McpServer {
         let started = std::time::Instant::now();
         let retry_diag = diag.clone();
         let outcome = resident_call(diag, ct, move |session| {
+            // Before the read that folds `module_members`: its symbol trees, warmed in
+            // chunks with a trim between, so a cold fold assembles from memos instead
+            // of holding every workspace file's syntax tree and text until it answers.
+            // A resident gone between here and the read is the read's own `Loading`.
+            if resident_ready {
+                let warm_cancel = std::sync::Arc::clone(session.cancel());
+                let _ =
+                    session.read_fanout(|resident, _| resident.warm_module_members(&warm_cancel));
+            }
             graph.read_optional(|snapshot| {
                 let source = graph_name_source(&graph, snapshot);
 
@@ -2495,6 +2504,15 @@ impl McpServer {
                             // the same file set that produced it.
                             let symbol = symbol.as_deref().unwrap_or_default();
                             let source = graph_name_source(&graph, snapshot);
+                            // The lookup folds `module_members`: warm its symbol trees
+                            // in chunks first, or a cold fold holds every file's tree
+                            // until it answers. The card read above found the resident
+                            // ready, so the graph read is held for the warm-up, where
+                            // it used to be held for the unchunked fold.
+                            let warm_cancel = std::sync::Arc::clone(session.cancel());
+                            let _ = session.read_fanout(|resident, _| {
+                                resident.warm_module_members(&warm_cancel)
+                            });
                             let answer = session.read(|resident, analysis, _generation| {
                                 let db = analysis.database();
                                 let query = ide::NameQuery::new(
@@ -6271,6 +6289,113 @@ mod rescan_hatch_consultations {
             "control: an answer that resolved does not"
         );
 
+        server.shutdown();
+    }
+}
+
+/// `graph resolve` and a `symbol_info` miss fold `module_members` through `lookup_names`,
+/// and both warm its symbol trees in chunks first, so a cold fold assembles from memos
+/// instead of holding every file's syntax tree until it answers.
+///
+/// The handler is the layer that decides to warm, so this is its gate; the chunking and
+/// the trim between chunks are gated on the resident (`trim_tests`). Every read trims after
+/// itself, which leaves nothing of the trees to count once the handler has answered. What
+/// the warm-up does leave, and a fold alone does not, is the resident's fan-out pool: only
+/// a sweep or a warm-up raises it, and these stands never sweep.
+#[cfg(test)]
+mod module_members_warm_up {
+    use super::*;
+    use crate::diagnostics_state::{test_support, DiagnosticsState};
+
+    const DECLARED: &str = "Сервер.Считать";
+    const ABSENT: &str = "Сервер.НетТакогоИмени";
+
+    fn stand() -> (tempfile::TempDir, McpServer, DiagnosticsState) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache).unwrap();
+        test_support::join_load(state.diagnostics());
+        let diag = state.diagnostics().clone();
+        (dir, McpServer::new(McpProfile::Workspace, state), diag)
+    }
+
+    fn token() -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    fn resolve_params(query: &str) -> Parameters<GraphParams> {
+        Parameters(GraphParams {
+            action: "resolve".to_owned(),
+            id: None,
+            query: Some(query.to_owned()),
+            ids: Vec::new(),
+            max_output_tokens: None,
+            detail: None,
+            dir: None,
+            depth: None,
+            max_nodes: None,
+            provenance: Vec::new(),
+            edge_kinds: Vec::new(),
+            top: None,
+            call_sites: None,
+            max_call_sites: None,
+        })
+    }
+
+    fn symbol_params(symbol: &str) -> Parameters<SymbolInfoParams> {
+        Parameters(SymbolInfoParams {
+            symbol: Some(symbol.to_owned()),
+            root_id: None,
+            path: None,
+            line: None,
+            column: None,
+            include: Vec::new(),
+            member_kind: None,
+            member_name: None,
+            locale: None,
+            max_output_tokens: None,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graph_resolve_warms_the_symbol_trees_before_it_folds() {
+        let (_dir, server, diag) = stand();
+        assert!(
+            !test_support::fan_out_pool_is_raised(&diag),
+            "the control: a stand that never swept has no fan-out pool"
+        );
+
+        server
+            .graph(resolve_params("Считать"), token())
+            .await
+            .expect("resolve answers from the resident");
+
+        assert!(
+            test_support::fan_out_pool_is_raised(&diag),
+            "resolve warmed the symbol trees before folding them"
+        );
+        server.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_symbol_info_miss_warms_the_symbol_trees_and_a_card_does_not() {
+        let (_dir, server, diag) = stand();
+
+        let _ =
+            server.symbol_info(symbol_params(DECLARED), token(), tasks::TaskCapable(false)).await;
+        assert!(
+            !test_support::fan_out_pool_is_raised(&diag),
+            "the control: a name that resolved is a card and folds no names"
+        );
+
+        let _ = server.symbol_info(symbol_params(ABSENT), token(), tasks::TaskCapable(false)).await;
+        assert!(
+            test_support::fan_out_pool_is_raised(&diag),
+            "a name that missed warmed the symbol trees before folding them"
+        );
         server.shutdown();
     }
 }

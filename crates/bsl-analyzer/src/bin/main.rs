@@ -9,15 +9,21 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // tracks live memory. `dirty_decay_ms` is non-zero to keep page reuse cheap on
 // hot allocation paths; `muzzy_decay_ms:0` returns muzzy pages promptly.
 // `background_thread` is only enabled on linux-gnu, where jemalloc supports it.
+// `narenas:4`: jemalloc defaults to 4 × ncpu arenas (128 on a 32-core host), and
+// a resident of ~3.6 GB live on ERP then holds 2–3 GB more in partially used
+// pages spread over them. Four arenas give back about 0.4 GB of that on the
+// MCP daemon (peak 4.8 → 4.4 GB, settled 3.3 → 3.0 GB) at the same speed:
+// graph readiness, the first `graph resolve` and a 5000-file sweep stay
+// within 5 % of the 128-arena binary over six cold runs each.
 #[cfg(not(target_os = "windows"))]
 const MALLOC_CONF_BYTES: &[u8] = {
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     {
-        b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0"
+        b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:4\0"
     }
     #[cfg(not(all(target_os = "linux", not(target_env = "musl"))))]
     {
-        b"dirty_decay_ms:1000,muzzy_decay_ms:0\0"
+        b"dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:4\0"
     }
 };
 

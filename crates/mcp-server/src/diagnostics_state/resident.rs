@@ -606,10 +606,28 @@ impl DiagnosticsResident {
     /// chunks with a trim between them. The indexes are one query each over every
     /// workspace file, so a cold one would otherwise parse the whole workspace inside
     /// the request and keep every syntax tree until it answers; warmed this way, the
-    /// trees of a chunk go at its end and only the small per-file memos stay. The pool
-    /// discipline is the sweep's: each job on its own db clone, registered with the
-    /// request's cancellation, nested parallelism refused.
+    /// trees of a chunk go at its end and only the small per-file memos stay.
     pub(crate) fn warm_name_indexes(&mut self, cancel: &RequestCancel) {
+        self.warm_per_file(cancel, |analysis, file_id| analysis.warm_name_indexes(&[file_id]));
+    }
+
+    /// Warm only the symbol trees `module_members` folds — what `graph resolve` and a
+    /// `symbol_info` miss read through `lookup_names`. The name sets `references`
+    /// also needs are left cold: they are read by nothing on these paths and hold
+    /// hundreds of megabytes on a large workspace.
+    pub(crate) fn warm_module_members(&mut self, cancel: &RequestCancel) {
+        self.warm_per_file(cancel, |analysis, file_id| analysis.warm_module_members(&[file_id]));
+    }
+
+    /// Run `job` over every resident file, in chunks with a trim between them. The
+    /// pool discipline is the sweep's: each job on its own db clone, registered with
+    /// the request's cancellation, nested parallelism refused. A cancelled request
+    /// returns without the trim: the trees it leaves go with the read's own trim.
+    fn warm_per_file(
+        &mut self,
+        cancel: &RequestCancel,
+        job: impl Fn(&Analysis, FileId) + Send + Sync,
+    ) {
         use rayon::prelude::*;
         use std::panic::AssertUnwindSafe;
 
@@ -628,6 +646,7 @@ impl DiagnosticsResident {
                 return;
             }
             let seed = SweepWorker::new(self.db.database().clone());
+            let job = &job;
             let outcome = self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
                 chunk.par_iter().try_for_each_with(seed, |worker, (file_id, _)| {
                     let file_id = *file_id;
@@ -641,9 +660,7 @@ impl DiagnosticsResident {
                     if cancel.is_cancelled() {
                         return Err(salsa::Cancelled::Local);
                     }
-                    salsa::Cancelled::catch(AssertUnwindSafe(|| {
-                        worker.analysis.warm_name_indexes(&[file_id]);
-                    }))
+                    salsa::Cancelled::catch(AssertUnwindSafe(|| job(&worker.analysis, file_id)))
                 })
             });
             match outcome {
@@ -2819,7 +2836,7 @@ mod tests {
 mod trim_tests {
     use std::path::Path;
 
-    use super::super::test_support::{module_path, wait_ready, write_common_module};
+    use super::super::test_support::{join_load, module_path, wait_ready, write_common_module};
     use super::super::{DiagnosticsState, ResidentOutcome, SweepOptions};
     use super::DiagnosticsResident;
     use crate::cancel::RequestCancel;
@@ -2829,7 +2846,11 @@ mod trim_tests {
     const MODULES: usize = 100;
 
     fn workspace_with_modules(root: &Path) {
-        for i in 0..MODULES {
+        workspace_with_n_modules(root, MODULES);
+    }
+
+    fn workspace_with_n_modules(root: &Path, n: usize) {
+        for i in 0..n {
             write_common_module(
                 root,
                 &format!("Модуль{i}"),
@@ -2839,10 +2860,42 @@ mod trim_tests {
         }
     }
 
+    fn module_ids(resident: &DiagnosticsResident, root: &Path, n: usize) -> Vec<vfs::FileId> {
+        (0..n)
+            .map(|i| {
+                resident
+                    .file_id_for(&module_path(root, &format!("Модуль{i}")))
+                    .expect("every written module is a resident file")
+            })
+            .collect()
+    }
+
+    /// The candidates `resolve` answers for the method every module exports.
+    fn resolve_candidates(resident: &DiagnosticsResident) -> serde_json::Value {
+        let source = crate::graph_query::GraphNameSource::absent(ide::ProviderState::NotReady);
+        let (mut body, _) = crate::tools::graph::resolve(
+            resident.db(),
+            ide::ProviderState::Answered,
+            &source,
+            None,
+            "Считать",
+            2 * MODULES,
+        );
+        body["candidates"].take()
+    }
+
     fn ready_state(root: &Path) -> DiagnosticsState {
         let state = DiagnosticsState::for_workspace(root.to_path_buf());
         state.ensure_loading();
         wait_ready(&state);
+        state
+    }
+
+    /// A resident that is ready because its loader was joined, not because a poll saw it
+    /// ready: no wall-clock deadline decides when the stand is up.
+    fn joined_state(root: &Path) -> DiagnosticsState {
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        join_load(&state);
         state
     }
 
@@ -2941,6 +2994,116 @@ mod trim_tests {
             (memos(resident, "SymbolTree>"), memos(resident, "FileNameUsage>"))
         }));
         assert_eq!(after, (MODULES, MODULES), "every file's symbol tree and name set");
+    }
+
+    /// The `module_members` warm-up memoises the symbol tree of every resident file and
+    /// nothing of the name sets: the second half is `references`' alone, and the zero
+    /// is what tells this warm-up from `warm_name_indexes`, which memoises both.
+    #[test]
+    fn warm_module_members_memoises_symbol_trees_and_no_name_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+
+        let before = ready(state.read(|resident, _| {
+            (memos(resident, "SymbolTree>"), memos(resident, "FileNameUsage>"))
+        }));
+        assert_eq!(before, (0, 0), "the control: a fresh resident holds neither index");
+
+        let after = ready(state.read_mut(|resident, _| {
+            resident.warm_module_members(&RequestCancel::default());
+            (memos(resident, "SymbolTree>"), memos(resident, "FileNameUsage>"))
+        }));
+        assert_eq!(after, (MODULES, 0), "every file's symbol tree, no name set");
+    }
+
+    /// The chunked warm-up never holds more than the interactive window of syntax
+    /// trees, even over a workspace wider than the window and than one chunk. Measured
+    /// inside the `read_mut` closure, before the read's own trim would hide a warm-up
+    /// that did not trim between its chunks.
+    #[test]
+    fn warm_module_members_keeps_at_most_the_interactive_window_of_syntax_trees() {
+        // Wider than `parse_query`'s interactive cap (512) and than one sweep chunk
+        // (500 files), so the warm-up runs three chunks and an untrimmed one shows.
+        const WIDE: usize = 1100;
+        const PARSE_WINDOW: usize = 512;
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_n_modules(dir.path(), WIDE);
+
+        // The control: one unchunked warm-up inside one read holds every tree.
+        let state = joined_state(dir.path());
+        let (all, bytes_all) = ready(state.read(|resident, _| {
+            let all = module_ids(resident, dir.path(), WIDE);
+            resident.analysis().warm_module_members(&all);
+            (memos(resident, "syntax::Parse<"), syntax_tree_bytes(resident))
+        }));
+        assert_eq!(all, WIDE, "the control: every module was parsed");
+        assert!(bytes_all > 0, "the control: the trees hold heap");
+
+        // A fresh resident, or the symbol trees would already be memoised and the
+        // chunked warm-up would parse nothing.
+        let state = joined_state(dir.path());
+        let (symbol_trees, bytes_chunked) = ready(state.read_mut(|resident, _| {
+            resident.warm_module_members(&RequestCancel::default());
+            (memos(resident, "SymbolTree>"), syntax_tree_bytes(resident))
+        }));
+        assert_eq!(symbol_trees, WIDE, "every file's symbol tree is memoised");
+        // The modules are identical, so the trees weigh the same: at most the window
+        // of them is still held, within one tree of slack.
+        assert!(
+            bytes_chunked <= bytes_all * (PARSE_WINDOW + 1) / WIDE,
+            "the warm-up keeps at most the interactive window of syntax trees: \
+             {bytes_chunked} of {bytes_all} bytes"
+        );
+    }
+
+    /// `resolve` answers the same candidates, in the same order with the same fields,
+    /// whether the symbol trees were warmed first or the fold parsed them itself.
+    #[test]
+    fn resolve_candidates_do_not_depend_on_the_warm_up() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+
+        let cold = ready(state.read(|resident, _| resolve_candidates(resident)));
+        let methods = cold
+            .as_array()
+            .expect("candidates is an array")
+            .iter()
+            .filter(|candidate| candidate["category"] == "module_method")
+            .count();
+        assert_eq!(methods, MODULES, "the control: every module's method is a candidate");
+
+        let warm = ready(state.read_mut(|resident, _| {
+            resident.warm_module_members(&RequestCancel::default());
+            resolve_candidates(resident)
+        }));
+        assert_eq!(serde_json::to_string(&warm).unwrap(), serde_json::to_string(&cold).unwrap());
+    }
+
+    /// A warm-up whose cancellation was requested before it started memoises nothing
+    /// and leaves the resident usable: a follow-up with a fresh token registry warms
+    /// every file — cancellation touches only per-worker clone tokens, never the
+    /// master db.
+    #[test]
+    fn a_pre_cancelled_warm_module_members_warms_nothing_and_leaves_the_resident_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+
+        let cancelled = RequestCancel::default();
+        cancelled.cancel_all();
+        let warmed = ready(state.read_mut(|resident, _| {
+            resident.warm_module_members(&cancelled);
+            memos(resident, "SymbolTree>")
+        }));
+        assert_eq!(warmed, 0, "a pre-cancelled warm-up memoises no symbol tree");
+
+        let warmed = ready(state.read_mut(|resident, _| {
+            resident.warm_module_members(&RequestCancel::default());
+            memos(resident, "SymbolTree>")
+        }));
+        assert_eq!(warmed, MODULES, "a fresh warm-up over the same resident completes");
     }
 
     /// Every served read trims: the syntax trees of files read earlier fall out once

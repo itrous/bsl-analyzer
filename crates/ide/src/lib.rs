@@ -366,17 +366,30 @@ impl Analysis {
         let _ = self.db.configurations_inventory();
     }
 
-    /// Memoise the per-file halves of the workspace-wide name indexes for `files`:
-    /// the symbol tree `module_members` folds and the name set `name_usage_index`
-    /// folds. Each aggregate is one query over every file, so a cold one builds with
-    /// every file's syntax tree live until it answers; warmed in chunks with a trim
-    /// between them, the aggregates assemble from memos and no tree outlives its
-    /// chunk. The accessors are the ones the aggregates read, so the memos are theirs.
-    pub fn warm_name_indexes(&self, files: &[FileId]) {
+    /// Memoise the symbol trees `module_members` folds, for `files`. The aggregate is
+    /// one query over every workspace file, so a cold one builds with every file's
+    /// syntax tree and text live until it answers; warmed in chunks with a trim between
+    /// them, it assembles from memos and no tree outlives its chunk. The accessor is the
+    /// one the fold reads, so the memos are its. The symbol-tree cap is 65 536: a
+    /// workspace above that would lose part of the warm-up to eviction and the fold
+    /// would parse those files again.
+    pub fn warm_module_members(&self, files: &[FileId]) {
         use hir::{DefDatabase, ModuleId};
-        use ide_db::base_db::FileIdInput;
         for &file_id in files {
             let _ = self.db.symbol_tree_ref(ModuleId::new(file_id));
+        }
+    }
+
+    /// Memoise the per-file halves of the workspace-wide name indexes for `files`:
+    /// the symbol trees `module_members` folds ([`Self::warm_module_members`]) and the
+    /// name sets `name_usage_index` folds. Each aggregate is one query over every file,
+    /// so a cold one builds with every file's syntax tree live until it answers; warmed
+    /// in chunks with a trim between them, the aggregates assemble from memos and no
+    /// tree outlives its chunk.
+    pub fn warm_name_indexes(&self, files: &[FileId]) {
+        use ide_db::base_db::FileIdInput;
+        self.warm_module_members(files);
+        for &file_id in files {
             let _ = hir::file_name_usage_query(&self.db, FileIdInput::new(&self.db, file_id));
         }
     }

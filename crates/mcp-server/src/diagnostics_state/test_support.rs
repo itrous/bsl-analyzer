@@ -250,6 +250,16 @@ pub(super) fn write_catalog(root: &Path, name: &str, code_length: u32) {
     write(root, &format!("Catalogs/{name}.xml"), &xml);
 }
 
+/// Whether the resident has raised its fan-out pool. Only a sweep or a warm-up raises
+/// it, so a stand that never swept and never warmed has none: a pool that is up after a
+/// call is the work of one of the two.
+pub(crate) fn fan_out_pool_is_raised(state: &DiagnosticsState) -> bool {
+    match state.read(|resident, _| resident.sweep_pool.get().is_some()) {
+        ResidentOutcome::Ready(raised, _) => raised,
+        _ => panic!("expected Ready outcome"),
+    }
+}
+
 pub(super) fn catalog_resolves(state: &DiagnosticsState, module: &Path) -> bool {
     let out = state.read(|resident, _| {
         let fid = resident.file_id_for(module).expect("module resolves to a FileId");
