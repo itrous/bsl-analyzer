@@ -20,7 +20,12 @@ from common import HARNESS_SCHEMA, MISSING_REASONS, HarnessError, median, read_j
 NOISE_SCHEMA = 1
 NOISE_SERIES = 5
 BLOCK_DELTA = 0.40
+# A time metric blocks only when it also grew by more than this many seconds:
+# +40% of a few milliseconds is scheduling jitter, not a regression.
+BLOCK_FLOOR_S = 0.020
 ISSUE_DELTA = 0.10
+# Memory kept after closing documents, per cycle: above it the night has an issue.
+CLOSE_GROWTH_LIMIT_KB = 50 * 1024
 NOISY = 0.40
 COMPLETENESS = 0.99
 # Recorded with every run but left out of comparability: routine system updates
@@ -53,21 +58,29 @@ CALLS_MCP = ("M1", "M2", "M3", "M5", "M6", "M7")
 class Metric:
     """One metric of the verdict. `call` None means a run-level value from
     `metrics`; `kind` is `delta` (Δ against noise), `growth` (D8),
-    `counter` (candidate above base is an issue, И38) or `completeness`."""
+    `counter` (candidate above base is an issue, И38), `completeness` or
+    `ceiling` (the candidate alone above `limit` is an issue). `floor` is the
+    absolute growth a `block` also needs."""
 
     key: str
     field: str
     call: str | None = None
     kind: str = "delta"
     lenient: bool = False
+    floor: float | None = None
+    limit: float | None = None
+
+
+def _floor(field: str, kind: str) -> float | None:
+    return BLOCK_FLOOR_S if kind == "delta" and field.endswith("_s") else None
 
 
 def _run(field: str, kind: str = "delta") -> Metric:
-    return Metric(field, field, None, kind)
+    return Metric(field, field, None, kind, floor=_floor(field, kind))
 
 
 def _call(call: str, field: str, kind: str = "delta", lenient: bool = False) -> Metric:
-    return Metric(f"{call}.{field}", field, call, kind, lenient)
+    return Metric(f"{call}.{field}", field, call, kind, lenient, floor=_floor(field, kind))
 
 
 VERDICT_METRICS = {
@@ -94,6 +107,9 @@ VERDICT_METRICS = {
         _run("p50_s"), _run("p95_s"), _run("timeouts", "counter"),
         *[_call(c, f, lenient=True) for c in CALLS_MCP for f in ("p50_s", "p95_s")],
         *[_call(c, "errors", "counter", lenient=True) for c in CALLS_MCP],
+    ],
+    "lsp-close-memory": [
+        Metric("rss_growth_max_kb", "rss_growth_max_kb", kind="ceiling", limit=CLOSE_GROWTH_LIMIT_KB),
     ],
 }
 
@@ -265,8 +281,10 @@ def table_outcome(base: str, cand: str) -> str | None:
     return None
 
 
-def delta_outcome(delta: float, noise: float) -> str:
-    if delta > BLOCK_DELTA:
+def delta_outcome(delta: float, noise: float, change: float = 0.0, floor: float | None = None) -> str:
+    """`change` is the absolute growth; with a `floor` a block needs more than it,
+    and a smaller growth is judged by the issue rule."""
+    if delta > BLOCK_DELTA and (floor is None or change > floor):
         return "block"
     if delta >= ISSUE_DELTA and delta > noise:
         return "issue"
@@ -286,7 +304,10 @@ def compare_metric(metric: Metric, base_records: list, cand_records: list, noise
            "delta": None, "noise": None}
     b_meta, c_meta = series_meta(base_records), series_meta(cand_records)
     outcome = None
-    if base_records and cand_records:
+    if metric.kind == "ceiling" and c_state == "valid":
+        # An absolute limit judges the candidate alone: no base, no noise, no block.
+        outcome = "issue" if c_value > metric.limit else "ok"
+    elif base_records and cand_records:
         if b_meta["help"] != c_meta["help"]:
             outcome = "help"
         elif b_meta["fingerprint"] != c_meta["fingerprint"]:
@@ -314,7 +335,7 @@ def compare_metric(metric: Metric, base_records: list, cand_records: list, noise
             elif value > NOISY:
                 outcome = "noisy"
             else:
-                outcome = delta_outcome(delta, value)
+                outcome = delta_outcome(delta, value, c_value - b_value, metric.floor)
     row["outcome"] = outcome
     row["labels"] = LABELS.get(outcome, [])
     if outcome == "both_invalid":

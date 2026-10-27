@@ -107,6 +107,8 @@ def build_ref(data: Data, ref_name: str, label: str | None = None) -> tuple[str,
 
 
 MCP_SCENARIOS = ("mcp-start", "mcp-memory", "mcp-load")
+# Scenarios measured on the warm cache that `lsp-session` of the same series left.
+LSP_FOLLOWERS = ("lsp-close-memory",)
 DEFAULT_CLIENTS = {"crm": [2, 4], "ut": [4]}
 HELPCHECK_TIMEOUT_S = 300.0
 # Discovery probes every feature in-process; CRM takes about 30 s.
@@ -349,6 +351,12 @@ def _remove(path: str) -> None:
         os.remove(path)
 
 
+def lsp_warm(results: str, corpus_id: str, series: str) -> bool:
+    """A warm series of lsp-session with a held run: the cache its followers measure on."""
+    series_dir = os.path.join(results, corpus_id, "lsp-session", "warm", series)
+    return any(read_json(path).get("held") for path in glob.glob(os.path.join(series_dir, "*.json")))
+
+
 class Measure:
     """One `measure` invocation: one scenario, temperature and series of
     one binary on one corpus (plan §7)."""
@@ -414,8 +422,16 @@ class Measure:
         if glob.glob(os.path.join(series_dir, "*.json")):
             raise HarnessError("series_exists", f"{sdir}/{a.temp}/{a.series} already has results")
         is_mcp = self.scenario in MCP_SCENARIOS
+        follower = self.scenario in LSP_FOLLOWERS
+        if follower and a.temp != "warm":
+            raise HarnessError("temp_unsupported", f"{self.scenario} is measured warm only")
         map_name = "mcp-memory" if is_mcp else self.scenario
-        group = f"mcp-{a.temp}-{a.series}" if is_mcp and a.temp == "warm" else f"{sdir}-{a.temp}-{a.series}"
+        if is_mcp and a.temp == "warm":
+            group = f"mcp-{a.temp}-{a.series}"
+        elif follower:
+            group = f"lsp-session-{a.temp}-{a.series}"
+        else:
+            group = f"{sdir}-{a.temp}-{a.series}"
         xdg_base = self.data.path("xdg", f"{self.binary['label']}-{self.binary['sha'][:12]}",
                                   a.corpus, group)
         cache_root = os.path.join(xdg_base, "cache")
@@ -431,7 +447,11 @@ class Measure:
             return self.unlaunched_all(s, "precondition_missing", f"point {' or '.join(needed)} is missing")
 
         if a.temp == "warm":
-            if self.scenario in ("mcp-start", "mcp-load"):
+            if self.scenario in ("mcp-start", "mcp-load", *LSP_FOLLOWERS):
+                # The reset creates the cache root before the first run, so a follower
+                # needs a held lsp-session run, not just the directory.
+                if follower and not lsp_warm(self.results, a.corpus, a.series):
+                    raise HarnessError("group_missing", "measure warm lsp-session in this series first")
                 if not os.path.isdir(cache_root):
                     raise HarnessError("group_missing", "measure warm mcp-memory in this series first")
                 for k in range(1, a.runs + 1):
@@ -641,6 +661,9 @@ class Measure:
         print(f"scenario={s['sdir']} corpus={self.args.corpus} temp={self.args.temp} "
               f"run={k if k is not None else 'warmup'} held={str(record['held']).lower()} "
               f"calls_ok={ok}/{len(measured)} reason={record['reason'] or '-'}", flush=True)
+        for cycle in record["metrics"].get("cycles") or []:
+            print(f"  cycle={cycle['cycle']} open_s={_fmt(cycle['open_s'])} "
+                  f"rss_closed_kb={cycle['rss_closed_kb']} growth_kb={cycle['growth_kb']}", flush=True)
 
 
 RELAY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay.py")

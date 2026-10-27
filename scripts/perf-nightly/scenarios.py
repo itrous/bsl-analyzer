@@ -1,5 +1,6 @@
-"""The six scenarios of plan §8: `analyze`, `lsp-session`, `lsp-workspace-diag`,
-`mcp-start`, `mcp-memory`, `mcp-load`.
+"""The scenarios of plan §8: `analyze`, `lsp-session`, `lsp-workspace-diag`,
+`mcp-start`, `mcp-memory`, `mcp-load`, and `lsp-close-memory` — memory kept
+after closing documents.
 
 Each scenario gets a `Ctx` and returns the run's outcome: `held`, `reason`,
 `metrics`, `calls`, `errors`, `exit_code`. Every wait ends on an event or on a
@@ -37,6 +38,9 @@ LSP_POLL_S = 0.5
 MCP_POLL_S = 1.0
 MCP_MEMORY_ROUNDS = 10
 MCP_LOAD_ROUNDS = 5
+CLOSE_CYCLES = 3
+CLOSE_SAMPLE_S = 30.0
+CLOSE_WINDOW_S = 120.0
 HELP_WARNINGS = (
     "platform help degraded",
     "platform help unavailable",
@@ -603,6 +607,118 @@ def run_lsp_wsdiag(ctx: Ctx) -> dict:
     return ctx.out
 
 
+def close_set(points: dict) -> list[dict]:
+    """The modules a cycle of `lsp-close-memory` opens: the rotation files,
+    then F and F_small, each file once."""
+    chosen, seen = [], set()
+    for point in [*(points.get("F_rot") or []), points.get("F"), points.get("F_small")]:
+        if point is not None and point["relative_path"] not in seen:
+            seen.add(point["relative_path"])
+            chosen.append(point)
+    return chosen
+
+
+def cycle_growth(ready_kb: int, closed_kb: list) -> list:
+    """Growth of each cycle: the first over the ready memory, every later one
+    over the memory left after the previous close."""
+    previous, growth = ready_kb, []
+    for value in closed_kb:
+        growth.append(value - previous)
+        previous = value
+    return growth
+
+
+def close_cycle(ctx: Ctx, run: LspRun, docs: list, number: int) -> dict:
+    """Open every module and wait for its diagnostics, work with them, close
+    them all, then sample the memory for two minutes."""
+    clock, p = ctx.clock, ctx.points
+    entry = {"id": f"C{number}", "first_s": None, "repeat_s": None, "count": len(docs),
+             "ok": True, "error": None, "repeats": 0}
+    texts = {d["relative_path"]: read_point_text(ctx, d) for d in docs}
+    after = len(run.client.notifications_snapshot())
+    opened_at = clock.now()
+    for doc in docs:
+        run.client.notify("textDocument/didOpen", {"textDocument": {
+            "uri": run.uri(doc["relative_path"]), "languageId": "bsl", "version": 1,
+            "text": texts[doc["relative_path"]]}})
+    last = opened_at
+    for doc in docs:
+        message = run.client.wait_publish(run.uri(doc["relative_path"]), after, PUBLISH_TIMEOUT_S)
+        if message is None:
+            if run.client.dead:
+                raise NotHeld("server_failed", "connection closed waiting for publishDiagnostics")
+            entry.update(ok=False, error="timeout")
+        else:
+            last = max(last, message["_received_at"])
+    open_s = last - opened_at if entry["ok"] else None
+    worked_at = clock.now()
+    requests = []
+    for doc in docs:
+        document = {"textDocument": {"uri": run.uri(doc["relative_path"])}}
+        end = _end_position(texts[doc["relative_path"]])
+        requests += [("textDocument/documentSymbol", document),
+                     ("textDocument/inlayHint", {**document, "range": {
+                         "start": {"line": 0, "character": 0}, "end": end}})]
+    for key, method in (("P_hover", "textDocument/hover"), ("P_compl", "textDocument/completion")):
+        point = p.get(key)
+        if point is not None and point["relative_path"] in texts:
+            requests.append((method, {"textDocument": {"uri": run.uri(point["relative_path"])},
+                                      "position": {"line": point["line"], "character": point["character"]}}))
+    for method, params in requests:
+        _, result, error = run.call(method, params)
+        if error is None and _count(result) == 0:
+            error = "empty result"
+        if error is not None and entry["ok"]:
+            entry.update(ok=False, error=f"{method}: {error}")
+    work_s = clock.now() - worked_at
+    rss_open = procs.snapshot(ctx.run_id)["rss_kb"]
+    for doc in docs:
+        run.client.notify("textDocument/didClose", {"textDocument": {"uri": run.uri(doc["relative_path"])}})
+    snaps = [procs.snapshot(ctx.run_id)]
+    for _ in range(int(CLOSE_WINDOW_S // CLOSE_SAMPLE_S)):
+        clock.sleep(CLOSE_SAMPLE_S)
+        snaps.append(procs.snapshot(ctx.run_id))
+    # A gone server has no resident memory: that would read as memory returned.
+    if run.client.dead or any(not snap["pids"] for snap in snaps):
+        raise NotHeld("server_failed", f"the server exited in the memory window of cycle {number}")
+    samples = [snap["rss_kb"] for snap in snaps]
+    entry["first_s"] = open_s
+    ctx.call(entry)
+    if entry["error"]:
+        ctx.error(f"cycle {number}: {entry['error']}")
+    return {"cycle": number, "ok": entry["ok"], "open_s": open_s, "work_s": work_s, "rss_open_kb": rss_open,
+            "rss_closed_samples_kb": samples, "rss_closed_kb": samples[-1]}
+
+
+def run_lsp_close_memory(ctx: Ctx) -> dict:
+    p = ctx.points
+    if "F" not in p or "Q" not in p:
+        raise NotHeld("precondition_missing", "point F or Q is missing")
+    docs = close_set(p)
+    run = LspRun(ctx)
+    m = ctx.out["metrics"]
+    try:
+        run.initialize(pull=False)
+        run.wait_ready(p["Q"]["query"])
+        m["rss_ready_kb"] = procs.snapshot(ctx.run_id)["rss_kb"]
+        ctx.ready_hook()
+        m["documents"] = len(docs)
+        cycles = [close_cycle(ctx, run, docs, number) for number in range(1, CLOSE_CYCLES + 1)]
+        for cycle, growth in zip(cycles, cycle_growth(m["rss_ready_kb"], [c["rss_closed_kb"] for c in cycles])):
+            cycle["growth_kb"] = growth
+        m["cycles"] = cycles
+        m["rss_closed_kb"] = cycles[-1]["rss_closed_kb"]
+        later = cycles[1:]
+        m["rss_growth_max_kb"] = max(c["growth_kb"] for c in later) \
+            if all(c["ok"] for c in cycles) else None
+        m["reopen_s"] = median([c["open_s"] for c in later]) if all(c["ok"] for c in later) else None
+    finally:
+        run.finish()
+    if help_warnings(run.stderr_path):
+        raise NotHeld("help_degraded", "stderr carries a platform help warning")
+    return ctx.out
+
+
 # -- MCP --------------------------------------------------------------------------
 
 # Whole words only: a field name such as `location_unavailable` is not a refusal.
@@ -976,6 +1092,7 @@ SCENARIOS = {
     "analyze": run_analyze,
     "lsp-session": run_lsp_session,
     "lsp-workspace-diag": run_lsp_wsdiag,
+    "lsp-close-memory": run_lsp_close_memory,
     "mcp-start": run_mcp_start,
     "mcp-memory": run_mcp_memory,
     "mcp-load": run_mcp_load,

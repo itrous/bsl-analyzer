@@ -13,7 +13,9 @@ Switches:
   foreign2       on the 2nd measured launch spawn a detached `perf-nightly-test-x` without the run marker
   analyze: no_done, total_mismatch, bad_line, bad_utf8, zero_files, exit2, help_warn, only_first
   helpcheck (BSL_LOG=info): help_noline, help_auto, help_degraded
-  lsp: hover_null, never_ready, foreign_publish, noexit, no_pull, help_warn_lsp
+  lsp: hover_null, never_ready, foreign_publish, noexit, no_pull, help_warn_lsp,
+       leak (every didOpen keeps 40 MiB resident for good)
+Every LSP didOpen and didClose is appended as `{"method", "uri"}` to FAKE_LOG/documents.jsonl.
   mcp: no_graph, iserror_m1, loading_m6, status_loading_m5, silent_m1,
        never_ready, diag_failed, search_failed, graph_failed, graph_disabled, graph_busy,
        graph_busy_no_target, graph_busy_failure, help_warn_mcp, field_unavailable_m1
@@ -150,6 +152,14 @@ class Wire:
         self.send({"jsonrpc": "2.0", "id": request["id"], "result": result})
 
 
+LEAK_BYTES = 40 << 20
+
+
+def log_document(method, uri):
+    with open(os.path.join(LOG, "documents.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"method": method, "uri": uri}, ensure_ascii=False) + "\n")
+
+
 LOC = {"uri": "file:///x.bsl", "range": {"start": {"line": 0, "character": 0},
                                          "end": {"line": 0, "character": 1}}}
 
@@ -157,6 +167,7 @@ LOC = {"uri": "file:///x.bsl", "range": {"start": {"line": 0, "character": 0},
 def lsp() -> int:
     wire = Wire()
     polls = 0
+    leaked = []
     if "help_warn_lsp" in MODE:
         sys.stderr.write("WARN platform help unavailable; platform lookups and docs are empty\n")
         sys.stderr.flush()
@@ -174,8 +185,14 @@ def lsp() -> int:
             polls += 1
             ready = polls > 2 and "never_ready" not in MODE
             wire.reply(message, [{"name": "s", "kind": 12, "location": LOC}] if ready else [])
+        elif method == "textDocument/didClose":
+            log_document(method, message["params"]["textDocument"]["uri"])
         elif method == "textDocument/didOpen":
             uri = message["params"]["textDocument"]["uri"]
+            log_document(method, uri)
+            if "leak" in MODE:
+                # Filled, not zeroed: every page of it is resident.
+                leaked.append(b"\x01" * LEAK_BYTES)
             if "foreign_publish" in MODE:
                 wire.send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
                            "params": {"uri": "file:///elsewhere.bsl", "diagnostics": [{}]}})

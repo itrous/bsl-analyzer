@@ -91,6 +91,75 @@ class Delta(unittest.TestCase):
         self.assertEqual(outcome(verdict.compare(base, cand, n, None), "rss_ready_kb"), "ok")
 
 
+class TimeFloor(unittest.TestCase):
+    """A time block needs more than +40% and more than 20 ms at once (owner decision)."""
+
+    def judge(self, base_s, cand_s, noise=0.08):
+        key = ("crm", "mcp-start", "warm")
+        base = {key: series({"init_s": base_s})}
+        cand = {key: series({"init_s": cand_s})}
+        n = noise_for({"crm/mcp-start/warm/init_s": noise})
+        return next(r for r in verdict.compare(base, cand, n, None) if r["metric"] == "init_s")
+
+    def test_a_block_needs_both_the_relative_and_the_absolute_growth(self):
+        # Straddles the 20 ms floor by a millisecond each way at about +50%.
+        self.assertEqual(self.judge(0.040, 0.061)["outcome"], "block")
+        self.assertEqual(self.judge(0.040, 0.059)["outcome"], "issue")
+        # +150% of 10 ms is 15 ms: above the relative threshold, below the floor.
+        row = self.judge(0.010, 0.025)
+        self.assertEqual((row["outcome"], round(row["delta"], 2)), ("issue", 1.5))
+        # Below the floor the issue rule still weighs the change against noise.
+        self.assertEqual(self.judge(0.010, 0.011, noise=0.20)["outcome"], "ok")
+        self.assertEqual(self.judge(10.0, 13.0)["outcome"], "issue")
+        self.assertEqual(self.judge(10.0, 14.5)["outcome"], "block")
+
+    def test_the_floor_is_on_time_metrics_only(self):
+        for metrics in verdict.VERDICT_METRICS.values():
+            for metric in metrics:
+                if metric.kind == "delta" and metric.field.endswith("_s"):
+                    self.assertEqual(metric.floor, verdict.BLOCK_FLOOR_S, metric.key)
+                else:
+                    self.assertIsNone(metric.floor, metric.key)
+
+    def test_memory_blocks_on_the_relative_threshold_alone(self):
+        base = {W: series({"wall_s": 100.0, "max_rss_kb": 10})}
+        cand = {W: series({"wall_s": 100.0, "max_rss_kb": 15})}
+        n = noise_for({"crm/analyze/warm/wall_s": 0.05, "crm/analyze/warm/max_rss_kb": 0.05})
+        self.assertEqual(outcome(verdict.compare(base, cand, n, None), "max_rss_kb"), "block")
+
+
+CLOSE = ("ut", "lsp-close-memory", "warm")
+
+
+class CloseGrowth(unittest.TestCase):
+    """Growth of memory after closing documents: above 50 MB a cycle is an issue, never a block."""
+
+    def judge(self, growth_kb, base=None, noise=None, stale="no noise.json"):
+        cand = {CLOSE: series({"rss_growth_max_kb": growth_kb}, runs=1)[:1]}
+        return verdict.compare(base or {}, cand, noise, stale)
+
+    def test_above_the_limit_is_an_issue_below_is_ok(self):
+        self.assertEqual([r["outcome"] for r in self.judge(60 * 1024)], ["issue"])
+        self.assertEqual([r["outcome"] for r in self.judge(51 * 1024)], ["issue"])
+        self.assertEqual([r["outcome"] for r in self.judge(49 * 1024)], ["ok"])
+        self.assertEqual([r["outcome"] for r in self.judge(-200)], ["ok"])
+
+    def test_growth_is_never_a_block_and_the_base_does_not_matter(self):
+        base = {CLOSE: series({"rss_growth_max_kb": 0}, runs=1)[:1]}
+        rows = self.judge(10 * 60 * 1024, base=base, noise=noise_for({}), stale=None)
+        self.assertEqual([r["outcome"] for r in rows], ["issue"])
+        self.assertEqual(verdict.night_verdict(rows)["verdict"], "issue")
+        self.assertEqual(rows[0]["labels"], ["perf", "regression"])
+
+    def test_an_invalid_candidate_without_a_base_is_incomplete(self):
+        rows = self.judge(None)
+        self.assertEqual([r["outcome"] for r in rows], ["incomplete"])
+
+    def test_it_takes_no_noise_calibration(self):
+        groups = [{CLOSE: series({"rss_growth_max_kb": v}, runs=1)[:1]} for v in (1, 2, 3, 4, 5)]
+        self.assertEqual(verdict.build_noise(groups), {})
+
+
 LSP = ("crm", "lsp-session", "warm")
 
 
@@ -323,7 +392,7 @@ class Noise(unittest.TestCase):
         self.assertEqual(verdict.self_check(groups, noise)["violations"], [])
         # Positive control: with noise not applied the 112 series becomes an issue.
         with patch.object(verdict, "delta_outcome",
-                          side_effect=lambda d, n: "issue" if d >= verdict.ISSUE_DELTA else "ok"):
+                          side_effect=lambda d, n, *_: "issue" if d >= verdict.ISSUE_DELTA else "ok"):
             self.assertNotEqual(verdict.self_check(groups, noise)["violations"], [])
 
     def test_uncalibrated_corpus_and_temperature(self):

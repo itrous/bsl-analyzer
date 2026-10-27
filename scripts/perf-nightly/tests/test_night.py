@@ -388,6 +388,77 @@ class BaseSelection(Workspace):
         self.assertEqual(night.select_base(repo, candidate), "v0.3.10", "only vX.Y.Z tags are releases")
 
 
+CLOSE_SET = (("lsp-session", ("crm",)), ("lsp-close-memory", ("crm",)))
+ALL = ["crm", "ut", "erp", "lombard"]
+
+
+class CloseMemory(NightCase):
+    """Memory after closing documents: the candidate alone, one run, on the
+    cache lsp-session warmed; reported with its time."""
+
+    def test_the_candidate_alone_measures_it_once_and_the_report_shows_it(self):
+        with patch.object(night, "SUITE", CLOSE_SET):
+            self.fresh_noise()
+            summary = self.night()
+        self.assertEqual(self.series("develop", f"night-{DATE}", "lsp-close-memory"), ["r1", "r1.json"])
+        self.assertEqual(self.series("v0.3.2", f"night-{DATE}", "lsp-close-memory"), [])
+        rows = read_json(self.data.path("nights", DATE, "compare.json"))["rows"]
+        row = next(r for r in rows if r["scenario"] == "lsp-close-memory")
+        self.assertEqual((row["metric"], row["base"]["state"], row["outcome"]),
+                         ("rss_growth_max_kb", "missing", "ok"))
+        [item] = summary["close_memory"]
+        self.assertEqual((item["label"], item["outcome"], len(item["cycles"])), ("ЦРМ", "ok", 3))
+        self.assertEqual(item["duration_s"], sum(summary["durations"]["candidate/crm/lsp-close-memory"]))
+        with open(self.data.path("nights", DATE, "report.md"), encoding="utf-8") as fh:
+            report = fh.read()
+        self.assertIn("## Память после закрытия документов", report)
+        self.assertIn("### ЦРМ", report)
+        self.assertIn("- время сценария: ", report)
+        self.assertIn("| 3 | ", report)
+
+    def test_without_its_warm_lsp_session_it_is_skipped(self):
+        clock = AdvancingClock(0.0)
+        session = night.Session(argparse.Namespace(corpora=None), clock, self.data, ["crm"],
+                                night.Window(clock, 0.0), night.Estimates(None))
+        with patch.object(night, "SUITE", CLOSE_SET):
+            session.suite([("base", self.paths["v0.3.2"]), ("candidate", self.paths["develop"])], "s")
+        self.assertEqual([(s["role"], s["scenario"]) for s in session.skipped][-1],
+                         ("candidate", "lsp-close-memory"))
+        self.assertNotIn(("base", "lsp-close-memory"), [(s["role"], s["scenario"]) for s in session.skipped])
+        self.assertEqual(self.measured(), [])
+
+    def test_a_failed_lsp_session_skips_it_and_keeps_the_rest_of_the_corpus(self):
+        set_mode("develop=help_warn_lsp")
+        clock = FakeClock()
+        session = night.Session(argparse.Namespace(corpora=None), clock, self.data, ["crm"],
+                                night.Window(clock, None), night.Estimates(None))
+        units = (*CLOSE_SET, ("analyze", ("crm",)))
+        with patch.object(night, "SUITE", units):
+            session.suite([("candidate", self.paths["develop"])], "s")
+        self.assertEqual(session.refused, {})
+        self.assertEqual([s["scenario"] for s in session.skipped], ["lsp-close-memory"])
+        self.assertEqual(self.series("develop", "s", "lsp-close-memory"), [])
+        self.assertEqual(len([n for n in self.series("develop", "s") if n.endswith(".json")]), 3)
+
+    def test_calibration_neither_measures_nor_needs_it(self):
+        write_json(self.data.path("noise.json"), {"harness_schema": HARNESS_SCHEMA - 1, "entries": {}})
+        with patch.object(night, "SUITE", CLOSE_SET):
+            summary = self.night()
+        self.assertEqual(summary["calibration"]["complete"], ["cal-1", "cal-2"])
+        self.assertEqual(self.series("v0.3.2", "cal-1", "lsp-close-memory"), [])
+
+    def test_the_nightly_set_fits_the_window_and_the_scenario_adds_at_most_ten_minutes(self):
+        estimates = night.Estimates(None)
+        both = estimates.series("base", ALL) + estimates.series("candidate", ALL)
+        window = night.seconds_until("08:45", datetime.datetime(2026, 10, 22, 5, 0))
+        self.assertLessEqual(both, window)
+        with patch.object(night, "SUITE", tuple(u for u in night.SUITE if u[0] != "lsp-close-memory")):
+            without = estimates.series("base", ALL) + estimates.series("candidate", ALL)
+        self.assertEqual(estimates.series("base", ALL) * 2, without)
+        self.assertLessEqual(both - without, 600)
+        self.assertEqual(both - without, night.UNIT_SECONDS[("lsp-close-memory", "ut")])
+
+
 class Suite(NightCase):
     def test_the_mcp_group_needs_its_warm_up(self):
         # A window that cuts the warm-up of mcp-memory leaves no warm cache: start and load are not run.
@@ -406,6 +477,9 @@ class Suite(NightCase):
         units = night.suite_units(["crm", "ut", "erp", "lombard"])
         self.assertEqual(units[:4], [("crm", "analyze"), ("crm", "lsp-session"),
                                      ("crm", "lsp-workspace-diag"), ("crm", "mcp")])
+        self.assertEqual([u for c, u in units if c == "ut"],
+                         ["analyze", "lsp-session", "lsp-close-memory", "lsp-workspace-diag", "mcp"])
+        self.assertNotIn("lsp-close-memory", [u for _, u in night.suite_units(["ut"], "base")])
         self.assertEqual([u for c, u in units if c in ("erp", "lombard")], ["analyze", "analyze"])
         self.assertEqual(night.unit_sdirs("crm", "mcp"), ["mcp-memory", "mcp-start", "mcp-load-c2",
                                                           "mcp-load-c4"])

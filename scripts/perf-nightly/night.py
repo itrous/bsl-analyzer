@@ -35,10 +35,15 @@ DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SUITE = (
     ("analyze", ("crm", "ut", "erp", "lombard")),
     ("lsp-session", ("crm", "ut")),
+    ("lsp-close-memory", ("ut",)),
     ("lsp-workspace-diag", ("crm", "ut")),
     ("mcp", ("crm", "ut")),
 )
 MCP_GROUP = ("mcp-memory", "mcp-start", "mcp-load")
+# Measured for the candidate only, in one run: an absolute limit needs no base,
+# and three two-minute samplings would not fit into the window twice.
+CANDIDATE_ONLY = ("lsp-close-memory",)
+CANDIDATE_ONLY_RUNS = 1
 # Seconds per run before any night has been measured (plan §11.1).
 UNIT_SECONDS = {
     ("analyze", "crm"): 29.4, ("analyze", "ut"): 93.2,
@@ -48,13 +53,17 @@ UNIT_SECONDS = {
     ("mcp-start", "crm"): 5.2, ("mcp-start", "ut"): 5.2,
     ("mcp-memory", "crm"): 74.9, ("mcp-memory", "ut"): 182.3,
     ("mcp-load-c2", "crm"): 74.9, ("mcp-load-c4", "crm"): 79.9, ("mcp-load-c4", "ut"): 193.0,
+    # lsp-session up to its last call, three cycles of 120 s sampling and their opens.
+    ("lsp-close-memory", "ut"): 520.0,
 }
 UNKNOWN_SECONDS = 300.0
 
 
-def suite_units(corpora: list[str]) -> list[tuple[str, str]]:
-    """[(corpus, unit)] of the set over the manifest corpora, corpus-major."""
-    return [(c, unit) for c in corpora for unit, members in SUITE if c in members]
+def suite_units(corpora: list[str], role: str | None = None) -> list[tuple[str, str]]:
+    """[(corpus, unit)] of the set over the manifest corpora, corpus-major; a
+    `base` side has no candidate-only units."""
+    return [(c, unit) for c in corpora for unit, members in SUITE
+            if c in members and not (role == "base" and unit in CANDIDATE_ONLY)]
 
 
 def unit_sdirs(corpus_id: str, unit: str) -> list[str]:
@@ -64,13 +73,20 @@ def unit_sdirs(corpus_id: str, unit: str) -> list[str]:
     return [unit]
 
 
-def expected_keys(corpora: list[str]) -> list[tuple[str, str, str]]:
-    return [(c, sdir, "warm") for c, unit in suite_units(corpora) for sdir in unit_sdirs(c, unit)]
+def expected_keys(corpora: list[str], role: str | None = None) -> list[tuple[str, str, str]]:
+    return [(c, sdir, "warm") for c, unit in suite_units(corpora, role) for sdir in unit_sdirs(c, unit)]
+
+
+def series_runs(sdir: str) -> int:
+    return CANDIDATE_ONLY_RUNS if sdir in CANDIDATE_ONLY else RUNS
 
 
 def runs_of(sdir: str) -> int:
-    """Launches a warm series may take: the warm-up run comes on top of N."""
-    return RUNS if sdir.startswith(("mcp-start", "mcp-load")) else RUNS + 1
+    """Launches a warm series may take: the warm-up run comes on top of N;
+    scenarios on a cache another scenario warmed have none."""
+    if sdir in CANDIDATE_ONLY or sdir.startswith(("mcp-start", "mcp-load")):
+        return series_runs(sdir)
+    return RUNS + 1
 
 
 class Estimates:
@@ -87,7 +103,7 @@ class Estimates:
         return UNIT_SECONDS.get((sdir, corpus_id), UNKNOWN_SECONDS)
 
     def series(self, role: str, corpora: list[str]) -> float:
-        return sum(self.run(role, c, sdir) * runs_of(sdir) for c, sdir, _ in expected_keys(corpora))
+        return sum(self.run(role, c, sdir) * runs_of(sdir) for c, sdir, _ in expected_keys(corpora, role))
 
 
 def previous_history(data: Data, before: str) -> dict | None:
@@ -145,8 +161,8 @@ class Session:
         """One `measure` invocation: `done`, `skipped` (the window cut a run)
         or `refused` (the corpus is refused for this binary)."""
         a = argparse.Namespace(data_dir=self.data.root, corpora=self.args.corpora, corpus=corpus_id,
-                               binary=binary, scenario=scenario, temp="warm", series=series, runs=RUNS,
-                               clients=None)
+                               binary=binary, scenario=scenario, temp="warm", series=series,
+                               runs=series_runs(scenario), clients=None)
 
         def fits(m, s) -> bool:
             seconds = self.estimates.run(role, corpus_id, s["sdir"])
@@ -177,14 +193,26 @@ class Session:
     def suite(self, sides: list[tuple[str, str]], series: str) -> None:
         """The set for each (role, binary) side, interleaved per unit so a
         window that runs out cuts both sides alike."""
+        lsp_done: set = set()
         for corpus_id, unit in suite_units(self.corpora):
             for role, binary in sides:
                 if (role, corpus_id) in self.refused:
                     continue
+                if unit in CANDIDATE_ONLY:
+                    if role == "base":
+                        continue
+                    if (role, corpus_id) not in lsp_done:
+                        # It runs on the cache a held lsp-session warmed; without one there is none.
+                        self.skipped.append({"role": role, "corpus": corpus_id, "scenario": unit,
+                                             "estimate_s": None})
+                        continue
                 for scenario in (MCP_GROUP if unit == "mcp" else (unit,)):
                     status = self.measure(role, binary, corpus_id, scenario, series)
                     if status == "refused":
                         break
+                    if status == "done" and scenario == "lsp-session" and perf_nightly.lsp_warm(
+                            self.data.results(perf_nightly.load_binary(binary)), corpus_id, series):
+                        lsp_done.add((role, corpus_id))
                     if status == "skipped" and scenario == "mcp-memory":
                         # Without its warm-up the MCP group has no warm cache to measure on.
                         self.skipped.append({"role": role, "corpus": corpus_id,
@@ -229,7 +257,7 @@ def complete(groups: dict, keys: list, prints: dict) -> bool:
 
 
 def current_cal(results_dir: str, corpora: list[str], prints: dict) -> list[str]:
-    keys = expected_keys(corpora)
+    keys = expected_keys(corpora, "base")
     return [f"cal-{n}" for n in cal_series(results_dir)
             if complete(verdict.load_series(results_dir, f"cal-{n}", set(corpora)), keys, prints)]
 
@@ -361,6 +389,23 @@ def write_report(out_dir: str, summary: dict, rows: list, table: dict | None) ->
         lines += [f"- {s['role']} {s['corpus']} {s['scenario']} (оценка "
                   f"{verdict.fmt(s['estimate_s'])} с)" for s in summary["skipped"]]
         lines.append("")
+    if summary.get("close_memory"):
+        limit = verdict.CLOSE_GROWTH_LIMIT_KB / 1024
+        lines += ["## Память после закрытия документов", "",
+                  f"Прирост цикла 2 и далее больше {limit:.0f} МБ — issue; цикл 1 считается от памяти "
+                  "готовности и в вердикт не идёт.", ""]
+        for item in summary["close_memory"]:
+            spent = "-" if item["duration_s"] is None else f"{item['duration_s'] / 60:.1f}"
+            lines += [f"### {item['label']}", "",
+                      f"- время сценария: {spent} мин (оценка {item['estimate_s'] / 60:.1f} мин)",
+                      f"- исход: {verdict.OUTCOME_TEXT.get(item['outcome'], item['outcome'])}", ""]
+            if item["cycles"]:
+                lines += ["| цикл | открытие, с | RSS после закрытия, МБ | прирост, МБ |", "|---|---|---|---|"]
+                lines += [f"| {c['cycle']} | {verdict.fmt(c['open_s'])} | {c['rss_closed_kb'] / 1024:.1f} | "
+                          f"{c['growth_kb'] / 1024:+.1f} |" for c in item["cycles"]]
+            else:
+                lines.append(f"- прогон не состоялся: {item['reason'] or 'нет записи'}")
+            lines.append("")
     if summary["refused"]:
         lines += ["## Отказы корпусов", ""] + [f"- {k}: {v}" for k, v in summary["refused"].items()] + [""]
     if rows:
@@ -470,11 +515,34 @@ def _night(args, clock, data, now, date, gate, out_dir, builder) -> dict:
     cand_groups = verdict.load_series(data.results(cand), series, set(corpora))
     keys = expected_keys(corpora)
     rows = verdict.compare(base_groups, cand_groups, read_noise(data), None, units=keys)
+    summary["close_memory"] = close_memory(manifest, corpora, cand_groups, rows, session)
     summary["diff"] = {"not_built": diff_missing(base_groups, cand_groups, corpora)}
     result = verdict.night_verdict(rows, diff_missing=summary["diff"]["not_built"])
     extra = [] if gate else [(os.path.basename(data.results(cand)), data.results(cand), series)]
     table = verdict.trend(data.path("results"), cand_groups, extra)
     return finish(rows, table, result)
+
+
+def close_memory(manifest: dict, corpora: list[str], cand_groups: dict, rows: list,
+                 session: Session) -> list[dict]:
+    """Per corpus of `lsp-close-memory`: its cycles, outcome, spent and expected time."""
+    found = []
+    for corpus_id, unit in suite_units(corpora):
+        if unit not in CANDIDATE_ONLY:
+            continue
+        records = cand_groups.get((corpus_id, unit, "warm"), [])
+        record = records[0] if records else {}
+        spent = session.durations.get(f"candidate/{corpus_id}/{unit}")
+        found.append({
+            "corpus": corpus_id, "label": manifest["corpora"][corpus_id]["label"],
+            "cycles": (record.get("metrics") or {}).get("cycles") or [],
+            "reason": record.get("reason"),
+            "outcome": next((r["outcome"] for r in rows if r["corpus"] == corpus_id and r["scenario"] == unit),
+                            "incomplete"),
+            "duration_s": sum(spent) if spent else None,
+            "estimate_s": session.estimates.run("candidate", corpus_id, unit) * runs_of(unit),
+        })
+    return found
 
 
 def _refused(session: Session) -> dict:
