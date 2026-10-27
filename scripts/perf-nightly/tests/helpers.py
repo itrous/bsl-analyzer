@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import corpus  # noqa: E402
 import perf_nightly  # noqa: E402
 import procs  # noqa: E402
+import scenarios  # noqa: E402
 from common import Data, sha256_file, write_json  # noqa: E402
 
 FAKE_APP = os.path.join(HERE, "fake_app.py")
@@ -96,6 +97,19 @@ def event_driven_process_waits(case: unittest.TestCase) -> None:
         sampler._stop.wait()
 
     case.enterContext(patch.object(procs.Sampler, "_loop", sample_until_stopped))
+
+
+def fake_latency(case: unittest.TestCase) -> None:
+    """`$/fake/latency` from the fake server moves the client's clock on by its
+    `seconds` before the answer it precedes arrives: that answer reads as slow."""
+    original = scenarios.HarnessLsp._handle_notification
+
+    def handle(self, message):
+        if message.get("method") == "$/fake/latency":
+            self.clock.advance((message.get("params") or {})["seconds"])
+        original(self, message)
+
+    case.enterContext(patch.object(scenarios.HarnessLsp, "_handle_notification", handle))
 
 
 def silenced(key) -> bool:

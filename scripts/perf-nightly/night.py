@@ -44,6 +44,15 @@ MCP_GROUP = ("mcp-memory", "mcp-start", "mcp-load")
 # and three two-minute samplings would not fit into the window twice.
 CANDIDATE_ONLY = ("lsp-close-memory",)
 CANDIDATE_ONLY_RUNS = 1
+# Corpora whose number of `analyze` diagnostics the report follows from night to night.
+DIAG_COUNT_CORPORA = ("ut",)
+DIAG_STATE_TEXT = {
+    "missing": "нет удержанного прогона кандидата",
+    "unstable": "нестабильно между прогонами",
+    "no_previous": "нет прошлой записи",
+    "changed": "**изменилось**",
+    "same": "без изменений",
+}
 # Seconds per run before any night has been measured (plan §11.1).
 UNIT_SECONDS = {
     ("analyze", "crm"): 29.4, ("analyze", "ut"): 93.2,
@@ -106,17 +115,68 @@ class Estimates:
         return sum(self.run(role, c, sdir) * runs_of(sdir) for c, sdir, _ in expected_keys(corpora, role))
 
 
-def previous_history(data: Data, before: str) -> dict | None:
-    """Durations of the latest night strictly before the date `before`."""
+def _summaries_before(data: Data, before: str):
+    """(date, summary) of the nights strictly before the date `before`, latest first."""
     dates = sorted(d for d in os.listdir(data.path("nights")) if DATE_RE.fullmatch(d) and d < before) \
         if os.path.isdir(data.path("nights")) else []
     for date in reversed(dates):
         path = data.path("nights", date, "summary.json")
         if os.path.isfile(path):
-            durations = read_json(path).get("durations")
-            if durations:
-                return durations
+            yield date, read_json(path)
+
+
+def previous_history(data: Data, before: str) -> dict | None:
+    """Durations of the latest night strictly before the date `before`."""
+    for _, summary in _summaries_before(data, before):
+        if summary.get("durations"):
+            return summary["durations"]
     return None
+
+
+def previous_diag_counts(data: Data, before: str) -> dict:
+    """{corpus: (count, date)}: the candidate's number of diagnostics from the
+    latest night strictly before `before` that has one for that corpus of
+    `DIAG_COUNT_CORPORA`; older nights are not read once every corpus has one."""
+    found = {}
+    for date, summary in _summaries_before(data, before):
+        for corpus_id in DIAG_COUNT_CORPORA:
+            item = (summary.get("diag_counts") or {}).get(corpus_id) or {}
+            if corpus_id not in found and item.get("candidate") is not None:
+                found[corpus_id] = (item["candidate"], date)
+        if len(found) == len(DIAG_COUNT_CORPORA):
+            break
+    return found
+
+
+def _diag_values(records: list) -> list:
+    return sorted({r["metrics"].get("total_diagnostics") for r in records if r["held"]} - {None})
+
+
+def diag_counts(base_groups: dict, cand_groups: dict, previous: dict) -> dict:
+    """Per corpus of `DIAG_COUNT_CORPORA`: the candidate's number of `analyze`
+    diagnostics against the previous night's; a note of the report, not of the
+    verdict. The base is shown only: develop adds diagnostics against a release."""
+    counts = {}
+    for corpus_id in DIAG_COUNT_CORPORA:
+        key = (corpus_id, "analyze", "warm")
+        if key not in base_groups and key not in cand_groups:
+            continue
+        values = _diag_values(cand_groups.get(key, []))
+        base = _diag_values(base_groups.get(key, []))
+        before, night = previous.get(corpus_id, (None, None))
+        candidate = values[0] if len(values) == 1 else None
+        if not values:
+            state = "missing"
+        elif len(values) > 1:
+            state = "unstable"
+        elif before is None:
+            state = "no_previous"
+        else:
+            state = "changed" if candidate != before else "same"
+        counts[corpus_id] = {"candidate": candidate, "values": values,
+                             "base": base[0] if len(base) == 1 else None,
+                             "previous": before, "previous_night": night, "state": state}
+    return counts
 
 
 class Window:
@@ -390,22 +450,39 @@ def write_report(out_dir: str, summary: dict, rows: list, table: dict | None) ->
                   f"{verdict.fmt(s['estimate_s'])} с)" for s in summary["skipped"]]
         lines.append("")
     if summary.get("close_memory"):
-        limit = verdict.CLOSE_GROWTH_LIMIT_KB / 1024
+        growth = verdict.CLOSE_GROWTH_LIMIT_KB / 1024
+        over = verdict.CLOSE_OVER_READY_LIMIT_KB / 1024
         lines += ["## Память после закрытия документов", "",
-                  f"Прирост цикла 2 и далее больше {limit:.0f} МБ — issue; цикл 1 считается от памяти "
-                  "готовности и в вердикт не идёт.", ""]
+                  f"Issue: прирост цикла 2 и далее больше {growth:.0f} МБ (цикл 1 считается от памяти "
+                  f"готовности и в это правило не идёт); RSS после закрытия любого цикла над памятью "
+                  f"готовности больше {over:.0f} МБ; глобальный запрос после повторного открытия "
+                  f"(циклы 2 и 3) дольше {verdict.GLOBAL_REOPEN_LIMIT_S} с.", ""]
         for item in summary["close_memory"]:
             spent = "-" if item["duration_s"] is None else f"{item['duration_s'] / 60:.1f}"
             lines += [f"### {item['label']}", "",
                       f"- время сценария: {spent} мин (оценка {item['estimate_s'] / 60:.1f} мин)",
                       f"- исход: {verdict.OUTCOME_TEXT.get(item['outcome'], item['outcome'])}", ""]
             if item["cycles"]:
-                lines += ["| цикл | открытие, с | RSS после закрытия, МБ | прирост, МБ |", "|---|---|---|---|"]
-                lines += [f"| {c['cycle']} | {verdict.fmt(c['open_s'])} | {c['rss_closed_kb'] / 1024:.1f} | "
-                          f"{c['growth_kb'] / 1024:+.1f} |" for c in item["cycles"]]
+                lines += ["| цикл | открытие, с | глобальный запрос, с | RSS после закрытия, МБ | "
+                          "над готовностью, МБ | прирост, МБ |", "|---|---|---|---|---|---|"]
+                for c in item["cycles"]:
+                    ready = item["rss_ready_kb"]
+                    over_ready = "-" if ready is None else f"{(c['rss_closed_kb'] - ready) / 1024:+.1f}"
+                    lines.append(f"| {c['cycle']} | {verdict.fmt(c['open_s'])} | {verdict.fmt(c.get('global_s'))} | "
+                                 f"{c['rss_closed_kb'] / 1024:.1f} | {over_ready} | {c['growth_kb'] / 1024:+.1f} |")
             else:
                 lines.append(f"- прогон не состоялся: {item['reason'] or 'нет записи'}")
             lines.append("")
+    if summary.get("diag_counts"):
+        lines += ["## Число диагностик", "",
+                  "`analyze` кандидата против прошлой ночи; в вердикт не идёт.", "",
+                  "| корпус | кандидат | прогоны | база | прошлая ночь | состояние |", "|---|---|---|---|---|---|"]
+        for corpus_id, item in summary["diag_counts"].items():
+            before = "-" if item["previous"] is None else f"{item['previous']} ({item['previous_night']})"
+            lines.append(f"| {corpus_id} | {verdict.fmt(item['candidate'])} | "
+                         f"{', '.join(str(v) for v in item['values']) or '-'} | {verdict.fmt(item['base'])} | "
+                         f"{before} | {DIAG_STATE_TEXT[item['state']]} |")
+        lines.append("")
     if summary["refused"]:
         lines += ["## Отказы корпусов", ""] + [f"- {k}: {v}" for k, v in summary["refused"].items()] + [""]
     if rows:
@@ -516,6 +593,7 @@ def _night(args, clock, data, now, date, gate, out_dir, builder) -> dict:
     keys = expected_keys(corpora)
     rows = verdict.compare(base_groups, cand_groups, read_noise(data), None, units=keys)
     summary["close_memory"] = close_memory(manifest, corpora, cand_groups, rows, session)
+    summary["diag_counts"] = diag_counts(base_groups, cand_groups, previous_diag_counts(data, date))
     summary["diff"] = {"not_built": diff_missing(base_groups, cand_groups, corpora)}
     result = verdict.night_verdict(rows, diff_missing=summary["diff"]["not_built"])
     extra = [] if gate else [(os.path.basename(data.results(cand)), data.results(cand), series)]
@@ -532,13 +610,15 @@ def close_memory(manifest: dict, corpora: list[str], cand_groups: dict, rows: li
             continue
         records = cand_groups.get((corpus_id, unit, "warm"), [])
         record = records[0] if records else {}
+        metrics = record.get("metrics") or {}
         spent = session.durations.get(f"candidate/{corpus_id}/{unit}")
+        own = [r for r in rows if r["corpus"] == corpus_id and r["scenario"] == unit]
         found.append({
             "corpus": corpus_id, "label": manifest["corpora"][corpus_id]["label"],
-            "cycles": (record.get("metrics") or {}).get("cycles") or [],
+            "cycles": metrics.get("cycles") or [],
+            "rss_ready_kb": metrics.get("rss_ready_kb"),
             "reason": record.get("reason"),
-            "outcome": next((r["outcome"] for r in rows if r["corpus"] == corpus_id and r["scenario"] == unit),
-                            "incomplete"),
+            "outcome": verdict.night_verdict(own)["verdict"] if own else "incomplete",
             "duration_s": sum(spent) if spent else None,
             "estimate_s": session.estimates.run("candidate", corpus_id, unit) * runs_of(unit),
         })

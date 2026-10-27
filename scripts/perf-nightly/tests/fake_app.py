@@ -14,7 +14,10 @@ Switches:
   analyze: no_done, total_mismatch, bad_line, bad_utf8, zero_files, exit2, help_warn, only_first
   helpcheck (BSL_LOG=info): help_noline, help_auto, help_degraded
   lsp: hover_null, never_ready, foreign_publish, noexit, no_pull, help_warn_lsp,
-       leak (every didOpen keeps 40 MiB resident for good)
+       leak (every didOpen keeps 40 MiB resident for good),
+       evict (after a didClose, the first request after the next didOpen is preceded by
+              `$/fake/latency` {"id", "seconds": 0.5}: the client's clock moves on by that much),
+       global_empty (after a didClose, the next workspace/symbol answers an empty list)
 Every LSP didOpen and didClose is appended as `{"method", "uri"}` to FAKE_LOG/documents.jsonl.
   mcp: no_graph, iserror_m1, loading_m6, status_loading_m5, silent_m1,
        never_ready, diag_failed, search_failed, graph_failed, graph_disabled, graph_busy,
@@ -153,6 +156,7 @@ class Wire:
 
 
 LEAK_BYTES = 40 << 20
+EVICT_SECONDS = 0.5
 
 
 def log_document(method, uri):
@@ -168,6 +172,7 @@ def lsp() -> int:
     wire = Wire()
     polls = 0
     leaked = []
+    closed = slow = empty = False
     if "help_warn_lsp" in MODE:
         sys.stderr.write("WARN platform help unavailable; platform lookups and docs are empty\n")
         sys.stderr.flush()
@@ -176,6 +181,10 @@ def lsp() -> int:
         if message is None:
             return 0
         method = message.get("method")
+        if slow and "id" in message:
+            slow = False
+            wire.send({"jsonrpc": "2.0", "method": "$/fake/latency",
+                       "params": {"id": message["id"], "seconds": EVICT_SECONDS}})
         if method == "initialize":
             caps = {} if "no_pull" in MODE else {"diagnosticProvider": {"workspaceDiagnostics": True}}
             wire.reply(message, {"capabilities": caps})
@@ -183,13 +192,18 @@ def lsp() -> int:
                        "params": {"token": "t", "value": {"kind": "end"}}})
         elif method == "workspace/symbol":
             polls += 1
-            ready = polls > 2 and "never_ready" not in MODE
+            ready = polls > 2 and "never_ready" not in MODE and not empty
+            empty = False
             wire.reply(message, [{"name": "s", "kind": 12, "location": LOC}] if ready else [])
         elif method == "textDocument/didClose":
             log_document(method, message["params"]["textDocument"]["uri"])
+            closed = "evict" in MODE
+            empty = "global_empty" in MODE
         elif method == "textDocument/didOpen":
             uri = message["params"]["textDocument"]["uri"]
             log_document(method, uri)
+            if closed:
+                slow, closed = True, False
             if "leak" in MODE:
                 # Filled, not zeroed: every page of it is resident.
                 leaked.append(b"\x01" * LEAK_BYTES)

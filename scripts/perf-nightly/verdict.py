@@ -26,6 +26,14 @@ BLOCK_FLOOR_S = 0.020
 ISSUE_DELTA = 0.10
 # Memory kept after closing documents, per cycle: above it the night has an issue.
 CLOSE_GROWTH_LIMIT_KB = 50 * 1024
+# Absolute limits judged on the candidate alone: above any of them the night has an issue.
+CLOSE_OVER_READY_LIMIT_KB = 300 * 1024
+GLOBAL_REOPEN_LIMIT_S = 0.2
+LSP_INIT_LIMIT_S = 0.1
+MCP_READY_LIMIT_KB = 512 * 1024
+MCP_GROWTH_LIMIT_KB = round(0.6 * 1024 * 1024)
+# The issue threshold of `analyze` on the corpora whose time and memory are tracked closer.
+ANALYZE_ISSUE_DELTA = 0.05
 NOISY = 0.40
 COMPLETENESS = 0.99
 # Recorded with every run but left out of comparability: routine system updates
@@ -60,7 +68,8 @@ class Metric:
     `metrics`; `kind` is `delta` (Δ against noise), `growth` (D8),
     `counter` (candidate above base is an issue, И38), `completeness` or
     `ceiling` (the candidate alone above `limit` is an issue). `floor` is the
-    absolute growth a `block` also needs."""
+    absolute growth a `block` also needs. `corpora` limits the metric to those
+    corpora; `issue_delta` overrides `ISSUE_DELTA` per corpus."""
 
     key: str
     field: str
@@ -69,14 +78,16 @@ class Metric:
     lenient: bool = False
     floor: float | None = None
     limit: float | None = None
+    corpora: tuple[str, ...] | None = None
+    issue_delta: tuple[tuple[str, float], ...] = ()
 
 
 def _floor(field: str, kind: str) -> float | None:
     return BLOCK_FLOOR_S if kind == "delta" and field.endswith("_s") else None
 
 
-def _run(field: str, kind: str = "delta") -> Metric:
-    return Metric(field, field, None, kind, floor=_floor(field, kind))
+def _run(field: str, kind: str = "delta", **extra) -> Metric:
+    return Metric(field, field, None, kind, floor=_floor(field, kind), **extra)
 
 
 def _call(call: str, field: str, kind: str = "delta", lenient: bool = False) -> Metric:
@@ -84,9 +95,13 @@ def _call(call: str, field: str, kind: str = "delta", lenient: bool = False) -> 
 
 
 VERDICT_METRICS = {
-    "analyze": [_run("wall_s"), _run("max_rss_kb")],
+    "analyze": [
+        _run(f, issue_delta=(("erp", ANALYZE_ISSUE_DELTA), ("ut", ANALYZE_ISSUE_DELTA)))
+        for f in ("wall_s", "max_rss_kb")
+    ],
     "lsp-session": [
-        _run("init_s"), _run("ready_s"), _run("rss_ready_kb"),
+        _run("init_s"), Metric("init_s_limit", "init_s", kind="ceiling", limit=LSP_INIT_LIMIT_S),
+        _run("ready_s"), _run("rss_ready_kb"),
         _call("L5", "publish_s"), _call("L5s", "publish_s"),
         *[_call(c, f) for c in CALLS_LSP_REPEAT for f in ("first_s", "repeat_s")],
         _call("G2", "first_s"), _call("G4", "first_s"),
@@ -100,6 +115,8 @@ VERDICT_METRICS = {
     "mcp-memory": [
         _run("rss_start_kb"), _run("rss_ready_kb"), _run("rss_series_kb"),
         _run("rss_growth_kb", "growth"), _run("ready_s"),
+        Metric("rss_ready_kb_limit", "rss_ready_kb", kind="ceiling", limit=MCP_READY_LIMIT_KB, corpora=("crm",)),
+        Metric("rss_growth_kb_limit", "rss_growth_kb", kind="ceiling", limit=MCP_GROWTH_LIMIT_KB),
         *[_call(c, f) for c in CALLS_MCP for f in ("first_s", "repeat_s")],
     ],
     # In mcp-load a failed call is counted in `errors`, not an invalid side (§8.3).
@@ -110,6 +127,8 @@ VERDICT_METRICS = {
     ],
     "lsp-close-memory": [
         Metric("rss_growth_max_kb", "rss_growth_max_kb", kind="ceiling", limit=CLOSE_GROWTH_LIMIT_KB),
+        Metric("rss_over_ready_max_kb", "rss_over_ready_max_kb", kind="ceiling", limit=CLOSE_OVER_READY_LIMIT_KB),
+        Metric("global_reopen_s", "global_reopen_s", kind="ceiling", limit=GLOBAL_REOPEN_LIMIT_S),
     ],
 }
 
@@ -120,6 +139,11 @@ def scenario_of(sdir: str) -> str:
 
 def metrics_of(sdir: str) -> list[Metric]:
     return VERDICT_METRICS.get(scenario_of(sdir), [])
+
+
+def corpus_metrics(corpus_id: str, sdir: str) -> list[Metric]:
+    """The metrics of a scenario that act on this corpus."""
+    return [m for m in metrics_of(sdir) if m.corpora is None or corpus_id in m.corpora]
 
 
 # -- series ---------------------------------------------------------------------
@@ -281,14 +305,15 @@ def table_outcome(base: str, cand: str) -> str | None:
     return None
 
 
-def delta_outcome(delta: float, noise: float, change: float = 0.0, floor: float | None = None) -> str:
+def delta_outcome(delta: float, noise: float, change: float = 0.0, floor: float | None = None,
+                  issue: float = ISSUE_DELTA) -> str:
     """`change` is the absolute growth; with a `floor` a block needs more than it,
-    and a smaller growth is judged by the issue rule."""
+    and a smaller growth is judged by the issue rule at `issue`."""
     if delta > BLOCK_DELTA and (floor is None or change > floor):
         return "block"
-    if delta >= ISSUE_DELTA and delta > noise:
+    if delta >= issue and delta > noise:
         return "issue"
-    if delta <= -ISSUE_DELTA and abs(delta) > noise:
+    if delta <= -issue and abs(delta) > noise:
         return "improved"
     return "ok"
 
@@ -303,6 +328,8 @@ def compare_metric(metric: Metric, base_records: list, cand_records: list, noise
            "base": {"state": b_state, "value": b_value}, "candidate": {"state": c_state, "value": c_value},
            "delta": None, "noise": None}
     b_meta, c_meta = series_meta(base_records), series_meta(cand_records)
+    if metric.kind == "ceiling":
+        row["limit"] = metric.limit
     outcome = None
     if metric.kind == "ceiling" and c_state == "valid":
         # An absolute limit judges the candidate alone: no base, no noise, no block.
@@ -335,7 +362,8 @@ def compare_metric(metric: Metric, base_records: list, cand_records: list, noise
             elif value > NOISY:
                 outcome = "noisy"
             else:
-                outcome = delta_outcome(delta, value, c_value - b_value, metric.floor)
+                issue = dict(metric.issue_delta).get(corpus_id, ISSUE_DELTA)
+                outcome = delta_outcome(delta, value, c_value - b_value, metric.floor, issue)
     row["outcome"] = outcome
     row["labels"] = LABELS.get(outcome, [])
     if outcome == "both_invalid":
@@ -361,7 +389,7 @@ def compare(base_groups: dict, cand_groups: dict, noise: dict | None, stale: str
     keys = sorted(units if units is not None else set(base_groups) | set(cand_groups))
     rows = []
     for where in keys:
-        for metric in metrics_of(where[1]):
+        for metric in corpus_metrics(where[0], where[1]):
             rows.append(compare_metric(metric, base_groups.get(where, []), cand_groups.get(where, []),
                                        noise, stale, where))
     return rows
@@ -484,7 +512,7 @@ def trend(results_root: str, cand_groups: dict, extra: list[tuple[str, str, str]
                 columns.append(name)
             series, seen = latest_series(rdir, where, meta["fingerprint"])
             records = load_series(rdir, series, {corpus_id}).get(where, []) if series else []
-            for metric in metrics_of(sdir):
+            for metric in corpus_metrics(corpus_id, sdir):
                 key = (corpus_id, sdir, temp, metric.key)
                 if series is None:
                     cells.setdefault(key, {})[name] = {"text": "несравнимо" if seen else "-"}
@@ -500,7 +528,7 @@ def trend(results_root: str, cand_groups: dict, extra: list[tuple[str, str, str]
             if name not in columns:
                 columns.append(name)
             records = load_series(rdir, series, {corpus_id}).get(where, [])
-            for metric in metrics_of(sdir):
+            for metric in corpus_metrics(corpus_id, sdir):
                 state, value = side(records, metric)
                 cells.setdefault((corpus_id, sdir, temp, metric.key), {})[name] = {
                     "value": value, "state": state, "series": series}
@@ -546,7 +574,10 @@ def row_line(row: dict) -> str:
     delta = "-" if row["delta"] is None else f"{row['delta'] * 100:+.1f}%"
     noise = "-" if row["noise"] is None else f"{row['noise'] * 100:.1f}%"
     b, c = row["base"], row["candidate"]
-    b_text = fmt(b["value"]) if b["state"] == "valid" else b["state"]
+    if row["kind"] == "ceiling":
+        b_text = f"≤ {fmt(row['limit'])}"
+    else:
+        b_text = fmt(b["value"]) if b["state"] == "valid" else b["state"]
     c_text = fmt(c["value"]) if c["state"] == "valid" else c["state"]
     return (f"| {row['corpus']} | {row['scenario']} | {row['temp']} | {row['metric']} | {b_text} | "
             f"{c_text} | {delta} | {noise} | {OUTCOME_TEXT[row['outcome']]} |")

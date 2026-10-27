@@ -663,7 +663,7 @@ class Measure:
               f"calls_ok={ok}/{len(measured)} reason={record['reason'] or '-'}", flush=True)
         for cycle in record["metrics"].get("cycles") or []:
             print(f"  cycle={cycle['cycle']} open_s={_fmt(cycle['open_s'])} "
-                  f"rss_closed_kb={cycle['rss_closed_kb']} growth_kb={cycle['growth_kb']}", flush=True)
+                  f"global_s={_fmt(cycle['global_s'])} rss_closed_kb={cycle['rss_closed_kb']} growth_kb={cycle['growth_kb']}", flush=True)
 
 
 RELAY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay.py")

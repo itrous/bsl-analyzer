@@ -629,7 +629,8 @@ def cycle_growth(ready_kb: int, closed_kb: list) -> list:
 
 
 def close_cycle(ctx: Ctx, run: LspRun, docs: list, number: int) -> dict:
-    """Open every module and wait for its diagnostics, work with them, close
+    """Open every module and wait for its diagnostics, work with them — the
+    global query first, so it pays for whatever the close evicted — close
     them all, then sample the memory for two minutes."""
     clock, p = ctx.clock, ctx.points
     entry = {"id": f"C{number}", "first_s": None, "repeat_s": None, "count": len(docs),
@@ -652,6 +653,13 @@ def close_cycle(ctx: Ctx, run: LspRun, docs: list, number: int) -> dict:
             last = max(last, message["_received_at"])
     open_s = last - opened_at if entry["ok"] else None
     worked_at = clock.now()
+    global_s, result, error = run.call("workspace/symbol", {"query": p["Q"]["query"]})
+    if error is None and _count(result) == 0:
+        error = "empty result"
+    if error is not None:
+        global_s = None
+        if entry["ok"]:
+            entry.update(ok=False, error=f"workspace/symbol: {error}")
     requests = []
     for doc in docs:
         document = {"textDocument": {"uri": run.uri(doc["relative_path"])}}
@@ -686,7 +694,8 @@ def close_cycle(ctx: Ctx, run: LspRun, docs: list, number: int) -> dict:
     ctx.call(entry)
     if entry["error"]:
         ctx.error(f"cycle {number}: {entry['error']}")
-    return {"cycle": number, "ok": entry["ok"], "open_s": open_s, "work_s": work_s, "rss_open_kb": rss_open,
+    return {"cycle": number, "ok": entry["ok"], "open_s": open_s, "global_s": global_s, "work_s": work_s,
+            "rss_open_kb": rss_open,
             "rss_closed_samples_kb": samples, "rss_closed_kb": samples[-1]}
 
 
@@ -711,6 +720,9 @@ def run_lsp_close_memory(ctx: Ctx) -> dict:
         later = cycles[1:]
         m["rss_growth_max_kb"] = max(c["growth_kb"] for c in later) \
             if all(c["ok"] for c in cycles) else None
+        m["rss_over_ready_max_kb"] = max(c["rss_closed_kb"] - m["rss_ready_kb"] for c in cycles) \
+            if all(c["ok"] for c in cycles) else None
+        m["global_reopen_s"] = max(c["global_s"] for c in later) if all(c["ok"] for c in later) else None
         m["reopen_s"] = median([c["open_s"] for c in later]) if all(c["ok"] for c in later) else None
     finally:
         run.finish()

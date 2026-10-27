@@ -138,26 +138,44 @@ class CloseGrowth(unittest.TestCase):
         cand = {CLOSE: series({"rss_growth_max_kb": growth_kb}, runs=1)[:1]}
         return verdict.compare(base or {}, cand, noise, stale)
 
+    def growth(self, rows):
+        return [r["outcome"] for r in rows if r["metric"] == "rss_growth_max_kb"]
+
     def test_above_the_limit_is_an_issue_below_is_ok(self):
-        self.assertEqual([r["outcome"] for r in self.judge(60 * 1024)], ["issue"])
-        self.assertEqual([r["outcome"] for r in self.judge(51 * 1024)], ["issue"])
-        self.assertEqual([r["outcome"] for r in self.judge(49 * 1024)], ["ok"])
-        self.assertEqual([r["outcome"] for r in self.judge(-200)], ["ok"])
+        self.assertEqual(self.growth(self.judge(60 * 1024)), ["issue"])
+        self.assertEqual(self.growth(self.judge(51 * 1024)), ["issue"])
+        self.assertEqual(self.growth(self.judge(49 * 1024)), ["ok"])
+        self.assertEqual(self.growth(self.judge(-200)), ["ok"])
 
     def test_growth_is_never_a_block_and_the_base_does_not_matter(self):
         base = {CLOSE: series({"rss_growth_max_kb": 0}, runs=1)[:1]}
         rows = self.judge(10 * 60 * 1024, base=base, noise=noise_for({}), stale=None)
-        self.assertEqual([r["outcome"] for r in rows], ["issue"])
+        self.assertEqual(self.growth(rows), ["issue"])
         self.assertEqual(verdict.night_verdict(rows)["verdict"], "issue")
         self.assertEqual(rows[0]["labels"], ["perf", "regression"])
 
     def test_an_invalid_candidate_without_a_base_is_incomplete(self):
         rows = self.judge(None)
-        self.assertEqual([r["outcome"] for r in rows], ["incomplete"])
+        self.assertEqual(self.growth(rows), ["incomplete"])
 
     def test_it_takes_no_noise_calibration(self):
         groups = [{CLOSE: series({"rss_growth_max_kb": v}, runs=1)[:1]} for v in (1, 2, 3, 4, 5)]
         self.assertEqual(verdict.build_noise(groups), {})
+
+    def test_the_limit_itself_is_ok_one_kib_above_is_an_issue(self):
+        def growth(kb):
+            return outcome(self.judge(kb), "rss_growth_max_kb")
+
+        self.assertEqual((growth(51201), growth(51200)), ("issue", "ok"))
+
+    def test_memory_over_ready_and_the_global_query_after_reopening_have_limits(self):
+        def judge(metric, value):
+            cand = {CLOSE: series({metric: value}, runs=1)[:1]}
+            return outcome(verdict.compare({}, cand, None, "no noise.json"), metric)
+
+        self.assertEqual((judge("rss_over_ready_max_kb", 307201), judge("rss_over_ready_max_kb", 307200)),
+                         ("issue", "ok"))
+        self.assertEqual((judge("global_reopen_s", 0.201), judge("global_reopen_s", 0.2)), ("issue", "ok"))
 
 
 LSP = ("crm", "lsp-session", "warm")
@@ -241,6 +259,124 @@ class Table(unittest.TestCase):
                 rows = verdict.compare(base, {LSP: series({}, held=False, reason=reason)}, noise_for({}), None)
                 self.assertEqual({r["outcome"] for r in rows}, {expected})
                 self.assertEqual(verdict.night_verdict(rows)["verdict"], expected)
+
+
+def lsp_session(init_s, l6_s=None):
+    calls = [] if l6_s is None else [{"id": "L6", "ok": True, "first_s": l6_s, "repeat_s": l6_s}]
+    return series({**LSP_METRICS, "init_s": init_s}, calls=calls)
+
+
+class Limits(unittest.TestCase):
+    """Absolute limits judged on the candidate alone, next to the relative rows of the same field."""
+
+    def test_init_above_a_tenth_of_a_second_is_an_issue_even_when_it_improved(self):
+        # The relative rule alone calls 0.20 -> 0.15 s an improvement and misses the limit.
+        for corpus_id in ("crm", "ut"):
+            where = (corpus_id, "lsp-session", "warm")
+            noise = noise_for({f"{corpus_id}/lsp-session/warm/init_s": 0.05})
+
+            def judge(cand_s):
+                rows = verdict.compare({where: lsp_session(0.20)}, {where: lsp_session(cand_s)}, noise, None)
+                return outcome(rows, "init_s"), outcome(rows, "init_s_limit")
+
+            with self.subTest(corpus=corpus_id):
+                self.assertEqual(judge(0.15), ("improved", "issue"))
+                self.assertEqual(judge(0.10)[1], "ok")
+                self.assertEqual(judge(0.05)[1], "ok")
+
+    def mcp(self, corpus_id, ready_kb, growth_kb=1000):
+        where = (corpus_id, "mcp-memory", "warm")
+        values = {"rss_start_kb": 1000, "rss_ready_kb": ready_kb, "rss_series_kb": ready_kb + growth_kb,
+                  "rss_growth_kb": growth_kb, "ready_s": 1.0}
+        return verdict.compare({}, {where: series(values)}, None, "no noise.json")
+
+    def test_mcp_ready_memory_is_limited_on_crm_only(self):
+        self.assertEqual(outcome(self.mcp("crm", 524289), "rss_ready_kb_limit"), "issue")
+        self.assertEqual(outcome(self.mcp("crm", 524288), "rss_ready_kb_limit"), "ok")
+        self.assertNotIn("rss_ready_kb_limit", [r["metric"] for r in self.mcp("ut", 900000)])
+        self.assertIn("rss_ready_kb", [r["metric"] for r in self.mcp("ut", 900000)])
+
+    def test_mcp_ready_memory_limit_stays_out_of_the_trend_of_other_corpora(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="perf-nightly-trend-"))
+        rdir = os.path.join(tmp, "develop-dddddddddddd")
+        values = {"rss_ready_kb": 900000, "rss_growth_kb": 1000}
+        for name in ("v0.3.2-cccccccccccc", "develop-dddddddddddd"):
+            for corpus_id in ("crm", "ut"):
+                for record in series(values):
+                    write_json(os.path.join(tmp, name, corpus_id, "mcp-memory", "warm", "night-1",
+                                            f"r{record['k']}.json"), record)
+        cand = verdict.load_series(rdir, "night-1")
+        cells = verdict.trend(tmp, cand, [("develop-dddddddddddd", rdir, "night-1")])["cells"]
+        columns = {"v0.3.2-cccccccccccc", "develop-dddddddddddd"}
+        self.assertEqual(set(cells[("crm", "mcp-memory", "warm", "rss_ready_kb_limit")]), columns)
+        self.assertNotIn(("ut", "mcp-memory", "warm", "rss_ready_kb_limit"), cells)
+        self.assertEqual(set(cells[("ut", "mcp-memory", "warm", "rss_growth_kb_limit")]), columns)
+
+    def test_mcp_growth_over_the_series_is_limited_on_crm_and_ut(self):
+        for corpus_id in ("crm", "ut"):
+            with self.subTest(corpus=corpus_id):
+                self.assertEqual(outcome(self.mcp(corpus_id, 1000, 629147), "rss_growth_kb_limit"), "issue")
+                self.assertEqual(outcome(self.mcp(corpus_id, 1000, 629146), "rss_growth_kb_limit"), "ok")
+
+    def test_the_report_row_shows_the_limit_in_place_of_the_base(self):
+        where = ("crm", "lsp-session", "warm")
+        rows = verdict.compare({where: lsp_session(0.20)}, {where: lsp_session(0.15)},
+                               noise_for({"crm/lsp-session/warm/init_s": 0.05}), None)
+        line = verdict.row_line(next(r for r in rows if r["metric"] == "init_s_limit"))
+        self.assertIn("| init_s_limit | ≤ 0.100 | 0.150 | - | - | issue perf |", line)
+        line = verdict.row_line(next(r for r in rows if r["metric"] == "init_s"))
+        self.assertIn("| init_s | 0.200 | 0.150 |", line)
+
+    def test_limits_take_no_noise_calibration_and_keep_the_harness_schema(self):
+        # A changed harness schema would make the current noise.json stale and cost nights of calibration.
+        self.assertEqual(HARNESS_SCHEMA, 1)
+        self.assertIsNone(verdict.noise_stale(noise_for({}), {"crm": FP}))
+        mcp_values = {"rss_start_kb": 1000, "rss_ready_kb": 1000, "rss_series_kb": 2000,
+                      "rss_growth_kb": 1000, "ready_s": 1.0}
+        close_values = {"rss_growth_max_kb": 1, "rss_over_ready_max_kb": 1, "global_reopen_s": 0.1}
+        groups = [{("crm", "lsp-session", "warm"): lsp_session(0.04 + i / 1000),
+                   ("crm", "mcp-memory", "warm"): series(mcp_values),
+                   CLOSE: series(close_values, runs=1)[:1]} for i in range(5)]
+        keys = set(verdict.build_noise(groups))
+        self.assertTrue({"crm/lsp-session/warm/init_s", "crm/mcp-memory/warm/rss_ready_kb",
+                         "crm/mcp-memory/warm/rss_growth_kb"} <= keys, keys)
+        self.assertEqual([k for k in keys if k.endswith("_limit") or "lsp-close-memory" in k], [])
+
+
+UT_LSP = ("ut", "lsp-session", "warm")
+
+
+class L6(unittest.TestCase):
+    """Inlay hints on UT: the general rules, issue at +10% over noise, block at +40% and +20 ms."""
+
+    def judge(self, cand_s):
+        noise = noise_for({"ut/lsp-session/warm/L6.first_s": 0.06})
+        rows = verdict.compare({UT_LSP: lsp_session(0.04, 0.365)}, {UT_LSP: lsp_session(0.04, cand_s)}, noise, None)
+        return outcome(rows, "L6.first_s")
+
+    def test_ten_percent_is_an_issue_forty_and_twenty_ms_a_block(self):
+        self.assertEqual([self.judge(v) for v in (0.41, 0.39, 0.52)], ["issue", "ok", "block"])
+
+
+class AnalyzeThreshold(unittest.TestCase):
+    """`analyze` on UT and ERP is an issue from +5% over noise; CRM and Lombard keep 10%."""
+
+    def judge(self, corpus_id, metric, base, cand, noise):
+        where = (corpus_id, "analyze", "warm")
+        values = {"wall_s": 10.0, "max_rss_kb": 1000}
+        rows = verdict.compare({where: series({**values, metric: base})}, {where: series({**values, metric: cand})},
+                               noise_for({f"{corpus_id}/analyze/warm/{metric}": noise}), None)
+        return outcome(rows, metric)
+
+    def test_the_threshold_follows_the_corpus(self):
+        self.assertEqual(self.judge("ut", "wall_s", 10.0, 10.6, 0.03), "issue")
+        self.assertEqual(self.judge("crm", "wall_s", 10.0, 10.6, 0.03), "ok")
+        self.assertEqual(self.judge("lombard", "wall_s", 10.0, 10.6, 0.03), "ok")
+        self.assertEqual(self.judge("erp", "max_rss_kb", 1000, 1060, 0.006), "issue")
+        self.assertEqual(self.judge("ut", "wall_s", 10.0, 10.4, 0.03), "ok")
+        self.assertEqual(self.judge("ut", "wall_s", 10.0, 10.6, 0.117), "ok")
+        self.assertEqual(self.judge("ut", "wall_s", 10.0, 9.4, 0.03), "improved")
+        self.assertEqual(self.judge("crm", "wall_s", 10.0, 9.4, 0.03), "ok")
 
 
 LOAD = ("crm", "mcp-load-c4", "warm")

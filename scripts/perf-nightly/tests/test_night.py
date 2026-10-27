@@ -10,6 +10,9 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
+import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from helpers import FOREIGN_PREFIX, FakeClock, Workspace, run_git, set_mode
@@ -415,6 +418,56 @@ class CloseMemory(NightCase):
         self.assertIn("### ЦРМ", report)
         self.assertIn("- время сценария: ", report)
         self.assertIn("| 3 | ", report)
+        self.assertIn("больше 50 МБ", report)
+        self.assertIn("больше 300 МБ", report)
+        self.assertIn("дольше 0.2 с", report)
+        self.assertIn("| цикл | открытие, с | глобальный запрос, с | RSS после закрытия, МБ | "
+                      "над готовностью, МБ | прирост, МБ |", report)
+        cycle = item["cycles"][2]
+        over = (cycle["rss_closed_kb"] - item["rss_ready_kb"]) / 1024
+        self.assertIn(f"| 3 | {verdict.fmt(cycle['open_s'])} | 0.000 | {cycle['rss_closed_kb'] / 1024:.1f} | "
+                      f"{over:+.1f} | ", report)
+
+    def test_the_table_shows_the_global_query_and_the_memory_over_ready(self):
+        mib = 1024
+        cycles = [{"cycle": n, "open_s": 1.0, "global_s": g, "rss_closed_kb": closed * mib, "growth_kb": grown * mib}
+                  for n, g, closed, grown in ((1, 0.0, 400, 300), (2, 0.5, 410, 10), (3, None, 420, 10))]
+        summary = {"name": DATE, "verdict": "issue", "reasons": [], "kind": "night",
+                   "candidate": {"label": "develop", "sha": "d" * 40}, "base": {"label": "v0.3.2", "sha": "b" * 40},
+                   "series": f"night-{DATE}", "started_at": "s", "finished_at": "f", "elapsed_s": 60.0,
+                   "deadline": None, "noise": {"status": "current"}, "not_compared": 0, "skipped": [],
+                   "refused": {}, "close_memory": [{"label": "УТ", "duration_s": 60.0, "estimate_s": 520.0,
+                                                   "outcome": "issue", "cycles": cycles, "rss_ready_kb": 100 * mib,
+                                                   "reason": None}]}
+        out = self.enterContext(tempfile.TemporaryDirectory(prefix="perf-nightly-report-"))
+        night.write_report(out, summary, [], None)
+        with open(os.path.join(out, "report.md"), encoding="utf-8") as fh:
+            report = fh.read()
+        self.assertIn("| 1 | 1.000 | 0.000 | 400.0 | +300.0 | +300.0 |", report)
+        self.assertIn("| 2 | 1.000 | 0.500 | 410.0 | +310.0 | +10.0 |", report)
+        self.assertIn("| 3 | 1.000 | - | 420.0 | +320.0 | +10.0 |", report)
+        self.assertIn("- исход: issue perf", report)
+
+    def test_the_outcome_of_the_section_is_the_worst_row_of_the_scenario(self):
+        # The first row of the scenario is ok, a later limit is exceeded.
+        session = SimpleNamespace(durations={}, estimates=night.Estimates(None))
+        manifest = {"corpora": {"ut": {"label": "УТ"}}}
+
+        def rows(*outcomes):
+            metrics = ("rss_growth_max_kb", "rss_over_ready_max_kb", "global_reopen_s")
+            return [{"corpus": "ut", "scenario": "lsp-close-memory", "metric": m, "outcome": o}
+                    for m, o in zip(metrics, outcomes)] + [
+                {"corpus": "ut", "scenario": "analyze", "metric": "wall_s", "outcome": "block"}]
+
+        def judged(found_rows):
+            [item] = night.close_memory(manifest, ["ut"], {}, found_rows, session)
+            return item["outcome"]
+
+        self.assertEqual(judged(rows("ok", "issue", "ok")), "issue")
+        self.assertEqual(judged(rows("ok", "ok", "issue")), "issue")
+        self.assertEqual(judged(rows("ok", "ok", "ok")), "ok")
+        self.assertEqual(judged(rows("issue", "incomplete", "incomplete")), "issue")
+        self.assertEqual(judged([]), "incomplete")
 
     def test_without_its_warm_lsp_session_it_is_skipped(self):
         clock = AdvancingClock(0.0)
@@ -457,6 +510,118 @@ class CloseMemory(NightCase):
         self.assertEqual(estimates.series("base", ALL) * 2, without)
         self.assertLessEqual(both - without, 600)
         self.assertEqual(both - without, night.UNIT_SECONDS[("lsp-close-memory", "ut")])
+
+    def test_the_scenario_still_costs_the_night_520_seconds(self):
+        # The global query adds no run and no estimate: before any night is measured the
+        # scenario adds the same 520 s as before.
+        estimates = night.Estimates(None)
+        with patch.object(night, "SUITE", tuple(u for u in night.SUITE if u[0] != "lsp-close-memory")):
+            without = estimates.series("base", ALL) + estimates.series("candidate", ALL)
+        self.assertEqual(estimates.series("base", ALL) + estimates.series("candidate", ALL) - without, 520.0)
+
+
+def analyze_runs(*counts, held=True):
+    return [{"held": held, "metrics": {"total_diagnostics": n}} for n in counts]
+
+
+UT = ("ut", "analyze", "warm")
+
+
+class DiagCounts(unittest.TestCase):
+    """The number of `analyze` diagnostics on UT against the previous night: a note, not a verdict."""
+
+    def test_the_candidate_is_compared_with_the_previous_night_not_with_the_base(self):
+        base = {UT: analyze_runs(5, 5, 5)}
+        cand = {UT: analyze_runs(2, 2, 2)}
+        changed = night.diag_counts(base, cand, {"ut": (3, "2026-10-21")})["ut"]
+        self.assertEqual(changed, {"candidate": 2, "values": [2], "base": 5, "previous": 3,
+                                   "previous_night": "2026-10-21", "state": "changed"})
+        same = night.diag_counts(base, cand, {"ut": (2, "2026-10-21")})["ut"]
+        self.assertEqual(same["state"], "same")
+
+    def test_unstable_runs_no_previous_record_and_no_held_run(self):
+        base = {UT: analyze_runs(5, 5, 5)}
+        unstable = night.diag_counts(base, {UT: analyze_runs(2, 3, 2)}, {"ut": (2, "2026-10-21")})["ut"]
+        self.assertEqual((unstable["state"], unstable["values"], unstable["candidate"]), ("unstable", [2, 3], None))
+        fresh = night.diag_counts(base, {UT: analyze_runs(2, 2, 2)}, {})["ut"]
+        self.assertEqual((fresh["state"], fresh["previous"], fresh["previous_night"]), ("no_previous", None, None))
+        failed = night.diag_counts(base, {UT: analyze_runs(2, 2, 2, held=False)}, {"ut": (2, "2026-10-21")})["ut"]
+        self.assertEqual((failed["state"], failed["candidate"]), ("missing", None))
+        self.assertEqual(night.diag_counts({}, {}, {}), {})
+
+    def test_only_the_ut_count_is_followed(self):
+        other = {("crm", "analyze", "warm"): analyze_runs(2, 2, 2), ("erp", "analyze", "warm"): analyze_runs(2, 2, 2)}
+        self.assertEqual(night.diag_counts(other, other, {"crm": (3, "2026-10-21")}), {})
+
+    def test_the_report_marks_a_changed_count_and_no_other_state(self):
+        states = {"changed": (2, "2026-10-21", "**изменилось**"), "same": (2, "2026-10-21", "без изменений"),
+                  "unstable": (None, None, "нестабильно между прогонами"),
+                  "no_previous": (None, None, "нет прошлой записи"),
+                  "missing": (None, None, "нет удержанного прогона кандидата")}
+        counts = {state: {"candidate": 2 if state in ("changed", "same") else None, "values": [2], "base": 5,
+                          "previous": before, "previous_night": night_date, "state": state}
+                  for state, (before, night_date, _) in states.items()}
+        summary = {"name": DATE, "verdict": "ok", "reasons": [], "kind": "night",
+                   "candidate": {"label": "develop", "sha": "d" * 40}, "base": {"label": "v0.3.2", "sha": "b" * 40},
+                   "series": f"night-{DATE}", "started_at": "s", "finished_at": "f", "elapsed_s": 60.0,
+                   "deadline": None, "noise": {"status": "current"}, "not_compared": 0, "skipped": [],
+                   "refused": {}, "diag_counts": counts}
+        out = self.enterContext(tempfile.TemporaryDirectory(prefix="perf-nightly-report-"))
+        night.write_report(out, summary, [], None)
+        with open(os.path.join(out, "report.md"), encoding="utf-8") as fh:
+            lines = {line.split(" | ")[0].lstrip("| "): line for line in fh.read().splitlines() if line.startswith("| ")}
+        for state, (_, _, text) in states.items():
+            with self.subTest(state=state):
+                self.assertTrue(lines[state].endswith(f" | {text} |"), lines[state])
+        self.assertEqual([state for state, line in lines.items() if "**" in line], ["changed"])
+
+
+class DiagCountsHistory(NightCase):
+    def write_night(self, date, **summary):
+        write_json(self.data.path("nights", date, "summary.json"), {"state": "done", **summary})
+
+    def test_nights_without_a_count_are_passed_over(self):
+        self.write_night("2026-10-18", diag_counts={"crm": {"candidate": 9}})
+        self.write_night("2026-10-19", diag_counts={"crm": {"candidate": 3}})
+        self.write_night("2026-10-20", diag_counts={"crm": {"candidate": None}})
+        self.write_night("2026-10-21")
+        self.write_night("2026-10-21-rerun", diag_counts={"crm": {"candidate": 7}})
+        self.write_night(DATE, diag_counts={"crm": {"candidate": 7}})
+        with patch.object(night, "DIAG_COUNT_CORPORA", ("crm",)):
+            self.assertEqual(night.previous_diag_counts(self.data, DATE), {"crm": (3, "2026-10-19")})
+
+    def test_the_search_stops_at_the_first_night_with_a_count(self):
+        # An older summary that no longer reads must not cost the night, as it does not for durations.
+        os.makedirs(self.data.path("nights", "2026-10-01"))
+        with open(self.data.path("nights", "2026-10-01", "summary.json"), "w") as fh:
+            fh.write("{")
+        self.write_night("2026-10-21", durations={"x": [1.0]}, diag_counts={"crm": {"candidate": 3}})
+        with patch.object(night, "DIAG_COUNT_CORPORA", ("crm",)):
+            self.assertEqual(night.previous_diag_counts(self.data, DATE), {"crm": (3, "2026-10-21")})
+        self.assertEqual(night.previous_history(self.data, DATE), {"x": [1.0]})
+
+    def test_a_night_reports_its_count_against_the_last_night_that_has_one(self):
+        # D−2 recorded 3, D−1 has no count, this night measures 2 diagnostics (one per module).
+        self.write_night("2026-10-20", diag_counts={"crm": {"candidate": 3}})
+        self.write_night("2026-10-21", durations={})
+        self.fresh_noise()
+        with patch.object(night, "SUITE", (*CLOSE_SET, ("analyze", ("crm",)))), \
+                patch.object(night, "DIAG_COUNT_CORPORA", ("crm",)):
+            summary = self.night()
+        self.assertEqual(summary["diag_counts"], {"crm": {
+            "candidate": 2, "values": [2], "base": 2, "previous": 3, "previous_night": "2026-10-20",
+            "state": "changed"}})
+        # The verdict comes from the rows alone: a changed count adds no outcome and no reason.
+        rows = read_json(self.data.path("nights", DATE, "compare.json"))["rows"]
+        result = verdict.night_verdict(rows, diff_missing=summary["diff"]["not_built"])
+        self.assertEqual((summary["verdict"], summary["reasons"]), (result["verdict"], result["reasons"]))
+        with open(self.data.path("nights", DATE, "report.md"), encoding="utf-8") as fh:
+            report = fh.read()
+        self.assertIn("## Память после закрытия документов", report)
+        self.assertIn("## Число диагностик", report)
+        self.assertIn("| crm | 2 | 2 | 2 | 3 (2026-10-20) | **изменилось** |", report)
+        self.assertEqual(read_json(self.data.path("nights", DATE, "summary.json"))["diag_counts"],
+                         summary["diag_counts"])
 
 
 class Suite(NightCase):
