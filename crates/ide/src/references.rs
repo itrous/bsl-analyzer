@@ -350,6 +350,95 @@ pub fn find_references_by_name(
 ) -> ReferencesResult {
     let _span = tracing::info_span!("find_references_by_name").entered();
 
+    match anchor_references(db, req, external) {
+        Anchored::Answered(result) => result,
+        Anchored::Walk(walk) => {
+            let mut hits = Vec::new();
+            for &file_id in walk.scanned() {
+                db.unwind_if_revision_cancelled();
+                hits.extend(walk_reference_file(db, file_id, walk.symbol(), req));
+            }
+            finish_references(db, walk, hits)
+        }
+    }
+}
+
+/// The walk one anchored symbol calls for, before any file of it is entered.
+///
+/// Everything in it is a value: the walk is handed from one database handle to another
+/// by a caller that drops the handle between the files it enters, so nothing here may
+/// borrow the database.
+#[derive(Debug, Clone)]
+pub struct ReferenceWalk {
+    symbol: SemanticSymbol,
+    /// The candidate files in walk order, already cut to `max_files`.
+    scanned: Vec<FileId>,
+    files_capped: bool,
+    /// The declarations an anchor by name resolved, which outrank the one the symbol
+    /// itself names; `None` for the other anchors.
+    declarations: Option<Vec<Declaration>>,
+    anchor_line: Option<u32>,
+    anchor_candidates_capped: bool,
+}
+
+impl ReferenceWalk {
+    pub fn symbol(&self) -> &SemanticSymbol {
+        &self.symbol
+    }
+
+    /// The files the walk enters, in order. `files_scanned` of the result is their
+    /// count whatever the walk finds in them.
+    pub fn scanned(&self) -> &[FileId] {
+        &self.scanned
+    }
+}
+
+/// What anchoring settled: an answer that needs no walk, or the walk to run.
+#[derive(Debug, Clone)]
+pub enum Anchored {
+    Answered(ReferencesResult),
+    Walk(ReferenceWalk),
+}
+
+impl Anchored {
+    /// The fields an anchoring branch settles AFTER it knows the symbol go into both
+    /// shapes alike: an answer that skipped the walk still carries the declarations a
+    /// graph id is derived from and the line a text anchor landed on.
+    fn with_declarations(self, declarations: Vec<Declaration>) -> Self {
+        match self {
+            Self::Answered(result) => Self::Answered(ReferencesResult { declarations, ..result }),
+            Self::Walk(walk) => {
+                Self::Walk(ReferenceWalk { declarations: Some(declarations), ..walk })
+            }
+        }
+    }
+
+    fn with_anchor_line(self, anchor_line: u32) -> Self {
+        let anchor_line = Some(anchor_line);
+        match self {
+            Self::Answered(result) => Self::Answered(ReferencesResult { anchor_line, ..result }),
+            Self::Walk(walk) => Self::Walk(ReferenceWalk { anchor_line, ..walk }),
+        }
+    }
+
+    fn with_anchor_candidates_capped(self, anchor_candidates_capped: bool) -> Self {
+        match self {
+            Self::Answered(result) => {
+                Self::Answered(ReferencesResult { anchor_candidates_capped, ..result })
+            }
+            Self::Walk(walk) => Self::Walk(ReferenceWalk { anchor_candidates_capped, ..walk }),
+        }
+    }
+}
+
+/// Resolve the anchor and decide which files to walk — the first of the three steps
+/// [`find_references_by_name`] is composed of, for a caller that walks the files itself
+/// ([`walk_reference_file`]) and reduces the hits at the end ([`finish_references`]).
+pub fn anchor_references(
+    db: &RootDatabaseImpl,
+    req: &ReferencesRequest,
+    external: &[&dyn crate::name_lookup::ExternalNameSource],
+) -> Anchored {
     match &req.anchor {
         ReferenceAnchor::Name(name) => resolve_by_name(db, name, req, external),
         ReferenceAnchor::Position { file_id, line, column } => {
@@ -370,7 +459,7 @@ fn resolve_by_name(
     name: &str,
     req: &ReferencesRequest,
     external: &[&dyn crate::name_lookup::ExternalNameSource],
-) -> ReferencesResult {
+) -> Anchored {
     let mut declarations = resolve_declarations(db, name);
     if let Some(files) = &req.anchor_files {
         declarations.retain(|decl| files.contains(&decl.file_id));
@@ -383,16 +472,14 @@ fn resolve_by_name(
             else {
                 // The declaration is there and its symbol is not: nothing knows
                 // where to look, which is what this category says.
-                return ReferencesResult::outcome_only(
+                return Anchored::Answered(ReferencesResult::outcome_only(
                     ReferencesOutcome::UnsupportedSymbol {
                         category: UnsupportedCategory::UnknownScope,
                     },
                     BodySource::Resident,
-                );
+                ));
             };
-            let mut result = collect_references(db, declaration.file_id, &symbol, req);
-            result.declarations = declarations;
-            result
+            begin_walk(db, declaration.file_id, symbol, req).with_declarations(declarations)
         }
         0 => {
             let dictionary = resolve_by_dictionary(db, name, req, external);
@@ -405,17 +492,17 @@ fn resolve_by_name(
                 return dictionary.result;
             }
             match classify_unreferenceable(db, name) {
-                Some(category) => ReferencesResult::outcome_only(
+                Some(category) => Anchored::Answered(ReferencesResult::outcome_only(
                     ReferencesOutcome::UnsupportedSymbol { category },
                     BodySource::Resident,
-                ),
+                )),
                 None => dictionary.result,
             }
         }
-        _ => ReferencesResult {
+        _ => Anchored::Answered(ReferencesResult {
             declarations,
             ..ReferencesResult::outcome_only(ReferencesOutcome::Ambiguous, BodySource::Resident)
-        },
+        }),
     }
 }
 
@@ -428,7 +515,7 @@ fn resolve_by_name(
 /// name could be walked from at all — the question that decides whether the card surface
 /// gets to call the name unwalkable.
 struct DictionaryAnswer {
-    result: ReferencesResult,
+    result: Anchored,
     anchorable: bool,
 }
 
@@ -488,14 +575,14 @@ fn resolve_by_dictionary(
             match symbol_at(db, place.file_id, range.start()) {
                 // The body is the reference list the resident walked, even
                 // though it was the dictionary that found the anchor.
-                Some(symbol) => collect_references(db, place.file_id, &symbol, req),
-                None => ReferencesResult {
+                Some(symbol) => begin_walk(db, place.file_id, symbol, req),
+                None => Anchored::Answered(ReferencesResult {
                     candidates: Some(lookup.clone()),
                     ..ReferencesResult::outcome_only(
                         ReferencesOutcome::NotFound,
                         BodySource::NameDictionary,
                     )
-                },
+                }),
             }
         }
         // Matched exactly, but nothing to walk: a metadata object, a platform
@@ -507,28 +594,28 @@ fn resolve_by_dictionary(
         // file set never touched, and not off "nothing anchored here".
         0 if anchorable.is_empty() && !unanchorable.is_empty() => {
             let category = unanchorable[0];
-            ReferencesResult {
+            Anchored::Answered(ReferencesResult {
                 candidates: Some(lookup.clone()),
                 ..ReferencesResult::outcome_only(
                     ReferencesOutcome::UnsupportedSymbol { category },
                     BodySource::NameDictionary,
                 )
-            }
+            })
         }
-        0 => ReferencesResult {
+        0 => Anchored::Answered(ReferencesResult {
             candidates: Some(lookup.clone()),
             ..ReferencesResult::outcome_only(
                 ReferencesOutcome::NotFound,
                 BodySource::NameDictionary,
             )
-        },
-        _ => ReferencesResult {
+        }),
+        _ => Anchored::Answered(ReferencesResult {
             candidates: Some(lookup.clone()),
             ..ReferencesResult::outcome_only(
                 ReferencesOutcome::Ambiguous,
                 BodySource::NameDictionary,
             )
-        },
+        }),
     };
 
     DictionaryAnswer {
@@ -536,10 +623,7 @@ fn resolve_by_dictionary(
         // to go: they are lost only once they fill the budget by themselves.
         // `NameLookupResult::truncated` is the wrong signal here — it is also true when
         // an unrelated provider capped its own prefix matches.
-        result: ReferencesResult {
-            anchor_candidates_capped: exact.len() >= ANCHOR_CANDIDATE_LIMIT,
-            ..result
-        },
+        result: result.with_anchor_candidates_capped(exact.len() >= ANCHOR_CANDIDATE_LIMIT),
         anchorable: !anchorable.is_empty(),
     }
 }
@@ -556,14 +640,20 @@ fn resolve_by_position(
     line: u32,
     column: u32,
     req: &ReferencesRequest,
-) -> ReferencesResult {
+) -> Anchored {
+    let not_found = || {
+        Anchored::Answered(ReferencesResult::outcome_only(
+            ReferencesOutcome::NotFound,
+            BodySource::Resident,
+        ))
+    };
     let Some(offset) = crate::name_lookup::offset_for_line_col(db, file_id, line, column) else {
-        return ReferencesResult::outcome_only(ReferencesOutcome::NotFound, BodySource::Resident);
+        return not_found();
     };
     let Some(symbol) = symbol_at(db, file_id, offset) else {
-        return ReferencesResult::outcome_only(ReferencesOutcome::NotFound, BodySource::Resident);
+        return not_found();
     };
-    collect_references(db, file_id, &symbol, req)
+    begin_walk(db, file_id, symbol, req)
 }
 
 /// The self-certifying anchor: the caller quotes the line it read, and the quote
@@ -581,7 +671,7 @@ fn resolve_by_text(
     column: Option<u32>,
     content: &str,
     req: &ReferencesRequest,
-) -> ReferencesResult {
+) -> Anchored {
     let stale = |reason: AnchorStaleReason, line_matches: usize| {
         ReferencesResult::outcome_only(
             ReferencesOutcome::AnchorStale { reason, line_matches },
@@ -593,7 +683,7 @@ fn resolve_by_text(
     // `contains("")` is true of every line, so an empty quote would report itself found on
     // all of them — the file's length dressed up as evidence.
     if needle.is_empty() {
-        return stale(AnchorStaleReason::NotInFile, 0);
+        return Anchored::Answered(stale(AnchorStaleReason::NotInFile, 0));
     }
     let text = db.file_text(file_id);
     let index =
@@ -628,7 +718,7 @@ fn resolve_by_text(
     }
     let line_matches = matching_lines.len();
     if spans.is_empty() {
-        return stale(AnchorStaleReason::NotInFile, 0);
+        return Anchored::Answered(stale(AnchorStaleReason::NotInFile, 0));
     }
 
     let parse = db.parse(file_id);
@@ -668,14 +758,14 @@ fn resolve_by_text(
     if tokens.is_empty() {
         // The axis the caller aimed with is the one the answer names: a column
         // that missed is a different mistake from a quote with no name in it.
-        return stale(
+        return Anchored::Answered(stale(
             if aimed_by_column {
                 AnchorStaleReason::ColumnOutsideQuotedText
             } else {
                 AnchorStaleReason::NoNameInQuotedText
             },
             line_matches,
-        );
+        ));
     }
 
     // Deduplicated by SYMBOL, not by token: one symbol quoted on five lines is
@@ -711,10 +801,10 @@ fn resolve_by_text(
     }
 
     if anchors.is_empty() {
-        return ReferencesResult {
+        return Anchored::Answered(ReferencesResult {
             anchor_candidates_capped: capped,
             ..stale(AnchorStaleReason::NameNotResolved, line_matches)
-        };
+        });
     }
 
     if anchors.len() > 1 {
@@ -728,18 +818,17 @@ fn resolve_by_text(
                 pointed_by_line: candidate.pointed_by_line,
             })
             .collect();
-        return ReferencesResult {
+        return Anchored::Answered(ReferencesResult {
             anchor_sites: sites,
             anchor_candidates_capped: capped,
             ..ReferencesResult::outcome_only(ReferencesOutcome::Ambiguous, BodySource::Resident)
-        };
+        });
     }
 
-    let anchor = &anchors[0];
-    let mut result = collect_references(db, file_id, &anchor.symbol, req);
-    result.anchor_line = Some(line_of(&anchor.token));
-    result.anchor_candidates_capped = capped;
-    result
+    let anchor = anchors.swap_remove(0);
+    begin_walk(db, file_id, anchor.symbol, req)
+        .with_anchor_line(line_of(&anchor.token))
+        .with_anchor_candidates_capped(capped)
 }
 
 /// One symbol the quote could name, with the token that will speak for it.
@@ -816,24 +905,25 @@ fn order_and_count_by_file(
     per_file
 }
 
-fn collect_references(
+/// Which files the symbol's references can stand in, cut to the request's cap.
+fn begin_walk(
     db: &RootDatabaseImpl,
     home_file: FileId,
-    symbol: &SemanticSymbol,
+    symbol: SemanticSymbol,
     req: &ReferencesRequest,
-) -> ReferencesResult {
+) -> Anchored {
     let scope = symbol.reference_scope(db);
     let candidate_files: Vec<FileId> = match scope {
         ReferenceScope::FileLocal => vec![home_file],
         // The one case where an empty list is not an answer: nothing knows
         // where to look, so nothing was looked at.
         ReferenceScope::Unknown => {
-            return ReferencesResult::outcome_only(
+            return Anchored::Answered(ReferencesResult::outcome_only(
                 ReferencesOutcome::UnsupportedSymbol {
                     category: UnsupportedCategory::UnknownScope,
                 },
                 BodySource::Resident,
-            )
+            ))
         }
         ReferenceScope::ModuleSymbolWorkspace => {
             workspace_candidate_files(db, home_file, &symbol.name)
@@ -842,54 +932,88 @@ fn collect_references(
 
     // The area is applied to the candidate files, before the walk: the total
     // must count what the filter admits, not what it later hides.
-    let candidate_files: Vec<FileId> = match &req.area.files {
+    let mut scanned: Vec<FileId> = match &req.area.files {
         Some(files) => candidate_files.into_iter().filter(|id| files.contains(id)).collect(),
         None => candidate_files,
     };
 
-    let files_capped = candidate_files.len() > req.max_files;
-    let scanned = &candidate_files[..candidate_files.len().min(req.max_files)];
+    let files_capped = scanned.len() > req.max_files;
+    scanned.truncate(req.max_files);
 
+    Anchored::Walk(ReferenceWalk {
+        symbol,
+        scanned,
+        files_capped,
+        declarations: None,
+        anchor_line: None,
+        anchor_candidates_capped: false,
+    })
+}
+
+/// The hits of `symbol` in one file of the walk, filtered by kind as the request asks —
+/// the second step. The cancellation checkpoint is the caller's, taken before each
+/// file: one checkpoint per file boundary, however the caller groups the files.
+pub fn walk_reference_file(
+    db: &RootDatabaseImpl,
+    file_id: FileId,
+    symbol: &SemanticSymbol,
+    req: &ReferencesRequest,
+) -> Vec<ReferenceHit> {
+    let locations = find_references_in_file(db, file_id, symbol);
+    if locations.is_empty() {
+        return Vec::new();
+    }
+    let parse = db.parse(file_id);
+    let root = parse.syntax_node();
     let mut hits = Vec::new();
-    for &file_id in scanned {
-        db.unwind_if_revision_cancelled();
-        let locations = find_references_in_file(db, file_id, symbol);
-        if locations.is_empty() {
+    for location in locations {
+        let Some(token) = root.token_at_offset(location.range.start()).right_biased() else {
+            continue;
+        };
+        let kind = classify_reference_token(&token);
+        if let Some(wanted) = &req.kinds {
+            if !wanted.contains(&kind) {
+                continue;
+            }
+        }
+        if !req.include_declaration && kind == ReferenceKind::Declaration {
             continue;
         }
-        let parse = db.parse(file_id);
-        let root = parse.syntax_node();
-        for location in locations {
-            let Some(token) = root.token_at_offset(location.range.start()).right_biased() else {
-                continue;
-            };
-            let kind = classify_reference_token(&token);
-            if let Some(wanted) = &req.kinds {
-                if !wanted.contains(&kind) {
-                    continue;
-                }
-            }
-            if !req.include_declaration && kind == ReferenceKind::Declaration {
-                continue;
-            }
-            let enclosing_range = enclosing_method_range(&token);
-            hits.push(ReferenceHit { file_id, range: location.range, enclosing_range, kind });
-        }
+        let enclosing_range = enclosing_method_range(&token);
+        hits.push(ReferenceHit { file_id, range: location.range, enclosing_range, kind });
     }
+    hits
+}
 
+/// Reduce the hits of every scanned file into the answer — the third step. The order
+/// of `hits` does not matter: the reduction sorts, so the answer is the same whatever
+/// order the files were walked in.
+pub fn finish_references(
+    db: &RootDatabaseImpl,
+    walk: ReferenceWalk,
+    mut hits: Vec<ReferenceHit>,
+) -> ReferencesResult {
     let per_file = order_and_count_by_file(db, &mut hits);
+    let ReferenceWalk {
+        symbol,
+        scanned,
+        files_capped,
+        declarations,
+        anchor_line,
+        anchor_candidates_capped,
+    } = walk;
 
     ReferencesResult {
         outcome: ReferencesOutcome::Resolved,
         body_source: BodySource::Resident,
         hits,
         per_file,
-        declarations: declaration_of(db, symbol),
+        declarations: declarations.unwrap_or_else(|| declaration_of(db, &symbol)),
         candidates: None,
         files_scanned: scanned.len(),
         files_capped,
-        anchor_candidates_capped: false,
-        anchor_line: None,
+        anchor_candidates_capped,
+        anchor_line,
         anchor_sites: Vec::new(),
     }
 }

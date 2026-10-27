@@ -672,6 +672,67 @@ impl DiagnosticsResident {
         }
     }
 
+    /// Run `f` on a database handle this request owns: the handle is cloned here, its
+    /// token registered with the request's cancellation, and it is dropped when `f`
+    /// returns or unwinds — so a trim that follows never waits on it. A request cancelled
+    /// before `f` starts unwinds at once, as [`super::ResidentSession::read`] does.
+    pub(crate) fn with_request_handle<T>(
+        &self,
+        cancel: &RequestCancel,
+        f: impl FnOnce(&Self, &Analysis) -> T,
+    ) -> T {
+        if cancel.is_cancelled() {
+            std::panic::resume_unwind(Box::new(salsa::Cancelled::Local));
+        }
+        let analysis = self.analysis();
+        cancel.register(salsa::Database::cancellation_token(analysis.database()));
+        analysis.attached(|analysis| f(self, analysis))
+    }
+
+    /// Run `job` over `files` in order, on the calling thread, in chunks with a trim
+    /// between them: what one file's job memoises — its syntax tree, lowered bodies,
+    /// inference — goes with its chunk instead of staying until the read ends. Each
+    /// chunk runs on a request handle of its own ([`Self::with_request_handle`]), and
+    /// the handle is gone by the time the trim takes the exclusive one. The files are
+    /// weighed the way the warm-up weighs them, by their size on disk. Cancellation is
+    /// observed at every file boundary and unwinds the whole walk, past the trim of the
+    /// chunk in progress and past the read's own trim, which runs only after a read
+    /// returns: what the cancelled chunk memoised stays live, bounded by one chunk,
+    /// until the next completed read trims. The results come back in the order of
+    /// `files`.
+    pub(crate) fn walk_files_in_chunks<T>(
+        &mut self,
+        cancel: &RequestCancel,
+        files: &[FileId],
+        job: impl Fn(&Analysis, FileId) -> T,
+    ) -> Vec<T> {
+        let weighed: Vec<(FileId, u64)> = {
+            let path_of: HashMap<FileId, &str> =
+                self.by_path.iter().map(|(path, id)| (*id, path.as_str())).collect();
+            files
+                .iter()
+                .map(|id| {
+                    let bytes = path_of
+                        .get(id)
+                        .map_or(0, |path| std::fs::metadata(path).map_or(0, |meta| meta.len()));
+                    (*id, bytes)
+                })
+                .collect()
+        };
+        let chunks = stdx::batch::chunks_by_budget(&weighed, |(_, bytes)| *bytes, SWEEP_CHUNK);
+        let mut out = Vec::with_capacity(files.len());
+        for chunk in chunks {
+            self.with_request_handle(cancel, |_, analysis| {
+                for (file_id, _) in chunk {
+                    salsa::Database::unwind_if_revision_cancelled(analysis.database());
+                    out.push(job(analysis, *file_id));
+                }
+            });
+            self.trim_between_chunks();
+        }
+        out
+    }
+
     fn clear_pool_node_caches(&self) {
         syntax::clear_shared_node_cache();
         if let Some(pool) = self.sweep_pool.get() {
@@ -2914,11 +2975,15 @@ mod trim_tests {
     /// Heap bytes the resident's syntax trees hold. Eviction drops a memo's value and
     /// keeps its slot, so the live count never moves; the trees' heap does.
     fn syntax_tree_bytes(resident: &DiagnosticsResident) -> usize {
-        resident
-            .db()
-            .memory_report()
+        heap_bytes(resident.db(), "syntax::Parse<")
+    }
+
+    /// Heap bytes the memos of the ingredient named by `output` hold, read through any
+    /// handle: a clone shares the storage the report walks.
+    fn heap_bytes(db: &ide::RootDatabaseImpl, output: &str) -> usize {
+        db.memory_report()
             .into_iter()
-            .filter(|(name, ..)| name.contains("syntax::Parse<"))
+            .filter(|(name, ..)| name.contains(output))
             .map(|(.., heap)| heap.unwrap_or(0))
             .sum()
     }
@@ -3104,6 +3169,325 @@ mod trim_tests {
             memos(resident, "SymbolTree>")
         }));
         assert_eq!(warmed, MODULES, "a fresh warm-up over the same resident completes");
+    }
+
+    /// One exported procedure and `n` modules calling it, each a module of its own: a
+    /// stand the `references` walk enters file by file. `workspace_with_n_modules` will
+    /// not do — its bodies call nothing, so a walk over it finds nothing to resolve.
+    fn workspace_with_n_callers(root: &Path, n: usize) {
+        write_common_module(
+            root,
+            "Объявление",
+            true,
+            "&НаСервере\nПроцедура ПриИзмененииПоля() Экспорт\nКонецПроцедуры\n",
+        );
+        for i in 0..n {
+            write_common_module(
+                root,
+                &format!("Вызов{i:04}"),
+                true,
+                "&НаСервере\nПроцедура Тело() Экспорт\n    \
+                 Объявление.ПриИзмененииПоля();\nКонецПроцедуры\n",
+            );
+        }
+    }
+
+    const DECLARED: &str = "Объявление.ПриИзмененииПоля";
+
+    /// Callers of the declared procedure: with the declaration, 1101 candidate files —
+    /// wider than two sweep chunks (500 files each) and than the interactive windows of
+    /// syntax trees (512) and lowered bodies (128), so one trim short shows.
+    const CALLERS: usize = 1100;
+    const CANDIDATES: usize = CALLERS + 1;
+    const CHUNK: usize = 500;
+
+    /// The walk's request, as `ide` reads it: every candidate, the declaration included,
+    /// and a cap above the tool's default so the stand is not cut at 2000.
+    fn callers_request() -> ide::ReferencesRequest {
+        ide::ReferencesRequest {
+            anchor: ide::ReferenceAnchor::Name(DECLARED.to_owned()),
+            anchor_files: None,
+            area: ide::ReferenceArea::default(),
+            kinds: None,
+            include_declaration: true,
+            max_files: 10_000,
+        }
+    }
+
+    fn callers_params() -> crate::tools::references::Params<'static> {
+        crate::tools::references::Params {
+            symbol: Some(DECLARED),
+            anchor_root_id: None,
+            root_id: None,
+            path: None,
+            line: None,
+            column: None,
+            line_content: None,
+            area_root_id: None,
+            area_path_prefix: None,
+            kinds: &[],
+            include_declaration: Some(true),
+            limit: None,
+            max_files: Some(10_000),
+            include_preview: None,
+        }
+    }
+
+    /// The serial walk, inside one read: the control every chunked walk is measured against.
+    fn serial_walk(
+        state: &DiagnosticsState,
+        request: &ide::ReferencesRequest,
+    ) -> ide::ReferencesResult {
+        ready(state.read(|resident, _| {
+            resident.analysis().attached(|analysis| {
+                ide::find_references_by_name(analysis.database(), request, &[])
+            })
+        }))
+    }
+
+    /// The chunked walk's three steps on one resident, with `sample` taken on the walk's
+    /// own handle after every file.
+    fn chunked_walk<T>(
+        resident: &mut DiagnosticsResident,
+        cancel: &RequestCancel,
+        request: &ide::ReferencesRequest,
+        sample: impl Fn(&ide::RootDatabaseImpl) -> T,
+    ) -> (ide::ReferencesResult, Vec<T>) {
+        let ide::Anchored::Walk(walk) = resident.with_request_handle(cancel, |_, analysis| {
+            ide::anchor_references(analysis.database(), request, &[])
+        }) else {
+            panic!("the declared name anchors a walk");
+        };
+        let scanned = walk.scanned().to_vec();
+        let walked = resident.walk_files_in_chunks(cancel, &scanned, |analysis, file_id| {
+            let db = analysis.database();
+            (ide::walk_reference_file(db, file_id, walk.symbol(), request), sample(db))
+        });
+        let (per_file, samples): (Vec<_>, Vec<T>) = walked.into_iter().unzip();
+        let result = resident.with_request_handle(cancel, |_, analysis| {
+            ide::finish_references(analysis.database(), walk, per_file.concat())
+        });
+        (result, samples)
+    }
+
+    /// Inside the chunked walk, never more than the interactive window plus one chunk of
+    /// syntax trees and of lowered bodies is held. Sampled INSIDE the walk, after every
+    /// file: the walk trims after its last chunk too, and a reading taken after it could
+    /// not tell a trim between chunks from one trim at the end — or from one chunk.
+    #[test]
+    fn references_walk_keeps_at_most_the_interactive_window_of_syntax_trees() {
+        const PARSE_WINDOW: usize = 512;
+        const BODIES_WINDOW: usize = 128;
+        // Walking references moves the process-global span counter the cancellation
+        // gates measure with; taking their gate keeps this test out of their numbers.
+        let _serialised = crate::walk_probe::WALK_GATE.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_n_callers(dir.path(), CALLERS);
+        let request = callers_request();
+
+        // The control: the serial walk inside one read holds every tree and every
+        // file's bodies until the read ends.
+        let state = joined_state(dir.path());
+        let (scanned, parse_all, bodies_all) = ready(state.read(|resident, _| {
+            let result = resident.analysis().attached(|analysis| {
+                ide::find_references_by_name(analysis.database(), &request, &[])
+            });
+            (
+                result.files_scanned,
+                heap_bytes(resident.db(), "syntax::Parse<"),
+                heap_bytes(resident.db(), "ModuleBodies>"),
+            )
+        }));
+        assert_eq!(scanned, CANDIDATES, "the control: every caller and the declaration");
+        assert!(parse_all > 0, "the control: the trees hold heap");
+        assert!(bodies_all > 0, "the control: the bodies hold heap");
+
+        // A fresh resident, or the serial walk's memos would make the chunked one parse
+        // nothing. Its name indexes are warmed first, as the handler warms them before
+        // the read: cold, the anchor alone would fold them over every file's syntax tree
+        // and the first chunk would start with the whole workspace live.
+        let state = joined_state(dir.path());
+        let cancel = RequestCancel::default();
+        let (result, samples) = ready(state.read_mut(|resident, _| {
+            resident.warm_name_indexes(&cancel);
+            chunked_walk(resident, &cancel, &request, |db| {
+                (heap_bytes(db, "syntax::Parse<"), heap_bytes(db, "ModuleBodies>"))
+            })
+        }));
+        assert_eq!(result.files_scanned, CANDIDATES);
+        assert_eq!(samples.len(), CANDIDATES, "one sample per file entered");
+        let parse_peak = samples.iter().map(|(parse, _)| *parse).max().unwrap();
+        let bodies_peak = samples.iter().map(|(_, bodies)| *bodies).max().unwrap();
+        // The modules are alike, so the memos weigh alike: the peak stands at the end
+        // of a chunk, when the window kept by the previous trim and the whole chunk are
+        // live — within one memo of slack.
+        assert!(
+            parse_peak <= parse_all * (PARSE_WINDOW + CHUNK + 1) / CANDIDATES,
+            "the walk keeps at most the window plus one chunk of syntax trees: \
+             {parse_peak} of {parse_all} bytes"
+        );
+        assert!(
+            bodies_peak <= bodies_all * (BODIES_WINDOW + CHUNK + 1) / CANDIDATES,
+            "the walk keeps at most the window plus one chunk of lowered bodies: \
+             {bodies_peak} of {bodies_all} bytes"
+        );
+    }
+
+    /// The chunked walk answers what the serial walk answers, field by field, on a stand
+    /// of three chunks: a chunk lost, or hits lost between chunks, changes the length.
+    #[test]
+    fn references_walk_answers_the_same_as_the_serial_walk() {
+        // Walking references moves the process-global span counter the cancellation
+        // gates measure with; taking their gate keeps this test out of their numbers.
+        let _serialised = crate::walk_probe::WALK_GATE.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_n_callers(dir.path(), CALLERS);
+        let request = callers_request();
+        let state = joined_state(dir.path());
+
+        let serial = serial_walk(&state, &request);
+        assert_eq!(serial.outcome, ide::ReferencesOutcome::Resolved);
+        assert_eq!(serial.hits.len(), CANDIDATES, "the control: every call and the declaration");
+        assert!(serial.files_scanned > 2 * CHUNK, "the control: the walk spans three chunks");
+
+        let cancel = RequestCancel::default();
+        let (chunked, _) =
+            ready(state.read_mut(|resident, _| chunked_walk(resident, &cancel, &request, |_| ())));
+        assert_eq!(chunked.hits, serial.hits);
+        assert_eq!(chunked.per_file, serial.per_file);
+        assert_eq!(chunked.files_scanned, serial.files_scanned);
+        assert_eq!(chunked.files_capped, serial.files_capped);
+        assert_eq!(chunked.declarations, serial.declarations);
+        assert_eq!(chunked.outcome, serial.outcome);
+    }
+
+    /// A `references` call whose cancellation was requested before it started unwinds
+    /// with the request's own cancellation, memoises no syntax tree, and leaves the
+    /// resident usable: the same resident answers the next call in full.
+    #[test]
+    fn a_pre_cancelled_references_walk_unwinds_and_leaves_the_resident_usable() {
+        use std::panic::AssertUnwindSafe;
+        // Walking references moves the process-global span counter the cancellation
+        // gates measure with; taking their gate keeps this test out of their numbers.
+        let _serialised = crate::walk_probe::WALK_GATE.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_n_callers(dir.path(), CALLERS);
+        let state = joined_state(dir.path());
+        let params = callers_params();
+
+        let before = ready(state.read(|resident, _| memos(resident, "syntax::Parse<")));
+        let cancelled = RequestCancel::default();
+        cancelled.cancel_all();
+        let unwound = salsa::Cancelled::catch(AssertUnwindSafe(|| {
+            state.read_mut(|resident, _| {
+                crate::tools::references::answer(resident, &cancelled, &params, 6000, &[])
+                    .map(|_| ())
+            })
+        }));
+        assert!(
+            matches!(unwound, Err(salsa::Cancelled::Local)),
+            "a pre-cancelled call unwinds with the request's own cancellation"
+        );
+        let after = ready(state.read(|resident, _| memos(resident, "syntax::Parse<")));
+        assert_eq!(after, before, "a pre-cancelled walk memoises no syntax tree");
+
+        let answer = ready(state.read_mut(|resident, _| {
+            crate::tools::references::answer(
+                resident,
+                &RequestCancel::default(),
+                &params,
+                6000,
+                &[],
+            )
+        }))
+        .expect("the same resident answers a fresh request");
+        let body = crate::tools::references::finish(answer, 0, 0, false)
+            .structured_content
+            .expect("the answer is structured content");
+        assert_eq!(body["outcome"], "resolved");
+        assert_eq!(body["total"], CANDIDATES);
+    }
+
+    /// A cancellation raised while a file's job runs stops the walk at the next file
+    /// boundary even though the job asks salsa nothing, so it never meets a query
+    /// checkpoint of its own: the walk's checkpoint is all that keeps the rest of the
+    /// chunk from running past the cancel. The control walks the same files uncancelled
+    /// and enters every one, so a count of one is the cancel's doing. The jobs open no
+    /// reference-walk span, which is why this test needs no gate on the span counter.
+    #[test]
+    fn a_cancel_raised_inside_a_job_stops_the_walk_at_the_next_file() {
+        use std::panic::AssertUnwindSafe;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_n_callers(dir.path(), 2);
+        let state = joined_state(dir.path());
+
+        let walk = |cancels: bool| {
+            let cancel = RequestCancel::default();
+            let entered = AtomicUsize::new(0);
+            let total = AtomicUsize::new(0);
+            let unwound = salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                state.read_mut(|resident, _| {
+                    let mut files: Vec<_> = resident.by_path.values().copied().collect();
+                    files.sort_by_key(|id| id.0);
+                    total.store(files.len(), Ordering::SeqCst);
+                    resident.walk_files_in_chunks(&cancel, &files, |_, _| {
+                        entered.fetch_add(1, Ordering::SeqCst);
+                        if cancels {
+                            cancel.cancel_all();
+                        }
+                    })
+                })
+            }));
+            (unwound.map(|_| ()), entered.into_inner(), total.into_inner())
+        };
+
+        let (uncancelled, entered, total) = walk(false);
+        assert!(uncancelled.is_ok(), "the control walk completes");
+        assert!(total >= 3, "the control: more than one file, so a boundary lies ahead");
+        assert_eq!(entered, total, "the control: an uncancelled walk enters every file");
+
+        let (cancelled, entered, _) = walk(true);
+        assert!(
+            matches!(cancelled, Err(salsa::Cancelled::Local)),
+            "a cancel raised inside a job unwinds the walk with the request's cancellation"
+        );
+        assert_eq!(entered, 1, "the walk entered no file after the one that cancelled it");
+    }
+
+    /// A request cancelled before it takes its handle runs nothing on it: the closure
+    /// is not called and the call unwinds with the request's own cancellation. The
+    /// control is the same call on a live request, which does run the closure — a closure
+    /// skipped for another reason would not pass for the cancel's doing.
+    #[test]
+    fn a_request_cancelled_before_its_handle_is_taken_runs_nothing_on_it() {
+        use std::cell::Cell;
+        use std::panic::AssertUnwindSafe;
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_n_callers(dir.path(), 1);
+        let state = joined_state(dir.path());
+
+        let ran = Cell::new(false);
+        let take_handle = |cancel: &RequestCancel| {
+            ran.set(false);
+            let outcome = salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                state.read(|resident, _| resident.with_request_handle(cancel, |_, _| ran.set(true)))
+            }));
+            (outcome.map(|_| ()), ran.get())
+        };
+
+        let (live, ran_live) = take_handle(&RequestCancel::default());
+        assert!(live.is_ok(), "the control call completes");
+        assert!(ran_live, "the control: a live request runs its closure on the handle");
+
+        let cancelled = RequestCancel::default();
+        cancelled.cancel_all();
+        let (dead, ran_dead) = take_handle(&cancelled);
+        assert!(
+            matches!(dead, Err(salsa::Cancelled::Local)),
+            "a request cancelled beforehand unwinds with its own cancellation"
+        );
+        assert!(!ran_dead, "nothing ran on a handle of a request that was already cancelled");
     }
 
     /// Every served read trims: the syntax trees of files read earlier fall out once

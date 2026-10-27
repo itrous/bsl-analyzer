@@ -84,8 +84,9 @@ pub use name_lookup::{
 };
 pub use reference_kind::{classify_reference_token, ReferenceKind};
 pub use references::{
-    find_references_by_name, AnchorSite, AnchorStaleReason, BodySource, FileIdSet, ReferenceAnchor,
-    ReferenceArea, ReferenceHit, ReferencesOutcome, ReferencesRequest, ReferencesResult,
+    anchor_references, find_references_by_name, finish_references, walk_reference_file, AnchorSite,
+    AnchorStaleReason, Anchored, BodySource, FileIdSet, ReferenceAnchor, ReferenceArea,
+    ReferenceHit, ReferenceWalk, ReferencesOutcome, ReferencesRequest, ReferencesResult,
 };
 pub use rename::{prepare_rename, rename, RenameError, RenameTarget};
 pub use signature_help::{ParameterInfo, SignatureHelp, SignatureInformation};

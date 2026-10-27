@@ -143,6 +143,12 @@ impl ResidentSession {
     /// attach in place that clone is a second database on one thread, which salsa
     /// rejects («Cannot change database mid-query»). The fan-out registers each worker
     /// handle itself, so it needs the registry, not the attach.
+    ///
+    /// The same door serves a walk with no pool at all that needs the resident MUTABLY
+    /// — to trim the memo caches between the chunks of files it enters — and takes a
+    /// request handle of its own for each phase around the walk and for every chunk
+    /// in it ([`DiagnosticsResident::with_request_handle`],
+    /// [`DiagnosticsResident::walk_files_in_chunks`]).
     pub(crate) fn read_fanout<T>(
         &self,
         f: impl FnOnce(&mut DiagnosticsResident, u64) -> T,
@@ -1422,7 +1428,7 @@ mod tests {
         symbol: &'a str,
     ) -> impl Fn() -> ResidentOutcome<ReferencesAnswer> + 'a {
         move || {
-            session.read(|resident, analysis, _| {
+            session.read_fanout(|resident, _| {
                 let params = crate::tools::references::Params {
                     symbol: Some(symbol),
                     anchor_root_id: None,
@@ -1442,7 +1448,7 @@ mod tests {
                 // No external sources: a graph source answers from a store of its own — it
                 // would hide what the resident does or does not know, and add work of its
                 // own to an interval the cancellation gates time.
-                crate::tools::references::answer(resident, analysis.database(), &params, 6000, &[])
+                crate::tools::references::answer(resident, session.cancel(), &params, 6000, &[])
             })
         }
     }

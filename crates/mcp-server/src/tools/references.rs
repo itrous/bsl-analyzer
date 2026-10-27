@@ -1,11 +1,13 @@
 //! Agent-facing `references` tool: every occurrence of ONE symbol, with what
 //! each occurrence does at its site.
 //!
-//! Thin projection over [`ide::find_references_by_name`]. Every semantic
-//! decision — which symbol an anchor names, whether it names more than one,
-//! which occurrences count, and what kind each is — is taken in `ide`. This
-//! module translates roots into file identities, projects places under the
-//! location contract, applies the display limit and the output budget, and
+//! Thin projection over the three steps of [`ide::find_references_by_name`] —
+//! [`ide::anchor_references`], [`ide::walk_reference_file`], [`ide::finish_references`].
+//! Every semantic decision — which symbol an anchor names, whether it names more
+//! than one, which occurrences count, and what kind each is — is taken in `ide`.
+//! This module translates roots into file identities, hands the walk to the
+//! resident so it runs in chunks with a trim between them, projects places under
+//! the location contract, applies the display limit and the output budget, and
 //! assembles the envelope.
 //!
 //! The one thing it must never do is answer an empty list where the search
@@ -25,6 +27,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::cancel::RequestCancel;
 use crate::diagnostics_state::DiagnosticsResident;
 use crate::tools::location as loc;
 use crate::tools::name_answer::{insert_resolved_location, NameAnswer};
@@ -110,17 +113,60 @@ struct Selection {
     path_prefix: Option<String>,
 }
 
-/// `db` is the caller's per-request handle, not `resident.db()`: the whole answer —
-/// anchor, walk and render — must run on the handle whose salsa token this request can
-/// cancel, or a cancelled call would keep computing on the master handle.
+/// Three phases on handles the resident hands out per phase, never on `resident.db()`:
+/// every query runs on a handle whose salsa token this request can cancel, or a cancelled
+/// call would keep computing on the master handle. The walk between the anchor and the
+/// render is the resident's, in chunks with a trim between them, which is why the
+/// resident is taken mutably: an answer about thousands of files must not keep every
+/// file's trees and bodies until it is rendered.
 pub(crate) fn answer(
-    resident: &DiagnosticsResident,
-    db: &ide::RootDatabaseImpl,
+    resident: &mut DiagnosticsResident,
+    cancel: &RequestCancel,
     params: &Params<'_>,
     max_output_tokens: usize,
     external: &[&dyn ide::ExternalNameSource],
 ) -> Result<Answer, McpError> {
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+
+    let (request, area_selection, anchored) = resident
+        .with_request_handle(cancel, |resident, analysis| {
+            anchor(resident, analysis.database(), params, external)
+        })?;
+
+    let result = match anchored {
+        ide::Anchored::Answered(result) => result,
+        ide::Anchored::Walk(walk) => {
+            let per_file = resident.walk_files_in_chunks(cancel, walk.scanned(), |analysis, id| {
+                ide::walk_reference_file(analysis.database(), id, walk.symbol(), &request)
+            });
+            resident.with_request_handle(cancel, |_, analysis| {
+                ide::finish_references(analysis.database(), walk, per_file.concat())
+            })
+        }
+    };
+
+    Ok(resident.with_request_handle(cancel, |resident, analysis| {
+        render(
+            analysis.database(),
+            resident.workspace_roots(),
+            &result,
+            params,
+            &request.anchor,
+            area_selection,
+            limit,
+            max_output_tokens,
+            resident.unread_count(),
+        )
+    }))
+}
+
+/// The first phase: the request as `ide` reads it, and what anchoring it settled.
+fn anchor(
+    resident: &DiagnosticsResident,
+    db: &ide::RootDatabaseImpl,
+    params: &Params<'_>,
+    external: &[&dyn ide::ExternalNameSource],
+) -> Result<(ReferencesRequest, Option<Selection>, ide::Anchored), McpError> {
     let max_files = params.max_files.unwrap_or(DEFAULT_MAX_FILES).min(MAX_MAX_FILES);
 
     let anchor = build_anchor(resident, params)?;
@@ -159,18 +205,8 @@ pub(crate) fn answer(
         max_files,
     };
 
-    let result = ide::find_references_by_name(db, &request, external);
-    Ok(render(
-        db,
-        resident.workspace_roots(),
-        &result,
-        params,
-        &request.anchor,
-        area_selection,
-        limit,
-        max_output_tokens,
-        resident.unread_count(),
-    ))
+    let anchored = ide::anchor_references(db, &request, external);
+    Ok((request, area_selection, anchored))
 }
 
 /// Publish the answer with the identity of whoever composed its body.

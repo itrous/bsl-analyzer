@@ -6,9 +6,10 @@
 //! assertions, so each one is paired with an input where the hit is required.
 
 use ide::{
-    find_references_by_name, lookup_names, resolve_declarations, symbol_info, NameQuery,
-    ReferenceAnchor, ReferenceArea, ReferenceKind, ReferencesOutcome, ReferencesRequest,
-    SymbolInfoRequest, SymbolInfoSections,
+    anchor_references, find_references_by_name, finish_references, lookup_names,
+    resolve_declarations, symbol_info, walk_reference_file, Anchored, NameQuery, ReferenceAnchor,
+    ReferenceArea, ReferenceKind, ReferencesOutcome, ReferencesRequest, SymbolInfoRequest,
+    SymbolInfoSections,
 };
 use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::metadata::{MdoEntry, MetadataListingData};
@@ -352,6 +353,54 @@ fn a_truncated_walk_is_declared() {
     let full = by_name(&db, "Продажи.Расчёт");
     assert!(!full.files_capped, "control: with room, nothing is capped");
     assert_eq!(full.hits.len(), 3);
+}
+
+/// The three steps — anchor, walk one file, finish — compose to the serial walk, and
+/// the reduction makes the answer independent of the order the files were walked in.
+/// The control: every one of the three files holds a hit, so a file lost between the
+/// steps would show in `hits` and in `per_file`.
+#[test]
+fn the_three_steps_compose_to_the_serial_walk_in_either_order() {
+    const SECOND_CLIENT: &str = "\
+Процедура Повторить() Экспорт
+    Продажи.Расчёт();
+КонецПроцедуры
+";
+    let (db, files) = db_with(&[
+        ("/ws/src/cf/CommonModules/Продажи/Ext/Module.bsl", SALES),
+        ("/ws/src/cf/CommonModules/Клиент/Ext/Module.bsl", CLIENT),
+        ("/ws/src/cf/CommonModules/Повтор/Ext/Module.bsl", SECOND_CLIENT),
+    ]);
+    let request = request(ReferenceAnchor::Name("Продажи.Расчёт".to_string()));
+
+    let serial = find_references_by_name(&db, &request, &[]);
+    assert_eq!(serial.outcome, ReferencesOutcome::Resolved);
+    assert_eq!(serial.files_scanned, files.len());
+    let files_hit: FxHashSet<FileId> = serial.hits.iter().map(|hit| hit.file_id).collect();
+    assert_eq!(files_hit.len(), files.len(), "the control: every file holds a hit");
+    assert_eq!(serial.declarations.len(), 1, "the control: the name resolved a declaration");
+
+    let stepped = |order: fn(&[FileId]) -> Vec<FileId>| {
+        let Anchored::Walk(walk) = anchor_references(&db, &request, &[]) else {
+            panic!("a resolved name anchors a walk");
+        };
+        let mut hits = Vec::new();
+        for file_id in order(walk.scanned()) {
+            hits.extend(walk_reference_file(&db, file_id, walk.symbol(), &request));
+        }
+        finish_references(&db, walk, hits)
+    };
+    let forward = stepped(|scanned| scanned.to_vec());
+    let reversed = stepped(|scanned| scanned.iter().rev().copied().collect());
+
+    for (order, result) in [("forward", &forward), ("reversed", &reversed)] {
+        assert_eq!(result.hits, serial.hits, "{order}: hits");
+        assert_eq!(result.per_file, serial.per_file, "{order}: per_file");
+        assert_eq!(result.files_scanned, serial.files_scanned, "{order}: files_scanned");
+        assert_eq!(result.files_capped, serial.files_capped, "{order}: files_capped");
+        assert_eq!(result.declarations, serial.declarations, "{order}: declarations");
+        assert_eq!(result.outcome, serial.outcome, "{order}: outcome");
+    }
 }
 
 /// The kind filter selects, and `include_declaration` is a separate switch —

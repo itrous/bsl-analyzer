@@ -2617,17 +2617,19 @@ impl McpServer {
                 // Before the read that folds them: the name indexes' per-file halves,
                 // warmed in chunks with a trim between, so a cold index is built from
                 // memos instead of holding every workspace file's syntax tree at once.
-                let warm_cancel = std::sync::Arc::clone(session.cancel());
-                let _ = session.read_fanout(|resident, _| resident.warm_name_indexes(&warm_cancel));
+                let cancel = std::sync::Arc::clone(session.cancel());
+                let _ = session.read_fanout(|resident, _| resident.warm_name_indexes(&cancel));
                 graph.read_optional(|snapshot| {
                     let graph_source = graph_name_source(&graph, snapshot);
 
                     // The whole answer is assembled under the resident read lock: the hits, the
                     // paths they are published under and the root table that names them all
                     // describe ONE revision, and taking any of them afterwards would stamp the
-                    // envelope of a resident that no longer produced the body.
+                    // envelope of a resident that no longer produced the body. The fan-out
+                    // door, not `read`: the walk takes the resident mutably to trim between
+                    // its chunks, and takes a request handle of its own for each phase.
                     let read = || {
-                        session.read(|resident, analysis, _generation| {
+                        session.read_fanout(|resident, _generation| {
                             let params = tools::references::Params {
                                 symbol: p.symbol.as_deref(),
                                 anchor_root_id: p.anchor_root_id.as_deref(),
@@ -2646,7 +2648,7 @@ impl McpServer {
                             };
                             tools::references::answer(
                                 resident,
-                                analysis.database(),
+                                &cancel,
                                 &params,
                                 max_output_tokens,
                                 &[&graph_source],
