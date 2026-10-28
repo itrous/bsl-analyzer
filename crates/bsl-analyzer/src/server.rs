@@ -1987,14 +1987,15 @@ fn apply_workspace_batch_completion(
                 tracing::warn!(
                     "workspace batch chunk exceeded propagated-panic retry budget; skipping"
                 );
-                advance_workspace_batch(state)
+                skip_workspace_batch_chunk(state)
             } else {
                 Ok(())
             }
         }
-        // A deterministic panic: skip the chunk (its files go uncovered until the next
-        // full sweep) rather than retry it forever. Advance as if it had computed empty.
-        WorkspaceBatchOutcome::Failed => advance_workspace_batch(state),
+        // A deterministic panic: skip the chunk rather than retry it forever. Its files
+        // are marked covered first, so finalize keeps their last diagnostics until the
+        // next full sweep instead of reading the skip as "left scope".
+        WorkspaceBatchOutcome::Failed => skip_workspace_batch_chunk(state),
         WorkspaceBatchOutcome::Computed(items) => {
             apply_workspace_batch_chunk(state, generation, items)?;
             advance_workspace_batch(state)
@@ -2089,9 +2090,29 @@ fn advance_plan_cursor(
     (finished, do_trim)
 }
 
-/// Reconcile a fully completed sweep: any file we had pushed but that this sweep never
-/// reported is gone from scope (deleted or the scope narrowed), so clear its stale
-/// diagnostics. Then reset the reported-set for the next sweep.
+/// Mark the files of the chunk the cursor still points at as covered, then advance.
+/// A skip never computed a report, but the files are still in the frozen plan, so
+/// they did not leave scope: recording them stops finalize from clearing diagnostics
+/// the previous sweep published. A file absent from the plan is not recorded and is
+/// still cleared.
+fn skip_workspace_batch_chunk(state: &mut GlobalState) -> Result<()> {
+    let covered = {
+        let plan = state.workspace_batch_plan.as_ref().expect("plan present after gate");
+        let start = plan.next_chunk * plan.chunk_size;
+        let end = (start + plan.chunk_size).min(plan.file_ids.len());
+        plan.file_ids[start..end]
+            .iter()
+            .filter_map(|file_id| plan.file_paths.url_for_file_id(*file_id).ok())
+            .collect::<Vec<_>>()
+    };
+    state.batch_reported.extend(covered);
+    advance_workspace_batch(state)
+}
+
+/// Reconcile a fully completed sweep: a pushed file this sweep neither reported nor
+/// covered by a skipped chunk is gone from scope (deleted or the scope narrowed), so
+/// clear its stale diagnostics. A skipped chunk stays covered, so its last diagnostics
+/// survive until a later sweep reports the file. Then reset the reported-set.
 fn finalize_workspace_batch(state: &mut GlobalState) -> Result<()> {
     let stale: Vec<lsp_types::Url> = state
         .batch_pushed
@@ -2130,9 +2151,10 @@ fn apply_workspace_batch_chunk(
         // entries that vanished from scope (deleted / scope narrowed) between sweeps.
         state.batch_reported.insert(item.uri.clone());
 
-        // Handoff: a file opened mid-batch is served live by the interactive stream.
-        // Skipping here (and never recording it) keeps the two streams from
-        // double-reporting; `handle_did_open` already cleared any earlier batch push.
+        // Handoff: a file opened mid-batch is served live by the interactive stream,
+        // so the batch does not push it (that would double-report). The URI was
+        // recorded above, which stops finalize from clearing a push the interactive
+        // stream still owns; `handle_did_open` clears that push itself.
         let opened_file_id = crate::lsp::file_id(state, &item.uri).ok();
         if state.mem_docs.contains(&item.uri)
             || opened_file_id.is_some_and(|file_id| state.open_files.contains(&file_id))
@@ -6904,7 +6926,8 @@ mod tests {
         let uri = crate::test_uri::file_uri("open.bsl");
 
         // The file was opened while the batch was computing: the interactive stream
-        // owns it, so the batch result is dropped and never recorded.
+        // owns it, so the batch does not push it. The URI is still recorded, which
+        // keeps finalize from clearing a push the interactive stream owns.
         state.mem_docs.insert(uri.clone(), "Процедура Т() КонецПроцедуры".to_string(), 1);
         let chunk = current_chunk(&state, vec![batch_item(&uri, "h1", vec![dummy_diagnostic()])]);
         handle_task(&mut state, chunk).unwrap();
@@ -7024,6 +7047,119 @@ mod tests {
         let chunk = current_chunk(&state, Vec::new());
         handle_task(&mut state, chunk).unwrap();
         assert!(state.workspace_batch_plan.is_none(), "the sweep finalizes after the last chunk");
+    }
+
+    /// Drain every `publishDiagnostics` on the client channel.
+    fn drain_publishes(
+        receiver: &crossbeam_channel::Receiver<Message>,
+    ) -> Vec<(lsp_types::Url, usize)> {
+        let mut publishes = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            match message {
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics" =>
+                {
+                    let params: lsp_types::PublishDiagnosticsParams =
+                        serde_json::from_value(notification.params).unwrap();
+                    publishes.push((params.uri, params.diagnostics.len()));
+                }
+                other => panic!("expected a publishDiagnostics notification, got {other:?}"),
+            }
+        }
+        publishes
+    }
+
+    /// One-chunk sweep whose only file is `skipped`. `gone` was pushed by an earlier sweep
+    /// but is not in the frozen plan, so finalize must still clear it.
+    fn install_one_file_sweep(
+        skipped: &lsp_types::Url,
+    ) -> (crate::global_state::GlobalState, crossbeam_channel::Receiver<Message>, lsp_types::Url)
+    {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        install_test_plan(&mut state, 1);
+
+        let mut vfs = vfs::Vfs::new();
+        let path = crate::test_uri::file_path("skipped.bsl");
+        vfs.set_file_contents(vfs::VfsPath::new(path.clone()), Some(Arc::from("")));
+        let file_id = vfs.file_id(&vfs::VfsPath::new(path)).expect("skipped file allocated");
+        let file_paths = crate::frozen_context::FrozenFilePaths::freeze(&vfs);
+        assert_eq!(file_paths.url_for_file_id(file_id).unwrap(), *skipped);
+
+        let plan = state.workspace_batch_plan.as_mut().expect("plan installed");
+        plan.chunk_size = 1;
+        plan.file_ids = Arc::new(vec![file_id]);
+        plan.file_paths = file_paths;
+
+        let gone = crate::test_uri::file_uri("gone.bsl");
+        let pushed = crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None };
+        state.batch_pushed.insert(skipped.clone(), pushed.clone());
+        state.batch_pushed.insert(gone.clone(), pushed);
+        (state, receiver, gone)
+    }
+
+    /// A skipped chunk is not "these files left scope": the file the previous sweep
+    /// published keeps its diagnostics, while a file in no chunk is still cleared.
+    fn assert_skip_keeps_chunk_diagnostics(
+        label: &str,
+        skip: impl Fn(&mut crate::global_state::GlobalState),
+    ) {
+        let skipped = crate::test_uri::file_uri("skipped.bsl");
+        let (mut state, receiver, gone) = install_one_file_sweep(&skipped);
+        skip(&mut state);
+
+        let publishes = drain_publishes(&receiver);
+        assert!(
+            !publishes.iter().any(|(uri, count)| uri == &skipped && *count == 0),
+            "{label}: a skipped chunk must not clear its file, got {publishes:?}"
+        );
+        assert!(
+            publishes.iter().any(|(uri, count)| uri == &gone && *count == 0),
+            "{label}: a file outside every chunk is still cleared, got {publishes:?}"
+        );
+        assert_eq!(
+            publishes.len(),
+            1,
+            "{label}: only the out-of-scope file is published, got {publishes:?}"
+        );
+        assert!(
+            state.batch_pushed.contains_key(&skipped),
+            "{label}: the skipped file's last push is retained"
+        );
+        assert!(!state.batch_pushed.contains_key(&gone));
+        assert!(state.workspace_batch_plan.is_none(), "{label}: the one-chunk sweep finalizes");
+    }
+
+    #[test]
+    fn workspace_batch_failed_chunk_does_not_clear_its_pushed_diagnostics() {
+        assert_skip_keeps_chunk_diagnostics("failed", |state| {
+            let generation = state.workspace_batch_generation;
+            handle_task(
+                state,
+                Task::WorkspaceBatchChunk {
+                    generation,
+                    outcome: crate::global_state::WorkspaceBatchOutcome::Failed,
+                },
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn workspace_batch_propagated_skip_does_not_clear_its_pushed_diagnostics() {
+        assert_skip_keeps_chunk_diagnostics("propagated", |state| {
+            let generation = state.workspace_batch_generation;
+            let propagated = || Task::WorkspaceBatchChunk {
+                generation,
+                outcome: crate::global_state::WorkspaceBatchOutcome::Propagated {
+                    from_claim: false,
+                },
+            };
+            for _ in 0..WORKSPACE_BATCH_MAX_PROPAGATED_RETRIES {
+                handle_task(state, propagated()).unwrap();
+            }
+            handle_task(state, propagated()).unwrap();
+        });
     }
 
     /// A cut that leaves the revision where the chunk was dispatched is a disk read that

@@ -399,8 +399,10 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
             // Classify the unwind. `PendingWrite` is a concurrent edit's revision bump —
             // retry the chunk once it settles. `PropagatedPanic` is ambiguous under
             // parallelism (a sibling blocked on an edit-cancelled query gets it too, not
-            // only a real panic), so retry it under a bounded budget. A non-cancellation
-            // panic is deterministic — skip the chunk rather than loop forever.
+            // only a real panic), so retry it under a bounded budget and, once that budget
+            // is spent, skip it. A non-cancellation panic is deterministic and is skipped
+            // at once. Either skip is covered by the event loop, so finalize keeps the
+            // chunk's last diagnostics instead of clearing them.
             Err(payload) => match payload.downcast_ref::<salsa::Cancelled>() {
                 Some(salsa::Cancelled::PendingWrite) => {
                     tracing::debug!(chunk = chunk_index, "workspace batch chunk cancelled by an edit; will retry");

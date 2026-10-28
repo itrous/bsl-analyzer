@@ -270,15 +270,17 @@ pub enum WorkspaceBatchOutcome {
     /// (transient) edit cancellation or a drifted disk read — or on a local cancellation.
     /// Retried like [`Self::Cancelled`] but with a bounded budget, so a transient cascade
     /// recovers while a real deterministic panic is skipped after the budget is spent
-    /// rather than looping forever.
+    /// rather than looping forever. A skip marks the chunk covered, same as [`Self::Failed`],
+    /// so finalize does not clear its last diagnostics.
     Propagated {
         /// Raised as `PropagatedPanic`: the worker was blocked on a query whose owner
         /// unwound, rather than cancelled locally.
         from_claim: bool,
     },
     /// The chunk unwound on a stray non-cancellation panic — deterministic, so retrying
-    /// would loop forever. The chunk is skipped (cursor advanced) and its files go
-    /// uncovered until the next full sweep.
+    /// would loop forever. The chunk is skipped (cursor advanced) and its files are
+    /// marked covered, so the sweep keeps their last diagnostics instead of clearing
+    /// them; the next full sweep reports them again.
     Failed,
 }
 
@@ -304,8 +306,9 @@ pub struct WorkspaceBatchItem {
 /// per chunk and trimming the Salsa LRU between chunks so only a single chunk's working
 /// set is resident at a time (a single long-lived snapshot never crosses a revision
 /// boundary, so Salsa would otherwise never trim — the whole reason the batch is
-/// chunked). `next_chunk` is the cursor into `file_ids`; on completion `batch_pushed`
-/// is reconciled against `batch_reported` to clear files that left scope.
+/// chunked). `next_chunk` is the cursor into `file_ids`. A skipped chunk is covered
+/// from that slice before the cursor moves; on completion `batch_pushed` is reconciled
+/// against `batch_reported` to clear only files that left scope.
 pub struct WorkspaceBatchPlan {
     pub generation: u64,
     pub file_ids: Arc<Vec<vfs::FileId>>,
@@ -570,10 +573,11 @@ pub struct GlobalState {
     /// snapshot (e.g. queued just before a reload turned the feature off) can never
     /// republish diagnostics under the new configuration.
     pub workspace_batch_generation: u64,
-    /// URIs the in-flight batch has reported so far (this generation). On a fully
-    /// completed sweep, any `batch_pushed` entry missing from this set no longer
-    /// exists in scope — the file was deleted or the scope narrowed — so its stale
-    /// diagnostics are cleared. Reset at the start of each sweep.
+    /// URIs this sweep has covered: reported by a computed chunk, or belonging to a
+    /// chunk that was skipped. On a fully completed sweep, a `batch_pushed` entry
+    /// missing from this set is gone from scope (deleted or the scope narrowed) and
+    /// its stale diagnostics are cleared. A skipped chunk is covered so its last
+    /// diagnostics survive until the next sweep. Reset at the start of each sweep.
     pub batch_reported: FxHashSet<Url>,
     /// The in-progress sweep, if any. `Some` means a chunked batch is walking its
     /// frozen file set; the event loop resumes it (dispatch next chunk) until the
