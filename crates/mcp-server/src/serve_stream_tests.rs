@@ -440,10 +440,19 @@ async fn legacy_scope_change_retires_mcp_stream_and_reconnects_with_explicit_cac
         .await
         .expect("scope-only project drift retires the old transport");
     session_finished(old_task).await;
+    // A ping's failure surfaces only when the client's own service task ends and drops
+    // the pending-responder state, so join that task instead of waiting by the clock
+    // for the consequence; a request through the retired peer then fails immediately
+    // at the closed sink.
+    let old_peer = old_client.peer().clone();
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, old_client.waiting())
+        .await
+        .expect("retired client service finishes")
+        .expect("retired client service quits cleanly");
     assert!(
         tokio::time::timeout(
             SHUTDOWN_TIMEOUT,
-            old_client.send_request(ClientRequest::PingRequest(PingRequest::default()))
+            old_peer.send_request(ClientRequest::PingRequest(PingRequest::default()))
         )
         .await
         .expect("retired client request is bounded")
