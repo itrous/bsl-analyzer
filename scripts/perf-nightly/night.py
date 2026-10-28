@@ -7,8 +7,9 @@ candidate against the release measured that night. With no current noise
 calibration it measures calibration series of the release instead, two a
 night, and writes `noise.json` after the fifth. Other `bsl-analyzer*` processes
 on the machine do not stop or cancel anything: their load is part of what the
-night and its calibration measure. Diff, triage and publication of issues are
-later steps of the plan and are not run here.
+night and its calibration measure. With `--publish` the night's perf issues
+are published (`publish.py`) before its summary is written. The diagnostics
+diff, its triage and diagnostics issues are not run here.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import subprocess
 
 import corpus
 import perf_nightly
+import publish
 import verdict
 from common import HARNESS_SCHEMA, Data, HarnessError, git, median, read_json, write_json
 
@@ -483,6 +485,10 @@ def write_report(out_dir: str, summary: dict, rows: list, table: dict | None) ->
                          f"{', '.join(str(v) for v in item['values']) or '-'} | {verdict.fmt(item['base'])} | "
                          f"{before} | {DIAG_STATE_TEXT[item['state']]} |")
         lines.append("")
+    if summary.get("publish"):
+        lines += ["## Публикация", ""] + [
+            f"- {e['action']} {'-' if e['issue'] is None else '#' + str(e['issue'])} {e['key']}"
+            + (f": {e['detail']}" if e["detail"] else "") for e in summary["publish"]] + [""]
     if summary["refused"]:
         lines += ["## Отказы корпусов", ""] + [f"- {k}: {v}" for k, v in summary["refused"].items()] + [""]
     if rows:
@@ -598,6 +604,10 @@ def _night(args, clock, data, now, date, gate, out_dir, builder) -> dict:
     result = verdict.night_verdict(rows, diff_missing=summary["diff"]["not_built"])
     extra = [] if gate else [(os.path.basename(data.results(cand)), data.results(cand), series)]
     table = verdict.trend(data.path("results"), cand_groups, extra)
+    if getattr(args, "publish", False):
+        labels = {c: manifest["corpora"][c]["label"] for c in corpora}
+        summary["publish"] = publish.publish_perf(out_dir, summary, rows, table, labels,
+                                                  publish.forbidden_strings(data, corpora), series_runs)
     return finish(rows, table, result)
 
 

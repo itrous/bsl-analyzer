@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import unittest
 
-from helpers import FakeClock, event_driven_process_waits, mock_env, run_git
+from helpers import FOREIGN_PREFIX, FakeClock, event_driven_process_waits, mock_env, run_git
 
 import perf_nightly
 from common import Data, read_json, sha256_bytes, write_json
@@ -76,7 +76,7 @@ class Modes(unittest.TestCase):
         args = perf_nightly.parser().parse_args([
             "measure", "--data-dir", self.data_dir, "--corpus", corpus_id, "--binary", self.binary,
             "--scenario", "analyze", "--temp", "warm", "--series", "e2e", "--runs", "1"])
-        perf_nightly.Measure(args, FakeClock(), self.data, foreign_prefix="perf-nightly-test").run()
+        perf_nightly.Measure(args, FakeClock(), self.data, foreign_prefix=FOREIGN_PREFIX).run()
         series = os.path.join(self.data.results(perf_nightly.load_binary(self.binary)), corpus_id,
                               "analyze", "warm", "e2e")
         record = read_json(os.path.join(series, "r1.json"))

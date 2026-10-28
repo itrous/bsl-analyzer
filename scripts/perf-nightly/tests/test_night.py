@@ -323,7 +323,7 @@ class Foreign(NightCase):
         self.assertEqual(self.held("v0.3.2", "base-s"), [(True, None)] * 3)
 
     def test_a_real_foreign_process_during_a_run_cancels_nothing(self):
-        # The fake app spawns a detached `perf-nightly-test-x` without the run marker on its 2nd launch.
+        # The fake app spawns a detached foreign-named process without the run marker on its 2nd launch.
         # Any foreign check, whatever prefix it asks for, looks for that name, so a check would see it.
         self.fresh_noise()
         set_mode("foreign2")

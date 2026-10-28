@@ -991,6 +991,7 @@ def parser() -> argparse.ArgumentParser:
     night.add_argument("--candidate", help="a release candidate tag; results go to gates/<tag>/")
     night.add_argument("--date", help="night key YYYY-MM-DD (default: today)")
     night.add_argument("--remote", help="URL the build clone fetches from (default: origin)")
+    night.add_argument("--publish", action="store_true", help="publish the night's perf issues with gh")
     night.set_defaults(func=cmd_night)
 
     compare = sub.add_parser("compare", help="verdict of a candidate series against a base series")

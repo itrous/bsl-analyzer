@@ -1,0 +1,12 @@
+id = "perf-nightly"
+command = ["/home/itrous/.pio/modules/perf-nightly"]
+cron = "0 5 * * *"
+timeout = "4h"
+
+[params]
+corpora = "corpora.toml"   # относительно data_dir
+deadline = "08:45"
+
+[limits]
+concurrent = 1
+runs_per_day = 1

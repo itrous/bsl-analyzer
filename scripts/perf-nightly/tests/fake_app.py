@@ -10,7 +10,7 @@ Switches:
   build          create <cwd>/.build/db
   stubborn       spawn a child that ignores SIGTERM and lives on (a daemon)
   daemon         spawn a child that lives on after the client leaves (handles SIGTERM)
-  foreign2       on the 2nd measured launch spawn a detached `perf-nightly-test-x` without the run marker
+  foreign2       on the 2nd measured launch spawn a detached `$FAKE_FOREIGN_PREFIX`x without the run marker
   analyze: no_done, total_mismatch, bad_line, bad_utf8, zero_files, exit2, help_warn, only_first
   helpcheck (BSL_LOG=info): help_noline, help_auto, help_degraded
   lsp: hover_null, never_ready, foreign_publish, noexit, no_pull, help_warn_lsp,
@@ -73,7 +73,7 @@ def side_effects(number: int) -> None:
             fh.write(str(child.pid))
     if "foreign2" in MODE and number == 2:
         env = {k: v for k, v in os.environ.items() if k != "PERF_NIGHTLY_RUN"}
-        child = subprocess.Popen(["perf-nightly-test-x", "-c", "import signal\nprint(flush=True)\nsignal.pause()"],
+        child = subprocess.Popen([os.environ["FAKE_FOREIGN_PREFIX"] + "x", "-c", "import signal\nprint(flush=True)\nsignal.pause()"],
                                  executable=sys.executable, env=env, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, start_new_session=True)
         child.stdout.readline()

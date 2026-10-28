@@ -83,9 +83,9 @@ class RealProcesses(unittest.TestCase):
 
     def test_stop_kills_a_term_ignoring_daemon_and_spares_unmarked_neighbours(self):
         run_id = "run-stop-test"
-        stubborn = self.keep(spawn(f"{FOREIGN_PREFIX}-app", procs.child_env(run_id), ignore_term=True))
-        polite = self.keep(spawn(f"{FOREIGN_PREFIX}-app", procs.child_env(run_id)))
-        neighbour = self.keep(spawn(f"{FOREIGN_PREFIX}-app", dict(os.environ)))
+        stubborn = self.keep(spawn(f"{FOREIGN_PREFIX}app", procs.child_env(run_id), ignore_term=True))
+        polite = self.keep(spawn(f"{FOREIGN_PREFIX}app", procs.child_env(run_id)))
+        neighbour = self.keep(spawn(f"{FOREIGN_PREFIX}app", dict(os.environ)))
         report = procs.stop(run_id, FakeClock(stuck=lambda pid: pid == stubborn.pid))
         self.assertEqual(sorted(report["terminated"]), sorted([stubborn.pid, polite.pid]))
         self.assertEqual(report["killed"], [stubborn.pid])
@@ -95,14 +95,14 @@ class RealProcesses(unittest.TestCase):
         self.assertIsNone(neighbour.poll(), "a process without the run marker must stay alive")
 
     def test_foreign_on_real_proc_matches_only_the_named_process(self):
-        named = self.keep(spawn(f"{FOREIGN_PREFIX}-app", dict(os.environ)))
+        named = self.keep(spawn(f"{FOREIGN_PREFIX}app", dict(os.environ)))
         shell = subprocess.Popen(["sh", "-c", f"read x; echo {FOREIGN_PREFIX}"], stdin=subprocess.PIPE,
                                  stdout=subprocess.DEVNULL)
         try:
             found = procs.foreign(prefix=FOREIGN_PREFIX)
         finally:
             shell.communicate(b"\n")
-        self.assertEqual(found, [{"pid": named.pid, "name": f"{FOREIGN_PREFIX}-app"}])
+        self.assertEqual(found, [{"pid": named.pid, "name": f"{FOREIGN_PREFIX}app"}])
 
 
 if __name__ == "__main__":

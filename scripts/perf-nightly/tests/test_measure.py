@@ -115,7 +115,7 @@ class Foreign(Workspace):
         self.helpcheck()
 
     def test_a_foreign_process_before_the_first_run_cancels_everything(self):
-        foreign = subprocess.Popen([f"{FOREIGN_PREFIX}-app", "-c", "import signal\nprint(flush=True)\nsignal.pause()"],
+        foreign = subprocess.Popen([f"{FOREIGN_PREFIX}app", "-c", "import signal\nprint(flush=True)\nsignal.pause()"],
                                    executable=sys.executable, stdout=subprocess.PIPE)
         foreign.stdout.readline()
         try:
@@ -132,7 +132,7 @@ class Foreign(Workspace):
 
     def test_nothing_is_deleted_while_a_foreign_process_runs(self):
         os.makedirs(os.path.join(self.snap, ".build"))
-        foreign = subprocess.Popen([f"{FOREIGN_PREFIX}-app", "-c", "import signal\nprint(flush=True)\nsignal.pause()"],
+        foreign = subprocess.Popen([f"{FOREIGN_PREFIX}app", "-c", "import signal\nprint(flush=True)\nsignal.pause()"],
                                    executable=sys.executable, stdout=subprocess.PIPE)
         foreign.stdout.readline()
         try:

@@ -26,8 +26,11 @@ from common import Data, sha256_file, write_json  # noqa: E402
 
 FAKE_APP = os.path.join(HERE, "fake_app.py")
 # Real-process tests use a name the production foreign check (`bsl-analyzer*`)
-# never matches, so a test run cannot disturb a measurement on the same host.
-FOREIGN_PREFIX = "perf-nightly-test"
+# never matches, so a test run cannot disturb a measurement on the same host;
+# the pid of the test process in it keeps two suites on one host from seeing
+# each other's processes as foreign.
+FOREIGN_PREFIX = f"perf-nightly-test-{os.getpid()}-"
+os.environ["FAKE_FOREIGN_PREFIX"] = FOREIGN_PREFIX
 MODULE = "﻿Процедура Тест() Экспорт\n\tСообщить(\"т\");\nКонецПроцедуры\n"
 
 
@@ -265,3 +268,34 @@ def mock_env(case: unittest.TestCase, values: dict) -> dict:
 
 def set_mode(*switches: str) -> None:
     os.environ["FAKE_MODE"] = ",".join(switches)
+
+
+class FakeGh:
+    """`tests/fake_gh.py` first in `PATH` as `gh`, over the given issues."""
+
+    def __init__(self, case: unittest.TestCase, root: str, issues=(), fail=()):
+        bin_dir = os.path.join(root, "gh-bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        path = os.path.join(bin_dir, "gh")
+        with open(path, "w") as fh:
+            fh.write(f'#!/bin/sh\nexec "{sys.executable}" "{os.path.join(HERE, "fake_gh.py")}" "$@"\n')
+        os.chmod(path, 0o755)
+        self.state_path = os.path.join(root, "gh-state.json")
+        self.log_path = os.path.join(root, "gh-calls.jsonl")
+        self.set(list(issues), list(fail))
+        mock_env(case, {"PATH": bin_dir + os.pathsep + os.environ["PATH"],
+                        "FAKE_GH_STATE": self.state_path, "FAKE_GH_LOG": self.log_path})
+
+    def set(self, issues: list, fail: list) -> None:
+        with open(self.state_path, "w", encoding="utf-8") as fh:
+            json.dump({"issues": issues, "fail": fail}, fh, ensure_ascii=False)
+
+    def state(self) -> dict:
+        with open(self.state_path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def calls(self) -> list:
+        if not os.path.exists(self.log_path):
+            return []
+        with open(self.log_path, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh]
