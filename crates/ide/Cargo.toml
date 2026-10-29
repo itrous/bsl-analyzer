@@ -36,6 +36,7 @@ blake3 = "1.8"
 nucleo-matcher.workspace = true
 
 [dev-dependencies]
+bsl-conventions = { workspace = true, features = ["test-support"] }
 bsl-types.workspace = true
 expect-test.workspace = true
 test-fixture.workspace = true

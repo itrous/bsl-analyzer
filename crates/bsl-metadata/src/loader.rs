@@ -73,15 +73,15 @@ pub fn load_from_directory_scoped(
 /// thread. Handing the work to a plain OS thread moves the fan-out to the global
 /// pool and parks the caller in `join`, which steals nothing. Installing on
 /// another rayon pool would NOT do: the caller would still wait on a latch.
-/// Probe `Ext/<name>` under an object directory, canonical spelling first;
-/// the returned path carries the REAL on-disk spelling (it flows into
-/// `module_file` and URIs, which must agree with the scanned universe).
+/// Probe `Ext/<name>` under an object directory; the returned path carries the
+/// REAL on-disk spelling (it flows into `module_file` and URIs, which must agree
+/// with the scanned universe).
 fn probe_ext_child(
     tree: &dyn DirTree,
     dir: &Path,
     name: bsl_conventions::ConventionalName,
 ) -> Option<std::path::PathBuf> {
-    bsl_conventions::resolve_chain_ci_in(
+    bsl_conventions::resolve_stored_chain_ci_in(
         tree,
         dir,
         &[bsl_conventions::ConventionalName::Ext.canonical(), name.canonical()],
@@ -89,16 +89,18 @@ fn probe_ext_child(
 }
 
 /// The `<name>.xml` sibling of an object directory: the stem is the OBJECT's
-/// name and matches exactly, only the extension is case-insensitive.
+/// name and matches exactly, only the extension is case-insensitive. Probes the
+/// canonical spelling first, so a full load, which only reads the file, does not
+/// list a large collection once per object; discovery, whose paths must agree
+/// with another source's, takes the sibling from its listing instead.
 fn probe_sibling_xml(tree: &dyn DirTree, dir: &Path, name: &str) -> Option<std::path::PathBuf> {
     bsl_conventions::find_child_stem_exact_in(tree, dir, name, bsl_conventions::XML_EXTENSION)
 }
 
-/// A collection directory under the root: canonical English spelling first,
-/// else the case variant the tree actually uses. Falls back to the constructed
-/// path so an absent collection keeps reading as empty.
+/// A collection directory under the root, named as the tree stores it. Falls
+/// back to the constructed path so an absent collection keeps reading as empty.
 fn collection_dir(tree: &dyn DirTree, root: &Path, name: &str) -> std::path::PathBuf {
-    bsl_conventions::find_child_ci_in(tree, root, name).unwrap_or_else(|| root.join(name))
+    bsl_conventions::find_stored_child_ci_in(tree, root, name).unwrap_or_else(|| root.join(name))
 }
 
 fn off_exclusive_pool<T: Send>(f: impl FnOnce() -> T + Send) -> T {
@@ -813,7 +815,14 @@ fn discover_dir_with_predefined(
         let path = &entry.path;
         if entry.is_dir() {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-            let Some(main) = probe_sibling_xml(tree, dir, name) else { continue };
+            let Some(main) = bsl_conventions::find_listed_child_stem_exact(
+                dir,
+                entries.iter().filter_map(|entry| entry.path.file_name()),
+                name,
+                bsl_conventions::XML_EXTENSION,
+            ) else {
+                continue;
+            };
             let predefined =
                 probe_ext_child(tree, path, bsl_conventions::ConventionalName::PredefinedXml);
             out.push(DiscoveredMdo { mdo_type, name: name.to_string(), main, predefined });
@@ -1669,11 +1678,9 @@ fn load_simple_metadata_objects_parallel(
 ///
 /// A case-insensitive volume (APFS and NTFS in their default setup) answers a
 /// lookup for any spelling, so `Alpha` and `alpha` are one entry there and a
-/// fixture cannot lay both down; the exact probe of a constructed path hits
-/// whatever the spelling, and the path handed back carries the CONSTRUCTED
-/// spelling instead of the one on disk. Both facts are observable, so a test
-/// asks the volume rather than the target OS: a case-sensitive volume mounted
-/// on macOS or Windows then still gets the full assertion.
+/// fixture cannot lay both down. That is observable, so a test asks the volume
+/// rather than the target OS: a case-sensitive volume mounted on macOS or
+/// Windows then still gets the full assertion.
 #[cfg(test)]
 fn fs_keeps_case_distinct(dir: &Path) -> bool {
     let probe = dir.join("bsl_case_distinction_probe");
@@ -3477,21 +3484,6 @@ mod case_parity_tests {
         std::fs::write(path, text).unwrap();
     }
 
-    /// The spelling a probe hands back under `root`: the one really on disk
-    /// where a wrong-case construction misses, the constructed canonical one
-    /// where the volume answers any spelling and the exact probe hits first.
-    fn probed_spelling(
-        root: &Path,
-        on_disk: &'static str,
-        canonical: &'static str,
-    ) -> &'static str {
-        if fs_keeps_case_distinct(root) {
-            on_disk
-        } else {
-            canonical
-        }
-    }
-
     const COMMON_XML: &str = concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         "<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\">",
@@ -3507,7 +3499,7 @@ mod case_parity_tests {
         write(&root.join("CommonModules/X/EXT/MODULE.BSL"), "// тело");
         let found = discover_common_module_structure(&root, &bsl_conventions::RealFs);
         assert_eq!(found.len(), 1);
-        let expected = probed_spelling(&root, "EXT/MODULE.BSL", "Ext/Module.bsl");
+        let expected = "EXT/MODULE.BSL";
         assert!(
             found[0].module_file.as_deref().is_some_and(|p| p.ends_with(expected)),
             "тело найдено и несёт написание {expected}: {:?}",
@@ -3524,7 +3516,7 @@ mod case_parity_tests {
         write(&root.join("WebServices/W/EXT/MODULE.BSL"), "//");
         write(&root.join("IntegrationServices/I.xml"), "<x/>");
         write(&root.join("IntegrationServices/I/EXT/MODULE.BSL"), "//");
-        let expected = probed_spelling(&root, "EXT/MODULE.BSL", "Ext/Module.bsl");
+        let expected = "EXT/MODULE.BSL";
         let http = discover_http_service_structure(&root, &bsl_conventions::RealFs);
         assert!(http[0].module_file.as_deref().is_some_and(|p| p.ends_with(expected)));
         let web = discover_web_service_structure(&root, &bsl_conventions::RealFs);
@@ -3563,7 +3555,7 @@ mod case_parity_tests {
         write(&root.join("Roles/Роль/EXT/RIGHTS.XML"), "<x/>");
         let roles = discover_role_structure(&root, &bsl_conventions::RealFs);
         assert_eq!(roles.len(), 1);
-        let expected = probed_spelling(&root, "EXT/RIGHTS.XML", "Ext/Rights.xml");
+        let expected = "EXT/RIGHTS.XML";
         assert!(
             roles[0].rights.as_deref().is_some_and(|p| p.ends_with(expected)),
             "права найдены через регистронезависимую пробу: {:?}",
@@ -3580,7 +3572,7 @@ mod case_parity_tests {
         let found = discover_metadata_structure(&root, &bsl_conventions::RealFs);
         let catalog = found.iter().find(|m| m.name == "Товар");
         assert!(catalog.is_some(), "каталог с соседним Товар.XML обнаружен");
-        let expected = probed_spelling(&root, "EXT/PREDEFINED.XML", "Ext/Predefined.xml");
+        let expected = "EXT/PREDEFINED.XML";
         assert!(
             catalog.unwrap().predefined.as_deref().is_some_and(|p| p.ends_with(expected)),
             "predefined найден через пробу"
@@ -3607,11 +3599,7 @@ mod case_parity_tests {
         let config = load_from_directory(&root).unwrap();
         let module = config.common_modules().iter().find(|m| m.name() == "X").unwrap();
         use crate::traits::Module as _;
-        let expected = probed_spelling(
-            &root,
-            "COMMONMODULES/X/EXT/MODULE.BSL",
-            "CommonModules/X/Ext/Module.bsl",
-        );
+        let expected = "COMMONMODULES/X/EXT/MODULE.BSL";
         assert_eq!(
             module.uri(),
             Some(expected),
@@ -3731,6 +3719,296 @@ mod tree_source_tests {
             discover_integration_service_structure(&root, &RealFs),
             discover_integration_service_structure(&root, &set),
         );
+    }
+
+    /// Every conventional part of the path spelled off convention: the
+    /// collection directory, the sibling XML's extension, each `Ext/` sidecar,
+    /// nested `Subsystems/`. Each `discover_*` gets at least one object.
+    fn off_convention_dump(root: &Path) -> Vec<PathBuf> {
+        [
+            "CATALOGS/Товары.XML",
+            "CATALOGS/Товары/Ext/Predefined.XML",
+            "Enums/Статусы.XML",
+            "InformationRegisters/Цены.XML",
+            "DefinedTypes/Тип.XML",
+            "CommonModules/Настройки.xml",
+            "CommonModules/Настройки/EXT/MODULE.BSL",
+            "EventSubscriptions/Событие.XML",
+            "ScheduledJobs/Задание.XML",
+            "SUBSYSTEMS/Продажи.xml",
+            "SUBSYSTEMS/Продажи/SUBSYSTEMS/Опт.xml",
+            "Roles/Админ.xml",
+            "Roles/Админ/Ext/Rights.XML",
+            "HTTPServices/Сервис.xml",
+            "HTTPServices/Сервис/EXT/MODULE.BSL",
+            "WebServices/Веб.xml",
+            "WebServices/Веб/EXT/MODULE.BSL",
+            "IntegrationServices/Интеграция.xml",
+            "IntegrationServices/Интеграция/EXT/MODULE.BSL",
+        ]
+        .iter()
+        .map(|file| root.join(file))
+        .collect()
+    }
+
+    /// On a case-insensitive volume a constructed spelling hits, so the resident
+    /// could name a file `Ext/Module.bsl` while the graph, reading the scanned
+    /// path set, names it `EXT/MODULE.BSL` — and the one object becomes two
+    /// candidates. The path set only ever answers with stored paths, so equality
+    /// with it is the on-disk spelling.
+    #[test]
+    fn both_tree_sources_agree_on_a_case_folding_tree() {
+        let root = Path::new("/ws");
+        let folding =
+            bsl_conventions::test_support::CaseFoldingTree::from_files(off_convention_dump(root));
+        let set = PathSetTree::from_files(off_convention_dump(root));
+
+        let common = discover_common_module_structure(root, &folding);
+        assert_eq!(common, discover_common_module_structure(root, &set));
+        assert_eq!(
+            common[0].module_file,
+            Some(root.join("CommonModules/Настройки/EXT/MODULE.BSL")),
+        );
+
+        let objects = discover_metadata_structure(root, &folding);
+        assert_eq!(objects, discover_metadata_structure(root, &set));
+        let catalog = objects.iter().find(|mdo| mdo.name == "Товары").expect("the catalog");
+        assert_eq!(catalog.main, root.join("CATALOGS/Товары.XML"));
+        assert_eq!(catalog.predefined, Some(root.join("CATALOGS/Товары/Ext/Predefined.XML")));
+        assert_eq!(objects.len(), 2, "{objects:?}");
+
+        let roles = discover_role_structure(root, &folding);
+        assert_eq!(roles, discover_role_structure(root, &set));
+        assert_eq!(roles[0].rights, Some(root.join("Roles/Админ/Ext/Rights.XML")));
+
+        let subsystems = discover_subsystem_structure(root, &folding);
+        assert_eq!(subsystems, discover_subsystem_structure(root, &set));
+        assert!(
+            subsystems.iter().any(|s| s.main == root.join("SUBSYSTEMS/Продажи/SUBSYSTEMS/Опт.xml")),
+            "{subsystems:?}",
+        );
+
+        let registers = discover_register_structure(root, &folding);
+        assert_eq!(registers, discover_register_structure(root, &set));
+        assert_eq!(registers.len(), 1);
+        let defined = discover_defined_type_structure(root, &folding);
+        assert_eq!(defined, discover_defined_type_structure(root, &set));
+        assert_eq!(defined.len(), 1);
+        let subscriptions = discover_event_subscription_structure(root, &folding);
+        assert_eq!(subscriptions, discover_event_subscription_structure(root, &set));
+        assert_eq!(subscriptions.len(), 1);
+        let jobs = discover_scheduled_job_structure(root, &folding);
+        assert_eq!(jobs, discover_scheduled_job_structure(root, &set));
+        assert_eq!(jobs.len(), 1);
+
+        let http = discover_http_service_structure(root, &folding);
+        assert_eq!(http, discover_http_service_structure(root, &set));
+        assert_eq!(http[0].module_file, Some(root.join("HTTPServices/Сервис/EXT/MODULE.BSL")));
+        let web = discover_web_service_structure(root, &folding);
+        assert_eq!(web, discover_web_service_structure(root, &set));
+        assert!(web[0].module_file.is_some());
+        let integration = discover_integration_service_structure(root, &folding);
+        assert_eq!(integration, discover_integration_service_structure(root, &set));
+        assert!(integration[0].module_file.is_some());
+    }
+
+    /// A dump that stores every name the way discovery asks for it, except
+    /// where a case variant sits beside it. `Обр` lists the variant of its
+    /// extension BEFORE the exact one, `Мод` lists `EXT/MODULE.BSL` before
+    /// `Ext/Module.bsl`; `Alpha/` has no `Alpha.xml`, only the other object's
+    /// `alpha.xml`; `Сирота/` has no XML at all.
+    fn byte_exact_dump() -> [&'static str; 11] {
+        [
+            "Catalogs/Обр.XML",
+            "Catalogs/Обр.xml",
+            "Catalogs/Обр/Ext/Predefined.xml",
+            "Catalogs/Только.XML",
+            "Catalogs/Только/Ext/Predefined.XML",
+            "Catalogs/Alpha/Ext/Predefined.xml",
+            "Catalogs/alpha.xml",
+            "Catalogs/Сирота/Ext/Predefined.xml",
+            "CommonModules/Мод.xml",
+            "CommonModules/Мод/EXT/MODULE.BSL",
+            "CommonModules/Мод/Ext/Module.bsl",
+        ]
+    }
+
+    /// What discovery answers over [`byte_exact_dump`] rooted at `root`.
+    fn assert_byte_exact_answers(root: &Path, tree: &dyn DirTree) {
+        let mut found: Vec<_> = discover_metadata_structure(root, tree)
+            .into_iter()
+            .map(|mdo| (mdo.name, mdo.main, mdo.predefined))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("alpha".to_string(), root.join("Catalogs/alpha.xml"), None,),
+                (
+                    "Обр".to_string(),
+                    root.join("Catalogs/Обр.xml"),
+                    Some(root.join("Catalogs/Обр/Ext/Predefined.xml")),
+                ),
+                (
+                    "Только".to_string(),
+                    root.join("Catalogs/Только.XML"),
+                    Some(root.join("Catalogs/Только/Ext/Predefined.XML")),
+                ),
+            ],
+        );
+
+        // The probe a full load still uses answers the same for every object
+        // that has a sibling XML: discovery changed where the name comes from,
+        // not which name is chosen.
+        for name in ["Обр", "Только", "Alpha"] {
+            let collection = root.join("Catalogs");
+            let listed = discover_metadata_structure(root, tree)
+                .into_iter()
+                .find(|mdo| mdo.name == name)
+                .map(|mdo| mdo.main);
+            assert_eq!(listed, probe_sibling_xml(tree, &collection, name), "{name}");
+        }
+
+        let modules = discover_common_module_structure(root, tree);
+        assert_eq!(modules.len(), 1, "{modules:?}");
+        assert_eq!(modules[0].main, root.join("CommonModules/Мод.xml"));
+        assert_eq!(
+            modules[0].module_file,
+            Some(root.join("CommonModules/Мод/Ext/Module.bsl")),
+            "the exact spelling wins over a variant listed before it",
+        );
+    }
+
+    /// Discovery reads the sibling `<name>.xml` off its own listing since the
+    /// case-folding fix, while a full load still probes it. Where every name is
+    /// stored the way it is asked for, both a path set and a case-sensitive disk
+    /// have to answer as the probe always did: the exact `<name>.xml` first, the
+    /// extension's case variant otherwise, and no case variant of the object's
+    /// own name.
+    #[test]
+    fn discovery_on_a_byte_exact_tree_answers_as_the_exact_first_probe_did() {
+        let root = Path::new("/ws");
+        let files = || byte_exact_dump().map(|file| root.join(file));
+        let set = PathSetTree::from_files(files());
+
+        let listed = set.child_names(&root.join("Catalogs"));
+        let at = |wanted: &str| listed.iter().position(|name| name == wanted);
+        assert!(
+            matches!((at("Обр.XML"), at("Обр.xml")), (Some(v), Some(e)) if v < e),
+            "the input has to list the variant before the exact name, or it cannot tell an \
+             exact-first answer from a first-match one",
+        );
+        assert_byte_exact_answers(root, &set);
+
+        let dir = temp_root("byte_exact");
+        if fs_keeps_case_distinct(&dir) {
+            for file in byte_exact_dump() {
+                write(&dir.join(file), "<x/>");
+            }
+            assert_byte_exact_answers(&dir, &RealFs);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The resident reads through `ScopedFs`. Discovery asks the listing first,
+    /// so an excluded entry has to stay absent from it exactly as it was from
+    /// the exact probe: an excluded `Ext/` costs its object the sidecar, an
+    /// excluded sibling XML costs the directory its object.
+    #[test]
+    fn an_excluded_entry_stays_absent_from_discovery() {
+        let root = temp_root("excluded");
+        for name in ["Скрытый", "Видимый", "Безымянный"] {
+            write(&root.join(format!("Catalogs/{name}.xml")), "<x/>");
+            write(&root.join(format!("Catalogs/{name}/Ext/Predefined.xml")), "<x/>");
+        }
+        let sidecar_of = |excluded: &ExcludedPaths| {
+            let mut found: Vec<_> = discover_metadata_structure(&root, &ScopedFs::new(excluded))
+                .into_iter()
+                .map(|mdo| (mdo.name, mdo.predefined.is_some()))
+                .collect();
+            found.sort();
+            found
+        };
+
+        // Without exclusions all three have a sidecar: the probe sees `Ext/`
+        // at all, so an absent one below is the exclusion's doing.
+        assert_eq!(
+            sidecar_of(&ExcludedPaths::default()),
+            [("Безымянный", true), ("Видимый", true), ("Скрытый", true)]
+                .map(|(name, sidecar)| (name.to_string(), sidecar)),
+        );
+
+        let excluded = ExcludedPaths::new([
+            root.join("Catalogs/Скрытый/Ext"),
+            root.join("Catalogs/Безымянный.xml"),
+        ]);
+        assert_eq!(
+            sidecar_of(&excluded),
+            [("Видимый", true), ("Скрытый", false)]
+                .map(|(name, sidecar)| (name.to_string(), sidecar)),
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Counts what a walk asks of the tree beneath it.
+    struct CountingTree {
+        inner: PathSetTree,
+        listings: std::cell::RefCell<Vec<PathBuf>>,
+        lookups: std::cell::RefCell<Vec<PathBuf>>,
+    }
+
+    impl DirTree for CountingTree {
+        fn kind_of(&self, path: &Path) -> Option<bsl_conventions::EntryKind> {
+            self.lookups.borrow_mut().push(path.to_path_buf());
+            self.inner.kind_of(path)
+        }
+
+        fn entries(&self, dir: &Path) -> Vec<bsl_conventions::TreeEntry> {
+            self.listings.borrow_mut().push(dir.to_path_buf());
+            self.inner.entries(dir)
+        }
+
+        fn child_names(&self, dir: &Path) -> Vec<std::ffi::OsString> {
+            self.listings.borrow_mut().push(dir.to_path_buf());
+            self.inner.child_names(dir)
+        }
+    }
+
+    /// Discovery already lists a collection to find its objects; the sibling
+    /// `<name>.xml` of each object directory comes from that same listing.
+    /// Probing it costs a lookup per object, and listing again per object
+    /// makes a large collection quadratic.
+    #[test]
+    fn a_collection_is_listed_once_per_discovery() {
+        let root = Path::new("/ws");
+        let names = ["Первый", "Второй", "Третий"];
+        let tree = CountingTree {
+            inner: PathSetTree::from_files(names.iter().flat_map(|name| {
+                [
+                    root.join(format!("Catalogs/{name}.xml")),
+                    root.join(format!("Catalogs/{name}/Ext/Predefined.xml")),
+                ]
+            })),
+            listings: Default::default(),
+            lookups: Default::default(),
+        };
+
+        let found = discover_metadata_structure(root, &tree);
+        assert_eq!(found.len(), names.len(), "{found:?}");
+
+        let collection = root.join("Catalogs");
+        let listed = tree.listings.borrow().iter().filter(|dir| **dir == collection).count();
+        assert_eq!(listed, 1, "the collection directory is listed once");
+        let sibling_lookups: Vec<_> = tree
+            .lookups
+            .borrow()
+            .iter()
+            .filter(|path| {
+                names.iter().any(|name| **path == collection.join(format!("{name}.xml")))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(sibling_lookups, Vec::<PathBuf>::new(), "a sibling XML is read off the listing");
     }
 
     /// A dump may place an object's directory behind a symlink. The kind has to

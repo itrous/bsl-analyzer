@@ -15,11 +15,13 @@
 //! composition — is owned by `bsl_metadata`'s module-path spec.
 
 mod probe;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod tree;
 
 pub use probe::{
-    find_child_ci, find_child_ci_in, find_child_stem_exact, find_child_stem_exact_in,
-    resolve_chain_ci, resolve_chain_ci_in,
+    find_child_ci, find_child_stem_exact, find_child_stem_exact_in, find_listed_child_stem_exact,
+    find_stored_child_ci_in, resolve_chain_ci, resolve_stored_chain_ci_in,
 };
 pub use tree::{DirTree, EntryKind, PathSetTree, RealFs, TreeEntry};
 

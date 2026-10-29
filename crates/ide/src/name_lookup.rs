@@ -1934,6 +1934,57 @@ mod tests {
         assert_eq!(merged.graph_id.as_deref(), Some("mdo/Catalog/Товары"));
     }
 
+    /// On a case-insensitive volume the resident walks the disk while the graph
+    /// walks its scanned path set. When the dump spells a conventional part of
+    /// the path off convention, both walks have to name the object's XML the
+    /// same way, or the one object folds into nothing and answers twice.
+    #[test]
+    fn a_metadata_object_spelled_off_convention_is_one_candidate() {
+        let root = std::path::Path::new("/ws/src/cf");
+        let files = || {
+            [root.join("CATALOGS/Товары.XML"), root.join("CATALOGS/Товары/Ext/ObjectModule.bsl")]
+        };
+        let main_of = |found: Vec<bsl_metadata::loader::DiscoveredMdo>| {
+            let object = found.into_iter().find(|mdo| mdo.name == "Товары").expect("the catalog");
+            object.main.to_string_lossy().into_owned()
+        };
+        let resident = main_of(bsl_metadata::loader::discover_metadata_structure(
+            root,
+            &bsl_conventions::test_support::CaseFoldingTree::from_files(files()),
+        ));
+        let graph_file = main_of(bsl_metadata::loader::discover_metadata_structure(
+            root,
+            &bsl_conventions::PathSetTree::from_files(files()),
+        ));
+        let db = db_with_metadata_object(
+            "/ws/src/cf",
+            bsl_metadata::MdoType::Catalog,
+            "Товары",
+            &resident,
+        );
+
+        let mut node = NameCandidate::new(
+            "Товары",
+            NameCategory::MetadataObject,
+            NameMatchTier::Name,
+            ProviderId::Graph,
+        )
+        .with_source_path(graph_file);
+        node.graph_id = Some("mdo/Catalog/Товары".to_string());
+        let graph = FakeSource::answering(ProviderId::Graph, vec![node], 1);
+
+        let found = lookup_names(
+            &db,
+            &NameQuery::new("Товары", 20).with_categories(&[NameCategory::MetadataObject]),
+            &[&graph],
+        );
+
+        assert_eq!(found.candidates.len(), 1, "{:?}", displays(&found));
+        let merged = &found.candidates[0];
+        assert!(merged.place.is_some(), "the XML resolved into a place");
+        assert_eq!(merged.graph_id.as_deref(), Some("mdo/Catalog/Товары"));
+    }
+
     /// A common module named in a subsystem's `<Content>` reaches the graph
     /// twice: as the module it is, and as the membership edge's endpoint. Both
     /// land on the file the module is written in, so they fold — and the id the

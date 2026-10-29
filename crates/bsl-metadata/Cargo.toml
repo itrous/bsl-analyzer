@@ -21,6 +21,7 @@ rayon = { workspace = true }
 bsl-platform = { path = "../bsl-platform" }
 
 [dev-dependencies]
+bsl-conventions = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 
 [lints]

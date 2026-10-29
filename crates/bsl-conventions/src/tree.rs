@@ -98,12 +98,14 @@ impl DirTree for RealFs {
 /// therefore invisible; the layout rules are written not to depend on bare
 /// directory existence for that reason.
 ///
-/// It also differs in CASE. This source matches byte-exactly, while [`RealFs`]
-/// inherits the filesystem's own answer: where that filesystem folds case, an
-/// exact probe for a constructed spelling hits, and the probe returns the
-/// spelling it constructed rather than the one on disk. Two sources reading one
-/// such tree then name a file differently — the constructed spelling here, the
-/// real one there.
+/// It also differs in CASE. This source's `kind_of` matches byte-exactly, while
+/// [`RealFs`] inherits the filesystem's own answer: where that filesystem folds
+/// case, a lookup of a constructed spelling hits. The walkers' probes
+/// ([`find_stored_child_ci_in`](crate::find_stored_child_ci_in),
+/// [`resolve_stored_chain_ci_in`](crate::resolve_stored_chain_ci_in),
+/// [`find_listed_child_stem_exact`](crate::find_listed_child_stem_exact)) do
+/// not let that difference through: they name a child from the parent's
+/// listing, so both sources name one file with its stored spelling.
 pub struct PathSetTree {
     children: HashMap<PathBuf, Vec<TreeEntry>>,
 }
