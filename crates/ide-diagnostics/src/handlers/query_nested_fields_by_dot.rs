@@ -56,11 +56,225 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    use super::check;
+    use crate::metadata::{DiagnosticSeverityLevel, MetadataTag};
     use crate::test_utils::{
         check_diagnostics_snapshot_for, check_hir_diagnostic_with_config, format_diags,
     };
-    use crate::DiagnosticCode;
-    use expect_test::expect;
+    use crate::{DiagnosticCode, DiagnosticsConfig, DiagnosticsContext};
+    use expect_test::{expect, Expect};
+    use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+    use ide_db::RootDatabaseImpl;
+    use vfs::{FileId, FileSet, VfsPath};
+
+    /// `<Type>` of an attribute: two or more entries make the type composite.
+    fn type_xml(types: &[&str]) -> String {
+        types.iter().map(|ty| format!("<v8:Type>{ty}</v8:Type>")).collect()
+    }
+
+    fn attributes_xml(tag: &str, attributes: &[(&str, &[&str])]) -> String {
+        attributes
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, types))| {
+                format!(
+                    "<{tag} uuid=\"20000000-0000-0000-0000-{idx:012}\"><Properties><Name>{name}</Name><Type>{}</Type></Properties></{tag}>",
+                    type_xml(types)
+                )
+            })
+            .collect()
+    }
+
+    fn object_xml(kind: &str, name: &str, children: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.20">
+	<{kind} uuid="10000000-0000-0000-0000-000000000001">
+		<Properties><Name>{name}</Name></Properties>
+		<ChildObjects>{children}</ChildObjects>
+	</{kind}>
+</MetaDataObject>"#
+        )
+    }
+
+    const NOMENCLATURE: &str = "cfg:CatalogRef.Номенклатура";
+    const WAREHOUSES: &str = "cfg:CatalogRef.Склады";
+    const PARTNERS: &str = "cfg:CatalogRef.Контрагенты";
+
+    /// `ЦеныОбъектов.Объект` and `Номенклатура.Поставщик` are composite references,
+    /// `Остатки.Номенклатура` and `Номенклатура.Производитель` are single references.
+    struct FixtureConfig {
+        root: std::path::PathBuf,
+    }
+
+    impl FixtureConfig {
+        fn materialize() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "bsl_query_nested_fields_fixture_{}_{}",
+                std::process::id(),
+                id
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let write = |path: &str, text: String| {
+                let path = root.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).expect("create fixture dirs");
+                std::fs::write(path, text).expect("write fixture xml");
+            };
+            write(
+                "Configuration.xml",
+                object_xml(
+                    "Configuration",
+                    "ТестРазыменование",
+                    "<Catalog>Номенклатура</Catalog><Catalog>Склады</Catalog>\
+                     <Catalog>Контрагенты</Catalog>\
+                     <InformationRegister>ЦеныОбъектов</InformationRegister>\
+                     <AccumulationRegister>Остатки</AccumulationRegister>",
+                ),
+            );
+            write(
+                "Catalogs/Номенклатура.xml",
+                object_xml(
+                    "Catalog",
+                    "Номенклатура",
+                    &attributes_xml(
+                        "Attribute",
+                        &[("Поставщик", &[PARTNERS, WAREHOUSES]), ("Производитель", &[PARTNERS])],
+                    ),
+                ),
+            );
+            write("Catalogs/Склады.xml", object_xml("Catalog", "Склады", ""));
+            write("Catalogs/Контрагенты.xml", object_xml("Catalog", "Контрагенты", ""));
+            write(
+                "InformationRegisters/ЦеныОбъектов.xml",
+                object_xml(
+                    "InformationRegister",
+                    "ЦеныОбъектов",
+                    &attributes_xml(
+                        "Dimension",
+                        &[
+                            ("Объект", &[NOMENCLATURE, WAREHOUSES]),
+                            ("Владелец", &[NOMENCLATURE, "xs:string"]),
+                            ("Признак", &["xs:string", "xs:decimal"]),
+                        ],
+                    ),
+                ),
+            );
+            write(
+                "AccumulationRegisters/Остатки.xml",
+                object_xml(
+                    "AccumulationRegister",
+                    "Остатки",
+                    &attributes_xml("Dimension", &[("Номенклатура", &[NOMENCLATURE])]),
+                ),
+            );
+            Self { root }
+        }
+    }
+
+    impl Drop for FixtureConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn check_with_fixture(query_body: &str, config: DiagnosticsConfig, expected: Expect) {
+        let fixture = FixtureConfig::materialize();
+        let workspace_root = fixture.root.clone();
+
+        let code = format!(
+            "Процедура Тест()\n    Запрос = Новый Запрос;\n    Запрос.Текст = \"{}\";\nКонецПроцедуры",
+            query_body
+        );
+
+        let mut db = RootDatabaseImpl::new();
+
+        let mut file_set = FileSet::default();
+        let file_id = FileId(0);
+        let module_path =
+            VfsPath::new(format!("{}/Ext/SessionModule.bsl", workspace_root.display()));
+        file_set.insert(file_id, module_path);
+
+        let source_root_id = SourceRootId(0);
+        db.set_source_root(source_root_id, SourceRoot::new_local(file_set));
+        db.set_file_source_root(file_id, source_root_id);
+        db.set_file_text(file_id, &code);
+
+        let configuration_path_input = ide_db::metadata::ConfigurationPathInput::new(
+            &db,
+            workspace_root.to_string_lossy().to_string(),
+            0,
+        );
+
+        let provider = ide_db::SalsaProvider::new(&db, Some(configuration_path_input));
+        let ctx = DiagnosticsContext::new(&config, file_id, &provider);
+
+        expected.assert_eq(&format_diags(&code, &check(&ctx)));
+    }
+
+    fn config_with_min_path_depth(depth: i64) -> DiagnosticsConfig {
+        let mut config = DiagnosticsConfig::default();
+        config.enabled.push(DiagnosticCode::QueryNestedFieldsByDot);
+        config.parameters.insert(
+            DiagnosticCode::QueryNestedFieldsByDot,
+            serde_json::json!({ "minPathDepth": depth }),
+        );
+        config
+    }
+
+    fn check_without_metadata(code: &str, config: DiagnosticsConfig, expected: Expect) {
+        let diagnostics: Vec<_> =
+            check_hir_diagnostic_with_config(code, config, crate::diagnostics)
+                .into_iter()
+                .filter(|d| d.code == DiagnosticCode::QueryNestedFieldsByDot)
+                .collect();
+        expected.assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn only_a_composite_reference_without_cast_is_reported() {
+        check_with_fixture(
+            "ВЫБРАТЬ Цены.Объект.Код КАК КодОбъекта, \
+             ВЫРАЗИТЬ(Цены.Объект КАК Справочник.Номенклатура).Код КАК КодНоменклатуры \
+             ИЗ РегистрСведений.ЦеныОбъектов КАК Цены; \
+             ВЫБРАТЬ Остатки.Номенклатура.Наименование КАК Наименование \
+             ИЗ РегистрНакопления.Остатки КАК Остатки",
+            DiagnosticsConfig::all_enabled(),
+            expect![[r#"
+                QueryNestedFieldsByDot @ 3:29..3:44
+                  message: Обнаружено разыменование ссылочного поля
+                  severity: Warning"#]],
+        );
+    }
+
+    #[test]
+    fn a_composite_of_a_reference_and_a_primitive_is_reported_one_of_primitives_is_not() {
+        check_with_fixture(
+            "ВЫБРАТЬ Цены.Владелец.Код КАК Код, Цены.Признак.Длина КАК Длина \
+             ИЗ РегистрСведений.ЦеныОбъектов КАК Цены",
+            DiagnosticsConfig::all_enabled(),
+            expect![[r#"
+                QueryNestedFieldsByDot @ 3:29..3:46
+                  message: Обнаружено разыменование ссылочного поля
+                  severity: Warning"#]],
+        );
+    }
+
+    #[test]
+    fn the_same_composite_path_without_metadata_is_silent() {
+        check_without_metadata(
+            r#"
+Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Цены.Объект.Код КАК Код ИЗ РегистрСведений.ЦеныОбъектов КАК Цены";
+КонецПроцедуры
+"#,
+            DiagnosticsConfig::all_enabled(),
+            expect![[r#""#]],
+        );
+    }
+
     #[test]
     fn test_query_nested_fields_by_dot() {
         let code = r#"Процедура СводкаУспеваемости(Начало, Конец)
@@ -142,34 +356,7 @@ mod tests {
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::QueryNestedFieldsByDot,
-            expect![[r#"
-                QueryNestedFieldsByDot @ 9:4..9:23
-                  message: Обнаружено разыменование ссылочного поля
-                  severity: Warning
-                QueryNestedFieldsByDot @ 10:4..10:25
-                  message: Обнаружено разыменование ссылочного поля
-                  severity: Warning
-                QueryNestedFieldsByDot @ 11:4..11:25
-                  message: Обнаружено разыменование ссылочного поля
-                  severity: Warning
-                QueryNestedFieldsByDot @ 16:4..16:22
-                  message: Обнаружено разыменование ссылочного поля
-                  severity: Warning
-                QueryNestedFieldsByDot @ 32:7..32:19
-                  message: Обнаружено разыменование ссылочного поля
-                  severity: Warning
-                QueryNestedFieldsByDot @ 32:21..32:37
-                  message: Обнаружено разыменование ссылочного поля
-                  severity: Warning
-                QueryNestedFieldsByDot @ 49:8..49:33
-                  message: Обнаружено разыменование ссылочного поля
-                  severity: Warning
-                QueryNestedFieldsByDot @ 49:36..49:65
-                  message: Обнаружено разыменование ссылочного поля
-                  severity: Warning
-                QueryNestedFieldsByDot @ 57:4..57:72
-                  message: Обнаружено разыменование ссылочного поля
-                  severity: Warning"#]],
+            expect![[r#""#]],
         );
     }
 
@@ -203,54 +390,73 @@ mod tests {
         );
     }
 
-    fn config_with_min_path_depth(depth: i64) -> crate::DiagnosticsConfig {
-        let mut config = crate::DiagnosticsConfig::default();
-        config.enabled.push(DiagnosticCode::QueryNestedFieldsByDot);
-        config.parameters.insert(
-            DiagnosticCode::QueryNestedFieldsByDot,
-            serde_json::json!({ "minPathDepth": depth }),
+    #[test]
+    fn test_min_path_depth_above_three_drops_three_part_normal_context() {
+        let query = "ВЫБРАТЬ Цены.Объект.Код КАК Код ИЗ РегистрСведений.ЦеныОбъектов КАК Цены";
+        check_with_fixture(query, config_with_min_path_depth(4), expect![[r#""#]]);
+        check_with_fixture(
+            query,
+            DiagnosticsConfig::all_enabled(),
+            expect![[r#"
+                QueryNestedFieldsByDot @ 3:29..3:44
+                  message: Обнаружено разыменование ссылочного поля
+                  severity: Warning"#]],
         );
-        config
     }
 
     #[test]
-    fn test_min_path_depth_above_three_drops_three_part_normal_context() {
-        let code = r#"
-Процедура Тест()
-    Запрос = Новый Запрос;
-    Запрос.Текст = "ВЫБРАТЬ T.Ссылка.Контрагент ИЗ Документ.Заказ КАК T";
-КонецПроцедуры
-"#;
-        let config = config_with_min_path_depth(4);
-        let diagnostics = check_hir_diagnostic_with_config(code, config, crate::diagnostics);
-        let diagnostics: Vec<_> = diagnostics
-            .into_iter()
-            .filter(|d| d.code == DiagnosticCode::QueryNestedFieldsByDot)
-            .collect();
-        expect![[r#""#]].assert_eq(&format_diags(code, &diagnostics));
+    fn the_rule_stays_on_by_default_with_its_severity_tags_and_threshold() {
+        check_with_fixture(
+            "ВЫБРАТЬ Цены.Объект.Код КАК Код ИЗ РегистрСведений.ЦеныОбъектов КАК Цены",
+            DiagnosticsConfig::default(),
+            expect![[r#"
+                QueryNestedFieldsByDot @ 3:29..3:44
+                  message: Обнаружено разыменование ссылочного поля
+                  severity: Warning"#]],
+        );
+        assert_eq!(super::METADATA.severity, DiagnosticSeverityLevel::Major);
+        assert_eq!(
+            super::METADATA.tags,
+            &[MetadataTag::Standard, MetadataTag::Sql, MetadataTag::Performance]
+        );
+    }
+
+    #[test]
+    fn a_virtual_table_parameter_path_of_a_composite_field_ignores_the_threshold() {
+        check_with_fixture(
+            "ВЫБРАТЬ Ц.Номенклатура КАК Н \
+             ИЗ РегистрСведений.ЦеныОбъектов.СрезПоследних(, Объект.Код = &К) КАК Ц",
+            config_with_min_path_depth(99),
+            expect![[r#"
+                QueryNestedFieldsByDot @ 3:98..3:108
+                  message: Обнаружено разыменование ссылочного поля
+                  severity: Warning"#]],
+        );
+        check_with_fixture(
+            "ВЫБРАТЬ О.Номенклатура КАК Н \
+             ИЗ РегистрНакопления.Остатки.Остатки(, Номенклатура.Наименование = &К) КАК О",
+            config_with_min_path_depth(99),
+            expect![[r#""#]],
+        );
     }
 
     #[test]
     fn test_min_path_depth_above_three_preserves_cast_member_chain() {
-        let code = r#"
-Процедура Тест()
-    Запрос = Новый Запрос;
-    Запрос.Текст =
-    "ВЫБРАТЬ ВЫРАЗИТЬ(T.Ссылка КАК Документ.Заказ).Валюта.Курс
-    |ИЗ Документ.Заказ КАК T";
-КонецПроцедуры
-"#;
-        let config = config_with_min_path_depth(99);
-        let diagnostics = check_hir_diagnostic_with_config(code, config, crate::diagnostics);
-        let diagnostics: Vec<_> = diagnostics
-            .into_iter()
-            .filter(|d| d.code == DiagnosticCode::QueryNestedFieldsByDot)
-            .collect();
-        expect![[r#"
-            QueryNestedFieldsByDot @ 5:14..5:63
-              message: Обнаружено разыменование ссылочного поля
-              severity: Warning"#]]
-        .assert_eq(&format_diags(code, &diagnostics));
+        check_with_fixture(
+            "ВЫБРАТЬ ВЫРАЗИТЬ(Цены.Объект КАК Справочник.Номенклатура).Поставщик.Код КАК Код \
+             ИЗ РегистрСведений.ЦеныОбъектов КАК Цены",
+            config_with_min_path_depth(99),
+            expect![[r#"
+                QueryNestedFieldsByDot @ 3:29..3:92
+                  message: Обнаружено разыменование ссылочного поля
+                  severity: Warning"#]],
+        );
+        check_with_fixture(
+            "ВЫБРАТЬ ВЫРАЗИТЬ(Цены.Объект КАК Справочник.Номенклатура).Производитель.Код КАК Код \
+             ИЗ РегистрСведений.ЦеныОбъектов КАК Цены",
+            config_with_min_path_depth(99),
+            expect![[r#""#]],
+        );
     }
 
     #[test]
@@ -258,60 +464,48 @@ mod tests {
         // `Т.ТЧ.(А, Б)` — выбор полей табличной части. Разыменования ссылки
         // здесь нет, глубина пути равна двум, и при пороге по умолчанию
         // находки быть не должно.
-        let code = r#"
+        check_without_metadata(
+            r#"
 Процедура Тест()
     Запрос = Новый Запрос;
     Запрос.Текст = "ВЫБРАТЬ T.Товары.(Номенклатура, Количество) ИЗ Документ.Заказ КАК T";
 КонецПроцедуры
-"#;
-        let config = config_with_min_path_depth(3);
-        let diagnostics = check_hir_diagnostic_with_config(code, config, crate::diagnostics);
-        let diagnostics: Vec<_> = diagnostics
-            .into_iter()
-            .filter(|d| d.code == DiagnosticCode::QueryNestedFieldsByDot)
-            .collect();
-        expect![[r#""#]].assert_eq(&format_diags(code, &diagnostics));
+"#,
+            config_with_min_path_depth(3),
+            expect![[r#""#]],
+        );
     }
 
     #[test]
-    fn a_dereference_before_inline_tabular_fields_still_fires() {
-        let code = r#"
+    fn a_dereference_of_a_single_reference_before_inline_tabular_fields_is_silent() {
+        check_without_metadata(
+            r#"
 Процедура Тест()
     Запрос = Новый Запрос;
     Запрос.Текст = "ВЫБРАТЬ T.Ссылка.Товары.(Номенклатура) ИЗ Документ.Заказ КАК T";
 КонецПроцедуры
-"#;
-        let config = config_with_min_path_depth(3);
-        let diagnostics = check_hir_diagnostic_with_config(code, config, crate::diagnostics);
-        let diagnostics: Vec<_> = diagnostics
-            .into_iter()
-            .filter(|d| d.code == DiagnosticCode::QueryNestedFieldsByDot)
-            .collect();
-        expect![[r#"
-            QueryNestedFieldsByDot @ 4:29..4:44
-              message: Обнаружено разыменование ссылочного поля
-              severity: Warning"#]]
-        .assert_eq(&format_diags(code, &diagnostics));
+"#,
+            config_with_min_path_depth(3),
+            expect![[r#""#]],
+        );
     }
 
     #[test]
-    fn test_min_path_depth_two_emits_two_part_normal_context() {
-        let code = r#"
+    fn a_two_part_path_is_silent_at_min_path_depth_two() {
+        check_without_metadata(
+            r#"
 Процедура Тест()
     Запрос = Новый Запрос;
     Запрос.Текст = "ВЫБРАТЬ T.Поле ИЗ Документ.Заказ КАК T";
 КонецПроцедуры
-"#;
-        let config = config_with_min_path_depth(2);
-        let diagnostics = check_hir_diagnostic_with_config(code, config, crate::diagnostics);
-        let diagnostics: Vec<_> = diagnostics
-            .into_iter()
-            .filter(|d| d.code == DiagnosticCode::QueryNestedFieldsByDot)
-            .collect();
-        expect![[r#"
-            QueryNestedFieldsByDot @ 4:29..4:35
-              message: Обнаружено разыменование ссылочного поля
-              severity: Warning"#]]
-        .assert_eq(&format_diags(code, &diagnostics));
+"#,
+            config_with_min_path_depth(2),
+            expect![[r#""#]],
+        );
+        check_with_fixture(
+            "ВЫБРАТЬ Цены.Объект КАК Объект ИЗ РегистрСведений.ЦеныОбъектов КАК Цены",
+            config_with_min_path_depth(2),
+            expect![[r#""#]],
+        );
     }
 }

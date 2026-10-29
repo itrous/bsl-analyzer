@@ -2,55 +2,81 @@
 
 ## Description
 
-This diagnostic reports dereference of reference fields through dot inside query
-text.
+This diagnostic reports, inside query text, a dot dereference of a field whose
+type in the metadata is a composite reference, when the field is not cast with
+`CAST` / `ВЫРАЗИТЬ`.
 
-The public rationale is performance-related: such expressions may lead to
-implicit joins and less predictable query execution. In practice it is often
-clearer and more efficient to fetch related data through explicit joins.
+The platform dereferences such a field by joining every table the composite
+type includes. When the field may point to several objects, the query joins the
+table of each of them, even if only one is needed. `ВЫРАЗИТЬ(... КАК Справочник.Х)`
+narrows the join to one table.
 
-The current implementation covers several forms:
+It fires when the field is followed by another member of the path and its type is:
 
-- ordinary nested field access in `SELECT`, `WHERE`, and `JOIN`;
-- nested field access inside virtual table parameters;
-- dereference after `CAST` / `ВЫРАЗИТЬ`.
+- composite with at least one reference among its parts, such as "item reference
+  or warehouse reference" and "item reference or string";
+- any reference or any reference of one kind, such as the standard `Recorder`
+  attribute of an accumulation register;
+- a defined type whose underlying type is one of the above.
+
+It does not fire:
+
+- on a field of a single reference type: that is an ordinary dereference joining
+  one table;
+- on a composite type without references, such as "string or number";
+- on a field whose type the metadata does not establish: no metadata is loaded,
+  the field is not in the table's field list, the defined type is not found.
+  Without metadata the diagnostic does not occur;
+- on a path cast with `ВЫРАЗИТЬ`: `ВЫРАЗИТЬ(Цены.Объект КАК Справочник.Номенклатура).Код`.
+  A `ССЫЛКА` / `REFS` condition does not replace the cast;
+- on `T.Field`: the last name of a path is only read and dereferences nothing;
+- on a field the metadata model lists without knowing whether the object has it.
+  The `Recorder` of an information register is listed that way, so
+  `Recorder.Date` of an information register is not reported.
+
+Paths are checked in every query section: the select list, join sources and
+conditions, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, virtual table parameters
+and nested queries. Inside the argument of `ВЫРАЗИТЬ` a path is checked as an
+ordinary one. After `ВЫРАЗИТЬ` the first member is a field of the one named
+table; a dereference further down the chain is reported when that field's type
+is a composite reference.
 
 ## Examples
 
-Incorrect:
+Incorrect (`Объект` is an item or a warehouse reference):
 
 ```bsl
 ВЫБРАТЬ
-    Продажи.Контрагент.Наименование КАК КонтрагентНаименование
+    Цены.Объект.Код КАК Код
 ИЗ
-    Документ.Продажи КАК Продажи
+    РегистрСведений.ЦеныОбъектов КАК Цены
 ```
 
 Correct:
 
 ```bsl
 ВЫБРАТЬ
-    Контрагенты.Наименование КАК КонтрагентНаименование
+    ВЫРАЗИТЬ(Цены.Объект КАК Справочник.Номенклатура).Код КАК Код
 ИЗ
-    Документ.Продажи КАК Продажи
-    ЛЕВОЕ СОЕДИНЕНИЕ Справочник.Контрагенты КАК Контрагенты
-    ПО Продажи.Контрагент = Контрагенты.Ссылка
+    РегистрСведений.ЦеныОбъектов КАК Цены
+ГДЕ
+    Цены.Объект ССЫЛКА Справочник.Номенклатура
 ```
 
 ## Configuration
 
 | Parameter      | Type   | Default | Description |
 |----------------|--------|---------|-------------|
-| `minPathDepth` | `int`  | `3`     | Minimum number of dot-separated parts in an ordinary `SELECT` / `WHERE` / `JOIN` column reference required to emit the diagnostic. The default `3` flags two-or-more-level dereferences such as `T.Ссылка.Поле`. Lower values widen coverage (`2` flags any single dereference like `T.Поле`); higher values narrow it. Values below `2` are clamped by the hard floor — a one-part identifier carries no dereference to flag. |
+| `minPathDepth` | `int`  | `3`     | Minimum number of parts of an ordinary path from a query source for a found dereference to be shown. The default `3` shows `T.Field.Attribute`; higher values hide shorter paths. A two-part `T.Field` is not reported at any value: it holds no dereference. |
 
-`minPathDepth` applies only to the ordinary column-ref path. Virtual-table parameter
-dereferences and `CAST` / `ВЫРАЗИТЬ` member chains carry their own intrinsic threshold
-in the syntax of the construct and always emit regardless of this setting.
+`minPathDepth` applies only to paths from a query source. Dereferences inside
+virtual table parameters and in chains after `CAST` / `ВЫРАЗИТЬ` have no length
+from a source and are shown at any value of the setting.
 
 To turn the diagnostic off entirely use the standard activation flag rather than
 `minPathDepth`.
 
 ## Sources
 
-- Related public guidance: [Dereference of composite-type reference fields in the query language (#std654)](https://its.1c.ru/db/v8std/content/654/hdoc)
+- Standard: [Dereference of composite-type reference fields in the query language (#std654)](https://its.1c.ru/db/v8std#content:654:hdoc)
 - Secondary reference: [v8std.ru: QueryNestedFieldsByDot](https://v8std.ru/diagnostics/bslls/QueryNestedFieldsByDot/)
