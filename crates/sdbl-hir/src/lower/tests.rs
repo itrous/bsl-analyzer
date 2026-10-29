@@ -2800,24 +2800,54 @@ fn having_clause_runs_ref_overuse_check() {
     );
 }
 
-#[test]
-fn having_clause_runs_nested_fields_check() {
-    let config = create_config_with_ref_attribute();
-
-    let code = "ВЫБРАТЬ КОЛИЧЕСТВО(*) КАК Кол ИЗ Справочник.СлужебныеФайлы КАК Т \
-                ИМЕЮЩИЕ МАКСИМУМ(Т.Файл.Код) > 0";
+fn nested_fields_by_dot_count(config: bsl_metadata::Configuration, code: &str) -> usize {
     let ast = parser::parse_sdbl(code);
     let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
-
-    let nested_diags: Vec<_> = package
+    package
         .all_diagnostics()
         .filter(|d| matches!(d, crate::diagnostics::SdblDiagnostic::QueryNestedFieldsByDot { .. }))
-        .collect();
+        .count()
+}
+
+#[test]
+fn having_clause_runs_nested_fields_check() {
+    let code = "ВЫБРАТЬ КОЛИЧЕСТВО(*) КАК Кол ИЗ Справочник.СлужебныеФайлы КАК Т \
+                ИМЕЮЩИЕ МАКСИМУМ(Т.Файл.Код) > 0";
 
     assert_eq!(
-        nested_diags.len(),
+        nested_fields_by_dot_count(create_config_with_ref_attribute(), code),
+        0,
+        "Файл — одна ссылка, его разыменование соединяет одну таблицу"
+    );
+
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_metadata_object(bsl_metadata::MetadataObject::new(
+        bsl_metadata::MdoType::Catalog,
+        "Файлы",
+    ));
+    let mut catalog =
+        bsl_metadata::MetadataObject::new(bsl_metadata::MdoType::Catalog, "СлужебныеФайлы");
+    catalog.add_attribute(bsl_metadata::Attribute {
+        name: "Файл".to_string(),
+        name_en: None,
+        attr_type: bsl_metadata::AttributeType::Composite {
+            types: vec![
+                bsl_metadata::AttributeType::Ref {
+                    mdo_type: bsl_metadata::MdoType::Catalog,
+                    name: "Файлы".to_string(),
+                },
+                bsl_metadata::AttributeType::Ref {
+                    mdo_type: bsl_metadata::MdoType::Catalog,
+                    name: "СлужебныеФайлы".to_string(),
+                },
+            ],
+        },
+    });
+    config.add_metadata_object(catalog);
+    assert_eq!(
+        nested_fields_by_dot_count(config, code),
         1,
-        "разыменование через точку в ИМЕЮЩИЕ должно детектироваться так же, как в ГДЕ"
+        "разыменование составной ссылки в ИМЕЮЩИЕ должно детектироваться так же, как в ГДЕ"
     );
 }
 
@@ -3227,4 +3257,110 @@ fn nested_query_parameter_is_not_a_source() {
     let package = lower_query_with_source_map(text);
 
     assert!(package.parameter_sources().is_empty(), "got {:?}", package.parameter_sources());
+}
+
+/// Catalogs `Заказы`, `Клиенты`, `Партнеры`, `Номенклатура`, `Склады` and the defined types
+/// `СсылкаНаКлиента`, `СсылкаНаПартнера` (single references), `СсылкаНаНоменклатуру` and
+/// the self-containing `Цикл`. `Партнеры.Объект` is a composite of two references.
+fn config_with_defined_types_reached_through_references() -> bsl_metadata::Configuration {
+    use bsl_metadata::{
+        Attribute, AttributeType, Configuration, DefinedType, MdoType, MetadataObject, Uuid,
+    };
+
+    let reference =
+        |name: &str| AttributeType::Ref { mdo_type: MdoType::Catalog, name: name.into() };
+    let defined = |name: &str| AttributeType::DefinedType { name: name.into() };
+    let catalog = |name: &str, attributes: Vec<(&str, AttributeType)>| {
+        let mut object = MetadataObject::new(MdoType::Catalog, name);
+        for (name, attr_type) in attributes {
+            object.add_attribute(Attribute { name: name.into(), name_en: None, attr_type });
+        }
+        object
+    };
+
+    let mut config = Configuration::new("Test");
+    for (name, underlying) in [
+        ("СсылкаНаКлиента", reference("Клиенты")),
+        ("СсылкаНаПартнера", reference("Партнеры")),
+        ("СсылкаНаНоменклатуру", reference("Номенклатура")),
+        ("Цикл", AttributeType::Composite { types: vec![defined("Цикл"), AttributeType::Boolean] }),
+    ] {
+        config.add_defined_type(
+            DefinedType::builder()
+                .uuid(Uuid::new_v4())
+                .name(name)
+                .underlying_type(underlying)
+                .build(),
+        );
+    }
+    config.add_metadata_object(catalog(
+        "Заказы",
+        vec![("Клиент", reference("Клиенты")), ("Покупатель", defined("СсылкаНаКлиента"))],
+    ));
+    config.add_metadata_object(catalog(
+        "Клиенты",
+        vec![
+            ("Партнер", defined("СсылкаНаПартнера")),
+            (
+                "Объект",
+                AttributeType::Composite {
+                    types: vec![
+                        defined("СсылкаНаНоменклатуру"),
+                        AttributeType::String { length: Some(10) },
+                    ],
+                },
+            ),
+            ("Цикличный", defined("Цикл")),
+        ],
+    ));
+    config.add_metadata_object(catalog(
+        "Партнеры",
+        vec![(
+            "Объект",
+            AttributeType::Composite {
+                types: vec![reference("Номенклатура"), reference("Склады")],
+            },
+        )],
+    ));
+    config.add_metadata_object(catalog("Номенклатура", vec![]));
+    config.add_metadata_object(catalog("Склады", vec![]));
+    config
+}
+
+#[test]
+fn query_nested_fields_reports_a_defined_type_arm_of_a_composite_reached_through_a_reference() {
+    let code = "ВЫБРАТЬ Т.Клиент.Объект.Код КАК Код ИЗ Справочник.Заказы КАК Т";
+    assert_eq!(
+        nested_fields_by_dot_count(config_with_defined_types_reached_through_references(), code),
+        1
+    );
+}
+
+#[test]
+fn query_nested_fields_follows_a_source_path_through_a_defined_type() {
+    let code = "ВЫБРАТЬ Т.Клиент.Партнер.Объект.Код КАК Код ИЗ Справочник.Заказы КАК Т";
+    assert_eq!(
+        nested_fields_by_dot_count(config_with_defined_types_reached_through_references(), code),
+        1
+    );
+}
+
+#[test]
+fn query_nested_fields_follows_a_cast_chain_through_a_defined_type() {
+    let code =
+        "ВЫБРАТЬ ВЫРАЗИТЬ(Т.Ссылка КАК Справочник.Заказы).Покупатель.Партнер.Объект.Код КАК Код \
+                ИЗ Справочник.Заказы КАК Т";
+    assert_eq!(
+        nested_fields_by_dot_count(config_with_defined_types_reached_through_references(), code),
+        1
+    );
+}
+
+#[test]
+fn query_nested_fields_ends_a_walk_through_a_self_containing_defined_type() {
+    let code = "ВЫБРАТЬ Т.Клиент.Цикличный.Поле.Код КАК Код ИЗ Справочник.Заказы КАК Т";
+    assert_eq!(
+        nested_fields_by_dot_count(config_with_defined_types_reached_through_references(), code),
+        0
+    );
 }

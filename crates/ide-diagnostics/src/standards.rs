@@ -240,7 +240,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::LogicalOrInJoinQuerySection => &[658],
         DiagnosticCode::LogicalOrInTheWhereSectionOfQuery => &[658],
         DiagnosticCode::MultilineStringInQuery => &[],
-        DiagnosticCode::QueryNestedFieldsByDot => &[],
+        DiagnosticCode::QueryNestedFieldsByDot => &[654],
         DiagnosticCode::QueryParseError => &[437],
         DiagnosticCode::QueryToMissingMetadata => &[],
         DiagnosticCode::QueryParameterSourceWithoutInto => &[],
@@ -348,7 +348,7 @@ mod tests {
     ///
     /// Такая ссылка полезна человеку и вредна машине: `standards` объявляет
     /// стандарты, которые правило проверяет, и выдача смежного номера называет
-    /// пользователю ложную причину срабатывания. Все семь — правила, которые
+    /// пользователю ложную причину срабатывания. Все шесть — правила, которые
     /// шире любого одного стандарта: ошибка разбора возникает не только на
     /// директивах, устаревшим объявляет API документация платформы, обращение
     /// в интернет диагностика лишь отмечает для ручного разбора, а std657 не
@@ -363,7 +363,6 @@ mod tests {
         DiagnosticCode::IncorrectUseOfStrTemplate,
         DiagnosticCode::InternetAccess,
         DiagnosticCode::ParseError,
-        DiagnosticCode::QueryNestedFieldsByDot,
     ];
 
     /// Обороты, которыми доки отделяют смежный источник от проверяемого.

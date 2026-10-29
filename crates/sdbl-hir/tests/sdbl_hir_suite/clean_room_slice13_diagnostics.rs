@@ -28,6 +28,82 @@ fn check(queries: &[&str], keep: fn(&SdblDiagnostic) -> bool, expect: Expect) {
     expect.assert_eq(&render(queries, keep));
 }
 
+const COMPOSITE_GROUP: &str =
+    "<v8:Type>cfg:CatalogRef.Группы</v8:Type><v8:Type>cfg:CatalogRef.Склады</v8:Type>";
+
+fn register_xml(kind: &str, name: &str, dimensions: &[(&str, &str)]) -> String {
+    let dimensions: String = dimensions
+        .iter()
+        .enumerate()
+        .map(|(idx, (name, ty))| {
+            format!(
+                "<Dimension uuid=\"22222222-2222-2222-2222-{idx:012}\"><Properties><Name>{name}</Name><Type>{ty}</Type></Properties></Dimension>"
+            )
+        })
+        .collect();
+    format!(
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10">
+<{kind} uuid="11111111-1111-1111-1111-111111111111"><Properties><Name>{name}</Name></Properties>
+<ChildObjects>{dimensions}</ChildObjects></{kind}></MetaDataObject>"#
+    )
+}
+
+/// `Справочник.Товары.Группа` and the register dimensions `ТоварныеЗапасы.Товар` and
+/// `ТоварыНаСкладах.Номенклатура` are composite references; `Справочник.Товары.Вид` is a
+/// single reference.
+fn composite_reference_metadata() -> std::sync::Arc<bsl_metadata::Configuration> {
+    use bsl_metadata::{Attribute, AttributeType, MdoType, MetadataObject};
+
+    let reference =
+        |name: &str| AttributeType::Ref { mdo_type: MdoType::Catalog, name: name.into() };
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_metadata_object(MetadataObject::new(MdoType::Catalog, "Группы"));
+    config.add_metadata_object(MetadataObject::new(MdoType::Catalog, "Склады"));
+    let mut goods = MetadataObject::new(MdoType::Catalog, "Товары");
+    goods.add_attribute(Attribute {
+        name: "Группа".into(),
+        name_en: None,
+        attr_type: AttributeType::Composite {
+            types: vec![reference("Группы"), reference("Склады")],
+        },
+    });
+    goods.add_attribute(Attribute {
+        name: "Вид".into(),
+        name_en: None,
+        attr_type: reference("Группы"),
+    });
+    config.add_metadata_object(goods);
+    for (name, dimension) in [("ТоварныеЗапасы", "Товар"), ("ТоварыНаСкладах", "Номенклатура")]
+    {
+        let xml = register_xml("AccumulationRegister", name, &[(dimension, COMPOSITE_GROUP)]);
+        config.add_register(
+            bsl_metadata::xml_parser::parse_accumulation_register_xml(&xml)
+                .expect("accumulation register fixture must parse"),
+        );
+    }
+    std::sync::Arc::new(config)
+}
+
+fn dotted_paths_with_metadata(query: &str) -> Vec<(&str, Option<u32>)> {
+    let parse = parser::parse_sdbl(query);
+    assert!(parse.errors().is_empty(), "{:?}", parse.errors());
+    let package = lower_sdbl_to_hir(&parse, Some(composite_reference_metadata()));
+    let mut paths: Vec<_> = package
+        .all_diagnostics()
+        .filter_map(|d| match d {
+            SdblDiagnostic::QueryNestedFieldsByDot { range, parts_count } => {
+                Some((*range, *parts_count))
+            }
+            _ => None,
+        })
+        .collect();
+    paths.sort_by_key(|(range, _)| (range.start(), range.end()));
+    paths
+        .into_iter()
+        .map(|(range, depth)| (&query[usize::from(range.start())..usize::from(range.end())], depth))
+        .collect()
+}
+
 // v8std #435 §1.1: a full outer join is reported once per occurrence.
 #[test]
 fn full_outer_join() {
@@ -225,25 +301,43 @@ fn field_alias_requirements() {
     );
 }
 
-// v8std #654 §1.1–1.2 and pubqlang «Использовать параметры виртуальных таблиц»: dotted
-// paths carry their length; inside a virtual table condition the path has none.
+// v8std #654 §1.2 and pubqlang «Использовать параметры виртуальных таблиц»: a dotted
+// path through a composite reference carries its length; inside a virtual table condition
+// the path has none. Without metadata no field type is known and nothing is reported.
 #[test]
 fn fields_through_a_dot() {
+    let queries = [
+        "ВЫБРАТЬ ТоварныеЗапасы.Товар.Артикул КАК Артикул ИЗ РегистрНакопления.ТоварныеЗапасы КАК ТоварныеЗапасы",
+        "ВЫБРАТЬ О.КоличествоОстаток КАК К ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, Номенклатура.Родитель = &Группа) КАК О",
+        "ВЫБРАТЬ 1 КАК Н ИЗ Справочник.Товары ГДЕ Справочник.Товары.Код = 1",
+        "ВЫБРАТЬ Т.Вид.Код КАК Код, Т.Группа КАК Группа ИЗ Справочник.Товары КАК Т",
+    ];
+    let mut out = String::new();
+    for query in queries {
+        writeln!(out, "{query}").unwrap();
+        for (text, depth) in dotted_paths_with_metadata(query) {
+            writeln!(out, "  {depth:?} `{text}`").unwrap();
+        }
+    }
+    expect![[r#"
+        ВЫБРАТЬ ТоварныеЗапасы.Товар.Артикул КАК Артикул ИЗ РегистрНакопления.ТоварныеЗапасы КАК ТоварныеЗапасы
+          Some(3) `ТоварныеЗапасы.Товар.Артикул`
+        ВЫБРАТЬ О.КоличествоОстаток КАК К ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, Номенклатура.Родитель = &Группа) КАК О
+          None `Номенклатура.Родитель`
+        ВЫБРАТЬ 1 КАК Н ИЗ Справочник.Товары ГДЕ Справочник.Товары.Код = 1
+        ВЫБРАТЬ Т.Вид.Код КАК Код, Т.Группа КАК Группа ИЗ Справочник.Товары КАК Т
+    "#]]
+    .assert_eq(&out);
+
     check(
-        &[
-            "ВЫБРАТЬ ТоварныеЗапасы.Товар.Артикул КАК Артикул ИЗ РегистрНакопления.ТоварныеЗапасы КАК ТоварныеЗапасы",
-            "ВЫБРАТЬ О.КоличествоОстаток КАК К ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, Номенклатура.Родитель = &Группа) КАК О",
-            "ВЫБРАТЬ 1 КАК Н ИЗ Справочник.Товары ГДЕ Справочник.Товары.Код = 1",
-        ],
+        &queries,
         |d| matches!(d, SdblDiagnostic::QueryNestedFieldsByDot { .. }),
         expect![[r#"
-            ВЫБРАТЬ ТоварныеЗапасы.Товар.Артикул КАК Артикул ИЗ РегистрНакопления.ТоварныеЗапасы КАК ТоварныеЗапасы
-              QueryNestedFieldsByDot { range: 15..69, parts_count: Some(3) } `ТоварныеЗапасы.Товар.Артикул`
-            ВЫБРАТЬ О.КоличествоОстаток КАК К ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, Номенклатура.Родитель = &Группа) КАК О
-              QueryNestedFieldsByDot { range: 15..52, parts_count: Some(2) } `О.КоличествоОстаток`
-              QueryNestedFieldsByDot { range: 151..192, parts_count: None } `Номенклатура.Родитель`
-            ВЫБРАТЬ 1 КАК Н ИЗ Справочник.Товары ГДЕ Справочник.Товары.Код = 1
-        "#]],
+        ВЫБРАТЬ ТоварныеЗапасы.Товар.Артикул КАК Артикул ИЗ РегистрНакопления.ТоварныеЗапасы КАК ТоварныеЗапасы
+        ВЫБРАТЬ О.КоличествоОстаток КАК К ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, Номенклатура.Родитель = &Группа) КАК О
+        ВЫБРАТЬ 1 КАК Н ИЗ Справочник.Товары ГДЕ Справочник.Товары.Код = 1
+        ВЫБРАТЬ Т.Вид.Код КАК Код, Т.Группа КАК Группа ИЗ Справочник.Товары КАК Т
+    "#]],
     );
 }
 
@@ -382,36 +476,25 @@ fn rewritten_messages_explain_each_diagnostic_and_keep_metadata_identity() {
 // Dotted source paths carry their depth regardless of the clause that evaluates them.
 #[test]
 fn dotted_paths_in_grouping_ordering_and_nested_queries_keep_ranges_and_depth() {
-    let query = "ВЫБРАТЬ 1 КАК Н ИЗ Таблица КАК Т СГРУППИРОВАТЬ ПО Т.Группа.Код ИМЕЮЩИЕ МАКСИМУМ(Т.Группа.Цена) > 0 УПОРЯДОЧИТЬ ПО Т.Группа.Имя";
-    let package = lower_sdbl_to_hir(&parser::parse_sdbl(query), None);
-    assert!(parser::parse_sdbl(query).errors().is_empty());
-    let paths: Vec<_> = package
-        .all_diagnostics()
-        .filter_map(|d| match d {
-            SdblDiagnostic::QueryNestedFieldsByDot { range, parts_count } => {
-                Some((&query[usize::from(range.start())..usize::from(range.end())], *parts_count))
-            }
-            _ => None,
-        })
-        .collect();
+    let query = "ВЫБРАТЬ 1 КАК Н ИЗ Справочник.Товары КАК Т СГРУППИРОВАТЬ ПО Т.Группа.Код, Т.Вид.Код ИМЕЮЩИЕ МАКСИМУМ(Т.Группа.Цена) > 0 И МАКСИМУМ(Т.Вид.Цена) > 0 УПОРЯДОЧИТЬ ПО Т.Группа.Имя, Т.Вид.Имя";
     assert_eq!(
-        paths,
+        dotted_paths_with_metadata(query),
         vec![("Т.Группа.Код", Some(3)), ("Т.Группа.Цена", Some(3)), ("Т.Группа.Имя", Some(3))]
     );
 
-    // Both the nested query and its enclosing source expose this diagnostic to consumers.
-    let query = "ВЫБРАТЬ 1 КАК Н ИЗ (ВЫБРАТЬ Т.Группа.Код КАК Код ИЗ Таблица КАК Т) КАК Вл";
-    let package = lower_sdbl_to_hir(&parser::parse_sdbl(query), None);
-    let paths: Vec<_> = package
-        .all_diagnostics()
-        .filter_map(|d| match d {
-            SdblDiagnostic::QueryNestedFieldsByDot { range, parts_count } => {
-                Some((&query[usize::from(range.start())..usize::from(range.end())], *parts_count))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(paths, vec![("Т.Группа.Код", Some(3)), ("Т.Группа.Код", Some(3))]);
+    // A nested query is checked by its own lowering only, whatever its alias and however
+    // the path is written.
+    for (query, path) in [
+        ("ВЫБРАТЬ 1 КАК Н ИЗ (ВЫБРАТЬ Т.Группа.Код КАК Код ИЗ Справочник.Товары КАК Т) КАК Вл", "Т.Группа.Код"),
+        ("ВЫБРАТЬ 1 КАК Н ИЗ Справочник.Товары КАК Т ГДЕ Т.Код В (ВЫБРАТЬ Т.Группа.Код ИЗ Справочник.Товары КАК Т)", "Т.Группа.Код"),
+        (
+            "ВЫБРАТЬ 1 КАК Н ИЗ (ВЫБРАТЬ ВЫРАЗИТЬ(Т.Вид КАК Справочник.Товары).Группа.Код КАК Код ИЗ Справочник.Товары КАК Т) КАК Вл",
+            "ВЫРАЗИТЬ(Т.Вид КАК Справочник.Товары).Группа.Код",
+        ),
+    ] {
+        let depth = path.starts_with("Т.").then_some(3);
+        assert_eq!(dotted_paths_with_metadata(query), vec![(path, depth)], "{query}");
+    }
 }
 
 #[test]
@@ -486,34 +569,9 @@ fn an_unprotected_optional_side_field_in_where_keeps_its_identity_and_range() {
 
 #[test]
 fn dotted_paths_in_join_where_and_membership_queries_are_not_skipped() {
-    let query = "ВЫБРАТЬ 1 КАК Н ИЗ Таблица КАК Т ЛЕВОЕ СОЕДИНЕНИЕ Другая КАК Д ПО Т.Группа.Код = Д.Код ГДЕ Т.Группа.Цена > 0 И Т.Код В (ВЫБРАТЬ Вл.Группа.Имя ИЗ Вложенная КАК Вл)";
-    let parse = parser::parse_sdbl(query);
-    assert!(parse.errors().is_empty(), "{:?}", parse.errors());
-    let package = lower_sdbl_to_hir(&parse, None);
-    let mut paths: Vec<_> = package
-        .all_diagnostics()
-        .filter_map(|d| match d {
-            SdblDiagnostic::QueryNestedFieldsByDot { range, parts_count } => {
-                Some((*range, *parts_count))
-            }
-            _ => None,
-        })
-        .collect();
-    paths.sort_by_key(|(range, depth)| (range.start(), range.end(), *depth));
-    let mut expected: Vec<_> = [
-        ("Т.Группа.Код", 3),
-        ("Д.Код", 2),
-        ("Т.Группа.Цена", 3),
-        ("Т.Код", 2),
-        ("Вл.Группа.Имя", 3),
-        ("Вл.Группа.Имя", 3),
-    ]
-    .into_iter()
-    .map(|(text, depth)| {
-        let start = text_size::TextSize::try_from(query.find(text).unwrap()).unwrap();
-        (text_size::TextRange::at(start, text_size::TextSize::of(text)), Some(depth))
-    })
-    .collect();
-    expected.sort_by_key(|(range, depth)| (range.start(), range.end(), *depth));
-    assert_eq!(paths, expected);
+    let query = "ВЫБРАТЬ 1 КАК Н ИЗ Справочник.Товары КАК Т ЛЕВОЕ СОЕДИНЕНИЕ Справочник.Группы КАК Д ПО Т.Группа.Код = Д.Код И Т.Вид.Код = Д.Код ГДЕ Т.Группа.Цена > 0 И Т.Вид.Цена > 0 И Т.Код В (ВЫБРАТЬ Вл.Группа.Имя ИЗ Справочник.Товары КАК Вл)";
+    assert_eq!(
+        dotted_paths_with_metadata(query),
+        vec![("Т.Группа.Код", Some(3)), ("Т.Группа.Цена", Some(3)), ("Вл.Группа.Имя", Some(3))]
+    );
 }
