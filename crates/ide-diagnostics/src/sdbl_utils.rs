@@ -1,4 +1,5 @@
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsConfig, DiagnosticsContext};
+use lexer::sdbl::{tokenize_sdbl, SdblToken, SdblTokenKind};
 use syntax::sdbl_query::LiteralTextMap;
 use syntax::{SyntaxKind, SyntaxNode, TextRange, TextSize};
 
@@ -12,6 +13,140 @@ pub type SdblDispatchFn = fn(
     query_text: &str,
     diagnostics: &mut Vec<Diagnostic>,
 );
+
+/// Whether a query text is attested as 1C's own query language, and not a foreign
+/// dialect that merely opens with `SELECT` — WQL (`SELECT Caption FROM Win32_Process`),
+/// T-SQL, an ADO command. Both attestations come from vocabulary only SDBL owns: a
+/// keyword spelled in Cyrillic, which no foreign dialect has, and the prefix of a
+/// metadata table (`Catalog.`), which only an SDBL data source names. The prefix is read
+/// from the lexer's own table roots, so a metadata kind without query tables (`Report.`,
+/// `Role.`) is a foreign qualifier, and a root word away from that position does not
+/// attest either: `Task` or `Document` is an ordinary column name in T-SQL and WQL. A
+/// foreign schema spelled like a root (`FROM Task.Users`) still attests — it reads
+/// exactly as `FROM Catalog.Library` does.
+///
+/// Only code attests; string literals, comments and quoted identifiers hold data. The
+/// SDBL lexer marks its own `"…"` and `//…`, but leaves the foreign forms — `'…'`,
+/// `--…`, `/*…*/`, `[…]`, `` `…` `` — as plain tokens, so the scan skips them as `ForeignRegion`s.
+///
+/// A text that attests to neither is not thereby ruled out, only unproven, which is why
+/// the answer costs a quick fix its place in a `fixAll` batch rather than costing the
+/// finding itself.
+pub fn sdbl_dialect_attested(query_text: &str) -> bool {
+    let tokens = tokenize_sdbl(query_text);
+    let mut region: Option<ForeignRegion> = None;
+    let mut index = 0;
+    while let Some(token) = tokens.get(index) {
+        let next = tokens.get(index + 1);
+        index += 1;
+        if let Some(open) = region {
+            if open.closes_at(token, next) {
+                region = None;
+                index += open.closer_len() - 1;
+            }
+            continue;
+        }
+        if let Some(opened) = ForeignRegion::opens_at(token, next) {
+            region = Some(opened);
+            index += opened.opener_len() - 1;
+            continue;
+        }
+        if is_trivia(token.kind) || token.kind == SdblTokenKind::String {
+            continue;
+        }
+        let is_prefix = tokens[index..]
+            .iter()
+            .find(|following| !is_trivia(following.kind))
+            .is_some_and(|following| following.kind == SdblTokenKind::Dot);
+        if is_prefix && is_query_table_root(token.kind) {
+            return true;
+        }
+        if token.kind != SdblTokenKind::Ident
+            && token.text.chars().any(|ch| matches!(ch, 'А'..='я' | 'Ё' | 'ё'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// A stretch of foreign syntax whose words are data: SDBL has no such form, so its lexer
+/// emits the delimiters as operators or `Error` tokens and the content as plain tokens.
+#[derive(Clone, Copy)]
+enum ForeignRegion {
+    Quoted(&'static str),
+    LineComment,
+    BlockComment,
+}
+
+impl ForeignRegion {
+    fn opens_at(token: &SdblToken, next: Option<&SdblToken>) -> Option<Self> {
+        let next_kind = next.map(|next| next.kind);
+        match (token.kind, token.text.as_str(), next_kind) {
+            (SdblTokenKind::Error, "'", _) => Some(Self::Quoted("'")),
+            (SdblTokenKind::Error, "[", _) => Some(Self::Quoted("]")),
+            (SdblTokenKind::Error, "`", _) => Some(Self::Quoted("`")),
+            (SdblTokenKind::Minus, _, Some(SdblTokenKind::Minus)) => Some(Self::LineComment),
+            (SdblTokenKind::Slash, _, Some(SdblTokenKind::Star)) => Some(Self::BlockComment),
+            _ => None,
+        }
+    }
+
+    fn closes_at(self, token: &SdblToken, next: Option<&SdblToken>) -> bool {
+        match self {
+            Self::Quoted(closer) => token.kind == SdblTokenKind::Error && token.text == closer,
+            Self::LineComment => token.kind == SdblTokenKind::Newline,
+            Self::BlockComment => {
+                token.kind == SdblTokenKind::Star
+                    && next.is_some_and(|next| next.kind == SdblTokenKind::Slash)
+            }
+        }
+    }
+
+    fn opener_len(self) -> usize {
+        match self {
+            Self::Quoted(_) => 1,
+            Self::LineComment | Self::BlockComment => 2,
+        }
+    }
+
+    fn closer_len(self) -> usize {
+        match self {
+            Self::Quoted(_) | Self::LineComment => 1,
+            Self::BlockComment => 2,
+        }
+    }
+}
+
+fn is_trivia(kind: SdblTokenKind) -> bool {
+    matches!(kind, SdblTokenKind::Whitespace | SdblTokenKind::Newline | SdblTokenKind::Comment)
+}
+
+fn is_query_table_root(kind: SdblTokenKind) -> bool {
+    use SdblTokenKind as S;
+    matches!(
+        kind,
+        S::MdoCatalog
+            | S::MdoDocument
+            | S::MdoEnum
+            | S::MdoChartOfCharacteristicTypes
+            | S::MdoChartOfAccounts
+            | S::MdoChartOfCalculationTypes
+            | S::MdoInformationRegister
+            | S::MdoAccumulationRegister
+            | S::MdoAccountingRegister
+            | S::MdoCalculationRegister
+            | S::MdoBusinessProcess
+            | S::MdoTask
+            | S::MdoExternalDataSource
+            | S::MdoConstant
+            | S::MdoConstants
+            | S::MdoSequence
+            | S::MdoDocumentJournal
+            | S::MdoExchangePlan
+            | S::MdoFilterCriterion
+    )
+}
 
 pub fn dispatch_simple(
     config: &DiagnosticsConfig,
@@ -457,5 +592,96 @@ pub(crate) fn for_each_executed_query(
         };
         let mapper = SdblPositionMapper::from_query_info(query_info, &bsl_source, &line_starts);
         f(text, package, &mapper, &query_info.query_text);
+    }
+}
+
+#[cfg(test)]
+mod dialect_tests {
+    use super::sdbl_dialect_attested;
+
+    #[test]
+    fn a_cyrillic_keyword_attests() {
+        assert!(sdbl_dialect_attested("ВЫБРАТЬ Оклад ИЗ Кадры"));
+    }
+
+    #[test]
+    fn a_metadata_prefix_attests() {
+        assert!(sdbl_dialect_attested("SELECT Shelf FROM Catalog.Library"));
+    }
+
+    #[test]
+    fn a_wql_text_attests_to_nothing() {
+        assert!(!sdbl_dialect_attested("SELECT Caption, ProcessId FROM Win32_Process"));
+    }
+
+    // Cyrillic inside a string literal is data, not language.
+    #[test]
+    fn cyrillic_in_a_literal_does_not_attest() {
+        assert!(!sdbl_dialect_attested(
+            "SELECT Caption FROM Win32_Process WHERE Caption = \"Блокнот\""
+        ));
+    }
+
+    // A metadata-type word attests only as a prefix: `Report` and `Role` are ordinary
+    // table and column names in T-SQL and WQL.
+    #[test]
+    fn a_metadata_type_word_outside_prefix_position_does_not_attest() {
+        assert!(!sdbl_dialect_attested("SELECT Report, Body FROM Reports"));
+        assert!(!sdbl_dialect_attested("SELECT Caption, Role FROM Win32_Process"));
+        assert!(!sdbl_dialect_attested("SELECT Caption FROM enum"));
+    }
+
+    // Reports, roles and common modules are metadata kinds without query tables: a
+    // `Report.` qualifier can only be a foreign table name.
+    #[test]
+    fn a_metadata_kind_without_query_tables_does_not_attest() {
+        assert!(!sdbl_dialect_attested("SELECT Report.Name FROM Report"));
+        assert!(!sdbl_dialect_attested("SELECT Role.Name FROM Role"));
+        assert!(!sdbl_dialect_attested("SELECT Name FROM CommonModule.Items"));
+    }
+
+    #[test]
+    fn a_query_table_root_attests_in_either_language() {
+        assert!(sdbl_dialect_attested("SELECT Amount FROM AccumulationRegister.Stock"));
+        assert!(sdbl_dialect_attested("SELECT Amount FROM Document.Invoice"));
+    }
+
+    #[test]
+    fn a_metadata_prefix_attests_across_whitespace() {
+        assert!(sdbl_dialect_attested("SELECT Shelf FROM Catalog\n\t.Library"));
+    }
+
+    // WQL and T-SQL quote strings with apostrophes; what sits between them is data.
+    #[test]
+    fn a_single_quoted_literal_does_not_attest() {
+        assert!(!sdbl_dialect_attested(
+            "SELECT Caption FROM Win32_Process WHERE Caption = 'Task.Run'"
+        ));
+        assert!(!sdbl_dialect_attested("SELECT Caption FROM Win32_Process WHERE Name = 'Строка'"));
+        assert!(!sdbl_dialect_attested("SELECT Caption FROM Win32_Process WHERE Caption = 'из'"));
+    }
+
+    // The SDBL lexer knows only `//` comments; foreign comments and quoted identifiers
+    // would otherwise reach the check as code.
+    #[test]
+    fn a_foreign_comment_or_quoted_identifier_does_not_attest() {
+        assert!(!sdbl_dialect_attested("SELECT Caption FROM Win32_Process -- выгрузка из базы"));
+        assert!(!sdbl_dialect_attested("SELECT Caption /* выбрать из Catalog.Library */ FROM T"));
+        assert!(!sdbl_dialect_attested("SELECT [Имя из базы] FROM Users"));
+        assert!(!sdbl_dialect_attested("SELECT `Имя из базы` FROM Users"));
+    }
+
+    #[test]
+    fn code_after_a_foreign_comment_still_attests() {
+        assert!(sdbl_dialect_attested("-- don't\nSELECT Shelf FROM Catalog.Library"));
+        assert!(sdbl_dialect_attested("SELECT /* note */ Shelf ИЗ Кадры"));
+        assert!(sdbl_dialect_attested("SELECT [Shelf] FROM Catalog.Library"));
+        assert!(sdbl_dialect_attested("SELECT Сумма - -1 КАК Остаток"));
+    }
+
+    #[test]
+    fn a_date_literal_does_not_hide_what_follows() {
+        assert!(sdbl_dialect_attested("SELECT Shelf FROM Catalog.Library WHERE Date > '20200101'"));
+        assert!(sdbl_dialect_attested("SELECT Shelf WHERE Date > '20200101' ИЛИ Shelf = 1"));
     }
 }

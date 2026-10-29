@@ -18,15 +18,28 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     lsp_severity_override: "",
 };
 
+/// A text not attested as 1C's own query language may be a foreign dialect that opens
+/// with `SELECT`: the edit stays an opt-in quick fix, so a `fixAll` batch can never
+/// append `КАК Caption` to a WQL literal and break it at runtime.
+fn alias_fix(attested: bool, label: String, edits: Vec<TextEdit>) -> Fix {
+    if attested {
+        Fix::safe(label, edits)
+    } else {
+        Fix::manual(label, edits)
+    }
+}
+
 pub(crate) fn build_alias_fix(
     field_name: &Option<String>,
     raw_name: &Option<String>,
     bsl_range: TextRange,
+    attested: bool,
 ) -> Vec<Fix> {
     match (field_name, raw_name) {
         (None, Some(name)) => {
             let insert = bsl_range.end();
-            vec![Fix::safe(
+            vec![alias_fix(
+                attested,
                 format!("Добавить псевдоним КАК {}", name),
                 vec![TextEdit {
                     range: TextRange::new(insert, insert),
@@ -37,7 +50,8 @@ pub(crate) fn build_alias_fix(
         (Some(name), _) => {
             let alias_byte_len = name.len() as u32;
             let insert = bsl_range.end() - line_index::TextSize::from(alias_byte_len);
-            vec![Fix::safe(
+            vec![alias_fix(
+                attested,
                 format!("Добавить ключевое слово КАК перед '{}'", name),
                 vec![TextEdit {
                     range: TextRange::new(insert, insert),
@@ -64,7 +78,8 @@ pub(crate) fn dispatch(
         } else {
             "Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК".to_string()
         };
-        let fixes = build_alias_fix(field_name, raw_name, bsl_range);
+        let attested = crate::sdbl_utils::sdbl_dialect_attested(query_text);
+        let fixes = build_alias_fix(field_name, raw_name, bsl_range, attested);
         diagnostics.push(Diagnostic {
             code,
             message,
@@ -603,5 +618,48 @@ mod tests {
             DiagnosticCode::AssignAliasFieldsInQuery,
             expect![[r#""#]],
         );
+    }
+
+    fn fix_is_safe_for_fix_all(query_text: &str) -> bool {
+        let config = DiagnosticsConfig {
+            only_enabled: Some(vec![DiagnosticCode::AssignAliasFieldsInQuery]),
+            ..Default::default()
+        };
+        let diagnostics = crate::validate_query_text(&config, None, query_text);
+        let first = diagnostics.first().expect("a finding is expected for this text");
+        let fix = first.fixes.first().expect("the finding is expected to carry a fix");
+        fix.safe_for_fix_all
+    }
+
+    // A WQL text opens with SELECT and names no 1C vocabulary at all. Appending `КАК
+    // Caption` to it breaks the WMI call at runtime, so the fix must stay out of fixAll.
+    #[test]
+    fn a_foreign_dialect_keeps_its_fix_out_of_fix_all() {
+        assert!(!fix_is_safe_for_fix_all("SELECT Caption, ProcessId FROM Win32_Process"));
+    }
+
+    #[test]
+    fn a_query_with_a_cyrillic_keyword_keeps_an_auto_applicable_fix() {
+        assert!(fix_is_safe_for_fix_all(
+            "ВЫБРАТЬ Должность КАК Позиция, Оклад ИЗ Справочник.Сотрудники"
+        ));
+    }
+
+    // English keywords are legal SDBL; the metadata prefix is what attests to it.
+    #[test]
+    fn an_english_query_over_a_metadata_table_keeps_an_auto_applicable_fix() {
+        assert!(fix_is_safe_for_fix_all("SELECT Shelf FROM Catalog.Library"));
+    }
+
+    #[test]
+    fn a_foreign_dialect_naming_a_metadata_type_keeps_its_fix_out_of_fix_all() {
+        assert!(!fix_is_safe_for_fix_all("SELECT Caption, Role FROM Win32_Process"));
+        assert!(!fix_is_safe_for_fix_all(
+            "SELECT Caption, ProcessId FROM Win32_Process WHERE Caption = 'Task'"
+        ));
+        assert!(!fix_is_safe_for_fix_all("SELECT Report.Name FROM Report"));
+        assert!(!fix_is_safe_for_fix_all(
+            "SELECT Caption, ProcessId FROM Win32_Process -- выгрузка из базы"
+        ));
     }
 }
