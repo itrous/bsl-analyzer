@@ -4694,41 +4694,44 @@ mod tests {
 
         let (mut state, hub) = state_with_hub(root);
         state.drift_interval = Duration::from_secs(60);
-        state.ensure_loading();
-        wait_ready(&state);
+        join_load(&state);
         // Warm the scan cache, so the scan the rescan branch performs is served from a
         // snapshot older than the file the probe is about to create.
-        state.force_rescan();
-        let _ = state.read(|_, _| ());
+        state.throttled_scan(root).expect("a scan warms the cache");
 
         // The debt is raised INSIDE the window between the health decision and the drain:
-        // raised any earlier, the read would take the scan path and never drain at all.
+        // raised any earlier, the drain would never see it.
         let probe_root = root.to_path_buf();
         let probe_hub = hub.clone();
         state.set_pre_drain_probe(move || {
-            // Subscribed before the write, so the delivery cannot pass ahead of the cursor.
-            let mut obs = probe_hub.subscribe();
+            let obs = probe_hub.subscribe();
+            let sudden = module_path(&probe_root, "Внезапный");
             write_common_module(
                 &probe_root,
                 "Внезапный",
                 true,
                 "&НаСервере\nФункция Внезапная() Экспорт КонецФункции",
             );
-            wait_until("the hub delivers the probe's write", || {
-                let batch = probe_hub.drain(obs);
-                obs = batch.cursor;
-                if batch.entries.iter().any(|e| e.raw.to_string_lossy().contains("Внезапный"))
-                {
-                    Ok(())
-                } else {
-                    Err("the write is not delivered yet")
-                }
-            });
-            probe_hub.unsubscribe(obs);
+            // The delivery is stated, not waited for: the hub takes the entry in before this
+            // returns, so no clock decides whether the write reached the cursors. Whether
+            // the backend reports a write at all is `change_hub`'s own subject.
+            probe_hub.deliver_modified_for_test(&sudden);
+            let batch = probe_hub.drain(obs);
+            probe_hub.unsubscribe(batch.cursor);
+            assert!(
+                batch.entries.iter().any(|e| e.raw.to_string_lossy().contains("Внезапный")),
+                "the hub holds the probe's write: {:?}",
+                batch.entries,
+            );
             probe_hub.degrade_external();
         });
 
-        let _ = state.read(|_, _| ());
+        // The drain path is entered directly, as `a_drain_in_flight_never_resurrects_the_evicted_cursor`
+        // does: going through `read` would make the stand depend on the hub reporting
+        // healthy, and a degraded hub routes the read to the scan instead, where the probe
+        // never fires and nothing is tested.
+        assert!(state.has_hub_cursor(), "a built resident holds a cursor");
+        state.poll_drift_via_drain(&hub, root);
 
         let sudden = module_path(root, "Внезапный");
         let found = state.read(|resident, _| resident.file_id_for(&sudden).is_some());
