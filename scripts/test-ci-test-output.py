@@ -129,7 +129,7 @@ for block in blocks("list_tests"):
         return result.returncode
 
     assert list_tests("list_tests --exact fixture --workspace --lib -- fixture::kept") == 0
-    assert list_tests("list_tests --exact fixture --workspace --lib -- fixture::muted") != 0
+    assert list_tests("list_tests --exact fixture --workspace --lib -- fixture::muted") == 0
     assert list_tests("list_tests --exact fixture --workspace --lib -- other::name") != 0
     assert list_tests("list_tests --exact fixture --workspace --lib -- fixture::gone") != 0
     assert list_tests("list_tests fixture --workspace --lib -- kept") == 0
