@@ -15,8 +15,8 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsConfig};
 /// `query_text` itself.
 ///
 /// `resolver` is what separates a full check from a parse-only one: without it the
-/// metadata-dependent rules (`UnknownFieldInQuery`, `QueryToMissingMetadata`) cannot fire at
-/// all, while the structural rules are unaffected. A caller that reports how complete its
+/// metadata-dependent rules ([`METADATA_DEPENDENT_CODES`]) cannot fire at all, while the
+/// structural rules are unaffected. A caller that reports how complete its
 /// answer is must decide that from whether it passed a resolver, not from whether the result
 /// is empty.
 pub fn validate_query_text(
@@ -63,11 +63,13 @@ pub fn validate_query_text(
 /// answer asserts their absence; a caller claiming a full check expects them to be reachable.
 ///
 /// Membership follows from the lowering, not from intent: each of these needs a resolved table
-/// to speak at all. `AmbiguousFieldInQuery` belongs here for the same reason as the other two —
-/// without a resolver a column's type stays `Unknown`, and the ambiguity marker is never
-/// reached. `DuplicateAliasInQuery` does not: an alias collision is visible in the query text.
+/// to speak at all. `AmbiguousFieldInQuery` and `QueryNestedFieldsByDot` belong here for the
+/// same reason — without a resolver a column's type stays `Unknown`, so neither the ambiguity
+/// marker nor a composite reference to dereference is ever reached. `DuplicateAliasInQuery`
+/// does not: an alias collision is visible in the query text.
 pub const METADATA_DEPENDENT_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::AmbiguousFieldInQuery,
+    DiagnosticCode::QueryNestedFieldsByDot,
     DiagnosticCode::QueryToMissingMetadata,
     DiagnosticCode::UnknownFieldInQuery,
 ];

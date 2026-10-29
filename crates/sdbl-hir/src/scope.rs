@@ -2,7 +2,7 @@ use std::sync::Arc;
 use stdx::case::CaseExt;
 
 use bsl_metadata::QueryMetadataResolver;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::hir::{FieldDef, Name, TableRef};
 use crate::types::SdblType;
@@ -637,30 +637,31 @@ impl<'a> Scope<'a> {
     }
 
     fn resolve_composite_fields(&self, types: &[SdblType]) -> Option<Vec<FieldDef>> {
+        self.resolve_composite_fields_in(types, &mut FxHashSet::default())
+    }
+
+    /// `resolving` holds the defined types being looked up through the resolver on the way
+    /// here, so a defined type that contains itself ends the walk instead of looping.
+    fn resolve_composite_fields_in(
+        &self,
+        types: &[SdblType],
+        resolving: &mut FxHashSet<String>,
+    ) -> Option<Vec<FieldDef>> {
         let mut all_fields = Vec::new();
         let mut seen_names = std::collections::HashSet::new();
 
         for ty in types {
-            match ty {
-                SdblType::Ref(mdo_ref) => {
-                    if let Some(fields) = self.resolve_ref_fields(mdo_ref) {
-                        for field in fields {
-                            if seen_names.insert(field.name.fold_lower()) {
-                                all_fields.push(field);
-                            }
-                        }
-                    }
-                }
+            let fields = match ty {
+                SdblType::Ref(mdo_ref) => self.resolve_ref_fields(mdo_ref),
                 SdblType::DefinedType { name, underlying_type } => {
-                    if let Some(fields) = self.resolve_defined_type_fields(name, underlying_type) {
-                        for field in fields {
-                            if seen_names.insert(field.name.fold_lower()) {
-                                all_fields.push(field);
-                            }
-                        }
-                    }
+                    self.resolve_defined_type_fields_in(name, underlying_type, resolving)
                 }
-                _ => {}
+                _ => None,
+            };
+            for field in fields.into_iter().flatten() {
+                if seen_names.insert(field.name.fold_lower()) {
+                    all_fields.push(field);
+                }
             }
         }
 
@@ -673,16 +674,51 @@ impl<'a> Scope<'a> {
 
     fn resolve_defined_type_fields(
         &self,
-        _name: &str,
+        name: &str,
         underlying_type: &Option<Box<SdblType>>,
     ) -> Option<Vec<FieldDef>> {
-        let underlying = underlying_type.as_ref()?;
+        self.resolve_defined_type_fields_in(name, underlying_type, &mut FxHashSet::default())
+    }
 
-        match underlying.as_ref() {
+    /// A field reached through a reference carries its defined type without the underlying
+    /// type, which is then looked up through the resolver.
+    fn resolve_defined_type_fields_in(
+        &self,
+        name: &str,
+        underlying_type: &Option<Box<SdblType>>,
+        resolving: &mut FxHashSet<String>,
+    ) -> Option<Vec<FieldDef>> {
+        if let Some(underlying) = underlying_type {
+            return self.resolve_underlying_fields(underlying, resolving);
+        }
+        let key = name.fold_lower();
+        if !resolving.insert(key.clone()) {
+            return None;
+        }
+        let fields = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.resolver().resolve_defined_type(name))
+            .and_then(|underlying| {
+                self.resolve_underlying_fields(
+                    &SdblType::from_attribute_type(&underlying),
+                    resolving,
+                )
+            });
+        resolving.remove(&key);
+        fields
+    }
+
+    fn resolve_underlying_fields(
+        &self,
+        underlying: &SdblType,
+        resolving: &mut FxHashSet<String>,
+    ) -> Option<Vec<FieldDef>> {
+        match underlying {
             SdblType::Ref(mdo_ref) => self.resolve_ref_fields(mdo_ref),
-            SdblType::Composite { types } => self.resolve_composite_fields(types),
+            SdblType::Composite { types } => self.resolve_composite_fields_in(types, resolving),
             SdblType::DefinedType { name: inner_name, underlying_type: inner_underlying } => {
-                self.resolve_defined_type_fields(inner_name, inner_underlying)
+                self.resolve_defined_type_fields_in(inner_name, inner_underlying, resolving)
             }
             _ => None,
         }

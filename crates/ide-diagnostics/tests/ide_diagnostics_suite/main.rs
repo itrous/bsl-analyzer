@@ -16,6 +16,7 @@ mod platform_membership_characterization;
 mod platform_ui_fact_characterization;
 mod preproc_symbol_docs;
 mod query_keyword_alias;
+mod query_nested_fields_routes;
 mod query_nested_in_select_list;
 mod register_records_element_member_checks;
 mod standalone_query_parity;

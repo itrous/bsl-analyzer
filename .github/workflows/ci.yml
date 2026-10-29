@@ -72,11 +72,12 @@ jobs:
           list_tests() {
             # list_tests [--exact] <test binary> <cargo test selection>... [-- <filter>...]
             # Lists without running: every filter must name a listed, non-ignored test of
-            # the binary (`mcp_server`, `source_set_cli`, ...); with no filter the binary
-            # must list one. The selection is the one the leg already built, so nothing
+            # the binary (`mcp_server`, `source_set_cli`, ...) or one disabled with
+            # `ignore`, which needs no run; with no filter the binary must list a
+            # runnable one. The selection is the one the leg already built, so nothing
             # compiles. The workflow forces colour on cargo, and a coloured `Running` line
             # would hide every section from the pattern, so these listings ask for none.
-            local exact=() binary selection=() filters=() listed ignored runnable status filter missing=0
+            local exact=() binary selection=() filters=() listed ignored runnable disabled status match what filter missing=0
             local pick='/ Running /{b=$0; sub(/.*deps\//,"",b); sub(/-[0-9a-f]+\)$/,"",b); cur=b; next} cur==want && /: test$/{sub(/: test$/,""); print}'
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             binary=$1; shift
@@ -92,16 +93,19 @@ jobs:
               printf '%s\n' "$ignored"
               return "$status"
             fi
-            runnable=$(comm -23 <(awk -v want="$binary" "$pick" <<<"$listed" | sort -u) <(awk -v want="$binary" "$pick" <<<"$ignored" | sort -u))
+            disabled=$(awk -v want="$binary" "$pick" <<<"$ignored" | sort -u)
+            runnable=$(comm -23 <(awk -v want="$binary" "$pick" <<<"$listed" | sort -u) <(printf '%s\n' "$disabled"))
             if [ "${#filters[@]}" -eq 0 ] && [ -z "$runnable" ]; then
               echo "::error::$binary lists no runnable test"
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$runnable" || { echo "::error::$binary has no runnable test $filter"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; what=$filter; else match=-Fq; what="matching $filter"; fi
+              if grep "$match" -- "$filter" <<<"$runnable"; then continue; fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$runnable" || { echo "::error::$binary has no runnable test matching $filter"; missing=1; }
+                echo "::error::$binary has no runnable or ignored test $what"; missing=1
               fi
             done
             return "$missing"
@@ -357,11 +361,12 @@ jobs:
           list_tests() {
             # list_tests [--exact] <test binary> <cargo test selection>... [-- <filter>...]
             # Lists without running: every filter must name a listed, non-ignored test of
-            # the binary (`mcp_server`, `source_set_cli`, ...); with no filter the binary
-            # must list one. The selection is the one the leg already built, so nothing
+            # the binary (`mcp_server`, `source_set_cli`, ...) or one disabled with
+            # `ignore`, which needs no run; with no filter the binary must list a
+            # runnable one. The selection is the one the leg already built, so nothing
             # compiles. The workflow forces colour on cargo, and a coloured `Running` line
             # would hide every section from the pattern, so these listings ask for none.
-            local exact=() binary selection=() filters=() listed ignored runnable status filter missing=0
+            local exact=() binary selection=() filters=() listed ignored runnable disabled status match what filter missing=0
             local pick='/ Running /{b=$0; sub(/.*deps\//,"",b); sub(/-[0-9a-f]+\)$/,"",b); cur=b; next} cur==want && /: test$/{sub(/: test$/,""); print}'
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             binary=$1; shift
@@ -377,16 +382,19 @@ jobs:
               printf '%s\n' "$ignored"
               return "$status"
             fi
-            runnable=$(comm -23 <(awk -v want="$binary" "$pick" <<<"$listed" | sort -u) <(awk -v want="$binary" "$pick" <<<"$ignored" | sort -u))
+            disabled=$(awk -v want="$binary" "$pick" <<<"$ignored" | sort -u)
+            runnable=$(comm -23 <(awk -v want="$binary" "$pick" <<<"$listed" | sort -u) <(printf '%s\n' "$disabled"))
             if [ "${#filters[@]}" -eq 0 ] && [ -z "$runnable" ]; then
               echo "::error::$binary lists no runnable test"
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$runnable" || { echo "::error::$binary has no runnable test $filter"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; what=$filter; else match=-Fq; what="matching $filter"; fi
+              if grep "$match" -- "$filter" <<<"$runnable"; then continue; fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$runnable" || { echo "::error::$binary has no runnable test matching $filter"; missing=1; }
+                echo "::error::$binary has no runnable or ignored test $what"; missing=1
               fi
             done
             return "$missing"
@@ -449,10 +457,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -469,10 +478,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
@@ -700,10 +716,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -720,10 +737,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
@@ -750,10 +774,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -770,10 +795,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
@@ -802,10 +834,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -822,10 +855,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
@@ -842,10 +882,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -862,10 +903,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
@@ -911,10 +959,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -931,17 +980,24 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
           }
           run_tests -p bsl-analyzer --test diagnostics_config_cli
           run_tests -p bsl-analyzer --test diagnostic_rules_protocol
-          run_tests -p bsl-analyzer --test source_set_cli -- diagnostics_rules_ workspace_cache_scope_
+          run_tests -p bsl-analyzer --test source_set_cli -- diagnostics_rules_ workspace_cache_scope_windows_source_delete_default_and_explicit
           run_tests -p bsl-analyzer --bin bsl-analyzer-app -- workspace_cache_scope_ cli::mcp cli::logging cli::lsp cli::mcp::tests::
           run_tests -p bsl-analyzer -- diagnostics_baseline_create diagnostics_baseline_update partitioned_baseline_transaction selective_baseline_transaction
       - name: Shared LSP and MCP owner and editor lifecycle
@@ -951,10 +1007,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -971,10 +1028,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
@@ -1008,10 +1072,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -1028,10 +1093,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
@@ -1044,10 +1116,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -1064,10 +1137,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
@@ -1080,10 +1160,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -1100,10 +1181,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"
@@ -1117,10 +1205,11 @@ jobs:
           run_tests() {
             # run_tests [--exact] <cargo test selection>... [-- <filter>...]
             # One cargo invocation for every filter. A filter that ran no passing test
-            # fails the step, so a renamed or moved test cannot silently drop out; with
-            # no filter the selection must run at least one test. Output streams, so a
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
             # step the runner cancels still shows the command that hung.
-            local exact=() selection=() filters=() log status passed filter missing=0
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
             if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
@@ -1137,10 +1226,17 @@ jobs:
               return 1
             fi
             for filter in "${filters[@]}"; do
-              if [ "${#exact[@]}" -gt 0 ]; then
-                grep -Fxq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
               else
-                grep -Fq -- "$filter" <<<"$passed" || { echo "::error::$filter ran no test"; missing=1; }
+                echo "::error::$filter ran no test"; missing=1
               fi
             done
             return "$missing"

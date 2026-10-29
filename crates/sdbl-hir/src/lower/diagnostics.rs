@@ -6,6 +6,7 @@ use crate::hir::{
 use crate::standard_fields::{
     is_schedule_data_value_field, register_table_of_path, VirtualTableType,
 };
+use crate::types::{MdoRef, SdblType};
 use bsl_metadata::MdoType;
 use stdx::case::CaseExt;
 
@@ -90,13 +91,17 @@ impl LoweringContext<'_> {
         }
     }
 
-    /// Reports every dotted path that starts from a query source, with its length.
+    /// Reports every dotted path that dereferences a field of a composite reference type.
     ///
-    /// Each step after a reference field is an implicit join with the referenced table, and
-    /// for a field of a composite type with every table it may point to. The length lets
-    /// the IDE layer apply the user's threshold. Inside the condition of a virtual table
-    /// the path starts from the virtual table's own field rather than from a source alias,
-    /// so any dot there already dereferences; such paths carry no length.
+    /// A step through a field of one reference type is an implicit join with that one table.
+    /// A step through a field of a composite type joins every table the type may point to,
+    /// which is what the platform cannot optimise away; `ВЫРАЗИТЬ` narrows it to one table.
+    /// A field whose type the metadata does not establish is not reported. A path from a
+    /// source alias carries its length so the IDE layer can apply the user's threshold.
+    /// Inside the condition of a virtual table and after `ВЫРАЗИТЬ` the path starts from a
+    /// field rather than from a source alias, so such paths carry no length.
+    ///
+    /// A nested query is checked by its own lowering, so it is not walked again here.
     pub(super) fn check_nested_fields_by_dot(&mut self, hir: &SdblHir) {
         for field in &hir.select.fields {
             self.report_dotted_paths(&field.expr, PathStart::SourceAlias);
@@ -129,21 +134,22 @@ impl LoweringContext<'_> {
     }
 
     fn report_dotted_paths_in_source(&mut self, table: &TableRef) {
-        for nested in &table.subquery {
-            self.check_nested_fields_by_dot(nested);
-        }
         for param in &table.virtual_table_params {
-            self.report_dotted_paths(param, PathStart::VirtualTableField);
+            self.report_dotted_paths(param, PathStart::VirtualTableField(table));
         }
     }
 
-    fn report_dotted_paths(&mut self, expr: &ExprHir, start: PathStart) {
+    fn report_dotted_paths(&mut self, expr: &ExprHir, start: PathStart<'_>) {
         if let ExprHir::ColumnRef { parts, range, .. } = expr {
-            if parts.len() >= 2 && !crate::is_mdo_type(parts[0].as_str()) {
-                let parts_count = match start {
-                    PathStart::SourceAlias => Some(parts.len() as u32),
-                    PathStart::VirtualTableField => None,
-                };
+            let reported = match start {
+                PathStart::SourceAlias => self
+                    .source_path_dereferences_composite(parts)
+                    .then_some(Some(parts.len() as u32)),
+                PathStart::VirtualTableField(table) => {
+                    self.virtual_table_path_dereferences_composite(table, parts).then_some(None)
+                }
+            };
+            if let Some(parts_count) = reported {
                 self.diagnostics
                     .push(SdblDiagnostic::QueryNestedFieldsByDot { range: *range, parts_count });
             }
@@ -152,22 +158,136 @@ impl LoweringContext<'_> {
         for child in direct_operands(expr) {
             self.report_dotted_paths(child, start);
         }
-        if let ExprHir::In { values: InValues::Subquery(nested), .. } = expr {
-            self.check_nested_fields_by_dot(nested);
-        }
         // `ВЫРАЗИТЬ(... КАК Справочник.Х).Поле` is the remedy the standard recommends: it
-        // reads one field of the one table named in the cast. Every further step
-        // dereferences that field, and there is no source alias to count the depth from.
+        // reads one field of the one table named in the cast. A further step dereferences
+        // that field, which is reported only when its own type is a composite reference.
         if let ExprHir::FunctionCall {
-            function: FunctionKind::Cast, member_access, range, ..
+            function: FunctionKind::Cast,
+            member_access,
+            cast_target: Some(target),
+            range,
+            ..
         } = expr
         {
-            if member_access.len() >= 2 {
+            if self.cast_chain_dereferences_composite(target, member_access) {
                 self.diagnostics.push(SdblDiagnostic::QueryNestedFieldsByDot {
                     range: *range,
                     parts_count: None,
                 });
             }
+        }
+    }
+
+    /// `Источник.Поле1.Поле2...`: some field followed by another member is a composite
+    /// reference. The last name is read, not dereferenced.
+    fn source_path_dereferences_composite(&self, parts: &[Name]) -> bool {
+        if parts.len() < 3 || crate::is_mdo_type(parts[0].as_str()) {
+            return false;
+        }
+        let alias = parts[0].as_str();
+        if self.field_is_provisional(self.scope.find_table(alias), parts[1].as_str()) {
+            return false;
+        }
+        let chain: Vec<String> = parts[1..].iter().map(|n| n.to_string()).collect();
+        (1..chain.len()).any(|hops| {
+            self.is_composite_reference(
+                &self.scope.resolve_nested_field_type(alias, &chain[..hops]),
+            )
+        })
+    }
+
+    /// `(Поле1.Поле2...)` in a virtual table's parameter: the head is a field of that table.
+    fn virtual_table_path_dereferences_composite(&self, table: &TableRef, parts: &[Name]) -> bool {
+        if parts.len() < 2 || self.field_is_provisional(Some(table), parts[0].as_str()) {
+            return false;
+        }
+        let chain: Vec<String> = parts.iter().map(|n| n.to_string()).collect();
+        (1..chain.len()).any(|hops| {
+            self.is_composite_reference(
+                &self.scope.resolve_nested_field_type(table.effective_name(), &chain[..hops]),
+            )
+        })
+    }
+
+    /// `ВЫРАЗИТЬ(... КАК Вид.Объект).Поле1.Поле2...`: the members are fields of the cast's
+    /// target, and the chain is reported when one of them is followed by another member
+    /// and is itself a composite reference.
+    fn cast_chain_dereferences_composite(&self, target: &MdoRef, members: &[Name]) -> bool {
+        let Some((_, hops)) = members.split_last() else {
+            return false;
+        };
+        let mut fields = self.scope.get_fields_for_ref(target);
+        for member in hops {
+            let Some(field) = fields.iter().find(|f| f.matches_name(member.as_str())) else {
+                return false;
+            };
+            if self.is_composite_reference(&field.ty) {
+                return true;
+            }
+            fields = match &field.ty {
+                SdblType::Ref(mdo_ref) => self.scope.get_fields_for_ref(mdo_ref),
+                SdblType::Composite { types } => self.scope.get_fields_for_composite(types),
+                SdblType::DefinedType { name, underlying_type } => {
+                    self.scope.get_fields_for_defined_type(name, underlying_type)
+                }
+                _ => return false,
+            };
+        }
+        false
+    }
+
+    fn field_is_provisional(&self, table: Option<&TableRef>, field: &str) -> bool {
+        table
+            .and_then(|table| table.metadata.as_ref())
+            .is_some_and(|metadata| metadata.column_is_provisional(field))
+    }
+
+    /// Whether a field of type `ty` is a composite reference: dereferencing it joins every
+    /// table the type may point to. `AnyRef` and `AnyObjectRef` stand for "any reference"
+    /// and "any reference of this kind", which the metadata records as composite. A single
+    /// `Ref`, a composite of primitives and a type the metadata does not establish are not.
+    fn is_composite_reference(&self, ty: &SdblType) -> bool {
+        let (ty, may_resolve) = self.expanded_resolving(ty, true);
+        match ty.as_ref() {
+            SdblType::AnyRef | SdblType::AnyObjectRef { .. } => true,
+            SdblType::Composite { types } => {
+                types.len() >= 2 && types.iter().any(|arm| self.is_reference_arm(arm, may_resolve))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_reference_arm(&self, ty: &SdblType, may_resolve: bool) -> bool {
+        let (ty, may_resolve) = self.expanded_resolving(ty, may_resolve);
+        match ty.as_ref() {
+            SdblType::Ref(_) | SdblType::AnyRef | SdblType::AnyObjectRef { .. } => true,
+            SdblType::Composite { types } => {
+                types.iter().any(|arm| self.is_reference_arm(arm, may_resolve))
+            }
+            _ => false,
+        }
+    }
+
+    /// [`expanded`], with a defined type whose underlying type is unknown looked up once.
+    ///
+    /// A field reached through a reference keeps its defined type unresolved. The lookup
+    /// resolves every defined type inside it, so what it leaves unresolved is a cycle or a
+    /// missing type and is not looked up again: the returned flag says whether a lookup is
+    /// still allowed below.
+    fn expanded_resolving<'t>(
+        &self,
+        ty: &'t SdblType,
+        may_resolve: bool,
+    ) -> (std::borrow::Cow<'t, SdblType>, bool) {
+        match expanded(ty) {
+            SdblType::DefinedType { name, underlying_type: None } if may_resolve => {
+                let resolved =
+                    self.resolve_attribute_type(&bsl_metadata::AttributeType::DefinedType {
+                        name: name.clone(),
+                    });
+                (std::borrow::Cow::Owned(expanded(&resolved).clone()), false)
+            }
+            ty => (std::borrow::Cow::Borrowed(ty), may_resolve),
         }
     }
 
@@ -538,9 +658,21 @@ impl LoweringContext<'_> {
 }
 
 #[derive(Clone, Copy)]
-enum PathStart {
+enum PathStart<'t> {
     SourceAlias,
-    VirtualTableField,
+    /// A parameter of this virtual table: the path's head is one of its fields.
+    VirtualTableField(&'t TableRef),
+}
+
+/// `ty` without the wrappers that do not change what it may hold: a defined type whose
+/// underlying type is known and an aggregate.
+fn expanded(ty: &SdblType) -> &SdblType {
+    match ty {
+        SdblType::DefinedType { underlying_type: Some(inner), .. } | SdblType::Aggregate(inner) => {
+            expanded(inner)
+        }
+        _ => ty,
+    }
 }
 
 /// The operands an expression evaluates directly. A nested query in `В (...)` is not an

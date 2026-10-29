@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.20">
+	<InformationRegister uuid="10000000-0000-0000-0000-000000000001">
+		<Properties><Name>ЦеныОбъектов</Name></Properties>
+		<ChildObjects>
+			<Dimension uuid="20000000-0000-0000-0000-000000000000"><Properties><Name>Объект</Name><Type><v8:Type>cfg:CatalogRef.Номенклатура</v8:Type><v8:Type>cfg:CatalogRef.Склады</v8:Type></Type></Properties></Dimension>
+			<Dimension uuid="20000000-0000-0000-0000-000000000001"><Properties><Name>Номенклатура</Name><Type><v8:Type>cfg:CatalogRef.Номенклатура</v8:Type></Type></Properties></Dimension>
+		</ChildObjects>
+	</InformationRegister>
+</MetaDataObject>
