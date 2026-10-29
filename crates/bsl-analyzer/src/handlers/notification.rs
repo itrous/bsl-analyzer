@@ -904,6 +904,8 @@ mod tests {
 
         fn set_config(&mut self, _config: vfs::loader::Config) {}
 
+        fn set_watch_only_files(&mut self, _files: Vec<paths::AbsPathBuf>) {}
+
         fn invalidate(&mut self, path: paths::AbsPathBuf) {
             self.0.lock().push(path);
         }

@@ -84,6 +84,17 @@ pub trait Handle: fmt::Debug {
 
     fn set_config(&mut self, config: Config);
 
+    /// Replace the exact list of watch-only files without a scan.
+    ///
+    /// Every listed file is put under observation as a load pass would. The names
+    /// absent from the previous list are announced, in input order, by one
+    /// [`Message::WatchOnly`]. No [`Message::Progress`] or [`Message::Loaded`] is
+    /// sent, the tree is neither walked nor read, and no registration is released.
+    ///
+    /// Applied in the same queue as [`Handle::set_config`] and [`Handle::invalidate`],
+    /// strictly after everything sent before it.
+    fn set_watch_only_files(&mut self, files: Vec<AbsPathBuf>);
+
     fn invalidate(&mut self, path: AbsPathBuf);
 
     fn load_sync(&mut self, path: &AbsPath) -> Option<Vec<u8>>;

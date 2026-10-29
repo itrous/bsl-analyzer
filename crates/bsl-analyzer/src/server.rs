@@ -4280,6 +4280,7 @@ mod tests {
                     unreachable!("injected loader")
                 }
                 fn set_config(&mut self, _config: vfs::loader::Config) {}
+                fn set_watch_only_files(&mut self, _files: Vec<paths::AbsPathBuf>) {}
                 fn invalidate(&mut self, path: paths::AbsPathBuf) {
                     self.0.lock().push(path);
                 }
@@ -4307,8 +4308,8 @@ mod tests {
                 fn drop(&mut self) {
                     crate::handlers::workspace_batch::g1_batch_barrier(false);
                     if self.wait_for_completion {
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        let deadline = std::time::Instant::now()
+                            + test_utils::wait::hang_guard(std::time::Duration::from_secs(10));
                         loop {
                             let remaining =
                                 deadline.saturating_duration_since(std::time::Instant::now());
@@ -4785,7 +4786,8 @@ mod tests {
             release_batch_on_drop.wait_for_completion = true;
             assert!(state.workspace_batch_in_flight, "production spawn must mark the batch active");
             assert!(state.workspace_batch_plan.is_some(), "production spawn builds a real plan");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now()
+                + test_utils::wait::hang_guard(std::time::Duration::from_secs(10));
             while !crate::handlers::workspace_batch::g1_batch_entered() {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -8406,5 +8408,264 @@ mod tests {
             state.shared_request_generation, stamped,
             "a request stamped before the reload is retried when it finishes"
         );
+    }
+
+    /// A baseline object is named after its content, so every publication changes the files
+    /// the loader observes. A standalone server hands the new list to the loader as a
+    /// watch-only update — not as a configuration, which would walk the workspace and run
+    /// the load finalization again — and the watch keeps both of its properties: a damaged
+    /// object of an enabled partition is seen, an edit of a dormant partition's object is not.
+    #[test]
+    fn publishing_a_baseline_moves_the_watch_without_reconfiguring_the_loader() {
+        use ide::diagnostics_baseline::{
+            diagnostic_fingerprint, DiagnosticsBaselineEntry, DiagnosticsBaselineRange,
+        };
+        use ide::partitioned_diagnostics_baseline::{
+            diagnostics_manifest, diagnostics_manifest_json, diagnostics_partition_json,
+            partition_object_path, DiagnosticsBaselineManifest, DiagnosticsBaselineManifestEntry,
+        };
+        use std::io::Write as _;
+
+        #[derive(Debug, Default)]
+        struct LoaderCalls {
+            configs: Vec<vfs::loader::Config>,
+            watch_only: Vec<Vec<paths::AbsPathBuf>>,
+        }
+        #[derive(Debug)]
+        struct RecordingLoader(Arc<Mutex<LoaderCalls>>);
+        impl vfs::loader::Handle for RecordingLoader {
+            fn spawn(_sender: vfs::loader::Sender) -> Self
+            where
+                Self: Sized,
+            {
+                unreachable!("injected loader")
+            }
+            fn set_config(&mut self, config: vfs::loader::Config) {
+                self.0.lock().unwrap().configs.push(config);
+            }
+            fn set_watch_only_files(&mut self, files: Vec<paths::AbsPathBuf>) {
+                self.0.lock().unwrap().watch_only.push(files);
+            }
+            fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
+            fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
+                None
+            }
+        }
+
+        let show_messages = |receiver: &crossbeam_channel::Receiver<lsp_server::Message>| {
+            receiver
+                .try_iter()
+                .filter_map(|message| match message {
+                    lsp_server::Message::Notification(notification)
+                        if notification.method == "window/showMessage" =>
+                    {
+                        Some(notification.params.to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        for source in ["src/cf", "src/cfe/Ext", "src/cfe/Dormant"] {
+            std::fs::create_dir_all(root.join(source)).unwrap();
+            std::fs::write(root.join(source).join("Configuration.xml"), "<Configuration/>")
+                .unwrap();
+        }
+        std::fs::write(
+            root.join("bsl-analyzer.toml"),
+            r#"[source]
+root = "src/cf"
+extensions = [{ name = "Ext", path = "src/cfe/Ext", scope = "InfoBase" }, { name = "Dormant", path = "src/cfe/Dormant", scope = "InfoBase" }]
+[diagnostics.baseline]
+directory = "baselines"
+include = ["main", "extension:Ext"]
+"#,
+        )
+        .unwrap();
+        let project = project_model::Project::new(root).unwrap();
+        let plan = project.diagnostics_baseline_partition_plan().unwrap().unwrap();
+        assert_eq!(plan.enabled_partition_ids, ["main", "extension:Ext"]);
+        assert_eq!(plan.partitions.len(), 3);
+        let directory =
+            project_model::ManagedBaselineDirectory::open(root, "baselines", true).unwrap();
+        let publish = |main: Vec<DiagnosticsBaselineEntry>| -> DiagnosticsBaselineManifest {
+            let mut entries = Vec::new();
+            for partition in &plan.partitions {
+                let diagnostics = if partition.id == "main" { main.clone() } else { vec![] };
+                let bytes =
+                    diagnostics_partition_json(partition.identity.clone(), diagnostics).unwrap();
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                let path = partition_object_path(&partition.id, &partition.key, &hash).unwrap();
+                if directory.open_file(&path).is_err() {
+                    directory.create_file_new(&path).unwrap().write_all(&bytes).unwrap();
+                }
+                entries.push(DiagnosticsBaselineManifestEntry {
+                    partition_id: partition.id.clone(),
+                    file: path,
+                    blake3: hash,
+                });
+            }
+            let manifest = diagnostics_manifest(plan.project_scope_fingerprint.clone(), entries);
+            let bytes = diagnostics_manifest_json(&manifest).unwrap();
+            let temp = "manifest.next.json";
+            if directory.open_file(temp).is_ok() {
+                directory.remove_file(temp).unwrap();
+            }
+            directory.create_file_new(temp).unwrap().write_all(&bytes).unwrap();
+            directory.replace_file(temp, "manifest.json").unwrap();
+            manifest
+        };
+        let object = |manifest: &DiagnosticsBaselineManifest, id: &str| {
+            let entry = manifest
+                .partitions
+                .iter()
+                .find(|entry| entry.partition_id == id)
+                .unwrap_or_else(|| panic!("the manifest has no partition {id}"));
+            paths::AbsPathBuf::assert_utf8(root.join("baselines").join(&entry.file))
+        };
+        let manifest_path = paths::AbsPathBuf::assert_utf8(root.join("baselines/manifest.json"));
+
+        let first = publish(vec![]);
+        let ext = object(&first, "extension:Ext");
+        let main0 = object(&first, "main");
+        let dormant = object(&first, "extension:Dormant");
+
+        let calls = Arc::new(Mutex::new(LoaderCalls::default()));
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (_loader_tx, loader_receiver) = crossbeam_channel::bounded(4);
+        let mut state = crate::global_state::GlobalState::with_loader(
+            sender,
+            Box::new(RecordingLoader(Arc::clone(&calls))),
+            loader_receiver,
+        );
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).unwrap();
+        state.vfs_done = true;
+
+        // Step 1: the first configuration carries the manifest and the enabled objects
+        // as exact files, and nothing that reaches the dormant partition's object.
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.configs.len(), 1, "the workspace root is configured once");
+            assert!(calls.watch_only.is_empty(), "no update has been asked for yet");
+            let watched: Vec<paths::AbsPathBuf> = calls.configs[0]
+                .load
+                .iter()
+                .find_map(|entry| match entry {
+                    vfs::loader::Entry::WatchOnlyFiles(files) => Some(files.clone()),
+                    _ => None,
+                })
+                .expect("the configuration has an exact-files entry");
+            assert_eq!(watched, vec![manifest_path.clone(), ext.clone(), main0.clone()]);
+            assert!(
+                calls.configs[0].load.iter().all(|entry| !entry.contains_file(&dormant)),
+                "the dormant partition's object is observed by the first configuration"
+            );
+        }
+        show_messages(&receiver);
+
+        // Step 2: a publication that renames the enabled `main` object reaches the loader
+        // as one update, with the new name and without the old one.
+        let path = "src/cf/Main.bsl";
+        let snippet = "Message(1);";
+        let entry = DiagnosticsBaselineEntry {
+            fingerprint: diagnostic_fingerprint(path, "LineLength", snippet, 0),
+            path: path.to_owned(),
+            code: "LineLength".to_owned(),
+            snippet: snippet.to_owned(),
+            occurrence: 0,
+            message: "message".to_owned(),
+            severity: "Warning".to_owned(),
+            range: DiagnosticsBaselineRange {
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 1,
+            },
+        };
+        let second = publish(vec![entry]);
+        let main1 = object(&second, "main");
+        assert_ne!(main1, main0, "the publication must rename the object, or nothing is tested");
+        let before = Arc::clone(&state.diagnostics_baseline);
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::WatchOnly { files: vec![manifest_path.clone()] },
+        )
+        .unwrap();
+        assert!(
+            !Arc::ptr_eq(&before, &state.diagnostics_baseline),
+            "the manifest event must reload the baseline"
+        );
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(
+                calls.configs.len(),
+                1,
+                "a publication reconfigured the loader, which scans the workspace again"
+            );
+            assert_eq!(
+                calls.watch_only,
+                vec![vec![manifest_path.clone(), ext.clone(), main1.clone()]],
+                "the update must name the manifest, the enabled objects as renamed, and no \
+                 dormant object"
+            );
+        }
+
+        // Step 3: an edit of the dormant partition's object neither reloads the baseline
+        // nor reaches the loader or the editor.
+        let before = Arc::clone(&state.diagnostics_baseline);
+        std::fs::write(&dormant, "{broken").unwrap();
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::WatchOnly { files: vec![dormant.clone()] },
+        )
+        .unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &state.diagnostics_baseline),
+            "an event for a dormant object reloaded the baseline"
+        );
+        assert!(
+            !state.reload_diagnostics_baseline(),
+            "a damaged dormant object moved the baseline"
+        );
+        let shown = show_messages(&receiver);
+        assert!(shown.is_empty(), "a dormant object's damage reached the editor: {shown:?}");
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.configs.len(), 1, "a dormant edit reconfigured the loader");
+            assert_eq!(calls.watch_only.len(), 1, "a dormant edit asked the loader for an update");
+        }
+
+        // Step 4: a damaged object of the enabled partition, renamed by the publication,
+        // is seen and shown, and the unchanged set of names costs the loader nothing.
+        std::fs::write(&main1, "{broken").unwrap();
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::WatchOnly { files: vec![main1.clone()] },
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &*state.diagnostics_baseline,
+                ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::Error { .. }
+            ),
+            "a damaged enabled object was not seen"
+        );
+        let shown = show_messages(&receiver);
+        assert!(
+            shown.iter().any(|message| message.contains("diagnostics baseline")),
+            "the damage was not shown to the editor: {shown:?}"
+        );
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.configs.len(), 1, "a damaged object reconfigured the loader");
+            assert_eq!(
+                calls.watch_only.len(),
+                1,
+                "a reload that left the observed names as they were asked the loader for an update"
+            );
+        }
     }
 }

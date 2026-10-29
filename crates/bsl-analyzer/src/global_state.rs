@@ -1357,6 +1357,8 @@ impl loader::Handle for NoopLoader {
 
     fn set_config(&mut self, _config: loader::Config) {}
 
+    fn set_watch_only_files(&mut self, _files: Vec<paths::AbsPathBuf>) {}
+
     fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
 
     fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
@@ -1515,6 +1517,7 @@ mod vfs_race_tests {
             fn set_config(&mut self, _config: loader::Config) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
+            fn set_watch_only_files(&mut self, _files: Vec<paths::AbsPathBuf>) {}
             fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
             fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
                 None
@@ -1647,6 +1650,7 @@ mod vfs_race_tests {
                 unreachable!("injected loader")
             }
             fn set_config(&mut self, _config: loader::Config) {}
+            fn set_watch_only_files(&mut self, _files: Vec<paths::AbsPathBuf>) {}
             fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
             fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
                 None
@@ -1833,6 +1837,7 @@ mod vfs_race_tests {
                 unreachable!("injected via with_loader, never spawned")
             }
             fn set_config(&mut self, _config: loader::Config) {}
+            fn set_watch_only_files(&mut self, _files: Vec<paths::AbsPathBuf>) {}
             fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
             fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
                 None
@@ -1904,6 +1909,7 @@ mod vfs_race_tests {
                 unreachable!("injected via with_loader, never spawned")
             }
             fn set_config(&mut self, _config: loader::Config) {}
+            fn set_watch_only_files(&mut self, _files: Vec<paths::AbsPathBuf>) {}
             fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
             fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
                 None
@@ -2019,6 +2025,7 @@ mod vfs_race_tests {
             fn set_config(&mut self, config: loader::Config) {
                 let _ = self.0.send(config);
             }
+            fn set_watch_only_files(&mut self, _files: Vec<paths::AbsPathBuf>) {}
             fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
             fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
                 None
@@ -2113,6 +2120,7 @@ mod vfs_race_tests {
             fn set_config(&mut self, config: loader::Config) {
                 let _ = self.0.send(config);
             }
+            fn set_watch_only_files(&mut self, _files: Vec<paths::AbsPathBuf>) {}
             fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
             fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
                 None

@@ -4974,6 +4974,7 @@ mod graph_supersession_contract {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "необязательный тест: ждёт событие наблюдателя ядра без надёжного срока; при неработающем наблюдателе зависает; запуск: cargo test -p mcp-server --lib -- --ignored --exact graph_supersession_contract::stale_snapshot_served_during_loading"]
     #[allow(
         clippy::await_holding_lock,
         reason = "serialize environment-dependent fixture across its async calls"

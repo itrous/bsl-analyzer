@@ -75,6 +75,7 @@ impl Drop for NotifyHandle {
 enum Message {
     Config(loader::Config),
     Invalidate(AbsPathBuf),
+    WatchOnlyFiles(Vec<AbsPathBuf>),
 }
 
 impl loader::Handle for NotifyHandle {
@@ -90,6 +91,10 @@ impl loader::Handle for NotifyHandle {
 
     fn set_config(&mut self, config: loader::Config) {
         self.sender.send(Message::Config(config)).unwrap();
+    }
+
+    fn set_watch_only_files(&mut self, files: Vec<AbsPathBuf>) {
+        self.sender.send(Message::WatchOnlyFiles(files)).unwrap();
     }
 
     fn invalidate(&mut self, path: AbsPathBuf) {
@@ -181,11 +186,12 @@ impl NotifyActor {
             match event {
                 Event::Message(msg) => match msg {
                     Message::Config(config) => {
-                        // The watcher SURVIVES a reconfiguration. Baseline object names
-                        // carry a content hash, so every baseline write changes the list
-                        // of watched paths and brings another config here; taking the
-                        // watcher down to build a new one leaves the whole tree
-                        // unobserved until the registrations are placed again. On
+                        // The watcher SURVIVES a reconfiguration. One arrives here when
+                        // the project configuration or its `extends` parent is edited;
+                        // a baseline write no longer does, its new object names come as
+                        // `Message::WatchOnlyFiles`. Taking the watcher down to build a
+                        // new one leaves the whole tree unobserved until the
+                        // registrations are placed again. On
                         // FSEvents the cost is not even confined to that gap: `watch`
                         // does not extend a running stream, it rebuilds one starting
                         // from "now", so whatever happened during the swap is reported
@@ -362,6 +368,7 @@ impl NotifyActor {
                         let files = vec![(path, contents)];
                         self.send(loader::Message::Changed { files });
                     }
+                    Message::WatchOnlyFiles(files) => self.set_watch_only_files(files),
                 },
                 Event::NotifyEvent(event) => {
                     if let Some(event) = log_notify_error(event) {
@@ -1080,10 +1087,15 @@ impl NotifyActor {
     /// A watcher that survives a reconfiguration would otherwise hold every target it
     /// was ever given: on inotify a descriptor per directory of a tree nobody watches
     /// any more, and a wake-up for each of its events. The sweep finds nothing while
-    /// the configuration is stable — the case that arrives on every baseline write — so
-    /// the stream rebuild an `unwatch` costs on FSEvents is paid only when the
-    /// requested set genuinely shrank, and paid BEFORE the scan, which then re-reads
-    /// whatever the rebuild dropped.
+    /// the configuration is stable, so the stream rebuild an `unwatch` costs on
+    /// FSEvents is paid only when the requested set genuinely shrank, and paid BEFORE
+    /// the scan, which then re-reads whatever the rebuild dropped.
+    ///
+    /// The sweep runs with a full configuration only. [`Self::set_watch_only_files`]
+    /// releases nothing: on FSEvents an `unwatch` rebuilds the stream, and only a scan,
+    /// which that update does not run, would recover what the rebuild dropped. The
+    /// registration of a name the update removed therefore stands until the next
+    /// configuration or until its directory disappears.
     fn release_watches_no_longer_requested(&self) {
         let Some((state, _)) = &self.watcher else { return };
         let stale: Vec<PathBuf> = state
@@ -1130,6 +1142,29 @@ impl NotifyActor {
             .iter()
             .chain(&self.watched_only_file_entries)
             .any(|file| file.parent() == Some(target.as_path()))
+    }
+
+    /// Replace the exact watch-only list, as [`loader::Handle::set_watch_only_files`]
+    /// promises: register every listed file, announce only the names the previous list
+    /// lacked, and neither scan nor release a registration.
+    fn set_watch_only_files(&mut self, files: Vec<AbsPathBuf>) {
+        let mut seen = FxHashSet::default();
+        let added: Vec<AbsPathBuf> = files
+            .iter()
+            .filter(|file| !self.watched_only_file_entries.contains(*file) && seen.insert(*file))
+            .cloned()
+            .collect();
+        // Replaced BEFORE watching: `watch_target` reads this set to place an exact file
+        // on its parent directory.
+        self.watched_only_file_entries = files.iter().cloned().collect();
+        // Every name, not only the new ones: a standing registration is skipped, while
+        // one `release_watch_if_gone` forgot is placed again, as a load pass would.
+        for file in &files {
+            self.watch(file.as_ref());
+        }
+        if !added.is_empty() {
+            self.send(loader::Message::WatchOnly { files: added });
+        }
     }
 
     #[track_caller]
@@ -2196,7 +2231,7 @@ mod tests {
         rx: &Receiver<loader::Message>,
         mut wanted: impl FnMut(&loader::Message) -> bool,
     ) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match rx.recv_timeout(remaining) {
                 Ok(msg) => {
@@ -2249,10 +2284,9 @@ mod tests {
         );
     }
 
-    /// Every baseline write brings another configuration here, because baseline object
-    /// names carry a content hash. The watch placed by the previous one must survive it:
-    /// a write during the rescan reaches the consumer only through a registration that
-    /// was never taken down.
+    /// An edit of the project configuration brings another configuration here. The
+    /// watch placed by the previous one must survive it: a write during the rescan
+    /// reaches the consumer only through a registration that was never taken down.
     #[test]
     fn a_reconfiguration_does_not_take_the_watch_down() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2291,6 +2325,293 @@ mod tests {
             }),
             "a write during a reconfiguration never arrived",
         );
+    }
+
+    /// Everything the loader sends up to and including the `Changed` that carries `marker`.
+    ///
+    /// The marker is a message the actor produces whatever the step under test did: an
+    /// `invalidate` queued behind it, which the actor answers once everything queued
+    /// before it has been handled, or a write to a watched file made after the write
+    /// under test, which the kernel reports in the order the writes happened. Either
+    /// way everything the step was going to send has been sent by the time the marker
+    /// comes back, so the stream is complete without a wait for an absence.
+    fn messages_until_marker(
+        rx: &Receiver<loader::Message>,
+        marker: &AbsPathBuf,
+    ) -> Vec<loader::Message> {
+        let mut seen = Vec::new();
+        loop {
+            let msg = rx.recv().expect("the loader stopped before the marker came back");
+            let is_marker = matches!(
+                &msg,
+                loader::Message::Changed { files } if files.iter().any(|(path, _)| path == marker)
+            );
+            seen.push(msg);
+            if is_marker {
+                return seen;
+            }
+        }
+    }
+
+    /// Everything the real actor loop sends for the calls `queue` makes on a handle,
+    /// run to its end on this thread. The handle's inbox is closed once `queue` has
+    /// returned, so the loop leaves by itself after the last queued message: nothing runs
+    /// in the background, and the output is complete when this returns.
+    fn sent_for(queue: impl FnOnce(&mut NotifyHandle)) -> Vec<loader::Message> {
+        let (sender, inbox) = unbounded::<Message>();
+        let idle = stdx::thread::Builder::new(stdx::thread::ThreadIntent::Worker, "test-queue")
+            .spawn(|| {})
+            .expect("spawn test worker");
+        // The handle latches its own flag when dropped, and the actor must not see that.
+        let mut handle =
+            NotifyHandle { sender, shutdown: Arc::new(AtomicBool::new(false)), _thread: idle };
+        queue(&mut handle);
+        drop(handle);
+
+        let (tx, rx) = unbounded::<loader::Message>();
+        NotifyActor::new(tx, Arc::new(AtomicBool::new(false))).run(inbox);
+        rx.try_iter().collect()
+    }
+
+    fn write_files(root: &Path, relatives: &[&str]) {
+        for relative in relatives {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            std::fs::write(&path, b"before").expect("write fixture");
+        }
+    }
+
+    /// The `src` directory scanned and observed, next to a watch-only list holding
+    /// `old`, also observed.
+    fn src_and_baseline_config(root: &Path, old: &AbsPathBuf, version: u32) -> loader::Config {
+        loader::Config {
+            version,
+            load: vec![
+                loader::Entry::Directories(loader::Directories {
+                    extensions: vec!["txt".to_string()],
+                    include: vec![AbsPathBuf::assert_utf8(root.join("src"))],
+                    exclude: vec![],
+                    hard_exclude: Default::default(),
+                    rules: Vec::new(),
+                }),
+                loader::Entry::WatchOnlyFiles(vec![old.clone()]),
+            ],
+            watch: vec![0, 1],
+        }
+    }
+
+    fn scanning(version: u32) -> impl Fn(&loader::Message) -> bool {
+        move |msg| {
+            matches!(
+                msg,
+                loader::Message::Progress {
+                    n_done: LoadingProgress::Scanning,
+                    config_version,
+                    ..
+                } if *config_version == version
+            )
+        }
+    }
+
+    /// A watch-only update queued right behind a configuration: it must not scan again,
+    /// must announce exactly the names it added, and must be applied after the
+    /// configuration sent before it instead of being wiped by it. Both calls are queued
+    /// before the loop starts, so the update is waiting while the configuration's pass
+    /// runs, which is the window a loop that took the next message early would use.
+    #[test]
+    fn a_watch_only_update_arms_new_names_without_a_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        write_files(&root, &["src/a.txt", "baseline/old.json", "fresh/new.json"]);
+        let old = AbsPathBuf::assert_utf8(root.join("baseline/old.json"));
+        let new = AbsPathBuf::assert_utf8(root.join("fresh/new.json"));
+
+        let sent = sent_for(|handle| {
+            handle.set_config(src_and_baseline_config(&root, &old, 1));
+            handle.set_watch_only_files(vec![new.clone()]);
+        });
+        let finished = sent
+            .iter()
+            .position(|msg| {
+                matches!(
+                    msg,
+                    loader::Message::Progress {
+                        n_done: LoadingProgress::Finished,
+                        config_version: 1,
+                        ..
+                    }
+                )
+            })
+            .expect("the configuration never finished loading");
+        // Everything after the end of the configuration's pass is what the update sent.
+        let update = &sent[finished + 1..];
+        assert!(
+            update.iter().all(|msg| !matches!(
+                msg,
+                loader::Message::Progress { .. } | loader::Message::Loaded { .. }
+            )),
+            "the update scanned or loaded: {update:?}"
+        );
+        let announced: Vec<&Vec<AbsPathBuf>> = update
+            .iter()
+            .filter_map(|msg| match msg {
+                loader::Message::WatchOnly { files } => Some(files),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            announced,
+            vec![&vec![new.clone()]],
+            "the update must announce its one new name, once, after the configuration ended"
+        );
+
+        // Positive control: the same window does show a scan when a scan is requested.
+        let control = sent_for(|handle| {
+            handle.set_config(src_and_baseline_config(&root, &old, 1));
+            handle.set_watch_only_files(vec![new.clone()]);
+            handle.set_config(src_and_baseline_config(&root, &old, 2));
+        });
+        assert!(
+            control.iter().any(scanning(2)),
+            "positive control: a configuration queued behind the update showed no scan: {control:?}"
+        );
+    }
+
+    /// A write to the name a watch-only update added reaches the consumer through the
+    /// registration the update placed: the name's directory is one nothing else watches.
+    ///
+    /// Optional, because the write is reported by the kernel's watcher on a thread of its
+    /// own and nothing here can tell a watcher that is not reporting from a slow one, so
+    /// the last wait is for good when the watcher is down. What the update registers is
+    /// pinned without that wait by `a_watch_only_update_reclassifies_and_keeps_registrations`.
+    #[test]
+    #[ignore = "необязательный тест: ждёт событие наблюдателя ядра блокирующим recv без срока, при неработающем наблюдателе зависает; запуск: cargo test -p vfs-notify --lib -- --ignored --exact tests::a_write_to_a_name_added_by_a_watch_only_update_is_delivered"]
+    fn a_write_to_a_name_added_by_a_watch_only_update_is_delivered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        write_files(
+            &root,
+            &[
+                "src/a.txt",
+                "src/applied.txt",
+                "src/tick.txt",
+                "baseline/old.json",
+                "fresh/new.json",
+            ],
+        );
+        let applied = AbsPathBuf::assert_utf8(root.join("src/applied.txt"));
+        let tick = AbsPathBuf::assert_utf8(root.join("src/tick.txt"));
+        let old = AbsPathBuf::assert_utf8(root.join("baseline/old.json"));
+        let new = AbsPathBuf::assert_utf8(root.join("fresh/new.json"));
+
+        let (tx, rx) = unbounded::<loader::Message>();
+        let mut handle = NotifyHandle::spawn(tx);
+        handle.set_config(src_and_baseline_config(&root, &old, 1));
+        handle.set_watch_only_files(vec![new.clone()]);
+        handle.invalidate(applied.clone());
+        // The queue is single: when the marker comes back the update has been applied.
+        messages_until_marker(&rx, &applied);
+
+        // `tick` sits in a directory the configuration watches, so its event comes whatever
+        // the update did, and it comes after the one for `new`: the watcher keeps the order
+        // of the writes.
+        std::fs::write(&new, b"after").expect("rewrite fixture");
+        std::fs::write(&tick, b"after").expect("rewrite sentinel");
+        let delivered = messages_until_marker(&rx, &tick);
+        assert!(
+            delivered.iter().any(
+                |msg| matches!(msg, loader::Message::WatchOnly { files } if files.contains(&new))
+            ),
+            "a write to the name the update added was never reported: {delivered:?}"
+        );
+    }
+
+    /// The watch-only update replaces the exact list, so a name it drops stops being a
+    /// baseline file at once, and registers every name it lists, so one that lost its
+    /// directory's registration gets it back. It never releases a registration: the
+    /// directory of a name that left the list keeps its watch.
+    #[test]
+    fn a_watch_only_update_reclassifies_and_keeps_registrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let (tx, rx) = unbounded::<loader::Message>();
+        let mut actor = NotifyActor::new(tx, Arc::new(AtomicBool::new(false)));
+        give_a_live_watcher(&mut actor);
+
+        let file_in = |directory: &str, name: &str| {
+            std::fs::create_dir_all(root.join(directory)).expect("create dir");
+            std::fs::write(root.join(directory).join(name), b"before").expect("write fixture");
+            AbsPathBuf::assert_utf8(root.join(directory).join(name))
+        };
+        let old = file_in("a", "old.json");
+        let new = file_in("b", "new.json");
+        let kept = file_in("c", "kept.json");
+        let (a_dir, b_dir, c_dir) = (root.join("a"), root.join("b"), root.join("c"));
+
+        actor.watched_only_file_entries.insert(old.clone());
+        actor.watched_only_file_entries.insert(kept.clone());
+        actor.watch(old.as_ref());
+        actor.watch(kept.as_ref());
+        // The registration on the kept name's directory is forgotten, as it is when the
+        // directory disappears, and the directory then comes back.
+        std::fs::remove_dir_all(&c_dir).expect("remove dir");
+        actor.release_watch_if_gone(&AbsPathBuf::assert_utf8(c_dir.clone()));
+        std::fs::create_dir(&c_dir).expect("recreate dir");
+        std::fs::write(&kept, b"before").expect("recreate fixture");
+        let before = registered_of(&actor);
+        assert!(
+            before.contains_key(&a_dir) && !before.contains_key(&c_dir),
+            "set-up: the old name's directory must be registered and the kept name's not: \
+             {before:?}"
+        );
+        assert!(rx.try_iter().next().is_none(), "set-up must announce nothing");
+        assert_eq!(
+            actor.classify_event_path(&old),
+            EventPathAction::WatchOnly,
+            "positive control: before the update the old name is a baseline file"
+        );
+
+        actor.set_watch_only_files(vec![new.clone(), kept.clone()]);
+
+        assert_eq!(
+            actor.classify_event_path(&old),
+            EventPathAction::Ignore,
+            "a name the update dropped is still taken for a baseline file"
+        );
+        assert_eq!(
+            actor.classify_event_path(&new),
+            EventPathAction::WatchOnly,
+            "a name the update added is not taken for a baseline file"
+        );
+        assert_eq!(
+            actor.classify_event_path(&kept),
+            EventPathAction::WatchOnly,
+            "a name the update kept is no longer taken for a baseline file"
+        );
+        let registered = registered_of(&actor);
+        for (what, directory) in [
+            ("the dropped name's directory lost its registration", &a_dir),
+            ("the added name's directory was not registered", &b_dir),
+            ("the kept name's directory was not registered again", &c_dir),
+        ] {
+            assert_eq!(
+                registered.get(directory),
+                Some(&RecursiveMode::NonRecursive),
+                "{what}: {registered:?}"
+            );
+        }
+        let announced: Vec<loader::Message> = rx.try_iter().collect();
+        assert!(
+            matches!(
+                announced.as_slice(),
+                [loader::Message::WatchOnly { files }] if files == &vec![new.clone()]
+            ),
+            "the update must announce exactly the added name in one message: {announced:?}"
+        );
+
+        actor.set_watch_only_files(vec![new.clone(), kept.clone()]);
+        let repeated: Vec<loader::Message> = rx.try_iter().collect();
+        assert!(repeated.is_empty(), "a list nothing was added to announced names: {repeated:?}");
     }
 
     #[test]

@@ -224,23 +224,7 @@ impl GlobalState {
             .collect();
         config_files.sort();
         config_files.dedup();
-        // NOTE: object names are content-addressed, so this list changes with every
-        // baseline write and each one reconfigures the loader — a full workspace rescan.
-        // Narrowing the watch to stable paths was tried and reverted: watching the
-        // manifest alone hides a corrupted enabled object, and watching the object
-        // directories makes edits to dormant partitions visible to the editor. Both
-        // properties are asserted by tests, so the rescan is what a reconfiguration
-        // still costs — the watch itself survives it, `vfs-notify` keeping its watcher
-        // and adding only targets it has not already registered.
-        let mut baseline_files: Vec<_> = self
-            .diagnostics_baseline
-            .observation_paths()
-            .into_iter()
-            .filter(|path| !self.source_exclusions.is_excluded_resolved(path))
-            .map(paths::AbsPathBuf::assert_utf8)
-            .collect();
-        baseline_files.sort();
-        baseline_files.dedup();
+        let baseline_files = self.baseline_watch_files();
 
         let include =
             project.source_roots().into_iter().map(paths::AbsPathBuf::assert_utf8).collect();
@@ -278,6 +262,28 @@ impl GlobalState {
             watch,
             version: self.vfs_progress_config_version,
         });
+    }
+
+    /// The exact baseline files the loader observes.
+    ///
+    /// Object names are derived from their content, so this list changes with every
+    /// baseline write. A full configuration carries it as a `WatchOnlyFiles` entry; a
+    /// later change goes to the loader through `set_watch_only_files`, which does not
+    /// rescan the workspace. Narrowing the watch to stable paths was tried and
+    /// reverted: watching the manifest alone hides a corrupted enabled object, and
+    /// watching the object directories makes edits to dormant partitions visible to
+    /// the editor. Both properties are asserted by tests.
+    fn baseline_watch_files(&self) -> Vec<paths::AbsPathBuf> {
+        let mut files: Vec<_> = self
+            .diagnostics_baseline
+            .observation_paths()
+            .into_iter()
+            .filter(|path| !self.source_exclusions.is_excluded_resolved(path))
+            .map(paths::AbsPathBuf::assert_utf8)
+            .collect();
+        files.sort();
+        files.dedup();
+        files
     }
 
     pub fn process_changes(&mut self, suppress_metadata_bump: bool) -> ChangeOutcome {
@@ -654,17 +660,17 @@ impl GlobalState {
     fn reload_diagnostics_baseline_confirming(&mut self, confirming: Option<u64>) -> bool {
         let Some(project) = self.project.as_ref() else { return false };
         let old_epoch = self.diagnostics_baseline.epoch().to_owned();
-        let old_paths = self.diagnostics_baseline.observation_paths();
+        let old_watch = self.baseline_watch_files();
         let snapshot =
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load_reusing(
                 project,
                 &self.diagnostics_baseline,
             );
         let changed = snapshot.epoch() != old_epoch;
-        let reconfigure = snapshot.observation_paths() != old_paths;
         self.install_diagnostics_baseline_confirming(snapshot, confirming);
-        if reconfigure && !self.analysis_host.is_shared() {
-            self.configure_loader();
+        let new_watch = self.baseline_watch_files();
+        if new_watch != old_watch && !self.analysis_host.is_shared() {
+            self.loader.set_watch_only_files(new_watch);
         }
         changed
     }
