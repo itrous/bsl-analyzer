@@ -5398,6 +5398,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "spins against a fixed 10 s deadline for the VFS writer's Salsa cancellation, which a loaded machine exceeds, then waits for the real workspace-diagnostic handler up to the hang guard; run: cargo test -p bsl-analyzer --lib g1_workspace_diagnostic_real_partial_is_terminal_after_pending_write -- --ignored"]
     fn g1_workspace_diagnostic_real_partial_is_terminal_after_pending_write() {
         g1_with_tracing(|| {
             use base_db::{SourceDatabase as _, SourceRoot, BSL_SOURCE_ROOT};

@@ -23,8 +23,7 @@ are clearly 1C's copyrighted expression.
 
 ## Licensing
 
-This package is **not** covered by bsl-analyzer's MIT / Apache-2.0 /
-LGPL-3.0 licensing. The code that extracts and consumes it is the project's
-own work and stays under the licenses declared in the bsl-analyzer
-repository. Whoever redistributes this package inherits an obligation to
-respect 1C's rights over its content.
+This package is **not** covered by bsl-analyzer's MIT license. The code
+that extracts and consumes it is the project's own work and stays under the
+license declared in the bsl-analyzer repository. Whoever redistributes
+this package inherits an obligation to respect 1C's rights over its content.

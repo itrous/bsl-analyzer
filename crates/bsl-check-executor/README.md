@@ -2,8 +2,8 @@
 
 This crate transfers the native Designer backend from commit
 `724155b2ec2f4e5b9fe9189de92d05c482eb5bd1` in this repository. The source
-files and synthetic XML fixtures are covered by the workspace dual license
-(`LICENSE-MIT` and `LICENSE-APACHE`); the fixtures contain no business data.
+files and synthetic XML fixtures are covered by the workspace MIT license
+(`LICENSE-MIT`); the fixtures contain no business data.
 
 Transferred implementation: `commands.rs`, `compiler.rs`, `profile.rs`,
 `runtime.rs`, `source.rs`, `types.rs`, `tests.rs`, and the XML/Python files in

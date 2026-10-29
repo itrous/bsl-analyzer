@@ -2,7 +2,7 @@
 name = "bsl-analyzer"
 version.workspace = true
 edition.workspace = true
-license = "LGPL-3.0-or-later"
+license.workspace = true
 rust-version.workspace = true
 
 [lib]

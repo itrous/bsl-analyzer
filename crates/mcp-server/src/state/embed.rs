@@ -2508,7 +2508,7 @@ mod tests {
     /// being replaced is what turns the retarget into a rebind.
     #[cfg(unix)]
     #[test]
-    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
+    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589; run: cargo test -p mcp-server --lib publish_hook_keeps_a_retargeted_roots_id -- --ignored"]
     fn publish_hook_keeps_a_retargeted_roots_id() {
         let fixture = RetargetedLink::new();
         assert!(fixture.publish(), "the linked extension root must be installed");
@@ -2609,7 +2609,7 @@ mod tests {
     /// provider keyed on the workspace instead of the layout would never find the artifact
     /// and the root table would stay frozen at its boot contents.
     #[test]
-    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
+    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589; run: cargo test -p mcp-server --lib publish_hook_transitions_roots_when_the_cache_lives_outside_the_workspace -- --ignored"]
     fn publish_hook_transitions_roots_when_the_cache_lives_outside_the_workspace() {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
