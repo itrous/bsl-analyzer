@@ -44,11 +44,14 @@ fn arg_mismatches(db: &RootDatabaseImpl, file_id: FileId) -> Vec<(TypeId, TypeId
         .collect()
 }
 
+// `Найти` is left undocumented: a union the documentation gave fits a slot of one
+// member, so only a computed `Число | Неопределено` keeps the unguarded call reporting.
 const NARROW_FIXTURE_MODULE: &str = r#"
 //- /CommonModules/ПервыйОбщийМодуль/Ext/Module.bsl
-// Возвращаемое значение:
-//   Число, Неопределено - индекс или Неопределено если не найден
-Функция Найти() Экспорт
+Функция Найти(Условие = Ложь) Экспорт
+    Если Условие Тогда
+        Возврат 1;
+    КонецЕсли;
     Возврат Неопределено;
 КонецФункции
 

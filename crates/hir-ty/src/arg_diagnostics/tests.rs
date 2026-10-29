@@ -68,7 +68,7 @@ fn t12_post_narrowing_applicable_survivor_suppresses_mismatch() {
     let string = db.string(None, false);
     let binding = binding(&db, &[&[number]], &[string]);
 
-    assert_eq!(diagnostic_for_binding(&db, &binding, &[number]), None);
+    assert_eq!(diagnostic_for_binding(&db, &binding, &[number], &mut |_| false), None);
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn t12_post_narrowing_indeterminate_survivor_suppresses_mismatch() {
     let string = db.string(None, false);
     let binding = binding(&db, &[&[number]], &[string]);
 
-    assert_eq!(diagnostic_for_binding(&db, &binding, &[db.unknown()]), None);
+    assert_eq!(diagnostic_for_binding(&db, &binding, &[db.unknown()], &mut |_| false), None);
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn t12_type_rejection_uses_best_candidate_and_first_incompatible_argument() {
     );
 
     assert_eq!(
-        diagnostic_for_binding(&db, &binding, &[number, string]),
+        diagnostic_for_binding(&db, &binding, &[number, string], &mut |_| false),
         Some(InferenceDiagnostic::TypeMismatch {
             expr: expr(2),
             expected: date,
@@ -112,12 +112,96 @@ fn t12_arity_rejection_uses_resolver_fallback_once() {
     let binding = binding(&db, &[&[number, number], &[number, number, number]], &[number]);
 
     assert_eq!(
-        diagnostic_for_binding(&db, &binding, &[number]),
+        diagnostic_for_binding(&db, &binding, &[number], &mut |_| false),
         Some(InferenceDiagnostic::MismatchedArgCount {
             call_expr: expr(0),
             required_count: 2,
             total_count: 2,
             found: 1,
+        })
+    );
+}
+
+#[test]
+fn documented_union_with_a_fitting_member_is_relieved() {
+    let db = InMemoryDb::new();
+    let structure = db.structure(None);
+    let maybe_structure = db.union(vec![structure, db.undefined()]);
+    let binding = binding(&db, &[&[structure]], &[maybe_structure]);
+
+    assert_eq!(diagnostic_for_binding(&db, &binding, &[maybe_structure], &mut |_| true), None);
+}
+
+#[test]
+fn computed_union_with_a_fitting_member_is_still_rejected() {
+    let db = InMemoryDb::new();
+    let structure = db.structure(None);
+    let maybe_structure = db.union(vec![structure, db.undefined()]);
+    let binding = binding(&db, &[&[structure]], &[maybe_structure]);
+
+    assert_eq!(
+        diagnostic_for_binding(&db, &binding, &[maybe_structure], &mut |_| false),
+        Some(InferenceDiagnostic::TypeMismatch {
+            expr: expr(1),
+            expected: structure,
+            actual: maybe_structure,
+            from_doc_comment: false,
+        })
+    );
+}
+
+#[test]
+fn documented_union_without_a_fitting_member_is_still_rejected() {
+    let db = InMemoryDb::new();
+    let structure = db.structure(None);
+    let maybe_number = db.union(vec![db.number(None, None), db.undefined()]);
+    let binding = binding(&db, &[&[structure]], &[maybe_number]);
+
+    assert_eq!(
+        diagnostic_for_binding(&db, &binding, &[maybe_number], &mut |_| true),
+        Some(InferenceDiagnostic::TypeMismatch {
+            expr: expr(1),
+            expected: structure,
+            actual: maybe_number,
+            from_doc_comment: false,
+        })
+    );
+}
+
+#[test]
+fn documented_value_of_a_foreign_type_is_still_rejected() {
+    let db = InMemoryDb::new();
+    let structure = db.structure(None);
+    let number = db.number(None, None);
+    let binding = binding(&db, &[&[structure]], &[number]);
+
+    assert_eq!(
+        diagnostic_for_binding(&db, &binding, &[number], &mut |_| true),
+        Some(InferenceDiagnostic::TypeMismatch {
+            expr: expr(1),
+            expected: structure,
+            actual: number,
+            from_doc_comment: false,
+        })
+    );
+}
+
+#[test]
+fn every_incompatible_argument_must_be_relieved() {
+    let db = InMemoryDb::new();
+    let structure = db.structure(None);
+    let number = db.number(None, None);
+    let maybe_structure = db.union(vec![structure, db.undefined()]);
+    let string = db.string(None, false);
+    let binding = binding(&db, &[&[structure, number]], &[maybe_structure, string]);
+
+    assert_eq!(
+        diagnostic_for_binding(&db, &binding, &[maybe_structure, string], &mut |_| true),
+        Some(InferenceDiagnostic::TypeMismatch {
+            expr: expr(1),
+            expected: structure,
+            actual: maybe_structure,
+            from_doc_comment: false,
         })
     );
 }

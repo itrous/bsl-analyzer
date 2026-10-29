@@ -829,6 +829,69 @@ fn push_branch_guards(
     }
 }
 
+/// Whether the local named `key` may take a value reaching definitions do not see at
+/// `use_stmt`.
+///
+/// An argument is passed by reference unless the callee declares it `Знач`, so a call may
+/// write the local it is given. `Выполнить` may write any local. The handler of `Попытка` is reached from
+/// the entry of the protected statements only, so a write among them that an error
+/// interrupts is not seen by the handler or the code after it.
+///
+/// `own_call` is the call the use is an argument of, as its binding names it (the call, or
+/// its callee): its write happens after the argument is read, so it reaches the use only
+/// round a loop around it.
+pub(crate) fn local_may_change_unseen(
+    body: &Body,
+    key: &str,
+    use_stmt: StmtIdx,
+    own_call: Option<ExprId>,
+) -> bool {
+    let names_local = |expr: &hir_def::hir::ExprIdx| matches!(body.expr_idx(*expr), Expr::Path(arg) if arg.as_str().fold_lower() == key);
+    let covers = |outer: StmtIdx, inner: StmtIdx| stmt_covers_stmt(body, outer, inner);
+    let in_loop = || {
+        body.stmts_iter().any(|(id, stmt)| {
+            matches!(stmt, Stmt::While { .. } | Stmt::For { .. } | Stmt::ForEach { .. })
+                && covers(id.to_idx(), use_stmt)
+        })
+    };
+    let is_own_call = |id: ExprId, callee: Option<&hir_def::hir::ExprIdx>| {
+        own_call.is_some_and(|own| {
+            own == id || callee.is_some_and(|callee| own == ExprId::from_idx(*callee))
+        })
+    };
+    let passed_to_call = body.exprs_iter().any(|(id, expr)| {
+        let (args, callee) = match expr {
+            Expr::Call { callee, args } => (args, Some(callee)),
+            Expr::MethodCall { args, .. } => (args, None),
+            _ => return false,
+        };
+        args.iter().any(names_local) && (!is_own_call(id, callee) || in_loop())
+    });
+    if passed_to_call {
+        return true;
+    }
+    let writes: Vec<StmtIdx> = body
+        .stmts_iter()
+        .filter_map(|(id, stmt)| match stmt {
+            Stmt::Assign { target, .. } if names_local(target) => Some(id.to_idx()),
+            Stmt::For { var, .. } | Stmt::ForEach { var, .. }
+                if body.binding_idx(*var).name.as_str().fold_lower() == key =>
+            {
+                Some(id.to_idx())
+            }
+            _ => None,
+        })
+        .collect();
+    body.stmts_iter().any(|(_, stmt)| match stmt {
+        Stmt::Execute { .. } => true,
+        Stmt::Try { body: protected, .. } => {
+            let in_protected = |target: StmtIdx| protected.iter().any(|s| covers(*s, target));
+            !in_protected(use_stmt) && writes.iter().any(|write| in_protected(*write))
+        }
+        _ => false,
+    })
+}
+
 /// Whether `target` is `root` itself or one of the statements nested in it.
 pub fn stmt_covers_stmt(body: &Body, root: StmtIdx, target: StmtIdx) -> bool {
     if root == target {

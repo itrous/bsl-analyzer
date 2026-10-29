@@ -2,16 +2,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base_db::FileIdInput;
+use dataflow::reaching_defs::{DefSite, ReachingDefsResult};
 use hir_def::body::Body;
-use hir_def::hir::Expr;
-use hir_def::{DefWithBodyId, ExprId, IdConversion, MethodIdInput, ModuleId};
+use hir_def::hir::{Expr, Stmt};
+use hir_def::{
+    BindingId, DefWithBodyId, ExprId, IdConversion, MethodId, MethodIdInput, ModuleId, StmtId,
+};
+use rustc_hash::FxHashMap;
+use stdx::case::CaseExt;
 use vfs::FileId;
 
 use bsl_types::builders::Builders;
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::TypeId;
 
-use crate::call_resolution::{resolve_candidates, ArgumentParameter, CallRejection, CallSelection};
+use crate::call_resolution::{
+    resolve_candidates, ArgumentApplicability, ArgumentParameter, CallRejection, CallResolution,
+    CallSelection, CandidateDisposition, CandidateProvenance, CandidateRejection,
+};
 use crate::db::HirDatabase;
 use crate::infer::{CallArgBinding, InferenceDiagnostic};
 use crate::narrow::{narrowed_type_at, refine_by_ternary_guard, NarrowState};
@@ -38,6 +46,7 @@ pub fn method_arg_diagnostics_query<'db>(
         body,
         &infer.call_arg_bindings,
         &infer.expr_types,
+        &infer.binding_types,
     ))
 }
 
@@ -67,6 +76,7 @@ pub fn module_code_arg_diagnostics_query<'db>(
         body,
         &infer.call_arg_bindings,
         &infer.expr_types,
+        &infer.binding_types,
     ))
 }
 
@@ -103,7 +113,8 @@ fn body_arg_diagnostics(
     owner: DefWithBodyId,
     body: &Body,
     bindings: &[CallArgBinding],
-    expr_types: &rustc_hash::FxHashMap<ExprId, TypeId>,
+    expr_types: &FxHashMap<ExprId, TypeId>,
+    binding_types: &FxHashMap<BindingId, TypeId>,
 ) -> Vec<InferenceDiagnostic> {
     if bindings.is_empty() {
         return Vec::new();
@@ -114,6 +125,7 @@ fn body_arg_diagnostics(
     // Narrowing is asked for once per body, and only once a call passes a
     // bare name as an argument — the only shape narrowing can refine.
     let mut narrow: Option<Option<Arc<dataflow::DataflowResult<NarrowState>>>> = None;
+    let mut values = DocumentedValues::new(db, file_id, owner, body, bindings, binding_types);
     let mut out = Vec::new();
     for binding in bindings {
         // A branch no environment of this body compiles never reaches the
@@ -140,7 +152,11 @@ fn body_arg_diagnostics(
             })
             .collect();
 
-        if let Some(diagnostic) = diagnostic_for_binding(db, binding, &post_types) {
+        let mut documented = |index: usize| {
+            binding.args.get(index).is_some_and(|arg| values.is_documented(*arg, binding.call_expr))
+        };
+        if let Some(diagnostic) = diagnostic_for_binding(db, binding, &post_types, &mut documented)
+        {
             out.push(diagnostic);
         }
     }
@@ -178,10 +194,163 @@ fn narrow_arg(
     refine_by_ternary_guard(db, body, expr_id.to_idx(), name, flow)
 }
 
+/// Whether the value of an argument expression is one the documentation typed:
+/// the return of a function documented with a type, a parameter the body was
+/// given its documented type for, or a local every reaching assignment of which
+/// is such a value. Answered lazily, and only for arguments a call was rejected on.
+struct DocumentedValues<'a> {
+    db: &'a dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    body: &'a Body,
+    bindings: &'a [CallArgBinding],
+    binding_types: &'a FxHashMap<BindingId, TypeId>,
+    reaching: Option<Option<Arc<ReachingDefsResult>>>,
+    memo: FxHashMap<(ExprId, ExprId), bool>,
+}
+
+impl<'a> DocumentedValues<'a> {
+    fn new(
+        db: &'a dyn HirDatabase,
+        file_id: FileId,
+        owner: DefWithBodyId,
+        body: &'a Body,
+        bindings: &'a [CallArgBinding],
+        binding_types: &'a FxHashMap<BindingId, TypeId>,
+    ) -> Self {
+        Self {
+            db,
+            file_id,
+            owner,
+            body,
+            bindings,
+            binding_types,
+            reaching: None,
+            memo: FxHashMap::default(),
+        }
+    }
+
+    /// `call_expr` is the call `expr` is an argument of, as its binding names it.
+    fn is_documented(&mut self, expr: ExprId, call_expr: ExprId) -> bool {
+        if let Some(known) = self.memo.get(&(expr, call_expr)) {
+            return *known;
+        }
+        // A value defined through itself (`Х = Х;` in a loop) proves nothing.
+        self.memo.insert((expr, call_expr), false);
+        let documented = match self.body.expr(expr) {
+            // Inference binds a call under its callee expression, not the call itself.
+            Expr::Call { callee, .. } => self.is_documented_call(ExprId::from_idx(*callee)),
+            Expr::Path(name) => self.is_documented_name(expr, name.as_str(), call_expr),
+            _ => false,
+        };
+        self.memo.insert((expr, call_expr), documented);
+        documented
+    }
+
+    /// Every candidate of the call is a user function whose documentation gives
+    /// the return a type: without one the signature takes the body's inferred
+    /// return, which is computed.
+    fn is_documented_call(&self, call_expr: ExprId) -> bool {
+        let Some(binding) = self.bindings.iter().find(|binding| binding.call_expr == call_expr)
+        else {
+            return false;
+        };
+        let candidates = binding.candidate.candidates.as_slice();
+        !candidates.is_empty()
+            && candidates.iter().all(|candidate| match candidate.provenance {
+                CandidateProvenance::UserMethod(id) => {
+                    self.db.interface_method(MethodId::from(id)).is_some_and(|decl| {
+                        decl.is_function
+                            && crate::method_resolution::materialise_signature(self.db, &decl).ret
+                                != self.db.unknown()
+                    })
+                }
+                CandidateProvenance::PlatformMethod { .. }
+                | CandidateProvenance::Builtin(_)
+                | CandidateProvenance::FunctionValue => false,
+            })
+    }
+
+    fn is_documented_name(&mut self, expr: ExprId, name: &str, call_expr: ExprId) -> bool {
+        let Some(stmt) = self.body.enclosing_stmt(expr) else {
+            return false;
+        };
+        // A write reaching definitions do not see leaves a value nothing documented.
+        // shortcut: every call the local is passed to counts as a possible writer, platform
+        // callables included (`ТипЗнч(Х)`, `Формат(Х, …)`), as inference counts them; telling
+        // apart callees that cannot rebind an argument would relieve those values as well.
+        let key = name.fold_lower();
+        if crate::narrow::local_may_change_unseen(self.body, &key, stmt.to_idx(), Some(call_expr)) {
+            return false;
+        }
+        let Some(defs) =
+            self.reaching().and_then(|reaching| reaching.defs_for_var_at_stmt(name, stmt))
+        else {
+            return false;
+        };
+        !defs.is_empty()
+            && defs.iter().all(|def| match def.def_site {
+                DefSite::Parameter(binding) => self.binding_types.contains_key(&binding),
+                DefSite::Assignment(stmt_raw) => match self.body.stmt(StmtId::from_raw(stmt_raw)) {
+                    Stmt::Assign { value, .. } => {
+                        self.is_documented(ExprId::from_idx(*value), call_expr)
+                    }
+                    _ => false,
+                },
+                DefSite::VarDecl(_)
+                | DefSite::ForLoop(_)
+                | DefSite::ForEachLoop(_)
+                | DefSite::Unknown => false,
+            })
+    }
+
+    fn reaching(&mut self) -> Option<Arc<ReachingDefsResult>> {
+        self.reaching
+            .get_or_insert_with(|| match self.owner {
+                DefWithBodyId::Method(local_id) => {
+                    let module = ModuleId::new(self.file_id);
+                    self.db.method_reaching_definitions(MethodIdInput::new(
+                        self.db,
+                        MethodId { module, local_id },
+                    ))
+                }
+                DefWithBodyId::ModuleCode => self.db.module_code_reaching_definitions(self.file_id),
+            })
+            .clone()
+    }
+}
+
+/// A call rejected on types is still sound when a rejected candidate failed only
+/// on documented union values each of which has a member the slot admits.
+fn relieved_by_documentation(
+    db: &dyn TypeKernelDb,
+    resolution: &CallResolution,
+    documented: &mut dyn FnMut(usize) -> bool,
+) -> bool {
+    resolution.candidates.iter().any(|fact| {
+        let CandidateDisposition::Rejected(CandidateRejection::TypeIncompatible { arguments }) =
+            &fact.disposition
+        else {
+            return false;
+        };
+        arguments
+            .iter()
+            .filter(|argument| argument.applicability == ArgumentApplicability::Incompatible)
+            .all(|argument| match argument.parameter {
+                ArgumentParameter::Declared { ty, .. } => {
+                    crate::subtype::is_coercible_documented_union(db, argument.argument_ty, ty)
+                        && documented(argument.index)
+                }
+                ArgumentParameter::MissingMetadata => false,
+            })
+    })
+}
+
 fn diagnostic_for_binding(
     db: &dyn TypeKernelDb,
     binding: &CallArgBinding,
     post_types: &[TypeId],
+    documented: &mut dyn FnMut(usize) -> bool,
 ) -> Option<InferenceDiagnostic> {
     let resolution = resolve_candidates(db, &binding.candidate.candidates, post_types);
     match resolution.selection {
@@ -202,6 +371,9 @@ fn diagnostic_for_binding(
             })
         }
         CallSelection::Rejected(CallRejection::Type) => {
+            if relieved_by_documentation(db, &resolution, documented) {
+                return None;
+            }
             let fallback = resolution.type_fallback()?;
             let argument = fallback.argument;
             let ArgumentParameter::Declared { ty: expected, .. } = argument.parameter else {

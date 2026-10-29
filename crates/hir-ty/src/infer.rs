@@ -2842,7 +2842,9 @@ impl<'db> InferenceContext<'db> {
                 let reaching =
                     self.reaching_assignment_types_at(self.read_point(use_stmt)?, &key)?;
                 let use_stmt = use_stmt.to_idx();
-                if !walk.inferred_leaves && self.local_may_change_unseen(&key, use_stmt) {
+                if !walk.inferred_leaves
+                    && crate::narrow::local_may_change_unseen(&self.body, &key, use_stmt, None)
+                {
                     return None;
                 }
                 let sources = self.loop_aware_definitions(&key, use_stmt, reaching)?;
@@ -2912,48 +2914,6 @@ impl<'db> InferenceContext<'db> {
             }
             _ => Some(stmt),
         }
-    }
-
-    /// Whether the local named `key` may take a value reaching definitions do not see at
-    /// `use_stmt`.
-    ///
-    /// An argument is passed by reference unless the callee declares it `Знач`, so a call may
-    /// write the local it is given. `Выполнить` may write any local. The handler of `Попытка` is reached from
-    /// the entry of the protected statements only, so a write among them that an error
-    /// interrupts is not seen by the handler or the code after it.
-    fn local_may_change_unseen(&self, key: &str, use_stmt: StmtIdx) -> bool {
-        let names_local = |expr: &hir_def::hir::ExprIdx| matches!(self.body.expr_idx(*expr), Expr::Path(arg) if arg.as_str().fold_lower() == key);
-        let passed_to_call = self.body.exprs_iter().any(|(_, expr)| match expr {
-            Expr::Call { args, .. } | Expr::MethodCall { args, .. } => args.iter().any(names_local),
-            _ => false,
-        });
-        if passed_to_call {
-            return true;
-        }
-        let covers = |outer: StmtIdx, inner: StmtIdx| {
-            crate::narrow::stmt_covers_stmt(&self.body, outer, inner)
-        };
-        let writes: Vec<StmtIdx> = self
-            .body
-            .stmts_iter()
-            .filter_map(|(id, stmt)| match stmt {
-                Stmt::Assign { target, .. } if names_local(target) => Some(id.to_idx()),
-                Stmt::For { var, .. } | Stmt::ForEach { var, .. }
-                    if self.body.binding_idx(*var).name.as_str().fold_lower() == key =>
-                {
-                    Some(id.to_idx())
-                }
-                _ => None,
-            })
-            .collect();
-        self.body.stmts_iter().any(|(_, stmt)| match stmt {
-            Stmt::Execute { .. } => true,
-            Stmt::Try { body: protected, .. } => {
-                let in_protected = |target: StmtIdx| protected.iter().any(|s| covers(*s, target));
-                !in_protected(use_stmt) && writes.iter().any(|write| in_protected(*write))
-            }
-            _ => false,
-        })
     }
 
     /// Where the definitions of `var_key` reaching `use_stmt` take their values, with loop

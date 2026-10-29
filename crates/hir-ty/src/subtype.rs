@@ -465,6 +465,19 @@ pub fn is_coercible_to(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool 
     is_assignable(db, from, to)
 }
 
+/// Whether a union the documentation gave fits a slot that admits one of its
+/// members. Documentation lists what may come in, and an author who passes such
+/// a value where one listed variant is expected chose that variant. This is
+/// argument-position policy for a value whose type came from documentation, not
+/// lattice truth: [`is_coercible_to`] keeps judging a union of unknown origin —
+/// one the analyzer computed — by its stricter rule.
+pub fn is_coercible_documented_union(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool {
+    match db.lookup_type(from) {
+        TypeKind::Union(parts) => parts.iter().any(|part| is_coercible_to(db, *part, to)),
+        _ => false,
+    }
+}
+
 /// A parameter slot accepts the bare ТаблицаЗначений — directly or as one
 /// member of a documented union (`ТаблицаЗначений, РезультатЗапроса, …`).
 /// Projected value tables never reach parameter position (doc types lower with
@@ -940,6 +953,21 @@ mod tests {
             !is_coercible_to(&db, from, structure),
             "a maybe-absent value into a slot that does not admit absence must keep firing"
         );
+    }
+
+    #[test]
+    fn documented_union_fits_where_one_member_fits() {
+        let db = InMemoryDb::new();
+        let structure = db.structure(None);
+        let number = db.number(None, None);
+        let maybe_structure = db.union(vec![structure, db.undefined()]);
+        assert!(is_coercible_documented_union(&db, maybe_structure, structure));
+        assert!(!is_coercible_to(&db, maybe_structure, structure));
+        assert!(!is_assignable(&db, maybe_structure, structure));
+
+        let maybe_number = db.union(vec![number, db.undefined()]);
+        assert!(!is_coercible_documented_union(&db, maybe_number, structure));
+        assert!(!is_coercible_documented_union(&db, number, structure));
     }
 
     #[test]

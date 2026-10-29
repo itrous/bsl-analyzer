@@ -49,12 +49,14 @@ fn mismatches(db: &RootDatabaseImpl, file_id: FileId) -> Vec<(TypeId, TypeId)> {
         .collect()
 }
 
+// `Найти` is left undocumented: a union the documentation gave fits a slot of one
+// member, so only a computed `Число | Неопределено` keeps the unguarded use reporting.
 const MODULE: &str = r#"
 //- /CommonModules/ПервыйОбщийМодуль/Ext/Module.bsl
-// Возвращаемое значение:
-//   - Число - индекс.
-//   - Неопределено - не найден.
-Функция Найти() Экспорт
+Функция Найти(Условие = Ложь) Экспорт
+    Если Условие Тогда
+        Возврат 1;
+    КонецЕсли;
     Возврат Неопределено;
 КонецФункции
 
