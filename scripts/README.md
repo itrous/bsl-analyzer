@@ -48,6 +48,8 @@ python3 $P calibrate --data-dir $D --binary $B --series 5   # cal-<i> и $D/nois
 python3 $P compare --data-dir $D --base v0.3.2/cal-1 --candidate v0.3.2/cal-2 --trend
 python3 $P night --data-dir $D --deadline 08:45            # → $D/nights/<дата>/
 python3 $P night --data-dir $D --candidate v0.3.3          # гейт тега → $D/gates/v0.3.3/
+python3 $P gate-calibrate --data-dir $D --base v0.4.1      # → $D/gate-cal/…, $D/gate-noise.json
+python3 $P gate --data-dir $D --base v0.4.1 --candidate <SHA|тег> --label <метка>  # → $D/gates/<метка>/
 python3 -m unittest discover -s scripts/perf-nightly/tests
 ```
 
@@ -62,6 +64,40 @@ python3 -m unittest discover -s scripts/perf-nightly/tests
 прогон, но обновление системы калибровку не сбрасывает. Положительные
 контроли `measure`: `--ballast-mb`, `--ballast-after-ready-mb`, `--inject-latency-ms`;
 контроль времени — запуск `measure` под `taskset -c 0-3`.
+
+`gate` — гейт скорости и памяти ночного релиза. Меряет на клоне ЕРП из `corpora.toml`
+(на коммите манифеста, без изменённых отслеживаемых файлов, иначе `source_mismatch`) с
+его закоммиченным конфигом, свежим `BSL_CACHE_DIR` на прогон и порядком вызовов и пауз
+прежнего протокола релиза. Серия A — три пары база/кандидат с чередованием: время
+`graph_ready_s` от запуска до первого `graph ready`, CPU прогона к этому моменту
+`graph_ready_cpu_s`, затем `graph resolve` (`graph_resolve_s`) и свип `diagnostics
+workspace` на 5000 файлов (`diagnostics_workspace_s`); серия B — кандидат ×3 с
+`--enable-tool references`. Δ — медиана кандидата к медиане базы минус 1, ν — шум из
+`$D/gate-noise.json`:
+
+| метрика | исход |
+|---|---|
+| `graph_ready_cpu_s`, `graph_resolve_s`, `diagnostics_workspace_s` | ν нет — `no_noise`; ν > 5 % — `noisy`; Δ > 5 % — `block` |
+| `graph_ready_s` | ν нет — `no_noise`; ν > 40 % — `noisy`; Δ ≤ max(5 %, ν) — не блок; выше при ν ≤ 5 % — `block`, при ν > 5 % — подтверждающий раунд из трёх пар и `block`, только если и его Δ′ > max(5 %, ν) |
+| `hwm_kb` кандидата (обе серии), references серии B | больше 7168 МиБ, 67,7 / 32,3 / 59,5 с — `block` |
+| ответы `graph resolve` и `aggregates` свипа каждой пары | байты различны — `block` (`answers_differ`); у первого прогона кандидата два разных непустых доп. resolve не получены — `answers_control` |
+| сбой или невалидный прогон | кандидата — `block`; базы или недобор прогонов — `incomplete` |
+
+Прогон, где чужая нагрузка за окно готовности графа больше двух ядер (`foreign_cores`
+по `/proc/stat`), не засчитывается (`foreign_load`) и повторяется на том же месте;
+перед каждым прогоном гейт ждёт MemAvailable ≥ 13 ГиБ и load1 ≤ 2. Ожидание и
+незасчитанные прогоны делят бюджет `--busy-budget-min` (60 минут), его исчерпание —
+`incomplete` с `machine_busy`. Вердикт `pass`, `block` или `incomplete` (коды выхода
+0 / 1 / 2) — в `$D/gates/<метка>/summary.json` и `report.md`; занятые `gate.lock`
+(`gate_busy`) и существующий каталог метки (`gate_exists`) — отказ без `summary.json`.
+Калибровка гейта — `gate-calibrate`: пять серий по три полных прогона базы, отдельный
+`gate-noise.json` (ночной `noise.json` не трогается); его устаревают смена CPU, числа
+потоков, схемы харнеса или гейта, коммита ЕРП и его конфига, без него гейт `incomplete`
+с `noise_stale`. Положительные контроли (в регламенте не используются):
+`--control-burn-cpu-s X` (кандидат тратит на X CPU-секунд больше до готовности графа),
+`--control-start-delay-s D` (сервер кандидата стартует на D с позже),
+`--control-foreign-burn N` (N занятых процессов вне прогона на окне готовности);
+`--ready-only` судит только готовность и вместо `pass` пишет `probe-ok`.
 
 Корпус, чей закоммиченный `bsl-analyzer.toml` проверяемые версии отвергают, получает
 в `corpora.toml` поле `config` — путь к приватной копии конфига в каталоге данных;

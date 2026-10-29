@@ -151,6 +151,16 @@ def machine_load(proc_root: str = "/proc") -> dict:
     }
 
 
+def machine_busy_s(proc_root: str = "/proc") -> float:
+    """CPU seconds the whole machine spent busy since boot: user, nice, system,
+    irq, softirq and steal of the `cpu ` line; idle and iowait are not work."""
+    for line in (_read(os.path.join(proc_root, "stat")) or b"").decode().splitlines():
+        if line.startswith("cpu "):
+            ticks = [int(x) for x in line.split()[1:9]]
+            return (ticks[0] + ticks[1] + ticks[2] + ticks[5] + ticks[6] + ticks[7]) / CLK_TCK
+    raise OSError(f"{proc_root}/stat has no cpu line")
+
+
 def _exited(fd: int) -> bool:
     poller = select.poll()
     poller.register(fd, select.POLLIN)
@@ -193,8 +203,9 @@ def stop(run_id: str, clock=None, proc_root: str = "/proc", grace: float = TERM_
 
 
 class Sampler:
-    """1 Hz sampler of the tracked set: peak of summed RSS and the last CPU
-    seen per PID (so processes that exit before the end still count)."""
+    """1 Hz sampler of the tracked set: peak of summed RSS, the last CPU and
+    the peak `VmHWM` seen per PID (so processes that exit before the end still
+    count)."""
 
     def __init__(self, run_id: str, interval: float = 1.0, proc_root: str = "/proc"):
         self.run_id = run_id
@@ -202,6 +213,7 @@ class Sampler:
         self.proc_root = proc_root
         self.peak_rss_kb = 0
         self._cpu: dict[str, float] = {}
+        self._hwm: dict[str, int] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -209,15 +221,21 @@ class Sampler:
 
     def sample(self) -> dict:
         snap = snapshot(self.run_id, self.proc_root)
+        hwm = {str(pid): _status_kb(pid, "VmHWM", self.proc_root) for pid in snap["pids"]}
         with self._lock:
             self.peak_rss_kb = max(self.peak_rss_kb, snap["rss_kb"])
             for pid, cpu in snap["cpu_by_pid"].items():
                 self._cpu[pid] = max(cpu, self._cpu.get(pid, 0.0))
+            for pid, kb in hwm.items():
+                if kb is not None:
+                    self._hwm[pid] = max(kb, self._hwm.get(pid, 0))
         return snap
 
-    def cpu_s(self) -> float:
+    def cpu_s(self, exclude=()) -> float:
+        """CPU of the set, without the PIDs in `exclude`."""
+        skip = {str(pid) for pid in exclude}
         with self._lock:
-            return sum(self._cpu.values())
+            return sum(v for pid, v in self._cpu.items() if pid not in skip)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -229,4 +247,6 @@ class Sampler:
             self._stop.set()
             self._thread.join()
             self.sample()
-        return {"rss_peak_kb": self.peak_rss_kb, "cpu_s": round(self.cpu_s(), 3)}
+        with self._lock:
+            hwm_kb = max(self._hwm.values(), default=0)
+        return {"rss_peak_kb": self.peak_rss_kb, "cpu_s": round(self.cpu_s(), 3), "hwm_kb": hwm_kb}

@@ -830,15 +830,16 @@ def call_available(actions: dict, tool: str, action: str | None) -> bool:
 
 
 class McpRun:
-    def __init__(self, ctx: Ctx, index: int = 0):
+    def __init__(self, ctx: Ctx, index: int = 0, extra_args=(), argv_prefix=()):
+        """`extra_args` follow `--source-dir <root>`; `argv_prefix` goes before
+        the binary (a wrapper that execs it keeps the PID and the marker)."""
         self.ctx = ctx
         self.stderr_path = os.path.join(ctx.run_dir, f"stderr-{index}.txt")
         self._stderr = open(self.stderr_path, "wb")
         self.spawned_at = ctx.clock.now()
-        self.client = McpClient(
-            ctx.server_argv([ctx.binary, "mcp", "serve", "--profile", "workspace", "--source-dir", ctx.root],
-                            "lines"),
-            ctx.root, ctx.env, self._stderr, ctx.clock)
+        argv = [*argv_prefix, ctx.binary, "mcp", "serve", "--profile", "workspace", "--source-dir", ctx.root,
+                *extra_args]
+        self.client = McpClient(ctx.server_argv(argv, "lines"), ctx.root, ctx.env, self._stderr, ctx.clock)
         self.actions: dict = {}
 
     def request(self, method, params, timeout=CALL_TIMEOUT_S):
@@ -867,10 +868,18 @@ class McpRun:
         self.actions = tool_actions((result or {}).get("tools") or [])
         return init_s, tools_s
 
-    def wait_ready(self) -> float:
+    def wait_ready(self, on_ready=None) -> float:
         """Poll the diagnostics and graph statuses once a second until both are
-        final; a backend that ends `failed` or `disabled` fails the run."""
+        final; a backend that ends `failed` or `disabled` fails the run.
+        `on_ready(backend)` runs once per backend on its first `ready`."""
         clock = self.ctx.clock
+        seen: set[str] = set()
+
+        def ready(backend: str) -> None:
+            if on_ready is not None and backend not in seen:
+                seen.add(backend)
+                on_ready(backend)
+
         while True:
             pending = []
             if "diagnostics" in self.actions:
@@ -880,6 +889,8 @@ class McpRun:
                     raise NotHeld("backend_failed", f"diagnostics status {state}")
                 if state != "ready":
                     pending.append("diagnostics")
+                else:
+                    ready("diagnostics")
             if "graph" in self.actions:
                 _, result, error = self.status("graph")
                 state = _state(result) if error is None else None
@@ -889,6 +900,8 @@ class McpRun:
                     raise NotHeld("backend_failed", f"graph status {state}: {_texts(result or {})}")
                 elif state is None or state in GRAPH_PENDING:
                     pending.append("graph")
+                elif state == "ready":
+                    ready("graph")
             if not pending:
                 return clock.now() - self.spawned_at
             if clock.now() - self.spawned_at >= READY_TIMEOUT_S:

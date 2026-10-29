@@ -892,6 +892,16 @@ def cmd_night(args, clock=None) -> int:
     return 0
 
 
+def cmd_gate(args, clock=None) -> int:
+    import gate
+    return gate.cmd_gate(args, clock)
+
+
+def cmd_gate_calibrate(args, clock=None) -> int:
+    import gate
+    return gate.cmd_gate_calibrate(args, clock)
+
+
 def cmd_compare(args) -> int:
     import verdict
     data = Data(args.data_dir)
@@ -993,6 +1003,30 @@ def parser() -> argparse.ArgumentParser:
     night.add_argument("--remote", help="URL the build clone fetches from (default: origin)")
     night.add_argument("--publish", action="store_true", help="publish the night's perf issues with gh")
     night.set_defaults(func=cmd_night)
+
+    gate = sub.add_parser("gate", help="release gate: a base tag against a candidate commit on ERP")
+    gate.add_argument("--data-dir", required=True)
+    gate.add_argument("--base", required=True, help="the release tag vX.Y.Z to compare against")
+    gate.add_argument("--candidate", required=True, help="any commit-ish of this repository")
+    gate.add_argument("--label", required=True, help="results go to <DATA>/gates/<label>/")
+    gate.add_argument("--ready-only", action="store_true",
+                      help="control probe: judge graph readiness alone; the verdict is probe-ok, never pass")
+    gate.add_argument("--busy-budget-min", type=float,
+                      help="minutes of waiting for a quiet machine and of runs redone under foreign load "
+                           "(default 60)")
+    gate.add_argument("--control-burn-cpu-s", type=float,
+                      help="control: candidate runs burn this many more CPU seconds before graph readiness")
+    gate.add_argument("--control-start-delay-s", type=float,
+                      help="control: the candidate server starts this many seconds later")
+    gate.add_argument("--control-foreign-burn", type=int,
+                      help="control: this many busy processes outside the run live through readiness")
+    gate.set_defaults(func=cmd_gate)
+
+    gate_calibrate = sub.add_parser("gate-calibrate", help="measure the gate's noise and write gate-noise.json")
+    gate_calibrate.add_argument("--data-dir", required=True)
+    gate_calibrate.add_argument("--base", required=True, help="the release tag vX.Y.Z to calibrate on")
+    gate_calibrate.add_argument("--series", type=int, help="series of three runs to measure (default 5)")
+    gate_calibrate.set_defaults(func=cmd_gate_calibrate)
 
     compare = sub.add_parser("compare", help="verdict of a candidate series against a base series")
     compare.add_argument("--data-dir", required=True)

@@ -22,6 +22,15 @@ Every LSP didOpen and didClose is appended as `{"method", "uri"}` to FAKE_LOG/do
   mcp: no_graph, iserror_m1, loading_m6, status_loading_m5, silent_m1,
        never_ready, diag_failed, search_failed, graph_failed, graph_disabled, graph_busy,
        graph_busy_no_target, graph_busy_failure, help_warn_mcp, field_unavailable_m1
+  mcp (the release gate):
+       graph_answers       `graph resolve` answers `structuredContent.result.candidates`: a non-empty list
+                           that differs between queries and is cut to `top`
+       graph_answers_same  the same list for every query (the gate's control cannot tell answers apart)
+       sweep_answers       `diagnostics workspace` answers `structuredContent.aggregates`
+       sweep_extra_code    one more aggregate code `X` (for the binary it is set on)
+       sweep_other_count   the same codes, one of them counted 8 times instead of 7
+       refs_tool           `references` is listed only when the server got `--enable-tool references`
+       cand_crash          the server exits right after it answered `initialize`
 Every MCP tool call is appended as `{"name", "arguments"}` to FAKE_LOG/tools.jsonl.
 """
 
@@ -261,6 +270,17 @@ def text(value, error=False, structured=None):
 
 
 GRAPH_STATUS_CALLS = []
+SWEEP_AGGREGATES = [
+    {"code": "BSL001", "count": 7, "files_affected": 3, "severity": "warning"},
+    {"code": "BSL002", "count": 2, "files_affected": 2, "severity": "error"},
+]
+
+
+def resolve_candidates(query, top):
+    """Distinct non-empty lists for distinct queries, cut to `top`."""
+    key = "same" if "graph_answers_same" in MODE else query
+    candidates = [{"id": f"{key}#{i}", "score": 10 - i} for i in range(2 + len(key) % 3)]
+    return candidates[:top] if top else candidates
 
 
 def tool_result(name, args, call_index):
@@ -290,6 +310,15 @@ def tool_result(name, args, call_index):
                 {**target, "state": "failed", "reason_code": "native_failure"}]}}))
         state = "disabled" if "graph_disabled" in MODE else "ready"
         return text(json.dumps({"state": state}))
+    if name == "graph" and action == "resolve" and ("graph_answers" in MODE or "graph_answers_same" in MODE):
+        candidates = resolve_candidates(args.get("query", ""), args.get("top"))
+        return text(json.dumps({"candidates": candidates}), structured={"result": {"candidates": candidates}})
+    if name == "diagnostics" and action == "workspace" and "sweep_answers" in MODE:
+        aggregates = [{**a, "count": 8} if "sweep_other_count" in MODE and a["code"] == "BSL001" else a
+                      for a in SWEEP_AGGREGATES]
+        aggregates += [{"code": "X", "count": 1, "files_affected": 1, "severity": "hint"}] \
+            if "sweep_extra_code" in MODE else []
+        return text(json.dumps({"aggregates": aggregates}), structured={"aggregates": aggregates})
     if name == "outline" and "field_unavailable_m1" in MODE:
         return text(json.dumps({"nodes": [{"name": "x", "location_unavailable": "no_source_location"}]}))
     if name == "outline" and "iserror_m1" in MODE:
@@ -309,8 +338,9 @@ def silence_once() -> bool:
         return False
 
 
-def mcp() -> int:
+def mcp(argv) -> int:
     out = sys.stdout
+    references = "--enable-tool" in argv and argv[argv.index("--enable-tool") + 1] == "references"
     calls = 0
     if "help_warn_mcp" in MODE:
         sys.stderr.write("WARN platform help degraded to the built-in interface facts; descriptions are empty\n")
@@ -328,9 +358,11 @@ def mcp() -> int:
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": message["id"], "result": {
                 "protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake"}}})
+            if "cand_crash" in MODE:
+                return 0
         elif method == "tools/list":
             tools = []
-            for name, actions in TOOLS:
+            for name, actions in TOOLS + ([("references", None)] if "refs_tool" in MODE and references else []):
                 if name == "graph" and "no_graph" in MODE:
                     continue
                 props = {"action": {"type": "string", "enum": actions}} if actions else {}
@@ -356,7 +388,7 @@ def main() -> int:
     if argv[:1] == ["lsp"]:
         return lsp()
     if argv[:2] == ["mcp", "serve"]:
-        return mcp()
+        return mcp(argv)
     return 64
 
 

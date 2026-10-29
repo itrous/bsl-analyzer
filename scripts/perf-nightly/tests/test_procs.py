@@ -1,6 +1,7 @@
 """Process accounting (plan §6.4): marker, foreign check, RSS sum, stop."""
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,79 @@ class FakeProcTree(unittest.TestCase):
         env = procs.child_env("run-e", {"XDG_CACHE_HOME": "/c"}, base={
             "BSL_CACHE_DIR": "/x", "BSL_MCP_BROKER": "0", "BSL_UNKNOWN_X": "1", "PATH": "/bin"})
         self.assertEqual(env, {"PATH": "/bin", procs.MARKER: "run-e", "XDG_CACHE_HOME": "/c"})
+
+
+def fake_run_proc(root, pid, run_id, hwm_kb, rss_kb=1000, cpu_ticks=(100, 50)):
+    """A process of a run with a VmHWM (utime and stime in clock ticks); a second
+    call for the same PID is the same process a moment later."""
+    shutil.rmtree(os.path.join(root, str(pid)), ignore_errors=True)
+    fake_proc(root, pid, ["bsl-analyzer-app", "mcp"], [f"{procs.MARKER}={run_id}"])
+    with open(os.path.join(root, str(pid), "status"), "w") as fh:
+        fh.write(f"Name:\tx\nVmHWM:\t{hwm_kb} kB\nVmRSS:\t{rss_kb} kB\n")
+    with open(os.path.join(root, str(pid), "stat"), "w") as fh:
+        fh.write(f"{pid} (x) S 1 1 1 0 -1 0 0 0 0 0 {cpu_ticks[0]} {cpu_ticks[1]} 0 0\n")
+
+
+class SamplerPeaks(unittest.TestCase):
+    """What the sampler keeps of the processes of a run: the peak `VmHWM` of
+    each process (also of one that exits), the largest of them, and the CPU."""
+
+    def setUp(self):
+        event_driven_process_waits(self)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def sampler(self):
+        sampler = procs.Sampler("run-h", proc_root=self.root)
+        self.addCleanup(sampler.stop)
+        return sampler
+
+    def test_hwm_is_the_largest_peak_of_the_run_and_the_other_fields_stay(self):
+        fake_run_proc(self.root, 300, "run-h", 5000, rss_kb=1000)
+        fake_run_proc(self.root, 301, "run-h", 8000, rss_kb=2500, cpu_ticks=(200, 100))
+        fake_run_proc(self.root, 302, "run-other", 99999, rss_kb=99999)
+        sampler = self.sampler()
+        sampler.sample()
+        self.assertEqual(sampler.stop(), {"rss_peak_kb": 3500, "cpu_s": 4.5, "hwm_kb": 8000})
+
+    def test_a_process_that_exits_keeps_its_peak_and_its_cpu(self):
+        fake_run_proc(self.root, 300, "run-h", 5000)
+        fake_run_proc(self.root, 301, "run-h", 8000, cpu_ticks=(200, 100))
+        sampler = self.sampler()
+        sampler.sample()
+        shutil.rmtree(os.path.join(self.root, "301"))
+        fake_run_proc(self.root, 300, "run-h", 6500, cpu_ticks=(300, 100))
+        sampler.sample()
+        stopped = sampler.stop()
+        self.assertEqual((stopped["hwm_kb"], stopped["cpu_s"]), (8000, 7.0))
+
+    def test_stop_takes_one_last_sample(self):
+        fake_run_proc(self.root, 300, "run-h", 5000)
+        sampler = self.sampler()
+        sampler.sample()
+        fake_run_proc(self.root, 300, "run-h", 9000)
+        self.assertEqual(sampler.stop()["hwm_kb"], 9000)
+
+    def test_a_peak_never_goes_down(self):
+        fake_run_proc(self.root, 300, "run-h", 7000)
+        sampler = self.sampler()
+        sampler.sample()
+        fake_run_proc(self.root, 300, "run-h", 4000)
+        sampler.sample()
+        self.assertEqual(sampler.stop()["hwm_kb"], 7000)
+
+    def test_a_run_without_processes_has_no_peak(self):
+        self.assertEqual(self.sampler().stop(), {"rss_peak_kb": 0, "cpu_s": 0.0, "hwm_kb": 0})
+
+    def test_cpu_without_the_excluded_pids(self):
+        fake_run_proc(self.root, 300, "run-h", 1)
+        fake_run_proc(self.root, 301, "run-h", 1, cpu_ticks=(200, 100))
+        sampler = self.sampler()
+        sampler.sample()
+        self.assertEqual((sampler.cpu_s(), sampler.cpu_s(()), sampler.cpu_s([301]), sampler.cpu_s([300, 301])),
+                         (4.5, 4.5, 1.5, 0.0))
+        self.assertEqual(sampler.cpu_s(exclude=[301, 999]), 1.5)
 
 
 def spawn(argv0, env, ignore_term=False):

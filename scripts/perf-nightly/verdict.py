@@ -58,6 +58,17 @@ OUTCOME_TEXT = {
     "incomparable": "несравнимо",
     "n/a": "n/a",
 }
+# The release gate (`gate.py`): work metrics are held to the bar itself and must
+# be calibrated within it; the wall time of graph readiness is held to
+# max(bar, noise), with a confirming round when its noise exceeds the bar.
+GATE_BAR = 0.05
+GATE_FOREIGN_CORES = 2.0
+GATE_HWM_LIMIT_KB = 7168 * 1024
+GATE_REFS_LIMITS_S = {"references_1_s": 67.7, "references_2_same_s": 32.3, "references_3_other_s": 59.5}
+GATE_DECISIVE = ("graph_ready_cpu_s", "graph_resolve_s", "diagnostics_workspace_s")
+GATE_WALL = ("graph_ready_s",)
+# Outcomes of a gate row that keep the gate from `pass` without blocking it.
+GATE_INCOMPLETE = ("no_noise", "noisy", "confirm", "incomplete")
 CALLS_LSP_REPEAT = ("L1", "L2", "L3", "L4", "L6", "G1", "G3")
 CALLS_MCP = ("M1", "M2", "M3", "M5", "M6", "M7")
 
@@ -131,6 +142,10 @@ VERDICT_METRICS = {
         Metric("global_reopen_s", "global_reopen_s", kind="ceiling", limit=GLOBAL_REOPEN_LIMIT_S),
     ],
 }
+
+
+# The gate's scenario; kept out of VERDICT_METRICS, which is the nightly set.
+GATE_METRICS = [_run(f) for f in GATE_DECISIVE + GATE_WALL]
 
 
 def scenario_of(sdir: str) -> str:
@@ -221,15 +236,16 @@ def noise_key(corpus_id: str, sdir: str, temp: str, key: str) -> str:
     return f"{corpus_id}/{sdir}/{temp}/{key}"
 
 
-def build_noise(series_groups: list[dict]) -> dict:
+def build_noise(series_groups: list[dict], metrics_for=metrics_of) -> dict:
     """{noise key: {medians, noise}} over calibration series (И45):
     (max − min) / median of the series medians; for memory growth the spread
     of growth over the median `rss_ready_kb` of the same series (D8). A metric
-    that is not valid in every series gets `noise: null` and its reason."""
+    that is not valid in every series gets `noise: null` and its reason.
+    `metrics_for(sdir)` names the metrics of a scenario."""
     entries = {}
     keys = sorted({k for groups in series_groups for k in groups})
     for corpus_id, sdir, temp in keys:
-        for metric in metrics_of(sdir):
+        for metric in metrics_for(sdir):
             if metric.kind not in ("delta", "growth"):
                 continue
             medians, ready, states = [], [], []
@@ -422,6 +438,45 @@ def night_verdict(rows: list[dict], *, stale: str | None = None,
     else:
         verdict = "ok"
     return {"verdict": verdict, "reasons": reasons, "uncompared": uncompared,
+            "counts": {o: outcomes.count(o) for o in sorted(set(outcomes))}}
+
+
+def gate_outcome(key: str, delta: float, noise: float | None, confirm_delta: float | None = None) -> str:
+    """Outcome of one gate metric by its Δ over the round, its calibrated noise
+    and, for the wall metric, the Δ′ of a confirming round (`confirm`: needed)."""
+    if noise is None:
+        return "no_noise"
+    if key not in GATE_WALL:
+        if noise > GATE_BAR:
+            return "noisy"
+        return "block" if delta > GATE_BAR else "ok"
+    if noise > NOISY:
+        return "noisy"
+    if delta <= GATE_BAR:
+        return "ok"
+    limit = max(GATE_BAR, noise)
+    if delta <= limit:
+        return "noise"
+    if noise <= GATE_BAR:
+        return "block"
+    if confirm_delta is None:
+        return "confirm"
+    return "block" if confirm_delta > limit else "noise"
+
+
+def gate_verdict(rows: list[dict], reasons: list[str]) -> dict:
+    """block > incomplete > pass: any `block` row blocks; otherwise any row
+    without a decision, or any reason, leaves the gate incomplete."""
+    outcomes = [r["outcome"] for r in rows]
+    found = list(reasons) + [f"{r['outcome']}: {r['metric']}" for r in rows
+                             if r["outcome"] == "block" or r["outcome"] in GATE_INCOMPLETE]
+    if "block" in outcomes:
+        verdict = "block"
+    elif any(o in GATE_INCOMPLETE for o in outcomes) or reasons:
+        verdict = "incomplete"
+    else:
+        verdict = "pass"
+    return {"verdict": verdict, "reasons": found,
             "counts": {o: outcomes.count(o) for o in sorted(set(outcomes))}}
 
 
