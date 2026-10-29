@@ -13,7 +13,7 @@ use hir_ty::{
     enumerate_fields, is_assignable, is_ref_ty, lookup_field, lookup_manager_field, lookup_method,
     platform_methods_for_manager, platform_methods_for_metadata_kind, FieldInfo, FieldOrigin,
 };
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use stdx::case::CaseExt;
 use vfs::FileId;
 
@@ -46,44 +46,57 @@ pub struct PlatformNameEntry<'a> {
     pub kind: PlatformNameKind,
     pub name: &'a str,
     pub english_name: &'a str,
-    pub owner: Option<&'a str>,
+    type_name: &'a str,
 }
 
-/// The platform name surface exposed to IDE consumers through the HIR facade.
-pub fn platform_name_entries() -> Vec<PlatformNameEntry<'static>> {
-    let platform = PlatformData::instance();
-    let mut entries = Vec::with_capacity(
-        platform.all_global_functions().len()
-            + platform.all_types().len()
-            + platform.all_methods().len()
-            + platform.all_properties().len(),
-    );
+impl<'a> PlatformNameEntry<'a> {
+    /// The owning type's display name. Resolved on demand: most consumers filter entries by
+    /// name first, and the owner is only worth a type lookup for the ones that survive.
+    pub fn owner(&self) -> Option<&'a str> {
+        platform_owner_display(PlatformData::instance(), self.type_name)
+    }
+}
 
-    entries.extend(platform.all_global_functions().iter().map(|function| PlatformNameEntry {
-        kind: PlatformNameKind::GlobalFunction,
-        name: &function.name,
-        english_name: &function.english_name,
-        owner: None,
-    }));
-    entries.extend(platform.all_types().iter().map(|ty| PlatformNameEntry {
-        kind: PlatformNameKind::Type,
-        name: &ty.name,
-        english_name: &ty.english_name,
-        owner: None,
-    }));
-    entries.extend(platform.all_methods().iter().map(|method| PlatformNameEntry {
-        kind: PlatformNameKind::Method,
-        name: &method.name,
-        english_name: &method.english_name,
-        owner: platform_owner_display(platform, &method.type_name),
-    }));
-    entries.extend(platform.all_properties().iter().map(|property| PlatformNameEntry {
-        kind: PlatformNameKind::Property,
-        name: &property.name,
-        english_name: &property.english_name,
-        owner: platform_owner_display(platform, &property.type_name),
-    }));
-    entries
+static PLATFORM_NAME_ENTRIES: OnceLock<Vec<PlatformNameEntry<'static>>> = OnceLock::new();
+
+/// The platform name surface exposed to IDE consumers through the HIR facade. The platform
+/// snapshot is fixed for the process, so the surface is built once.
+pub fn platform_name_entries() -> &'static [PlatformNameEntry<'static>] {
+    PLATFORM_NAME_ENTRIES.get_or_init(|| {
+        let platform = PlatformData::instance();
+        let mut entries = Vec::with_capacity(
+            platform.all_global_functions().len()
+                + platform.all_types().len()
+                + platform.all_methods().len()
+                + platform.all_properties().len(),
+        );
+
+        entries.extend(platform.all_global_functions().iter().map(|function| PlatformNameEntry {
+            kind: PlatformNameKind::GlobalFunction,
+            name: &function.name,
+            english_name: &function.english_name,
+            type_name: "",
+        }));
+        entries.extend(platform.all_types().iter().map(|ty| PlatformNameEntry {
+            kind: PlatformNameKind::Type,
+            name: &ty.name,
+            english_name: &ty.english_name,
+            type_name: "",
+        }));
+        entries.extend(platform.all_methods().iter().map(|method| PlatformNameEntry {
+            kind: PlatformNameKind::Method,
+            name: &method.name,
+            english_name: &method.english_name,
+            type_name: &method.type_name,
+        }));
+        entries.extend(platform.all_properties().iter().map(|property| PlatformNameEntry {
+            kind: PlatformNameKind::Property,
+            name: &property.name,
+            english_name: &property.english_name,
+            type_name: &property.type_name,
+        }));
+        entries
+    })
 }
 
 fn platform_owner_display<'a>(platform: &'a PlatformData, type_name: &'a str) -> Option<&'a str> {
@@ -549,8 +562,113 @@ mod tests {
         }
         assert!(entries.iter().any(|entry| {
             entry.kind == PlatformNameKind::Method
-                && entry.owner.is_some_and(|owner| !owner.is_ascii())
+                && entry.owner().is_some_and(|owner| !owner.is_ascii())
         }));
+    }
+
+    struct LegacyNameEntry<'a> {
+        kind: PlatformNameKind,
+        name: &'a str,
+        english_name: &'a str,
+        owner: Option<&'a str>,
+    }
+
+    /// The name surface as it was built per call: the owner's display name resolved on the spot
+    /// for every method and property.
+    fn legacy_platform_name_entries() -> Vec<LegacyNameEntry<'static>> {
+        let platform = PlatformData::instance();
+        let mut entries = Vec::with_capacity(
+            platform.all_global_functions().len()
+                + platform.all_types().len()
+                + platform.all_methods().len()
+                + platform.all_properties().len(),
+        );
+
+        entries.extend(platform.all_global_functions().iter().map(|function| LegacyNameEntry {
+            kind: PlatformNameKind::GlobalFunction,
+            name: &function.name,
+            english_name: &function.english_name,
+            owner: None,
+        }));
+        entries.extend(platform.all_types().iter().map(|ty| LegacyNameEntry {
+            kind: PlatformNameKind::Type,
+            name: &ty.name,
+            english_name: &ty.english_name,
+            owner: None,
+        }));
+        entries.extend(platform.all_methods().iter().map(|method| LegacyNameEntry {
+            kind: PlatformNameKind::Method,
+            name: &method.name,
+            english_name: &method.english_name,
+            owner: platform_owner_display(platform, &method.type_name),
+        }));
+        entries.extend(platform.all_properties().iter().map(|property| LegacyNameEntry {
+            kind: PlatformNameKind::Property,
+            name: &property.name,
+            english_name: &property.english_name,
+            owner: platform_owner_display(platform, &property.type_name),
+        }));
+        entries
+    }
+
+    #[test]
+    fn name_entries_match_the_ones_built_with_every_owner_resolved() {
+        let legacy = legacy_platform_name_entries();
+        let entries = platform_name_entries();
+        assert!(!entries.is_empty(), "the built-in catalog is not empty");
+        assert_eq!(entries.len(), legacy.len());
+        for (position, (entry, legacy)) in entries.iter().zip(&legacy).enumerate() {
+            assert_eq!(
+                (entry.kind, entry.name, entry.english_name, entry.owner()),
+                (legacy.kind, legacy.name, legacy.english_name, legacy.owner),
+                "entry {position}",
+            );
+        }
+    }
+
+    /// The owner is the display name of the type, not the raw name the member is filed under; the
+    /// members whose two differ are the ones a consumer that skipped the lookup would get wrong.
+    #[test]
+    fn owners_are_display_names_for_the_members_filed_under_an_english_type_name() {
+        let legacy = legacy_platform_name_entries();
+        let entries = platform_name_entries();
+        let localized_in_legacy = legacy
+            .iter()
+            .zip(entries)
+            .filter(|(legacy, entry)| {
+                !entry.type_name.is_empty() && legacy.owner != Some(entry.type_name)
+            })
+            .count();
+        let localized = entries
+            .iter()
+            .filter(|entry| !entry.type_name.is_empty() && entry.owner() != Some(entry.type_name))
+            .count();
+        assert!(localized > 0, "the catalog files members under English type names");
+        assert_eq!(localized, localized_in_legacy);
+    }
+
+    /// Same as `platform_name_entries_cover_every_kind_and_localize_owners`, which asks the help
+    /// corpus: the built-in catalog lists every kind too, and shows owners by their Russian names.
+    #[test]
+    fn name_entries_cover_every_kind_and_localize_owners_on_the_built_in_catalog() {
+        let entries = platform_name_entries();
+        for kind in [
+            PlatformNameKind::GlobalFunction,
+            PlatformNameKind::Type,
+            PlatformNameKind::Method,
+            PlatformNameKind::Property,
+        ] {
+            assert!(entries.iter().any(|entry| entry.kind == kind), "missing {kind:?}");
+        }
+        assert!(entries.iter().any(|entry| {
+            entry.kind == PlatformNameKind::Method
+                && entry.owner().is_some_and(|owner| !owner.is_ascii())
+        }));
+    }
+
+    #[test]
+    fn the_name_entries_are_built_once_per_process() {
+        assert_eq!(platform_name_entries().as_ptr(), platform_name_entries().as_ptr());
     }
 
     fn designer_fixture_path() -> PathBuf {

@@ -2,11 +2,12 @@ use crate::tools::response::{serialized_bytes, structured_with_text, truncate_te
 use bsl_platform::PlatformDataInner;
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData as McpError;
+use rustc_hash::FxHashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const REFERENCE_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 
@@ -79,96 +80,190 @@ pub(crate) fn list_platform(
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     let needle = name.map(str::to_lowercase);
-    let mut items: Vec<_> = platform_references()
-        .into_iter()
-        .filter(|item| kind.is_none_or(|kind| item.kind == kind))
-        .filter(|item| {
+    let entries: Vec<&CatalogEntry> = platform_catalog()
+        .entries
+        .iter()
+        .filter(|entry| kind.is_none_or(|kind| entry.reference.kind == kind))
+        .filter(|entry| {
             needle.as_deref().is_none_or(|needle| {
-                item.name.to_lowercase().contains(needle)
-                    || item
-                        .english_name
-                        .as_deref()
-                        .is_some_and(|name| name.to_lowercase().contains(needle))
+                entry.name_lower.contains(needle)
+                    || entry.english_lower.as_deref().is_some_and(|name| name.contains(needle))
             })
         })
         .collect();
-    sort_platform_references(&mut items);
-    let total = items.len();
-    let lines: Vec<_> = items
-        .iter()
-        .map(|item| {
-            if item.owner.is_empty() {
-                format!("{}: {} [{}]", item.kind.as_str(), item.name, item.reference_id)
-            } else {
-                format!(
-                    "{}: {}.{} [{}]",
-                    item.kind.as_str(),
-                    item.owner,
-                    item.name,
-                    item.reference_id
-                )
-            }
-        })
-        .collect();
-    let build = |shown: usize| -> Result<CallToolResult, McpError> {
-        let exhausted = shown < total;
-        let body = serde_json::to_value(ListPlatformResponse {
-            action: ListPlatformAction::ListPlatform,
-            schema_version: ListPlatformSchemaVersion::V1,
-            shown,
-            total,
-            items: items[..shown].to_vec(),
-            budget_exhausted: exhausted,
-            budget_hint: exhausted
-                .then(|| "narrow kind/name or increase max_output_tokens".to_owned()),
-        })
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(structured_with_text(lines[..shown].join("\n"), body))
-    };
-    let full = build(total)?;
-    let ceiling = max_output_tokens.saturating_mul(4);
-    if serialized_bytes(&full) <= ceiling {
-        return Ok(full);
-    }
-    let (mut low, mut high) = (0usize, total);
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        if serialized_bytes(&build(mid)?) <= ceiling {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    build(low)
+    let shown = shown_within_budget(&entries, max_output_tokens.saturating_mul(4))?;
+    let shown_entries = &entries[..shown];
+    list_platform_response(
+        shown_entries.iter().map(|entry| entry.reference.clone()).collect(),
+        shown,
+        entries.len(),
+        shown_entries.iter().map(|entry| entry.line.as_str()).collect::<Vec<_>>().join("\n"),
+    )
 }
 
-pub(crate) fn platform_references() -> Vec<PlatformReference> {
-    let platform = PlatformDataInner::instance();
-    let mut references = Vec::with_capacity(
-        platform.all_types().len()
-            + platform.all_methods().len()
-            + platform.all_properties().len()
-            + platform.all_constructors().len()
-            + platform.all_global_functions().len(),
-    );
+fn list_platform_response(
+    items: Vec<PlatformReference>,
+    shown: usize,
+    total: usize,
+    text: String,
+) -> Result<CallToolResult, McpError> {
+    let exhausted = shown < total;
+    let body = serde_json::to_value(ListPlatformResponse {
+        action: ListPlatformAction::ListPlatform,
+        schema_version: ListPlatformSchemaVersion::V1,
+        items,
+        shown,
+        total,
+        budget_exhausted: exhausted,
+        budget_hint: exhausted.then(|| "narrow kind/name or increase max_output_tokens".to_owned()),
+    })
+    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    Ok(structured_with_text(text, body))
+}
 
-    references.extend(platform.all_types().iter().map(reference_for_type));
-    references
-        .extend(platform.all_methods().iter().map(|item| reference_for_method(platform, item)));
-    references.extend(
-        platform.all_properties().iter().map(|item| reference_for_property(platform, item)),
-    );
-    references.extend(
-        platform.all_constructors().iter().map(|item| reference_for_constructor(platform, item)),
-    );
-    references.extend(
-        platform
-            .all_global_functions()
-            .iter()
-            .map(|item| reference_for_global_function(platform, item)),
-    );
-    sort_platform_references(&mut references);
-    references
+/// How many leading `entries` the answer shows within `ceiling` serialized bytes: all of them
+/// when they fit, otherwise the longest prefix that fits next to the exhausted-budget hint, or
+/// none. The answer's size is its envelope with empty `items` and text, plus every shown item and
+/// escaped text line, plus a comma between items and an escaped `\n` between lines; JSON escaping
+/// is per character, so the sum is the serialized length exactly and no candidate is built.
+fn shown_within_budget(entries: &[&CatalogEntry], ceiling: usize) -> Result<usize, McpError> {
+    let total = entries.len();
+    let envelope = |shown| {
+        list_platform_response(Vec::new(), shown, total, String::new())
+            .map(|empty| serialized_bytes(&empty))
+    };
+    let parts = |entry: &CatalogEntry| entry.item_bytes + entry.line_bytes;
+
+    let complete = envelope(total)?
+        + entries.iter().copied().map(parts).sum::<usize>()
+        + 3 * total.saturating_sub(1);
+    if complete <= ceiling {
+        return Ok(total);
+    }
+    let exhausted = envelope(0)?;
+    let mut shown = 0;
+    let mut items = 0;
+    for (index, entry) in entries[..total.saturating_sub(1)].iter().enumerate() {
+        items += parts(entry) + if index == 0 { 0 } else { 3 };
+        if exhausted + decimal_len(index + 1) - 1 + items > ceiling {
+            break;
+        }
+        shown = index + 1;
+    }
+    Ok(shown)
+}
+
+fn decimal_len(value: usize) -> usize {
+    value.checked_ilog10().map_or(1, |exponent| exponent as usize + 1)
+}
+
+/// The platform catalog as `list_platform` and `reference_id` lookups see it. The platform
+/// snapshot is fixed for the process, so every reference is derived once.
+struct PlatformCatalog {
+    /// Every reference in the listing's order.
+    entries: Vec<CatalogEntry>,
+    by_reference_id: FxHashMap<String, CatalogTarget>,
+}
+
+struct CatalogEntry {
+    reference: PlatformReference,
+    line: String,
+    name_lower: String,
+    english_lower: Option<String>,
+    /// Serialized length of `reference` as an item of the answer.
+    item_bytes: usize,
+    /// Length of `line` inside the answer's escaped text, without quotes.
+    line_bytes: usize,
+}
+
+impl CatalogEntry {
+    fn new(reference: PlatformReference) -> Self {
+        let line = if reference.owner.is_empty() {
+            format!("{}: {} [{}]", reference.kind.as_str(), reference.name, reference.reference_id)
+        } else {
+            format!(
+                "{}: {}.{} [{}]",
+                reference.kind.as_str(),
+                reference.owner,
+                reference.name,
+                reference.reference_id
+            )
+        };
+        Self {
+            name_lower: reference.name.to_lowercase(),
+            english_lower: reference.english_name.as_deref().map(str::to_lowercase),
+            item_bytes: serialized_bytes(&reference),
+            line_bytes: serialized_bytes(&line) - 2,
+            line,
+            reference,
+        }
+    }
+}
+
+/// A catalog item as an index into its `PlatformDataInner::all_*()` collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogTarget {
+    Type(usize),
+    Method(usize),
+    Property(usize),
+    Constructor(usize),
+    GlobalFunction(usize),
+}
+
+static PLATFORM_CATALOG: OnceLock<PlatformCatalog> = OnceLock::new();
+
+fn platform_catalog() -> &'static PlatformCatalog {
+    PLATFORM_CATALOG.get_or_init(|| {
+        let platform = PlatformDataInner::instance();
+        let mut targets = Vec::with_capacity(
+            platform.all_types().len()
+                + platform.all_methods().len()
+                + platform.all_properties().len()
+                + platform.all_constructors().len()
+                + platform.all_global_functions().len(),
+        );
+        targets.extend(
+            platform
+                .all_types()
+                .iter()
+                .enumerate()
+                .map(|(index, item)| (reference_for_type(item), CatalogTarget::Type(index))),
+        );
+        targets.extend(platform.all_methods().iter().enumerate().map(|(index, item)| {
+            (reference_for_method(platform, item), CatalogTarget::Method(index))
+        }));
+        targets.extend(platform.all_properties().iter().enumerate().map(|(index, item)| {
+            (reference_for_property(platform, item), CatalogTarget::Property(index))
+        }));
+        targets.extend(platform.all_constructors().iter().enumerate().map(|(index, item)| {
+            (reference_for_constructor(platform, item), CatalogTarget::Constructor(index))
+        }));
+        targets.extend(platform.all_global_functions().iter().enumerate().map(|(index, item)| {
+            (reference_for_global_function(platform, item), CatalogTarget::GlobalFunction(index))
+        }));
+
+        let by_reference_id = index_reference_ids(
+            targets.iter().map(|(reference, target)| (reference.reference_id.clone(), *target)),
+        );
+        let mut references: Vec<_> = targets.into_iter().map(|(reference, _)| reference).collect();
+        sort_platform_references(&mut references);
+        PlatformCatalog {
+            entries: references.into_iter().map(CatalogEntry::new).collect(),
+            by_reference_id,
+        }
+    })
+}
+
+/// The first target of every `reference_id`, in iteration order — the item a linear scan of the
+/// catalog would find.
+fn index_reference_ids(
+    targets: impl IntoIterator<Item = (String, CatalogTarget)>,
+) -> FxHashMap<String, CatalogTarget> {
+    let mut index = FxHashMap::default();
+    for (reference_id, target) in targets {
+        index.entry(reference_id).or_insert(target);
+    }
+    index
 }
 
 pub(crate) fn platform_reference_for_document(
@@ -533,12 +628,38 @@ fn reference(
     }
 }
 
+/// Owner types by exact English name and by exact name; on a clash the first type in catalog
+/// order wins, as a linear scan of `all_types()` would.
+struct OwnerIndex {
+    by_english: FxHashMap<&'static str, usize>,
+    by_name: FxHashMap<&'static str, usize>,
+}
+
+static OWNER_INDEX: OnceLock<OwnerIndex> = OnceLock::new();
+
+fn owner_index() -> &'static OwnerIndex {
+    OWNER_INDEX.get_or_init(|| {
+        let types = PlatformDataInner::instance().all_types();
+        let mut index = OwnerIndex {
+            by_english: FxHashMap::with_capacity_and_hasher(types.len(), Default::default()),
+            by_name: FxHashMap::with_capacity_and_hasher(types.len(), Default::default()),
+        };
+        for (position, item) in types.iter().enumerate() {
+            index.by_english.entry(item.english_name.as_str()).or_insert(position);
+            index.by_name.entry(item.name.as_str()).or_insert(position);
+        }
+        index
+    })
+}
+
 fn owner_identity(platform: &PlatformDataInner, owner: &str) -> (String, Value) {
-    let owner_type = platform
-        .all_types()
-        .iter()
-        .find(|item| item.english_name == owner)
-        .or_else(|| platform.all_types().iter().find(|item| item.name == owner));
+    debug_assert!(std::ptr::eq(platform, PlatformDataInner::instance()));
+    let index = owner_index();
+    let owner_type = index
+        .by_english
+        .get(owner)
+        .or_else(|| index.by_name.get(owner))
+        .map(|&position| &platform.all_types()[position]);
     match owner_type {
         Some(item) => (
             item.name.to_string(),
@@ -821,48 +942,25 @@ pub(crate) fn bsl_syntax_help_by_reference_id(
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     let platform = PlatformDataInner::instance();
-    let card = platform
-        .all_types()
-        .iter()
-        .find(|item| reference_for_type(item).reference_id == reference_id)
-        .map(|item| type_card(platform, item))
-        .or_else(|| {
-            platform
-                .all_methods()
-                .iter()
-                .find(|item| reference_for_method(platform, item).reference_id == reference_id)
-                .map(|item| method_card(platform, item))
-        })
-        .or_else(|| {
-            platform
-                .all_properties()
-                .iter()
-                .find(|item| reference_for_property(platform, item).reference_id == reference_id)
-                .map(|item| property_card(platform, item))
-        })
-        .or_else(|| {
-            platform
-                .all_constructors()
-                .iter()
-                .find(|item| reference_for_constructor(platform, item).reference_id == reference_id)
-                .map(|item| constructor_card(platform, item))
-        })
-        .or_else(|| {
-            platform
-                .all_global_functions()
-                .iter()
-                .find(|item| {
-                    reference_for_global_function(platform, item).reference_id == reference_id
-                })
-                .map(|item| {
-                    (
-                        format_global_function(platform, item),
-                        SyntaxHelpItem::GlobalFunction {
-                            function: callable_from_global_function(platform, item),
-                        },
-                    )
-                })
-        });
+    let card = platform_catalog().by_reference_id.get(reference_id).map(|target| match *target {
+        CatalogTarget::Type(index) => type_card(platform, &platform.all_types()[index]),
+        CatalogTarget::Method(index) => method_card(platform, &platform.all_methods()[index]),
+        CatalogTarget::Property(index) => {
+            property_card(platform, &platform.all_properties()[index])
+        }
+        CatalogTarget::Constructor(index) => {
+            constructor_card(platform, &platform.all_constructors()[index])
+        }
+        CatalogTarget::GlobalFunction(index) => {
+            let item = &platform.all_global_functions()[index];
+            (
+                format_global_function(platform, item),
+                SyntaxHelpItem::GlobalFunction {
+                    function: callable_from_global_function(platform, item),
+                },
+            )
+        }
+    });
     match card {
         Some((text, item)) => syntax_help_result(text, item, max_output_tokens),
         None => syntax_help_not_found(Some(reference_id), None, None),
@@ -1644,6 +1742,10 @@ fn format_constructor_signature(
 mod tests {
     use super::*;
 
+    fn catalog_references() -> Vec<&'static PlatformReference> {
+        platform_catalog().entries.iter().map(|entry| &entry.reference).collect()
+    }
+
     #[test]
     fn reference_ids_are_encoded_identity_digests_and_stable_when_a_peer_is_added() {
         let original = reference(
@@ -1685,7 +1787,7 @@ mod tests {
 
     #[test]
     fn platform_catalog_contains_all_five_kinds_and_distinguishes_type_homonyms() {
-        let references = platform_references();
+        let references = catalog_references();
         if PlatformDataInner::instance().all_types().is_empty() {
             return;
         }
@@ -1744,7 +1846,7 @@ mod tests {
             .iter()
             .any(|item| item["name"] == "Массив"));
 
-        let references = platform_references();
+        let references = catalog_references();
         let method = references
             .iter()
             .find(|item| {
@@ -1796,7 +1898,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn every_catalog_kind_round_trips_by_exact_reference_id() {
-        let references = platform_references();
+        let references = catalog_references();
         for (kind, expected) in [
             (PlatformReferenceKind::Type, "type"),
             (PlatformReferenceKind::Method, "method"),
@@ -1820,7 +1922,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn homonymous_type_ids_open_distinct_exact_cards() {
-        let references: Vec<_> = platform_references()
+        let references: Vec<_> = catalog_references()
             .into_iter()
             .filter(|item| item.kind == PlatformReferenceKind::Type && item.name == "ЭлементыФормы")
             .collect();
@@ -1833,7 +1935,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn method_property_collisions_and_constructor_overloads_open_exact_cards() {
-        let references = platform_references();
+        let references = catalog_references();
         let property = references
             .iter()
             .find(|property| {
@@ -2265,5 +2367,764 @@ mod tests {
         assert!(syntax_help_card("Читать", Some("РегистрБухгалтерииНаборЗаписей")).is_err());
         assert!(syntax_help_card("Прочитать", Some("НетТакогоТипа.Имя")).is_err());
         assert!(syntax_help_card("Прочитать", Some("Массив")).is_err());
+    }
+}
+
+/// The cached catalog against the implementation it replaced: `owner_identity` scanning
+/// `all_types()`, `platform_references()` rebuilt per call, `list_platform` measuring prefixes by
+/// serializing them, and `reference_id` lookup scanning the whole catalog. The `legacy_*`
+/// functions are those implementations as they were, so an answer that differs from them is a
+/// changed answer.
+#[cfg(test)]
+mod catalog_equivalence {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn legacy_owner_identity(platform: &PlatformDataInner, owner: &str) -> (String, Value) {
+        let owner_type = platform
+            .all_types()
+            .iter()
+            .find(|item| item.english_name == owner)
+            .or_else(|| platform.all_types().iter().find(|item| item.name == owner));
+        match owner_type {
+            Some(item) => (
+                item.name.to_string(),
+                json!([
+                    item.name.as_str(),
+                    non_empty(item.english_name.as_str()),
+                    item.xdto_name.as_deref()
+                ]),
+            ),
+            None => (owner.to_owned(), json!([owner, null, null])),
+        }
+    }
+
+    fn legacy_reference_for_method(
+        platform: &PlatformDataInner,
+        item: &bsl_platform::PlatformMethod,
+    ) -> PlatformReference {
+        let (owner, owner_identity) = legacy_owner_identity(platform, item.type_name.as_str());
+        let english_name = non_empty(item.english_name.as_str());
+        let signature = callable_identity(
+            item.return_type.as_deref(),
+            &item.parameters,
+            item.variants
+                .iter()
+                .map(|variant| (variant.variant_name.as_deref(), variant.parameters.as_slice())),
+        );
+        reference(
+            PlatformReferenceKind::Method,
+            owner,
+            item.name.as_str(),
+            english_name.clone(),
+            platform.get_method_docs(item.id).and_then(|docs| non_empty(&docs.description)),
+            json!(["method", owner_identity, item.name.as_str(), english_name, signature]),
+        )
+    }
+
+    fn legacy_reference_for_property(
+        platform: &PlatformDataInner,
+        item: &bsl_platform::PlatformProperty,
+    ) -> PlatformReference {
+        let (owner, owner_identity) = legacy_owner_identity(platform, item.type_name.as_str());
+        let english_name = non_empty(item.english_name.as_str());
+        reference(
+            PlatformReferenceKind::Property,
+            owner,
+            item.name.as_str(),
+            english_name.clone(),
+            platform.get_property_docs(item.id).and_then(|docs| non_empty(&docs.description)),
+            json!([
+                "property",
+                owner_identity,
+                item.name.as_str(),
+                english_name,
+                item.property_types.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
+                item.is_readonly
+            ]),
+        )
+    }
+
+    fn legacy_reference_for_constructor(
+        platform: &PlatformDataInner,
+        item: &bsl_platform::PlatformConstructor,
+    ) -> PlatformReference {
+        let (owner, owner_identity) = legacy_owner_identity(platform, item.type_name.as_str());
+        let signature = callable_identity(
+            None,
+            &item.parameters,
+            std::iter::empty::<(Option<&str>, &[bsl_platform::MethodParam])>(),
+        );
+        let name = item.variant_name.as_deref().unwrap_or(&signature);
+        reference(
+            PlatformReferenceKind::Constructor,
+            owner,
+            name,
+            None,
+            platform.get_constructor_docs(item.id).and_then(|docs| non_empty(&docs.description)),
+            json!(["constructor", owner_identity, name, signature]),
+        )
+    }
+
+    fn legacy_sort_platform_references(references: &mut [PlatformReference]) {
+        references.sort_by_cached_key(|item| {
+            (
+                item.kind,
+                item.owner.to_lowercase(),
+                item.name.to_lowercase(),
+                item.reference_id.clone(),
+            )
+        });
+    }
+
+    /// Every catalog item with the reference the old code built for it, in construction order.
+    fn legacy_targets() -> Vec<(PlatformReference, CatalogTarget)> {
+        let platform = PlatformDataInner::instance();
+        let mut targets = Vec::new();
+        targets.extend(
+            platform
+                .all_types()
+                .iter()
+                .enumerate()
+                .map(|(index, item)| (reference_for_type(item), CatalogTarget::Type(index))),
+        );
+        targets.extend(platform.all_methods().iter().enumerate().map(|(index, item)| {
+            (legacy_reference_for_method(platform, item), CatalogTarget::Method(index))
+        }));
+        targets.extend(platform.all_properties().iter().enumerate().map(|(index, item)| {
+            (legacy_reference_for_property(platform, item), CatalogTarget::Property(index))
+        }));
+        targets.extend(platform.all_constructors().iter().enumerate().map(|(index, item)| {
+            (legacy_reference_for_constructor(platform, item), CatalogTarget::Constructor(index))
+        }));
+        targets.extend(platform.all_global_functions().iter().enumerate().map(|(index, item)| {
+            (reference_for_global_function(platform, item), CatalogTarget::GlobalFunction(index))
+        }));
+        targets
+    }
+
+    fn legacy_platform_references() -> Vec<PlatformReference> {
+        let mut references: Vec<_> =
+            legacy_targets().into_iter().map(|(reference, _)| reference).collect();
+        legacy_sort_platform_references(&mut references);
+        references
+    }
+
+    struct Legacy {
+        targets: Vec<(PlatformReference, CatalogTarget)>,
+        sorted: Vec<PlatformReference>,
+    }
+
+    fn legacy() -> &'static Legacy {
+        static LEGACY: OnceLock<Legacy> = OnceLock::new();
+        LEGACY.get_or_init(|| Legacy {
+            targets: legacy_targets(),
+            sorted: legacy_platform_references(),
+        })
+    }
+
+    /// The old `list_platform` over `references` in place of `platform_references()`, so that a
+    /// sweep of many arguments does not rebuild the catalog for each.
+    fn legacy_list_platform(
+        references: &[PlatformReference],
+        kind: Option<PlatformReferenceKind>,
+        name: Option<&str>,
+        max_output_tokens: usize,
+    ) -> Result<CallToolResult, McpError> {
+        let needle = name.map(str::to_lowercase);
+        let mut items: Vec<_> = references
+            .iter()
+            .filter(|item| kind.is_none_or(|kind| item.kind == kind))
+            .filter(|item| {
+                needle.as_deref().is_none_or(|needle| {
+                    item.name.to_lowercase().contains(needle)
+                        || item
+                            .english_name
+                            .as_deref()
+                            .is_some_and(|name| name.to_lowercase().contains(needle))
+                })
+            })
+            .cloned()
+            .collect();
+        legacy_sort_platform_references(&mut items);
+        let total = items.len();
+        let lines: Vec<_> = items
+            .iter()
+            .map(|item| {
+                if item.owner.is_empty() {
+                    format!("{}: {} [{}]", item.kind.as_str(), item.name, item.reference_id)
+                } else {
+                    format!(
+                        "{}: {}.{} [{}]",
+                        item.kind.as_str(),
+                        item.owner,
+                        item.name,
+                        item.reference_id
+                    )
+                }
+            })
+            .collect();
+        let build = |shown: usize| -> Result<CallToolResult, McpError> {
+            let exhausted = shown < total;
+            let body = serde_json::to_value(ListPlatformResponse {
+                action: ListPlatformAction::ListPlatform,
+                schema_version: ListPlatformSchemaVersion::V1,
+                shown,
+                total,
+                items: items[..shown].to_vec(),
+                budget_exhausted: exhausted,
+                budget_hint: exhausted
+                    .then(|| "narrow kind/name or increase max_output_tokens".to_owned()),
+            })
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            Ok(structured_with_text(lines[..shown].join("\n"), body))
+        };
+        let full = build(total)?;
+        let ceiling = max_output_tokens.saturating_mul(4);
+        if serialized_bytes(&full) <= ceiling {
+            return Ok(full);
+        }
+        let (mut low, mut high) = (0usize, total);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if serialized_bytes(&build(mid)?) <= ceiling {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        build(low)
+    }
+
+    fn legacy_bsl_syntax_help_by_reference_id(
+        reference_id: &str,
+        max_output_tokens: usize,
+    ) -> Result<CallToolResult, McpError> {
+        let platform = PlatformDataInner::instance();
+        let card = platform
+            .all_types()
+            .iter()
+            .find(|item| reference_for_type(item).reference_id == reference_id)
+            .map(|item| type_card(platform, item))
+            .or_else(|| {
+                platform
+                    .all_methods()
+                    .iter()
+                    .find(|item| {
+                        legacy_reference_for_method(platform, item).reference_id == reference_id
+                    })
+                    .map(|item| method_card(platform, item))
+            })
+            .or_else(|| {
+                platform
+                    .all_properties()
+                    .iter()
+                    .find(|item| {
+                        legacy_reference_for_property(platform, item).reference_id == reference_id
+                    })
+                    .map(|item| property_card(platform, item))
+            })
+            .or_else(|| {
+                platform
+                    .all_constructors()
+                    .iter()
+                    .find(|item| {
+                        legacy_reference_for_constructor(platform, item).reference_id
+                            == reference_id
+                    })
+                    .map(|item| constructor_card(platform, item))
+            })
+            .or_else(|| {
+                platform
+                    .all_global_functions()
+                    .iter()
+                    .find(|item| {
+                        reference_for_global_function(platform, item).reference_id == reference_id
+                    })
+                    .map(|item| {
+                        (
+                            format_global_function(platform, item),
+                            SyntaxHelpItem::GlobalFunction {
+                                function: callable_from_global_function(platform, item),
+                            },
+                        )
+                    })
+            });
+        match card {
+            Some((text, item)) => syntax_help_result(text, item, max_output_tokens),
+            None => syntax_help_not_found(Some(reference_id), None, None),
+        }
+    }
+
+    /// The answer as a client receives it: text block and `structuredContent` together.
+    fn wire(result: Result<CallToolResult, McpError>) -> String {
+        serde_json::to_string(&result.expect("the call answers")).expect("a result serializes")
+    }
+
+    fn structured_field<'a>(result: &'a CallToolResult, field: &str) -> &'a Value {
+        &result.structured_content.as_ref().expect("structured content")[field]
+    }
+
+    #[test]
+    fn the_legacy_catalog_is_the_cached_one_in_order_and_content() {
+        let cached: Vec<_> =
+            platform_catalog().entries.iter().map(|entry| &entry.reference).collect();
+        let legacy = &legacy().sorted;
+        assert!(!legacy.is_empty(), "the built-in catalog is not empty");
+        assert_eq!(cached.len(), legacy.len());
+        for (position, (cached, legacy)) in cached.iter().zip(legacy).enumerate() {
+            assert_eq!(*cached, legacy, "catalog position {position}");
+        }
+    }
+
+    /// Owners are resolved by an exact index, first type wins. Its cells are owners the catalog
+    /// has: every name a member carries, every type's own two names, an unknown name and the
+    /// empty one.
+    #[test]
+    fn owner_identity_matches_the_scan_for_every_owner_the_catalog_names() {
+        let platform = PlatformDataInner::instance();
+        let mut owners: HashSet<&str> = ["", "НетТакогоТипа", "NoSuchType"].into_iter().collect();
+        owners.extend(platform.all_methods().iter().map(|item| item.type_name.as_str()));
+        owners.extend(platform.all_properties().iter().map(|item| item.type_name.as_str()));
+        owners.extend(platform.all_constructors().iter().map(|item| item.type_name.as_str()));
+        for item in platform.all_types() {
+            owners.insert(item.name.as_str());
+            owners.insert(item.english_name.as_str());
+        }
+        assert!(owners.len() > 1_000, "the sweep reaches the catalog, not a corner of it");
+        for owner in owners {
+            assert_eq!(
+                owner_identity(platform, owner),
+                legacy_owner_identity(platform, owner),
+                "owner {owner:?}",
+            );
+        }
+    }
+
+    /// The members whose owner's English name is shared by two types are where the scan and a
+    /// case-folding `get_type()` part ways, so the equality below is only worth something when
+    /// they exist and the folded lookup really answers them differently.
+    #[test]
+    fn every_member_keeps_its_reference_id_including_owners_with_a_shared_english_name() {
+        let platform = PlatformDataInner::instance();
+        let mut types_per_english_name: HashMap<&str, usize> = HashMap::new();
+        for item in platform.all_types() {
+            *types_per_english_name.entry(item.english_name.as_str()).or_default() += 1;
+        }
+        let shared: HashSet<&str> = types_per_english_name
+            .into_iter()
+            .filter_map(|(name, count)| (count >= 2).then_some(name))
+            .collect();
+        let members_of_shared_owner = platform
+            .all_methods()
+            .iter()
+            .map(|item| item.type_name.as_str())
+            .chain(platform.all_properties().iter().map(|item| item.type_name.as_str()))
+            .chain(platform.all_constructors().iter().map(|item| item.type_name.as_str()))
+            .filter(|owner| shared.contains(owner))
+            .count();
+        assert!(members_of_shared_owner > 0, "the catalog has members of a shared English name");
+
+        let folded_lookup_differs = shared.iter().any(|owner| {
+            let scanned = platform.all_types().iter().find(|item| item.english_name == *owner);
+            let folded = platform.get_type(owner);
+            scanned.map(|item| &item.name) != folded.map(|item| &item.name)
+        });
+        assert!(folded_lookup_differs, "a lookup through get_type() would name another owner");
+
+        let cached = &platform_catalog().entries;
+        let legacy = &legacy().sorted;
+        assert_eq!(cached.len(), legacy.len());
+        let differing: Vec<_> = cached
+            .iter()
+            .zip(legacy)
+            .filter(|(cached, legacy)| cached.reference.reference_id != legacy.reference_id)
+            .map(|(_, legacy)| legacy.reference_id.as_str())
+            .take(5)
+            .collect();
+        assert!(differing.is_empty(), "reference ids changed: {differing:?}");
+    }
+
+    #[test]
+    fn the_catalog_is_derived_once_per_process() {
+        assert!(std::ptr::eq(platform_catalog(), platform_catalog()));
+        assert!(std::ptr::eq(owner_index(), owner_index()));
+    }
+
+    #[test]
+    fn the_first_target_of_a_repeated_reference_id_wins() {
+        let index = index_reference_ids([
+            ("a".to_owned(), CatalogTarget::Method(3)),
+            ("b".to_owned(), CatalogTarget::Type(0)),
+            ("a".to_owned(), CatalogTarget::Method(1)),
+            ("a".to_owned(), CatalogTarget::Property(2)),
+            ("b".to_owned(), CatalogTarget::Type(7)),
+        ]);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index["a"], CatalogTarget::Method(3));
+        assert_eq!(index["b"], CatalogTarget::Type(0));
+    }
+
+    /// For every `reference_id` the old code could be asked, the index names the item a scan of
+    /// the catalog finds first. An id repeated inside one kind is the case where "first" and
+    /// "last" differ; the kinds cannot repeat each other's ids (the id starts with its kind).
+    #[test]
+    fn the_index_names_the_item_a_linear_scan_finds_for_every_reference_id() {
+        let targets = &legacy().targets;
+        let index = &platform_catalog().by_reference_id;
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut repeated = 0;
+        for (position, (reference, target)) in targets.iter().enumerate() {
+            let id = reference.reference_id.as_str();
+            assert!(id.starts_with(&format!("{}:", reference.kind.as_str())), "{id}");
+            let first = if seen.insert(id) {
+                *target
+            } else {
+                repeated += 1;
+                targets[..position]
+                    .iter()
+                    .find(|(earlier, _)| earlier.reference_id == id)
+                    .map(|(_, earlier)| *earlier)
+                    .expect("a repeated id has an earlier holder")
+            };
+            assert_eq!(index.get(id), Some(&first), "{id}");
+        }
+        assert_eq!(index.len(), seen.len(), "the index holds no id the catalog lacks");
+        assert!(repeated > 0, "the catalog repeats ids, so first and last holder differ");
+    }
+
+    #[test]
+    fn syntax_help_by_reference_id_matches_the_scan() {
+        let platform = PlatformDataInner::instance();
+        let targets = &legacy().targets;
+        let mut shared_english_name: HashMap<&str, usize> = HashMap::new();
+        for item in platform.all_types() {
+            *shared_english_name.entry(item.english_name.as_str()).or_default() += 1;
+        }
+        let owned_by_shared_name =
+            |type_name: &str| shared_english_name.get(type_name).is_some_and(|&count| count >= 2);
+        let owner_of = |target: &CatalogTarget| match *target {
+            CatalogTarget::Method(index) => Some(platform.all_methods()[index].type_name.as_str()),
+            CatalogTarget::Property(index) => {
+                Some(platform.all_properties()[index].type_name.as_str())
+            }
+            CatalogTarget::Constructor(index) => {
+                Some(platform.all_constructors()[index].type_name.as_str())
+            }
+            CatalogTarget::Type(_) | CatalogTarget::GlobalFunction(_) => None,
+        };
+
+        let mut ids: Vec<&str> = vec!["type::missing~deadbeef", "method:Нет:Нет~00"];
+        for kind in [
+            PlatformReferenceKind::Type,
+            PlatformReferenceKind::Method,
+            PlatformReferenceKind::Property,
+            PlatformReferenceKind::Constructor,
+            PlatformReferenceKind::GlobalFunction,
+        ] {
+            let of_kind: Vec<_> =
+                targets.iter().filter(|(reference, _)| reference.kind == kind).collect();
+            ids.push(of_kind.first().expect("every kind has an item").0.reference_id.as_str());
+            ids.push(of_kind.last().expect("every kind has an item").0.reference_id.as_str());
+        }
+        let homonyms = targets
+            .iter()
+            .filter(|(reference, _)| {
+                reference.kind == PlatformReferenceKind::Type && reference.name == "ЭлементыФормы"
+            })
+            .count();
+        assert!(homonyms >= 2, "ЭлементыФормы is the type name two types share");
+        ids.extend(
+            targets
+                .iter()
+                .filter(|(reference, _)| {
+                    reference.kind == PlatformReferenceKind::Type
+                        && reference.name == "ЭлементыФормы"
+                })
+                .map(|(reference, _)| reference.reference_id.as_str()),
+        );
+        let of_shared_owner: Vec<_> = targets
+            .iter()
+            .filter(|(_, target)| owner_of(target).is_some_and(owned_by_shared_name))
+            .map(|(reference, _)| reference.reference_id.as_str())
+            .collect();
+        assert!(!of_shared_owner.is_empty(), "members of a shared English owner name exist");
+        ids.extend(of_shared_owner);
+
+        for id in ids {
+            for budget in [6_000, 100] {
+                assert_eq!(
+                    wire(bsl_syntax_help_by_reference_id(id, budget)),
+                    wire(legacy_bsl_syntax_help_by_reference_id(id, budget)),
+                    "{id} at {budget} tokens",
+                );
+            }
+        }
+    }
+
+    fn list_platform_matches_for(
+        legacy: &[PlatformReference],
+        kind: Option<PlatformReferenceKind>,
+        name: Option<&str>,
+        budget: usize,
+    ) {
+        assert_eq!(
+            wire(list_platform(kind, name, budget)),
+            wire(legacy_list_platform(legacy, kind, name, budget)),
+            "kind {kind:?}, name {name:?}, {budget} tokens",
+        );
+    }
+
+    #[test]
+    fn list_platform_matches_legacy() {
+        let legacy = &legacy().sorted;
+        for kind in [None, Some(PlatformReferenceKind::Method), Some(PlatformReferenceKind::Type)] {
+            for name in [None, Some("добав"), Some("array"), Some("\"")] {
+                for budget in [0, 1, 100, 1_000, 6_000, 50_000, usize::MAX] {
+                    list_platform_matches_for(legacy, kind, name, budget);
+                }
+            }
+        }
+    }
+
+    /// The unfiltered catalog does not fit the default budget, so the default answer is a
+    /// cut one; and the budgets that separate a prefix from the whole are met in the sweep.
+    #[test]
+    fn list_platform_matrix_reaches_both_a_cut_and_a_whole_answer() {
+        let cut = list_platform(None, None, 6_000).unwrap();
+        assert_eq!(structured_field(&cut, "budget_exhausted"), &json!(true));
+        assert!(structured_field(&cut, "shown").as_u64().unwrap() > 0);
+        let whole =
+            list_platform(Some(PlatformReferenceKind::Type), Some("массив"), usize::MAX).unwrap();
+        assert_eq!(structured_field(&whole, "budget_exhausted"), &json!(false));
+        assert!(structured_field(&whole, "total").as_u64().unwrap() > 0);
+    }
+
+    /// Every budget from nothing to the whole answer, over a slice of the real catalog small
+    /// enough to run the old search at each of them.
+    #[test]
+    fn list_platform_matches_legacy_at_every_budget_over_a_real_slice() {
+        let legacy = &legacy().sorted;
+        let kind = Some(PlatformReferenceKind::GlobalFunction);
+        let name = Some("сообщ");
+        let whole = legacy_list_platform(legacy, kind, name, usize::MAX).unwrap();
+        let total = structured_field(&whole, "total").as_u64().unwrap();
+        assert!((2..=40).contains(&total), "the slice stays sweepable: {total} items");
+        let mut shown_values = HashSet::new();
+        for budget in 0..=serialized_bytes(&whole) / 4 + 1 {
+            let expected = legacy_list_platform(legacy, kind, name, budget).unwrap();
+            shown_values.insert(structured_field(&expected, "shown").as_u64().unwrap());
+            assert_eq!(
+                wire(list_platform(kind, name, budget)),
+                serde_json::to_string(&expected).unwrap(),
+                "{budget} tokens",
+            );
+        }
+        assert_eq!(shown_values.len() as u64, total + 1, "the sweep cuts the slice at every size");
+    }
+
+    /// Items whose escaped text is not its raw text: quotes, backslashes, controls that JSON
+    /// writes as two bytes and as six, and characters it leaves alone.
+    const AWKWARD: &[&str] = &[
+        "plain",
+        "кавычки \"внутри\"",
+        "back\\slash",
+        "tab\tand\nnewline",
+        "cr\rlf",
+        "bell\u{7}",
+        "low\u{1}\u{1f}controls",
+        "bs\u{8}ff\u{c}",
+        "del\u{7f}",
+        "sep\u{2028}\u{2029}",
+        "эмодзи😀",
+        "mixed \"\\\n\t\u{0}",
+    ];
+
+    fn awkward(seed: usize) -> &'static str {
+        AWKWARD[seed % AWKWARD.len()]
+    }
+
+    fn synthetic_references(count: usize) -> Vec<PlatformReference> {
+        let kinds = [
+            PlatformReferenceKind::Type,
+            PlatformReferenceKind::Method,
+            PlatformReferenceKind::Property,
+            PlatformReferenceKind::Constructor,
+            PlatformReferenceKind::GlobalFunction,
+        ];
+        let mut references: Vec<_> = (0..count)
+            .map(|index| {
+                let kind = kinds[index % kinds.len()];
+                let owner = match kind {
+                    PlatformReferenceKind::Type | PlatformReferenceKind::GlobalFunction => {
+                        String::new()
+                    }
+                    _ => awkward(index).to_owned(),
+                };
+                let name = format!("{}{index:02}", awkward(index * 7 + 3));
+                let english_name = (index % 3 != 0).then(|| awkward(index * 5 + 1).to_owned());
+                let description = (index % 2 == 0).then(|| awkward(index * 11 + 2).repeat(3));
+                let mut item = reference(
+                    kind,
+                    owner.clone(),
+                    &name,
+                    english_name.clone(),
+                    description,
+                    json!([index, owner, name, english_name]),
+                );
+                if index % 4 == 1 {
+                    item.reference_id = format!("{}~\"\\{index}\n", awkward(index));
+                }
+                item
+            })
+            .collect();
+        legacy_sort_platform_references(&mut references);
+        references
+    }
+
+    /// `list_platform` after the catalog is chosen: the shown count from sizes measured once, the
+    /// answer assembled once.
+    fn list_over(
+        entries: &[CatalogEntry],
+        max_output_tokens: usize,
+    ) -> Result<CallToolResult, McpError> {
+        let entries: Vec<&CatalogEntry> = entries.iter().collect();
+        let shown = shown_within_budget(&entries, max_output_tokens.saturating_mul(4))?;
+        list_platform_response(
+            entries[..shown].iter().map(|entry| entry.reference.clone()).collect(),
+            shown,
+            entries.len(),
+            entries[..shown].iter().map(|entry| entry.line.as_str()).collect::<Vec<_>>().join("\n"),
+        )
+    }
+
+    /// The shown count of an answer is the one the old search over real serializations picks, at
+    /// every budget, over items that JSON escapes unevenly.
+    #[test]
+    fn shown_within_budget_matches_the_search_over_serializations_at_every_budget() {
+        let escaped_longer =
+            |text: &str| serde_json::to_string(text).unwrap().len() - 2 > text.len();
+        let sample = synthetic_references(40);
+        assert!(
+            sample.iter().any(|item| escaped_longer(&item.name))
+                && sample.iter().any(|item| escaped_longer(&item.owner))
+                && sample.iter().any(|item| item.reference_id.contains('"'))
+                && sample.iter().any(|item| item.reference_id.contains('\\')),
+            "the sample has text that escaping lengthens, in the names, owners and ids",
+        );
+        for count in [0, 1, 2, 3, 40] {
+            let references = synthetic_references(count);
+            let entries: Vec<_> = references.iter().cloned().map(CatalogEntry::new).collect();
+            let whole = legacy_list_platform(&references, None, None, usize::MAX).unwrap();
+            let mut shown_values = HashSet::new();
+            for budget in 0..=serialized_bytes(&whole) / 4 + 1 {
+                let expected = legacy_list_platform(&references, None, None, budget).unwrap();
+                shown_values.insert(structured_field(&expected, "shown").as_u64().unwrap());
+                assert_eq!(
+                    wire(list_over(&entries, budget)),
+                    serde_json::to_string(&expected).unwrap(),
+                    "{count} items at {budget} tokens",
+                );
+            }
+            assert_eq!(
+                shown_values.len(),
+                count + 1,
+                "{count} items: the sweep stops the old search at every prefix length",
+            );
+        }
+    }
+
+    // The three tests below ask the built-in catalog what the corpus-gated tests of
+    // `tests` ask the help corpus: every kind opens by its exact id, homonymous types open
+    // different cards, a method and a property of one name and overloaded constructors open
+    // the cards of their own kind. They run without the corpus.
+
+    fn card_of(reference: &PlatformReference) -> CallToolResult {
+        bsl_syntax_help_by_reference_id(&reference.reference_id, 50_000).unwrap()
+    }
+
+    #[test]
+    fn every_catalog_kind_opens_by_exact_reference_id_on_the_built_in_catalog() {
+        let entries = &platform_catalog().entries;
+        for (kind, expected) in [
+            (PlatformReferenceKind::Type, "type"),
+            (PlatformReferenceKind::Method, "method"),
+            (PlatformReferenceKind::Property, "property"),
+            (PlatformReferenceKind::Constructor, "constructor"),
+            (PlatformReferenceKind::GlobalFunction, "global_function"),
+        ] {
+            let reference = entries
+                .iter()
+                .map(|entry| &entry.reference)
+                .find(|item| item.kind == kind)
+                .unwrap_or_else(|| panic!("missing {expected} reference"));
+            let result = card_of(reference);
+            assert_eq!(structured_field(&result, "kind"), expected, "{}", reference.reference_id);
+            assert_eq!(structured_field(&result, "schema_version"), "2");
+        }
+
+        let missing = bsl_syntax_help_by_reference_id("type::missing~deadbeef", 6000).unwrap();
+        assert_eq!(structured_field(&missing, "status"), "not_found");
+    }
+
+    #[test]
+    fn homonymous_type_ids_open_distinct_cards_on_the_built_in_catalog() {
+        let references: Vec<_> = platform_catalog()
+            .entries
+            .iter()
+            .map(|entry| &entry.reference)
+            .filter(|item| item.kind == PlatformReferenceKind::Type && item.name == "ЭлементыФормы")
+            .collect();
+        assert_eq!(references.len(), 2);
+        let first = card_of(references[0]);
+        let second = card_of(references[1]);
+        assert_ne!(first.structured_content, second.structured_content);
+    }
+
+    #[test]
+    fn method_property_collisions_and_constructor_overloads_open_their_own_cards_on_the_built_in_catalog(
+    ) {
+        let references: Vec<_> =
+            platform_catalog().entries.iter().map(|entry| &entry.reference).collect();
+        let property = references
+            .iter()
+            .find(|property| {
+                property.kind == PlatformReferenceKind::Property
+                    && references.iter().any(|method| {
+                        method.kind == PlatformReferenceKind::Method
+                            && method.owner == property.owner
+                            && method.name == property.name
+                    })
+            })
+            .expect("the built-in catalog contains a method/property collision");
+        let method = references
+            .iter()
+            .find(|method| {
+                method.kind == PlatformReferenceKind::Method
+                    && method.owner == property.owner
+                    && method.name == property.name
+            })
+            .unwrap();
+        assert_ne!(method.reference_id, property.reference_id);
+        for (reference, kind) in [(method, "method"), (property, "property")] {
+            assert_eq!(structured_field(&card_of(reference), "kind"), kind);
+        }
+
+        let mut constructors_by_owner = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for constructor in
+            references.iter().filter(|item| item.kind == PlatformReferenceKind::Constructor)
+        {
+            constructors_by_owner.entry(&constructor.owner).or_default().push(constructor);
+        }
+        let variants = constructors_by_owner
+            .into_values()
+            .find(|variants| variants.len() > 1)
+            .expect("the built-in catalog contains constructor overloads");
+        assert_ne!(variants[0].reference_id, variants[1].reference_id);
+        let first = card_of(variants[0]);
+        let second = card_of(variants[1]);
+        assert_eq!(structured_field(&first, "kind"), "constructor");
+        assert_eq!(structured_field(&second, "kind"), "constructor");
+        assert_ne!(first.structured_content, second.structured_content);
     }
 }

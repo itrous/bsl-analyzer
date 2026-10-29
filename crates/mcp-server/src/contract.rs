@@ -866,6 +866,41 @@ mod tests {
         }
     }
 
+    /// The cards opened by `reference_id` are the same union as the ones opened by name, so the
+    /// same keys are required of each of the five kinds the catalog lists. The first listed item
+    /// of every kind stands for it. Unlike the test above this one needs no help corpus.
+    #[test]
+    fn syntax_help_cards_by_reference_id_carry_every_field_the_schema_requires() {
+        use crate::tools::platform::PlatformReferenceKind as Kind;
+        use crate::tools::platform::{bsl_syntax_help_by_reference_id, list_platform};
+
+        let schema = output_schema(McpProfile::Reference, "syntax_help").expect("outputSchema");
+        for kind in
+            [Kind::Type, Kind::Method, Kind::Property, Kind::Constructor, Kind::GlobalFunction]
+        {
+            let listing = list_platform(Some(kind), None, 2_000).unwrap();
+            let reference_id = listing.structured_content.as_ref().expect("structuredContent")
+                ["items"][0]["reference_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{kind:?}: the listing shows an item"))
+                .to_owned();
+            let result = bsl_syntax_help_by_reference_id(&reference_id, 6000).unwrap();
+            let card = result.structured_content.expect("structuredContent");
+            for key in required_keys(&schema) {
+                assert!(card.get(&key).is_some(), "{reference_id}: card omits required `{key}`");
+            }
+            let branch = schema["oneOf"]
+                .as_array()
+                .expect("the card is a tagged union")
+                .iter()
+                .find(|variant| variant["properties"]["kind"]["const"] == card["kind"])
+                .unwrap_or_else(|| panic!("{reference_id}: no schema branch for {}", card["kind"]));
+            for key in required_keys(branch) {
+                assert!(card.get(&key).is_some(), "{reference_id}: card omits required `{key}`");
+            }
+        }
+    }
+
     fn required_keys(schema: &Value) -> Vec<String> {
         schema["required"]
             .as_array()

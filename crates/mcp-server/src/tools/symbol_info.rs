@@ -11,6 +11,7 @@ use std::{path::Path, sync::Arc};
 use ide::{Locale, SymbolInfoCard, SymbolInfoRequest, SymbolInfoSections, SymbolPosition};
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData as McpError;
+use rustc_hash::FxHashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -519,12 +520,13 @@ pub(crate) fn render_card(
     };
     body["freshness"] = stamp.freshness(completeness(false)).to_value();
 
-    let full = structured(body.clone());
-    if serialized_bytes(&full) <= max_output_tokens.saturating_mul(4) {
-        return full;
+    let mut measure = CardMeasure::of(&body);
+    if measure.total() <= max_output_tokens.saturating_mul(4) {
+        return structured(body);
     }
     body["freshness"] = stamp.freshness(completeness(true)).to_value();
-    fit_card_to_budget(body, max_output_tokens)
+    measure.set("freshness", &body["freshness"]);
+    fit_card_to_budget(body, measure, max_output_tokens)
 }
 
 /// What the caller knows about the resident that answered: its root table (for locations)
@@ -776,25 +778,27 @@ fn card_to_value(card: &SymbolInfoCard) -> Value {
     Value::Object(body)
 }
 
-fn fit_card_to_budget(mut body: Value, max_output_tokens: usize) -> CallToolResult {
+fn fit_card_to_budget(
+    mut body: Value,
+    mut measure: CardMeasure,
+    max_output_tokens: usize,
+) -> CallToolResult {
     let ceiling = max_output_tokens.saturating_mul(4);
     let symbol = body["symbol"].clone();
-    body["truncated"] = json!(true);
-    body["budget_hint"] = json!("increase max_output_tokens or narrow member_kind/member_name");
-
-    let fitted = |body: &Value| {
-        let result = structured(body.clone());
-        (serialized_bytes(&result) <= ceiling).then_some(result)
-    };
-    if let Some(result) = fitted(&body) {
-        return result;
+    for (field, value) in [
+        ("truncated", json!(true)),
+        ("budget_hint", json!("increase max_output_tokens or narrow member_kind/member_name")),
+    ] {
+        measure.set(field, &value);
+        body[field] = value;
+    }
+    if measure.total() <= ceiling {
+        return structured(body);
     }
 
     for field in ["doc", "usages"] {
-        if body.as_object_mut().is_some_and(|body| body.remove(field).is_some()) {
-            if let Some(result) = fitted(&body) {
-                return result;
-            }
+        if remove_field(&mut body, &mut measure, field) && measure.total() <= ceiling {
+            return structured(body);
         }
     }
     if body
@@ -802,23 +806,19 @@ fn fit_card_to_budget(mut body: Value, max_output_tokens: usize) -> CallToolResu
         .and_then(Value::as_object_mut)
         .is_some_and(|definition| definition.remove("snippet").is_some())
     {
-        if let Some(result) = fitted(&body) {
-            return result;
+        measure.set("definition", &body["definition"]);
+        if measure.total() <= ceiling {
+            return structured(body);
         }
     }
-    while body
-        .get_mut("members")
-        .and_then(Value::as_array_mut)
-        .is_some_and(|members| members.pop().is_some())
-    {
-        if let Some(result) = fitted(&body) {
-            return result;
+    if let Some(kept) = measure.members_within(ceiling) {
+        if let Some(members) = body.get_mut("members").and_then(Value::as_array_mut) {
+            members.truncate(kept);
         }
+        return structured(body);
     }
-    if body.as_object_mut().expect("card body is an object").remove("members").is_some() {
-        if let Some(result) = fitted(&body) {
-            return result;
-        }
+    if remove_field(&mut body, &mut measure, "members") && measure.total() <= ceiling {
+        return structured(body);
     }
     for field in [
         "definitions",
@@ -831,10 +831,8 @@ fn fit_card_to_budget(mut body: Value, max_output_tokens: usize) -> CallToolResu
         "usages_unavailable",
         "semantics_unavailable",
     ] {
-        if body.as_object_mut().is_some_and(|body| body.remove(field).is_some()) {
-            if let Some(result) = fitted(&body) {
-                return result;
-            }
+        if remove_field(&mut body, &mut measure, field) && measure.total() <= ceiling {
+            return structured(body);
         }
     }
 
@@ -846,6 +844,140 @@ fn fit_card_to_budget(mut body: Value, max_output_tokens: usize) -> CallToolResu
         "budget_hint": "increase max_output_tokens or narrow member_kind/member_name",
     }))
 }
+
+fn remove_field(body: &mut Value, measure: &mut CardMeasure, field: &str) -> bool {
+    let removed = body.as_object_mut().is_some_and(|body| body.remove(field).is_some());
+    if removed {
+        measure.remove(field);
+    }
+    removed
+}
+
+/// Bytes a piece of JSON text adds to a `structured` answer, which carries the body twice: as
+/// raw JSON in `structuredContent` and as an escaped string in the text block. JSON escaping is
+/// per character, so both counts of a whole are the sums of its parts' counts.
+#[derive(Debug, Clone, Copy, Default)]
+struct Cost {
+    raw: usize,
+    escaped: usize,
+}
+
+impl Cost {
+    fn of_json(text: &str) -> Self {
+        Self { raw: text.len(), escaped: serialized_bytes(&text) - 2 }
+    }
+
+    /// A `"key": value` member of an object, colon included.
+    fn field(key: &str, value: &Value) -> Self {
+        Self::of_json(&Value::from(key).to_string())
+            + Self::of_json(&value.to_string())
+            + Self::punct(1)
+    }
+
+    /// Unescaped punctuation: brackets, commas, colons.
+    fn punct(bytes: usize) -> Self {
+        Self { raw: bytes, escaped: bytes }
+    }
+
+    /// Brackets and separating commas of a container with `len` elements.
+    fn framing(len: usize) -> Self {
+        Self::punct(2 + len.saturating_sub(1))
+    }
+}
+
+impl std::ops::Add for Cost {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self { raw: self.raw + other.raw, escaped: self.escaped + other.escaped }
+    }
+}
+
+impl std::iter::Sum for Cost {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), std::ops::Add::add)
+    }
+}
+
+/// The size of `structured(body)` kept up to date as the budget fit edits the card's top-level
+/// fields, so each probe is arithmetic over parts measured once rather than a serialization.
+struct CardMeasure {
+    /// The answer around a body of `{}`, minus that body's own two counts.
+    wrapper: usize,
+    fields: FxHashMap<String, Cost>,
+    /// `members` when it is an array: the key with its colon, and every member.
+    members: Option<(Cost, Vec<Cost>)>,
+}
+
+impl CardMeasure {
+    fn of(body: &Value) -> Self {
+        let mut measure = Self {
+            wrapper: serialized_bytes(&structured(json!({}))) - 4,
+            fields: FxHashMap::default(),
+            members: None,
+        };
+        for (key, value) in body.as_object().into_iter().flatten() {
+            measure.set(key, value);
+        }
+        measure
+    }
+
+    fn set(&mut self, key: &str, value: &Value) {
+        self.remove(key);
+        match value {
+            Value::Array(members) if key == MEMBERS => {
+                let key = Cost::of_json(&Value::from(key).to_string()) + Cost::punct(1);
+                let members =
+                    members.iter().map(|member| Cost::of_json(&member.to_string())).collect();
+                self.members = Some((key, members));
+            }
+            _ => {
+                self.fields.insert(key.to_owned(), Cost::field(key, value));
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if key == MEMBERS {
+            self.members = None;
+        }
+        self.fields.remove(key);
+    }
+
+    fn total(&self) -> usize {
+        self.total_with_members(self.members.as_ref().map_or(0, |(_, members)| members.len()))
+    }
+
+    /// The size with only the first `kept` members of the `members` array.
+    fn total_with_members(&self, kept: usize) -> usize {
+        let members = self.members.as_ref().map(|(key, members)| {
+            *key + members[..kept].iter().copied().sum() + Cost::framing(kept)
+        });
+        let count = self.fields.len() + usize::from(members.is_some());
+        let cost = self.fields.values().copied().sum::<Cost>()
+            + members.unwrap_or_default()
+            + Cost::framing(count);
+        self.wrapper + cost.raw + cost.escaped
+    }
+
+    /// The largest number of members, short of all of them, whose card fits `ceiling`. The size
+    /// grows with every member kept, so the scan stops at the first prefix that does not fit.
+    fn members_within(&self, ceiling: usize) -> Option<usize> {
+        let (_, members) = self.members.as_ref().filter(|(_, members)| !members.is_empty())?;
+        let mut size = self.total_with_members(0);
+        let mut kept = (size <= ceiling).then_some(0);
+        for (index, member) in members[..members.len().saturating_sub(1)].iter().enumerate() {
+            size += member.raw + member.escaped + if index == 0 { 0 } else { 2 };
+            if size > ceiling {
+                break;
+            }
+            kept = Some(index + 1);
+        }
+        kept
+    }
+}
+
+const MEMBERS: &str = "members";
 
 #[cfg(test)]
 mod tests {
@@ -1515,5 +1647,364 @@ mod tests {
         assert_eq!(data["state"], "failed");
         assert_eq!(data["reason"], "broken cache");
         assert_eq!(data["retry_after_ms"], 5_000);
+    }
+
+    /// The budget fit against the one it replaced, which cut the card by serializing it after
+    /// every step: `render_card` measuring the whole answer first, and `fit_card_to_budget`
+    /// popping members one at a time. The `legacy_*` functions are those as they were.
+    mod legacy_equivalence {
+        use super::*;
+        use std::collections::HashSet;
+
+        fn legacy_render_card(
+            card: &SymbolInfoCard,
+            graph: Option<&GraphDb>,
+            top_modules: usize,
+            max_output_tokens: usize,
+            stamp: &ResidentStamp<'_>,
+        ) -> CallToolResult {
+            let mut body = card_to_value(card);
+            let mut degraded = card.semantics_unavailable;
+            let mut indexing = false;
+
+            if let Some(graph_id) = card.graph_id.as_deref() {
+                body["graph_id"] = json!(graph_id);
+            }
+
+            if !card.semantics_unavailable {
+                match (card.graph_id.as_deref(), graph) {
+                    (Some(graph_id), Some(graph)) => match usages(graph, graph_id, top_modules) {
+                        Some(u) => {
+                            body["usages"] = u;
+                        }
+                        None => {
+                            body["usages_unavailable"] = json!("symbol not in call graph");
+                            degraded = true;
+                        }
+                    },
+                    (Some(_), None) => {
+                        body["usages_unavailable"] = json!("graph indexing");
+                        indexing = true;
+                    }
+                    (None, _) => {}
+                }
+            }
+
+            body["definitions"] = json!(definitions_value(card, stamp));
+
+            let completeness = |budget_exhausted| {
+                Completeness::complete()
+                    .when(
+                        budget_exhausted,
+                        ReasonCode::OutputBudget,
+                        "card trimmed to fit max_output_tokens",
+                    )
+                    .when(
+                        degraded,
+                        ReasonCode::ModalityDegraded,
+                        "the call graph could not answer for this symbol",
+                    )
+                    .when(
+                        indexing,
+                        ReasonCode::IndexBuilding,
+                        "the call graph is still indexing, so usages are not counted yet",
+                    )
+            };
+            body["freshness"] = stamp.freshness(completeness(false)).to_value();
+
+            let full = structured(body.clone());
+            if serialized_bytes(&full) <= max_output_tokens.saturating_mul(4) {
+                return full;
+            }
+            body["freshness"] = stamp.freshness(completeness(true)).to_value();
+            legacy_fit_card_to_budget(body, max_output_tokens)
+        }
+
+        fn legacy_fit_card_to_budget(mut body: Value, max_output_tokens: usize) -> CallToolResult {
+            let ceiling = max_output_tokens.saturating_mul(4);
+            let symbol = body["symbol"].clone();
+            body["truncated"] = json!(true);
+            body["budget_hint"] =
+                json!("increase max_output_tokens or narrow member_kind/member_name");
+
+            let fitted = |body: &Value| {
+                let result = structured(body.clone());
+                (serialized_bytes(&result) <= ceiling).then_some(result)
+            };
+            if let Some(result) = fitted(&body) {
+                return result;
+            }
+
+            for field in ["doc", "usages"] {
+                if body.as_object_mut().is_some_and(|body| body.remove(field).is_some()) {
+                    if let Some(result) = fitted(&body) {
+                        return result;
+                    }
+                }
+            }
+            if body
+                .get_mut("definition")
+                .and_then(Value::as_object_mut)
+                .is_some_and(|definition| definition.remove("snippet").is_some())
+            {
+                if let Some(result) = fitted(&body) {
+                    return result;
+                }
+            }
+            while body
+                .get_mut("members")
+                .and_then(Value::as_array_mut)
+                .is_some_and(|members| members.pop().is_some())
+            {
+                if let Some(result) = fitted(&body) {
+                    return result;
+                }
+            }
+            if body.as_object_mut().expect("card body is an object").remove("members").is_some() {
+                if let Some(result) = fitted(&body) {
+                    return result;
+                }
+            }
+            for field in [
+                "definitions",
+                "freshness",
+                "definition",
+                "kind",
+                "container",
+                "signature",
+                "return_type",
+                "usages_unavailable",
+                "semantics_unavailable",
+            ] {
+                if body.as_object_mut().is_some_and(|body| body.remove(field).is_some()) {
+                    if let Some(result) = fitted(&body) {
+                        return result;
+                    }
+                }
+            }
+
+            structured(json!({
+                "schema_version": "1",
+                "status": "ok",
+                "symbol": symbol,
+                "truncated": true,
+                "budget_hint": "increase max_output_tokens or narrow member_kind/member_name",
+            }))
+        }
+
+        fn wire(result: &CallToolResult) -> String {
+            serde_json::to_string(result).expect("a result serializes")
+        }
+
+        const MEMBERS_OF_A_FULL_CARD: usize = 4;
+
+        /// Names, paths and prose in which the escaped text is longer than the raw one.
+        const PROSE: &str = "Документация \"в кавычках\"\nвторая строка с \\ и\tтабуляцией\u{1}. ";
+
+        fn members(count: usize) -> Vec<SymbolMember> {
+            (0..count)
+                .rev()
+                .map(|i| match i % 3 {
+                    0 => SymbolMember::metadata(
+                        format!("Рек\"визит\\{i:03}"),
+                        "Реквизит",
+                        "attribute",
+                        Some("Строка".to_string()),
+                    ),
+                    1 => SymbolMember::callable(
+                        format!("Метод{i:03}"),
+                        "Метод",
+                        "method",
+                        format!("Метод{i:03}(Знач П: Число = \"а\\б\")"),
+                        SymbolMemberOrigin::Module,
+                    ),
+                    _ => SymbolMember::metadata(format!("Поле{i:03}"), "Поле", "field", None),
+                })
+                .collect()
+        }
+
+        /// Suffixes of the symbol, the one field no cut ever removes. Each moves the size of the
+        /// card at every step of the fit by a different amount modulo the four bytes of a budget
+        /// token, which is what lets some budget land exactly on the size of a step: `x` adds
+        /// two bytes, the control character thirteen, both fifteen.
+        const SYMBOL_PADDINGS: [&str; 4] = ["", "x", "\u{1}", "\u{1}x"];
+
+        /// Four cards that reach the budget fit by different roads: one that carries everything
+        /// it can lose, one with no prose and no snippet to lose first, one with no members, and
+        /// one that has little but its identity.
+        fn cards(padding: &str) -> [(&'static str, SymbolInfoCard); 4] {
+            let mut full = method_card();
+            full.kind = "metadata object";
+            full.symbol.push_str(padding);
+            full.doc = Some(PROSE.repeat(3));
+            full.definition.as_mut().unwrap().snippet = Some("Фрагмент \"кода\"\n".repeat(4));
+            full.members = members(MEMBERS_OF_A_FULL_CARD);
+
+            let mut undocumented = full.clone();
+            undocumented.doc = None;
+            undocumented.definition.as_mut().unwrap().snippet = None;
+
+            let mut memberless = full.clone();
+            memberless.members = Vec::new();
+
+            let mut bare = method_card();
+            bare.symbol.push_str(padding);
+            bare.doc = None;
+            bare.definition = None;
+            bare.definitions = Vec::new();
+            bare.container = None;
+            bare.signature = None;
+            bare.return_type = None;
+            bare.semantics_unavailable = true;
+
+            [
+                ("full", full),
+                ("undocumented", undocumented),
+                ("memberless", memberless),
+                ("bare", bare),
+            ]
+        }
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct Shape {
+            truncated: bool,
+            doc: bool,
+            usages: bool,
+            snippet: bool,
+            members: Option<usize>,
+            keys: usize,
+        }
+
+        fn shape(result: &CallToolResult) -> Shape {
+            let body = result.structured_content.as_ref().expect("structured content");
+            Shape {
+                truncated: body.get("truncated").is_some(),
+                doc: body.get("doc").is_some(),
+                usages: body.get("usages").is_some(),
+                snippet: body["definition"].get("snippet").is_some(),
+                members: body.get("members").and_then(Value::as_array).map(Vec::len),
+                keys: body.as_object().map_or(0, serde_json::Map::len),
+            }
+        }
+
+        /// Every road of the fit must have been taken by the sweep, or equality across it proves
+        /// nothing about the roads it skipped.
+        #[track_caller]
+        fn any(what: &str, found: bool) {
+            assert!(found, "no budget of the sweep {what}");
+        }
+
+        #[track_caller]
+        fn assert_every_road_was_taken(shapes: &HashSet<Shape>, members: usize, usages: bool) {
+            any(
+                "dropped the prose and kept the snippet",
+                shapes.iter().any(|s| {
+                    s.truncated
+                        && !s.doc
+                        && s.snippet
+                        && s.usages == usages
+                        && s.members == Some(members)
+                }),
+            );
+            if usages {
+                any(
+                    "dropped the prose and then the usages",
+                    shapes.iter().any(|s| s.truncated && !s.doc && !s.usages && s.snippet),
+                );
+            }
+            any(
+                "dropped the snippet and kept every member",
+                shapes
+                    .iter()
+                    .any(|s| s.truncated && !s.snippet && !s.usages && s.members == Some(members)),
+            );
+            any(
+                "kept some members but not all",
+                shapes.iter().any(|s| s.members.is_some_and(|kept| 0 < kept && kept < members)),
+            );
+            any("kept an empty member list", shapes.iter().any(|s| s.members == Some(0)));
+            any(
+                "dropped the members and kept other fields",
+                shapes.iter().any(|s| s.truncated && s.members.is_none() && s.keys > 5),
+            );
+            any(
+                "fell back to the bare card",
+                shapes.iter().any(|s| s.truncated && s.members.is_none() && s.keys == 5),
+            );
+        }
+
+        /// Every budget from nothing to past the whole card, for each of four cards, at each
+        /// padding of the symbol.
+        #[test]
+        fn render_card_matches_legacy() {
+            let roots = stand_roots();
+            let stamp = stamp(&roots);
+            for padding in SYMBOL_PADDINGS {
+                for (label, card) in cards(padding) {
+                    let whole =
+                        legacy_render_card(&card, None, DEFAULT_TOP_MODULES, usize::MAX, &stamp);
+                    let mut shapes = HashSet::new();
+                    for budget in 0..=serialized_bytes(&whole) / 4 + 1 {
+                        let expected =
+                            legacy_render_card(&card, None, DEFAULT_TOP_MODULES, budget, &stamp);
+                        shapes.insert(shape(&expected));
+                        assert_eq!(
+                            wire(&render_card(&card, None, DEFAULT_TOP_MODULES, budget, &stamp)),
+                            wire(&expected),
+                            "{label} card, symbol padding {padding:?}, {budget} tokens",
+                        );
+                    }
+                    if label == "full" {
+                        any("kept the whole card", shapes.iter().any(|s| !s.truncated));
+                        assert_every_road_was_taken(&shapes, MEMBERS_OF_A_FULL_CARD, false);
+                    }
+                }
+            }
+        }
+
+        /// The roads `render_card` cannot take without a call graph: a card that carries the
+        /// usages summary loses it after the prose and before the snippet.
+        #[test]
+        fn fit_card_to_budget_matches_legacy_for_a_card_with_usages() {
+            let roots = stand_roots();
+            for padding in SYMBOL_PADDINGS {
+                let (_, card) = cards(padding).into_iter().next().unwrap();
+                let mut body =
+                    render_card(&card, None, DEFAULT_TOP_MODULES, usize::MAX, &stamp(&roots))
+                        .structured_content
+                        .unwrap();
+                body["usages"] = json!({
+                    "count": 12,
+                    "top_modules": [
+                        {"module": "Модуль \"А\"", "count": 7},
+                        {"module": "Модуль\\Б", "count": 5},
+                    ],
+                    "graph_id": "method/common/МойМодуль/Сложить",
+                    "top_modules_sampled": true,
+                });
+                body["usages_unavailable"] = json!("graph indexing");
+                let whole = structured(body.clone());
+
+                let mut shapes = HashSet::new();
+                // Past the whole card: the notice the fit adds is itself a cost the budget must
+                // cover.
+                for budget in 0..=serialized_bytes(&whole) / 4 + 200 {
+                    let expected = legacy_fit_card_to_budget(body.clone(), budget);
+                    shapes.insert(shape(&expected));
+                    assert_eq!(
+                        wire(&fit_card_to_budget(body.clone(), CardMeasure::of(&body), budget)),
+                        wire(&expected),
+                        "symbol padding {padding:?}, {budget} tokens",
+                    );
+                }
+                any(
+                    "cut nothing but added the notice",
+                    shapes
+                        .iter()
+                        .any(|s| s.truncated && s.doc && s.members == Some(MEMBERS_OF_A_FULL_CARD)),
+                );
+                assert_every_road_was_taken(&shapes, MEMBERS_OF_A_FULL_CARD, true);
+            }
+        }
     }
 }

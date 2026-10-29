@@ -1231,7 +1231,7 @@ fn from_platform(db: &RootDatabaseImpl, merge: &mut Merge<'_>) -> Vec<NameCandid
             continue;
         };
         let canonical = entry.name;
-        let owner = entry.owner.map(str::to_owned);
+        let owner = entry.owner().map(str::to_owned);
         let symbol = match entry.kind {
             hir::PlatformNameKind::GlobalFunction => Some(canonical.to_owned()),
             hir::PlatformNameKind::Method => owner
@@ -2255,6 +2255,260 @@ mod tests {
         // The three database-backed sources are still missing, and the answer
         // has to keep saying so.
         assert!(found.is_partial());
+    }
+
+    /// The method every test below asks about: its name, in either language, is carried by no
+    /// other platform entry, and its owner is filed in the catalog under another spelling than
+    /// the one the owner is shown by. A candidate that kept the raw type name, or lost the owner,
+    /// is therefore a different answer.
+    fn the_uniquely_named_method_of_a_localized_owner(
+    ) -> (&'static bsl_platform::PlatformMethod, &'static str) {
+        let platform = bsl_platform::PlatformDataInner::instance();
+        let mut spellings: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let names = platform
+            .all_global_functions()
+            .iter()
+            .map(|item| (&item.name, &item.english_name))
+            .chain(platform.all_types().iter().map(|item| (&item.name, &item.english_name)))
+            .chain(platform.all_methods().iter().map(|item| (&item.name, &item.english_name)))
+            .chain(platform.all_properties().iter().map(|item| (&item.name, &item.english_name)));
+        for (name, english_name) in names {
+            *spellings.entry(name.to_lowercase()).or_default() += 1;
+            *spellings.entry(english_name.to_lowercase()).or_default() += 1;
+        }
+        platform
+            .all_methods()
+            .iter()
+            .filter(|method| spellings[&method.name.to_lowercase()] == 1)
+            .filter(|method| spellings[&method.english_name.to_lowercase()] == 1)
+            .filter_map(|method| {
+                let owner = platform.get_type(&method.type_name)?;
+                (owner.name != method.type_name && !owner.name.contains('.'))
+                    .then_some((method, owner.name.as_str()))
+            })
+            .next()
+            .expect("the catalog has a uniquely named method of an owner filed under another name")
+    }
+
+    /// A platform method is published under its owner's display name, and the owner is
+    /// resolved for the entries that matched.
+    #[test]
+    fn a_platform_method_is_published_under_its_owner_s_display_name() {
+        let (method, owner) = the_uniquely_named_method_of_a_localized_owner();
+
+        let db = build(&[]);
+        let query =
+            NameQuery::new(&method.name, 200).with_categories(&[NameCategory::PlatformMember]);
+        let found = look(&db, &query);
+        let candidate = found
+            .candidates
+            .iter()
+            .find(|c| c.display == method.name)
+            .unwrap_or_else(|| panic!("`{}` did not find the method", method.name));
+
+        assert_eq!(candidate.symbol.as_deref(), Some(format!("{owner}.{}", method.name).as_str()));
+        assert_eq!(
+            candidate.platform_ref,
+            Some(PlatformRef { name: method.name.to_string(), type_name: Some(owner.to_owned()) }),
+        );
+    }
+
+    /// Russian, English and shouted — one method, one answer, one `symbol`, under the owner's
+    /// display name.
+    #[test]
+    fn three_spellings_of_one_platform_method_are_one_candidate_under_its_owner() {
+        let (method, owner) = the_uniquely_named_method_of_a_localized_owner();
+        let db = build(&[]);
+        let ask = |text: &str| {
+            let query = NameQuery::new(text, 200).with_categories(&[NameCategory::PlatformMember]);
+            let mut found: Vec<_> = look(&db, &query)
+                .candidates
+                .into_iter()
+                .filter(|c| c.display == method.name)
+                .collect();
+            assert_eq!(found.len(), 1, "`{text}` found {} candidates of the method", found.len());
+            found.remove(0)
+        };
+
+        let ru = ask(&method.name);
+        let en = ask(&method.english_name.to_lowercase());
+        let shouted = ask(&method.name.to_uppercase());
+
+        assert_eq!(ru.symbol.as_deref(), Some(format!("{owner}.{}", method.name).as_str()));
+        assert_eq!(en.symbol, ru.symbol);
+        assert_eq!(shouted.symbol, ru.symbol);
+        assert_eq!(en.platform_ref, ru.platform_ref);
+        assert_eq!(shouted.platform_ref, ru.platform_ref);
+        assert_eq!(ru.match_tier, NameMatchTier::Exact);
+    }
+
+    /// Same as `three_spellings_of_one_platform_member_are_one_candidate`, which asks the help
+    /// corpus: the built-in catalog holds the global function too.
+    #[test]
+    fn three_spellings_of_one_platform_member_are_one_candidate_on_the_built_in_catalog() {
+        let db = build(&[]);
+        let ask = |text: &str| {
+            let query = NameQuery::new(text, 50).with_categories(&[NameCategory::PlatformMember]);
+            look(&db, &query)
+                .candidates
+                .into_iter()
+                .find(|c| c.display == "СтрНайти")
+                .unwrap_or_else(|| panic!("`{text}` did not find СтрНайти"))
+        };
+
+        let ru = ask("СтрНайти");
+        let en = ask("strfind");
+        let shouted = ask("СТРНАЙТИ");
+
+        assert_eq!(ru.symbol.as_deref(), Some("СтрНайти"));
+        assert_eq!(en.symbol, ru.symbol);
+        assert_eq!(shouted.symbol, ru.symbol);
+        assert_eq!(ru.match_tier, NameMatchTier::Exact);
+        assert_eq!(en.match_tier, NameMatchTier::CaseInsensitive);
+    }
+
+    /// Same as `the_platform_answers_on_a_host_that_has_built_nothing`, which asks the help
+    /// corpus: the name it asks for is held by the built-in catalog.
+    #[test]
+    fn the_platform_answers_on_a_host_that_has_built_nothing_on_the_built_in_catalog() {
+        let db = build(&[]);
+
+        let found =
+            look(&db, &NameQuery::new("СтрНайти", 20).with_workspace(ProviderState::NotReady));
+
+        assert_eq!(found.state_of(ProviderId::Platform), Some(ProviderState::Answered));
+        assert_eq!(found.state_of(ProviderId::ModuleMembers), Some(ProviderState::NotReady));
+        assert!(
+            found.candidates.iter().any(|c| c.category == NameCategory::PlatformMember),
+            "{:?}",
+            found.candidates,
+        );
+        assert!(found.is_partial());
+    }
+
+    struct LegacyPlatformEntry {
+        kind: hir::PlatformNameKind,
+        name: &'static str,
+        english_name: &'static str,
+        owner: Option<&'static str>,
+    }
+
+    /// The platform name surface as it was built before: the owner of every method and property
+    /// resolved up front.
+    fn legacy_platform_entries() -> &'static [LegacyPlatformEntry] {
+        static ENTRIES: std::sync::OnceLock<Vec<LegacyPlatformEntry>> = std::sync::OnceLock::new();
+        ENTRIES.get_or_init(|| {
+            let platform = bsl_platform::PlatformDataInner::instance();
+            let owner = |type_name: &'static str| {
+                (!type_name.is_empty())
+                    .then(|| platform.get_type(type_name).map_or(type_name, |ty| ty.name.as_str()))
+            };
+            let mut entries = Vec::new();
+            entries.extend(platform.all_global_functions().iter().map(|item| {
+                LegacyPlatformEntry {
+                    kind: hir::PlatformNameKind::GlobalFunction,
+                    name: &item.name,
+                    english_name: &item.english_name,
+                    owner: None,
+                }
+            }));
+            entries.extend(platform.all_types().iter().map(|item| LegacyPlatformEntry {
+                kind: hir::PlatformNameKind::Type,
+                name: &item.name,
+                english_name: &item.english_name,
+                owner: None,
+            }));
+            entries.extend(platform.all_methods().iter().map(|item| LegacyPlatformEntry {
+                kind: hir::PlatformNameKind::Method,
+                name: &item.name,
+                english_name: &item.english_name,
+                owner: owner(&item.type_name),
+            }));
+            entries.extend(platform.all_properties().iter().map(|item| LegacyPlatformEntry {
+                kind: hir::PlatformNameKind::Property,
+                name: &item.name,
+                english_name: &item.english_name,
+                owner: owner(&item.type_name),
+            }));
+            entries
+        })
+    }
+
+    /// `from_platform` over the entries built before.
+    fn legacy_from_platform(db: &RootDatabaseImpl, merge: &Merge<'_>) -> Vec<NameCandidate> {
+        let mut out = Vec::new();
+        for entry in legacy_platform_entries() {
+            db.unwind_if_revision_cancelled();
+            let Some(tier) = merge.best_tier(&[entry.name, entry.english_name]) else {
+                continue;
+            };
+            let canonical = entry.name;
+            let owner = entry.owner.map(str::to_owned);
+            let symbol = match entry.kind {
+                hir::PlatformNameKind::GlobalFunction => Some(canonical.to_owned()),
+                hir::PlatformNameKind::Method => owner
+                    .as_deref()
+                    .filter(|owner| !owner.contains('.'))
+                    .map(|owner| format!("{owner}.{canonical}")),
+                hir::PlatformNameKind::Type | hir::PlatformNameKind::Property => None,
+            };
+            let mut candidate = NameCandidate::new(
+                canonical,
+                NameCategory::PlatformMember,
+                tier,
+                ProviderId::Platform,
+            );
+            candidate.symbol = symbol;
+            candidate.platform_ref =
+                Some(PlatformRef { name: canonical.to_owned(), type_name: owner });
+            out.push(candidate);
+        }
+        out
+    }
+
+    /// The candidates the platform provider hands to `lookup_names` are the ones it handed
+    /// before the owner was resolved on demand: same candidates, same order, same owners.
+    #[test]
+    fn platform_candidates_equal_the_ones_built_with_every_owner_resolved() {
+        let (method, _) = the_uniquely_named_method_of_a_localized_owner();
+        let english_lowercase = method.english_name.to_lowercase();
+        let method_name = method.name.to_string();
+        let db = build(&[]);
+
+        let mut localized_owners = 0;
+        let mut answered = 0;
+        for text in [
+            "СтрНайти",
+            "СтрНайт",
+            "strfind",
+            "СТРНАЙТИ",
+            method_name.as_str(),
+            english_lowercase.as_str(),
+            "добав",
+            "array",
+            "Массив",
+            "а",
+            "нетТакогоИмениВПлатформеЯщик",
+        ] {
+            let query = NameQuery::new(text, 100);
+            let folded = text.fold_lower();
+            let cached = from_platform(&db, &mut Merge::new(&db, &query, folded.clone()));
+            let legacy = legacy_from_platform(&db, &Merge::new(&db, &query, folded));
+            assert_eq!(cached, legacy, "`{text}`");
+            answered += usize::from(!cached.is_empty());
+            localized_owners += cached
+                .iter()
+                .filter(|c| {
+                    c.platform_ref
+                        .as_ref()
+                        .and_then(|r| r.type_name.as_deref())
+                        .is_some_and(|owner| !owner.is_ascii())
+                })
+                .count();
+        }
+        assert!(answered >= 9, "the queries reach the platform: {answered} answered");
+        assert!(localized_owners > 0, "some candidates carry a localized owner");
     }
 
     /// An empty answer means one of two different things, and the difference is

@@ -383,6 +383,102 @@ async fn shared_platform_listing_is_identical_in_workspace_and_reference_profile
     assert!(workspace.0["shown"].as_u64().unwrap() < workspace.0["total"].as_u64().unwrap());
 }
 
+/// A server on the state that has neither a workspace nor a reference worker. The catalog calls
+/// read neither, and nothing is left running once the session closes.
+fn catalog_server(profile: McpProfile) -> McpServer {
+    McpServer::new(profile, SharedState::shared())
+}
+
+/// Same as `contract_is_discoverable_and_readable_over_a_session` in what it asks of
+/// `syntax_help`, which asks the help corpus; the built-in catalog holds the type `Массив` too.
+/// The card is opened by name and then by the `reference_id` the listing gives for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn syntax_help_answers_by_name_and_by_reference_id_over_a_session_on_the_built_in_catalog() {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    tokio::spawn(serve_stream(catalog_server(McpProfile::Reference), server_io));
+    let client = ().serve(client_io).await.expect("session initialized");
+
+    let tools = client.list_tools(Default::default()).await.expect("tools/list");
+    let syntax_help =
+        tools.tools.iter().find(|tool| tool.name == "syntax_help").expect("syntax_help is listed");
+    assert!(
+        syntax_help.output_schema.as_ref().is_some_and(|schema| {
+            serde_json::to_string(schema.as_ref())
+                .is_ok_and(|schema| schema.contains("schema_version"))
+        }),
+        "syntax_help publishes a versioned outputSchema"
+    );
+
+    let by_name = client
+        .call_tool(
+            CallToolRequestParams::new("syntax_help")
+                .with_arguments(Map::from_iter([("name".to_owned(), json!("Массив"))])),
+        )
+        .await
+        .expect("syntax_help call by name");
+    let body = by_name.structured_content.expect("syntax_help structuredContent");
+    assert_eq!(body["schema_version"], "2");
+    assert_eq!(body["kind"], "type");
+    assert_eq!(body["name"], "Массив");
+    assert!(
+        by_name.content.first().and_then(|content| content.as_text()).is_some(),
+        "legacy text content remains available"
+    );
+
+    let listing = client
+        .call_tool(CallToolRequestParams::new("search").with_arguments(Map::from_iter([
+            ("action".to_owned(), json!("list_platform")),
+            ("kind".to_owned(), json!("type")),
+            ("name".to_owned(), json!("массив")),
+            ("max_output_tokens".to_owned(), json!(50_000)),
+        ])))
+        .await
+        .expect("list_platform call");
+    let items =
+        listing.structured_content.expect("list_platform structuredContent")["items"].clone();
+    let reference_id = items
+        .as_array()
+        .expect("the listing carries items")
+        .iter()
+        .find(|item| item["name"] == "Массив")
+        .expect("the type Массив is listed")["reference_id"]
+        .as_str()
+        .expect("an item carries its reference_id")
+        .to_owned();
+
+    let by_id = client
+        .call_tool(
+            CallToolRequestParams::new("syntax_help")
+                .with_arguments(Map::from_iter([("reference_id".to_owned(), json!(reference_id))])),
+        )
+        .await
+        .expect("syntax_help call by reference_id");
+    let body = by_id.structured_content.expect("syntax_help structuredContent");
+    assert_eq!(body["schema_version"], "2");
+    assert_eq!(body["kind"], "type");
+    assert_eq!(body["name"], "Массив");
+
+    client.cancel().await.expect("session closed");
+}
+
+async fn budgeted_platform_list_on(profile: McpProfile) -> (Value, String) {
+    budgeted_platform_list(catalog_server(profile)).await
+}
+
+/// Same as `shared_platform_listing_is_identical_in_workspace_and_reference_profiles`, which
+/// asks the help corpus: the built-in catalog does not fit the budget either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_platform_listing_is_identical_in_both_profiles_on_the_built_in_catalog() {
+    let workspace = budgeted_platform_list_on(McpProfile::Workspace).await;
+    let reference = budgeted_platform_list_on(McpProfile::Reference).await;
+
+    assert_eq!(workspace, reference);
+    assert_eq!(workspace.0["action"], "list_platform");
+    assert_eq!(workspace.0["schema_version"], "1");
+    assert_eq!(workspace.0["budget_exhausted"], true);
+    assert!(workspace.0["shown"].as_u64().unwrap() < workspace.0["total"].as_u64().unwrap());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_tools_enforce_their_declared_required_params() {
     let ws = TempDir::new().unwrap();

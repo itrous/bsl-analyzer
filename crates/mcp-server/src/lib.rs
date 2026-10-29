@@ -1683,11 +1683,20 @@ impl McpServer {
                     )
                 })
             }
-            SearchCommand::ListPlatform(params) => tools::platform::list_platform(
-                params.kind,
-                params.name.as_deref(),
-                params.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS),
-            ),
+            SearchCommand::ListPlatform(params) => {
+                let max_output_tokens = params
+                    .max_output_tokens
+                    .unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
+                tokio::task::spawn_blocking(move || {
+                    tools::platform::list_platform(
+                        params.kind,
+                        params.name.as_deref(),
+                        max_output_tokens,
+                    )
+                })
+                .await
+                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
+            }
             command @ (SearchCommand::FindDocs { .. } | SearchCommand::SearchDocs { .. }) => {
                 self.state.ensure_reference_loading();
                 let semantic_failure = self
@@ -3243,11 +3252,20 @@ impl McpServer {
                     tools::search::docs_not_ready(action)
                 })
             }
-            SearchCommand::ListPlatform(params) => tools::platform::list_platform(
-                params.kind,
-                params.name.as_deref(),
-                params.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS),
-            ),
+            SearchCommand::ListPlatform(params) => {
+                let max_output_tokens = params
+                    .max_output_tokens
+                    .unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
+                tokio::task::spawn_blocking(move || {
+                    tools::platform::list_platform(
+                        params.kind,
+                        params.name.as_deref(),
+                        max_output_tokens,
+                    )
+                })
+                .await
+                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
+            }
             SearchCommand::SearchCode(_) => unreachable!("reference schema excludes search_code"),
         }?;
         let indexing = self.state.reference_indexing();
@@ -3293,10 +3311,18 @@ impl McpServer {
                 p.type_name.as_deref(),
                 p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS),
             ),
-            SyntaxHelpParams::ByReferenceId(p) => tools::platform::bsl_syntax_help_by_reference_id(
-                &p.reference_id,
-                p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS),
-            ),
+            SyntaxHelpParams::ByReferenceId(p) => {
+                let max_output_tokens =
+                    p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
+                tokio::task::spawn_blocking(move || {
+                    tools::platform::bsl_syntax_help_by_reference_id(
+                        &p.reference_id,
+                        max_output_tokens,
+                    )
+                })
+                .await
+                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
+            }
         }
     }
 }
@@ -6777,6 +6803,192 @@ mod resident_failed_answers {
 
         gate.release();
         server.shutdown();
+    }
+}
+
+/// `search(action = "list_platform")` and `syntax_help(reference_id = …)` through a server answer
+/// what the catalog functions answer when called with the arguments the client sent, in both
+/// profiles, and they do their catalog work off the runtime's worker threads.
+#[cfg(test)]
+mod platform_catalog_calls {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn token() -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    fn wire(result: &CallToolResult) -> String {
+        serde_json::to_string(result).expect("a result serializes")
+    }
+
+    fn body(result: &CallToolResult) -> &Value {
+        result.structured_content.as_ref().expect("structured content")
+    }
+
+    /// The catalog branches read nothing from a workspace, so both servers stand on the state
+    /// that has none: it admits no owner, so `shutdown` finds nothing to wait for. A server over
+    /// a real workspace starts a watcher, and the shutdown would wait for it to leave.
+    fn workspace_server() -> McpServer {
+        McpServer::new(McpProfile::Workspace, SharedState::shared())
+    }
+
+    fn reference_server() -> McpServer {
+        McpServer::new(McpProfile::Reference, SharedState::shared())
+    }
+
+    fn list_platform_params(arguments: &Value) -> (WorkspaceSearchParams, ReferenceSearchParams) {
+        (
+            serde_json::from_value(arguments.clone()).unwrap(),
+            serde_json::from_value(arguments.clone()).unwrap(),
+        )
+    }
+
+    fn syntax_help_params(
+        reference_id: &str,
+        max_output_tokens: Option<usize>,
+    ) -> SyntaxHelpParams {
+        let mut arguments = json!({"reference_id": reference_id});
+        if let Some(budget) = max_output_tokens {
+            arguments["max_output_tokens"] = json!(budget);
+        }
+        serde_json::from_value(arguments).unwrap()
+    }
+
+    fn reference_id_of_the_type_array() -> String {
+        let listing = tools::platform::list_platform(
+            Some(tools::platform::PlatformReferenceKind::Type),
+            Some("массив"),
+            usize::MAX,
+        )
+        .unwrap();
+        body(&listing)["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "Массив")
+            .expect("the type Массив is listed")["reference_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_catalog_calls_answer_what_the_functions_answer_for_the_arguments_sent() {
+        let workspace = workspace_server();
+        let reference = reference_server();
+
+        let default_budget = tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS;
+        let direct = tools::platform::list_platform(None, None, default_budget).unwrap();
+        assert_eq!(
+            body(&direct)["budget_exhausted"],
+            true,
+            "the catalog does not fit the default budget, so a changed default shows",
+        );
+        let (for_workspace, for_reference) =
+            list_platform_params(&json!({"action": "list_platform"}));
+        let through_workspace =
+            workspace.workspace_search(Parameters(for_workspace), token()).await.unwrap();
+        let through_reference =
+            reference.reference_search(Parameters(for_reference), token()).await.unwrap();
+        assert_eq!(wire(&through_workspace), wire(&direct), "workspace, unfiltered");
+        assert_eq!(wire(&through_reference), wire(&direct), "reference, unfiltered");
+
+        let direct = tools::platform::list_platform(
+            Some(tools::platform::PlatformReferenceKind::Method),
+            Some("массив"),
+            100,
+        )
+        .unwrap();
+        assert!(body(&direct)["total"].as_u64().unwrap() > 0, "{}", body(&direct));
+        assert!(
+            body(&direct)["shown"].as_u64() < body(&direct)["total"].as_u64(),
+            "the budget cuts the answer, so a dropped budget shows",
+        );
+        let (for_workspace, for_reference) = list_platform_params(&json!({
+            "action": "list_platform",
+            "kind": "method",
+            "name": "массив",
+            "max_output_tokens": 100,
+        }));
+        let through_workspace =
+            workspace.workspace_search(Parameters(for_workspace), token()).await.unwrap();
+        let through_reference =
+            reference.reference_search(Parameters(for_reference), token()).await.unwrap();
+        assert_eq!(wire(&through_workspace), wire(&direct), "workspace, filtered and cut");
+        assert_eq!(wire(&through_reference), wire(&direct), "reference, filtered and cut");
+
+        let reference_id = reference_id_of_the_type_array();
+        for (budget, sent) in [(default_budget, None), (100, Some(100))] {
+            let direct =
+                tools::platform::bsl_syntax_help_by_reference_id(&reference_id, budget).unwrap();
+            if budget == 100 {
+                assert_eq!(
+                    body(&direct)["budget_exhausted"],
+                    true,
+                    "the card does not fit 100 tokens, so a dropped budget shows",
+                );
+            }
+            for (profile, server) in [("workspace", &workspace), ("reference", &reference)] {
+                let through = server
+                    .syntax_help(Parameters(syntax_help_params(&reference_id, sent)))
+                    .await
+                    .unwrap();
+                assert_eq!(wire(&through), wire(&direct), "{profile}, budget {sent:?}");
+            }
+        }
+
+        workspace.shutdown();
+        reference.shutdown();
+    }
+
+    /// A fresh single-thread runtime has no blocking threads until a call asks for one, and a
+    /// thread it starts afterwards can only be one that call started.
+    fn blocking_threads_started_by<F, Fut>(call: F) -> usize
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future,
+    {
+        let started = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = started.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .on_thread_start(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .build()
+            .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        runtime.block_on(call());
+        started.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn the_catalog_branches_leave_the_runtime_worker() {
+        let workspace = workspace_server();
+        let reference = reference_server();
+        let (for_workspace, for_reference) =
+            list_platform_params(&json!({"action": "list_platform"}));
+        let reference_id = reference_id_of_the_type_array();
+
+        let started = blocking_threads_started_by(|| async {
+            workspace.workspace_search(Parameters(for_workspace), token()).await.unwrap()
+        });
+        assert_eq!(started, 1, "workspace_search list_platform");
+        let started = blocking_threads_started_by(|| async {
+            reference.reference_search(Parameters(for_reference), token()).await.unwrap()
+        });
+        assert_eq!(started, 1, "reference_search list_platform");
+        let started = blocking_threads_started_by(|| async {
+            workspace
+                .syntax_help(Parameters(syntax_help_params(&reference_id, None)))
+                .await
+                .unwrap()
+        });
+        assert_eq!(started, 1, "syntax_help by reference_id");
+
+        workspace.shutdown();
+        reference.shutdown();
     }
 }
 
