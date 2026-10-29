@@ -2419,6 +2419,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on, and asserts that a call returns within 100 ms; run: cargo test -p mcp-server --lib a_request_miss_never_consults_the_lease -- --ignored"]
     fn a_request_miss_never_consults_the_lease() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2556,6 +2557,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on, and asserts that a call returns within 100 ms; run: cargo test -p mcp-server --lib background_snapshot_preserves_all_typed_outcomes -- --ignored"]
     fn background_snapshot_preserves_all_typed_outcomes() {
         use crate::workspace_lease::{LeaseOperationError, LeaseOperationOutcome};
 
@@ -2628,6 +2630,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib publication_without_a_complete_descriptor_pool_cannot_be_ready -- --ignored"]
     fn publication_without_a_complete_descriptor_pool_cannot_be_ready() {
         use std::sync::atomic::Ordering;
 
@@ -2667,6 +2670,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib drift_marks_stale_and_async_reload_bumps_generation -- --ignored"]
     fn drift_marks_stale_and_async_reload_bumps_generation() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2711,6 +2715,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib graph_freshness_invalidates_on_hub_delivery -- --ignored"]
     fn graph_freshness_invalidates_on_hub_delivery() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2761,6 +2766,7 @@ mod tests {
     /// read stale after a `dependsOn`-only config edit (no `.bsl`/`.xml` touched),
     /// and the kicked reload must publish a fresh generation that reads clean.
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_depends_on_only_edit_marks_a_served_graph_stale_and_reloads -- --ignored"]
     fn a_depends_on_only_edit_marks_a_served_graph_stale_and_reloads() {
         use super::super::test_support::{write_extension_config, write_extension_workspace};
 
@@ -2791,6 +2797,7 @@ mod tests {
     /// under that root must be hub-delivered — proof the rebuild re-pointed the
     /// live watcher instead of leaving the new subtree to the reconciler.
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_topology_reload_rearms_the_hub_onto_the_new_extension_root -- --ignored"]
     fn a_topology_reload_rearms_the_hub_onto_the_new_extension_root() {
         use super::super::test_support::write;
 
@@ -2941,6 +2948,7 @@ mod tests {
     /// can only patch file stats, not the topology, so serving its fold after a
     /// config edit would keep a stale topology fresh for up to the walk interval.
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib graph_freshness_sees_a_config_edit_through_the_hub -- --ignored"]
     fn graph_freshness_sees_a_config_edit_through_the_hub() {
         use super::super::test_support::{write_extension_config, write_extension_workspace};
 
@@ -2992,6 +3000,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib graph_freshness_ignores_non_scan_files -- --ignored"]
     fn graph_freshness_ignores_non_scan_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

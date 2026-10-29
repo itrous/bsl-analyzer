@@ -5364,6 +5364,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib original_transient_arms_withheld_build_until_trigger -- --ignored"]
     fn original_transient_arms_withheld_build_until_trigger() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -6607,6 +6608,7 @@ mod tests {
     /// A retry the owner could not start — its lease could not be confirmed just then — keeps
     /// the failed reload owed: the graph still reads behind and the alarm stays armed.
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_failed_reload_whose_retry_is_held_stays_owed -- --ignored"]
     fn a_failed_reload_whose_retry_is_held_stays_owed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

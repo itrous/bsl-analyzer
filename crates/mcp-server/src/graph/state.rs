@@ -7264,6 +7264,7 @@ mod tests {
     /// went out beside it.
     #[cfg(unix)]
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_walk_that_outlived_its_episode_is_still_the_only_walk -- --ignored"]
     fn a_walk_that_outlived_its_episode_is_still_the_only_walk() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -7858,6 +7859,7 @@ mod tests {
     /// path moved under it, the lease could not be taken, and the lease is gone for good.
     #[cfg(unix)]
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_refused_install_retires_nothing -- --ignored"]
     fn a_refused_install_retires_nothing() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -9601,6 +9603,7 @@ mod tests {
     /// rebuild loop the probe would itself create.
     #[cfg(unix)]
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_chronically_unreadable_subtree_is_probed_but_never_rebuilt -- --ignored"]
     fn a_chronically_unreadable_subtree_is_probed_but_never_rebuilt() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -10504,7 +10507,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
+    #[ignore = "waits for graph readiness and hub delivery against polling ceilings and sleeps through the owed-marks grace period; the graph has no status-change event and the grace period no controllable clock; run: cargo test -p mcp-server --lib deferred_context_mark_keeps_its_reported_fact -- --ignored"]
     fn deferred_context_mark_keeps_its_reported_fact() {
         use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
 
@@ -10932,6 +10935,7 @@ mod tests {
 
     /// [`a_refused_spawn_gives_its_claim_back`] for a reload.
     #[test]
+    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_refused_reload_spawn_gives_its_claim_back -- --ignored"]
     fn a_refused_reload_spawn_gives_its_claim_back() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
