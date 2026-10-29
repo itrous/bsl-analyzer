@@ -391,6 +391,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         DiagnosticCode::VirtualTableCallWithoutParameters,
         "SDBL virtual table parameter policy; not BSL identifier parity",
     ),
+    (
+        DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
+        "SDBL virtual table condition policy; message names the table path from the query text, not BSL identifier parity",
+    ),
 ];
 
 const BILINGUAL_FIXTURES: &[(DiagnosticCode, &str, &str)] = &[
@@ -692,7 +696,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 208, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 209, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

@@ -21,6 +21,14 @@ pub enum SdblDiagnostic {
         range: TextRange,
     },
 
+    /// A calculation-register table whose condition parameter does not narrow it to a recorder,
+    /// so the platform builds it over every record of the register.
+    CalculationRegisterVirtualTableWithoutRecorder {
+        table_name: String,
+        register_name: String,
+        range: TextRange,
+    },
+
     /// A call the platform rejects with «Неверные параметры»: the argument list does not fit
     /// the table's parameter list.
     InvalidVirtualTableParameters {
@@ -257,6 +265,9 @@ impl SdblDiagnostic {
                     expected_params.join(", ")
                 )
             }
+            Self::CalculationRegisterVirtualTableWithoutRecorder { table_name, .. } => {
+                format!("В условии виртуальной таблицы \"{}\" нет отбора по регистратору", table_name)
+            }
             Self::UnknownField { table_name, field_name, .. } => {
                 format!("Поле '{}' не найдено в таблице '{}'", field_name, table_name)
             }
@@ -387,6 +398,7 @@ impl SdblDiagnostic {
             Self::QueryToMissingMetadata { range, .. } => *range,
             Self::JoinWithVirtualTable { range, .. } => *range,
             Self::VirtualTableCallWithoutParameters { range, .. } => *range,
+            Self::CalculationRegisterVirtualTableWithoutRecorder { range, .. } => *range,
             Self::InvalidVirtualTableParameters { range, .. } => *range,
             Self::UnknownField { range, .. } => *range,
             Self::AmbiguousColumnRef { range, .. } => *range,
@@ -426,6 +438,7 @@ impl SdblDiagnostic {
 
             Self::JoinWithVirtualTable { .. } => false,
             Self::VirtualTableCallWithoutParameters { .. } => false,
+            Self::CalculationRegisterVirtualTableWithoutRecorder { .. } => false,
             Self::AliasRequired { .. } => false,
             Self::DuplicateAlias { .. } => true,
             Self::FullOuterJoin { .. } => false,

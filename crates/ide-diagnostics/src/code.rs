@@ -190,6 +190,7 @@ pub enum DiagnosticCode {
 
     AmbiguousFieldInQuery,
     AssignAliasFieldsInQuery,
+    CalculationRegisterVirtualTableWithoutRecorder,
     DuplicateAliasInQuery,
     FieldsFromJoinsWithoutIsNull,
     FullOuterJoinQuery,

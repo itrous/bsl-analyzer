@@ -254,6 +254,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::UsingLikeInQuery => &[726],
         // Проверяемое требование — std657 «Обращения к виртуальным таблицам»; остальные поясняют контекст.
         DiagnosticCode::VirtualTableCallWithoutParameters => &[657, 733],
+        DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder => &[],
         DiagnosticCode::UnknownSuppressionCode => &[456],
         DiagnosticCode::SuppressionWithoutCode => &[456],
     }
@@ -347,14 +348,16 @@ mod tests {
     ///
     /// Такая ссылка полезна человеку и вредна машине: `standards` объявляет
     /// стандарты, которые правило проверяет, и выдача смежного номера называет
-    /// пользователю ложную причину срабатывания. Все шесть — правила, которые
+    /// пользователю ложную причину срабатывания. Все семь — правила, которые
     /// шире любого одного стандарта: ошибка разбора возникает не только на
-    /// директивах, устаревшим объявляет API документация платформы, а обращение
-    /// в интернет диагностика лишь отмечает для ручного разбора.
+    /// директивах, устаревшим объявляет API документация платформы, обращение
+    /// в интернет диагностика лишь отмечает для ручного разбора, а std657 не
+    /// требует отбора по регистратору, и суффикс сообщения назвал бы его причиной.
     ///
     /// Оговорка живёт в тексте дока, поэтому перечень поддержан сторожем
     /// [`excluded_docs_still_disclaim`]: исключение не переживёт своё основание.
     const CONTEXT_ONLY_DOCS: &[DiagnosticCode] = &[
+        DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
         DiagnosticCode::DeprecatedPlatformApi,
         DiagnosticCode::IfElseDuplicatedCodeBlock,
         DiagnosticCode::IncorrectUseOfStrTemplate,

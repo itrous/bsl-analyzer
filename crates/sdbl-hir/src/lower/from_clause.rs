@@ -318,6 +318,23 @@ impl LoweringContext<'_> {
             );
         }
 
+        if let Some(slot) = recorder_condition_slot(&parts, register_table) {
+            let filtered = match condition_slot(table_ref.syntax(), slot) {
+                ConditionSlot::Empty => false,
+                ConditionSlot::Unreadable => true,
+                ConditionSlot::Argument(argument) => has_recorder_filter(&argument),
+            };
+            if !filtered {
+                self.diagnostics.push(
+                    SdblDiagnostic::CalculationRegisterVirtualTableWithoutRecorder {
+                        table_name: full_name.clone(),
+                        register_name: parts[1].clone(),
+                        range: table_ref.syntax().text_range(),
+                    },
+                );
+            }
+        }
+
         TableRef {
             parts: parts.iter().map(|s| Name::from(s.as_str())).collect(),
             full_name,
@@ -1450,16 +1467,21 @@ impl LoweringContext<'_> {
 /// The arguments of a virtual-table call as the text spells them: one entry per comma-separated
 /// position, `None` for an empty one.
 ///
-/// Read from the commas of the call itself rather than from the lowered parameter list, which
-/// keeps only the expression kinds it lowers and so can drop or add an entry. `None` when the
-/// call did not parse cleanly — a recovered argument list says nothing reliable about
-/// positions, and a template macro such as `#ВременнаяТаблица1` is exactly such a list.
+/// `None` when the call did not parse cleanly — a recovered argument list says nothing reliable
+/// about positions, and a template macro such as `#ВременнаяТаблица1` is exactly such a list.
 fn call_arguments(table_ref: &syntax::SyntaxNode) -> Option<Vec<Option<syntax::SyntaxNode>>> {
-    use syntax::{NodeOrToken, SyntaxKind};
-
-    if table_ref.descendants().any(|node| node.kind() == SyntaxKind::ERROR) {
+    if table_ref.descendants().any(|node| node.kind() == syntax::SyntaxKind::ERROR) {
         return None;
     }
+    argument_positions(table_ref)
+}
+
+/// The arguments of a virtual-table call by the commas of the call itself rather than by the
+/// lowered parameter list, which keeps only the expression kinds it lowers and so can drop or
+/// add an entry. `None` when the list is not closed or holds a token no argument starts with.
+fn argument_positions(table_ref: &syntax::SyntaxNode) -> Option<Vec<Option<syntax::SyntaxNode>>> {
+    use syntax::{NodeOrToken, SyntaxKind};
+
     let mut arguments = Vec::new();
     let mut current: Option<syntax::SyntaxNode> = None;
     let mut inside = false;
@@ -1534,6 +1556,145 @@ fn is_condition(argument: &syntax::SyntaxNode) -> bool {
                 }
             }
             _ => return false,
+        }
+    }
+}
+
+/// The position of the condition parameter of a calculation-register table that is built over
+/// every record of the register unless the condition narrows it to a recorder.
+///
+/// `База<Регистр>` tables are named by the configuration, so a third segment spelled with that
+/// prefix is taken for one; a recalculation named the same way is indistinguishable by the text.
+fn recorder_condition_slot(
+    parts: &[String],
+    register_table: Option<(MdoType, VirtualTableType)>,
+) -> Option<usize> {
+    let [root, _, table] = parts else {
+        return None;
+    };
+    if let Some((_, VirtualTableType::ScheduleData | VirtualTableType::AdjustedEffectivePeriod)) =
+        register_table
+    {
+        return Some(0);
+    }
+    if root.parse::<MdoType>().ok()? != MdoType::CalculationRegister {
+        return None;
+    }
+    let table = table.fold_lower();
+    let rest = table.strip_prefix("база").or_else(|| table.strip_prefix("base"))?;
+    (!rest.is_empty()).then_some(3)
+}
+
+enum ConditionSlot {
+    Empty,
+    /// The argument list did not parse into positions or the slot holds only a data-composition
+    /// extension: the condition is completed at run time, not absent.
+    Unreadable,
+    Argument(syntax::SyntaxNode),
+}
+
+fn condition_slot(table_ref: &syntax::SyntaxNode, index: usize) -> ConditionSlot {
+    use syntax::{NodeOrToken, SyntaxKind};
+
+    let has_parens = table_ref
+        .children_with_tokens()
+        .any(|child| matches!(child, NodeOrToken::Token(t) if t.kind() == SyntaxKind::L_PAREN));
+    if !has_parens {
+        return ConditionSlot::Empty;
+    }
+    // A recovery error inside one argument's expression leaves the commas, and so every position,
+    // where they are; only an error between the arguments makes the list unreadable.
+    if table_ref.children().any(|child| child.kind() == SyntaxKind::ERROR) {
+        return ConditionSlot::Unreadable;
+    }
+    let Some(mut arguments) = argument_positions(table_ref) else {
+        return ConditionSlot::Unreadable;
+    };
+    if index >= arguments.len() {
+        return ConditionSlot::Empty;
+    }
+    if let Some(argument) = arguments.swap_remove(index) {
+        return ConditionSlot::Argument(argument);
+    }
+
+    // `argument_positions` passes over an extension, so its position is found from the commas.
+    let mut position = 0;
+    for child in
+        table_ref.children_with_tokens().skip_while(|child| child.kind() != SyntaxKind::L_PAREN)
+    {
+        match child {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::COMMA => position += 1,
+            NodeOrToken::Node(node)
+                if position == index && node.kind() == SyntaxKind::SDBL_QUERY_EXTENSION =>
+            {
+                return ConditionSlot::Unreadable;
+            }
+            _ => {}
+        }
+    }
+    ConditionSlot::Empty
+}
+
+/// Whether a condition narrows the table to a recorder: `Регистратор = <выражение>` either way
+/// round or `Регистратор В (...)`, alone or as a conjunct. A comparison under `ИЛИ` or `НЕ`
+/// does not narrow the table, and a disjunction of recorder comparisons is not unfolded.
+fn has_recorder_filter(condition: &syntax::SyntaxNode) -> bool {
+    use syntax::SyntaxKind;
+
+    let node = unwrap_operand(condition);
+    let has_token = |kind| node.children_with_tokens().any(|child| child.kind() == kind);
+    match node.kind() {
+        SyntaxKind::SDBL_LOGICAL_AND_EXPR => {
+            node.children().any(|child| has_recorder_filter(&child))
+        }
+        SyntaxKind::SDBL_COMPARISON_EXPR if has_token(SyntaxKind::EQ) => {
+            node.children().any(|operand| is_recorder_field(&operand))
+        }
+        SyntaxKind::SDBL_IN_EXPR if !has_token(SyntaxKind::KW_NOT) => {
+            node.children().next().is_some_and(|operand| is_recorder_field(&operand))
+        }
+        _ => false,
+    }
+}
+
+fn is_recorder_field(operand: &syntax::SyntaxNode) -> bool {
+    let node = unwrap_operand(operand);
+    if node.kind() != syntax::SyntaxKind::SDBL_COLUMN_REF {
+        return false;
+    }
+    let mut tokens = syntax::ast_utils::significant_tokens(&node);
+    match (tokens.next(), tokens.next()) {
+        (Some(name), None) => {
+            matches!(name.text().fold_lower().as_str(), "регистратор" | "recorder")
+        }
+        _ => false,
+    }
+}
+
+/// Descends through the nodes the tree wraps every operand in — one per precedence level, and
+/// parentheses — while they hold a single child and no operator of their own.
+fn unwrap_operand(node: &syntax::SyntaxNode) -> syntax::SyntaxNode {
+    use syntax::SyntaxKind;
+
+    let mut node = node.clone();
+    loop {
+        let wrapper = matches!(
+            node.kind(),
+            SyntaxKind::SDBL_LOGICAL_OR_EXPR
+                | SyntaxKind::SDBL_LOGICAL_AND_EXPR
+                | SyntaxKind::SDBL_ADDITIVE_EXPR
+                | SyntaxKind::SDBL_MULTIPLICATIVE_EXPR
+                | SyntaxKind::SDBL_PAREN_EXPR
+        );
+        let has_operator =
+            node.children_with_tokens().filter_map(|element| element.into_token()).any(|token| {
+                !token.kind().is_trivia()
+                    && !matches!(token.kind(), SyntaxKind::L_PAREN | SyntaxKind::R_PAREN)
+            });
+        let mut children = node.children();
+        match (children.next(), children.next()) {
+            (Some(only), None) if wrapper && !has_operator => node = only,
+            _ => return node,
         }
     }
 }

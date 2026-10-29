@@ -65,6 +65,7 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::QueryParseError,
     DiagnosticCode::AmbiguousFieldInQuery,
     DiagnosticCode::AssignAliasFieldsInQuery,
+    DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
     DiagnosticCode::DuplicateAliasInQuery,
     DiagnosticCode::FieldsFromJoinsWithoutIsNull,
     DiagnosticCode::FullOuterJoinQuery,
@@ -354,6 +355,10 @@ pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispat
     (DiagnosticCode::DuplicateAliasInQuery, handlers::duplicate_alias_in_query::dispatch),
     (DiagnosticCode::AssignAliasFieldsInQuery, handlers::assign_alias_fields_in_query::dispatch),
     (
+        DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
+        handlers::calculation_register_virtual_table_without_recorder::dispatch,
+    ),
+    (
         DiagnosticCode::FieldsFromJoinsWithoutIsNull,
         handlers::fields_from_joins_without_is_null::dispatch,
     ),
@@ -406,12 +411,37 @@ fn collect_sdbl_hir_single_pass(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let sdbl_queries = ctx.all_sdbl_in_file();
     let line_starts = build_line_index_shared(&bsl_source);
 
+    // The narrowing needs the module, so it lives here rather than in the dispatch a bare query
+    // text shares.
+    let writing_module_root = ctx
+        .config_bool(
+            DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
+            handlers::calculation_register_virtual_table_without_recorder::ONLY_IN_MODULES_WRITING_REGISTER,
+            false,
+        )
+        .then(|| ctx.parse().syntax_node());
+
     let mut diagnostics = Vec::new();
 
     for ((_, sdbl_package), (_, query_info)) in sdbl_hirs.iter().zip(sdbl_queries.iter()) {
         let mapper = SdblPositionMapper::from_query_info(query_info, &bsl_source, &line_starts);
 
         for hir_diag in sdbl_package.all_diagnostics() {
+            if let (
+                Some(root),
+                sdbl_hir::SdblDiagnostic::CalculationRegisterVirtualTableWithoutRecorder {
+                    register_name,
+                    ..
+                },
+            ) = (&writing_module_root, hir_diag)
+            {
+                if !handlers::calculation_register_virtual_table_without_recorder::writes_register(
+                    root,
+                    register_name,
+                ) {
+                    continue;
+                }
+            }
             for (_, dispatch_fn) in &enabled {
                 dispatch_fn(
                     ctx.config,

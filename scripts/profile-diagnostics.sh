@@ -23,6 +23,7 @@ DIAGNOSTICS=(
     BadWords
     BeginTransactionBeforeTryCatch
     CachedPublic
+    CalculationRegisterVirtualTableWithoutRecorder
     CanonicalSpellingKeywords
     CodeAfterAsyncCall
     CodeBlockBeforeSub

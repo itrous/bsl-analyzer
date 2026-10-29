@@ -4,6 +4,7 @@ pub mod assign_alias_fields_in_query;
 pub mod bad_words;
 pub mod begin_transaction_before_try_catch;
 pub mod cached_public;
+pub mod calculation_register_virtual_table_without_recorder;
 pub mod canonical_spelling_keywords;
 pub mod code_after_async_call;
 pub mod code_block_before_sub;
@@ -435,6 +436,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::AmbiguousFieldInQuery => Some(&ambiguous_field_in_query::METADATA),
         DiagnosticCode::DuplicateAliasInQuery => Some(&duplicate_alias_in_query::METADATA),
+        DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder => {
+            Some(&calculation_register_virtual_table_without_recorder::METADATA)
+        }
         DiagnosticCode::UnknownFieldInQuery => Some(&unknown_field_in_query::METADATA),
         DiagnosticCode::InvalidVirtualTableParameters => {
             Some(&invalid_virtual_table_parameters::METADATA)
