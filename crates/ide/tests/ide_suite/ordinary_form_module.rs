@@ -138,3 +138,51 @@ fn ordinary_form_module_is_checked_for_the_managed_thick_client() {
     assert_eq!(unavailable.len(), 1, "{unavailable:?}");
     assert!(unavailable[0].contains("ОсновнойСерверДоступен"), "{unavailable:?}");
 }
+
+/// `Выполнить`/`Вычислить` in an ordinary form module is not the vulnerability the standard
+/// describes: the module runs in the thick client only, and the standard exempts client code.
+/// The syntactic `&НаКлиенте` exemption cannot cover this - directives in an ordinary form do
+/// not decide where its code runs.
+#[test]
+fn execute_in_an_ordinary_form_module_is_not_reported() {
+    const EXECUTE: &str = "\
+Процедура ПередОткрытием(Отказ, СтандартнаяОбработка)
+\tТекстКода = \"Заголовок = 1;\";
+\tВыполнить(ТекстКода);
+\tЗначение = Вычислить(ТекстКода);
+КонецПроцедуры
+";
+    let (db, file_id) = setup(ordinary_form_module(), EXECUTE);
+    assert!(db.module_metadata(ModuleId::new(file_id)).is_ordinary_form_module());
+
+    let reported: Vec<String> =
+        ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
+            .into_iter()
+            .filter(|d| d.code == DiagnosticCode::ExecuteExternalCode)
+            .map(|d| d.message)
+            .collect();
+    assert!(reported.is_empty(), "{reported:?}");
+}
+
+/// The same text in a MANAGED form module is still reported: a directive-less method there
+/// compiles on the server too.
+#[test]
+fn execute_in_a_managed_form_module_is_still_reported() {
+    const EXECUTE: &str = "\
+Процедура ПередОткрытием(Отказ, СтандартнаяОбработка)
+\tТекстКода = \"Заголовок = 1;\";
+\tВыполнить(ТекстКода);
+\tЗначение = Вычислить(ТекстКода);
+КонецПроцедуры
+";
+    let (db, file_id) = setup(managed_form_module(), EXECUTE);
+    assert!(!db.module_metadata(ModuleId::new(file_id)).is_ordinary_form_module());
+
+    let reported: Vec<String> =
+        ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
+            .into_iter()
+            .filter(|d| d.code == DiagnosticCode::ExecuteExternalCode)
+            .map(|d| d.message)
+            .collect();
+    assert_eq!(reported.len(), 2, "{reported:?}");
+}
