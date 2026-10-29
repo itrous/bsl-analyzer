@@ -582,7 +582,7 @@ mod metadata_tests {
 
         assert_eq!(meta.diagnostic_type, DiagnosticType::CodeSmell);
         assert_eq!(meta.severity, DiagnosticSeverityLevel::Critical);
-        assert!(!meta.activated_by_default);
+        assert!(meta.activated_by_default);
         assert_eq!(
             meta.tags,
             &[MetadataTag::Sql, MetadataTag::Suspicious, MetadataTag::Unpredictable]
@@ -619,7 +619,6 @@ mod metadata_tests {
             DiagnosticCode::BadWords,
             DiagnosticCode::CodeAfterAsyncCall,
             DiagnosticCode::DenyIncompleteValues,
-            DiagnosticCode::FieldsFromJoinsWithoutIsNull,
             DiagnosticCode::FileSystemAccess,
             DiagnosticCode::FunctionNameStartsWithGet,
             DiagnosticCode::FunctionOutParameter,
@@ -729,7 +728,6 @@ mod metadata_tests {
             DiagnosticCode::BadWords,
             DiagnosticCode::CodeAfterAsyncCall,
             DiagnosticCode::DenyIncompleteValues,
-            DiagnosticCode::FieldsFromJoinsWithoutIsNull,
             DiagnosticCode::FileSystemAccess,
             DiagnosticCode::FunctionNameStartsWithGet,
             DiagnosticCode::FunctionOutParameter,
@@ -749,6 +747,7 @@ mod metadata_tests {
         let enabled_codes = [
             DiagnosticCode::DataExchangeLoading,
             DiagnosticCode::ExecuteExternalCode,
+            DiagnosticCode::FieldsFromJoinsWithoutIsNull,
             DiagnosticCode::ImplicitDatabaseReadInCycle,
             DiagnosticCode::RedundantAccessToObject,
             DiagnosticCode::SameMetadataObjectAndChildNames,

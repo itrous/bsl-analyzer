@@ -12,7 +12,7 @@ mod types;
 pub use context_detector::{detect_context, is_mdo_type, parse_nested_column_ref};
 pub use diagnostics::{
     ambiguous_qualified_head_message, invalid_virtual_table_parameters_message, LikeUsageKind,
-    SdblDiagnostic, VirtualTableParameterProblem,
+    SdblDiagnostic, VirtualTableParameterProblem, SCHEDULE_DATA_NULL_MESSAGE,
 };
 pub use hir::{
     ExprHir, FieldDef, FieldHir, FunctionKind, GroupByHir, InValues, JoinHir, JoinType, Name,

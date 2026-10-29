@@ -292,6 +292,41 @@ fn inner_joined_table_with_a_nested_left_join_is_not_optional() {
     assert!(reported.is_empty(), "no optional-side field is used: {reported:?}");
 }
 
+// A schedule value of ДанныеГрафика read without ЕСТЬNULL lowers to its own variant: the
+// message is the schedule wording, the variant range is the source's table reference and the
+// field reference keeps its own range.
+#[test]
+fn schedule_data_variant_message_and_source_range() {
+    let query = "ВЫБРАТЬ\n\tДанныеГрафика.НомерСтроки КАК НомерСтроки,\n\tДанныеГрафика.ЧасыФактическийПериодДействия * 100 КАК Сумма\nИЗ\n\tРегистрРасчета.Начисления.ДанныеГрафика(Регистратор = &Регистратор) КАК ДанныеГрафика";
+    let package = lower_sdbl_to_hir(&parser::parse_sdbl(query), None);
+    let found: Vec<_> = package
+        .all_diagnostics()
+        .filter(|d| matches!(d, SdblDiagnostic::ScheduleDataFieldWithoutNullCheck { .. }))
+        .collect();
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    let SdblDiagnostic::ScheduleDataFieldWithoutNullCheck { unprotected_fields, .. } = found[0]
+    else {
+        unreachable!("filtered above");
+    };
+    assert_eq!(
+        sdbl_hir::SCHEDULE_DATA_NULL_MESSAGE,
+        "Поле данных графика может быть NULL, если график за период не заполнен: добавьте проверку через ЕСТЬ NULL или функцию ЕСТЬNULL"
+    );
+    assert_eq!(found[0].message(), sdbl_hir::SCHEDULE_DATA_NULL_MESSAGE);
+
+    let slice =
+        |range: text_size::TextRange| &query[usize::from(range.start())..usize::from(range.end())];
+    assert!(
+        slice(found[0].range()).contains("РегистрРасчета.Начисления.ДанныеГрафика"),
+        "variant range: {}",
+        slice(found[0].range())
+    );
+    assert_eq!(unprotected_fields.len(), 1, "{unprotected_fields:?}");
+    assert_eq!(slice(unprotected_fields[0].range), "ДанныеГрафика.ЧасыФактическийПериодДействия");
+    assert_ne!(slice(found[0].range()), slice(unprotected_fields[0].range));
+}
+
 #[test]
 fn every_query_quality_diagnostic_has_a_message() {
     let query = "ВЫБРАТЬ Т.Поле.Вложенное, \"Текст\" КАК С ИЗ Таблица КАК Т ПОЛНОЕ СОЕДИНЕНИЕ (ВЫБРАТЬ 1 КАК Поле) КАК Д ПО Т.Поле = Д.Поле ИЛИ Т.Х = Д.Поле ГДЕ Т.Поле = 1 ИЛИ Т.Поле ПОДОБНО Т.Шаблон";

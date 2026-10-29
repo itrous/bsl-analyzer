@@ -24,6 +24,26 @@ const REGISTER_TABLES: &[(&str, &str, VirtualTableType)] = &[
     ("изменения", "changes", VirtualTableType::Changes),
 ];
 
+/// Period kinds a `ДанныеГрафика` value field ends with, already folded. The query field is the
+/// schedule resource name glued to one of them (`ЧасыФактическийПериодДействия`); the model does
+/// not read the register's schedule, so the resource name itself is unknown here.
+const SCHEDULE_DATA_VALUE_SUFFIXES: &[(&str, &str)] = &[
+    ("периоддействия", "actionperiod"),
+    ("фактическийпериоддействия", "actualactionperiod"),
+    ("периодрегистрации", "registrationperiod"),
+    ("базовыйпериод", "baseperiod"),
+];
+
+/// Whether a field of `ДанныеГрафика` is a schedule value, which is NULL when the schedule has
+/// no data for the period. The bare period name is a field of the register itself, so the
+/// resource prefix must not be empty.
+pub fn is_schedule_data_value_field(name: &str) -> bool {
+    let name = name.fold_lower();
+    SCHEDULE_DATA_VALUE_SUFFIXES.iter().any(|(ru, en)| {
+        [*ru, *en].into_iter().any(|suffix| name.len() > suffix.len() && name.ends_with(suffix))
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtualTableType {
     SliceLast,

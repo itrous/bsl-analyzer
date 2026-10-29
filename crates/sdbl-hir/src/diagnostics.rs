@@ -109,6 +109,13 @@ pub enum SdblDiagnostic {
         unprotected_fields: Vec<UnprotectedFieldRef>,
     },
 
+    /// Schedule values of a `ДанныеГрафика` source read without NULL handling. `range` is the
+    /// source's table reference.
+    ScheduleDataFieldWithoutNullCheck {
+        range: TextRange,
+        unprotected_fields: Vec<UnprotectedFieldRef>,
+    },
+
     MultilineString {
         range: TextRange,
     },
@@ -179,6 +186,11 @@ pub enum VirtualTableParameterProblem {
     /// A condition passed in a parameter that takes a value. `position` is 1-based.
     ConditionAsValue { position: usize, slot: String },
 }
+
+/// The one wording of an unprotected `ДанныеГрафика` value, shared by the enum rendering and the
+/// `ide-diagnostics` handler. It offers no inner join: the NULL comes from an unfilled schedule,
+/// not from a join.
+pub const SCHEDULE_DATA_NULL_MESSAGE: &str = "Поле данных графика может быть NULL, если график за период не заполнен: добавьте проверку через ЕСТЬ NULL или функцию ЕСТЬNULL";
 
 /// The one wording of a parameter-list error, shared by the enum rendering and the
 /// `ide-diagnostics` handler.
@@ -322,6 +334,7 @@ impl SdblDiagnostic {
                     join_str
                 )
             }
+            Self::ScheduleDataFieldWithoutNullCheck { .. } => SCHEDULE_DATA_NULL_MESSAGE.to_string(),
             Self::MultilineString { .. } => {
                 "Строковый литерал запроса может продолжаться на следующей строке: перенос \
                  строки войдёт в значение литерала"
@@ -389,6 +402,7 @@ impl SdblDiagnostic {
             Self::LogicalOrInWhere { range } => *range,
             Self::LogicalOrInJoin { range } => *range,
             Self::FieldsFromJoinWithoutNullCheck { range, .. } => *range,
+            Self::ScheduleDataFieldWithoutNullCheck { range, .. } => *range,
             Self::MultilineString { range } => *range,
             Self::QueryNestedFieldsByDot { range, .. } => *range,
             Self::RefOveruse { range } => *range,
@@ -420,6 +434,7 @@ impl SdblDiagnostic {
             Self::LogicalOrInWhere { .. } => false,
             Self::LogicalOrInJoin { .. } => false,
             Self::FieldsFromJoinWithoutNullCheck { .. } => false,
+            Self::ScheduleDataFieldWithoutNullCheck { .. } => false,
             Self::MultilineString { .. } => false,
             Self::QueryNestedFieldsByDot { .. } => false,
             Self::RefOveruse { .. } => false,

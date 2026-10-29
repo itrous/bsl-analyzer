@@ -179,7 +179,6 @@ impl DiagnosticsConfig {
             DiagnosticCode::BadWords,
             DiagnosticCode::CodeAfterAsyncCall,
             DiagnosticCode::DenyIncompleteValues,
-            DiagnosticCode::FieldsFromJoinsWithoutIsNull,
             DiagnosticCode::FileSystemAccess,
             DiagnosticCode::FunctionNameStartsWithGet,
             DiagnosticCode::FunctionOutParameter,

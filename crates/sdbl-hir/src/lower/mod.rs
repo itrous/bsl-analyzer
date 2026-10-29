@@ -339,6 +339,7 @@ impl LoweringContext<'_> {
         };
 
         self.check_joins_for_unprotected_fields(&hir);
+        self.check_schedule_data_for_unprotected_fields(&hir);
 
         if check_field_aliases {
             self.check_alias_without_as_keyword(&hir);

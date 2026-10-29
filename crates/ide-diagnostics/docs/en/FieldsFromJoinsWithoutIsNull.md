@@ -11,6 +11,10 @@ To make such queries explicit and stable, wrap the field in `ISNULL()`, check it
 
 The current implementation treats `ISNULL(field, default)`, `field IS NULL`, `field IS NOT NULL`, and `NOT (field IS NULL)` as valid protection patterns.
 
+The calculation register virtual table ScheduleData returns one row per register record even when the schedule has no data for the period. The fields <schedule resource>ActionPeriod, <schedule resource>ActualActionPeriod, <schedule resource>RegistrationPeriod and <schedule resource>BasePeriod are then NULL. Replacing a join with an inner join does not remove this NULL: the source is not a join. Wrap such a field in `ISNULL()` or check it with `IS NULL`. There is no numbered standard for NULL from an unfilled schedule.
+
+The rule is on by default: it reports both outer-join fields and ScheduleData fields.
+
 ## Examples
 <!-- В данном разделе приводятся примеры, на которые диагностика срабатывает, а также можно привести пример, как можно исправить ситуацию -->
 ```sdbl
@@ -54,6 +58,23 @@ Another possible variant:
     //или НЕ РегистрПродажи.Документ ЕСТЬ NULL
 ```
 The last option effectively emulates an inner join. If that is the real intention, it is usually clearer to replace the outer join with `INNER JOIN`.
+
+A schedule value read without `ISNULL()` (reported):
+```sdbl
+ВЫБРАТЬ
+	ДанныеГрафика.НомерСтроки КАК НомерСтроки,
+	ДанныеГрафика.ЧасыФактическийПериодДействия * 100 КАК Сумма
+ИЗ
+	РегистрРасчета.Начисления.ДанныеГрафика(Регистратор = &Регистратор) КАК ДанныеГрафика
+```
+Correct:
+```sdbl
+ВЫБРАТЬ
+	ДанныеГрафика.НомерСтроки КАК НомерСтроки,
+	ЕСТЬNULL(ДанныеГрафика.ЧасыФактическийПериодДействия, 0) КАК Часы
+ИЗ
+	РегистрРасчета.Начисления.ДанныеГрафика(Регистратор = &Регистратор) КАК ДанныеГрафика
+```
 
 ## Sources
 <!-- Необходимо указывать ссылки на все источники, из которых почерпнута информация для создания диагностики -->

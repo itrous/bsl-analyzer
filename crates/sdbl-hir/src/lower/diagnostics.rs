@@ -3,6 +3,10 @@ use crate::diagnostics::{SdblDiagnostic, UnprotectedFieldRef};
 use crate::hir::{
     BinaryOp, ExprHir, FunctionKind, InValues, JoinType, Name, SdblHir, TableRef, UnaryOp,
 };
+use crate::standard_fields::{
+    is_schedule_data_value_field, register_table_of_path, VirtualTableType,
+};
+use bsl_metadata::MdoType;
 use stdx::case::CaseExt;
 
 impl LoweringContext<'_> {
@@ -38,6 +42,49 @@ impl LoweringContext<'_> {
                     join_type: join.join_type,
                     range: join.range,
                     unprotected_fields,
+                });
+            }
+        }
+    }
+
+    /// Reports schedule values of a calculation register's `ДанныеГрафика` used without NULL
+    /// handling.
+    ///
+    /// The table returns a row for every register record even when the schedule has no data
+    /// for the period, and then its schedule values are NULL. A use already reported as an
+    /// optional join side is left to the join check, so one use gets one message.
+    pub(super) fn check_schedule_data_for_unprotected_fields(&mut self, hir: &SdblHir) {
+        let reported_by_joins: Vec<_> = self
+            .diagnostics
+            .iter()
+            .filter_map(|diag| match diag {
+                SdblDiagnostic::FieldsFromJoinWithoutNullCheck { unprotected_fields, .. } => {
+                    Some(unprotected_fields.iter().map(|field| field.range))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        let sources = hir.from.iter().chain(hir.joins.iter().map(|join| &join.table));
+        for source in sources {
+            if register_table_of_path(&source.parts)
+                != Some((MdoType::CalculationRegister, VirtualTableType::ScheduleData))
+            {
+                continue;
+            }
+
+            let mut uses = Vec::new();
+            NullableUses::new(source.effective_name()).collect(hir, &mut uses);
+            uses.retain(|field| {
+                is_schedule_data_value_field(&field.field_name)
+                    && !reported_by_joins.contains(&field.range)
+            });
+
+            if !uses.is_empty() {
+                self.diagnostics.push(SdblDiagnostic::ScheduleDataFieldWithoutNullCheck {
+                    range: source.range,
+                    unprotected_fields: uses,
                 });
             }
         }

@@ -13,7 +13,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     scope: DiagnosticScope::All,
     modules: &[],
     minutes_to_fix: 2,
-    activated_by_default: false,
+    activated_by_default: true,
     compatibility_mode: DiagnosticCompatibilityMode::Undefined,
     tags: &[MetadataTag::Sql, MetadataTag::Suspicious, MetadataTag::Unpredictable],
     can_locate_on_project: false,
@@ -52,6 +52,22 @@ pub(crate) fn dispatch(
                 message: message.clone(),
                 severity: config.severity(code),
                 range: bsl_range,
+                tags: config.tags(code),
+                fixes: vec![],
+            });
+        }
+    } else if let sdbl_hir::SdblDiagnostic::ScheduleDataFieldWithoutNullCheck {
+        unprotected_fields,
+        ..
+    } = diag
+    {
+        let code = DiagnosticCode::FieldsFromJoinsWithoutIsNull;
+        for field_ref in unprotected_fields {
+            diagnostics.push(Diagnostic {
+                code,
+                message: sdbl_hir::SCHEDULE_DATA_NULL_MESSAGE.to_string(),
+                severity: config.severity(code),
+                range: mapper.map_range(field_ref.range, query_text),
                 tags: config.tags(code),
                 fixes: vec![],
             });
