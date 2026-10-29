@@ -88,8 +88,8 @@ copyrighted expression.
 
 ## Licensing
 
-The help corpus is **not** covered by the workspace's MIT / Apache-2.0 /
-LGPL-3.0 licensing. The Rust code that parses and consumes it (in
+The help corpus is **not** covered by the project's MIT license. The Rust
+code that parses and consumes it (in
 `crates/bsl-platform/src/`, `crates/bsl-platform/tools/html-parser/` and
 `crates/platform-help/`) is the project's own work and remains under the
 crate license declared in `Cargo.toml`.

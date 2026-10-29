@@ -1,194 +1,87 @@
 # Licensing
 
-This workspace is dual-licensed per crate. The default license for new
-code is `MIT OR Apache-2.0`; one library crate, `ide-diagnostics`, remains
-under `LGPL-3.0-or-later` for the reasons given in the Tier B section.
+The code of this project is licensed under the MIT license. SPDX: `MIT`.
+This covers every crate of the workspace, `ide-diagnostics` and
+`bsl-analyzer` included: each manifest takes the license from
+`[workspace.package]` in the root `Cargo.toml`.
 
-The shipped LSP server binary (`bsl-analyzer-app`) statically links
-both tiers and is therefore distributed under `LGPL-3.0-or-later`,
-because it links `ide-diagnostics`.
+The shipped LSP server binary (`bsl-analyzer-app`) is distributed under the
+MIT license as well. Linking `ide-diagnostics` does not change that: the crate
+is MIT like the rest of the code.
 
-Provenance analysis lives in `docs/legal/`. Start with
-`docs/legal/sdbl-provenance-2026-07-audit.md`: it supersedes the April 2026
-estimates on the state of the code and carries the exit criteria for moving a
-crate from Tier B to Tier A. For `sdbl-hir`, the current position is
-`docs/legal/sdbl-clean-room-slice13.md` together with
-`docs/legal/sdbl-corpus-integration.md`; for `parser` and `lexer`, it is
-`docs/legal/bsl-clean-room-slices.md` together with
-`docs/legal/sdbl-rule-naming-attestation.md`.
+The only license text of the project is `LICENSE-MIT`.
+
+Third-party material bundled in the tree is not the project's code and keeps
+its own terms; it is listed in the section on external fixtures below.
+
+## Provenance history
+
+Provenance analysis is the history of how the code came to be, not a
+statement of the current license; its records are not part of this
+repository. Earlier revisions of this
+document split the workspace into license tiers and kept `ide-diagnostics` and
+the binary on a copyleft license while 17 SDBL diagnostics depended on the SDBL
+parser chain. That arrangement has ended: the owner closed the caveat, the
+contributors to `ide-diagnostics` confirmed their contributions in
+<https://github.com/itrous/bsl-analyzer/issues/314>, and the whole workspace
+moved to MIT (<https://github.com/itrous/bsl-analyzer/issues/733>). Where a
+provenance record speaks of tiers, it records that history.
 
 In short: the SDBL and BSL grammar layers were originally written with the
 upstream `bsl-parser` grammar files open — this is established by this
 repository's own history, not inferred, and `NOTICE` keeps that record. The
 SDBL layer was then rewritten slice by slice, the BSL layer was re-derived or
-attested rule by rule, and the programme that did so is complete; the
-limits it accepted are listed below and in the documents it names.
+attested rule by rule, and the programme that did so is complete. It
+recorded:
 
-## Tier A — `MIT OR Apache-2.0`
+- `cfg` taxonomy/API slice: the CFG attestation.
+- `bsl-metadata` model slice, re-derived from 1C Designer XML artifacts:
+  the bsl-metadata attestation. The crate's test fixtures listed below keep
+  their own provenance.
+- `sdbl-hir`: the comparison with the upstream lowering, the Slice 13
+  attestation and the corpus integration record.
+- `parser` and `lexer`: the BSL token inventory (B1), the preprocessor
+  symbols (B2), the grammar functions against Chapter 4 of the 1C
+  Developer's Guide (B3), the origin of the test material (B4), the
+  compatibility decision and the SDBL rule names kept by owner decision O1.
+  O1 is a review, not a proof of independent authorship, and it does not
+  erase the grammar consultation that `NOTICE` records.
+- SDBL lexer and parser slices: the 2026-07 provenance audit and the
+  rewrite plan.
 
-SPDX: `MIT OR Apache-2.0`. Anyone may take the code of any of these
-crates — the crate's own sources, in isolation — and redistribute it under
-either MIT or Apache-2.0. The permission does not extend to a build of the
-crate: what such a build may be redistributed under also depends on the
-tiers of the crates it pulls in.
+The limits the programme accepted stay as recorded: the boundary of table 4.5.4
+that the tree does not make observable (B3, tracked in
+<https://github.com/itrous/bsl-analyzer/issues/51>); the handler-name limit of
+B1 and the divergence of `SyntaxKind::is_preprocessor` from the inventory (B1,
+tracked as github#47); `crates/parser/tests/fixtures/Module.bsl`, third-party
+content listed below; and the historical record of
+`crates/parser/tests/fixtures/user_query_with_highlighting_issue.sdbl`, an
+artifact deleted from the tree by `f9053fce`, whose origin was never established
+and whose absence of replacement the owner accepted (issues 52 and 245).
 
-Two caveats apply to the phrase "in isolation", which earlier versions
-of this document used without qualification:
+## Clean-room practice
 
-- **A crate is only as reusable as its dependencies.** `hir-ty`, `hir`
-  and `dataflow` depend on `cfg`; fourteen crates depend on
-  `bsl-metadata`; the crates marked in the last column of the table
-  below pull in Tier B crates. Taking such a crate means taking its
-  dependency tree under whatever those crates are licensed. The
-  per-crate SPDX describes that crate's own code, not the terms on which
-  the resulting build can be redistributed.
-- **The identified `cfg` taxonomy/API slice has been independently
-  re-derived and verified.** The bounded derivation and analysis-preservation
-  checks are recorded in [the CFG attestation](docs/legal/cfg-clean-room-slice.md).
-  The history of its copyleft reference remains in `NOTICE`; closing this
-  slice changes neither the per-crate SPDX nor dependency restrictions.
-  **The identified `bsl-metadata` model slice has been re-derived** from
-  1C Designer XML artifacts and the analyzer's own needs: a recorded
-  observation of 97 996 documents, an old-to-derived registry for every
-  decision of that slice, and the removals it called for are documented in
-  [the bsl-metadata attestation](docs/legal/bsl-metadata-clean-room-slice.md).
-  The crate's test fixtures listed below keep their own provenance and
-  remain under review; closing this slice changes neither the per-crate
-  SPDX nor dependency restrictions.
-- **The `sdbl-hir` clean-room replacement is complete.** A line-by-line
-  audit of all production lines of the crate, the replacements of its ten
-  findings (F01–F10) and an independent test corpus are recorded in
-  [the comparison](docs/legal/sdbl-hir-upstream-comparison.md),
-  [the Slice 13 attestation](docs/legal/sdbl-clean-room-slice13.md) and
-  [the corpus integration record](docs/legal/sdbl-corpus-integration.md).
-  The crate moves to Tier A on that basis. Its normal dependencies reach
-  `parser` and `lexer` through `base-db` and `syntax`; when it moved, that kept
-  it in the last column of the table below. Both have since moved to Tier A, so
-  its entry there is now a dash. Its own `parser` dependency is a
-  dev-dependency and is not counted.
-- **The `parser` and `lexer` clean-room programme is complete.** The BSL
-  token inventory was rewritten
-  ([B1](docs/legal/bsl-clean-room-slice-b1.md)), the preprocessor symbols
-  were re-derived ([B2](docs/legal/bsl-clean-room-slice-b2.md)), every
-  grammar function carries a verdict against Chapter 4 of the 1C
-  Developer's Guide — 86 functions, 30 re-derived, 56 attested, none open
-  ([B3](docs/legal/bsl-clean-room-slice-b3.md)) — and the origin of the test
-  material is recorded ([B4](docs/legal/bsl-clean-room-slice-b4.md)). The
-  acceptance of parsing compatibility is recorded in
-  [the compatibility decision](docs/legal/bsl-compatibility-decision.md).
-  The SDBL rule names were reviewed and kept by owner decision O1
-  ([the attestation](docs/legal/sdbl-rule-naming-attestation.md), 2026-10-05):
-  that is a review, not a proof of independent authorship, and it does not
-  erase the grammar consultation that `NOTICE` records. Both crates move to
-  Tier A on that basis; neither pulls in a Tier B crate. Limits the
-  programme accepted stay as recorded: the boundary of table 4.5.4 that the
-  tree does not make observable (B3, tracked in
-  <https://github.com/itrous/bsl-analyzer/issues/51>); the handler-name
-  limit of B1 and the divergence of `SyntaxKind::is_preprocessor` from the
-  inventory (B1, tracked as github#47);
-  `crates/parser/tests/fixtures/Module.bsl`, third-party content listed
-  below; and the historical record of
-  `crates/parser/tests/fixtures/user_query_with_highlighting_issue.sdbl`, an
-  artifact deleted from the tree by `f9053fce` before the base of this move,
-  whose origin was never established and whose absence of replacement the
-  owner accepted (issues 52 and 245).
-
-The last column lists the Tier B crates reachable from a crate through
-its normal and build dependencies, followed transitively inside this
-workspace; dev-dependencies are not counted. A dash means none is
-reachable. How the column is derived, the provenance walk of Tier A
-done under #151 and the additions made under #154 are recorded in
-`docs/legal/tier-a-provenance-audit.md`.
-
-| Crate | Purpose | Pulls in Tier B |
-|---|---|---|
-| `syntax` | Rowan-based lossless CST wrapper | — |
-| `base-db` | Salsa foundation, VFS integration | — |
-| `vfs`, `vfs-notify` | Virtual file system and file watching | — |
-| `project-model` | Project configuration loader | — |
-| `intern`, `stdx`, `profile`, `line-index`, `paths` | Utility crates | — |
-| `cfg`, `cfg-types`, `dataflow` | Control-flow graph and dataflow analysis | — |
-| `hir-def`, `hir-ty`, `hir` | High-level IR: ItemTree, SymbolTree, type inference | — |
-| `ide-db`, `ide-assists`, `ide` | IDE database and high-level IDE API | `ide-db`, `ide-assists`: —; `ide`: `ide-diagnostics` |
-| `lexer` | BSL and SDBL lexers. BSL inventory: [B1](docs/legal/bsl-clean-room-slice-b1.md); SDBL: attestations of Slices 1–5 listed in [the audit](docs/legal/sdbl-provenance-2026-07-audit.md); owner decision O1: [rule-name attestation](docs/legal/sdbl-rule-naming-attestation.md) | — |
-| `parser` | BSL and SDBL parsers. BSL grammar attestation: [B3](docs/legal/bsl-clean-room-slice-b3.md); preprocessor symbols: [B2](docs/legal/bsl-clean-room-slice-b2.md); SDBL rule names: owner decision O1, [attestation](docs/legal/sdbl-rule-naming-attestation.md) | — |
-| `sdbl-hir` | SDBL HIR: semantic representation of queries | — |
-| `bsl-metadata` | Configuration XML/Config parsing | — |
-| `bsl-platform` | Platform types and methods catalog | — |
-| `bsl-config` | Visible configurations and `ConfigId` | — |
-| `bsl-types` | Type kernel | — |
-| `bsl-search`, `symbol-info` | Search and symbol indexing | — |
-| `code-chunk` | Splitting sources into fragments | — |
-| `parser-error` | Parse error types | — |
-| `ide-host-core` | Shared analysis host | `ide-diagnostics` |
-| `vcs` | Git diff reports for analysis scoping | — |
-| `test-fixture`, `test-utils` | Test infrastructure | — |
-| `mcp-server` | MCP protocol server | `ide-diagnostics` |
-| `bsl-debug` | DAP protocol support | — |
-| `bsl-launcher` | Process launcher | — |
-| `naparnik` | AI completion integration layer | — |
-| `onec-client` | 1C integration client | — |
-| `xtask` | Workspace tooling | — |
-
-## Tier B — `LGPL-3.0-or-later`
-
-SPDX: `LGPL-3.0-or-later`. These crates are kept under the upstream
-license because they currently contain grammar, token or test material
-that traces back to the `bsl-parser` project (LGPL-3.0-or-later).
-
-| Crate | Blocker | Tracking document |
-|---|---|---|
-| `ide-diagnostics` | 17 diagnostics depend on the SDBL parser chain | `docs/legal/ide-diagnostics-licensing-summary.md` |
-| `bsl-analyzer` | Top-level LSP server, statically links `ide-diagnostics` | — |
-
-A Tier B crate moves to Tier A when its clean-room replacement is
-complete and the corresponding provenance note is updated in
-`docs/legal/`. The concrete checklist is in
-`docs/legal/sdbl-provenance-2026-07-audit.md`, section “Exit criteria”.
-
-`parser` and `lexer` left Tier B on 2026-10-06, once the BSL programme (B1–B4)
-and the SDBL exit criteria were closed; the record is in
-`docs/legal/tier-a-provenance-audit.md`, section 11. Moving them does not
-change the licence of the shipped binary while `ide-diagnostics` stays here.
-
-## Clean-room replacement policy
-
-When working on code that is about to move from Tier B to Tier A:
+The programme above is complete; this is how its replacement work was done, and
+how any further replacement of material traced to `bsl-parser` should be done:
 
 1. The implementation source of truth is:
    - official 1C documentation (https://its.1c.ru/db/pubqlang,
      https://its.1c.ru/db/v8std);
-   - independently authored local specifications
-     (see `docs/legal/sdbl-select-mini-spec.md`);
+   - independently authored local specifications;
    - observed local parser behavior only where it is explicitly
      preserved for IDE or recovery reasons.
 2. The `bsl-parser` grammar files (`BSLParser.g4`, `BSLLexer.g4`,
    `SDBLParser.g4`, `SDBLLexer.g4`) must not be consulted while
    writing replacement code. Consulting them to audit what was or was
    not derived is a separate activity: it is permitted, it must be
-   recorded in `docs/legal/`, and whoever performs it must not also
+   recorded in the provenance records, and whoever performs it must not also
    write replacement code afterwards without a clean context.
 3. Commit messages for replacement work should state the primary
    source used (for example, a specific ITS page).
 
-The full rewrite plan is in `docs/legal/sdbl-clean-room-slices.md`.
-
-## License files
-
-The repository ships four license texts. Which one applies to a given
-file or crate follows the per-crate SPDX identifier in that crate's
-`Cargo.toml`.
-
-| File | Applies to |
-|---|---|
-| `LICENSE-MIT` | Tier A crates, at the recipient's option |
-| `LICENSE-APACHE` | Tier A crates, at the recipient's option |
-| `LICENSE-LGPL` | Tier B crates and the shipped binary |
-| `LICENSE-GPL` | Accompanies `LICENSE-LGPL` as required by the LGPL |
-
 ## External fixtures and third-party content
 
-The workspace license does **not** cover the files below. They are
+The project's MIT license does **not** cover the files below. They are
 bundled for build reproducibility and interoperability with the
 1C:Enterprise platform. Downstream redistribution of the final binary
 inherits the obligations of the original sources.
@@ -270,7 +163,7 @@ inherits the obligations of the original sources.
 | `crates/bsl-metadata/fixtures/designer/WebServices/WebСервис1.xml` | bsl-language-server-rust | test fixture, added by `4601ffcb` |
 | `crates/ide-diagnostics/test_data/metadata/designer/` (51 files, whole directory) | bsl-language-server (Java), by the message of `8591e553`; content identical to the `4601ffcb` fixtures | removed test fixture, added by `8591e553`, not referenced by any test; present in history only — see below |
 | `crates/ide-diagnostics/test_data/set_permissions_for_new_objects/Roles/` (6 XML files) | not named by its commit; content identical to the `designer/Roles/` files above | test fixture, first added by `0629d987`, moved by `4527ea15` — see below |
-| `crates/bsl-platform/data/platform_data.json` (removed by #312; history only), platform help packages | ООО «1С-Софт» | 1C copyright, see `crates/bsl-platform/data/PROVENANCE.md` — not covered by MIT / Apache-2.0 / LGPL-3.0; packages carry their own `NOTICE.md` |
+| `crates/bsl-platform/data/platform_data.json` (removed by #312; history only), platform help packages | ООО «1С-Софт» | 1C copyright, see `crates/bsl-platform/data/PROVENANCE.md` — not covered by the project's MIT license; packages carry their own `NOTICE.md` |
 | `crates/bsl-platform/data/platform_facts.json` (compiled into the binary) | structured interface facts of the 1C:Enterprise platform, derived from the corpus above with every text removed | factual information about the platform's API, treated as not protectable expression — see `PROVENANCE.md`; contains no description, parameter documentation, example or note; a test fails if any such field appears |
 
 The preprocessor symbol list, formerly in
@@ -278,15 +171,14 @@ The preprocessor symbol list, formerly in
 `crates/syntax/src/preproc_symbols.rs`, was re-derived from section 4.8.1.2
 of the 1C Developer's Guide. Both lines of its provenance — the list and the
 test material of its diagnostic — are described in
-`docs/legal/bsl-clean-room-slice-b2.md`. This is a provenance record, not a
+the B2 record. This is a provenance record, not a
 change of licence: the file stays under the licence of its crate.
 
 Test material that came from `bsl-language-server` — the fixture of the
 unknown-preprocessor-symbol diagnostic — is **no longer present**. It was
 replaced on 2026-08-21 with material derived from section 4.8.1.2 of the 1C
 Developer's Guide, so it is not an entry in the table above: the table lists
-third-party content that is still bundled. See
-`docs/legal/bsl-clean-room-slice-b2.md`;
+third-party content that is still bundled.
 `crates/retired-material-gate/tests/retired_material.rs` fails if the retired
 material reappears verbatim in any Git-tracked file of that crate, whatever
 its extension.
@@ -400,27 +292,25 @@ uncertainty is not a better map but replacement of the material, tracked in
 `https://github.com/itrous/bsl-analyzer/issues/52`.
 
 The evidence for the class statement — the commit messages, the migration commit,
-and the four failure modes in full — is in
-`docs/legal/bsl-clean-room-slice-b4.md`.
+and the four failure modes in full — is in the B4 record.
 
 **Replacement of the named class (2026-10-06).** The diagnostic test material
 whose introducing commits name an external source for the *test* material —
-40 current carriers in `crates/ide-diagnostics/src/handlers/`, listed with their
-introducing commits in `docs/legal/ide-diagnostics-test-material.md` — has been
+40 current carriers in `crates/ide-diagnostics/src/handlers/` — has been
 replaced by inputs composed from the normative sections of this repository's
 own diagnostic documentation and the current rules. Every old scenario of those
 carriers is mapped to a new test, the new tests were shown to fail on mutations
-of their own inputs (the two exceptions are recorded there), and
+of their own inputs (with two recorded exceptions), and
 `crates/retired-material-gate/tests/retired_material.rs` fails if a retired literal of
 those carriers reappears byte for byte anywhere in the crate — four generic
-blocks that also occur in files outside the queue are recorded there instead of
+blocks that also occur in files outside the queue are recorded instead of
 being fingerprinted. The paragraphs above remain the historical record of the import and are
 not withdrawn by this one.
 
 This replacement is bounded. It covers that queue only. Test material in the
 crate whose introducing commit names no source is neither declared external nor
 declared cleaned; the gate catches verbatim return, not paraphrase or computed
-text; and nothing here changes the tier of any crate or the SDBL caveat recorded
-in `docs/legal/ide-diagnostics-licensing-summary.md`.
+text; and it is a provenance record, not a change of licence. The later closure
+of the SDBL caveat is described under "Provenance history" above.
 
 See `NOTICE` for upstream acknowledgements.
