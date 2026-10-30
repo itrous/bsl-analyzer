@@ -26,6 +26,7 @@ Every LSP didOpen and didClose is appended as `{"method", "uri"}` to FAKE_LOG/do
        graph_answers       `graph resolve` answers `structuredContent.result.candidates`: a non-empty list
                            that differs between queries and is cut to `top`
        graph_answers_same  the same list for every query (the gate's control cannot tell answers apart)
+       resolve_other       `graph resolve` ids carry a prefix (the answers differ from the other binary's)
        sweep_answers       `diagnostics workspace` answers `structuredContent.aggregates`
        sweep_extra_code    one more aggregate code `X` (for the binary it is set on)
        sweep_other_count   the same codes, one of them counted 8 times instead of 7
@@ -279,7 +280,8 @@ SWEEP_AGGREGATES = [
 def resolve_candidates(query, top):
     """Distinct non-empty lists for distinct queries, cut to `top`."""
     key = "same" if "graph_answers_same" in MODE else query
-    candidates = [{"id": f"{key}#{i}", "score": 10 - i} for i in range(2 + len(key) % 3)]
+    prefix = "other:" if "resolve_other" in MODE else ""
+    candidates = [{"id": f"{prefix}{key}#{i}", "score": 10 - i} for i in range(2 + len(key) % 3)]
     return candidates[:top] if top else candidates
 
 

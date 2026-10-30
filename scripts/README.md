@@ -80,7 +80,8 @@ workspace` на 5000 файлов (`diagnostics_workspace_s`); серия B — 
 | `graph_ready_cpu_s`, `graph_resolve_s`, `diagnostics_workspace_s` | ν нет — `no_noise`; ν > 5 % — `noisy`; Δ > 5 % — `block` |
 | `graph_ready_s` | ν нет — `no_noise`; ν > 40 % — `noisy`; Δ ≤ max(5 %, ν) — не блок; выше при ν ≤ 5 % — `block`, при ν > 5 % — подтверждающий раунд из трёх пар и `block`, только если и его Δ′ > max(5 %, ν) |
 | `hwm_kb` кандидата (обе серии), references серии B | больше 7168 МиБ, 67,7 / 32,3 / 59,5 с — `block` |
-| ответы `graph resolve` и `aggregates` свипа каждой пары | байты различны — `block` (`answers_differ`); у первого прогона кандидата два разных непустых доп. resolve не получены — `answers_control` |
+| ответы `graph resolve` каждой пары | байты различны — `block` (`answers_differ`); у первого прогона кандидата два разных непустых доп. resolve не получены — `answers_control` |
+| `aggregates` свипа | вердикт не меняют; в отчёте и `summary.json` — «новые», «исчезнувшие» и «изменённые» коды (корректность диагностик судят тесты проекта и CHANGELOG, гейт — время и память) |
 | сбой или невалидный прогон | кандидата — `block`; базы или недобор прогонов — `incomplete` |
 
 Прогон, где чужая нагрузка за окно готовности графа больше двух ядер (`foreign_cores`

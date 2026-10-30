@@ -361,21 +361,32 @@ class Answers(GateCase):
     def test_answers_equal_differ_and_control(self):
         # Equal.
         _, summary, _ = self.gate(label="equal")
-        self.assertEqual((summary["answers"]["outcome"], summary["answers"]["codes"]), ("ok", []))
+        self.assertEqual((summary["answers"]["outcome"], summary["answers"]["new_codes"]), ("ok", []))
         self.assertTrue(all(not p["differ"] for p in summary["answers"]["pairs"]))
         self.assertEqual(len(summary["answers"]["pairs"]), 3)
-        # One more code on the candidate: block, with that code named.
+        # One more code on the candidate: listed as new, the verdict stays.
         set_mode(*self.modes.split(","), f"{CAND_LABEL}=sweep_extra_code")
         code, summary, _ = self.gate(label="extra")
-        self.assertEqual((code, summary["verdict"]), (1, "block"))
-        self.assertIn("answers_differ", summary["reasons"])
-        self.assertEqual(summary["answers"]["codes"], ["X"])
-        self.assertEqual([p["differ"] for p in summary["answers"]["pairs"]], [["f-diagnostics-workspace"]] * 3)
-        self.assertIn("X", self.report("extra"))
-        # The same codes, one count apart: a comparison of sizes would let it through.
+        self.assertEqual((code, summary["verdict"]), (0, "pass"))
+        self.assertNotIn("answers_differ", summary["reasons"])
+        self.assertEqual(summary["answers"]["outcome"], "ok")
+        self.assertEqual(summary["answers"]["new_codes"], [{"code": "X", "count": 1, "files_affected": 1}])
+        self.assertEqual([p["differ"] for p in summary["answers"]["pairs"]], [[]] * 3)
+        report = self.report("extra")
+        self.assertIn("## Новые коды", report)
+        self.assertIn("| X | 1 | 1 |", report)
+        # The same codes, one count apart: listed as changed, the verdict stays.
         set_mode(*self.modes.split(","), f"{CAND_LABEL}=sweep_other_count")
         code, summary, _ = self.gate(label="count")
-        self.assertEqual((code, summary["verdict"], summary["answers"]["codes"]), (1, "block", ["BSL001"]))
+        self.assertEqual((code, summary["verdict"], summary["answers"]["outcome"]), (0, "pass", "ok"))
+        self.assertEqual([c["code"] for c in summary["answers"]["changed_codes"]], ["BSL001"])
+        self.assertIn("| BSL001 |", self.report("count"))
+        # A resolve answer that differs byte for byte still blocks.
+        set_mode(*self.modes.split(","), f"{CAND_LABEL}=resolve_other")
+        code, summary, _ = self.gate(label="resolve")
+        self.assertEqual((code, summary["verdict"]), (1, "block"))
+        self.assertIn("answers_differ", summary["reasons"])
+        self.assertEqual(summary["answers"]["outcome"], "block")
         # Answers that cannot differ: the control has nothing to tell them apart with.
         set_mode("graph_answers_same", "sweep_answers", "refs_tool")
         code, summary, _ = self.gate(label="control")
@@ -417,23 +428,57 @@ class AnswerFiles(unittest.TestCase):
 
     def test_equal_answers_with_a_working_control_are_ok(self):
         result = self.compare()
-        self.assertEqual((result["outcome"], result["control"], result["codes"]), ("ok", True, []))
+        self.assertEqual((result["outcome"], result["control"], result["new_codes"], result["vanished_codes"],
+                          result["changed_codes"]), ("ok", True, [], [], []))
 
-    def test_every_field_of_an_aggregate_and_its_presence_counts(self):
-        sweep = [{"code": "A", "count": 1, "files_affected": 1, "severity": "warning"},
-                 {"code": "B", "count": 2, "files_affected": 2, "severity": "error"}]
-        variants = {
-            "count": ([{**sweep[0], "count": 2}, sweep[1]], ["A"]),
-            "files_affected": ([{**sweep[0], "files_affected": 5}, sweep[1]], ["A"]),
-            "severity": ([sweep[0], {**sweep[1], "severity": "hint"}], ["B"]),
-            "absent": ([sweep[0]], ["B"]),
-            "added": ([*sweep, {"code": "C", "count": 1, "files_affected": 1, "severity": "hint"}], ["C"]),
-        }
-        for name, (cand, codes) in variants.items():
+    SWEEP = [{"code": "A", "count": 1, "files_affected": 1, "severity": "warning"},
+             {"code": "B", "count": 2, "files_affected": 2, "severity": "error"}]
+
+    @staticmethod
+    def fields(aggregate):
+        return {k: v for k, v in aggregate.items() if k != "code"}
+
+    def sweep_of(self, cand):
+        result = self.compare(cand={gate.SWEEP_ANSWER: cand})
+        self.assertEqual((result["outcome"], result["pairs"][0]["differ"]), ("ok", []))
+        return result
+
+    def test_a_new_code_is_listed_and_does_not_block(self):
+        added = [{"code": "C", "count": 160, "files_affected": 92, "severity": "hint"},
+                 {"code": "D", "count": 3, "files_affected": 1, "severity": "error"}]
+        result = self.sweep_of([*self.SWEEP, *added])
+        self.assertEqual(result["new_codes"], [{"code": "C", "count": 160, "files_affected": 92},
+                                               {"code": "D", "count": 3, "files_affected": 1}])
+        self.assertEqual((result["vanished_codes"], result["changed_codes"]), ([], []))
+        self.assertEqual(result["pairs"][0]["new"], ["C", "D"])
+
+    def test_a_vanished_code_is_listed_and_does_not_block(self):
+        result = self.sweep_of([self.SWEEP[0]])
+        self.assertEqual(result["vanished_codes"], [{"code": "B", "count": 2, "files_affected": 2}])
+        self.assertEqual((result["new_codes"], result["changed_codes"]), ([], []))
+
+    def test_a_changed_code_is_listed_with_both_sides_and_does_not_block(self):
+        variants = {"count": {**self.SWEEP[0], "count": 2}, "files_affected": {**self.SWEEP[0], "files_affected": 5},
+                    "severity": {**self.SWEEP[0], "severity": "hint"}}
+        for name, changed in variants.items():
             with self.subTest(name=name):
-                result = self.compare(cand={gate.SWEEP_ANSWER: cand})
-                self.assertEqual((result["outcome"], result["codes"]), ("block", codes))
-                self.assertEqual(result["pairs"][0]["differ"], [gate.SWEEP_ANSWER])
+                result = self.sweep_of([changed, self.SWEEP[1]])
+                self.assertEqual(result["changed_codes"], [{"code": "A", "base": self.fields(self.SWEEP[0]),
+                                                            "candidate": self.fields(changed)}])
+                self.assertEqual((result["new_codes"], result["vanished_codes"]), ([], []))
+
+    def test_a_code_changing_differently_in_two_pairs_keeps_both_rows(self):
+        pairs = [(self.launch(), self.launch(**{gate.SWEEP_ANSWER: [{**self.SWEEP[0], "count": count}, self.SWEEP[1]]}))
+                 for count in (2, 3)]
+        result = gate.compare_answers(pairs)
+        self.assertEqual((result["outcome"], [c["candidate"]["count"] for c in result["changed_codes"]]),
+                         ("ok", [2, 3]))
+
+    def test_new_vanished_and_changed_codes_together_leave_the_outcome_ok(self):
+        result = self.sweep_of([{**self.SWEEP[0], "count": 9},
+                                {"code": "C", "count": 1, "files_affected": 1, "severity": "hint"}])
+        self.assertEqual(([c["code"] for c in result["new_codes"]], [c["code"] for c in result["vanished_codes"]],
+                          [c["code"] for c in result["changed_codes"]]), (["C"], ["B"], ["A"]))
 
     def test_a_resolve_answer_that_differs_byte_for_byte_blocks(self):
         for name in gate.RESOLVE_ANSWERS:
@@ -441,7 +486,7 @@ class AnswerFiles(unittest.TestCase):
                 result = self.compare(cand={name: [{"id": "other"}] if name != "c-graph-resolve-extra-0" else
                                             [{"id": "x0"}, {"id": "more"}]})
                 self.assertEqual(result["outcome"], "block")
-                self.assertEqual((result["pairs"][0]["differ"], result["codes"]), ([name], []))
+                self.assertEqual(result["pairs"][0]["differ"], [name])
 
     def test_an_answer_one_side_lacks_differs(self):
         result = self.compare(cand={"d-graph-resolve-3": None})
@@ -460,7 +505,7 @@ class AnswerFiles(unittest.TestCase):
                                  ("incomplete", False, []))
 
     def test_a_difference_outranks_a_missing_control(self):
-        result = self.compare(cand={"c-graph-resolve-extra-1": [{"id": "x0"}], gate.SWEEP_ANSWER: []})
+        result = self.compare(cand={"c-graph-resolve-extra-1": [{"id": "x0"}], "d-graph-resolve-3": []})
         self.assertEqual(result["outcome"], "block")
 
     def test_a_pair_with_a_run_that_did_not_hold_is_not_compared(self):
@@ -1028,14 +1073,15 @@ class Report(GateCase):
         self.assertIn("решает от Δ > max(5 %, ν) = 5.0 % (ν = 3.0 %)", report)
 
     def test_the_report_of_a_full_gate_lists_every_table(self):
-        self.script.values["wall"] = candidate_slower(1.0)
+        self.script.values["wall"] = candidate_slower(1.5)
         set_mode(*self.modes.split(","), f"{CAND_LABEL}=sweep_extra_code")
         code, summary, _ = self.gate()
         report = self.read("g1")
-        for heading in ("## Правило", "## Потолки", "## Ответы", "## Прогоны"):
+        for heading in ("## Правило", "## Потолки", "## Ответы", "## Новые коды", "## Исчезнувшие коды",
+                        "## Изменённые коды", "## Прогоны"):
             self.assertIn(heading, report)
         self.assertIn("- вердикт: **block**", report)
-        self.assertIn("answers_differ", report)
+        self.assertNotIn("answers_differ", report)
         self.assertIn("| A-c1 | candidate | A | true | - | 0.000 |", report)
 
 

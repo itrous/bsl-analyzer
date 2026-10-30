@@ -576,29 +576,45 @@ def _read_answer(run_dir: str, name: str) -> bytes | None:
 
 def _aggregates(data: bytes | None) -> dict:
     items = json.loads(data) if data else None
-    return {a.get("code"): (a.get("count"), a.get("files_affected"), a.get("severity"))
+    return {str(a.get("code")): {"count": a.get("count"), "files_affected": a.get("files_affected"),
+                                 "severity": a.get("severity")}
             for a in items or [] if isinstance(a, dict)}
 
 
+def _sweep_delta(base: bytes | None, cand: bytes | None) -> dict:
+    """The sweep of the candidate against the base, by diagnostic code. Only
+    reported: the correctness of diagnostics is the project's tests and the
+    CHANGELOG, the gate judges time and memory."""
+    left, right = _aggregates(base), _aggregates(cand)
+    return {
+        "new": [{"code": code, "count": right[code]["count"], "files_affected": right[code]["files_affected"]}
+                for code in sorted(right.keys() - left.keys())],
+        "vanished": [{"code": code, "count": left[code]["count"], "files_affected": left[code]["files_affected"]}
+                     for code in sorted(left.keys() - right.keys())],
+        "changed": [{"code": code, "base": left[code], "candidate": right[code]}
+                    for code in sorted(left.keys() & right.keys()) if left[code] != right[code]],
+    }
+
+
 def compare_answers(pairs: list[tuple[dict, dict]]) -> dict:
-    """Byte equality of every answer of each pair (base, candidate) of launches
-    that held, and the control that the answers can differ at all: the first
-    candidate run has two different non-empty extra resolves (`control` None:
-    no candidate run held, the control was not made)."""
-    compared, codes = [], set()
+    """Byte equality of every resolve answer of each pair (base, candidate) of
+    launches that held, and the control that the answers can differ at all: the
+    first candidate run has two different non-empty extra resolves (`control`
+    None: no candidate run held, the control was not made). The sweep
+    aggregates do not decide: they are listed as new, vanished and changed
+    codes."""
+    compared, sweep = [], {"new": [], "vanished": [], "changed": []}
     for base, cand in pairs:
         if not (base["held"] and cand["held"]):
             continue
-        differ, pair_codes = [], []
-        for name in (*RESOLVE_ANSWERS, SWEEP_ANSWER):
-            b, c = _read_answer(base["dir"], name), _read_answer(cand["dir"], name)
-            if b != c:
-                differ.append(name)
-                if name == SWEEP_ANSWER:
-                    left, right = _aggregates(b), _aggregates(c)
-                    pair_codes = sorted(str(k) for k in set(left) | set(right) if left.get(k) != right.get(k))
-        codes.update(pair_codes)
-        compared.append({"pair": f"{base['run']}/{cand['run']}", "differ": differ, "codes": pair_codes})
+        differ = [name for name in RESOLVE_ANSWERS
+                  if _read_answer(base["dir"], name) != _read_answer(cand["dir"], name)]
+        delta = _sweep_delta(_read_answer(base["dir"], SWEEP_ANSWER), _read_answer(cand["dir"], SWEEP_ANSWER))
+        for kind, items in delta.items():
+            # A code whose values differ between pairs keeps a row per value: the spread is not hidden.
+            sweep[kind] += [i for i in items if i not in sweep[kind]]
+        compared.append({"pair": f"{base['run']}/{cand['run']}", "differ": differ,
+                         **{kind: [i["code"] for i in items] for kind, items in delta.items()}})
     first = next((cand for _, cand in pairs if cand["held"]), None)
     control = None
     if first is not None:
@@ -610,7 +626,8 @@ def compare_answers(pairs: list[tuple[dict, dict]]) -> dict:
         outcome = "incomplete"
     else:
         outcome = "ok"
-    return {"pairs": compared, "codes": sorted(codes), "control": control, "outcome": outcome}
+    return {"pairs": compared, "control": control, "outcome": outcome,
+            **{f"{kind}_codes": sorted(sweep[kind], key=lambda i: i["code"]) for kind in sweep}}
 
 
 # -- the gate ---------------------------------------------------------------------------
@@ -753,6 +770,10 @@ def _side_text(side: dict) -> str:
     return verdict.fmt(side["value"]) if side["state"] == "valid" else side["state"]
 
 
+def _aggregate_text(aggregate: dict) -> str:
+    return f"{aggregate['count']}/{aggregate['files_affected']}/{aggregate['severity']}"
+
+
 def write_report(out_dir: str, summary: dict) -> None:
     lines = [f"# Гейт {os.path.basename(out_dir)}", "",
              f"- вердикт: **{summary['verdict']}**",
@@ -784,10 +805,24 @@ def write_report(out_dir: str, summary: dict) -> None:
         lines.append("")
     answers = summary.get("answers")
     if answers:
-        lines += ["## Ответы", "", f"- исход: {answers['outcome']}; контроль: {answers['control']}",
-                  f"- коды aggregates, разошедшиеся: {', '.join(answers['codes']) or '-'}", ""]
+        lines += ["## Ответы", "", f"- исход: {answers['outcome']}; контроль: {answers['control']}"]
         lines += [f"- {p['pair']}: {', '.join(p['differ']) or 'равны'}" for p in answers["pairs"]]
-        lines.append("")
+        lines += ["", "Агрегаты свипа вердикт не меняют: корректность диагностик судят тесты проекта и "
+                      "CHANGELOG «Изменения поведения», гейт судит время и память.", ""]
+        for title, key, head, cells in (
+                ("Новые коды", "new_codes", "| код | count | files_affected |",
+                 lambda i: f"| {i['code']} | {i['count']} | {i['files_affected']} |"),
+                ("Исчезнувшие коды", "vanished_codes", "| код | count | files_affected |",
+                 lambda i: f"| {i['code']} | {i['count']} | {i['files_affected']} |"),
+                ("Изменённые коды", "changed_codes", "| код | было (count/files_affected/severity) | стало |",
+                 lambda i: f"| {i['code']} | {_aggregate_text(i['base'])} | {_aggregate_text(i['candidate'])} |")):
+            lines += [f"## {title}", ""]
+            items = answers.get(key) or []
+            if items:
+                lines += [head, "|---|---|---|", *map(cells, items)]
+            else:
+                lines.append("-")
+            lines.append("")
     runs = summary.get("runs") or []
     if runs:
         lines += ["## Прогоны", "", "| прогон | сторона | серия | засчитан | причина | foreign_cores |",
