@@ -316,6 +316,11 @@ impl GraphIndex {
         self.node_dispatch.keys().copied()
     }
 
+    /// Every indexed module, in no particular order.
+    pub fn modules(&self) -> impl Iterator<Item = ModuleId> + '_ {
+        self.methods.keys().copied()
+    }
+
     /// One module's method declaration facts in declaration order, for a streaming
     /// consumer that needs each method's name/ranges/dispatch without re-scanning the
     /// whole-workspace node set per module. `None` if the module is not indexed.
@@ -643,10 +648,18 @@ pub fn project_method_pairs_from_intents<DB: ConfigsDatabase + Clone + Send>(
     intents: &[(ModuleId, crate::call_graph::ModuleCallSummary)],
 ) -> Vec<(ModuleId, Vec<MethodCallPair>)> {
     let warm: Vec<ModuleId> = intents.iter().map(|&(module, _)| module).collect();
-    parallel_per_item(pool, db, intents, &warm, |db, (module, summary)| {
-        let resolved = resolve_summary_via_index(db, *module, summary, index);
-        (*module, resolved_summary_method_pairs(&resolved))
-    })
+    // No text is loaded here, so there is no size to order by.
+    parallel_per_item(
+        pool,
+        db,
+        intents,
+        &warm,
+        |_| 0,
+        |db, (module, summary)| {
+            let resolved = resolve_summary_via_index(db, *module, summary, index);
+            (*module, resolved_summary_method_pairs(&resolved))
+        },
+    )
 }
 
 fn resolved_summary_method_pairs(summary: &ResolvedModuleSummary) -> Vec<MethodCallPair> {
@@ -1102,7 +1115,96 @@ where
     R: Send,
     F: Fn(&DB, ModuleId) -> R + Sync + Send,
 {
-    parallel_per_item(pool, db, batch, batch, |db, &module| f(db, module))
+    // A module's cost is roughly its text: the largest go first so the batch does
+    // not end with one big module running alone while the pool idles.
+    parallel_per_item(
+        pool,
+        db,
+        batch,
+        batch,
+        |&module| db.file_text(module.file_id).len(),
+        |db, &module| f(db, module),
+    )
+}
+
+/// Run `f(seed, item)` for every item on `pool`, with the results in `items` order
+/// however the items were scheduled. Each job gets its own clone of `seed`. The
+/// items run largest first by `size`, every worker taking the next-largest from one
+/// cursor — a greedy longest-first schedule, which a split-and-steal `par_iter` over
+/// a sorted list would not give (it hands each worker a contiguous run of the list).
+fn map_in_order_largest_first<S, T, R>(
+    pool: &rayon::ThreadPool,
+    seed: S,
+    items: &[T],
+    size: impl Fn(&T) -> usize,
+    f: impl Fn(&mut S, &T) -> R + Sync + Send,
+) -> Vec<R>
+where
+    S: Clone + Send,
+    T: Sync,
+    R: Send,
+{
+    use rayon::prelude::*;
+
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    let sizes: Vec<usize> = items.iter().map(size).collect();
+    order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]).then(a.cmp(&b)));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let jobs = pool.current_num_threads().clamp(1, items.len().max(1));
+    let parts: Vec<Vec<(usize, R)>> = pool.install(|| {
+        (0..jobs)
+            .into_par_iter()
+            .with_max_len(1)
+            .map_with(seed, |seed, _| {
+                let mut done = Vec::new();
+                loop {
+                    let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&index) = order.get(at) else { break };
+                    done.push((index, f(seed, &items[index])));
+                }
+                done
+            })
+            .collect()
+    });
+    let mut results: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+    for (index, result) in parts.into_iter().flatten() {
+        results[index] = Some(result);
+    }
+    results.into_iter().map(|result| result.expect("every item ran once")).collect()
+}
+
+#[cfg(test)]
+mod map_in_order_tests {
+    use super::map_in_order_largest_first;
+
+    /// One worker makes the schedule observable: it runs the items largest first,
+    /// yet the results come back in the items' own order.
+    #[test]
+    fn results_are_in_item_order_while_work_runs_largest_first() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let items = [1usize, 100, 10, 1000];
+        let ran = std::sync::Mutex::new(Vec::new());
+        let results = map_in_order_largest_first(
+            &pool,
+            (),
+            &items,
+            |&size| size,
+            |(), &size| {
+                ran.lock().unwrap().push(size);
+                size * 2
+            },
+        );
+        assert_eq!(results, vec![2, 200, 20, 2000]);
+        assert_eq!(ran.into_inner().unwrap(), vec![1000, 100, 10, 1]);
+    }
+
+    #[test]
+    fn every_item_runs_once_on_a_wide_pool() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let items: Vec<usize> = (0..1000).map(|i| (i * 7919) % 97).collect();
+        let results = map_in_order_largest_first(&pool, 0u8, &items, |&s| s, |_, &s| s + 1);
+        assert_eq!(results, items.iter().map(|s| s + 1).collect::<Vec<_>>());
+    }
 }
 
 /// The generic core of [`parallel_per_module`]: run `f` over arbitrary
@@ -1114,6 +1216,7 @@ fn parallel_per_item<DB, T, R, F>(
     db: &DB,
     items: &[T],
     warm: &[ModuleId],
+    size: impl Fn(&T) -> usize,
     f: F,
 ) -> Vec<R>
 where
@@ -1122,8 +1225,6 @@ where
     R: Send,
     F: Fn(&DB, &T) -> R + Sync + Send,
 {
-    use rayon::prelude::*;
-
     // Warm the configuration loader ONCE on THIS thread before the parallel region.
     // `bsl_metadata::load_from_directory` (reached through the lru-cached
     // `load_configuration` query) fans out over its own `rayon::scope`; if it ran
@@ -1145,18 +1246,12 @@ where
         db.warm_config_roots(warm);
     }
 
-    let seed = db.clone();
-    pool.install(move || {
-        items
-            .par_iter()
-            .map_with(seed, |db, item| {
-                // Mark the job so internally-parallel entry points (the metadata
-                // loader) can detect that the warm-up above failed to keep them off
-                // this pool, instead of deadlocking silently.
-                let _guard = stdx::par_guard::enter_no_nested_parallelism();
-                f(&*db, item)
-            })
-            .collect()
+    map_in_order_largest_first(pool, db.clone(), items, size, |db, item| {
+        // Mark the job so internally-parallel entry points (the metadata loader)
+        // can detect that the warm-up above failed to keep them off this pool,
+        // instead of deadlocking silently.
+        let _guard = stdx::par_guard::enter_no_nested_parallelism();
+        f(&*db, item)
     })
 }
 
@@ -2322,16 +2417,8 @@ impl<'a> GraphRowEncoder<'a> {
     pub fn encode(&self, node: &GraphNode) -> (String, bool) {
         match node {
             GraphNode::Method(method) => {
-                let name = self.method_name(*method);
-                let path = self.path_for(method.module.file_id);
-                if let Some(key) = path.as_deref().and_then(module_key_for_path) {
-                    (format!("method/{}/{name}", encode_scope(&key)), true)
-                } else if let Some(rel) = path.as_deref().and_then(|p| self.rel_path(p)) {
-                    (format!("method/file/{rel}::{name}"), true)
-                } else {
-                    let base = path.as_deref().and_then(basename).unwrap_or("?");
-                    (format!("method/file/{base}::{name}"), false)
-                }
+                let (prefix, addressable) = self.method_id_prefix(method.module);
+                (format!("{prefix}{}", self.method_name(*method)), addressable)
             }
             GraphNode::ModuleCode(module) => {
                 let path = self.path_for(module.file_id);
@@ -2405,6 +2492,52 @@ impl<'a> GraphRowEncoder<'a> {
     }
 
     /// Project a node to its storage row.
+    /// What every method id of `module` starts with — the id up to the method name —
+    /// and whether such ids are addressable.
+    pub fn method_id_prefix(&self, module: ModuleId) -> (String, bool) {
+        let path = self.path_for(module.file_id);
+        if let Some(key) = path.as_deref().and_then(module_key_for_path) {
+            (format!("method/{}/", encode_scope(&key)), true)
+        } else if let Some(rel) = path.as_deref().and_then(|p| self.rel_path(p)) {
+            (format!("method/file/{rel}::"), true)
+        } else {
+            let base = path.as_deref().and_then(basename).unwrap_or("?");
+            (format!("method/file/{base}::"), false)
+        }
+    }
+
+    /// The method nodes of the index (the set of [`GraphIndex::method_nodes`]) in the
+    /// order of their durable ids: modules by id prefix, methods by name within one.
+    /// A store clustered by the id then takes them as appends instead of inserts all
+    /// over its tree, and namesake declarations of one module — which share an id —
+    /// arrive first-declared first, so which of them the store keeps is the same
+    /// every build rather than whichever a hash order put first.
+    ///
+    /// Only the order within a module is exact: across modules the prefix order
+    /// differs from the id order where one prefix is a prefix of another, which costs
+    /// the store nothing.
+    pub fn method_nodes_in_id_order(&self) -> impl Iterator<Item = MethodId> + '_ {
+        let mut modules: Vec<(String, Option<&str>, ModuleId)> = self
+            .index
+            .modules()
+            .map(|module| {
+                (
+                    self.method_id_prefix(module).0,
+                    self.paths.get(&module.file_id).map(String::as_str),
+                    module,
+                )
+            })
+            .collect();
+        modules.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        modules.into_iter().flat_map(move |(_, _, module)| {
+            let mut entries: Vec<&GraphMethodEntry> =
+                self.index.module_method_entries(module).unwrap_or_default().iter().collect();
+            // Stable, so namesakes keep their declaration order (their ordinal).
+            entries.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+            entries.into_iter().map(move |entry| MethodId { module, local_id: entry.local_id })
+        })
+    }
+
     pub fn node_row(&self, node: &GraphNode) -> NodeRow {
         let (id, addressable) = self.encode(node);
         match node {
@@ -2704,6 +2837,69 @@ mod module_layout_hash_tests {
             index.module_sig_hash(module).expect("indexed module has a signature hash"),
             index.module_layout_hash(module).expect("indexed module has a layout hash"),
         )
+    }
+
+    /// The id-ordered walk visits exactly the dispatch-seeded method set, with ids
+    /// non-decreasing and the namesakes of one module (one id, two declarations, here
+    /// in the two branches of a preprocessor condition) first-declared first — the
+    /// order that makes the store's first-wins choice the same every build.
+    #[test]
+    fn method_nodes_in_id_order_sorts_ids_and_keeps_namesakes_first_declared_first() {
+        let later = ModuleId::new(FileId(0));
+        let earlier = ModuleId::new(FileId(1));
+        let mut index = GraphIndex::new();
+        for (module, source) in [
+            (
+                later,
+                "Процедура Яблоко() Экспорт КонецПроцедуры\n\
+                 #Если Сервер Тогда\n\
+                 Процедура Дважды() Экспорт КонецПроцедуры\n\
+                 #Иначе\n\
+                 Процедура Дважды() Экспорт КонецПроцедуры\n\
+                 #КонецЕсли\n\
+                 Процедура Абрикос() Экспорт КонецПроцедуры",
+            ),
+            (earlier, "Процедура Яма() Экспорт КонецПроцедуры"),
+        ] {
+            let parse = parser::parse(source);
+            let methods =
+                crate::call_graph::extract_graph_methods(&crate::ItemTree::from_parse(&parse));
+            index.insert_module_data(module, methods, None, false);
+        }
+        let paths: FxHashMap<FileId, String> = [
+            (FileId(0), "src/cf/CommonModules/Я/Ext/Module.bsl".to_string()),
+            (FileId(1), "src/cf/CommonModules/А/Ext/Module.bsl".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let no_objects = MdoFiles::default();
+        let encoder = GraphRowEncoder::new(&index, &paths, None, &no_objects);
+
+        let order: Vec<MethodId> = encoder.method_nodes_in_id_order().collect();
+        let ids: Vec<String> =
+            order.iter().map(|m| encoder.encode(&GraphNode::Method(*m)).0).collect();
+        assert_eq!(
+            ids,
+            [
+                "method/common/А/Яма",
+                "method/common/Я/Абрикос",
+                "method/common/Я/Дважды",
+                "method/common/Я/Дважды",
+                "method/common/Я/Яблоко",
+            ],
+            "ids come out sorted, the namesakes adjacent"
+        );
+        let namesakes: Vec<u32> = order
+            .iter()
+            .filter(|m| m.local_id.name.as_str() == "дважды")
+            .map(|m| m.local_id.ordinal)
+            .collect();
+        assert_eq!(namesakes, [0, 1], "the first declaration leads the second");
+
+        let seeded: FxHashSet<MethodId> = index.method_nodes().collect();
+        let walked: FxHashSet<MethodId> = order.iter().copied().collect();
+        assert_eq!(walked, seeded, "the walk is the seeded set, nothing more or less");
+        assert_eq!(order.len(), seeded.len(), "and visits each once");
     }
 
     /// The index answers the same method the symbol tree does, so both must fold

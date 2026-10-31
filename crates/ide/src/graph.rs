@@ -610,6 +610,162 @@ pub(crate) fn clear_node_caches(pool: &rayon::ThreadPool) {
     pool.broadcast(|_| syntax::clear_shared_node_cache());
 }
 
+/// Drops values on a thread of its own, one at a time. A batch database is tens of
+/// thousands of syntax trees and memos; dropping it held the build thread for a
+/// measurable part of every batch. The hand-over is a rendezvous (an unbuffered
+/// channel): `send` returns only once the thread has taken the value, which it does
+/// after finishing the previous drop — so at most one value is ever being dropped
+/// while the sender works on the next, and the build's peak stays one batch wider.
+struct BackgroundDrop<T: Send + 'static> {
+    values: Option<std::sync::mpsc::SyncSender<T>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl<T: Send + 'static> BackgroundDrop<T> {
+    fn spawn(name: &str) -> std::io::Result<Self> {
+        let (values, received) = std::sync::mpsc::sync_channel::<T>(0);
+        let thread = std::thread::Builder::new().name(name.to_owned()).spawn(move || {
+            for value in received {
+                drop(value)
+            }
+        })?;
+        Ok(Self { values: Some(values), thread: Some(thread) })
+    }
+
+    /// Hand `value` to the thread; returns once it has been taken. Fails when the
+    /// thread is gone (it panicked while dropping an earlier value).
+    fn send(&self, value: T) -> Result<(), String> {
+        self.values
+            .as_ref()
+            .expect("the channel is open until finish")
+            .send(value)
+            .map_err(|_| "the batch database drop thread stopped".to_owned())
+    }
+
+    /// Wait for every value handed over to be dropped; a panic while dropping is
+    /// the error.
+    fn finish(mut self) -> Result<(), String> {
+        drop(self.values.take());
+        self.thread
+            .take()
+            .expect("joined once")
+            .join()
+            .map_err(|_| "the batch database drop thread panicked".to_owned())
+    }
+}
+
+impl<T: Send + 'static> Drop for BackgroundDrop<T> {
+    fn drop(&mut self) {
+        drop(self.values.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod background_drop_tests {
+    use super::BackgroundDrop;
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// Events in the order they happened, written by whichever thread saw them.
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    /// Its drop waits for the gate, so the test decides when a drop completes, and
+    /// logs its completion.
+    struct Held {
+        name: &'static str,
+        log: Log,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let (open, opened) = &*self.gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = opened.wait(open).unwrap();
+            }
+            self.log.lock().unwrap().push(self.name);
+        }
+    }
+
+    fn set(flag: &Arc<(Mutex<bool>, Condvar)>) {
+        let (value, changed) = &**flag;
+        *value.lock().unwrap() = true;
+        changed.notify_all();
+    }
+
+    fn wait_for(flag: &Arc<(Mutex<bool>, Condvar)>) {
+        let (value, changed) = &**flag;
+        let mut value = value.lock().unwrap();
+        while !*value {
+            value = changed.wait(value).unwrap();
+        }
+    }
+
+    /// The hand-over is a rendezvous: `send` of the second value returns only after
+    /// the first value's drop has completed. A buffered channel would take the
+    /// second value while the first is still being dropped.
+    #[test]
+    fn a_send_returns_only_after_the_previous_value_is_dropped() {
+        let log: Log = Arc::default();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let dropper = BackgroundDrop::spawn("test-drop").unwrap();
+
+        dropper
+            .send(Held { name: "first dropped", log: Arc::clone(&log), gate: Arc::clone(&gate) })
+            .unwrap();
+        let second =
+            Held { name: "second dropped", log: Arc::clone(&log), gate: Arc::clone(&gate) };
+        // The dropper holds the first value at the gate; nothing is dropped yet.
+        assert!(log.lock().unwrap().is_empty());
+
+        let handing_over = Arc::new((Mutex::new(false), Condvar::new()));
+        std::thread::scope(|scope| {
+            let hand_over = scope.spawn(|| {
+                set(&handing_over);
+                let sent = dropper.send(second);
+                log.lock().unwrap().push("second taken");
+                sent
+            });
+            // Open the gate only once the hand-over is under way, so the first drop
+            // cannot complete before the second value is offered.
+            wait_for(&handing_over);
+            set(&gate);
+            hand_over.join().unwrap().unwrap();
+        });
+        dropper.finish().unwrap();
+        // The second drop races the hand-over's own log line; the first drop does not.
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert!(
+            log.iter().position(|e| *e == "first dropped")
+                < log.iter().position(|e| *e == "second taken"),
+            "{log:?}"
+        );
+    }
+
+    struct PanicsOnDrop(bool);
+
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            if self.0 {
+                panic!("dropping the batch database failed");
+            }
+        }
+    }
+
+    #[test]
+    fn a_panic_while_dropping_fails_the_hand_over_and_the_finish() {
+        let dropper = BackgroundDrop::spawn("test-drop").unwrap();
+        dropper.send(PanicsOnDrop(true)).unwrap();
+        // The thread is gone after the panic, so the next hand-over is refused.
+        assert!(dropper.send(PanicsOnDrop(false)).is_err());
+        assert!(dropper.finish().unwrap_err().contains("panicked"));
+    }
+}
+
 /// Open one batch database, run `run` against it, explicitly drop it, then clear
 /// parser node caches. `observe` is called after the drop and after the cache
 /// clear so callers can emit lifecycle events at exactly those boundaries.
@@ -994,6 +1150,10 @@ pub fn build_workspace_graph_rows(
     // one thread and panic. Keeping the pool per build also confines any salsa query
     // that parallelises internally (e.g. metadata loading) to this build's threads.
     let pool = rayon::ThreadPoolBuilder::new().build()?;
+    // Each batch database is dropped off the build thread (see `BackgroundDrop`):
+    // the drop overlaps the next batch's load and projection instead of serialising
+    // between them, while at most one database waits to be dropped.
+    let dropper = BackgroundDrop::<RootDatabaseImpl>::spawn("bsl-graph-drop")?;
 
     // Build the index batch-by-batch: it must cover every resolution target, but
     // only one batch's item trees are resident while it is assembled.
@@ -1002,6 +1162,7 @@ pub fn build_workspace_graph_rows(
         note("index", i, batch);
         let db = open_batch(batch);
         index.add_batch(&pool, &db, batch);
+        dropper.send(db)?;
         clear_node_caches(&pool);
     }
 
@@ -1026,10 +1187,13 @@ pub fn build_workspace_graph_rows(
 
     // Phase A — every method node (the fold's dispatch-seeded set), including
     // isolated methods that no edge references. No database needed: the index and
-    // path map carry every fact. Flushed in batches of node rows.
+    // path map carry every fact. Flushed in batches of node rows, in id order: the
+    // store clusters nodes by id, so rows in id order append instead of landing all
+    // over its tree, and the namesake kept for a shared id is always the first
+    // declared.
     mark("method_nodes");
     let mut node_batch: Vec<NodeRow> = Vec::with_capacity(flush_rows);
-    for method in index.method_nodes() {
+    for method in encoder.method_nodes_in_id_order() {
         node_batch.push(encoder.node_row(&GraphNode::Method(method)));
         if node_batch.len() >= flush_rows {
             summary.node_rows += node_batch.len();
@@ -1110,6 +1274,7 @@ pub fn build_workspace_graph_rows(
                 unresolved_calls.push((scope, method_lower, file));
             }
         }
+        dropper.send(db)?;
         clear_node_caches(&pool);
     }
     for (i, &batch) in batches.iter().enumerate() {
@@ -1129,6 +1294,7 @@ pub fn build_workspace_graph_rows(
         if let Some(fused) = fused.as_deref_mut() {
             emit_fused_chunks(&db, batch, paths, &index, &mut method_edge_facts, fused)?;
         }
+        dropper.send(db)?;
         clear_node_caches(&pool);
     }
     summary.unresolved_calls = unresolved_calls;
@@ -1146,6 +1312,7 @@ pub fn build_workspace_graph_rows(
         let db = open_batch(batch);
         let edges = project_batch_form_edges(&pool, &db, batch, paths, &mut state);
         emit(&edges, &mut summary, &mut seen_aux, sink)?;
+        dropper.send(db)?;
         clear_node_caches(&pool);
     }
 
@@ -1234,6 +1401,7 @@ pub fn build_workspace_graph_rows(
     summary.casing_variant_objects = variants;
 
     mark("done");
+    dropper.finish()?;
     Ok(summary)
 }
 

@@ -22,6 +22,7 @@ use crate::{
     semantic_key_for_indexed_document, semantic_text_for_indexed_document,
     BaselineOverlaySearchService, BaselineRef, CorpusId,
 };
+use rayon::prelude::*;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -2484,21 +2485,50 @@ impl SearchEngine {
         stored.map(|value| (value, reason))
     }
 
-    fn prepare_boot_file(
+    /// Whether the plain [`code_chunk::Chunker`] cuts this engine's documents: an embedder
+    /// with a token policy cuts them its own way, and that cut needs the embedder.
+    fn chunks_plainly(&self) -> bool {
+        self.embedder.as_ref().and_then(Embedder::token_policy).is_none()
+    }
+
+    /// What a boot file costs away from the store: its read, its content hash and, under the
+    /// plain chunker, its parse into chunks. Pure, so a pool can draft many files at once
+    /// while the store's own thread does only what needs the store. A file whose content
+    /// hash is the one `stored` is not parsed: the store's half skips it unchanged, as it
+    /// always did before any parse.
+    fn draft_boot_file(
+        file_path: &Path,
+        chunk_plainly: bool,
+        stored: Option<&[u8]>,
+    ) -> DraftedBootFile {
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(content) => content,
+            Err(error) => return DraftedBootFile::Unread(error),
+        };
+        let hash = blake3::hash(content.as_bytes());
+        let changed = stored != Some(hash.as_bytes());
+        let chunks = (chunk_plainly && changed).then(|| code_chunk::Chunker::chunk(&content));
+        DraftedBootFile::Read { content, hash, chunks }
+    }
+
+    /// The store's half of a boot file: the hash decision and the documents, rendered with
+    /// the provider where the file owes graph context. A draft chunked by the plain chunker
+    /// is not parsed again; one without chunks is cut here, by the embedder's policy.
+    fn prepare_drafted_boot_file(
         &self,
         key: &FileKey,
         file_path: &Path,
+        draft: DraftedBootFile,
         with_graph_context: bool,
     ) -> Result<PreparedBootFile, SearchError> {
-        let content = match std::fs::read_to_string(file_path) {
-            Ok(content) => content,
-            Err(error) => {
+        let (content, hash, drafted_chunks) = match draft {
+            DraftedBootFile::Read { content, hash, chunks } => (content, hash, chunks),
+            DraftedBootFile::Unread(error) => {
                 lifecycle::decision(self.store.db_path(), key, Reason::ReadError, None, None);
                 warn!(?file_path, "failed to read file: {error}");
                 return Ok(PreparedBootFile::Unread);
             }
         };
-        let hash = blake3::hash(content.as_bytes());
         let (stored_hash, reason) = self.observed_file_hash(key, hash.as_bytes())?;
         let had_prior = match stored_hash {
             Some(stored_hash) if stored_hash == hash.as_bytes() => {
@@ -2509,12 +2539,17 @@ impl SearchEngine {
         };
         let provider =
             if with_graph_context { self.graph_context_provider.as_deref() } else { None };
-        let (documents, context_owed) = crate::document::prepare_indexed_documents(
-            key,
-            &content,
-            provider,
-            self.embedder.as_ref(),
-        )?;
+        let (documents, context_owed) = match drafted_chunks {
+            Some(chunks) => {
+                crate::document::prepare_indexed_documents_chunked(key, &content, &chunks, provider)
+            }
+            None => crate::document::prepare_indexed_documents(
+                key,
+                &content,
+                provider,
+                self.embedder.as_ref(),
+            )?,
+        };
         let (chunks, rendered_contexts, source_spans) =
             crate::document::chunks_contexts_and_spans(&documents);
         if chunks.is_empty() {
@@ -2642,29 +2677,70 @@ impl SearchEngine {
             ) -> ControlFlow<(), Result<(), SearchError>>,
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
+        self.ingest_boot_files_fenced_by(files, with_graph_context, BOOT_DRAFT_WINDOW, apply)
+    }
+
+    /// [`Self::ingest_boot_files_fenced`] with the drafting window given, so a test can
+    /// cross window boundaries with a handful of files.
+    fn ingest_boot_files_fenced_by<F>(
+        &mut self,
+        files: &[(FileKey, PathBuf)],
+        with_graph_context: bool,
+        window: stdx::batch::BatchBudget,
+        apply: &mut F,
+    ) -> Result<FenceOutcome<FtsIngest>, SearchError>
+    where
+        F: FnMut(
+            &mut dyn FnMut(
+                &mut dyn FnMut() -> ControlFlow<()>,
+            ) -> ControlFlow<(), Result<(), SearchError>>,
+        ) -> FenceOutcome<Result<(), SearchError>>,
+    {
+        // The drafting pool lives for this ingest only: its threads' parser caches go with
+        // it, as the init thread's own cache went with the init before the pool existed.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(BOOT_DRAFT_THREADS)
+            .thread_name(|index| format!("bsl-search-draft-{index}"))
+            .build()
+            .map_err(|error| warn!("boot ingest drafts on the init thread: {error}"))
+            .ok();
+        let chunk_plainly = self.chunks_plainly();
+        // The hashes the store holds, read once: with them the pool leaves an unchanged
+        // file unparsed instead of parsing it for a verdict the store's half then discards.
+        let stored: HashMap<FileKey, Vec<u8>> =
+            self.store.all_files_in_collection("code")?.into_iter().collect();
+        let weighed: Vec<(usize, u64)> = files
+            .iter()
+            .enumerate()
+            .map(|(index, (_, path))| (index, std::fs::metadata(path).map_or(0, |meta| meta.len())))
+            .collect();
+        let windows = stdx::batch::chunks_by_budget(&weighed, |(_, bytes)| *bytes, window);
         let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ExplicitRebuild);
         let lifecycle_result = lifecycle_batch.context().in_scope(|| {
             let mut result = FtsIngest { indexed: 0, unread: 0 };
-            for (key, path) in files {
-                let prepared = self.prepare_boot_file(key, path, with_graph_context)?;
-                match prepared {
-                    PreparedBootFile::Unchanged => continue,
-                    PreparedBootFile::Unread => {
-                        result.unread += 1;
-                        continue;
-                    }
-                    prepared => {
-                        match Self::fenced_checkpointed_value(apply, |checkpoint| {
-                            self.apply_prepared_boot_file_checkpointed(&prepared, checkpoint)
-                        })? {
-                            FenceOutcome::Applied(()) => {}
-                            FenceOutcome::TransientRefusal => {
-                                return Ok(FenceOutcome::TransientRefusal);
-                            }
-                            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
-                            FenceOutcome::Released => return Ok(FenceOutcome::Released),
-                        }
-                        result.indexed += 1;
+            for window in windows {
+                let draft = |(index, _): &(usize, u64)| {
+                    let (key, path) = &files[*index];
+                    Self::draft_boot_file(path, chunk_plainly, stored.get(key).map(Vec::as_slice))
+                };
+                let drafts: Vec<DraftedBootFile> = match &pool {
+                    Some(pool) => pool.install(|| window.par_iter().map(draft).collect()),
+                    None => window.iter().map(draft).collect(),
+                };
+                if let Some(pool) = &pool {
+                    // What a window's parses interned stays with the worker otherwise, and
+                    // the next window interns its own: cleared per window, the pool's
+                    // caches hold one window's tokens at most.
+                    pool.broadcast(|_| syntax::clear_shared_node_cache());
+                }
+                for ((index, _), draft) in window.iter().zip(drafts) {
+                    let (key, path) = &files[*index];
+                    let prepared =
+                        self.prepare_drafted_boot_file(key, path, draft, with_graph_context)?;
+                    if let ControlFlow::Break(refused) =
+                        self.ingest_prepared_boot_file(prepared, &mut result, apply)?
+                    {
+                        return Ok(refused);
                     }
                 }
             }
@@ -2678,6 +2754,45 @@ impl SearchEngine {
         };
         lifecycle_batch.finish(lifecycle_outcome);
         lifecycle_result
+    }
+
+    /// Write one prepared boot file under the fence, counting it into `result`; a fence
+    /// refusal comes back as the ingest's own outcome.
+    fn ingest_prepared_boot_file<F>(
+        &mut self,
+        prepared: PreparedBootFile,
+        result: &mut FtsIngest,
+        apply: &mut F,
+    ) -> Result<ControlFlow<FenceOutcome<FtsIngest>>, SearchError>
+    where
+        F: FnMut(
+            &mut dyn FnMut(
+                &mut dyn FnMut() -> ControlFlow<()>,
+            ) -> ControlFlow<(), Result<(), SearchError>>,
+        ) -> FenceOutcome<Result<(), SearchError>>,
+    {
+        match prepared {
+            PreparedBootFile::Unchanged => {}
+            PreparedBootFile::Unread => result.unread += 1,
+            prepared => {
+                match Self::fenced_checkpointed_value(apply, |checkpoint| {
+                    self.apply_prepared_boot_file_checkpointed(&prepared, checkpoint)
+                })? {
+                    FenceOutcome::Applied(()) => {}
+                    FenceOutcome::TransientRefusal => {
+                        return Ok(ControlFlow::Break(FenceOutcome::TransientRefusal));
+                    }
+                    FenceOutcome::Superseded => {
+                        return Ok(ControlFlow::Break(FenceOutcome::Superseded));
+                    }
+                    FenceOutcome::Released => {
+                        return Ok(ControlFlow::Break(FenceOutcome::Released))
+                    }
+                }
+                result.indexed += 1;
+            }
+        }
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Index workspace files for *deferred* embedding: chunk each changed file, attach
@@ -6722,9 +6837,28 @@ struct RemovedBatch {
 /// UTF-8. The walk's own counters cannot see this: `stat` needs no read permission, so such a
 /// file is enumerated and counted as healthy. A caller that must not stand behind an incomplete
 /// corpus has to ask separately, which is why the count travels instead of only being logged.
+#[derive(Debug)]
 pub struct FtsIngest {
     pub indexed: usize,
     pub unread: usize,
+}
+
+/// Files a boot ingest drafts at once before writing them: the drafts in flight — texts and
+/// their chunks — are the ingest's peak memory and scale with the window's bytes, so both
+/// are capped, the way a diagnostics sweep caps its chunk.
+const BOOT_DRAFT_WINDOW: stdx::batch::BatchBudget =
+    stdx::batch::BatchBudget::files(512).with_bytes(32 << 20);
+
+/// Drafting threads of a boot ingest. The drafts are a third of the ingest's work and
+/// the graph build runs beside it on every core; a few threads finish them well ahead of
+/// the single writer without taking the build's cores for long.
+const BOOT_DRAFT_THREADS: usize = 8;
+
+/// A boot file as the drafting pool leaves it: read and hashed, chunked when the plain
+/// chunker cuts this engine's documents, or the read's error.
+enum DraftedBootFile {
+    Unread(std::io::Error),
+    Read { content: String, hash: blake3::Hash, chunks: Option<Vec<code_chunk::Chunk>> },
 }
 
 enum PreparedBootFile {
@@ -8331,6 +8465,158 @@ mod tests {
         assert_eq!(plan.missing_embeddings().len(), 1);
         assert_eq!(plan.reused_embeddings().len(), 1);
         assert_eq!(embeddings.len(), 2);
+    }
+
+    /// Every chunk row of a store, in id order: what a boot ingest writes, including the
+    /// order it writes it in.
+    fn chunk_rows(db_path: &Path) -> Vec<(i64, String, String, String, u32, u32, String)> {
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT c.id, f.path, c.kind, c.symbol_name, c.line_start, c.line_end, c.text
+                 FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn boot_ingest_drafted_in_windows_writes_the_rows_of_the_sequential_ingest() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        // Sizes across the window's byte cap: the big module closes a window on its own,
+        // the small ones share windows, and one file is unreadable as source.
+        let big = (0..40)
+            .map(|i| format!("Процедура Большая{i}()\n    Х = {i};\nКонецПроцедуры\n"))
+            .collect::<String>();
+        let modules = [
+            ("Alpha.bsl", "Процедура Альфа()\nКонецПроцедуры\n".to_owned()),
+            ("Beta.bsl", "Функция Бета()\n    Возврат 1;\nКонецФункции\n".to_owned()),
+            ("Gamma.bsl", big),
+            ("Delta.bsl", "// только комментарий\n".to_owned()),
+            ("Epsilon.bsl", "Процедура Эпсилон()\nКонецПроцедуры\n".to_owned()),
+        ];
+        for (name, text) in &modules {
+            fs::write(workspace.join(name), text).unwrap();
+        }
+        fs::write(workspace.join("Broken.bsl"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let windowed_db = workspace.join("windowed.db");
+        let mut windowed = SearchEngine::fts_only(&windowed_db).unwrap();
+        let files = windowed.boot_ingest_files(workspace);
+        assert_eq!(files.len(), 6, "every module and the unreadable file are walked");
+        let window = stdx::batch::BatchBudget::files(2).with_bytes(600);
+        let ingested = match windowed
+            .ingest_boot_files_fenced_by(
+                &files,
+                false,
+                window,
+                &mut SearchEngine::permit_checkpointed_apply,
+            )
+            .unwrap()
+        {
+            FenceOutcome::Applied(result) => result,
+            other => panic!("the permit-all fence applied nothing: {other:?}"),
+        };
+        assert_eq!((ingested.indexed, ingested.unread), (4, 1));
+
+        let sequential_db = workspace.join("sequential.db");
+        let mut sequential = SearchEngine::fts_only(&sequential_db).unwrap();
+        let reference = sequential.ingest_files_fts(&files).unwrap();
+        assert_eq!((reference.indexed, reference.unread), (4, 1));
+
+        let rows = chunk_rows(&windowed_db);
+        assert_eq!(rows.len(), 43, "forty big procedures and three small modules");
+        assert_eq!(rows, chunk_rows(&sequential_db));
+
+        // A warm store: every readable file's hash is the stored one, so nothing is written
+        // and the rows stay as they were, ids included.
+        let again = match windowed
+            .ingest_boot_files_fenced_by(
+                &files,
+                false,
+                window,
+                &mut SearchEngine::permit_checkpointed_apply,
+            )
+            .unwrap()
+        {
+            FenceOutcome::Applied(result) => result,
+            other => panic!("the permit-all fence applied nothing: {other:?}"),
+        };
+        assert_eq!((again.indexed, again.unread), (0, 1));
+        assert_eq!(rows, chunk_rows(&windowed_db));
+
+        // The comparison sees the write order: the same files ingested backwards land
+        // under other ids, so an ingest that reordered its windows could not pass above.
+        let reversed_db = workspace.join("reversed.db");
+        let mut reversed = SearchEngine::fts_only(&reversed_db).unwrap();
+        let backwards: Vec<_> = files.iter().rev().cloned().collect();
+        reversed
+            .ingest_boot_files_fenced_by(
+                &backwards,
+                false,
+                window,
+                &mut SearchEngine::permit_checkpointed_apply,
+            )
+            .unwrap();
+        assert_ne!(rows, chunk_rows(&reversed_db));
+    }
+
+    /// The drafting pool parses a file only when its hash is not the one the store
+    /// holds: an unchanged file comes back read and hashed but unparsed, a changed or
+    /// new one with its chunks, a file cut by an embedder's policy unparsed whatever its
+    /// hash, and a file that is not UTF-8 as its read error.
+    #[test]
+    fn a_draft_parses_only_a_changed_file_under_the_plain_chunker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Module.bsl");
+        let text = "Процедура Черновик()\nКонецПроцедуры\n";
+        fs::write(&path, text).unwrap();
+        let hash = blake3::hash(text.as_bytes());
+
+        let read = |draft: super::DraftedBootFile| match draft {
+            super::DraftedBootFile::Read { content, hash: drafted, chunks } => {
+                assert_eq!(content, text);
+                assert_eq!(drafted, hash);
+                chunks
+            }
+            super::DraftedBootFile::Unread(error) => panic!("the file reads: {error}"),
+        };
+        let unchanged =
+            read(SearchEngine::draft_boot_file(&path, true, Some(&hash.as_bytes()[..])));
+        assert!(unchanged.is_none(), "an unchanged file is not parsed");
+
+        let other = blake3::hash(b"an earlier version");
+        for stored in [Some(&other.as_bytes()[..]), None] {
+            let chunks = read(SearchEngine::draft_boot_file(&path, true, stored))
+                .expect("a changed or new file is parsed on the pool");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].kind, ChunkKind::Procedure);
+            assert_eq!(chunks[0].name, "Черновик");
+        }
+
+        let cut_by_the_embedder = read(SearchEngine::draft_boot_file(&path, false, None));
+        assert!(cut_by_the_embedder.is_none(), "the embedder's cut stays on the store's thread");
+
+        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        assert!(matches!(
+            SearchEngine::draft_boot_file(&path, true, None),
+            super::DraftedBootFile::Unread(_)
+        ));
     }
 
     #[test]

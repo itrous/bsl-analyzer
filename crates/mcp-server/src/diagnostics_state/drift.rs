@@ -3866,18 +3866,31 @@ mod tests {
             "an owed debt does not put reads on the scan path — nothing is measured here",
         );
 
+        let walks = state.scan_count();
         state.kick_full_reload();
-        wait_until("the rebuild finishes", || match lock_inner(&state.inner).reload {
-            ReloadState::Running => Err("the rebuild is still running"),
-            ReloadState::Failed(_) => panic!("the rebuild failed"),
-            ReloadState::Idle => Ok(()),
+        // The rebuild publishes `Idle` under `inner` and settles the debt right after, from
+        // the same thread: `Idle` alone is observable a moment before the settle, so the wait
+        // is for the settle itself — the cursor the rebuild took no longer owes. A failed
+        // rebuild is reported at once; a settle the hub refused never arrives, and the wait
+        // says what the cursor still owes. The reconciler's periodic scan would pay the same
+        // debt by itself, so a walk during the wait is the regression this test exists for,
+        // not a way to pass it.
+        wait_until("the rebuild settles the debt its fresh cursor carried", || {
+            if let ReloadState::Failed(error) = &lock_inner(&state.inner).reload {
+                panic!("the rebuild failed: {error}");
+            }
+            assert_eq!(state.scan_count(), walks, "a scan, not the rebuild, is paying the debt");
+            let cursor = (*lock_recover(&state.hub_cursor))
+                .ok_or("the resident holds no cursor".to_owned())?;
+            match hub.health_for(Some(cursor)) {
+                Health::Healthy => Ok(()),
+                owed => Err(format!("the cursor still owes {owed:?}")),
+            }
         });
-
-        let cursor = lock_recover(&state.hub_cursor).expect("the rebuilt resident holds a cursor");
         assert_eq!(
-            hub.health_for(Some(cursor)),
-            Health::Healthy,
-            "the successful rebuild paid the debt its fresh cursor carried",
+            lock_inner(&state.inner).reload,
+            ReloadState::Idle,
+            "the settle follows the publish, so a settled debt means a finished rebuild",
         );
 
         let scans = state.scan_count();
