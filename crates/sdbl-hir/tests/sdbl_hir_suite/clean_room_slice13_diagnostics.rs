@@ -540,9 +540,11 @@ fn a_disjunction_of_different_subjects_inside_an_on_subquery_is_reported() {
     assert_eq!(operators, vec![text_size::TextRange::at(start, text_size::TextSize::of("ИЛИ"))]);
 }
 
+/// The selected use keeps its identity and range; the same field in `ГДЕ` only filters the
+/// row out and is not a second use.
 #[test]
-fn an_unprotected_optional_side_field_in_where_keeps_its_identity_and_range() {
-    let query = "ВЫБРАТЬ Н.Код КАК Код ИЗ Номенклатура КАК Н ЛЕВОЕ СОЕДИНЕНИЕ Остатки КАК О ПО О.Код = Н.Код ГДЕ О.КоличествоОстаток > 0";
+fn an_unprotected_optional_side_field_keeps_its_identity_and_range() {
+    let query = "ВЫБРАТЬ О.КоличествоОстаток КАК Остаток ИЗ Номенклатура КАК Н ЛЕВОЕ СОЕДИНЕНИЕ Остатки КАК О ПО О.Код = Н.Код ГДЕ О.КоличествоОстаток > 0";
     let package = lower_sdbl_to_hir(&parser::parse_sdbl(query), None);
     let uses: Vec<_> = package
         .all_diagnostics()
