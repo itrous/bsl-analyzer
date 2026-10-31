@@ -346,7 +346,17 @@ impl LoweringContext<'_> {
                     _ => unreachable!(),
                 }
             }
-            _ => FunctionKind::Unknown(func_name.clone()),
+            _ => {
+                if let Some(token) = func_name_token.as_ref() {
+                    if !lexer::sdbl::is_sdbl_vocabulary_word(&func_name) {
+                        self.diagnostics.push(SdblDiagnostic::UnknownFunction {
+                            function_name: func_name.clone(),
+                            range: token.text_range(),
+                        });
+                    }
+                }
+                FunctionKind::Unknown(func_name.clone())
+            }
         };
 
         let args: Vec<ExprHir> = if matches!(function, FunctionKind::Value) {

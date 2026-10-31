@@ -1126,9 +1126,39 @@ pub fn tokenize_sdbl(input: &str) -> Vec<SdblToken> {
     result
 }
 
+/// Whether the query language itself knows `word` (a function, virtual table, keyword or type).
+///
+/// The parser collapses every `Fn*`, `Vt*`, `Kw*` and type token to a plain identifier, so this
+/// lexer is the only place where "the language knows this word" survives.
+pub fn is_sdbl_vocabulary_word(word: &str) -> bool {
+    let mut significant = tokenize_sdbl(word)
+        .into_iter()
+        .filter(|token| !matches!(token.kind, SdblTokenKind::Whitespace | SdblTokenKind::Newline));
+    match (significant.next(), significant.next()) {
+        (Some(token), None) => token.kind != SdblTokenKind::Ident,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vocabulary_words_are_recognised() {
+        for word in ["ВРЕГ", "СокрЛП", "Цел", "Sqrt", "Остатки", "ТИП", "ВЫРАЗИТЬ"]
+        {
+            assert!(is_sdbl_vocabulary_word(word), "{word} must be a vocabulary word");
+        }
+    }
+
+    #[test]
+    fn invented_words_are_not_vocabulary() {
+        for word in ["ПОДСТРКА", "ВЫДУМАННАЯФУНКЦИЯ", "КОНКАТ", "ДОБАВИТЬМЕСЯЦ", "", "Т.Имя"]
+        {
+            assert!(!is_sdbl_vocabulary_word(word), "{word:?} must not be a vocabulary word");
+        }
+    }
 
     #[test]
     fn test_select_statement() {

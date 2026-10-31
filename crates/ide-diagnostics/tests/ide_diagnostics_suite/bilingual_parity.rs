@@ -377,6 +377,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "SDBL field resolution diagnostic; requires configuration metadata fixture",
     ),
     (
+        DiagnosticCode::UnknownQueryFunction,
+        "SDBL function vocabulary check; the message names the misspelled function by design",
+    ),
+    (
         DiagnosticCode::InvalidVirtualTableParameters,
         "SDBL virtual-table argument list; message names the table and the parameter by design",
     ),
@@ -697,7 +701,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 210, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 211, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

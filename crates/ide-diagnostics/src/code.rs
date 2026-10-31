@@ -208,6 +208,7 @@ pub enum DiagnosticCode {
     QueryParameterSourceWithoutInto,
     QueryTotalsInValueTableInto,
     UnknownFieldInQuery,
+    UnknownQueryFunction,
     UnlimitedLengthStringUsageInQuery,
     RefOveruse,
     SelectTopWithoutOrderBy,
