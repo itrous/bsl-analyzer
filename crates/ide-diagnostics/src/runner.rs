@@ -442,6 +442,15 @@ fn collect_sdbl_hir_single_pass(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                     continue;
                 }
             }
+            if let sdbl_hir::SdblDiagnostic::QueryToMissingMetadata { table_name, .. } = hir_diag {
+                if handlers::query_to_missing_metadata::is_substituted_template(
+                    &ctx.parse().syntax_node(),
+                    query_info.bsl_literal_range,
+                    table_name,
+                ) {
+                    continue;
+                }
+            }
             for (_, dispatch_fn) in &enabled {
                 dispatch_fn(
                     ctx.config,
@@ -453,8 +462,6 @@ fn collect_sdbl_hir_single_pass(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             }
         }
     }
-
-    handlers::query_to_missing_metadata::drop_substituted_templates(ctx, &mut diagnostics);
 
     diagnostics
 }

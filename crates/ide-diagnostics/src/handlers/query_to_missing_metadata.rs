@@ -2,6 +2,9 @@ use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsConfig, DiagnosticsContext};
 use sdbl_hir;
+use stdx::case::CaseExt;
+use syntax::ast_utils::{active_children, significant_tokens};
+use syntax::{SyntaxKind, SyntaxNode, TextRange};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -41,82 +44,131 @@ pub(crate) fn dispatch(
 }
 
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
-    let mut diagnostics = crate::sdbl_utils::collect_sdbl_via_dispatch(
+    crate::sdbl_utils::collect_sdbl_via_dispatch(
         ctx,
         DiagnosticCode::QueryToMissingMetadata,
         dispatch,
-    );
-    drop_substituted_templates(ctx, &mut diagnostics);
-    diagnostics
+    )
 }
 
-// The runner pass does not call `check`, so it applies this filter itself; without it the
-// module-aware narrowing would exist only in a path production never takes.
-pub(crate) fn drop_substituted_templates(
-    ctx: &DiagnosticsContext,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    if !diagnostics.iter().any(|d| d.code == DiagnosticCode::QueryToMissingMetadata) {
-        return;
-    }
-    let needles = substituted_needles(ctx);
-    if needles.is_empty() {
-        return;
-    }
-    diagnostics.retain(|d| {
-        d.code != DiagnosticCode::QueryToMissingMetadata
-            || !path_has_substituted_segment(&d.message, &needles)
-    });
-}
-
-// A query text kept as a template has a placeholder inside the table path that the module
-// replaces at run time; without this the placeholder is reported as a missing table forever.
-fn substituted_needles(ctx: &DiagnosticsContext) -> Vec<String> {
-    use syntax::SyntaxKind;
-    let root = ctx.parse().syntax_node();
-    let mut needles = Vec::new();
-    for tok in root.descendants_with_tokens().filter_map(|e| e.into_token()) {
-        if tok.kind() != SyntaxKind::IDENT {
-            continue;
-        }
-        // `eq_ignore_ascii_case` folds ASCII only, so a Russian name has to be folded in full:
-        // a module that writes `стрзаменить` would otherwise keep the false finding.
-        let name = tok.text().to_lowercase();
-        if name != "стрзаменить" && name != "strreplace" {
-            continue;
-        }
-        let Some(call) =
-            tok.parent().and_then(|p| p.ancestors().find(|n| n.kind() == SyntaxKind::CALL_EXPR))
-        else {
-            continue;
-        };
-        let Some(arg_list) = call.children().find(|n| n.kind() == SyntaxKind::ARG_LIST) else {
-            continue;
-        };
-        let Some(second) = arg_list.children().filter(|n| n.kind() == SyntaxKind::EXPR).nth(1)
-        else {
-            continue;
-        };
-        let Some(literal) = second.descendants().find(|n| n.kind() == SyntaxKind::LITERAL) else {
-            continue;
-        };
-        if let Some(content) = crate::sdbl_utils::extract_string_content(&literal) {
-            if !content.is_empty() {
-                needles.push(content);
-            }
-        }
-    }
-    needles
-}
-
-// Whole-segment comparison only: a substring match would silence real misses whose name merely
-// contains the substituted text.
-fn path_has_substituted_segment(message: &str, needles: &[String]) -> bool {
-    let Some(path) = message.split('"').nth(1) else {
+/// Whether the query of the literal at `literal_range` is a template the module completes by
+/// `СтрЗаменить` / `StrReplace` before it runs, replacing a whole segment of `table_name`.
+///
+/// Such a template parses cleanly, so its placeholder would otherwise be reported as a missing
+/// table forever. The replacement is tied to this query: its first argument is the literal
+/// itself or the variable the literal is assigned to, used later in the same method, and its
+/// result is used. The search string must equal a whole segment, case included, as the platform
+/// searches: a substring match would silence real misses whose name merely contains it.
+pub(crate) fn is_substituted_template(
+    root: &SyntaxNode,
+    literal_range: TextRange,
+    table_name: &str,
+) -> bool {
+    let Some(literal) = root
+        .covering_element(literal_range)
+        .ancestors()
+        .find(|node| node.kind() == SyntaxKind::LITERAL && node.text_range() == literal_range)
+    else {
         return false;
     };
-    path.split('.')
-        .any(|segment| needles.iter().any(|needle| segment.to_lowercase() == needle.to_lowercase()))
+    let text = enclosing_text(&literal);
+    let Some(parent) = text.parent() else { return false };
+    let calls: Vec<SyntaxNode> = match parent.kind() {
+        SyntaxKind::ARG_LIST if active_children(&parent).next().as_ref() == Some(&text) => {
+            parent.parent().filter(is_str_replace).into_iter().collect()
+        }
+        SyntaxKind::ASSIGN_STMT => {
+            let mut sides = active_children(&parent);
+            let (Some(target), Some(value)) = (sides.next(), sides.next()) else { return false };
+            if value != text {
+                return false;
+            }
+            let holder = folded(&target);
+            let scope = parent
+                .ancestors()
+                .find(|node| {
+                    matches!(node.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF)
+                })
+                .unwrap_or_else(|| root.clone());
+            scope
+                .descendants()
+                .filter(|call| {
+                    call.text_range().start() >= parent.text_range().end()
+                        && is_str_replace(call)
+                        && argument(call, 0).is_some_and(|arg| folded(&arg) == holder)
+                })
+                .collect()
+        }
+        _ => return false,
+    };
+    calls
+        .iter()
+        .filter(|call| unwrap_up(call).parent().map(|p| p.kind()) != Some(SyntaxKind::CALL_STMT))
+        .filter_map(|call| argument(call, 1))
+        .filter(|search| search.kind() == SyntaxKind::LITERAL)
+        .filter_map(|search| crate::sdbl_utils::extract_string_content(&search))
+        .any(|search| table_name.split('.').any(|segment| segment == search))
+}
+
+/// The whole text expression the literal belongs to: itself, or the constant concatenation it
+/// is a piece of, with any wrapping parentheses.
+fn enclosing_text(literal: &SyntaxNode) -> SyntaxNode {
+    let mut current = unwrap_up(literal);
+    while let Some(parent) = current.parent().filter(is_concatenation) {
+        current = unwrap_up(&parent);
+    }
+    current
+}
+
+fn is_concatenation(node: &SyntaxNode) -> bool {
+    node.kind() == SyntaxKind::BINARY_EXPR
+        && node
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .any(|token| token.kind() == SyntaxKind::PLUS)
+}
+
+/// The outermost `EXPR` or parentheses wrapper whose only content is `node`.
+fn unwrap_up(node: &SyntaxNode) -> SyntaxNode {
+    let mut current = node.clone();
+    while let Some(parent) = current
+        .parent()
+        .filter(|parent| matches!(parent.kind(), SyntaxKind::EXPR | SyntaxKind::PAREN_EXPR))
+    {
+        current = parent;
+    }
+    current
+}
+
+/// The node an `EXPR` or parentheses wrapper stands for.
+fn unwrap_down(node: &SyntaxNode) -> SyntaxNode {
+    let mut current = node.clone();
+    while matches!(current.kind(), SyntaxKind::EXPR | SyntaxKind::PAREN_EXPR) {
+        match active_children(&current).next() {
+            Some(child) => current = child,
+            None => break,
+        }
+    }
+    current
+}
+
+/// The global `СтрЗаменить` / `StrReplace`, called by its bare name.
+fn is_str_replace(call: &SyntaxNode) -> bool {
+    call.kind() == SyntaxKind::CALL_EXPR
+        && active_children(call).next().is_some_and(|callee| {
+            let name = folded(&unwrap_down(&callee));
+            name == "стрзаменить" || name == "strreplace"
+        })
+}
+
+fn argument(call: &SyntaxNode, index: usize) -> Option<SyntaxNode> {
+    let args = active_children(call).find(|node| node.kind() == SyntaxKind::ARG_LIST)?;
+    active_children(&args).nth(index).map(|arg| unwrap_down(&arg))
+}
+
+/// The node's significant text, case-folded: `Шаблон` and `шаблон` name one variable.
+fn folded(node: &SyntaxNode) -> String {
+    significant_tokens(node).map(|token| token.text().to_string()).collect::<String>().fold_lower()
 }
 
 #[cfg(test)]
@@ -365,6 +417,78 @@ mod tests {
             .iter()
             .filter(|d| d.code == DiagnosticCode::QueryToMissingMetadata)
             .collect();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    fn missing_tables(source: &str) -> Vec<crate::Diagnostic> {
+        crate::test_utils::check_with_config_xml(source, DOCUMENT_CONFIG_XML, &[])
+            .into_iter()
+            .filter(|d| d.code == DiagnosticCode::QueryToMissingMetadata)
+            .collect()
+    }
+
+    #[test]
+    fn a_replacement_of_another_template_leaves_a_separate_query_reported() {
+        let found = missing_tables(
+            r#"
+Процедура Тест(КлючЗначение) Экспорт
+    Шаблон = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Блок = СтрЗаменить(Шаблон, "ИмяВидаДокумента", КлючЗначение.Ключ);
+    Запрос = Новый Запрос("ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т");
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_replacement_of_unrelated_text_does_not_hide_the_query() {
+        let found = missing_tables(
+            r#"
+Процедура Тест() Экспорт
+    Шаблон = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Иное = СтрЗаменить("abc", "ИмяВидаДокумента", "X");
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_replacement_whose_result_is_dropped_does_not_complete_the_query() {
+        let found = missing_tables(
+            r#"
+Процедура Тест(Имя) Экспорт
+    ТекстЗапроса = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    СтрЗаменить(ТекстЗапроса, "ИмяВидаДокумента", Имя);
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_search_string_in_another_case_does_not_match_the_placeholder() {
+        let found = missing_tables(
+            r#"
+Процедура Тест() Экспорт
+    Шаблон = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Блок = СтрЗаменить(Шаблон, "имявидадокумента", "РеализацияТоваров");
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_literal_passed_straight_to_the_replacement_is_a_template() {
+        let found = missing_tables(
+            r#"
+Процедура Тест(Имя) Экспорт
+    Текст = СтрЗаменить("ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т", "ИмяВидаДокумента", Имя);
+КонецПроцедуры
+"#,
+        );
         assert!(found.is_empty(), "{found:?}");
     }
 }
