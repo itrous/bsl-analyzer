@@ -509,12 +509,16 @@ def _delta(base: float, cand: float) -> float:
     return 0.0 if cand == base else math.inf
 
 
-def cpu_outcome(delta: float, wall_delta: float | None, noise: float | None) -> tuple[str, str | None]:
-    """Outcome and the ground of the rule for `graph_ready_cpu_s`. More work
-    over the bar blocks unless the wall time fell by at least as much: the
-    machine has idle cores, the user waits for the wall. The noise of the CPU
-    time is held to the bar as for any work metric."""
-    outcome = verdict.gate_outcome("graph_ready_cpu_s", delta, noise)
+# Work metrics whose growth over the bar is forgiven where the wall time fell by more.
+TRADED_METRICS = ("graph_ready_cpu_s", "graph_resolve_s", "diagnostics_workspace_s")
+
+
+def traded_outcome(key: str, delta: float, wall_delta: float | None, noise: float | None) -> tuple[str, str | None]:
+    """Outcome and the ground of the rule for a work metric of `TRADED_METRICS`.
+    More work over the bar blocks unless the wall time fell by at least as much:
+    the machine has idle cores, the user waits for the wall. The noise of the
+    metric is held to the bar as for any work metric."""
+    outcome = verdict.gate_outcome(key, delta, noise)
     if outcome != "block":
         return outcome, None
     if wall_delta is not None and -wall_delta >= delta:
@@ -539,8 +543,8 @@ def rule_rows(base: list, cand: list, noise: dict, ready_only: bool) -> list[dic
         outcome = side_outcome(b_state, c_state)
         if outcome is None:
             row["delta"] = _delta(b_value, c_value)
-            if key == "graph_ready_cpu_s":
-                outcome, row["basis"] = cpu_outcome(row["delta"], wall_delta, nu)
+            if key in TRADED_METRICS:
+                outcome, row["basis"] = traded_outcome(key, row["delta"], wall_delta, nu)
                 row["wall_delta"] = wall_delta
             else:
                 outcome = verdict.gate_outcome(key, row["delta"], nu)
@@ -782,10 +786,12 @@ def _gate(args, clock, builder, machine, data: Data, out_dir: str, summary: dict
 # -- report ---------------------------------------------------------------------------
 
 
-CPU_BASIS = {
-    "growth_traded": "рост CPU принят как размен на ускорение (сокращение стены не меньше роста CPU)",
-    "growth_not_repaid": "блок: рост CPU больше 5 % не окуплен сокращением стены",
+GROWTH_BASIS = {
+    "growth_traded": "рост {what} принят как размен на ускорение (сокращение стены не меньше роста {what})",
+    "growth_not_repaid": "блок: рост {what} больше 5 % не окуплен сокращением стены",
 }
+GROWTH_WHAT = {"graph_ready_cpu_s": "CPU", "graph_resolve_s": "graph_resolve_s",
+               "diagnostics_workspace_s": "diagnostics_workspace_s"}
 
 
 def _pct(value) -> str:
@@ -824,10 +830,11 @@ def write_report(out_dir: str, summary: dict) -> None:
             lines += ["", f"Стеночная метрика решает от Δ > max(5 %, ν) = {wall['limit'] * 100:.1f} % "
                           f"(ν = {wall['noise'] * 100:.1f} %); меньший сдвиг стены от шума не отличим.", ""]
         for row in rows:
-            basis = CPU_BASIS.get(row.get("basis"))
+            basis = GROWTH_BASIS.get(row.get("basis"))
             if basis:
-                lines += [f"- {row['metric']}: {basis}; Δ стены {_pct(row.get('wall_delta'))}, "
-                          f"Δ CPU {_pct(row['delta'])}.", ""]
+                what = GROWTH_WHAT[row["metric"]]
+                lines += [f"- {row['metric']}: {basis.format(what=what)}; Δ стены {_pct(row.get('wall_delta'))}, "
+                          f"Δ {what} {_pct(row['delta'])}.", ""]
     ceilings = summary.get("ceilings") or []
     if ceilings:
         lines += ["## Потолки", "", "| метрика | кандидат | предел | исход |", "|---|---|---|---|"]

@@ -306,6 +306,21 @@ class Order(GateCase):
         self.assertIn("блок: рост CPU больше 5 % не окуплен сокращением стены", report)
         self.assertIn("Δ стены +0.0%, Δ CPU +24.0%", report)
 
+    def test_more_resolve_time_for_a_shorter_wait_passes_and_the_report_says_why(self):
+        self.script.values["wall"] = candidate_slower(0.55)
+        self.script.values["elapsed"] = lambda run, name: \
+            1.0509 * self.script.ELAPSED[name] if name == "graph_resolve" and run.role == "c" else None
+        code, summary, _ = self.gate()
+        self.assertEqual((code, summary["verdict"]), (0, "pass"))
+        resolve = self.row(summary, "graph_resolve_s")
+        self.assertEqual((resolve["outcome"], resolve["basis"]), ("ok", "growth_traded"))
+        self.assertAlmostEqual(resolve["delta"], 0.0509)
+        self.assertAlmostEqual(resolve["wall_delta"], -0.45)
+        with open(self.data.path("gates", "g1", "report.md"), encoding="utf-8") as fh:
+            report = fh.read()
+        self.assertIn("graph_resolve_s: рост graph_resolve_s принят как размен на ускорение", report)
+        self.assertIn("Δ стены -45.0%, Δ graph_resolve_s +5.1%", report)
+
     def test_a_wait_regression_above_a_small_noise_blocks_without_a_second_round(self):
         self.script.values["wall"] = candidate_slower(1.5)
         code, summary, _ = self.gate()

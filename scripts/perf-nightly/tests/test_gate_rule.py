@@ -113,10 +113,10 @@ class CpuTradedForWall(unittest.TestCase):
 
     def test_the_gain_of_the_wall_must_reach_the_growth(self):
         # Equal: traded; a hair less gain: not. The wall at -24 % and at -23.9 % is far from the wall's own limit.
-        self.assertEqual(gate.cpu_outcome(0.24, -0.24, 0.01), ("ok", "growth_traded"))
-        self.assertEqual(gate.cpu_outcome(0.24, -0.239, 0.01), ("block", "growth_not_repaid"))
-        self.assertEqual(gate.cpu_outcome(0.0501, -0.0501, 0.01), ("ok", "growth_traded"))
-        self.assertEqual(gate.cpu_outcome(0.0501, None, 0.01), ("block", "growth_not_repaid"))
+        self.assertEqual(gate.traded_outcome("graph_ready_cpu_s", 0.24, -0.24, 0.01), ("ok", "growth_traded"))
+        self.assertEqual(gate.traded_outcome("graph_ready_cpu_s", 0.24, -0.239, 0.01), ("block", "growth_not_repaid"))
+        self.assertEqual(gate.traded_outcome("graph_ready_cpu_s", 0.0501, -0.0501, 0.01), ("ok", "growth_traded"))
+        self.assertEqual(gate.traded_outcome("graph_ready_cpu_s", 0.0501, None, 0.01), ("block", "growth_not_repaid"))
 
     def test_a_noisy_cpu_time_never_passes_however_fast_the_wall(self):
         for cpu_noise, expected in ((0.06, "noisy"), (None, "no_noise")):
@@ -127,18 +127,70 @@ class CpuTradedForWall(unittest.TestCase):
                     self.assertEqual(rows["graph_ready_cpu_s"]["outcome"], expected)
                     self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "incomplete")
 
-    def test_only_the_cpu_of_readiness_is_traded(self):
-        # Resolve and sweep time are held to the bar with no wall to pay for them.
+    def test_the_trade_is_the_same_rule_for_every_work_metric(self):
+        # CPU of readiness, resolve and sweep: +24 % against a wall at -45 % is paid for in each.
         base, cand = side(40.0, 40.0, 40.0), side(49.6, 49.6, 49.6)
         for r in cand:
             r["metrics"]["graph_ready_s"] = 55.0
         for r in base:
             r["metrics"]["graph_ready_s"] = 100.0
         rows = {r["metric"]: r for r in gate.rule_rows(base, cand, self.NOISE, False)}
-        self.assertEqual(rows["graph_ready_cpu_s"]["outcome"], "ok")
-        self.assertEqual(rows["graph_resolve_s"]["outcome"], "block")
-        self.assertEqual(rows["diagnostics_workspace_s"]["outcome"], "block")
-        self.assertNotIn("basis", rows["graph_resolve_s"])
+        for key in DECISIVE:
+            with self.subTest(key=key):
+                self.assertEqual((rows[key]["outcome"], rows[key]["basis"]), ("ok", "growth_traded"))
+                self.assertAlmostEqual(rows[key]["wall_delta"], -0.45)
+        self.assertNotIn("basis", rows["graph_ready_s"])
+
+
+class ResolveAndSweepTradedForWall(unittest.TestCase):
+    """`graph_resolve_s` and `diagnostics_workspace_s` follow the rule of the CPU time."""
+
+    NOISE = noise_of(graph_ready_s=0.03, graph_ready_cpu_s=0.01, graph_resolve_s=0.013, diagnostics_workspace_s=0.01)
+
+    def rows(self, key, wall, growth, noise=None):
+        steady = {"graph_ready_cpu_s": 40.0, "graph_resolve_s": 17.7, "diagnostics_workspace_s": 22.1}
+        base = [record(k + 1, graph_ready_s=250.0, **steady) for k in range(3)]
+        cand = [record(k + 1, graph_ready_s=250.0 * (1 + wall), **{**steady, key: steady[key] * (1 + growth)})
+                for k in range(3)]
+        noise = noise or self.NOISE
+        return {r["metric"]: r for r in gate.rule_rows(base, cand, noise, False)}
+
+    def test_growth_just_over_the_bar_with_a_much_faster_wall_passes_with_a_note(self):
+        row = self.rows("graph_resolve_s", -0.45, 0.0509)["graph_resolve_s"]
+        self.assertEqual((row["outcome"], row["basis"]), ("ok", "growth_traded"))
+        self.assertAlmostEqual(row["delta"], 0.0509)
+        self.assertAlmostEqual(row["wall_delta"], -0.45)
+
+    def test_growth_with_a_flat_wall_blocks(self):
+        row = self.rows("graph_resolve_s", 0.01, 0.10)["graph_resolve_s"]
+        self.assertEqual((row["outcome"], row["basis"]), ("block", "growth_not_repaid"))
+
+    def test_growth_within_the_bar_passes_without_a_note(self):
+        row = self.rows("graph_resolve_s", 0.0, 0.03)["graph_resolve_s"]
+        self.assertEqual((row["outcome"], row["basis"]), ("ok", None))
+
+    def test_the_sweep_trades_growth_for_a_faster_wall(self):
+        row = self.rows("diagnostics_workspace_s", -0.20, 0.08)["diagnostics_workspace_s"]
+        self.assertEqual((row["outcome"], row["basis"]), ("ok", "growth_traded"))
+        self.assertAlmostEqual(row["wall_delta"], -0.20)
+
+    def test_the_gain_of_the_wall_must_reach_the_growth(self):
+        for key in ("graph_resolve_s", "diagnostics_workspace_s"):
+            with self.subTest(key=key):
+                self.assertEqual(gate.traded_outcome(key, 0.08, -0.08, 0.01), ("ok", "growth_traded"))
+                self.assertEqual(gate.traded_outcome(key, 0.08, -0.079, 0.01), ("block", "growth_not_repaid"))
+                self.assertEqual(gate.traded_outcome(key, 0.08, None, 0.01), ("block", "growth_not_repaid"))
+
+    def test_a_noisy_metric_never_passes_however_fast_the_wall(self):
+        for key in ("graph_resolve_s", "diagnostics_workspace_s"):
+            for noise_value, expected in ((0.06, "noisy"), (None, "no_noise")):
+                for growth in (0.08, 0.03, 0.0):
+                    with self.subTest(key=key, noise=noise_value, growth=growth):
+                        rows = self.rows(key, -0.45, growth, noise_of(**{
+                            "graph_ready_s": 0.03, "graph_ready_cpu_s": 0.01, "graph_resolve_s": 0.01,
+                            "diagnostics_workspace_s": 0.01, key: noise_value}))
+                        self.assertEqual(rows[key]["outcome"], expected)
+                        self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "incomplete")
 
 
 class WallMetric(unittest.TestCase):
