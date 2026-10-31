@@ -695,6 +695,9 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ),
     // The build watchdog holds a stop of its own and goes with the build.
     ("graph_db.rs", "spawn_build_watchdog", ".wait_timeout(", Waiting::OwnProtocol),
+    // A scan worker waiting for bytes in flight to come back under the cap: released by the
+    // reads in flight, each of which ends with its file.
+    ("graph/byte_budget.rs", "with", ".wait(", Waiting::Bounded),
     // A read waiting for a pooled graph handle to come back: bounded by the caller's wait.
     ("graph/snapshot.rs", "checkout_with_admission_wait", ".wait_timeout(", Waiting::Bounded),
     // The budget of a patch's SQL: a watchdog thread that interrupts the statement in flight.

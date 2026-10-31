@@ -555,6 +555,68 @@ impl GraphDbWriter {
     }
 }
 
+/// Row portions queued ahead of the writer. Beyond the queue, one portion is being
+/// written and one is being handed over (`send` copies it before it may block), so
+/// at most three portions live beside the build's own — tens of MiB, well under the
+/// batch texts themselves — while the writer still runs a portion ahead of the build.
+const ROW_PORTIONS_IN_FLIGHT: usize = 1;
+
+type RowPortion = (Vec<NodeRow>, Vec<EdgeRow>);
+
+/// The graph writer on a thread of its own, fed row portions in order over a bounded
+/// channel, so the SQLite inserts overlap the next batch's projection instead of
+/// holding the build thread. One thread owns the connection throughout; the writer
+/// comes back to the build thread when the channel closes, for the tail tables and
+/// `finalize`.
+struct RowWriterThread {
+    portions: Option<std::sync::mpsc::SyncSender<RowPortion>>,
+    thread: Option<std::thread::JoinHandle<anyhow::Result<GraphDbWriter>>>,
+}
+
+impl RowWriterThread {
+    fn spawn(
+        writer: GraphDbWriter,
+        mut write: impl FnMut(&mut GraphDbWriter, &[NodeRow], &[EdgeRow]) -> anyhow::Result<()>
+            + Send
+            + 'static,
+    ) -> anyhow::Result<Self> {
+        let (portions, received) =
+            std::sync::mpsc::sync_channel::<RowPortion>(ROW_PORTIONS_IN_FLIGHT);
+        let thread = std::thread::Builder::new()
+            .name("bsl-graph-writer".to_owned())
+            .spawn(move || {
+                let mut writer = writer;
+                for (nodes, edges) in received {
+                    write(&mut writer, &nodes, &edges)?;
+                }
+                Ok(writer)
+            })
+            .context("spawning the graph writer thread")?;
+        Ok(Self { portions: Some(portions), thread: Some(thread) })
+    }
+
+    /// Queue one portion; blocks while the writer is [`ROW_PORTIONS_IN_FLIGHT`]
+    /// behind. Fails once the writer has stopped — its reason comes from
+    /// [`Self::finish`].
+    fn send(&self, nodes: &[NodeRow], edges: &[EdgeRow]) -> anyhow::Result<()> {
+        self.portions
+            .as_ref()
+            .expect("the channel is open until finish")
+            .send((nodes.to_vec(), edges.to_vec()))
+            .map_err(|_| anyhow::anyhow!("graph writer stopped before the build finished"))
+    }
+
+    /// Close the channel and wait for the writer to drain it; a write error or a
+    /// panic on the writer thread comes back as the error.
+    fn finish(mut self) -> anyhow::Result<GraphDbWriter> {
+        drop(self.portions.take());
+        match self.thread.take().expect("joined once").join() {
+            Ok(outcome) => outcome,
+            Err(_) => Err(anyhow::anyhow!("graph writer thread panicked")),
+        }
+    }
+}
+
 const FILES_INSERT_SQL: &str = "INSERT OR REPLACE INTO files \
      (root_id, path, content_hash, fingerprint, sig_hash, \
       stat_len, stat_mtime_ns, stat_ctime_ns, stat_ino, stat_dev, stat_observed_ns) \
@@ -1148,10 +1210,15 @@ pub(crate) fn build_graph_database_inner(
     // counted many times over.
     let mut unread: BTreeSet<PathBuf> = BTreeSet::new();
 
-    // Scope the closures so their borrows end before `finalize`. `open_batch`
-    // loads only the batch's texts (sharing the resident source root + config);
-    // `sink` persists the freshly-encoded rows (the sole `&mut writer` borrow).
-    let summary = {
+    // The node/edge rows go to the writer on its own thread; the build thread only
+    // encodes them. `open_batch` loads only the batch's texts (sharing the resident
+    // source root + config). Scoped so the closures' borrows end before the writer
+    // is taken back for the tail tables and `finalize`.
+    let writer = RowWriterThread::spawn(writer, |writer, nodes, edges| {
+        writer.write_nodes(nodes)?;
+        writer.write_edges(edges)
+    })?;
+    let built = {
         let mut open_batch = |batch: &[ModuleId]| -> RootDatabaseImpl {
             let batch_files: Vec<(FileId, PathBuf)> =
                 batch.iter().map(|m| (m.file_id, file_paths[&m.file_id].clone())).collect();
@@ -1163,8 +1230,7 @@ pub(crate) fn build_graph_database_inner(
         let mut sink = |nodes: &[NodeRow],
                         edges: &[EdgeRow]|
          -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            writer.write_nodes(nodes)?;
-            writer.write_edges(edges)?;
+            writer.send(nodes, edges)?;
             Ok(())
         };
         ide::build_workspace_graph_rows(
@@ -1178,7 +1244,14 @@ pub(crate) fn build_graph_database_inner(
             chunk_sink,
             Some(&ticker),
         )
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    // A writer failure reaches the build as a closed channel, so the writer's own
+    // error is the one to report when both sides failed.
+    let (summary, mut writer) = match (built, writer.finish()) {
+        (Ok(summary), Ok(writer)) => (summary, writer),
+        (_, Err(writer_error)) => return Err(writer_error),
+        (Err(build_error), Ok(_)) => return Err(build_error),
     };
 
     // Persist a per-file fingerprint for every graph-relevant file (`.bsl` + `.xml`),
@@ -1196,10 +1269,12 @@ pub(crate) fn build_graph_database_inner(
             file_paths.get(&m.file_id).map(|p| (p.to_string_lossy().into_owned(), h))
         })
         .collect();
+    let xml_sig_hashes = crate::graph::scan::xml_sig_hashes(&universe.stats);
     let file_rows: anyhow::Result<Vec<FileFingerprint>> = universe
         .stats
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(index, s)| {
             let Some(key) = s.key(roots) else {
                 return Err(anyhow::anyhow!(
                     "graph scan file is outside registered workspace roots: {}",
@@ -1209,9 +1284,7 @@ pub(crate) fn build_graph_database_inner(
             let content_hash = s.persisted_content_hash();
             let sig_hash =
                 if bsl_conventions::str_has_extension(&s.path, bsl_conventions::XML_EXTENSION) {
-                    crate::graph::scan::xml_semantic_hash_file(&s.canonical).map(|h| {
-                        u64::from_le_bytes(h[..8].try_into().expect("blake3 hash >= 8 bytes"))
-                    })
+                    xml_sig_hashes[index]
                 } else {
                     sig_by_path.get(&s.path).copied()
                 };
@@ -2893,6 +2966,116 @@ mod tests {
         Connection::open(path).unwrap()
     }
 
+    fn portion(index: usize) -> (Vec<NodeRow>, Vec<EdgeRow>) {
+        let nodes: Vec<NodeRow> = (0..500)
+            .map(|k| {
+                method_node(&format!("method/common/X/P{index}N{k}"), &format!("P{index}N{k}"))
+            })
+            .collect();
+        let edges: Vec<EdgeRow> = (0..500)
+            .map(|k| edge(&format!("method/common/X/P{index}N{k}"), "method/common/X/Hub"))
+            .collect();
+        (nodes, edges)
+    }
+
+    fn test_meta() -> GraphMeta {
+        GraphMeta {
+            revision: 1,
+            fingerprint: GraphFp::default(),
+            files: 0,
+            built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
+        }
+    }
+
+    /// The writer thread persists portions in the order they were sent, and loses none.
+    #[test]
+    fn row_writer_thread_keeps_send_order_and_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bsl-graph.db");
+        let writer = RowWriterThread::spawn(GraphDbWriter::create(&path).unwrap(), |w, n, e| {
+            w.write_nodes(n)?;
+            w.write_edges(e)
+        })
+        .unwrap();
+        let mut sent_from_ids = Vec::new();
+        for index in 0..3 {
+            let (nodes, edges) = portion(index);
+            sent_from_ids.extend(edges.iter().map(|e| e.from_id.clone()));
+            writer.send(&nodes, &edges).unwrap();
+        }
+        writer.finish().unwrap().finalize(&test_meta()).unwrap();
+
+        let conn = open(&path);
+        let stored: Vec<String> = conn
+            .prepare("SELECT from_id FROM edges ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(stored, sent_from_ids);
+        let nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap();
+        assert_eq!(nodes, 1500);
+    }
+
+    /// A failing write stops the build within a bounded number of portions (the
+    /// channel's capacity, then a closed channel) and surfaces as the writer's error.
+    #[test]
+    fn row_writer_thread_reports_a_failing_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bsl-graph.db");
+        let mut written = 0;
+        let writer =
+            RowWriterThread::spawn(GraphDbWriter::create(&path).unwrap(), move |w, n, e| {
+                written += 1;
+                if written == 2 {
+                    anyhow::bail!("disk full");
+                }
+                w.write_nodes(n)?;
+                w.write_edges(e)
+            })
+            .unwrap();
+        let mut refused_at = None;
+        for index in 0..(ROW_PORTIONS_IN_FLIGHT + 4) {
+            let (nodes, edges) = portion(index);
+            if writer.send(&nodes, &edges).is_err() {
+                refused_at = Some(index);
+                break;
+            }
+        }
+        assert!(refused_at.is_some(), "the build keeps feeding a dead writer");
+        let error = writer.finish().err().expect("the write error reaches the build");
+        assert!(error.to_string().contains("disk full"), "{error:#}");
+    }
+
+    /// A panic on the writer thread is an error for the build, never a hang.
+    #[test]
+    fn row_writer_thread_reports_a_panicking_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bsl-graph.db");
+        let mut written = 0;
+        let writer =
+            RowWriterThread::spawn(GraphDbWriter::create(&path).unwrap(), move |w, n, e| {
+                written += 1;
+                assert_ne!(written, 2, "writer panics on the second portion");
+                w.write_nodes(n)?;
+                w.write_edges(e)
+            })
+            .unwrap();
+        let mut refused_at = None;
+        for index in 0..(ROW_PORTIONS_IN_FLIGHT + 4) {
+            let (nodes, edges) = portion(index);
+            if writer.send(&nodes, &edges).is_err() {
+                refused_at = Some(index);
+                break;
+            }
+        }
+        assert!(refused_at.is_some(), "the build keeps feeding a dead writer");
+        let error = writer.finish().err().expect("the panic reaches the build");
+        assert!(error.to_string().contains("panicked"), "{error:#}");
+    }
+
     #[test]
     fn writes_and_reads_back_nodes_and_edges() {
         let dir = tempfile::tempdir().unwrap();
@@ -3327,6 +3510,151 @@ mod tests {
     /// against the scanned universe.
     fn expected_file(_root: &Path, relative: &str) -> (String, String) {
         (String::new(), relative.replace('\\', "/"))
+    }
+
+    /// Every batch database goes to the drop thread, so a build of several batches
+    /// never has more than two alive — the one it works on and the one being
+    /// dropped — and none outlives the build. Each database is given a configuration
+    /// cache of its own that nothing else holds, so the cache's strong count is the
+    /// database's liveness: at every open at most one earlier database is still
+    /// alive, and after the build none is.
+    #[test]
+    fn a_build_of_many_batches_keeps_at_most_two_batch_databases_alive() {
+        use std::sync::{Mutex, Weak};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        stage_catalog_workspace(root, "Процедура П0() Экспорт КонецПроцедуры");
+        for index in 1..7 {
+            let name = format!("Модуль{index}");
+            std::fs::create_dir_all(root.join(format!("CommonModules/{name}/Ext"))).unwrap();
+            std::fs::write(
+                root.join(format!("CommonModules/{name}.xml")),
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+    <CommonModule uuid="00000000-0000-0000-0000-00000000001{index}">
+        <Properties><Name>{name}</Name><Server>true</Server></Properties>
+    </CommonModule>
+</MetaDataObject>"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(format!("CommonModules/{name}/Ext/Module.bsl")),
+                format!(
+                    "Процедура П{index}() Экспорт
+    Модуль.П0();
+КонецПроцедуры"
+                ),
+            )
+            .unwrap();
+        }
+        let (project, universe) = scanned_project(root);
+        let files = &universe.files;
+        let modules: Vec<ModuleId> = files.iter().map(|(f, _)| ModuleId::new(*f)).collect();
+        let paths: FxHashMap<FileId, String> =
+            files.iter().map(|(f, p)| (*f, p.to_string_lossy().replace('\\', "/"))).collect();
+        let file_paths: FxHashMap<FileId, PathBuf> =
+            files.iter().map(|(f, p)| (*f, p.clone())).collect();
+        let batches = plan_batches(&universe, &modules, &file_paths, BatchBudget::files(2));
+        assert!(batches.len() >= 3, "{} modules in {} batches", modules.len(), batches.len());
+        let mdo_files = crate::graph::mdo_files::mdo_files(
+            &project.configs,
+            &bsl_conventions::PathSetTree::from_files(
+                universe.stats.iter().map(|stat| PathBuf::from(&stat.path)),
+            ),
+        );
+        let source_root = build_source_root(files);
+
+        let caches: Mutex<Vec<Weak<ide::GraphConfigCache>>> = Mutex::default();
+        let alive_at_open: Mutex<Vec<usize>> = Mutex::default();
+        let mut open_batch = |batch: &[ModuleId]| -> RootDatabaseImpl {
+            let alive =
+                caches.lock().unwrap().iter().filter(|cache| cache.strong_count() > 0).count();
+            alive_at_open.lock().unwrap().push(alive);
+            let cache = Arc::new(ide::GraphConfigCache::default());
+            caches.lock().unwrap().push(Arc::downgrade(&cache));
+            let batch_files: Vec<(FileId, PathBuf)> =
+                batch.iter().map(|m| (m.file_id, file_paths[&m.file_id].clone())).collect();
+            db_for_files(&source_root, &batch_files, &project.configs, Some(&cache)).db
+        };
+        let mut rows = 0usize;
+        let mut sink = |nodes: &[NodeRow],
+                        edges: &[EdgeRow]|
+         -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            rows += nodes.len() + edges.len();
+            Ok(())
+        };
+        ide::build_workspace_graph_rows(
+            &modules,
+            &paths,
+            Some(&project.workspace_root),
+            &mdo_files,
+            &batches,
+            &mut open_batch,
+            &mut sink,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(rows > 0, "the build projected something");
+        let alive_at_open = alive_at_open.into_inner().unwrap();
+        let caches = caches.into_inner().unwrap();
+        // Four passes (index, calls, queries, forms) over at least three batches.
+        assert!(alive_at_open.len() >= 12, "{alive_at_open:?}");
+        assert_eq!(caches.len(), alive_at_open.len());
+        assert!(
+            alive_at_open.iter().all(|&alive| alive <= 1),
+            "an earlier batch database beside the one being dropped: {alive_at_open:?}"
+        );
+        assert!(
+            caches.iter().all(|cache| cache.strong_count() == 0),
+            "a batch database outlived the build"
+        );
+    }
+
+    /// Two declarations of one name in one module share an id, and the store keeps
+    /// the first row it is given: the build hands it the first declaration, so the
+    /// stored anchor is the same every build instead of whichever a hash order led
+    /// with.
+    #[test]
+    fn a_namesake_pair_is_stored_by_its_first_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let body = "#Если Сервер Тогда\n\
+                    Процедура Дважды() Экспорт\nКонецПроцедуры\n\
+                    #Иначе\n\
+                    Процедура Дважды() Экспорт\nКонецПроцедуры\n\
+                    #КонецЕсли\n";
+        stage_catalog_workspace(root, body);
+        write_catalog(root);
+        let first = body.find("Дважды").unwrap() as i64;
+        let second = body.rfind("Дважды").unwrap() as i64;
+        assert_ne!(first, second);
+
+        let db = root.join(".build/graph.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let (project, universe) = scanned_project(root);
+        build_graph_database(
+            &project,
+            &universe,
+            &db,
+            stdx::batch::BatchBudget::files(1),
+            &build_meta(),
+        )
+        .unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        let stored: Vec<i64> = conn
+            .prepare("SELECT name_offset FROM nodes WHERE id = 'method/common/Модуль/Дважды'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(stored, [first], "one row, anchored at the first declaration");
     }
 
     /// The full build is the path that places an object: the catalog, role and

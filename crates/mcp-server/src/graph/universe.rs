@@ -224,20 +224,36 @@ pub(crate) fn file_stats_from(set: &SourceSet) -> Vec<FileStat> {
 }
 
 pub(crate) fn file_stats_with_content_errors(set: &SourceSet, roots: &[PathBuf]) -> ContentScan {
-    let mut stats: Vec<FileStat> = Vec::new();
+    // The rows are decided before any byte is read: a second spelling of one
+    // canonical path is dropped here, so the file is read once however the reads
+    // are scheduled.
     let mut seen: HashSet<String> = HashSet::new();
+    let listed: Vec<(&project_model::WalkedFile, String, super::content_hash::StatIdentity)> = set
+        .files
+        .iter()
+        .filter(|file| file.role != FileRole::Ignored)
+        .filter_map(|file| {
+            let path = file.canonical.to_string_lossy().into_owned();
+            seen.insert(path.clone())
+                .then(|| (file, path, super::content_hash::StatIdentity::of(&file.metadata)))
+        })
+        .collect();
+    // Hashing the contents is the scan's cost on a cold cache (7 GB on a large
+    // configuration); each file's hash is independent, so they are read on a pool,
+    // largest first, under a cap on the bytes in flight.
+    let sizes: Vec<u64> = listed.iter().map(|(_, _, stat)| stat.len).collect();
+    let contents = super::byte_budget::map_largest_first(
+        &sizes,
+        super::byte_budget::SCAN_BYTES_IN_FLIGHT,
+        |index| {
+            let (file, _, stat) = &listed[index];
+            super::content_hash::content_of(&file.canonical, *stat)
+        },
+    );
+    let mut stats: Vec<FileStat> = Vec::with_capacity(listed.len());
     let mut content_unreadable = 0;
     let mut hashed = 0;
-    for file in &set.files {
-        if file.role == FileRole::Ignored {
-            continue;
-        }
-        let path = file.canonical.to_string_lossy().into_owned();
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        let stat = super::content_hash::StatIdentity::of(&file.metadata);
-        let content = super::content_hash::content_of(&file.canonical, stat);
+    for ((file, path, stat), content) in listed.into_iter().zip(contents) {
         hashed += usize::from(content.read);
         if content.hash.is_none() {
             content_unreadable += 1;
@@ -626,5 +642,138 @@ mod tests {
         // The scan is name-sorted, so the surviving row is the byte-wise first
         // name — the deterministic winner that replaced the readdir lottery.
         assert_eq!(stats[0].len, 1, "the surviving row must be the first-sorted file's");
+    }
+
+    /// The sequential content pass this scan had before its reads went to a pool,
+    /// kept as the reference the parallel pass is held to.
+    fn reference_content_scan(set: &SourceSet) -> ContentScan {
+        let mut stats: Vec<FileStat> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut content_unreadable = 0;
+        let mut hashed = 0;
+        for file in &set.files {
+            if file.role == FileRole::Ignored {
+                continue;
+            }
+            let path = file.canonical.to_string_lossy().into_owned();
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let stat = super::super::content_hash::StatIdentity::of(&file.metadata);
+            let content = super::super::content_hash::content_of(&file.canonical, stat);
+            hashed += usize::from(content.read);
+            if content.hash.is_none() {
+                content_unreadable += 1;
+            }
+            stats.push(FileStat {
+                path,
+                canonical: file.canonical.clone(),
+                walked: file.walked.clone(),
+                mtime: stat.mtime_ns,
+                len: stat.len,
+                content_hash: content.hash,
+                stat,
+                observed_at_ns: content.observed_at_ns,
+            });
+        }
+        ContentScan { stats, content_unreadable, hashed }
+    }
+
+    fn walked(root: &Path, walked: &Path, canonical: &Path) -> project_model::WalkedFile {
+        project_model::WalkedFile {
+            root: root.to_path_buf(),
+            role: project_model::file_role::file_role(canonical),
+            walked: walked.to_path_buf(),
+            canonical: canonical.to_path_buf(),
+            metadata: fs::metadata(canonical).unwrap(),
+        }
+    }
+
+    /// The content pass on a pool is a scheduling change only: row by row — order,
+    /// hash, stat, whether the bytes were observed — and in its counters, it equals
+    /// the sequential pass, over a set with an entry that cannot be read whoever runs
+    /// the test (a directory), one closed by permissions, and two spellings of one
+    /// canonical path.
+    #[cfg(unix)]
+    #[test]
+    fn the_parallel_content_pass_equals_the_sequential_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut files = Vec::new();
+        for index in 0..46u32 {
+            let path = if index % 5 == 0 {
+                root.join(format!("Catalogs/Obj{index}.xml"))
+            } else {
+                root.join(format!("CommonModules/M{index}/Ext/Module.bsl"))
+            };
+            write(
+                &path,
+                &format!(
+                    "Процедура П{index}() Экспорт КонецПроцедуры {}",
+                    "x".repeat((index * 97 % 500) as usize)
+                ),
+            );
+            files.push(walked(&root, &path, &path));
+        }
+        // A directory named like a module: `read` fails with EISDIR for every user.
+        let directory = root.join("CommonModules/Dir/Ext/Module.bsl");
+        fs::create_dir_all(&directory).unwrap();
+        files.insert(3, walked(&root, &directory, &directory));
+        // Two spellings of one file: the second row is dropped, the file read once.
+        let twice = root.join("CommonModules/M1/Ext/Module.bsl");
+        let link = root.join("Link/Module.bsl");
+        files.insert(20, walked(&root, &link, &twice));
+        // Closed by permissions, unless permissions do not bind this user.
+        let closed = root.join("CommonModules/Closed/Ext/Module.bsl");
+        write(&closed, "Процедура З() КонецПроцедуры");
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+        let closed_binds = fs::read(&closed).is_err();
+        if !closed_binds {
+            eprintln!("skipping the chmod 000 leg: mode 0o000 is not an obstacle for this user");
+        }
+        files.push(walked(&root, &closed, &closed));
+        assert_eq!(files.len(), 49);
+        let set = SourceSet {
+            files,
+            unreadable: 0,
+            loops: 0,
+            dangling: 0,
+            canonicalizations: 0,
+            canonical_fallbacks: 0,
+        };
+
+        // Each pass starts with nothing remembered under the root, so both read every
+        // file however long the set-up took against the racy window of a fresh write.
+        let forget = || {
+            super::super::content_hash::retain_listed(std::slice::from_ref(&root), &HashSet::new())
+        };
+        forget();
+        let expected = reference_content_scan(&set);
+        forget();
+        let actual = file_stats_with_content_errors(&set, &[]);
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(actual.hashed, expected.hashed);
+        assert_eq!(actual.hashed, 48, "every distinct canonical path is read once");
+        assert_eq!(actual.content_unreadable, expected.content_unreadable);
+        assert_eq!(actual.content_unreadable, 1 + usize::from(closed_binds));
+        assert_eq!(actual.stats.len(), expected.stats.len());
+        for (actual, expected) in actual.stats.iter().zip(&expected.stats) {
+            assert_eq!(actual.path, expected.path);
+            assert_eq!(actual.canonical, expected.canonical);
+            assert_eq!(actual.walked, expected.walked);
+            assert_eq!(actual.content_hash, expected.content_hash, "{}", actual.path);
+            assert_eq!(actual.stat, expected.stat);
+            assert_eq!(actual.len, expected.len);
+            assert_eq!(actual.mtime, expected.mtime);
+            assert_eq!(actual.observed_at_ns.is_some(), expected.observed_at_ns.is_some());
+        }
+        assert!(actual.stats.iter().any(|stat| stat.canonical == twice && stat.walked == twice));
+        assert!(
+            !actual.stats.iter().any(|stat| stat.walked == link),
+            "the second spelling is dropped"
+        );
     }
 }
