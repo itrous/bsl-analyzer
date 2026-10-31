@@ -454,6 +454,8 @@ fn collect_sdbl_hir_single_pass(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         }
     }
 
+    handlers::query_to_missing_metadata::drop_substituted_templates(ctx, &mut diagnostics);
+
     diagnostics
 }
 

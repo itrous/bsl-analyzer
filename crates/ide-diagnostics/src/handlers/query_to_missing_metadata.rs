@@ -41,11 +41,83 @@ pub(crate) fn dispatch(
 }
 
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
-    crate::sdbl_utils::collect_sdbl_via_dispatch(
+    let mut diagnostics = crate::sdbl_utils::collect_sdbl_via_dispatch(
         ctx,
         DiagnosticCode::QueryToMissingMetadata,
         dispatch,
-    )
+    );
+    drop_substituted_templates(ctx, &mut diagnostics);
+    diagnostics
+}
+
+// The runner pass does not call `check`, so it applies this filter itself; without it the
+// module-aware narrowing would exist only in a path production never takes.
+pub(crate) fn drop_substituted_templates(
+    ctx: &DiagnosticsContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !diagnostics.iter().any(|d| d.code == DiagnosticCode::QueryToMissingMetadata) {
+        return;
+    }
+    let needles = substituted_needles(ctx);
+    if needles.is_empty() {
+        return;
+    }
+    diagnostics.retain(|d| {
+        d.code != DiagnosticCode::QueryToMissingMetadata
+            || !path_has_substituted_segment(&d.message, &needles)
+    });
+}
+
+// A query text kept as a template has a placeholder inside the table path that the module
+// replaces at run time; without this the placeholder is reported as a missing table forever.
+fn substituted_needles(ctx: &DiagnosticsContext) -> Vec<String> {
+    use syntax::SyntaxKind;
+    let root = ctx.parse().syntax_node();
+    let mut needles = Vec::new();
+    for tok in root.descendants_with_tokens().filter_map(|e| e.into_token()) {
+        if tok.kind() != SyntaxKind::IDENT {
+            continue;
+        }
+        // `eq_ignore_ascii_case` folds ASCII only, so a Russian name has to be folded in full:
+        // a module that writes `стрзаменить` would otherwise keep the false finding.
+        let name = tok.text().to_lowercase();
+        if name != "стрзаменить" && name != "strreplace" {
+            continue;
+        }
+        let Some(call) =
+            tok.parent().and_then(|p| p.ancestors().find(|n| n.kind() == SyntaxKind::CALL_EXPR))
+        else {
+            continue;
+        };
+        let Some(arg_list) = call.children().find(|n| n.kind() == SyntaxKind::ARG_LIST) else {
+            continue;
+        };
+        let Some(second) = arg_list.children().filter(|n| n.kind() == SyntaxKind::EXPR).nth(1)
+        else {
+            continue;
+        };
+        let Some(literal) = second.descendants().find(|n| n.kind() == SyntaxKind::LITERAL) else {
+            continue;
+        };
+        if let Some(content) = crate::sdbl_utils::extract_string_content(&literal) {
+            if !content.is_empty() {
+                needles.push(content);
+            }
+        }
+    }
+    needles
+}
+
+// Whole-segment comparison only: a substring match would silence real misses whose name merely
+// contains the substituted text.
+fn path_has_substituted_segment(message: &str, needles: &[String]) -> bool {
+    let Some(path) = message.split('"').nth(1) else {
+        return false;
+    };
+    path.split('.').any(|segment| {
+        needles.iter().any(|needle| segment.to_lowercase() == needle.to_lowercase())
+    })
 }
 
 #[cfg(test)]
@@ -212,5 +284,88 @@ mod tests {
                   message: Источник запроса "CommonModule.MetadataQueries" не разрешается в таблицу метаданных конфигурации
                   severity: Blocker"#]],
         );
+    }
+
+    const DOCUMENT_CONFIG_XML: &str = r#"
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Configuration uuid="00000000-0000-0000-0000-000000000000">
+        <Properties>
+            <Name>TestConfiguration</Name>
+        </Properties>
+        <ChildObjects>
+            <Document>РеализацияТоваров</Document>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>
+"#;
+
+    #[test]
+    fn a_template_table_name_substituted_in_the_module_is_not_a_missing_table() {
+        let diagnostics = crate::test_utils::check_with_config_xml(
+            r#"
+Процедура Тест(КлючЗначение) Экспорт
+    Шаблон =
+    "ВЫБРАТЬ
+    |	Товары.Ссылка КАК Ссылка
+    |ИЗ
+    |	Документ.ИмяВидаДокумента.Товары КАК Товары";
+
+    Блок = СтрЗаменить(Шаблон, "ИмяВидаДокумента", КлючЗначение.Ключ);
+КонецПроцедуры
+"#,
+            DOCUMENT_CONFIG_XML,
+            &[],
+        );
+        let found: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::QueryToMissingMetadata)
+            .collect();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn the_same_literal_without_the_substitution_is_still_reported() {
+        let diagnostics = crate::test_utils::check_with_config_xml(
+            r#"
+Процедура Тест(КлючЗначение) Экспорт
+    Шаблон =
+    "ВЫБРАТЬ
+    |	Товары.Ссылка КАК Ссылка
+    |ИЗ
+    |	Документ.ИмяВидаДокумента.Товары КАК Товары";
+КонецПроцедуры
+"#,
+            DOCUMENT_CONFIG_XML,
+            &[],
+        );
+        let found: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::QueryToMissingMetadata)
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn the_substitution_is_recognised_whatever_case_its_name_is_written_in() {
+        let diagnostics = crate::test_utils::check_with_config_xml(
+            r#"
+Процедура Тест(КлючЗначение) Экспорт
+    Шаблон =
+    "ВЫБРАТЬ
+    |	Товары.Ссылка КАК Ссылка
+    |ИЗ
+    |	Документ.ИмяВидаДокумента.Товары КАК Товары";
+
+    Блок = стрзаменить(Шаблон, "ИмяВидаДокумента", КлючЗначение.Ключ);
+КонецПроцедуры
+"#,
+            DOCUMENT_CONFIG_XML,
+            &[],
+        );
+        let found: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::QueryToMissingMetadata)
+            .collect();
+        assert!(found.is_empty(), "{found:?}");
     }
 }
