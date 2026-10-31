@@ -3364,3 +3364,81 @@ fn query_nested_fields_ends_a_walk_through_a_self_containing_defined_type() {
         0
     );
 }
+
+fn config_with_owned_tabular_sections() -> bsl_metadata::Configuration {
+    use bsl_metadata::{
+        tabular_section::{TabularSection, TabularSectionAttribute},
+        MdoType, MetadataObject,
+    };
+
+    let uuid_nil = *TabularSection::new(Default::default(), "temp").uuid();
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    for (mdo_type, name, section) in [
+        (MdoType::Document, "Заказ", "Товары"),
+        (MdoType::Document, "Счет", "Товары"),
+        (MdoType::Catalog, "Клиенты", "Телефоны"),
+    ] {
+        let mut object = MetadataObject::new(mdo_type, name);
+        let mut ts = TabularSection::new(uuid_nil, section);
+        ts.set_attributes(vec![TabularSectionAttribute::new(
+            uuid_nil,
+            "Количество",
+            parse_attr_type_for_test("Number"),
+        )]);
+        object.add_tabular_section(ts);
+        config.add_metadata_object(object);
+    }
+    config
+}
+
+fn join_null_check_count(package: &SdblPackage) -> usize {
+    single_query_hir(package)
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, crate::SdblDiagnostic::FieldsFromJoinWithoutNullCheck { .. }))
+        .count()
+}
+
+/// Resolved metadata does not change the owner proof: the resolved owner of a tabular
+/// section joined by its ref is not reported, the resolved owner of another object is.
+#[test]
+fn owner_proof_holds_with_resolved_metadata() {
+    let metadata = std::sync::Arc::new(config_with_owned_tabular_sections());
+    let lower = |code: &str| {
+        lower_sdbl_to_hir(&parser::parse_sdbl(code), Some(std::sync::Arc::clone(&metadata)))
+    };
+
+    for code in [
+        "ВЫБРАТЬ Заказ.Дата ИЗ Документ.Заказ.Товары КАК Товары ЛЕВОЕ СОЕДИНЕНИЕ Документ.Заказ КАК Заказ ПО Товары.Ссылка = Заказ.Ссылка",
+        "ВЫБРАТЬ Клиент.Наименование ИЗ Справочник.Клиенты.Телефоны КАК Телефоны ЛЕВОЕ СОЕДИНЕНИЕ Справочник.Клиенты КАК Клиент ПО Телефоны.Ссылка = Клиент.Ссылка",
+    ] {
+        let package = lower(code);
+        let hir = single_query_hir(&package);
+        assert!(hir.from[0].is_resolved() && hir.joins[0].table.is_resolved(), "{code}");
+        assert_eq!(join_null_check_count(&package), 0, "{code}");
+    }
+
+    let other_owner = lower(
+        "ВЫБРАТЬ Счет.Дата ИЗ Документ.Заказ.Товары КАК Товары ЛЕВОЕ СОЕДИНЕНИЕ Документ.Счет КАК Счет ПО Товары.Ссылка = Счет.Ссылка",
+    );
+    assert!(single_query_hir(&other_owner).joins[0].table.is_resolved());
+    assert_eq!(join_null_check_count(&other_owner), 1);
+}
+
+/// A cross join has no optional side: the same query that reports a left join's field is
+/// silent once the join type is cross.
+#[test]
+fn cross_join_has_no_optional_side() {
+    let mut hir = lower_query(
+        "ВЫБРАТЬ Ставки.Ставка ИЗ Документ.Заказ.Товары КАК Товары ЛЕВОЕ СОЕДИНЕНИЕ РегистрСведений.Ставки КАК Ставки ПО Товары.Номенклатура = Ставки.Номенклатура",
+    );
+    let check = |hir: &SdblHir| {
+        let mut ctx = super::context::LoweringContext::new(None);
+        ctx.check_joins_for_unprotected_fields(hir);
+        ctx.diagnostics.len()
+    };
+
+    assert_eq!(check(&hir), 1);
+    hir.joins[0].join_type = JoinType::Cross;
+    assert_eq!(check(&hir), 0);
+}

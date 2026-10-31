@@ -297,3 +297,101 @@ fn join_field_is_reported_under_default_config() {
     assert_eq!(text_under(&source, &found[0]), "Цены.Цена");
     assert_eq!(found[0].message, JOIN_MESSAGE);
 }
+
+/// The module of issue #768, kept as the handler's fixture.
+const ISSUE_768_MODULE: &str =
+    include_str!("../../../ide-diagnostics/src/handlers/fixtures/fields_from_joins_issue_768.bsl");
+
+/// Under the default config only the product of case 4 is reported: the owner of a tabular
+/// section, the branch under a comparison of the same side and the field used only in a
+/// condition are silent, while the same factor inside ЕСТЬNULL in case 5 is protected.
+#[test]
+fn issue_768_module_reports_only_the_unprotected_product() {
+    let found = diagnostics(ISSUE_768_MODULE, &DiagnosticsConfig::default());
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(text_under(ISSUE_768_MODULE, &found[0]), "Ставки.Ставка");
+    assert_eq!(found[0].message, JOIN_MESSAGE);
+    let case_4 = ISSUE_768_MODULE.find("Функция СуммаСНалогом()").unwrap();
+    let case_5 = ISSUE_768_MODULE.find("Функция СуммаСНалогомЕстьNull()").unwrap();
+    assert!((case_4..case_5).contains(&usize::from(found[0].range.start())), "{found:?}");
+}
+
+const RATES: &str = "ИЗ Документ.Заказ.Товары КАК Товары ЛЕВОЕ СОЕДИНЕНИЕ РегистрСведений.Ставки КАК Ставки ПО Товары.Номенклатура = Ставки.Номенклатура";
+
+/// A field of the optional side used only in a condition does not reach the result; selecting
+/// it next to the same condition is still reported.
+#[test]
+fn a_field_used_only_in_a_condition_is_not_reported() {
+    assert_eq!(
+        reported(&module(&format!(
+            "ВЫБРАТЬ Товары.Номенклатура {RATES} ГДЕ Ставки.Ставка = &Ставка"
+        ))),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        reported(&module(&format!("ВЫБРАТЬ Ставки.Код {RATES} ГДЕ Ставки.Ставка = &Ставка"))),
+        vec!["Ставки.Код"]
+    );
+}
+
+/// The raw uses of the field are reported each, the one inside ЕСТЬNULL is not.
+#[test]
+fn each_raw_use_in_the_result_is_reported() {
+    let source = module(&format!(
+        "ВЫБРАТЬ Ставки.Ставка КАК А, Товары.Сумма * Ставки.Ставка КАК Б, ЕСТЬNULL(Ставки.Ставка, 0) КАК В {RATES}"
+    ));
+    let found = diagnostics(&source, &rule_enabled());
+
+    assert_eq!(found.len(), 2, "{found:?}");
+    let protected = source.find("ЕСТЬNULL(Ставки.Ставка").unwrap();
+    assert!(found.iter().all(|d| usize::from(d.range.start()) < protected), "{found:?}");
+    assert!(found.iter().all(|d| text_under(&source, d) == "Ставки.Ставка"), "{found:?}");
+}
+
+/// A schedule value is NULL in a present row, so a condition on it is still a use and a
+/// comparison of the row's other field does not protect it.
+#[test]
+fn schedule_data_value_keeps_its_conditions_and_guards() {
+    let value = "ДанныеГрафика.ЧасыПериодДействия";
+    for query in [
+        format!("ВЫБРАТЬ ДанныеГрафика.НомерСтроки КАК Н ИЗ {SCHEDULE_SOURCE} ГДЕ {value} > 0"),
+        format!("ВЫБРАТЬ ВЫБОР КОГДА {value} > 0 ТОГДА 1 ИНАЧЕ 0 КОНЕЦ КАК Н ИЗ {SCHEDULE_SOURCE}"),
+        format!("ВЫБРАТЬ ВЫБОР КОГДА ДанныеГрафика.НомерСтроки <> 0 ТОГДА {value} ИНАЧЕ 0 КОНЕЦ КАК Н ИЗ {SCHEDULE_SOURCE}"),
+    ] {
+        let source = module(&query);
+        let found = diagnostics(&source, &rule_enabled());
+        assert_eq!(found.len(), 1, "{query}: {found:?}");
+        assert_eq!(text_under(&source, &found[0]), value, "{query}");
+        assert_eq!(found[0].message, SCHEDULE_DATA_MESSAGE, "{query}");
+    }
+}
+
+/// On the optional side of a left join the comparison of the row's field proves the row, not
+/// the schedule value: the join is silent and the value is reported once as schedule data.
+#[test]
+fn schedule_data_value_under_a_row_comparison_on_a_join_side_is_reported_once() {
+    let source = module(&format!(
+        "ВЫБРАТЬ ВЫБОР КОГДА ДанныеГрафика.НомерСтроки <> 0 ТОГДА {SCHEDULE_FIELD} ИНАЧЕ 0 КОНЕЦ КАК Н ИЗ Документ.Движение КАК Движение ЛЕВОЕ СОЕДИНЕНИЕ {SCHEDULE_SOURCE} ПО Движение.Ссылка = ДанныеГрафика.Регистратор"
+    ));
+    let found = diagnostics(&source, &rule_enabled());
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(text_under(&source, &found[0]), SCHEDULE_FIELD);
+    assert_eq!(found[0].message, SCHEDULE_DATA_MESSAGE);
+}
+
+/// Disabling the code silences both the join and the schedule reports that the default
+/// config produces.
+#[test]
+fn disabled_rule_reports_nothing() {
+    let config = DiagnosticsConfig { disabled: vec![CODE], ..DiagnosticsConfig::default() };
+    let join = module(
+        "ВЫБРАТЬ Товары.Наименование КАК Наименование, Цены.Цена КАК Цена ИЗ Справочник.Товары КАК Товары ЛЕВОЕ СОЕДИНЕНИЕ РегистрСведений.Цены КАК Цены ПО Цены.Товар = Товары.Ссылка",
+    );
+
+    assert_eq!(diagnostics(&join, &DiagnosticsConfig::default()).len(), 1);
+    assert_eq!(diagnostics(&join, &config), Vec::<Diagnostic>::new());
+    assert_eq!(diagnostics(UNPROTECTED_PROCEDURE, &DiagnosticsConfig::default()).len(), 1);
+    assert_eq!(diagnostics(UNPROTECTED_PROCEDURE, &config), Vec::<Diagnostic>::new());
+}
