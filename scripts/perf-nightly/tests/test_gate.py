@@ -282,6 +282,30 @@ class Order(GateCase):
         code, summary, _ = self.gate(label="g2")
         self.assertEqual((code, summary["verdict"]), (0, "pass"))
 
+    def test_more_work_for_a_shorter_wait_passes_and_the_report_says_why(self):
+        self.script.values["wall"] = candidate_slower(0.55)
+        self.script.values["cpu"] = lambda run: 49.6 if run.role == "c" else 40.0
+        code, summary, _ = self.gate("--ready-only")
+        self.assertEqual((code, summary["verdict"]), (0, "probe-ok"))
+        cpu = self.row(summary, "graph_ready_cpu_s")
+        self.assertEqual((cpu["outcome"], cpu["basis"]), ("ok", "growth_traded"))
+        self.assertAlmostEqual(cpu["delta"], 0.24)
+        self.assertAlmostEqual(cpu["wall_delta"], -0.45)
+        with open(self.data.path("gates", "g1", "report.md"), encoding="utf-8") as fh:
+            report = fh.read()
+        self.assertIn("рост CPU принят как размен на ускорение", report)
+        self.assertIn("Δ стены -45.0%, Δ CPU +24.0%", report)
+
+    def test_more_work_without_a_shorter_wait_blocks_and_the_report_says_why(self):
+        self.script.values["cpu"] = lambda run: 49.6 if run.role == "c" else 40.0
+        code, summary, _ = self.gate("--ready-only")
+        self.assertEqual((code, summary["verdict"]), (1, "block"))
+        self.assertEqual(self.row(summary, "graph_ready_cpu_s")["basis"], "growth_not_repaid")
+        with open(self.data.path("gates", "g1", "report.md"), encoding="utf-8") as fh:
+            report = fh.read()
+        self.assertIn("блок: рост CPU больше 5 % не окуплен сокращением стены", report)
+        self.assertIn("Δ стены +0.0%, Δ CPU +24.0%", report)
+
     def test_a_wait_regression_above_a_small_noise_blocks_without_a_second_round(self):
         self.script.values["wall"] = candidate_slower(1.5)
         code, summary, _ = self.gate()

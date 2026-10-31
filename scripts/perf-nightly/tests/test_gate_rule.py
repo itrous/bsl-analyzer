@@ -73,6 +73,74 @@ class DecisiveMetrics(unittest.TestCase):
             self.assertIn(rows[-1]["outcome"], result["reasons"][0])
 
 
+class CpuTradedForWall(unittest.TestCase):
+    """More CPU time is accepted where the wall time fell by at least as much;
+    the machine has idle cores, the user waits for the wall."""
+
+    NOISE = noise_of(graph_ready_s=0.03, graph_ready_cpu_s=0.01, graph_resolve_s=0.01, diagnostics_workspace_s=0.01)
+
+    def rows(self, wall, cpu, noise=None):
+        base = [record(k + 1, graph_ready_s=100.0, graph_ready_cpu_s=40.0) for k in range(3)]
+        cand = [record(k + 1, graph_ready_s=100.0 * (1 + wall), graph_ready_cpu_s=40.0 * (1 + cpu))
+                for k in range(3)]
+        rows = gate.rule_rows(base, cand, noise or self.NOISE, True)
+        return {r["metric"]: r for r in rows}
+
+    def test_a_faster_wall_pays_for_the_growth_of_cpu(self):
+        rows = self.rows(-0.45, 0.24)
+        cpu = rows["graph_ready_cpu_s"]
+        self.assertEqual((cpu["outcome"], cpu["basis"]), ("ok", "growth_traded"))
+        self.assertAlmostEqual(cpu["delta"], 0.24)
+        self.assertAlmostEqual(cpu["wall_delta"], -0.45)
+        self.assertEqual(rows["graph_ready_s"]["outcome"], "ok")
+        self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "pass")
+
+    def test_growth_without_a_faster_wall_blocks(self):
+        for wall in (0.01, 0.0):
+            with self.subTest(wall=wall):
+                cpu = self.rows(wall, 0.24)["graph_ready_cpu_s"]
+                self.assertEqual((cpu["outcome"], cpu["basis"]), ("block", "growth_not_repaid"))
+
+    def test_growth_larger_than_the_gain_of_the_wall_blocks(self):
+        rows = self.rows(-0.10, 0.30)
+        self.assertEqual(rows["graph_ready_cpu_s"]["outcome"], "block")
+        self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "block")
+
+    def test_growth_within_the_bar_passes_without_a_note(self):
+        cpu = self.rows(-0.45, 0.03)["graph_ready_cpu_s"]
+        self.assertEqual((cpu["outcome"], cpu["basis"]), ("ok", None))
+        self.assertEqual(self.rows(0.0, 0.05)["graph_ready_cpu_s"]["outcome"], "ok")
+
+    def test_the_gain_of_the_wall_must_reach_the_growth(self):
+        # Equal: traded; a hair less gain: not. The wall at -24 % and at -23.9 % is far from the wall's own limit.
+        self.assertEqual(gate.cpu_outcome(0.24, -0.24, 0.01), ("ok", "growth_traded"))
+        self.assertEqual(gate.cpu_outcome(0.24, -0.239, 0.01), ("block", "growth_not_repaid"))
+        self.assertEqual(gate.cpu_outcome(0.0501, -0.0501, 0.01), ("ok", "growth_traded"))
+        self.assertEqual(gate.cpu_outcome(0.0501, None, 0.01), ("block", "growth_not_repaid"))
+
+    def test_a_noisy_cpu_time_never_passes_however_fast_the_wall(self):
+        for cpu_noise, expected in ((0.06, "noisy"), (None, "no_noise")):
+            with self.subTest(noise=cpu_noise):
+                noise = noise_of(graph_ready_s=0.03, graph_ready_cpu_s=cpu_noise)
+                for cpu_delta in (0.24, 0.03, 0.0):
+                    rows = self.rows(-0.45, cpu_delta, noise)
+                    self.assertEqual(rows["graph_ready_cpu_s"]["outcome"], expected)
+                    self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "incomplete")
+
+    def test_only_the_cpu_of_readiness_is_traded(self):
+        # Resolve and sweep time are held to the bar with no wall to pay for them.
+        base, cand = side(40.0, 40.0, 40.0), side(49.6, 49.6, 49.6)
+        for r in cand:
+            r["metrics"]["graph_ready_s"] = 55.0
+        for r in base:
+            r["metrics"]["graph_ready_s"] = 100.0
+        rows = {r["metric"]: r for r in gate.rule_rows(base, cand, self.NOISE, False)}
+        self.assertEqual(rows["graph_ready_cpu_s"]["outcome"], "ok")
+        self.assertEqual(rows["graph_resolve_s"]["outcome"], "block")
+        self.assertEqual(rows["diagnostics_workspace_s"]["outcome"], "block")
+        self.assertNotIn("basis", rows["graph_resolve_s"])
+
+
 class WallMetric(unittest.TestCase):
     def test_wall_within_noise_needs_confirmation(self):
         # The measurement of 2026-10-29: base 332.4 / 412.4 / 364.4, candidate 428.5 / 444.4 / 358.4.

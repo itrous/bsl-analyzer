@@ -509,9 +509,23 @@ def _delta(base: float, cand: float) -> float:
     return 0.0 if cand == base else math.inf
 
 
+def cpu_outcome(delta: float, wall_delta: float | None, noise: float | None) -> tuple[str, str | None]:
+    """Outcome and the ground of the rule for `graph_ready_cpu_s`. More work
+    over the bar blocks unless the wall time fell by at least as much: the
+    machine has idle cores, the user waits for the wall. The noise of the CPU
+    time is held to the bar as for any work metric."""
+    outcome = verdict.gate_outcome("graph_ready_cpu_s", delta, noise)
+    if outcome != "block":
+        return outcome, None
+    if wall_delta is not None and -wall_delta >= delta:
+        return "ok", "growth_traded"
+    return "block", "growth_not_repaid"
+
+
 def rule_rows(base: list, cand: list, noise: dict, ready_only: bool) -> list[dict]:
     keys = READY_ONLY_METRICS if ready_only else (*verdict.GATE_WALL, *verdict.GATE_DECISIVE)
     rows = []
+    wall_delta = None
     for key in keys:
         metric = METRICS[key]
         b_state, b_value = side(base, metric)
@@ -525,7 +539,13 @@ def rule_rows(base: list, cand: list, noise: dict, ready_only: bool) -> list[dic
         outcome = side_outcome(b_state, c_state)
         if outcome is None:
             row["delta"] = _delta(b_value, c_value)
-            outcome = verdict.gate_outcome(key, row["delta"], nu)
+            if key == "graph_ready_cpu_s":
+                outcome, row["basis"] = cpu_outcome(row["delta"], wall_delta, nu)
+                row["wall_delta"] = wall_delta
+            else:
+                outcome = verdict.gate_outcome(key, row["delta"], nu)
+        if wall:
+            wall_delta = row["delta"]
         row["outcome"] = outcome
         rows.append(row)
     return rows
@@ -762,6 +782,12 @@ def _gate(args, clock, builder, machine, data: Data, out_dir: str, summary: dict
 # -- report ---------------------------------------------------------------------------
 
 
+CPU_BASIS = {
+    "growth_traded": "рост CPU принят как размен на ускорение (сокращение стены не меньше роста CPU)",
+    "growth_not_repaid": "блок: рост CPU больше 5 % не окуплен сокращением стены",
+}
+
+
 def _pct(value) -> str:
     return "-" if value is None else f"{value * 100:+.1f}%"
 
@@ -797,6 +823,11 @@ def write_report(out_dir: str, summary: dict) -> None:
         if wall is not None and wall["noise"] is not None:
             lines += ["", f"Стеночная метрика решает от Δ > max(5 %, ν) = {wall['limit'] * 100:.1f} % "
                           f"(ν = {wall['noise'] * 100:.1f} %); меньший сдвиг стены от шума не отличим.", ""]
+        for row in rows:
+            basis = CPU_BASIS.get(row.get("basis"))
+            if basis:
+                lines += [f"- {row['metric']}: {basis}; Δ стены {_pct(row.get('wall_delta'))}, "
+                          f"Δ CPU {_pct(row['delta'])}.", ""]
     ceilings = summary.get("ceilings") or []
     if ceilings:
         lines += ["## Потолки", "", "| метрика | кандидат | предел | исход |", "|---|---|---|---|"]
