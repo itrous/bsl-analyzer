@@ -96,15 +96,22 @@ pub(crate) fn is_substituted_template(
         }
         _ => return false,
     };
-    calls
-        .iter()
-        .filter(|call| result_is_used(call))
-        .filter_map(|call| {
-            let search = string_literal(&argument(call, 1)?)?;
-            let replacement = argument(call, 2).and_then(|arg| string_literal(&arg));
-            (replacement.as_ref() != Some(&search)).then_some(search)
-        })
-        .any(|search| table_name.split('.').any(|segment| segment == search))
+    // A replacement by the search string itself leaves the placeholder in a text that may run, so
+    // one such call keeps the finding whatever the other calls replace.
+    let mut substituted = false;
+    for call in calls.iter().filter(|call| result_is_used(call)) {
+        let Some(search) = argument(call, 1).and_then(|arg| string_literal(&arg)) else {
+            continue;
+        };
+        if !table_name.split('.').any(|segment| segment == search) {
+            continue;
+        }
+        if argument(call, 2).and_then(|arg| string_literal(&arg)).as_ref() == Some(&search) {
+            return false;
+        }
+        substituted = true;
+    }
+    substituted
 }
 
 fn string_literal(node: &SyntaxNode) -> Option<String> {
@@ -655,5 +662,20 @@ mod tests {
 "#,
         );
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_replacement_that_keeps_the_text_beside_one_that_changes_it_is_still_reported() {
+        let found = missing_tables(
+            r#"
+Процедура Тест() Экспорт
+    Шаблон = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Исправленный = СтрЗаменить(Шаблон, "ИмяВидаДокумента", "РеализацияТоваров");
+    Неизмененный = СтрЗаменить(Шаблон, "ИмяВидаДокумента", "ИмяВидаДокумента");
+    Запрос = Новый Запрос(Неизмененный);
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 }
