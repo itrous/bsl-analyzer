@@ -115,9 +115,8 @@ fn path_has_substituted_segment(message: &str, needles: &[String]) -> bool {
     let Some(path) = message.split('"').nth(1) else {
         return false;
     };
-    path.split('.').any(|segment| {
-        needles.iter().any(|needle| segment.to_lowercase() == needle.to_lowercase())
-    })
+    path.split('.')
+        .any(|segment| needles.iter().any(|needle| segment.to_lowercase() == needle.to_lowercase()))
 }
 
 #[cfg(test)]
