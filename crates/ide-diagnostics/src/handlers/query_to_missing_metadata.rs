@@ -55,10 +55,11 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 /// `СтрЗаменить` / `StrReplace` before it runs, replacing a whole segment of `table_name`.
 ///
 /// Such a template parses cleanly, so its placeholder would otherwise be reported as a missing
-/// table forever. The replacement is tied to this query: its first argument is the literal
+/// table forever. The replacements are tied to this query: their first argument is the literal
 /// itself or the variable the literal is assigned to, used later in the same method only by
-/// such replacements, and its result is used. The search string must equal a whole segment, case included, as the platform
-/// searches: a substring match would silence real misses whose name merely contains it.
+/// such replacements, and every one whose result is used replaces a whole segment of the path.
+/// The search string must equal the segment, case included, as the platform searches: a
+/// substring match would silence real misses whose name merely contains it.
 pub(crate) fn is_substituted_template(
     root: &SyntaxNode,
     literal_range: TextRange,
@@ -96,22 +97,17 @@ pub(crate) fn is_substituted_template(
         }
         _ => return false,
     };
-    // A replacement by the search string itself leaves the placeholder in a text that may run, so
-    // one such call keeps the finding whatever the other calls replace.
-    let mut substituted = false;
-    for call in calls.iter().filter(|call| result_is_used(call)) {
-        let Some(search) = argument(call, 1).and_then(|arg| string_literal(&arg)) else {
-            continue;
-        };
-        if !table_name.split('.').any(|segment| segment == search) {
-            continue;
-        }
-        if argument(call, 2).and_then(|arg| string_literal(&arg)).as_ref() == Some(&search) {
-            return false;
-        }
-        substituted = true;
-    }
-    substituted
+    // Each used result may be the text that runs, so every one of them has to replace a whole
+    // segment of this path, and by something other than the search string itself.
+    let mut used = calls.iter().filter(|call| result_is_used(call)).peekable();
+    used.peek().is_some()
+        && used.all(|call| {
+            let Some(search) = argument(call, 1).and_then(|arg| string_literal(&arg)) else {
+                return false;
+            };
+            table_name.split('.').any(|segment| segment == search)
+                && argument(call, 2).and_then(|arg| string_literal(&arg)).as_ref() != Some(&search)
+        })
 }
 
 fn string_literal(node: &SyntaxNode) -> Option<String> {
@@ -673,6 +669,21 @@ mod tests {
     Исправленный = СтрЗаменить(Шаблон, "ИмяВидаДокумента", "РеализацияТоваров");
     Неизмененный = СтрЗаменить(Шаблон, "ИмяВидаДокумента", "ИмяВидаДокумента");
     Запрос = Новый Запрос(Неизмененный);
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_template_also_replaced_elsewhere_is_still_reported() {
+        let found = missing_tables(
+            r#"
+Процедура Тест() Экспорт
+    Шаблон = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Исправленный = СтрЗаменить(Шаблон, "ИмяВидаДокумента", "РеализацияТоваров");
+    БезИзменений = СтрЗаменить(Шаблон, "НесуществующийФрагмент", "X");
+    Запрос = Новый Запрос(БезИзменений);
 КонецПроцедуры
 "#,
         );
