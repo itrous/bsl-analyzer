@@ -11,31 +11,37 @@ use bsl_metadata::MdoType;
 use stdx::case::CaseExt;
 
 impl LoweringContext<'_> {
-    /// Reports fields of the optional side of an outer join that are used without NULL
-    /// handling.
+    /// Reports fields of the optional side of an outer join that reach the query result
+    /// without NULL handling.
     ///
     /// Rows of the preserved side that found no pair get NULL in every field of the
-    /// optional side. NULL is neither zero nor an empty string: arithmetic and comparisons
-    /// with it yield NULL, so a field used as a value has to be replaced through `ЕСТЬNULL`
-    /// or reached only after an `ЕСТЬ NULL` test. One diagnostic per join lists every
-    /// unprotected use, so the fix can be made in one place.
+    /// optional side. NULL is neither zero nor an empty string: arithmetic with it yields
+    /// NULL, so a selected value has to be replaced through `ЕСТЬNULL` or reached only after
+    /// a test that the row is present. A use in a condition only filters the row out and is
+    /// not reported. The owner of a tabular section joined by its own ref always has a row,
+    /// so it is not an optional side. One diagnostic per join lists every unprotected use,
+    /// so the fix can be made in one place.
     pub(super) fn check_joins_for_unprotected_fields(&mut self, hir: &SdblHir) {
-        // The preserved side of ПРАВОЕ and the other side of ПОЛНОЕ are the query's own
-        // sources; a source without an alias is referred to by its table name.
-        let sources = hir.from.iter().map(TableRef::effective_name);
+        let owner = owner_present_for_every_row(hir);
 
         for join in &hir.joins {
-            let joined = join.table.effective_name();
-            let optional_sides: Vec<&str> = match join.join_type {
+            // The preserved side of ПРАВОЕ and the other side of ПОЛНОЕ are the query's own
+            // sources.
+            let optional_sides: Vec<&TableRef> = match join.join_type {
                 JoinType::Inner | JoinType::Cross => continue,
-                JoinType::Left => vec![joined],
-                JoinType::Right => sources.clone().collect(),
-                JoinType::Full => std::iter::once(joined).chain(sources.clone()).collect(),
+                JoinType::Left => vec![&join.table],
+                JoinType::Right => hir.from.iter().collect(),
+                JoinType::Full => std::iter::once(&join.table).chain(&hir.from).collect(),
             };
 
             let mut unprotected_fields = Vec::new();
             for side in optional_sides {
-                NullableUses::new(side).collect(hir, &mut unprotected_fields);
+                if owner.is_some_and(|owner| std::ptr::eq(owner, side)) {
+                    continue;
+                }
+                // A source without an alias is referred to by its table name.
+                NullableUses::new(side.effective_name(), NullSource::MissingRow)
+                    .collect(hir, &mut unprotected_fields);
             }
 
             if !unprotected_fields.is_empty() {
@@ -76,7 +82,8 @@ impl LoweringContext<'_> {
             }
 
             let mut uses = Vec::new();
-            NullableUses::new(source.effective_name()).collect(hir, &mut uses);
+            NullableUses::new(source.effective_name(), NullSource::EmptyValue)
+                .collect(hir, &mut uses);
             uses.retain(|field| {
                 is_schedule_data_value_field(&field.field_name)
                     && !reported_by_joins.contains(&field.range)
@@ -713,7 +720,79 @@ fn direct_operands(expr: &ExprHir) -> Vec<&ExprHir> {
     }
 }
 
-/// Uses of one optional join side that may observe its NULL.
+/// The source in a query whose `ИЗ` list is one tabular section and whose one join is its
+/// owner, joined by nothing but the equality of their refs.
+///
+/// Every row of a tabular section belongs to an existing owner, so the owner always has a
+/// row for it. Only this immediate pair is proven: in a chain of joins the flat join list
+/// does not tell which side a nested join preserves. Any other conjunct of the condition
+/// may filter the owner out, so it voids the proof.
+fn owner_present_for_every_row(hir: &SdblHir) -> Option<&TableRef> {
+    let ([source], [join]) = (hir.from.as_slice(), hir.joins.as_slice()) else {
+        return None;
+    };
+    let condition = join.condition.as_ref()?;
+    [(source, &join.table), (&join.table, source)]
+        .into_iter()
+        .find(|(section, owner)| {
+            owns_section(owner, section)
+                && joins_by_refs(condition, section.effective_name(), owner.effective_name())
+        })
+        .map(|(_, owner)| owner)
+}
+
+/// `Документ.X` for `Документ.X.Секция`, and the same for a catalog, in either language.
+fn owns_section(owner: &TableRef, section: &TableRef) -> bool {
+    let ([owner_kind, owner_name], [section_kind, section_name, _]) =
+        (owner.parts.as_slice(), section.parts.as_slice())
+    else {
+        return false;
+    };
+    let kind = |part: &Name| part.as_str().parse::<MdoType>().ok();
+    matches!(kind(owner_kind), Some(MdoType::Document | MdoType::Catalog))
+        && kind(owner_kind) == kind(section_kind)
+        && stdx::case::eq_ignore_case(owner_name.as_str(), section_name.as_str())
+}
+
+/// `Секция.Ссылка = Владелец.Ссылка` in either order, alone or repeated in a conjunction.
+fn joins_by_refs(condition: &ExprHir, section: &str, owner: &str) -> bool {
+    match condition {
+        ExprHir::BinaryOp { lhs, op: BinaryOp::And, rhs, .. } => {
+            joins_by_refs(lhs, section, owner) && joins_by_refs(rhs, section, owner)
+        }
+        ExprHir::BinaryOp { lhs, op: BinaryOp::Eq, rhs, .. } => {
+            (is_ref_of(lhs, section) && is_ref_of(rhs, owner))
+                || (is_ref_of(lhs, owner) && is_ref_of(rhs, section))
+        }
+        _ => false,
+    }
+}
+
+fn is_ref_of(expr: &ExprHir, source: &str) -> bool {
+    let ExprHir::ColumnRef { parts, .. } = expr else {
+        return false;
+    };
+    // The alias is matched as the uses of a side are; see `NullableUses::is_side_field`.
+    matches!(parts.as_slice(), [alias, field]
+        if alias.as_str().eq_ignore_ascii_case(source)
+            && (stdx::case::eq_ignore_case(field.as_str(), "Ссылка")
+                || stdx::case::eq_ignore_case(field.as_str(), "Ref")))
+}
+
+/// Why a side's field may be NULL, which decides where NULL can do harm and what proves the
+/// field is not NULL.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NullSource {
+    /// The row of an optional join side is missing. A condition on its field is false and
+    /// only filters the row out, so only the selected values are uses; a true comparison of
+    /// any of its fields proves the row is present.
+    MissingRow,
+    /// The value of a present row is empty, as a schedule value of `ДанныеГрафика` is. A
+    /// condition on it is a use too, and the row's other fields say nothing about it.
+    EmptyValue,
+}
+
+/// Uses of one side that may observe its NULL.
 ///
 /// A use is safe when NULL cannot reach it: inside `ЕСТЬNULL`, in a `ВЫБОР` branch that is
 /// taken only after a test has shown the side is present, next to an `ЕСТЬ NULL` test in a
@@ -721,11 +800,12 @@ fn direct_operands(expr: &ExprHir) -> Vec<&ExprHir> {
 /// for presence. The null test itself is not a use.
 struct NullableUses<'a> {
     side: &'a str,
+    source: NullSource,
 }
 
 impl<'a> NullableUses<'a> {
-    fn new(side: &'a str) -> Self {
-        Self { side }
+    fn new(side: &'a str, source: NullSource) -> Self {
+        Self { side, source }
     }
 
     fn collect(&self, hir: &SdblHir, out: &mut Vec<UnprotectedFieldRef>) {
@@ -737,8 +817,10 @@ impl<'a> NullableUses<'a> {
         for field in &hir.select.fields {
             self.walk(&field.expr, filtered_by_presence, out);
         }
-        if let Some(condition) = &hir.where_clause {
-            self.walk(condition, filtered_by_presence, out);
+        if self.source == NullSource::EmptyValue {
+            if let Some(condition) = &hir.where_clause {
+                self.walk(condition, filtered_by_presence, out);
+            }
         }
     }
 
@@ -756,14 +838,23 @@ impl<'a> NullableUses<'a> {
             ExprHir::IsNull { .. } => {}
             ExprHir::FunctionCall { function: FunctionKind::Isnull, .. } => {}
             ExprHir::Case { operand, when_clauses, else_expr, .. } => {
-                if let Some(operand) = operand {
-                    self.walk(operand, protected, out);
+                let conditions_are_uses = self.source == NullSource::EmptyValue;
+                // The operand of a simple `ВЫБОР` is compared implicitly; that equality is
+                // not taken as a proof.
+                let comparison_proves_row =
+                    self.source == NullSource::MissingRow && operand.is_none();
+                if conditions_are_uses {
+                    if let Some(operand) = operand {
+                        self.walk(operand, protected, out);
+                    }
                 }
                 let mut present = protected;
                 for clause in when_clauses {
-                    self.walk(&clause.condition, present, out);
-                    let branch_present =
-                        present || self.proves_presence_when_true(&clause.condition);
+                    if conditions_are_uses {
+                        self.walk(&clause.condition, present, out);
+                    }
+                    let branch_present = present
+                        || self.proves_presence_when_true(&clause.condition, comparison_proves_row);
                     self.walk(&clause.result, branch_present, out);
                     present = present || self.proves_presence_when_false(&clause.condition);
                 }
@@ -807,19 +898,31 @@ impl<'a> NullableUses<'a> {
         )
     }
 
-    /// `ЕСТЬ НЕ NULL`, `НЕ ... ЕСТЬ NULL`, or a conjunction containing one of them.
-    fn proves_presence_when_true(&self, condition: &ExprHir) -> bool {
+    /// `ЕСТЬ НЕ NULL`, `НЕ ... ЕСТЬ NULL`, `ЕСТЬNULL(Поле, З) <> З`, with
+    /// `comparison_proves_row` a comparison of a field of the side itself, or a conjunction
+    /// containing one of them.
+    ///
+    /// A comparison with NULL is never true, so a true comparison of the field proves the
+    /// row; a function or an expression around the field may turn NULL into a value first.
+    fn proves_presence_when_true(&self, condition: &ExprHir, comparison_proves_row: bool) -> bool {
         match condition {
             ExprHir::BinaryOp { lhs, op: BinaryOp::And, rhs, .. } => {
-                self.proves_presence_when_true(lhs) || self.proves_presence_when_true(rhs)
+                self.proves_presence_when_true(lhs, comparison_proves_row)
+                    || self.proves_presence_when_true(rhs, comparison_proves_row)
             }
             ExprHir::UnaryOp { op: UnaryOp::Not, expr, .. } => self.is_null_test(expr, false),
-            ExprHir::BinaryOp { lhs, op: BinaryOp::Ne, rhs, .. } => {
-                self.differs_from_its_replacement(lhs, rhs)
-                    || self.differs_from_its_replacement(rhs, lhs)
+            ExprHir::BinaryOp { lhs, op, rhs, .. } if op.is_comparison() => {
+                (comparison_proves_row && (self.is_side_column(lhs) || self.is_side_column(rhs)))
+                    || (*op == BinaryOp::Ne
+                        && (self.differs_from_its_replacement(lhs, rhs)
+                            || self.differs_from_its_replacement(rhs, lhs)))
             }
             _ => self.is_null_test(condition, true),
         }
+    }
+
+    fn is_side_column(&self, expr: &ExprHir) -> bool {
+        matches!(expr, ExprHir::ColumnRef { parts, .. } if self.is_side_field(parts))
     }
 
     /// `ЕСТЬNULL(Поле, З) <> З`: the function returns the replacement exactly when the
