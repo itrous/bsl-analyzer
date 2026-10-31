@@ -331,8 +331,20 @@ pub(crate) fn prepare_indexed_documents(
             );
         }
     }
+    Ok(prepare_indexed_documents_chunked(key, source, &Chunker::chunk(source), provider))
+}
+
+/// The documents of `source` already cut by the plain [`Chunker`]: the half of
+/// [`prepare_indexed_documents`] that needs the provider, for a caller that parsed the
+/// file off the provider's thread. Same documents in the same order as the whole.
+pub(crate) fn prepare_indexed_documents_chunked(
+    key: &FileKey,
+    source: &str,
+    chunks: &[Chunk],
+    provider: Option<&dyn GraphContextProvider>,
+) -> (Vec<IndexedDocument>, bool) {
     let mut context_failed = false;
-    let documents = Chunker::chunk(source)
+    let documents = chunks
         .iter()
         .map(|chunk| {
             let (document, failed) = indexed_document_for_chunk(key, chunk, source, provider);
@@ -340,7 +352,7 @@ pub(crate) fn prepare_indexed_documents(
             document
         })
         .collect();
-    Ok((documents, context_failed))
+    (documents, context_failed)
 }
 
 pub(crate) fn chunks_contexts_and_spans(

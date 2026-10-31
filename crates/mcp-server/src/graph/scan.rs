@@ -419,6 +419,86 @@ pub(crate) fn xml_semantic_hash_file(path: &Path) -> Option<[u8; 32]> {
     Some(xml_semantic_hash(&content))
 }
 
+/// The persisted `sig_hash` of every XML entry of `stats`, by stats index (`None` for
+/// a non-XML entry or an unreadable file), each equal to [`xml_semantic_hash_file`]
+/// of that entry. Hashed on a pool of this call's own, largest files first so no
+/// single big template is left to run alone at the end, with the bytes in flight
+/// capped at [`SCAN_BYTES_IN_FLIGHT`] — the DOM of one 120 MB template alone is
+/// several times its text.
+pub(crate) fn xml_sig_hashes(stats: &[FileStat]) -> Vec<Option<u64>> {
+    xml_sig_hashes_within(stats, super::byte_budget::SCAN_BYTES_IN_FLIGHT)
+}
+
+fn xml_sig_hashes_within(stats: &[FileStat], bytes_in_flight: u64) -> Vec<Option<u64>> {
+    let xml: Vec<usize> = (0..stats.len())
+        .filter(|&index| {
+            bsl_conventions::str_has_extension(&stats[index].path, bsl_conventions::XML_EXTENSION)
+        })
+        .collect();
+    let sizes: Vec<u64> = xml.iter().map(|&index| stats[index].len).collect();
+    let hashed = super::byte_budget::map_largest_first(&sizes, bytes_in_flight, |at| {
+        xml_semantic_hash_file(&stats[xml[at]].canonical)
+            .map(|h| u64::from_le_bytes(h[..8].try_into().expect("blake3 hash >= 8 bytes")))
+    });
+    let mut hashes = vec![None; stats.len()];
+    for (at, hash) in hashed.into_iter().enumerate() {
+        hashes[xml[at]] = hash;
+    }
+    hashes
+}
+
+#[cfg(test)]
+mod sig_hash_tests {
+    use super::*;
+
+    /// Parallel hashing is a scheduling change only: every entry's `sig_hash` equals
+    /// the sequential per-file hash, at the entry's own index, with a file larger than
+    /// the whole byte cap, an unreadable entry (a directory) and non-XML rows mixed in.
+    #[test]
+    fn parallel_sig_hashes_equal_sequential_ones_in_stats_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stats = Vec::new();
+        for i in 0..45u32 {
+            let path = dir.path().join(format!("Obj{i}.xml"));
+            // Sizes from a few bytes to ~10 KB, not monotone in the index.
+            let body = "<Item attr=\"v\">текст</Item>".repeat(((i * 7) % 45) as usize * 8 + 1);
+            let xml = format!("<MetaDataObject><Properties><Name>N{i}</Name><Version>{i}</Version></Properties>{body}</MetaDataObject>");
+            std::fs::write(&path, &xml).unwrap();
+            stats.push(FileStat::for_test(path.to_str().unwrap(), 0, xml.len() as u64));
+            if i % 9 == 0 {
+                let module = dir.path().join(format!("M{i}.bsl"));
+                std::fs::write(&module, "Процедура П() КонецПроцедуры").unwrap();
+                stats.push(FileStat::for_test(module.to_str().unwrap(), 0, 10));
+            }
+        }
+        let unreadable = dir.path().join("Dir.xml");
+        std::fs::create_dir(&unreadable).unwrap();
+        stats.insert(7, FileStat::for_test(unreadable.to_str().unwrap(), 0, 1));
+
+        let largest = stats.iter().map(|s| s.len).max().unwrap();
+        assert!(largest > 1024, "the fixture must hold a file larger than the cap");
+        let parallel = xml_sig_hashes_within(&stats, 1024);
+
+        let sequential: Vec<Option<u64>> = stats
+            .iter()
+            .map(|stat| {
+                bsl_conventions::str_has_extension(&stat.path, bsl_conventions::XML_EXTENSION)
+                    .then(|| xml_semantic_hash_file(&stat.canonical))
+                    .flatten()
+                    .map(|h| u64::from_le_bytes(h[..8].try_into().unwrap()))
+            })
+            .collect();
+        assert_eq!(parallel.len(), stats.len());
+        assert_eq!(parallel, sequential);
+        assert_eq!(parallel[7], None, "the directory entry hashes to nothing");
+        assert!(parallel.iter().filter(|h| h.is_some()).count() == 45);
+        assert!(
+            parallel.iter().filter_map(|h| *h).collect::<std::collections::HashSet<_>>().len() > 40,
+            "distinct files hash differently, so a row written to a wrong index is visible"
+        );
+    }
+}
+
 fn hash_xml_node(node: bsl_metadata::roxmltree::Node<'_, '_>, hasher: &mut blake3::Hasher) {
     if node.is_element() {
         let tag = node.tag_name().name();

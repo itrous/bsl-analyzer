@@ -17,6 +17,8 @@ test-seams = []
 bsl-conventions.workspace = true
 code-chunk.workspace = true
 project-model.workspace = true
+rayon.workspace = true
+stdx.workspace = true
 syntax.workspace = true
 
 rusqlite = { workspace = true, features = ["functions"] }

@@ -261,10 +261,16 @@ pub(crate) fn db_for_files(
         db.set_graph_config_cache(Arc::clone(cache));
     }
     db.set_source_root(GRAPH_SOURCE_ROOT, source_root.clone());
+    // The reads (and their UTF-8 checks) are independent, so they go to the pool;
+    // the database inputs are then set in `batch_files` order as before.
+    let texts: Vec<std::io::Result<String>> = {
+        use rayon::prelude::*;
+        batch_files.par_iter().map(|(_, path)| std::fs::read_to_string(path)).collect()
+    };
     let mut unread = Vec::new();
-    for (file_id, path) in batch_files {
+    for ((file_id, path), text) in batch_files.iter().zip(texts) {
         db.set_file_source_root(*file_id, GRAPH_SOURCE_ROOT);
-        match std::fs::read_to_string(path) {
+        match text {
             Ok(text) => db.set_file_text(*file_id, &text),
             Err(e) => {
                 tracing::warn!(path = %path.display(), "graph scan: read failed: {e}");
