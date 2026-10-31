@@ -3842,6 +3842,35 @@ mod surface_guards {
             .err()
             .expect("unknown keys must be refused");
         assert!(error.to_string().contains("module_kind"), "{error}");
+        // The refusal also lists the keys that ARE accepted, so a typo is answerable from
+        // the error alone, without a round of reading the findings.
+        assert!(error.to_string().contains("range_start"), "{error}");
+    }
+
+    #[test]
+    fn diagnostics_params_refuse_a_misspelled_range_instead_of_sweeping_the_whole_file() {
+        let typo = serde_json::json!({
+            "action": "file",
+            "path": "src/cf/CommonModules/Payments/Ext/Module.bsl",
+            "line_start": 470,
+            "line_end": 505
+        });
+        let error = serde_json::from_value::<DiagnosticsParams>(typo)
+            .err()
+            .expect("a misspelled range must be refused, not ignored");
+        // serde names ONE unknown field — the first one in key order, not in call order —
+        // so a call carrying several invented keys is answered about one of them. What has
+        // to hold is that the refusal names a misspelled key and lists the accepted ones.
+        let message = error.to_string();
+        assert!(message.contains("line_end") || message.contains("line_start"), "{message}");
+        assert!(message.contains("range_start"), "{message}");
+        let correct = serde_json::json!({
+            "action": "file",
+            "path": "src/cf/CommonModules/Payments/Ext/Module.bsl",
+            "range_start": 470,
+            "range_end": 505
+        });
+        assert!(serde_json::from_value::<DiagnosticsParams>(correct).is_ok());
     }
 
     #[test]
