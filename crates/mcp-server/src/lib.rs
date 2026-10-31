@@ -348,6 +348,7 @@ impl McpProfile {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MetadataParams {
     /// info | tree | object | form | status.
     action: String,
@@ -626,6 +627,7 @@ fn syntax_help_xor_schema(schema: &mut schemars::Schema) {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct QueryParams {
     /// validate | execute | schema.
     action: String,
@@ -649,6 +651,7 @@ struct QueryParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ExecuteParams {
     /// check | run | eval.
     action: String,
@@ -668,6 +671,7 @@ struct ExecuteParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EventLogParams {
     /// Lower time bound (inclusive), ISO-8601, e.g. `2026-07-05T00:00:00` or `2026-07-05`.
     date_from: Option<String>,
@@ -700,6 +704,7 @@ struct EventLogParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GraphParams {
     /// overview | schema | status | node | source | neighbors | callers | callees | resolve
     action: String,
@@ -742,6 +747,7 @@ struct GraphParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(transform = symbol_info_input_schema)]
 struct SymbolInfoParams {
     /// Qualified name of the symbol (primary input): a common-module method
@@ -826,6 +832,7 @@ fn symbol_info_input_schema(schema: &mut schemars::Schema) {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReferencesParams {
     /// Qualified name of the symbol whose references you want: a common-module method
     /// (`ОбщегоНазначения.ЗначениеРеквизитаОбъекта`), an object/manager module method
@@ -897,6 +904,7 @@ struct ReferencesParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DiagnosticsParams {
     /// catalog | schema | status | file | snippet | workspace.
     action: String,
@@ -945,6 +953,7 @@ struct DiagnosticsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct OutlineParams {
     /// Absolute or workspace-relative `.bsl` path, or a path relative to `root_id`.
     path: String,
@@ -962,6 +971,7 @@ struct OutlineParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ItsHelpParams {
     /// Natural-language question for the ITS expert help.
     question: String,
@@ -971,6 +981,7 @@ struct ItsHelpParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DebugParams {
     /// attach | disconnect | set_breakpoint | remove_breakpoint | continue | step |
     /// wait_stop | stack_trace | locals | eval.
@@ -3817,6 +3828,90 @@ mod surface_guards {
             "name": "Массив", "reference_id": "type::x~digest"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn diagnostics_params_refuse_an_unknown_key_and_name_it_in_the_error() {
+        let invented = serde_json::json!({
+            "action": "snippet",
+            "code": "Процедура Проверка() Экспорт\n\tА = 1;\nКонецПроцедуры",
+            "module_kind": "ManagerModule",
+            "nonsense_key_12345": "абракадабра"
+        });
+        let error = serde_json::from_value::<DiagnosticsParams>(invented)
+            .err()
+            .expect("unknown keys must be refused");
+        assert!(error.to_string().contains("module_kind"), "{error}");
+        // The refusal also lists the keys that ARE accepted, so a typo is answerable from
+        // the error alone, without a round of reading the findings.
+        assert!(error.to_string().contains("range_start"), "{error}");
+    }
+
+    #[test]
+    fn diagnostics_params_refuse_a_misspelled_range_instead_of_sweeping_the_whole_file() {
+        let typo = serde_json::json!({
+            "action": "file",
+            "path": "src/cf/CommonModules/Payments/Ext/Module.bsl",
+            "line_start": 470,
+            "line_end": 505
+        });
+        let error = serde_json::from_value::<DiagnosticsParams>(typo)
+            .err()
+            .expect("a misspelled range must be refused, not ignored");
+        // serde names ONE unknown field — the first one in key order, not in call order —
+        // so a call carrying several invented keys is answered about one of them. What has
+        // to hold is that the refusal names a misspelled key and lists the accepted ones.
+        let message = error.to_string();
+        assert!(message.contains("line_end") || message.contains("line_start"), "{message}");
+        assert!(message.contains("range_start"), "{message}");
+        let correct = serde_json::json!({
+            "action": "file",
+            "path": "src/cf/CommonModules/Payments/Ext/Module.bsl",
+            "range_start": 470,
+            "range_end": 505
+        });
+        assert!(serde_json::from_value::<DiagnosticsParams>(correct).is_ok());
+    }
+
+    #[test]
+    fn diagnostics_params_accept_the_same_request_without_invented_keys() {
+        let valid = serde_json::json!({
+            "action": "snippet",
+            "code": "Процедура Проверка() Экспорт\n\tА = 1;\nКонецПроцедуры"
+        });
+        assert!(serde_json::from_value::<DiagnosticsParams>(valid).is_ok());
+    }
+
+    #[test]
+    fn metadata_params_refuse_an_unknown_key_and_accept_the_valid_request() {
+        let valid = serde_json::json!({
+            "action": "object", "object_type": "Документ", "object_name": "X"
+        });
+        assert!(serde_json::from_value::<MetadataParams>(valid).is_ok());
+        let invented = serde_json::json!({
+            "action": "object", "object_type": "Документ", "object_name": "X",
+            "nonsense_key_12345": "абракадабра"
+        });
+        let error = serde_json::from_value::<MetadataParams>(invented)
+            .err()
+            .expect("unknown keys must be refused");
+        assert!(error.to_string().contains("nonsense_key_12345"), "{error}");
+    }
+
+    #[test]
+    fn search_params_keep_valid_calls_parsing_and_legacy_branches_open_to_unknown_keys() {
+        assert!(serde_json::from_value::<WorkspaceSearchParams>(serde_json::json!({
+            "action": "search_code", "query": "needle"
+        }))
+        .is_ok());
+        assert!(serde_json::from_value::<WorkspaceSearchParams>(serde_json::json!({
+            "action": "status"
+        }))
+        .is_ok());
+        assert!(serde_json::from_value::<WorkspaceSearchParams>(serde_json::json!({
+            "action": "search_code", "query": "needle", "module_kind": "x"
+        }))
+        .is_ok());
     }
 
     #[test]
