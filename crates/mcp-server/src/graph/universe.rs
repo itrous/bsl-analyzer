@@ -645,7 +645,9 @@ mod tests {
     }
 
     /// The sequential content pass this scan had before its reads went to a pool,
-    /// kept as the reference the parallel pass is held to.
+    /// kept as the reference the parallel pass is held to. Its only caller is the
+    /// unix-bound pass test below, so it is unix-bound too: elsewhere it would be dead.
+    #[cfg(unix)]
     fn reference_content_scan(set: &SourceSet) -> ContentScan {
         let mut stats: Vec<FileStat> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -679,6 +681,8 @@ mod tests {
         ContentScan { stats, content_unreadable, hashed }
     }
 
+    /// A walked row over a real file, for the unix-bound pass test below.
+    #[cfg(unix)]
     fn walked(root: &Path, walked: &Path, canonical: &Path) -> project_model::WalkedFile {
         project_model::WalkedFile {
             root: root.to_path_buf(),
