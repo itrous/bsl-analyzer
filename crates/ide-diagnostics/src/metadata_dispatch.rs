@@ -16,6 +16,7 @@ pub(crate) const METADATA_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::ForbiddenMetadataName,
     DiagnosticCode::MetadataObjectNameLength,
     DiagnosticCode::MissingFormEventHandler,
+    DiagnosticCode::OrdinaryFormDialogUnread,
     DiagnosticCode::WrongDataPathForFormElements,
     DiagnosticCode::WrongHttpServiceHandler,
     DiagnosticCode::WrongWebServiceHandler,
@@ -71,6 +72,7 @@ pub fn collect_metadata_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic>
     diagnostics.extend(handlers::metadata_object_name_length::from_metadata(metadata_ref, ctx));
 
     diagnostics.extend(handlers::missing_form_event_handler::from_metadata(metadata_ref, ctx));
+    diagnostics.extend(handlers::ordinary_form_dialog_unread::from_metadata(metadata_ref, ctx));
 
     diagnostics
         .extend(handlers::wrong_data_path_for_form_elements::from_metadata(metadata_ref, ctx));

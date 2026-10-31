@@ -2,11 +2,11 @@ use crate::enums::FormType;
 use crate::error::{MetadataError, Result};
 use crate::form::{
     Form, FormAdditionalColumns, FormAttribute, FormAttributeColumn, FormElement, FormElementKind,
-    FormEventHandler,
+    FormEventHandler, OrdinaryDialogRejection,
 };
 use crate::metadata_object::AttributeType;
 
-use super::form_sidecar::read_ordinary_form_sidecar;
+use super::form_sidecar::{read_ordinary_form_sidecar, SidecarRejection};
 use super::helpers::parse_uuid;
 use super::type_parser::parse_type_xml;
 
@@ -395,32 +395,40 @@ pub fn parse_form_from_bsl_path(bsl_path: &std::path::Path) -> Result<Form> {
         Err(read_error) => {
             let may_be_ordinary = descriptor_absent
                 || metadata.as_ref().is_some_and(|m| m.form_type == FormType::Ordinary);
-            let sidecar = bsl_path
-                .parent()
-                .filter(|_| may_be_ordinary)
-                .and_then(|dir| {
-                    bsl_conventions::find_child_ci(
-                        dir,
-                        bsl_conventions::ConventionalName::FormJson.canonical(),
-                    )
-                })
-                .and_then(|sidecar_path| {
-                    match read_ordinary_form_sidecar(&sidecar_path, form_name) {
-                        Ok(form) => Some(form),
-                        Err(rejection) => {
-                            tracing::warn!(
-                                path = %sidecar_path.display(),
-                                %rejection,
-                                "ordinary form sidecar ignored"
-                            );
-                            None
-                        }
+            let mut rejection_reason: Option<OrdinaryDialogRejection> = None;
+            let sidecar_path = bsl_path.parent().filter(|_| may_be_ordinary).and_then(|dir| {
+                bsl_conventions::find_child_ci(
+                    dir,
+                    bsl_conventions::ConventionalName::FormJson.canonical(),
+                )
+            });
+            let sidecar = sidecar_path.and_then(|sidecar_path| {
+                match read_ordinary_form_sidecar(&sidecar_path, form_name) {
+                    Ok(form) => Some(form),
+                    Err(rejection) => {
+                        tracing::warn!(
+                            path = %sidecar_path.display(),
+                            %rejection,
+                            "ordinary form sidecar ignored"
+                        );
+                        rejection_reason = Some(match rejection {
+                            SidecarRejection::Unreadable(_) => OrdinaryDialogRejection::Unreadable,
+                            SidecarRejection::Malformed(_) => OrdinaryDialogRejection::Malformed,
+                            SidecarRejection::InvalidSchema(_) => {
+                                OrdinaryDialogRejection::InvalidSchema
+                            }
+                            SidecarRejection::Stale => OrdinaryDialogRejection::Stale,
+                        });
+                        None
                     }
-                });
+                }
+            });
             match sidecar {
                 Some(form) => form,
                 None if metadata.as_ref().is_some_and(|m| m.form_type == FormType::Ordinary) => {
-                    Form::ordinary_without_dialog(form_name)
+                    let mut form = Form::ordinary_without_dialog(form_name);
+                    form.ordinary_dialog_rejection = rejection_reason;
+                    form
                 }
                 None => {
                     return Err(crate::error::MetadataError::InvalidFormat(format!(
@@ -1183,6 +1191,43 @@ mod tests {
         // Written in the same pass (equal times) or later: it describes the dialog.
         set_mtime(&sidecar, later);
         assert!(reads_dialog(&parse_form_from_bsl_path(&module).unwrap()));
+    }
+
+    #[test]
+    fn ordinary_form_fallback_carries_the_rejection_reason() {
+        use crate::form::OrdinaryDialogRejection as Reason;
+
+        let dir = tempfile::tempdir().unwrap();
+        let module = ordinary_form_on_disk(dir.path());
+        let sidecar = module.with_file_name("Form.json");
+        let form_bin = module.parent().unwrap().parent().unwrap().join("Form.bin");
+
+        let absent = parse_form_from_bsl_path(&module).unwrap();
+        assert_eq!(absent.ordinary_dialog_rejection(), None);
+        assert!(!absent.ordinary_dialog_known());
+
+        std::fs::write(&sidecar, "{ not json").unwrap();
+        let malformed = parse_form_from_bsl_path(&module).unwrap();
+        assert_eq!(malformed.ordinary_dialog_rejection(), Some(Reason::Malformed));
+
+        std::fs::write(&sidecar, sidecar_json(0)).unwrap();
+        let schema = parse_form_from_bsl_path(&module).unwrap();
+        assert_eq!(schema.ordinary_dialog_rejection(), Some(Reason::InvalidSchema));
+
+        std::fs::write(&sidecar, sidecar_json(2)).unwrap();
+        let earlier =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let later = earlier + std::time::Duration::from_secs(60);
+        set_mtime(&sidecar, earlier);
+        set_mtime(&form_bin, later);
+        let stale = parse_form_from_bsl_path(&module).unwrap();
+        assert_eq!(stale.ordinary_dialog_rejection(), Some(Reason::Stale));
+        assert!(!stale.ordinary_dialog_known());
+
+        set_mtime(&sidecar, later);
+        let read = parse_form_from_bsl_path(&module).unwrap();
+        assert_eq!(read.ordinary_dialog_rejection(), None);
+        assert!(read.ordinary_dialog_known());
     }
 
     #[test]

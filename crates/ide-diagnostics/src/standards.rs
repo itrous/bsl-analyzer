@@ -196,6 +196,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::MissingEventSubscriptionHandler => &[],
         DiagnosticCode::MissingFormEventHandler => &[],
         DiagnosticCode::OrdinaryAppSupport => &[467],
+        DiagnosticCode::OrdinaryFormDialogUnread => &[],
         DiagnosticCode::PrivilegedModuleMethodCall => &[],
         DiagnosticCode::ProtectedModule => &[],
         DiagnosticCode::RedundantAccessToObject => &[],

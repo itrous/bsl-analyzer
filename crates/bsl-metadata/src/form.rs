@@ -220,6 +220,28 @@ pub fn ordinary_form_default_handlers() -> Vec<FormEventHandler> {
         .collect()
 }
 
+/// Why an existing `Ext/Form/Form.json` did not describe the dialog of an ordinary form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrdinaryDialogRejection {
+    /// `Ext/Form.bin` is newer than the sidecar: the dialog changed after it was written.
+    Stale,
+    Unreadable,
+    Malformed,
+    InvalidSchema,
+}
+
+impl OrdinaryDialogRejection {
+    /// The Russian wording the diagnostic puts in parentheses.
+    pub fn reason_ru(self) -> &'static str {
+        match self {
+            Self::Stale => "сайдкар Ext/Form/Form.json старше Ext/Form.bin",
+            Self::Unreadable => "сайдкар Ext/Form/Form.json не читается",
+            Self::Malformed => "сайдкар Ext/Form/Form.json не разбирается",
+            Self::InvalidSchema => "версия схемы сайдкара Ext/Form/Form.json не поддерживается",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Form {
     pub name: String,
@@ -237,6 +259,10 @@ pub struct Form {
     /// `form.handlers` still uses default names for the form's own events.
     /// Always `false` for a managed form, whose dialog is `Ext/Form.xml`.
     pub ordinary_dialog_known: bool,
+    /// Why an existing sidecar was rejected. `None` both when the dialog was read and
+    /// when there is no sidecar at all: the sidecar is optional, so its absence is a
+    /// normal state and is not reported.
+    pub ordinary_dialog_rejection: Option<OrdinaryDialogRejection>,
 }
 
 impl Form {
@@ -251,6 +277,7 @@ impl Form {
             attributes: Vec::new(),
             has_base_form: false,
             ordinary_dialog_known: false,
+            ordinary_dialog_rejection: None,
         }
     }
 
@@ -270,6 +297,7 @@ impl Form {
             attributes: Vec::new(),
             has_base_form: false,
             ordinary_dialog_known: false,
+            ordinary_dialog_rejection: None,
         }
     }
 
@@ -291,6 +319,7 @@ impl Form {
             attributes: Vec::new(),
             has_base_form: false,
             ordinary_dialog_known: false,
+            ordinary_dialog_rejection: None,
         }
     }
 
@@ -349,6 +378,14 @@ impl Form {
 
     pub fn has_base_form(&self) -> bool {
         self.has_base_form
+    }
+
+    pub fn ordinary_dialog_known(&self) -> bool {
+        self.ordinary_dialog_known
+    }
+
+    pub fn ordinary_dialog_rejection(&self) -> Option<OrdinaryDialogRejection> {
+        self.ordinary_dialog_rejection
     }
 
     pub fn event_handlers(&self) -> &[FormEventHandler] {

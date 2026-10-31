@@ -129,6 +129,14 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     }
 
     if let Some(ref form) = metadata.form {
+        // An ordinary form keeps its dialog in the binary `Ext/Form.bin`; without a usable
+        // `Ext/Form/Form.json` its bindings are unknown, so ANY local method may be a
+        // button's handler. Reporting them unused turns one unread file into a pack of
+        // false findings over every handler of the form, so stay silent here and let
+        // `OrdinaryFormDialogUnread` say why the check was dropped.
+        if form.is_ordinary() && !form.ordinary_dialog_known() {
+            return Vec::new();
+        }
         for handler in form.event_handlers() {
             called_methods.insert(handler.handler_name.fold_lower());
         }
@@ -1303,6 +1311,81 @@ mod tests {
             "operation-bound method must be exempt, unbound one must stay flagged: {unused_diags:?}"
         );
         assert!(unused_diags[0].message.contains("НеИспользуемая"));
+    }
+
+    fn form_module_metadata(form: bsl_metadata::Form) -> hir::ModuleMetadata {
+        hir::ModuleMetadata {
+            module_type: bsl_metadata::ModuleType::FormModule,
+            execution_context: None,
+            common_module: None,
+            mdo: None,
+            register: None,
+            command: None,
+            form: Some(std::sync::Arc::new(form)),
+            http_service: None,
+            web_service: None,
+            integration_service: None,
+        }
+    }
+
+    const ORDINARY_FORM_MODULE: &str = r#"
+Процедура КнопкаОКНажатие(Кнопка)
+КонецПроцедуры
+
+Процедура НеИспользуемая()
+КонецПроцедуры
+"#;
+
+    #[test]
+    fn test_ordinary_form_with_unknown_dialog_reports_no_unused_methods() {
+        let form = bsl_metadata::Form::ordinary_without_dialog("Форма");
+        let diagnostics = crate::test_utils::check_metadata_diagnostic(
+            form_module_metadata(form),
+            ORDINARY_FORM_MODULE,
+            |_metadata, ctx| super::check(ctx),
+        );
+        let unused: Vec<_> =
+            diagnostics.iter().filter(|d| d.code == DiagnosticCode::UnusedLocalMethod).collect();
+        assert!(unused.is_empty(), "unknown dialog must stay silent: {unused:?}");
+    }
+
+    #[test]
+    fn test_ordinary_form_with_known_dialog_still_reports_unused_methods() {
+        let mut form = bsl_metadata::Form::ordinary_without_dialog("Форма");
+        form.ordinary_dialog_known = true;
+        form.event_handlers.push(bsl_metadata::FormEventHandler {
+            event_type: "Нажатие".to_string(),
+            handler_name: "КнопкаОКНажатие".to_string(),
+        });
+        let diagnostics = crate::test_utils::check_metadata_diagnostic(
+            form_module_metadata(form),
+            ORDINARY_FORM_MODULE,
+            |_metadata, ctx| super::check(ctx),
+        );
+        let unused: Vec<_> =
+            diagnostics.iter().filter(|d| d.code == DiagnosticCode::UnusedLocalMethod).collect();
+        assert_eq!(unused.len(), 1, "{unused:?}");
+        assert!(unused[0].message.contains("НеИспользуемая"));
+    }
+
+    #[test]
+    fn test_form_of_unknown_type_still_reports_unused_methods() {
+        let form = bsl_metadata::Form::new(
+            "Форма".to_string(),
+            bsl_metadata::FormType::Unknown,
+            uuid::Uuid::nil(),
+        );
+        let diagnostics = crate::test_utils::check_metadata_diagnostic(
+            form_module_metadata(form),
+            ORDINARY_FORM_MODULE,
+            |_metadata, ctx| super::check(ctx),
+        );
+        let unused: Vec<_> =
+            diagnostics.iter().filter(|d| d.code == DiagnosticCode::UnusedLocalMethod).collect();
+        assert!(
+            unused.iter().any(|d| d.message.contains("НеИспользуемая")),
+            "only an ordinary form drops the check: {unused:?}"
+        );
     }
 
     #[test]

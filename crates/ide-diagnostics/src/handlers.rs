@@ -123,6 +123,7 @@ pub mod number_of_values_in_structure_constructor;
 pub mod one_statement_per_line;
 pub mod order_of_params;
 pub mod ordinary_app_support;
+pub mod ordinary_form_dialog_unread;
 pub mod os_users_method;
 pub mod pairing_broken_transaction;
 pub mod parse_error;
@@ -420,6 +421,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::MissingFormEventHandler => Some(&missing_form_event_handler::METADATA),
         DiagnosticCode::MultilineStringInQuery => Some(&multiline_string_in_query::METADATA),
         DiagnosticCode::OrdinaryAppSupport => Some(&ordinary_app_support::METADATA),
+        DiagnosticCode::OrdinaryFormDialogUnread => Some(&ordinary_form_dialog_unread::METADATA),
         DiagnosticCode::PrivilegedModuleMethodCall => {
             Some(&privileged_module_method_call::METADATA)
         }

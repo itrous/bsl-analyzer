@@ -257,6 +257,7 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     ),
     (DiagnosticCode::MissingFormEventHandler, "form metadata handler-name resolution"),
     (DiagnosticCode::OrdinaryAppSupport, "configuration compatibility diagnostic"),
+    (DiagnosticCode::OrdinaryFormDialogUnread, "rejected form sidecar diagnostic; needs form metadata"),
     (
         DiagnosticCode::PrivilegedModuleMethodCall,
         "metadata/cross-module call diagnostic; requires privileged module fixture",
@@ -696,7 +697,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 209, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 210, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

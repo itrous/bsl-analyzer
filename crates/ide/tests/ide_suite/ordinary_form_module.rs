@@ -89,10 +89,10 @@ fn ordinary_form_module_is_not_held_to_managed_form_rules() {
         assert!(lines_of(&found, code).is_empty(), "{code:?} in an ordinary form: {found:?}");
     }
     // A procedure named after a form event counts as bound, with the event's signature.
-    assert!(!lines_of(&found, DiagnosticCode::UnusedLocalMethod).contains(&0), "{found:?}");
     assert!(!lines_of(&found, DiagnosticCode::UnusedParameters).contains(&0), "{found:?}");
-    // Any other procedure is still checked: the default names cover events only.
-    assert_eq!(lines_of(&found, DiagnosticCode::UnusedLocalMethod), vec![7], "{found:?}");
+    // The fixture has no `Ext/Form/Form.json`, so the dialog's button bindings are unknown
+    // and any procedure may be a handler: the unused-method search is off in this module.
+    assert!(lines_of(&found, DiagnosticCode::UnusedLocalMethod).is_empty(), "{found:?}");
 }
 
 #[test]

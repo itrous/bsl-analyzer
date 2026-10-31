@@ -109,7 +109,7 @@ enum Binding<'a> {
 /// The missing procedure has no place in the module, so the finding goes on the
 /// module as a whole: its first line, or an empty range at the start of an empty
 /// module.
-fn first_line_range(text: &str) -> TextRange {
+pub(crate) fn first_line_range(text: &str) -> TextRange {
     let end = text.find(['\r', '\n']).unwrap_or(text.len());
     TextRange::new(0.into(), (end as u32).into())
 }

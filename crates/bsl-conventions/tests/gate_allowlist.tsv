@@ -33,6 +33,7 @@ crates/bsl-metadata/src/enums.rs	SessionModule	1	вне-класса: имя в�
 crates/bsl-metadata/src/enums.rs	ValueManagerModule	1	вне-класса: имя вида модуля в значениях XML
 crates/bsl-metadata/src/enums.rs	WEBServiceModule	1	вне-класса: имя вида модуля в значениях XML
 crates/bsl-metadata/src/event_subscription.rs	CommonModule	1	вне-класса: значение в XML метаданных
+crates/bsl-metadata/src/form.rs	сайдкар Ext/Form/Form.json старше Ext/Form.bin	1	вне-класса: текст сообщения об ошибке
 crates/bsl-metadata/src/loader.rs	cannot read Predefined.xml	1	вне-класса: текст лога
 crates/bsl-metadata/src/metadata_object.rs	CommonModule	1	вне-класса: имя XML-тега
 crates/bsl-metadata/src/scheduled_job.rs	CommonModule	1	вне-класса: значение в XML метаданных
