@@ -4,7 +4,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsConfig, DiagnosticsContext};
 use sdbl_hir;
 use stdx::case::CaseExt;
 use syntax::ast_utils::{active_children, significant_tokens};
-use syntax::{SyntaxKind, SyntaxNode, TextRange};
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextRange};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -56,8 +56,8 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 ///
 /// Such a template parses cleanly, so its placeholder would otherwise be reported as a missing
 /// table forever. The replacement is tied to this query: its first argument is the literal
-/// itself or the variable the literal is assigned to, used later in the same method, and its
-/// result is used. The search string must equal a whole segment, case included, as the platform
+/// itself or the variable the literal is assigned to, used later in the same method only by
+/// such replacements, and its result is used. The search string must equal a whole segment, case included, as the platform
 /// searches: a substring match would silence real misses whose name merely contains it.
 pub(crate) fn is_substituted_template(
     root: &SyntaxNode,
@@ -83,31 +83,93 @@ pub(crate) fn is_substituted_template(
             if value != text {
                 return false;
             }
-            let holder = folded(&target);
             let scope = parent
                 .ancestors()
                 .find(|node| {
                     matches!(node.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF)
                 })
                 .unwrap_or_else(|| root.clone());
-            scope
-                .descendants()
-                .filter(|call| {
-                    call.text_range().start() >= parent.text_range().end()
-                        && is_str_replace(call)
-                        && argument(call, 0).is_some_and(|arg| folded(&arg) == holder)
-                })
-                .collect()
+            match template_replacements(&scope, &parent, &folded(&target)) {
+                Some(calls) => calls,
+                None => return false,
+            }
         }
         _ => return false,
     };
     calls
         .iter()
-        .filter(|call| unwrap_up(call).parent().map(|p| p.kind()) != Some(SyntaxKind::CALL_STMT))
+        .filter(|call| result_is_used(call))
         .filter_map(|call| argument(call, 1))
         .filter(|search| search.kind() == SyntaxKind::LITERAL)
         .filter_map(|search| crate::sdbl_utils::extract_string_content(&search))
         .any(|search| table_name.split('.').any(|segment| segment == search))
+}
+
+/// The replacements that read the text `assignment` stores in `holder`, or `None` when the text
+/// is also read some other way — passed to a query, concatenated, returned — and so may run as
+/// written. The text lives until the holder or its owner is assigned again; that assignment's
+/// own value still reads it, as `Текст = СтрЗаменить(Текст, ...)` does.
+fn template_replacements(
+    scope: &SyntaxNode,
+    assignment: &SyntaxNode,
+    holder: &str,
+) -> Option<Vec<SyntaxNode>> {
+    let owner = holder.split('.').next().unwrap_or(holder);
+    let is_overwrite = |target: &SyntaxNode| {
+        let target = folded(target);
+        target == holder || target == owner
+    };
+    let after = assignment.text_range().end();
+    let until = scope
+        .descendants()
+        .filter(|stmt| stmt.kind() == SyntaxKind::ASSIGN_STMT && stmt.text_range().start() >= after)
+        .find(|stmt| active_children(stmt).next().is_some_and(|target| is_overwrite(&target)))
+        .map_or(scope.text_range().end(), |stmt| stmt.text_range().end());
+    let mut calls = Vec::new();
+    for token in scope.descendants_with_tokens().filter_map(|element| element.into_token()) {
+        let start = token.text_range().start();
+        if start < after
+            || start >= until
+            || !token.kind().is_name_token()
+            || token.text().fold_lower() != owner
+            || is_member_name(&token)
+        {
+            continue;
+        }
+        let written = token
+            .parent_ancestors()
+            .find(|node| node.kind() == SyntaxKind::ASSIGN_STMT)
+            .and_then(|stmt| active_children(&stmt).next())
+            .is_some_and(|target| target.text_range().contains(start) && is_overwrite(&target));
+        if written {
+            continue;
+        }
+        let call = token
+            .parent_ancestors()
+            .find(|node| node.kind() == SyntaxKind::ARG_LIST)
+            .and_then(|args| args.parent())
+            .filter(|call| {
+                is_str_replace(call)
+                    && result_is_used(call)
+                    && argument(call, 0).is_some_and(|arg| {
+                        arg.text_range().contains(start) && folded(&arg) == holder
+                    })
+            })?;
+        calls.push(call);
+    }
+    Some(calls)
+}
+
+/// A name after a dot is a member of something else, not the variable of the same name.
+fn is_member_name(token: &SyntaxToken) -> bool {
+    std::iter::successors(token.prev_token(), |prev| prev.prev_token())
+        .find(|prev| !prev.kind().is_trivia())
+        .is_some_and(|prev| prev.kind() == SyntaxKind::DOT)
+}
+
+/// `СтрЗаменить` returns the new text; called as a statement it changes nothing.
+fn result_is_used(call: &SyntaxNode) -> bool {
+    unwrap_up(call).parent().map(|parent| parent.kind()) != Some(SyntaxKind::CALL_STMT)
 }
 
 /// The whole text expression the literal belongs to: itself, or the constant concatenation it
@@ -486,6 +548,52 @@ mod tests {
             r#"
 Процедура Тест(Имя) Экспорт
     Текст = СтрЗаменить("ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т", "ИмяВидаДокумента", Имя);
+КонецПроцедуры
+"#,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_template_also_run_as_written_is_still_reported() {
+        let found = missing_tables(
+            r#"
+Процедура Тест() Экспорт
+    Шаблон = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Результат = СтрЗаменить(Шаблон, "ИмяВидаДокумента", "РеализацияТоваров");
+    Запрос = Новый Запрос(Шаблон);
+    Запрос.Выполнить();
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_query_text_replaced_in_place_is_a_template() {
+        let found = missing_tables(
+            r#"
+Процедура Тест(Имя) Экспорт
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Запрос.Текст = СтрЗаменить(Запрос.Текст, "ИмяВидаДокумента", Имя);
+    Запрос.Выполнить();
+КонецПроцедуры
+"#,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_template_replaced_once_per_key_is_a_template() {
+        let found = missing_tables(
+            r#"
+Процедура Тест(Виды) Экспорт
+    Шаблон = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Тексты = Новый Массив;
+    Для Каждого КлючЗначение Из Виды Цикл
+        Тексты.Добавить(СтрЗаменить(Шаблон, "ИмяВидаДокумента", КлючЗначение.Ключ));
+    КонецЦикла;
 КонецПроцедуры
 "#,
         );
