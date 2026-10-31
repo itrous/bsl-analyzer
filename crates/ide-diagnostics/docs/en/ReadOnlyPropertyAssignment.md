@@ -6,7 +6,7 @@ The read-only fact comes from the platform data. Its main source is the platform
 
 ## Why this is a problem
 
-The parser accepts the statement, but at runtime the assignment either raises an exception or silently fails to modify the object. The idiomatic replacement is typically a dedicated setter method (`SetParameter` for query parameters) or a full rebuild of the object.
+The parser accepts the statement, but at runtime the assignment always raises an exception (`Object field is not writable`), so the finding is reported as an error, not a smell. The idiomatic replacement is typically a dedicated setter method (`SetParameter` for query parameters) or a full rebuild of the object.
 
 ## Examples
 
