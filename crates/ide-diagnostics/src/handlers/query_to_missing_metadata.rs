@@ -99,16 +99,25 @@ pub(crate) fn is_substituted_template(
     calls
         .iter()
         .filter(|call| result_is_used(call))
-        .filter_map(|call| argument(call, 1))
-        .filter(|search| search.kind() == SyntaxKind::LITERAL)
-        .filter_map(|search| crate::sdbl_utils::extract_string_content(&search))
+        .filter_map(|call| {
+            let search = string_literal(&argument(call, 1)?)?;
+            let replacement = argument(call, 2).and_then(|arg| string_literal(&arg));
+            (replacement.as_ref() != Some(&search)).then_some(search)
+        })
         .any(|search| table_name.split('.').any(|segment| segment == search))
+}
+
+fn string_literal(node: &SyntaxNode) -> Option<String> {
+    (node.kind() == SyntaxKind::LITERAL)
+        .then(|| crate::sdbl_utils::extract_string_content(node))
+        .flatten()
 }
 
 /// The replacements that read the text `assignment` stores in `holder`, or `None` when the text
 /// is also read some other way — passed to a query, concatenated, returned — and so may run as
-/// written. The text lives until the holder or its owner is assigned again; that assignment's
-/// own value still reads it, as `Текст = СтрЗаменить(Текст, ...)` does.
+/// written. The text lives until the holder or its owner is assigned again in the same block of
+/// statements; that assignment's own value still reads it, as `Текст = СтрЗаменить(Текст, ...)`
+/// does. An assignment in a nested branch or loop may not run, so the text outlives it.
 fn template_replacements(
     scope: &SyntaxNode,
     assignment: &SyntaxNode,
@@ -122,7 +131,11 @@ fn template_replacements(
     let after = assignment.text_range().end();
     let until = scope
         .descendants()
-        .filter(|stmt| stmt.kind() == SyntaxKind::ASSIGN_STMT && stmt.text_range().start() >= after)
+        .filter(|stmt| {
+            stmt.kind() == SyntaxKind::ASSIGN_STMT
+                && stmt.text_range().start() >= after
+                && stmt.parent() == assignment.parent()
+        })
         .find(|stmt| active_children(stmt).next().is_some_and(|target| is_overwrite(&target)))
         .map_or(scope.text_range().end(), |stmt| stmt.text_range().end());
     let mut calls = Vec::new();
@@ -594,6 +607,50 @@ mod tests {
     Для Каждого КлючЗначение Из Виды Цикл
         Тексты.Добавить(СтрЗаменить(Шаблон, "ИмяВидаДокумента", КлючЗначение.Ключ));
     КонецЦикла;
+КонецПроцедуры
+"#,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_replacement_that_keeps_the_text_does_not_complete_the_template() {
+        let found = missing_tables(
+            r#"
+Процедура Тест() Экспорт
+    Текст = СтрЗаменить("ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т", "ИмяВидаДокумента", "ИмяВидаДокумента");
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn an_overwrite_in_a_branch_does_not_end_the_template() {
+        let found = missing_tables(
+            r#"
+Процедура Тест(Флаг) Экспорт
+    Шаблон = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Блок = СтрЗаменить(Шаблон, "ИмяВидаДокумента", "РеализацияТоваров");
+    Если Флаг Тогда
+        Шаблон = "";
+    КонецЕсли;
+    Запрос = Новый Запрос(Шаблон);
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn an_overwrite_in_the_same_block_ends_the_template() {
+        let found = missing_tables(
+            r#"
+Процедура Тест() Экспорт
+    Шаблон = "ВЫБРАТЬ Т.Ссылка КАК Ссылка ИЗ Документ.ИмяВидаДокумента.Товары КАК Т";
+    Блок = СтрЗаменить(Шаблон, "ИмяВидаДокумента", "РеализацияТоваров");
+    Шаблон = "";
+    Запрос = Новый Запрос(Шаблон);
 КонецПроцедуры
 "#,
         );
