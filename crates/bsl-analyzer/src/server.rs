@@ -936,6 +936,10 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
                     state.vfs_done = true;
                     state.report_progress("Loading", Progress::End, Some("Done".into()), Some(1.0));
 
+                    // Started before the open documents are scheduled, so a form module
+                    // opened right after the load does not build the fold on its own worker.
+                    state.prime_foreign_handler_bindings();
+
                     // Documents opened during the load had their dependency
                     // preload and diagnostics deferred; replay both now that
                     // the source root and metadata substrate are complete.
