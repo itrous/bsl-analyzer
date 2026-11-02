@@ -43,6 +43,23 @@ def main() -> int:
     elif args[:2] == ["issue", "edit"]:
         issue = next(i for i in issues if i["number"] == int(args[2]))
         issue["labels"].append(option("--add-label"))
+    elif args[:2] == ["api", "--paginate"]:
+        # As `gh api --paginate`: one JSON array per page, the arrays one after another.
+        route = args[2].split("?")[0].split("/", 3)[-1]
+        size = int(state.get("page_size", 100))
+        if route == "issues":
+            items = [{"number": i["number"], "state": i["state"].lower(), "title": i["title"], "body": i["body"],
+                      "state_reason": (i["stateReason"] or "").lower() or None,
+                      "labels": [{"name": n} for n in i["labels"]]} | ({"pull_request": {}} if i.get("pull") else {})
+                     for i in issues]
+        elif route == "issues/comments":
+            items = [{"issue_url": f"https://api.github.com/repos/itrous/bsl-analyzer/issues/{i['number']}",
+                      "body": body} for i in issues for body in i["comments"]]
+        else:
+            print(f"fake gh: unsupported {args}", file=sys.stderr)
+            return 2
+        for start in range(0, len(items), size) if items else [0]:
+            print(json.dumps(items[start:start + size], ensure_ascii=False))
     elif args[0] == "api":
         number = int(args[1].split("/")[-2])
         for body in next(i for i in issues if i["number"] == number)["comments"]:

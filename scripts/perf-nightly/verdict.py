@@ -69,6 +69,18 @@ GATE_DECISIVE = ("graph_ready_cpu_s", "graph_resolve_s", "diagnostics_workspace_
 GATE_WALL = ("graph_ready_s",)
 # Outcomes of a gate row that keep the gate from `pass` without blocking it.
 GATE_INCOMPLETE = ("no_noise", "noisy", "confirm", "incomplete")
+# The second base of the gate, `baseline.json`: metric -> (unit, aggregate of the
+# candidate). There is no trade between these metrics and no bar on top of the noise.
+GATE_RECORD = {
+    "graph_ready_s": ("s", "median_A"),
+    "graph_ready_cpu_s": ("s", "median_A"),
+    "graph_resolve_s": ("s", "median_A"),
+    "diagnostics_workspace_s": ("s", "median_A"),
+    "hwm_kb": ("KB", "max_AB"),
+    "references_1_s": ("s", "median_B"),
+    "references_2_same_s": ("s", "median_B"),
+    "references_3_other_s": ("s", "median_B"),
+}
 CALLS_LSP_REPEAT = ("L1", "L2", "L3", "L4", "L6", "G1", "G3")
 CALLS_MCP = ("M1", "M2", "M3", "M5", "M6", "M7")
 
@@ -478,6 +490,25 @@ def gate_verdict(rows: list[dict], reasons: list[str]) -> dict:
         verdict = "pass"
     return {"verdict": verdict, "reasons": found,
             "counts": {o: outcomes.count(o) for o in sorted(set(outcomes))}}
+
+
+def record_limit(record: float, noise: float) -> float:
+    return record * (1 + noise)
+
+
+def record_outcome(value: float, record: float, noise: float) -> str:
+    """Against a best value: above its noise blocks; equal to the limit does not."""
+    return "block" if value > record_limit(record, noise) else "ok"
+
+
+def record_improved(value: float, record: float, noise: float) -> bool:
+    return value < record * (1 - noise)
+
+
+def spread_noise(values: list[float]) -> float | None:
+    """(max − min) / median of the aggregates of calibration series; None at a zero median."""
+    scale = median(values)
+    return (max(values) - min(values)) / scale if scale else None
 
 
 def not_compared(rows: list[dict]) -> int:

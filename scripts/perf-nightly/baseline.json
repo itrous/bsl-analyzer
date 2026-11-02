@@ -1,0 +1,214 @@
+{
+  "schema": 1,
+  "profile": {
+    "config_sha256": "b77bd7bbd78aa8dbf50bfb8966388a2314a6738c2d3c2cfce3d2fede49055c77",
+    "cpu_model": "AMD Ryzen 9 5950X 16-Core Processor",
+    "gate_schema": 1,
+    "harness_schema": 1,
+    "kernel": "7.2.11-arch1-1",
+    "mem_total": "31 GiB",
+    "nproc": 32,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "source_commit": "9469321be80a4d3903b224d0ab7fab385d4ac655"
+  },
+  "protocol": {
+    "build": "release",
+    "call_timeout_s": 1800.0,
+    "corpus": "erp",
+    "extra_resolve": ["ЗначениеРеквизитаОбъекта", "ЗначениеРеквизит", "ОбщегоНазначения"],
+    "extra_top": 50,
+    "module": "src/cf/CommonModules/ОбщегоНазначения/Ext/Module.bsl",
+    "pauses_s": [20.0, 60.0, 30.0],
+    "runs": 3,
+    "scenario": "mcp-graph",
+    "sweep_max_files": 5000,
+    "symbols": ["ОбщегоНазначения.ОбщийМодуль", "ОбщегоНазначения.ЗначениеРеквизитаОбъекта"],
+    "temp": "cold"
+  },
+  "metrics": {
+    "graph_ready_s": {
+      "value": 145.43540564802242,
+      "unit": "s",
+      "aggregate": "median_A",
+      "record_sha": "09d5b2d117a9eeb02ca6892a6c3718e05fdba484",
+      "measured_at": "2026-11-01T03:26:45+00:00",
+      "evidence": {
+        "kind": "historical_import",
+        "summary": "data/gates/0.4.3-2026-11-01/summary.json",
+        "role": "candidate",
+        "series": "A",
+        "runs": ["A-c1", "A-c2", "A-c3"],
+        "confirmation": null
+      },
+      "noise": {
+        "value": 0.045009872812704146,
+        "source": "data/gate-noise.json",
+        "created_at": "2026-10-30T00:32:28+00:00",
+        "profile": "#/profile",
+        "statistic": "(max-min)/median of five series medians of A"
+      }
+    },
+    "graph_ready_cpu_s": {
+      "value": 1245.29,
+      "unit": "s",
+      "aggregate": "median_A",
+      "record_sha": "698aafd6bb7394da35ca2bee1111841d2a914870",
+      "measured_at": "2026-10-31T03:39:33+00:00",
+      "evidence": {
+        "kind": "historical_import",
+        "summary": "data/gates/0.4.2-2026-10-31/summary.json",
+        "role": "candidate",
+        "series": "A",
+        "runs": ["A-c1", "A-c2", "A-c3"],
+        "confirmation": null
+      },
+      "noise": {
+        "value": 0.012051462543783054,
+        "source": "data/gate-noise.json",
+        "created_at": "2026-10-30T00:32:28+00:00",
+        "profile": "#/profile",
+        "statistic": "(max-min)/median of five series medians of A"
+      }
+    },
+    "graph_resolve_s": {
+      "value": 17.442752545000985,
+      "unit": "s",
+      "aggregate": "median_A",
+      "record_sha": "698aafd6bb7394da35ca2bee1111841d2a914870",
+      "measured_at": "2026-10-31T03:39:33+00:00",
+      "evidence": {
+        "kind": "historical_import",
+        "summary": "data/gates/0.4.2-2026-10-31/summary.json",
+        "role": "candidate",
+        "series": "A",
+        "runs": ["A-c1", "A-c2", "A-c3"],
+        "confirmation": null
+      },
+      "noise": {
+        "value": 0.012697172820715787,
+        "source": "data/gate-noise.json",
+        "created_at": "2026-10-30T00:32:28+00:00",
+        "profile": "#/profile",
+        "statistic": "(max-min)/median of five series medians of A"
+      }
+    },
+    "diagnostics_workspace_s": {
+      "value": 21.9344880010176,
+      "unit": "s",
+      "aggregate": "median_A",
+      "record_sha": "1cb57b34ebebc4b7dfc6f78efb7d7bb8977cdc25",
+      "measured_at": "2026-10-31T03:39:33+00:00",
+      "evidence": {
+        "kind": "historical_import",
+        "summary": "data/gates/0.4.2-2026-10-31/summary.json",
+        "role": "base",
+        "series": "A",
+        "runs": ["A-b1", "A-b2", "A-b3"],
+        "confirmation": null
+      },
+      "noise": {
+        "value": 0.009017533120752664,
+        "source": "data/gate-noise.json",
+        "created_at": "2026-10-30T00:32:28+00:00",
+        "profile": "#/profile",
+        "statistic": "(max-min)/median of five series medians of A"
+      }
+    },
+    "hwm_kb": {
+      "value": 4667316,
+      "unit": "KB",
+      "aggregate": "max_AB",
+      "record_sha": "46533be7136107338be24b5bd6c96fad41e0fd61",
+      "measured_at": "2026-11-01T03:26:45+00:00",
+      "evidence": {
+        "kind": "owner_target",
+        "summary": "data/gates/0.4.3-2026-11-01/summary.json",
+        "role": "base",
+        "series": "A",
+        "runs": ["A-b1", "A-b2", "A-b3"],
+        "confirmation": null,
+        "note": "Цель владельца для общего пика A+B. Число — max(4616852,4667316,4662144) серии A базы v0.4.2, без references; измеренным пиком A+B этого бинарника оно не является."
+      },
+      "noise": {
+        "value": null,
+        "source": null,
+        "created_at": null,
+        "profile": null,
+        "statistic": "(max-min)/median of five series max(A+B)",
+        "base_A_noise": {
+          "value": null,
+          "source": null,
+          "created_at": null,
+          "profile": null,
+          "statistic": "(max-min)/median of five series max(A)"
+        }
+      }
+    },
+    "references_1_s": {
+      "value": 56.56816865399014,
+      "unit": "s",
+      "aggregate": "median_B",
+      "record_sha": "698aafd6bb7394da35ca2bee1111841d2a914870",
+      "measured_at": "2026-10-31T03:39:33+00:00",
+      "evidence": {
+        "kind": "historical_import",
+        "summary": "data/gates/0.4.2-2026-10-31/summary.json",
+        "role": "candidate",
+        "series": "B",
+        "runs": ["B-c1", "B-c2", "B-c3"],
+        "confirmation": null
+      },
+      "noise": {
+        "value": null,
+        "source": null,
+        "created_at": null,
+        "profile": null,
+        "statistic": "(max-min)/median of five series medians of B"
+      }
+    },
+    "references_2_same_s": {
+      "value": 24.998699392017443,
+      "unit": "s",
+      "aggregate": "median_B",
+      "record_sha": "09d5b2d117a9eeb02ca6892a6c3718e05fdba484",
+      "measured_at": "2026-11-01T03:26:45+00:00",
+      "evidence": {
+        "kind": "historical_import",
+        "summary": "data/gates/0.4.3-2026-11-01/summary.json",
+        "role": "candidate",
+        "series": "B",
+        "runs": ["B-c1", "B-c2", "B-c3"],
+        "confirmation": null
+      },
+      "noise": {
+        "value": null,
+        "source": null,
+        "created_at": null,
+        "profile": null,
+        "statistic": "(max-min)/median of five series medians of B"
+      }
+    },
+    "references_3_other_s": {
+      "value": 49.895538646000205,
+      "unit": "s",
+      "aggregate": "median_B",
+      "record_sha": "698aafd6bb7394da35ca2bee1111841d2a914870",
+      "measured_at": "2026-10-31T03:39:33+00:00",
+      "evidence": {
+        "kind": "historical_import",
+        "summary": "data/gates/0.4.2-2026-10-31/summary.json",
+        "role": "candidate",
+        "series": "B",
+        "runs": ["B-c1", "B-c2", "B-c3"],
+        "confirmation": null
+      },
+      "noise": {
+        "value": null,
+        "source": null,
+        "created_at": null,
+        "profile": null,
+        "statistic": "(max-min)/median of five series medians of B"
+      }
+    }
+  }
+}

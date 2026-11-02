@@ -1002,6 +1002,7 @@ def parser() -> argparse.ArgumentParser:
     night.add_argument("--date", help="night key YYYY-MM-DD (default: today)")
     night.add_argument("--remote", help="URL the build clone fetches from (default: origin)")
     night.add_argument("--publish", action="store_true", help="publish the night's perf issues with gh")
+    night.add_argument("--baseline", help="the record file (default: baseline.json next to gate.py)")
     night.set_defaults(func=cmd_night)
 
     gate = sub.add_parser("gate", help="release gate: a base tag against a candidate commit on ERP")
@@ -1020,12 +1021,16 @@ def parser() -> argparse.ArgumentParser:
                       help="control: the candidate server starts this many seconds later")
     gate.add_argument("--control-foreign-burn", type=int,
                       help="control: this many busy processes outside the run live through readiness")
+    gate.add_argument("--baseline", help="the record file (default: baseline.json next to gate.py)")
     gate.set_defaults(func=cmd_gate)
 
     gate_calibrate = sub.add_parser("gate-calibrate", help="measure the gate's noise and write gate-noise.json")
     gate_calibrate.add_argument("--data-dir", required=True)
     gate_calibrate.add_argument("--base", required=True, help="the release tag vX.Y.Z to calibrate on")
     gate_calibrate.add_argument("--series", type=int, help="series of three runs to measure (default 5)")
+    gate_calibrate.add_argument("--record-metrics-only", action="store_true",
+                                help="measure only the noise of peak memory and references, by series of A×3+B×3, "
+                                     "next to the entries that exist")
     gate_calibrate.set_defaults(func=cmd_gate_calibrate)
 
     compare = sub.add_parser("compare", help="verdict of a candidate series against a base series")

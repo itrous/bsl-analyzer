@@ -9,11 +9,17 @@ absolute ceilings and the byte equality of the answers. A run during which the
 machine spent more than two cores on work outside the run does not count and is
 measured again. `gate-calibrate` measures the base alone and writes
 `gate-noise.json`, separate from the nightly `noise.json`.
+
+The second base is `baseline.json`: the best confirmed value of each metric,
+judged by `C > R·(1+ν)` on the full profile and protocol of the record. A
+second round measures an improvement over it; neither the gate nor the night
+writes the file. `record_night` measures develop against it with the same runs.
 """
 
 from __future__ import annotations
 
 import fcntl
+import glob
 import json
 import math
 import os
@@ -30,7 +36,8 @@ import scenarios
 import verdict
 from clock import RealClock
 from common import (
-    HARNESS_SCHEMA, MISSING_REASONS, Data, HarnessError, git, median, read_json, repo_root, sha256_bytes, write_json,
+    HARNESS_SCHEMA, HERE, MISSING_REASONS, Data, HarnessError, git, median, read_json, repo_root, sha256_bytes,
+    write_json,
 )
 
 GATE_SCHEMA = 1
@@ -61,6 +68,16 @@ LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 METRICS = {m.key: m for m in verdict.GATE_METRICS}
 READY_ONLY_METRICS = ("graph_ready_s", "graph_ready_cpu_s")
 REFS_METRICS = tuple(verdict.GATE_REFS_LIMITS_S)
+BASELINE_SCHEMA = 1
+BASELINE_PATH = os.path.join(HERE, "baseline.json")
+EVIDENCE_FIELDS = ("kind", "summary", "role", "series", "runs", "confirmation")
+MEMORY_A_KEY = "hwm_A_kb"
+HWM_METRIC = verdict.Metric("hwm_kb", "hwm_kb")
+# Seconds per run of a record night with no earlier one on this profile: the
+# longest held run of each series of the release gate of 2026-11-01.
+RECORD_RUN_ESTIMATE_S = {"A": 319.58177912799874, "B": 401.89415255299537}
+# The one binary of the noise a record lacks: a release that has the references tool.
+RECORD_CALIBRATION_BASE = "v0.4.2"
 # Burns its share of CPU seconds of its own and exits.
 BURN_CODE = (
     "import sys, time\n"
@@ -80,6 +97,10 @@ DELAY_CODE = (
 
 class MachineBusy(Exception):
     """The budget for waiting on a quiet machine is spent."""
+
+
+class WindowExhausted(Exception):
+    """The next run would not end inside the window of the night."""
 
 
 class Machine:
@@ -132,9 +153,9 @@ def foreign_cores(busy_s: float, own_cpu_s: float, wall_s: float) -> float:
 # -- source and noise ----------------------------------------------------------------
 
 
-def check_source(data: Data) -> dict:
+def check_source(data: Data, manifest_path: str | None = None) -> dict:
     """The ERP clone of the manifest, at its commit, with no tracked file changed."""
-    manifest = corpus.load_manifest(data.path("corpora.toml"))
+    manifest = corpus.load_manifest(manifest_path or data.path("corpora.toml"))
     entry = manifest["corpora"].get(CORPUS)
     if entry is None:
         raise HarnessError("manifest_invalid", f"no `{CORPUS}` corpus in the manifest")
@@ -430,9 +451,12 @@ def run_pass(ctx, series: str, ready_only: bool, *, record: dict, controls: dict
 class Runner:
     """Runs in their order, each after the quiet-machine precondition; a run
     with foreign load is measured again in its place. Waiting and the runs
-    that did not count share one budget."""
+    that did not count share one budget. `fits(series)`, when given, says
+    whether a run of the series still ends inside a window; it is asked while
+    the machine is waited for and after that, and a run that does not fit never
+    starts."""
 
-    def __init__(self, clock, machine, source: dict, print_: dict, budget_min: float):
+    def __init__(self, clock, machine, source: dict, print_: dict, budget_min: float, fits=None):
         self.clock = clock
         self.machine = machine
         self.source = source
@@ -440,19 +464,26 @@ class Runner:
         self.budget_s = budget_min * 60.0
         self.spent_s = 0.0
         self.launches: list[dict] = []
+        self.fits = fits
 
-    def wait_quiet(self) -> None:
+    def check_window(self, series: str) -> None:
+        if self.fits is not None and not self.fits(series):
+            raise WindowExhausted()
+
+    def wait_quiet(self, series: str) -> None:
         while not self.machine.quiet()["ok"]:
             if self.spent_s >= self.budget_s:
                 raise MachineBusy()
+            self.check_window(series)
             self.clock.sleep(PRECONDITION_POLL_S)
             self.spent_s += PRECONDITION_POLL_S
+        self.check_window(series)
 
     def run(self, run_dir: str, binary: dict, role: str, series: str, k: int, ready_only: bool,
             controls: dict, record_path: str | None = None) -> dict:
         attempt = 0
         while True:
-            self.wait_quiet()
+            self.wait_quiet(series)
             attempt += 1
             this_dir = run_dir if attempt == 1 else f"{run_dir}.{attempt}"
             shutil.rmtree(this_dir, ignore_errors=True)
@@ -568,25 +599,40 @@ def confirm_row(row: dict, base: list, cand: list) -> None:
     row["outcome"] = outcome
 
 
-def _ceiling(key: str, groups: list[list], value, limit: float) -> dict:
-    metric = verdict.Metric(key, key)
+def _worst_state(groups: list[list], metric) -> str:
     states = [side(records, metric)[0] for records in groups]
-    worst = next((s for s in ("failed", "invalid", "missing", "n/a") if s in states), "valid")
-    row = {"metric": key, "kind": "ceiling", "limit": limit, "candidate": {"state": worst, "value": None}}
-    outcome = side_outcome("valid", row["candidate"]["state"])
-    if outcome is None:
-        row["candidate"]["value"] = value()
-        outcome = "block" if row["candidate"]["value"] > limit else "ok"
-    row["outcome"] = outcome
-    return row
+    return next((s for s in ("failed", "invalid", "missing", "n/a") if s in states), "valid")
 
 
-def ceiling_rows(series_a: list, series_b: list) -> list[dict]:
-    rows = [_ceiling("hwm_kb", [series_a, series_b],
-                     lambda: max(r["metrics"]["hwm_kb"] for r in series_a + series_b),
-                     verdict.GATE_HWM_LIMIT_KB)]
+def peak(groups: list[list]) -> tuple[str, float | None]:
+    """(state, value) of the peak memory over the given series taken together."""
+    state = _worst_state(groups, HWM_METRIC)
+    return state, max(r["metrics"]["hwm_kb"] for records in groups for r in records) if state == "valid" else None
+
+
+def _ceiling(key: str, groups: list[list], value: float | None, limit: float) -> dict:
+    """`value` is what the held runs measured. Above the limit it blocks whatever
+    the other runs did: a round that did not finish cannot erase a measured excess."""
+    state = _worst_state(groups, verdict.Metric(key, key))
+    if value is not None and value > limit:
+        return {"metric": key, "kind": "ceiling", "limit": limit, "candidate": {"state": "valid", "value": value},
+                "outcome": "block"}
+    return {"metric": key, "kind": "ceiling", "limit": limit,
+            "candidate": {"state": state, "value": value if state == "valid" else None},
+            "outcome": side_outcome("valid", state) or "ok"}
+
+
+def ceiling_rows(series_a: list, series_b: list, confirm: tuple[list, list] | None = None) -> list[dict]:
+    """Peak memory over every run of the candidate; a reference over its worst
+    round median, since the medians of two rounds do not mix."""
+    groups_a = [series_a] + ([confirm[0]] if confirm else [])
+    groups_b = [series_b] + ([confirm[1]] if confirm else [])
+    groups = groups_a + groups_b
+    peaks = [r["metrics"].get("hwm_kb") for records in groups for r in records if r["held"]]
+    rows = [_ceiling("hwm_kb", groups, max(filter(verdict._number, peaks), default=None), verdict.GATE_HWM_LIMIT_KB)]
     for key, limit in verdict.GATE_REFS_LIMITS_S.items():
-        rows.append(_ceiling(key, [series_b], lambda key=key: side(series_b, verdict.Metric(key, key))[1], limit))
+        medians = [side(b, verdict.Metric(key, key))[1] for b in groups_b]
+        rows.append(_ceiling(key, groups_b, max((m for m in medians if m is not None), default=None), limit))
     return rows
 
 
@@ -654,6 +700,249 @@ def compare_answers(pairs: list[tuple[dict, dict]]) -> dict:
             **{f"{kind}_codes": sorted(sweep[kind], key=lambda i: i["code"]) for kind in sweep}}
 
 
+# -- the record ------------------------------------------------------------------------
+
+
+def measured_protocol() -> dict:
+    """The part of the protocol that decides whether a run compares with a record."""
+    return {"corpus": CORPUS, "scenario": SCENARIO, "runs": RUNS, "symbols": [SYMBOL_1, SYMBOL_2],
+            "module": MODULE_REL, "extra_resolve": list(EXTRA_RESOLVE), "extra_top": EXTRA_TOP,
+            "sweep_max_files": SWEEP_MAX_FILES, "pauses_s": [PAUSE_READY_S, PAUSE_SETTLE_S, PAUSE_SWEEP_S],
+            "call_timeout_s": CALL_TIMEOUT_S, "temp": TEMP, "build": "release"}
+
+
+def _differing(expected: dict, measured: dict) -> list[str]:
+    return sorted(k for k in expected.keys() | measured.keys() if expected.get(k) != measured.get(k))
+
+
+def _text(value) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def noise_value(noise) -> float | None:
+    """The tolerance of a `noise` object; anything but a finite number ≥ 0 is none."""
+    value = noise.get("value") if isinstance(noise, dict) else None
+    return value if verdict._number(value) and math.isfinite(value) and value >= 0 else None
+
+
+class Baseline:
+    """`baseline.json`, read once per run. What is wrong with it is a named
+    reason of the record, never an exception: the old rule still gets judged."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.sha256 = None
+        self.profile: dict = {}
+        self.protocol: dict = {}
+        self.metrics: dict = {}
+        self.reasons: list[str] = []
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            self.reasons.append("baseline_missing")
+            return
+        self.sha256 = sha256_bytes(raw)
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            self.reasons.append("baseline_invalid:not_json")
+            return
+        # `True` and `1.0` equal 1 in Python, and neither is a known schema.
+        if not isinstance(doc, dict) or type(doc.get("schema")) is not int or doc["schema"] != BASELINE_SCHEMA:
+            self.reasons.append("baseline_invalid:schema")
+            return
+        for part in ("profile", "protocol", "metrics"):
+            if not isinstance(doc.get(part), dict) or not doc[part]:
+                self.reasons.append(f"baseline_invalid:{part}")
+        if self.reasons:
+            return
+        self.profile, self.protocol, self.metrics = doc["profile"], doc["protocol"], doc["metrics"]
+        self.reasons += [f"baseline_invalid:{key}" for key in self.metrics if key not in verdict.GATE_RECORD]
+
+    def problem(self, key: str) -> str | None:
+        """Why this record cannot judge its metric."""
+        entry = self.metrics.get(key)
+        unit, aggregate = verdict.GATE_RECORD[key]
+        if not isinstance(entry, dict):
+            return f"baseline_invalid:{key}"
+        value = entry.get("value")
+        evidence = entry.get("evidence")
+        if not verdict._number(value) or not math.isfinite(value) or value <= 0 \
+                or entry.get("unit") != unit or entry.get("aggregate") != aggregate \
+                or not _text(entry.get("record_sha")) or not _text(entry.get("measured_at")) \
+                or not isinstance(evidence, dict) or any(field not in evidence for field in EVIDENCE_FIELDS):
+            return f"baseline_invalid:{key}"
+        return None if noise_value(entry.get("noise")) is not None else f"record_no_noise:{key}"
+
+    def incomparable(self, print_: dict | None) -> list[str]:
+        """The reasons no number of this measurement compares with any record."""
+        reasons = list(self.reasons)
+        if self.profile and print_ is not None:
+            diff = _differing(self.profile, print_)
+            reasons += [f"record_profile_mismatch:{','.join(diff)}"] if diff else []
+        if self.protocol:
+            diff = _differing(self.protocol, measured_protocol())
+            reasons += [f"record_protocol_mismatch:{','.join(diff)}"] if diff else []
+        return reasons
+
+
+def baseline_path(args) -> str:
+    return getattr(args, "baseline", None) or BASELINE_PATH
+
+
+def new_round() -> dict:
+    """The runs of one round apart, so that no median mixes two rounds."""
+    return {"base": [], "candidate": [], "B": [], "names": {"base": [], "candidate": [], "B": []}}
+
+
+def _round_side(key: str, round_: dict) -> tuple[str, float | None]:
+    aggregate = verdict.GATE_RECORD[key][1]
+    if aggregate == "max_AB":
+        return peak([round_["candidate"], round_["B"]])
+    return side(round_["candidate" if aggregate == "median_A" else "B"], verdict.Metric(key, key))
+
+
+def _worst_cell(cells: list[dict]) -> dict:
+    rank = {"ok": 0, "incomplete": 1, "block": 2}
+    return max(cells, key=lambda c: (rank[c["outcome"]], -math.inf if c["delta"] is None else c["delta"]))
+
+
+def record_row(key: str, baseline: Baseline, incomparable: list[str], rounds: list[dict]) -> dict:
+    """One record metric over the rounds: each round is compared on its own and
+    the row is the worst of them, so a later round cannot erase a block."""
+    unit, aggregate = verdict.GATE_RECORD[key]
+    entry = baseline.metrics.get(key)
+    entry = entry if isinstance(entry, dict) else {}
+    nu = noise_value(entry.get("noise"))
+    row = {"metric": key, "kind": "record", "unit": unit, "aggregate": aggregate,
+           "record": {"value": entry.get("value"), "sha": entry.get("record_sha"),
+                      "measured_at": entry.get("measured_at"), "evidence": entry.get("evidence")},
+           "candidate": {"state": None, "value": None}, "delta": None, "noise": nu, "limit": None,
+           "outcome": "incomplete", "reason": None, "rounds": []}
+    blocked = "; ".join(incomparable) or baseline.problem(key)
+    if blocked:
+        row["reason"] = blocked
+        return row
+    record = entry["value"]
+    row["limit"] = verdict.record_limit(record, nu)
+    for round_ in rounds:
+        state, value = _round_side(key, round_)
+        cell = {"candidate": {"state": state, "value": value}, "delta": None, "improved": False,
+                "outcome": side_outcome("valid", state)}
+        if cell["outcome"] is None:
+            cell["delta"] = _delta(record, value)
+            cell["outcome"] = verdict.record_outcome(value, record, nu)
+            cell["improved"] = verdict.record_improved(value, record, nu)
+        row["rounds"].append(cell)
+    if not row["rounds"]:
+        row["reason"] = f"record_missing:{key}"
+        return row
+    worst = _worst_cell(row["rounds"])
+    row.update(candidate=worst["candidate"], delta=worst["delta"], outcome=worst["outcome"])
+    if row["outcome"] == "incomplete":
+        row["reason"] = f"record_missing:{key}"
+    return row
+
+
+def _unique(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
+
+
+def record_section(baseline: Baseline, print_: dict | None, rounds: list[dict], keys, probe: bool) -> dict:
+    """`summary.record`: its rows and its own verdict. A probe does not vouch for anything."""
+    incomparable = baseline.incomparable(print_)
+    rows = [record_row(key, baseline, incomparable, rounds) for key in keys]
+    reasons = _unique([part for r in rows if r["outcome"] == "incomplete" for part in r["reason"].split("; ")])
+    result = verdict.gate_verdict([r for r in rows if r["outcome"] == "block"], _unique(incomparable + reasons))
+    found = "probe-ok" if probe and result["verdict"] == "pass" else result["verdict"]
+    return {"baseline_path": baseline.path, "baseline_sha256": baseline.sha256, "profile": print_,
+            "baseline_profile": baseline.profile, "protocol": baseline.protocol, "entries": baseline.metrics,
+            "rows": rows, "verdict": found, "reasons": result["reasons"]}
+
+
+def memory_base_row(baseline: Baseline, print_: dict | None, rounds: list[dict]) -> dict:
+    """Peak of series A of the candidate against peak of series A of the base,
+    each round on its own: B has references, which the base does not measure."""
+    entry = baseline.metrics.get("hwm_kb")
+    noise = entry.get("noise") if isinstance(entry, dict) else None
+    nu = noise_value(noise.get("base_A_noise")) if isinstance(noise, dict) else None
+    row = {"metric": MEMORY_A_KEY, "kind": "memory_base", "base": {"state": None, "value": None},
+           "candidate": {"state": None, "value": None}, "delta": None, "noise": nu, "limit": None,
+           "outcome": "incomplete", "reason": None, "rounds": []}
+    blocked = "; ".join(baseline.incomparable(print_)) or (None if nu is not None else f"record_no_noise:{MEMORY_A_KEY}")
+    if blocked:
+        row["reason"] = blocked
+        return row
+    for round_ in rounds:
+        b_state, b_value = peak([round_["base"]])
+        c_state, c_value = peak([round_["candidate"]])
+        cell = {"base": {"state": b_state, "value": b_value}, "candidate": {"state": c_state, "value": c_value},
+                "delta": None, "limit": None, "outcome": side_outcome(b_state, c_state)}
+        if cell["outcome"] is None:
+            cell["delta"] = _delta(b_value, c_value)
+            cell["limit"] = verdict.record_limit(b_value, nu)
+            cell["outcome"] = verdict.record_outcome(c_value, b_value, nu)
+        row["rounds"].append(cell)
+    worst = _worst_cell(row["rounds"])
+    row.update(base=worst["base"], candidate=worst["candidate"], delta=worst["delta"], limit=worst["limit"],
+               outcome=worst["outcome"])
+    if row["outcome"] == "incomplete":
+        row["reason"] = f"memory_base_missing:{MEMORY_A_KEY}"
+    return row
+
+
+def second_base_judgement(section: dict, memory: dict | None) -> tuple[list[dict], list[str]]:
+    """Rows and reasons the second base adds to the verdict of the whole gate;
+    `record:` tells its block of a metric from the block of the old rule."""
+    judged = [{"metric": f"record:{r['metric']}", "outcome": "block"} for r in section["rows"]
+              if r["outcome"] == "block"]
+    reasons = [r for r in section["reasons"] if not r.startswith("block: ")]
+    if memory is not None and memory["outcome"] == "block":
+        judged.append({"metric": "memory_base", "outcome": "block"})
+    elif memory is not None and memory["outcome"] == "incomplete":
+        reasons += memory["reason"].split("; ")
+    return judged, _unique(reasons)
+
+
+def _improved_metrics(section: dict) -> list[str]:
+    return [r["metric"] for r in section["rows"] if any(c["improved"] for c in r["rounds"])]
+
+
+def _names(round_: dict, aggregate: str) -> list[str]:
+    names = round_["names"]
+    if aggregate == "max_AB":
+        return names["candidate"] + names["B"]
+    return names["candidate" if aggregate == "median_A" else "B"]
+
+
+def _round_held(round_: dict) -> bool:
+    return all(len(round_[part]) == RUNS and all(r["held"] for r in round_[part]) for part in ("base", "candidate", "B"))
+
+
+def record_proposals(section: dict, baseline: Baseline, rounds: list[dict], answers: dict | None, label: str,
+                     sha: str, print_: dict) -> list[dict]:
+    """The metrics that beat their record by more than the noise in both full
+    rounds, each at the worse of the two. `baseline.json` is moved by a commit
+    of the person who reads these."""
+    if len(rounds) != 2 or not all(_round_held(r) for r in rounds) or (answers or {}).get("outcome") != "ok":
+        return []
+    found = []
+    for row in section["rows"]:
+        if len(row["rounds"]) != 2 or not all(c["improved"] for c in row["rounds"]):
+            continue
+        values = [c["candidate"]["value"] for c in row["rounds"]]
+        aggregate = row["aggregate"]
+        found.append({
+            "metric": row["metric"], "unit": row["unit"], "aggregate": aggregate, "value": max(values),
+            "rounds": values, "previous_value": row["record"]["value"], "record_sha": sha,
+            "measured_at": verdict.now_iso(), "noise": baseline.metrics[row["metric"]]["noise"], "profile": print_,
+            "evidence": {"kind": "confirmed", "summary": f"data/gates/{label}/summary.json", "role": "candidate",
+                         "series": {"median_A": "A", "median_B": "B", "max_AB": "A+B"}[aggregate],
+                         "runs": _names(rounds[0], aggregate), "confirmation": _names(rounds[1], aggregate)}})
+    return found
+
+
 # -- the gate ---------------------------------------------------------------------------
 
 
@@ -683,6 +972,7 @@ def cmd_gate(args, clock=None, builder=None, machine=None) -> int:
         os.makedirs(out_dir)
         summary = {"verdict": None, "reasons": [], "rows": [], "answers": None, "ceilings": [], "runs": [],
                    "noise": None, "controls": _controls(args) or None, "protocol": protocol(args),
+                   "record": None, "memory_base": None, "record_proposals": [], "record_confirmation": None,
                    "base": {"label": args.base, "sha": None},
                    "candidate": {"label": args.candidate, "sha": None},
                    "started_at": verdict.now_iso(), "finished_at": None}
@@ -700,11 +990,8 @@ def cmd_gate(args, clock=None, builder=None, machine=None) -> int:
 
 
 def protocol(args) -> dict:
-    return {"gate_schema": GATE_SCHEMA, "corpus": CORPUS, "scenario": SCENARIO, "runs": RUNS,
-            "ready_only": bool(getattr(args, "ready_only", False)),
-            "symbols": [SYMBOL_1, SYMBOL_2], "module": MODULE_REL, "extra_resolve": list(EXTRA_RESOLVE),
-            "extra_top": EXTRA_TOP, "sweep_max_files": SWEEP_MAX_FILES,
-            "pauses_s": [PAUSE_READY_S, PAUSE_SETTLE_S, PAUSE_SWEEP_S], "call_timeout_s": CALL_TIMEOUT_S,
+    measured = {k: v for k, v in measured_protocol().items() if k not in ("temp", "build")}
+    return {"gate_schema": GATE_SCHEMA, **measured, "ready_only": bool(getattr(args, "ready_only", False)),
             "bar": verdict.GATE_BAR, "foreign_cores_limit": verdict.GATE_FOREIGN_CORES,
             "hwm_limit_kb": verdict.GATE_HWM_LIMIT_KB, "refs_limits_s": verdict.GATE_REFS_LIMITS_S,
             "busy_budget_min": _budget(args)}
@@ -716,71 +1003,220 @@ def _budget(args) -> float:
 
 
 def _gate(args, clock, builder, machine, data: Data, out_dir: str, summary: dict) -> None:
+    ready_only = bool(args.ready_only)
+    controls = _controls(args)
+    probe = ready_only or bool(controls)
+    keys = READY_ONLY_METRICS if ready_only else tuple(verdict.GATE_RECORD)
+    baseline = Baseline(baseline_path(args))
+    summary["record"] = record_section(baseline, None, [], keys, probe)
     source = check_source(data)
     print_ = fingerprint(machine, source)
+    summary["record"] = record_section(baseline, print_, [], keys, probe)
     noise = read_noise(data)
     stale = noise_stale(noise, print_)
     summary["noise"] = {"status": stale or "current",
                         "values": {key: noise_of(noise, key) for key in METRICS} if noise else None}
     if stale is not None:
-        summary.update(verdict="incomplete", reasons=[f"noise_stale: {stale}"])
+        summary.update(verdict="incomplete", reasons=[f"noise_stale: {stale}", *baseline.incomparable(print_)])
         return
     base, cand = build_pair(data, args.base, args.candidate, builder)
     summary["base"] = {"label": base["label"], "sha": base["sha"]}
     summary["candidate"] = {"label": cand["label"], "sha": cand["sha"]}
-    ready_only = bool(args.ready_only)
-    controls = _controls(args)
     if "control_burn_cpu_s" in controls:
         controls["burners"] = burn_count(controls["control_burn_cpu_s"], noise)
     spin = {k: v for k, v in controls.items() if k == "control_foreign_burn"}
     runner = Runner(clock, machine, source, print_, _budget(args))
     runs = os.path.join(out_dir, "runs")
     reasons: list[str] = []
-    series: dict[str, list] = {"base": [], "candidate": [], "confirm_base": [], "confirm_candidate": [], "B": []}
+    rounds: list[dict] = []
     pairs: list = []
 
-    def round_(first: int, base_key: str, cand_key: str) -> None:
+    def measure_round() -> None:
+        found = new_round()
+        rounds.append(found)
+
+        def run(part: str, name: str, binary: dict, role: str, series: str, k: int, run_controls: dict) -> dict:
+            found[part].append(runner.run(os.path.join(runs, name), binary, role, series, k, ready_only,
+                                          run_controls))
+            launch = runner.launches[-1]
+            found["names"][part].append(launch["run"])
+            return launch
+
+        first = (len(rounds) - 1) * RUNS
         for k in range(1, RUNS + 1):
-            index = first + k - 1
-            series[base_key].append(runner.run(os.path.join(runs, f"A-b{index}"), base, "base", "A", k,
-                                               ready_only, spin))
-            b_launch = runner.launches[-1]
-            series[cand_key].append(runner.run(os.path.join(runs, f"A-c{index}"), cand, "candidate", "A", k,
-                                               ready_only, controls))
-            pairs.append((b_launch, runner.launches[-1]))
+            b_launch = run("base", f"A-b{first + k}", base, "base", "A", k, spin)
+            pairs.append((b_launch, run("candidate", f"A-c{first + k}", cand, "candidate", "A", k, controls)))
+        if not ready_only:
+            for k in range(1, RUNS + 1):
+                run("B", f"B-c{first + k}", cand, "candidate", "B", k, controls)
 
     rows: list[dict] = []
     ceilings: list[dict] = []
+    confirmation = {"requested": False, "triggers": [], "complete": False}
     try:
-        round_(1, "base", "candidate")
-        rows = rule_rows(series["base"], series["candidate"], noise, ready_only)
+        measure_round()
+        rows = rule_rows(rounds[0]["base"], rounds[0]["candidate"], noise, ready_only)
         wall = next(r for r in rows if r["metric"] in verdict.GATE_WALL)
-        if wall["outcome"] == "confirm":
-            round_(RUNS + 1, "confirm_base", "confirm_candidate")
-            confirm_row(wall, series["confirm_base"], series["confirm_candidate"])
-        if not ready_only:
-            for k in range(1, RUNS + 1):
-                series["B"].append(runner.run(os.path.join(runs, f"B-c{k}"), cand, "candidate", "B", k,
-                                              False, controls))
+        confirm_wall = wall["outcome"] == "confirm"
+        improved = [] if probe else _improved_metrics(record_section(baseline, print_, rounds, keys, probe))
+        if confirm_wall or improved:
+            confirmation.update(requested=True, triggers=(["wall"] if confirm_wall else []) + improved)
+            measure_round()
+            confirmation["complete"] = all(_round_held(r) for r in rounds)
+            if confirm_wall:
+                confirm_row(wall, rounds[1]["base"], rounds[1]["candidate"])
     except MachineBusy:
         reasons.append("machine_busy")
         if not rows:
-            rows = rule_rows(series["base"], series["candidate"], noise, ready_only)
+            rows = rule_rows(rounds[0]["base"], rounds[0]["candidate"], noise, ready_only)
     answers = None
     if not ready_only:
-        ceilings = ceiling_rows(series["candidate"] + series["confirm_candidate"], series["B"])
+        ceilings = ceiling_rows(rounds[0]["candidate"], rounds[0]["B"],
+                                (rounds[1]["candidate"], rounds[1]["B"]) if len(rounds) > 1 else None)
         answers = compare_answers(pairs)
         if answers["outcome"] == "block":
             reasons.append("answers_differ")
         elif answers["control"] is False:
             reasons.append("answers_control")
-    judged = rows + ceilings + ([{"metric": "answers", "outcome": answers["outcome"]}] if answers else [])
-    result = verdict.gate_verdict(judged, reasons)
-    if ready_only and result["verdict"] == "pass":
+    section = record_section(baseline, print_, rounds, keys, probe)
+    memory = None if ready_only else memory_base_row(baseline, print_, rounds)
+    second_rows, second_reasons = second_base_judgement(section, memory)
+    judged = rows + ceilings + ([{"metric": "answers", "outcome": answers["outcome"]}] if answers else []) + second_rows
+    result = verdict.gate_verdict(judged, reasons + second_reasons)
+    if probe and result["verdict"] == "pass":
         result["verdict"] = "probe-ok"
+    proposals = [] if probe else record_proposals(section, baseline, rounds, answers, os.path.basename(out_dir),
+                                                  cand["sha"], print_)
     summary.update(verdict=result["verdict"], reasons=result["reasons"], counts=result["counts"], rows=rows,
-                   ceilings=ceilings, answers=answers, runs=runner.launches,
-                   busy_spent_s=runner.spent_s)
+                   ceilings=ceilings, answers=answers, runs=runner.launches, busy_spent_s=runner.spent_s,
+                   record=section, memory_base=memory, record_proposals=proposals, record_confirmation=confirmation)
+
+
+# -- the night against the record -------------------------------------------------------
+
+
+def _record_attempt_dir(data: Data, name: str) -> tuple[str, bool]:
+    """(directory, it holds a finished measurement). A directory left without a
+    summary is not a measurement; it stays, and the attempt gets a suffix."""
+    attempt = 1
+    while True:
+        path = data.path("gates", name if attempt == 1 else f"{name}-{attempt}")
+        if not os.path.exists(path):
+            return path, False
+        if os.path.isfile(os.path.join(path, "summary.json")):
+            return path, True
+        attempt += 1
+
+
+def record_estimates(data: Data, date: str, print_: dict) -> dict:
+    """Seconds per run of each series: the longest run of its held three on the
+    latest earlier record night of this profile, or `RECORD_RUN_ESTIMATE_S`."""
+    found = dict(RECORD_RUN_ESTIMATE_S)
+    pending = set(found)
+    for path in sorted(glob.glob(os.path.join(glob.escape(data.path("gates")), "record-night-*", "summary.json")),
+                       reverse=True):
+        summary = read_json(path)
+        if summary.get("date", date) >= date or (summary.get("record") or {}).get("profile") != print_:
+            continue
+        for series in sorted(pending):
+            durations = (summary.get("durations") or {}).get(series)
+            if durations:
+                found[series] = max(durations)
+                pending.discard(series)
+    return found
+
+
+def _baseline_reference(path: str) -> dict:
+    """The record file as an issue may name it: the repository's own path and
+    commit; a path outside the repository is not published."""
+    try:
+        root = repo_root()
+    except HarnessError:
+        return {"path": os.path.basename(path), "commit": None}
+    relative = os.path.relpath(os.path.abspath(path), root)
+    return {"path": os.path.basename(path) if relative.startswith("..") else relative,
+            "commit": git("rev-parse", "HEAD", cwd=root, check=False) or None}
+
+
+def _record_result(summary_path: str | None, summary: dict | None, reasons: list[str], reused: bool = False) -> dict:
+    return {"verdict": summary["verdict"] if summary else "incomplete",
+            "record_verdict": (summary.get("record") or {}).get("verdict") if summary else None,
+            "reasons": summary["reasons"] if summary else reasons, "summary": summary_path,
+            "report": f"{os.path.dirname(summary_path)}/report.md" if summary_path else None, "reused": reused}
+
+
+def _public_summary(out_dir: str) -> str:
+    return f"data/gates/{os.path.basename(out_dir)}/summary.json"
+
+
+def record_night(args, clock, data: Data, date: str, cand: dict, window, machine=None) -> dict:
+    """Three runs of series A and three of series B of an already built develop
+    against the numbers of the record: no base, no second round, no proposals.
+    Whatever stands in the way is the reason of an incomplete record, and the
+    warm set of the night goes on regardless."""
+    machine = machine or Machine()
+    os.makedirs(data.root, exist_ok=True)
+    with open(data.path("gate.lock"), "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _record_result(None, None, ["gate_busy"])
+        try:
+            out_dir, finished = _record_attempt_dir(data, f"record-night-{date}-{cand['sha'][:12]}")
+            if finished:
+                return _record_result(_public_summary(out_dir), read_json(os.path.join(out_dir, "summary.json")), [],
+                                      reused=True)
+            return _record_night(args, clock, data, date, cand, window, machine, out_dir)
+        except (HarnessError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+            reason = exc.reason if isinstance(exc, HarnessError) else "harness_error"
+            detail = exc.detail if isinstance(exc, HarnessError) else f"{type(exc).__name__}: {exc}"
+            return _record_result(None, None, [f"{reason}: {detail}" if detail else reason])
+
+
+def _record_night(args, clock, data: Data, date: str, cand: dict, window, machine, out_dir: str) -> dict:
+    source = check_source(data, getattr(args, "corpora", None))
+    print_ = fingerprint(machine, source)
+    path = baseline_path(args)
+    baseline = Baseline(path)
+    estimates = record_estimates(data, date, print_)
+    runner = Runner(clock, machine, source, print_, BUSY_BUDGET_MIN, lambda series: window.fits(estimates[series]))
+    os.makedirs(out_dir)
+    started_at = verdict.now_iso()
+    found = new_round()
+    reasons: list[str] = []
+    try:
+        for series, part in (("A", "candidate"), ("B", "B")):
+            for k in range(1, RUNS + 1):
+                found[part].append(runner.run(os.path.join(out_dir, "runs", f"{series}-c{k}"), cand, "candidate",
+                                              series, k, False, {}))
+                found["names"][part].append(runner.launches[-1]["run"])
+    except MachineBusy:
+        reasons.append("machine_busy")
+    except WindowExhausted:
+        reasons.append("window_exhausted")
+    section = record_section(baseline, print_, [found], tuple(verdict.GATE_RECORD), False)
+    ceilings = ceiling_rows(found["candidate"], found["B"])
+    second_rows, second_reasons = second_base_judgement(section, None)
+    result = verdict.gate_verdict(ceilings + second_rows, reasons + second_reasons)
+    durations = {series: [r["duration_s"] for r in records]
+                 for series, records in (("A", found["candidate"]), ("B", found["B"]))
+                 if len(records) == RUNS and all(r["held"] for r in records)}
+    values = [{"run": name, "series": series, "held": record["held"],
+               "metrics": {key: record["metrics"].get(key) for key in verdict.GATE_RECORD}}
+              for series, part in (("A", "candidate"), ("B", "B"))
+              for name, record in zip(found["names"][part], found[part])]
+    summary = {"mode": "record-night", "date": date, "candidate": {"label": cand["label"], "sha": cand["sha"]},
+               # A night compares no release: its top verdict never says `pass`.
+               "verdict": "ok" if result["verdict"] == "pass" else result["verdict"], "reasons": result["reasons"],
+               "counts": result["counts"], "record": section, "ceilings": ceilings, "runs": runner.launches,
+               "run_values": values, "durations": durations, "baseline": _baseline_reference(path),
+               "artifacts": {"summary": _public_summary(out_dir),
+                             "report": f"{os.path.dirname(_public_summary(out_dir))}/report.md"},
+               "protocol": protocol(None), "controls": None, "noise": None, "busy_spent_s": runner.spent_s,
+               "started_at": started_at, "finished_at": verdict.now_iso()}
+    write_report(out_dir, summary)
+    write_json(os.path.join(out_dir, "summary.json"), summary)
+    return _record_result(_public_summary(out_dir), summary, [])
 
 
 # -- report ---------------------------------------------------------------------------
@@ -798,6 +1234,10 @@ def _pct(value) -> str:
     return "-" if value is None else f"{value * 100:+.1f}%"
 
 
+def _share(value) -> str:
+    return "-" if value is None else f"{value * 100:.2f}%"
+
+
 def _side_text(side: dict) -> str:
     return verdict.fmt(side["value"]) if side["state"] == "valid" else side["state"]
 
@@ -806,18 +1246,72 @@ def _aggregate_text(aggregate: dict) -> str:
     return f"{aggregate['count']}/{aggregate['files_affected']}/{aggregate['severity']}"
 
 
+def _record_lines(summary: dict) -> list[str]:
+    """The sections of the second base; a summary older than it has none, which
+    says nothing about passing it."""
+    record = summary.get("record")
+    night = summary.get("mode") == "record-night"
+    lines = ["## Рекорд", ""]
+    if record is None:
+        lines += ["- ратчет не измерялся", ""]
+    else:
+        lines += [f"- итог: **{record['verdict']}**", f"- причины: {'; '.join(record['reasons']) or '-'}",
+                  f"- baseline: {record['baseline_path']} (sha256 {record['baseline_sha256'] or '-'})", "",
+                  "| метрика | агрегат | рекорд | кандидат | Δ | ν | предел | SHA рекорда | источник | исход | причина |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|"]
+        for row in record["rows"]:
+            evidence = row["record"]["evidence"]
+            candidate = row["candidate"]
+            shown = verdict.fmt(candidate["value"]) if candidate["state"] == "valid" else candidate["state"] or "-"
+            lines.append(f"| {row['metric']} | {row['aggregate']} | {verdict.fmt(row['record']['value'])} | {shown} | "
+                         f"{_pct(row['delta'])} | {_share(row['noise'])} | {verdict.fmt(row['limit'])} | "
+                         f"{str(row['record']['sha'] or '-')[:12]} | "
+                         f"{evidence.get('kind', '-') if isinstance(evidence, dict) else '-'} | "
+                         f"{row['outcome']} | {row['reason'] or '-'} |")
+        lines.append("")
+    if night:
+        return lines
+    lines += ["## Память A/A", ""]
+    memory = summary.get("memory_base")
+    if memory is None:
+        lines += ["- не измерялась", ""]
+    else:
+        lines += [f"- пик A базы: {_side_text(memory['base']) if memory['base']['state'] else '-'}; "
+                  f"пик A кандидата: {_side_text(memory['candidate']) if memory['candidate']['state'] else '-'}; "
+                  f"Δ {_pct(memory['delta'])}; ν {_share(memory['noise'])}; предел {verdict.fmt(memory['limit'])}; "
+                  f"исход {memory['outcome']}" + (f" ({memory['reason']})" if memory["reason"] else ""), ""]
+    lines += ["## Предложения рекорда", ""]
+    if record is None:
+        lines += ["- ратчет не измерялся", ""]
+        return lines
+    confirmation = summary.get("record_confirmation") or {}
+    if confirmation.get("requested"):
+        lines += [f"- второй раунд: {', '.join(confirmation['triggers'])}; "
+                  f"{'полный' if confirmation['complete'] else 'неполный'}"]
+    proposals = summary.get("record_proposals") or []
+    lines += [f"- {p['metric']}: {verdict.fmt(p['previous_value'])} → {verdict.fmt(p['value'])} {p['unit']}, "
+              f"раунды {', '.join(verdict.fmt(v) for v in p['rounds'])}, SHA {p['record_sha']}" for p in proposals] or \
+        ["- нет"]
+    return lines + [""]
+
+
 def write_report(out_dir: str, summary: dict) -> None:
     lines = [f"# Гейт {os.path.basename(out_dir)}", "",
              f"- вердикт: **{summary['verdict']}**",
-             f"- причины: {'; '.join(summary['reasons']) or '-'}",
-             f"- база: {summary['base']['label']} {summary['base']['sha'] or '-'}",
-             f"- кандидат: {summary['candidate']['label']} {summary['candidate']['sha'] or '-'}",
-             f"- калибровка: {(summary.get('noise') or {}).get('status', '-')}",
-             f"- контроли: {json.dumps(summary['controls'], ensure_ascii=False) if summary['controls'] else '-'}",
-             ""]
+             f"- причины: {'; '.join(summary['reasons']) or '-'}"]
+    if summary.get("mode") == "record-night":
+        lines.append("- режим: ночная проверка рекорда, не гейт релиза")
+    else:
+        lines.append(f"- база: {summary['base']['label']} {summary['base']['sha'] or '-'}")
+    lines += [f"- кандидат: {summary['candidate']['label']} {summary['candidate']['sha'] or '-'}",
+              f"- калибровка: {(summary.get('noise') or {}).get('status', '-')}",
+              f"- контроли: {json.dumps(summary['controls'], ensure_ascii=False) if summary['controls'] else '-'}",
+              ""]
     rows = summary.get("rows") or []
+    if summary.get("mode") != "record-night":
+        lines += ["## Прошлый релиз", ""]
     if rows:
-        lines += ["## Правило", "", "| метрика | род | база | кандидат | Δ | ν | предел | Δ′ | исход |",
+        lines += ["| метрика | род | база | кандидат | Δ | ν | предел | Δ′ | исход |",
                   "|---|---|---|---|---|---|---|---|---|"]
         for row in rows:
             noise = "-" if row["noise"] is None else f"{row['noise'] * 100:.1f}%"
@@ -835,6 +1329,9 @@ def write_report(out_dir: str, summary: dict) -> None:
                 what = GROWTH_WHAT[row["metric"]]
                 lines += [f"- {row['metric']}: {basis.format(what=what)}; Δ стены {_pct(row.get('wall_delta'))}, "
                           f"Δ {what} {_pct(row['delta'])}.", ""]
+    elif summary.get("mode") != "record-night":
+        lines += ["- не измерялся", ""]
+    lines += _record_lines(summary)
     ceilings = summary.get("ceilings") or []
     if ceilings:
         lines += ["## Потолки", "", "| метрика | кандидат | предел | исход |", "|---|---|---|---|"]
@@ -883,6 +1380,8 @@ def cmd_gate_calibrate(args, clock=None, builder=None, machine=None) -> int:
     if count < verdict.NOISE_SERIES:
         # Fewer series medians make the spread a poor, down to zero, estimate of noise.
         raise HarnessError("series_invalid", f"--series {count}: the noise needs {verdict.NOISE_SERIES} series")
+    if args.record_metrics_only and args.base != RECORD_CALIBRATION_BASE:
+        raise HarnessError("base_invalid", f"--record-metrics-only measures {RECORD_CALIBRATION_BASE}, not {args.base}")
     os.makedirs(data.root, exist_ok=True)
     with open(data.path("gate.lock"), "w") as lock:
         try:
@@ -893,6 +1392,8 @@ def cmd_gate_calibrate(args, clock=None, builder=None, machine=None) -> int:
         print_ = fingerprint(machine, source)
         base, _ = build_pair(data, args.base, None, builder)
         root = data.path("gate-cal", f"{base['label']}-{base['sha'][:12]}")
+        if args.record_metrics_only:
+            return _calibrate_record(clock, machine, data, source, print_, base, root, count)
         groups, busy = [], []
         for index in range(1, count + 1):
             series_dir = os.path.join(root, f"s{index}")
@@ -919,3 +1420,68 @@ def cmd_gate_calibrate(args, clock=None, builder=None, machine=None) -> int:
               f"busy={','.join(f's{i}' for i in busy) or '-'} written={str(written).lower()} " +
               " ".join(f"nu.{key}={verdict.fmt(value)}" for key, value in sorted(values.items())))
         return 0 if written else 2
+
+
+def record_noise_entries(groups: list[tuple[list, list]], binary: dict, print_: dict) -> dict:
+    """{noise key: entry} of the aggregates a record judges that the old
+    calibration does not hold, over series of (A, B). Every entry names its own
+    binary, profile and date: they are not those of the root of `gate-noise.json`.
+    A number needs every series with both of its threes: a failed run never
+    turns into a zero spread."""
+    def aggregates(key: str, series_a: list, series_b: list) -> tuple[str, float | None]:
+        if key == MEMORY_A_KEY:
+            return peak([series_a])
+        return peak([series_a, series_b]) if key == "hwm_kb" else side(series_b, verdict.Metric(key, key))
+
+    identity = {"binary": {"label": binary["label"], "sha": binary["sha"], "sha256": binary["sha256"]},
+                "fingerprint": print_, "created_at": verdict.now_iso()}
+    keys = (MEMORY_A_KEY, "hwm_kb", *REFS_METRICS)
+    found = {key: [aggregates(key, a, b) for a, b in groups] for key in keys}
+    full = all(state == "valid" for sides in found.values() for state, _ in sides)
+    entries = {}
+    for key, sides in found.items():
+        values = [value for state, value in sides if state == "valid"]
+        entry = {**identity, "aggregates": values, "states": [state for state, _ in sides],
+                 "noise": verdict.spread_noise(values) if full else None}
+        if entry["noise"] is None:
+            entry["reason"] = ("zero median" if full else "not valid in every series" if len(values) < len(sides)
+                               else "another aggregate is not valid in every series")
+        entries[verdict.noise_key(CORPUS, SCENARIO, TEMP, key)] = entry
+    return entries
+
+
+def _calibrate_record(clock, machine, data: Data, source: dict, print_: dict, base: dict, root: str,
+                      count: int) -> int:
+    """`gate-calibrate --record-metrics-only`: its own series of A×3+B×3 of a
+    fixed binary. The numbers join `gate-noise.json` only when the profile is
+    the one of its calibration; its entries are never remeasured or replaced."""
+    groups, busy = [], []
+    for index in range(1, count + 1):
+        series_dir = os.path.join(root, f"record-s{index}")
+        shutil.rmtree(series_dir, ignore_errors=True)
+        runner = Runner(clock, machine, source, print_, BUSY_BUDGET_MIN)
+        series_a, series_b = [], []
+        try:
+            for name, series, records in (("A-b", "A", series_a), ("B-b", "B", series_b)):
+                for k in range(1, RUNS + 1):
+                    records.append(runner.run(os.path.join(series_dir, f"{name}{k}"), base, "base", series, k, False, {}))
+        except MachineBusy:
+            busy.append(index)
+        groups.append((series_a, series_b))
+    entries = record_noise_entries(groups, base, print_)
+    values = {key.rsplit("/", 1)[1]: entry["noise"] for key, entry in entries.items()}
+    measured = all(value is not None for value in values.values())
+    noise = read_noise(data)
+    calibrated = ((noise or {}).get("fingerprints") or {}).get(CORPUS)
+    differs = ["gate-noise.json"] if calibrated is None else _differing(calibrated, print_)
+    write_json(os.path.join(root, "record-noise.json"),
+               {"schema": verdict.NOISE_SCHEMA, "gate_schema": GATE_SCHEMA, "differs_from_calibration": differs,
+                "entries": entries})
+    merged = measured and not differs
+    if merged:
+        write_json(data.path("gate-noise.json"), {**noise, "entries": {**noise["entries"], **entries}})
+    print(f"gate-calibrate record-metrics binary={base['label']} series={count} "
+          f"busy={','.join(f's{i}' for i in busy) or '-'} merged={str(merged).lower()} "
+          f"differs={','.join(differs) or '-'} " +
+          " ".join(f"nu.{key}={verdict.fmt(value)}" for key, value in sorted(values.items())))
+    return 0 if merged else 2

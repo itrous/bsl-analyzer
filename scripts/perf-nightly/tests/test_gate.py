@@ -361,8 +361,8 @@ class Confirmation(GateCase):
         code, summary, _ = self.gate()
         self.assertEqual((code, summary["verdict"]), (1, "block"))
         self.assertEqual([r["run"] for r in summary["runs"]],
-                         ["A-b1", "A-c1", "A-b2", "A-c2", "A-b3", "A-c3",
-                          "A-b4", "A-c4", "A-b5", "A-c5", "A-b6", "A-c6", "B-c1", "B-c2", "B-c3"])
+                         ["A-b1", "A-c1", "A-b2", "A-c2", "A-b3", "A-c3", "B-c1", "B-c2", "B-c3",
+                          "A-b4", "A-c4", "A-b5", "A-c5", "A-b6", "A-c6", "B-c4", "B-c5", "B-c6"])
         wall = self.row(summary, "graph_ready_s")
         self.assertEqual(wall["outcome"], "block")
         self.assertAlmostEqual(wall["delta"], 0.20)
@@ -384,7 +384,7 @@ class Confirmation(GateCase):
         self.assertEqual((code, summary["verdict"], summary["reasons"][0]), (2, "incomplete", "machine_busy"))
         self.assertEqual(self.row(summary, "graph_ready_s")["outcome"], "confirm")
         self.assertEqual(summary["runs"][-1]["run"], "A-b4")
-        self.assertNotIn("B", {r["series"] for r in summary["runs"]})
+        self.assertEqual([r["run"] for r in summary["runs"] if r["series"] == "B"], ["B-c1", "B-c2", "B-c3"])
 
     def test_the_confirming_round_does_not_decide_the_work_metrics(self):
         # CPU +10 % is a block of its own; the wall confirmation only keeps the wall row.
@@ -1116,8 +1116,8 @@ class Report(GateCase):
         set_mode(*self.modes.split(","), f"{CAND_LABEL}=sweep_extra_code")
         code, summary, _ = self.gate()
         report = self.read("g1")
-        for heading in ("## Правило", "## Потолки", "## Ответы", "## Новые коды", "## Исчезнувшие коды",
-                        "## Изменённые коды", "## Прогоны"):
+        for heading in ("## Прошлый релиз", "## Рекорд", "## Память A/A", "## Предложения рекорда", "## Потолки", "## Ответы",
+                        "## Новые коды", "## Исчезнувшие коды", "## Изменённые коды", "## Прогоны"):
             self.assertIn(heading, report)
         self.assertIn("- вердикт: **block**", report)
         self.assertNotIn("answers_differ", report)
