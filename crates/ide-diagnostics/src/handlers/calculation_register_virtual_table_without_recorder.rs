@@ -15,11 +15,12 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Sql, MetadataTag::Standard, MetadataTag::Performance],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
-/// Narrows the rule to modules that write the register, which keeps report modules quiet. A
-/// bare query text has no module, so the narrowing applies only where there is a file.
+/// Narrows the rule to modules that write the register, which keeps report modules quiet; on
+/// unless set to `false`. A bare query text has no module, so the narrowing applies only where
+/// there is a file.
 pub(crate) const ONLY_IN_MODULES_WRITING_REGISTER: &str = "onlyInModulesWritingRegister";
 
 pub(crate) fn dispatch(
@@ -77,25 +78,64 @@ fn last_ident(node: &SyntaxNode) -> Option<SyntaxToken> {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::MetadataOverride;
     use crate::test_utils::{
-        check_diagnostics_for_with_config, check_diagnostics_snapshot_for, check_hir_diagnostic,
-        format_diags,
+        check_diagnostics_for_with_config, check_diagnostics_snapshot_for,
+        check_file_diagnostics_with_config, format_diags,
     };
     use crate::{Diagnostic, DiagnosticCode, DiagnosticsConfig, Severity};
     use expect_test::{expect, Expect};
 
     const CODE: DiagnosticCode = DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder;
+    const WITHOUT_PARAMETERS: DiagnosticCode = DiagnosticCode::VirtualTableCallWithoutParameters;
 
     const SCHEDULE: &str = "РегистрРасчета.Начисления.ДанныеГрафика";
     const PERIOD: &str = "РегистрРасчета.Начисления.ФактическийПериодДействия";
     const BASE: &str = "РегистрРасчета.Начисления.БазаНачисления";
+    /// A condition that passes the table a parameter without taking a stand on the recorder, so
+    /// the rule has something to judge and the neighbouring rule has nothing to say.
+    const CONDITION: &str = "ВидРасчета = &ВидРасчета";
 
-    fn check(source: &str, expected: Expect) {
-        check_diagnostics_snapshot_for(source, CODE, expected);
+    fn narrowed(value: bool) -> DiagnosticsConfig {
+        let mut config = DiagnosticsConfig::all_enabled();
+        config
+            .parameters
+            .insert(CODE, serde_json::json!({ "onlyInModulesWritingRegister": value }));
+        config
     }
 
+    fn check(source: &str, expected: Expect) {
+        expected.assert_eq(&format_diags(source, &findings(source)));
+    }
+
+    /// The query text alone decides: the narrowing has its own tests.
     fn findings(source: &str) -> Vec<Diagnostic> {
-        check_hir_diagnostic(source).into_iter().filter(|diag| diag.code == CODE).collect()
+        check_diagnostics_for_with_config(source, narrowed(false), CODE)
+    }
+
+    /// How many findings the rule and the neighbouring rule give, in that order.
+    fn pair(source: &str, config: &DiagnosticsConfig) -> (usize, usize) {
+        let count = |code| check_diagnostics_for_with_config(source, config.clone(), code).len();
+        (count(CODE), count(WITHOUT_PARAMETERS))
+    }
+
+    /// The same count for a query text with no module around it.
+    fn bare_pair(query: &str, config: &DiagnosticsConfig) -> (usize, usize) {
+        let found = crate::validate_query_text(config, None, query);
+        let count = |code| found.iter().filter(|diag| diag.code == code).count();
+        (count(CODE), count(WITHOUT_PARAMETERS))
+    }
+
+    /// The source text of each table the rule reports.
+    fn reported_tables(source: &str) -> Vec<&str> {
+        findings(source)
+            .iter()
+            .map(|diag| &source[usize::from(diag.range.start())..usize::from(diag.range.end())])
+            .collect()
+    }
+
+    fn query_module(query: &str) -> String {
+        format!("Процедура Проверка()\n    Запрос = Новый Запрос;\n    Запрос.Текст = \"{query}\";\nКонецПроцедуры\n")
     }
 
     /// One procedure per table reference, each reading from it in its own query, so a case
@@ -123,7 +163,7 @@ mod tests {
             format!("В условии виртуальной таблицы \"{path}\" нет отбора по регистратору"),
             "{table}"
         );
-        assert_eq!(found[0].severity, Severity::Major, "{table}");
+        assert_eq!(found[0].severity, Severity::Warning, "{table}");
     }
 
     fn assert_silent(table: &str) {
@@ -174,21 +214,91 @@ mod tests {
 КонецПроцедуры
 "#,
             expect![[r#"
-                CalculationRegisterVirtualTableWithoutRecorder @ 8:4..8:43
-                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                  severity: Major
                 CalculationRegisterVirtualTableWithoutRecorder @ 19:4..19:69
                   message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 
     #[test]
-    fn a_table_without_arguments_or_with_empty_ones_is_reported() {
-        assert_fires(SCHEDULE);
-        assert_fires(&format!("{SCHEDULE}()"));
-        assert_fires(&format!("{SCHEDULE}(, )"));
-        assert_silent(&schedule("Регистратор = &Регистратор"));
+    fn a_call_without_parameters_is_left_to_the_neighbouring_rule() {
+        let tables = [
+            SCHEDULE.to_string(),
+            format!("{SCHEDULE}()"),
+            format!("{SCHEDULE}(, )"),
+            PERIOD.to_string(),
+            format!("{PERIOD}()"),
+            format!("{PERIOD}(, )"),
+            "CalculationRegister.Accruals.ScheduleData".to_string(),
+            "CalculationRegister.Accruals.AdjustedEffectivePeriod()".to_string(),
+        ];
+        for table in &tables {
+            assert_eq!(pair(&module_of(&[table]), &narrowed(false)), (0, 1), "{table}");
+        }
+        assert_eq!(pair(&module_of(&[&schedule(CONDITION)]), &narrowed(false)), (1, 0));
+    }
+
+    #[test]
+    fn a_call_without_parameters_stays_with_the_neighbouring_rule_whatever_the_where_says() {
+        let source = |table: &str| {
+            query_module(&format!(
+                "ВЫБРАТЬ Т.Поле КАК Поле\n    |ИЗ {table} КАК Т\n    |ГДЕ Т.Регистратор <> &Ссылка"
+            ))
+        };
+        assert_eq!(pair(&source(PERIOD), &narrowed(false)), (0, 1));
+        assert_eq!(pair(&source(&format!("{PERIOD}({CONDITION})")), &narrowed(false)), (1, 0));
+    }
+
+    #[test]
+    fn switching_the_neighbouring_rule_off_does_not_bring_the_recorder_report_back() {
+        let mut config = narrowed(false);
+        config.disabled.push(WITHOUT_PARAMETERS);
+        assert_eq!(pair(&module_of(&[SCHEDULE]), &config), (0, 0));
+        assert_eq!(
+            bare_pair(&format!("ВЫБРАТЬ Т.Поле КАК Поле ИЗ {SCHEDULE} КАК Т"), &config),
+            (0, 0)
+        );
+        assert_eq!(pair(&module_of(&[&schedule(CONDITION)]), &config), (1, 0));
+    }
+
+    #[test]
+    fn a_call_without_parameters_does_not_shield_other_tables_of_the_query() {
+        let judged = schedule(CONDITION);
+        let joined = |first: &str, second: &str| {
+            query_module(&format!(
+                "ВЫБРАТЬ Т.Поле КАК Поле\n    |ИЗ {first} КАК Т\n    |ЛЕВОЕ СОЕДИНЕНИЕ {second} КАК Д\n    |ПО ИСТИНА"
+            ))
+        };
+        for source in [joined(SCHEDULE, &judged), joined(&judged, SCHEDULE)] {
+            assert_eq!(reported_tables(&source), [judged.as_str()], "{source}");
+            assert_eq!(pair(&source, &narrowed(false)), (1, 1), "{source}");
+        }
+
+        let nested = |outer: &str, inner: &str| {
+            query_module(&format!(
+                "ВЫБРАТЬ Т.Поле КАК Поле\n    |ИЗ {outer} КАК Т\n    |ЛЕВОЕ СОЕДИНЕНИЕ (ВЫБРАТЬ В.Поле КАК Поле\n    |    ИЗ {inner} КАК В) КАК Д\n    |ПО ИСТИНА"
+            ))
+        };
+        for source in [nested(SCHEDULE, &judged), nested(&judged, SCHEDULE)] {
+            assert_eq!(reported_tables(&source), [judged.as_str()], "{source}");
+            assert_eq!(pair(&source, &narrowed(false)), (1, 1), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_base_table_is_not_shielded_by_the_neighbouring_rule() {
+        for table in [
+            BASE.to_string(),
+            format!("{BASE}()"),
+            format!("{BASE}(&Измерения)"),
+            format!("{BASE}(&Измерения, &Измерения)"),
+            format!("{BASE}(&Измерения, &Измерения, , )"),
+            format!("{BASE}(Регистратор = &Регистратор, &Измерения, , )"),
+        ] {
+            assert_eq!(pair(&module_of(&[&table]), &narrowed(false)), (1, 0), "{table}");
+        }
+        let filtered = format!("{BASE}(&Измерения, &Измерения, , Регистратор = &Регистратор)");
+        assert_eq!(pair(&module_of(&[&filtered]), &narrowed(false)), (0, 0));
     }
 
     #[test]
@@ -217,12 +327,9 @@ mod tests {
         check(
             source,
             expect![[r#"
-            CalculationRegisterVirtualTableWithoutRecorder @ 4:9..4:48
-              message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-              severity: Major
-            CalculationRegisterVirtualTableWithoutRecorder @ 11:9..11:74
-              message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-              severity: Major"#]],
+                CalculationRegisterVirtualTableWithoutRecorder @ 11:9..11:74
+                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
+                  severity: Warning"#]],
         );
     }
 
@@ -233,9 +340,71 @@ mod tests {
     }
 
     #[test]
-    fn a_recorder_inequality_is_not_a_filter() {
-        assert_fires(&schedule("Регистратор <> &Регистратор"));
-        assert_silent(&schedule("Регистратор = &Регистратор"));
+    fn a_recorder_inequality_is_a_deliberate_exclusion() {
+        for condition in [
+            "Регистратор <> &Ссылка",
+            "&Ссылка <> Регистратор",
+            "(Регистратор <> &Ссылка)",
+            "Сотрудник = &Сотрудник И Регистратор <> &Ссылка",
+            "(Сотрудник = &Сотрудник) И (&Ссылка <> Регистратор)",
+            "регистратор <> &Ссылка",
+            "РЕГИСТРАТОР <> &Ссылка",
+        ] {
+            assert_silent(&schedule(condition));
+            assert_silent(&format!("{PERIOD}({condition})"));
+            assert_silent(&format!("{BASE}(&Измерения, &Измерения, , {condition})"));
+        }
+        for condition in
+            ["Recorder <> &Ref", "&Ref <> recorder", "Employee = &E AND Recorder <> &Ref"]
+        {
+            assert_silent(&format!("CalculationRegister.Accruals.ScheduleData({condition})"));
+            assert_silent(&format!(
+                "CalculationRegister.Accruals.AdjustedEffectivePeriod({condition})"
+            ));
+            assert_silent(&format!(
+                "CalculationRegister.Accruals.BaseMainAccruals(&D, &D, , {condition})"
+            ));
+        }
+        assert_fires(&schedule("Сотрудник = &Сотрудник"));
+    }
+
+    #[test]
+    fn a_recorder_inequality_outside_the_condition_of_a_base_table_does_not_count() {
+        assert_fires(&format!("{BASE}(Регистратор <> &Ссылка, &Измерения, , )"));
+        assert_fires(&format!("{BASE}(Регистратор <> &Ссылка, &Измерения, , {CONDITION})"));
+        assert_silent(&format!("{BASE}(&Измерения, &Измерения, , Регистратор <> &Ссылка)"));
+    }
+
+    #[test]
+    fn only_a_direct_recorder_inequality_counts_as_an_exclusion() {
+        for condition in [
+            "Сотрудник <> &Сотрудник",
+            "&Сотрудник <> Сотрудник",
+            "Регистратор.Номер <> &Номер",
+            "Т.Регистратор <> &Ссылка",
+            "Регистратор <> &Ссылка ИЛИ Сотрудник = &Сотрудник",
+            "Регистратор <> &А ИЛИ Регистратор <> &Б",
+            "НЕ Регистратор <> &Ссылка",
+            "НЕ (Регистратор <> &Ссылка)",
+            "Регистратор < &Ссылка",
+            "Регистратор > &Ссылка",
+            "Регистратор <= &Ссылка",
+            "Регистратор >= &Ссылка",
+        ] {
+            assert_fires(&schedule(condition));
+        }
+        assert_silent(&schedule("Сотрудник = &Сотрудник И Регистратор <> &Ссылка"));
+    }
+
+    #[test]
+    fn a_recorder_inequality_in_the_where_clause_does_not_stand_in_for_the_parameter() {
+        let source = |condition: &str| {
+            query_module(&format!(
+                "ВЫБРАТЬ Т.Поле КАК Поле\n    |ИЗ {SCHEDULE}({condition}) КАК Т\n    |ГДЕ Т.Регистратор <> &Ссылка"
+            ))
+        };
+        assert_eq!(findings(&source(CONDITION)).len(), 1);
+        assert_eq!(findings(&source("Регистратор <> &Ссылка")).len(), 0);
     }
 
     #[test]
@@ -302,7 +471,6 @@ mod tests {
 
     #[test]
     fn english_schedule_data_is_judged_like_the_russian_one() {
-        assert_fires("CalculationRegister.Accruals.ScheduleData");
         assert_silent("CalculationRegister.Accruals.ScheduleData(Recorder = &Recorder)");
         assert_fires(
             "CalculationRegister.Accruals.ScheduleData(CalculationType = &CalculationType)",
@@ -311,14 +479,15 @@ mod tests {
 
     #[test]
     fn the_actual_action_period_table_is_judged() {
-        assert_fires(PERIOD);
         assert_fires(&format!("{PERIOD}(ВидРасчета = &ВидРасчета)"));
         assert_silent(&format!("{PERIOD}(Регистратор = &Регистратор)"));
     }
 
     #[test]
     fn the_english_adjusted_effective_period_table_is_judged() {
-        assert_fires("CalculationRegister.Accruals.AdjustedEffectivePeriod");
+        assert_fires(
+            "CalculationRegister.Accruals.AdjustedEffectivePeriod(CalculationType = &CalculationType)",
+        );
         assert_silent("CalculationRegister.Accruals.AdjustedEffectivePeriod(Recorder = &Recorder)");
     }
 
@@ -354,16 +523,19 @@ mod tests {
 
     #[test]
     fn other_tables_of_the_calculation_register_are_not_judged() {
-        assert_fires(SCHEDULE);
+        assert_fires(&schedule(CONDITION));
         assert_silent("РегистрРасчета.Начисления.Изменения");
         assert_silent("РегистрРасчета.Начисления");
         assert_silent("РегистрРасчета.Начисления.Перерасчет");
         assert_silent("РегистрРасчета.Начисления.База");
+        assert_silent("CalculationRegister.Accruals.Changes");
+        assert_silent("CalculationRegister.Accruals");
+        assert_silent("CalculationRegister.Accruals.Base");
     }
 
     #[test]
     fn a_virtual_table_of_another_register_kind_is_not_judged() {
-        assert_fires(SCHEDULE);
+        assert_fires(&schedule(CONDITION));
         assert_silent("РегистрНакопления.Запасы.Остатки");
         assert_silent("РегистрНакопления.Запасы.Остатки(, Склад = &Склад)");
         assert_silent("РегистрНакопления.Запасы.БазаОстатков");
@@ -391,15 +563,15 @@ mod tests {
 Процедура Регистр()
     Запрос = Новый Запрос;
     Запрос.Текст = "ВЫБРАТЬ Т.Поле КАК Поле
-    |ИЗ РегистрРасчета.Начисления.ДанныеГрафика КАК Т";
+    |ИЗ РегистрРасчета.Начисления.ДанныеГрафика(ВидРасчета = &ВидРасчета) КАК Т";
 КонецПроцедуры
 "#;
         check(
             source,
             expect![[r#"
-            CalculationRegisterVirtualTableWithoutRecorder @ 20:9..20:48
-              message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-              severity: Major"#]],
+                CalculationRegisterVirtualTableWithoutRecorder @ 20:9..20:74
+                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
+                  severity: Warning"#]],
         );
     }
 
@@ -417,7 +589,7 @@ mod tests {
 КонецФункции
 "#;
         check(source, expect![[""]]);
-        assert_fires(&schedule(""));
+        assert_fires(&schedule(CONDITION));
     }
 
     #[test]
@@ -433,7 +605,7 @@ mod tests {
 КонецФункции
 "#;
         check(source, expect![[""]]);
-        assert_fires(&schedule(""));
+        assert_fires(&schedule(CONDITION));
     }
 
     #[test]
@@ -447,7 +619,7 @@ mod tests {
         let source = r#"Функция Отчёт(Условие) Экспорт
     Запрос = Новый Запрос;
     Запрос.Текст = "ВЫБРАТЬ Т.Поле КАК Поле
-    |ИЗ РегистрРасчета.Начисления.ДанныеГрафика() КАК Т
+    |ИЗ РегистрРасчета.Начисления.ДанныеГрафика(ВидРасчета = &ВидРасчета) КАК Т
     |ЛЕВОЕ СОЕДИНЕНИЕ РегистрРасчета.Начисления.ФактическийПериодДействия(" + Условие + ") КАК Д
     |ПО ИСТИНА";
     Возврат Запрос;
@@ -456,9 +628,9 @@ mod tests {
         check(
             source,
             expect![[r#"
-            CalculationRegisterVirtualTableWithoutRecorder @ 4:9..4:50
-              message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-              severity: Major"#]],
+                CalculationRegisterVirtualTableWithoutRecorder @ 4:9..4:74
+                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
+                  severity: Warning"#]],
         );
     }
 
@@ -467,7 +639,7 @@ mod tests {
         assert_silent(&schedule("{Регистратор = &Регистратор}"));
         assert_silent(&schedule("{(Регистратор = &Регистратор)}"));
         assert_silent(&format!("{BASE}(&Измерения, &Измерения, , {{Регистратор = &Регистратор}})"));
-        assert_fires(&schedule(""));
+        assert_fires(&schedule(CONDITION));
     }
 
     #[test]
@@ -481,16 +653,16 @@ mod tests {
     Запрос = Новый Запрос;
     Запрос.Текст = "ВЫБРАТЬ Т.Поле КАК Поле
     |ИЗ Справочник.Сотрудники КАК Т
-    |ЛЕВОЕ СОЕДИНЕНИЕ РегистрРасчета.Начисления.ДанныеГрафика КАК Д
+    |ЛЕВОЕ СОЕДИНЕНИЕ РегистрРасчета.Начисления.ДанныеГрафика(ВидРасчета = &ВидРасчета) КАК Д
     |ПО Т.Ссылка = Д.Сотрудник";
 КонецПроцедуры
 "#;
         check(
             source,
             expect![[r#"
-            CalculationRegisterVirtualTableWithoutRecorder @ 5:23..5:62
-              message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-              severity: Major"#]],
+                CalculationRegisterVirtualTableWithoutRecorder @ 5:23..5:88
+                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
+                  severity: Warning"#]],
         );
     }
 
@@ -500,24 +672,24 @@ mod tests {
     Запрос = Новый Запрос;
     Запрос.Текст = "ВЫБРАТЬ Т.Поле КАК Поле
     |ИЗ (ВЫБРАТЬ Д.Поле КАК Поле
-    |    ИЗ РегистрРасчета.Начисления.ДанныеГрафика КАК Д) КАК Т";
+    |    ИЗ РегистрРасчета.Начисления.ДанныеГрафика(ВидРасчета = &ВидРасчета) КАК Д) КАК Т";
 КонецПроцедуры
 "#;
         check(
             source,
             expect![[r#"
-            CalculationRegisterVirtualTableWithoutRecorder @ 5:13..5:52
-              message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-              severity: Major"#]],
+                CalculationRegisterVirtualTableWithoutRecorder @ 5:13..5:78
+                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
+                  severity: Warning"#]],
         );
     }
 
     #[test]
-    fn the_call_without_parameters_rule_still_reports_the_same_tables() {
+    fn the_call_without_parameters_rule_reports_alone_on_the_tables_it_reports() {
         let source = module_of(&[SCHEDULE, PERIOD, &schedule("ВидРасчета = &ВидРасчета")]);
         check_diagnostics_snapshot_for(
             &source,
-            DiagnosticCode::VirtualTableCallWithoutParameters,
+            WITHOUT_PARAMETERS,
             expect![[r#"
                 VirtualTableCallWithoutParameters @ 4:9..4:48
                   message: Не следует использовать виртуальные таблицы без параметров
@@ -529,16 +701,74 @@ mod tests {
         check(
             &source,
             expect![[r#"
-            CalculationRegisterVirtualTableWithoutRecorder @ 4:9..4:48
-              message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-              severity: Major
-            CalculationRegisterVirtualTableWithoutRecorder @ 9:9..9:60
-              message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ФактическийПериодДействия" нет отбора по регистратору
-              severity: Major
             CalculationRegisterVirtualTableWithoutRecorder @ 14:9..14:74
               message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-              severity: Major"#]],
+              severity: Warning"#]],
         );
+    }
+
+    #[test]
+    fn a_base_table_is_filtered_by_either_form_in_its_fourth_argument_only() {
+        for condition in [
+            "&Регистратор = Регистратор",
+            "Регистратор В (&Список)",
+            "(Регистратор = &Регистратор) И (ВидРасчета = &ВидРасчета)",
+        ] {
+            assert_silent(&format!("{BASE}(&Измерения, &Измерения, , {condition})"));
+            assert_fires(&format!("{BASE}({condition}, &Измерения, , )"));
+        }
+    }
+
+    #[test]
+    fn the_finding_is_a_warning_on_both_inputs_unless_the_user_raises_it() {
+        let table = schedule(CONDITION);
+        let raised = {
+            let mut config = narrowed(false);
+            config.metadata_overrides.insert(
+                CODE,
+                MetadataOverride { lsp_severity: Some("Error".to_owned()), ..Default::default() },
+            );
+            config
+        };
+        let module = module_of(&[&table]);
+        let query = format!("ВЫБРАТЬ Т.Поле КАК Поле ИЗ {table} КАК Т");
+        let in_query = |config: &DiagnosticsConfig| -> Vec<Diagnostic> {
+            crate::validate_query_text(config, None, &query)
+                .into_iter()
+                .filter(|diag| diag.code == CODE)
+                .collect()
+        };
+        let table_start = query.find(&table).unwrap();
+
+        for found in [findings(&module), in_query(&narrowed(false))] {
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].severity, Severity::Warning);
+            assert_eq!(
+                found[0].message,
+                format!("В условии виртуальной таблицы \"{SCHEDULE}\" нет отбора по регистратору")
+            );
+        }
+        let standalone = in_query(&narrowed(false));
+        assert_eq!(usize::from(standalone[0].range.start()), table_start);
+        assert_eq!(usize::from(standalone[0].range.end()), table_start + table.len());
+        assert_eq!(
+            &module[usize::from(findings(&module)[0].range.start())..][..table.len()],
+            table
+        );
+
+        let in_module = check_diagnostics_for_with_config(&module, raised.clone(), CODE);
+        assert_eq!(in_module[0].severity, Severity::Error);
+        assert_eq!(in_query(&raised)[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn a_bare_query_text_follows_the_same_conditions_as_a_module() {
+        let config = narrowed(true);
+        let query = |table: &str| format!("ВЫБРАТЬ Т.Поле КАК Поле ИЗ {table} КАК Т");
+        assert_eq!(bare_pair(&query(SCHEDULE), &config), (0, 1));
+        assert_eq!(bare_pair(&query(&format!("{SCHEDULE}()")), &config), (0, 1));
+        assert_eq!(bare_pair(&query(&schedule("Регистратор <> &Ссылка")), &config), (0, 0));
+        assert_eq!(bare_pair(&query(&schedule(CONDITION)), &config), (1, 0));
     }
 
     #[test]
@@ -583,18 +813,10 @@ mod tests {
     "ВЫБРАТЬ
     |    ДанныеГрафика.НомерСтроки КАК НомерСтроки
     |ИЗ
-    |    РегистрРасчета.Начисления.ДанныеГрафика КАК ДанныеГрафика";
+    |    РегистрРасчета.Начисления.ДанныеГрафика(Сотрудник = &Сотрудник) КАК ДанныеГрафика";
     Запрос.Выполнить();
 КонецПроцедуры
 "#;
-
-        fn narrowed(value: bool) -> DiagnosticsConfig {
-            let mut config = DiagnosticsConfig::all_enabled();
-            config
-                .parameters
-                .insert(CODE, serde_json::json!({ "onlyInModulesWritingRegister": value }));
-            config
-        }
 
         fn check_narrowed(source: &str, expected: Expect) {
             let found = check_diagnostics_for_with_config(source, narrowed(true), CODE);
@@ -627,9 +849,9 @@ mod tests {
             check_narrowed(
                 &with_statement("Движения.Начисления.Добавить();"),
                 expect![[r#"
-                CalculationRegisterVirtualTableWithoutRecorder @ 11:10..11:49
-                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                  severity: Major"#]],
+                    CalculationRegisterVirtualTableWithoutRecorder @ 11:10..11:73
+                      message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
+                      severity: Warning"#]],
             );
         }
 
@@ -643,38 +865,38 @@ mod tests {
             check_narrowed(
                 &with_statement("ЭтотОбъект.Движения.Начисления.Записать();"),
                 expect![[r#"
-                    CalculationRegisterVirtualTableWithoutRecorder @ 11:10..11:49
+                    CalculationRegisterVirtualTableWithoutRecorder @ 11:10..11:73
                       message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                      severity: Major"#]],
+                      severity: Warning"#]],
             );
             check_narrowed(
                 &with_statement("движения.начисления.Записать();"),
                 expect![[r#"
-                CalculationRegisterVirtualTableWithoutRecorder @ 11:10..11:49
-                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                  severity: Major"#]],
+                    CalculationRegisterVirtualTableWithoutRecorder @ 11:10..11:73
+                      message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
+                      severity: Warning"#]],
             );
-            let english = "Procedure Write()\n    RegisterRecords.Accruals.Write();\nEndProcedure\n\nProcedure Query()\n    Query = New Query;\n    Query.Text = \"SELECT T.Field AS Field\n    |FROM CalculationRegister.Accruals.ScheduleData AS T\";\nEndProcedure\n";
+            let english = "Procedure Write()\n    RegisterRecords.Accruals.Write();\nEndProcedure\n\nProcedure Query()\n    Query = New Query;\n    Query.Text = \"SELECT T.Field AS Field\n    |FROM CalculationRegister.Accruals.ScheduleData(Employee = &Employee) AS T\";\nEndProcedure\n";
             check_narrowed(
                 english,
                 expect![[r#"
-                CalculationRegisterVirtualTableWithoutRecorder @ 8:11..8:52
-                  message: В условии виртуальной таблицы "CalculationRegister.Accruals.ScheduleData" нет отбора по регистратору
-                  severity: Major"#]],
+                    CalculationRegisterVirtualTableWithoutRecorder @ 8:11..8:74
+                      message: В условии виртуальной таблицы "CalculationRegister.Accruals.ScheduleData" нет отбора по регистратору
+                      severity: Warning"#]],
             );
         }
 
         #[test]
         fn a_bare_query_text_is_not_narrowed() {
-            let query = "ВЫБРАТЬ Т.Поле КАК Поле ИЗ РегистрРасчета.Начисления.ДанныеГрафика КАК Т";
+            let query = "ВЫБРАТЬ Т.Поле КАК Поле ИЗ РегистрРасчета.Начисления.ДанныеГрафика(Сотрудник = &Сотрудник) КАК Т";
             let found: Vec<_> = crate::validate_query_text(&narrowed(true), None, query)
                 .into_iter()
                 .filter(|diag| diag.code == CODE)
                 .collect();
             expect![[r#"
-                CalculationRegisterVirtualTableWithoutRecorder @ 1:28..1:67
+                CalculationRegisterVirtualTableWithoutRecorder @ 1:28..1:91
                   message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                  severity: Major"#]].assert_eq(&format_diags(query, &found));
+                  severity: Warning"#]].assert_eq(&format_diags(query, &found));
         }
 
         #[test]
@@ -683,9 +905,9 @@ mod tests {
             check_narrowed(
                 &with_statement("Движения.Начисления.Добавить();"),
                 expect![[r#"
-                    CalculationRegisterVirtualTableWithoutRecorder @ 11:10..11:49
+                    CalculationRegisterVirtualTableWithoutRecorder @ 11:10..11:73
                       message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                      severity: Major"#]],
+                      severity: Warning"#]],
             );
         }
 
@@ -707,26 +929,135 @@ mod tests {
             check_narrowed(
                 &source,
                 expect![[r#"
-                CalculationRegisterVirtualTableWithoutRecorder @ 13:10..13:49
-                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                  severity: Major"#]],
+                    CalculationRegisterVirtualTableWithoutRecorder @ 13:10..13:73
+                      message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
+                      severity: Warning"#]],
             );
         }
 
         #[test]
-        fn without_the_parameter_or_with_it_false_the_module_does_not_matter() {
-            let off = check_diagnostics_for_with_config(FILE_QUERY, narrowed(false), CODE);
+        fn with_the_parameter_false_the_module_does_not_matter() {
+            for source in
+                [FILE_QUERY.to_string(), with_statement("Движения.Начисления.Добавить();")]
+            {
+                assert_eq!(
+                    check_diagnostics_for_with_config(&source, narrowed(false), CODE).len(),
+                    1,
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn without_the_parameter_the_module_is_narrowed() {
+            let unset = DiagnosticsConfig::all_enabled;
+            assert_eq!(check_diagnostics_for_with_config(FILE_QUERY, unset(), CODE).len(), 0);
+            let writing = with_statement("Движения.Начисления.Добавить();");
+            assert_eq!(check_diagnostics_for_with_config(&writing, unset(), CODE).len(), 1);
+            let bare = "ВЫБРАТЬ Т.Поле КАК Поле ИЗ РегистрРасчета.Начисления.ДанныеГрафика(Сотрудник = &Сотрудник) КАК Т";
+            assert_eq!(bare_pair(bare, &unset()), (1, 0));
+        }
+
+        #[test]
+        fn a_deliberate_exclusion_is_silent_in_a_module_the_narrowing_keeps() {
+            let writing = |condition: &str| {
+                FILE_QUERY.replace("Сотрудник = &Сотрудник", condition)
+                    + "\nПроцедура Запись()\n    Движения.Начисления.Добавить();\nКонецПроцедуры\n"
+            };
+            let count = |source: &str| {
+                check_diagnostics_for_with_config(source, narrowed(true), CODE).len()
+            };
+            assert_eq!(count(&writing("Сотрудник = &Сотрудник")), 1);
+            assert_eq!(count(&writing("Сотрудник = &Сотрудник И Регистратор <> &Ссылка")), 0);
+        }
+    }
+
+    mod issue_766 {
+        use super::*;
+
+        const MODULE: &str = include_str!(
+            "fixtures/calculation_register_virtual_table_without_recorder_issue766.bsl"
+        );
+
+        fn writing_module() -> String {
+            format!(
+                "Процедура Запись()\n\tДвижения.Начисления.Записать();\nКонецПроцедуры\n\n{MODULE}"
+            )
+        }
+
+        fn both_rules(source: &str, config: DiagnosticsConfig) -> String {
+            let found: Vec<_> = check_file_diagnostics_with_config(source, config)
+                .into_iter()
+                .filter(|diag| diag.code == CODE || diag.code == WITHOUT_PARAMETERS)
+                .collect();
+            format_diags(source, &found)
+        }
+
+        /// The query texts of the module's literals, in source order.
+        fn bare_queries() -> Vec<String> {
+            MODULE
+                .split("Запрос.Текст =")
+                .skip(1)
+                .map(|tail| {
+                    let (_, literal) = tail.split_once('"').unwrap();
+                    let (literal, _) = literal.split_once('"').unwrap();
+                    literal
+                        .lines()
+                        .map(|line| line.trim_start().trim_start_matches('|'))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_module_that_does_not_write_the_register_keeps_only_the_parameter_report() {
             expect![[r#"
-                CalculationRegisterVirtualTableWithoutRecorder @ 7:10..7:49
-                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                  severity: Major"#]].assert_eq(&format_diags(FILE_QUERY, &off));
-            check(
-                FILE_QUERY,
-                expect![[r#"
-                CalculationRegisterVirtualTableWithoutRecorder @ 7:10..7:49
-                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ДанныеГрафика" нет отбора по регистратору
-                  severity: Major"#]],
+                VirtualTableCallWithoutParameters @ 28:4..28:55
+                  message: Не следует использовать виртуальные таблицы без параметров
+                  severity: Major"#]]
+            .assert_eq(&both_rules(MODULE, narrowed(true)));
+        }
+
+        #[test]
+        fn the_default_gives_what_the_narrowing_gives() {
+            assert_eq!(
+                both_rules(MODULE, DiagnosticsConfig::all_enabled()),
+                both_rules(MODULE, narrowed(true))
             );
+            assert_eq!(
+                both_rules(&writing_module(), DiagnosticsConfig::all_enabled()),
+                both_rules(&writing_module(), narrowed(true))
+            );
+        }
+
+        #[test]
+        fn a_module_that_writes_the_register_gets_a_warning_for_the_history_only() {
+            expect![[r#"
+                CalculationRegisterVirtualTableWithoutRecorder @ 13:4..16:61
+                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ФактическийПериодДействия" нет отбора по регистратору
+                  severity: Warning
+                VirtualTableCallWithoutParameters @ 32:4..32:55
+                  message: Не следует использовать виртуальные таблицы без параметров
+                  severity: Major"#]].assert_eq(&both_rules(&writing_module(), narrowed(true)));
+        }
+
+        #[test]
+        fn without_the_narrowing_the_history_is_reported_in_any_module() {
+            expect![[r#"
+                CalculationRegisterVirtualTableWithoutRecorder @ 9:4..12:61
+                  message: В условии виртуальной таблицы "РегистрРасчета.Начисления.ФактическийПериодДействия" нет отбора по регистратору
+                  severity: Warning
+                VirtualTableCallWithoutParameters @ 28:4..28:55
+                  message: Не следует использовать виртуальные таблицы без параметров
+                  severity: Major"#]].assert_eq(&both_rules(MODULE, narrowed(false)));
+        }
+
+        #[test]
+        fn the_bare_queries_are_judged_as_in_a_module_that_writes_the_register() {
+            let counts: Vec<_> =
+                bare_queries().iter().map(|query| bare_pair(query, &narrowed(true))).collect();
+            assert_eq!(counts, [(1, 0), (0, 1), (0, 0), (0, 0)]);
         }
     }
 }

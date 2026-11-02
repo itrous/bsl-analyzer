@@ -21,8 +21,9 @@ pub enum SdblDiagnostic {
         range: TextRange,
     },
 
-    /// A calculation-register table whose condition parameter does not narrow it to a recorder,
-    /// so the platform builds it over every record of the register.
+    /// A calculation-register table whose condition parameter neither narrows it to a recorder nor
+    /// excludes one on purpose, so the platform builds it over every record of the register. A
+    /// table reported as [`Self::VirtualTableCallWithoutParameters`] is left to that report.
     CalculationRegisterVirtualTableWithoutRecorder {
         table_name: String,
         register_name: String,
