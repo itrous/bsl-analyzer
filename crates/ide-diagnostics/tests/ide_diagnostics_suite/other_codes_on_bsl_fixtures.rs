@@ -100,8 +100,8 @@ fn other_codes_on_the_bsl_fixtures_are_unchanged() {
         fields_from_joins_issue_773.bsl | CodeOutOfRegion | 2:11..2:21 | Hint | [] | Процедура находится вне области (#Область/#Region). Весь код модуля должен быть организован в области для лучшей структуры.
         query_parse_error_complex_valid.bsl | CodeOutOfRegion | 1:11..1:15 | Hint | [] | Процедура находится вне области (#Область/#Region). Весь код модуля должен быть организован в области для лучшей структуры.
         query_parse_error_complex_valid.bsl | DeprecatedPlatformApi | 90:36..90:47 | Warning | [Deprecated] | Используйте "ТекущаяДатаСеанса" вместо устаревшего "ТекущаяДата"
-        query_parse_error_complex_valid.bsl | InvalidCharacterInFile | 29:3..29:67 | Major | [] | Нужно исправить на правильный символ "-"
-        query_parse_error_complex_valid.bsl | InvalidCharacterInFile | 60:3..60:73 | Major | [] | Нужно исправить на правильный символ "-"
+        query_parse_error_complex_valid.bsl | InvalidCharacterInFile | 29:3..29:67 | Warning | [] | Нужно исправить на правильный символ "-"
+        query_parse_error_complex_valid.bsl | InvalidCharacterInFile | 60:3..60:73 | Warning | [] | Нужно исправить на правильный символ "-"
         query_parse_error_complex_valid.bsl | JoinWithVirtualTable | 20:5..20:54 | Warning | [] | Не следует использовать соединения с виртуальными таблицами
         query_parse_error_complex_valid.bsl | JoinWithVirtualTable | 21:23..21:90 | Warning | [] | Не следует использовать соединения с виртуальными таблицами
         query_parse_error_complex_valid.bsl | JoinWithVirtualTable | 24:23..24:73 | Warning | [] | Не следует использовать соединения с виртуальными таблицами

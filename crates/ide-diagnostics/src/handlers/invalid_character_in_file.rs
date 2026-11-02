@@ -17,7 +17,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Error, MetadataTag::Standard, MetadataTag::Unpredictable],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 const ILLEGAL_DASHES: &[char] =
@@ -264,46 +264,46 @@ mod tests {
             expect![[r#"
                 InvalidCharacterInFile @ 2:15..2:18
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 3:16..3:19
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 4:15..4:18
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 5:23..5:26
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 6:21..6:24
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 7:1..7:34
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 13:1..13:33
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 15:16..15:19
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 18:1..18:2
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 21:1..21:2
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 23:1..23:2
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 25:1..25:2
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 27:1..27:2
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 29:1..29:2
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -318,7 +318,7 @@ mod tests {
             expect![[r#"
                 InvalidCharacterInFile @ 2:5..2:16
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -331,7 +331,7 @@ mod tests {
             expect![[r#"
                 InvalidCharacterInFile @ 1:1..1:27
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -360,22 +360,22 @@ mod tests {
             expect![[r#"
                 InvalidCharacterInFile @ 1:5..1:8
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 2:5..2:8
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 3:5..3:8
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 4:5..4:8
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 5:5..5:8
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 6:5..6:8
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -388,10 +388,10 @@ mod tests {
             expect![[r#"
                 InvalidCharacterInFile @ 1:5..1:8
                   message: Нужно исправить на правильный символ "-"
-                  severity: Major
+                  severity: Warning
                 InvalidCharacterInFile @ 2:5..2:8
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 }
