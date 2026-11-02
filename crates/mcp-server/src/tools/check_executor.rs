@@ -894,6 +894,8 @@ mod tests {
     const FAKE_EXECUTOR: &str = r#"#!/usr/bin/env python3
 import json, os, signal, subprocess, sys, time
 mode = sys.argv[1]
+def mark_stop_ready():
+    if len(sys.argv) > 2: open(sys.argv[2], 'w').close()
 if mode == 'exit1-immediate':
     print('{"status":"valid"}', flush=True)
     sys.exit(1)
@@ -938,15 +940,21 @@ if mode in ('coordinated-within-r', 'coordinated-over-r'):
 if mode.startswith('route'):
     with open(sys.argv[2], 'a') as marker:
         marker.write(request['input_kind'] + '\n')
-if mode == 'hang': time.sleep(30)
+if mode == 'hang':
+    mark_stop_ready()
+    time.sleep(30)
 if mode == 'term-ignore':
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    mark_stop_ready()
     time.sleep(30)
 if mode == 'early-term-exit':
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    mark_stop_ready()
     time.sleep(30)
 if mode == 'descendant-pipe':
-    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.45)'])
+    child = subprocess.Popen([sys.executable, '-c', 'import sys, time; time.sleep(float(sys.argv[1]))',
+                              sys.argv[3] if len(sys.argv) > 3 else '0.45'])
+    mark_stop_ready()
     sys.exit(0)
 if mode == 'overflow':
     sys.stdout.buffer.write(b'x' * 20000); sys.stdout.flush(); time.sleep(30)
@@ -1280,7 +1288,7 @@ if mode == 'exit1': sys.exit(1)
     async fn fake_executor_enforces_pipe_and_deadline_limits_and_reaps_term_ignoring_child() {
         for mode in ["overflow", "stderr-overflow"] {
             let result = fake_result(mode, |profile| {
-                profile.timeout = Duration::from_secs(3);
+                profile.timeout = test_utils::wait::hang_guard(Duration::from_secs(3));
                 profile.max_response_bytes = 16_384;
                 profile.max_stderr_bytes = 1_024;
             })
@@ -1312,10 +1320,56 @@ if mode == 'exit1': sys.exit(1)
                 );
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            assert!(
-                started.elapsed() < Duration::from_secs(3),
-                "hard stop and reap remain bounded"
-            );
+            if cfg!(timing_contract) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "hard stop and reap remain bounded"
+                );
+            }
+        }
+    }
+
+    /// The stop budget, on the runtime's clock: a stopwatch would also time how long this machine
+    /// takes to start the executor. A running blocking task holds the paused clock, so the deadline
+    /// starts counting only once the executor has reached the state its mode is about. From then
+    /// on the clock moves only when nothing else can run, so a wait the product leaves unbounded
+    /// lets it run past the budget however fast the machine is.
+    #[tokio::test(start_paused = true)]
+    async fn stop_and_reap_stay_within_their_budget_on_the_runtime_clock() {
+        const TIMEOUT: Duration = Duration::from_millis(100);
+        const GRACE: Duration = Duration::from_millis(150);
+        const REAP: Duration = Duration::from_millis(250);
+        // Every timer of the stop rounds its wait up to the next millisecond.
+        const TIMER_ROUNDING: Duration = Duration::from_millis(4);
+        // The descendant has to hold the pipe past the deadline, whatever delay a loaded machine
+        // puts between the executor's readiness and the clock moving.
+        const DESCENDANT_HOLD_SECS: &str = "30";
+
+        for mode in ["hang", "term-ignore", "early-term-exit", "descendant-pipe"] {
+            let temp = tempfile::tempdir().unwrap();
+            let ready = temp.path().join("stop-ready");
+            let observed = ready.clone();
+            let stop_ready = tokio::task::spawn_blocking(move || {
+                test_utils::wait::poll_until(
+                    Duration::from_secs(60),
+                    Duration::from_millis(5),
+                    || observed.exists(),
+                )
+            });
+            let result = tokio::time::timeout(
+                TIMEOUT + GRACE + REAP + TIMER_ROUNDING,
+                fake_result(mode, |profile| {
+                    profile.timeout = TIMEOUT;
+                    profile.stop_grace = GRACE;
+                    profile.reap_timeout = REAP;
+                    profile.args.push(ready.into_os_string());
+                    profile.args.push(DESCENDANT_HOLD_SECS.into());
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("mode={mode}: hard stop and reap remain bounded"));
+            assert!(stop_ready.await.unwrap(), "mode={mode}: the executor never became ready");
+            assert_eq!(result_code(&result).as_deref(), Some("transport_timeout"), "mode={mode}");
         }
     }
 

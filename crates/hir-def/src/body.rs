@@ -625,10 +625,6 @@ pub enum BodyDiagnostic<R = TextRange> {
         ident_range: R,
     },
 
-    CreateQueryInCycle {
-        range: R,
-    },
-
     DeletingCollectionItem {
         collection_text: String,
         range: R,
@@ -933,9 +929,6 @@ impl<R> BodyDiagnostic<R> {
                 stmt_range: f(stmt_range),
                 ident_range: f(ident_range),
             },
-            BodyDiagnostic::CreateQueryInCycle { range } => {
-                BodyDiagnostic::CreateQueryInCycle { range: f(range) }
-            }
             BodyDiagnostic::DeletingCollectionItem { collection_text, range } => {
                 BodyDiagnostic::DeletingCollectionItem { collection_text, range: f(range) }
             }
@@ -1315,7 +1308,6 @@ impl<R: Copy> BodyDiagnostic<R> {
             BodyDiagnostic::CommonModuleAssign { range, .. } => *range,
             BodyDiagnostic::MissingCommonModuleMethod { range, .. } => *range,
             BodyDiagnostic::RewriteMethodParameter { ident_range, .. } => *ident_range,
-            BodyDiagnostic::CreateQueryInCycle { range } => *range,
             BodyDiagnostic::DeletingCollectionItem { range, .. } => *range,
             BodyDiagnostic::SelfInsertion { range } => *range,
             BodyDiagnostic::DeprecatedAttribute8312 { range, .. } => *range,

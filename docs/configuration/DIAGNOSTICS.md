@@ -282,6 +282,10 @@ TooManyReturns = { maxReturnsCount = 5 }
 Директивы работают одинаково в LSP, MCP и CLI (`analyze`, все репортёры, включая
 SARIF — подавлённые не попадают в отчёт).
 
+Подавление выполнения запроса в помощнике снимает находки `CreateQueryInCycle` со всех
+цепочек, основанных только на нём: см.
+[описание диагностики](../../crates/ide-diagnostics/docs/ru/CreateQueryInCycle.md#обоснованное-исключение).
+
 ### Совместимость с bsl-language-server
 
 По умолчанию распознаются и директивы bsl-language-server, чтобы существующие

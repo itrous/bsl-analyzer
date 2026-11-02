@@ -117,8 +117,8 @@ pub mod dataflow {
 
     pub mod reaching_defs {
         pub use ::dataflow::reaching_defs::{
-            DefSite, Definition, DefinitionIndex, ReachingDefs, ReachingDefsResult,
-            ReachingDefsTransfer,
+            solve_reaching_definitions, DefSite, Definition, DefinitionIndex, ReachingDefs,
+            ReachingDefsResult, ReachingDefsTransfer,
         };
     }
 
@@ -221,6 +221,10 @@ pub use hir_ty::narrow::{
     NarrowState,
 };
 pub use hir_ty::proc_signature;
+pub use hir_ty::query_in_loop::{
+    query_in_loop_candidates, BodyQueryFacts, LocalQueryCall, QueryCallKey, QueryExecutionKind,
+    QueryExecutionSite, QueryInLoopCandidate,
+};
 pub use hir_ty::query_text_dataflow::{executed_query_texts, ExecutedQueryText};
 pub use hir_ty::{
     form_control_platform_type_chain, form_control_platform_type_name, form_element_kind_label,

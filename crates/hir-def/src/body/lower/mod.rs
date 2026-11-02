@@ -44,8 +44,6 @@ pub(crate) struct LoweringCtx {
 
     pub(crate) loop_depth: usize,
 
-    pub(crate) query_vars: FxHashMap<NormName, QueryVarType>,
-
     pub(crate) foreach_collections: Vec<(ExprIdx, String)>,
 
     pub(crate) is_client_only: bool,
@@ -71,14 +69,6 @@ pub(crate) struct LoweringCtx {
     pub(crate) except_has_raise: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum QueryVarType {
-    Query,
-    QueryBuilder,
-    ReportBuilder,
-    Undefined,
-}
-
 impl LoweringCtx {
     pub(crate) fn new(is_function: bool) -> Self {
         Self {
@@ -93,7 +83,6 @@ impl LoweringCtx {
             cancel_params: FxHashSet::default(),
             pending_sdbl: Vec::new(),
             loop_depth: 0,
-            query_vars: FxHashMap::default(),
             foreach_collections: Vec::new(),
             is_client_only: false,
             has_no_context_annotation: false,
@@ -208,21 +197,6 @@ impl LoweringCtx {
 
     pub(crate) fn in_loop(&self) -> bool {
         self.loop_depth > 0
-    }
-
-    pub(crate) fn register_query_var(&mut self, name: String, var_type: QueryVarType) {
-        self.query_vars.insert(NormName::intern(&name), var_type);
-    }
-
-    pub(crate) fn get_query_var_type(&self, name: &str) -> Option<QueryVarType> {
-        self.query_vars.get(&NormName::intern(name)).copied()
-    }
-
-    pub(crate) fn is_query_var(&self, name: &str) -> bool {
-        matches!(
-            self.get_query_var_type(name),
-            Some(QueryVarType::Query | QueryVarType::QueryBuilder | QueryVarType::ReportBuilder)
-        )
     }
 
     pub(crate) fn enter_foreach(&mut self, collection_expr: ExprIdx, collection_text: String) {

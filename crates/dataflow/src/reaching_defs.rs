@@ -426,6 +426,59 @@ impl ReachingDefsTransfer {
     }
 }
 
+/// Reaching definitions over one body. Parameters seed the entry state only
+/// for methods; module-level code has none.
+pub fn solve_reaching_definitions(
+    cfg: Arc<cfg::ControlFlowGraph>,
+    body_arc: &Arc<Body>,
+    seed_params: bool,
+) -> Option<Arc<ReachingDefsResult>> {
+    solve_with(ReachingDefsTransfer, cfg, body_arc, seed_params)
+}
+
+/// [`solve_reaching_definitions`] where nothing crosses an unexecutable edge: a write followed by
+/// `Возврат`, `Прервать` or `ВызватьИсключение` does not reach the text after the jump, and a
+/// write in dead code reaches nothing.
+pub fn solve_executable_reaching_definitions(
+    cfg: Arc<cfg::ControlFlowGraph>,
+    body_arc: &Arc<Body>,
+    seed_params: bool,
+) -> Option<Arc<ReachingDefsResult>> {
+    solve_with(ExecutableReachingDefsTransfer, cfg, body_arc, seed_params)
+}
+
+fn solve_with<T: Transfer<ReachingDefs>>(
+    transfer: T,
+    cfg: Arc<cfg::ControlFlowGraph>,
+    body_arc: &Arc<Body>,
+    seed_params: bool,
+) -> Option<Arc<ReachingDefsResult>> {
+    let body: &Body = body_arc;
+    let params: Vec<_> = if seed_params {
+        body.params().map(|param_id| (body.binding(param_id).name.clone(), param_id)).collect()
+    } else {
+        Vec::new()
+    };
+    let def_index = DefinitionIndex::from_body_with_params(body, params);
+
+    let mut initial_defs = ReachingDefs::new(def_index.clone());
+    if seed_params {
+        for param_id in body.params() {
+            let binding = body.binding(param_id);
+            initial_defs.insert(&Definition::parameter(&binding.name, param_id));
+        }
+    }
+
+    let mut solver = crate::DataflowSolver::new(cfg, body.clone(), transfer);
+    solver.set_max_iterations(crate::DEFAULT_MAX_ITERATIONS);
+    solver.set_bottom_factory(|| ReachingDefs::new(def_index.clone()));
+    solver.set_initial_state(initial_defs);
+
+    solver.solve().map(|dataflow_result| {
+        Arc::new(ReachingDefsResult::new(dataflow_result, Arc::clone(body_arc)))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReachingDefsResult {
     block_in: rustc_hash::FxHashMap<petgraph::graph::NodeIndex, ReachingDefs>,
@@ -435,6 +488,15 @@ pub struct ReachingDefsResult {
     stmt_to_block: rustc_hash::FxHashMap<hir_def::StmtId, petgraph::graph::NodeIndex>,
 
     block_stmts: rustc_hash::FxHashMap<petgraph::graph::NodeIndex, Vec<la_arena::RawIdx>>,
+
+    /// The vertex of each condition a pass evaluates anew, by that condition: such a statement
+    /// belongs to no basic block, and what enters the vertex is what the condition reads.
+    condition_blocks: rustc_hash::FxHashMap<hir_def::ExprId, petgraph::graph::NodeIndex>,
+
+    /// The block entering each `Для` and `Для Каждого`, by the first expression of the header.
+    /// Those run once, on entry: what the loop's own back-edge brings to the header never
+    /// reaches them, so they read what leaves this block.
+    loop_entry_blocks: rustc_hash::FxHashMap<hir_def::ExprId, petgraph::graph::NodeIndex>,
 
     /// Shared with the lowering memo: a retained result must not carry its
     /// own copy of the body.
@@ -447,17 +509,40 @@ impl ReachingDefsResult {
 
         let mut stmt_to_block = rustc_hash::FxHashMap::default();
         let mut block_stmts = rustc_hash::FxHashMap::default();
+        let mut condition_blocks = rustc_hash::FxHashMap::default();
+        let mut loop_entry_blocks = rustc_hash::FxHashMap::default();
+        // The builder creates a loop header before its body, so among the header's predecessors
+        // only the block entering the loop precedes it.
+        let entry_of = |header: petgraph::graph::NodeIndex| {
+            dataflow.cfg().incoming_edges(header).map(|(source, _)| source).find(|s| *s < header)
+        };
 
         for (block_idx, vertex) in dataflow.cfg().vertices() {
-            if let CfgVertex::BasicBlock(basic_block) = vertex {
-                let stmts: Vec<la_arena::RawIdx> =
-                    basic_block.statements().iter().map(|stmt_id| stmt_id.into_raw()).collect();
+            match vertex {
+                CfgVertex::BasicBlock(basic_block) => {
+                    let stmts: Vec<la_arena::RawIdx> =
+                        basic_block.statements().iter().map(|stmt_id| stmt_id.into_raw()).collect();
 
-                block_stmts.insert(block_idx, stmts);
+                    block_stmts.insert(block_idx, stmts);
 
-                for &stmt_id in basic_block.statements() {
-                    stmt_to_block.insert(stmt_id, block_idx);
+                    for &stmt_id in basic_block.statements() {
+                        stmt_to_block.insert(stmt_id, block_idx);
+                    }
                 }
+                CfgVertex::Conditional(header) => {
+                    condition_blocks.insert(header.condition, block_idx);
+                }
+                CfgVertex::WhileHeader(header) => {
+                    condition_blocks.insert(header.condition, block_idx);
+                }
+                CfgVertex::ForHeader(header) => {
+                    loop_entry_blocks.extend(entry_of(block_idx).map(|entry| (header.from, entry)));
+                }
+                CfgVertex::ForEachHeader(header) => {
+                    loop_entry_blocks
+                        .extend(entry_of(block_idx).map(|entry| (header.collection, entry)));
+                }
+                _ => {}
             }
         }
 
@@ -469,7 +554,15 @@ impl ReachingDefsResult {
             block_out.insert(block_idx, out_state.clone());
         }
 
-        Self { block_in, block_out, stmt_to_block, block_stmts, body }
+        Self {
+            block_in,
+            block_out,
+            stmt_to_block,
+            block_stmts,
+            condition_blocks,
+            loop_entry_blocks,
+            body,
+        }
     }
 
     pub fn defs_before_stmt(&self, stmt_id: hir_def::StmtId) -> Option<&ReachingDefs> {
@@ -511,6 +604,20 @@ impl ReachingDefsResult {
         Some(reaching.defs_for_var(var_name).cloned().collect())
     }
 
+    /// The definitions of `var_name` a header reads, by the expression it evaluates first: an
+    /// `Если`, `ИначеЕсли` or `Пока` condition, a `Для` lower bound, a `Для Каждого` collection.
+    pub fn defs_for_var_at_header(
+        &self,
+        var_name: &str,
+        header_expr: hir_def::ExprId,
+    ) -> Option<Vec<Definition>> {
+        let state = match self.condition_blocks.get(&header_expr) {
+            Some(block) => self.block_in.get(block)?,
+            None => self.block_out.get(self.loop_entry_blocks.get(&header_expr)?)?,
+        };
+        Some(state.defs_for_var(var_name).cloned().collect())
+    }
+
     pub fn var_is_defined_at_stmt(&self, var_name: &str, stmt_id: hir_def::StmtId) -> bool {
         self.defs_before_stmt(stmt_id)
             .map(|reaching| reaching.has_def_for_var(var_name))
@@ -525,7 +632,7 @@ impl ReachingDefsResult {
         self.block_in.get(&block_idx)
     }
 
-    /// Approximate live heap bytes for Salsa's `memory_usage` report: the four
+    /// Approximate live heap bytes for Salsa's `memory_usage` report: the six
     /// per-block hashbrown tables (including each `ReachingDefs` bitset and the
     /// `block_stmts` index vectors). The shared [`Body`] and the shared
     /// `Arc<DefinitionIndex>` payloads behind each `ReachingDefs` are counted
@@ -542,6 +649,8 @@ impl ReachingDefsResult {
             bytes += v.estimated_heap();
         }
         bytes += crate::map_table_bytes::<hir_def::StmtId, NodeIndex>(self.stmt_to_block.len());
+        bytes += crate::map_table_bytes::<hir_def::ExprId, NodeIndex>(self.condition_blocks.len());
+        bytes += crate::map_table_bytes::<hir_def::ExprId, NodeIndex>(self.loop_entry_blocks.len());
         bytes += crate::map_table_bytes::<NodeIndex, Vec<la_arena::RawIdx>>(self.block_stmts.len());
         for stmts in self.block_stmts.values() {
             bytes += crate::vec_bytes::<la_arena::RawIdx>(stmts.len());
@@ -549,6 +658,21 @@ impl ReachingDefsResult {
         // The body is the lowering memo's `Arc`, counted there; only the pointer
         // is this result's own.
         bytes
+    }
+}
+
+struct ExecutableReachingDefsTransfer;
+
+impl Transfer<ReachingDefs> for ExecutableReachingDefsTransfer {
+    fn transfer_stmt(&self, stmt_id: RawIdx, state: &ReachingDefs, body: &Body) -> ReachingDefs {
+        ReachingDefsTransfer.transfer_stmt(stmt_id, state, body)
+    }
+
+    fn transfer_edge(&self, edge_kind: cfg::CfgEdgeType, state: &ReachingDefs) -> ReachingDefs {
+        match edge_kind {
+            cfg::CfgEdgeType::Unexecutable => ReachingDefs::new(state.def_index.clone()),
+            _ => state.clone(),
+        }
     }
 }
 

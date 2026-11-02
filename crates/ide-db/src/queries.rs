@@ -425,46 +425,6 @@ pub fn method_cfg_query<'db>(
     Arc::new(hir::cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), body))
 }
 
-/// Reaching definitions over one body. Parameters seed the entry state only
-/// for methods; module-level code has none.
-fn solve_reaching_definitions(
-    cfg: Arc<hir::cfg::ControlFlowGraph>,
-    body_arc: &Arc<hir::Body>,
-    seed_params: bool,
-) -> Option<Arc<hir::dataflow::reaching_defs::ReachingDefsResult>> {
-    use hir::dataflow::reaching_defs::{
-        Definition, DefinitionIndex, ReachingDefs, ReachingDefsTransfer,
-    };
-
-    let body: &hir::Body = body_arc;
-    let params: Vec<_> = if seed_params {
-        body.params().map(|param_id| (body.binding(param_id).name.clone(), param_id)).collect()
-    } else {
-        Vec::new()
-    };
-    let def_index = DefinitionIndex::from_body_with_params(body, params);
-
-    let mut initial_defs = ReachingDefs::new(def_index.clone());
-    if seed_params {
-        for param_id in body.params() {
-            let binding = body.binding(param_id);
-            initial_defs.insert(&Definition::parameter(&binding.name, param_id));
-        }
-    }
-
-    let mut solver = hir::dataflow::DataflowSolver::new(cfg, body.clone(), ReachingDefsTransfer);
-    solver.set_max_iterations(hir::dataflow::DEFAULT_MAX_ITERATIONS);
-    solver.set_bottom_factory(|| ReachingDefs::new(def_index.clone()));
-    solver.set_initial_state(initial_defs);
-
-    solver.solve().map(|dataflow_result| {
-        Arc::new(hir::dataflow::reaching_defs::ReachingDefsResult::new(
-            dataflow_result,
-            Arc::clone(body_arc),
-        ))
-    })
-}
-
 #[salsa::tracked(lru = 8192, heap_size = heap_estimate::reaching_defs_heap, returns(clone))]
 pub fn reaching_definitions_query<'db>(
     db: &'db dyn RootDatabase,
@@ -472,7 +432,11 @@ pub fn reaching_definitions_query<'db>(
 ) -> Option<Arc<hir::dataflow::reaching_defs::ReachingDefsResult>> {
     let _span = tracing::info_span!("reaching_definitions", ?method_id_input).entered();
     let cfg = method_cfg_query(db, method_id_input);
-    solve_reaching_definitions(cfg, db.method_body_ref(method_id_input), true)
+    hir::dataflow::reaching_defs::solve_reaching_definitions(
+        cfg,
+        db.method_body_ref(method_id_input),
+        true,
+    )
 }
 
 #[salsa::tracked(lru = 128, heap_size = heap_estimate::reaching_defs_heap, returns(clone))]
@@ -485,7 +449,7 @@ pub fn module_code_reaching_definitions_query<'db>(
     let module_bodies = db.module_bodies_ref(ModuleId::new(file_id));
     let body_arc = module_bodies.module_code_arc()?;
     let cfg = module_level_cfg_query(db, file_id_input);
-    solve_reaching_definitions(cfg, body_arc, false)
+    hir::dataflow::reaching_defs::solve_reaching_definitions(cfg, body_arc, false)
 }
 
 #[salsa::tracked(lru = 8192, heap_size = heap_estimate::path_terminates_heap, returns(clone))]
