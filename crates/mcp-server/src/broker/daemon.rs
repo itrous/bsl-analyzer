@@ -1145,6 +1145,29 @@ mod shared_tests {
         );
     }
 
+    /// Whether a client reaches the endpoint at this instant, without waiting for it to accept.
+    /// A Unix socket connect never waits. A Windows connect to a pipe whose instances are all
+    /// held by connected sessions would sit in `WaitNamedPipe` on a blocking thread that outlives
+    /// its caller's timeout and the session's drain, so the pipe is tried once instead.
+    async fn endpoint_reachable_now(key: &SharedBackendKey) -> bool {
+        #[cfg(unix)]
+        {
+            connect_endpoint(shared_backend_name(key).unwrap(), HANDSHAKE_TIMEOUT).await.is_ok()
+        }
+        #[cfg(windows)]
+        {
+            use interprocess::os::windows::named_pipe::{pipe_mode, tokio::DuplexPipeStream};
+
+            let path = format!(r"\\.\pipe\bsl-shared-{}.sock", key.digest());
+            DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path_with_wait_mode(
+                path,
+                interprocess::ConnectWaitMode::Timeout(Duration::ZERO),
+            )
+            .await
+            .is_ok()
+        }
+    }
+
     /// A client told its scope retired reconnects at once. While the listener lives, that
     /// connection only waits in its backlog, and closing the listener resets it: the rebind then
     /// fails instead of launching the next backend. So a session must not hear of the retirement
@@ -1184,12 +1207,7 @@ mod shared_tests {
                         tokio::select! {
                             _ = shutdown.cancelled() => {}
                             _ = retired.cancelled() => {
-                                let reached = connect_endpoint(
-                                    shared_backend_name(&key).unwrap(),
-                                    HANDSHAKE_TIMEOUT,
-                                )
-                                .await;
-                                reconnect.send(reached.is_ok()).unwrap();
+                                reconnect.send(endpoint_reachable_now(&key).await).unwrap();
                             }
                         }
                         Ok(())
@@ -1210,20 +1228,24 @@ mod shared_tests {
                 connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT)
                     .await
                     .unwrap();
-            client_handshake(
-                &mut client,
-                &Handshake { identity: identity.clone(), adapter: AdapterKind::Mcp },
-            )
+            tokio::time::timeout(test_utils::wait::hang_guard(HANDSHAKE_TIMEOUT), async {
+                client_handshake(
+                    &mut client,
+                    &Handshake { identity: identity.clone(), adapter: AdapterKind::Mcp },
+                )
+                .await
+                .unwrap();
+                write_session_context(&mut client, &[]).await.unwrap();
+            })
             .await
-            .unwrap();
-            write_session_context(&mut client, &[]).await.unwrap();
+            .expect("the client's handshake and session context are bounded");
             tokio::time::timeout(
                 test_utils::wait::hang_guard(Duration::from_secs(5)),
                 attached_rx.recv(),
             )
             .await
-            .unwrap()
-            .unwrap();
+            .expect("the session reaches the adapter")
+            .expect("the adapter callback is alive");
             clients.push(client);
         }
 
@@ -1234,11 +1256,15 @@ mod shared_tests {
                 reconnect_rx.recv(),
             )
             .await
-            .unwrap()
-            .unwrap();
+            .expect("a session hears of the retirement")
+            .expect("the session reports before the daemon cuts it off");
             assert!(!reached, "the endpoint closes before a session hears of the retirement");
         }
-        daemon.await.unwrap().unwrap();
+        tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(5)), daemon)
+            .await
+            .expect("the daemon finishes once its sessions have ended")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

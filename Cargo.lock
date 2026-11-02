@@ -4731,6 +4731,7 @@ dependencies = [
  "base-db",
  "bsl-metadata",
  "expect-test",
+ "lexer",
  "parser",
  "rustc-hash 2.1.2",
  "smol_str",
