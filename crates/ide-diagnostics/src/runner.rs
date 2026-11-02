@@ -425,7 +425,7 @@ fn collect_sdbl_hir_single_pass(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         .config_bool(
             DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
             handlers::calculation_register_virtual_table_without_recorder::ONLY_IN_MODULES_WRITING_REGISTER,
-            false,
+            true,
         )
         .then(|| ctx.parse().syntax_node());
 
