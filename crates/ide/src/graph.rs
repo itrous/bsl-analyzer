@@ -1512,9 +1512,11 @@ pub fn reproject_changed_modules(
     );
     let changed_set: FxHashSet<ModuleId> = changed.iter().copied().collect();
 
-    // Phase A — method nodes for the changed modules only.
-    let mut nodes: Vec<NodeRow> = index
-        .method_nodes()
+    // Phase A — method nodes for the changed modules only, in the order the full build
+    // writes them: the store keeps the first row of a shared id, so this keeps the same
+    // namesake a full build keeps.
+    let mut nodes: Vec<NodeRow> = encoder
+        .method_nodes_in_id_order()
         .filter(|m| changed_set.contains(&m.module))
         .map(|m| encoder.node_row(&GraphNode::Method(m)))
         .collect();
@@ -3436,6 +3438,44 @@ mod tests {
         // Full header through the export keyword, not just the name.
         assert_eq!(node.signature.as_deref(), Some("Функция Считать() Экспорт"));
         assert!(node.addressable);
+    }
+
+    /// The id of a namesake pair is shared, so what it resolves to is a choice: the
+    /// declaration listed first, whichever kind of method either of them is.
+    #[test]
+    fn a_namesake_id_resolves_to_the_declaration_listed_first() {
+        let pairs = [
+            (
+                "a function over a procedure",
+                "Функция Дважды(Первый) Экспорт\nВозврат 1;\nКонецФункции\n\n\
+                 Процедура Дважды(Второй, Третий)\nКонецПроцедуры",
+                "Функция Дважды(Первый) Экспорт",
+            ),
+            (
+                "a procedure over a function",
+                "Процедура Дважды(Первый) Экспорт\nКонецПроцедуры\n\n\
+                 Функция Дважды(Второй, Третий)\nВозврат 1;\nКонецФункции",
+                "Процедура Дважды(Первый) Экспорт",
+            ),
+            (
+                "two functions",
+                "Функция Дважды(Первый) Экспорт\nВозврат 1;\nКонецФункции\n\n\
+                 Функция Дважды(Второй, Третий)\nВозврат 2;\nКонецФункции",
+                "Функция Дважды(Первый) Экспорт",
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (label, source, top_signature) in pairs {
+            let a = workspace(&[("/src/CommonModules/Модуль/Ext/Module.bsl", source)]);
+            let node = a
+                .graph_node(ROOT, None, "method/common/Модуль/Дважды", GraphDetail::Signatures)
+                .expect("the shared id resolves")
+                .node;
+            if node.signature.as_deref() != Some(top_signature) {
+                wrong.push(format!("{label}: {:?}, not {top_signature:?}", node.signature));
+            }
+        }
+        assert!(wrong.is_empty(), "the id resolved to the lower declaration: {wrong:#?}");
     }
 
     #[test]
