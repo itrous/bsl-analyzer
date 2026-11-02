@@ -1348,10 +1348,10 @@ mod tests {
     #[tokio::test]
     async fn native_log_growth_over_the_limit_stops_the_owned_process() {
         let directory = tempfile::tempdir().unwrap();
-        let executable = script(
-            directory.path(),
-            "while :; do printf 1234567890 > native.log; sleep 0.01; done",
-        );
+        // Written once and left alone: `>` empties the file before it writes, so a script that
+        // kept rewriting the log could be stopped in between and leave nothing to read back.
+        let executable =
+            script(directory.path(), "printf 1234567890 > native.log\nwhile :; do sleep 1; done");
         let log = directory.path().join("native.log");
         let output = super::super::tests::guard_future(
             run_bounded_with_log(
