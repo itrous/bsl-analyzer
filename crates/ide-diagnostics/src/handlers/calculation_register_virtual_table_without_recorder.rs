@@ -693,10 +693,10 @@ mod tests {
             expect![[r#"
                 VirtualTableCallWithoutParameters @ 4:9..4:48
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major
+                  severity: Warning
                 VirtualTableCallWithoutParameters @ 9:9..9:60
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
         check(
             &source,

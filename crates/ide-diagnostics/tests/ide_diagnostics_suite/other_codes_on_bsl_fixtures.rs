@@ -125,8 +125,8 @@ fn other_codes_on_the_bsl_fixtures_are_unchanged() {
         query_parse_error_complex_valid.bsl | UnresolvedField | 91:37..91:55 | Major | [] | Поле 'Склады' не найдено у типа 'СправочникМенеджер'
         query_parse_error_complex_valid.bsl | UnresolvedField | 92:45..92:63 | Major | [] | Поле 'Склады' не найдено у типа 'СправочникМенеджер'
         query_parse_error_complex_valid.bsl | UnusedLocalMethod | 1:11..1:15 | Warning | [Unnecessary] | Неиспользуемый локальный метод "Тест"
-        query_parse_error_complex_valid.bsl | VirtualTableCallWithoutParameters | 24:23..24:73 | Major | [] | Не следует использовать виртуальные таблицы без параметров
-        query_parse_error_complex_valid.bsl | VirtualTableCallWithoutParameters | 54:23..54:73 | Major | [] | Не следует использовать виртуальные таблицы без параметров"#]]);
+        query_parse_error_complex_valid.bsl | VirtualTableCallWithoutParameters | 24:23..24:73 | Warning | [] | Не следует использовать виртуальные таблицы без параметров
+        query_parse_error_complex_valid.bsl | VirtualTableCallWithoutParameters | 54:23..54:73 | Warning | [] | Не следует использовать виртуальные таблицы без параметров"#]]);
 }
 
 /// The control of the snapshot above: a projection that saw no findings at all would match any
