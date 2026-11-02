@@ -1129,13 +1129,41 @@ pub fn tokenize_sdbl(input: &str) -> Vec<SdblToken> {
 /// Whether the query language itself knows `word` (a function, virtual table, keyword or type).
 ///
 /// The parser collapses every `Fn*`, `Vt*`, `Kw*` and type token to a plain identifier, so this
-/// lexer is the only place where "the language knows this word" survives.
+/// lexer is the only place where "the language knows this word" survives. Metadata roots and
+/// period names collapse too, but neither names anything that can be called, so a call spelled
+/// with one of them is as wrong as a typo.
 pub fn is_sdbl_vocabulary_word(word: &str) -> bool {
+    use SdblTokenKind as K;
+
     let mut significant = tokenize_sdbl(word)
         .into_iter()
-        .filter(|token| !matches!(token.kind, SdblTokenKind::Whitespace | SdblTokenKind::Newline));
+        .filter(|token| !matches!(token.kind, K::Whitespace | K::Newline));
     match (significant.next(), significant.next()) {
-        (Some(token), None) => token.kind != SdblTokenKind::Ident,
+        (Some(token), None) => !matches!(
+            token.kind,
+            K::Ident
+                | K::PeriodTenDays
+                | K::PeriodHalfYear
+                | K::MdoCatalog
+                | K::MdoDocument
+                | K::MdoDocumentJournal
+                | K::MdoInformationRegister
+                | K::MdoAccumulationRegister
+                | K::MdoAccountingRegister
+                | K::MdoCalculationRegister
+                | K::MdoChartOfAccounts
+                | K::MdoChartOfCalculationTypes
+                | K::MdoChartOfCharacteristicTypes
+                | K::MdoExchangePlan
+                | K::MdoEnum
+                | K::MdoBusinessProcess
+                | K::MdoTask
+                | K::MdoConstant
+                | K::MdoConstants
+                | K::MdoSequence
+                | K::MdoFilterCriterion
+                | K::MdoExternalDataSource
+        ),
         _ => false,
     }
 }

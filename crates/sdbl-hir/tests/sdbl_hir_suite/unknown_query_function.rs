@@ -48,6 +48,16 @@ fn real_functions_without_a_dedicated_kind_stay_silent() {
 }
 
 #[test]
+fn a_metadata_root_or_period_name_called_as_a_function_is_reported() {
+    for function in
+        ["Справочник", "Catalog", "РегистрСведений", "ВнешнийИсточникДанных", "Декада", "HalfYear"]
+    {
+        let query = format!("ВЫБРАТЬ {function}(1) КАК Поле ИЗ Справочник.Товары КАК Т");
+        assert_eq!(unknown_function_names(&query), [function], "{query}");
+    }
+}
+
+#[test]
 fn a_virtual_table_call_is_not_a_function_call() {
     let names = unknown_function_names(
         "ВЫБРАТЬ Т.Остаток ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(&Дата, Склад = &Склад) КАК Т",
