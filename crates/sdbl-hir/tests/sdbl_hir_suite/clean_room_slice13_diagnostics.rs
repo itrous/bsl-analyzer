@@ -540,33 +540,45 @@ fn a_disjunction_of_different_subjects_inside_an_on_subquery_is_reported() {
     assert_eq!(operators, vec![text_size::TextRange::at(start, text_size::TextSize::of("ИЛИ"))]);
 }
 
-/// The selected use keeps its identity and range; the same field in `ГДЕ` only filters the
-/// row out and is not a second use.
+/// The selected use keeps its identity and range; the same field in a `ГДЕ` that admits the
+/// row without a pair only filters other rows out and is not a second use. A `ГДЕ` that
+/// excludes that row leaves nothing to report.
 #[test]
 fn an_unprotected_optional_side_field_keeps_its_identity_and_range() {
-    let query = "ВЫБРАТЬ О.КоличествоОстаток КАК Остаток ИЗ Номенклатура КАК Н ЛЕВОЕ СОЕДИНЕНИЕ Остатки КАК О ПО О.Код = Н.Код ГДЕ О.КоличествоОстаток > 0";
-    let package = lower_sdbl_to_hir(&parser::parse_sdbl(query), None);
-    let uses: Vec<_> = package
-        .all_diagnostics()
-        .filter_map(|d| match d {
-            SdblDiagnostic::FieldsFromJoinWithoutNullCheck {
-                join_type,
-                unprotected_fields,
-                ..
-            } => {
-                let fields: Vec<_> = unprotected_fields
-                    .iter()
-                    .map(|f| (f.table_alias.as_str(), f.field_name.as_str(), f.range))
-                    .collect();
-                Some((*join_type, fields))
-            }
-            _ => None,
-        })
-        .collect();
+    let uses = |query: &str| {
+        let package = lower_sdbl_to_hir(&parser::parse_sdbl(query), None);
+        package
+            .all_diagnostics()
+            .filter_map(|d| match d {
+                SdblDiagnostic::FieldsFromJoinWithoutNullCheck {
+                    join_type,
+                    unprotected_fields,
+                    ..
+                } => {
+                    let fields: Vec<_> = unprotected_fields
+                        .iter()
+                        .map(|f| (f.table_alias.clone(), f.field_name.clone(), f.range))
+                        .collect();
+                    Some((*join_type, fields))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let query = "ВЫБРАТЬ О.КоличествоОстаток КАК Остаток ИЗ Номенклатура КАК Н ЛЕВОЕ СОЕДИНЕНИЕ Остатки КАК О ПО О.Код = Н.Код ГДЕ О.КоличествоОстаток > 0 ИЛИ Н.Код = 1";
     let text = "О.КоличествоОстаток";
     let start = text_size::TextSize::try_from(query.find(text).unwrap()).unwrap();
     let range = text_size::TextRange::at(start, text_size::TextSize::of(text));
-    assert_eq!(uses, vec![(sdbl_hir::JoinType::Left, vec![("О", "КоличествоОстаток", range)])]);
+    assert_eq!(
+        uses(query),
+        vec![(
+            sdbl_hir::JoinType::Left,
+            vec![("О".to_string(), "КоличествоОстаток".to_string(), range)]
+        )]
+    );
+
+    let excluding = "ВЫБРАТЬ О.КоличествоОстаток КАК Остаток ИЗ Номенклатура КАК Н ЛЕВОЕ СОЕДИНЕНИЕ Остатки КАК О ПО О.Код = Н.Код ГДЕ О.КоличествоОстаток > 0";
+    assert_eq!(uses(excluding), vec![]);
 }
 
 #[test]

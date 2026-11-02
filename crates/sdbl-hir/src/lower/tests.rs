@@ -3429,16 +3429,402 @@ fn owner_proof_holds_with_resolved_metadata() {
 /// silent once the join type is cross.
 #[test]
 fn cross_join_has_no_optional_side() {
-    let mut hir = lower_query(
-        "ВЫБРАТЬ Ставки.Ставка ИЗ Документ.Заказ.Товары КАК Товары ЛЕВОЕ СОЕДИНЕНИЕ РегистрСведений.Ставки КАК Ставки ПО Товары.Номенклатура = Ставки.Номенклатура",
-    );
+    let code = "ВЫБРАТЬ Ставки.Ставка ИЗ Документ.Заказ.Товары КАК Товары ЛЕВОЕ СОЕДИНЕНИЕ РегистрСведений.Ставки КАК Ставки ПО Товары.Номенклатура = Ставки.Номенклатура";
+    let mut hir = lower_query(code);
+    let ast = parser::parse_sdbl(code);
+    let query = ast
+        .syntax_node()
+        .descendants()
+        .find_map(<syntax::ast::SdblQuery as syntax::ast::AstNode>::cast)
+        .expect("query");
     let check = |hir: &SdblHir| {
         let mut ctx = super::context::LoweringContext::new(None);
-        ctx.check_joins_for_unprotected_fields(hir);
+        ctx.check_joins_for_unprotected_fields(hir, &query);
         ctx.diagnostics.len()
     };
 
     assert_eq!(check(&hir), 1);
     hir.joins[0].join_type = JoinType::Cross;
     assert_eq!(check(&hir), 0);
+}
+
+// What the NULL of a missing row reaches when the metadata gives the field a type: the
+// replacement of `ЕСТЬNULL` is evaluated only for a type it is known to survive.
+
+/// A register `Курсы` whose resource `Значение` has the given type, beside `Код` and `Вид`,
+/// the fields the choice under test selects.
+fn register_config(
+    value: bsl_metadata::AttributeType,
+    defined_types: &[(&str, bsl_metadata::AttributeType)],
+) -> std::sync::Arc<bsl_metadata::Configuration> {
+    use bsl_metadata::{
+        register::RegisterResource, AttributeType, DefinedType, Dimension, MdoType, Register, Uuid,
+    };
+
+    let resource = |name: &str, attr_type: AttributeType| {
+        let mut resource = RegisterResource::new(Default::default(), name);
+        resource.set_attr_type(attr_type);
+        resource
+    };
+    let register = Register::builder()
+        .name("Курсы")
+        .mdo_type(MdoType::InformationRegister)
+        .dimensions(vec![Dimension::builder().name("Ключ").build()])
+        .resources(vec![
+            resource("Значение", value),
+            resource("Код", AttributeType::String { length: Some(10) }),
+            resource("Вид", AttributeType::String { length: Some(10) }),
+        ])
+        .build();
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_register(register);
+    for (name, underlying) in defined_types {
+        config.add_defined_type(
+            DefinedType::builder()
+                .uuid(Uuid::new_v4())
+                .name(*name)
+                .underlying_type(underlying.clone())
+                .build(),
+        );
+    }
+    std::sync::Arc::new(config)
+}
+
+/// The text under every unprotected use of an optional join side that `query` reports.
+fn unprotected_uses(
+    query: &str,
+    metadata: Option<std::sync::Arc<bsl_metadata::Configuration>>,
+) -> Vec<String> {
+    let ast = parser::parse_sdbl(query);
+    assert!(ast.errors().is_empty(), "{query}: {:?}", ast.errors());
+    let package = lower_sdbl_to_hir(&ast, metadata);
+    package
+        .all_diagnostics()
+        .filter_map(|diagnostic| match diagnostic {
+            crate::SdblDiagnostic::FieldsFromJoinWithoutNullCheck {
+                unprotected_fields, ..
+            } => Some(unprotected_fields),
+            _ => None,
+        })
+        .flatten()
+        .map(|field| {
+            query[usize::from(field.range.start())..usize::from(field.range.end())].to_string()
+        })
+        .collect()
+}
+
+const THEN_FIELD: &str = "Т.Код";
+const ELSE_FIELD: &str = "Т.Вид";
+const BOTH_FIELDS: [&str; 2] = [THEN_FIELD, ELSE_FIELD];
+const REGISTER_SOURCE: &str =
+    "ИЗ Документ.Заказ КАК Док ЛЕВОЕ СОЕДИНЕНИЕ РегистрСведений.Курсы КАК Т ПО Док.Ключ = Т.Ключ";
+
+fn choice_over_register(condition: &str) -> String {
+    format!(
+        "ВЫБРАТЬ ВЫБОР КОГДА {condition} ТОГДА {THEN_FIELD} ИНАЧЕ {ELSE_FIELD} КОНЕЦ КАК Р {REGISTER_SOURCE}"
+    )
+}
+
+/// The fields reported for the choice when `Т.Значение` has the type, and when no metadata
+/// is known at all.
+fn typed_and_untyped(
+    value: bsl_metadata::AttributeType,
+    condition: &str,
+) -> (Vec<String>, Vec<String>) {
+    let query = choice_over_register(condition);
+    (unprotected_uses(&query, Some(register_config(value, &[]))), unprotected_uses(&query, None))
+}
+
+#[test]
+fn isnull_replacement_is_computed_only_for_a_known_type() {
+    use bsl_metadata::AttributeType as Type;
+
+    let cases = [
+        (Type::Number { precision: 15, scale: 4 }, "ЕСТЬNULL(Т.Значение, 0)", "0"),
+        (Type::Boolean, "ЕСТЬNULL(Т.Значение, ЛОЖЬ)", "ЛОЖЬ"),
+        (Type::String { length: Some(2) }, "ЕСТЬNULL(Т.Значение, \"AB\")", "\"AB\""),
+        (Type::DateTime, "ЕСТЬNULL(Т.Значение, ДАТАВРЕМЯ(1, 1, 1))", "ДАТАВРЕМЯ(1, 1, 1)"),
+        (Type::Date, "ISNULL(Т.Значение, DATETIME(1, 1, 1))", "DATETIME(1, 1, 1)"),
+    ];
+    for (value, replaced, constant) in cases {
+        // Equal to its replacement the missing row makes the condition true: the branch is
+        // reached and the one after it is not.
+        let (typed, untyped) =
+            typed_and_untyped(value.clone(), &format!("{replaced} = {constant}"));
+        assert_eq!(typed, [THEN_FIELD], "{value:?}");
+        // Without the type the replacement may not survive the conversion: both are reported.
+        assert_eq!(untyped, BOTH_FIELDS, "{value:?}");
+        // Unequal to its replacement the condition is false: the branch is safe.
+        let (typed, untyped) =
+            typed_and_untyped(value.clone(), &format!("{replaced} <> {constant}"));
+        assert_eq!(typed, [ELSE_FIELD], "{value:?}");
+        assert_eq!(untyped, BOTH_FIELDS, "{value:?}");
+    }
+}
+
+#[test]
+fn a_replacement_that_may_not_survive_the_type_stays_unknown() {
+    use bsl_metadata::AttributeType as Type;
+
+    let unknown = [
+        // Does not fit the digits, has a fraction, or is of another kind than the field.
+        (Type::Number { precision: 2, scale: 0 }, "ЕСТЬNULL(Т.Значение, 100) = 100"),
+        (Type::Number { precision: 15, scale: 4 }, "ЕСТЬNULL(Т.Значение, 0.5) = 0.5"),
+        (Type::Number { precision: 15, scale: 4 }, "ЕСТЬNULL(Т.Значение, \"AB\") = \"AB\""),
+        (Type::Boolean, "ЕСТЬNULL(Т.Значение, 0) = 0"),
+        (Type::String { length: Some(2) }, "ЕСТЬNULL(Т.Значение, 0) = 0"),
+        (Type::Date, "ЕСТЬNULL(Т.Значение, ДАТАВРЕМЯ(2000, 1, 1)) = ДАТАВРЕМЯ(2000, 1, 1)"),
+        (Type::DateTime, "ЕСТЬNULL(Т.Значение, ДАТАВРЕМЯ(&Год, 1, 1)) = ДАТАВРЕМЯ(&Год, 1, 1)"),
+        // A string longer than a real field is cut, and a field of unknown length is not known
+        // to keep it.
+        (Type::String { length: Some(1) }, "ЕСТЬNULL(Т.Значение, \"AB\") = \"AB\""),
+        (Type::String { length: None }, "ЕСТЬNULL(Т.Значение, \"AB\") = \"AB\""),
+        // Several types in one field, and a defined type the configuration does not resolve.
+        (
+            Type::Composite {
+                types: vec![
+                    Type::Number { precision: 15, scale: 4 },
+                    Type::String { length: Some(5) },
+                ],
+            },
+            "ЕСТЬNULL(Т.Значение, 0) = 0",
+        ),
+        (Type::DefinedType { name: "Неизвестный".into() }, "ЕСТЬNULL(Т.Значение, 0) = 0"),
+        // Strings spelled differently may or may not be equal, depending on the collation.
+        (Type::String { length: Some(2) }, "ЕСТЬNULL(Т.Значение, \"AB\") = \"ab\""),
+    ];
+    for (value, condition) in unknown {
+        let (typed, _) = typed_and_untyped(value.clone(), condition);
+        assert_eq!(typed, BOTH_FIELDS, "{value:?} {condition}");
+    }
+
+    // The controls on the same fields, where the replacement is known to survive: the same
+    // condition shapes with a value that fits, a string of the field's length or an
+    // unlimited one, and a defined type that resolves to a number.
+    let known = [
+        (Type::Number { precision: 2, scale: 0 }, "ЕСТЬNULL(Т.Значение, 99) = 99"),
+        (Type::Number { precision: 15, scale: 4 }, "ЕСТЬNULL(Т.Значение, 0) = 0"),
+        (Type::Number { precision: 2, scale: 0 }, "ЕСТЬNULL(Т.Значение, 0) = 0"),
+        (Type::String { length: Some(2) }, "ЕСТЬNULL(Т.Значение, \"AB\") = \"AB\""),
+        (Type::String { length: Some(0) }, "ЕСТЬNULL(Т.Значение, \"ABC\") = \"ABC\""),
+        (Type::Boolean, "ЕСТЬNULL(Т.Значение, ИСТИНА) = ИСТИНА"),
+        (Type::Boolean, "ЕСТЬNULL(Т.Значение, Ложь) = FALSE"),
+        (Type::Boolean, "ЕСТЬNULL(Т.Значение, TRUE) = ИСТИНА"),
+    ];
+    for (value, condition) in known {
+        let (typed, _) = typed_and_untyped(value.clone(), condition);
+        assert_eq!(typed, [THEN_FIELD], "{value:?} {condition}");
+    }
+    let defined = register_config(
+        Type::DefinedType { name: "Деньги".into() },
+        &[("Деньги", Type::Number { precision: 15, scale: 2 })],
+    );
+    assert_eq!(
+        unprotected_uses(&choice_over_register("ЕСТЬNULL(Т.Значение, 0) = 0"), Some(defined)),
+        [THEN_FIELD]
+    );
+}
+
+#[test]
+fn a_replacement_that_differs_from_the_compared_constant_makes_the_condition_false() {
+    use bsl_metadata::AttributeType as Type;
+
+    let value = Type::Number { precision: 15, scale: 4 };
+    let (typed, _) = typed_and_untyped(value.clone(), "ЕСТЬNULL(Т.Значение, 0) = 1");
+    assert_eq!(typed, [ELSE_FIELD]);
+    let (typed, _) = typed_and_untyped(value, "ЕСТЬNULL(Т.Значение, 0) <> 1");
+    assert_eq!(typed, [THEN_FIELD]);
+}
+
+#[test]
+fn a_parameter_replacement_may_be_null() {
+    use bsl_metadata::AttributeType as Type;
+
+    let value = Type::Number { precision: 15, scale: 4 };
+    // The parameter can be NULL, and then the comparison is not true: nothing is decided.
+    for condition in ["ЕСТЬNULL(Т.Значение, &П) = 0", "ЕСТЬNULL(Т.Значение, &П) = &П"]
+    {
+        let (typed, _) = typed_and_untyped(value.clone(), condition);
+        assert_eq!(typed, BOTH_FIELDS, "{condition}");
+    }
+    // The control: a literal on the same typed field is decided.
+    let (typed, _) = typed_and_untyped(value, "ЕСТЬNULL(Т.Значение, 0) = 0");
+    assert_eq!(typed, [THEN_FIELD]);
+}
+
+#[test]
+fn a_replaced_value_is_followed_by_the_branches_after_a_surely_true_condition() {
+    use bsl_metadata::AttributeType as Type;
+
+    let query = format!(
+        "ВЫБРАТЬ ВЫБОР КОГДА ЕСТЬNULL(Т.Значение, 0) = 0 ТОГДА 0 КОГДА &П ТОГДА {THEN_FIELD} ИНАЧЕ {ELSE_FIELD} КОНЕЦ КАК Р {REGISTER_SOURCE}"
+    );
+    let typed = register_config(Type::Number { precision: 15, scale: 4 }, &[]);
+    assert_eq!(unprotected_uses(&query, Some(typed)), Vec::<String>::new());
+    assert_eq!(unprotected_uses(&query, None), BOTH_FIELDS);
+}
+
+#[test]
+fn arithmetic_on_a_replaced_value_is_not_undefined() {
+    use bsl_metadata::AttributeType as Type;
+
+    let value = Type::Number { precision: 15, scale: 4 };
+    // The replacement turns NULL into a number, and a number plus one is not NULL.
+    let (typed, _) = typed_and_untyped(value.clone(), "ЕСТЬNULL(Т.Значение, 1) + 1 > 0");
+    assert_eq!(typed, BOTH_FIELDS);
+    // The control: the field itself, without the replacement, is NULL and so is the sum.
+    let (typed, _) = typed_and_untyped(value, "Т.Значение + 1 > 0");
+    assert_eq!(typed, [ELSE_FIELD]);
+}
+
+#[test]
+fn the_minimal_date_is_a_constant_only_as_that_exact_constructor() {
+    use bsl_metadata::AttributeType as Type;
+
+    // The pair from the report that motivated the rule: without a row the replacement equals
+    // the compared date, so the comparison is false and the branch behind it is safe.
+    for condition in [
+        "ЕСТЬNULL(Т.Значение, ДАТАВРЕМЯ(1, 1, 1)) <> ДАТАВРЕМЯ(1, 1, 1)",
+        "ISNULL(Т.Значение, DATETIME(1, 1, 1)) <> DATETIME(1, 1, 1)",
+    ] {
+        let (typed, untyped) = typed_and_untyped(Type::DateTime, condition);
+        assert_eq!(typed, [ELSE_FIELD], "{condition}");
+        assert_eq!(untyped, BOTH_FIELDS, "{condition}");
+    }
+    for condition in [
+        "ЕСТЬNULL(Т.Значение, ДАТАВРЕМЯ(&Год, 1, 1)) <> ДАТАВРЕМЯ(&Год, 1, 1)",
+        "ЕСТЬNULL(Т.Значение, ДАТАВРЕМЯ(1, 1, 1, 0, 0, 0)) <> ДАТАВРЕМЯ(1, 1, 1, 0, 0, 0)",
+        "ЕСТЬNULL(Т.Значение, ДАТАВРЕМЯ(1, 1, 1)) <> ДАТАВРЕМЯ(1, 1, 2)",
+    ] {
+        let (typed, _) = typed_and_untyped(Type::DateTime, condition);
+        assert_eq!(typed, BOTH_FIELDS, "{condition}");
+    }
+}
+
+#[test]
+fn a_function_that_turns_null_into_a_value_is_undefined_for_no_type() {
+    use bsl_metadata::AttributeType as Type;
+
+    for condition in [
+        "ПРЕДСТАВЛЕНИЕ(Т.Значение) = \"\"",
+        "КОЛИЧЕСТВО(Т.Значение) = 0",
+        "НеизвестнаяФункция(Т.Значение) = 0",
+        "(ВЫБОР КОГДА Т.Значение ЕСТЬ NULL ТОГДА 1 ИНАЧЕ 0 КОНЕЦ) = 1",
+    ] {
+        let (typed, untyped) =
+            typed_and_untyped(Type::Number { precision: 15, scale: 4 }, condition);
+        assert_eq!(typed, BOTH_FIELDS, "{condition}");
+        assert_eq!(untyped, BOTH_FIELDS, "{condition}");
+    }
+}
+
+#[test]
+fn a_temporary_table_keeps_the_whole_replacement_string_and_a_real_table_does_not() {
+    let query = |source: &str| {
+        format!(
+            "ВЫБРАТЬ ВЫРАЗИТЬ(\"\" КАК Строка(1)) КАК Значение, 1 КАК Код, 2 КАК Вид ПОМЕСТИТЬ ВТ ИЗ Справочник.Прочее КАК Прочее; \
+             ВЫБРАТЬ ВЫБОР КОГДА ЕСТЬNULL(Т.Значение, \"AB\") = \"AB\" ТОГДА {THEN_FIELD} ИНАЧЕ {ELSE_FIELD} КОНЕЦ КАК Р \
+             ИЗ Документ.Заказ КАК Док ЛЕВОЕ СОЕДИНЕНИЕ {source} КАК Т ПО Док.Ключ = Т.Значение"
+        )
+    };
+    // The field of a temporary table is a one-character string, and the platform keeps both.
+    assert_eq!(unprotected_uses(&query("ВТ"), None), [THEN_FIELD]);
+    // A nested query in the place of the table is not a temporary table: its field is
+    // judged like a real one, whose one character would cut the string.
+    assert_eq!(
+        unprotected_uses(
+            &query("(ВЫБРАТЬ ВЫРАЗИТЬ(\"\" КАК Строка(1)) КАК Значение, 1 КАК Код, 2 КАК Вид ИЗ Справочник.Прочее КАК Прочее)"),
+            None
+        ),
+        BOTH_FIELDS
+    );
+}
+
+#[test]
+fn a_value_reaching_the_result_is_reported_for_every_type() {
+    use bsl_metadata::{register::RegisterResource, AttributeType as Type, MdoType};
+
+    let resource = |name: &str, attr_type: Type| {
+        let mut resource = RegisterResource::new(Default::default(), name);
+        resource.set_attr_type(attr_type);
+        resource
+    };
+    let register = bsl_metadata::Register::builder()
+        .name("Курсы")
+        .mdo_type(MdoType::InformationRegister)
+        .dimensions(vec![bsl_metadata::Dimension::builder().name("Ключ").build()])
+        .resources(vec![
+            resource(
+                "Сотрудник",
+                Type::Ref { mdo_type: MdoType::Catalog, name: "Сотрудники".into() },
+            ),
+            resource("Наименование", Type::String { length: Some(10) }),
+            resource("Дата", Type::DateTime),
+            resource("Количество", Type::Number { precision: 15, scale: 2 }),
+            resource("Действует", Type::Boolean),
+            resource("ВидРасчета", Type::Ref { mdo_type: MdoType::Catalog, name: "Виды".into() }),
+        ])
+        .build();
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_register(register);
+    let config = std::sync::Arc::new(config);
+
+    for field in ["Сотрудник", "Наименование", "Дата", "Количество", "Действует"]
+    {
+        let query = format!("ВЫБРАТЬ Т.{field} {REGISTER_SOURCE}");
+        assert_eq!(unprotected_uses(&query, Some(config.clone())), [format!("Т.{field}")]);
+    }
+    // The branch that is reached exactly when the field is NULL yields NULL: a use for any type.
+    let query = format!(
+        "ВЫБРАТЬ ВЫБОР КОГДА Т.Сотрудник ЕСТЬ NULL ТОГДА Т.ВидРасчета КОНЕЦ КАК Р {REGISTER_SOURCE}"
+    );
+    assert_eq!(unprotected_uses(&query, Some(config.clone())), ["Т.ВидРасчета"]);
+    // Wrapped in ЕСТЬNULL, only the wrapped use is gone.
+    let query = format!("ВЫБРАТЬ ЕСТЬNULL(Т.Количество, 0), Т.Количество {REGISTER_SOURCE}");
+    assert_eq!(unprotected_uses(&query, Some(config)), ["Т.Количество"]);
+}
+
+#[test]
+fn a_member_read_through_parentheses_is_a_step_along_a_reference() {
+    // `(Т.Значение).Имя` is read through the field, so it is NULL for a present row too and
+    // proves nothing about the row; the AST knows what the HIR of the expression forgets.
+    assert_eq!(
+        unprotected_uses(
+            &format!("ВЫБРАТЬ {THEN_FIELD} {REGISTER_SOURCE} ГДЕ (Т.Значение).Имя > 0"),
+            None
+        ),
+        [THEN_FIELD]
+    );
+    // The control: the field itself in the same position hides the selected one.
+    assert_eq!(
+        unprotected_uses(
+            &format!("ВЫБРАТЬ {THEN_FIELD} {REGISTER_SOURCE} ГДЕ Т.Значение > 0"),
+            None
+        ),
+        Vec::<String>::new()
+    );
+}
+
+/// The owner is proven from the syntax tree of the query, so a join of the HIR that the tree
+/// does not confirm leaves the owner an ordinary optional side.
+#[test]
+fn an_owner_join_that_the_syntax_cannot_confirm_is_not_exempt() {
+    let code = "ВЫБРАТЬ Заказ.Дата ИЗ Документ.Заказ.Товары КАК Товары ЛЕВОЕ СОЕДИНЕНИЕ Документ.Заказ КАК Заказ ПО Товары.Ссылка = Заказ.Ссылка";
+    let ast = parser::parse_sdbl(code);
+    let query = ast
+        .syntax_node()
+        .descendants()
+        .find_map(<syntax::ast::SdblQuery as syntax::ast::AstNode>::cast)
+        .expect("query");
+    let package = lower_sdbl_to_hir(&ast, None);
+    let mut hir = single_query_hir(&package).clone();
+    let check = |hir: &SdblHir| {
+        let mut ctx = super::context::LoweringContext::new(None);
+        ctx.check_joins_for_unprotected_fields(hir, &query);
+        ctx.diagnostics.len()
+    };
+
+    assert_eq!(check(&hir), 0);
+    hir.joins[0].range = text_size::TextRange::empty(0.into());
+    assert_eq!(check(&hir), 1);
 }

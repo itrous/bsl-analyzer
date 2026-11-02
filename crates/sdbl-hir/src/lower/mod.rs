@@ -4,6 +4,7 @@ mod diagnostics;
 mod expr;
 mod from_clause;
 mod join_clause;
+mod missing_row;
 #[cfg(test)]
 mod register_table_tests;
 mod register_tables;
@@ -338,7 +339,7 @@ impl LoweringContext<'_> {
             range,
         };
 
-        self.check_joins_for_unprotected_fields(&hir);
+        self.check_joins_for_unprotected_fields(&hir, query);
         self.check_schedule_data_for_unprotected_fields(&hir);
 
         if check_field_aliases {
