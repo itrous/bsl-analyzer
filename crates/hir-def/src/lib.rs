@@ -224,7 +224,7 @@ impl ModuleId {
 /// nobody's key, so the memos keyed by it stay valid; only a namesake added
 /// above moves the ordinal of the namesakes below it. The item tree assigns
 /// keys ([`ItemTree::methods`]) and every other numbering is a projection.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MethodKey {
     pub name: intern::NormName,
     /// Position among the module's declarations of this name, from zero.
@@ -245,6 +245,16 @@ impl MethodKey {
 impl std::fmt::Debug for MethodKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}#{}", self.name.as_str(), self.ordinal)
+    }
+}
+
+/// Hashes the folded spelling, then the ordinal. A derived hash would feed in the
+/// `NormName` id, which follows intern order, and so would differ between runs for the
+/// same method. Consistent with `Eq`: equal ids are equal spellings.
+impl std::hash::Hash for MethodKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.as_str().hash(state);
+        self.ordinal.hash(state);
     }
 }
 
@@ -1055,5 +1065,65 @@ mod execution_context_tests {
         let ctx = compute_execution_context(&cm(false, false, false, false, false));
         assert_eq!(ctx, ExecutionContext::Unknown);
         assert!(MethodDispatch::from_execution_context(ctx).is_none());
+    }
+}
+
+#[cfg(test)]
+mod method_key_hash_tests {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    /// Keeps every byte a `Hash` impl feeds the hasher, so the comparison is of what the
+    /// key hands over and cannot pass by a finishing function colliding two inputs.
+    #[derive(Default)]
+    struct Recording(Vec<u8>);
+
+    impl Hasher for Recording {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+
+        fn finish(&self) -> u64 {
+            unreachable!("the test reads the recorded stream")
+        }
+    }
+
+    fn stream(value: impl Hash) -> Vec<u8> {
+        let mut recording = Recording::default();
+        value.hash(&mut recording);
+        recording.0
+    }
+
+    #[test]
+    fn a_method_key_hashes_its_folded_spelling_and_ordinal_not_a_pool_index() {
+        assert_eq!(stream(MethodKey::nth("Дважды", 1)), stream(("дважды", 1u32)));
+        assert_eq!(stream(MethodKey::nth("Twice", 3)), stream(("twice", 3u32)));
+    }
+
+    #[test]
+    fn a_method_id_hashes_its_module_then_the_key() {
+        let module = ModuleId::new(vfs::FileId(7));
+        let id = MethodId { module, local_id: MethodKey::nth("Дважды", 1) };
+        assert_eq!(stream(id), stream((module, "дважды", 1u32)));
+    }
+
+    #[test]
+    fn case_stays_out_of_the_identity_and_ordinal_and_module_stay_in_it() {
+        let module = ModuleId::new(vfs::FileId(7));
+        let other_module = ModuleId::new(vfs::FileId(8));
+        let id = |module, key| MethodId { module, local_id: key };
+
+        for (upper, lower) in [("ДВАЖДЫ", "дважды"), ("TWICE", "twice")] {
+            let key = MethodKey::first(upper);
+            assert_eq!(key, MethodKey::first(lower));
+            assert_eq!(stream(key), stream(MethodKey::first(lower)));
+
+            let next = MethodKey::nth(upper, 1);
+            assert_ne!(key, next);
+            assert_ne!(stream(key), stream(next));
+
+            assert_ne!(id(module, key), id(other_module, key));
+            assert_ne!(stream(id(module, key)), stream(id(other_module, key)));
+        }
     }
 }

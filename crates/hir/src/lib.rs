@@ -421,15 +421,11 @@ impl<'db, DB: ConfigsDatabase + base_db::RootQueryDb> Semantics<'db, DB> {
         Module::new(self.db, module_id)
     }
 
+    /// The first declaration of `name` in the module, whichever kinds its namesakes are.
     pub fn find_method(&self, file_id: vfs::FileId, name: &str) -> Option<Method<'db, DB>> {
-        let module = self.module_from_file(file_id);
-        let search_name = Name::new(name);
-
-        module
-            .procedures()
-            .into_iter()
-            .chain(module.functions())
-            .find(|method| method.name().eq_ignore_case(&search_name))
+        self.db
+            .interface_method_named(ModuleId::new(file_id), &Name::new(name))
+            .map(|method| Method::new(self.db, method.id))
     }
 
     pub(crate) fn try_resolve_qualified_name_for_token(

@@ -3615,46 +3615,679 @@ mod tests {
         );
     }
 
-    /// Two declarations of one name in one module share an id, and the store keeps
-    /// the first row it is given: the build hands it the first declaration, so the
-    /// stored anchor is the same every build instead of whichever a hash order led
-    /// with.
-    #[test]
-    fn a_namesake_pair_is_stored_by_its_first_declaration() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let body = "#Если Сервер Тогда\n\
-                    Процедура Дважды() Экспорт\nКонецПроцедуры\n\
-                    #Иначе\n\
-                    Процедура Дважды() Экспорт\nКонецПроцедуры\n\
-                    #КонецЕсли\n";
-        stage_catalog_workspace(root, body);
-        write_catalog(root);
-        let first = body.find("Дважды").unwrap() as i64;
-        let second = body.rfind("Дважды").unwrap() as i64;
-        assert_ne!(first, second);
+    /// One declaration of a namesake pair and the row it would be stored as.
+    struct Declared {
+        text: &'static str,
+        /// The tail of the header, which is where `sig_end` stands.
+        header_end: &'static str,
+        is_export: bool,
+    }
 
-        let db = root.join(".build/graph.db");
+    /// Two declarations of `Дважды` that differ in everything a row records, with an
+    /// outgoing call only the lower one makes. The preprocessor pair swaps which of them
+    /// is exported, so neither export value can pass for the first declaration's.
+    struct NamesakeCase {
+        label: &'static str,
+        body: String,
+        top: Declared,
+    }
+
+    fn namesake_cases() -> [NamesakeCase; 2] {
+        const CALLEES: &str = "Процедура ТолькоВерхний()\nКонецПроцедуры\n\n\
+                               Процедура ТолькоНижний()\nКонецПроцедуры\n";
+        let plain_top = Declared {
+            text:
+                "&НаСервере\nПроцедура Дважды(Первый) Экспорт\n    ТолькоВерхний();\nКонецПроцедуры",
+            header_end: "(Первый) Экспорт",
+            is_export: true,
+        };
+        let plain_lower = "&НаКлиенте\nФункция Дважды(Второй, Третий)\n    ТолькоНижний();\n    \
+                           Возврат 1;\nКонецФункции";
+        let branch_top = Declared {
+            text: "Процедура Дважды(Первый)\n    ТолькоВерхний();\nКонецПроцедуры",
+            header_end: "(Первый)",
+            is_export: false,
+        };
+        let branch_lower = "Функция Дважды(Второй, Третий) Экспорт\n    ТолькоНижний();\n    \
+                            Возврат 1;\nКонецФункции";
+        [
+            NamesakeCase {
+                label: "plain pair",
+                body: format!("{}\n\n{plain_lower}\n\n{CALLEES}", plain_top.text),
+                top: plain_top,
+            },
+            NamesakeCase {
+                label: "preprocessor branches",
+                body: format!(
+                    "#Если Сервер Тогда\n{}\n#Иначе\n{branch_lower}\n#КонецЕсли\n\n{CALLEES}",
+                    branch_top.text
+                ),
+                top: branch_top,
+            },
+        ]
+    }
+
+    const NAMESAKE_ID: &str = "method/common/Модуль/Дважды";
+
+    /// Every column of a stored method row but the id it was looked up by.
+    #[derive(Debug, PartialEq)]
+    struct StoredRow {
+        kind: String,
+        name: String,
+        qualified: String,
+        module: Option<String>,
+        file: Option<(String, String)>,
+        name_offset: i64,
+        sig_end: i64,
+        src_start: i64,
+        src_end: i64,
+        dispatch: Option<String>,
+        is_export: i64,
+        addressable: i64,
+    }
+
+    fn stored_namesake_rows(db: &Path) -> Vec<StoredRow> {
+        Connection::open(db)
+            .unwrap()
+            .prepare(
+                "SELECT kind, name, qualified, module, file_root_id, file_path, name_offset, \
+                 sig_end, src_start, src_end, dispatch, is_export, addressable \
+                 FROM nodes WHERE id = ?1",
+            )
+            .unwrap()
+            .query_map([NAMESAKE_ID], |row| {
+                let root_id: Option<String> = row.get(4)?;
+                let path: Option<String> = row.get(5)?;
+                Ok(StoredRow {
+                    kind: row.get(0)?,
+                    name: row.get(1)?,
+                    qualified: row.get(2)?,
+                    module: row.get(3)?,
+                    file: root_id.zip(path),
+                    name_offset: row.get(6)?,
+                    sig_end: row.get(7)?,
+                    src_start: row.get(8)?,
+                    src_end: row.get(9)?,
+                    dispatch: row.get(10)?,
+                    is_export: row.get(11)?,
+                    addressable: row.get(12)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// The whole row of `top` inside `body`, worked out from the source text. The module
+    /// is a server common module, whose context overrides the annotations for `dispatch`.
+    fn expected_top_row(root: &Path, body: &str, top: &Declared) -> StoredRow {
+        let start = body.find(top.text).unwrap();
+        StoredRow {
+            kind: "method".to_string(),
+            name: "Дважды".to_string(),
+            qualified: "ОбщийМодуль.Модуль.Дважды".to_string(),
+            module: Some("ОбщийМодуль.Модуль".to_string()),
+            file: Some(expected_file(root, "CommonModules/Модуль/Ext/Module.bsl")),
+            name_offset: (start + top.text.find("Дважды").unwrap()) as i64,
+            sig_end: (start + top.text.find(top.header_end).unwrap() + top.header_end.len()) as i64,
+            src_start: start as i64,
+            src_end: (start + top.text.len()) as i64,
+            dispatch: Some("server".to_string()),
+            is_export: top.is_export as i64,
+            addressable: 1,
+        }
+    }
+
+    fn built_graph(root: &Path, db: &Path) {
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let (project, universe) = scanned_project(root);
         build_graph_database(
             &project,
             &universe,
-            &db,
+            db,
             stdx::batch::BatchBudget::files(1),
             &build_meta(),
         )
         .unwrap();
+    }
 
-        let conn = Connection::open(&db).unwrap();
-        let stored: Vec<i64> = conn
-            .prepare("SELECT name_offset FROM nodes WHERE id = 'method/common/Модуль/Дважды'")
+    /// What `update_graph_database_bodies` does, without the 5 s the patch is held to
+    /// there: which row a store keeps does not depend on how fast the machine writes it.
+    fn patched_copy(
+        project: &crate::graph::ProjectSnapshot,
+        universe: &crate::graph::universe::ScannedUniverse,
+        src: &Path,
+        out: &Path,
+        changed: &[PathBuf],
+    ) {
+        let patch =
+            compute_body_patch(project, universe, src, changed, stdx::batch::BatchBudget::files(1))
+                .unwrap();
+        std::fs::copy(src, out).unwrap();
+        begin_body_patch(out, project, universe, &patch, &build_meta(), false, Duration::MAX)
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .commit()
+            .unwrap();
+    }
+
+    fn line_character(text: &str, offset: usize) -> (u64, u64) {
+        let before = &text[..offset];
+        let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+        (before.matches('\n').count() as u64, before[line_start..].encode_utf16().count() as u64)
+    }
+
+    fn position_range(text: &str, start: usize, end: usize) -> serde_json::Value {
+        let (start_line, start_character) = line_character(text, start);
+        let (end_line, end_character) = line_character(text, end);
+        serde_json::json!({
+            "start_line": start_line,
+            "start_character": start_character,
+            "end_line": end_line,
+            "end_character": end_character,
+        })
+    }
+
+    /// What the stored graph answers about the shared id: the name and enclosing ranges
+    /// of `top`, the way a client navigating by that id receives them.
+    fn assert_node_navigates_to_top(
+        root: &Path,
+        db: &Path,
+        body: &str,
+        top: &Declared,
+        label: &str,
+    ) {
+        let project = crate::graph::ProjectSnapshot::load(root);
+        let node = crate::graph_query::GraphDb::open(db)
+            .unwrap()
+            .node(NAMESAKE_ID, ide::GraphDetail::Names, project.search_roots.as_ref())
+            .unwrap()
+            .expect("the shared id resolves")
+            .node;
+        let location = node.location.expect("a method has a place");
+        let start = body.find(top.text).unwrap();
+        let name = start + top.text.find("Дважды").unwrap();
+        assert_eq!(
+            location["range"],
+            position_range(body, name, name + "Дважды".len()),
+            "{label}: name range"
+        );
+        assert_eq!(
+            location["enclosing_range"],
+            position_range(body, start, start + top.text.len()),
+            "{label}: enclosing range"
+        );
+    }
+
+    fn stored_call_targets(db: &Path) -> Vec<String> {
+        let mut targets: Vec<String> = Connection::open(db)
+            .unwrap()
+            .prepare("SELECT to_id FROM edges WHERE from_id = ?1")
+            .unwrap()
+            .query_map([NAMESAKE_ID], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        targets.sort();
+        targets
+    }
+
+    /// Two declarations of one name in one module share an id, and the store keeps
+    /// the first row it is given: both the full build and a reprojection hand it the
+    /// first declaration, so the stored row is whole, the same every build, and what a
+    /// client navigating by the id lands on. The lower declaration still counts for the
+    /// graph: its call is stored under the shared id.
+    #[test]
+    fn a_namesake_pair_is_stored_by_its_first_declaration() {
+        for case in namesake_cases() {
+            let NamesakeCase { label, body, top } = case;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            stage_catalog_workspace(root, &body);
+            write_catalog(root);
+
+            let db = root.join(".build/graph.db");
+            built_graph(root, &db);
+            assert_eq!(
+                stored_namesake_rows(&db),
+                [expected_top_row(root, &body, &top)],
+                "{label}: full build"
+            );
+            assert_node_navigates_to_top(root, &db, &body, &top, label);
+            let calls = [
+                "method/common/Модуль/ТолькоВерхний".to_string(),
+                "method/common/Модуль/ТолькоНижний".to_string(),
+            ];
+            assert_eq!(stored_call_targets(&db), calls, "{label}: full build");
+
+            // An edit above moves every offset, so a row left over from the build cannot
+            // pass for the reprojected one.
+            let edited = format!("// правка\n{body}");
+            let module = root.join("CommonModules/Модуль/Ext/Module.bsl");
+            std::fs::write(&module, &edited).unwrap();
+            let (project, universe) = scanned_project(root);
+            let patched = root.join(".build/patched.db");
+            patched_copy(&project, &universe, &db, &patched, &[module.canonicalize().unwrap()]);
+            assert_eq!(
+                stored_namesake_rows(&patched),
+                [expected_top_row(root, &edited, &top)],
+                "{label}: reprojection"
+            );
+            assert_node_navigates_to_top(root, &patched, &edited, &top, label);
+            assert_eq!(stored_call_targets(&patched), calls, "{label}: reprojection");
+
+            let rebuilt = root.join(".build/rebuilt.db");
+            built_graph(root, &rebuilt);
+            assert_eq!(
+                stored_namesake_rows(&patched),
+                stored_namesake_rows(&rebuilt),
+                "{label}: reprojection against a full build"
+            );
+        }
+    }
+
+    /// Enough namesakes that a hash order cannot line them up by chance: the rows a
+    /// reprojection hands the store come in declaration order, and that order alone
+    /// decides which of them a first-wins store keeps, wherever a write batch ends.
+    #[test]
+    fn a_reprojection_hands_the_store_namesakes_in_declaration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let body: String = (0..8)
+            .map(|i| format!("Процедура Дважды(П{i})\nКонецПроцедуры\n\n"))
+            .chain(["Процедура Другой()\nКонецПроцедуры\n".to_string()])
+            .collect();
+        stage_catalog_workspace(root, &body);
+        let db = root.join(".build/graph.db");
+        built_graph(root, &db);
+
+        let module = root.join("CommonModules/Модуль/Ext/Module.bsl");
+        let (project, universe) = scanned_project(root);
+        let patch = compute_body_patch(
+            &project,
+            &universe,
+            &db,
+            &[module.canonicalize().unwrap()],
+            stdx::batch::BatchBudget::files(1),
+        )
+        .unwrap();
+        let rows: Vec<NodeRow> = patch
+            .rows_for_test()
+            .nodes
+            .iter()
+            .filter(|row| row.id == NAMESAKE_ID)
+            .cloned()
+            .collect();
+        let expected: Vec<Option<u32>> =
+            body.match_indices("Дважды").map(|(offset, _)| Some(offset as u32)).collect();
+        assert_eq!(rows.iter().map(|row| row.name_offset).collect::<Vec<_>>(), expected);
+
+        let stored_offset = |rows: &[&[NodeRow]]| -> i64 {
+            let store = tempfile::tempdir().unwrap();
+            let path = store.path().join("rows.db");
+            let mut writer = GraphDbWriter::create(&path).unwrap();
+            for batch in rows {
+                writer.write_nodes(batch).unwrap();
+            }
+            writer.finalize(&build_meta()).unwrap();
+            open(&path)
+                .query_row("SELECT name_offset FROM nodes WHERE id = ?1", [NAMESAKE_ID], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let top = expected[0].unwrap() as i64;
+        assert_eq!(stored_offset(&[&rows]), top, "one batch");
+        assert_eq!(stored_offset(&[&rows[..1], &rows[1..]]), top, "a batch ending after the top");
+        assert_eq!(stored_offset(&[&rows[..4], &rows[4..]]), top, "a batch ending midway");
+
+        let lower_first: Vec<NodeRow> = rows.iter().rev().cloned().collect();
+        assert_eq!(
+            stored_offset(&[&lower_first]),
+            expected.last().unwrap().unwrap() as i64,
+            "the store only keeps what comes first: the order is what chooses"
+        );
+    }
+
+    /// Every value of `table`, with the type SQLite holds it under and a length prefix on
+    /// the variable-size ones so no two rows serialise alike. Sorted, because a `SELECT`
+    /// promises no order; duplicates stay, because the multiset is what a table holds.
+    fn table_dump(conn: &Connection, table: &str) -> String {
+        let columns: Vec<String> = conn
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}') ORDER BY cid"))
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(stored, [first], "one row, anchored at the first declaration");
+        assert!(!columns.is_empty(), "no such table: {table}");
+        let mut statement =
+            conn.prepare(&format!("SELECT {} FROM {table}", columns.join(", "))).unwrap();
+        let mut query = statement.query([]).unwrap();
+        let mut rows: Vec<String> = Vec::new();
+        while let Some(row) = query.next().unwrap() {
+            let values: Vec<String> = (0..columns.len())
+                .map(|index| match row.get_ref(index).unwrap() {
+                    rusqlite::types::ValueRef::Null => "N".to_string(),
+                    rusqlite::types::ValueRef::Integer(value) => format!("I{value}"),
+                    rusqlite::types::ValueRef::Real(value) => format!("R{:x}", value.to_bits()),
+                    rusqlite::types::ValueRef::Text(bytes) => {
+                        format!("T{}:{}", bytes.len(), String::from_utf8_lossy(bytes))
+                    }
+                    rusqlite::types::ValueRef::Blob(bytes) => {
+                        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                        format!("B{}:{hex}", bytes.len())
+                    }
+                })
+                .collect();
+            rows.push(values.join(","));
+        }
+        rows.sort();
+        format!("{table}({})\n{}\n", columns.join(","), rows.join("\n"))
+    }
+
+    /// The logical schema. `rootpage` stays out: it says where a table's pages landed.
+    fn schema_dump(conn: &Connection) -> String {
+        conn.prepare(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema \
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok(format!(
+                "{}|{}|{}|{:?}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n")
+    }
+
+    const GRAPH_TABLES: [&str; 6] =
+        ["nodes", "edges", "in_degree", "meta", "files", "unresolved_calls"];
+
+    #[test]
+    fn a_table_dump_tells_apart_what_a_projection_would_merge() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (v)").unwrap();
+        let dump_of = |values: &str| {
+            conn.execute_batch(&format!("DELETE FROM t; INSERT INTO t VALUES {values};")).unwrap();
+            table_dump(&conn, "t")
+        };
+        assert_ne!(dump_of("(NULL)"), dump_of("('N')"));
+        assert_ne!(dump_of("('')"), dump_of("(NULL)"));
+        assert_ne!(dump_of("('ab')"), dump_of("(x'6162')"));
+        assert_ne!(dump_of("(1)"), dump_of("('1')"));
+        assert_ne!(dump_of("(1), (1)"), dump_of("(1)"), "a repeated row counts");
+        assert_ne!(dump_of("(x'ff00')"), dump_of("(x'ff01')"), "a blob stays whole");
+        assert_eq!(dump_of("(1), (2)"), dump_of("(2), (1)"), "the order of a SELECT does not");
+    }
+
+    const COLD_ORDER: &str = "BSL_GRAPH_COLD_BUILD_ORDER";
+    const COLD_TARGET: &str = "BSL_GRAPH_COLD_BUILD_TARGET";
+    const COLD_OUT: &str = "BSL_GRAPH_COLD_BUILD_OUT";
+    const COLD_NAMES: [&str; 8] = [
+        "Дважды",
+        "ТолькоВерхний",
+        "ТолькоНижний",
+        "Общий",
+        "Уникальный",
+        "Изолированный",
+        "Регистр",
+        "Вызывающий",
+    ];
+
+    /// The module of [`stage_cold_target`] that holds the namesakes.
+    const COLD_MODULE: &str = "Процедура Дважды(Первый) Экспорт\n    ТолькоВерхний();\nКонецПроцедуры\n\n\
+         Функция Дважды(Второй, Третий)\n    ТолькоНижний();\n    Возврат Другой.Общий();\nКонецФункции\n\n\
+         Процедура ТолькоВерхний()\nКонецПроцедуры\n\n\
+         Процедура ТолькоНижний()\nКонецПроцедуры\n\n\
+         Процедура Общий() Экспорт\nКонецПроцедуры\n\n\
+         Процедура Уникальный() Экспорт\n    Общий();\n    дважды(1);\nКонецПроцедуры\n\n\
+         Процедура Изолированный()\nКонецПроцедуры\n\n\
+         Процедура Регистр() Экспорт\nКонецПроцедуры\n\n\
+         Процедура РЕГИСТР(Иной)\nКонецПроцедуры\n";
+
+    /// Namesakes, unique and isolated methods, local and cross-module calls, and one name
+    /// in two modules.
+    fn stage_cold_target(root: &Path) {
+        stage_catalog_workspace(root, COLD_MODULE);
+        write_catalog(root);
+        std::fs::create_dir_all(root.join("CommonModules/Другой/Ext")).unwrap();
+        std::fs::write(
+            root.join("CommonModules/Другой.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000003">
+        <Properties><Name>Другой</Name><Server>true</Server></Properties>
+    </CommonModule>
+</MetaDataObject>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("CommonModules/Другой/Ext/Module.bsl"),
+            "Функция Общий() Экспорт\n    Модуль.ДВАЖДЫ(1);\n    Модуль.Уникальный();\n    \
+             Модуль.НетТакого();\n    Возврат Справочники.Товары.СоздатьЭлемент();\nКонецФункции\n",
+        )
+        .unwrap();
+    }
+
+    /// The pool ids of a built project's method names, as the derived `Hash` of a
+    /// `NormName` hands them over: what makes one process's history visibly another's.
+    fn pool_ids(root: &Path) -> String {
+        use std::hash::{Hash, Hasher};
+        let (project, universe) = scanned_project(root);
+        let source_root = build_source_root(&universe.files);
+        let db = db_for_files(&source_root, &universe.files, &project.configs, None).db;
+        let mut index = ide::graph_index::GraphIndex::new();
+        for (file, _) in &universe.files {
+            index.add_module(&db, ModuleId::new(*file));
+        }
+        let mut ids: Vec<String> = index
+            .method_nodes()
+            .map(|method| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                method.local_id.name.hash(&mut hasher);
+                format!("{}={:x}", method.local_id.name.as_str(), hasher.finish())
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids.join("\n")
+    }
+
+    /// One side of the comparison, in a process of its own: a preparatory project moves
+    /// the intern pool, then the target goes into an empty database. The target's stat
+    /// fields and observation time are fixed because they describe the disk and the clock
+    /// rather than the input; the content hashes and lengths stay the real ones.
+    fn cold_build_child(order: &str, target: &Path, out: &Path) {
+        let preparatory = tempfile::tempdir().unwrap();
+        let mut names: Vec<String> = COLD_NAMES
+            .iter()
+            .map(|name| format!("Процедура {name}() Экспорт\nКонецПроцедуры\n"))
+            .collect();
+        let lead = match order {
+            "forward" => 1,
+            "reverse" => {
+                names.reverse();
+                5
+            }
+            other => panic!("unknown pool order {other}"),
+        };
+        let extras = (0..lead).map(|i| format!("Процедура Подготовка{i}()\nКонецПроцедуры\n"));
+        let body: String = extras.chain(names).collect();
+        stage_catalog_workspace(preparatory.path(), &body);
+        built_graph(preparatory.path(), &preparatory.path().join(".build/graph.db"));
+
+        if !target.exists() {
+            std::fs::create_dir_all(target).unwrap();
+            stage_cold_target(target);
+        }
+        let (project, mut universe) = scanned_project(target);
+        for stat in &mut universe.stats {
+            stat.stat = crate::graph::content_hash::StatIdentity {
+                len: stat.len,
+                mtime_ns: 1,
+                change: None,
+            };
+            stat.observed_at_ns = Some(1);
+        }
+        std::fs::create_dir_all(out).unwrap();
+        build_graph_database(
+            &project,
+            &universe,
+            &out.join("graph.db"),
+            // Both modules in one batch: its modules are indexed in parallel.
+            stdx::batch::BatchBudget::files(2),
+            &build_meta(),
+        )
+        .unwrap();
+
+        let conn = Connection::open(out.join("graph.db")).unwrap();
+        std::fs::write(out.join("schema.dump"), schema_dump(&conn)).unwrap();
+        for table in GRAPH_TABLES {
+            std::fs::write(out.join(format!("{table}.dump")), table_dump(&conn, table)).unwrap();
+        }
+        std::fs::write(out.join("pool.ids"), pool_ids(target)).unwrap();
+    }
+
+    /// Two new processes, one binary and one input, but different intern histories: every
+    /// value of every table comes out the same. Not a matter of two runs that happened to
+    /// agree: the pool ids are shown to differ, and the namesake's row is held to the top
+    /// declaration on its own, since two equally wrong winners would also compare equal.
+    #[test]
+    fn cold_builds_with_different_pool_histories_store_identical_tables() {
+        if let Ok(order) = std::env::var(COLD_ORDER) {
+            let target = PathBuf::from(std::env::var(COLD_TARGET).unwrap());
+            let out = PathBuf::from(std::env::var(COLD_OUT).unwrap());
+            cold_build_child(&order, &target, &out);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let build = |order: &str| -> PathBuf {
+            let out = dir.path().join(order);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "graph_db::tests::cold_builds_with_different_pool_histories_store_identical_tables",
+                    "--nocapture",
+                ])
+                .env(COLD_ORDER, order)
+                .env(COLD_TARGET, &target)
+                .env(COLD_OUT, &out)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            out
+        };
+        let forward = build("forward");
+        let reverse = build("reverse");
+        let read = |out: &Path, name: &str| std::fs::read(out.join(name)).unwrap();
+
+        assert_ne!(
+            read(&forward, "pool.ids"),
+            read(&reverse, "pool.ids"),
+            "the preparatory projects left the pool as it was: nothing here was put to the test"
+        );
+        assert_eq!(read(&forward, "schema.dump"), read(&reverse, "schema.dump"), "schema");
+        for table in GRAPH_TABLES {
+            let name = format!("{table}.dump");
+            assert_eq!(
+                String::from_utf8(read(&forward, &name)).unwrap(),
+                String::from_utf8(read(&reverse, &name)).unwrap(),
+                "{table}"
+            );
+        }
+
+        let (top, lower) = (
+            COLD_MODULE.find("Дважды").unwrap() as i64,
+            COLD_MODULE.match_indices("Дважды").nth(1).unwrap().0 as i64,
+        );
+        let conn = Connection::open(forward.join("graph.db")).unwrap();
+        let stored = stored_namesake_rows(&forward.join("graph.db"));
+        assert_eq!(stored.iter().map(|row| row.name_offset).collect::<Vec<_>>(), [top]);
+        assert_eq!(stored[0].is_export, 1, "the top declaration is the exported one");
+
+        // Moved to the lower declaration, only this one value tells the two apart: the
+        // comparison above would have caught it, and a projection without offsets would not.
+        conn.execute(
+            "UPDATE nodes SET name_offset = ?1 WHERE id = ?2",
+            params![lower, NAMESAKE_ID],
+        )
+        .unwrap();
+        assert_ne!(
+            table_dump(&conn, "nodes").into_bytes(),
+            read(&reverse, "nodes.dump"),
+            "the comparison cannot see a coordinate"
+        );
+    }
+
+    /// A unique method keeps its own row, a name in two modules stays two rows, and two
+    /// spellings of one name keep their own ids. The namesake pair's lower call survives.
+    #[test]
+    fn unique_methods_and_other_modules_keep_their_rows_beside_a_namesake_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        stage_cold_target(root);
+        let db = root.join(".build/graph.db");
+        built_graph(root, &db);
+        let conn = Connection::open(&db).unwrap();
+
+        let offset = |id: &str| -> Option<i64> {
+            conn.query_row("SELECT name_offset FROM nodes WHERE id = ?1", [id], |row| row.get(0))
+                .optional()
+                .unwrap()
+        };
+        let at = |needle: &str| COLD_MODULE.find(needle).unwrap() as i64;
+        let in_module = |name: &str| format!("method/common/Модуль/{name}");
+        assert_eq!(offset(&in_module("Уникальный")), Some(at("Уникальный")));
+        assert_eq!(offset(&in_module("Изолированный")), Some(at("Изолированный")));
+        assert_eq!(offset(&in_module("Общий")), Some(at("Общий() Экспорт")));
+        assert_eq!(
+            offset("method/common/Другой/Общий"),
+            Some("Функция ".len() as i64),
+            "one name in two modules is two rows"
+        );
+        assert_eq!(offset(&in_module("Регистр")), Some(at("Регистр")));
+        assert_eq!(offset(&in_module("РЕГИСТР")), Some(at("РЕГИСТР")), "spellings keep their ids");
+        assert_eq!(
+            stored_call_targets(&db),
+            [
+                "method/common/Другой/Общий".to_string(),
+                in_module("ТолькоВерхний"),
+                in_module("ТолькоНижний"),
+            ]
+        );
+
+        // The other module calls the pair by a respelled name: it is the exported top
+        // declaration that answers, since the lower one is not visible from outside.
+        let count = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> i64 {
+            conn.query_row(sql, params, |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM edges WHERE from_id = ?1 AND to_id = ?2",
+                &[&"method/common/Другой/Общий", &NAMESAKE_ID],
+            ),
+            1,
+            "a call by name reaches the pair"
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM unresolved_calls WHERE method_lower = 'дважды'", &[]),
+            0,
+            "and is not left unresolved"
+        );
     }
 
     /// The full build is the path that places an object: the catalog, role and
