@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use ide_db::TextRange;
-use syntax::{NodeOrToken, SyntaxKind, SyntaxNode};
+use syntax::{NodeOrToken, SyntaxKind, SyntaxNode, TextSize};
 
 use crate::define_metadata;
 use crate::metadata::*;
@@ -79,10 +79,7 @@ pub(crate) fn apply(
 ) -> bool {
     let text = db.file_text(file_id);
 
-    let native_present = contains_ignore_ascii_case(&text, NATIVE_MARKER);
-    let bslls_present =
-        config.bslls_suppression_compat && contains_ignore_ascii_case(&text, BSLLS_MARKER);
-    if !native_present && !bslls_present {
+    if !has_directive_marker(&text, config.bslls_suppression_compat) {
         return false;
     }
 
@@ -100,10 +97,7 @@ pub(crate) fn apply(
             if is_meta_code(d.code) {
                 return true;
             }
-            match line_index.try_line_col(d.range.start()) {
-                Some(lc) => !parsed.map.is_suppressed(lc.line, d.code),
-                None => true,
-            }
+            !parsed.map.is_suppressed_at(&line_index, d.range.start(), d.code)
         });
     }
     let mut changed = diags.len() != before;
@@ -125,6 +119,35 @@ pub(crate) fn apply(
     }
 
     changed
+}
+
+/// What the file's directives say, for a check that has to know before [`apply`] runs. It adds
+/// no meta-diagnostics: [`apply`] alone reports a broken directive, once, at the end.
+pub(crate) struct SuppressionLookup {
+    map: SuppressionMap,
+    line_index: line_index::LineIndex,
+}
+
+impl SuppressionLookup {
+    pub(crate) fn new(root: &SyntaxNode, text: &str, bslls: bool) -> Self {
+        let line_index = line_index::LineIndex::new(text);
+        let map = if has_directive_marker(text, bslls) {
+            parse_directives(root, &line_index, bslls).map
+        } else {
+            SuppressionMap::default()
+        };
+        Self { map, line_index }
+    }
+
+    /// Whether [`apply`] would drop a finding of `code` starting at `offset`.
+    pub(crate) fn is_suppressed(&self, offset: TextSize, code: DiagnosticCode) -> bool {
+        self.map.is_suppressed_at(&self.line_index, offset, code)
+    }
+}
+
+fn has_directive_marker(text: &str, bslls: bool) -> bool {
+    contains_ignore_ascii_case(text, NATIVE_MARKER)
+        || (bslls && contains_ignore_ascii_case(text, BSLLS_MARKER))
 }
 
 fn severity_of(config: &DiagnosticsConfig, code: DiagnosticCode) -> Severity {
@@ -152,6 +175,16 @@ impl SuppressionMap {
     fn is_suppressed(&self, line: u32, code: DiagnosticCode) -> bool {
         in_ranges(&self.all, line)
             || self.per_code.get(&code).is_some_and(|ranges| in_ranges(ranges, line))
+    }
+
+    /// A finding is addressed by the line its range starts on.
+    fn is_suppressed_at(
+        &self,
+        line_index: &line_index::LineIndex,
+        offset: TextSize,
+        code: DiagnosticCode,
+    ) -> bool {
+        line_index.try_line_col(offset).is_some_and(|lc| self.is_suppressed(lc.line, code))
     }
 }
 
@@ -783,5 +816,90 @@ mod tests {
         let diags = check_raw_diagnostics(&code);
         assert!(!has(&diags, DiagnosticCode::UnknownSuppressionCode), "{diags:#?}");
         assert_eq!(self_assign_lines(&diags, &code), vec![4]);
+    }
+
+    /// Every line of `code` that holds a self-assignment, by 0-based number.
+    fn self_assign_candidates(code: &str) -> Vec<u32> {
+        code.lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("А = А;") || line.contains("Б = Б;"))
+            .map(|(number, _)| number as u32)
+            .collect()
+    }
+
+    fn line_start(code: &str, line: u32) -> TextSize {
+        let offset: usize = code.split_inclusive('\n').take(line as usize).map(str::len).sum();
+        TextSize::from(offset as u32)
+    }
+
+    /// The read-only lookup says, line by line, what [`apply`] removes from the diagnostics and
+    /// leaves the file's meta-diagnostics to `apply` alone.
+    #[test]
+    fn lookup_agrees_with_apply_on_every_directive_shape() {
+        use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+
+        const HEAD: &str = "Процедура Тест()\n";
+        const TAIL: &str = "КонецПроцедуры\n";
+        let shapes: [(&str, Vec<u32>, Vec<u32>); 10] = [
+            // (statements, suppressed lines with BSLLS compat, suppressed lines without it)
+            ("    // bsl-analyzer:disable-next-line SelfAssign\n    А = А;\n    Б = Б;\n", vec![2], vec![2]),
+            ("    А = А; // bsl-analyzer:disable-line SelfAssign\n    Б = Б;\n", vec![1], vec![1]),
+            ("    // bsl-analyzer:off SelfAssign\n    А = А;\n    // bsl-analyzer:on SelfAssign\n    Б = Б;\n", vec![2], vec![2]),
+            ("    // bsl-analyzer:off SelfAssign\n    А = А;\n    Б = Б;\n", vec![2, 3], vec![2, 3]),
+            ("    // BSLLS:SelfAssign-off\n    А = А;\n    // BSLLS:SelfAssign-on\n    Б = Б;\n", vec![2], vec![]),
+            ("    // bsl-analyzer:off\n    А = А;\n", vec![2], vec![2]),
+            ("    // bsl-analyzer:off SelfAssig\n    А = А;\n", vec![], vec![]),
+            ("    // bsl-analyzer:on SelfAssign\n    А = А;\n", vec![], vec![]),
+            ("    А = А;\n    Б = Б;\n", vec![], vec![]),
+            // A native directive makes the file worth parsing; the BSLLS one in it counts only with compat.
+            (
+                "    // bsl-analyzer:disable-next-line SelfAssign\n    А = А;\n    // BSLLS:SelfAssign-off\n    Б = Б;\n    // BSLLS:SelfAssign-on\n",
+                vec![2, 4],
+                vec![2],
+            ),
+        ];
+        for (statements, with_compat, without_compat) in shapes {
+            for line_break in ["\n", "\r\n"] {
+                let code = format!("{HEAD}{statements}{TAIL}").replace('\n', line_break);
+                for (compat, expected) in [(true, &with_compat), (false, &without_compat)] {
+                    let config = DiagnosticsConfig {
+                        bslls_suppression_compat: compat,
+                        ..DiagnosticsConfig::all_enabled()
+                    };
+                    let mut fixture = test_fixture::Fixture::new();
+                    fixture.add_file("/test.bsl", &code);
+                    let file_id = fixture.first_file().expect("fixture should have a file");
+                    let mut db = ide_db::RootDatabaseImpl::new();
+                    let mut file_set = vfs::FileSet::default();
+                    file_set.insert(file_id, vfs::VfsPath::new("/test.bsl"));
+                    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+                    db.set_file_source_root(file_id, SourceRootId(0));
+                    db.set_file_text(file_id, &code);
+
+                    let read: &dyn ide_db::RootDatabase = &db;
+                    let lookup = SuppressionLookup::new(
+                        &read.parse(file_id).syntax_node(),
+                        &read.file_text(file_id),
+                        compat,
+                    );
+                    let candidates = self_assign_candidates(&code);
+                    let hidden: Vec<u32> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|&line| {
+                            lookup
+                                .is_suppressed(line_start(&code, line), DiagnosticCode::SelfAssign)
+                        })
+                        .collect();
+                    assert_eq!(&hidden, expected, "lookup, compat={compat}:\n{code}");
+
+                    let diags = crate::file_diagnostics(&db, file_id, &config);
+                    let shown = self_assign_lines(&diags, &code);
+                    let left: Vec<u32> =
+                        candidates.into_iter().filter(|line| !expected.contains(line)).collect();
+                    assert_eq!(shown, left, "apply, compat={compat}:\n{code}");
+                }
+            }
+        }
     }
 }

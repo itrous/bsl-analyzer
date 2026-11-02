@@ -1,8 +1,9 @@
 use crate::define_metadata;
 use crate::metadata::*;
-use crate::AnalysisContext;
-use crate::{Diagnostic, DiagnosticCode};
-use hir::LocalRange;
+use crate::suppression::SuppressionLookup;
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
+use hir::{query_in_loop_candidates, DefWithBodyId, QueryCallKey, QueryInLoopCandidate};
+use rustc_hash::FxHashSet;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -18,14 +19,71 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     lsp_severity_override: "",
 };
 
-pub fn from_hir(range: LocalRange, ctx: &AnalysisContext) -> Option<Diagnostic<LocalRange>> {
-    crate::simple_hir_diagnostic(
-        DiagnosticCode::CreateQueryInCycle,
-        "Выполнение запроса в цикле приводит к деградации производительности. \
-         Создайте запрос один раз до цикла и изменяйте только параметры внутри цикла",
-        range,
-        ctx,
-    )
+const DIRECT_MESSAGE: &str =
+    "Выполнение запроса в цикле приводит к деградации производительности. \
+     Создайте запрос один раз до цикла и изменяйте только параметры внутри цикла";
+
+/// Judged per file, not per body: the facts come from the fold of the module that the base-aware
+/// passes also read, and their ranges are placed by that same provider's source maps.
+pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
+    let code = DiagnosticCode::CreateQueryInCycle;
+    if ctx.is_disabled_with_metadata(code) {
+        return Vec::new();
+    }
+    let infer = ctx.infer();
+    let bodies = ctx.module_bodies();
+    let site_range = |site: &QueryCallKey| {
+        let source_map = match site.owner {
+            DefWithBodyId::Method(key) => bodies.source_map(key),
+            DefWithBodyId::ModuleCode => {
+                bodies.module_code_result().map(|lower| lower.source_map())
+            }
+        }?;
+        source_map.expr_range(site.call)
+    };
+
+    // A suppressed execution is no ground for any caller, so it is cut before reachability. A
+    // suppressed call is another matter: the finalizer hides that finding alone, and its callee
+    // stays a ground for the other callers.
+    let suppressions = SuppressionLookup::new(
+        &ctx.parse().syntax_node(),
+        &ctx.file_text(),
+        ctx.config.bslls_suppression_compat,
+    );
+    let active: FxHashSet<QueryCallKey> = infer
+        .query_facts_by_body
+        .iter()
+        .flat_map(|(&owner, facts)| {
+            facts
+                .executions
+                .iter()
+                .map(move |execution| QueryCallKey { owner, call: execution.call })
+        })
+        .filter(|site| {
+            site_range(site).is_some_and(|range| !suppressions.is_suppressed(range.start(), code))
+        })
+        .collect();
+
+    query_in_loop_candidates(&infer.query_facts_by_body, &active)
+        .into_iter()
+        .filter_map(|candidate| {
+            let (site, message) = match candidate {
+                QueryInLoopCandidate::Execution(site) => (site, DIRECT_MESSAGE.to_string()),
+                QueryInLoopCandidate::LocalCall { site, target } => {
+                    let name = ctx.interface_method(target)?.name.clone();
+                    (
+                        site,
+                        format!(
+                            "Вызов локального метода «{name}» в теле цикла приводит к выполнению \
+                             запроса непосредственно или через локальные методы этого модуля. \
+                             Получите необходимые данные одним запросом до цикла"
+                        ),
+                    )
+                }
+            };
+            crate::simple_hir_diagnostic(code, message, site_range(&site)?, ctx.analysis())
+        })
+        .collect()
 }
 
 #[cfg(test)]

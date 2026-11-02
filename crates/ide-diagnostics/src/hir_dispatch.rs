@@ -7,7 +7,6 @@ pub(crate) const HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::CodeAfterAsyncCall,
     DiagnosticCode::CommitTransactionOutsideTryCatch,
     DiagnosticCode::CommonModuleAssign,
-    DiagnosticCode::CreateQueryInCycle,
     DiagnosticCode::DeletingCollectionItem,
     DiagnosticCode::DeprecatedPlatformApi,
     DiagnosticCode::DeprecatedMethodCall,
@@ -207,9 +206,6 @@ pub fn dispatch_hir_diagnostic(
                 *ident_range,
                 ctx,
             )
-        }
-        BodyDiagnostic::CreateQueryInCycle { range } => {
-            handlers::create_query_in_cycle::from_hir(*range, ctx)
         }
         BodyDiagnostic::DeletingCollectionItem { collection_text, range } => {
             handlers::deleting_collection_item::from_hir(collection_text, *range, ctx)

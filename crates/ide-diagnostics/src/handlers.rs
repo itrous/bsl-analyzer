@@ -545,6 +545,10 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
 }
 
 #[cfg(test)]
+#[path = "handlers/create_query_in_cycle_tests.rs"]
+mod create_query_in_cycle_tests;
+
+#[cfg(test)]
 #[path = "handlers/implicit_database_read_in_cycle_tests.rs"]
 mod implicit_database_read_in_cycle_tests;
 

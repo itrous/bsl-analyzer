@@ -105,6 +105,12 @@ pub(crate) const WEAVING_DIAGNOSTICS: &[DiagnosticCode] =
 pub(crate) const SUPPRESSION_DIAGNOSTICS: &[DiagnosticCode] =
     &[DiagnosticCode::UnknownSuppressionCode, DiagnosticCode::SuppressionWithoutCode];
 
+/// Diagnostics a file-level handler judges from the module's inference fold, called directly from
+/// `module_diagnostics` and the base-aware passes. Only the coverage-invariant test consumes this.
+#[cfg(test)]
+pub(crate) const INFERENCE_FOLD_DIAGNOSTICS: &[DiagnosticCode] =
+    &[DiagnosticCode::CreateQueryInCycle];
+
 pub fn run_diagnostic<F>(
     name: &'static str,
     ctx: &DiagnosticsContext,
@@ -508,6 +514,7 @@ mod tests {
             ("INFERENCE_DIAGNOSTICS", crate::hir_inference_dispatch::INFERENCE_DIAGNOSTICS),
             ("WEAVING_DIAGNOSTICS", WEAVING_DIAGNOSTICS),
             ("SUPPRESSION_DIAGNOSTICS", SUPPRESSION_DIAGNOSTICS),
+            ("INFERENCE_FOLD_DIAGNOSTICS", INFERENCE_FOLD_DIAGNOSTICS),
         ];
 
         let mut code_to_arrays: HashMap<DiagnosticCode, Vec<&str>> = HashMap::new();

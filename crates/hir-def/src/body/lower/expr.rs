@@ -631,34 +631,6 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
         }
     }
 
-    if ctx.in_loop() && actual_callee.kind() == SyntaxKind::FIELD_EXPR {
-        if let Some(method_token) = actual_callee
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .filter(|tok| matches!(tok.kind(), SyntaxKind::IDENT | SyntaxKind::KW_EXECUTE))
-            .last()
-        {
-            let method_name = method_token.text().fold_lower();
-            if matches!(method_name.as_str(), "execute" | "выполнить") {
-                let receiver = match ctx.body.expr_idx(callee) {
-                    Expr::Field { base, .. } => Some(*base),
-                    Expr::MethodCall { receiver, .. } => Some(*receiver),
-                    _ => None,
-                };
-
-                if let Some(receiver_id) = receiver {
-                    if let Some(var_name) = extract_receiver_name(ctx, receiver_id) {
-                        if ctx.is_query_var(&var_name) {
-                            ctx.emit(BodyDiagnostic::CreateQueryInCycle {
-                                range: node.text_range(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     if actual_callee.kind() == SyntaxKind::FIELD_EXPR {
         let object_name_opt = active_children(&actual_callee).next().and_then(|base_node| {
             if base_node.kind() == SyntaxKind::IDENT {
@@ -1074,18 +1046,6 @@ fn lower_field_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
     }
 
     Expr::Field { base, field: field_name }
-}
-
-fn extract_receiver_name(ctx: &LoweringCtx, expr_id: ExprIdx) -> Option<String> {
-    let expr = ctx.body.expr_idx(expr_id);
-    match expr {
-        Expr::Path(name) => Some(name.as_str().to_string()),
-        Expr::Field { base, field } => {
-            let base_name = extract_receiver_name(ctx, *base)?;
-            Some(format!("{}.{}", base_name, field.as_str()))
-        }
-        _ => None,
-    }
 }
 
 enum QualifiedCallInfo {

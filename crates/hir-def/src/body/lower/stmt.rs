@@ -559,29 +559,6 @@ fn lower_assign_stmt(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Option<Stmt> {
         }
     }
 
-    if let Some((target_name, _)) = target_name {
-        use super::QueryVarType;
-
-        if let Expr::New { type_name: Some(type_name), .. } = ctx.body.expr_idx(value) {
-            let type_str = type_name.as_str().fold_lower();
-            let query_type = match type_str.as_str() {
-                "запрос" | "query" => QueryVarType::Query,
-                "построительзапроса" | "querybuilder" => {
-                    QueryVarType::QueryBuilder
-                }
-                "построительотчета" | "reportbuilder" => {
-                    QueryVarType::ReportBuilder
-                }
-                _ => QueryVarType::Undefined,
-            };
-            ctx.register_query_var(target_name.as_str().to_string(), query_type);
-        } else if let Expr::Path(source_name) = ctx.body.expr_idx(value) {
-            if let Some(source_type) = ctx.get_query_var_type(source_name.as_str()) {
-                ctx.register_query_var(target_name.as_str().to_string(), source_type);
-            }
-        }
-    }
-
     Some(Stmt::Assign { target, value })
 }
 
