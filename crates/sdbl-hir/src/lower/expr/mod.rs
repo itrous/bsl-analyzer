@@ -440,7 +440,6 @@ impl LoweringContext<'_> {
             | FunctionKind::Lower
             | FunctionKind::Ltrim
             | FunctionKind::Rtrim
-            | FunctionKind::Concat
             | FunctionKind::Presentation => SdblType::string(),
 
             FunctionKind::Year
@@ -453,7 +452,6 @@ impl LoweringContext<'_> {
             FunctionKind::DateTime | FunctionKind::BeginOfPeriod | FunctionKind::EndOfPeriod => {
                 SdblType::DateTime
             }
-            FunctionKind::AddMonth => SdblType::Date,
             FunctionKind::DateDiff => SdblType::number(),
 
             FunctionKind::Isnull => {
