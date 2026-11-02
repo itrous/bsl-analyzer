@@ -401,6 +401,10 @@ fn isolated_backend_env(cache: &Path, runtime: &Path) -> EnvGuard {
     env.set("BSL_CACHE_DIR", cache);
     env.set("BSL_SHARED_BACKEND_MARKERS", "1");
     env.set("BSL_LOG", "info");
+    // An inherited BSL_LOG_FILE wins over BSL_MCP_DAEMON_LOG in the binary's log-sink
+    // precedence, so the daemon would write its markers to that machine-wide file and
+    // backend_markers() below would always read an empty log.
+    env.remove("BSL_LOG_FILE");
     env.set("BSL_MCP_DAEMON_LOG", runtime.join("shared-daemon.log"));
     env.set("BSL_MCP_IDLE_TTL_SECS", "1");
     env.set("BSL_MCP_ORPHAN_GRACE_SECS", "1");
