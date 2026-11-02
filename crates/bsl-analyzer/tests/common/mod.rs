@@ -136,6 +136,8 @@ pub struct Lsp {
     /// The methods of the last few messages a wait took in, for the failure message of a
     /// wait that ran out: what the server was saying is the context of what it did not.
     recent: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// See [`Self::start_unbounded`].
+    unbounded: bool,
 }
 
 impl Lsp {
@@ -161,6 +163,20 @@ impl Lsp {
             command.env("BSL_LOG_FILE", log).env("BSL_LOG", "warn");
         }
         Self::start_command(command, root, capabilities, SILENCE)
+    }
+
+    /// A client that does not judge the server by the clock: a wait ends on what it waits for, or
+    /// fails when the server closes its output, and shutdown ends when the process exits. A server
+    /// that stays alive and silent is not failed by this client.
+    pub fn start_unbounded(root: &Path, mode: Option<&str>, capabilities: Value) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+        command.arg("lsp");
+        if let Some(mode) = mode {
+            command.args(["--mode", mode]);
+        }
+        let mut lsp = Self::start_command(command, root, capabilities, test_utils::wait::NO_BOUND);
+        lsp.unbounded = true;
+        lsp
     }
 
     pub fn start_stdio(root: &Path) -> Self {
@@ -261,6 +277,7 @@ impl Lsp {
             protocol_errors,
             pending: Default::default(),
             recent: Default::default(),
+            unbounded: false,
         };
         let root_uri = lsp_types::Url::from_directory_path(root).unwrap();
         lsp.send(json!({
@@ -364,6 +381,11 @@ impl Lsp {
     /// hanging the runner.
     #[track_caller]
     pub fn wait_for(&self, predicate: impl Fn(&Value) -> bool) -> Value {
+        if self.unbounded {
+            return self
+                .wait_for_within(test_utils::wait::NO_BOUND, predicate)
+                .expect("a wait without a bound ends on its message or on closed output");
+        }
         self.wait_for_judging(SILENCE, BUSY_CEILING, predicate)
     }
 
@@ -600,7 +622,9 @@ impl Lsp {
         let response = self.request(id, "shutdown", Value::Null);
         assert!(response["error"].is_null(), "shutdown request failed: {response}");
         self.send(json!({"jsonrpc": "2.0", "method": "exit"}));
-        let status = match self.wait_for_exit_within(PROCESS_SHUTDOWN_TIMEOUT, "shutdown/exit") {
+        let bound =
+            if self.unbounded { test_utils::wait::NO_BOUND } else { PROCESS_SHUTDOWN_TIMEOUT };
+        let status = match self.wait_for_exit_within(bound, "shutdown/exit") {
             Ok(Some(status)) => status,
             Ok(None) => {
                 let pid = self.child.id();
