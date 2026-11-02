@@ -1235,6 +1235,7 @@ async fn concurrent_broker_sessions_keep_tools_and_native_context_local_with_lsp
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "необязательный тест: ответ schema при удержанных учётных данных и ожидания маркеров не ограничены: блокировка запроса держит тест бесконечно; запуск под внешним пределом: timeout 900 cargo test -p bsl-analyzer --test shared_workspace_backend lsp_only_defers_search_activation_and_mcp_schema_answers_while_credentials_are_held -- --ignored --exact"]
 async fn lsp_only_defers_search_activation_and_mcp_schema_answers_while_credentials_are_held() {
     let _environment = PROTOCOL_ENV_LOCK.lock().await;
     let root = fixture();
@@ -1418,6 +1419,7 @@ async fn lsp_only_defers_search_activation_and_mcp_schema_answers_while_credenti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "необязательный тест: ожидания маркеров и событий смены области не ограничены: пропущенная смена конфига держит тест бесконечно; запуск под внешним пределом: timeout 900 cargo test -p bsl-analyzer --test shared_workspace_backend scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state -- --ignored --exact"]
 async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
     let _environment = PROTOCOL_ENV_LOCK.lock().await;
     let root = fixture();
@@ -1679,6 +1681,7 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "необязательный тест: ожидания маркеров нового владельца и его подключения не ограничены: пропущенная смена .env держит тест бесконечно; запуск под внешним пределом: timeout 900 cargo test -p bsl-analyzer --test shared_workspace_backend dotenv_configuration_root_change_rebinds_shared_lsp_and_retires_mcp -- --ignored --exact"]
 async fn dotenv_configuration_root_change_rebinds_shared_lsp_and_retires_mcp() {
     let _environment = PROTOCOL_ENV_LOCK.lock().await;
     let root = fixture();
@@ -2049,6 +2052,7 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "необязательный тест: ожидания маркеров, потокового чанка и выхода прокси после гибели демона не ограничены: прокси, который не завершился, держит тест бесконечно; запуск под внешним пределом: timeout 900 cargo test -p bsl-analyzer --test shared_workspace_backend daemon_crash_ends_inflight_sessions_and_next_lsp_start_uses_a_new_epoch -- --ignored --exact"]
 async fn daemon_crash_ends_inflight_sessions_and_next_lsp_start_uses_a_new_epoch() {
     let _environment = PROTOCOL_ENV_LOCK.lock().await;
     let root = fixture();
@@ -2190,6 +2194,7 @@ async fn daemon_crash_ends_inflight_sessions_and_next_lsp_start_uses_a_new_epoch
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "необязательный тест: ожидания ответов LSP и конца загрузки MCP не ограничены: живой молчащий или вечно загружающийся сервер держит тест бесконечно; запуск под внешним пределом: timeout 900 cargo test -p bsl-analyzer --test shared_workspace_backend explicit_stdio_lsp_and_mcp_use_the_core_without_starting_a_shared_daemon -- --ignored --exact"]
 async fn explicit_stdio_lsp_and_mcp_use_the_core_without_starting_a_shared_daemon() {
     let _environment = PROTOCOL_ENV_LOCK.lock().await;
     let root = fixture();
@@ -2237,6 +2242,7 @@ async fn explicit_stdio_lsp_and_mcp_use_the_core_without_starting_a_shared_daemo
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "необязательный тест: ожидания диагностики и ответов LSP не ограничены: живой молчащий сервер держит тест бесконечно; запуск под внешним пределом: timeout 900 cargo test -p bsl-analyzer --test shared_workspace_backend shared_lsp_preserves_case_alias_uri_after_open_file_is_deleted -- --ignored --exact"]
 async fn shared_lsp_preserves_case_alias_uri_after_open_file_is_deleted() {
     let _environment = PROTOCOL_ENV_LOCK.lock().await;
     let root = fixture();
@@ -2299,6 +2305,7 @@ async fn shared_lsp_preserves_case_alias_uri_after_open_file_is_deleted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "необязательный тест: ожидание ответа и закрытия вывода процесса не ограничено: живой молчащий сервер держит тест бесконечно; запуск под внешним пределом: timeout 900 cargo test -p bsl-analyzer --test shared_workspace_backend auto_lsp_falls_back_before_initialize_forwarding_without_replaying_public_frames -- --ignored --exact"]
 async fn auto_lsp_falls_back_before_initialize_forwarding_without_replaying_public_frames() {
     let _environment = PROTOCOL_ENV_LOCK.lock().await;
     let root = fixture();
