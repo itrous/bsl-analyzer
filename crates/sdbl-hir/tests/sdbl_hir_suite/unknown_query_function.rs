@@ -64,3 +64,17 @@ fn a_virtual_table_call_is_not_a_function_call() {
     );
     assert!(names.is_empty(), "virtual table reported as unknown function: {names:?}");
 }
+
+#[test]
+fn index_by_sets_is_clause_syntax_not_a_function_call() {
+    let names = unknown_function_names(
+        "ВЫБРАТЬ Т.А, Т.Б ПОМЕСТИТЬ ВТ ИЗ Справочник.Товары КАК Т ИНДЕКСИРОВАТЬ ПО НАБОРАМ ((А, Б), (Б))",
+    );
+    assert!(names.is_empty(), "the clause keyword reported as unknown: {names:?}");
+}
+
+#[test]
+fn the_index_by_sets_spelling_is_still_a_typo_outside_that_clause() {
+    let names = unknown_function_names("ВЫБРАТЬ НАБОРАМ(Т.Имя) ИЗ Справочник.Товары КАК Т");
+    assert_eq!(names, ["НАБОРАМ"]);
+}

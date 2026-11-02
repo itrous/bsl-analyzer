@@ -348,7 +348,9 @@ impl LoweringContext<'_> {
             }
             _ => {
                 if let Some(token) = func_name_token.as_ref() {
-                    if !lexer::sdbl::is_sdbl_vocabulary_word(&func_name) {
+                    if !lexer::sdbl::is_sdbl_vocabulary_word(&func_name)
+                        && !is_index_by_sets(node, &func_name)
+                    {
                         self.diagnostics.push(SdblDiagnostic::UnknownFunction {
                             function_name: func_name.clone(),
                             range: token.text_range(),
@@ -674,6 +676,25 @@ impl LoweringContext<'_> {
 
         ExprHir::Tuple { elements, range: node.text_range() }
     }
+}
+
+/// `ИНДЕКСИРОВАТЬ ПО НАБОРАМ (...)` is clause syntax that the grammar reads as a call, so what
+/// tells it from a call of a function with that name is the place: in the clause itself, not in
+/// the arguments of another call.
+fn is_index_by_sets(call: &syntax::SyntaxNode, name: &str) -> bool {
+    use syntax::SyntaxKind;
+
+    matches!(name.to_uppercase().as_str(), "НАБОРАМ" | "SETS")
+        && call
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| {
+                matches!(
+                    ancestor.kind(),
+                    SyntaxKind::SDBL_FUNCTION_CALL | SyntaxKind::SDBL_INDEX_BY
+                )
+            })
+            .is_some_and(|ancestor| ancestor.kind() == SyntaxKind::SDBL_INDEX_BY)
 }
 
 fn classify_primitive_cast_target(name: &str, decimals: &[u32]) -> SdblType {
