@@ -36,6 +36,7 @@
 ```bash
 D=~/.pio/jobs/perf-nightly/data                 # corpora.toml лежит здесь
 P=scripts/perf-nightly/perf_nightly.py
+R=scripts/perf-nightly/baseline.json
 python3 $P build --data-dir $D --ref v0.3.2     # → $D/bin/<label>-<sha12>-<rustc12>/
 python3 $P snapshot --data-dir $D --corpus crm
 python3 $P points --data-dir $D --corpus crm --binary $B
@@ -46,11 +47,13 @@ python3 $P report --data-dir $D --corpus crm --series s1
 python3 $P suite --data-dir $D --binary $B --series night-2026-10-21  # ночной набор одного бинаря
 python3 $P calibrate --data-dir $D --binary $B --series 5   # cal-<i> и $D/noise.json
 python3 $P compare --data-dir $D --base v0.3.2/cal-1 --candidate v0.3.2/cal-2 --trend
-python3 $P night --data-dir $D --deadline 08:45            # → $D/nights/<дата>/
+python3 $P night --data-dir "$D" --deadline 08:45 --baseline "$R" --publish  # → $D/nights/<дата>/, холодный рекорд → $D/gates/record-night-<дата>-<sha12>/
 python3 $P night --data-dir $D --candidate v0.3.3          # гейт тега → $D/gates/v0.3.3/
 python3 $P gate-calibrate --data-dir $D --base v0.4.1      # → $D/gate-cal/…, $D/gate-noise.json
-python3 $P gate --data-dir $D --base v0.4.1 --candidate <SHA|тег> --label <метка>  # → $D/gates/<метка>/
-python3 -m unittest discover -s scripts/perf-nightly/tests
+# После окончания 0.4.4; отдельное измерение недостающих допусков.
+python3 $P gate-calibrate --data-dir "$D" --base v0.4.2 --record-metrics-only
+python3 $P gate --data-dir "$D" --base <T> --candidate <SHA> --label <уникальная-метка> --baseline "$R"  # → $D/gates/<метка>/
+python3 -B -m unittest discover -s scripts/perf-nightly/tests
 ```
 
 `night` собирает develop (или тег-кандидат) и последний релиз-предок, меряет ночной
@@ -63,7 +66,19 @@ python3 -m unittest discover -s scripts/perf-nightly/tests
 точек или схемы харнеса; версии ядра и `rustc` и объём памяти пишутся в каждый
 прогон, но обновление системы калибровку не сбрасывает. Положительные
 контроли `measure`: `--ballast-mb`, `--ballast-after-ready-mb`, `--inject-latency-ms`;
-контроль времени — запуск `measure` под `taskset -c 0-3`.
+контроль времени — запуск `measure` под `taskset -c 0-3`. Эта оговорка про версии ядра,
+`rustc` и память относится только к тёплому сравнению `night`: у рекорда они значимы.
+
+Отдельно от тёплого набора и раньше него `night` меряет develop холодно: три прогона
+серии A и три серии B, без базы и без подтверждающего раунда, и сравнивает их с
+`baseline.json`. Результат — `$D/gates/record-night-<дата>-<sha12>/`, ссылка и отдельный
+итог — в разделе `record` ночного `summary.json`. Эта проверка не зависит от `noise.json`;
+прогон, не успевающий к дедлайну, не начинается (`window_exhausted`), занятый `gate.lock`
+— `gate_busy`. Ночь без пройденного рекорда не бывает `ok`. Она не обновляет рекорд и не заменяет релизный гейт. С `--publish`
+выход за предел рекорда — один открытый issue на метрику (`perf-ratchet/<метрика>`) с
+диапазоном `<record_sha>..<develop_sha>`, который называет кандидатов на причину, а не
+виновника; несопоставимый профиль или отсутствующий шум — `perf-ratchet/profile` с меткой
+`perf`, без утверждения о регрессии.
 
 `gate` — гейт скорости и памяти ночного релиза. Меряет на клоне ЕРП из `corpora.toml`
 (на коммите манифеста, без изменённых отслеживаемых файлов, иначе `source_mismatch`) с
@@ -84,6 +99,38 @@ workspace` на 5000 файлов (`diagnostics_workspace_s`); серия B — 
 | `aggregates` свипа | вердикт не меняют; в отчёте и `summary.json` — «новые», «исчезнувшие» и «изменённые» коды (корректность диагностик судят тесты проекта и CHANGELOG, гейт — время и память) |
 | сбой или невалидный прогон | кандидата — `block`; базы или недобор прогонов — `incomplete` |
 
+Вторая база гейта — рекорд, `scripts/perf-nightly/baseline.json` (или `--baseline <путь>`),
+лучшее подтверждённое значение каждой метрики независимо от других. Разделы отчёта:
+«Прошлый релиз» — правило таблицы выше, «Рекорд» и «Память A/A» — ниже, «Предложения
+рекорда». C — агрегат кандидата, R — рекорд, ν — шум из записи рекорда:
+
+| метрика | агрегат кандидата |
+|---|---|
+| `graph_ready_s`, `graph_ready_cpu_s`, `graph_resolve_s`, `diagnostics_workspace_s` | медиана A |
+| `hwm_kb` | максимум A+B |
+| `references_1_s`, `references_2_same_s`, `references_3_other_s` | медиана B |
+
+`C > R·(1+ν)`, то есть Δ > ν, — `block`; равенство и меньший рост проходят. Пяти процентов
+и размена работы на стену здесь нет. Отсутствующий шум (`record_no_noise:<метрика>`),
+неполный или неверный файл (`baseline_missing`, `baseline_invalid`), отличие любого поля
+профиля или протокола (`record_profile_mismatch:<поля>`, `record_protocol_mismatch:<поля>`)
+дают `incomplete` без численного сравнения: в полный профиль рекорда входят версии ядра и
+`rustc` и объём памяти. Память дополнительно сравнивается как максимум A кандидата с
+максимумом A базы той же серии с допуском `base_A_noise`. References базы не меряются,
+абсолютные потолки прежние. Итог гейта — `block > incomplete > pass`; `record.verdict` —
+отдельно, и старый `summary.json` без `record` показывается как «ратчет не измерялся», а не
+как пройденный рекорд. Контроли и `--ready-only` дают `probe-ok` вместо `pass`.
+
+Подтверждение общее: если старое правило требует его для стены или какая-либо метрика
+улучшила рекорд больше чем на ν, гейт меряет один второй раунд A×3+B×3 (`A-b4…6`, `A-c4…6`,
+`B-c4…6`), то есть до 18 прогонов вместо 9. Раунды считаются раздельно, блок любого из них
+остаётся. `record_proposals` содержит метрики, улучшившие рекорд больше чем на ν в обоих
+полных раундах, со значением худшего из двух агрегатов. Ни `gate`, ни `night` файл рекорда
+не пишут: предложение переносит человек коммитом `chore(perf): ratchet <metric> <old> ->
+<new>` и только вниз; заполнение шума — `chore(perf): calibrate record tolerances`.
+
+Оптимизацию закрепляет рекорд, а не релиз. Выпуск версии не повышает baseline и не прощает накопленные небольшие ухудшения. Подтверждённое двумя раундами улучшение сверх шума переносит исполнитель оптимизации из record_proposals в baseline отдельным обычным коммитом с SHA и ссылкой на summary. Один удачный прогон рекорд не двигает; возврат памяти к 4 667 316 KB остаётся обязательным. Ночной develop проверяется заранее, но его успешный отчёт не заменяет релизный гейт по обеим базам.
+
 Прогон, где чужая нагрузка за окно готовности графа больше двух ядер (`foreign_cores`
 по `/proc/stat`), не засчитывается (`foreign_load`) и повторяется на том же месте;
 перед каждым прогоном гейт ждёт MemAvailable ≥ 13 ГиБ и load1 ≤ 2. Ожидание и
@@ -94,7 +141,12 @@ workspace` на 5000 файлов (`diagnostics_workspace_s`); серия B — 
 Калибровка гейта — `gate-calibrate`: пять серий по три полных прогона базы, отдельный
 `gate-noise.json` (ночной `noise.json` не трогается); его устаревают смена CPU, числа
 потоков, схемы харнеса или гейта, коммита ЕРП и его конфига, без него гейт `incomplete`
-с `noise_stale`. Положительные контроли (в регламенте не используются):
+с `noise_stale`. `gate-calibrate --record-metrics-only` меряет недостающие рекорду шумы
+`hwm_A_kb`, `hwm_kb` и трёх references: пять серий по A×3+B×3, всего 30 прогонов; ν —
+(максимум − минимум) / медиана агрегатов серий. Прежние записи `gate-noise.json` не
+меняются, новые дописываются только при полном совпадении профиля с его калибровкой;
+иначе результат остаётся в `$D/gate-cal/<бинарь>/record-noise.json`, а код выхода — 2.
+Перенос чисел в `baseline.json` — отдельный коммит. Положительные контроли (в регламенте не используются):
 `--control-burn-cpu-s X` (кандидат тратит на X CPU-секунд больше до готовности графа),
 `--control-start-delay-s D` (сервер кандидата стартует на D с позже),
 `--control-foreign-burn N` (N занятых процессов вне прогона на окне готовности);
