@@ -174,6 +174,7 @@ pub mod uninitialized_local_variable;
 pub mod union_all;
 pub mod unknown_field_in_query;
 pub mod unknown_preprocessor_symbol;
+pub mod unknown_query_function;
 pub mod unknown_type_in_new;
 pub mod unlimited_length_string_usage_in_query;
 pub mod unreachable_code;
@@ -442,6 +443,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
             Some(&calculation_register_virtual_table_without_recorder::METADATA)
         }
         DiagnosticCode::UnknownFieldInQuery => Some(&unknown_field_in_query::METADATA),
+        DiagnosticCode::UnknownQueryFunction => Some(&unknown_query_function::METADATA),
         DiagnosticCode::InvalidVirtualTableParameters => {
             Some(&invalid_virtual_table_parameters::METADATA)
         }

@@ -247,6 +247,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::QueryParameterSourceWithoutInto => &[],
         DiagnosticCode::QueryTotalsInValueTableInto => &[],
         DiagnosticCode::UnknownFieldInQuery => &[],
+        DiagnosticCode::UnknownQueryFunction => &[],
         DiagnosticCode::InvalidVirtualTableParameters => &[],
         DiagnosticCode::UnlimitedLengthStringUsageInQuery => &[432],
         DiagnosticCode::RefOveruse => &[654],
