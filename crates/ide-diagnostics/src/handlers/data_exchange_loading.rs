@@ -21,7 +21,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Standard, MetadataTag::Badpractice, MetadataTag::Unpredictable],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 const MONITORED_PROCEDURES: &[&str] =
@@ -522,9 +522,9 @@ mod tests {
         expect![[r#"
             DataExchangeLoading @ 2:11..2:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
         assert_eq!(diagnostics[0].code, DiagnosticCode::DataExchangeLoading);
-        assert_eq!(diagnostics[0].severity, crate::Severity::Critical);
+        assert_eq!(diagnostics[0].severity, crate::Severity::Warning);
     }
 
     /// A module variable above the handler must not hide it: the bodies are
@@ -542,7 +542,7 @@ mod tests {
         expect![[r#"
             DataExchangeLoading @ 4:11..4:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -568,7 +568,7 @@ mod tests {
         expect![[r#"
             DataExchangeLoading @ 4:11..4:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -612,7 +612,7 @@ EndProcedure
         expect![[r#"
             DataExchangeLoading @ 2:11..2:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
@@ -663,7 +663,7 @@ EndProcedure
         expect![[r#"
             DataExchangeLoading @ 1:11..1:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
@@ -678,7 +678,7 @@ EndProcedure"#;
         expect![[r#"
             DataExchangeLoading @ 1:11..1:18
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
@@ -693,7 +693,7 @@ EndProcedure"#;
         expect![[r#"
             DataExchangeLoading @ 1:11..1:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
@@ -715,7 +715,7 @@ EndProcedure"#;
         expect![[r#"
             DataExchangeLoading @ 1:11..1:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
@@ -771,7 +771,7 @@ EndProcedure"#;
         expect![[r#"
             DataExchangeLoading @ 1:11..1:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -786,7 +786,7 @@ EndProcedure"#;
         expect![[r#"
             DataExchangeLoading @ 1:11..1:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -822,7 +822,7 @@ EndProcedure"#;
         expect![[r#"
             DataExchangeLoading @ 1:11..1:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -848,7 +848,7 @@ EndProcedure"#;
         expect![[r#"
             DataExchangeLoading @ 1:11..1:23
               message: Отсутствует проверка условия ОбменДанными.Загрузка в обработчике события. Необходимо добавить проверку для предотвращения выполнения логики при обмене данными
-              severity: Critical"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
