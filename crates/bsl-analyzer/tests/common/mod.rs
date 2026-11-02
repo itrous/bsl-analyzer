@@ -138,6 +138,8 @@ pub struct Lsp {
     recent: std::sync::Mutex<std::collections::VecDeque<String>>,
     /// See [`Self::start_unbounded`].
     unbounded: bool,
+    /// How many answers each client request id got, over every message a wait took in.
+    answers: std::sync::Mutex<std::collections::HashMap<u64, usize>>,
 }
 
 impl Lsp {
@@ -278,6 +280,7 @@ impl Lsp {
             pending: Default::default(),
             recent: Default::default(),
             unbounded: false,
+            answers: Default::default(),
         };
         let root_uri = lsp_types::Url::from_directory_path(root).unwrap();
         lsp.send(json!({
@@ -454,8 +457,26 @@ impl Lsp {
         Some(utime + stime)
     }
 
+    /// Takes in everything left of the server's output, until the last process holding it closes
+    /// it. Without a bound, so call it after the server has exited.
+    pub fn finish_output(&self) {
+        for message in self.messages.iter() {
+            self.note_seen(&message);
+        }
+    }
+
+    /// How many answers the client request `id` has had among the messages taken in so far.
+    pub fn answer_count(&self, id: u64) -> usize {
+        let answers = self.answers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        answers.get(&id).copied().unwrap_or(0)
+    }
+
     fn note_seen(&self, message: &Value) {
         const KEPT: usize = 8;
+        if let (true, Some(id)) = (message["method"].is_null(), message["id"].as_u64()) {
+            let mut answers = self.answers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *answers.entry(id).or_default() += 1;
+        }
         let label = match (message["method"].as_str(), message["id"].as_u64()) {
             (Some(method), _) => method.to_owned(),
             (None, Some(id)) => format!("response #{id}"),

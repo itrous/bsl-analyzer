@@ -640,36 +640,6 @@ fn collect_scope_retirement_events(
     events
 }
 
-/// Waits for the message `is_end` picks and returns it with everything the server wrote before it.
-fn collect_until(editor: &Lsp, is_end: impl Fn(&Value) -> bool) -> (Value, Vec<Value>) {
-    let before = std::cell::RefCell::new(Vec::new());
-    let end = editor.wait_for(|message| {
-        let found = is_end(message);
-        if !found {
-            before.borrow_mut().push(message.clone());
-        }
-        found
-    });
-    (end, before.into_inner())
-}
-
-/// Sends a request and returns its answer with everything the server wrote before it, which is
-/// where a message the server must not send by then is looked for, instead of in a window of
-/// silence.
-fn request_collecting(
-    editor: &mut Lsp,
-    id: u64,
-    method: &str,
-    params: Value,
-) -> (Value, Vec<Value>) {
-    editor.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-    collect_until(editor, |message| message["id"] == id && message["method"].is_null())
-}
-
-fn answers_request(messages: &[Value], id: u64) -> bool {
-    messages.iter().any(|message| message["id"] == id && message["method"].is_null())
-}
-
 fn request_definition_until_ready(
     editor: &mut Lsp,
     first_id: u64,
@@ -1593,19 +1563,10 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
 
     let caller_uri = lsp_types::Url::from_file_path(&caller).unwrap();
     let call_character = caller_buffer.lines().nth(1).unwrap().find("ЧисловоеЗначение").unwrap();
-    let (excluded_definition, before_answer) = request_collecting(
-        &mut editor,
+    let excluded_definition = editor.request(
         80,
         "textDocument/definition",
         json!({"textDocument": {"uri": caller_uri}, "position": {"line": 1, "character": call_character}}),
-    );
-    assert!(
-        !answers_request(&before_answer, 70),
-        "scope retirement does not answer one client request twice: {before_answer:?}"
-    );
-    assert!(
-        !answers_request(&before_answer, 1),
-        "private rebind does not send a second public initialize response: {before_answer:?}"
     );
     assert!(
         excluded_definition["error"].is_null(),
@@ -1678,6 +1639,9 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
     mcp_process.kill().await.ok();
     let _ = mcp_process.wait().await;
     assert!(editor.shutdown(rebound_definition_id + 2).success(), "rebound LSP shuts down cleanly");
+    editor.finish_output();
+    assert_eq!(editor.answer_count(70), 1, "scope retirement answers one client request once");
+    assert_eq!(editor.answer_count(1), 1, "private rebind sends one public initialize response");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2325,33 +2289,20 @@ async fn auto_lsp_falls_back_before_initialize_forwarding_without_replaying_publ
     let mut editor = Lsp::start_unbounded(root.path(), None, json!({}));
     artifacts.checkpoint("auto LSP completed pre-session stdio fallback");
     assert_eq!(editor.initialize_response["id"], 1, "one public initialize response");
-    let uri = lsp_types::Url::from_file_path(
-        root.path().join("CommonModules/Потребитель/Ext/Module.bsl"),
-    )
-    .unwrap();
-    editor.send(json!({
-        "jsonrpc": "2.0", "method": "textDocument/didOpen",
-        "params": {"textDocument": {"uri": uri, "languageId": "bsl", "version": 1, "text": CALLER}}
-    }));
-    let (_, mut session) = collect_until(&editor, |message| {
-        message["method"] == "textDocument/publishDiagnostics"
-            && message["params"]["uri"] == uri.as_str()
-    });
-    let (shutdown, before_shutdown) = request_collecting(&mut editor, 3, "shutdown", Value::Null);
-    session.extend(before_shutdown);
-    assert!(shutdown["error"].is_null(), "shutdown request failed: {shutdown}");
-    editor.send(json!({"jsonrpc": "2.0", "method": "exit"}));
-    let exit = editor.child.wait().expect("fallback LSP exits");
-    assert!(exit.success(), "fallback LSP shuts down cleanly");
+    let diagnostics =
+        editor.open(&root.path().join("CommonModules/Потребитель/Ext/Module.bsl"), CALLER);
+    assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
+    assert!(editor.shutdown(3).success(), "fallback LSP shuts down cleanly");
     assert!(
         backend_markers(runtime.path()).is_empty(),
         "a failed pre-session endpoint does not start a daemon"
     );
     // No daemon started, so stdout and stderr close with the process: all of both has arrived.
-    session.extend(editor.messages.iter());
-    assert!(
-        !answers_request(&session, 1),
-        "fallback does not replay public initialize or emit a second reply: {session:?}"
+    editor.finish_output();
+    assert_eq!(
+        editor.answer_count(1),
+        1,
+        "fallback does not replay public initialize or emit a second reply"
     );
     let stderr = editor.finish_stderr();
     assert!(
