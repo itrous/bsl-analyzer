@@ -19,7 +19,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Error, MetadataTag::Unpredictable, MetadataTag::Suspicious],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
