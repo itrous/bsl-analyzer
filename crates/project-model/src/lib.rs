@@ -6618,8 +6618,7 @@ extensions = [{ name = "T" }]
             ["Allowed.bsl", "Reports/R/Ext/ObjectModule.bsl", "temporary/Visible.bsl"]
         );
         assert!(project.is_source_excluded(&root.join("temp/Hidden.bsl")));
-        assert!(project
-            .is_source_excluded(&root.join("Reports/R/Templates/T/Ext/Generated.bsl")));
+        assert!(project.is_source_excluded(&root.join("Reports/R/Templates/T/Ext/Generated.bsl")));
         assert!(!project.is_source_excluded(&root.join("temporary/Visible.bsl")));
     }
 
