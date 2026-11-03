@@ -10,8 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 ### Изменения поведения
 
 Не ломают API: набор инструментов MCP и ключи конфигурации прежние. Полный проход по конфигурации
-меняет набор и уровень находок `CalculationRegisterVirtualTableWithoutRecorder` и сокращает набор
-находок `MissedRequiredParameter` и `TypeMismatch`.
+меняет набор и уровень находок `CalculationRegisterVirtualTableWithoutRecorder`, сокращает набор
+находок `MissedRequiredParameter` и `TypeMismatch` и понижает уровень находок
+`ServerSideExportFormMethod`.
 
 - diagnostics: `MissedRequiredParameter` больше не отмечает позицию, оставленную пустой между
   запятыми (`Сложение(, 2)`, `Сложение(1, )`): платформа принимает такой вызов и передаёт
@@ -21,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 - diagnostics: `TypeMismatch` срабатывает, только когда наборы ожидаемых и полученных типов не
   пересекаются: `Число | Неопределено` в параметре `Число` больше не отмечается. Вызов отмечает
   первый аргумент без общего типа с параметром. `TypeMismatchByDocComment` не меняется (#788).
+- diagnostics: `ServerSideExportFormMethod` теперь предупреждение, а не блокирующая ошибка: редактор
+  показывает находку как warning, в SARIF она получает `warning` вместо `error`. Набор находок
+  прежний; оценка правила в метаданных (`Blocker`) не меняется (#792).
 
 - diagnostics: `CalculationRegisterVirtualTableWithoutRecorder` теперь предупреждение, а не ошибка:
   правило эвристическое и не знает, рассчитывается ли в этом месте свой набор записей.
