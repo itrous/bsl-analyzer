@@ -50,7 +50,13 @@ fn replacement_for(ch: char) -> Option<&'static str> {
 /// program does not see the text; manual in a comment the analyzer parses and in
 /// an error token (the replacement changes how the line parses).
 fn token_fix(kind: SyntaxKind, text: &str, start: TextSize) -> Option<Fix<LocalRange>> {
-    let edits: Vec<TextEdit<LocalRange>> = text
+    // A lone `\r` ends the line inside a whitespace token, and what follows it is
+    // glued to nothing.
+    let fixed = match kind {
+        SyntaxKind::WHITESPACE => text.split('\r').next().unwrap_or(text),
+        _ => text,
+    };
+    let edits: Vec<TextEdit<LocalRange>> = fixed
         .char_indices()
         .filter_map(|(offset, ch)| {
             let new_text = replacement_for(ch)?;

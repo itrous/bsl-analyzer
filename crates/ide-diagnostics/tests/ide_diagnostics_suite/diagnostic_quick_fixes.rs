@@ -337,6 +337,19 @@ fn a_non_breaking_space_glued_to_an_identifier_is_replaced_safely() {
 }
 
 #[test]
+fn a_glued_non_breaking_space_fix_stops_at_a_line_break_inside_the_whitespace() {
+    // A lone `\r` breaks the line for the platform but stays inside one whitespace token.
+    // The space on the next line glues to nothing, and a safe fix does not touch it.
+    let source = "А\u{00A0}\r\u{00A0}= 1;\n";
+    let diagnostics = module_diagnostics(source, Project::default());
+    assert_eq!(
+        fixes_of(source, &diagnostics, DiagnosticCode::InvalidCharacterInFile),
+        "InvalidCharacterInFile @ 1:2 Заменить недопустимые символы [fix_all=true]\n\
+         А \r\u{00A0}= 1;\n"
+    );
+}
+
+#[test]
 fn illegal_character_in_a_multiline_string_comment_line_is_manual() {
     // A continuation line that starts with `//` (no `|`) is a COMMENT token, but
     // it is text of the literal. A safe fix would change that value unattended.
