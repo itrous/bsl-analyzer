@@ -46,16 +46,10 @@ fn replacement_for(ch: char) -> Option<&'static str> {
     }
 }
 
-/// Replaces every illegal character of one token. Safe in whitespace and comments,
-/// where the program does not see the text; manual in a string literal (the value
-/// changes: a non-breaking space may be exactly what the code searches for) and in
+/// Replaces every illegal character of one token. Safe in whitespace, where the
+/// program does not see the text; manual in a comment the analyzer parses and in
 /// an error token (the replacement changes how the line parses).
-fn token_fix(
-    kind: SyntaxKind,
-    text: &str,
-    start: TextSize,
-    changes_text: bool,
-) -> Option<Fix<LocalRange>> {
+fn token_fix(kind: SyntaxKind, text: &str, start: TextSize) -> Option<Fix<LocalRange>> {
     let edits: Vec<TextEdit<LocalRange>> = text
         .char_indices()
         .filter_map(|(offset, ch)| {
@@ -70,22 +64,19 @@ fn token_fix(
     if edits.is_empty() {
         return None;
     }
-    // A comment the program does not read stays safe. A `//` line of a multiline
-    // literal, and a parameter-doc separator the analyzer parses, do not: the
-    // replacement changes a value or a computed type.
-    let invisible =
-        matches!(kind, SyntaxKind::WHITESPACE) || (kind == SyntaxKind::COMMENT && !changes_text);
-    Some(if invisible {
+    // Whitespace carries no meaning for the platform, so turning the character into
+    // an ordinary space there changes nothing but the compilability of the module.
+    Some(if kind == SyntaxKind::WHITESPACE {
         Fix::safe("Заменить недопустимые символы", edits)
     } else {
         Fix::manual("Заменить недопустимые символы (меняет текст программы)", edits)
     })
 }
 
+/// The platform compiles a comment whatever stands in it, so only a comment the
+/// analyzer itself reads is worth a report: a `//` line of a multiline literal and
+/// an `Имя - Тип` line of a `Параметры:` section, whose split the character breaks.
 fn comment_replacement_changes_meaning(token: &SyntaxToken, text: &str) -> bool {
-    if token.kind() != SyntaxKind::COMMENT {
-        return false;
-    }
     if syntax::comment_token_is_string_text(token) {
         return true;
     }
@@ -142,6 +133,23 @@ fn in_parameters_section(token: &SyntaxToken) -> bool {
     false
 }
 
+/// Verified on 8.3.27: a non-breaking space breaks compilation only when it is
+/// absorbed into the preceding identifier, keyword or number; isolated by an
+/// ordinary space, after punctuation or an operator, and at the start or the end of
+/// a line the module compiles.
+fn whitespace_corrupts_previous_token(token: &SyntaxToken, text: &str) -> bool {
+    if !text.starts_with(ILLEGAL_SPACE) {
+        return false;
+    }
+    let Some(previous) = token.prev_token() else {
+        return false;
+    };
+    if previous.kind().is_trivia() {
+        return false;
+    }
+    previous.text().chars().next_back().is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+}
+
 fn create_diagnostic(
     range: LocalRange,
     char_type: InvalidCharType,
@@ -176,44 +184,49 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
     let mut diagnostics = Vec::new();
 
     for token in ctx.tokens() {
-        {
-            let should_check = matches!(
-                token.kind(),
-                SyntaxKind::STRING
-                    | SyntaxKind::STRING_PART
-                    | SyntaxKind::STRING_START
-                    | SyntaxKind::STRING_TAIL
-                    | SyntaxKind::WHITESPACE
-                    | SyntaxKind::COMMENT
-                    | SyntaxKind::ERROR
-            );
+        let text = token.text();
 
-            if should_check {
-                let text = token.text();
+        let has_illegal_space = text.chars().any(|ch| ch == ILLEGAL_SPACE);
+        let has_illegal_dash = text.chars().any(|ch| ILLEGAL_DASHES.contains(&ch));
 
-                let has_illegal_space = text.chars().any(|ch| ch == ILLEGAL_SPACE);
-                let has_illegal_dash = text.chars().any(|ch| ILLEGAL_DASHES.contains(&ch));
-
-                if has_illegal_space || has_illegal_dash {
-                    let char_type = if has_illegal_space {
-                        InvalidCharType::IllegalSpace
-                    } else {
-                        InvalidCharType::IllegalDash
-                    };
-
-                    let changes_text = comment_replacement_changes_meaning(&token, text);
-                    let fix =
-                        token_fix(token.kind(), text, token.text_range().start(), changes_text);
-                    diagnostics.push(create_diagnostic(
-                        LocalRange::of_detached_node(token.text_range()),
-                        char_type,
-                        fix.into_iter().collect(),
-                        code,
-                        ctx,
-                    ));
-                }
-            }
+        if !has_illegal_space && !has_illegal_dash {
+            continue;
         }
+
+        // Report only where the compiler reads the character. A string literal is
+        // data - the platform compiles it and the character may be exactly what the
+        // code displays or searches for; a comment it does not read at all; a
+        // whitespace run only corrupts the token it is glued to. In an error token
+        // the character has already broken parsing, or it stands in code.
+        let worth_reporting = match token.kind() {
+            SyntaxKind::STRING
+            | SyntaxKind::STRING_PART
+            | SyntaxKind::STRING_START
+            | SyntaxKind::STRING_TAIL => false,
+            SyntaxKind::COMMENT => comment_replacement_changes_meaning(&token, text),
+            SyntaxKind::WHITESPACE => whitespace_corrupts_previous_token(&token, text),
+            SyntaxKind::ERROR => true,
+            _ => false,
+        };
+
+        if !worth_reporting {
+            continue;
+        }
+
+        let char_type = if has_illegal_space {
+            InvalidCharType::IllegalSpace
+        } else {
+            InvalidCharType::IllegalDash
+        };
+
+        let fix = token_fix(token.kind(), text, token.text_range().start());
+        diagnostics.push(create_diagnostic(
+            LocalRange::of_detached_node(token.text_range()),
+            char_type,
+            fix.into_iter().collect(),
+            code,
+            ctx,
+        ));
     }
 
     acc.extend(diagnostics);
@@ -262,33 +275,6 @@ mod tests {
             code,
             DiagnosticCode::InvalidCharacterInFile,
             expect![[r#"
-                InvalidCharacterInFile @ 2:15..2:18
-                  message: Нужно исправить на правильный символ "-"
-                  severity: Major
-                InvalidCharacterInFile @ 3:16..3:19
-                  message: Нужно исправить на правильный символ "-"
-                  severity: Major
-                InvalidCharacterInFile @ 4:15..4:18
-                  message: Нужно исправить на правильный символ "-"
-                  severity: Major
-                InvalidCharacterInFile @ 5:23..5:26
-                  message: Нужно исправить на правильный символ "-"
-                  severity: Major
-                InvalidCharacterInFile @ 6:21..6:24
-                  message: Нужно исправить на правильный символ "-"
-                  severity: Major
-                InvalidCharacterInFile @ 7:1..7:34
-                  message: Нужно исправить на правильный символ "-"
-                  severity: Major
-                InvalidCharacterInFile @ 13:1..13:33
-                  message: Нужно заменить символ неразрывного пробела на обычный пробел
-                  severity: Major
-                InvalidCharacterInFile @ 15:16..15:19
-                  message: Нужно заменить символ неразрывного пробела на обычный пробел
-                  severity: Major
-                InvalidCharacterInFile @ 18:1..18:2
-                  message: Нужно заменить символ неразрывного пробела на обычный пробел
-                  severity: Major
                 InvalidCharacterInFile @ 21:1..21:2
                   message: Нужно исправить на правильный символ "-"
                   severity: Major
@@ -315,10 +301,17 @@ mod tests {
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::InvalidCharacterInFile,
-            expect![[r#"
-                InvalidCharacterInFile @ 2:5..2:16
-                  message: Нужно исправить на правильный символ "-"
-                  severity: Major"#]],
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn test_nbsp_in_string_literal() {
+        let code = "А = \"метр\u{00A0}куб\";\n";
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#""#]],
         );
     }
 
@@ -328,8 +321,91 @@ mod tests {
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn test_dash_in_ordinary_comment() {
+        let code = concat!("// тире \u{2014}\n", "Ч3 = 4;\n");
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn test_nbsp_glued_to_identifier_or_number() {
+        let code = concat!(
+            "Ч2\u{00A0}= 1;\n",
+            "Ч = 1\u{00A0}+ 2;\n",
+            "Ч7 = 1\u{00A0};\n",
+            "Если\u{00A0}Истина Тогда Ч9 = 1; КонецЕсли;\n",
+            "Ч11 = 1\u{00A0}\u{00A0}+ 2;\n",
+            "Ч12 = 1\u{00A0}\n",
+            "+ 2;\n",
+        );
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
             expect![[r#"
-                InvalidCharacterInFile @ 1:1..1:27
+                InvalidCharacterInFile @ 1:3..1:4
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major
+                InvalidCharacterInFile @ 2:6..2:7
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major
+                InvalidCharacterInFile @ 3:7..3:8
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major
+                InvalidCharacterInFile @ 4:5..4:6
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major
+                InvalidCharacterInFile @ 5:8..5:10
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major
+                InvalidCharacterInFile @ 6:8..6:9
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
+    fn test_nbsp_separated_from_code() {
+        let code = concat!(
+            "Ч1   \u{00A0}   = 1;\n",
+            "Ч10 =\u{00A0}1;\n",
+            "Ч5 = Макс(1,\u{00A0}2);\n",
+            "Ч8 = Макс(\u{00A0}1, 2);\n",
+            "\u{00A0}\u{00A0}Ч2 = 3;\n",
+            "\u{00A0} Ч3 = 1;\n",
+            " \u{00A0}Ч4 = 1;\n",
+            "Ч6 = 1;\u{00A0}\n",
+        );
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn test_nbsp_breaks_parameter_doc_line() {
+        let code = concat!(
+            "// Описание.\n",
+            "//\n",
+            "// Параметры:\n",
+            "//  Имя\u{00A0}- Строка - описание\n",
+            "//\n",
+            "Процедура Тест(Имя) Экспорт\n",
+            "КонецПроцедуры\n",
+        );
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#"
+                InvalidCharacterInFile @ 4:1..4:28
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
                   severity: Major"#]],
         );
@@ -352,28 +428,35 @@ mod tests {
     }
 
     #[test]
-    fn test_all_illegal_dashes() {
-        let code = "А = \"\u{AD}\";\nБ = \"\u{2012}\";\nВ = \"\u{2013}\";\nГ = \"\u{2014}\";\nД = \"\u{2015}\";\nЕ = \"\u{2212}\";";
+    fn test_all_illegal_dashes_in_expression() {
+        let code = concat!(
+            "А = 5 \u{AD} 2;\n",
+            "Б = 5 \u{2012} 2;\n",
+            "В = 5 \u{2013} 2;\n",
+            "Г = 5 \u{2014} 2;\n",
+            "Д = 5 \u{2015} 2;\n",
+            "Е = 5 \u{2212} 2;\n",
+        );
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::InvalidCharacterInFile,
             expect![[r#"
-                InvalidCharacterInFile @ 1:5..1:8
+                InvalidCharacterInFile @ 1:7..1:8
                   message: Нужно исправить на правильный символ "-"
                   severity: Major
-                InvalidCharacterInFile @ 2:5..2:8
+                InvalidCharacterInFile @ 2:7..2:8
                   message: Нужно исправить на правильный символ "-"
                   severity: Major
-                InvalidCharacterInFile @ 3:5..3:8
+                InvalidCharacterInFile @ 3:7..3:8
                   message: Нужно исправить на правильный символ "-"
                   severity: Major
-                InvalidCharacterInFile @ 4:5..4:8
+                InvalidCharacterInFile @ 4:7..4:8
                   message: Нужно исправить на правильный символ "-"
                   severity: Major
-                InvalidCharacterInFile @ 5:5..5:8
+                InvalidCharacterInFile @ 5:7..5:8
                   message: Нужно исправить на правильный символ "-"
                   severity: Major
-                InvalidCharacterInFile @ 6:5..6:8
+                InvalidCharacterInFile @ 6:7..6:8
                   message: Нужно исправить на правильный символ "-"
                   severity: Major"#]],
         );
@@ -381,15 +464,15 @@ mod tests {
 
     #[test]
     fn test_mixed_invalid_chars() {
-        let code = "А = \"\u{2013}\";\nБ = \"\u{00A0}\";";
+        let code = concat!("А = 5 \u{2013} 2;\n", "Б2\u{00A0}= 1;\n");
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::InvalidCharacterInFile,
             expect![[r#"
-                InvalidCharacterInFile @ 1:5..1:8
+                InvalidCharacterInFile @ 1:7..1:8
                   message: Нужно исправить на правильный символ "-"
                   severity: Major
-                InvalidCharacterInFile @ 2:5..2:8
+                InvalidCharacterInFile @ 2:3..2:4
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
                   severity: Major"#]],
         );

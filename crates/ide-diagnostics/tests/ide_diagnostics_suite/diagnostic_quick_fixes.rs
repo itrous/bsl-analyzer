@@ -315,13 +315,24 @@ fn a_module_method_of_the_same_name_is_not_renamed() {
 // --- InvalidCharacterInFile ----------------------------------------------------------
 
 #[test]
-fn illegal_characters_in_a_comment_are_replaced_safely() {
+fn illegal_characters_in_an_ordinary_comment_are_not_reported() {
+    // The platform compiles a comment whatever stands in it, so there is nothing
+    // to fix - and nothing to report.
     let source = "// Итог\u{00A0}\u{2014} сумма с\u{00AD}кидки\nА = 1;\n";
+    let diagnostics = module_diagnostics(source, Project::default());
+    assert_eq!(fixes_of(source, &diagnostics, DiagnosticCode::InvalidCharacterInFile), "");
+}
+
+#[test]
+fn a_non_breaking_space_glued_to_an_identifier_is_replaced_safely() {
+    // Absorbed into the identifier, it keeps the module from compiling; the
+    // ordinary space that replaces it carries no meaning of its own.
+    let source = "А\u{00A0}= 1;\n";
     let diagnostics = module_diagnostics(source, Project::default());
     assert_eq!(
         fixes_of(source, &diagnostics, DiagnosticCode::InvalidCharacterInFile),
-        "InvalidCharacterInFile @ 1:1 Заменить недопустимые символы [fix_all=true]\n\
-         // Итог - сумма скидки\nА = 1;\n"
+        "InvalidCharacterInFile @ 1:2 Заменить недопустимые символы [fix_all=true]\n\
+         А = 1;\n"
     );
 }
 
@@ -369,15 +380,12 @@ fn illegal_character_in_a_parameter_doc_separator_is_manual() {
 }
 
 #[test]
-fn illegal_character_in_a_string_is_a_manual_fix() {
-    // A non-breaking space inside a literal may be exactly what the code looks for.
+fn illegal_character_in_a_string_is_not_reported() {
+    // The platform compiles the literal, and a non-breaking space inside it may be
+    // exactly what the code looks for - there is nothing wrong to report.
     let source = "Процедура Тест(Текст)\n    Текст = СтрЗаменить(Текст, \"\u{00A0}\", \"\");\nКонецПроцедуры\n";
     let diagnostics = module_diagnostics(source, Project::default());
-    assert_eq!(
-        fixes_of(source, &diagnostics, DiagnosticCode::InvalidCharacterInFile),
-        "InvalidCharacterInFile @ 2:32 Заменить недопустимые символы (меняет текст программы) [fix_all=false]\n\
-         Процедура Тест(Текст)\n    Текст = СтрЗаменить(Текст, \" \", \"\");\nКонецПроцедуры\n"
-    );
+    assert_eq!(fixes_of(source, &diagnostics, DiagnosticCode::InvalidCharacterInFile), "");
 }
 
 // --- ServerSideExportFormMethod ------------------------------------------------------
