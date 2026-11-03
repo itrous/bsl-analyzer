@@ -4465,9 +4465,56 @@ mod tests {
         std::time::Duration::from_secs(10 * 60)
     };
 
+    /// Interpreter names to try, in order. The list is platform-dependent because python.org
+    /// installs `python.exe` on Windows and ships no `python3.exe`.
+    fn python_candidates() -> &'static [&'static str] {
+        if cfg!(windows) {
+            &["python3", "python"]
+        } else {
+            &["python3"]
+        }
+    }
+
+    /// Returns the first candidate that can be spawned; the error names every candidate tried.
+    fn resolve_python_from(candidates: &[&str]) -> Result<String, String> {
+        let mut failures = Vec::new();
+        for candidate in candidates {
+            match std::process::Command::new(candidate)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(_) => return Ok((*candidate).to_owned()),
+                Err(error) => failures.push(format!("{candidate}: {error}")),
+            }
+        }
+        Err(format!("no python interpreter could be spawned; tried [{}]", failures.join(", ")))
+    }
+
+    fn resolve_python() -> String {
+        resolve_python_from(python_candidates()).unwrap_or_else(|message| panic!("{message}"))
+    }
+
+    #[test]
+    fn python_candidates_start_with_python3_and_are_platform_dependent() {
+        let candidates = python_candidates();
+        assert_eq!(candidates[0], "python3");
+        assert_eq!(candidates.contains(&"python"), cfg!(windows));
+    }
+
+    #[test]
+    fn resolve_python_from_impossible_candidates_names_all_of_them() {
+        let error =
+            resolve_python_from(&["bsl-no-such-python-a", "bsl-no-such-python-b"]).unwrap_err();
+        assert!(error.contains("bsl-no-such-python-a"), "{error}");
+        assert!(error.contains("bsl-no-such-python-b"), "{error}");
+    }
+
     fn helper_program(response: &str, exit_code: i32) -> SearchPostgresCredentialHelperConfig {
         SearchPostgresCredentialHelperConfig {
-            program: Some("python3".to_owned()),
+            program: Some(resolve_python()),
             args: vec![
                 "-c".to_owned(),
                 "import sys; sys.stdin.readline(); sys.stdout.write(sys.argv[1]); sys.exit(int(sys.argv[2]))"
