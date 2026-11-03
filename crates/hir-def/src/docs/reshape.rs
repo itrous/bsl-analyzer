@@ -238,6 +238,11 @@ impl Block<'_> {
         (ways, section)
     }
 
+    // shortcut: a line whose replacement moves a boundary parses the block again, so the cost
+    // is quadratic in the number of such lines. Outside the few lines that decide a link, these
+    // start with a soft hyphen and become a field marker or a `Параметры:` header, which takes
+    // seconds only at thousands of them in one block. If real modules hold such blocks, the
+    // parameter parser has to resume from a saved state instead.
     fn reshaped_by_whole_block(&self, index: usize) -> bool {
         let mut candidate = self.lines.to_vec();
         candidate[index].clone_from(&self.replaced[index]);
