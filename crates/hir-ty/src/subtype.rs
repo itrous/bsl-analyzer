@@ -485,6 +485,9 @@ fn member_labels(db: &dyn TypeKernelDb, ty: TypeId) -> Vec<String> {
         TypeKind::Union(members) => {
             members.iter().flat_map(|member| member_labels(db, *member)).collect()
         }
+        // The stored name is the Russian one, except for namesakes: those print alike but
+        // keep an English alias, because they are distinct types.
+        TypeKind::PlatformObject(facet) => vec![facet.name.to_string()],
         kind => {
             let ctx = PlainDisplayCtx { locale: Locale::Ru, precision_visible: false };
             vec![display_name(kind, &ctx, db)]
@@ -584,6 +587,19 @@ mod tests {
         assert!(!type_sets_overlap(&db, number, undefined));
         assert!(!type_sets_overlap(&db, number, string_or_undefined));
         assert!(!type_sets_overlap(&db, string, formatted));
+    }
+
+    #[test]
+    fn type_sets_overlap_tells_platform_namesakes_apart() {
+        // Both print as `ЭлементыФормы`, yet they are distinct types with distinct members.
+        let db = InMemoryDb::new();
+        let form_items = db.platform_object("FormItems".into());
+        let controls = db.platform_object("Controls".into());
+        let controls_or_string = db.union(vec![controls, db.string(None, false)]);
+
+        assert!(!is_coercible_to(&db, controls_or_string, form_items));
+        assert!(!type_sets_overlap(&db, form_items, controls_or_string));
+        assert!(type_sets_overlap(&db, form_items, form_items));
     }
 
     #[test]
