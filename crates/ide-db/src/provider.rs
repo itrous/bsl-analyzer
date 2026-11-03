@@ -292,6 +292,9 @@ pub trait AnalysisProvider {
 
     fn kernel_type_display(&self, id: bsl_types::kind::TypeId, locale: base_db::Locale) -> String;
 
+    /// Whether the type is `Undefined` or a union containing it.
+    fn kernel_type_includes_undefined(&self, id: bsl_types::kind::TypeId) -> bool;
+
     /// The project's `min_platform_version`; `None` (the default for providers
     /// without project settings) keeps the min-platform check silent.
     fn min_platform_version(&self) -> Option<Arc<str>> {

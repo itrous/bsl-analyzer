@@ -41,7 +41,7 @@ pub fn from_hir(
 }
 
 /// Whether two union display labels (`A | B | C`) share a member.
-fn labels_overlap(expected: &str, actual: &str) -> bool {
+pub(crate) fn labels_overlap(expected: &str, actual: &str) -> bool {
     let actual_members = actual.split(" | ").map(str::trim);
     expected.split(" | ").map(str::trim).any(|member| actual_members.clone().any(|a| a == member))
 }

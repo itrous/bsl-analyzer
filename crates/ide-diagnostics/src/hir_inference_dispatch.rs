@@ -13,6 +13,7 @@ pub(crate) const INFERENCE_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::MismatchedArgCount,
     DiagnosticCode::TypeMismatch,
     DiagnosticCode::TypeMismatchByDocComment,
+    DiagnosticCode::PossiblyUndefinedValue,
     DiagnosticCode::UnresolvedField,
     DiagnosticCode::UnresolvedMetadataPath,
     DiagnosticCode::ReadOnlyPropertyAssignment,
@@ -55,6 +56,7 @@ const ARG_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::MismatchedArgCount,
     DiagnosticCode::TypeMismatch,
     DiagnosticCode::TypeMismatchByDocComment,
+    DiagnosticCode::PossiblyUndefinedValue,
 ];
 
 /// The base-aware passes of the extension merge re-infer a whole module
@@ -180,7 +182,9 @@ fn dispatch_inference_diagnostic(
             if *from_doc_comment {
                 handlers::type_mismatch_by_doc_comment::from_hir(*expected, *actual, range, ctx)
             } else {
-                handlers::type_mismatch::from_hir(*expected, *actual, range, ctx)
+                handlers::type_mismatch::from_hir(*expected, *actual, range, ctx).or_else(|| {
+                    handlers::possibly_undefined_value::from_hir(*expected, *actual, range, ctx)
+                })
             }
         }
         InferenceDiagnostic::UnresolvedField { receiver_ty, field_name, .. } => {

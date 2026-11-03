@@ -178,6 +178,7 @@ pub enum DiagnosticCode {
     MismatchedArgCount,
     TypeMismatch,
     TypeMismatchByDocComment,
+    PossiblyUndefinedValue,
     UnresolvedField,
     UnresolvedMetadataPath,
     ReadOnlyPropertyAssignment,
