@@ -47,18 +47,7 @@ pub fn comment_token_is_string_text(token: &SyntaxToken) -> bool {
     if token.kind() != SyntaxKind::COMMENT {
         return false;
     }
-    let left = non_trivia_kind(token, false);
-    let right = non_trivia_kind(token, true);
-    matches!(left, Some(SyntaxKind::STRING_START | SyntaxKind::STRING_PART))
-        && matches!(
-            right,
-            Some(
-                SyntaxKind::STRING_PART
-                    | SyntaxKind::STRING_TAIL
-                    | SyntaxKind::KW_END_PROCEDURE
-                    | SyntaxKind::KW_END_FUNCTION
-            )
-        )
+    is_string_text_between(non_trivia_kind(token, false), non_trivia_kind(token, true))
 }
 
 /// A `//` line of a multiline literal sits a few tokens from the string boundary.
@@ -121,9 +110,14 @@ pub fn comment_runs_of(text: &str, tokens: &[LineToken]) -> Vec<CommentRun> {
 }
 
 fn runs_of(tokens: &[LineToken], line_breaks: &[usize]) -> Vec<CommentRun> {
-    collect_runs(tokens.iter().zip(line_breaks).enumerate().map(|(index, (token, &breaks))| {
-        (token.kind, token.range, breaks, is_string_text_at(tokens, index))
-    }))
+    let string_text = string_text_flags(tokens);
+    collect_runs(
+        tokens
+            .iter()
+            .zip(line_breaks)
+            .zip(string_text)
+            .map(|((token, &breaks), string_text)| (token.kind, token.range, breaks, string_text)),
+    )
 }
 
 /// Переводы строки, которые несёт токен. Кроме `NEWLINE` это одиночные `\r`
@@ -200,9 +194,7 @@ fn collect_runs(
 /// справа означает, что строка оборвана и литерал ею не продолжен, — это
 /// настоящий комментарий. Правило лексическое, потому что судить его
 /// приходится и там, где дерева нет, — по токенам одного блока строк.
-fn is_string_text_at(tokens: &[LineToken], index: usize) -> bool {
-    let left = tokens[..index].iter().rev().map(|t| t.kind).find(|k| !k.is_trivia());
-    let right = tokens[index + 1..].iter().map(|t| t.kind).find(|k| !k.is_trivia());
+fn is_string_text_between(left: Option<SyntaxKind>, right: Option<SyntaxKind>) -> bool {
     matches!(left, Some(SyntaxKind::STRING_START | SyntaxKind::STRING_PART))
         && matches!(
             right,
@@ -215,10 +207,84 @@ fn is_string_text_at(tokens: &[LineToken], index: usize) -> bool {
         )
 }
 
+/// Значимые соседи каждого токена — за один проход в каждую сторону: внутри
+/// серии значимых токенов нет, и искать их от каждой её строки было бы
+/// квадратично по длине серии.
+fn string_text_flags(tokens: &[LineToken]) -> Vec<bool> {
+    let mut next_significant = vec![None; tokens.len()];
+    let mut right = None;
+    for (index, token) in tokens.iter().enumerate().rev() {
+        next_significant[index] = right;
+        if !token.kind.is_trivia() {
+            right = Some(token.kind);
+        }
+    }
+    let mut left = None;
+    tokens
+        .iter()
+        .zip(next_significant)
+        .map(|(token, right)| {
+            let string_text = is_string_text_between(left, right);
+            if !token.kind.is_trivia() {
+                left = Some(token.kind);
+            }
+            string_text
+        })
+        .collect()
+}
+
 fn push_run(runs: &mut Vec<CommentRun>, lines: Vec<CommentLine>) {
     let range = match (lines.first(), lines.last()) {
         (Some(first), Some(last)) => TextRange::new(first.range.start(), last.range.end()),
         _ => return,
     };
     runs.push(CommentRun { lines, range });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Определение правила: от токена ищем значимых соседей по всему потоку.
+    fn string_text_by_scanning(tokens: &[LineToken], index: usize) -> bool {
+        let left = tokens[..index].iter().rev().map(|t| t.kind).find(|k| !k.is_trivia());
+        let right = tokens[index + 1..].iter().map(|t| t.kind).find(|k| !k.is_trivia());
+        is_string_text_between(left, right)
+    }
+
+    #[test]
+    fn string_text_flags_agree_with_scanning_on_every_short_stream() {
+        const KINDS: [SyntaxKind; 7] = [
+            SyntaxKind::COMMENT,
+            SyntaxKind::NEWLINE,
+            SyntaxKind::STRING_START,
+            SyntaxKind::STRING_PART,
+            SyntaxKind::STRING_TAIL,
+            SyntaxKind::KW_END_PROCEDURE,
+            SyntaxKind::IDENT,
+        ];
+        let mut string_text_seen = 0;
+        for length in 0..=6u32 {
+            for mut code in 0..KINDS.len().pow(length) {
+                let tokens: Vec<LineToken> = (0..length)
+                    .map(|_| {
+                        let kind = KINDS[code % KINDS.len()];
+                        code /= KINDS.len();
+                        LineToken { kind, range: TextRange::default() }
+                    })
+                    .collect();
+                let flags = string_text_flags(&tokens);
+                for (index, flag) in flags.iter().enumerate() {
+                    assert_eq!(
+                        *flag,
+                        string_text_by_scanning(&tokens, index),
+                        "token {index} of {tokens:?}"
+                    );
+                    string_text_seen += usize::from(*flag);
+                }
+                assert_eq!(flags.len(), tokens.len());
+            }
+        }
+        assert!(string_text_seen > 1_000, "only {string_text_seen} flags were set");
+    }
 }

@@ -1,6 +1,7 @@
 use bsl_metadata::{FormType, ModuleType};
 use hir::AnnotationKind;
 use ide_db::TextRange;
+use stdx::case::starts_with_ignore_case;
 use syntax::ast::{AstNode, FunctionDef, ProcedureDef};
 use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
@@ -48,14 +49,20 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for (_, proc) in item_tree.procedures() {
-        if proc.is_export && !has_client_annotation(&proc.annotations) {
+        if proc.is_export
+            && !has_client_annotation(&proc.annotations)
+            && !is_bsp_pluggable_handler(proc.name.as_str())
+        {
             let fixes = fixes_for(proc.source_range);
             diagnostics.push(make_diagnostic(proc.name_range, fixes, code, ctx));
         }
     }
 
     for (_, func) in item_tree.functions() {
-        if func.is_export && !has_client_annotation(&func.annotations) {
+        if func.is_export
+            && !has_client_annotation(&func.annotations)
+            && !is_bsp_pluggable_handler(func.name.as_str())
+        {
             let fixes = fixes_for(func.source_range);
             diagnostics.push(make_diagnostic(func.name_range, fixes, code, ctx));
         }
@@ -108,6 +115,13 @@ fn has_client_annotation(annotations: &[hir::Annotation]) -> bool {
                 | AnnotationKind::AtClientAtServerNoContext
         )
     })
+}
+
+/// The БСП reserves the `Подключаемый_` prefix, `Attachable_` in English code, for form
+/// handlers it calls from outside the form through a form reference, so `Экспорт` is part
+/// of that contract and cannot be removed.
+fn is_bsp_pluggable_handler(name: &str) -> bool {
+    ["подключаемый_", "attachable_"].iter().any(|prefix| starts_with_ignore_case(name, prefix))
 }
 
 fn make_diagnostic(
@@ -201,6 +215,63 @@ mod tests {
 КонецПроцедуры
 "#;
         assert!(flagged(code).is_empty(), "&НаКлиенте export must not be flagged");
+    }
+
+    #[test]
+    fn bsp_pluggable_handler_export_not_flagged() {
+        let code = r#"
+&НаСервере
+Процедура Подключаемый_ВыполнитьКомандуНаСервере(Контекст, Результат) Экспорт
+КонецПроцедуры
+
+&НаСервере
+Функция подключаемый_ПолучитьДанные() Экспорт
+	Возврат Неопределено;
+КонецФункции
+"#;
+        assert!(
+            flagged(code).is_empty(),
+            "Подключаемый_ handlers are called by the БСП from outside the form"
+        );
+    }
+
+    #[test]
+    fn bsp_pluggable_handler_english_prefix_export_not_flagged() {
+        let code = r#"
+&AtServer
+Procedure Attachable_ContinueCommandExecutionAtServer(Parameters, Additional) Export
+EndProcedure
+
+&AtServer
+Function attachable_GetData() Export
+	Return Undefined;
+EndFunction
+"#;
+        assert!(flagged(code).is_empty(), "the БСП prefix has an English form");
+    }
+
+    #[test]
+    fn attachable_word_not_at_name_start_still_flagged() {
+        let code = r#"
+&AtServer
+Procedure RunAttachable_Command() Export
+EndProcedure
+"#;
+        assert_eq!(flagged(code).len(), 1, "the exemption is anchored at the name start");
+    }
+
+    #[test]
+    fn pluggable_word_not_at_name_start_still_flagged() {
+        let code = r#"
+&НаСервере
+Процедура ОбработатьПодключаемый_Команду() Экспорт
+КонецПроцедуры
+
+&НаСервере
+Процедура ЗаполнитьНаСервере() Экспорт
+КонецПроцедуры
+"#;
+        assert_eq!(flagged(code).len(), 2, "the exemption is anchored at the name start");
     }
 
     #[test]
