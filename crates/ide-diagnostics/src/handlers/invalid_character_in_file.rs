@@ -345,6 +345,7 @@ mod tests {
             "Ч11 = 1\u{00A0}\u{00A0}+ 2;\n",
             "Ч12 = 1\u{00A0}\n",
             "+ 2;\n",
+            "Ч13 = 1\u{00A0} + 2;\n",
         );
         check_diagnostics_snapshot_for(
             code,
@@ -366,6 +367,9 @@ mod tests {
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
                   severity: Major
                 InvalidCharacterInFile @ 6:8..6:9
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major
+                InvalidCharacterInFile @ 8:8..8:10
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
                   severity: Major"#]],
         );
