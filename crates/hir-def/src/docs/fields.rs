@@ -1,20 +1,29 @@
 //! Field continuations belong to the documented container, not its return-type union.
 
 use super::{
-    parse_parameter_line, parse_return_type_union, parse_type_line, split_type_description,
-    ParameterDoc, TypeDoc,
+    mark_role, parse_parameter_line, parse_return_type_union, parse_type_line,
+    split_type_description, DescriptionUse, LineRole, ParameterDoc, TypeDoc,
 };
 
 /// Consumes a field block while retaining the boundary with the next top-level declaration.
-pub(super) fn parse_fields(lines: &[String], cursor: &mut usize) -> Vec<ParameterDoc> {
+pub(super) fn parse_fields(
+    lines: &[String],
+    cursor: &mut usize,
+    roles: Option<&mut [LineRole]>,
+) -> Vec<ParameterDoc> {
     let Some(level) = lines.get(*cursor).and_then(|line| marker_depth(line.trim())) else {
         return Vec::new();
     };
-    parse_fields_at_level(lines, cursor, level)
+    parse_fields_at_level(lines, cursor, level, roles)
 }
 
 /// The number of leading stars is the field's nesting level in 1C documentation.
-fn parse_fields_at_level(lines: &[String], cursor: &mut usize, level: usize) -> Vec<ParameterDoc> {
+fn parse_fields_at_level(
+    lines: &[String],
+    cursor: &mut usize,
+    level: usize,
+    mut roles: Option<&mut [LineRole]>,
+) -> Vec<ParameterDoc> {
     let mut fields = Vec::<ParameterDoc>::new();
     let mut current: Option<usize> = None;
     let mut field_indent = indentation(&lines[*cursor]);
@@ -31,7 +40,8 @@ fn parse_fields_at_level(lines: &[String], cursor: &mut usize, level: usize) -> 
                 break;
             }
             if marker_level > level {
-                let nested = parse_fields_at_level(lines, cursor, marker_level);
+                let nested =
+                    parse_fields_at_level(lines, cursor, marker_level, roles.as_deref_mut());
                 if let Some(field) = current.map(|index| &mut fields[index]) {
                     if let Some(last_type) = field.types.last_mut() {
                         last_type.parameters.extend(nested);
@@ -40,6 +50,7 @@ fn parse_fields_at_level(lines: &[String], cursor: &mut usize, level: usize) -> 
                 continue;
             }
 
+            mark_role(&mut roles, *cursor, LineRole::FieldMarker(level));
             current = parse_field(trimmed, level).map(|field| {
                 fields.push(field);
                 fields.len() - 1
@@ -47,6 +58,7 @@ fn parse_fields_at_level(lines: &[String], cursor: &mut usize, level: usize) -> 
             field_indent = indentation(line);
             open_union = field_union_is_open(trimmed);
         } else if indentation(line) > field_indent {
+            let mut role = LineRole::Text { level, description: DescriptionUse::Prose };
             if let Some(field) = current.map(|index| &mut fields[index]) {
                 let continuation = (open_union || trimmed.starts_with('-'))
                     .then(|| continuation_types(trimmed))
@@ -54,6 +66,7 @@ fn parse_fields_at_level(lines: &[String], cursor: &mut usize, level: usize) -> 
                 if let Some(types) = continuation {
                     field.types.extend(types);
                     open_union = type_union_is_open(trimmed);
+                    role = LineRole::Type(level);
                 } else {
                     if let Some(last) = field.types.last_mut() {
                         let description = last.description.get_or_insert_with(String::new);
@@ -63,8 +76,11 @@ fn parse_fields_at_level(lines: &[String], cursor: &mut usize, level: usize) -> 
                         description.push_str(trimmed);
                     }
                     open_union = false;
+                    let description = DescriptionUse::of(field.types.last());
+                    role = LineRole::Text { level, description };
                 }
             }
+            mark_role(&mut roles, *cursor, role);
         } else {
             break;
         }
