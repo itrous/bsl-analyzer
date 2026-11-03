@@ -422,7 +422,19 @@ fn analyze_salsa(
     let mut proj_config = if let Some(ref cfg) = config_path {
         project_model::ProjectConfig::load_from_file(cfg)?
     } else {
-        project_model::ProjectConfig::load(&source_dir)?.unwrap_or_default()
+        // `--source-dir` usually points at the configuration root inside a project
+        // while the config sits at the project root; `load` looks in one directory
+        // only and would silently run on defaults here.
+        match project_model::ProjectConfig::discover(&source_dir)? {
+            Some((config, path)) => {
+                tracing::info!(path = %path.display(), "Using project configuration");
+                config
+            }
+            None => {
+                tracing::info!("No project configuration found, using defaults");
+                project_model::ProjectConfig::default()
+            }
+        }
     };
 
     // Applied before anything reads the config: `configuration_path` and

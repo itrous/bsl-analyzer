@@ -2934,6 +2934,26 @@ impl ProjectConfig {
         Ok(None)
     }
 
+    /// Finds the project config starting from any directory inside the project:
+    /// the nearest directory on the way up to the filesystem root that holds one of [`CONFIG_FILE_NAMES`] wins, and within
+    /// it the usual file-name precedence applies. Returns the config together
+    /// with the file it came from, so a caller can say which one a run used.
+    ///
+    /// [`ProjectConfig::load`] deliberately looks in one directory only; a batch
+    /// run is pointed at the configuration root (`<project>/src/cf`) while the
+    /// config sits at the project root, and `load` there silently yields defaults.
+    pub fn discover(start_dir: &Path) -> Result<Option<(Self, PathBuf)>, ConfigLoadError> {
+        for candidate in start_dir.ancestors() {
+            for filename in CONFIG_FILE_NAMES {
+                let path = candidate.join(filename);
+                if path.is_file() {
+                    return Self::load_from_file(&path).map(|config| Some((config, path)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn load_from_file(path: &Path) -> Result<Self, ConfigLoadError> {
         let err = |message: String| ConfigLoadError { path: path.to_path_buf(), message };
         if !path.exists() {
@@ -8281,6 +8301,56 @@ type_narrowing = false
             err.is_err(),
             "an invalid scope value must fail deserialization, never degrade to on"
         );
+    }
+
+    fn write_config(dir: &Path, name: &str, text: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn discover_finds_the_config_in_an_ancestor_and_reports_its_path() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "");
+        let start = dir.path().join("src/cf");
+        fs::create_dir_all(&start).unwrap();
+
+        let (_, path) = ProjectConfig::discover(&start).unwrap().expect("config not found");
+        assert_eq!(path, dir.path().join("bsl-analyzer.toml"));
+        assert!(ProjectConfig::load(&start).unwrap().is_none(), "load must stay single-directory");
+    }
+
+    #[test]
+    fn discover_returns_none_when_no_directory_up_the_tree_has_a_config() {
+        let dir = tempdir().unwrap();
+        let start = dir.path().join("a/b");
+        fs::create_dir_all(&start).unwrap();
+        // The temp root may itself sit under a directory with a config; only
+        // assert on what this tree controls.
+        if let Some((_, path)) = ProjectConfig::discover(&start).unwrap() {
+            assert!(!path.starts_with(dir.path()), "found a config inside the empty tree");
+        }
+    }
+
+    #[test]
+    fn discover_prefers_the_nearest_directory() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "");
+        let start = dir.path().join("src/cf");
+        write_config(&start, ".bsl-analyzer.json", "{}");
+
+        let (_, path) = ProjectConfig::discover(&start).unwrap().expect("config not found");
+        assert_eq!(path, start.join(".bsl-analyzer.json"));
+    }
+
+    #[test]
+    fn discover_keeps_the_file_name_precedence_within_a_directory() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "");
+        write_config(dir.path(), ".bsl-analyzer.json", "{}");
+
+        let (_, path) = ProjectConfig::discover(dir.path()).unwrap().expect("config not found");
+        assert_eq!(path, dir.path().join("bsl-analyzer.toml"));
     }
 }
 
