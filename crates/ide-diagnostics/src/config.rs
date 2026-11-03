@@ -1,6 +1,8 @@
 use crate::handlers;
 use crate::handlers::deprecated_platform_api::ExcludeProblem;
-use crate::metadata::{parse_severity, DiagnosticSeverityLevel, DiagnosticType, MetadataTag};
+use crate::metadata::{
+    parse_severity, parse_severity_opt, DiagnosticSeverityLevel, DiagnosticType, MetadataTag,
+};
 use crate::{DiagnosticCode, Severity};
 use base_db::{DiagnosticsConfigInput, Locale};
 use std::collections::HashMap;
@@ -9,8 +11,12 @@ use std::path::Path;
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataOverride {
     pub severity: Option<DiagnosticSeverityLevel>,
+    // Project configs spell keys in camelCase while the interned form (`to_input`) is
+    // snake_case JSON; aliases accept both without changing what is stored.
+    #[serde(alias = "diagnosticType")]
     pub diagnostic_type: Option<DiagnosticType>,
     pub tags: Option<Vec<MetadataTag>>,
+    #[serde(alias = "lspSeverity")]
     pub lsp_severity: Option<String>,
 }
 
@@ -151,6 +157,49 @@ impl DiagnosticsConfig {
                 unknown_code_hint(name)
             );
         }
+        if let Some(overrides) =
+            diagnostics.get("metadataOverrides").and_then(serde_json::Value::as_object)
+        {
+            for (name, over) in overrides {
+                if name.parse::<DiagnosticCode>().is_ok() {
+                    let severity = over.get("lspSeverity").or_else(|| over.get("lsp_severity"));
+                    if let Some(value) = severity.and_then(serde_json::Value::as_str) {
+                        if parse_severity_opt(value).is_none() {
+                            tracing::warn!(
+                                key = name.as_str(),
+                                config_file = %file,
+                                "unknown lspSeverity `{value}` for `{name}` in \
+                                 [diagnostics.metadataOverrides] of {file}: the override falls \
+                                 back to `warning`; the accepted names are {}",
+                                ACCEPTED_SEVERITY_NAMES.join(", ")
+                            );
+                        }
+                    }
+                    continue;
+                }
+                tracing::warn!(
+                    key = name.as_str(),
+                    config_file = %file,
+                    "unknown diagnostic code `{name}` in [diagnostics.metadataOverrides] of \
+                     {file}: the override is ignored and the rule keeps its default severity; \
+                     {}",
+                    unknown_code_hint(name)
+                );
+            }
+        }
+        if let Some(sections) = diagnostics.as_object() {
+            for name in
+                sections.keys().filter(|name| !KNOWN_DIAGNOSTICS_KEYS.contains(&name.as_str()))
+            {
+                tracing::warn!(
+                    key = name.as_str(),
+                    config_file = %file,
+                    "unknown key `{name}` in [diagnostics] of {file}: the section is ignored; \
+                     the supported keys are {}",
+                    KNOWN_DIAGNOSTICS_KEYS.join(", ")
+                );
+            }
+        }
         for problem in handlers::deprecated_platform_api::unknown_excluded_names(diagnostics) {
             match problem {
                 ExcludeProblem::UnknownName(name) => tracing::warn!(
@@ -251,6 +300,22 @@ impl DiagnosticsConfig {
     }
 }
 
+/// Top-level keys of the `[diagnostics]` value that reaches [`DiagnosticsConfig`].
+/// `baseline` is absent on purpose: `project-model` keeps it in its own field and
+/// strips it from the rules JSON, so it never arrives here.
+const KNOWN_DIAGNOSTICS_KEYS: &[&str] = &[
+    "parameters",
+    "metadataOverrides",
+    "ordinaryAppSupport",
+    "dataflowMaxIterations",
+    "bsllsSuppressionCompat",
+];
+
+/// Hint text for the unknown-severity warning, not the criterion: `parse_severity_opt`
+/// decides, so a stale entry here costs a slightly wrong hint, never a wrong verdict.
+const ACCEPTED_SEVERITY_NAMES: &[&str] =
+    &["error", "warning", "information", "info", "hint", "blocker", "critical", "major"];
+
 /// Codes this analyzer used to have, with the code that took over their checks.
 /// All of them were merged into `DeprecatedPlatformApi` in v0.2.50.
 pub(crate) const REMOVED_CODES: &[(&str, &str, &str)] = &[
@@ -328,6 +393,7 @@ impl<'de> serde::Deserialize<'de> for DiagnosticsConfig {
                 let mut ordinary_app_support = false;
                 let mut dataflow_max_iterations = hir::dataflow::DEFAULT_MAX_ITERATIONS;
                 let mut bslls_suppression_compat = true;
+                let mut metadata_overrides = HashMap::new();
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -360,6 +426,14 @@ impl<'de> serde::Deserialize<'de> for DiagnosticsConfig {
                                 }
                             }
                         }
+                        "metadataOverrides" => {
+                            let overrides: HashMap<String, MetadataOverride> = map.next_value()?;
+                            metadata_overrides.extend(overrides.into_iter().filter_map(
+                                |(code_str, over)| {
+                                    Some((code_str.parse::<DiagnosticCode>().ok()?, over))
+                                },
+                            ));
+                        }
                         _ => {
                             let _: serde_json::Value = map.next_value()?;
                         }
@@ -372,7 +446,7 @@ impl<'de> serde::Deserialize<'de> for DiagnosticsConfig {
                     parameters,
                     ordinary_app_support,
                     dataflow_max_iterations,
-                    metadata_overrides: HashMap::new(),
+                    metadata_overrides,
                     only_enabled: None,
                     locale: Locale::default(),
                     bslls_suppression_compat,
@@ -1120,6 +1194,66 @@ mod tests {
             MetadataOverride { lsp_severity: Some("hint".into()), ..Default::default() },
         );
         assert_eq!(config.severity(DiagnosticCode::UnavailableInEnvironment), Severity::Hint);
+    }
+
+    fn override_section() -> serde_json::Value {
+        json!({ "metadataOverrides": { "CommonModuleInvalidType": { "lspSeverity": "warning" } } })
+    }
+
+    #[test]
+    fn metadata_override_from_project_config_lowers_severity() {
+        assert_eq!(
+            DiagnosticsConfig::default().severity(DiagnosticCode::CommonModuleInvalidType),
+            Severity::Major,
+            "control: the default grade is not Warning"
+        );
+        let config = DiagnosticsConfig::from_project_json(&override_section(), Locale::En);
+        assert_eq!(config.severity(DiagnosticCode::CommonModuleInvalidType), Severity::Warning);
+        // The snake_case spelling of the interned form keeps working next to the camelCase one.
+        let snake = json!({ "metadataOverrides": { "CommonModuleInvalidType": { "lsp_severity": "hint" } } });
+        let config = DiagnosticsConfig::from_project_json(&snake, Locale::En);
+        assert_eq!(config.severity(DiagnosticCode::CommonModuleInvalidType), Severity::Hint);
+    }
+
+    #[test]
+    fn metadata_override_from_project_config_survives_the_interned_round_trip() {
+        let config = DiagnosticsConfig::from_project_json(&override_section(), Locale::En);
+        let restored = DiagnosticsConfig::from_input(&config.to_input());
+        assert_eq!(restored, config);
+        assert_eq!(restored.severity(DiagnosticCode::CommonModuleInvalidType), Severity::Warning);
+    }
+
+    #[test]
+    fn unknown_diagnostics_section_and_override_code_are_reported() {
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let raw = json!({
+            "metadataOverride": { "CommonModuleInvalidType": { "lspSeverity": "warning" } },
+            "metadataOverrides": { "NoSuchCode": { "lspSeverity": "warning" } },
+            "ordinaryAppSupport": true,
+        });
+        let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&raw, Some(file)));
+        assert_eq!(warnings.len(), 2, "one warning per ignored key: {warnings:#?}");
+        let section = warnings.iter().find(|w| w.contains("`metadataOverride`")).unwrap();
+        assert!(section.contains("bsl-analyzer.toml"), "names the file: {section}");
+        assert!(section.contains("metadataOverrides"), "lists the supported keys: {section}");
+        let code = warnings.iter().find(|w| w.contains("`NoSuchCode`")).unwrap();
+        assert!(code.contains("[diagnostics.metadataOverrides]"), "names the section: {code}");
+
+        let typo = json!({
+            "metadataOverrides": { "CommonModuleInvalidType": { "lspSeverity": "warnng" } }
+        });
+        let warnings =
+            warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&typo, Some(file)));
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("`warnng`"), "names the value: {}", warnings[0]);
+        assert!(warnings[0].contains("`CommonModuleInvalidType`"), "{}", warnings[0]);
+        assert!(warnings[0].contains("bsl-analyzer.toml"), "{}", warnings[0]);
+        assert!(warnings[0].contains("falls back to `warning`"), "{}", warnings[0]);
+
+        let known = warnings_of(|| {
+            DiagnosticsConfig::warn_unknown_parameters(&override_section(), Some(file))
+        });
+        assert!(known.is_empty(), "a valid section is silent: {known:#?}");
     }
 }
 
