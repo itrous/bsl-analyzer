@@ -311,6 +311,29 @@ pub fn parse_variable_docs(comments: &[String]) -> Option<VariableDocs> {
     Some(VariableDocs { raw, purpose, types: Vec::new(), deprecation, link: None })
 }
 
+/// Whether two versions of a method's documentation lines say different things about its
+/// parameters: their names, types and structure fields. Prose is not part of that, since
+/// no reader takes a meaning from it.
+pub fn doc_lines_change_parameters(before: &[String], after: &[String]) -> bool {
+    let parameters =
+        |lines: &[String]| parse_method_docs(lines).map(|docs| docs.parameters).unwrap_or_default();
+    !same_parameter_shape(&parameters(before), &parameters(after))
+}
+
+fn same_parameter_shape(left: &[ParameterDoc], right: &[ParameterDoc]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.name == right.name
+                && left.types.len() == right.types.len()
+                && left.types.iter().zip(&right.types).all(|(left, right)| {
+                    left.is_hyperlink == right.is_hyperlink
+                        && left.type_label_and_description().0
+                            == right.type_label_and_description().0
+                        && same_parameter_shape(&left.parameters, &right.parameters)
+                })
+        })
+}
+
 fn parse_method_docs(comments: &[String]) -> Option<MethodDocs> {
     if comments.is_empty() {
         return None;

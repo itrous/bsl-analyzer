@@ -1,10 +1,10 @@
+use crate::body_context::is_method_node;
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::{BodyContext, Diagnostic, DiagnosticCode, Fix, TextEdit};
 use hir::LocalRange;
 use ide_db::TextRange;
-use stdx::case::CaseExt;
-use syntax::{SyntaxKind, SyntaxToken, TextSize};
+use syntax::{CommentRun, SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -75,13 +75,95 @@ fn token_fix(kind: SyntaxKind, text: &str, start: TextSize) -> Option<Fix<LocalR
 
 /// The platform compiles a comment whatever stands in it, so only a comment the
 /// analyzer itself reads is worth a report: a `//` line of a multiline literal and
-/// an `Имя - Тип` line of a `Параметры:` section, whose split the character breaks.
-fn comment_replacement_changes_meaning(token: &SyntaxToken, text: &str) -> bool {
-    if syntax::comment_token_is_string_text(token) {
-        return true;
+/// a line of a method's documentation whose parameters the character reshapes.
+fn comment_replacement_changes_meaning(token: &SyntaxToken, comments: &mut BodyComments) -> bool {
+    syntax::comment_token_is_string_text(token)
+        || replacement_reshapes_documented_parameters(token, comments).unwrap_or(false)
+}
+
+/// The comments of a body with the text they index, for the method documentation
+/// the analyzer cuts out of them.
+struct BodyComments {
+    root: SyntaxNode,
+    text: String,
+    runs: Vec<CommentRun>,
+    block: Option<CommentBlock>,
+}
+
+/// The lines last read as one block: a long block holds many comments, and reading it
+/// anew from each of them would be quadratic in a block no replacement reshapes at all.
+struct CommentBlock {
+    run: usize,
+    last_line: usize,
+    documentation: Option<MethodDocumentation>,
+}
+
+struct MethodDocumentation {
+    lines: Vec<String>,
+    any_replacement_reshapes: bool,
+}
+
+fn replacement_reshapes_documented_parameters(
+    token: &SyntaxToken,
+    comments: &mut BodyComments,
+) -> Option<bool> {
+    let start = token.text_range().start();
+    let run = comments.runs.partition_point(|run| run.range().end() <= start);
+    let lines = comments.runs.get(run)?.lines();
+    let line = lines.partition_point(|line| line.range.start() < start);
+    if !lines.get(line)?.owns_line {
+        return Some(false);
     }
-    let replaced = apply_char_replacements(text);
-    parameter_doc_parts(text) != parameter_doc_parts(&replaced) && in_parameters_section(token)
+
+    // Tokens come in text order, so a line up to the block's end lies inside it.
+    if !comments.block.as_ref().is_some_and(|block| block.run == run && line <= block.last_line) {
+        let last_line = line + lines[line + 1..].iter().take_while(|line| line.owns_line).count();
+        let documentation = comments
+            .root
+            .token_at_offset(lines[last_line].range.start())
+            .right_biased()
+            .and_then(|comment| method_starting_after(&comment))
+            .and_then(|method_start| {
+                syntax::extract_leading_comment_lines_at_offset(
+                    method_start.into(),
+                    &comments.text,
+                    &comments.runs,
+                )
+            })
+            .map(|lines| {
+                let replaced: Vec<String> =
+                    lines.iter().map(|line| apply_char_replacements(line)).collect();
+                let any_replacement_reshapes = hir::doc_lines_change_parameters(&lines, &replaced);
+                MethodDocumentation { lines, any_replacement_reshapes }
+            });
+        comments.block = Some(CommentBlock { run, last_line, documentation });
+    }
+
+    let block = comments.block.as_ref()?;
+    let documentation = block.documentation.as_ref()?;
+    if !documentation.any_replacement_reshapes {
+        return Some(false);
+    }
+    // shortcut: every reshaping line parses its block again, which takes seconds only at
+    // thousands of such lines in one block; an incremental parser would remove that.
+    let index = documentation.lines.len().checked_sub(block.last_line - line + 1)?;
+    let mut replaced = documentation.lines.clone();
+    replaced[index] = apply_char_replacements(&replaced[index]);
+    Some(hir::doc_lines_change_parameters(&documentation.lines, &replaced))
+}
+
+/// Start of the method that is the first thing below `comment`.
+fn method_starting_after(comment: &SyntaxToken) -> Option<TextSize> {
+    let mut cursor = comment.next_token();
+    while let Some(token) = cursor {
+        if !matches!(token.kind(), SyntaxKind::WHITESPACE | SyntaxKind::NEWLINE) {
+            let start = token.text_range().start();
+            let method = token.parent_ancestors().find(is_method_node)?;
+            return (method.text_range().start() == start).then_some(start);
+        }
+        cursor = token.next_token();
+    }
+    None
 }
 
 fn apply_char_replacements(text: &str) -> String {
@@ -93,44 +175,6 @@ fn apply_char_replacements(text: &str) -> String {
         }
     }
     out
-}
-
-/// `Имя - Тип` as the doc parser splits it, or `None` when the ASCII separator
-/// is absent. Illegal spaces and dashes around the hyphen fail this split.
-fn parameter_doc_parts(text: &str) -> Option<(String, String)> {
-    let body = text.trim().trim_start_matches('/').trim().replace('\t', " ");
-    let mut parts = body.splitn(3, " - ");
-    let name = parts.next()?.trim();
-    let ty = parts.next()?.trim();
-    let mut chars = name.chars();
-    let first = chars.next()?;
-    if !(first.is_alphabetic() || first == '_')
-        || !chars.all(|ch| ch.is_alphanumeric() || ch == '_')
-    {
-        return None;
-    }
-    Some((name.to_string(), ty.to_string()))
-}
-
-fn in_parameters_section(token: &SyntaxToken) -> bool {
-    let mut cursor = token.prev_token();
-    let mut steps = 0u32;
-    while let Some(current) = cursor {
-        steps += 1;
-        if steps > 400 {
-            return false;
-        }
-        if current.kind() == SyntaxKind::COMMENT {
-            let body = current.text().trim().trim_start_matches('/').trim().fold_lower();
-            if body.starts_with("параметры:") || body.starts_with("parameters:") {
-                return true;
-            }
-        } else if !current.kind().is_trivia() {
-            return false;
-        }
-        cursor = current.prev_token();
-    }
-    false
 }
 
 /// Verified on 8.3.27: a non-breaking space breaks compilation only when it is
@@ -182,6 +226,7 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
     }
 
     let mut diagnostics = Vec::new();
+    let mut comments = None;
 
     for token in ctx.tokens() {
         let text = token.text();
@@ -203,7 +248,15 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
             | SyntaxKind::STRING_PART
             | SyntaxKind::STRING_START
             | SyntaxKind::STRING_TAIL => false,
-            SyntaxKind::COMMENT => comment_replacement_changes_meaning(&token, text),
+            SyntaxKind::COMMENT => {
+                let comments = comments.get_or_insert_with(|| BodyComments {
+                    root: ctx.root().clone(),
+                    text: ctx.root().text().to_string(),
+                    runs: syntax::comment_runs(ctx.root()),
+                    block: None,
+                });
+                comment_replacement_changes_meaning(&token, comments)
+            }
             SyntaxKind::WHITESPACE => whitespace_corrupts_previous_token(&token, text),
             SyntaxKind::ERROR => true,
             _ => false,
@@ -410,6 +463,142 @@ mod tests {
             DiagnosticCode::InvalidCharacterInFile,
             expect![[r#"
                 InvalidCharacterInFile @ 4:1..4:28
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
+    fn test_doc_line_past_any_fixed_distance_from_the_header() {
+        let code = format!(
+            "// Параметры:\n{}//  Имя \u{2013} Строка\nПроцедура Тест(Имя)\nКонецПроцедуры\n",
+            "// пояснение\n".repeat(201)
+        );
+        check_diagnostics_snapshot_for(
+            &code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#"
+                InvalidCharacterInFile @ 203:1..203:17
+                  message: Нужно исправить на правильный символ "-"
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
+    fn test_doc_line_after_another_section_is_not_a_parameter() {
+        let code = concat!(
+            "// Параметры:\n",
+            "//  Арг - Строка\n",
+            "// Возвращаемое значение:\n",
+            "//  Имя\u{00A0}- Строка\n",
+            "Процедура Тест(Арг)\n",
+            "КонецПроцедуры\n",
+        );
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn test_doc_line_below_a_blank_line_is_not_under_the_header() {
+        let code = concat!(
+            "// Параметры:\n",
+            "\n",
+            "//  Имя \u{2013} Строка\n",
+            "Процедура Тест(Имя)\n",
+            "КонецПроцедуры\n",
+        );
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn test_parameter_shaped_comment_outside_a_method_header_is_not_reported() {
+        let code = concat!(
+            "// Параметры:\n",
+            "//  Имя\u{00A0}- Строка\n",
+            "\n",
+            "Процедура Тест(Имя)\n",
+            "    // Параметры:\n",
+            "    //  Имя\u{00A0}- Строка\n",
+            "    Имя = 1;\n",
+            "КонецПроцедуры\n",
+            "\n",
+            "Ч = 1; // Параметры:\n",
+            "//  Имя\u{00A0}- Строка\n",
+            "Процедура Тест2(Имя)\n",
+            "КонецПроцедуры\n",
+        );
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn test_doc_line_above_an_annotated_method_is_reported() {
+        let code = concat!(
+            "// Параметры:\n",
+            "//  Имя\u{00A0}- Строка\n",
+            "&НаСервере\n",
+            "Процедура Тест(Имя)\n",
+            "КонецПроцедуры\n",
+        );
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#"
+                InvalidCharacterInFile @ 2:1..2:17
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
+    fn test_doc_line_the_replacement_does_not_reshape_is_not_reported() {
+        let code = concat!(
+            "// Параметры:\n",
+            "//  Первый - Строка - две\u{00A0}части \u{2014} описание\n",
+            "//  Второй - СправочникСсылка.Номенклатура,\n",
+            "//  СправочникСсылка.Контрагенты \u{2013} описание\n",
+            "Процедура Тест(Первый, Второй)\n",
+            "КонецПроцедуры\n",
+        );
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn test_doc_line_the_replacement_reshapes_is_reported() {
+        let code = concat!(
+            "// Параметры:\n",
+            "//  Первый - Строка \u{2013} описание\n",
+            "//  СправочникСсылка.Контрагенты\u{00A0}-\u{00A0}описание\n",
+            "//  Второй - Структура:\n",
+            "//    * Поле\u{00A0}-\u{00A0}Строка\n",
+            "Процедура Тест(Первый, Второй)\n",
+            "КонецПроцедуры\n",
+        );
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::InvalidCharacterInFile,
+            expect![[r#"
+                InvalidCharacterInFile @ 2:1..2:31
+                  message: Нужно исправить на правильный символ "-"
+                  severity: Major
+                InvalidCharacterInFile @ 3:1..3:44
+                  message: Нужно заменить символ неразрывного пробела на обычный пробел
+                  severity: Major
+                InvalidCharacterInFile @ 5:1..5:22
                   message: Нужно заменить символ неразрывного пробела на обычный пробел
                   severity: Major"#]],
         );

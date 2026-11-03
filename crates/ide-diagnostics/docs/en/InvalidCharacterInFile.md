@@ -18,8 +18,9 @@ A character is reported:
   compile;
 - in a `//` line inside a multiline string literal: that line is text of the literal,
   not a comment;
-- in a `Name - Type` line of a `Parameters:` section of a method description, when the
-  character breaks the separator: the analyzer no longer sees the parameter type.
+- in a line of a `Parameters:` section of a description directly above a method, when
+  replacing the character changes the parsed parameters: their names, types or structure
+  fields.
 
 A character is not reported:
 
