@@ -1015,7 +1015,7 @@ mod tests {
             expect![[r#"
                 VirtualTableCallWithoutParameters @ 28:4..28:55
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major"#]]
+                  severity: Warning"#]]
             .assert_eq(&both_rules(MODULE, narrowed(true)));
         }
 
@@ -1039,7 +1039,7 @@ mod tests {
                   severity: Warning
                 VirtualTableCallWithoutParameters @ 32:4..32:55
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major"#]].assert_eq(&both_rules(&writing_module(), narrowed(true)));
+                  severity: Warning"#]].assert_eq(&both_rules(&writing_module(), narrowed(true)));
         }
 
         #[test]
@@ -1050,7 +1050,7 @@ mod tests {
                   severity: Warning
                 VirtualTableCallWithoutParameters @ 28:4..28:55
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major"#]].assert_eq(&both_rules(MODULE, narrowed(false)));
+                  severity: Warning"#]].assert_eq(&both_rules(MODULE, narrowed(false)));
         }
 
         #[test]
