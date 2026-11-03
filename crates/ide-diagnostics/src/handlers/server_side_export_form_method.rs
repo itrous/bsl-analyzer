@@ -117,11 +117,11 @@ fn has_client_annotation(annotations: &[hir::Annotation]) -> bool {
     })
 }
 
-/// The БСП reserves the `Подключаемый_` prefix for form handlers it calls from outside
-/// the form through a form reference, so `Экспорт` is part of that contract and
-/// cannot be removed.
+/// The БСП reserves the `Подключаемый_` prefix, `Attachable_` in English code, for form
+/// handlers it calls from outside the form through a form reference, so `Экспорт` is part
+/// of that contract and cannot be removed.
 fn is_bsp_pluggable_handler(name: &str) -> bool {
-    starts_with_ignore_case(name, "подключаемый_")
+    ["подключаемый_", "attachable_"].iter().any(|prefix| starts_with_ignore_case(name, prefix))
 }
 
 fn make_diagnostic(
@@ -233,6 +233,31 @@ mod tests {
             flagged(code).is_empty(),
             "Подключаемый_ handlers are called by the БСП from outside the form"
         );
+    }
+
+    #[test]
+    fn bsp_pluggable_handler_english_prefix_export_not_flagged() {
+        let code = r#"
+&AtServer
+Procedure Attachable_ContinueCommandExecutionAtServer(Parameters, Additional) Export
+EndProcedure
+
+&AtServer
+Function attachable_GetData() Export
+	Return Undefined;
+EndFunction
+"#;
+        assert!(flagged(code).is_empty(), "the БСП prefix has an English form");
+    }
+
+    #[test]
+    fn attachable_word_not_at_name_start_still_flagged() {
+        let code = r#"
+&AtServer
+Procedure RunAttachable_Command() Export
+EndProcedure
+"#;
+        assert_eq!(flagged(code).len(), 1, "the exemption is anchored at the name start");
     }
 
     #[test]
