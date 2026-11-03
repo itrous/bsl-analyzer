@@ -1,3 +1,4 @@
+use self::reshape::{DescriptionUse, LineRole};
 use crate::item_tree::ModItem;
 use crate::{MethodId, VariableId};
 use std::sync::Arc;
@@ -8,9 +9,11 @@ use syntax::{
 };
 
 mod fields;
+mod reshape;
 mod tokens;
 mod type_expr;
 
+pub use reshape::doc_lines_reshaped_by_replacement;
 pub use tokens::{doc_comment_tokens, DocCommentToken, DocCommentTokenKind};
 pub use type_expr::*;
 
@@ -122,27 +125,7 @@ impl TypeDoc {
         let Some(text) = description else {
             return (self.name.clone(), None);
         };
-        if !matches!(
-            self.name.fold_lower().as_str(),
-            "массив"
-                | "фиксированныймассив"
-                | "соответствие"
-                | "фиксированноесоответствие"
-                | "структура"
-                | "фиксированнаяструктура"
-                | "таблицазначений"
-                | "списокзначений"
-                | "деревозначений"
-                | "array"
-                | "fixedarray"
-                | "map"
-                | "fixedmap"
-                | "structure"
-                | "fixedstructure"
-                | "valuetable"
-                | "valuelist"
-                | "valuetree"
-        ) {
+        if !is_collection_type_name(&self.name) {
             return (self.name.clone(), description);
         }
         let (element, prose) = split_type_description(text)
@@ -154,6 +137,30 @@ impl TypeDoc {
             (self.name.clone(), description)
         }
     }
+}
+
+fn is_collection_type_name(name: &str) -> bool {
+    matches!(
+        name.fold_lower().as_str(),
+        "массив"
+            | "фиксированныймассив"
+            | "соответствие"
+            | "фиксированноесоответствие"
+            | "структура"
+            | "фиксированнаяструктура"
+            | "таблицазначений"
+            | "списокзначений"
+            | "деревозначений"
+            | "array"
+            | "fixedarray"
+            | "map"
+            | "fixedmap"
+            | "structure"
+            | "fixedstructure"
+            | "valuetable"
+            | "valuelist"
+            | "valuetree"
+    )
 }
 
 /// `comment_runs` are the comment runs of the module tree `file_text` was
@@ -676,6 +683,14 @@ fn see_reference_ranges(line: &str) -> Vec<(std::ops::Range<usize>, std::ops::Ra
 }
 
 fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
+    parse_parameters_with_roles(lines, None)
+}
+
+/// The parser itself reports each line's role, so the roles cannot drift from the parse.
+fn parse_parameters_with_roles(
+    lines: &[String],
+    mut roles: Option<&mut [LineRole]>,
+) -> Vec<ParameterDoc> {
     let mut parameters = Vec::new();
     let mut current_param: Option<(String, Vec<TypeDoc>)> = None;
 
@@ -690,7 +705,7 @@ fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
 
         if trimmed.starts_with('*') {
             cursor -= 1;
-            let fields = fields::parse_fields(lines, &mut cursor);
+            let fields = fields::parse_fields(lines, &mut cursor, roles.as_deref_mut());
             if let Some((_, types)) = &mut current_param {
                 if let Some(last_type) = types.last_mut() {
                     last_type.parameters.extend(fields);
@@ -705,6 +720,7 @@ fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
                     if let Some((_, types)) = &mut current_param {
                         types.push(TypeDoc::simple(type_name, description));
                     }
+                    mark_role(&mut roles, cursor - 1, LineRole::Type(0));
                     continue;
                 }
             }
@@ -720,6 +736,7 @@ fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
                     if let Some((_, types)) = &mut current_param {
                         types.push(TypeDoc::simple(type_name, description));
                     }
+                    mark_role(&mut roles, cursor - 1, LineRole::Type(0));
                     continue;
                 }
             }
@@ -730,12 +747,16 @@ fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
                 parameters.push(ParameterDoc { name, types });
             }
             current_param = Some((param_name, types));
+            mark_role(&mut roles, cursor - 1, LineRole::Parameter);
             continue;
         }
 
+        let mut description = DescriptionUse::Prose;
         if let Some((_, types)) = &mut current_param {
             append_type_description(types, trimmed);
+            description = DescriptionUse::of(types.last());
         }
+        mark_role(&mut roles, cursor - 1, LineRole::Text { level: 0, description });
     }
 
     if let Some((name, types)) = current_param {
@@ -743,6 +764,12 @@ fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
     }
 
     parameters
+}
+
+fn mark_role(roles: &mut Option<&mut [LineRole]>, line: usize, role: LineRole) {
+    if let Some(roles) = roles {
+        roles[line] = role;
+    }
 }
 
 fn parse_parameter_line(line: &str) -> Option<(String, Vec<TypeDoc>)> {
@@ -827,7 +854,7 @@ fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
 
         if trimmed.starts_with('*') {
             cursor -= 1;
-            let fields = fields::parse_fields(lines, &mut cursor);
+            let fields = fields::parse_fields(lines, &mut cursor, None);
             if let Some(ref mut type_doc) = current_type {
                 type_doc.parameters.extend(fields);
             }

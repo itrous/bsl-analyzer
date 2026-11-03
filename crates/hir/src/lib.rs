@@ -85,8 +85,8 @@ pub use hir_def::call_graph::{
     CALL_SITE_NOT_RECORDED, NO_CALL_SITE,
 };
 pub use hir_def::docs::{
-    doc_comment_tokens, is_dotted_type_reference, DocCommentToken, DocCommentTokenKind, MethodDocs,
-    ParameterDoc, TypeDoc, VariableDocs,
+    doc_comment_tokens, doc_lines_reshaped_by_replacement, is_dotted_type_reference,
+    DocCommentToken, DocCommentTokenKind, MethodDocs, ParameterDoc, TypeDoc, VariableDocs,
 };
 pub use hir_def::graph_index;
 pub use hir_def::graph_index::{call_hierarchy_method_digest, MethodCallDigest};
