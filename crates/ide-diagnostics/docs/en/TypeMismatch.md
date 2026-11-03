@@ -19,6 +19,7 @@ The analyzer resolves each call into exactly one of three mutually exclusive sel
 
 - **Doc-Comment Split**: Mismatches where the expected type is derived from JSDoc comments are reported as `TypeMismatchByDocComment` to distinguish between platform-enforced types and user-defined documentation.
 - **Unknown Arguments**: An argument or parameter of type `Unknown` is indeterminate and does not itself cause `TypeMismatch`. Other concrete incompatible arguments can still reject the call.
+- **Overlapping Types**: The diagnostic fires only when the expected and the actual type sets share no member. A value of type `Number | Undefined` inferred from code branches is not reported in a `Number` parameter, because some of its values fit. When a call has several such arguments, the first argument sharing no member is reported.
 - **Ambiguity**: Ambiguity in type resolution does not trigger a `TypeMismatch`. The diagnostic only fires when the candidate selection is explicitly rejected.
 
 ## Examples
@@ -26,6 +27,12 @@ The analyzer resolves each call into exactly one of three mutually exclusive sel
 ```bsl
 // ValueTable.Insert expects a Number for the index
 ValueTable.Insert("not a number"); // Type mismatch: expected 'Number', found 'String'
+
+Position = Undefined;
+If Condition Then
+    Position = 5;
+EndIf;
+Result = Left("abc", Position); // No finding: 'Number | Undefined' overlaps 'Number'
 ```
 
 ## Sources

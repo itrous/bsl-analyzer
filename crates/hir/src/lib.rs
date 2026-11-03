@@ -13,6 +13,7 @@ pub use hir_ty::infer::CandidateCallBinding;
 pub use hir_ty::metadata_path::MissingMetadata;
 pub use hir_ty::method_lookup::platform_type_key_id;
 pub use hir_ty::min_platform;
+pub use hir_ty::subtype::type_sets_overlap;
 pub use hir_ty::this_object::coerce_to_metadata_ref_id;
 pub use hir_ty::TyLoweringContext;
 pub use hir_ty::{

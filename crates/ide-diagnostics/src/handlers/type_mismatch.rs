@@ -28,11 +28,10 @@ pub fn from_hir(
     let locale = ctx.locale();
     let expected_label = ctx.kernel_type_display(expected, locale);
     let actual_label = ctx.kernel_type_display(actual, locale);
-    // An overlapping set means some value of this expression is acceptable, so
-    // the analyzer cannot state a mismatch; only a disjoint set can.
-    // Identical labels (distinct internal types sharing a display name, e.g. a
-    // doc-derived nominal type vs the inferred platform one) are the full overlap.
-    if labels_overlap(&expected_label, &actual_label) {
+    // An overlapping set means some value of this expression is acceptable, so the analyzer
+    // cannot state a mismatch; only a disjoint set can. Two sides rendering identically in
+    // the message language make it self-contradictory whatever their members are.
+    if expected_label == actual_label || ctx.kernel_types_overlap(expected, actual) {
         return None;
     }
     let message =
@@ -40,29 +39,11 @@ pub fn from_hir(
     crate::simple_hir_diagnostic(DiagnosticCode::TypeMismatch, message, range, ctx)
 }
 
-/// Whether two union display labels (`A | B | C`) share a member.
-fn labels_overlap(expected: &str, actual: &str) -> bool {
-    let actual_members = actual.split(" | ").map(str::trim);
-    expected.split(" | ").map(str::trim).any(|member| actual_members.clone().any(|a| a == member))
-}
-
 #[cfg(test)]
 mod tests {
     use crate::test_utils::check_diagnostics_snapshot_for;
     use crate::DiagnosticCode;
     use expect_test::expect;
-
-    use super::labels_overlap;
-
-    #[test]
-    fn label_overlap_is_by_member_not_by_substring() {
-        assert!(labels_overlap("Булево | Строка", "ФорматированнаяСтрока | Строка"));
-        assert!(labels_overlap("Число", "Число | Неопределено"));
-        assert!(labels_overlap("Строка", "Строка"));
-        assert!(!labels_overlap("Число", "Неопределено"));
-        assert!(!labels_overlap("Число", "Строка | Неопределено"));
-        assert!(!labels_overlap("Строка", "ФорматированнаяСтрока"));
-    }
 
     // The arguments below are variables whose union the analyzer computed from
     // branches: a union the documentation gave is relieved earlier, in hir-ty.
@@ -142,6 +123,86 @@ mod tests {
                 TypeMismatch @ 7:28..7:35
                   message: Несоответствие типов: ожидалось 'Число', получено 'Строка | Неопределено'
                   severity: Major"#]],
+        );
+    }
+
+    #[test]
+    fn a_union_nested_in_a_member_is_not_a_member_of_the_outer_set() {
+        // The control's label reads `ПолеФормы:Значение -> Булево | Число`, yet the value
+        // passed is the control, not a number.
+        let form_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10">
+    <ChildItems>
+        <InputField name="ПолеВвода" id="1">
+            <DataPath>Значение</DataPath>
+        </InputField>
+    </ChildItems>
+    <Attributes>
+        <Attribute name="Значение" id="2">
+            <Type>
+                <v8:Type>xs:boolean</v8:Type>
+                <v8:Type>xs:decimal</v8:Type>
+            </Type>
+        </Attribute>
+    </Attributes>
+</Form>"#;
+        let code = "&НаКлиенте\nПроцедура Тест()\n    Р = Лев(\"abc\", Элементы.ПолеВвода);\nКонецПроцедуры\n";
+        let messages: Vec<String> = crate::test_utils::check_form_with_form_xml(code, form_xml)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::TypeMismatch)
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert_eq!(
+            messages,
+            ["Несоответствие типов: ожидалось 'Число', получено 'ПолеФормы:Значение -> Булево | Число'"]
+        );
+    }
+
+    #[test]
+    fn an_overlapping_argument_does_not_hide_a_disjoint_one_after_it() {
+        let code = r#"
+Процедура Тест(Условие)
+    Начало = Неопределено;
+    Если Условие Тогда
+        Начало = 1;
+    КонецЕсли;
+    Результат = Сред("abc", Начало, "x");
+КонецПроцедуры
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::TypeMismatch,
+            expect![[r#"
+                TypeMismatch @ 7:37..7:40
+                  message: Несоответствие типов: ожидалось 'Число', получено 'Строка'
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
+    fn a_documented_slot_reports_its_first_incompatible_argument_as_before() {
+        let code = r#"
+// Параметры:
+//   Первый - Число - значение.
+//   Второй - Число - значение.
+Процедура Принять(Первый, Второй) Экспорт
+КонецПроцедуры
+
+Процедура Тест(Условие)
+    Начало = Неопределено;
+    Если Условие Тогда
+        Начало = 1;
+    КонецЕсли;
+    Принять(Начало, "x");
+КонецПроцедуры
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::TypeMismatchByDocComment,
+            expect![[r#"
+                TypeMismatchByDocComment @ 13:13..13:19
+                  message: Несоответствие типов: ожидалось 'Число', получено 'Число | Неопределено' (тип параметра из описания)
+                  severity: Error"#]],
         );
     }
 }

@@ -17,8 +17,9 @@ use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::TypeId;
 
 use crate::call_resolution::{
-    resolve_candidates, ArgumentApplicability, ArgumentParameter, CallRejection, CallResolution,
-    CallSelection, CandidateDisposition, CandidateProvenance, CandidateRejection,
+    resolve_candidates, ArgumentApplicability, ArgumentEvaluation, ArgumentParameter,
+    CallRejection, CallResolution, CallSelection, CandidateDisposition, CandidateId,
+    CandidateProvenance, CandidateRejection,
 };
 use crate::db::HirDatabase;
 use crate::infer::{CallArgBinding, InferenceDiagnostic};
@@ -346,6 +347,32 @@ fn relieved_by_documentation(
     })
 }
 
+/// A call reports one argument, and an argument whose set overlaps the slot is not a mismatch
+/// the analyzer can state. Reporting the first incompatible one regardless would let it hide a
+/// plainly wrong argument after it.
+fn first_disjoint_argument(
+    db: &dyn TypeKernelDb,
+    resolution: &CallResolution,
+    candidate: CandidateId,
+) -> Option<ArgumentEvaluation> {
+    let fact = resolution.candidates.iter().find(|fact| fact.id == candidate)?;
+    let CandidateDisposition::Rejected(CandidateRejection::TypeIncompatible { arguments }) =
+        &fact.disposition
+    else {
+        return None;
+    };
+    arguments
+        .iter()
+        .filter(|argument| argument.applicability == ArgumentApplicability::Incompatible)
+        .find(|argument| match argument.parameter {
+            ArgumentParameter::Declared { ty, .. } => {
+                !crate::subtype::type_sets_overlap(db, ty, argument.argument_ty)
+            }
+            ArgumentParameter::MissingMetadata => false,
+        })
+        .copied()
+}
+
 fn diagnostic_for_binding(
     db: &dyn TypeKernelDb,
     binding: &CallArgBinding,
@@ -375,16 +402,21 @@ fn diagnostic_for_binding(
                 return None;
             }
             let fallback = resolution.type_fallback()?;
-            let argument = fallback.argument;
-            let ArgumentParameter::Declared { ty: expected, .. } = argument.parameter else {
-                return None;
-            };
             let signature = binding
                 .candidate
                 .candidates
                 .as_slice()
                 .iter()
                 .find(|candidate| candidate.id == fallback.candidate)?;
+            let argument = if signature.from_doc_comment {
+                fallback.argument
+            } else {
+                first_disjoint_argument(db, &resolution, fallback.candidate)
+                    .unwrap_or(fallback.argument)
+            };
+            let ArgumentParameter::Declared { ty: expected, .. } = argument.parameter else {
+                return None;
+            };
             Some(InferenceDiagnostic::TypeMismatch {
                 expr: *binding.args.get(argument.index)?,
                 expected,

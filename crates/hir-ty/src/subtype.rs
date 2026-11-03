@@ -1,4 +1,5 @@
 use bsl_types::builders::Builders;
+use bsl_types::display::{display_name, Locale, PlainDisplayCtx};
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::{MetadataKind, TypeId, TypeKind};
 use stdx::case::CaseExt;
@@ -465,6 +466,32 @@ pub fn is_coercible_to(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool 
     is_assignable(db, from, to)
 }
 
+/// Whether the value sets of two types share a member, compared by what the types are
+/// called: distinct internal types can share a name (a doc-derived nominal type and the
+/// inferred platform one), and a value of either fits the other.
+///
+/// Compares the members of the union itself. The printed label of the whole type cannot be
+/// split back into them, because a union nested inside a member prints with the same
+/// separator (`ПолеФормы:Реквизит -> Число | Строка` is one form control). The labels use one
+/// fixed locale so that the answer does not depend on the language of the message.
+pub fn type_sets_overlap(db: &dyn TypeKernelDb, left: TypeId, right: TypeId) -> bool {
+    let left = member_labels(db, left);
+    let right = member_labels(db, right);
+    left.iter().any(|label| right.contains(label))
+}
+
+fn member_labels(db: &dyn TypeKernelDb, ty: TypeId) -> Vec<String> {
+    match db.lookup_type(ty) {
+        TypeKind::Union(members) => {
+            members.iter().flat_map(|member| member_labels(db, *member)).collect()
+        }
+        kind => {
+            let ctx = PlainDisplayCtx { locale: Locale::Ru, precision_visible: false };
+            vec![display_name(kind, &ctx, db)]
+        }
+    }
+}
+
 /// Whether a union the documentation gave fits a slot that admits one of its
 /// members. Documentation lists what may come in, and an author who passes such
 /// a value where one listed variant is expected chose that variant. This is
@@ -536,6 +563,45 @@ mod tests {
     use bsl_types::facet::{ArgArity, FunctionFacet, FunctionOrigin, ParamPassing, ParamSpec};
     use bsl_types::testing::InMemoryDb;
     use std::sync::Arc;
+
+    #[test]
+    fn type_sets_overlap_by_member_not_by_substring_of_the_label() {
+        let db = InMemoryDb::new();
+        let number = db.number(None, None);
+        let string = db.string(None, false);
+        let undefined = db.undefined();
+        let boolean = db.boolean();
+        let formatted = db.platform_object("ФорматированнаяСтрока".to_string());
+
+        let number_or_undefined = db.union(vec![number, undefined]);
+        let string_or_undefined = db.union(vec![string, undefined]);
+        let boolean_or_string = db.union(vec![boolean, string]);
+        let formatted_or_string = db.union(vec![formatted, string]);
+
+        assert!(type_sets_overlap(&db, boolean_or_string, formatted_or_string));
+        assert!(type_sets_overlap(&db, number, number_or_undefined));
+        assert!(type_sets_overlap(&db, string, string));
+        assert!(!type_sets_overlap(&db, number, undefined));
+        assert!(!type_sets_overlap(&db, number, string_or_undefined));
+        assert!(!type_sets_overlap(&db, string, formatted));
+    }
+
+    #[test]
+    fn type_sets_overlap_does_not_look_inside_a_member() {
+        let db = InMemoryDb::new();
+        let number = db.number(None, None);
+        let string = db.string(None, false);
+        let array_of_either = db.array(Some(db.union(vec![number, string])));
+
+        assert!(!type_sets_overlap(&db, string, array_of_either));
+        assert!(type_sets_overlap(&db, array_of_either, array_of_either));
+    }
+
+    #[test]
+    fn type_sets_overlap_ignores_the_precision_the_message_does_not_print() {
+        let db = InMemoryDb::new();
+        assert!(type_sets_overlap(&db, db.number(None, None), db.number(Some(10), Some(2))));
+    }
 
     fn fn_ty(db: &dyn TypeKernelDb, params: Vec<TypeId>, ret: TypeId) -> TypeId {
         let params: Arc<[ParamSpec]> = params
