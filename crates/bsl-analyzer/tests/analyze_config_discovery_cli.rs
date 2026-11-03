@@ -54,10 +54,15 @@ fn findings(project: &Path) -> usize {
 }
 
 fn findings_in(source_dir: &Path) -> usize {
+    findings_with(source_dir, &[])
+}
+
+fn findings_with(source_dir: &Path, flags: &[&str]) -> usize {
     let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
         .arg("analyze")
         .arg("-s")
         .arg(source_dir)
+        .args(flags)
         .args(["--format", "jsonl"])
         .env_remove("ONEC_CONFIGURATIONS_ROOT")
         .output()
@@ -110,4 +115,23 @@ fn a_discovered_configs_relative_paths_resolve_against_its_own_directory() {
     );
     // Against `-s` the path would be `src/cf/ext/E`, which does not exist, and the run would fail.
     assert_eq!(findings(dir.path()), 1);
+}
+
+#[test]
+fn extension_flags_stay_relative_to_the_source_dir_under_a_discovered_config() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    // A config above `-s` makes the project root differ from it; the flags are typed from `-s`.
+    write(&dir.path().join("bsl-analyzer.toml"), "");
+    let manifest = "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>";
+    for name in ["F", "G"] {
+        write(&dir.path().join(format!("src/cf/ext/{name}/Configuration.xml")), manifest);
+    }
+    let source_dir = dir.path().join("src/cf");
+    assert_eq!(findings_with(&source_dir, &["--extension", "F=ext/F"]), 1);
+    assert_eq!(
+        findings_with(&source_dir, &["--extension", "ext/*"]),
+        1,
+        "a glob must survive the rebase"
+    );
 }
