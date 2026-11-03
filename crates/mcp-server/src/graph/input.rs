@@ -414,7 +414,7 @@ mod tests {
             "Allowed.bsl",
             "temp/Hidden.bsl",
             ".tool/Hidden.bsl",
-            "Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "Reports/R/Templates/T/Ext/Generated.bsl",
             "Reports/R/Ext/ObjectModule.bsl",
         ] {
             let path = root.join(relative);
@@ -446,14 +446,14 @@ mod tests {
 
         fs::write(
             root.join("bsl-analyzer.toml"),
-            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/*.Queries.bsl\"]\n",
+            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/Generated.bsl\"]\n",
         )
         .unwrap();
         let scoped = project_model::Project::new(root).unwrap();
         assert_eq!(scanned(&scoped), ["Allowed.bsl", "Reports/R/Ext/ObjectModule.bsl"]);
 
         let (roots, _) = crate::project::workspace_roots(&scoped, &[]);
-        let queries = root.join("Reports/R/Templates/T/Ext/Template.Queries.bsl");
+        let queries = root.join("Reports/R/Templates/T/Ext/Generated.bsl");
         assert!(roots.user_excluded().is_excluded(&queries), "search roots lost the patterns");
         assert!(!roots.user_excluded().is_excluded(&root.join("Allowed.bsl")));
         assert_ne!(

@@ -685,7 +685,7 @@ mod tests {
 
         std::fs::write(
             workspace.path().join("bsl-analyzer.toml"),
-            "[source]\nexclude = [\"ignored\"]\nexclude_globs = [\"**/*.Queries.bsl\"]\n",
+            "[source]\nexclude = [\"ignored\"]\nexclude_globs = [\"**/Generated.bsl\"]\n",
         )
         .unwrap();
         let patterns_added = project(workspace.path());

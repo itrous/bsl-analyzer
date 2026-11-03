@@ -460,9 +460,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("root");
         write(&root.join("Allowed.bsl"), "");
-        write(&root.join("Hidden.Queries.bsl"), "");
+        write(&root.join("Hidden.Generated.bsl"), "");
         write(&root.join("nested/Kept.bsl"), "");
-        let excluded = ExcludedPaths::default().with_patterns(&root, ["*.Queries.bsl"]).unwrap();
+        let excluded = ExcludedPaths::default().with_patterns(&root, ["*.Generated.bsl"]).unwrap();
 
         let unscoped = SourceSet::scan(std::slice::from_ref(&root));
         let scoped = SourceSet::scan_in_scope(std::slice::from_ref(&root), &[], &excluded);

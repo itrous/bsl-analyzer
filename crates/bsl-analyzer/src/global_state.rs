@@ -2037,7 +2037,7 @@ mod vfs_race_tests {
             "Allowed.bsl",
             "temp/Hidden.bsl",
             ".tool/Hidden.bsl",
-            "Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "Reports/R/Templates/T/Ext/Generated.bsl",
         ] {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2045,7 +2045,7 @@ mod vfs_race_tests {
         }
         std::fs::write(
             root.join("bsl-analyzer.toml"),
-            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/*.Queries.bsl\"]\n",
+            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/Generated.bsl\"]\n",
         )
         .unwrap();
 
@@ -2069,7 +2069,7 @@ mod vfs_race_tests {
                 _ => None,
             })
             .expect("a directory scan");
-        let queries = root.join("Reports/R/Templates/T/Ext/Template.Queries.bsl");
+        let queries = root.join("Reports/R/Templates/T/Ext/Generated.bsl");
         for hidden in [root.join("temp/Hidden.bsl"), root.join(".tool/Hidden.bsl"), queries.clone()]
         {
             assert!(
