@@ -165,11 +165,11 @@ pub fn doc_lines_reshaped_by_replacement(
     replace: impl Fn(&str) -> String,
 ) -> Vec<bool> {
     let replaced: Vec<String> = lines.iter().map(|line| replace(line)).collect();
-    reshaped_lines(lines, &replaced)
+    judged_lines(lines, &replaced)
 }
 
 /// `lines` and `replaced` pair up line by line.
-fn reshaped_lines(lines: &[String], replaced: &[String]) -> Vec<bool> {
+fn judged_lines(lines: &[String], replaced: &[String]) -> Vec<bool> {
     let mut reshaped = vec![false; lines.len()];
     let parameters = parameters_of(lines);
     if same_parameter_shape(&parameters, &parameters_of(replaced)) {
@@ -468,7 +468,7 @@ mod tests {
             let (lines, replaced) = block_of(&pairs);
             let expected = reshaped_by_full_parse(&lines, &replaced);
             reshaped_lines += expected.iter().filter(|reshaped| **reshaped).count();
-            assert_eq!(reshaped_lines(&lines, &replaced), expected, "block: {lines:#?}");
+            assert_eq!(judged_lines(&lines, &replaced), expected, "block: {lines:#?}");
         }
         assert!(reshaped_lines > 5_000, "only {reshaped_lines} reshaped lines were exercised");
     }
@@ -478,7 +478,7 @@ mod tests {
         let (lines, replaced) = block_of(pairs);
         let expected = reshaped_by_full_parse(&lines, &replaced);
         assert_eq!(expected[line], verdict, "full parse of {lines:#?}");
-        assert_eq!(reshaped_lines(&lines, &replaced), expected);
+        assert_eq!(judged_lines(&lines, &replaced), expected);
     }
 
     #[test]
@@ -600,9 +600,6 @@ mod tests {
             (" хвост \u{2014} текст", " хвост - текст"),
             (" за\u{A0}разделителем", " за разделителем"),
         ]);
-        assert_eq!(
-            reshaped_lines(&lines, &replaced),
-            [false, true, false, false, true, true, false]
-        );
+        assert_eq!(judged_lines(&lines, &replaced), [false, true, false, false, true, true, false]);
     }
 }
