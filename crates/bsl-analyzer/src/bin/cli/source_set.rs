@@ -513,6 +513,36 @@ impl SourceSetArgs {
     }
 }
 
+/// `relative` with `/` separators, the spelling config files use.
+pub fn slash_path(relative: &Path) -> String {
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+/// Flag paths are written relative to `-s`, but the project resolves them against `project_root`;
+/// prefixing keeps them meaning the same directories when a discovered config moved that root.
+pub fn rebase_override(
+    mut over: SourceSetOverride,
+    source_dir: &Path,
+    project_root: &Path,
+) -> SourceSetOverride {
+    let Ok(prefix) = source_dir.strip_prefix(project_root) else { return over };
+    if prefix.as_os_str().is_empty() {
+        return over;
+    }
+    let prefixed = |path: &str| slash_path(&prefix.join(path));
+    over.configuration_root = over.configuration_root.map(|root| prefixed(&root));
+    for decl in over.extensions.iter_mut().flatten() {
+        match decl {
+            ExtensionDecl::Path(path) => *path = prefixed(path),
+            ExtensionDecl::Structured(structured) => structured.path = prefixed(&structured.path),
+        }
+    }
+    for decl in over.externals.iter_mut().flatten() {
+        decl.path = prefixed(&decl.path);
+    }
+    over
+}
+
 /// `NAME=PATH` splits on the first `=`; anything else is a bare path.
 ///
 /// The split is unconditional, which costs one case: a directory whose own name

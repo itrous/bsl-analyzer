@@ -18,7 +18,10 @@ fn write(path: &Path, text: &str) {
 /// An ordinary-application configuration under `project/src/cf` whose only common
 /// module (`Сервер` + `ВнешнееСоединение`) is a `CommonModuleInvalidType` finding.
 fn fixture(project: &Path) {
-    let cf = project.join("src/cf");
+    fixture_at(&project.join("src/cf"));
+}
+
+fn fixture_at(cf: &Path) {
     write(
         &cf.join("Configuration.xml"),
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -47,10 +50,14 @@ fn fixture(project: &Path) {
 /// How many [`CODE`] findings `analyze --source-dir <project>/src/cf` reports with no
 /// `-c`. Not narrowed with `--only-diagnostic`: that flag overrides the config's switches.
 fn findings(project: &Path) -> usize {
+    findings_in(&project.join("src/cf"))
+}
+
+fn findings_in(source_dir: &Path) -> usize {
     let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
         .arg("analyze")
         .arg("-s")
-        .arg(project.join("src/cf"))
+        .arg(source_dir)
         .args(["--format", "jsonl"])
         .env_remove("ONEC_CONFIGURATIONS_ROOT")
         .output()
@@ -86,5 +93,21 @@ fn a_config_at_the_project_root_applies_to_the_source_dir_below_it() {
 fn without_a_config_the_rule_still_reports() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
+    assert_eq!(findings(dir.path()), 1);
+}
+
+#[test]
+fn a_discovered_configs_relative_paths_resolve_against_its_own_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    write(
+        &dir.path().join("ext/E/Configuration.xml"),
+        "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+    );
+    write(
+        &dir.path().join("bsl-analyzer.toml"),
+        "[source]\nextensions = [{ name = \"E\", path = \"ext/E\", dependsOn = [], scope = \"InfoBase\" }]\n",
+    );
+    // Against `-s` the path would be `src/cf/ext/E`, which does not exist, and the run would fail.
     assert_eq!(findings(dir.path()), 1);
 }
