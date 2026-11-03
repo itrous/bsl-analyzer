@@ -596,6 +596,10 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         hir::kernel_type_label(&self.db, id, locale, false)
     }
 
+    fn kernel_types_overlap(&self, left: hir::TypeId, right: hir::TypeId) -> bool {
+        hir::type_sets_overlap(&self.db, left, right)
+    }
+
     fn parse(&self, file_id: vfs::FileId) -> syntax::Parse<syntax::SyntaxNode> {
         use ide_db::base_db::RootQueryDb;
         self.db.parse(file_id)

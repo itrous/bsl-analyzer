@@ -292,6 +292,13 @@ pub trait AnalysisProvider {
 
     fn kernel_type_display(&self, id: bsl_types::kind::TypeId, locale: base_db::Locale) -> String;
 
+    /// Whether the value sets of two types share a member; see `hir::type_sets_overlap`.
+    fn kernel_types_overlap(
+        &self,
+        left: bsl_types::kind::TypeId,
+        right: bsl_types::kind::TypeId,
+    ) -> bool;
+
     /// The project's `min_platform_version`; `None` (the default for providers
     /// without project settings) keeps the min-platform check silent.
     fn min_platform_version(&self) -> Option<Arc<str>> {

@@ -198,9 +198,9 @@ fn every_incompatible_argument_must_be_relieved() {
     assert_eq!(
         diagnostic_for_binding(&db, &binding, &[maybe_structure, string], &mut |_| true),
         Some(InferenceDiagnostic::TypeMismatch {
-            expr: expr(1),
-            expected: structure,
-            actual: maybe_structure,
+            expr: expr(2),
+            expected: number,
+            actual: string,
             from_doc_comment: false,
         })
     );
