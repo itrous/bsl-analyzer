@@ -145,7 +145,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::OSUsersMethod => &[],
         DiagnosticCode::TempFilesDir => &[542],
         DiagnosticCode::FormDataToValue => &[409],
-        DiagnosticCode::GetFormMethod => &[404],
+        DiagnosticCode::GetFormMethod => &[404, 487],
         DiagnosticCode::GlobalContextMethodCollision8312 => &[],
         DiagnosticCode::GlobalContextMethodConflict => &[],
         DiagnosticCode::InternetAccess => &[],
