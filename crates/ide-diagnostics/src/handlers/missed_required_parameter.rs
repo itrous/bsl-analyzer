@@ -249,7 +249,9 @@ fn check_missing_params(method: &hir::MethodDecl, provided_args: &[bool]) -> Vec
             continue;
         }
 
-        let is_missing = i >= provided_args.len() || !provided_args[i];
+        // A comma-skipped position is legal in BSL and is passed as `Неопределено`,
+        // so only a trailing omission can leave a parameter without a value.
+        let is_missing = i >= provided_args.len();
 
         if is_missing {
             missing.push(param.name.as_str().to_string());
@@ -267,7 +269,7 @@ mod tests {
     use test_fixture::CfeFixtureBuilder;
 
     #[test]
-    fn test_missed_required_parameter_simple() {
+    fn test_positional_skip_is_not_missing() {
         let code = r#"
 Процедура Тест()
     Результат = Сложение(, 2);
@@ -280,10 +282,151 @@ mod tests {
         check_diagnostics_snapshot_for(
             code,
             DiagnosticCode::MissedRequiredParameter,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn test_missed_required_parameter_trailing_omission() {
+        let code = r#"
+Процедура Тест()
+    Результат = Сложение(1);
+КонецПроцедуры
+
+Функция Сложение(Левый, Правый)
+    Возврат Левый + Правый;
+КонецФункции
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::MissedRequiredParameter,
             expect![[r#"
-                MissedRequiredParameter @ 3:17..3:30
-                  message: Укажите обязательный параметр 'Левый'
+                MissedRequiredParameter @ 3:17..3:28
+                  message: Укажите обязательный параметр 'Правый'
                   severity: Major"#]],
+        );
+    }
+
+    #[test]
+    fn test_trailing_comma_skip_is_not_missing() {
+        let code = r#"
+Процедура Тест()
+    Результат = Сложение(1, );
+КонецПроцедуры
+
+Функция Сложение(Левый, Правый)
+    Возврат Левый + Правый;
+КонецФункции
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::MissedRequiredParameter,
+            expect![[r#""#]],
+        );
+    }
+
+    // Characterizes a known gap OUTSIDE this handler: the platform accepts
+    // `Сложение(, )` and passes `Неопределено` for both parameters (measured on
+    // 8.3.17.1549 and 8.3.27.2214), so the finding below is wrong. The cause is
+    // upstream of the handler - for a list with no expression at all, the presence
+    // list lowered for a local call drops the last position - and the snapshot is
+    // kept so that fixing that lowering makes this test fail and be updated to an
+    // empty expectation.
+    #[test]
+    fn test_both_positions_skipped_still_reports_known_lowering_gap() {
+        let code = r#"
+Процедура Тест()
+    Результат = Сложение(, );
+КонецПроцедуры
+
+Функция Сложение(Левый, Правый)
+    Возврат Левый + Правый;
+КонецФункции
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::MissedRequiredParameter,
+            expect![[r#"
+                MissedRequiredParameter @ 3:17..3:29
+                  message: Укажите обязательный параметр 'Правый'
+                  severity: Major"#]],
+        );
+    }
+
+    /// The common-module route counts the positions of the lowered call, not the presence
+    /// list of a local call, so a skip is measured on it separately. Its all-empty call
+    /// holds every position, unlike the local one characterized above.
+    #[test]
+    fn a_skipped_position_is_not_missing_on_a_common_module_call() {
+        let messages = module_calling(
+            "    Х = Другой.Три(, 2, 3);\n    Х = Другой.Три(1, , 3);\n    Х = Другой.Три(1, 2, );\n    \
+             Х = Другой.Три(, , );\n    Х = Другой.Три(1, 2);\n",
+        );
+        assert_eq!(
+            messages,
+            vec!["Укажите обязательный параметр 'В'".to_string()],
+            "only the trailing omission is reported"
+        );
+    }
+
+    /// The manager route also counts the lowered call, and reads the signature from the
+    /// manager module rather than from a common module.
+    #[test]
+    fn a_skipped_position_is_not_missing_on_a_manager_call() {
+        const CONFIGURATION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>Тест</Name></Properties>
+        <ChildObjects>
+            <Catalog>Товары</Catalog>
+            <CommonModule>Проба</CommonModule>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+        const CATALOG_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Catalog uuid="00000000-0000-0000-0000-000000000002">
+        <Properties><Name>Товары</Name></Properties>
+    </Catalog>
+</MetaDataObject>"#;
+        const MODULE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000003">
+        <Properties><Name>Проба</Name><Server>true</Server></Properties>
+    </CommonModule>
+</MetaDataObject>"#;
+        const MODULE_PATH: &str = "CommonModules/Проба/Ext/Module.bsl";
+
+        let messages: Vec<_> = crate::test_utils::check_config_files_with_unreadable(
+            &[
+                ("Configuration.xml", CONFIGURATION_XML),
+                ("Catalogs/Товары.xml", CATALOG_XML),
+                ("CommonModules/Проба.xml", MODULE_XML),
+                (
+                    "Catalogs/Товары/Ext/ManagerModule.bsl",
+                    "Функция Три(А, Б, В) Экспорт\n    Возврат А;\nКонецФункции\n",
+                ),
+                (
+                    MODULE_PATH,
+                    "Процедура Тест() Экспорт\n\
+                     Х = Справочники.Товары.Три(, 2, 3);\n\
+                     Х = Справочники.Товары.Три(1, 2, );\n\
+                     Х = Справочники.Товары.Три(, , );\n\
+                     Х = Справочники.Товары.Три(1, 2);\n\
+                     КонецПроцедуры\n",
+                ),
+            ],
+            MODULE_PATH,
+            &[],
+        )
+        .into_iter()
+        .filter(|diag| diag.code == DiagnosticCode::MissedRequiredParameter)
+        .map(|diag| diag.message)
+        .collect();
+        assert_eq!(
+            messages,
+            vec!["Укажите обязательный параметр 'В'".to_string()],
+            "only the trailing omission is reported"
         );
     }
 
@@ -324,7 +467,7 @@ mod tests {
     fn test_comprehensive() {
         let code = r#"Процедура Рассчет()
 
-    Результат = Сложение(, 2); // Range(2, 16, 2, 29)
+    Результат = Сложение(, 2);
     Сообщить(Результат);
 
     Инкремент(Результат);
@@ -339,7 +482,7 @@ mod tests {
     Результат = Сложение(); // 2xRange(14, 16, 14, 26)
     Сообщить(Результат);
 
-    Сообщить(Сложение(,)); // 2хRange(17, 13, 17, 24)
+    Сообщить(Сложение(,)); // Range(17, 13, 17, 24)
     Сообщить(Менеджер("Справочник")); // Range(18, 13, 18, 35)
 КонецПроцедуры
 
@@ -373,9 +516,6 @@ mod tests {
             code,
             DiagnosticCode::MissedRequiredParameter,
             expect![[r#"
-                MissedRequiredParameter @ 3:17..3:30
-                  message: Укажите обязательный параметр 'Левый'
-                  severity: Major
                 MissedRequiredParameter @ 9:17..9:28
                   message: Укажите обязательный параметр 'Правый'
                   severity: Major
@@ -383,13 +523,10 @@ mod tests {
                   message: Укажите обязательный параметр 'Левый', 'Правый'
                   severity: Major
                 MissedRequiredParameter @ 18:14..18:25
-                  message: Укажите обязательный параметр 'Левый', 'Правый'
+                  message: Укажите обязательный параметр 'Правый'
                   severity: Major
                 MissedRequiredParameter @ 19:14..19:36
                   message: Укажите обязательный параметр 'Вид'
-                  severity: Major
-                MissedRequiredParameter @ 30:17..30:41
-                  message: Укажите обязательный параметр 'Левый'
                   severity: Major"#]],
         );
     }
@@ -508,7 +645,7 @@ mod tests {
     /// does compile are still reported — a local call and a common-module call alike.
     #[test]
     fn a_branch_no_environment_compiles_is_not_judged() {
-        const CALLS: &str = "    Х = Три(1, , 3);\n    Х = Другой.Три(1, , 3);\n";
+        const CALLS: &str = "    Х = Три(1, 2);\n    Х = Другой.Три(1, 2);\n";
         let branch = |condition: &str| {
             module_calling(&format!("#Если {condition} Тогда\n{CALLS}#КонецЕсли\n"))
         };
@@ -529,11 +666,11 @@ mod tests {
     #[test]
     fn a_call_after_an_uncompiled_branch_is_still_judged() {
         let messages = module_calling(
-            "#Если Сервер И Не Сервер Тогда\n    Х = Три(1, , 3);\n#КонецЕсли\n    Х = Три(, 2, 3);\n",
+            "#Если Сервер И Не Сервер Тогда\n    Х = Три(1, 2);\n#КонецЕсли\n    Х = Три(1, 2);\n",
         );
         assert_eq!(
             messages,
-            vec!["Укажите обязательный параметр 'А'".to_string()],
+            vec!["Укажите обязательный параметр 'В'".to_string()],
             "only the compiled call after the branch is reported"
         );
     }
@@ -543,7 +680,7 @@ mod tests {
     /// branch is no more decided than the branch itself.
     #[test]
     fn an_undecided_branch_is_judged() {
-        const CALLS: &str = "    Х = Три(1, , 3);\n    Х = Другой.Три(1, , 3);\n";
+        const CALLS: &str = "    Х = Три(1, 2);\n    Х = Другой.Три(1, 2);\n";
 
         let then_branch = module_calling(&format!("#Если Линукс Тогда\n{CALLS}#КонецЕсли\n"));
         assert_eq!(then_branch.len(), 2, "the condition is undecided: {then_branch:?}");
@@ -572,7 +709,7 @@ mod tests {
                 .map(|diag| diag.message)
                 .collect::<Vec<_>>()
         };
-        const CALL: &str = "    Х = Три(1, , 3);\n";
+        const CALL: &str = "    Х = Три(1, 2);\n";
 
         let plain = module(CALL);
         assert_eq!(plain.len(), 1, "the session module compiles the plain call: {plain:?}");
@@ -592,7 +729,7 @@ mod tests {
     fn a_branch_of_a_module_of_unknown_environment_is_judged() {
         let fixture = "//- /test.bsl\n\
                        Функция Три(А, Б, В) Экспорт\n    Возврат А;\nКонецФункции\n\n\
-                       Процедура Тест()\n#Если Сервер Тогда\n    Х = Три(1, , 3);\n#КонецЕсли\n\
+                       Процедура Тест()\n#Если Сервер Тогда\n    Х = Три(1, 2);\n#КонецЕсли\n\
                        КонецПроцедуры\n";
         let messages: Vec<_> = crate::test_utils::check_hir_diagnostic_with_fixtures(fixture)
             .into_iter()
@@ -610,7 +747,7 @@ mod tests {
             in_server_module(&format!(
                 "Функция Три(А, Б, В) Экспорт\n    Возврат А;\nКонецФункции\n\n\
                  #Если {condition} Тогда\n\
-                 Процедура Тест() Экспорт\n    Х = Три(1, , 3);\n    Х = Другой.Три(1, , 3);\n\
+                 Процедура Тест() Экспорт\n    Х = Три(1, 2);\n    Х = Другой.Три(1, 2);\n\
                  КонецПроцедуры\n#КонецЕсли\n"
             ))
         };
