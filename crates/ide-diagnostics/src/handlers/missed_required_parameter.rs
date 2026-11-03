@@ -308,6 +308,51 @@ mod tests {
     }
 
     #[test]
+    fn test_trailing_comma_skip_is_not_missing() {
+        let code = r#"
+Процедура Тест()
+    Результат = Сложение(1, );
+КонецПроцедуры
+
+Функция Сложение(Левый, Правый)
+    Возврат Левый + Правый;
+КонецФункции
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::MissedRequiredParameter,
+            expect![[r#""#]],
+        );
+    }
+
+    // Characterizes a known gap OUTSIDE this handler: the platform accepts
+    // `Сложение(, )` and passes `Неопределено` for both parameters (measured on
+    // 8.3.17.1549 and 8.3.27.2214), so the finding below is wrong. The cause is
+    // upstream of the handler - two adjacent empty positions reach it as a single
+    // argument - and the snapshot is kept so that fixing the argument lowering
+    // makes this test fail and be updated to an empty expectation.
+    #[test]
+    fn test_both_positions_skipped_still_reports_known_lowering_gap() {
+        let code = r#"
+Процедура Тест()
+    Результат = Сложение(, );
+КонецПроцедуры
+
+Функция Сложение(Левый, Правый)
+    Возврат Левый + Правый;
+КонецФункции
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::MissedRequiredParameter,
+            expect![[r#"
+                MissedRequiredParameter @ 3:17..3:29
+                  message: Укажите обязательный параметр 'Правый'
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
     fn test_cfe_exported_common_module_signature_is_visible() {
         let code = r#"
 #Область ПрограммныйИнтерфейс
