@@ -28,8 +28,7 @@ A character is not reported:
   displays or searches for;
 - in an ordinary comment: the platform does not compile it;
 - as a non-breaking space separated from the preceding token by an ordinary space,
-  following punctuation or an operator, or at the start or the end of a line: the
-  module compiles.
+  following punctuation or an operator, or at the start of a line: the module compiles.
 
 Standard #std456 advises against these characters in the module text as a whole; this
 diagnostic does not check that advice.

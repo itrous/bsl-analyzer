@@ -179,8 +179,8 @@ fn apply_char_replacements(text: &str) -> String {
 
 /// Verified on 8.3.27: a non-breaking space breaks compilation only when it is
 /// absorbed into the preceding identifier, keyword or number; isolated by an
-/// ordinary space, after punctuation or an operator, and at the start or the end of
-/// a line the module compiles.
+/// ordinary space, after punctuation or an operator, and at the start of a line the
+/// module compiles.
 fn whitespace_corrupts_previous_token(token: &SyntaxToken, text: &str) -> bool {
     if !text.starts_with(ILLEGAL_SPACE) {
         return false;
