@@ -256,6 +256,14 @@ impl AnalysisProvider for SalsaProvider<'_> {
         hir::kernel_type_label(self.db, id, locale, false)
     }
 
+    fn kernel_types_overlap(
+        &self,
+        left: bsl_types::kind::TypeId,
+        right: bsl_types::kind::TypeId,
+    ) -> bool {
+        hir::type_sets_overlap(self.db, left, right)
+    }
+
     fn min_platform_version(&self) -> Option<Arc<str>> {
         HirDatabase::min_platform_version(self.db)
     }
