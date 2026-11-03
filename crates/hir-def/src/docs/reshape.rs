@@ -156,11 +156,20 @@ fn label_texts(roles: &[LineRole], lines: &[String]) -> (Vec<Option<usize>>, Vec
     (text_of_line, texts)
 }
 
-/// For each line, whether putting its version from `replaced` into `lines`, with every other
-/// line left as it is, changes what the documentation says about its parameters: their names,
-/// types and structure fields. Prose is not part of that, since no reader takes a meaning from
-/// it. Nothing is reported for a block that replacing every line at once leaves the same.
-pub fn doc_lines_reshaped_by_replacement(lines: &[String], replaced: &[String]) -> Vec<bool> {
+/// For each line, whether putting its `replace`d version into `lines`, with every other line
+/// left as it is, changes what the documentation says about its parameters: their names, types
+/// and structure fields. Prose is not part of that, since no reader takes a meaning from it.
+/// Nothing is reported for a block that replacing every line at once leaves the same.
+pub fn doc_lines_reshaped_by_replacement(
+    lines: &[String],
+    replace: impl Fn(&str) -> String,
+) -> Vec<bool> {
+    let replaced: Vec<String> = lines.iter().map(|line| replace(line)).collect();
+    reshaped_lines(lines, &replaced)
+}
+
+/// `lines` and `replaced` pair up line by line.
+fn reshaped_lines(lines: &[String], replaced: &[String]) -> Vec<bool> {
     let mut reshaped = vec![false; lines.len()];
     let parameters = parameters_of(lines);
     if same_parameter_shape(&parameters, &parameters_of(replaced)) {
@@ -459,11 +468,7 @@ mod tests {
             let (lines, replaced) = block_of(&pairs);
             let expected = reshaped_by_full_parse(&lines, &replaced);
             reshaped_lines += expected.iter().filter(|reshaped| **reshaped).count();
-            assert_eq!(
-                doc_lines_reshaped_by_replacement(&lines, &replaced),
-                expected,
-                "block: {lines:#?}"
-            );
+            assert_eq!(reshaped_lines(&lines, &replaced), expected, "block: {lines:#?}");
         }
         assert!(reshaped_lines > 5_000, "only {reshaped_lines} reshaped lines were exercised");
     }
@@ -473,7 +478,7 @@ mod tests {
         let (lines, replaced) = block_of(pairs);
         let expected = reshaped_by_full_parse(&lines, &replaced);
         assert_eq!(expected[line], verdict, "full parse of {lines:#?}");
-        assert_eq!(doc_lines_reshaped_by_replacement(&lines, &replaced), expected);
+        assert_eq!(reshaped_lines(&lines, &replaced), expected);
     }
 
     #[test]
@@ -596,7 +601,7 @@ mod tests {
             (" за\u{A0}разделителем", " за разделителем"),
         ]);
         assert_eq!(
-            doc_lines_reshaped_by_replacement(&lines, &replaced),
+            reshaped_lines(&lines, &replaced),
             [false, true, false, false, true, true, false]
         );
     }

@@ -131,11 +131,7 @@ fn replacement_reshapes_documented_parameters(
                     &comments.runs,
                 )
             })
-            .map(|lines| {
-                let replaced: Vec<String> =
-                    lines.iter().map(|line| apply_char_replacements(line)).collect();
-                hir::doc_lines_reshaped_by_replacement(&lines, &replaced)
-            })
+            .map(|lines| hir::doc_lines_reshaped_by_replacement(&lines, apply_char_replacements))
             .unwrap_or_default();
         comments.block = Some(CommentBlock { run, last_line, reshaped_lines });
     }
