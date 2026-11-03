@@ -96,17 +96,12 @@ struct BodyComments {
     block: Option<CommentBlock>,
 }
 
-/// The lines last read as one block: a long block holds many comments, and reading it
-/// anew from each of them would be quadratic in a block no replacement reshapes at all.
+/// The lines last read as one block: a long block holds many comments, and it is read
+/// once, however many of them have a character to judge.
 struct CommentBlock {
     run: usize,
     last_line: usize,
-    documentation: Option<MethodDocumentation>,
-}
-
-struct MethodDocumentation {
-    lines: Vec<String>,
-    any_replacement_reshapes: bool,
+    reshaped_lines: Vec<bool>,
 }
 
 fn replacement_reshapes_documented_parameters(
@@ -124,7 +119,7 @@ fn replacement_reshapes_documented_parameters(
     // Tokens come in text order, so a line up to the block's end lies inside it.
     if !comments.block.as_ref().is_some_and(|block| block.run == run && line <= block.last_line) {
         let last_line = line + lines[line + 1..].iter().take_while(|line| line.owns_line).count();
-        let documentation = comments
+        let reshaped_lines = comments
             .root
             .token_at_offset(lines[last_line].range.start())
             .right_biased()
@@ -139,23 +134,15 @@ fn replacement_reshapes_documented_parameters(
             .map(|lines| {
                 let replaced: Vec<String> =
                     lines.iter().map(|line| apply_char_replacements(line)).collect();
-                let any_replacement_reshapes = hir::doc_lines_change_parameters(&lines, &replaced);
-                MethodDocumentation { lines, any_replacement_reshapes }
-            });
-        comments.block = Some(CommentBlock { run, last_line, documentation });
+                hir::doc_lines_reshaped_by_replacement(&lines, &replaced)
+            })
+            .unwrap_or_default();
+        comments.block = Some(CommentBlock { run, last_line, reshaped_lines });
     }
 
     let block = comments.block.as_ref()?;
-    let documentation = block.documentation.as_ref()?;
-    if !documentation.any_replacement_reshapes {
-        return Some(false);
-    }
-    // shortcut: every reshaping line parses its block again, which takes seconds only at
-    // thousands of such lines in one block; an incremental parser would remove that.
-    let index = documentation.lines.len().checked_sub(block.last_line - line + 1)?;
-    let mut replaced = documentation.lines.clone();
-    replaced[index] = apply_char_replacements(&replaced[index]);
-    Some(hir::doc_lines_change_parameters(&documentation.lines, &replaced))
+    let index = block.reshaped_lines.len().checked_sub(block.last_line - line + 1)?;
+    Some(block.reshaped_lines[index])
 }
 
 /// Start of the method that is the first thing below `comment`.
