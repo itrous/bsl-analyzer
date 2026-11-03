@@ -194,28 +194,6 @@ enum JudgingWay {
     WholeBlock,
 }
 
-/// What the lines from some point of a section to its end add to the parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SectionTail {
-    Nothing,
-    MaybeSomething,
-    Entries,
-}
-
-impl SectionTail {
-    fn of_role(role: LineRole) -> Self {
-        match role {
-            LineRole::Parameter | LineRole::Type(0) => Self::Entries,
-            LineRole::Blank
-            | LineRole::Text {
-                description: DescriptionUse::Prose | DescriptionUse::CollectionProse,
-                ..
-            } => Self::Nothing,
-            _ => Self::MaybeSomething,
-        }
-    }
-}
-
 struct Block<'a> {
     lines: &'a [String],
     replaced: &'a [String],
@@ -266,6 +244,23 @@ impl Block<'_> {
         !same_parameter_shape(&self.parameters, &parameters_of(&candidate))
     }
 
+    /// How many lines of the section say all it says about the parameters. A line can only add
+    /// to what the lines above it said: a name, a type, a field or the rest of a label, whose
+    /// end moves only forward. So once the parameters are complete they stay so, and a few
+    /// parses find the point for every line that would end the section.
+    fn shortest_complete_prefix(&self, section_lines: &[String]) -> usize {
+        let (mut low, mut high) = (0, section_lines.len());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if same_parameter_shape(&self.parameters, &parse_parameters(&section_lines[..middle])) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        low
+    }
+
     fn judge_section_lines(
         &self,
         section: Range<usize>,
@@ -276,11 +271,7 @@ impl Block<'_> {
         let mut roles = vec![LineRole::default(); section_lines.len()];
         parse_parameters_with_roles(section_lines, Some(&mut roles));
 
-        let mut tails = vec![SectionTail::Nothing; section_lines.len() + 1];
-        for (offset, role) in roles.iter().enumerate().rev() {
-            tails[offset] = tails[offset + 1].max(SectionTail::of_role(*role));
-        }
-
+        let mut complete_prefix = None;
         let (text_of_line, label_texts) = label_texts(&roles, section_lines);
         let mut anchors = Anchors::default();
         let mut previous = None;
@@ -290,12 +281,10 @@ impl Block<'_> {
             match ways[index] {
                 JudgingWay::WholeBlock => {}
                 JudgingWay::ClosesSection => {
-                    // The parameters end above this line, and an entry below it is gone.
-                    reshaped[index] = match tails[offset] {
-                        SectionTail::Nothing => false,
-                        SectionTail::MaybeSomething => self.reshaped_by_whole_block(index),
-                        SectionTail::Entries => true,
-                    };
+                    // The parameters end above this line.
+                    let complete_prefix = *complete_prefix
+                        .get_or_insert_with(|| self.shortest_complete_prefix(section_lines));
+                    reshaped[index] = offset < complete_prefix;
                 }
                 JudgingWay::Window if line != new_line => {
                     let label_lines = text_of_line[offset]
@@ -558,6 +547,35 @@ mod tests {
             ],
             2,
             true,
+        );
+    }
+
+    #[test]
+    fn a_line_that_closes_the_section_reshapes_when_a_field_is_below_it() {
+        assert_verdict_on_line(
+            &[
+                ("Параметры:", "Параметры:"),
+                (" Набор - Структура:", " Набор - Структура:"),
+                ("Возвращаемое\u{A0}значение:", "Возвращаемое значение:"),
+                ("   * Поле - Строка", "   * Поле - Строка"),
+            ],
+            2,
+            true,
+        );
+    }
+
+    #[test]
+    fn a_line_that_closes_the_section_changes_nothing_above_mere_prose() {
+        assert_verdict_on_line(
+            &[
+                ("Параметры:", "Параметры:"),
+                (" Имя\u{A0}- Строка", " Имя - Строка"),
+                (" Набор - Структура:", " Набор - Структура:"),
+                ("Возвращаемое\u{A0}значение:", "Возвращаемое значение:"),
+                (" просто текст", " просто текст"),
+            ],
+            3,
+            false,
         );
     }
 
