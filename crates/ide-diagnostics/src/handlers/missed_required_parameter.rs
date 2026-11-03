@@ -328,9 +328,10 @@ mod tests {
     // Characterizes a known gap OUTSIDE this handler: the platform accepts
     // `Сложение(, )` and passes `Неопределено` for both parameters (measured on
     // 8.3.17.1549 and 8.3.27.2214), so the finding below is wrong. The cause is
-    // upstream of the handler - two adjacent empty positions reach it as a single
-    // argument - and the snapshot is kept so that fixing the argument lowering
-    // makes this test fail and be updated to an empty expectation.
+    // upstream of the handler - for a list with no expression at all, the presence
+    // list lowered for a local call drops the last position - and the snapshot is
+    // kept so that fixing that lowering makes this test fail and be updated to an
+    // empty expectation.
     #[test]
     fn test_both_positions_skipped_still_reports_known_lowering_gap() {
         let code = r#"
@@ -349,6 +350,83 @@ mod tests {
                 MissedRequiredParameter @ 3:17..3:29
                   message: Укажите обязательный параметр 'Правый'
                   severity: Major"#]],
+        );
+    }
+
+    /// The common-module route counts the positions of the lowered call, not the presence
+    /// list of a local call, so a skip is measured on it separately. Its all-empty call
+    /// holds every position, unlike the local one characterized above.
+    #[test]
+    fn a_skipped_position_is_not_missing_on_a_common_module_call() {
+        let messages = module_calling(
+            "    Х = Другой.Три(, 2, 3);\n    Х = Другой.Три(1, , 3);\n    Х = Другой.Три(1, 2, );\n    \
+             Х = Другой.Три(, , );\n    Х = Другой.Три(1, 2);\n",
+        );
+        assert_eq!(
+            messages,
+            vec!["Укажите обязательный параметр 'В'".to_string()],
+            "only the trailing omission is reported"
+        );
+    }
+
+    /// The manager route also counts the lowered call, and reads the signature from the
+    /// manager module rather than from a common module.
+    #[test]
+    fn a_skipped_position_is_not_missing_on_a_manager_call() {
+        const CONFIGURATION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>Тест</Name></Properties>
+        <ChildObjects>
+            <Catalog>Товары</Catalog>
+            <CommonModule>Проба</CommonModule>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+        const CATALOG_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Catalog uuid="00000000-0000-0000-0000-000000000002">
+        <Properties><Name>Товары</Name></Properties>
+    </Catalog>
+</MetaDataObject>"#;
+        const MODULE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000003">
+        <Properties><Name>Проба</Name><Server>true</Server></Properties>
+    </CommonModule>
+</MetaDataObject>"#;
+        const MODULE_PATH: &str = "CommonModules/Проба/Ext/Module.bsl";
+
+        let messages: Vec<_> = crate::test_utils::check_config_files_with_unreadable(
+            &[
+                ("Configuration.xml", CONFIGURATION_XML),
+                ("Catalogs/Товары.xml", CATALOG_XML),
+                ("CommonModules/Проба.xml", MODULE_XML),
+                (
+                    "Catalogs/Товары/Ext/ManagerModule.bsl",
+                    "Функция Три(А, Б, В) Экспорт\n    Возврат А;\nКонецФункции\n",
+                ),
+                (
+                    MODULE_PATH,
+                    "Процедура Тест() Экспорт\n\
+                     Х = Справочники.Товары.Три(, 2, 3);\n\
+                     Х = Справочники.Товары.Три(1, 2, );\n\
+                     Х = Справочники.Товары.Три(, , );\n\
+                     Х = Справочники.Товары.Три(1, 2);\n\
+                     КонецПроцедуры\n",
+                ),
+            ],
+            MODULE_PATH,
+            &[],
+        )
+        .into_iter()
+        .filter(|diag| diag.code == DiagnosticCode::MissedRequiredParameter)
+        .map(|diag| diag.message)
+        .collect();
+        assert_eq!(
+            messages,
+            vec!["Укажите обязательный параметр 'В'".to_string()],
+            "only the trailing omission is reported"
         );
     }
 
@@ -389,7 +467,7 @@ mod tests {
     fn test_comprehensive() {
         let code = r#"Процедура Рассчет()
 
-    Результат = Сложение(, 2); // Range(2, 16, 2, 29)
+    Результат = Сложение(, 2);
     Сообщить(Результат);
 
     Инкремент(Результат);
@@ -404,7 +482,7 @@ mod tests {
     Результат = Сложение(); // 2xRange(14, 16, 14, 26)
     Сообщить(Результат);
 
-    Сообщить(Сложение(,)); // 2хRange(17, 13, 17, 24)
+    Сообщить(Сложение(,)); // Range(17, 13, 17, 24)
     Сообщить(Менеджер("Справочник")); // Range(18, 13, 18, 35)
 КонецПроцедуры
 
