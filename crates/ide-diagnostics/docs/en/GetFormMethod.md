@@ -3,10 +3,15 @@
 <!-- Блоки выше заполняются автоматически, не трогать -->
 ## Description
 
-Standard `#std487` (“Minimizing the number of server calls and traffic”),
-p. 4.1, requires a form that is opened from code to be opened in a single call
-with the global context method `OpenForm()`. Obtaining the form with
-`GetForm()` and then opening it by hand costs an extra server call.
+1C recommendations prefer opening forms through the global context method
+`OpenForm()` (`OpenFormModal()` for older `8.2`-era projects) instead of first
+obtaining a form object with `GetForm()`.
+
+The one-call requirement is stated explicitly in standard `#std487`
+(“Minimizing the number of server calls and traffic”), p. 4.1: a form that is
+opened from code should be opened in a single call with `OpenForm()`.
+Obtaining the form with `GetForm()` and then opening it by hand costs an extra
+server call.
 
 The `GetForm()` call itself works and returns a form object; the standard does
 not forbid obtaining one, for example to get a navigation link, to print, or to
@@ -38,6 +43,8 @@ EndProcedure
 ```
 
 ## Sources
-* Primary source: [ITS / v8std #std487: Minimizing the number of server calls and traffic (RU)](https://its.1c.ru/db/v8std#content:487:hdoc)
+* Primary source: [ITS / v8std #std404: Opening forms (RU)](https://its.1c.ru/db/v8std#content:404:hdoc)
+* Secondary source: [v8std.ru: #std404](https://v8std.ru/std/404/)
+* Secondary source: [ITS / v8std #std487: Minimizing the number of server calls and traffic (RU)](https://its.1c.ru/db/v8std#content:487:hdoc)
 * Secondary source: [v8std.ru: #std487](https://v8std.ru/std/487/)
 * Secondary source: [v8std.ru: GetFormMethod](https://v8std.ru/diagnostics/bslls/GetFormMethod/)
