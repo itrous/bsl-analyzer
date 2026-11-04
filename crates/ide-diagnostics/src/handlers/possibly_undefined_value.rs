@@ -107,6 +107,29 @@ mod tests {
     }
 
     #[test]
+    fn a_disjoint_argument_of_the_same_call_takes_the_report() {
+        // A call reports one argument, and the disjoint one is the stronger verdict.
+        let code = r#"
+Процедура Тест(Условие)
+    Позиция = Неопределено;
+    Если Условие Тогда
+        Позиция = 5;
+    КонецЕсли;
+    Результат = Сред("abc", Позиция, "x");
+КонецПроцедуры
+"#;
+        check_diagnostics_snapshot_for(code, DiagnosticCode::PossiblyUndefinedValue, expect![[""]]);
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::TypeMismatch,
+            expect![[r#"
+                TypeMismatch @ 7:38..7:41
+                  message: Несоответствие типов: ожидалось 'Число', получено 'Строка'
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
     fn overlap_without_undefined_is_silent() {
         // Meets in `Строка`; `Неопределено` is on neither side.
         let code = r#"

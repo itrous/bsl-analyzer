@@ -17,6 +17,7 @@ The code is not necessarily wrong: a value that is `Undefined` on one branch is 
 - **Parameter accepts `Undefined`**: nothing is reported when the expected set itself contains `Undefined`.
 - **Disjoint types**: when the sets do not overlap, `TypeMismatch` applies instead of this hint.
 - **Overlap without `Undefined`**: stays fully silent.
+- **One argument per call**: when a call has an argument with a disjoint type, that argument gets `TypeMismatch` and the hint is not reported.
 
 ## Examples
 
