@@ -419,29 +419,58 @@ fn analyze_salsa(
     let output_dir = output_dir.unwrap_or_else(|| PathBuf::from("."));
 
     tracing::info!("Loading project configuration");
-    let mut proj_config = if let Some(ref cfg) = config_path {
-        project_model::ProjectConfig::load_from_file(cfg)?
+    let (mut proj_config, config_dir) = if let Some(ref cfg) = config_path {
+        (project_model::ProjectConfig::load_from_file(cfg)?, None)
     } else {
-        project_model::ProjectConfig::load(&source_dir)?.unwrap_or_default()
+        // `--source-dir` usually points at the configuration root inside a project
+        // while the config sits at the project root; `load` looks in one directory
+        // only and would silently run on defaults here.
+        match project_model::ProjectConfig::discover(&source_dir)? {
+            Some((config, path)) => {
+                tracing::info!(path = %path.display(), "Using project configuration");
+                (config, path.parent().map(Path::to_path_buf))
+            }
+            None => {
+                tracing::info!("No project configuration found, using defaults");
+                (project_model::ProjectConfig::default(), None)
+            }
+        }
     };
+
+    // A discovered config's relative paths mean "relative to the config file", wherever `-s` points.
+    let project_root = config_dir.unwrap_or_else(|| source_dir.clone());
 
     // Applied before anything reads the config: `configuration_path` and
     // `load_metadata` below run on this value, and the path the first produces
     // becomes the interned configuration input the diagnostics resolve through.
-    source_set.resolve(&source_dir)?.apply_to(&mut proj_config);
-    bsl_analyzer::help_bootstrap::bootstrap_for_config(&proj_config, &source_dir);
+    super::source_set::rebase_override(
+        source_set.resolve(&source_dir)?,
+        &source_dir,
+        &project_root,
+    )
+    .apply_to(&mut proj_config);
+    if project_root != source_dir
+        && proj_config.configuration_root.is_none()
+        && proj_config.configuration_dependency.is_none()
+    {
+        // Without a declared root the project would search from the config's directory and lose `-s`.
+        if let Ok(relative) = source_dir.strip_prefix(&project_root) {
+            proj_config.configuration_root = Some(super::source_set::slash_path(relative));
+        }
+    }
+    bsl_analyzer::help_bootstrap::bootstrap_for_config(&proj_config, &project_root);
 
     let scope = build_scope(&source_dir, &scope_args, proj_config.analysis.diff_base.as_deref())?;
     let author_filter =
         build_author_filter(&source_dir, &ignored_authors, &proj_config.analysis.ignored_authors)?;
 
-    let _metadata = proj_config.load_metadata(&source_dir)?;
-    let configuration_path = proj_config.resolve_configuration_path(&source_dir)?;
+    let _metadata = proj_config.load_metadata(&project_root)?;
+    let configuration_path = proj_config.resolve_configuration_path(&project_root)?;
 
     // Scope the file walk to the configuration source root (+ extension roots)
     // instead of the raw `-s` dir, so vendored/build copies such as
     // `.build/vendor` are not analyzed as a duplicate configuration.
-    let project = project_model::Project::with_config(&source_dir, proj_config.clone())?;
+    let project = project_model::Project::with_config(&project_root, proj_config.clone())?;
     project.warn_about_external_discovery_rejections();
     if baseline_command.is_some() && project.diagnostics_baseline()?.is_none() {
         return Err("[diagnostics.baseline].path is not configured".into());
