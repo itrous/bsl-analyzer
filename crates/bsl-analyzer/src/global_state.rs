@@ -92,6 +92,10 @@ pub enum Task {
         /// revision: unlike a drifted disk read, another run does not meet it again.
         local: bool,
     },
+    ForeignHandlerBindingsPrimed {
+        /// The cancellation that ended it early, if one did.
+        cut: Option<salsa::Cancelled>,
+    },
     DiagnosticsReady {
         uri: Url,
         diagnostics: Vec<lsp_types::Diagnostic>,
@@ -251,6 +255,22 @@ impl DispatchStamp {
     pub fn drifted_since(self, dispatched: DispatchStamp) -> bool {
         self.revision == dispatched.revision && self.drifts != dispatched.drifts
     }
+}
+
+/// Where the foreign handler bindings priming stands. At most one run is on the pool: a
+/// run for a storage replaced meanwhile is cut, and its report starts the run the
+/// replacement wants.
+#[derive(Debug, Default)]
+pub(crate) struct ForeignBindingsPriming {
+    /// The current storage still wants a run started.
+    pub(crate) pending: bool,
+    pub(crate) in_flight: bool,
+    /// Where the store stood when the in-flight (or last) run started.
+    pub(crate) started: Option<DispatchStamp>,
+    /// Set when a run was cut by a disk read that drifted from its revision, which unwinds
+    /// the same way until the change is applied. The next run waits for the revision to move
+    /// from this one, or for an idle tick.
+    pub(crate) parked_at: Option<salsa::Revision>,
 }
 
 /// What a finished batch chunk carries back to the event loop.
@@ -448,6 +468,7 @@ pub struct GlobalState {
     /// waits for the revision to move from this one, or for an idle tick, instead of
     /// restarting at once.
     pub(crate) shared_metadata_warm_parked_at: Option<salsa::Revision>,
+    pub(crate) foreign_bindings_priming: ForeignBindingsPriming,
     pub(crate) shared_request_generation: u64,
     pub(crate) shared_owner_generation: Option<u64>,
     pub(crate) shared_configuration_error: Option<String>,
@@ -746,6 +767,7 @@ impl GlobalState {
             shared_metadata_warm_pending: false,
             shared_metadata_warm_started: None,
             shared_metadata_warm_parked_at: None,
+            foreign_bindings_priming: ForeignBindingsPriming::default(),
             shared_request_generation: 0,
             shared_owner_generation: None,
             shared_configuration_error: None,
@@ -1244,6 +1266,62 @@ impl GlobalState {
         }
     }
 
+    /// Build the source root's foreign handler bindings on the pool once the workspace is
+    /// loaded. The fold scans every file of the root one after another, so the first form
+    /// module that asks for it pays the whole scan on the diagnostics worker: measured at
+    /// 1.4 s on a 10 000-object configuration, inside a client budget of 15 s, and the
+    /// time is then reported against whichever rule asked first. The CLI primes it for the
+    /// same reason, see `bin/cli/analyze.rs`.
+    ///
+    /// The request stands until a run starts: one still in flight or a full task pool only
+    /// delays it; the event loop starts it once neither holds
+    /// ([`Self::start_foreign_handler_bindings_priming`]).
+    pub(crate) fn prime_foreign_handler_bindings(&mut self) {
+        self.foreign_bindings_priming.pending = true;
+        self.foreign_bindings_priming.parked_at = None;
+        self.start_foreign_handler_bindings_priming();
+    }
+
+    /// Only two rules consult the fold; with both switched off nothing would read it.
+    pub(crate) fn foreign_bindings_readers_enabled(&self) -> bool {
+        ide::DiagnosticsConfig::from_input(&self.diagnostics_config).any_enabled(&[
+            ide::DiagnosticCode::UnusedLocalMethod,
+            ide::DiagnosticCode::UnusedParameters,
+        ])
+    }
+
+    pub(crate) fn start_foreign_handler_bindings_priming(&mut self) {
+        let priming = &self.foreign_bindings_priming;
+        if !priming.pending || priming.in_flight || !self.task_pool.pool.has_capacity() {
+            return;
+        }
+        if priming.parked_at.is_some_and(|at| at == self.analysis_host.request_revision()) {
+            return;
+        }
+        if !self.foreign_bindings_readers_enabled() {
+            tracing::debug!("foreign handler bindings: both consumers disabled, priming skipped");
+            self.foreign_bindings_priming.pending = false;
+            return;
+        }
+
+        let db = self.analysis_host.raw_database().clone();
+        let started = DispatchStamp::of(&db);
+        let analysis_guard = self.note_analysis_spawned();
+        let spawned = self.task_pool.pool.try_spawn(move || {
+            let _analysis_guard = analysis_guard;
+            foreign_handler_bindings_priming(move || {
+                db.prime_foreign_handler_bindings(base_db::BSL_SOURCE_ROOT)
+            })
+        });
+        if spawned.is_ok() {
+            let priming = &mut self.foreign_bindings_priming;
+            priming.pending = false;
+            priming.in_flight = true;
+            priming.started = Some(started);
+            priming.parked_at = None;
+        }
+    }
+
     /// Where the store [`SessionAnalysisHost::analysis`] reads stands now — the store the
     /// warm-up and the sweep's chunks run on.
     pub(crate) fn dispatch_stamp(&self) -> DispatchStamp {
@@ -1342,6 +1420,38 @@ pub(crate) fn shared_metadata_warmup(warm: impl FnOnce()) -> Task {
             Task::SharedMetadataWarmed { cancelled: false, local: false }
         }
     }
+}
+
+/// Run the foreign handler bindings priming and report how it ended. Only a cancellation
+/// can ask for another run: a priming that failed otherwise would fail the same way again,
+/// and the file that asks for the fold next meets the failure at its own boundary.
+pub(crate) fn foreign_handler_bindings_priming(prime: impl FnOnce()) -> Task {
+    let begun = std::time::Instant::now();
+    let primed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(prime));
+    // The per-file work parsed on rayon's threads. Their green-node caches never evict, and
+    // the idle trim's broadcast reaches only the task pool's workers, so nothing else in a
+    // server session would release the trees these caches now pin.
+    rayon::broadcast(|_| syntax::clear_shared_node_cache());
+    let cut = match primed {
+        Ok(()) => {
+            tracing::info!(
+                elapsed_ms = begun.elapsed().as_millis() as u64,
+                "foreign handler bindings primed",
+            );
+            None
+        }
+        Err(payload) => match payload.downcast::<salsa::Cancelled>() {
+            Ok(cut) => {
+                tracing::debug!(?cut, "foreign handler bindings priming cancelled");
+                Some(*cut)
+            }
+            Err(_) => {
+                tracing::warn!("foreign handler bindings priming failed; not retried");
+                None
+            }
+        },
+    };
+    Task::ForeignHandlerBindingsPrimed { cut }
 }
 
 #[derive(Debug)]
