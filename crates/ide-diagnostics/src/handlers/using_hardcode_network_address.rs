@@ -20,7 +20,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Standard],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 const DEFAULT_SEARCH_WORDS_EXCLUSION: &str =
@@ -352,34 +352,34 @@ FoundedElement = HTMLDocument.evaluate(".//img[ancestor::div[@aria-hidden=""Fals
             expect![[r#"
                 UsingHardcodeNetworkAddress @ 3:16..3:32
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical
+                  severity: Warning
                 UsingHardcodeNetworkAddress @ 7:24..7:40
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical
+                  severity: Warning
                 UsingHardcodeNetworkAddress @ 10:24..10:65
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical
+                  severity: Warning
                 UsingHardcodeNetworkAddress @ 11:24..11:65
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical
+                  severity: Warning
                 UsingHardcodeNetworkAddress @ 13:45..13:86
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical
+                  severity: Warning
                 UsingHardcodeNetworkAddress @ 21:19..21:30
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical
+                  severity: Warning
                 UsingHardcodeNetworkAddress @ 24:8..24:120
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical
+                  severity: Warning
                 UsingHardcodeNetworkAddress @ 58:105..58:115
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical
+                  severity: Warning
                 UsingHardcodeNetworkAddress @ 66:10..66:23
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical
+                  severity: Warning
                 UsingHardcodeNetworkAddress @ 72:7..72:16
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -572,7 +572,7 @@ FoundedElement = HTMLDocument.evaluate(".//img[ancestor::div[@aria-hidden=""Fals
             expect![[r#"
                 UsingHardcodeNetworkAddress @ 3:10..3:23
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -589,7 +589,7 @@ FoundedElement = HTMLDocument.evaluate(".//img[ancestor::div[@aria-hidden=""Fals
             expect![[r#"
                 UsingHardcodeNetworkAddress @ 3:10..3:51
                   message: Используется хранение в коде ip-адреса
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 
