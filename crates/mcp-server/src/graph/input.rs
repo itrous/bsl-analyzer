@@ -491,6 +491,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "the scanned path is spelled differently from the fixture path on Windows"
+    )]
     fn user_exclusions_change_portable_identity_and_the_scanned_universe() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
