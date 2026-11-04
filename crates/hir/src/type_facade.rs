@@ -397,12 +397,32 @@ pub fn kernel_type_label(
     locale: base_db::Locale,
     precision: bool,
 ) -> String {
-    let kernel_locale = match locale {
+    let ctx = plain_display(locale, precision);
+    kernel_display(db.lookup_type(id), &ctx, db)
+}
+
+/// Labels of a union's own members, each rendered whole. `None` when `id` is not a union.
+///
+/// The printed label of the whole type cannot be split back into these: a union nested
+/// inside a member prints with the same ` | ` separator (`Массив из Число | Строка` is one array).
+pub fn kernel_union_member_labels(
+    db: &dyn TypeKernelDb,
+    id: TypeId,
+    locale: base_db::Locale,
+) -> Option<Vec<String>> {
+    let TypeKind::Union(members) = db.lookup_type(id) else {
+        return None;
+    };
+    let ctx = plain_display(locale, false);
+    Some(members.iter().map(|member| kernel_display(db.lookup_type(*member), &ctx, db)).collect())
+}
+
+fn plain_display(locale: base_db::Locale, precision: bool) -> PlainDisplayCtx {
+    let locale = match locale {
         base_db::Locale::Ru => KernelLocale::Ru,
         base_db::Locale::En => KernelLocale::En,
     };
-    let ctx = PlainDisplayCtx { locale: kernel_locale, precision_visible: precision };
-    kernel_display(db.lookup_type(id), &ctx, db)
+    PlainDisplayCtx { locale, precision_visible: precision }
 }
 
 fn field_from_info(info: FieldInfo) -> Field {
@@ -1292,6 +1312,28 @@ mod tests {
         let to = fixed_function(&db, vec![db.number(None, None)], number_or_string);
         assert!(t(&db, file_id, from).is_assignable_to(&t(&db, file_id, to)));
         assert!(!t(&db, file_id, to).is_assignable_to(&t(&db, file_id, from)));
+    }
+
+    #[test]
+    fn union_member_labels_keep_a_nested_separator_inside_the_member() {
+        use bsl_types::builders::Builders;
+        use bsl_types::facet::DateComponent;
+        use bsl_types::testing::InMemoryDb;
+
+        let db = InMemoryDb::new();
+        let nested = db.union(vec![db.number(None, None), db.string(None, false)]);
+        let array = db.array(Some(nested));
+        let outer =
+            db.union(vec![array, db.boolean(), db.undefined(), db.date(DateComponent::Date)]);
+
+        let labels = kernel_union_member_labels(&db, outer, base_db::Locale::Ru).expect("union");
+        assert_eq!(labels.len(), 4, "{labels:?}");
+        assert!(
+            labels.iter().any(|label| label.contains(" | ")),
+            "a union nested in a member is not another member: {labels:?}"
+        );
+        assert_eq!(labels.join(" | "), kernel_type_label(&db, outer, base_db::Locale::Ru, false));
+        assert!(kernel_union_member_labels(&db, array, base_db::Locale::Ru).is_none());
     }
 
     #[test]

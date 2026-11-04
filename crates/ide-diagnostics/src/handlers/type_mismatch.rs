@@ -22,18 +22,25 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
 /// Union members kept in a message; the rest is summarised as a count.
 const MESSAGE_UNION_MEMBERS: usize = 3;
 
-/// Cuts a union label down for a diagnostic message. An expected type that is a union of all
-/// metadata-object kinds rendered as a 4744-character line, unreadable in a hover. Callers must
-/// compare labels BEFORE shortening: two different unions can share their first members.
-pub(crate) fn shorten_type_union(label: &str) -> String {
-    // `bsl-types` display joins union members with exactly this separator.
-    const SEPARATOR: &str = " | ";
-    let total = label.split(SEPARATOR).count();
-    if total <= MESSAGE_UNION_MEMBERS {
-        return label.to_owned();
+/// Shortens a union for a diagnostic message. `members` are the union's own members, each
+/// already rendered whole: a union nested inside a member prints with the same separator and
+/// is not another member. Callers must compare full labels BEFORE shortening: two different
+/// unions can share their first members.
+pub(crate) fn shorten_union_members(members: &[String]) -> String {
+    if members.len() <= MESSAGE_UNION_MEMBERS {
+        return members.join(" | ");
     }
-    let kept: Vec<&str> = label.split(SEPARATOR).take(MESSAGE_UNION_MEMBERS).collect();
-    format!("{} | … и ещё {}", kept.join(SEPARATOR), total - MESSAGE_UNION_MEMBERS)
+    let kept = members[..MESSAGE_UNION_MEMBERS].join(" | ");
+    format!("{kept} | … и ещё {}", members.len() - MESSAGE_UNION_MEMBERS)
+}
+
+/// The label to print. A long union keeps the first [`MESSAGE_UNION_MEMBERS`] members; every
+/// other type, including one whose own label contains ` | `, is printed in full.
+pub(crate) fn message_type_label(ctx: &AnalysisContext, id: TypeId, full_label: String) -> String {
+    match ctx.kernel_union_member_labels(id, ctx.locale()) {
+        Some(members) if members.len() > MESSAGE_UNION_MEMBERS => shorten_union_members(&members),
+        _ => full_label,
+    }
 }
 
 pub fn from_hir(
@@ -51,8 +58,8 @@ pub fn from_hir(
     if expected_label == actual_label || ctx.kernel_types_overlap(expected, actual) {
         return None;
     }
-    let (expected_label, actual_label) =
-        (shorten_type_union(&expected_label), shorten_type_union(&actual_label));
+    let expected_label = message_type_label(ctx, expected, expected_label);
+    let actual_label = message_type_label(ctx, actual, actual_label);
     let message =
         format!("Несоответствие типов: ожидалось '{expected_label}', получено '{actual_label}'");
     crate::simple_hir_diagnostic(DiagnosticCode::TypeMismatch, message, range, ctx)
@@ -60,59 +67,59 @@ pub fn from_hir(
 
 #[cfg(test)]
 mod tests {
-    use super::shorten_type_union;
+    use super::shorten_union_members;
     use crate::test_utils::check_diagnostics_snapshot_for;
     use crate::DiagnosticCode;
     use expect_test::expect;
 
-    #[test]
-    fn shorten_leaves_a_label_without_separator_alone() {
-        assert_eq!(shorten_type_union("Число"), "Число");
-        assert_eq!(shorten_type_union(""), "");
+    fn members(labels: &[&str]) -> Vec<String> {
+        labels.iter().map(|label| (*label).to_owned()).collect()
     }
 
     #[test]
     fn shorten_leaves_up_to_three_members_alone() {
-        assert_eq!(shorten_type_union("А"), "А");
-        assert_eq!(shorten_type_union("А | Б | В"), "А | Б | В");
+        assert_eq!(shorten_union_members(&members(&["А"])), "А");
+        assert_eq!(shorten_union_members(&members(&["А", "Б", "В"])), "А | Б | В");
+        assert_eq!(shorten_union_members(&[]), "");
     }
 
     #[test]
     fn shorten_cuts_the_fourth_member_onwards() {
-        assert_eq!(shorten_type_union("А | Б | В | Г"), "А | Б | В | … и ещё 1");
+        assert_eq!(shorten_union_members(&members(&["А", "Б", "В", "Г"])), "А | Б | В | … и ещё 1");
     }
 
     #[test]
     fn shorten_bounds_a_sixty_member_union() {
-        let members: Vec<String> = (0..60).map(|i| format!("ОбъектМетаданных: Вид{i}")).collect();
-        let full = members.join(" | ");
-        let short = shorten_type_union(&full);
+        let labels: Vec<String> = (0..60).map(|i| format!("ОбъектМетаданных: Вид{i}")).collect();
+        let short = shorten_union_members(&labels);
         assert!(short.ends_with(" | … и ещё 57"), "{short}");
         assert_eq!(short.split(" | ").count(), 4);
         assert!(short.chars().count() < 120, "{} chars", short.chars().count());
-        assert!(full.chars().count() > 1000);
+        assert!(labels.join(" | ").chars().count() > 1000);
     }
 
     #[test]
-    fn shorten_keeps_a_member_with_spaces_intact() {
+    fn shorten_keeps_a_member_that_prints_a_separator_intact() {
+        let labels = members(&[
+            "ОбъектМетаданных: HTTPСервис",
+            "Строка",
+            "ПолеФормы:Значение -> Булево | Число",
+            "Дата",
+        ]);
         assert_eq!(
-            shorten_type_union("ОбъектМетаданных: HTTPСервис | Строка | Число | Булево"),
-            "ОбъектМетаданных: HTTPСервис | Строка | Число | … и ещё 1"
-        );
-        assert_eq!(
-            shorten_type_union("ОбъектМетаданных: HTTPСервис"),
-            "ОбъектМетаданных: HTTPСервис"
+            shorten_union_members(&labels),
+            "ОбъектМетаданных: HTTPСервис | Строка | ПолеФормы:Значение -> Булево | Число | … и ещё 1"
         );
     }
 
     #[test]
     fn distinct_unions_sharing_three_members_differ_in_full_but_not_shortened() {
-        // The guard in `from_hir` must compare these full labels: shortened they are
+        // The guard in `from_hir` must compare the full labels: shortened they are
         // equal, and comparing after shortening would drop a real finding.
-        let expected = "А | Б | В | Г";
-        let actual = "А | Б | В | Д";
+        let expected = members(&["А", "Б", "В", "Г"]);
+        let actual = members(&["А", "Б", "В", "Д"]);
         assert_ne!(expected, actual);
-        assert_eq!(shorten_type_union(expected), shorten_type_union(actual));
+        assert_eq!(shorten_union_members(&expected), shorten_union_members(&actual));
     }
 
     // The arguments below are variables whose union the analyzer computed from
@@ -225,6 +232,70 @@ mod tests {
         assert_eq!(
             messages,
             ["Несоответствие типов: ожидалось 'Число', получено 'ПолеФормы:Значение -> Булево | Число'"]
+        );
+    }
+
+    #[test]
+    fn a_four_member_union_message_keeps_three_members() {
+        // Each `Если` without `Иначе` leaves the previous value reachable, and a literal
+        // assignment is a member narrowing can join. The message must name three of them
+        // and count the fourth, not print the whole union.
+        let code = r#"
+Процедура Тест(У1, У2, У3)
+    Значение = "а";
+    Если У1 Тогда
+        Значение = Истина;
+    КонецЕсли;
+    Если У2 Тогда
+        Значение = Неопределено;
+    КонецЕсли;
+    Если У3 Тогда
+        Значение = '20240101';
+    КонецЕсли;
+    Результат = Лев("abc", Значение);
+КонецПроцедуры
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::TypeMismatch,
+            expect![[r#"
+                TypeMismatch @ 13:28..13:36
+                  message: Несоответствие типов: ожидалось 'Число', получено 'Булево | ДатаВремя | Строка | … и ещё 1'
+                  severity: Major"#]],
+        );
+    }
+
+    #[test]
+    fn a_form_control_whose_value_is_a_long_union_is_not_cut() {
+        // The control is one type. Its value prints four members with the same separator a
+        // union uses; splitting that label would hide the control and invent a count.
+        let form_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10">
+    <ChildItems>
+        <InputField name="ПолеВвода" id="1">
+            <DataPath>Значение</DataPath>
+        </InputField>
+    </ChildItems>
+    <Attributes>
+        <Attribute name="Значение" id="2">
+            <Type>
+                <v8:Type>xs:boolean</v8:Type>
+                <v8:Type>xs:decimal</v8:Type>
+                <v8:Type>xs:string</v8:Type>
+                <v8:Type>xs:dateTime</v8:Type>
+            </Type>
+        </Attribute>
+    </Attributes>
+</Form>"#;
+        let code = "&НаКлиенте\nПроцедура Тест()\n    Р = Лев(\"abc\", Элементы.ПолеВвода);\nКонецПроцедуры\n";
+        let messages: Vec<String> = crate::test_utils::check_form_with_form_xml(code, form_xml)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::TypeMismatch)
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert_eq!(
+            messages,
+            ["Несоответствие типов: ожидалось 'Число', получено 'ПолеФормы:Значение -> Булево | ДатаВремя | Число | Строка'"]
         );
     }
 

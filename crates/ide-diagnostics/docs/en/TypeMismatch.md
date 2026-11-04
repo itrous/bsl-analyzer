@@ -20,6 +20,7 @@ The analyzer resolves each call into exactly one of three mutually exclusive sel
 - **Doc-Comment Split**: Mismatches where the expected type is derived from JSDoc comments are reported as `TypeMismatchByDocComment` to distinguish between platform-enforced types and user-defined documentation.
 - **Unknown Arguments**: An argument or parameter of type `Unknown` is indeterminate and does not itself cause `TypeMismatch`. Other concrete incompatible arguments can still reject the call.
 - **Overlapping Types**: The diagnostic fires only when the expected and the actual type sets share no member. A value of type `Number | Undefined` inferred from code branches is not reported in a `Number` parameter, because some of its values fit. When a call has several such arguments, the first argument sharing no member is reported.
+- **Long unions**: A message keeps the first three members of a union and appends ` | … и ещё N` for the rest. The suffix is Russian because the message template is Russian. Detection still compares the full labels, so a long union is reported exactly when the full one would be. A type that is not itself a union is printed in full, even when its label contains ` | `. Other views of the type keep the full label. `TypeMismatchByDocComment` shortens the same way.
 - **Ambiguity**: Ambiguity in type resolution does not trigger a `TypeMismatch`. The diagnostic only fires when the candidate selection is explicitly rejected.
 
 ## Examples
