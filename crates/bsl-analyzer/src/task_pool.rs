@@ -127,7 +127,7 @@ impl<T: Send + 'static> TaskPool<T> {
     /// For thread-maintenance work (clearing a worker's thread-local caches) whose
     /// completion must not count as loop activity — a result `T` would wake the
     /// loop and reset the idle clock that scheduled the job in the first place.
-    pub fn try_spawn_detached<F>(&self, job: F) -> Result<(), TrySpawnError>
+    fn try_spawn_detached<F>(&self, job: F) -> Result<(), TrySpawnError>
     where
         F: FnOnce() + Send + 'static,
     {

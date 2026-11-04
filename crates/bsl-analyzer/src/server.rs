@@ -1308,6 +1308,12 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 if owner_had_no_snapshot && frozen && !state.shared_view_seeded {
                     state.shared_seed_queued = false;
                 }
+                // A shared session has no loader, so its seed stands where the standalone
+                // load's end stands: the priming starts before the documents are scheduled.
+                // After the settings and the catch-up above, as the warm-up below is.
+                if published && state.vfs_done {
+                    state.prime_foreign_handler_bindings();
+                }
                 if state.vfs_done {
                     for uri in state.opened_document_uris() {
                         crate::handlers::schedule_diagnostics(state, &uri);
@@ -1399,6 +1405,23 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 }
             }
             state.start_shared_metadata_warmup();
+        }
+        Task::ForeignHandlerBindingsPrimed { cut, started } => {
+            // What it computed before the cut stays memoised, so another run continues from
+            // there, and the document whose open or edit cut it can read the fold sooner. A
+            // cut by a disk read that drifted, with no write since, would unwind another run
+            // the same way, and a propagated panic may be a real one; after those the first
+            // form module builds what is left, as it would without the priming.
+            let again = match cut {
+                Some(salsa::Cancelled::Local) => true,
+                Some(salsa::Cancelled::PendingWrite) => {
+                    !state.dispatch_stamp().drifted_since(started)
+                }
+                _ => false,
+            };
+            if again {
+                state.prime_foreign_handler_bindings();
+            }
         }
         Task::DependenciesPreloaded { file_id, count } => {
             tracing::debug!(file_id = file_id.0, count, "dependencies preloaded");
@@ -8266,6 +8289,289 @@ mod tests {
             shared_metadata_warmup(|| std::panic::resume_unwind(Box::new("a parser bug"))),
             Task::SharedMetadataWarmed { cancelled: false, local: false }
         ));
+    }
+
+    /// Run the event loop's share until the priming job reports, and hand back what cut it.
+    fn priming_end(state: &mut crate::global_state::GlobalState) -> Option<salsa::Cancelled> {
+        let deadline = std::time::Instant::now()
+            + test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match state.task_pool.receiver.recv_timeout(left).expect("the priming job reports") {
+                Task::ForeignHandlerBindingsPrimed { cut, .. } => return cut,
+                task => handle_task(state, task).unwrap(),
+            }
+        }
+    }
+
+    fn state_with_a_source_root() -> crate::global_state::GlobalState {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        state.init_empty_source_root();
+        state
+    }
+
+    /// The load's end reaches the fold on the pool: the first form module then reads it. The
+    /// input holds a helper that binds a handler by name, so the fold has a finding to keep,
+    /// and files it scans and rejects; a database that counts executions shows what ran.
+    #[test]
+    fn the_end_of_the_load_primes_the_foreign_handler_bindings() {
+        use base_db::BSL_SOURCE_ROOT;
+        use hir::DefDatabase as _;
+
+        let root = tempfile::tempdir().expect("create workspace");
+        let module = |name: &str, text: &str| {
+            let path = root.path().join("CommonModules").join(name).join("Ext/Module.bsl");
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create module directory");
+            std::fs::write(&path, text).expect("write module");
+            (path, text.to_owned())
+        };
+        let modules = [
+            module(
+                "Привязка",
+                "Процедура Подключить(Форма) Экспорт\n    \
+                 Форма.ПодключитьОбработчикОжидания(\"Обработчик\", 1);\nКонецПроцедуры\n",
+            ),
+            module("Прочее", "Процедура Прочая() Экспорт\nКонецПроцедуры\n"),
+        ];
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        *state.analysis_host.raw_database_mut() = ide::RootDatabaseImpl::new_with_salsa_events();
+        state.init_empty_source_root();
+        {
+            let mut vfs = state.vfs.write();
+            for (path, text) in &modules {
+                vfs.set_file_contents(
+                    vfs::VfsPath::from(path.as_path()),
+                    Some(Arc::from(text.as_str())),
+                );
+            }
+        }
+        state.process_changes(false);
+        assert!(state.analysis_host.raw_database().salsa_events_reset());
+
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::Progress {
+                n_total: 2,
+                n_done: vfs::loader::LoadingProgress::Finished,
+                config_version: 0,
+                dir: None,
+            },
+        )
+        .expect("finish the load");
+        let cut = priming_end(&mut state);
+        assert!(cut.is_none(), "nothing writes during the load's end: {cut:?}");
+
+        let db = state.analysis_host.raw_database();
+        let executions = |family: &str| db.salsa_family_churn(family).expect("counted").0;
+        assert_eq!(executions("workspace_foreign_handler_bindings_query"), 1);
+        assert_eq!(executions("file_mentions_handler_binding_query"), 2);
+        assert!(db.salsa_events_reset());
+        let bindings = db.workspace_foreign_handler_bindings(BSL_SOURCE_ROOT);
+        assert!(bindings.is_bound("Обработчик"), "the helper's binding is found");
+        assert_eq!(
+            executions("workspace_foreign_handler_bindings_query"),
+            0,
+            "the fold is read, not built, by whoever asks next"
+        );
+    }
+
+    /// Only `UnusedLocalMethod` and `UnusedParameters` read the fold. The inputs switch them
+    /// off through each setting that can, and keep one of them on through each, so a gate
+    /// that always primes and one that never does both fail.
+    #[test]
+    fn priming_runs_while_a_rule_that_reads_the_fold_can_run() {
+        let strings = |codes: &[&str]| codes.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        type Case = (&'static str, &'static [&'static str], Option<&'static [&'static str]>, bool);
+        let cases: &[Case] = &[
+            ("by default", &[], None, true),
+            ("one disabled", &["UnusedLocalMethod"], None, true),
+            ("the other disabled", &["UnusedParameters"], None, true),
+            ("both disabled", &["UnusedLocalMethod", "UnusedParameters"], None, false),
+            ("restricted to a reader", &[], Some(&["UnusedParameters"]), true),
+            ("restricted to another rule", &[], Some(&["LineLength"]), false),
+        ];
+        for &(name, disabled, only, primes) in cases {
+            let mut state = state_with_a_source_root();
+            state.diagnostics_config.disabled = strings(disabled);
+            state.diagnostics_config.only_enabled = only.map(strings);
+
+            state.prime_foreign_handler_bindings();
+
+            assert_eq!(!state.interactive_analysis_quiescent(), primes, "{name}");
+            if primes {
+                assert!(priming_end(&mut state).is_none(), "{name}");
+            }
+        }
+    }
+
+    /// The priming's every ending reaches the event loop: only a report tells a cut that is
+    /// worth another run from a finished one, and the task pool would swallow a panic
+    /// without one.
+    #[test]
+    fn a_priming_reports_every_ending() {
+        use crate::global_state::foreign_handler_bindings_priming as priming;
+
+        let state = state_with_a_source_root();
+        let started = state.dispatch_stamp();
+        let cut_of = |prime: fn()| match priming(started, prime) {
+            Task::ForeignHandlerBindingsPrimed { cut, started: reported } => {
+                assert_eq!(reported, started);
+                cut
+            }
+            other => panic!("not a priming report: {other:?}"),
+        };
+        assert!(cut_of(|| {}).is_none());
+        assert!(matches!(
+            cut_of(|| std::panic::resume_unwind(Box::new(salsa::Cancelled::PendingWrite))),
+            Some(salsa::Cancelled::PendingWrite)
+        ));
+        assert!(matches!(
+            cut_of(|| std::panic::resume_unwind(Box::new(salsa::Cancelled::Local))),
+            Some(salsa::Cancelled::Local)
+        ));
+        assert!(matches!(
+            cut_of(|| std::panic::resume_unwind(Box::new(salsa::Cancelled::PropagatedPanic))),
+            Some(salsa::Cancelled::PropagatedPanic)
+        ));
+        assert!(cut_of(|| std::panic::resume_unwind(Box::new("a parser bug"))).is_none());
+    }
+
+    /// A write cuts the priming, typically the open of the very form module it is for, so
+    /// another run follows. Each input that must not rerun is one where a rerun would meet
+    /// the same unwind, or where the run already finished.
+    #[test]
+    fn a_priming_cut_by_a_change_runs_again() {
+        use base_db::SourceDatabase as _;
+
+        let mut state = state_with_a_source_root();
+        let report = |state: &mut crate::global_state::GlobalState,
+                      cut: Option<salsa::Cancelled>,
+                      started,
+                      again: bool,
+                      name: &str| {
+            handle_task(state, Task::ForeignHandlerBindingsPrimed { cut, started }).unwrap();
+            assert_eq!(!state.interactive_analysis_quiescent(), again, "{name}");
+            if again {
+                assert!(priming_end(state).is_none(), "{name}");
+            }
+        };
+
+        let started = state.dispatch_stamp();
+        report(&mut state, None, started, false, "a finished run");
+        report(&mut state, Some(salsa::Cancelled::PendingWrite), started, true, "an eviction");
+        report(&mut state, Some(salsa::Cancelled::PropagatedPanic), started, false, "a panic");
+
+        state.analysis_host.raw_database_mut().set_workspace_load_complete(true);
+        report(&mut state, Some(salsa::Cancelled::PendingWrite), started, true, "a write");
+
+        let started = state.dispatch_stamp();
+        state.analysis_host.raw_database().note_disk_drift();
+        report(&mut state, Some(salsa::Cancelled::PendingWrite), started, false, "a drifted read");
+        report(&mut state, Some(salsa::Cancelled::Local), started, true, "the loop's own cancel");
+    }
+
+    /// Green-node caches are thread-local and never evict, and the idle trim reaches only the
+    /// task pool's workers. Two parses of one text on one thread share nodes while its cache
+    /// holds them; that is the control, taken inside one job so that nothing can clear the
+    /// cache between the two parses. After the priming the same text is parsed anew.
+    #[test]
+    fn a_priming_releases_what_rayon_threads_parsed() {
+        const SOURCE: &str = "Процедура А(Б)\n    В = Б + 1;\nКонецПроцедуры\n";
+        let share_a_node = |left: &syntax::Parse<syntax::SyntaxNode>,
+                            right: &syntax::Parse<syntax::SyntaxNode>| {
+            let nodes = |parse: &syntax::Parse<syntax::SyntaxNode>| {
+                parse
+                    .syntax_node()
+                    .descendants()
+                    .map(|node| std::ptr::from_ref(&*node.green()).addr())
+                    .collect::<std::collections::HashSet<_>>()
+            };
+            !nodes(left).is_disjoint(&nodes(right))
+        };
+        let cached = rayon::broadcast(|_| {
+            let first = parser::parse_with_shared_cache(SOURCE);
+            let second = parser::parse_with_shared_cache(SOURCE);
+            assert!(share_a_node(&first, &second), "control: the cache keeps parsed nodes");
+            first
+        });
+
+        let state = state_with_a_source_root();
+        crate::global_state::foreign_handler_bindings_priming(state.dispatch_stamp(), || {});
+
+        rayon::broadcast(|context| {
+            let parsed = parser::parse_with_shared_cache(SOURCE);
+            assert!(
+                !share_a_node(&cached[context.index()], &parsed),
+                "rayon thread {} still holds the tree",
+                context.index()
+            );
+        });
+    }
+
+    /// A shared session has no loader to report the load's end: the seed of its editor
+    /// storage stands there, and without this the session a client gets by default leaves
+    /// the whole fold to the first form module.
+    #[test]
+    fn a_shared_session_primes_its_seeded_storage() {
+        use base_db::BSL_SOURCE_ROOT;
+        use hir::DefDatabase as _;
+
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n")
+            .expect("write project config");
+        std::fs::write(
+            root.path().join("Helper.bsl"),
+            "Процедура Подключить(Форма) Экспорт\n    \
+             Форма.ПодключитьОбработчикОжидания(\"Обработчик\", 1);\nКонецПроцедуры\n",
+        )
+        .expect("write source");
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+        let publications = owner.subscribe();
+        loop {
+            match owner.readiness() {
+                mcp_server::WorkspaceReadiness::Ready { .. } => break,
+                mcp_server::WorkspaceReadiness::Loading => {
+                    publications.recv().expect("the owner publishes its workspace");
+                }
+                other => panic!("the test workspace does not load: {other:?}"),
+            }
+        }
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new_shared(sender, owner.clone());
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
+        refresh_shared_readiness(&mut state);
+        state.schedule_shared_seed();
+
+        let cut = priming_end(&mut state);
+        assert!(cut.is_none(), "nothing writes to a storage just seeded: {cut:?}");
+        assert!(state.shared_view_seeded);
+        let db = state.analysis_host.view().expect("the session's storage").database();
+        assert!(
+            db.workspace_foreign_handler_bindings(BSL_SOURCE_ROOT).is_bound("Обработчик"),
+            "the storage the session answers from holds the fold"
+        );
+
+        drop(state);
+        drop(owner);
+        drop(backend);
     }
 
     /// A shared session answers `initialize` before it asks for its owner: the owner's

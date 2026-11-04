@@ -92,6 +92,12 @@ pub enum Task {
         /// revision: unlike a drifted disk read, another run does not meet it again.
         local: bool,
     },
+    ForeignHandlerBindingsPrimed {
+        /// The cancellation that ended it early, if one did.
+        cut: Option<salsa::Cancelled>,
+        /// Where the store stood when it started.
+        started: DispatchStamp,
+    },
     DiagnosticsReady {
         uri: Url,
         diagnostics: Vec<lsp_types::Diagnostic>,
@@ -1252,13 +1258,10 @@ impl GlobalState {
     /// same reason, see `bin/cli/analyze.rs`.
     pub(crate) fn prime_foreign_handler_bindings(&mut self) {
         // Only two rules consult the fold; with both switched off nothing would read it.
-        let rule_is_active = |code: &str| {
-            if let Some(ref only) = self.diagnostics_config.only_enabled {
-                return only.iter().any(|enabled| enabled == code);
-            }
-            !self.diagnostics_config.disabled.iter().any(|disabled| disabled == code)
-        };
-        if !["UnusedLocalMethod", "UnusedParameters"].iter().copied().any(rule_is_active) {
+        if !ide::DiagnosticsConfig::from_input(&self.diagnostics_config).any_enabled(&[
+            ide::DiagnosticCode::UnusedLocalMethod,
+            ide::DiagnosticCode::UnusedParameters,
+        ]) {
             tracing::debug!("foreign handler bindings: both consumers disabled, priming skipped");
             return;
         }
@@ -1268,20 +1271,13 @@ impl GlobalState {
         }
 
         let db = self.analysis_host.raw_database().clone();
+        let started = DispatchStamp::of(&db);
         let analysis_guard = self.note_analysis_spawned();
-        let spawned = self.task_pool.pool.try_spawn_detached(move || {
+        let spawned = self.task_pool.pool.try_spawn(move || {
             let _analysis_guard = analysis_guard;
-            let started = std::time::Instant::now();
-            let primed = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+            foreign_handler_bindings_priming(started, move || {
                 db.prime_foreign_handler_bindings(base_db::BSL_SOURCE_ROOT)
-            }));
-            match primed {
-                Ok(()) => tracing::info!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "foreign handler bindings primed",
-                ),
-                Err(_) => tracing::debug!("foreign handler bindings priming cancelled"),
-            }
+            })
         });
         if spawned.is_err() {
             tracing::warn!("task pool rejected foreign handler bindings priming");
@@ -1386,6 +1382,41 @@ pub(crate) fn shared_metadata_warmup(warm: impl FnOnce()) -> Task {
             Task::SharedMetadataWarmed { cancelled: false, local: false }
         }
     }
+}
+
+/// Run the foreign handler bindings priming and report how it ended. Only a cancellation
+/// can ask for another run: a priming that failed otherwise would fail the same way again,
+/// and the file that asks for the fold next meets the failure at its own boundary.
+pub(crate) fn foreign_handler_bindings_priming(
+    started: DispatchStamp,
+    prime: impl FnOnce(),
+) -> Task {
+    let begun = std::time::Instant::now();
+    let primed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(prime));
+    // The per-file work parsed on rayon's threads. Their green-node caches never evict, and
+    // the idle trim's broadcast reaches only the task pool's workers, so nothing else in a
+    // server session would release the trees these caches now pin.
+    rayon::broadcast(|_| syntax::clear_shared_node_cache());
+    let cut = match primed {
+        Ok(()) => {
+            tracing::info!(
+                elapsed_ms = begun.elapsed().as_millis() as u64,
+                "foreign handler bindings primed",
+            );
+            None
+        }
+        Err(payload) => match payload.downcast::<salsa::Cancelled>() {
+            Ok(cut) => {
+                tracing::debug!(?cut, "foreign handler bindings priming cancelled");
+                Some(*cut)
+            }
+            Err(_) => {
+                tracing::warn!("foreign handler bindings priming failed; not retried");
+                None
+            }
+        },
+    };
+    Task::ForeignHandlerBindingsPrimed { cut, started }
 }
 
 #[derive(Debug)]
