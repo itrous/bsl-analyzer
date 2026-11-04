@@ -23,7 +23,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Badpractice, MetadataTag::Standard],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 const DEFAULT_SEARCH_DELETE_FILE_METHOD: &str =
@@ -336,25 +336,25 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 7:30..7:63
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 20:31..20:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла4' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 26:31..26:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла5' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 46:30..46:63
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 50:31..50:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла2' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 65:31..65:59
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла3' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 72:27..72:55
               message: Нужно добавить удаление временного файла 'ИмяФайлаНаДиске' после использования
-              severity: Major"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
@@ -374,19 +374,19 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 7:30..7:63
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 26:31..26:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла5' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 50:31..50:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла2' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 65:31..65:59
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла3' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 72:27..72:55
               message: Нужно добавить удаление временного файла 'ИмяФайлаНаДиске' после использования
-              severity: Major"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
@@ -406,40 +406,40 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 7:30..7:63
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 10:31..10:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла2' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 14:31..14:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла3' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 20:31..20:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла4' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 26:31..26:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла5' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 31:31..31:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла6' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 35:17..35:39
               message: Нужно добавить удаление временного файла 'TempFile7' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 46:30..46:63
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 50:31..50:64
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла2' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 61:30..61:58
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 65:31..65:59
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла3' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 72:27..72:55
               message: Нужно добавить удаление временного файла 'ИмяФайлаНаДиске' после использования
-              severity: Major"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
@@ -455,7 +455,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:30..3:63
               message: Нужно добавить удаление временного файла 'ИмяПромежуточногоФайла' после использования
-              severity: Major"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
@@ -471,10 +471,10 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:26..3:48
               message: Нужно добавить удаление временного файла после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 4:17..4:50
               message: Нужно добавить удаление временного файла после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
 
         let code2 = r#"
@@ -487,7 +487,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:35..3:68
               message: Нужно добавить удаление временного файла после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code2, &diagnostics2));
     }
 
@@ -521,16 +521,16 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 8:25..8:58
               message: Нужно добавить удаление временного файла 'Файл2' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 11:26..11:48
               message: Нужно добавить удаление временного файла после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 14:36..14:69
               message: Нужно добавить удаление временного файла после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 17:17..17:50
               message: Нужно добавить удаление временного файла после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -554,7 +554,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:28..3:61
               message: Нужно добавить удаление временного файла 'ИмяФайла' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
 
         let code = r#"
@@ -581,10 +581,10 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:25..3:58
               message: Нужно добавить удаление временного файла 'Файл1' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 4:25..4:58
               message: Нужно добавить удаление временного файла 'Файл2' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -599,7 +599,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:28..3:50
               message: Нужно добавить удаление временного файла 'TempFile' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
 
         let code = r#"
@@ -625,7 +625,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:28..3:61
               message: Нужно добавить удаление временного файла 'ИмяФайла' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
 
         let mut config = DiagnosticsConfig::default();
@@ -653,7 +653,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:24..3:57
               message: Нужно добавить удаление временного файла 'Файл' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -686,7 +686,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 4:28..4:61
               message: Нужно добавить удаление временного файла 'Файл' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -736,10 +736,10 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:25..3:58
               message: Нужно добавить удаление временного файла 'Файл1' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 4:25..4:58
               message: Нужно добавить удаление временного файла 'Файл2' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -783,7 +783,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:28..3:61
               message: Нужно добавить удаление временного файла 'ИмяФайла' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -804,7 +804,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 4:25..4:58
               message: Нужно добавить удаление временного файла 'Файл2' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -823,7 +823,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:28..3:61
               message: Нужно добавить удаление временного файла 'ИмяФайла' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -846,7 +846,7 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 9:28..9:61
               message: Нужно добавить удаление временного файла 'ИмяФайла' после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -862,10 +862,10 @@ mod tests {
         expect![[r#"
             MissingTemporaryFileDeletion @ 3:24..3:57
               message: Нужно добавить удаление временного файла 'Файл' после использования
-              severity: Major
+              severity: Warning
             MissingTemporaryFileDeletion @ 4:26..4:48
               message: Нужно добавить удаление временного файла после использования
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 }

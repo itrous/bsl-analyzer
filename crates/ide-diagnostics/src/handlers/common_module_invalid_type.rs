@@ -15,7 +15,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Standard, MetadataTag::Unpredictable, MetadataTag::Design],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 pub fn from_metadata(
