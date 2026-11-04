@@ -469,6 +469,10 @@ fn analyze_salsa(
                     proj_config.configuration_root = Some(super::source_set::slash_path(nested));
                 }
             } else {
+                // An extension under `-s` must still be named: anchoring `-s`
+                // itself would hide it, because `-s` holds no Configuration.xml.
+                proj_config.anchored_extension =
+                    proj_config.extension_from(&source_dir, &project_root)?;
                 proj_config.source_anchor = Some(source_dir.clone());
             }
         }

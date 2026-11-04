@@ -192,3 +192,30 @@ fn a_configuration_nested_under_the_source_dir_stays_the_subject() {
         "the walk widened from the configuration to all of -s: {stdout}"
     );
 }
+
+#[test]
+fn an_extension_nested_under_the_source_dir_is_still_called_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let ext = dir.path().join("src/cfe/Ext");
+    write(
+        &ext.join("Configuration.xml"),
+        "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+    );
+    write(&ext.join("Module.bsl"), "Процедура П() Экспорт\nКонецПроцедуры\n");
+    write(&dir.path().join("bsl-analyzer.toml"), "");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .arg("analyze")
+        .arg("-s")
+        .arg(dir.path().join("src"))
+        .args(["--format", "jsonl"])
+        .env_remove("ONEC_CONFIGURATIONS_ROOT")
+        .output()
+        .expect("failed to run the analyzer");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("is a configuration extension analyzed without its main configuration"),
+        "{stderr}"
+    );
+}

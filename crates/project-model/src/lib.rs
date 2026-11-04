@@ -632,6 +632,7 @@ impl Project {
         // has no base at all, and both report the same unresolved calls.
         let subject = self
             .configuration_path()
+            .filter(|path| configuration_xml_in(path).is_some())
             .or(self.extension_in_config_location.as_deref())
             .or_else(|| self.extension_paths.first().map(|(_, path)| path.as_path()))
             .unwrap_or(&self.root);
@@ -653,7 +654,9 @@ impl Project {
     /// Unlike an extension, an external root cannot be mistaken for the base,
     /// so the subject is the declared list, not the resolved source path.
     pub fn standalone_external_notice(&self) -> Option<String> {
-        if self.configuration_path().is_some() || self.external_paths.is_empty() {
+        let has_configuration =
+            self.configuration_path().is_some_and(|path| configuration_xml_in(path).is_some());
+        if has_configuration || self.external_paths.is_empty() {
             return None;
         }
         let names: Vec<&str> = self.external_paths.iter().map(|(name, _)| name.as_str()).collect();
@@ -1088,7 +1091,11 @@ impl Project {
                     excluded: true,
                 });
             }
-            return Ok(found(path));
+            return Ok(DiscoveredSource {
+                configuration: Some(path),
+                extension: config.anchored_extension.clone(),
+                excluded: false,
+            });
         }
         // A directory that carries `Configuration.xml` where a MAIN configuration is
         // expected, but turned out to be an extension. It is not a base and does not
@@ -2621,6 +2628,14 @@ pub struct ProjectConfig {
     #[doc(hidden)]
     pub source_anchor: Option<PathBuf>,
 
+    /// Extension the search under [`Self::source_anchor`] found. Kept so the
+    /// standalone-extension advisory still names it: the anchor itself has no
+    /// `Configuration.xml`, and treating that as the configuration subject
+    /// would hide the extension.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub anchored_extension: Option<PathBuf>,
+
     /// Parent files merged in through `extends` (TOML only), nearest first. Set by
     /// the loader; read it through [`Self::extends_chain`].
     #[serde(skip)]
@@ -2991,6 +3006,21 @@ impl ProjectConfig {
         Ok(match search_configuration(start, 2, &exclusions, &mut excluded) {
             SearchOutcome::Configuration(path) => Some(path),
             SearchOutcome::Extension(_) | SearchOutcome::None => None,
+        })
+    }
+
+    /// An extension the same search found when it found no main configuration.
+    /// `None` when a main configuration won, or when the search found neither.
+    pub fn extension_from(
+        &self,
+        start: &Path,
+        project_root: &Path,
+    ) -> Result<Option<PathBuf>, ConfigLoadError> {
+        let exclusions = self.source_exclusions(project_root)?;
+        let mut excluded = false;
+        Ok(match search_configuration(start, 2, &exclusions, &mut excluded) {
+            SearchOutcome::Extension(path) => Some(path),
+            SearchOutcome::Configuration(_) | SearchOutcome::None => None,
         })
     }
 
@@ -4019,6 +4049,7 @@ impl From<TomlConfig> for ProjectConfig {
             diagnostics: toml.diagnostics,
             config_file_path: None,
             source_anchor: None,
+            anchored_extension: None,
             extends_chain: Vec::new(),
             code_lens: toml.code_lens,
             formatting: toml.formatting,
