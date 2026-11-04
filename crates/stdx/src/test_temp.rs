@@ -17,8 +17,8 @@ pub fn root() -> &'static Path {
     ROOT.get_or_init(|| {
         let temp = std::env::temp_dir();
         let root = temp.join(format!("{PREFIX}{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("failed to create the test temp root");
-        sweep_stale(&temp, &root, STALE_AFTER);
+        prepare_root(&root);
+        sweep_stale(&temp, &root, SystemTime::now(), STALE_AFTER);
         root
     })
 }
@@ -30,11 +30,17 @@ pub fn unique_dir(name: &str) -> PathBuf {
     dir
 }
 
+// A root that already exists was left by a finished process with the same pid, and reusing it
+// would break the promise of `unique_dir`, whose counter starts over in every process.
+fn prepare_root(root: &Path) {
+    let _ = std::fs::remove_dir_all(root);
+    std::fs::create_dir_all(root).expect("failed to create the test temp root");
+}
+
 // Every error is ignored: a sibling may belong to a live run, be locked, or be owned by another
 // user, and cleanup of foreign leftovers must never fail a test.
-fn sweep_stale(temp: &Path, own_root: &Path, max_age: Duration) {
+fn sweep_stale(temp: &Path, own_root: &Path, now: SystemTime, max_age: Duration) {
     let Ok(entries) = std::fs::read_dir(temp) else { return };
-    let now = SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
         if path == own_root || !entry.file_name().to_string_lossy().starts_with(PREFIX) {
@@ -68,24 +74,34 @@ mod tests {
     }
 
     #[test]
-    fn sweep_leaves_fresh_sibling_and_removes_stale() {
+    fn sweep_removes_only_stale_prefixed_siblings() {
         let temp = unique_dir("sweep");
         let own = temp.join(format!("{PREFIX}own"));
-        let fresh = temp.join(format!("{PREFIX}fresh"));
-        let stale = temp.join(format!("{PREFIX}stale"));
+        let sibling = temp.join(format!("{PREFIX}sibling"));
         let other = temp.join("unrelated");
-        for dir in [&own, &fresh, &stale, &other] {
+        for dir in [&own, &sibling, &other] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        // A tiny max age stands in for an old mtime, which cannot be set without a new dependency.
-        std::thread::sleep(Duration::from_millis(20));
-        sweep_stale(&temp, &own, Duration::from_millis(10));
-        assert!(own.exists() && other.exists());
-        assert!(!fresh.exists() && !stale.exists());
 
-        let fresh_again = temp.join(format!("{PREFIX}fresh2"));
-        std::fs::create_dir_all(&fresh_again).unwrap();
-        sweep_stale(&temp, &own, STALE_AFTER);
-        assert!(fresh_again.exists());
+        let now = SystemTime::now();
+        sweep_stale(&temp, &own, now, STALE_AFTER);
+        assert!(sibling.exists(), "a sibling younger than the limit stays");
+
+        sweep_stale(&temp, &own, now + 2 * STALE_AFTER, STALE_AFTER);
+        assert!(!sibling.exists(), "a sibling older than the limit goes");
+        assert!(own.exists() && other.exists());
+    }
+
+    // Roots outlive their process, so a later process can get the same pid and find the old root.
+    #[test]
+    fn a_reused_pid_root_starts_empty() {
+        let root = unique_dir("reused-pid").join(format!("{PREFIX}7"));
+        prepare_root(&root);
+        std::fs::write(root.join("leftover"), "").unwrap();
+
+        prepare_root(&root);
+
+        assert!(root.is_dir());
+        assert!(!root.join("leftover").exists());
     }
 }
