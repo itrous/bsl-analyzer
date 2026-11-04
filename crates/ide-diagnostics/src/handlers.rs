@@ -129,6 +129,7 @@ pub mod pairing_broken_transaction;
 pub mod parse_error;
 pub mod platform_member_hidden_by_compatibility_mode;
 pub mod platform_member_newer_than_min_version;
+pub mod possibly_undefined_value;
 pub mod postfix_access_on_expression;
 pub mod privileged_module_method_call;
 pub mod procedure_returns_value;
@@ -526,6 +527,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::MismatchedArgCount => Some(&mismatched_arg_count::METADATA),
         DiagnosticCode::TypeMismatch => Some(&type_mismatch::METADATA),
         DiagnosticCode::TypeMismatchByDocComment => Some(&type_mismatch_by_doc_comment::METADATA),
+        DiagnosticCode::PossiblyUndefinedValue => Some(&possibly_undefined_value::METADATA),
         DiagnosticCode::UnresolvedField => Some(&unresolved_field::METADATA),
         DiagnosticCode::UnresolvedMetadataPath => Some(&unresolved_metadata_path::METADATA),
         DiagnosticCode::ReadOnlyPropertyAssignment => Some(&read_only_property::METADATA),
