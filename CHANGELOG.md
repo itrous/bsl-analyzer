@@ -10,8 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 ### Изменения поведения
 
 Не ломают API: набор инструментов MCP и ключи конфигурации прежние. Полный проход по конфигурации
-меняет набор и уровень находок `CalculationRegisterVirtualTableWithoutRecorder` и сокращает наборы
-находок `MissedRequiredParameter`, `TypeMismatch` и `InvalidCharacterInFile`.
+меняет набор и уровень находок `CalculationRegisterVirtualTableWithoutRecorder`, сокращает наборы
+находок `MissedRequiredParameter`, `TypeMismatch` и `InvalidCharacterInFile` и понижает уровень
+находок `ServerSideExportFormMethod`.
 
 - diagnostics: `MissedRequiredParameter` больше не отмечает позицию, оставленную пустой между
   запятыми (`Сложение(, 2)`, `Сложение(1, )`): платформа принимает такой вызов и передаёт
@@ -21,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 - diagnostics: `TypeMismatch` срабатывает, только когда наборы ожидаемых и полученных типов не
   пересекаются: `Число | Неопределено` в параметре `Число` больше не отмечается. Вызов отмечает
   первый аргумент без общего типа с параметром. `TypeMismatchByDocComment` не меняется (#788).
+- diagnostics: `ServerSideExportFormMethod` теперь предупреждение, а не блокирующая ошибка: редактор
+  показывает находку как warning, в SARIF она получает `warning` вместо `error`. Понижение уровня
+  набор находок не меняет; оценка правила в метаданных (`Blocker`) не меняется (#792).
 - diagnostics: `InvalidCharacterInFile` отмечает символ только там, где он мешает компиляции или
   меняет смысл разбираемого текста: в коде, в неразрывном пробеле, приклеенном к предыдущему
   идентификатору, ключевому слову или числу, в строке `//` многострочного литерала и в строке
