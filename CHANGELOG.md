@@ -12,8 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 Не ломают API: набор инструментов MCP и ключи конфигурации прежние. Полный проход по конфигурации
 меняет набор и уровень находок `CalculationRegisterVirtualTableWithoutRecorder`, сокращает наборы
 находок `MissedRequiredParameter`, `TypeMismatch` и `InvalidCharacterInFile` и понижает уровень
-находок `ServerSideExportFormMethod`.
+находок `ServerSideExportFormMethod`. Файлы `*.Queries.bsl` больше не анализируются.
 
+- project-model: файлы с именем вида `*.Queries.bsl` (`Ext/Template.Queries.bsl`,
+  `Ext/Form.Queries.bsl`) больше не считаются исходниками: это выгрузки запросов, которые инструменты
+  индексации пишут рядом с метаданными, а не модули. CLI, LSP и MCP их не анализируют и не
+  индексируют, поэтому их находки `ParseError` из отчёта исчезают. Модуль в каталоге `Queries` и файл
+  `Queries.bsl` остаются исходниками (#798).
 - diagnostics: `MissedRequiredParameter` больше не отмечает позицию, оставленную пустой между
   запятыми (`Сложение(, 2)`, `Сложение(1, )`): платформа принимает такой вызов и передаёт
   `Неопределено`. Отмечается только нехватка позиций (`Сложение(1)`). Рекомендацию #std640 не
