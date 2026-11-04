@@ -108,7 +108,8 @@ ParseError = true
         .find(|event| {
             event["type"] == "file"
                 && event["path"].as_str().is_some_and(|path| {
-                    path.ends_with("cfe/Repro/CommonModules/Appearance/Ext/Module.bsl")
+                    path.replace('\\', "/")
+                        .ends_with("cfe/Repro/CommonModules/Appearance/Ext/Module.bsl")
                 })
         })
         .unwrap_or_else(|| panic!("changed extension module was not analyzed: {events:?}"));

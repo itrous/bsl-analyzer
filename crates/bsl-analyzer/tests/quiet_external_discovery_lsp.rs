@@ -54,7 +54,7 @@ fn initial_lsp_load_reports_invalid_discovery_once_across_internal_requests() {
         .find(|line| line.contains("auto-discovered external directories were skipped"))
         .expect("initial discovery summary should be present");
     assert!(
-        summary.contains("src/epf/not-an-export"),
+        summary.replace("\\\\", "/").contains("src/epf/not-an-export"),
         "summary should use a relative path: {summary}"
     );
     assert!(
