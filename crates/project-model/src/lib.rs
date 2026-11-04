@@ -6579,7 +6579,7 @@ extensions = [{ name = "T" }]
             "Allowed.bsl",
             "temp/Hidden.bsl",
             ".tool/Hidden.bsl",
-            "Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "Reports/R/Templates/T/Ext/Generated.bsl",
             "Reports/R/Ext/ObjectModule.bsl",
             "temporary/Visible.bsl",
         ] {
@@ -6611,15 +6611,14 @@ extensions = [{ name = "T" }]
         assert_eq!(without.len(), 6, "positive control: every file is scanned without patterns");
 
         let (with, project) = scan(
-            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/*.Queries.bsl\"]\n",
+            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/Generated.bsl\"]\n",
         );
         assert_eq!(
             with,
             ["Allowed.bsl", "Reports/R/Ext/ObjectModule.bsl", "temporary/Visible.bsl"]
         );
         assert!(project.is_source_excluded(&root.join("temp/Hidden.bsl")));
-        assert!(project
-            .is_source_excluded(&root.join("Reports/R/Templates/T/Ext/Template.Queries.bsl")));
+        assert!(project.is_source_excluded(&root.join("Reports/R/Templates/T/Ext/Generated.bsl")));
         assert!(!project.is_source_excluded(&root.join("temporary/Visible.bsl")));
     }
 

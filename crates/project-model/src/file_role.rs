@@ -41,7 +41,11 @@ pub fn file_role(path: &Path) -> FileRole {
         return FileRole::Ignored;
     };
     if SOURCE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
-        FileRole::Source
+        if is_derived_queries_extract(path) {
+            FileRole::Ignored
+        } else {
+            FileRole::Source
+        }
     } else if ext.eq_ignore_ascii_case(FORM_SIDECAR_EXTENSION) {
         if is_form_sidecar_path(path) {
             FileRole::MetadataWatched
@@ -64,6 +68,16 @@ pub fn file_role(path: &Path) -> FileRole {
     } else {
         FileRole::Ignored
     }
+}
+
+/// `Ext/Template.Queries.bsl` and `Ext/Form.Queries.bsl` are query extracts that indexing
+/// tools write next to the metadata; the real query lives in the XML, nothing compiles
+/// these files, and parsing them as BSL only yields `ParseError` noise.
+fn is_derived_queries_extract(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    stem.rsplit_once('.').is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("Queries"))
 }
 
 pub fn is_bsl_source_path(path: &Path) -> bool {
@@ -176,6 +190,26 @@ mod tests {
     fn classifies_bsl_as_source() {
         assert_eq!(file_role(Path::new("/ws/CommonModules/X/Ext/Module.bsl")), FileRole::Source);
         assert!(is_bsl_source_path(Path::new("/ws/a.bsl")));
+    }
+
+    #[test]
+    fn derived_queries_extracts_are_ignored() {
+        for path in [
+            "/ws/Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "/ws/Catalogs/C/Forms/F/Ext/Form.Queries.bsl",
+            "/ws/Ext/template.queries.BSL",
+        ] {
+            assert_eq!(file_role(Path::new(path)), FileRole::Ignored, "{path}");
+            assert!(!is_bsl_source_path(Path::new(path)), "{path}");
+        }
+        assert_eq!(file_role(Path::new("/ws/Catalogs/C/Ext/Module.bsl")), FileRole::Source);
+        // A directory named `Queries` does not disqualify a real module.
+        assert_eq!(file_role(Path::new("/ws/Queries/Ext/Module.bsl")), FileRole::Source);
+        assert_eq!(file_role(Path::new("/ws/Queries.bsl/Module.bsl")), FileRole::Source);
+        // Not a BSL file at all: guards against matching by substring.
+        assert_eq!(file_role(Path::new("/ws/Queries.bsl.txt")), FileRole::Ignored);
+        // A bare `Queries.bsl` has no `.Queries` suffix component; it is an ordinary module.
+        assert_eq!(file_role(Path::new("/ws/Queries.bsl")), FileRole::Source);
     }
 
     #[test]
