@@ -1110,7 +1110,7 @@ mod tests {
         assert_eq!(config.severity(DiagnosticCode::ModuleAccessibility), Severity::Warning);
         assert_eq!(config.severity(DiagnosticCode::ServerSideExportFormMethod), Severity::Warning);
         // Control: metadata without a static override keeps its computed grade.
-        assert_eq!(config.severity(DiagnosticCode::CommonModuleInvalidType), Severity::Major);
+        assert_eq!(config.severity(DiagnosticCode::DeletingCollectionItem), Severity::Major);
     }
 
     #[test]

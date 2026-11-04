@@ -18,7 +18,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Unpredictable, MetadataTag::Standard],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 const DEFAULT_ANALYZE_INTERNET_MAIL_PROFILE: bool = true;
@@ -338,31 +338,31 @@ mod tests {
             expect![[r#"
                 TimeoutsInExternalResources @ 4:21..4:76
                   message: Timeout not specified when working with external resource
-                  severity: Critical
+                  severity: Warning
                 TimeoutsInExternalResources @ 6:21..6:93
                   message: Timeout not specified when working with external resource
-                  severity: Critical
+                  severity: Warning
                 TimeoutsInExternalResources @ 10:19..10:73
                   message: Timeout not specified when working with external resource
-                  severity: Critical
+                  severity: Warning
                 TimeoutsInExternalResources @ 14:17..14:81
                   message: Timeout not specified when working with external resource
-                  severity: Critical
+                  severity: Warning
                 TimeoutsInExternalResources @ 22:22..22:66
                   message: Timeout not specified when working with external resource
-                  severity: Critical
+                  severity: Warning
                 TimeoutsInExternalResources @ 35:15..35:44
                   message: Timeout not specified when working with external resource
-                  severity: Critical
+                  severity: Warning
                 TimeoutsInExternalResources @ 72:27..72:115
                   message: Timeout not specified when working with external resource
-                  severity: Critical
+                  severity: Warning
                 TimeoutsInExternalResources @ 79:11..79:40
                   message: Timeout not specified when working with external resource
-                  severity: Critical
+                  severity: Warning
                 TimeoutsInExternalResources @ 81:48..81:77
                   message: Timeout not specified when working with external resource
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -379,7 +379,7 @@ mod tests {
             expect![[r#"
                 TimeoutsInExternalResources @ 3:21..3:76
                   message: Timeout not specified when working with external resource
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -426,7 +426,7 @@ mod tests {
             expect![[r#"
                 TimeoutsInExternalResources @ 3:15..3:44
                   message: Timeout not specified when working with external resource
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 

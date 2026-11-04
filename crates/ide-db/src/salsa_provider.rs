@@ -272,6 +272,10 @@ impl AnalysisProvider for SalsaProvider<'_> {
         hir::kernel_union_member_labels(self.db, id, locale)
     }
 
+    fn kernel_type_includes_undefined(&self, id: bsl_types::kind::TypeId) -> bool {
+        hir::kernel_type_includes_undefined(self.db, id)
+    }
+
     fn min_platform_version(&self) -> Option<Arc<str>> {
         HirDatabase::min_platform_version(self.db)
     }

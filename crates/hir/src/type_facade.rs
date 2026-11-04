@@ -425,6 +425,17 @@ fn plain_display(locale: base_db::Locale, precision: bool) -> PlainDisplayCtx {
     PlainDisplayCtx { locale, precision_visible: precision }
 }
 
+/// Whether the type is `Undefined` or a union that has `Undefined` among its members.
+pub fn kernel_type_includes_undefined(db: &dyn TypeKernelDb, id: TypeId) -> bool {
+    match db.lookup_type(id) {
+        TypeKind::Undefined => true,
+        TypeKind::Union(members) => {
+            members.iter().any(|m| matches!(db.lookup_type(*m), TypeKind::Undefined))
+        }
+        _ => false,
+    }
+}
+
 fn field_from_info(info: FieldInfo) -> Field {
     Field {
         env: match info.origin {
