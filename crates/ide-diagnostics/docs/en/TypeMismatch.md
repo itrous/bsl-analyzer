@@ -32,7 +32,7 @@ Position = Undefined;
 If Condition Then
     Position = 5;
 EndIf;
-Result = Left("abc", Position); // No finding: 'Number | Undefined' overlaps 'Number'
+Result = Left("abc", Position); // No TypeMismatch: 'Number | Undefined' overlaps 'Number'; this is the PossiblyUndefinedValue hint's case
 ```
 
 ## Sources

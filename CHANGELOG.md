@@ -10,9 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 ### Изменения поведения
 
 Не ломают API: набор инструментов MCP и ключи конфигурации прежние. Полный проход по конфигурации
-меняет набор и уровень находок `CalculationRegisterVirtualTableWithoutRecorder`, сокращает наборы
-находок `MissedRequiredParameter`, `TypeMismatch` и `InvalidCharacterInFile` и понижает уровень
-находок `ServerSideExportFormMethod` и четырнадцати правил стандартов разработки.
+получает новое правило, меняет набор и уровень находок
+`CalculationRegisterVirtualTableWithoutRecorder`, сокращает наборы находок
+`MissedRequiredParameter`, `TypeMismatch` и `InvalidCharacterInFile` и понижает уровень находок
+`ServerSideExportFormMethod` и четырнадцати правил стандартов разработки.
 
 - diagnostics: `MissedRequiredParameter` больше не отмечает позицию, оставленную пустой между
   запятыми (`Сложение(, 2)`, `Сложение(1, )`): платформа принимает такой вызов и передаёт
@@ -22,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 - diagnostics: `TypeMismatch` срабатывает, только когда наборы ожидаемых и полученных типов не
   пересекаются: `Число | Неопределено` в параметре `Число` больше не отмечается. Вызов отмечает
   первый аргумент без общего типа с параметром. `TypeMismatchByDocComment` не меняется (#788).
+- diagnostics: новое правило `PossiblyUndefinedValue` (подсказка, включено по умолчанию) — аргумент
+  на одной ветви получает значение нужного типа, а на другой остаётся `Неопределено`, которое параметр
+  не принимает: `Лев("abc", Позиция)` при `Позиция` типа `Число | Неопределено`. Код законен, вызов
+  завершится ошибкой только на этой ветви (#794).
 - diagnostics: `ServerSideExportFormMethod` теперь предупреждение, а не блокирующая ошибка: редактор
   показывает находку как warning, в SARIF она получает `warning` вместо `error`. Понижение уровня
   набор находок не меняет; оценка правила в метаданных (`Blocker`) не меняется (#792).

@@ -299,6 +299,7 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "known bug: message embeds argument counts from resolved callee",
     ),
     (DiagnosticCode::TypeMismatch, "known bug: message embeds localized type names"),
+    (DiagnosticCode::PossiblyUndefinedValue, "known bug: message embeds localized type names"),
     (DiagnosticCode::TypeMismatchByDocComment, "known bug: message embeds localized type names"),
     (DiagnosticCode::UnresolvedField, "known bug: message embeds field/type names"),
     (
@@ -701,7 +702,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 211, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 212, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]
