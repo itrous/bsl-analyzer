@@ -164,3 +164,31 @@ fn a_directory_without_a_configuration_is_not_replaced_by_one_above_it() {
         "a configuration found above -s replaced it: {stdout}"
     );
 }
+
+#[test]
+fn a_configuration_nested_under_the_source_dir_stays_the_subject() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    write(&dir.path().join("bsl-analyzer.toml"), "");
+    write(&dir.path().join("src/old/Module.bsl"), "Процедура Старая() Экспорт\nКонецПроцедуры\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .arg("analyze")
+        .arg("-s")
+        .arg(dir.path().join("src"))
+        .args(["--format", "jsonl"])
+        .env_remove("ONEC_CONFIGURATIONS_ROOT")
+        .output()
+        .expect("failed to run the analyzer");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stdout.contains("СерверныйМодуль"),
+        "the configuration under -s was not analyzed: {stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("old/Module.bsl") && !stdout.contains("old\\Module.bsl"),
+        "the walk widened from the configuration to all of -s: {stdout}"
+    );
+}

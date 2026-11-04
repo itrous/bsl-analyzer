@@ -453,12 +453,21 @@ fn analyze_salsa(
         && proj_config.configuration_root.is_none()
         && proj_config.configuration_dependency.is_none()
     {
-        // Without a declared root the project would search from the config's directory and lose `-s`.
-        // A root that holds `Configuration.xml` sticks; one that does not is warned about and
-        // searched past, so that case is anchored directly instead of declared as a root.
+        // Without a declared root the project would search from the config's directory
+        // and could adopt a configuration that is not under `-s`. One sitting in `-s`
+        // is declared as the root. One nested under `-s` is the same two-level search
+        // the model used to run from `-s`; only when that search finds nothing is `-s`
+        // anchored, so a configuration beside it is not substituted and the walk does
+        // not widen to all of `-s`.
         if let Ok(relative) = source_dir.strip_prefix(&project_root) {
             if super::source_set::directory_has_configuration_xml(&source_dir) {
                 proj_config.configuration_root = Some(super::source_set::slash_path(relative));
+            } else if let Some(found) =
+                proj_config.main_configuration_from(&source_dir, &project_root)?
+            {
+                if let Ok(nested) = found.strip_prefix(&project_root) {
+                    proj_config.configuration_root = Some(super::source_set::slash_path(nested));
+                }
             } else {
                 proj_config.source_anchor = Some(source_dir.clone());
             }

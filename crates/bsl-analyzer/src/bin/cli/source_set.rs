@@ -515,7 +515,9 @@ impl SourceSetArgs {
 
 /// `relative` with `/` separators, the spelling config files use.
 pub fn slash_path(relative: &Path) -> String {
-    relative.to_string_lossy().replace('\\', "/")
+    // Only the platform separator. On Unix `\` is a legal name character; rewriting
+    // it would turn a flag path that already resolved against `-s` into another path.
+    relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 /// Flag paths are written relative to `-s`, but the project resolves them against `project_root`;
@@ -595,12 +597,12 @@ fn is_extension_dir(root: &Path, rel: &str) -> bool {
     root_configuration_xml(&root.join(rel)).is_some()
 }
 
-/// The directory's `Configuration.xml` as a real file, in whatever ASCII case
-/// the tree spells it.
 pub(crate) fn directory_has_configuration_xml(dir: &Path) -> bool {
     root_configuration_xml(dir).is_some()
 }
 
+/// The directory's `Configuration.xml` as a real file, in whatever ASCII case
+/// the tree spells it.
 fn root_configuration_xml(dir: &Path) -> Option<std::path::PathBuf> {
     bsl_conventions::find_child_ci(
         dir,
@@ -1364,5 +1366,12 @@ extensions = [
             configuration_root_provider(&args(&[]), None, dir.path()),
             SourceProvider::AutoDiscovery
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slash_path_keeps_a_literal_backslash_on_unix() {
+        let path = std::path::Path::new("src").join("Старый\\Модуль");
+        assert_eq!(super::slash_path(&path), "src/Старый\\Модуль");
     }
 }

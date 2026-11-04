@@ -2976,6 +2976,24 @@ impl ProjectConfig {
         Ok(None)
     }
 
+    /// The main configuration a search from `start` adopts: `start` itself or at
+    /// most two levels below it. An extension is not a result. This is the search
+    /// [`Project::with_config`] runs when no root is declared, so a caller that
+    /// builds the project at a different directory can keep the configuration
+    /// that search would have found under `start`.
+    pub fn main_configuration_from(
+        &self,
+        start: &Path,
+        project_root: &Path,
+    ) -> Result<Option<PathBuf>, ConfigLoadError> {
+        let exclusions = self.source_exclusions(project_root)?;
+        let mut excluded = false;
+        Ok(match search_configuration(start, 2, &exclusions, &mut excluded) {
+            SearchOutcome::Configuration(path) => Some(path),
+            SearchOutcome::Extension(_) | SearchOutcome::None => None,
+        })
+    }
+
     pub fn load_from_file(path: &Path) -> Result<Self, ConfigLoadError> {
         let err = |message: String| ConfigLoadError { path: path.to_path_buf(), message };
         if !path.exists() {
@@ -8401,6 +8419,23 @@ type_narrowing = false
             ProjectConfig { source_anchor: Some(loose.clone()), ..ProjectConfig::default() };
         let built = Project::with_config(&project, config).unwrap();
         assert_eq!(built.configuration_path(), Some(loose.as_path()));
+    }
+
+    #[test]
+    fn main_configuration_from_finds_a_configuration_nested_under_the_start() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let cf = project.join("src/cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::create_dir_all(project.join("other/cf")).unwrap();
+        fs::write(project.join("other/cf/Configuration.xml"), "<Configuration/>").unwrap();
+
+        let found = ProjectConfig::default()
+            .main_configuration_from(&project.join("src"), &project)
+            .unwrap()
+            .expect("nested configuration");
+        assert_eq!(found, cf);
     }
 }
 
