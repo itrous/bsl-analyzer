@@ -9187,7 +9187,7 @@ mod tests {
             Connection::open(out)
                 .unwrap()
                 .query_row(
-                    "SELECT sig_hash FROM files WHERE path LIKE '%Сервер/Ext/Module.bsl'",
+                    "SELECT sig_hash FROM files WHERE REPLACE(path, char(92), '/') LIKE '%Сервер/Ext/Module.bsl'",
                     [],
                     |r| r.get(0),
                 )
@@ -11840,7 +11840,8 @@ mod form_twin_tests {
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
         let project = crate::graph::ProjectSnapshot::load_excluding(root, &cache.exclusions(root));
         let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
-        let metadata_path = root.join("Catalogs/Товары.xml");
+        let metadata_path: std::path::PathBuf =
+            root.canonicalize().unwrap().join("Catalogs/Товары.xml").components().collect();
         let (owners, forms) = crate::graph_db::local_metadata_delta(
             &project,
             &universe,
@@ -12274,7 +12275,12 @@ mod form_twin_tests {
             "CommonModules/Сервер/Ext/Module.bsl",
             "&НаСервере\nФункция Считать() Экспорт\nВозврат Дополнительный.Extra();\nКонецФункции",
         );
-        let extra = root.join("CommonModules/Дополнительный/Ext/Module.bsl");
+        let extra: std::path::PathBuf = root
+            .canonicalize()
+            .unwrap()
+            .join("CommonModules/Дополнительный/Ext/Module.bsl")
+            .components()
+            .collect();
         std::fs::remove_file(&extra).unwrap();
 
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
@@ -12292,7 +12298,7 @@ mod form_twin_tests {
             .collect();
         assert!(
             unresolved_rows.iter().any(|(_, method, path)| method == "extra"
-                && path.ends_with("CommonModules/Сервер/Ext/Module.bsl")),
+                && path.replace('\\', "/").ends_with("CommonModules/Сервер/Ext/Module.bsl")),
             "cold graph must record the unresolved caller reverse index: {unresolved_rows:?}"
         );
 

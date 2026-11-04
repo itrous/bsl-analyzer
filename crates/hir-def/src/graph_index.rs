@@ -2182,6 +2182,25 @@ pub fn display_scope(key: &ModuleKey) -> String {
     }
 }
 
+/// What is left of `abs` under `root`, both with forward slashes. Windows spells one directory
+/// several ways: `canonicalize` answers `//?/C:/…` while a walk keeps the spelling of its root,
+/// and paths there ignore case, so a literal comparison would lose the relative path.
+fn strip_root<'a>(abs: &'a str, root: &str) -> Option<&'a str> {
+    if !cfg!(windows) {
+        return abs.strip_prefix(root);
+    }
+    let (abs, root) = (without_windows_prefix(abs), without_windows_prefix(root));
+    let head = abs.get(..root.len())?;
+    head.eq_ignore_ascii_case(root).then(|| &abs[root.len()..])
+}
+
+fn without_windows_prefix(path: &str) -> &str {
+    path.strip_prefix("//?/UNC/")
+        .or_else(|| path.strip_prefix("//?/"))
+        .or_else(|| path.strip_prefix("//"))
+        .unwrap_or(path)
+}
+
 fn basename(path: &str) -> Option<&str> {
     path.rsplit('/').next()
 }
@@ -2397,7 +2416,7 @@ impl<'a> GraphRowEncoder<'a> {
     fn rel_path(&self, abs: &str) -> Option<String> {
         let root = self.workspace_root?;
         let root_str = root.to_str()?.replace('\\', "/");
-        let stripped = abs.strip_prefix(&root_str)?;
+        let stripped = strip_root(abs, &root_str)?;
         Some(stripped.trim_start_matches('/').to_string())
     }
 
@@ -2815,6 +2834,29 @@ mod role_rls_tests {
 #[cfg(test)]
 mod module_layout_hash_tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_root_is_stripped_literally_outside_windows() {
+        assert_eq!(strip_root("/ws/a/M.bsl", "/ws"), Some("/a/M.bsl"));
+        assert_eq!(strip_root("/WS/a/M.bsl", "/ws"), None);
+        assert_eq!(strip_root("//?/ws/a/M.bsl", "/ws"), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn every_windows_spelling_of_a_root_is_stripped() {
+        for (abs, root) in [
+            ("C:/ws/a/M.bsl", "C:/ws"),
+            ("//?/C:/ws/a/M.bsl", "C:/ws"),
+            ("C:/ws/a/M.bsl", "//?/C:/ws"),
+            ("c:/WS/a/M.bsl", "//?/C:/ws"),
+            ("//server/share/a/M.bsl", "//?/UNC/server/share"),
+        ] {
+            assert_eq!(strip_root(abs, root), Some("/a/M.bsl"), "{abs} under {root}");
+        }
+        assert_eq!(strip_root("D:/ws/a/M.bsl", "C:/ws"), None);
+    }
 
     fn hashes(source: &str) -> (u64, u64) {
         hashes_marked(source, false)

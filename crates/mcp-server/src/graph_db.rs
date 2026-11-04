@@ -85,7 +85,10 @@ use crate::graph::input::{build_source_root, db_for_files};
 // 24: XML semantic fingerprints now preserve tree boundaries/namespaces and exported method
 // signatures include parameter composition. Existing version-23 rows cannot prove either
 // property, so they are invalidated through the normal cache-format gate.
-pub(crate) const SCHEMA_VERSION: u32 = 24;
+// 25: the row encoder strips the workspace root whichever way Windows spells it, so a full build
+// there mints `method/file/<rel>::<name>` where version 24 minted `method/file/<basename>::<name>`
+// and an incremental patch minted the former: one database could hold both for one method.
+pub(crate) const SCHEMA_VERSION: u32 = 25;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
