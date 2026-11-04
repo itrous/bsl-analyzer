@@ -1244,6 +1244,50 @@ impl GlobalState {
         }
     }
 
+    /// Build the source root's foreign handler bindings on the pool once the workspace is
+    /// loaded. The fold scans every file of the root one after another, so the first form
+    /// module that asks for it pays the whole scan on the diagnostics worker: measured at
+    /// 1.4 s on a 10 000-object configuration, inside a client budget of 15 s, and the
+    /// time is then reported against whichever rule asked first. The CLI primes it for the
+    /// same reason, see `bin/cli/analyze.rs`.
+    pub(crate) fn prime_foreign_handler_bindings(&mut self) {
+        // Only two rules consult the fold; with both switched off nothing would read it.
+        let rule_is_active = |code: &str| {
+            if let Some(ref only) = self.diagnostics_config.only_enabled {
+                return only.iter().any(|enabled| enabled == code);
+            }
+            !self.diagnostics_config.disabled.iter().any(|disabled| disabled == code)
+        };
+        if !["UnusedLocalMethod", "UnusedParameters"].iter().copied().any(rule_is_active) {
+            tracing::debug!("foreign handler bindings: both consumers disabled, priming skipped");
+            return;
+        }
+        if !self.task_pool.pool.has_capacity() {
+            tracing::debug!("task pool saturated; foreign handler bindings priming skipped");
+            return;
+        }
+
+        let db = self.analysis_host.raw_database().clone();
+        let analysis_guard = self.note_analysis_spawned();
+        let spawned = self.task_pool.pool.try_spawn_detached(move || {
+            let _analysis_guard = analysis_guard;
+            let started = std::time::Instant::now();
+            let primed = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+                db.prime_foreign_handler_bindings(base_db::BSL_SOURCE_ROOT)
+            }));
+            match primed {
+                Ok(()) => tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "foreign handler bindings primed",
+                ),
+                Err(_) => tracing::debug!("foreign handler bindings priming cancelled"),
+            }
+        });
+        if spawned.is_err() {
+            tracing::warn!("task pool rejected foreign handler bindings priming");
+        }
+    }
+
     /// Where the store [`SessionAnalysisHost::analysis`] reads stands now — the store the
     /// warm-up and the sweep's chunks run on.
     pub(crate) fn dispatch_stamp(&self) -> DispatchStamp {
