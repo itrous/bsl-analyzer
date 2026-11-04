@@ -34,6 +34,10 @@ pub fn from_hir(
     if expected_label == actual_label {
         return None;
     }
+    let (expected_label, actual_label) = (
+        super::type_mismatch::shorten_type_union(&expected_label),
+        super::type_mismatch::shorten_type_union(&actual_label),
+    );
     let message = format!(
         "Несоответствие типов: ожидалось '{expected_label}', получено '{actual_label}' (тип параметра из описания)"
     );

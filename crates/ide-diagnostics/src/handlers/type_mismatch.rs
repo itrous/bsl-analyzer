@@ -19,6 +19,23 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     lsp_severity_override: "",
 };
 
+/// Union members kept in a message; the rest is summarised as a count.
+const MESSAGE_UNION_MEMBERS: usize = 3;
+
+/// Cuts a union label down for a diagnostic message. An expected type that is a union of all
+/// metadata-object kinds rendered as a 4744-character line, unreadable in a hover. Callers must
+/// compare labels BEFORE shortening: two different unions can share their first members.
+pub(crate) fn shorten_type_union(label: &str) -> String {
+    // `bsl-types` display joins union members with exactly this separator.
+    const SEPARATOR: &str = " | ";
+    let total = label.split(SEPARATOR).count();
+    if total <= MESSAGE_UNION_MEMBERS {
+        return label.to_owned();
+    }
+    let kept: Vec<&str> = label.split(SEPARATOR).take(MESSAGE_UNION_MEMBERS).collect();
+    format!("{} | … и ещё {}", kept.join(SEPARATOR), total - MESSAGE_UNION_MEMBERS)
+}
+
 pub fn from_hir(
     expected: TypeId,
     actual: TypeId,
@@ -34,6 +51,8 @@ pub fn from_hir(
     if expected_label == actual_label || ctx.kernel_types_overlap(expected, actual) {
         return None;
     }
+    let (expected_label, actual_label) =
+        (shorten_type_union(&expected_label), shorten_type_union(&actual_label));
     let message =
         format!("Несоответствие типов: ожидалось '{expected_label}', получено '{actual_label}'");
     crate::simple_hir_diagnostic(DiagnosticCode::TypeMismatch, message, range, ctx)
@@ -41,9 +60,60 @@ pub fn from_hir(
 
 #[cfg(test)]
 mod tests {
+    use super::shorten_type_union;
     use crate::test_utils::check_diagnostics_snapshot_for;
     use crate::DiagnosticCode;
     use expect_test::expect;
+
+    #[test]
+    fn shorten_leaves_a_label_without_separator_alone() {
+        assert_eq!(shorten_type_union("Число"), "Число");
+        assert_eq!(shorten_type_union(""), "");
+    }
+
+    #[test]
+    fn shorten_leaves_up_to_three_members_alone() {
+        assert_eq!(shorten_type_union("А"), "А");
+        assert_eq!(shorten_type_union("А | Б | В"), "А | Б | В");
+    }
+
+    #[test]
+    fn shorten_cuts_the_fourth_member_onwards() {
+        assert_eq!(shorten_type_union("А | Б | В | Г"), "А | Б | В | … и ещё 1");
+    }
+
+    #[test]
+    fn shorten_bounds_a_sixty_member_union() {
+        let members: Vec<String> = (0..60).map(|i| format!("ОбъектМетаданных: Вид{i}")).collect();
+        let full = members.join(" | ");
+        let short = shorten_type_union(&full);
+        assert!(short.ends_with(" | … и ещё 57"), "{short}");
+        assert_eq!(short.split(" | ").count(), 4);
+        assert!(short.chars().count() < 120, "{} chars", short.chars().count());
+        assert!(full.chars().count() > 1000);
+    }
+
+    #[test]
+    fn shorten_keeps_a_member_with_spaces_intact() {
+        assert_eq!(
+            shorten_type_union("ОбъектМетаданных: HTTPСервис | Строка | Число | Булево"),
+            "ОбъектМетаданных: HTTPСервис | Строка | Число | … и ещё 1"
+        );
+        assert_eq!(
+            shorten_type_union("ОбъектМетаданных: HTTPСервис"),
+            "ОбъектМетаданных: HTTPСервис"
+        );
+    }
+
+    #[test]
+    fn distinct_unions_sharing_three_members_differ_in_full_but_not_shortened() {
+        // The guard in `from_hir` must compare these full labels: shortened they are
+        // equal, and comparing after shortening would drop a real finding.
+        let expected = "А | Б | В | Г";
+        let actual = "А | Б | В | Д";
+        assert_ne!(expected, actual);
+        assert_eq!(shorten_type_union(expected), shorten_type_union(actual));
+    }
 
     // The arguments below are variables whose union the analyzer computed from
     // branches: a union the documentation gave is relieved earlier, in hir-ty.
