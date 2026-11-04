@@ -597,6 +597,10 @@ fn is_extension_dir(root: &Path, rel: &str) -> bool {
 
 /// The directory's `Configuration.xml` as a real file, in whatever ASCII case
 /// the tree spells it.
+pub(crate) fn directory_has_configuration_xml(dir: &Path) -> bool {
+    root_configuration_xml(dir).is_some()
+}
+
 fn root_configuration_xml(dir: &Path) -> Option<std::path::PathBuf> {
     bsl_conventions::find_child_ci(
         dir,

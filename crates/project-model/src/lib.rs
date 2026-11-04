@@ -1076,6 +1076,20 @@ impl Project {
             extension: None,
             excluded: false,
         };
+        // The caller already chose this directory (`analyze -s`). A missing
+        // `Configuration.xml` must not fall through to a search from `root`:
+        // that search replaces the directory the caller named.
+        if let Some(path) = config.source_anchor.clone() {
+            if exclusions.is_excluded_resolved(&path) {
+                tracing::info!(?path, "anchored source is excluded by [source].exclude");
+                return Ok(DiscoveredSource {
+                    configuration: None,
+                    extension: None,
+                    excluded: true,
+                });
+            }
+            return Ok(found(path));
+        }
         // A directory that carries `Configuration.xml` where a MAIN configuration is
         // expected, but turned out to be an extension. It is not a base and does not
         // become a source root, yet it is what makes this project a base-less
@@ -2599,6 +2613,14 @@ pub struct ProjectConfig {
     #[doc(hidden)]
     pub config_file_path: Option<PathBuf>,
 
+    /// Directory the caller already chose as the source subject. Set by the CLI
+    /// when a discovered config would otherwise search from its own directory
+    /// and replace `-s`. Not a config-file field: a declared `[source].root`
+    /// that lacks `Configuration.xml` still warns and searches.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub source_anchor: Option<PathBuf>,
+
     /// Parent files merged in through `extends` (TOML only), nearest first. Set by
     /// the loader; read it through [`Self::extends_chain`].
     #[serde(skip)]
@@ -3978,6 +4000,7 @@ impl From<TomlConfig> for ProjectConfig {
         Self {
             diagnostics: toml.diagnostics,
             config_file_path: None,
+            source_anchor: None,
             extends_chain: Vec::new(),
             code_lens: toml.code_lens,
             formatting: toml.formatting,
@@ -8351,6 +8374,33 @@ type_narrowing = false
 
         let (_, path) = ProjectConfig::discover(dir.path()).unwrap().expect("config not found");
         assert_eq!(path, dir.path().join("bsl-analyzer.toml"));
+    }
+
+    #[test]
+    fn discover_returns_the_parse_error_of_a_broken_ancestor_config() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "=\n");
+        let start = dir.path().join("src/cf");
+        fs::create_dir_all(&start).unwrap();
+
+        let error = ProjectConfig::discover(&start).unwrap_err();
+        assert_eq!(error.path.file_name().unwrap(), "bsl-analyzer.toml");
+    }
+
+    #[test]
+    fn source_anchor_is_the_subject_even_when_a_configuration_sits_beside_it() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let cf = project.join("src/cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let loose = project.join("loose");
+        fs::create_dir_all(&loose).unwrap();
+
+        let config =
+            ProjectConfig { source_anchor: Some(loose.clone()), ..ProjectConfig::default() };
+        let built = Project::with_config(&project, config).unwrap();
+        assert_eq!(built.configuration_path(), Some(loose.as_path()));
     }
 }
 

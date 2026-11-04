@@ -135,3 +135,32 @@ fn extension_flags_stay_relative_to_the_source_dir_under_a_discovered_config() {
         "a glob must survive the rebase"
     );
 }
+
+#[test]
+fn a_directory_without_a_configuration_is_not_replaced_by_one_above_it() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    write(&dir.path().join("bsl-analyzer.toml"), "");
+    let loose = dir.path().join("loose");
+    write(&loose.join("Module.bsl"), "Процедура Проверить() Экспорт\nКонецПроцедуры\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .arg("analyze")
+        .arg("-s")
+        .arg(&loose)
+        .args(["--format", "jsonl"])
+        .env_remove("ONEC_CONFIGURATIONS_ROOT")
+        .output()
+        .expect("failed to run the analyzer");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stdout.contains("Module.bsl"),
+        "the directory named by -s was not analyzed: {stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("СерверныйМодуль"),
+        "a configuration found above -s replaced it: {stdout}"
+    );
+}

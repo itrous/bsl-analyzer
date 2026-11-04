@@ -454,8 +454,14 @@ fn analyze_salsa(
         && proj_config.configuration_dependency.is_none()
     {
         // Without a declared root the project would search from the config's directory and lose `-s`.
+        // A root that holds `Configuration.xml` sticks; one that does not is warned about and
+        // searched past, so that case is anchored directly instead of declared as a root.
         if let Ok(relative) = source_dir.strip_prefix(&project_root) {
-            proj_config.configuration_root = Some(super::source_set::slash_path(relative));
+            if super::source_set::directory_has_configuration_xml(&source_dir) {
+                proj_config.configuration_root = Some(super::source_set::slash_path(relative));
+            } else {
+                proj_config.source_anchor = Some(source_dir.clone());
+            }
         }
     }
     bsl_analyzer::help_bootstrap::bootstrap_for_config(&proj_config, &project_root);
