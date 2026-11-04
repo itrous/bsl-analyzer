@@ -1222,6 +1222,24 @@ mod tests {
         let restored = DiagnosticsConfig::from_input(&config.to_input());
         assert_eq!(restored, config);
         assert_eq!(restored.severity(DiagnosticCode::CommonModuleInvalidType), Severity::Warning);
+
+        // camelCase `diagnosticType` is the project spelling; the interned form stores
+        // the snake_case field, and the round trip must not drop it.
+        let with_type = json!({
+            "metadataOverrides": {
+                "CommonModuleInvalidType": {
+                    "lspSeverity": "warning",
+                    "diagnosticType": "CodeSmell"
+                }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&with_type, Locale::En);
+        let over = config
+            .metadata_overrides
+            .get(&DiagnosticCode::CommonModuleInvalidType)
+            .expect("override parsed");
+        assert_eq!(over.diagnostic_type, Some(DiagnosticType::CodeSmell));
+        assert_eq!(DiagnosticsConfig::from_input(&config.to_input()), config);
     }
 
     #[test]
