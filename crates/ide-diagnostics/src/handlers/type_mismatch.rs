@@ -36,10 +36,30 @@ pub(crate) fn shorten_union_members(members: &[String]) -> String {
 
 /// The label to print. A long union keeps the first [`MESSAGE_UNION_MEMBERS`] members; every
 /// other type, including one whose own label contains ` | `, is printed in full.
-pub(crate) fn message_type_label(ctx: &AnalysisContext, id: TypeId, full_label: String) -> String {
+fn message_type_label(ctx: &AnalysisContext, id: TypeId, full_label: String) -> String {
     match ctx.kernel_union_member_labels(id, ctx.locale()) {
         Some(members) if members.len() > MESSAGE_UNION_MEMBERS => shorten_union_members(&members),
         _ => full_label,
+    }
+}
+
+/// Shortened labels for a message. When shortening would make the two sides read the same,
+/// the full labels are kept: the tail was the only difference, and a message that says the
+/// two sides are identical is not actionable. Callers have already dropped a pair whose full
+/// labels are equal.
+pub(crate) fn labels_for_message(
+    ctx: &AnalysisContext,
+    expected: TypeId,
+    actual: TypeId,
+    expected_full: String,
+    actual_full: String,
+) -> (String, String) {
+    let expected_short = message_type_label(ctx, expected, expected_full.clone());
+    let actual_short = message_type_label(ctx, actual, actual_full.clone());
+    if expected_short == actual_short {
+        (expected_full, actual_full)
+    } else {
+        (expected_short, actual_short)
     }
 }
 
@@ -58,8 +78,8 @@ pub fn from_hir(
     if expected_label == actual_label || ctx.kernel_types_overlap(expected, actual) {
         return None;
     }
-    let expected_label = message_type_label(ctx, expected, expected_label);
-    let actual_label = message_type_label(ctx, actual, actual_label);
+    let (expected_label, actual_label) =
+        labels_for_message(ctx, expected, actual, expected_label, actual_label);
     let message =
         format!("Несоответствие типов: ожидалось '{expected_label}', получено '{actual_label}'");
     crate::simple_hir_diagnostic(DiagnosticCode::TypeMismatch, message, range, ctx)
@@ -317,6 +337,40 @@ mod tests {
                 TypeMismatch @ 7:37..7:40
                   message: Несоответствие типов: ожидалось 'Число', получено 'Строка'
                   severity: Major"#]],
+        );
+    }
+
+    #[test]
+    fn shortened_doc_union_sides_stay_distinguishable() {
+        // The first three members match, so shortening would print the same text on both
+        // sides. The finding stays, and the full labels keep the tail that tells them apart.
+        let code = r#"
+// Параметры:
+//   П1 - Число, Строка, Булево, ТаблицаЗначений - значение.
+Процедура Принять(П1) Экспорт
+КонецПроцедуры
+
+Процедура Тест(У1, У2, У3)
+    Значение = Неопределено;
+    Если У1 Тогда
+        Значение = Истина;
+    КонецЕсли;
+    Если У2 Тогда
+        Значение = 1;
+    КонецЕсли;
+    Если У3 Тогда
+        Значение = "а";
+    КонецЕсли;
+    Принять(Значение);
+КонецПроцедуры
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::TypeMismatchByDocComment,
+            expect![[r#"
+                TypeMismatchByDocComment @ 18:13..18:21
+                  message: Несоответствие типов: ожидалось 'Булево | Число | Строка | ТаблицаЗначений', получено 'Булево | Число | Строка | Неопределено' (тип параметра из описания)
+                  severity: Error"#]],
         );
     }
 
