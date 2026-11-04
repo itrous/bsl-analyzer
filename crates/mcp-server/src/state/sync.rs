@@ -4037,7 +4037,9 @@ mod tests {
             "the owned module is marked context-dirty: {dirty:?}",
         );
         assert!(
-            dirty.contains(&bsl_search::FileKey::configuration("CommonModules/Б/Ext/Module.bsl")),
+            dirty.contains(&bsl_search::FileKey::configuration(
+                "CommonModules/Б/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR)
+            )),
             "the referencing module (reads the catalog) is marked context-dirty: {dirty:?}",
         );
         assert!(

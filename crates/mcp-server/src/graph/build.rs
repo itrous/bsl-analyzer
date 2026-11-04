@@ -8657,8 +8657,10 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(metadata_context.1.as_deref(), Some("metadata context"), "rooted={rooted}");
-            let epf_context =
-                stored.iter().find(|(path, _)| path.ends_with("Ext/ObjectModule.bsl")).unwrap();
+            let epf_context = stored
+                .iter()
+                .find(|(path, _)| path.replace('\\', "/").ends_with("Ext/ObjectModule.bsl"))
+                .unwrap();
             assert_eq!(epf_context.1, None, "rooted={rooted}");
         }
     }
