@@ -400,11 +400,7 @@ fn setup_applied_visibility() -> RootDatabaseImpl {
 }
 
 fn setup_form_resolution_visibility() -> (RootDatabaseImpl, PathBuf) {
-    let temp_root = std::env::temp_dir().join(format!(
-        "bsl-analyzer-form-visibility-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-    ));
+    let temp_root = stdx::test_temp::unique_dir("bsl-analyzer-form-visibility");
     let roots =
         [temp_root.join("base"), temp_root.join("extension-a"), temp_root.join("extension-b")];
     for root in &roots {

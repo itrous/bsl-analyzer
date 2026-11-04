@@ -3,7 +3,6 @@ use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 use vfs::{FileId, VfsPath};
 
 fn designer_fixture_path() -> PathBuf {
@@ -80,9 +79,7 @@ fn assert_metadata_ref(
 }
 
 fn temp_designer_config_with_register_recorders() -> PathBuf {
-    let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let root = std::env::temp_dir()
-        .join(format!("bsl-analyzer-register-recorders-{}-{suffix}", std::process::id()));
+    let root = stdx::test_temp::unique_dir("bsl-analyzer-register-recorders");
     fs::create_dir_all(root.join("InformationRegisters")).unwrap();
     fs::create_dir_all(root.join("AccumulationRegisters")).unwrap();
     fs::create_dir_all(root.join("CalculationRegisters")).unwrap();
