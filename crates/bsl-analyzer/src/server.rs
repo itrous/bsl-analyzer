@@ -631,6 +631,7 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
         admit_pending_latency_retries(state)?;
         state.schedule_shared_seed();
         state.start_shared_metadata_warmup();
+        state.start_foreign_handler_bindings_priming();
         if state.shared_seed_running {
             hold_shared_test_gate("BSL_TEST_SHARED_LSP_EVENT_GATE");
         }
@@ -802,6 +803,7 @@ fn handle_idle_tick(state: &mut GlobalState) {
         plan.parked_at = None;
     }
     state.shared_metadata_warm_parked_at = None;
+    state.foreign_bindings_priming.parked_at = None;
     state.release_parked_diagnostics(true);
 }
 
@@ -1233,6 +1235,11 @@ fn readmit_shared_documents(state: &mut GlobalState) {
     }
 }
 
+/// Whether a real panic in the store could have reached a job dispatched at `dispatched`.
+fn panic_in_store_since(state: &GlobalState, dispatched: DispatchStamp) -> bool {
+    crate::panic_watch::panicked_in(state.analysis_host.raw_database(), dispatched.revision)
+}
+
 pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Result<()> {
     use crate::global_state::Task;
 
@@ -1370,17 +1377,26 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
             if state.diagnostics_generation.get(&uri) == Some(&generation) {
                 state.diagnostics_tokens.remove(&uri);
             }
-            // Batch LRU writes can cancel the latest open-buffer diagnostics too.
-            if matches!(kind, salsa::Cancelled::PendingWrite | salsa::Cancelled::Local)
+            // Batch LRU writes can cancel the latest open-buffer diagnostics too. So can a
+            // write that unwinds whoever owns a query this job waits on, the fold's priming
+            // among them: the waiter gets `PropagatedPanic` whatever unwound the owner, and
+            // only the panic stamp tells that from a real panic, which must not be retried.
+            let retried = match kind {
+                salsa::Cancelled::PendingWrite | salsa::Cancelled::Local => true,
+                salsa::Cancelled::PropagatedPanic => !panic_in_store_since(state, dispatched),
+                _ => false,
+            };
+            if retried
                 && state.diagnostics_generation.get(&uri) == Some(&generation)
                 && state.mem_docs.get_version(&uri) == Some(version)
             {
                 // A pending write from a closed file read from disk that drifted from its
                 // revision, with no write since, would unwind a re-dispatch now the same
-                // way. It waits for the revision to move or for an idle tick. An LRU
-                // eviction cuts the same way without a drift and is retried at once.
+                // way, and so would a waiter's unwind behind it. It waits for the revision
+                // to move or for an idle tick. An LRU eviction cuts the same way without a
+                // drift and is retried at once.
                 let now = DispatchStamp::of(state.analysis_host.raw_database());
-                if matches!(kind, salsa::Cancelled::PendingWrite) && now.drifted_since(dispatched) {
+                if !matches!(kind, salsa::Cancelled::Local) && now.drifted_since(dispatched) {
                     state.parked_diagnostics.insert(uri, now.revision);
                 } else {
                     state.enqueue_pending_diagnostics(uri);
@@ -1406,22 +1422,32 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
             }
             state.start_shared_metadata_warmup();
         }
-        Task::ForeignHandlerBindingsPrimed { cut, started } => {
+        Task::ForeignHandlerBindingsPrimed { cut } => {
+            state.foreign_bindings_priming.in_flight = false;
             // What it computed before the cut stays memoised, so another run continues from
             // there, and the document whose open or edit cut it can read the fold sooner. A
-            // cut by a disk read that drifted, with no write since, would unwind another run
-            // the same way, and a propagated panic may be a real one; after those the first
-            // form module builds what is left, as it would without the priming.
-            let again = match cut {
-                Some(salsa::Cancelled::Local) => true,
-                Some(salsa::Cancelled::PendingWrite) => {
-                    !state.dispatch_stamp().drifted_since(started)
+            // cut by a disk read that drifted from its revision, with no write since and
+            // other than the loop's own local cancel, unwinds another run the same way, so
+            // it waits for the revision to move (or for an idle tick). After a real panic
+            // the first form module meets it at its own boundary.
+            let started = state.foreign_bindings_priming.started;
+            let again = match &cut {
+                Some(salsa::Cancelled::PropagatedPanic) => {
+                    started.is_some_and(|started| !panic_in_store_since(state, started))
                 }
+                Some(salsa::Cancelled::PendingWrite | salsa::Cancelled::Local) => true,
                 _ => false,
             };
             if again {
-                state.prime_foreign_handler_bindings();
+                state.foreign_bindings_priming.pending = true;
+                let now = state.dispatch_stamp();
+                if !matches!(cut, Some(salsa::Cancelled::Local))
+                    && started.is_some_and(|started| now.drifted_since(started))
+                {
+                    state.foreign_bindings_priming.parked_at = Some(now.revision);
+                }
             }
+            state.start_foreign_handler_bindings_priming();
         }
         Task::DependenciesPreloaded { file_id, count } => {
             tracing::debug!(file_id = file_id.0, count, "dependencies preloaded");
@@ -6522,17 +6548,73 @@ mod tests {
         for cancelled in [
             task(17, 7, salsa::Cancelled::PendingWrite),
             task(42, 6, salsa::Cancelled::Local),
-            task(42, 7, salsa::Cancelled::PropagatedPanic),
+            task(17, 7, salsa::Cancelled::PropagatedPanic),
         ] {
             handle_task(&mut state, cancelled).unwrap();
-            assert!(
-                state.pending_diagnostics_uris.is_empty(),
-                "stale/panicked work is not retried"
-            );
+            assert!(state.pending_diagnostics_uris.is_empty(), "stale work is not retried");
         }
         state.mem_docs.remove(&uri);
         handle_task(&mut state, task(42, 7, salsa::Cancelled::PendingWrite)).unwrap();
         assert!(state.pending_diagnostics_uris.is_empty(), "closed documents are not retried");
+    }
+
+    /// A waiter gets `PropagatedPanic` whatever unwound the query's owner: a job behind the
+    /// fold's priming gets it from the write that cut the priming, and dropping it would
+    /// leave the open document unpublished. Only the panic stamp tells a real panic, whose
+    /// re-dispatch would replay it; the stamp's revision is the input that tells them apart,
+    /// and a cut with a drift waits like any drifted cut.
+    #[test]
+    fn diagnostics_behind_a_cut_owner_are_retried_unless_a_query_really_panicked() {
+        use base_db::SourceDatabase as _;
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        let uri = crate::test_uri::file_uri("behind-a-claim.bsl");
+        state.mem_docs.insert(uri.clone(), "text".into(), 42);
+        state.diagnostics_generation.insert(uri.clone(), 7);
+        let cut = |state: &mut crate::global_state::GlobalState, dispatched| {
+            handle_task(
+                state,
+                Task::DiagnosticsCancelled {
+                    uri: uri.clone(),
+                    version: 42,
+                    generation: 7,
+                    kind: salsa::Cancelled::PropagatedPanic,
+                    dispatched,
+                    completed_at: std::time::Instant::now(),
+                },
+            )
+            .unwrap();
+        };
+
+        let dispatched = DispatchStamp::of(state.analysis_host.raw_database());
+        state.analysis_host.raw_database_mut().set_workspace_load_complete(true);
+        cut(&mut state, dispatched);
+        assert_eq!(
+            std::mem::take(&mut state.pending_diagnostics_uris),
+            vec![uri.clone()],
+            "the write that unwound the owner is no reason to drop the document"
+        );
+
+        let dispatched = DispatchStamp::of(state.analysis_host.raw_database());
+        state.analysis_host.raw_database().note_disk_drift();
+        cut(&mut state, dispatched);
+        assert!(state.pending_diagnostics_uris.is_empty(), "a drifted owner's waiter waits");
+        assert!(state.parked_diagnostics.remove(&uri).is_some(), "and is not dropped");
+
+        let dispatched = DispatchStamp::of(state.analysis_host.raw_database());
+        state.analysis_host.raw_database().record_query_panic(dispatched.revision);
+        cut(&mut state, dispatched);
+        assert!(state.pending_diagnostics_uris.is_empty(), "a real panic is not retried");
+        assert!(state.parked_diagnostics.is_empty(), "nor parked");
+
+        state.analysis_host.raw_database_mut().set_workspace_load_complete(true);
+        let dispatched = DispatchStamp::of(state.analysis_host.raw_database());
+        cut(&mut state, dispatched);
+        assert_eq!(
+            std::mem::take(&mut state.pending_diagnostics_uris),
+            vec![uri.clone()],
+            "a panic in an older revision cannot reach this job"
+        );
     }
 
     /// A pending write after which no revision started and a disk read drifted from its
@@ -8291,14 +8373,18 @@ mod tests {
         ));
     }
 
-    /// Run the event loop's share until the priming job reports, and hand back what cut it.
+    /// Run the event loop's share until the priming job reports, and hand back what cut it,
+    /// leaving what the report would start to the caller.
     fn priming_end(state: &mut crate::global_state::GlobalState) -> Option<salsa::Cancelled> {
         let deadline = std::time::Instant::now()
             + test_utils::wait::hang_guard(std::time::Duration::from_secs(60));
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match state.task_pool.receiver.recv_timeout(left).expect("the priming job reports") {
-                Task::ForeignHandlerBindingsPrimed { cut, .. } => return cut,
+                Task::ForeignHandlerBindingsPrimed { cut } => {
+                    state.foreign_bindings_priming.in_flight = false;
+                    return cut;
+                }
                 task => handle_task(state, task).unwrap(),
             }
         }
@@ -8414,13 +8500,8 @@ mod tests {
     fn a_priming_reports_every_ending() {
         use crate::global_state::foreign_handler_bindings_priming as priming;
 
-        let state = state_with_a_source_root();
-        let started = state.dispatch_stamp();
-        let cut_of = |prime: fn()| match priming(started, prime) {
-            Task::ForeignHandlerBindingsPrimed { cut, started: reported } => {
-                assert_eq!(reported, started);
-                cut
-            }
+        let cut_of = |prime: fn()| match priming(prime) {
+            Task::ForeignHandlerBindingsPrimed { cut } => cut,
             other => panic!("not a priming report: {other:?}"),
         };
         assert!(cut_of(|| {}).is_none());
@@ -8440,8 +8521,9 @@ mod tests {
     }
 
     /// A write cuts the priming, typically the open of the very form module it is for, so
-    /// another run follows. Each input that must not rerun is one where a rerun would meet
-    /// the same unwind, or where the run already finished.
+    /// another run follows. Each input that must not run again at once is one where a rerun
+    /// would meet the same unwind, or where the run already finished. The drifted cuts wait
+    /// for what lifts the wait: a write, or an idle tick.
     #[test]
     fn a_priming_cut_by_a_change_runs_again() {
         use base_db::SourceDatabase as _;
@@ -8449,28 +8531,114 @@ mod tests {
         let mut state = state_with_a_source_root();
         let report = |state: &mut crate::global_state::GlobalState,
                       cut: Option<salsa::Cancelled>,
-                      started,
                       again: bool,
                       name: &str| {
-            handle_task(state, Task::ForeignHandlerBindingsPrimed { cut, started }).unwrap();
+            state.foreign_bindings_priming.in_flight = true;
+            handle_task(state, Task::ForeignHandlerBindingsPrimed { cut }).unwrap();
             assert_eq!(!state.interactive_analysis_quiescent(), again, "{name}");
             if again {
                 assert!(priming_end(state).is_none(), "{name}");
             }
         };
+        let stamp = |state: &mut crate::global_state::GlobalState| {
+            state.foreign_bindings_priming.started = Some(state.dispatch_stamp());
+        };
+        let edit = |state: &mut crate::global_state::GlobalState| {
+            state.analysis_host.raw_database_mut().set_workspace_load_complete(true);
+        };
+        let drift = |state: &crate::global_state::GlobalState| {
+            state.analysis_host.raw_database().note_disk_drift();
+        };
+        let waits = |state: &mut crate::global_state::GlobalState, name: &str| {
+            state.start_foreign_handler_bindings_priming();
+            assert!(state.interactive_analysis_quiescent(), "{name}: the wait holds");
+            assert!(state.foreign_bindings_priming.pending, "{name}: and is not dropped");
+        };
+        let lifted = |state: &mut crate::global_state::GlobalState, name: &str| {
+            state.start_foreign_handler_bindings_priming();
+            assert!(!state.interactive_analysis_quiescent(), "{name}: the wait is lifted");
+            assert!(priming_end(state).is_none(), "{name}");
+        };
 
-        let started = state.dispatch_stamp();
-        report(&mut state, None, started, false, "a finished run");
-        report(&mut state, Some(salsa::Cancelled::PendingWrite), started, true, "an eviction");
-        report(&mut state, Some(salsa::Cancelled::PropagatedPanic), started, false, "a panic");
+        stamp(&mut state);
+        report(&mut state, None, false, "a finished run");
+        report(&mut state, Some(salsa::Cancelled::PendingWrite), true, "an eviction");
+        report(&mut state, Some(salsa::Cancelled::PropagatedPanic), true, "behind a cut owner");
 
-        state.analysis_host.raw_database_mut().set_workspace_load_complete(true);
-        report(&mut state, Some(salsa::Cancelled::PendingWrite), started, true, "a write");
+        edit(&mut state);
+        report(&mut state, Some(salsa::Cancelled::PendingWrite), true, "a write");
 
-        let started = state.dispatch_stamp();
-        state.analysis_host.raw_database().note_disk_drift();
-        report(&mut state, Some(salsa::Cancelled::PendingWrite), started, false, "a drifted read");
-        report(&mut state, Some(salsa::Cancelled::Local), started, true, "the loop's own cancel");
+        stamp(&mut state);
+        drift(&state);
+        report(&mut state, Some(salsa::Cancelled::PendingWrite), false, "a drifted read");
+        waits(&mut state, "a drifted read");
+        edit(&mut state);
+        lifted(&mut state, "the write that applies the change");
+
+        stamp(&mut state);
+        drift(&state);
+        report(&mut state, Some(salsa::Cancelled::PropagatedPanic), false, "behind a drift");
+        waits(&mut state, "behind a drift");
+        handle_idle_tick(&mut state);
+        lifted(&mut state, "an idle tick");
+
+        stamp(&mut state);
+        drift(&state);
+        report(&mut state, Some(salsa::Cancelled::Local), true, "the loop's own cancel");
+
+        stamp(&mut state);
+        let revision = state.dispatch_stamp().revision;
+        state.analysis_host.raw_database().record_query_panic(revision);
+        report(&mut state, Some(salsa::Cancelled::PropagatedPanic), false, "a real panic");
+        assert!(!state.foreign_bindings_priming.pending, "a real panic is not run again");
+    }
+
+    /// A request made while a run is on the pool stands until the run reports: the storage
+    /// may have been replaced under that run, and two runs would only scan the root twice.
+    /// A request that finds the pool full stands too. The report, or the event loop's next
+    /// turn, starts it; a run that was not asked for again does not repeat.
+    #[test]
+    fn a_priming_request_waits_for_the_run_in_flight_and_for_room_on_the_pool() {
+        let mut state = state_with_a_source_root();
+
+        state.foreign_bindings_priming.in_flight = true;
+        state.prime_foreign_handler_bindings();
+        assert!(state.interactive_analysis_quiescent(), "no second run beside the first");
+        assert!(state.foreign_bindings_priming.pending, "the request stands");
+        handle_task(&mut state, Task::ForeignHandlerBindingsPrimed { cut: None }).unwrap();
+        assert!(!state.interactive_analysis_quiescent(), "the report starts the asked-for run");
+        assert!(priming_end(&mut state).is_none());
+        state.start_foreign_handler_bindings_priming();
+        assert!(state.interactive_analysis_quiescent(), "nothing more was asked for");
+
+        let mut state = state_with_a_source_root();
+        state.task_pool = crate::task_pool::TaskPool::new_with_workers(1);
+        let (taken, held) = crossbeam_channel::bounded::<()>(0);
+        let (release, gate) = crossbeam_channel::bounded::<()>(0);
+        let idle = || Task::AnalysisProgressTick { epoch: u64::MAX };
+        state
+            .task_pool
+            .pool
+            .try_spawn(move || {
+                taken.send(()).unwrap();
+                gate.recv().unwrap();
+                idle()
+            })
+            .unwrap();
+        held.recv().unwrap();
+        while state.task_pool.pool.has_capacity() {
+            state.task_pool.pool.try_spawn(idle).unwrap();
+        }
+        state.prime_foreign_handler_bindings();
+        assert!(state.interactive_analysis_quiescent(), "a full pool takes no run");
+        assert!(state.foreign_bindings_priming.pending, "the request stands");
+        release.send(()).unwrap();
+        while !state.task_pool.pool.has_capacity() {
+            std::thread::yield_now();
+        }
+        state.start_foreign_handler_bindings_priming();
+        assert!(!state.interactive_analysis_quiescent(), "room on the pool starts it");
+        assert!(priming_end(&mut state).is_none());
     }
 
     /// Green-node caches are thread-local and never evict, and the idle trim reaches only the
@@ -8498,8 +8666,7 @@ mod tests {
             first
         });
 
-        let state = state_with_a_source_root();
-        crate::global_state::foreign_handler_bindings_priming(state.dispatch_stamp(), || {});
+        crate::global_state::foreign_handler_bindings_priming(|| {});
 
         rayon::broadcast(|context| {
             let parsed = parser::parse_with_shared_cache(SOURCE);
