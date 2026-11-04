@@ -15,9 +15,9 @@ pub struct StartEvent {
     // reads as "line 200"; a `lines[start_line - 1]` lookup then lands on the previous
     // line and the correct finding looks wrong. Fixed in `new`, not a parameter, so no
     // caller can claim another base.
-    pub line_base: u8,
+    line_base: u8,
 
-    pub column_base: u8,
+    column_base: u8,
 }
 
 impl StartEvent {
