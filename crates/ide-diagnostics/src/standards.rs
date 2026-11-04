@@ -220,6 +220,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::MismatchedArgCount => &[],
         DiagnosticCode::TypeMismatch => &[],
         DiagnosticCode::TypeMismatchByDocComment => &[],
+        DiagnosticCode::PossiblyUndefinedValue => &[],
         DiagnosticCode::UnresolvedField => &[],
         DiagnosticCode::UnresolvedMetadataPath => &[],
         DiagnosticCode::ReadOnlyPropertyAssignment => &[],
