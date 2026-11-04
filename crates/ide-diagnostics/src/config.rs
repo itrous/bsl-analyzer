@@ -451,14 +451,13 @@ fn parsed_override(entry: &serde_json::Value) -> ParsedOverride {
                     }
                 }
                 if bad {
+                    // Tags replace the rule's tags wholesale, so a mixed list would
+                    // drop the ones the author did not repeat. Ignore the field.
                     notes.push(OverrideNote::InvalidField {
                         field: "tags",
                         detail: "expected names of metadata tags".to_owned(),
                     });
-                }
-                // An empty array is a real override (clear the tags). A list of only
-                // unrecognised names is not: nothing was applied.
-                if !bad || !tags.is_empty() {
+                } else {
                     over.tags = Some(tags);
                     applied = true;
                 }
@@ -473,30 +472,52 @@ fn parsed_override(entry: &serde_json::Value) -> ParsedOverride {
     ParsedOverride { value: applied.then_some(over), notes }
 }
 
-/// camelCase wins when both spellings are present: that is the project-file form.
-/// A differing snake_case value is reported, not applied.
+/// camelCase wins when both spellings are strings and differ: that is the project-file
+/// form. A non-string does not win — the other spelling is used when it is a string,
+/// and the warning names the key that was actually written.
 fn take_string_alias(
     object: &serde_json::Map<String, serde_json::Value>,
     camel: &'static str,
     snake: &'static str,
     notes: &mut Vec<OverrideNote>,
 ) -> Option<String> {
-    let camel_v = object.get(camel);
-    let snake_v = object.get(snake);
-    if camel_v.is_some() && snake_v.is_some() && camel_v != snake_v {
-        notes.push(OverrideNote::AliasClash(camel, snake));
-    }
-    let value = camel_v.or(snake_v)?;
-    match value.as_str() {
-        Some(text) => Some(text.to_owned()),
-        None => {
-            notes.push(OverrideNote::InvalidField {
-                field: camel,
-                detail: "expected a string".to_owned(),
-            });
+    let camel_str = object.get(camel).map(serde_json::Value::as_str);
+    let snake_str = object.get(snake).map(serde_json::Value::as_str);
+    match (camel_str, snake_str) {
+        (None, None) => None,
+        (Some(None), None) => {
+            notes.push(expected_string(camel));
             None
         }
+        (None, Some(None)) => {
+            notes.push(expected_string(snake));
+            None
+        }
+        (Some(None), Some(None)) => {
+            notes.push(expected_string(camel));
+            notes.push(expected_string(snake));
+            None
+        }
+        (Some(None), Some(Some(text))) => {
+            notes.push(expected_string(camel));
+            Some(text.to_owned())
+        }
+        (Some(Some(text)), Some(None)) => {
+            notes.push(expected_string(snake));
+            Some(text.to_owned())
+        }
+        (Some(Some(camel_text)), Some(Some(snake_text))) => {
+            if camel_text != snake_text {
+                notes.push(OverrideNote::AliasClash(camel, snake));
+            }
+            Some(camel_text.to_owned())
+        }
+        (Some(Some(text)), None) | (None, Some(Some(text))) => Some(text.to_owned()),
     }
+}
+
+fn expected_string(field: &'static str) -> OverrideNote {
+    OverrideNote::InvalidField { field, detail: "expected a string".to_owned() }
 }
 
 fn warn_metadata_overrides(diagnostics: &serde_json::Value, file: &str) {
@@ -1679,6 +1700,65 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("`severity`") && w.contains("does not change the finding")),
             "{warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_tag_list_is_not_applied() {
+        let raw = json!({
+            "metadataOverrides": {
+                "CommonModuleInvalidType": { "tags": ["Unused", "NoSuchTag"] }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
+        assert!(
+            config
+                .metadata_overrides
+                .get(&DiagnosticCode::CommonModuleInvalidType)
+                .and_then(|over| over.tags.as_ref())
+                .is_none(),
+            "a mixed list must not replace the rule's tags"
+        );
+        let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&raw, None));
+        assert!(
+            warnings.iter().any(|w| w.contains("`tags`") && w.contains("the field is ignored")),
+            "{warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn a_non_string_alias_does_not_hide_the_other_spelling() {
+        let raw = json!({
+            "metadataOverrides": {
+                "CommonModuleInvalidType": {
+                    "diagnosticType": 1,
+                    "diagnostic_type": "CodeSmell"
+                }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
+        assert_eq!(
+            config
+                .metadata_overrides
+                .get(&DiagnosticCode::CommonModuleInvalidType)
+                .and_then(|over| over.diagnostic_type),
+            Some(DiagnosticType::CodeSmell),
+            "the string spelling still applies"
+        );
+
+        let snake = json!({
+            "metadataOverrides": { "CommonModuleInvalidType": { "lsp_severity": 5 } }
+        });
+        let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&snake, None));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`lsp_severity`") && w.contains("expected a string")),
+            "names the key that was written: {warnings:#?}"
+        );
+        assert!(
+            warnings.iter().all(|w| !w.contains("`lspSeverity`")),
+            "does not name the spelling the author did not write: {warnings:#?}"
         );
     }
 }
