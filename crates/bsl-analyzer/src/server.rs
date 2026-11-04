@@ -8493,6 +8493,32 @@ mod tests {
         }
     }
 
+    /// The load's end skips the priming while both readers are off, so the reload that
+    /// switches one on is what asks for it. A reload that leaves the readers as they were,
+    /// and one during the load, whose end primes anyway, do not.
+    #[test]
+    fn a_reload_that_switches_a_reader_on_primes_the_fold() {
+        let readers_off = |state: &mut crate::global_state::GlobalState| {
+            state.diagnostics_config.disabled =
+                vec!["UnusedLocalMethod".to_owned(), "UnusedParameters".to_owned()];
+        };
+
+        let mut state = state_with_a_source_root();
+        state.vfs_done = true;
+        readers_off(&mut state);
+        state.update_diagnostics_config();
+        assert!(!state.interactive_analysis_quiescent(), "the reader switched on primes");
+        assert!(priming_end(&mut state).is_none());
+
+        state.update_diagnostics_config();
+        assert!(state.interactive_analysis_quiescent(), "a reader already on does not");
+
+        state.vfs_done = false;
+        readers_off(&mut state);
+        state.update_diagnostics_config();
+        assert!(state.interactive_analysis_quiescent(), "the load's end does it during a load");
+    }
+
     /// The priming's every ending reaches the event loop: only a report tells a cut that is
     /// worth another run from a finished one, and the task pool would swallow a panic
     /// without one.

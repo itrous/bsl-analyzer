@@ -13,6 +13,7 @@ impl GlobalState {
     }
 
     pub fn update_diagnostics_config(&mut self) {
+        let fold_was_read = self.foreign_bindings_readers_enabled();
         let project_locale = self.project.as_ref().and_then(|p| Self::project_locale(&p.config));
         let locale = resolve_locale(project_locale, self.lsp_locale);
 
@@ -49,6 +50,12 @@ impl GlobalState {
                 disabled = ?self.diagnostics_config.disabled,
                 "disabled diagnostics from config"
             );
+        }
+
+        // The load's end skipped the priming while nothing read the fold; a reload that
+        // switches a reader on would leave the whole scan to the first form module.
+        if self.vfs_done && !fold_was_read && self.foreign_bindings_readers_enabled() {
+            self.prime_foreign_handler_bindings();
         }
     }
 
