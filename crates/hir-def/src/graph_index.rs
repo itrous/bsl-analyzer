@@ -2190,8 +2190,14 @@ fn strip_root<'a>(abs: &'a str, root: &str) -> Option<&'a str> {
         return abs.strip_prefix(root);
     }
     let (abs, root) = (without_windows_prefix(abs), without_windows_prefix(root));
-    let head = abs.get(..root.len())?;
-    head.eq_ignore_ascii_case(root).then(|| &abs[root.len()..])
+    let mut rest = abs.chars();
+    for expected in root.chars() {
+        let found = rest.next()?;
+        if !found.to_lowercase().eq(expected.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(rest.as_str())
 }
 
 fn without_windows_prefix(path: &str) -> &str {
@@ -2851,6 +2857,7 @@ mod module_layout_hash_tests {
             ("//?/C:/ws/a/M.bsl", "C:/ws"),
             ("C:/ws/a/M.bsl", "//?/C:/ws"),
             ("c:/WS/a/M.bsl", "//?/C:/ws"),
+            ("c:/проекты/a/M.bsl", "//?/C:/Проекты"),
             ("//server/share/a/M.bsl", "//?/UNC/server/share"),
         ] {
             assert_eq!(strip_root(abs, root), Some("/a/M.bsl"), "{abs} under {root}");
