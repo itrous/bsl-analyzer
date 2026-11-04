@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -9,15 +10,14 @@ const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Per-process scratch root `<system temp>/bsl-tests-<pid>`.
+/// Per-process scratch root `<system temp>/bsl-tests-<pid>-<n>`.
 ///
 /// The root is deliberately not removed at process exit: a failing test is easier to debug when
 /// its files survive, and the 24-hour sweep of sibling roots bounds the disk use.
 pub fn root() -> &'static Path {
     ROOT.get_or_init(|| {
         let temp = std::env::temp_dir();
-        let root = temp.join(format!("{PREFIX}{}", std::process::id()));
-        prepare_root(&root);
+        let root = create_root(&temp, std::process::id());
         sweep_stale(&temp, &root, SystemTime::now(), STALE_AFTER);
         root
     })
@@ -30,11 +30,19 @@ pub fn unique_dir(name: &str) -> PathBuf {
     dir
 }
 
-// A root that already exists was left by a finished process with the same pid, and reusing it
-// would break the promise of `unique_dir`, whose counter starts over in every process.
-fn prepare_root(root: &Path) {
-    let _ = std::fs::remove_dir_all(root);
-    std::fs::create_dir_all(root).expect("failed to create the test temp root");
+// Only a directory made by this call is used. Whatever already holds the name may be the leftover
+// of a finished process with the same pid, undeletable, or planted by another user as a symlink,
+// and reusing it would break the promise of `unique_dir`, whose counter restarts in every process.
+fn create_root(temp: &Path, pid: u32) -> PathBuf {
+    let mut attempt = 0u32;
+    loop {
+        let root = temp.join(format!("{PREFIX}{pid}-{attempt}"));
+        match std::fs::create_dir(&root) {
+            Ok(()) => return root,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => attempt += 1,
+            Err(err) => panic!("failed to create the test temp root {}: {err}", root.display()),
+        }
+    }
 }
 
 // Every error is ignored: a sibling may belong to a live run, be locked, or be owned by another
@@ -61,7 +69,8 @@ mod tests {
     fn root_is_stable_and_pid_named() {
         assert_eq!(root(), root());
         assert!(root().is_dir());
-        assert!(root().ends_with(format!("{PREFIX}{}", std::process::id())));
+        let name = root().file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(&format!("{PREFIX}{}-", std::process::id())));
     }
 
     #[test]
@@ -94,14 +103,29 @@ mod tests {
 
     // Roots outlive their process, so a later process can get the same pid and find the old root.
     #[test]
-    fn a_reused_pid_root_starts_empty() {
-        let root = unique_dir("reused-pid").join(format!("{PREFIX}7"));
-        prepare_root(&root);
-        std::fs::write(root.join("leftover"), "").unwrap();
+    fn a_taken_root_name_is_skipped() {
+        let temp = unique_dir("taken-root");
+        let leftover = create_root(&temp, 7);
+        std::fs::write(leftover.join("leftover"), "").unwrap();
 
-        prepare_root(&root);
+        let root = create_root(&temp, 7);
 
-        assert!(root.is_dir());
-        assert!(!root.join("leftover").exists());
+        assert_ne!(root, leftover);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert!(leftover.join("leftover").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_does_not_redirect_the_root() {
+        let temp = unique_dir("planted-root");
+        let target = temp.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, temp.join(format!("{PREFIX}7-0"))).unwrap();
+
+        let root = create_root(&temp, 7);
+
+        assert!(root.symlink_metadata().unwrap().is_dir());
+        assert_eq!(root.file_name().unwrap().to_str().unwrap(), format!("{PREFIX}7-1"));
     }
 }
