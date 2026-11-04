@@ -2673,7 +2673,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "the scope count differs by one on Windows; cause not established"
+        ignore = "path-spelling: the scope admits no module because the report path and the resident path are spelled differently on Windows"
     )]
     fn sweep_under_scope_excludes_unchanged_files_and_counts_them() {
         use std::sync::Arc;

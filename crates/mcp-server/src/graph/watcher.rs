@@ -1063,7 +1063,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "a body save counted two reloads instead of one on Windows; cause not established"
+        ignore = "watch-events: depends on how file notifications are grouped, and Windows groups them differently"
     )]
     fn a_body_edit_reloads_the_graph_with_no_other_consumer() {
         let dir = tempfile::tempdir().unwrap();

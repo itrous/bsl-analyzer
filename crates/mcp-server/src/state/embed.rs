@@ -2316,10 +2316,6 @@ mod tests {
     /// The production publish hook, not a hand-called transition, installs and removes an
     /// extension from the root table carried by the graph's exact project snapshot.
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "the extension root is not published on Windows; cause not established"
-    )]
     fn production_publish_hook_transitions_live_search_roots() {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -2357,7 +2353,10 @@ mod tests {
         wait_for_root_count(&engine, 2);
         let guard = engine.lock().unwrap();
         let published_engine = guard.as_ref().unwrap();
-        assert!(published_engine.workspace_roots().unwrap().contains_id("ext/live"));
+        assert!(published_engine
+            .workspace_roots()
+            .unwrap()
+            .contains_id(&"ext/live".replace('/', std::path::MAIN_SEPARATOR_STR)));
         let published_provider = published_engine.graph_context_provider().unwrap();
         assert!(
             !Arc::ptr_eq(&boot_provider, &published_provider),
@@ -3560,10 +3559,6 @@ mod tests {
     /// against stale facts. Reverting the `drift_pending` guard makes the deferred call consume
     /// the mark and the survival assertion fails.
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "the context was not re-rendered on Windows; cause not established"
-    )]
     fn context_refresh_defers_marks_while_graph_drift_is_pending() {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
@@ -3572,7 +3567,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
-        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
+        let module_rel =
+            "CommonModules/Сервер/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR);
+        let module_rel = module_rel.as_str();
 
         // A chunk with a stale stored context and NO live embedding (so consumption needs no
         // embedder — the mark, not the vector, is under test).
@@ -3733,10 +3730,6 @@ mod tests {
     /// mark nobody handed to the graph — stamped straight into the store — gets bound `0` and
     /// survives the publish; an unbounded consume would clear it.
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "the mark did not survive the publication on Windows; cause not established"
-    )]
     fn a_publication_clears_no_mark_nobody_handed_it() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
@@ -3745,7 +3738,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
-        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
+        let module_rel =
+            "CommonModules/Сервер/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR);
+        let module_rel = module_rel.as_str();
 
         let db_path = workspace.join("search.db");
         {
@@ -3842,10 +3837,6 @@ mod tests {
     /// pickup against the already-fresh boot graph. Removing the `consume_leftover_marks` call
     /// leaves the mark stranded and the final assertion fails.
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "the leftover mark did not survive the boot publish on Windows; cause not established"
-    )]
     fn leftover_marks_are_consumed_after_boot_wiring() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
@@ -3854,7 +3845,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
-        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
+        let module_rel =
+            "CommonModules/Сервер/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR);
+        let module_rel = module_rel.as_str();
 
         let db_path = workspace.join("search.db");
         {

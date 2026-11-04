@@ -4713,7 +4713,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "the digest is empty on Windows; cause not established")]
     fn source_root_scoped_method_digest_keeps_only_internal_pairs() {
         // Given: direct method calls within two distinct source roots and across their boundary.
         let dir = tempfile::tempdir().unwrap();
@@ -4755,10 +4754,10 @@ mod tests {
         let digest = read_source_root_scoped_sqlite_method_call_digest(
             &path,
             [
-                bsl_search::FileKey::new("", path_a.to_string_lossy().into_owned()),
+                bsl_search::FileKey::new("", path_a.to_string_lossy().replace('\\', "/")),
                 bsl_search::FileKey::new(
                     "",
-                    root_a.join("Target.bsl").to_string_lossy().into_owned(),
+                    root_a.join("Target.bsl").to_string_lossy().replace('\\', "/"),
                 ),
                 bsl_search::FileKey::new(
                     "",

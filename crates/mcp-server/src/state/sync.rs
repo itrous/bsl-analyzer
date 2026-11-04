@@ -2454,7 +2454,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "the stand already held an acted-on loss on Windows; cause not established"
+        ignore = "watch-events: depends on how file notifications are grouped, and Windows groups them differently"
     )]
     fn a_reconcile_taken_while_the_search_rescan_waits_keeps_its_identity() {
         use crate::change_hub::{test_support::eventually, WorkspaceChangeHub};
@@ -2670,7 +2670,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "the failures did not coalesce into one rescan on Windows; cause not established"
+        ignore = "watch-events: depends on how file notifications are grouped, and Windows groups them differently"
     )]
     fn durable_drift_error_advances_cursor_and_coalesces_debt() {
         use crate::change_hub::{test_support::eventually, WorkspaceChangeHub};

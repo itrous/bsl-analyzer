@@ -2110,7 +2110,7 @@ mod tests {
         #[test]
         #[cfg_attr(
             windows,
-            ignore = "the two spellings give different result ids on Windows; cause not established"
+            ignore = "path-spelling: the result id carries the path spelling, which differs between the two calls on Windows"
         )]
         fn the_configuration_root_id_reads_a_path_against_the_configuration() {
             use crate::diagnostics_state::test_support::{

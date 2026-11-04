@@ -687,7 +687,7 @@ mod shared_owner_tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "the removed buffer still answers through the case alias on Windows; cause not established"
+        ignore = "path-spelling: on Windows the snapshot still resolves the case alias after the buffer is removed"
     )]
     fn shared_admission_open_uri_case_alias_resolves_after_external_file_deletion() {
         let root = tempfile::tempdir().expect("create shared workspace");

@@ -1327,10 +1327,7 @@ mod tests {
     /// both are asserted together, because dropping either is the failure this step exists
     /// to prevent.
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "the card leaves the root id empty on Windows; cause not established"
-    )]
+    #[cfg_attr(windows, ignore = "posix-fixture: the stand roots are POSIX absolute paths")]
     fn a_card_carries_both_the_old_line_and_the_new_location() {
         let card = method_card();
         let roots = stand_roots();

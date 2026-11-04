@@ -5161,10 +5161,6 @@ mod tests {
     /// superseded one lends nothing new, lets its read in flight finish, closes its handles and
     /// lets the file go, and only then does its successor open it.
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "expects to supersede the database file in place, which did not happen on Windows; cause not established"
-    )]
     fn a_superseded_owner_lets_the_file_go_once_its_reads_finish() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
