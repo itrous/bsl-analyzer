@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 Не ломают API: набор инструментов MCP и ключи конфигурации прежние. Полный проход по конфигурации
 меняет набор и уровень находок `CalculationRegisterVirtualTableWithoutRecorder`, сокращает наборы
 находок `MissedRequiredParameter`, `TypeMismatch` и `InvalidCharacterInFile` и понижает уровень
-находок `ServerSideExportFormMethod`.
+находок `ServerSideExportFormMethod` и четырнадцати правил стандартов разработки.
 
 - diagnostics: `MissedRequiredParameter` больше не отмечает позицию, оставленную пустой между
   запятыми (`Сложение(, 2)`, `Сложение(1, )`): платформа принимает такой вызов и передаёт
@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 - diagnostics: `ServerSideExportFormMethod` теперь предупреждение, а не блокирующая ошибка: редактор
   показывает находку как warning, в SARIF она получает `warning` вместо `error`. Понижение уровня
   набор находок не меняет; оценка правила в метаданных (`Blocker`) не меняется (#792).
+- diagnostics: четырнадцать правил стандартов теперь предупреждение, а не ошибка: редактор
+  показывает находку как warning, в SARIF она получает `warning` вместо `error`. Набор находок
+  не меняется; собственная оценка правила в метаданных не меняется. В CodeClimate находки с
+  прежней оценкой `Critical` или `Error` становятся `major`; находки `Major` и раньше были
+  `major`. Правила: `CommonModuleInvalidType`, `DataExchangeLoading`, `IncorrectUseLikeInQuery`,
+  `InvalidCharacterInFile`, `MetadataObjectNameLength`, `MissingCodeTryCatchEx`,
+  `MissingTemporaryFileDeletion`, `SameMetadataObjectAndChildNames`, `StyleElementConstructors`,
+  `TimeoutsInExternalResources`, `UsingHardcodeNetworkAddress`, `UsingHardcodePath`,
+  `UsingObjectNotAvailableUnix`, `VirtualTableCallWithoutParameters` (#795).
 - diagnostics: `InvalidCharacterInFile` отмечает символ только там, где он мешает компиляции или
   меняет смысл разбираемого текста: в коде, в неразрывном пробеле, приклеенном к предыдущему
   идентификатору, ключевому слову или числу, в строке `//` многострочного литерала и в строке
