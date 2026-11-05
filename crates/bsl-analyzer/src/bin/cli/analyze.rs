@@ -447,7 +447,7 @@ fn analyze_salsa(
         source_set.resolve(&source_dir)?,
         &source_dir,
         &project_root,
-    )
+    )?
     .apply_to(&mut proj_config);
     if project_root != source_dir
         && proj_config.configuration_root.is_none()
@@ -459,14 +459,23 @@ fn analyze_salsa(
         // the model used to run from `-s`; only when that search finds nothing is `-s`
         // anchored, so a configuration beside it is not substituted and the walk does
         // not widen to all of `-s`.
+        // A root is a string in the config; a directory whose name is not UTF-8 is
+        // anchored by its path instead, since a lossy spelling names another directory.
+        let declare_root =
+            |config: &mut project_model::ProjectConfig, dir: &Path, relative: &Path| {
+                match super::source_set::slash_path(relative) {
+                    Some(root) => config.configuration_root = Some(root),
+                    None => config.source_anchor = Some(dir.to_path_buf()),
+                }
+            };
         if let Ok(relative) = source_dir.strip_prefix(&project_root) {
             if super::source_set::directory_has_configuration_xml(&source_dir) {
-                proj_config.configuration_root = Some(super::source_set::slash_path(relative));
+                declare_root(&mut proj_config, &source_dir, relative);
             } else if let Some(found) =
                 proj_config.main_configuration_from(&source_dir, &project_root)?
             {
                 if let Ok(nested) = found.strip_prefix(&project_root) {
-                    proj_config.configuration_root = Some(super::source_set::slash_path(nested));
+                    declare_root(&mut proj_config, &found, nested);
                 }
             } else {
                 // An extension under `-s` must still be named: anchoring `-s`

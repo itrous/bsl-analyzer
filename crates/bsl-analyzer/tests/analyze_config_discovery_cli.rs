@@ -256,3 +256,30 @@ fn an_extension_named_by_the_source_dir_does_not_own_external_objects() {
         "{stderr}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_source_dir_whose_name_is_not_utf8_is_not_swapped_for_its_lossy_spelling() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let requested = dir.path().join(std::ffi::OsString::from_vec(b"cf-\xff".to_vec()));
+    fixture_at(&requested);
+    // The spelling `to_string_lossy` gives the requested directory.
+    let lossy = dir.path().join("cf-\u{FFFD}");
+    write(&lossy.join("Configuration.xml"), "<Configuration/>");
+    write(&lossy.join("Replacement.bsl"), "Процедура П() Экспорт\nКонецПроцедуры\n");
+    write(&dir.path().join("bsl-analyzer.toml"), "");
+
+    // `-s .`: the binary takes no non-UTF-8 argument, but a working directory can be one.
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .args(["analyze", "-s", ".", "--format", "jsonl"])
+        .current_dir(&requested)
+        .env_remove("ONEC_CONFIGURATIONS_ROOT")
+        .output()
+        .expect("failed to run the analyzer");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("СерверныйМодуль"), "-s was not analyzed: {stdout}");
+    assert!(!stdout.contains("Replacement.bsl"), "its lossy spelling was analyzed: {stdout}");
+}
