@@ -91,6 +91,7 @@ pub enum DiagnosticCode {
     CompilationDirectiveLost,
     CompilationDirectiveNeedLess,
     CreateQueryInCycle,
+    LocalCallWithQueryInCycle,
     ImplicitDatabaseReadInCycle,
     DataExchangeLoading,
     DeletingCollectionItem,

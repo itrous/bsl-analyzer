@@ -547,6 +547,7 @@ fn implicit_database_read_in_cycle_manager_search_query_replacement_has_no_query
 "#;
     assert_count(source, DiagnosticCode::ImplicitDatabaseReadInCycle, 0);
     assert_count(source, DiagnosticCode::CreateQueryInCycle, 0);
+    assert_count(source, DiagnosticCode::LocalCallWithQueryInCycle, 0);
 }
 
 #[test]
@@ -569,6 +570,7 @@ fn implicit_database_read_in_cycle_coexists_with_explicit_query_diagnostic_witho
 "#;
     let implicit = assert_count(source, DiagnosticCode::ImplicitDatabaseReadInCycle, 3);
     let explicit = assert_count(source, DiagnosticCode::CreateQueryInCycle, 1);
+    assert_count(source, DiagnosticCode::LocalCallWithQueryInCycle, 0);
     let expressions = ["Ссылка.Артикул", "Строка(Ссылка)", "Справочники.Товары.НайтиПоКоду(Код)"];
     for (diag, expression) in implicit.iter().zip(expressions) {
         assert_eq!(range_text(source, diag), expression);

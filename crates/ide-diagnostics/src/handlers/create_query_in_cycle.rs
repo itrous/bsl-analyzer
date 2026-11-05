@@ -27,7 +27,10 @@ const DIRECT_MESSAGE: &str =
 /// passes also read, and their ranges are placed by that same provider's source maps.
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let code = DiagnosticCode::CreateQueryInCycle;
-    if ctx.is_disabled_with_metadata(code) {
+    let local_call_code = DiagnosticCode::LocalCallWithQueryInCycle;
+    // Each code is disabled on its own; `simple_hir_diagnostic` drops the findings of a disabled
+    // one, so the whole pass is skipped only when both are off.
+    if ctx.is_disabled_with_metadata(code) && ctx.is_disabled_with_metadata(local_call_code) {
         return Vec::new();
     }
     let infer = ctx.infer();
@@ -67,12 +70,13 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     query_in_loop_candidates(&infer.query_facts_by_body, &active)
         .into_iter()
         .filter_map(|candidate| {
-            let (site, message) = match candidate {
-                QueryInLoopCandidate::Execution(site) => (site, DIRECT_MESSAGE.to_string()),
+            let (site, finding_code, message) = match candidate {
+                QueryInLoopCandidate::Execution(site) => (site, code, DIRECT_MESSAGE.to_string()),
                 QueryInLoopCandidate::LocalCall { site, target } => {
                     let name = ctx.interface_method(target)?.name.clone();
                     (
                         site,
+                        local_call_code,
                         format!(
                             "Вызов локального метода «{name}» в теле цикла приводит к выполнению \
                              запроса непосредственно или через локальные методы этого модуля. \
@@ -81,7 +85,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                     )
                 }
             };
-            crate::simple_hir_diagnostic(code, message, site_range(&site)?, ctx.analysis())
+            crate::simple_hir_diagnostic(finding_code, message, site_range(&site)?, ctx.analysis())
         })
         .collect()
 }

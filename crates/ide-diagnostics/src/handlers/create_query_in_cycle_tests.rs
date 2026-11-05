@@ -3,11 +3,19 @@ use crate::{DiagnosticCode, DiagnosticsConfig};
 use expect_test::expect;
 
 const CODE: DiagnosticCode = DiagnosticCode::CreateQueryInCycle;
+const CALL: DiagnosticCode = DiagnosticCode::LocalCallWithQueryInCycle;
 
 fn count(source: &str) -> usize {
     check_file_diagnostics_with_config(source, DiagnosticsConfig::default())
         .iter()
         .filter(|d| d.code == CODE)
+        .count()
+}
+
+fn count_call(source: &str) -> usize {
+    check_file_diagnostics_with_config(source, DiagnosticsConfig::default())
+        .iter()
+        .filter(|d| d.code == CALL)
         .count()
 }
 
@@ -279,7 +287,8 @@ const RECURSION_WITHOUT_QUERY: &str =
 const HELPER_OUTSIDE_LOOP: &str =
     include_str!("fixtures/create_query_in_cycle/helper_outside_loop.bsl");
 
-/// The text of each finding's range, in file order.
+/// The text of each direct finding's range, in file order.
+#[allow(dead_code)]
 fn reported(source: &str) -> Vec<String> {
     let mut diags: Vec<_> =
         check_file_diagnostics_with_config(source, DiagnosticsConfig::default())
@@ -290,19 +299,30 @@ fn reported(source: &str) -> Vec<String> {
     diags.into_iter().map(|d| source[d.range].to_string()).collect()
 }
 
+/// The text of each local-call finding's range, in file order.
+fn reported_call(source: &str) -> Vec<String> {
+    let mut diags: Vec<_> =
+        check_file_diagnostics_with_config(source, DiagnosticsConfig::default())
+            .into_iter()
+            .filter(|d| d.code == CALL)
+            .collect();
+    diags.sort_by_key(|d| d.range.start());
+    diags.into_iter().map(|d| source[d.range].to_string()).collect()
+}
+
 #[test]
 fn create_query_in_cycle_i03_helper_execute() {
     check_diagnostics_snapshot_for(
         HELPER_EXECUTE,
-        CODE,
+        CALL,
         expect![[r#"
-            CreateQueryInCycle @ 9:3..9:23
+            LocalCallWithQueryInCycle @ 9:3..9:23
               message: Вызов локального метода «ПрочитатьЦену» в теле цикла приводит к выполнению запроса непосредственно или через локальные методы этого модуля. Получите необходимые данные одним запросом до цикла
-              severity: Critical"#]],
+              severity: Warning"#]],
     );
     let without = HELPER_EXECUTE.replace("\tЗапрос.Выполнить();\n", "");
     assert!(!without.contains("Выполнить"));
-    assert_eq!(count(&without), 0);
+    assert_eq!(count_call(&without), 0);
 }
 
 fn chain(len: usize, tail: &str, reversed: bool) -> String {
@@ -330,16 +350,20 @@ fn chain(len: usize, tail: &str, reversed: bool) -> String {
 
 #[test]
 fn create_query_in_cycle_i04_helper_chain() {
-    assert_eq!(reported(HELPER_CHAIN), vec!["ПрочитатьТариф(Тариф)"]);
+    assert_eq!(reported_call(HELPER_CHAIN), vec!["ПрочитатьТариф(Тариф)"]);
     let without_edge = HELPER_CHAIN.replace("\tЦены = ПрочитатьЦены(Тариф);\n", "");
-    assert_eq!(count(&without_edge), 0);
+    assert_eq!(count_call(&without_edge), 0);
 
     let query = "\tЗ = Новый Запрос;\n\tЗ.ВыполнитьПакет();\n";
     // Longer than any depth a recursive walk or the local type proof would be limited by.
     for len in [2, 3, 40, 400] {
         for reversed in [false, true] {
-            assert_eq!(reported(&chain(len, query, reversed)), vec!["П0()"], "{len} {reversed}");
-            assert_eq!(count(&chain(len, "", reversed)), 0, "{len} {reversed}");
+            assert_eq!(
+                reported_call(&chain(len, query, reversed)),
+                vec!["П0()"],
+                "{len} {reversed}"
+            );
+            assert_eq!(count_call(&chain(len, "", reversed)), 0, "{len} {reversed}");
         }
     }
 }
@@ -370,7 +394,7 @@ fn create_query_in_cycle_i04_effective_module_reaches_an_unchanged_helper() {
     let with_query = effective_findings("\tЗ = Новый Запрос;\n\tЗ.Выполнить();\n");
     let without_query = effective_findings("\tА = 1;\n");
     let ours = |diags: &[crate::Diagnostic]| {
-        diags.iter().filter(|d| d.code == CODE).map(|d| d.message.clone()).collect::<Vec<_>>()
+        diags.iter().filter(|d| d.code == CALL).map(|d| d.message.clone()).collect::<Vec<_>>()
     };
     let found = ours(&with_query);
     assert_eq!(found.len(), 1, "{with_query:?}");
@@ -378,38 +402,41 @@ fn create_query_in_cycle_i04_effective_module_reaches_an_unchanged_helper() {
     assert!(ours(&without_query).is_empty(), "{without_query:?}");
     // Other diagnostics of the file stay as they are.
     let others = |diags: &[crate::Diagnostic]| {
-        diags.iter().filter(|d| d.code != CODE).map(|d| (d.code, d.range)).collect::<Vec<_>>()
+        diags.iter().filter(|d| d.code != CALL).map(|d| (d.code, d.range)).collect::<Vec<_>>()
     };
     assert_eq!(others(&with_query), others(&without_query));
 }
 
 #[test]
 fn create_query_in_cycle_i05_recursion_with_query() {
-    assert_eq!(reported(RECURSION_WITH_QUERY), vec!["ОбойтиДерево(Узел)", "ОбойтиЧётные(Узел)"]);
+    assert_eq!(
+        reported_call(RECURSION_WITH_QUERY),
+        vec!["ОбойтиДерево(Узел)", "ОбойтиЧётные(Узел)"]
+    );
     let without_seeds = RECURSION_WITH_QUERY
         .replace("\tЗапрос.Выполнить();\n", "")
         .replace("\tЗапрос.ВыполнитьПакет();\n", "");
-    assert_eq!(count(&without_seeds), 0);
+    assert_eq!(count_call(&without_seeds), 0);
     // The seed reachable only by the later edge of the component is what fires.
     let later_edge = RECURSION_WITH_QUERY.replace("\tЗапрос.Выполнить();\n", "");
-    assert_eq!(reported(&later_edge), vec!["ОбойтиЧётные(Узел)"]);
+    assert_eq!(reported_call(&later_edge), vec!["ОбойтиЧётные(Узел)"]);
 }
 
 #[test]
 fn create_query_in_cycle_i06_recursion_without_query() {
-    assert_eq!(count(RECURSION_WITHOUT_QUERY), 0);
+    assert_eq!(count_call(RECURSION_WITHOUT_QUERY), 0);
     let seeded = RECURSION_WITHOUT_QUERY.replace(
         "Процедура ОбойтиНечётные(Узел)\n",
         "Процедура ОбойтиНечётные(Узел)\n\tЗ = Новый Запрос;\n\tЗ.ВыполнитьПакет();\n",
     );
-    assert_eq!(reported(&seeded), vec!["ОбойтиЧётные(Узел)"]);
+    assert_eq!(reported_call(&seeded), vec!["ОбойтиЧётные(Узел)"]);
 }
 
 #[test]
 fn create_query_in_cycle_i07_helper_outside_loop() {
-    assert_eq!(count(HELPER_OUTSIDE_LOOP), 0);
+    assert_eq!(count_call(HELPER_OUTSIDE_LOOP), 0);
     let moved = HELPER_OUTSIDE_LOOP.replace("Итог = Удвоить(Тариф);", "Итог = ПрочитатьЦены();");
-    assert_eq!(reported(&moved), vec!["ПрочитатьЦены()"]);
+    assert_eq!(reported_call(&moved), vec!["ПрочитатьЦены()"]);
 }
 
 #[test]
@@ -426,10 +453,10 @@ fn create_query_in_cycle_i09_only_resolved_local_calls_connect() {
         "ДругойПомощник()",
         "Помощник(1, 2, 3)",
     ] {
-        assert_eq!(count(&looped(call)), 0, "{call}");
+        assert_eq!(count_call(&looped(call)), 0, "{call}");
     }
-    assert_eq!(reported(&looped("Помощник()")), vec!["Помощник()"]);
-    assert_eq!(reported(&looped("помощник()")), vec!["помощник()"]);
+    assert_eq!(reported_call(&looped("Помощник()")), vec!["Помощник()"]);
+    assert_eq!(reported_call(&looped("помощник()")), vec!["помощник()"]);
 }
 
 #[test]
@@ -451,7 +478,7 @@ fn create_query_in_cycle_i09_common_module_boundary() {
             |db, ctx| crate::file_diagnostics(db, ctx.file_id, ctx.config),
         )
         .into_iter()
-        .filter(|d| d.code == CODE)
+        .filter(|d| d.code == CALL)
         .map(|d| caller[d.range].to_string())
         .collect()
     }
@@ -473,7 +500,7 @@ fn create_query_in_cycle_i09_self_form_where_inference_resolves_it() {
         let source = format!("&НаСервере\nПроцедура Помощник() Экспорт\n{helper_body}КонецПроцедуры\n\n&НаСервере\nПроцедура Обход(Коллекция)\n\tДля Каждого Э Из Коллекция Цикл\n\t\t{receiver}.Помощник();\n\tКонецЦикла;\nКонецПроцедуры\n");
         crate::test_utils::check_form_with_common_modules(&source, &[])
             .into_iter()
-            .filter(|d| d.code == CODE)
+            .filter(|d| d.code == CALL)
             .map(|d| source[d.range].to_string())
             .collect::<Vec<_>>()
     };
@@ -488,10 +515,10 @@ fn create_query_in_cycle_i09_self_form_where_inference_resolves_it() {
 fn create_query_in_cycle_i10_helpers_in_both_languages() {
     let ru = "Процедура Помощник()\n\tЗапрос = Новый Запрос;\n\tЗапрос.ВыполнитьПакет();\nКонецПроцедуры\n\nПроцедура Обход(Коллекция)\n\tДля Каждого Э Из Коллекция Цикл\n\t\tпомощник();\n\tКонецЦикла;\nКонецПроцедуры\n";
     let en = "Procedure Helper()\n\tRequest = New Query;\n\tRequest.ExecuteBatch();\nEndProcedure\n\nProcedure Walk(Items)\n\tFor Each Item In Items Do\n\t\tHELPER();\n\tEndDo;\nEndProcedure\n";
-    assert_eq!(reported(ru), vec!["помощник()"]);
-    assert_eq!(reported(en), vec!["HELPER()"]);
-    assert_eq!(count(&ru.replace("\tЗапрос.ВыполнитьПакет();\n", "")), 0);
-    assert_eq!(count(&en.replace("\tRequest.ExecuteBatch();\n", "")), 0);
+    assert_eq!(reported_call(ru), vec!["помощник()"]);
+    assert_eq!(reported_call(en), vec!["HELPER()"]);
+    assert_eq!(count_call(&ru.replace("\tЗапрос.ВыполнитьПакет();\n", "")), 0);
+    assert_eq!(count_call(&en.replace("\tRequest.ExecuteBatch();\n", "")), 0);
 }
 
 #[test]
@@ -507,18 +534,18 @@ fn create_query_in_cycle_i11_helper_positions() {
         "\tПока Параметр Цикл\n\t\tА = Помощник();\n\tКонецЦикла;",
         "\tПока Параметр Цикл\n\t\tДля Й = 1 По 3 Цикл\n\t\t\tСообщить(Помощник());\n\t\tКонецЦикла;\n\tКонецЦикла;",
     ] {
-        assert_eq!(reported(&body(inside)), vec!["Помощник()"], "{inside}");
+        assert_eq!(reported_call(&body(inside)), vec!["Помощник()"], "{inside}");
     }
     for header in [
         "\tПока Помощник() Цикл\n\t\tА = 1;\n\tКонецЦикла;",
         "\tДля Каждого Э Из Помощник() Цикл\n\t\tА = 1;\n\tКонецЦикла;",
     ] {
-        assert_eq!(count(&body(header)), 0, "{header}");
+        assert_eq!(count_call(&body(header)), 0, "{header}");
     }
     let module_code = format!("{helper}Пока Истина Цикл\n\tПомощник();\nКонецЦикла;\n");
-    assert_eq!(reported(&module_code), vec!["Помощник()"]);
+    assert_eq!(reported_call(&module_code), vec!["Помощник()"]);
     let module_code_outside = format!("{helper}Помощник();\n");
-    assert_eq!(count(&module_code_outside), 0);
+    assert_eq!(count_call(&module_code_outside), 0);
 }
 
 #[test]
@@ -531,17 +558,19 @@ fn create_query_in_cycle_i12_builders_through_helpers() {
         ("Новый Запрос", "ВыполнитьПакет", 1),
     ] {
         let source = format!("Процедура Помощник()\n\tП = {ctor};\n\tП.{exec}();\nКонецПроцедуры\n\nПроцедура Обход(Коллекция)\n\tДля Каждого Э Из Коллекция Цикл\n\t\tПомощник();\n\tКонецЦикла;\nКонецПроцедуры\n");
-        assert_eq!(count(&source), expected, "{ctor} {exec}");
+        assert_eq!(count_call(&source), expected, "{ctor} {exec}");
     }
 }
 
 #[test]
 fn create_query_in_cycle_i13_paths_do_not_multiply() {
     let diamond = "Процедура Низ()\n\tЗ = Новый Запрос;\n\tЗ.Выполнить();\n\tЗ.ВыполнитьПакет();\nКонецПроцедуры\n\nПроцедура Левый()\n\tНиз();\nКонецПроцедуры\n\nПроцедура Правый()\n\tНиз();\nКонецПроцедуры\n\nПроцедура Верх()\n\tЛевый();\n\tПравый();\nКонецПроцедуры\n\nПроцедура Обход(Коллекция)\n\tДля Каждого Э Из Коллекция Цикл\n\t\tВерх();\n\tКонецЦикла;\nКонецПроцедуры\n";
-    assert_eq!(reported(diamond), vec!["Верх()"]);
+    assert_eq!(reported_call(diamond), vec!["Верх()"]);
+    assert_eq!(count(diamond), 0);
     // An execution nested in a helper call's argument and the helper call are two predicates.
     let nested = "Функция Помощник(Значение)\n\tЗ = Новый Запрос;\n\tВозврат З.Выполнить();\nКонецФункции\n\nПроцедура Обход(Коллекция)\n\tЗ = Новый Запрос;\n\tДля Каждого Э Из Коллекция Цикл\n\t\tПомощник(З.Выполнить());\n\tКонецЦикла;\nКонецПроцедуры\n";
-    assert_eq!(reported(nested), vec!["Помощник(З.Выполнить())", "З.Выполнить()"]);
+    assert_eq!(reported_call(nested), vec!["Помощник(З.Выполнить())"]);
+    assert_eq!(reported(nested), vec!["З.Выполнить()"]);
 }
 
 const SUPPRESSED_HELPER: &str =
@@ -553,6 +582,7 @@ const MIXED_EXECUTIONS: &str = include_str!("fixtures/create_query_in_cycle/mixe
 const DISABLED_PROFILE: &str = include_str!("fixtures/create_query_in_cycle/disabled_profile.bsl");
 
 const NEXT_LINE: &str = "// bsl-analyzer:disable-next-line CreateQueryInCycle\n";
+const NEXT_LINE_CALL: &str = "// bsl-analyzer:disable-next-line LocalCallWithQueryInCycle\n";
 
 /// `source` without every line that holds `needle`.
 fn without_lines(source: &str, needle: &str) -> String {
@@ -567,7 +597,7 @@ fn unsuppressed(source: &str) -> String {
 fn finding_lines(source: &str, diags: &[crate::Diagnostic]) -> Vec<String> {
     let mut lines: Vec<_> = diags
         .iter()
-        .filter(|d| d.code == CODE)
+        .filter(|d| d.code == CALL)
         .map(|d| {
             let start = usize::from(d.range.start());
             let line_start = source[..start].rfind('\n').map_or(0, |i| i + 1);
@@ -608,54 +638,54 @@ fn counts_on_one_db(revisions: &[&str]) -> Vec<usize> {
             db.set_file_text(file_id, text);
             let incremental = crate::file_diagnostics(&db, file_id, &config);
             assert_eq!(incremental, raw_diagnostics(text, &config), "revision:\n{text}");
-            incremental.iter().filter(|d| d.code == CODE).count()
+            incremental.iter().filter(|d| d.code == CALL).count()
         })
         .collect()
 }
 
 #[test]
 fn create_query_in_cycle_i14_suppressed_helper() {
-    assert_eq!(count(SUPPRESSED_HELPER), 0);
-    assert_eq!(count(&unsuppressed(SUPPRESSED_HELPER)), 2);
+    assert_eq!(count_call(SUPPRESSED_HELPER), 0);
+    assert_eq!(count_call(&unsuppressed(SUPPRESSED_HELPER)), 2);
     let elsewhere = unsuppressed(SUPPRESSED_HELPER)
         .replace("\tЗапрос = Новый Запрос;\n", &format!("\t{NEXT_LINE}\tЗапрос = Новый Запрос;\n"));
-    assert_eq!(count(&elsewhere), 2);
+    assert_eq!(count_call(&elsewhere), 2);
 }
 
 #[test]
 fn create_query_in_cycle_i15_suppressed_chain_and_recursion() {
     for source in [SUPPRESSED_CHAIN, SUPPRESSED_RECURSION] {
-        assert_eq!(count(source), 0, "{source}");
-        assert_eq!(count(&unsuppressed(source)), 2, "{source}");
+        assert_eq!(count_call(source), 0, "{source}");
+        assert_eq!(count_call(&unsuppressed(source)), 2, "{source}");
     }
 }
 
 #[test]
 fn create_query_in_cycle_i16_only_the_named_execution_stops_being_a_ground() {
-    assert_eq!(count(MIXED_EXECUTIONS), 2);
+    assert_eq!(count_call(MIXED_EXECUTIONS), 2);
     let both = MIXED_EXECUTIONS.replace(
         "\tЗапрос.ВыполнитьПакет();\n",
         &format!("\t{NEXT_LINE}\tЗапрос.ВыполнитьПакет();\n"),
     );
-    assert_eq!(count(&both), 0);
+    assert_eq!(count_call(&both), 0);
     let swapped = unsuppressed(MIXED_EXECUTIONS).replace(
         "\tЗапрос.ВыполнитьПакет();\n",
         &format!("\t{NEXT_LINE}\tЗапрос.ВыполнитьПакет();\n"),
     );
-    assert_eq!(count(&swapped), 2);
-    assert_eq!(count(&unsuppressed(MIXED_EXECUTIONS)), 2);
+    assert_eq!(count_call(&swapped), 2);
+    assert_eq!(count_call(&unsuppressed(MIXED_EXECUTIONS)), 2);
 }
 
 #[test]
 fn create_query_in_cycle_i17_directive_addresses_the_execution_line() {
     let before_text = unsuppressed(SUPPRESSED_HELPER)
         .replace("\tЗапрос.Текст = ", &format!("\t{NEXT_LINE}\tЗапрос.Текст = "));
-    assert_eq!(count(&before_text), 2);
+    assert_eq!(count_call(&before_text), 2);
     // A multi-line call is addressed by the line it starts on.
     let multiline = "Процедура Помощник()\n\tЗапрос = Новый Запрос;\n\t// bsl-analyzer:disable-next-line CreateQueryInCycle\n\tЗапрос.ВыполнитьПакет(\n\t);\nКонецПроцедуры\n\nПроцедура Обход(К)\n\tДля Каждого Э Из К Цикл\n\t\tПомощник();\n\tКонецЦикла;\nКонецПроцедуры\n";
-    assert_eq!(count(multiline), 0);
+    assert_eq!(count_call(multiline), 0);
     let on_the_closing_line = "Процедура Помощник()\n\tЗапрос = Новый Запрос;\n\tЗапрос.ВыполнитьПакет(\n\t// bsl-analyzer:disable-next-line CreateQueryInCycle\n\t);\nКонецПроцедуры\n\nПроцедура Обход(К)\n\tДля Каждого Э Из К Цикл\n\t\tПомощник();\n\tКонецЦикла;\nКонецПроцедуры\n";
-    assert_eq!(count(on_the_closing_line), 1);
+    assert_eq!(count_call(on_the_closing_line), 1);
 }
 
 #[test]
@@ -667,24 +697,24 @@ fn create_query_in_cycle_i18_a_suppressed_call_hides_only_itself() {
     let off_on = plain
         .replace(
             "\tДля Каждого Тариф Из Тарифы Цикл\n",
-            "\t// bsl-analyzer:off CreateQueryInCycle\n\tДля Каждого Тариф Из Тарифы Цикл\n",
+            "\t// bsl-analyzer:off LocalCallWithQueryInCycle\n\tДля Каждого Тариф Из Тарифы Цикл\n",
         )
         .replace(
             "\tКонецЦикла;\nКонецПроцедуры\n\nПроцедура ВторойОбход",
-            "\tКонецЦикла;\n\t// bsl-analyzer:on CreateQueryInCycle\nКонецПроцедуры\n\nПроцедура ВторойОбход",
+            "\tКонецЦикла;\n\t// bsl-analyzer:on LocalCallWithQueryInCycle\nКонецПроцедуры\n\nПроцедура ВторойОбход",
         );
     assert_eq!(lines(&off_on), vec!["ПрочитатьЦены();"]);
-    assert_eq!(count(&without_lines(&off_on, "bsl-analyzer:")), 2);
+    assert_eq!(count_call(&without_lines(&off_on, "bsl-analyzer:")), 2);
 
     let on_the_call = plain.replacen(
         "\t\tПрочитатьЦены();\n",
-        "\t\tПрочитатьЦены(); // bsl-analyzer:disable-line CreateQueryInCycle\n",
+        "\t\tПрочитатьЦены(); // bsl-analyzer:disable-line LocalCallWithQueryInCycle\n",
         1,
     );
     // The first caller's finding is hidden, the second caller's stays on its own line.
     let remaining: Vec<usize> = raw_diagnostics(&on_the_call, &config)
         .iter()
-        .filter(|d| d.code == CODE)
+        .filter(|d| d.code == CALL)
         .map(|d| usize::from(d.range.start()))
         .collect();
     assert_eq!(remaining, vec![on_the_call.rfind("ПрочитатьЦены()").unwrap()]);
@@ -692,13 +722,13 @@ fn create_query_in_cycle_i18_a_suppressed_call_hides_only_itself() {
     // A directive on the header leaves the body's line alone.
     let on_the_header = plain.replacen(
         "\tДля Каждого Тариф Из Тарифы Цикл\n",
-        &format!("\t{NEXT_LINE}\tДля Каждого Тариф Из Тарифы Цикл\n"),
+        &format!("\t{NEXT_LINE_CALL}\tДля Каждого Тариф Из Тарифы Цикл\n"),
         1,
     );
     assert_eq!(lines(&on_the_header).len(), 2);
 
     // Suppressing a call inside a middle helper does not clear what it calls for other parents.
-    let middle = "Процедура Низ()\n\tЗ = Новый Запрос;\n\tЗ.Выполнить();\nКонецПроцедуры\n\nПроцедура Середина()\n\tНиз(); // bsl-analyzer:disable-line CreateQueryInCycle\nКонецПроцедуры\n\nПроцедура Первый(К)\n\tДля Каждого Э Из К Цикл\n\t\tСередина();\n\tКонецЦикла;\nКонецПроцедуры\n\nПроцедура Второй(К)\n\tДля Каждого Э Из К Цикл\n\t\tНиз();\n\tКонецЦикла;\nКонецПроцедуры\n";
+    let middle = "Процедура Низ()\n\tЗ = Новый Запрос;\n\tЗ.Выполнить();\nКонецПроцедуры\n\nПроцедура Середина()\n\tНиз(); // bsl-analyzer:disable-line LocalCallWithQueryInCycle\nКонецПроцедуры\n\nПроцедура Первый(К)\n\tДля Каждого Э Из К Цикл\n\t\tСередина();\n\tКонецЦикла;\nКонецПроцедуры\n\nПроцедура Второй(К)\n\tДля Каждого Э Из К Цикл\n\t\tНиз();\n\tКонецЦикла;\nКонецПроцедуры\n";
     assert_eq!(lines(middle), vec!["Низ();", "Середина();"]);
 }
 
@@ -716,20 +746,20 @@ fn create_query_in_cycle_i19_directive_semantics_stay_line_based() {
     let run = |directive: &str| raw_diagnostics(&helper_with_directive(directive), &config);
 
     let native = run("// bsl-analyzer:disable-next-line CreateQueryInCycle");
-    assert_eq!(with_code(&native, CODE), 0);
+    assert_eq!(with_code(&native, CALL), 0);
 
     let typo = run("// bsl-analyzer:disable-next-line CreateQueryInCycl");
-    assert_eq!(with_code(&typo, CODE), 1);
+    assert_eq!(with_code(&typo, CALL), 1);
     assert_eq!(with_code(&typo, DiagnosticCode::UnknownSuppressionCode), 1);
 
     let code_less = run("// bsl-analyzer:disable-next-line");
-    assert_eq!(with_code(&code_less, CODE), 0);
+    assert_eq!(with_code(&code_less, CALL), 0);
     assert_eq!(with_code(&code_less, DiagnosticCode::SuppressionWithoutCode), 1);
 
     let skip_check = run("// @skip-check CreateQueryInCycle");
-    assert_eq!(with_code(&skip_check, CODE), 1);
+    assert_eq!(with_code(&skip_check, CALL), 1);
     let foreign = run("// other-tool:disable-next-line CreateQueryInCycle");
-    assert_eq!(with_code(&foreign, CODE), 1);
+    assert_eq!(with_code(&foreign, CALL), 1);
 
     // An explanation written into the code list is a token of that list.
     let reason_in_list = run("// bsl-analyzer:disable-next-line CreateQueryInCycle обоснование");
@@ -737,28 +767,28 @@ fn create_query_in_cycle_i19_directive_semantics_stay_line_based() {
 
     // Unmatched forms.
     let unmatched_on = run("// bsl-analyzer:on CreateQueryInCycle");
-    assert_eq!(with_code(&unmatched_on, CODE), 1);
+    assert_eq!(with_code(&unmatched_on, CALL), 1);
     let unmatched_off = run("// bsl-analyzer:off CreateQueryInCycle");
-    assert_eq!(with_code(&unmatched_off, CODE), 0);
+    assert_eq!(with_code(&unmatched_off, CALL), 0);
 
     // BSLLS aliases under both settings, native under the setting that turns them off.
     let bslls = helper_with_directive("// BSLLS:CreateQueryInCycle-off");
-    assert_eq!(with_code(&raw_diagnostics(&bslls, &config), CODE), 0);
+    assert_eq!(with_code(&raw_diagnostics(&bslls, &config), CALL), 0);
     let no_compat = DiagnosticsConfig { bslls_suppression_compat: false, ..Default::default() };
-    assert_eq!(with_code(&raw_diagnostics(&bslls, &no_compat), CODE), 1);
+    assert_eq!(with_code(&raw_diagnostics(&bslls, &no_compat), CALL), 1);
     let native_no_compat =
         helper_with_directive("// bsl-analyzer:disable-next-line CreateQueryInCycle");
-    assert_eq!(with_code(&raw_diagnostics(&native_no_compat, &no_compat), CODE), 0);
+    assert_eq!(with_code(&raw_diagnostics(&native_no_compat, &no_compat), CALL), 0);
     let foreign_bslls = run("// BSLLS:НетТакогоКода-off");
     assert_eq!(with_code(&foreign_bslls, DiagnosticCode::UnknownSuppressionCode), 0);
-    assert_eq!(with_code(&foreign_bslls, CODE), 1);
+    assert_eq!(with_code(&foreign_bslls, CALL), 1);
 
     // Line endings.
     for source in [SUPPRESSED_HELPER, MIXED_EXECUTIONS] {
         let crlf = source.replace('\n', "\r\n");
         assert_eq!(
-            with_code(&raw_diagnostics(&crlf, &config), CODE),
-            with_code(&raw_diagnostics(source, &config), CODE),
+            with_code(&raw_diagnostics(&crlf, &config), CALL),
+            with_code(&raw_diagnostics(source, &config), CALL),
         );
     }
 
@@ -782,32 +812,47 @@ fn create_query_in_cycle_i19_directive_semantics_stay_line_based() {
 #[test]
 fn create_query_in_cycle_i20_profile_on_one_database() {
     let (db, file_id) = raw_db(DISABLED_PROFILE);
+    // (direct findings, local-call findings): the fixture holds two of each.
     let run = |config: &DiagnosticsConfig| {
         let diags = crate::file_diagnostics(&db, file_id, config);
-        with_code(&diags, CODE)
+        (with_code(&diags, CODE), with_code(&diags, CALL))
     };
     let enabled = DiagnosticsConfig::default();
-    let disabled = DiagnosticsConfig { disabled: vec![CODE], ..Default::default() };
+    let disabled = DiagnosticsConfig { disabled: vec![CODE, CALL], ..Default::default() };
+    let direct_off = DiagnosticsConfig { disabled: vec![CODE], ..Default::default() };
+    let call_off = DiagnosticsConfig { disabled: vec![CALL], ..Default::default() };
     let only_other = DiagnosticsConfig {
         only_enabled: Some(vec![DiagnosticCode::SelfAssign]),
         ..Default::default()
     };
-    let only_this = DiagnosticsConfig { only_enabled: Some(vec![CODE]), ..Default::default() };
+    let only_direct = DiagnosticsConfig { only_enabled: Some(vec![CODE]), ..Default::default() };
+    let only_call = DiagnosticsConfig { only_enabled: Some(vec![CALL]), ..Default::default() };
 
-    assert_eq!(run(&disabled), 0);
-    assert_eq!(run(&only_other), 0);
-    assert_eq!(run(&enabled), 4);
-    assert_eq!(run(&disabled), 0);
-    assert_eq!(run(&only_this), 4);
+    assert_eq!(run(&disabled), (0, 0));
+    assert_eq!(run(&only_other), (0, 0));
+    assert_eq!(run(&enabled), (2, 2));
+    assert_eq!(run(&disabled), (0, 0));
+    // Each code is switched on its own: neither one's profile hides the other.
+    assert_eq!(run(&direct_off), (0, 2));
+    assert_eq!(run(&call_off), (2, 0));
+    assert_eq!(run(&only_direct), (2, 0));
+    assert_eq!(run(&only_call), (0, 2));
 
     let meta = crate::handlers::get_metadata(CODE).expect("registered");
     assert!(meta.activated_by_default);
     assert_eq!(meta.scope, crate::metadata::DiagnosticScope::All);
     assert!(meta.modules.is_empty());
+    let call_meta = crate::handlers::get_metadata(CALL).expect("registered");
+    assert!(call_meta.activated_by_default);
+    assert_eq!(call_meta.scope, crate::metadata::DiagnosticScope::All);
+    assert!(call_meta.modules.is_empty());
     let diags = crate::file_diagnostics(&db, file_id, &enabled);
     let finding = diags.iter().find(|d| d.code == CODE).expect("a finding");
     assert_eq!(finding.severity, meta.effective_severity());
     assert_eq!(finding.severity, crate::Severity::Critical);
+    let call_finding = diags.iter().find(|d| d.code == CALL).expect("a finding");
+    assert_eq!(call_finding.severity, call_meta.effective_severity());
+    assert_eq!(call_finding.severity, crate::Severity::Warning);
 
     let lowered = DiagnosticsConfig {
         metadata_overrides: std::collections::HashMap::from([(
@@ -824,7 +869,8 @@ fn create_query_in_cycle_i20_profile_on_one_database() {
         .iter()
         .filter(|d| d.code == CODE)
         .all(|d| d.severity == crate::Severity::Warning));
-    assert_eq!(with_code(&diags, CODE), 4);
+    assert_eq!(with_code(&diags, CODE), 2);
+    assert_eq!(with_code(&diags, CALL), 2);
 }
 
 #[test]
@@ -863,11 +909,11 @@ fn create_query_in_cycle_i24_positions_follow_the_text_on_one_database() {
     let (mut db, file_id) = raw_db(SUPPRESSED_HELPER);
 
     let first = crate::file_diagnostics(&db, file_id, &config);
-    assert_eq!(with_code(&first, CODE), 0);
+    assert_eq!(with_code(&first, CALL), 0);
 
     db.set_file_text(file_id, &shifted);
     let moved = crate::file_diagnostics(&db, file_id, &config);
-    assert_eq!(with_code(&moved, CODE), 0, "the directive still addresses the execution");
+    assert_eq!(with_code(&moved, CALL), 0, "the directive still addresses the execution");
     assert_eq!(moved, raw_diagnostics(&shifted, &config));
 
     db.set_file_text(file_id, &shifted_plain);
@@ -876,12 +922,12 @@ fn create_query_in_cycle_i24_positions_follow_the_text_on_one_database() {
     let expected: Vec<usize> =
         shifted_plain.match_indices("\t\tПрочитатьЦены()").map(|(at, _)| at + 2).collect();
     let mut starts: Vec<usize> =
-        revealed.iter().filter(|d| d.code == CODE).map(|d| usize::from(d.range.start())).collect();
+        revealed.iter().filter(|d| d.code == CALL).map(|d| usize::from(d.range.start())).collect();
     starts.sort();
     assert_eq!(starts, expected);
 }
 
-fn extension_findings(base: &str, ext: &str) -> Vec<String> {
+fn extension_findings(code: DiagnosticCode, base: &str, ext: &str) -> Vec<String> {
     let mut builder = test_fixture::CfeFixtureBuilder::new("");
     builder.add_base_module("Сервер", base);
     builder.add_extension("Расш", "");
@@ -895,7 +941,7 @@ fn extension_findings(base: &str, ext: &str) -> Vec<String> {
         |db, ctx| crate::file_diagnostics(db, ctx.file_id, ctx.config),
     )
     .into_iter()
-    .filter(|d| d.code == CODE)
+    .filter(|d| d.code == code)
     .map(|d| ext[d.range].to_string())
     .collect()
 }
@@ -907,9 +953,13 @@ fn create_query_in_cycle_i14_effective_mask_reads_the_effective_text() {
         format!("Процедура Цель(К) Экспорт\n\tА = 1;\nКонецПроцедуры\n\nПроцедура Помощник()\n\tЗ = Новый Запрос;\n\t{directive}\n\tЗ.Выполнить();\nКонецПроцедуры\n")
     };
     let ext = "&ИзменениеИКонтроль(\"Цель\")\nПроцедура Расш_Цель(К)\n\tА = 1;\n#Вставка\n\tДля Каждого Э Из К Цикл\n\t\tПомощник();\n\tКонецЦикла;\n#КонецВставки\nКонецПроцедуры\n";
-    assert_eq!(extension_findings(&base("// Комментарий."), ext), vec!["Помощник()"]);
+    assert_eq!(extension_findings(CALL, &base("// Комментарий."), ext), vec!["Помощник()"]);
     assert_eq!(
-        extension_findings(&base("// bsl-analyzer:disable-next-line CreateQueryInCycle"), ext),
+        extension_findings(
+            CALL,
+            &base("// bsl-analyzer:disable-next-line CreateQueryInCycle"),
+            ext,
+        ),
         Vec::<String>::new()
     );
 
@@ -917,9 +967,13 @@ fn create_query_in_cycle_i14_effective_mask_reads_the_effective_text() {
         format!("&ИзменениеИКонтроль(\"Цель\")\nПроцедура Расш_Цель(К)\n\tА = 1;\n#Вставка\n\tЗ = Новый Запрос;\n\tДля Каждого Э Из К Цикл\n\t\t{directive}\n\t\tЗ.Выполнить();\n\tКонецЦикла;\n#КонецВставки\nКонецПроцедуры\n")
     };
     let silent_base = "Процедура Цель(К) Экспорт\n\tА = 1;\nКонецПроцедуры\n";
-    assert_eq!(extension_findings(silent_base, &direct("// Комментарий.")), vec!["З.Выполнить()"]);
+    assert_eq!(
+        extension_findings(CODE, silent_base, &direct("// Комментарий.")),
+        vec!["З.Выполнить()"]
+    );
     assert_eq!(
         extension_findings(
+            CODE,
             silent_base,
             &direct("// bsl-analyzer:disable-next-line CreateQueryInCycle")
         ),
@@ -934,15 +988,15 @@ fn create_query_in_cycle_i09_weaving_stays_in_the_extension_module() {
     let ext = |call: &str| {
         format!("&После(\"Цель\")\nПроцедура Расш_Цель(К)\n\tДля Каждого Э Из К Цикл\n\t\t{call}();\n\tКонецЦикла;\nКонецПроцедуры\n\nПроцедура ВРасширении()\n\tЗ = Новый Запрос;\n\tЗ.Выполнить();\nКонецПроцедуры\n")
     };
-    assert_eq!(extension_findings(base, &ext("ВРасширении")), vec!["ВРасширении()"]);
-    assert_eq!(extension_findings(base, &ext("ВБазе")), Vec::<String>::new());
+    assert_eq!(extension_findings(CALL, base, &ext("ВРасширении")), vec!["ВРасширении()"]);
+    assert_eq!(extension_findings(CALL, base, &ext("ВБазе")), Vec::<String>::new());
 }
 
 #[test]
 fn create_query_in_cycle_i10_suppression_in_english() {
     let source = "Procedure Helper()\n\tRequest = New Query;\n\t// bsl-analyzer:disable-next-line CreateQueryInCycle\n\tRequest.ExecuteBatch();\nEndProcedure\n\nProcedure First(Items)\n\tFor Each Item In Items Do\n\t\thelper();\n\tEndDo;\nEndProcedure\n\nProcedure Second(Items)\n\tWhile Items.Next() Do\n\t\tHELPER();\n\tEndDo;\nEndProcedure\n";
-    assert_eq!(count(source), 0);
-    assert_eq!(count(&unsuppressed(source)), 2);
+    assert_eq!(count_call(source), 0);
+    assert_eq!(count_call(&unsuppressed(source)), 2);
 }
 
 /// `Для` and `Для Каждого` evaluate their header once, on entry, so what their own body writes
@@ -1029,10 +1083,10 @@ fn create_query_in_cycle_i08_recovered_helper_call_makes_no_edge() {
     let source = |call: &str| {
         format!("Процедура Помощник()\n\tЗ = Новый Запрос;\n\tЗ.Выполнить();\nКонецПроцедуры\n\nПроцедура Тест(Коллекция)\n\tДля Каждого Э Из Коллекция Цикл\n\t\t{call}\n\tКонецЦикла;\nКонецПроцедуры\n")
     };
-    assert_eq!(reported(&source("Помощник();")), vec!["Помощник()"]);
-    assert_eq!(count(&source("Помощник(;")), 0);
+    assert_eq!(reported_call(&source("Помощник();")), vec!["Помощник()"]);
+    assert_eq!(count_call(&source("Помощник(;")), 0);
     // The call that follows a broken one is still judged on its own.
-    assert_eq!(reported(&source("Помощник(;\n\t\tПомощник();")), vec!["Помощник()"]);
+    assert_eq!(reported_call(&source("Помощник(;\n\t\tПомощник();")), vec!["Помощник()"]);
 }
 
 #[test]
@@ -1041,12 +1095,12 @@ fn create_query_in_cycle_i04_removing_an_edge_of_a_long_chain() {
     for len in [2, 40, 400] {
         for reversed in [false, true] {
             let whole = chain(len, query, reversed);
-            assert_eq!(reported(&whole), vec!["П0()"], "{len} {reversed}");
+            assert_eq!(reported_call(&whole), vec!["П0()"], "{len} {reversed}");
             // The last edge, into the method that holds the execution, and one in the middle.
             for target in [len - 1, len / 2] {
                 let cut = whole.replace(&format!("\tП{target}();\n"), "");
                 assert_ne!(cut, whole, "the edge into П{target} exists");
-                assert_eq!(count(&cut), 0, "edge into П{target} of {len} {reversed}");
+                assert_eq!(count_call(&cut), 0, "edge into П{target} of {len} {reversed}");
             }
         }
     }
@@ -1071,10 +1125,11 @@ fn create_query_in_cycle_i11_module_code_loop_forms() {
             format!("З = Новый Запрос;\nК = Новый Массив;\n{head}\n\tЗ.Выполнить();\n{tail}\n");
         assert_eq!(count(&direct), 1, "{head}");
         let through_helper = format!("{helper}К = Новый Массив;\n{head}\n\tПомощник();\n{tail}\n");
-        assert_eq!(reported(&through_helper), vec!["Помощник()"], "{head}");
+        assert_eq!(reported_call(&through_helper), vec!["Помощник()"], "{head}");
+        assert_eq!(count(&through_helper), 0, "{head}");
         // The same loop without the call in its body.
         let empty = format!("{helper}К = Новый Массив;\n{head}\n\tА = 1;\n{tail}\nПомощник();\n");
-        assert_eq!(count(&empty), 0, "{head}");
+        assert_eq!(count_call(&empty), 0, "{head}");
     }
     // A header evaluated once, outside of any outer loop, is not a loop body.
     let header = "З = Новый Запрос;\nДля Каждого Э Из З.Выполнить().Выгрузить() Цикл\n\tА = 1;\nКонецЦикла;\n";
@@ -1084,32 +1139,33 @@ fn create_query_in_cycle_i11_module_code_loop_forms() {
 #[test]
 fn create_query_in_cycle_i20_tags_come_from_the_context() {
     let (db, file_id) = raw_db(DISABLED_PROFILE);
-    let tagged = |config: &DiagnosticsConfig| -> Vec<Vec<crate::DiagnosticTag>> {
+    let tagged = |config: &DiagnosticsConfig| -> Vec<(DiagnosticCode, Vec<crate::DiagnosticTag>)> {
         crate::file_diagnostics(&db, file_id, config)
             .into_iter()
-            .filter(|d| d.code == CODE)
-            .map(|d| d.tags)
+            .filter(|d| d.code == CODE || d.code == CALL)
+            .map(|d| (d.code, d.tags))
             .collect()
     };
     let default = DiagnosticsConfig::default();
+    let unused_override = || crate::MetadataOverride {
+        tags: Some(vec![crate::metadata::MetadataTag::Unused]),
+        ..Default::default()
+    };
     let unused = DiagnosticsConfig {
-        metadata_overrides: std::collections::HashMap::from([(
-            CODE,
-            crate::MetadataOverride {
-                tags: Some(vec![crate::metadata::MetadataTag::Unused]),
-                ..Default::default()
-            },
-        )]),
+        metadata_overrides: std::collections::HashMap::from([
+            (CODE, unused_override()),
+            (CALL, unused_override()),
+        ]),
         ..Default::default()
     };
     // Direct, batch, helper and recursive findings all carry what the context names.
     let by_default = tagged(&default);
     assert_eq!(by_default.len(), 4);
-    assert!(by_default.iter().all(|tags| *tags == default.tags(CODE)), "{by_default:?}");
+    assert!(by_default.iter().all(|(code, tags)| *tags == default.tags(*code)), "{by_default:?}");
     let overridden = tagged(&unused);
     assert_eq!(overridden.len(), 4);
     assert!(
-        overridden.iter().all(|tags| *tags == vec![crate::DiagnosticTag::Unnecessary]),
+        overridden.iter().all(|(_, tags)| *tags == vec![crate::DiagnosticTag::Unnecessary]),
         "{overridden:?}"
     );
 }
@@ -1123,7 +1179,8 @@ fn create_query_in_cycle_i20_profile_in_the_effective_module() {
     );
     builder.add_extension("Расш", "");
     let ext = "&ИзменениеИКонтроль(\"Цель\")\nПроцедура Расш_Цель(Коллекция)\n\tА = 1;\n#Вставка\n\tДля Каждого Э Из Коллекция Цикл\n\t\tПомощник();\n\tКонецЦикла;\n#КонецВставки\nКонецПроцедуры\n";
-    let disabled = DiagnosticsConfig { disabled: vec![CODE], ..Default::default() };
+    let disabled = DiagnosticsConfig { disabled: vec![CALL], ..Default::default() };
+    let direct_off = DiagnosticsConfig { disabled: vec![CODE], ..Default::default() };
     let only_other = DiagnosticsConfig {
         only_enabled: Some(vec![DiagnosticCode::SelfAssign]),
         ..Default::default()
@@ -1139,16 +1196,17 @@ fn create_query_in_cycle_i20_profile_in_the_effective_module() {
         |_| {},
         |db, ctx| {
             let found = |config: &DiagnosticsConfig| {
-                with_code(&crate::file_diagnostics(db, ctx.file_id, config), CODE)
+                with_code(&crate::file_diagnostics(db, ctx.file_id, config), CALL)
             };
             assert_eq!(found(&disabled), 0);
             assert_eq!(found(&only_other), 0);
             assert_eq!(found(&enabled), 1);
+            assert_eq!(found(&direct_off), 1);
             assert_eq!(found(&disabled), 0);
             crate::file_diagnostics(db, ctx.file_id, &enabled)
         },
     );
-    assert_eq!(with_code(&last, CODE), 1);
+    assert_eq!(with_code(&last, CALL), 1);
 }
 
 #[test]
@@ -1168,17 +1226,17 @@ fn create_query_in_cycle_i23_a_helper_call_keeps_its_neighbours() {
     let self_assign = DiagnosticCode::SelfAssign;
     let unknown = DiagnosticCode::UnknownSuppressionCode;
     let both = source(query, "А = А;");
-    assert_eq!(texts(&both, CODE), vec!["Помощник()"]);
+    assert_eq!(texts(&both, CALL), vec!["Помощник()"]);
     assert_eq!(texts(&both, self_assign), vec!["А = А"]);
     assert_eq!(texts(&both, unknown).len(), 1);
     // Dropping the execution removes only its finding; the others stay where they were.
     let no_query = source("\tА = 1;\n", "А = А;");
-    assert!(texts(&no_query, CODE).is_empty());
+    assert!(texts(&no_query, CALL).is_empty());
     assert_eq!(texts(&no_query, self_assign), vec!["А = А"]);
     assert_eq!(texts(&no_query, unknown).len(), 1);
     // Dropping the neighbour removes only that one.
     let no_neighbour = source(query, "А = 1;");
-    assert_eq!(texts(&no_neighbour, CODE), vec!["Помощник()"]);
+    assert_eq!(texts(&no_neighbour, CALL), vec!["Помощник()"]);
     assert!(texts(&no_neighbour, self_assign).is_empty());
     assert_eq!(texts(&no_neighbour, unknown).len(), 1);
 }
@@ -1202,13 +1260,13 @@ fn create_query_in_cycle_i24_moving_only_one_side_of_the_edge() {
         (helper_down(SUPPRESSED_HELPER), 0),
         (helper_down(&callers_down(SUPPRESSED_HELPER)), 0),
     ] {
-        assert_eq!(count(&suppressed), expected, "{suppressed}");
+        assert_eq!(count_call(&suppressed), expected, "{suppressed}");
         let revealed = unsuppressed(&suppressed);
         assert_ne!(revealed, plain);
         let starts = |text: &str| -> Vec<usize> {
             let mut starts: Vec<usize> = raw_diagnostics(text, &config)
                 .iter()
-                .filter(|d| d.code == CODE)
+                .filter(|d| d.code == CALL)
                 .map(|d| usize::from(d.range.start()))
                 .collect();
             starts.sort();
@@ -1225,7 +1283,7 @@ fn create_query_in_cycle_i24_moving_only_one_side_of_the_edge() {
             db.set_file_text(file_id, text);
             let incremental = crate::file_diagnostics(&db, file_id, &config);
             assert_eq!(incremental, raw_diagnostics(text, &config), "{text}");
-            let shown = with_code(&incremental, CODE);
+            let shown = with_code(&incremental, CALL);
             assert_eq!(shown, if *text == suppressed { 0 } else { 2 });
         }
     }
