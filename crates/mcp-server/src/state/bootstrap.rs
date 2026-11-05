@@ -4088,7 +4088,7 @@ mod tests {
         .unwrap();
         fs::write(
             nested.path().join("bsl-analyzer.toml"),
-            format!("[source]\nroot = \"{}\"\n", sources.display()),
+            format!("[source]\nroot = \"{}\"\n", sources.display().to_string().replace('\\', "/")),
         )
         .unwrap();
         let over_project_root =

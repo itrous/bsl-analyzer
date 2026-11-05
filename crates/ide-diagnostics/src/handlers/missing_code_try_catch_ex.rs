@@ -18,7 +18,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Standard, MetadataTag::Badpractice],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
     clean_code_attribute: CleanCodeAttribute::Intentional,
 };
 
@@ -328,7 +328,7 @@ mod tests {
             expect![[r#"
             MissingCodeTryCatchEx @ 4:2..4:12
               message: Блок исключения молча подавляет ошибку: добавьте `ВызватьИсключение` или вызов журналирования
-              severity: Major"#]],
+              severity: Warning"#]],
         );
 
         let diagnostics = check_body_diagnostic(code, check_body);
@@ -356,7 +356,7 @@ mod tests {
             expect![[r#"
             MissingCodeTryCatchEx @ 6:2..6:12
               message: Блок исключения только откатывает транзакцию, но не фиксирует ошибку: добавьте логирование или `ВызватьИсключение`
-              severity: Major"#]],
+              severity: Warning"#]],
         );
 
         let diagnostics = check_body_diagnostic(code, check_body);
@@ -417,10 +417,10 @@ mod tests {
             expect![[r#"
             MissingCodeTryCatchEx @ 4:2..4:12
               message: Отсутствует код в блоке исключения
-              severity: Major
+              severity: Warning
             MissingCodeTryCatchEx @ 12:2..12:12
               message: Отсутствует код в блоке исключения
-              severity: Major"#]],
+              severity: Warning"#]],
         );
     }
 
@@ -453,7 +453,7 @@ mod tests {
         expect![[r#"
             MissingCodeTryCatchEx @ 4:2..4:12
               message: Отсутствует код в блоке исключения
-              severity: Major"#]]
+              severity: Warning"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }
 
@@ -478,10 +478,10 @@ mod tests {
             expect![[r#"
             MissingCodeTryCatchEx @ 4:2..4:12
               message: Блок исключения молча подавляет ошибку: добавьте `ВызватьИсключение` или вызов журналирования
-              severity: Major
+              severity: Warning
             MissingCodeTryCatchEx @ 7:3..7:13
               message: Отсутствует код в блоке исключения
-              severity: Major"#]],
+              severity: Warning"#]],
         );
     }
 
@@ -519,7 +519,7 @@ mod tests {
             expect![[r#"
             MissingCodeTryCatchEx @ 4:2..4:12
               message: Блок исключения молча подавляет ошибку: добавьте `ВызватьИсключение` или вызов журналирования
-              severity: Major"#]],
+              severity: Warning"#]],
         );
     }
 

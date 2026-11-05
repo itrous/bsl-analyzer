@@ -159,6 +159,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "no resident set size reader on Windows")]
     fn call_hierarchy_points_resolve_within_module() {
         let decl = off("Процедура Внутренняя") + "Процедура ".len() as u32;
         let r =
@@ -191,6 +192,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "no resident set size reader on Windows")]
     fn call_hierarchy_index_bench_reports_todo_five_digest() {
         // Given: the two-method fixture and one module per fresh builder batch.
         let r = run_one_mode(
@@ -438,6 +440,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "no resident set size reader on Windows")]
     fn memory_mode_brackets_the_execution_with_rss_points() {
         let r =
             run_one_mode(FeatureSpec::DocumentSymbol, Expect::NonEmpty, RunMode::Memory).unwrap();

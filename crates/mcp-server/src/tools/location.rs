@@ -665,6 +665,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "the fixture spells POSIX absolute paths, which are not absolute on Windows"
+    )]
     fn a_path_derives_the_root_it_lies_in() {
         let roots = roots();
         let ext = extension_root_id(&roots);
@@ -686,6 +690,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "the fixture spells POSIX absolute paths, which are not absolute on Windows"
+    )]
     fn a_path_outside_every_root_names_the_reason() {
         let roots = roots();
 

@@ -1721,10 +1721,10 @@ mod tests {
         write("Allowed.bsl");
         write("temp/Hidden.bsl");
         write(".tool/Hidden.bsl");
-        write("Reports/R/Templates/T/Ext/Template.Queries.bsl");
+        write("Reports/R/Templates/T/Ext/Generated.bsl");
         write("Reports/R/Ext/ObjectModule.bsl");
         write("temporary/Visible.bsl");
-        let patterns = ["temp", ".tool", "**/*.Queries.bsl"];
+        let patterns = ["temp", ".tool", "**/Generated.bsl"];
         let dirs = loader::Directories {
             extensions: vec!["bsl".to_owned()],
             include: vec![root.clone()],

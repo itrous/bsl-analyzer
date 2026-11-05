@@ -10211,7 +10211,7 @@ mod tests {
     fn a_runtime_subtree_leaves_out_files_matched_by_an_exclusion_pattern() {
         let dir = tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("runtime");
-        for relative in ["Allowed.bsl", "temp/Hidden.bsl", "Ext/Template.Queries.bsl"] {
+        for relative in ["Allowed.bsl", "temp/Hidden.bsl", "Ext/Generated.bsl"] {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "").unwrap();
@@ -10229,11 +10229,11 @@ mod tests {
 
         assert_eq!(
             collected(&ExcludedPaths::default()),
-            ["Allowed.bsl", "Ext/Template.Queries.bsl", "temp/Hidden.bsl"].map(PathBuf::from),
+            ["Allowed.bsl", "Ext/Generated.bsl", "temp/Hidden.bsl"].map(PathBuf::from),
             "positive control: without a pattern every file is collected"
         );
         let patterns =
-            ExcludedPaths::default().with_patterns(&root, ["temp", "**/*.Queries.bsl"]).unwrap();
+            ExcludedPaths::default().with_patterns(&root, ["temp", "**/Generated.bsl"]).unwrap();
         assert_eq!(collected(&patterns), [PathBuf::from("Allowed.bsl")]);
     }
 

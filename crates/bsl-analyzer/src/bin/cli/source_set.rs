@@ -1160,6 +1160,7 @@ extensions = [
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows strips trailing blanks from a directory name")]
     fn surrounding_blanks_are_kept_in_paths_and_dropped_in_names() {
         let dir = tempdir().unwrap();
         extension_dir(dir.path(), " ext ");

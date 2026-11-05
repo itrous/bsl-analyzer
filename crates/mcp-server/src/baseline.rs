@@ -2275,6 +2275,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "the credential helper fixture is a POSIX shell or python3 script"
+    )]
     fn workspace_bootstrap_defers_only_the_network_connect() {
         let bootstrap =
             BaselineRuntime::workspace_bootstrap(None, &resolvable_postgres_project_config())
@@ -2762,6 +2766,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "the credential helper fixture is a POSIX shell or python3 script"
+    )]
     fn refreshable_source_probe_status_refreshes_retryable_failures() {
         let postgres = SearchPostgresConfig {
             host: Some("127.0.0.1".to_owned()),
@@ -2855,6 +2863,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "the credential helper fixture is a POSIX shell or python3 script"
+    )]
     fn refreshable_source_preserves_non_terminal_fallback_error_after_refresh() {
         let postgres = SearchPostgresConfig {
             host: Some("127.0.0.1".to_owned()),

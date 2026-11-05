@@ -13,8 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 получает новое правило, меняет набор и уровень находок
 `CalculationRegisterVirtualTableWithoutRecorder`, сокращает наборы находок
 `MissedRequiredParameter`, `TypeMismatch` и `InvalidCharacterInFile` и понижает уровень находок
-`ServerSideExportFormMethod`.
+`ServerSideExportFormMethod` и четырнадцати правил стандартов разработки. Файлы `*.Queries.bsl` больше не
+анализируются.
 
+- project-model: файлы с именем вида `*.Queries.bsl` (`Ext/Template.Queries.bsl`,
+  `Ext/Form.Queries.bsl`) больше не считаются исходниками: это выгрузки запросов, которые инструменты
+  индексации пишут рядом с метаданными, а не модули. CLI, LSP и MCP их не анализируют и не
+  индексируют, поэтому их находки `ParseError` из отчёта исчезают. Модуль в каталоге `Queries` и файл
+  `Queries.bsl` остаются исходниками (#798).
+- mcp: на Windows полная сборка графа даёт те же идентификаторы методов, что и инкрементальная:
+  `method/file/<путь>::<имя>` вместо `method/file/<имя файла>::<имя>`, когда корень проекта написан
+  иначе, чем путь обхода. Сохранённые у клиентов идентификаторы на Windows устаревают. `SCHEMA_VERSION`
+  графа поднята до 25, поэтому существующие графы один раз перестроятся на всех платформах (#798).
 - diagnostics: `MissedRequiredParameter` больше не отмечает позицию, оставленную пустой между
   запятыми (`Сложение(, 2)`, `Сложение(1, )`): платформа принимает такой вызов и передаёт
   `Неопределено`. Отмечается только нехватка позиций (`Сложение(1)`). Рекомендацию #std640 не
@@ -23,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 - diagnostics: `TypeMismatch` срабатывает, только когда наборы ожидаемых и полученных типов не
   пересекаются: `Число | Неопределено` в параметре `Число` больше не отмечается. Вызов отмечает
   первый аргумент без общего типа с параметром. `TypeMismatchByDocComment` не меняется (#788).
+- diagnostics: сообщение `TypeMismatch` и `TypeMismatchByDocComment` оставляет первые три члена
+  объединения и дописывает « | … и ещё N», когда членов больше. Сравнение по-прежнему идёт по
+  полным меткам до сокращения, поэтому набор находок, диапазоны и уровень не меняются. Если
+  сокращённые стороны читаются одинаково, печатаются полные метки. Тип, который сам не
+  объединение, печатается целиком. Другие представления типа остаются полными (#796).
 - diagnostics: новое правило `PossiblyUndefinedValue` (подсказка, включено по умолчанию) — аргумент
   на одной ветви получает значение нужного типа, а на другой остаётся `Неопределено`, которое параметр
   не принимает: `Лев("abc", Позиция)` при `Позиция` типа `Число | Неопределено`. Код законен, вызов
@@ -30,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 - diagnostics: `ServerSideExportFormMethod` теперь предупреждение, а не блокирующая ошибка: редактор
   показывает находку как warning, в SARIF она получает `warning` вместо `error`. Понижение уровня
   набор находок не меняет; оценка правила в метаданных (`Blocker`) не меняется (#792).
+- diagnostics: четырнадцать правил стандартов теперь предупреждение, а не ошибка: редактор
+  показывает находку как warning, в SARIF она получает `warning` вместо `error`. Набор находок
+  не меняется; собственная оценка правила в метаданных не меняется. В CodeClimate находки с
+  прежней оценкой `Critical` или `Error` становятся `major`; находки `Major` и раньше были
+  `major`. Правила: `CommonModuleInvalidType`, `DataExchangeLoading`, `IncorrectUseLikeInQuery`,
+  `InvalidCharacterInFile`, `MetadataObjectNameLength`, `MissingCodeTryCatchEx`,
+  `MissingTemporaryFileDeletion`, `SameMetadataObjectAndChildNames`, `StyleElementConstructors`,
+  `TimeoutsInExternalResources`, `UsingHardcodeNetworkAddress`, `UsingHardcodePath`,
+  `UsingObjectNotAvailableUnix`, `VirtualTableCallWithoutParameters` (#795).
 - diagnostics: `InvalidCharacterInFile` отмечает символ только там, где он мешает компиляции или
   меняет смысл разбираемого текста: в коде, в неразрывном пробеле, приклеенном к предыдущему
   идентификатору, ключевому слову или числу, в строке `//` многострочного литерала и в строке

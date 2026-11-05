@@ -14,7 +14,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Sql, MetadataTag::Standard, MetadataTag::Performance],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 pub(crate) fn dispatch(
@@ -111,13 +111,13 @@ mod tests {
             expect![[r#"
                 VirtualTableCallWithoutParameters @ 4:9..4:41
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major
+                  severity: Warning
                 VirtualTableCallWithoutParameters @ 29:9..29:44
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major
+                  severity: Warning
                 VirtualTableCallWithoutParameters @ 36:9..36:46
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -168,7 +168,7 @@ mod tests {
             expect![[r#"
                 VirtualTableCallWithoutParameters @ 3:27..3:60
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -183,7 +183,7 @@ mod tests {
             expect![[r#"
                 VirtualTableCallWithoutParameters @ 3:27..3:61
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -250,7 +250,7 @@ mod tests {
             expect![[r#"
                 VirtualTableCallWithoutParameters @ 5:9..5:46
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -265,7 +265,7 @@ mod tests {
             expect![[r#"
                 VirtualTableCallWithoutParameters @ 3:27..3:63
                   message: Не следует использовать виртуальные таблицы без параметров
-                  severity: Major"#]],
+                  severity: Warning"#]],
         );
     }
 }

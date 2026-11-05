@@ -1,5 +1,10 @@
 use std::process::Command;
 
+/// JSONL escapes a Windows separator as two backslashes.
+fn forward_slashes(jsonl: String) -> String {
+    jsonl.replace("\\\\", "/")
+}
+
 #[test]
 fn analyze_command_excludes_hidden_sources_but_keeps_component_prefix_siblings() {
     let dir = tempfile::tempdir().unwrap();
@@ -30,7 +35,7 @@ fn analyze_command_excludes_hidden_sources_but_keeps_component_prefix_siblings()
         .unwrap();
     assert!(output.status.success(), "analyze failed: {}", String::from_utf8_lossy(&output.stderr));
 
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = forward_slashes(String::from_utf8(output.stdout).unwrap());
     let lines: Vec<_> = stdout.lines().collect();
     assert!(
         lines.first().is_some_and(|line| line.contains("\"total_files\":2")),
@@ -104,7 +109,7 @@ fn analyze_command_keeps_an_external_config_as_the_exclusion_base() {
         .unwrap();
     assert!(output.status.success(), "analyze failed: {}", String::from_utf8_lossy(&output.stderr));
 
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = forward_slashes(String::from_utf8(output.stdout).unwrap());
     assert!(
         stdout.lines().next().is_some_and(|line| line.contains("\"total_files\":2")),
         "the command resolved exclusions from the source root, cwd, or ignored --config: {stdout}"

@@ -5576,7 +5576,11 @@ fn an_external_under_src_epf_is_discovered_unless_opted_out() {
         "the CLI load reports its invalid auto-discovery result once: {}",
         discovered.stderr
     );
-    assert!(discovered.stderr.contains("src/epf/not-an-export"), "{}", discovered.stderr);
+    assert!(
+        discovered.stderr.replace("\\\\", "/").contains("src/epf/not-an-export"),
+        "{}",
+        discovered.stderr
+    );
     assert_eq!(
         discovered.unresolved_modules_at(EPF_FORM_MODULE),
         vec![MISSING_MODULE.to_string()],
