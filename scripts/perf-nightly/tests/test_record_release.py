@@ -9,7 +9,7 @@ import os
 import shlex
 import unittest
 
-from gate_fixtures import CAND_LABEL, MACHINE
+from gate_fixtures import CAND_LABEL, MACHINE, timed
 from helpers import set_mode
 from record_fixtures import RecordCase
 
@@ -44,7 +44,7 @@ class ReleaseDecision(RecordCase):
         if name == "record block":
             self.set_record("diagnostics_workspace_s", 10.0, 0.01)
         elif name == "previous release block":
-            self.script.values["cpu"] = lambda run: 44.0 if run.role == "c" else 40.0
+            self.script.values["elapsed"] = timed("graph_resolve", lambda run: 19.58 if run.role == "c" else None)
         elif name == "record incomplete":
             self.set_record("graph_resolve_s", noise=None)
         elif name == "profile incomplete":
@@ -92,16 +92,16 @@ class ReleaseDecision(RecordCase):
 
     def test_an_old_pass_that_the_record_blocks_is_a_block_that_shows_both_bases(self):
         code, summary, line = self.run_scenario("record block")
-        self.assertEqual({r["outcome"] for r in summary["rows"]}, {"ok"}, "the previous release: pass")
+        self.assertEqual(self.decided(summary), {"ok"}, "the previous release: pass")
         self.assertEqual((code, summary["verdict"], summary["record"]["verdict"]), (1, "block", "block"))
         self.assertIn("block: record:diagnostics_workspace_s", summary["reasons"])
         report = self.report_text("record-block")
         old = self.cells(report, "| diagnostics_workspace_s | decisive |")
         record = self.cells(report, "| diagnostics_workspace_s | median_A |")
         self.assertEqual(old[2:4], ["22.100", "22.100"], "base and candidate of the previous release")
-        # metric, aggregate, record, candidate, Δ, ν, limit, record SHA, source, outcome, reason
-        self.assertEqual(record[2:], ["10.000", "22.100", "+121.0%", "1.00%", "10.100", "bbbbbbbbbbbb", "historical_import",
-                                      "block", "-"])
+        # metric, aggregate, record, candidate, Δ, ν, limit, its basis, record SHA, source, outcome, reason
+        self.assertEqual(record[2:], ["10.000", "22.100", "+121.0%", "1.00%", "10.100", "шум записи (ν)", "bbbbbbbbbbbb",
+                                      "historical_import", "block", "-"])
         for part in ("## Прошлый релиз", "## Рекорд", "## Прогоны", "| A-c1 | candidate | A | true |"):
             self.assertIn(part, report)
         self.assertTrue(line.strip().endswith(f"out={self.data.path('gates', 'record-block')}"),
@@ -111,7 +111,7 @@ class ReleaseDecision(RecordCase):
     def test_a_failure_of_both_bases_is_one_block_with_every_reason_and_the_memory_target_is_named(self):
         code, summary, _ = self.run_scenario("both bases fail")
         self.assertEqual((code, summary["verdict"]), (1, "block"))
-        self.assertIn("block: graph_ready_cpu_s", summary["reasons"])
+        self.assertIn("block: graph_resolve_s", summary["reasons"])
         self.assertIn("block: record:diagnostics_workspace_s", summary["reasons"])
         code, summary, _ = self.run_scenario("peak over the target")
         self.assertIn("| owner_target | block |", self.report_text("peak-over-the-target"))
@@ -124,7 +124,7 @@ class ReleaseDecision(RecordCase):
                 code, summary, _ = self.run_scenario(name)
                 self.assertEqual((code, summary["verdict"]), (2, "incomplete"))
                 self.assertIn(reason, summary["reasons"])
-                self.assertNotIn("block", [r["outcome"] for r in summary["rows"]])
+                self.assertNotIn("block", self.decided(summary))
 
     def test_a_probe_and_a_summary_without_a_record_do_not_vouch_for_a_release(self):
         code, probe, _ = self.gate("--ready-only", label="probe")

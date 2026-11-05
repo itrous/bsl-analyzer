@@ -23,7 +23,7 @@ import procs
 import scenarios
 import verdict
 from common import HarnessError, read_json, write_json
-from gate_fixtures import BASE_SHA, BASE_TAG, CAND_LABEL, GateCase, MACHINE, ScriptedMachine
+from gate_fixtures import BASE_SHA, BASE_TAG, CAND_LABEL, GateCase, MACHINE, ScriptedMachine, timed
 
 # The release protocol as the ad-hoc driver of the measurement of 2026-10-29 ran it
 # (/home/itrous/src/.temp/bsl304-plan-bench/driver3.py:28-30, :195-236).
@@ -173,7 +173,7 @@ class Order(GateCase):
         self.assertEqual(summary["candidate"]["label"], CAND_LABEL)
         self.assertEqual([r["metric"] for r in summary["rows"]],
                          ["graph_ready_s", "graph_ready_cpu_s", "graph_resolve_s", "diagnostics_workspace_s"])
-        self.assertEqual({r["outcome"] for r in summary["rows"]}, {"ok"})
+        self.assertEqual(self.decided(summary), {"ok"})
         self.assertEqual([(r["metric"], r["outcome"]) for r in summary["ceilings"]],
                          [("hwm_kb", "ok"), ("references_1_s", "ok"), ("references_2_same_s", "ok"),
                           ("references_3_other_s", "ok")])
@@ -247,12 +247,12 @@ class Order(GateCase):
 
     def test_a_block_stands_when_the_machine_gets_busy_later(self):
         # The work regression is found in the first round; series B then meets foreign load and a spent budget.
-        self.script.values["cpu"] = lambda run: 44.0 if run.role == "c" else 40.0
+        self.script.values["elapsed"] = timed("graph_resolve", lambda run: 19.58 if run.role == "c" else None)
         self.script.values["foreign"] = lambda run: 8.0 if run.series == "B" else 0.0
         code, summary, _ = self.gate("--busy-budget-min", "1")
         self.assertEqual((code, summary["verdict"]), (1, "block"))
         self.assertEqual(summary["reasons"][0], "machine_busy")
-        self.assertIn("block: graph_ready_cpu_s", summary["reasons"])
+        self.assertIn("block: graph_resolve_s", summary["reasons"])
         self.assertEqual([r["run"] for r in summary["runs"]][-1], "B-c1")
 
     def test_waiting_for_a_quiet_machine_spends_the_budget(self):
@@ -270,41 +270,33 @@ class Order(GateCase):
         self.assertEqual(self.clock.sleeps, [30.0, 30.0])
         self.assertEqual((summary["runs"], self.launches()), ([], []))
 
-    def test_a_work_regression_blocks(self):
-        self.script.values["cpu"] = lambda run: 44.0 if run.role == "c" else 40.0
-        code, summary, _ = self.gate()
-        self.assertEqual((code, summary["verdict"]), (1, "block"))
-        self.assertEqual(self.row(summary, "graph_ready_cpu_s")["outcome"], "block")
-        self.assertAlmostEqual(self.row(summary, "graph_ready_cpu_s")["delta"], 0.1)
-        self.assertEqual(self.row(summary, "graph_ready_s")["outcome"], "ok")
-        self.assertIn("block: graph_ready_cpu_s", summary["reasons"])
-        self.script.values["cpu"] = lambda run: 41.9 if run.role == "c" else 40.0
-        code, summary, _ = self.gate(label="g2")
-        self.assertEqual((code, summary["verdict"]), (0, "pass"))
-
-    def test_more_work_for_a_shorter_wait_passes_and_the_report_says_why(self):
-        self.script.values["wall"] = candidate_slower(0.55)
-        self.script.values["cpu"] = lambda run: 49.6 if run.role == "c" else 40.0
-        code, summary, _ = self.gate("--ready-only")
-        self.assertEqual((code, summary["verdict"]), (0, "probe-ok"))
-        cpu = self.row(summary, "graph_ready_cpu_s")
-        self.assertEqual((cpu["outcome"], cpu["basis"]), ("ok", "growth_traded"))
-        self.assertAlmostEqual(cpu["delta"], 0.24)
-        self.assertAlmostEqual(cpu["wall_delta"], -0.45)
-        with open(self.data.path("gates", "g1", "report.md"), encoding="utf-8") as fh:
-            report = fh.read()
-        self.assertIn("рост CPU принят как размен на ускорение", report)
-        self.assertIn("Δ стены -45.0%, Δ CPU +24.0%", report)
+    def test_more_cpu_is_shown_and_decides_nothing(self):
+        for number, (args, verdict_ok) in enumerate((((), "pass"), (("--ready-only",), "probe-ok"))):
+            with self.subTest(args=args):
+                self.script.values["cpu"] = lambda run: 80.0 if run.role == "c" else 40.0
+                code, summary, _ = self.gate(*args, label=f"cpu{number}")
+                self.assertEqual((code, summary["verdict"]), (0, verdict_ok))
+                cpu = self.row(summary, "graph_ready_cpu_s")
+                self.assertEqual((cpu["kind"], cpu["outcome"], cpu["limit"]), ("observation", "observation", None))
+                self.assertAlmostEqual(cpu["delta"], 1.0)
+                self.assertNotIn("basis", cpu)
+                self.assertEqual(summary["record_confirmation"]["requested"], False)
+                with open(self.data.path("gates", f"cpu{number}", "report.md"), encoding="utf-8") as fh:
+                    report = fh.read()
+                self.assertRegex(report, r"\| graph_ready_cpu_s \| observation \| 40\.000 \| 80\.000 \| \+100\.0% \| 1\.0% \| - \| "
+                                         r"- \| наблюдение; на вердикт не влияет \|")
+                self.assertNotIn("рост CPU", report)
 
     def test_more_work_without_a_shorter_wait_blocks_and_the_report_says_why(self):
-        self.script.values["cpu"] = lambda run: 49.6 if run.role == "c" else 40.0
-        code, summary, _ = self.gate("--ready-only")
+        self.script.values["elapsed"] = timed("graph_resolve", lambda run: 17.8 * 1.24 if run.role == "c" else None)
+        code, summary, _ = self.gate()
         self.assertEqual((code, summary["verdict"]), (1, "block"))
-        self.assertEqual(self.row(summary, "graph_ready_cpu_s")["basis"], "growth_not_repaid")
+        self.assertEqual(self.row(summary, "graph_resolve_s")["basis"], "growth_not_repaid")
+        self.assertEqual(self.row(summary, "graph_ready_s")["outcome"], "ok")
         with open(self.data.path("gates", "g1", "report.md"), encoding="utf-8") as fh:
             report = fh.read()
-        self.assertIn("блок: рост CPU больше 5 % не окуплен сокращением стены", report)
-        self.assertIn("Δ стены +0.0%, Δ CPU +24.0%", report)
+        self.assertIn("блок: рост graph_resolve_s больше 5 % не окуплен сокращением стены", report)
+        self.assertIn("Δ стены +0.0%, Δ graph_resolve_s +24.0%", report)
 
     def test_more_resolve_time_for_a_shorter_wait_passes_and_the_report_says_why(self):
         self.script.values["wall"] = candidate_slower(0.55)
@@ -328,7 +320,7 @@ class Order(GateCase):
         wall = self.row(summary, "graph_ready_s")
         self.assertEqual(wall["outcome"], "block")
         self.assertNotIn("confirm", wall)
-        self.assertEqual(self.row(summary, "graph_ready_cpu_s")["outcome"], "ok")
+        self.assertEqual(self.row(summary, "graph_ready_cpu_s")["outcome"], "observation")
         self.assertEqual(len([r for r in summary["runs"] if r["series"] == "A"]), 6)
 
     def test_a_regression_of_resolve_or_sweep_blocks(self):
@@ -387,12 +379,12 @@ class Confirmation(GateCase):
         self.assertEqual([r["run"] for r in summary["runs"] if r["series"] == "B"], ["B-c1", "B-c2", "B-c3"])
 
     def test_the_confirming_round_does_not_decide_the_work_metrics(self):
-        # CPU +10 % is a block of its own; the wall confirmation only keeps the wall row.
+        # Resolve +10 % is a block of its own; the wall confirmation only keeps the wall row.
         self.script.values["wall"] = self.wall(120.0, 100.0)
-        self.script.values["cpu"] = lambda run: 44.0 if run.role == "c" else 40.0
+        self.script.values["elapsed"] = timed("graph_resolve", lambda run: 19.58 if run.role == "c" else None)
         code, summary, _ = self.gate()
         self.assertEqual((code, summary["verdict"]), (1, "block"))
-        self.assertEqual(self.row(summary, "graph_ready_cpu_s")["outcome"], "block")
+        self.assertEqual(self.row(summary, "graph_resolve_s")["outcome"], "block")
         self.assertEqual(self.row(summary, "graph_ready_s")["outcome"], "noise")
 
 
@@ -634,14 +626,14 @@ class FailedSides(GateCase):
         set_mode(*self.modes.split(","), f"{CAND_LABEL}=cand_crash")
         code, summary, _ = self.gate(label="cand")
         self.assertEqual((code, summary["verdict"]), (1, "block"))
-        self.assertEqual({r["outcome"] for r in summary["rows"]}, {"block"})
+        self.assertEqual(self.decided(summary), {"block"})
         self.assertEqual({r["reason"] for r in summary["runs"] if r["role"] == "candidate"}, {"server_failed"})
         self.assertTrue(all(r["held"] for r in summary["runs"] if r["role"] == "base"))
         # The base's server does: no decision, never `pass` (the nightly table says `fixed` for it).
         set_mode(*self.modes.split(","), f"{BASE_TAG}=cand_crash")
         code, summary, _ = self.gate(label="base")
         self.assertEqual((code, summary["verdict"]), (2, "incomplete"))
-        self.assertEqual({r["outcome"] for r in summary["rows"]}, {"incomplete"})
+        self.assertEqual(self.decided(summary), {"incomplete"})
         self.assertNotIn("block", {r["outcome"] for r in summary["rows"] + summary["ceilings"]})
         # Both: the candidate failed.
         set_mode(*self.modes.split(","), f"{CAND_LABEL}=cand_crash", f"{BASE_TAG}=cand_crash")
@@ -896,7 +888,7 @@ class ReadyOnly(GateCase):
             self.assertFalse(os.path.exists(self.data.path("gates", "g1", "runs", run_dir, "answers")))
 
     def test_a_probe_can_still_block(self):
-        self.script.values["cpu"] = lambda run: 44.0 if run.role == "c" else 40.0
+        self.script.values["wall"] = candidate_slower(1.5)
         code, summary, _ = self.gate("--ready-only")
         self.assertEqual((code, summary["verdict"]), (1, "block"))
 
@@ -940,8 +932,10 @@ class Controls(GateCase):
                 self.assertEqual(record["metrics"]["graph_ready_cpu_s"], 0.0, name)
                 self.assertIsNone(record["controls"], name)
         self.assertEqual(summary["controls"], {"control_burn_cpu_s": 0.3})
-        self.assertEqual((code, summary["verdict"]), (1, "block"))
-        self.assertEqual(self.row(summary, "graph_ready_cpu_s")["outcome"], "block")
+        self.assertEqual((code, summary["verdict"]), (0, "probe-ok"), "what the burners burn is shown and decides nothing")
+        cpu = self.row(summary, "graph_ready_cpu_s")
+        self.assertEqual(cpu["outcome"], "observation")
+        self.assertGreaterEqual(cpu["candidate"]["value"], 0.3)
         self.assertEqual(self.row(summary, "graph_ready_s")["outcome"], "ok")
         burners = [s for s in self.spawned if s["code"] == gate.BURN_CODE]
         # max(4, ⌈0.3 / (0.5 · 100)⌉) burners per candidate run, each burning an equal share, carrying the run's marker.

@@ -11,9 +11,13 @@ measured again. `gate-calibrate` measures the base alone and writes
 `gate-noise.json`, separate from the nightly `noise.json`.
 
 The second base is `baseline.json`: the best confirmed value of each metric,
-judged by `C > R·(1+ν)` on the full profile and protocol of the record. A
+judged by `C > R·(1+ν)` on the full profile and protocol of the record. Memory
+without a measured ν is held to the bar instead, and never counts as improved. A
 second round measures an improvement over it; neither the gate nor the night
 writes the file. `record_night` measures develop against it with the same runs.
+
+The CPU time is observed against both bases and decides nothing. New features
+buy no time and no memory: the sweep and the CHANGELOG enter no judgement.
 """
 
 from __future__ import annotations
@@ -540,28 +544,47 @@ def _delta(base: float, cand: float) -> float:
     return 0.0 if cand == base else math.inf
 
 
-# Work metrics whose growth over the bar is forgiven where the wall time fell by more.
-TRADED_METRICS = ("graph_ready_cpu_s", "graph_resolve_s", "diagnostics_workspace_s")
+# Work metrics whose growth over their limit is forgiven where the wall time fell by more.
+TRADED_METRICS = ("graph_resolve_s", "diagnostics_workspace_s")
 
 
-def traded_outcome(key: str, delta: float, wall_delta: float | None, noise: float | None) -> tuple[str, str | None]:
-    """Outcome and the ground of the rule for a work metric of `TRADED_METRICS`.
-    More work over the bar blocks unless the wall time fell by at least as much:
-    the machine has idle cores, the user waits for the wall. The noise of the
-    metric is held to the bar as for any work metric."""
-    outcome = verdict.gate_outcome(key, delta, noise)
-    if outcome != "block":
-        return outcome, None
+def repaid_outcome(delta: float, wall_delta: float | None) -> tuple[str, str]:
+    """What becomes of a block of a work metric, whichever limit it passed. It
+    stays unless the wall time of the same comparison fell by at least as much:
+    the machine has idle cores, the user waits for the wall."""
     if wall_delta is not None and -wall_delta >= delta:
         return "ok", "growth_traded"
     return "block", "growth_not_repaid"
 
 
+def traded_outcome(key: str, delta: float, wall_delta: float | None, noise: float | None) -> tuple[str, str | None]:
+    """Outcome and the ground of the rule for a work metric of `TRADED_METRICS`
+    against the previous release. The noise of the metric is held to the bar as
+    for any work metric."""
+    outcome = verdict.gate_outcome(key, delta, noise)
+    return (outcome, None) if outcome != "block" else repaid_outcome(delta, wall_delta)
+
+
+def observation_row(key: str, base: list, cand: list, nu: float | None) -> dict:
+    """The numbers of an observed metric against the previous release. What is
+    missing is told in the row and leaves the gate as it is."""
+    b_state, b_value = side(base, METRICS[key])
+    c_state, c_value = side(cand, METRICS[key])
+    missing = [f"{name}: {state}" for name, state in (("base", b_state), ("candidate", c_state)) if state != "valid"]
+    return {"metric": key, "kind": "observation", "base": {"state": b_state, "value": b_value},
+            "candidate": {"state": c_state, "value": c_value},
+            "delta": None if missing else _delta(b_value, c_value), "noise": nu, "limit": None,
+            "outcome": "observation", "reason": "; ".join(missing + ([] if nu is not None else ["no_noise"])) or None}
+
+
 def rule_rows(base: list, cand: list, noise: dict, ready_only: bool) -> list[dict]:
-    keys = READY_ONLY_METRICS if ready_only else (*verdict.GATE_WALL, *verdict.GATE_DECISIVE)
+    keys = READY_ONLY_METRICS if ready_only else (*verdict.GATE_WALL, *verdict.GATE_OBSERVED, *verdict.GATE_DECISIVE)
     rows = []
     wall_delta = None
     for key in keys:
+        if key in verdict.GATE_OBSERVED:
+            rows.append(observation_row(key, base, cand, noise_of(noise, key)))
+            continue
         metric = METRICS[key]
         b_state, b_value = side(base, metric)
         c_state, c_value = side(cand, metric)
@@ -725,6 +748,12 @@ def noise_value(noise) -> float | None:
     return value if verdict._number(value) and math.isfinite(value) and value >= 0 else None
 
 
+def noise_absent(noise) -> bool:
+    """No tolerance was given at all: no object, no `value` or a null one. A given
+    one that `noise_value` refuses is something else: a broken record."""
+    return noise is None or (isinstance(noise, dict) and noise.get("value") is None)
+
+
 class Baseline:
     """`baseline.json`, read once per run. What is wrong with it is a named
     reason of the record, never an exception: the old rule still gets judged."""
@@ -760,8 +789,8 @@ class Baseline:
         self.profile, self.protocol, self.metrics = doc["profile"], doc["protocol"], doc["metrics"]
         self.reasons += [f"baseline_invalid:{key}" for key in self.metrics if key not in verdict.GATE_RECORD]
 
-    def problem(self, key: str) -> str | None:
-        """Why this record cannot judge its metric."""
+    def invalid(self, key: str) -> str | None:
+        """Why this entry, whatever its tolerance, is not a record of its metric."""
         entry = self.metrics.get(key)
         unit, aggregate = verdict.GATE_RECORD[key]
         if not isinstance(entry, dict):
@@ -773,7 +802,18 @@ class Baseline:
                 or not _text(entry.get("record_sha")) or not _text(entry.get("measured_at")) \
                 or not isinstance(evidence, dict) or any(field not in evidence for field in EVIDENCE_FIELDS):
             return f"baseline_invalid:{key}"
-        return None if noise_value(entry.get("noise")) is not None else f"record_no_noise:{key}"
+        return None
+
+    def problem(self, key: str) -> str | None:
+        """Why this record cannot judge its metric. Memory without a measured
+        tolerance still can: `record_row` holds it to the bar."""
+        invalid = self.invalid(key)
+        if invalid:
+            return invalid
+        noise = self.metrics[key].get("noise")
+        if noise_value(noise) is not None or (key == HWM_METRIC.key and noise_absent(noise)):
+            return None
+        return f"record_no_noise:{key}"
 
     def incomparable(self, print_: dict | None) -> list[str]:
         """The reasons no number of this measurement compares with any record."""
@@ -808,9 +848,36 @@ def _worst_cell(cells: list[dict]) -> dict:
     return max(cells, key=lambda c: (rank[c["outcome"]], -math.inf if c["delta"] is None else c["delta"]))
 
 
+def _record_wall_delta(baseline: Baseline, round_: dict) -> float | None:
+    """The wall of this round against its own record; None where that is no comparison."""
+    key = verdict.GATE_WALL[0]
+    state, value = _round_side(key, round_)
+    return _delta(baseline.metrics[key]["value"], value) if state == "valid" and not baseline.problem(key) else None
+
+
+def _observed_record_row(row: dict, baseline: Baseline, incomparable: list[str], rounds: list[dict]) -> dict:
+    """An observed metric against its record: what can be shown of it over the
+    rounds, the largest value on top. Whatever is wrong with its entry or its noise
+    is told in the row and leaves the record as it is."""
+    key = row["metric"]
+    invalid = "; ".join(incomparable) or baseline.invalid(key)
+    for round_ in rounds:
+        state, value = _round_side(key, round_)
+        row["rounds"].append({"candidate": {"state": state, "value": value}, "improved": False, "outcome": "observation",
+                              "delta": _delta(row["record"]["value"], value) if state == "valid" and not invalid else None})
+    measured = [c for c in row["rounds"] if c["candidate"]["state"] == "valid"]
+    top = max(measured, key=lambda c: c["candidate"]["value"], default=row["rounds"][0] if row["rounds"] else None)
+    if top is not None:
+        row.update(candidate=top["candidate"], delta=top["delta"])
+    reasons = [invalid or baseline.problem(key), None if measured else f"record_missing:{key}"]
+    row.update(outcome="observation", reason="; ".join(r for r in reasons if r) or None)
+    return row
+
+
 def record_row(key: str, baseline: Baseline, incomparable: list[str], rounds: list[dict]) -> dict:
     """One record metric over the rounds: each round is compared on its own and
-    the row is the worst of them, so a later round cannot erase a block."""
+    the row is the worst of them, so a later round cannot erase a block, and a wall
+    that repaid the growth in one round repays nothing in another."""
     unit, aggregate = verdict.GATE_RECORD[key]
     entry = baseline.metrics.get(key)
     entry = entry if isinstance(entry, dict) else {}
@@ -818,28 +885,37 @@ def record_row(key: str, baseline: Baseline, incomparable: list[str], rounds: li
     row = {"metric": key, "kind": "record", "unit": unit, "aggregate": aggregate,
            "record": {"value": entry.get("value"), "sha": entry.get("record_sha"),
                       "measured_at": entry.get("measured_at"), "evidence": entry.get("evidence")},
-           "candidate": {"state": None, "value": None}, "delta": None, "noise": nu, "limit": None,
+           "candidate": {"state": None, "value": None}, "delta": None, "noise": nu, "limit": None, "limit_basis": None,
            "outcome": "incomplete", "reason": None, "rounds": []}
+    if key in verdict.GATE_OBSERVED:
+        return _observed_record_row(row, baseline, incomparable, rounds)
     blocked = "; ".join(incomparable) or baseline.problem(key)
     if blocked:
         row["reason"] = blocked
         return row
     record = entry["value"]
-    row["limit"] = verdict.record_limit(record, nu)
+    # The bar is a margin, not a measured noise: `noise` stays null and nothing counts as improved.
+    margin = verdict.GATE_BAR if nu is None else nu
+    row.update(limit=verdict.record_limit(record, margin), limit_basis="bar_no_noise" if nu is None else "noise")
     for round_ in rounds:
         state, value = _round_side(key, round_)
         cell = {"candidate": {"state": state, "value": value}, "delta": None, "improved": False,
                 "outcome": side_outcome("valid", state)}
         if cell["outcome"] is None:
             cell["delta"] = _delta(record, value)
-            cell["outcome"] = verdict.record_outcome(value, record, nu)
-            cell["improved"] = verdict.record_improved(value, record, nu)
+            cell["outcome"] = verdict.record_outcome(value, record, margin)
+            cell["improved"] = nu is not None and verdict.record_improved(value, record, nu)
+            if key in TRADED_METRICS:
+                cell["wall_delta"] = _record_wall_delta(baseline, round_)
+                if cell["outcome"] == "block":
+                    cell["outcome"], cell["basis"] = repaid_outcome(cell["delta"], cell["wall_delta"])
         row["rounds"].append(cell)
     if not row["rounds"]:
         row["reason"] = f"record_missing:{key}"
         return row
     worst = _worst_cell(row["rounds"])
-    row.update(candidate=worst["candidate"], delta=worst["delta"], outcome=worst["outcome"])
+    row.update(candidate=worst["candidate"], delta=worst["delta"], outcome=worst["outcome"],
+               basis=worst.get("basis"), wall_delta=worst.get("wall_delta"))
     if row["outcome"] == "incomplete":
         row["reason"] = f"record_missing:{key}"
     return row
@@ -1226,8 +1302,14 @@ GROWTH_BASIS = {
     "growth_traded": "рост {what} принят как размен на ускорение (сокращение стены не меньше роста {what})",
     "growth_not_repaid": "блок: рост {what} больше 5 % не окуплен сокращением стены",
 }
-GROWTH_WHAT = {"graph_ready_cpu_s": "CPU", "graph_resolve_s": "graph_resolve_s",
-               "diagnostics_workspace_s": "diagnostics_workspace_s"}
+# The record has a limit of its own for each metric: no bar is named here.
+RECORD_GROWTH_BASIS = {
+    "growth_traded": "рост {what} выше предела рекорда {limit} принят как размен на ускорение "
+                     "(сокращение стены против рекорда не меньше роста {what})",
+    "growth_not_repaid": "блок: рост {what} выше предела рекорда {limit} не окуплен сокращением стены против рекорда",
+}
+LIMIT_BASIS = {"noise": "шум записи (ν)", "bar_no_noise": "бар 5 %, шум отсутствует"}
+OBSERVATION_TEXT = "наблюдение; на вердикт не влияет"
 
 
 def _pct(value) -> str:
@@ -1246,6 +1328,10 @@ def _aggregate_text(aggregate: dict) -> str:
     return f"{aggregate['count']}/{aggregate['files_affected']}/{aggregate['severity']}"
 
 
+def _outcome_text(outcome: str) -> str:
+    return OBSERVATION_TEXT if outcome == "observation" else outcome
+
+
 def _record_lines(summary: dict) -> list[str]:
     """The sections of the second base; a summary older than it has none, which
     says nothing about passing it."""
@@ -1257,18 +1343,26 @@ def _record_lines(summary: dict) -> list[str]:
     else:
         lines += [f"- итог: **{record['verdict']}**", f"- причины: {'; '.join(record['reasons']) or '-'}",
                   f"- baseline: {record['baseline_path']} (sha256 {record['baseline_sha256'] or '-'})", "",
-                  "| метрика | агрегат | рекорд | кандидат | Δ | ν | предел | SHA рекорда | источник | исход | причина |",
-                  "|---|---|---|---|---|---|---|---|---|---|---|"]
+                  "| метрика | агрегат | рекорд | кандидат | Δ | ν | предел | основание предела | SHA рекорда | "
+                  "источник | исход | причина |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for row in record["rows"]:
             evidence = row["record"]["evidence"]
             candidate = row["candidate"]
             shown = verdict.fmt(candidate["value"]) if candidate["state"] == "valid" else candidate["state"] or "-"
             lines.append(f"| {row['metric']} | {row['aggregate']} | {verdict.fmt(row['record']['value'])} | {shown} | "
                          f"{_pct(row['delta'])} | {_share(row['noise'])} | {verdict.fmt(row['limit'])} | "
+                         f"{LIMIT_BASIS.get(row.get('limit_basis'), '-')} | "
                          f"{str(row['record']['sha'] or '-')[:12]} | "
                          f"{evidence.get('kind', '-') if isinstance(evidence, dict) else '-'} | "
-                         f"{row['outcome']} | {row['reason'] or '-'} |")
+                         f"{_outcome_text(row['outcome'])} | {row['reason'] or '-'} |")
         lines.append("")
+        for row in record["rows"]:
+            basis = RECORD_GROWTH_BASIS.get(row.get("basis"))
+            if basis:
+                what = row["metric"]
+                lines += [f"- {what}: {basis.format(what=what, limit=verdict.fmt(row['limit']))}; "
+                          f"Δ стены {_pct(row.get('wall_delta'))}, Δ {what} {_pct(row['delta'])}.", ""]
     if night:
         return lines
     lines += ["## Память A/A", ""]
@@ -1316,9 +1410,11 @@ def write_report(out_dir: str, summary: dict) -> None:
         for row in rows:
             noise = "-" if row["noise"] is None else f"{row['noise'] * 100:.1f}%"
             confirm = _pct((row.get("confirm") or {}).get("delta"))
+            limit = "-" if row["limit"] is None else f"{row['limit'] * 100:.1f}%"
+            missing = f" ({row['reason']})" if row.get("reason") else ""
             lines.append(f"| {row['metric']} | {row['kind']} | {_side_text(row['base'])} | "
                          f"{_side_text(row['candidate'])} | {_pct(row['delta'])} | {noise} | "
-                         f"{row['limit'] * 100:.1f}% | {confirm} | {row['outcome']} |")
+                         f"{limit} | {confirm} | {_outcome_text(row['outcome'])}{missing} |")
         wall = next((r for r in rows if r["kind"] == "wall"), None)
         if wall is not None and wall["noise"] is not None:
             lines += ["", f"Стеночная метрика решает от Δ > max(5 %, ν) = {wall['limit'] * 100:.1f} % "
@@ -1326,7 +1422,7 @@ def write_report(out_dir: str, summary: dict) -> None:
         for row in rows:
             basis = GROWTH_BASIS.get(row.get("basis"))
             if basis:
-                what = GROWTH_WHAT[row["metric"]]
+                what = row["metric"]
                 lines += [f"- {row['metric']}: {basis.format(what=what)}; Δ стены {_pct(row.get('wall_delta'))}, "
                           f"Δ {what} {_pct(row['delta'])}.", ""]
     elif summary.get("mode") != "record-night":
@@ -1343,7 +1439,8 @@ def write_report(out_dir: str, summary: dict) -> None:
         lines += ["## Ответы", "", f"- исход: {answers['outcome']}; контроль: {answers['control']}"]
         lines += [f"- {p['pair']}: {', '.join(p['differ']) or 'равны'}" for p in answers["pairs"]]
         lines += ["", "Агрегаты свипа вердикт не меняют: корректность диагностик судят тесты проекта и "
-                      "CHANGELOG «Изменения поведения», гейт судит время и память.", ""]
+                      "CHANGELOG «Изменения поведения», гейт судит время и память. Изменения функционала "
+                      "не расширяют временные пределы.", ""]
         for title, key, head, cells in (
                 ("Новые коды", "new_codes", "| код | count | files_affected |",
                  lambda i: f"| {i['code']} | {i['count']} | {i['files_affected']} |"),
@@ -1409,7 +1506,8 @@ def cmd_gate_calibrate(args, clock=None, builder=None, machine=None) -> int:
             groups.append({(CORPUS, SCENARIO, TEMP): records})
         entries = verdict.build_noise(groups, lambda sdir: verdict.GATE_METRICS)
         values = {key.rsplit("/", 1)[1]: entry["noise"] for key, entry in entries.items()}
-        written = bool(values) and all(v is not None for v in values.values())
+        # An observed metric without a noise is told in its row; it keeps no calibration from the gate.
+        written = bool(values) and all(v is not None for k, v in values.items() if k not in verdict.GATE_OBSERVED)
         if written:
             write_json(data.path("gate-noise.json"), {
                 "schema": verdict.NOISE_SCHEMA, "harness_schema": HARNESS_SCHEMA, "gate_schema": GATE_SCHEMA,
