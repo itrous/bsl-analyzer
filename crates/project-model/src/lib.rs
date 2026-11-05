@@ -2987,7 +2987,9 @@ impl ProjectConfig {
         for candidate in start_dir.ancestors() {
             for filename in CONFIG_FILE_NAMES {
                 let path = candidate.join(filename);
-                if path.is_file() {
+                // `exists`, as in `load`: a config path that is not a readable file is an
+                // error, not a reason to adopt an unrelated config further up.
+                if path.exists() {
                     return Self::load_from_file(&path).map(|config| Some((config, path)));
                 }
             }
@@ -8474,6 +8476,19 @@ type_narrowing = false
 
         let error = ProjectConfig::discover(&start).unwrap_err();
         assert_eq!(error.path.file_name().unwrap(), "bsl-analyzer.toml");
+    }
+
+    #[test]
+    fn discover_does_not_pass_over_a_nearer_config_path_it_cannot_read() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "");
+        let nested = dir.path().join("nested");
+        fs::create_dir_all(nested.join("bsl-analyzer.toml")).unwrap();
+        let start = nested.join("src/cf");
+        fs::create_dir_all(&start).unwrap();
+
+        let error = ProjectConfig::discover(&start).unwrap_err();
+        assert_eq!(error.path, nested.join("bsl-analyzer.toml"));
     }
 
     #[test]
