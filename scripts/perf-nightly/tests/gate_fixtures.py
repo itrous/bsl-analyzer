@@ -52,6 +52,12 @@ def parse_run(run_id: str) -> Run:
     return Run(found["series"], found["role"], int(found["n"]), int(found["attempt"] or 1))
 
 
+def timed(call: str, value):
+    """Script value of `elapsed`: the seconds of `call`, a number or a function
+    of the run; a function that returns None and any other call keep `ELAPSED`."""
+    return lambda run, name: (value(run) if callable(value) else value) if name == call else None
+
+
 class Script:
     """What the fake server cannot give deterministically. Each value is a
     constant or a function of the run: `wall` (seconds to graph readiness),
@@ -342,3 +348,7 @@ class GateCase(unittest.TestCase):
 
     def row(self, summary: dict, metric: str) -> dict:
         return next(r for r in summary["rows"] + summary["ceilings"] if r["metric"] == metric)
+
+    def decided(self, summary: dict) -> set:
+        """The outcomes of the rows against the previous release that judge anything."""
+        return {r["outcome"] for r in summary["rows"] if r["kind"] != "observation"}

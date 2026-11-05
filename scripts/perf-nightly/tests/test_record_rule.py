@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from gate_fixtures import BASE_TAG, CAND_LABEL
+from gate_fixtures import BASE_TAG, CAND_LABEL, timed
 from helpers import set_mode
 from record_fixtures import MEASURED, RecordCase, full_round
 
@@ -56,12 +56,17 @@ class Judged(RecordCase):
         return {r["metric"]: r for r in section["rows"]}
 
     def assert_not_compared(self, section: dict, reason: str, metrics=None) -> None:
-        """Every row of `metrics` (default: all) is incomplete for `reason`, with no number set against another."""
+        """Every row of `metrics` (default: all that judge) is incomplete for `reason`, with no number set
+        against another; an observed row tells the same reason and judges nothing."""
         rows = self.rows(section)
-        for metric in metrics or rows:
+        for metric in metrics or [m for m in rows if m not in verdict.GATE_OBSERVED]:
             row = rows[metric]
             self.assertEqual((row["outcome"], row["reason"], row["delta"], row["candidate"]["value"]),
                              ("incomplete", reason, None, None), metric)
+        if metrics is None:
+            for metric in verdict.GATE_OBSERVED:
+                self.assertEqual((rows[metric]["outcome"], rows[metric]["delta"]), ("observation", None), metric)
+                self.assertIn(reason, rows[metric]["reason"], metric)
         self.assertIn(reason, section["reasons"])
         self.assertEqual(section["verdict"], "incomplete")
 
@@ -82,8 +87,13 @@ class RecordRows(RecordCase):
             self.assertEqual(row["record"], {"value": entry["value"], "sha": entry["record_sha"],
                                              "measured_at": entry["measured_at"], "evidence": entry["evidence"]})
             self.assertEqual(row["candidate"], {"state": "valid", "value": MEASURED[metric]}, metric)
-            self.assertEqual((row["delta"], row["noise"], row["outcome"]), (0.0, entry["noise"]["value"], "ok"))
-            self.assertAlmostEqual(row["limit"], entry["value"] * (1 + entry["noise"]["value"]))
+            observed = metric in verdict.GATE_OBSERVED
+            self.assertEqual((row["delta"], row["noise"], row["outcome"]),
+                             (0.0, entry["noise"]["value"], "observation" if observed else "ok"))
+            if observed:
+                self.assertIsNone(row["limit"])
+            else:
+                self.assertAlmostEqual(row["limit"], entry["value"] * (1 + entry["noise"]["value"]))
         self.assertEqual((code, summary["verdict"], record["verdict"]), (0, "pass", "pass"))
         self.assertEqual(record["baseline_path"], self.baseline_path)
         self.assertEqual(record["baseline_sha256"], sha256_file(self.baseline_path))
@@ -99,13 +109,13 @@ class RecordRows(RecordCase):
 
         def read_then_rewrite(path):
             found = original(path)
-            self.set_record("graph_ready_cpu_s", 1.0, 0.0)
+            self.set_record("graph_resolve_s", 1.0, 0.0)
             return found
 
         with patch.object(gate, "Baseline", read_then_rewrite):
             _, summary, _ = self.gate()
         self.assertEqual(summary["record"]["baseline_sha256"], digest)
-        self.assertEqual(self.record_row(summary, "graph_ready_cpu_s")["record"]["value"], MEASURED["graph_ready_cpu_s"])
+        self.assertEqual(self.record_row(summary, "graph_resolve_s")["record"]["value"], MEASURED["graph_resolve_s"])
         self.assertEqual(summary["record"]["verdict"], "pass")
 
     def test_a_summary_without_a_record_reads_as_not_measured_and_not_as_passed(self):
@@ -134,7 +144,7 @@ class RecordRows(RecordCase):
         self.assertEqual((missing["outcome"], missing["reason"], missing["delta"]),
                          ("incomplete", "baseline_invalid:references_2_same_s", None))
         seven = [r for r in rows if r is not missing]
-        self.assertEqual({r["outcome"] for r in seven}, {"ok"})
+        self.assertEqual({r["outcome"] for r in seven if r["metric"] not in verdict.GATE_OBSERVED}, {"ok"})
         self.assertTrue(all(r["delta"] is not None for r in seven), "the other seven are compared")
         self.assertEqual(summary["record"]["verdict"], "incomplete")
         self.assertEqual((code, summary["verdict"]), (2, "incomplete"))
@@ -145,8 +155,9 @@ class RecordRows(RecordCase):
             hwm_A_kb=dict(doc["metrics"]["hwm_kb"])))
         code, summary, _ = self.gate()
         for row in summary["record"]["rows"]:
+            outcome = "observation" if row["metric"] in verdict.GATE_OBSERVED else "incomplete"
             self.assertEqual((row["outcome"], row["reason"], row["delta"]),
-                             ("incomplete", "baseline_invalid:hwm_A_kb", None), row["metric"])
+                             (outcome, "baseline_invalid:hwm_A_kb", None), row["metric"])
         self.assertEqual((code, summary["verdict"]), (2, "incomplete"))
 
 
@@ -197,7 +208,10 @@ class ShippedBaseline(unittest.TestCase):
         self.assertEqual(baseline.reasons, [])
         for metric, entry in self.doc["metrics"].items():
             value = entry["noise"]["value"]
-            if value is None:
+            if metric == "hwm_kb":
+                self.assertIsNone(value, "the bar stands in for it and is not written down as one")
+                self.assertIsNone(baseline.problem(metric))
+            elif value is None:
                 self.assertEqual(baseline.problem(metric), f"record_no_noise:{metric}")
             else:
                 self.assertIsNone(baseline.problem(metric))
@@ -212,62 +226,64 @@ class ShippedBaseline(unittest.TestCase):
 class RecordRule(RecordCase):
     """И02."""
 
-    def cpu(self, record, candidate, base=None, noise=0.01):
-        self.set_record("graph_ready_cpu_s", record, noise)
-        self.script.values["cpu"] = lambda run: candidate if run.role == "c" else (candidate if base is None else base)
+    def work(self, record, candidate, base=None, noise=0.01):
+        self.set_record("graph_resolve_s", record, noise)
+        self.script.values["elapsed"] = timed("graph_resolve", lambda run: candidate if run.role == "c" or base is None
+                                              else base)
 
     def test_the_record_blocks_above_its_limit_and_at_no_other_value(self):
         for number, (candidate, outcome) in enumerate(((100.0, "ok"), (99.5, "ok"), (100.5, "ok"), (101.0, "ok"),
                                                        (101.001, "block"), (130.0, "block"))):
             with self.subTest(candidate=candidate):
-                self.cpu(100.0, candidate)
+                self.work(100.0, candidate)
                 code, summary, _ = self.gate(label=f"c{number}")
-                row = self.record_row(summary, "graph_ready_cpu_s")
+                row = self.record_row(summary, "graph_resolve_s")
                 self.assertEqual(row["outcome"], outcome)
                 self.assertAlmostEqual(row["limit"], 101.0)
                 self.assertAlmostEqual(row["delta"], (candidate - 100.0) / 100.0)
-                self.assertEqual({r["outcome"] for r in summary["rows"]}, {"ok"}, "the old rule sees no change")
+                self.assertEqual(self.decided(summary), {"ok"}, "the old rule sees no change")
                 self.assertEqual((code, summary["verdict"]), (1, "block") if outcome == "block" else (0, "pass"))
                 self.assertEqual(summary["record"]["verdict"], "block" if outcome == "block" else "pass")
 
     def test_a_loss_the_old_bar_forgives_is_a_loss_of_the_record(self):
-        self.cpu(100.0, 108.16, base=104.0)
+        self.work(100.0, 108.16, base=104.0)
         before = self.baseline_bytes()
         code, summary, _ = self.gate()
-        self.assertEqual({r["outcome"] for r in summary["rows"]}, {"ok"}, "the previous release: pass")
-        self.assertAlmostEqual(self.row(summary, "graph_ready_cpu_s")["delta"], 0.04)
-        row = self.record_row(summary, "graph_ready_cpu_s")
+        self.assertEqual(self.decided(summary), {"ok"}, "the previous release: pass")
+        self.assertAlmostEqual(self.row(summary, "graph_resolve_s")["delta"], 0.04)
+        row = self.record_row(summary, "graph_resolve_s")
         self.assertEqual((row["outcome"], row["record"]["value"]), ("block", 100.0))
         self.assertAlmostEqual(row["delta"], 0.0816)
         self.assertEqual((code, summary["verdict"], summary["record"]["verdict"]), (1, "block", "block"))
-        self.assertIn("block: record:graph_ready_cpu_s", summary["reasons"])
+        self.assertIn("block: record:graph_resolve_s", summary["reasons"])
         self.assertEqual(self.baseline_bytes(), before, "the gate does not move the record")
 
-    def test_a_shorter_wait_does_not_buy_work_over_the_record(self):
+    def test_a_shorter_wait_buys_work_over_the_record_as_it_does_over_the_release(self):
         for number, (candidate, traded) in enumerate(((110.0, True), (102.0, False))):
-            with self.subTest(candidate_cpu=candidate):
-                self.set_record("graph_ready_cpu_s", 100.0, 0.01)
+            with self.subTest(candidate_work=candidate):
+                self.work(100.0, candidate, base=100.0)
                 self.script.values["wall"] = candidate_slower(0.5)
-                self.script.values["cpu"] = lambda run, c=candidate: c if run.role == "c" else 100.0
                 code, summary, _ = self.gate(label=f"w{number}")
-                old = self.row(summary, "graph_ready_cpu_s")
+                old = self.row(summary, "graph_resolve_s")
                 self.assertEqual(old["outcome"], "ok")
                 self.assertEqual(old.get("basis"), "growth_traded" if traded else None)
                 self.assertEqual(self.row(summary, "graph_ready_s")["outcome"], "ok")
-                record = self.record_row(summary, "graph_ready_cpu_s")
-                self.assertEqual(record["outcome"], "block", "the record has no trade and no 5 % on top of ν")
+                record = self.record_row(summary, "graph_resolve_s")
+                self.assertEqual((record["outcome"], record["basis"]), ("ok", "growth_traded"),
+                                 "over its own limit, which has no 5 % on top of ν")
                 self.assertAlmostEqual(record["delta"], (candidate - 100.0) / 100.0)
-                self.assertEqual((code, summary["verdict"]), (1, "block"))
+                self.assertAlmostEqual(record["wall_delta"], -0.5)
+                self.assertEqual((code, summary["verdict"]), (0, "pass"))
 
     def test_a_series_of_small_losses_does_not_lift_the_record(self):
-        self.set_record("graph_ready_cpu_s", 100.0, 0.01)
+        self.set_record("graph_resolve_s", 100.0, 0.01)
         before = self.baseline_bytes()
         previous = 100.0
         for number, current in enumerate((103.0, 106.0, 109.0)):
-            self.script.values["cpu"] = lambda run, p=previous, c=current: c if run.role == "c" else p
+            self.script.values["elapsed"] = timed("graph_resolve", lambda run, p=previous, c=current: c if run.role == "c" else p)
             code, summary, _ = self.gate(label=f"s{number}")
-            self.assertEqual({r["outcome"] for r in summary["rows"]}, {"ok"}, "every release passes the one before")
-            row = self.record_row(summary, "graph_ready_cpu_s")
+            self.assertEqual(self.decided(summary), {"ok"}, "every release passes the one before")
+            row = self.record_row(summary, "graph_resolve_s")
             self.assertEqual((row["outcome"], row["record"]["value"]), ("block", 100.0))
             self.assertEqual(code, 1)
             self.assertEqual(self.baseline_bytes(), before)
@@ -275,17 +291,17 @@ class RecordRule(RecordCase):
 
     def test_a_round_cannot_erase_the_block_of_another_round_and_can_add_one(self):
         # A second round runs where a metric improved; the record row is the worst of the rounds.
-        self.set_record("graph_ready_cpu_s", 100.0, 0.01)
+        self.set_record("diagnostics_workspace_s", 100.0, 0.01)
         self.set_record("graph_resolve_s", 20.0, 0.01)      # 17.8 is an improvement: the trigger
-        self.script.values["cpu"] = lambda run: 105.0 if run.n <= 3 else 98.0
+        self.script.values["elapsed"] = timed("diagnostics_workspace", lambda run: 105.0 if run.n <= 3 else 98.0)
         code, summary, _ = self.gate(label="first")
-        row = self.record_row(summary, "graph_ready_cpu_s")
+        row = self.record_row(summary, "diagnostics_workspace_s")
         self.assertEqual([c["outcome"] for c in row["rounds"]], ["block", "ok"])
         self.assertEqual((row["outcome"], round(row["delta"], 6)), ("block", 0.05))
         self.assertEqual((code, summary["verdict"]), (1, "block"))
-        self.script.values["cpu"] = lambda run: 98.0 if run.n <= 3 else 105.0
+        self.script.values["elapsed"] = timed("diagnostics_workspace", lambda run: 98.0 if run.n <= 3 else 105.0)
         code, summary, _ = self.gate(label="second")
-        row = self.record_row(summary, "graph_ready_cpu_s")
+        row = self.record_row(summary, "diagnostics_workspace_s")
         self.assertEqual([c["outcome"] for c in row["rounds"]], ["ok", "block"])
         self.assertEqual((row["outcome"], round(row["delta"], 6)), ("block", 0.05))
         self.assertEqual((code, summary["verdict"]), (1, "block"))
@@ -293,8 +309,8 @@ class RecordRule(RecordCase):
                          "the block of one metric neither proposes it nor keeps another from being confirmed")
 
     def test_the_peak_of_the_second_round_counts_for_the_ceiling(self):
-        self.set_record("graph_ready_cpu_s", 100.0, 0.01)
-        self.script.values["cpu"] = 98.0                       # improved in round one: a second round
+        self.set_record("graph_resolve_s", 100.0, 0.01)
+        self.script.values["elapsed"] = timed("graph_resolve", 98.0)   # improved in round one: a second round
         self.script.values["hwm_kb"] = lambda run: 8 << 20 if (run.series, run.n) == ("B", 5) else 4 << 20
         code, summary, _ = self.gate()
         self.assertEqual([r["run"] for r in summary["runs"]][-3:], ["B-c4", "B-c5", "B-c6"])
@@ -328,7 +344,7 @@ class Incomparable(Judged):
                 section = self.section()
                 self.assert_not_compared(section, "record_no_noise:graph_resolve_s", ["graph_resolve_s"])
                 others = [r for r in section["rows"] if r["metric"] != "graph_resolve_s"]
-                self.assertEqual({r["outcome"] for r in others}, {"ok"})
+                self.assertEqual({r["outcome"] for r in others if r["metric"] not in verdict.GATE_OBSERVED}, {"ok"})
                 self.assertTrue(all(r["delta"] == 0.0 for r in others), "an independent metric is still compared")
 
     def test_a_zero_tolerance_is_a_tolerance(self):
@@ -420,19 +436,19 @@ class Incomparable(Judged):
         self.assertIn("record_profile_mismatch:source_commit", summary["reasons"])
         self.assertTrue(all(r["delta"] is None and r["reason"] == "record_profile_mismatch:source_commit"
                             for r in summary["record"]["rows"]))
-        self.assertEqual({r["outcome"] for r in summary["rows"]}, {"ok"}, "the old rule is judged all the same")
+        self.assertEqual(self.decided(summary), {"ok"}, "the old rule is judged all the same")
 
     def test_a_kernel_changed_on_the_machine_compares_nothing_and_cannot_be_cured_by_raising_the_record(self):
         before = self.baseline_bytes()
         self.machine.print["kernel"] = "7.0"
-        self.script.values["cpu"] = lambda run: 80.0 if run.role == "c" else 40.0   # a loss the old rule blocks
+        self.script.values["elapsed"] = timed("graph_resolve", lambda run: 40.0 if run.role == "c" else 20.0)   # a loss the old rule blocks
         code, summary, _ = self.gate()
         self.assertEqual(summary["noise"]["status"], "current", "the kernel is not what stales the calibration")
         self.assertEqual(summary["record"]["profile"]["kernel"], "7.0")
         self.assertEqual(summary["record"]["baseline_profile"]["kernel"], "6.1")
         self.assertTrue(all(r["delta"] is None and r["reason"] == "record_profile_mismatch:kernel"
                             for r in summary["record"]["rows"]))
-        self.assertEqual(self.row(summary, "graph_ready_cpu_s")["outcome"], "block")
+        self.assertEqual(self.row(summary, "graph_resolve_s")["outcome"], "block")
         self.assertEqual((code, summary["verdict"], summary["record"]["verdict"]), (1, "block", "incomplete"))
         self.assertIn("record_profile_mismatch:kernel", summary["reasons"])
         self.assertEqual(self.baseline_bytes(), before)
@@ -451,7 +467,7 @@ class Incomparable(Judged):
         code, summary, _ = self.gate()
         self.assertEqual((code, summary["verdict"]), (2, "incomplete"))
         self.assertEqual(summary["reasons"].count("baseline_missing"), 1)
-        self.assertEqual({r["outcome"] for r in summary["rows"]}, {"ok"})
+        self.assertEqual(self.decided(summary), {"ok"})
         self.assertEqual(summary["record"]["baseline_sha256"], None)
         self.assertTrue(all(r["delta"] is None for r in summary["record"]["rows"]))
 
@@ -559,7 +575,7 @@ class Priority(RecordCase):
 
     def old_rule(self, kind):
         if kind == "block":
-            self.script.values["cpu"] = lambda run: 44.0 if run.role == "c" else 40.0
+            self.script.values["elapsed"] = timed("graph_resolve", lambda run: 19.58 if run.role == "c" else None)
         elif kind == "incomplete":
             self.break_gate_noise("graph_resolve_s")
 
@@ -582,7 +598,7 @@ class Priority(RecordCase):
                     self.assertEqual(summary["record"]["verdict"], record, "the record is judged on its rows alone")
                     reasons = " | ".join(summary["reasons"])
                     if old == "block":
-                        self.assertIn("block: graph_ready_cpu_s", reasons)
+                        self.assertIn("block: graph_resolve_s", reasons)
                     if old == "incomplete":
                         self.assertIn("no_noise: graph_resolve_s", reasons)
                     if record == "block":
@@ -630,7 +646,7 @@ class Priority(RecordCase):
                 self.reset()
                 self.record(record)
                 code, summary, _ = self.gate(label=record)
-                self.assertEqual({r["outcome"] for r in summary["rows"]}, {"ok"})
+                self.assertEqual(self.decided(summary), {"ok"})
                 self.assertNotEqual((code, summary["verdict"]), (0, "pass"))
                 self.assertEqual(summary["record"]["verdict"], record)
 
@@ -642,7 +658,7 @@ class Priority(RecordCase):
         row = self.record_row(summary, "hwm_kb")
         self.assertEqual((row["candidate"]["value"], row["outcome"]), (6917564.0, "block"))
         self.assertAlmostEqual(row["delta"], 0.48212891520522716, places=12)
-        self.assertEqual({r["outcome"] for r in summary["rows"]}, {"ok"}, "the previous release: pass")
+        self.assertEqual(self.decided(summary), {"ok"}, "the previous release: pass")
         self.assertEqual(self.row(summary, "hwm_kb")["outcome"], "ok", "under the old ceiling of 7 GiB")
         self.assertEqual((code, summary["verdict"]), (1, "block"))
         self.assertIn("block: record:hwm_kb", summary["reasons"])
@@ -655,8 +671,8 @@ class Priority(RecordCase):
     def test_a_measured_excess_stands_when_the_second_round_is_cut_short(self):
         # Round one improves the work metric, which asks for a second round, and takes memory over its ceiling;
         # the machine is busy from the tenth run on. An incomplete round must not erase what was measured.
-        self.set_record("graph_ready_cpu_s", 100.0, 0.01)
-        self.script.values["cpu"] = 98.0
+        self.set_record("graph_resolve_s", 100.0, 0.01)
+        self.script.values["elapsed"] = timed("graph_resolve", 98.0)
         self.script.values["hwm_kb"] = lambda run: 8 << 20 if run.series == "B" else 4 << 20
         self.machine.quiet_of = lambda n: len(self.script.runs) < 9
         code, summary, _ = self.gate()
@@ -668,8 +684,7 @@ class Priority(RecordCase):
 
     def test_a_probe_never_vouches_for_a_release_and_never_proposes_a_record(self):
         # An improvement beyond the noise: a full gate would run a second round and propose it.
-        self.set_record("graph_ready_cpu_s", 40.0, 0.01)
-        self.script.values["cpu"] = 30.0
+        self.set_record("graph_ready_s", 120.0, 0.01)
         code, summary, _ = self.gate("--ready-only", label="probe")
         self.assertEqual((code, summary["verdict"], summary["record"]["verdict"]), (0, "probe-ok", "probe-ok"))
         self.assertEqual([r["metric"] for r in summary["record"]["rows"]], ["graph_ready_s", "graph_ready_cpu_s"])
@@ -682,10 +697,10 @@ class Priority(RecordCase):
         # The full gate of the same world proposes: the probe's silence is the probe's own.
         code, summary, _ = self.gate(label="full")
         self.assertEqual((code, summary["verdict"], [p["metric"] for p in summary["record_proposals"]]),
-                         (0, "pass", ["graph_ready_cpu_s"]))
+                         (0, "pass", ["graph_ready_s"]))
 
     def test_a_probe_can_still_block_by_the_record(self):
-        self.set_record("graph_ready_cpu_s", 30.0, 0.01)
+        self.set_record("graph_ready_s", 90.0, 0.01)
         code, summary, _ = self.gate("--ready-only")
         self.assertEqual((code, summary["verdict"], summary["record"]["verdict"]), (1, "block", "block"))
 
