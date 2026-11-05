@@ -13,7 +13,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Standard, MetadataTag::Sql, MetadataTag::Unpredictable],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 pub(crate) fn dispatch(
@@ -91,19 +91,19 @@ mod tests {
             expect![[r#"
             IncorrectUseLikeInQuery @ 6:4..6:45
               message: Нужно исправить выражение в соответствии со стандартом
-              severity: Major
+              severity: Warning
             IncorrectUseLikeInQuery @ 7:4..7:32
               message: Нужно исправить выражение в соответствии со стандартом
-              severity: Major
+              severity: Warning
             IncorrectUseLikeInQuery @ 15:6..15:43
               message: Нужно исправить выражение в соответствии со стандартом
-              severity: Major
+              severity: Warning
             IncorrectUseLikeInQuery @ 19:7..19:38
               message: Нужно исправить выражение в соответствии со стандартом
-              severity: Major
+              severity: Warning
             IncorrectUseLikeInQuery @ 23:6..23:38
               message: Нужно исправить выражение в соответствии со стандартом
-              severity: Major"#]],
+              severity: Warning"#]],
         );
     }
 
@@ -136,7 +136,7 @@ mod tests {
             expect![[r#"
             IncorrectUseLikeInQuery @ 2:68..2:102
               message: Нужно исправить выражение в соответствии со стандартом
-              severity: Major"#]],
+              severity: Warning"#]],
         );
     }
 
