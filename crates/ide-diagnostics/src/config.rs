@@ -1,16 +1,23 @@
 use crate::handlers;
 use crate::handlers::deprecated_platform_api::ExcludeProblem;
-use crate::metadata::{parse_severity, DiagnosticSeverityLevel, DiagnosticType, MetadataTag};
+use crate::metadata::{
+    parse_severity, parse_severity_opt, DiagnosticSeverityLevel, DiagnosticType, MetadataTag,
+};
 use crate::{DiagnosticCode, Severity};
 use base_db::{DiagnosticsConfigInput, Locale};
 use std::collections::HashMap;
 use std::path::Path;
+use stdx::case::CaseExt;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataOverride {
     pub severity: Option<DiagnosticSeverityLevel>,
+    // Project configs spell keys in camelCase while the interned form (`to_input`) is
+    // snake_case JSON; aliases accept both without changing what is stored.
+    #[serde(alias = "diagnosticType")]
     pub diagnostic_type: Option<DiagnosticType>,
     pub tags: Option<Vec<MetadataTag>>,
+    #[serde(alias = "lspSeverity")]
     pub lsp_severity: Option<String>,
 }
 
@@ -151,6 +158,20 @@ impl DiagnosticsConfig {
                 unknown_code_hint(name)
             );
         }
+        warn_metadata_overrides(diagnostics, &file);
+        if let Some(sections) = diagnostics.as_object() {
+            for name in
+                sections.keys().filter(|name| !KNOWN_DIAGNOSTICS_KEYS.contains(&name.as_str()))
+            {
+                tracing::warn!(
+                    key = name.as_str(),
+                    config_file = %file,
+                    "unknown key `{name}` in [diagnostics] of {file}: the section is ignored; \
+                     the supported keys are {}",
+                    KNOWN_DIAGNOSTICS_KEYS.join(", ")
+                );
+            }
+        }
         for problem in handlers::deprecated_platform_api::unknown_excluded_names(diagnostics) {
             match problem {
                 ExcludeProblem::UnknownName(name) => tracing::warn!(
@@ -251,6 +272,330 @@ impl DiagnosticsConfig {
     }
 }
 
+/// Top-level keys of the `[diagnostics]` value that reaches [`DiagnosticsConfig`].
+/// `baseline` is absent on purpose: `project-model` keeps it in its own field and
+/// strips it from the rules JSON, so it never arrives here.
+const KNOWN_DIAGNOSTICS_KEYS: &[&str] = &[
+    "parameters",
+    "metadataOverrides",
+    "ordinaryAppSupport",
+    "dataflowMaxIterations",
+    "bsllsSuppressionCompat",
+];
+
+/// Hint text for the unknown-severity warning, not the criterion: `parse_severity_opt`
+/// decides, so a stale entry here costs a slightly wrong hint, never a wrong verdict.
+const ACCEPTED_SEVERITY_NAMES: &[&str] =
+    &["error", "warning", "information", "info", "hint", "blocker", "critical", "major"];
+
+/// Hint text for an unrecognised `diagnosticType`. The parser accepts any case and
+/// an underscore (`CODE_SMELL`); a stale entry here only wrongs the hint.
+const ACCEPTED_DIAGNOSTIC_TYPES: &[&str] =
+    &["Error", "CodeSmell", "Vulnerability", "SecurityHotspot"];
+
+const ACCEPTED_SEVERITY_LEVELS: &[&str] = &["Info", "Minor", "Major", "Critical", "Blocker"];
+
+fn compact_name(s: &str) -> String {
+    s.fold_lower().chars().filter(|c| *c != '_').collect()
+}
+
+fn parse_diagnostic_type(s: &str) -> Option<DiagnosticType> {
+    match compact_name(s).as_str() {
+        "error" => Some(DiagnosticType::Error),
+        "codesmell" => Some(DiagnosticType::CodeSmell),
+        "vulnerability" => Some(DiagnosticType::Vulnerability),
+        "securityhotspot" => Some(DiagnosticType::SecurityHotspot),
+        _ => None,
+    }
+}
+
+fn parse_severity_level(s: &str) -> Option<DiagnosticSeverityLevel> {
+    match compact_name(s).as_str() {
+        "info" => Some(DiagnosticSeverityLevel::Info),
+        "minor" => Some(DiagnosticSeverityLevel::Minor),
+        "major" => Some(DiagnosticSeverityLevel::Major),
+        "critical" => Some(DiagnosticSeverityLevel::Critical),
+        "blocker" => Some(DiagnosticSeverityLevel::Blocker),
+        _ => None,
+    }
+}
+
+fn parse_metadata_tag(s: &str) -> Option<MetadataTag> {
+    match compact_name(s).as_str() {
+        "standard" => Some(MetadataTag::Standard),
+        "lockinos" => Some(MetadataTag::Lockinos),
+        "sql" => Some(MetadataTag::Sql),
+        "performance" => Some(MetadataTag::Performance),
+        "brainoverload" => Some(MetadataTag::Brainoverload),
+        "badpractice" => Some(MetadataTag::Badpractice),
+        "clumsy" => Some(MetadataTag::Clumsy),
+        "design" => Some(MetadataTag::Design),
+        "suspicious" => Some(MetadataTag::Suspicious),
+        "unpredictable" => Some(MetadataTag::Unpredictable),
+        "deprecated" => Some(MetadataTag::Deprecated),
+        "unused" => Some(MetadataTag::Unused),
+        "error" => Some(MetadataTag::Error),
+        "localize" => Some(MetadataTag::Localize),
+        _ => None,
+    }
+}
+
+fn known_override_field(name: &str) -> bool {
+    matches!(
+        name,
+        "severity" | "diagnosticType" | "diagnostic_type" | "tags" | "lspSeverity" | "lsp_severity"
+    )
+}
+
+enum OverrideNote {
+    NotATable,
+    UnknownField(String),
+    AliasClash(&'static str, &'static str),
+    InvalidField {
+        field: &'static str,
+        detail: String,
+    },
+    UnknownSeverity(String),
+    /// Stored for the round trip, but no finding reads it. `lspSeverity` is what changes
+    /// the reported grade; `tags` is what changes the tags.
+    InertField(&'static str),
+}
+
+struct ParsedOverride {
+    value: Option<MetadataOverride>,
+    notes: Vec<OverrideNote>,
+}
+
+fn metadata_overrides_from_section(
+    value: &serde_json::Value,
+) -> HashMap<DiagnosticCode, MetadataOverride> {
+    let Some(entries) = value.as_object() else {
+        return HashMap::new();
+    };
+    entries
+        .iter()
+        .filter_map(|(name, entry)| {
+            let code = name.parse().ok()?;
+            parsed_override(entry).value.map(|over| (code, over))
+        })
+        .collect()
+}
+
+fn parsed_override(entry: &serde_json::Value) -> ParsedOverride {
+    let Some(object) = entry.as_object() else {
+        return ParsedOverride { value: None, notes: vec![OverrideNote::NotATable] };
+    };
+    let mut notes = Vec::new();
+    for key in object.keys() {
+        if !known_override_field(key) {
+            notes.push(OverrideNote::UnknownField(key.clone()));
+        }
+    }
+    let mut over = MetadataOverride::default();
+    let mut applied = false;
+
+    if let Some(text) = take_string_alias(object, "lspSeverity", "lsp_severity", &mut notes) {
+        if parse_severity_opt(&text).is_none() {
+            notes.push(OverrideNote::UnknownSeverity(text.clone()));
+        }
+        over.lsp_severity = Some(text);
+        applied = true;
+    }
+    if let Some(text) = take_string_alias(object, "diagnosticType", "diagnostic_type", &mut notes) {
+        match parse_diagnostic_type(&text) {
+            Some(ty) => {
+                over.diagnostic_type = Some(ty);
+                applied = true;
+                notes.push(OverrideNote::InertField("diagnosticType"));
+            }
+            None => notes.push(OverrideNote::InvalidField {
+                field: "diagnosticType",
+                detail: format!(
+                    "unknown name `{text}`; the accepted names are {}",
+                    ACCEPTED_DIAGNOSTIC_TYPES.join(", ")
+                ),
+            }),
+        }
+    }
+    if let Some(value) = object.get("severity") {
+        match value.as_str() {
+            Some(text) => match parse_severity_level(text) {
+                Some(level) => {
+                    over.severity = Some(level);
+                    applied = true;
+                    notes.push(OverrideNote::InertField("severity"));
+                }
+                None => notes.push(OverrideNote::InvalidField {
+                    field: "severity",
+                    detail: format!(
+                        "unknown name `{text}`; the accepted names are {}",
+                        ACCEPTED_SEVERITY_LEVELS.join(", ")
+                    ),
+                }),
+            },
+            None => notes.push(OverrideNote::InvalidField {
+                field: "severity",
+                detail: "expected a string".to_owned(),
+            }),
+        }
+    }
+    if let Some(value) = object.get("tags") {
+        match value.as_array() {
+            Some(items) => {
+                let mut tags = Vec::new();
+                let mut bad = false;
+                for item in items {
+                    match item.as_str().and_then(parse_metadata_tag) {
+                        Some(tag) => tags.push(tag),
+                        None => bad = true,
+                    }
+                }
+                if bad {
+                    // Tags replace the rule's tags wholesale, so a mixed list would
+                    // drop the ones the author did not repeat. Ignore the field.
+                    notes.push(OverrideNote::InvalidField {
+                        field: "tags",
+                        detail: "expected names of metadata tags".to_owned(),
+                    });
+                } else {
+                    over.tags = Some(tags);
+                    applied = true;
+                }
+            }
+            None => notes.push(OverrideNote::InvalidField {
+                field: "tags",
+                detail: "expected an array of names".to_owned(),
+            }),
+        }
+    }
+
+    ParsedOverride { value: applied.then_some(over), notes }
+}
+
+/// camelCase wins when both spellings are strings and differ: that is the project-file
+/// form. A non-string does not win — the other spelling is used when it is a string,
+/// and the warning names the key that was actually written.
+fn take_string_alias(
+    object: &serde_json::Map<String, serde_json::Value>,
+    camel: &'static str,
+    snake: &'static str,
+    notes: &mut Vec<OverrideNote>,
+) -> Option<String> {
+    let camel_str = object.get(camel).map(serde_json::Value::as_str);
+    let snake_str = object.get(snake).map(serde_json::Value::as_str);
+    match (camel_str, snake_str) {
+        (None, None) => None,
+        (Some(None), None) => {
+            notes.push(expected_string(camel));
+            None
+        }
+        (None, Some(None)) => {
+            notes.push(expected_string(snake));
+            None
+        }
+        (Some(None), Some(None)) => {
+            notes.push(expected_string(camel));
+            notes.push(expected_string(snake));
+            None
+        }
+        (Some(None), Some(Some(text))) => {
+            notes.push(expected_string(camel));
+            Some(text.to_owned())
+        }
+        (Some(Some(text)), Some(None)) => {
+            notes.push(expected_string(snake));
+            Some(text.to_owned())
+        }
+        (Some(Some(camel_text)), Some(Some(snake_text))) => {
+            if camel_text != snake_text {
+                notes.push(OverrideNote::AliasClash(camel, snake));
+            }
+            Some(camel_text.to_owned())
+        }
+        (Some(Some(text)), None) | (None, Some(Some(text))) => Some(text.to_owned()),
+    }
+}
+
+fn expected_string(field: &'static str) -> OverrideNote {
+    OverrideNote::InvalidField { field, detail: "expected a string".to_owned() }
+}
+
+fn warn_metadata_overrides(diagnostics: &serde_json::Value, file: &str) {
+    let Some(section) = diagnostics.get("metadataOverrides") else {
+        return;
+    };
+    let Some(entries) = section.as_object() else {
+        tracing::warn!(
+            key = "metadataOverrides",
+            config_file = %file,
+            "[diagnostics.metadataOverrides] of {file} is not a table: the section is ignored \
+             and the other settings still apply"
+        );
+        return;
+    };
+    for (name, entry) in entries {
+        if name.parse::<DiagnosticCode>().is_err() {
+            tracing::warn!(
+                key = name.as_str(),
+                config_file = %file,
+                "unknown diagnostic code `{name}` in [diagnostics.metadataOverrides] of \
+                 {file}: the override is ignored and the rule keeps its default severity; \
+                 {}",
+                unknown_code_hint(name)
+            );
+            continue;
+        }
+        for note in parsed_override(entry).notes {
+            warn_override_note(name, note, file);
+        }
+    }
+}
+
+fn warn_override_note(name: &str, note: OverrideNote, file: &str) {
+    match note {
+        OverrideNote::NotATable => tracing::warn!(
+            key = name,
+            config_file = %file,
+            "invalid metadata override for `{name}` in [diagnostics.metadataOverrides] of \
+             {file}: expected a table; the override is ignored and the rule keeps its default \
+             severity"
+        ),
+        OverrideNote::UnknownField(field) => tracing::warn!(
+            key = field.as_str(),
+            config_file = %file,
+            "unknown field `{field}` in [diagnostics.metadataOverrides.{name}] of {file}: \
+             the field is ignored"
+        ),
+        OverrideNote::AliasClash(camel, snake) => tracing::warn!(
+            key = name,
+            config_file = %file,
+            "both `{camel}` and `{snake}` are set for `{name}` in \
+             [diagnostics.metadataOverrides] of {file}: the values differ, the camelCase \
+             value is used"
+        ),
+        OverrideNote::InvalidField { field, detail } => tracing::warn!(
+            key = name,
+            config_file = %file,
+            "invalid `{field}` for `{name}` in [diagnostics.metadataOverrides] of {file}: \
+             {detail}; the field is ignored and the other settings still apply"
+        ),
+        OverrideNote::UnknownSeverity(value) => tracing::warn!(
+            key = name,
+            config_file = %file,
+            "unknown lspSeverity `{value}` for `{name}` in \
+             [diagnostics.metadataOverrides] of {file}: the override falls \
+             back to `warning`; the accepted names are {}",
+            ACCEPTED_SEVERITY_NAMES.join(", ")
+        ),
+        OverrideNote::InertField(field) => tracing::warn!(
+            key = name,
+            config_file = %file,
+            "`{field}` for `{name}` in [diagnostics.metadataOverrides] of {file} is stored \
+             but does not change the finding; set `lspSeverity` to change the reported severity"
+        ),
+    }
+}
+
 /// Codes this analyzer used to have, with the code that took over their checks.
 /// All of them were merged into `DeprecatedPlatformApi` in v0.2.50.
 pub(crate) const REMOVED_CODES: &[(&str, &str, &str)] = &[
@@ -328,6 +673,7 @@ impl<'de> serde::Deserialize<'de> for DiagnosticsConfig {
                 let mut ordinary_app_support = false;
                 let mut dataflow_max_iterations = hir::dataflow::DEFAULT_MAX_ITERATIONS;
                 let mut bslls_suppression_compat = true;
+                let mut metadata_overrides = HashMap::new();
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -360,6 +706,12 @@ impl<'de> serde::Deserialize<'de> for DiagnosticsConfig {
                                 }
                             }
                         }
+                        "metadataOverrides" => {
+                            // One bad entry must not fail the visitor: that would drop every
+                            // other setting in the section. Entries are parsed on their own.
+                            let value: serde_json::Value = map.next_value()?;
+                            metadata_overrides = metadata_overrides_from_section(&value);
+                        }
                         _ => {
                             let _: serde_json::Value = map.next_value()?;
                         }
@@ -372,7 +724,7 @@ impl<'de> serde::Deserialize<'de> for DiagnosticsConfig {
                     parameters,
                     ordinary_app_support,
                     dataflow_max_iterations,
-                    metadata_overrides: HashMap::new(),
+                    metadata_overrides,
                     only_enabled: None,
                     locale: Locale::default(),
                     bslls_suppression_compat,
@@ -1121,6 +1473,293 @@ mod tests {
             MetadataOverride { lsp_severity: Some("hint".into()), ..Default::default() },
         );
         assert_eq!(config.severity(DiagnosticCode::UnavailableInEnvironment), Severity::Hint);
+    }
+
+    fn override_section() -> serde_json::Value {
+        json!({ "metadataOverrides": { "DeletingCollectionItem": { "lspSeverity": "warning" } } })
+    }
+
+    #[test]
+    fn metadata_override_from_project_config_lowers_severity() {
+        assert_eq!(
+            DiagnosticsConfig::default().severity(DiagnosticCode::DeletingCollectionItem),
+            Severity::Major,
+            "control: the default grade is not Warning"
+        );
+        let config = DiagnosticsConfig::from_project_json(&override_section(), Locale::En);
+        assert_eq!(config.severity(DiagnosticCode::DeletingCollectionItem), Severity::Warning);
+        // The snake_case spelling of the interned form keeps working next to the camelCase one.
+        let snake = json!({ "metadataOverrides": { "DeletingCollectionItem": { "lsp_severity": "hint" } } });
+        let config = DiagnosticsConfig::from_project_json(&snake, Locale::En);
+        assert_eq!(config.severity(DiagnosticCode::DeletingCollectionItem), Severity::Hint);
+    }
+
+    #[test]
+    fn metadata_override_from_project_config_survives_the_interned_round_trip() {
+        let config = DiagnosticsConfig::from_project_json(&override_section(), Locale::En);
+        let restored = DiagnosticsConfig::from_input(&config.to_input());
+        assert_eq!(restored, config);
+        assert_eq!(restored.severity(DiagnosticCode::DeletingCollectionItem), Severity::Warning);
+
+        // camelCase `diagnosticType` is the project spelling; the interned form stores
+        // the snake_case field, and the round trip must not drop it.
+        let with_type = json!({
+            "metadataOverrides": {
+                "DeletingCollectionItem": {
+                    "lspSeverity": "warning",
+                    "diagnosticType": "CodeSmell"
+                }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&with_type, Locale::En);
+        let over = config
+            .metadata_overrides
+            .get(&DiagnosticCode::DeletingCollectionItem)
+            .expect("override parsed");
+        assert_eq!(over.diagnostic_type, Some(DiagnosticType::CodeSmell));
+        assert_eq!(DiagnosticsConfig::from_input(&config.to_input()), config);
+    }
+
+    #[test]
+    fn unknown_diagnostics_section_and_override_code_are_reported() {
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let raw = json!({
+            "metadataOverride": { "DeletingCollectionItem": { "lspSeverity": "warning" } },
+            "metadataOverrides": { "NoSuchCode": { "lspSeverity": "warning" } },
+            "ordinaryAppSupport": true,
+        });
+        let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&raw, Some(file)));
+        assert_eq!(warnings.len(), 2, "one warning per ignored key: {warnings:#?}");
+        let section = warnings.iter().find(|w| w.contains("`metadataOverride`")).unwrap();
+        assert!(section.contains("bsl-analyzer.toml"), "names the file: {section}");
+        assert!(section.contains("metadataOverrides"), "lists the supported keys: {section}");
+        let code = warnings.iter().find(|w| w.contains("`NoSuchCode`")).unwrap();
+        assert!(code.contains("[diagnostics.metadataOverrides]"), "names the section: {code}");
+
+        let typo = json!({
+            "metadataOverrides": { "DeletingCollectionItem": { "lspSeverity": "warnng" } }
+        });
+        let warnings =
+            warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&typo, Some(file)));
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("`warnng`"), "names the value: {}", warnings[0]);
+        assert!(warnings[0].contains("`DeletingCollectionItem`"), "{}", warnings[0]);
+        assert!(warnings[0].contains("bsl-analyzer.toml"), "{}", warnings[0]);
+        assert!(warnings[0].contains("falls back to `warning`"), "{}", warnings[0]);
+
+        let known = warnings_of(|| {
+            DiagnosticsConfig::warn_unknown_parameters(&override_section(), Some(file))
+        });
+        assert!(known.is_empty(), "a valid section is silent: {known:#?}");
+    }
+
+    #[test]
+    fn a_bad_override_entry_does_not_discard_the_rest_of_the_config() {
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let raw = json!({
+            "parameters": { "LineLength": false },
+            "metadataOverrides": {
+                "DeletingCollectionItem": { "diagnosticType": "CodeSmel" },
+                "Typo": { "lspSeverity": "hint" }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
+        assert!(
+            config.is_disabled(DiagnosticCode::LineLength),
+            "one bad override must not reset the section: {:?}",
+            config.disabled
+        );
+        assert_eq!(
+            config
+                .metadata_overrides
+                .get(&DiagnosticCode::Typo)
+                .and_then(|over| over.lsp_severity.as_deref()),
+            Some("hint"),
+            "a sibling override still applies"
+        );
+        assert!(
+            config
+                .metadata_overrides
+                .get(&DiagnosticCode::DeletingCollectionItem)
+                .and_then(|over| over.diagnostic_type)
+                .is_none(),
+            "the bad field is not stored"
+        );
+        let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&raw, Some(file)));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`CodeSmel`") && w.contains("`DeletingCollectionItem`")),
+            "names the bad value and the code: {warnings:#?}"
+        );
+
+        // A case difference is a spelling of the same type, not a reason to drop the section.
+        let folded = json!({
+            "parameters": { "LineLength": false },
+            "metadataOverrides": {
+                "DeletingCollectionItem": { "diagnosticType": "codeSmell" }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&folded, Locale::En);
+        assert!(config.is_disabled(DiagnosticCode::LineLength));
+        assert_eq!(
+            config
+                .metadata_overrides
+                .get(&DiagnosticCode::DeletingCollectionItem)
+                .and_then(|over| over.diagnostic_type),
+            Some(DiagnosticType::CodeSmell)
+        );
+
+        let not_a_table = json!({
+            "parameters": { "LineLength": false },
+            "metadataOverrides": "hint"
+        });
+        let config = DiagnosticsConfig::from_project_json(&not_a_table, Locale::En);
+        assert!(config.is_disabled(DiagnosticCode::LineLength));
+    }
+
+    #[test]
+    fn both_severity_spellings_do_not_drop_the_override() {
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let same = json!({
+            "metadataOverrides": {
+                "DeletingCollectionItem": { "lspSeverity": "hint", "lsp_severity": "hint" }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&same, Locale::En);
+        assert_eq!(config.severity(DiagnosticCode::DeletingCollectionItem), Severity::Hint);
+        let warnings =
+            warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&same, Some(file)));
+        assert!(warnings.is_empty(), "equal spellings are not a clash: {warnings:#?}");
+
+        let clash = json!({
+            "parameters": { "LineLength": false },
+            "metadataOverrides": {
+                "DeletingCollectionItem": { "lspSeverity": "hint", "lsp_severity": "error" }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&clash, Locale::En);
+        assert!(config.is_disabled(DiagnosticCode::LineLength));
+        assert_eq!(
+            config.severity(DiagnosticCode::DeletingCollectionItem),
+            Severity::Hint,
+            "camelCase wins"
+        );
+        let warnings =
+            warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&clash, Some(file)));
+        assert!(
+            warnings.iter().any(|w| w.contains("lspSeverity") && w.contains("lsp_severity")),
+            "{warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_override_field_is_reported_and_not_applied() {
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let raw = json!({
+            "metadataOverrides": { "DeletingCollectionItem": { "lspSeveriti": "hint" } }
+        });
+        let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
+        assert_eq!(
+            config.severity(DiagnosticCode::DeletingCollectionItem),
+            Severity::Major,
+            "a misspelled field must not change the grade"
+        );
+        let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&raw, Some(file)));
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("`lspSeveriti`"), "{}", warnings[0]);
+        assert!(warnings[0].contains("bsl-analyzer.toml"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn an_inert_override_field_is_reported() {
+        let file = Path::new("/work/project/bsl-analyzer.toml");
+        let raw = json!({
+            "metadataOverrides": {
+                "DeletingCollectionItem": { "diagnosticType": "Vulnerability", "severity": "Blocker" }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
+        assert_eq!(
+            config.severity(DiagnosticCode::DeletingCollectionItem),
+            Severity::Major,
+            "neither field changes the reported grade"
+        );
+        let over = config.metadata_overrides.get(&DiagnosticCode::DeletingCollectionItem).unwrap();
+        assert_eq!(over.diagnostic_type, Some(DiagnosticType::Vulnerability));
+        assert_eq!(over.severity, Some(DiagnosticSeverityLevel::Blocker));
+        let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&raw, Some(file)));
+        assert!(
+            warnings.iter().any(
+                |w| w.contains("`diagnosticType`") && w.contains("does not change the finding")
+            ),
+            "{warnings:#?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`severity`") && w.contains("does not change the finding")),
+            "{warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_tag_list_is_not_applied() {
+        let raw = json!({
+            "metadataOverrides": {
+                "DeletingCollectionItem": { "tags": ["Unused", "NoSuchTag"] }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
+        assert!(
+            config
+                .metadata_overrides
+                .get(&DiagnosticCode::DeletingCollectionItem)
+                .and_then(|over| over.tags.as_ref())
+                .is_none(),
+            "a mixed list must not replace the rule's tags"
+        );
+        let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&raw, None));
+        assert!(
+            warnings.iter().any(|w| w.contains("`tags`") && w.contains("the field is ignored")),
+            "{warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn a_non_string_alias_does_not_hide_the_other_spelling() {
+        let raw = json!({
+            "metadataOverrides": {
+                "DeletingCollectionItem": {
+                    "diagnosticType": 1,
+                    "diagnostic_type": "CodeSmell"
+                }
+            }
+        });
+        let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
+        assert_eq!(
+            config
+                .metadata_overrides
+                .get(&DiagnosticCode::DeletingCollectionItem)
+                .and_then(|over| over.diagnostic_type),
+            Some(DiagnosticType::CodeSmell),
+            "the string spelling still applies"
+        );
+
+        let snake = json!({
+            "metadataOverrides": { "DeletingCollectionItem": { "lsp_severity": 5 } }
+        });
+        let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&snake, None));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`lsp_severity`") && w.contains("expected a string")),
+            "names the key that was written: {warnings:#?}"
+        );
+        assert!(
+            warnings.iter().all(|w| !w.contains("`lspSeverity`")),
+            "does not name the spelling the author did not write: {warnings:#?}"
+        );
     }
 }
 
