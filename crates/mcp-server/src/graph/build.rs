@@ -5875,14 +5875,14 @@ mod tests {
                 return;
             }
             let before = graph.observation();
-            write(
+            crate::graph::test_support::replace(
                 &hook_root,
                 "CommonModules/Сервер/Ext/Module.bsl",
                 "&НаСервере\nФункция Считать() Экспорт\nВозврат 99;\nКонецФункции",
             );
             crate::graph::test_support::wait_for_hub_seq_above(&hook_hub, before);
             let before_restore = graph.observation();
-            write(
+            crate::graph::test_support::replace(
                 &hook_root,
                 "CommonModules/Сервер/Ext/Module.bsl",
                 "&НаСервере\nФункция Считать() Экспорт КонецФункции",
