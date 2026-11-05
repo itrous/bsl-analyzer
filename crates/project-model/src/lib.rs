@@ -4475,7 +4475,9 @@ mod tests {
         }
     }
 
-    /// Returns the first candidate that can be spawned; the error names every candidate tried.
+    /// Returns the first candidate whose `--version` succeeds; the error names every candidate
+    /// tried. A launcher stub that spawns but fails `--version` cannot run the helper either,
+    /// and accepting it would shadow a working interpreter later in the list.
     fn resolve_python_from(candidates: &[&str]) -> Result<String, String> {
         let mut failures = Vec::new();
         for candidate in candidates {
@@ -4486,11 +4488,12 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .status()
             {
-                Ok(_) => return Ok((*candidate).to_owned()),
+                Ok(status) if status.success() => return Ok((*candidate).to_owned()),
+                Ok(status) => failures.push(format!("{candidate}: {status}")),
                 Err(error) => failures.push(format!("{candidate}: {error}")),
             }
         }
-        Err(format!("no python interpreter could be spawned; tried [{}]", failures.join(", ")))
+        Err(format!("no working python interpreter found; tried [{}]", failures.join(", ")))
     }
 
     fn resolve_python() -> String {
@@ -4510,6 +4513,14 @@ mod tests {
             resolve_python_from(&["bsl-no-such-python-a", "bsl-no-such-python-b"]).unwrap_err();
         assert!(error.contains("bsl-no-such-python-a"), "{error}");
         assert!(error.contains("bsl-no-such-python-b"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_python_from_rejects_a_candidate_whose_version_probe_fails() {
+        // `false` spawns but exits non-zero even for `--version`, like a shim with no interpreter.
+        let error = resolve_python_from(&["false"]).unwrap_err();
+        assert!(error.contains("false"), "{error}");
     }
 
     /// A helper that reads the request line, writes `response` and exits with `exit_code`.
