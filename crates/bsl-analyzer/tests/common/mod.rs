@@ -85,7 +85,19 @@ pub fn project() -> tempfile::TempDir {
 pub fn replace_config(path: &Path, text: &str) {
     let next = path.with_extension("toml.next");
     std::fs::write(&next, text).expect("write the next config");
-    std::fs::rename(&next, path).expect("swap the config in");
+    // Windows refuses the rename for as long as the server has the old file open.
+    let mut attempts = 0;
+    loop {
+        match std::fs::rename(&next, path) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied && attempts < 10_000 =>
+            {
+                attempts += 1;
+                std::thread::yield_now();
+            }
+            result => break result.expect("swap the config in"),
+        }
+    }
 }
 
 /// An action repeated until the server reacts to it.

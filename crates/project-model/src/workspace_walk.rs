@@ -358,6 +358,10 @@ mod tests {
         names
     }
 
+    fn walked_under(outcome: &WalkOutcome, dir: &str) -> bool {
+        outcome.files.iter().any(|f| f.walked.components().any(|c| c.as_os_str() == dir))
+    }
+
     #[cfg(unix)]
     fn running_as_root() -> bool {
         // SAFETY: `geteuid` takes no arguments, cannot fail and touches no memory.
@@ -872,7 +876,7 @@ mod tests {
         let names: Vec<String> =
             outcome.files.iter().map(|f| f.walked.display().to_string()).collect();
         assert_eq!(names.len(), 2, "walked: {names:?}");
-        assert!(names.iter().all(|n| !n.contains("/.build/")), "walked: {names:?}");
+        assert!(!walked_under(&outcome, ".build"), "walked: {names:?}");
         assert!(names.iter().any(|n| n.contains(".buildfoo")), "walked: {names:?}");
     }
 
@@ -900,15 +904,9 @@ mod tests {
         let names: Vec<String> =
             outcome.files.iter().map(|f| f.walked.display().to_string()).collect();
 
-        assert!(names.iter().any(|n| n.contains("/W/")), "the workspace module: {names:?}");
-        assert!(
-            names.iter().any(|n| n.contains("/E/")),
-            "the declared root under the hole: {names:?}"
-        );
-        assert!(
-            !names.iter().any(|n| n.contains("/V/")),
-            "the rest of the hole was re-opened: {names:?}"
-        );
+        assert!(walked_under(&outcome, "W"), "the workspace module: {names:?}");
+        assert!(walked_under(&outcome, "E"), "the declared root under the hole: {names:?}");
+        assert!(!walked_under(&outcome, "V"), "the rest of the hole was re-opened: {names:?}");
     }
 
     /// A hole that swallows a root must never empty the walk.
@@ -957,11 +955,8 @@ mod tests {
 
         let names: Vec<String> =
             outcome.files.iter().map(|f| f.walked.display().to_string()).collect();
-        assert!(names.iter().any(|n| n.contains("/W/")), "the sources were not walked: {names:?}");
-        assert!(
-            !names.iter().any(|n| n.contains("/V/")),
-            "the cache was walked back in as sources: {names:?}"
-        );
+        assert!(walked_under(&outcome, "W"), "the sources were not walked: {names:?}");
+        assert!(!walked_under(&outcome, "V"), "the cache was walked back in as sources: {names:?}");
     }
 
     /// Skipping holes must stay free per entry: the decision is lexical, so it costs no

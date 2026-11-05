@@ -517,9 +517,27 @@ mod tests {
         inspect_diagnostics_baseline, SourceProvider, SourceProviders, SourceSetArgs,
     };
 
+    /// A credential helper that reads the request and answers with a valid response. Windows
+    /// has no `python3` to rely on, so there it is a script that prints a response file.
+    fn credential_helper(dir: &std::path::Path) -> (String, String) {
+        const RESPONSE: &str = r#"{"protocol":"bsl-analyzer.postgres-helper.v1","ok":true,"url":"postgres://user:pass@127.0.0.1:1/bsl_search"}"#;
+        let (program, args) = if cfg!(windows) {
+            let script = dir.join("helper.cmd");
+            fs::write(dir.join("response.txt"), RESPONSE).unwrap();
+            fs::write(&script, "@echo off\r\nset /p request=\r\ntype \"%~dp0response.txt\"\r\n")
+                .unwrap();
+            ("cmd", vec!["/C".to_owned(), script.to_string_lossy().into_owned()])
+        } else {
+            let script = "import sys; sys.stdin.readline(); sys.stdout.write(sys.argv[1])";
+            ("python3", vec!["-c".to_owned(), script.to_owned(), RESPONSE.to_owned()])
+        };
+        (program.to_owned(), serde_json::to_string(&args).unwrap())
+    }
+
     #[test]
     fn check_config_accepts_toml_project_config() {
         let dir = tempdir().unwrap();
+        let (program, args) = credential_helper(dir.path());
         let config = dir.path().join("bsl-analyzer.toml");
         fs::write(
             &config,
@@ -538,12 +556,8 @@ schema = "bsl_search"
 vault_role_base = "prod/search/bsl-analyzer"
 
 [search.baseline.postgres.credential_helper]
-program = "python3"
-args = [
-  "-c",
-  "import sys; sys.stdin.readline(); sys.stdout.write(sys.argv[1])",
-  '{"protocol":"bsl-analyzer.postgres-helper.v1","ok":true,"url":"postgres://user:pass@127.0.0.1:1/bsl_search"}'
-]
+program = "{program}"
+args = {args}
 
 [search.baseline.workspace_code.policy]
 publish_branches = ["develop"]
@@ -551,7 +565,9 @@ publish_branches = ["develop"]
 [[search.baseline.workspace_code.policy.branches]]
 match = "*"
 select_branch = "develop"
-"#,
+"#
+            .replace("{program}", &program)
+            .replace("{args}", &args),
         )
         .unwrap();
 
@@ -561,6 +577,7 @@ select_branch = "develop"
     #[test]
     fn check_config_accepts_helper_based_json_project_config() {
         let dir = tempdir().unwrap();
+        let (program, args) = credential_helper(dir.path());
         let config = dir.path().join(".bsl-analyzer.json");
         fs::write(
             &config,
@@ -575,12 +592,8 @@ select_branch = "develop"
                             "schema": "bsl_search",
                             "vaultRoleBase": "prod/search/bsl-analyzer",
                             "credentialHelper": {
-                                "program": "python3",
-                                "args": [
-                                    "-c",
-                                    "import sys; sys.stdin.readline(); sys.stdout.write(sys.argv[1])",
-                                    "{\"protocol\":\"bsl-analyzer.postgres-helper.v1\",\"ok\":true,\"url\":\"postgres://user:pass@127.0.0.1:1/bsl_search\"}"
-                                ]
+                                "program": "{program}",
+                                "args": {args}
                             }
                         },
                         "workspaceCode": {
@@ -593,7 +606,9 @@ select_branch = "develop"
                         }
                     }
                 }
-            }"#,
+            }"#
+            .replace("{program}", &program)
+            .replace("{args}", &args),
         )
         .unwrap();
 

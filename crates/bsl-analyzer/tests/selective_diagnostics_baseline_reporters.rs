@@ -51,11 +51,11 @@ fn selective_baseline_reporters_keep_existing_containers_and_show_policy() {
             .unwrap();
     assert_eq!(json["baseline"]["selection"], "selective");
     assert!(json["baseline"]["unsuppressed"].as_u64().unwrap() > 0);
-    assert!(json["diagnostics"]
-        .as_array()
+    assert!(json["diagnostics"].as_array().unwrap().iter().any(|file| file["file"]
+        .as_str()
         .unwrap()
-        .iter()
-        .any(|file| file["file"].as_str().unwrap().starts_with("src/cfe/Ext/")));
+        .replace('\\', "/")
+        .starts_with("src/cfe/Ext/")));
 
     let sarif: serde_json::Value =
         serde_json::from_slice(&fs::read(temp.path().join("reports/bsl-analyzer.sarif")).unwrap())

@@ -227,6 +227,11 @@ mod tests {
     }
 
     /// The keys the published corpus carries, one entry per file however many chunks it holds.
+    /// Durable keys carry the platform's separator; the assertions spell them with `/`.
+    fn portable(keys: &Keys) -> Keys {
+        keys.iter().map(|(root, path)| (root.replace('\\', "/"), path.replace('\\', "/"))).collect()
+    }
+
     fn published_keys(root: &Path) -> Keys {
         build_workspace_code(&project_at(root))
             .unwrap()
@@ -577,7 +582,7 @@ mod tests {
              update or drop"
         );
         assert!(
-            published.contains(&(
+            portable(&published).contains(&(
                 "src/cfe/Первое".to_owned(),
                 "CommonModules/Общий/Ext/Module.bsl".to_owned()
             )),
@@ -666,7 +671,7 @@ mod tests {
         let published = published_keys(&root);
 
         assert_eq!(
-            published
+            portable(&published)
                 .iter()
                 .filter(|(_, path)| path.ends_with("Вложенный/Ext/Module.bsl"))
                 .collect::<Vec<_>>(),
