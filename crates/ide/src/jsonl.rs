@@ -10,11 +10,25 @@ pub struct StartEvent {
     pub total_files: usize,
 
     pub version: &'static str,
+
+    // The stream is read by consumers that never see `--help`, and `"start_line": 200`
+    // reads as "line 200"; a `lines[start_line - 1]` lookup then lands on the previous
+    // line and the correct finding looks wrong. Fixed in `new`, not a parameter, so no
+    // caller can claim another base.
+    line_base: u8,
+
+    column_base: u8,
 }
 
 impl StartEvent {
     pub fn new(total_files: usize) -> Self {
-        Self { event_type: "start", total_files, version: env!("CARGO_PKG_VERSION") }
+        Self {
+            event_type: "start",
+            total_files,
+            version: env!("CARGO_PKG_VERSION"),
+            line_base: 0,
+            column_base: 0,
+        }
     }
 }
 
@@ -117,6 +131,7 @@ mod tests {
         assert!(json.contains(r#""type":"start""#));
         assert!(json.contains(r#""total_files":100"#));
         assert!(json.contains(r#""version":"#));
+        assert!(json.ends_with(r#""line_base":0,"column_base":0}"#), "{json}");
     }
 
     #[test]
