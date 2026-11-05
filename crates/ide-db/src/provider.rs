@@ -299,6 +299,18 @@ pub trait AnalysisProvider {
         right: bsl_types::kind::TypeId,
     ) -> bool;
 
+    /// Labels of a union's own members, each rendered whole. `None` when `id` is not a
+    /// union. The whole-type label cannot be split on ` | `: a member can print that
+    /// separator itself.
+    fn kernel_union_member_labels(
+        &self,
+        id: bsl_types::kind::TypeId,
+        locale: base_db::Locale,
+    ) -> Option<Vec<String>>;
+
+    /// Whether the type is `Undefined` or a union containing it.
+    fn kernel_type_includes_undefined(&self, id: bsl_types::kind::TypeId) -> bool;
+
     /// The project's `min_platform_version`; `None` (the default for providers
     /// without project settings) keeps the min-platform check silent.
     fn min_platform_version(&self) -> Option<Arc<str>> {

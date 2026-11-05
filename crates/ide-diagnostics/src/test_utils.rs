@@ -600,6 +600,18 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         hir::type_sets_overlap(&self.db, left, right)
     }
 
+    fn kernel_union_member_labels(
+        &self,
+        id: hir::TypeId,
+        locale: base_db::Locale,
+    ) -> Option<Vec<String>> {
+        hir::kernel_union_member_labels(&self.db, id, locale)
+    }
+
+    fn kernel_type_includes_undefined(&self, id: hir::TypeId) -> bool {
+        hir::kernel_type_includes_undefined(&self.db, id)
+    }
+
     fn parse(&self, file_id: vfs::FileId) -> syntax::Parse<syntax::SyntaxNode> {
         use ide_db::base_db::RootQueryDb;
         self.db.parse(file_id)

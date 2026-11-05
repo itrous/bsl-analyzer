@@ -10,9 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 ### Изменения поведения
 
 Не ломают API: набор инструментов MCP и ключи конфигурации прежние. Полный проход по конфигурации
-меняет набор и уровень находок `CalculationRegisterVirtualTableWithoutRecorder`, сокращает наборы
-находок `MissedRequiredParameter`, `TypeMismatch` и `InvalidCharacterInFile` и понижает уровень
-находок `ServerSideExportFormMethod`.
+получает новое правило, меняет набор и уровень находок
+`CalculationRegisterVirtualTableWithoutRecorder`, сокращает наборы находок
+`MissedRequiredParameter`, `TypeMismatch` и `InvalidCharacterInFile` и понижает уровень находок
+`ServerSideExportFormMethod` и четырнадцати правил стандартов разработки.
 
 - diagnostics: `MissedRequiredParameter` больше не отмечает позицию, оставленную пустой между
   запятыми (`Сложение(, 2)`, `Сложение(1, )`): платформа принимает такой вызов и передаёт
@@ -22,9 +23,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 - diagnostics: `TypeMismatch` срабатывает, только когда наборы ожидаемых и полученных типов не
   пересекаются: `Число | Неопределено` в параметре `Число` больше не отмечается. Вызов отмечает
   первый аргумент без общего типа с параметром. `TypeMismatchByDocComment` не меняется (#788).
+- diagnostics: сообщение `TypeMismatch` и `TypeMismatchByDocComment` оставляет первые три члена
+  объединения и дописывает « | … и ещё N», когда членов больше. Сравнение по-прежнему идёт по
+  полным меткам до сокращения, поэтому набор находок, диапазоны и уровень не меняются. Если
+  сокращённые стороны читаются одинаково, печатаются полные метки. Тип, который сам не
+  объединение, печатается целиком. Другие представления типа остаются полными (#796).
+- diagnostics: новое правило `PossiblyUndefinedValue` (подсказка, включено по умолчанию) — аргумент
+  на одной ветви получает значение нужного типа, а на другой остаётся `Неопределено`, которое параметр
+  не принимает: `Лев("abc", Позиция)` при `Позиция` типа `Число | Неопределено`. Код законен, вызов
+  завершится ошибкой только на этой ветви (#794).
 - diagnostics: `ServerSideExportFormMethod` теперь предупреждение, а не блокирующая ошибка: редактор
   показывает находку как warning, в SARIF она получает `warning` вместо `error`. Понижение уровня
   набор находок не меняет; оценка правила в метаданных (`Blocker`) не меняется (#792).
+- diagnostics: четырнадцать правил стандартов теперь предупреждение, а не ошибка: редактор
+  показывает находку как warning, в SARIF она получает `warning` вместо `error`. Набор находок
+  не меняется; собственная оценка правила в метаданных не меняется. В CodeClimate находки с
+  прежней оценкой `Critical` или `Error` становятся `major`; находки `Major` и раньше были
+  `major`. Правила: `CommonModuleInvalidType`, `DataExchangeLoading`, `IncorrectUseLikeInQuery`,
+  `InvalidCharacterInFile`, `MetadataObjectNameLength`, `MissingCodeTryCatchEx`,
+  `MissingTemporaryFileDeletion`, `SameMetadataObjectAndChildNames`, `StyleElementConstructors`,
+  `TimeoutsInExternalResources`, `UsingHardcodeNetworkAddress`, `UsingHardcodePath`,
+  `UsingObjectNotAvailableUnix`, `VirtualTableCallWithoutParameters` (#795).
 - diagnostics: `InvalidCharacterInFile` отмечает символ только там, где он мешает компиляции или
   меняет смысл разбираемого текста: в коде, в неразрывном пробеле, приклеенном к предыдущему
   идентификатору, ключевому слову или числу, в строке `//` многострочного литерала и в строке
