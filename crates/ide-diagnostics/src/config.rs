@@ -1476,22 +1476,22 @@ mod tests {
     }
 
     fn override_section() -> serde_json::Value {
-        json!({ "metadataOverrides": { "CommonModuleInvalidType": { "lspSeverity": "warning" } } })
+        json!({ "metadataOverrides": { "DeletingCollectionItem": { "lspSeverity": "warning" } } })
     }
 
     #[test]
     fn metadata_override_from_project_config_lowers_severity() {
         assert_eq!(
-            DiagnosticsConfig::default().severity(DiagnosticCode::CommonModuleInvalidType),
+            DiagnosticsConfig::default().severity(DiagnosticCode::DeletingCollectionItem),
             Severity::Major,
             "control: the default grade is not Warning"
         );
         let config = DiagnosticsConfig::from_project_json(&override_section(), Locale::En);
-        assert_eq!(config.severity(DiagnosticCode::CommonModuleInvalidType), Severity::Warning);
+        assert_eq!(config.severity(DiagnosticCode::DeletingCollectionItem), Severity::Warning);
         // The snake_case spelling of the interned form keeps working next to the camelCase one.
-        let snake = json!({ "metadataOverrides": { "CommonModuleInvalidType": { "lsp_severity": "hint" } } });
+        let snake = json!({ "metadataOverrides": { "DeletingCollectionItem": { "lsp_severity": "hint" } } });
         let config = DiagnosticsConfig::from_project_json(&snake, Locale::En);
-        assert_eq!(config.severity(DiagnosticCode::CommonModuleInvalidType), Severity::Hint);
+        assert_eq!(config.severity(DiagnosticCode::DeletingCollectionItem), Severity::Hint);
     }
 
     #[test]
@@ -1499,13 +1499,13 @@ mod tests {
         let config = DiagnosticsConfig::from_project_json(&override_section(), Locale::En);
         let restored = DiagnosticsConfig::from_input(&config.to_input());
         assert_eq!(restored, config);
-        assert_eq!(restored.severity(DiagnosticCode::CommonModuleInvalidType), Severity::Warning);
+        assert_eq!(restored.severity(DiagnosticCode::DeletingCollectionItem), Severity::Warning);
 
         // camelCase `diagnosticType` is the project spelling; the interned form stores
         // the snake_case field, and the round trip must not drop it.
         let with_type = json!({
             "metadataOverrides": {
-                "CommonModuleInvalidType": {
+                "DeletingCollectionItem": {
                     "lspSeverity": "warning",
                     "diagnosticType": "CodeSmell"
                 }
@@ -1514,7 +1514,7 @@ mod tests {
         let config = DiagnosticsConfig::from_project_json(&with_type, Locale::En);
         let over = config
             .metadata_overrides
-            .get(&DiagnosticCode::CommonModuleInvalidType)
+            .get(&DiagnosticCode::DeletingCollectionItem)
             .expect("override parsed");
         assert_eq!(over.diagnostic_type, Some(DiagnosticType::CodeSmell));
         assert_eq!(DiagnosticsConfig::from_input(&config.to_input()), config);
@@ -1524,7 +1524,7 @@ mod tests {
     fn unknown_diagnostics_section_and_override_code_are_reported() {
         let file = Path::new("/work/project/bsl-analyzer.toml");
         let raw = json!({
-            "metadataOverride": { "CommonModuleInvalidType": { "lspSeverity": "warning" } },
+            "metadataOverride": { "DeletingCollectionItem": { "lspSeverity": "warning" } },
             "metadataOverrides": { "NoSuchCode": { "lspSeverity": "warning" } },
             "ordinaryAppSupport": true,
         });
@@ -1537,13 +1537,13 @@ mod tests {
         assert!(code.contains("[diagnostics.metadataOverrides]"), "names the section: {code}");
 
         let typo = json!({
-            "metadataOverrides": { "CommonModuleInvalidType": { "lspSeverity": "warnng" } }
+            "metadataOverrides": { "DeletingCollectionItem": { "lspSeverity": "warnng" } }
         });
         let warnings =
             warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&typo, Some(file)));
         assert_eq!(warnings.len(), 1, "{warnings:#?}");
         assert!(warnings[0].contains("`warnng`"), "names the value: {}", warnings[0]);
-        assert!(warnings[0].contains("`CommonModuleInvalidType`"), "{}", warnings[0]);
+        assert!(warnings[0].contains("`DeletingCollectionItem`"), "{}", warnings[0]);
         assert!(warnings[0].contains("bsl-analyzer.toml"), "{}", warnings[0]);
         assert!(warnings[0].contains("falls back to `warning`"), "{}", warnings[0]);
 
@@ -1559,7 +1559,7 @@ mod tests {
         let raw = json!({
             "parameters": { "LineLength": false },
             "metadataOverrides": {
-                "CommonModuleInvalidType": { "diagnosticType": "CodeSmel" },
+                "DeletingCollectionItem": { "diagnosticType": "CodeSmel" },
                 "Typo": { "lspSeverity": "hint" }
             }
         });
@@ -1580,7 +1580,7 @@ mod tests {
         assert!(
             config
                 .metadata_overrides
-                .get(&DiagnosticCode::CommonModuleInvalidType)
+                .get(&DiagnosticCode::DeletingCollectionItem)
                 .and_then(|over| over.diagnostic_type)
                 .is_none(),
             "the bad field is not stored"
@@ -1589,7 +1589,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("`CodeSmel`") && w.contains("`CommonModuleInvalidType`")),
+                .any(|w| w.contains("`CodeSmel`") && w.contains("`DeletingCollectionItem`")),
             "names the bad value and the code: {warnings:#?}"
         );
 
@@ -1597,7 +1597,7 @@ mod tests {
         let folded = json!({
             "parameters": { "LineLength": false },
             "metadataOverrides": {
-                "CommonModuleInvalidType": { "diagnosticType": "codeSmell" }
+                "DeletingCollectionItem": { "diagnosticType": "codeSmell" }
             }
         });
         let config = DiagnosticsConfig::from_project_json(&folded, Locale::En);
@@ -1605,7 +1605,7 @@ mod tests {
         assert_eq!(
             config
                 .metadata_overrides
-                .get(&DiagnosticCode::CommonModuleInvalidType)
+                .get(&DiagnosticCode::DeletingCollectionItem)
                 .and_then(|over| over.diagnostic_type),
             Some(DiagnosticType::CodeSmell)
         );
@@ -1623,11 +1623,11 @@ mod tests {
         let file = Path::new("/work/project/bsl-analyzer.toml");
         let same = json!({
             "metadataOverrides": {
-                "CommonModuleInvalidType": { "lspSeverity": "hint", "lsp_severity": "hint" }
+                "DeletingCollectionItem": { "lspSeverity": "hint", "lsp_severity": "hint" }
             }
         });
         let config = DiagnosticsConfig::from_project_json(&same, Locale::En);
-        assert_eq!(config.severity(DiagnosticCode::CommonModuleInvalidType), Severity::Hint);
+        assert_eq!(config.severity(DiagnosticCode::DeletingCollectionItem), Severity::Hint);
         let warnings =
             warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&same, Some(file)));
         assert!(warnings.is_empty(), "equal spellings are not a clash: {warnings:#?}");
@@ -1635,13 +1635,13 @@ mod tests {
         let clash = json!({
             "parameters": { "LineLength": false },
             "metadataOverrides": {
-                "CommonModuleInvalidType": { "lspSeverity": "hint", "lsp_severity": "error" }
+                "DeletingCollectionItem": { "lspSeverity": "hint", "lsp_severity": "error" }
             }
         });
         let config = DiagnosticsConfig::from_project_json(&clash, Locale::En);
         assert!(config.is_disabled(DiagnosticCode::LineLength));
         assert_eq!(
-            config.severity(DiagnosticCode::CommonModuleInvalidType),
+            config.severity(DiagnosticCode::DeletingCollectionItem),
             Severity::Hint,
             "camelCase wins"
         );
@@ -1657,11 +1657,11 @@ mod tests {
     fn an_unknown_override_field_is_reported_and_not_applied() {
         let file = Path::new("/work/project/bsl-analyzer.toml");
         let raw = json!({
-            "metadataOverrides": { "CommonModuleInvalidType": { "lspSeveriti": "hint" } }
+            "metadataOverrides": { "DeletingCollectionItem": { "lspSeveriti": "hint" } }
         });
         let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
         assert_eq!(
-            config.severity(DiagnosticCode::CommonModuleInvalidType),
+            config.severity(DiagnosticCode::DeletingCollectionItem),
             Severity::Major,
             "a misspelled field must not change the grade"
         );
@@ -1676,16 +1676,16 @@ mod tests {
         let file = Path::new("/work/project/bsl-analyzer.toml");
         let raw = json!({
             "metadataOverrides": {
-                "CommonModuleInvalidType": { "diagnosticType": "Vulnerability", "severity": "Blocker" }
+                "DeletingCollectionItem": { "diagnosticType": "Vulnerability", "severity": "Blocker" }
             }
         });
         let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
         assert_eq!(
-            config.severity(DiagnosticCode::CommonModuleInvalidType),
+            config.severity(DiagnosticCode::DeletingCollectionItem),
             Severity::Major,
             "neither field changes the reported grade"
         );
-        let over = config.metadata_overrides.get(&DiagnosticCode::CommonModuleInvalidType).unwrap();
+        let over = config.metadata_overrides.get(&DiagnosticCode::DeletingCollectionItem).unwrap();
         assert_eq!(over.diagnostic_type, Some(DiagnosticType::Vulnerability));
         assert_eq!(over.severity, Some(DiagnosticSeverityLevel::Blocker));
         let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&raw, Some(file)));
@@ -1707,14 +1707,14 @@ mod tests {
     fn a_mixed_tag_list_is_not_applied() {
         let raw = json!({
             "metadataOverrides": {
-                "CommonModuleInvalidType": { "tags": ["Unused", "NoSuchTag"] }
+                "DeletingCollectionItem": { "tags": ["Unused", "NoSuchTag"] }
             }
         });
         let config = DiagnosticsConfig::from_project_json(&raw, Locale::En);
         assert!(
             config
                 .metadata_overrides
-                .get(&DiagnosticCode::CommonModuleInvalidType)
+                .get(&DiagnosticCode::DeletingCollectionItem)
                 .and_then(|over| over.tags.as_ref())
                 .is_none(),
             "a mixed list must not replace the rule's tags"
@@ -1730,7 +1730,7 @@ mod tests {
     fn a_non_string_alias_does_not_hide_the_other_spelling() {
         let raw = json!({
             "metadataOverrides": {
-                "CommonModuleInvalidType": {
+                "DeletingCollectionItem": {
                     "diagnosticType": 1,
                     "diagnostic_type": "CodeSmell"
                 }
@@ -1740,14 +1740,14 @@ mod tests {
         assert_eq!(
             config
                 .metadata_overrides
-                .get(&DiagnosticCode::CommonModuleInvalidType)
+                .get(&DiagnosticCode::DeletingCollectionItem)
                 .and_then(|over| over.diagnostic_type),
             Some(DiagnosticType::CodeSmell),
             "the string spelling still applies"
         );
 
         let snake = json!({
-            "metadataOverrides": { "CommonModuleInvalidType": { "lsp_severity": 5 } }
+            "metadataOverrides": { "DeletingCollectionItem": { "lsp_severity": 5 } }
         });
         let warnings = warnings_of(|| DiagnosticsConfig::warn_unknown_parameters(&snake, None));
         assert!(
