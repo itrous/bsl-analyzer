@@ -219,3 +219,40 @@ fn an_extension_nested_under_the_source_dir_is_still_called_out() {
         "{stderr}"
     );
 }
+
+#[test]
+fn an_extension_named_by_the_source_dir_does_not_own_external_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let ext = dir.path().join("src/cfe/Ext");
+    write(
+        &ext.join("Configuration.xml"),
+        "<Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose></Properties>",
+    );
+    write(
+        &dir.path().join("src/epf/E/E.xml"),
+        r#"<MetaDataObject><ExternalDataProcessor uuid="3696c164-ad14-4a0d-b659-10e3bf6d6ad2"><Properties><Name>E</Name></Properties></ExternalDataProcessor></MetaDataObject>"#,
+    );
+    write(&dir.path().join("src/epf/E/E/Ext/ObjectModule.bsl"), "");
+    write(&dir.path().join("bsl-analyzer.toml"), "");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .arg("analyze")
+        .arg("-s")
+        .arg(&ext)
+        .args(["--format", "jsonl"])
+        .env_remove("ONEC_CONFIGURATIONS_ROOT")
+        .output()
+        .expect("failed to run the analyzer");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("is a configuration extension analyzed without its main configuration"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "external data processors/reports [E] are analyzed without an owning configuration"
+        ),
+        "{stderr}"
+    );
+}

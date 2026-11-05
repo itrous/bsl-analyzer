@@ -654,8 +654,12 @@ impl Project {
     /// Unlike an extension, an external root cannot be mistaken for the base,
     /// so the subject is the declared list, not the resolved source path.
     pub fn standalone_external_notice(&self) -> Option<String> {
-        let has_configuration =
-            self.configuration_path().is_some_and(|path| configuration_xml_in(path).is_some());
+        // A root that is an extension owns no external objects: their calls target the
+        // main configuration, which is just as absent as in a project with no root.
+        let has_configuration = self.configuration_path().is_some_and(|path| {
+            configuration_xml_in(path).is_some()
+                && configuration_kind(path) != ConfigurationKind::Extension
+        });
         if has_configuration || self.external_paths.is_empty() {
             return None;
         }
@@ -8914,10 +8918,21 @@ externals = [
         touch_base(dir.path(), "src/cf");
         let project = Project::with_config(
             dir.path(),
-            ProjectConfig { configuration_root: Some("src/cf".into()), ..config },
+            ProjectConfig { configuration_root: Some("src/cf".into()), ..config.clone() },
         )
         .unwrap();
         assert!(project.standalone_external_notice().is_none(), "with a base: silent");
+
+        touch_extension(dir.path(), "src/cfe/Ext");
+        let project = Project::with_config(
+            dir.path(),
+            ProjectConfig { configuration_root: Some("src/cfe/Ext".into()), ..config },
+        )
+        .unwrap();
+        assert!(
+            project.standalone_external_notice().is_some(),
+            "a root that is an extension is no base for an external"
+        );
     }
 
     /// An export kept inside the base's tree is refused by the partition plan
