@@ -291,6 +291,11 @@ impl OverlayRetry {
         self.state.lock().unwrap().failed
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_disarmed(&self) -> bool {
+        self.state.lock().unwrap().disarmed
+    }
+
     /// Completed passes so far — the single-flight proof in tests.
     #[cfg(test)]
     pub(crate) fn pass_count(&self) -> usize {
@@ -1653,16 +1658,16 @@ mod tests {
         // Marks alone are no work of the driver's; a fresh fact after its failure is.
         retry.fail_for_test();
         retry.kick_fresh();
-        // The pass flags the takeover before it is counted as finished, so the count is read
-        // only once that pass has ended.
-        assert!(wait_for(5_000, || retry.pass_count() > before), "the fresh pass finishes");
-        assert!(mine.is_superseded(), "the fresh check observes takeover");
-        assert_eq!(
-            retry.pass_count(),
-            before + 1,
-            "one typed admission attempt observes the supersession"
-        );
+        // Whoever looks first observes the takeover: the fresh pass's admission, or the lease's
+        // heartbeat, which re-reads ownership every second and so wins on a slow machine. Either
+        // way the driver ends disarmed, and it is disarmed only after counting its last pass.
+        assert!(wait_for(5_000, || retry.is_disarmed()), "the driver settles terminally");
+        assert!(mine.is_superseded(), "the takeover is observed");
         let terminal_passes = retry.pass_count();
+        assert!(
+            terminal_passes <= before + 1,
+            "no more than the one fresh pass runs against a superseded lease"
+        );
 
         // The newer daemon exits cleanly; the old process remains terminally read-only.
         newer.release();

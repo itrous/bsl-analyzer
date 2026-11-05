@@ -651,14 +651,14 @@ mod tests {
     #[test]
     fn patterns_match_files_and_directories_relative_to_the_base() {
         let base = absolute("patterns");
-        let excluded = with_patterns(&base, &["temp", ".tool/**", "**/*.Queries.bsl", "src/gen"]);
+        let excluded = with_patterns(&base, &["temp", ".tool/**", "**/Generated.bsl", "src/gen"]);
 
         for hidden in [
             "temp",
             "temp/Module.bsl",
             "src/cf/temp/deep/Module.bsl",
             ".tool/Module.bsl",
-            "src/cf/Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "src/cf/Reports/R/Templates/T/Ext/Generated.bsl",
             "src/gen/Module.bsl",
             "./src/../temp/Module.bsl",
         ] {
@@ -671,7 +671,7 @@ mod tests {
         for visible in [
             "temporary/Module.bsl",
             "src/cf/Reports/R/Ext/ObjectModule.bsl",
-            "src/cf/Queries.bsl.txt",
+            "src/cf/Generated.bsl.txt",
             "other/src/gen/Module.bsl",
             ".tool2/Module.bsl",
         ] {
@@ -684,7 +684,7 @@ mod tests {
         assert!(!excluded.is_empty());
         assert_eq!(
             excluded.patterns().collect::<Vec<_>>(),
-            ["temp", ".tool/**", "**/*.Queries.bsl", "src/gen"]
+            ["temp", ".tool/**", "**/Generated.bsl", "src/gen"]
         );
     }
 
@@ -720,9 +720,9 @@ mod tests {
     #[test]
     fn patterns_ignore_case_on_windows() {
         let base = absolute("case");
-        let excluded = with_patterns(&base, &["**/*.Queries.bsl"]);
+        let excluded = with_patterns(&base, &["**/Generated.bsl"]);
 
-        assert!(excluded.is_excluded(&base.join("Ext/TEMPLATE.QUERIES.BSL")));
+        assert!(excluded.is_excluded(&base.join("Ext/GENERATED.BSL")));
     }
 
     #[test]

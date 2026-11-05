@@ -1,5 +1,10 @@
 use std::process::Command;
 
+/// JSONL escapes a Windows separator as two backslashes.
+fn forward_slashes(jsonl: String) -> String {
+    jsonl.replace("\\\\", "/")
+}
+
 #[test]
 fn analyze_command_excludes_hidden_sources_but_keeps_component_prefix_siblings() {
     let dir = tempfile::tempdir().unwrap();
@@ -30,7 +35,7 @@ fn analyze_command_excludes_hidden_sources_but_keeps_component_prefix_siblings()
         .unwrap();
     assert!(output.status.success(), "analyze failed: {}", String::from_utf8_lossy(&output.stderr));
 
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = forward_slashes(String::from_utf8(output.stdout).unwrap());
     let lines: Vec<_> = stdout.lines().collect();
     assert!(
         lines.first().is_some_and(|line| line.contains("\"total_files\":2")),
@@ -39,6 +44,34 @@ fn analyze_command_excludes_hidden_sources_but_keeps_component_prefix_siblings()
     assert!(lines.iter().any(|line| line.contains("Allowed.bsl")), "{stdout}");
     assert!(lines.iter().any(|line| line.contains(".tmp2/Visible.bsl")), "{stdout}");
     assert!(lines.iter().all(|line| !line.contains(".tmp/Hidden.bsl")), "{stdout}");
+}
+
+#[test]
+fn analyze_jsonl_start_event_names_the_zero_based_coordinates() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("Module.bsl"), "").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .args([
+            "analyze",
+            "--source-dir",
+            root.to_str().unwrap(),
+            "--workspace-dir",
+            root.to_str().unwrap(),
+            "--format",
+            "jsonl",
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "analyze failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let first = stdout.lines().next().expect("a start event");
+    println!("first jsonl line: {first}");
+    assert!(first.contains("\"line_base\":0"), "{first}");
+    assert!(first.contains("\"column_base\":0"), "{first}");
 }
 
 #[test]
@@ -76,7 +109,7 @@ fn analyze_command_keeps_an_external_config_as_the_exclusion_base() {
         .unwrap();
     assert!(output.status.success(), "analyze failed: {}", String::from_utf8_lossy(&output.stderr));
 
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = forward_slashes(String::from_utf8(output.stdout).unwrap());
     assert!(
         stdout.lines().next().is_some_and(|line| line.contains("\"total_files\":2")),
         "the command resolved exclusions from the source root, cwd, or ignored --config: {stdout}"

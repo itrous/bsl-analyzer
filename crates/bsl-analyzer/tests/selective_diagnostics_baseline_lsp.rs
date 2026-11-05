@@ -242,6 +242,10 @@ include = ["main", "extension:Ext"]
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "replaces the config while the server may hold it open, which Windows can refuse"
+)]
 fn selective_lsp_config_reload_applies_selection_and_republishes() {
     let dir = full_manifest_selective_project();
     // The server republishes under the path it resolved through the filesystem, so a root

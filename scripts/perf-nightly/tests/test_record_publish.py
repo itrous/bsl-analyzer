@@ -22,7 +22,7 @@ import pio_module
 import publish
 from common import read_json
 
-CPU = "perf-ratchet/graph_ready_cpu_s"
+WORK = "perf-ratchet/graph_resolve_s"
 WALL = "perf-ratchet/graph_ready_s"
 PROFILE = "perf-ratchet/profile"
 NEXT = "2026-10-23"
@@ -44,7 +44,7 @@ class RecordPublish(RecordCase):
     def setUp(self):
         super().setUp()
         self.gh = FakeGh(self, self.tmp)
-        self.set_record("graph_ready_cpu_s", 30.0, 0.01, sha=RECORD_SHA)   # the candidate's 40 is over it by 33 %
+        self.set_record("graph_resolve_s", 15.0, 0.01, sha=RECORD_SHA)   # the candidate's 17.8 is over it by 18.67 %
         self.ancestor = lambda sha, of: True
 
     def summary(self, date=DATE, machine=None) -> dict:
@@ -81,15 +81,15 @@ class OneIssuePerMetric(RecordPublish):
     def test_a_new_excess_opens_one_issue_with_the_range_the_values_and_the_links(self):
         saved = self.summary()
         entries = self.publish(saved)
-        self.assertEqual(self.actions(entries), [("create", 1, CPU)])
+        self.assertEqual(self.actions(entries), [("create", 1, WORK)])
         [created] = self.issues()
-        self.assertEqual(created["title"], "perf: рекорд превышен — graph_ready_cpu_s")
+        self.assertEqual(created["title"], "perf: рекорд превышен — graph_resolve_s")
         self.assertEqual(created["labels"], ["perf", "regression", "release-blocker"])
         lines = self.lines(created["body"])
-        self.assertIn(f"{publish.KEY_PREFIX}{CPU}", lines)
+        self.assertIn(f"{publish.KEY_PREFIX}{WORK}", lines)
         self.assertIn(f"{publish.NIGHT_PREFIX}record-{DATE}-{SHA_12}", lines)
-        for part in ("Метрика: graph_ready_cpu_s, s, агрегат median_A.", "Рекорд R = 30.0; кандидат C = 40.0.",
-                     "Δ = +33.33%; ν = 1.00%; предел R·(1+ν) = 30.3; абсолютный потолок: -.",
+        for part in ("Метрика: graph_resolve_s, s, агрегат median_A.", "Рекорд R = 15.0; кандидат C = 17.8.",
+                     "Δ = +18.67%; ν = 1.00%; предел R·(1+ν) = 15.15; абсолютный потолок: -.",
                      f"SHA рекордсмена: {RECORD_SHA}; develop: {CAND_SHA}.",
                      f"`{RECORD_SHA}..{CAND_SHA}`",
                      f"https://github.com/itrous/bsl-analyzer/compare/{RECORD_SHA}...{CAND_SHA}",
@@ -101,7 +101,7 @@ class OneIssuePerMetric(RecordPublish):
             self.assertIn(part, created["body"])
         table = [line for line in lines if line.startswith("| A-c")]
         self.assertEqual(len(table), 3, "the held runs of the series A")
-        self.assertTrue(all(line.endswith("| true | 40.0 |") for line in table))
+        self.assertTrue(all(line.endswith("| true | 17.8 |") for line in table))
         self.assertNotIn("B-c1", created["body"])
         self.assertEqual(os.path.isfile(os.path.join(self.out(), publish.LOG)), True)
 
@@ -116,11 +116,11 @@ class OneIssuePerMetric(RecordPublish):
         self.edit_baseline(lambda doc: doc["metrics"]["hwm_kb"]["evidence"].update(kind="owner_target"))
         self.publish(self.summary())
         memory = next(i for i in self.issues() if "hwm_kb" in i["title"])
-        cpu = next(i for i in self.issues() if "graph_ready_cpu_s" in i["title"])
+        work = next(i for i in self.issues() if "graph_resolve_s" in i["title"])
         self.assertIn(publish.OWNER_TARGET_TEXT, memory["body"])
         self.assertIn("Цель 4 667 316 KB задана для общего пика", memory["body"])
         self.assertIn("исправление памяти — отдельная задача", memory["body"])
-        self.assertNotIn("4 667 316", cpu["body"])
+        self.assertNotIn("4 667 316", work["body"])
         self.assertIn("абсолютный потолок: 7340032", memory["body"])
 
     def test_a_record_that_is_not_an_ancestor_says_so_and_promises_no_linear_range(self):
@@ -130,7 +130,7 @@ class OneIssuePerMetric(RecordPublish):
         self.assertIn(f"`{RECORD_SHA}..{CAND_SHA}`", created["body"])
 
     def test_the_record_holder_itself_has_an_empty_range_and_sends_the_search_to_the_environment(self):
-        self.set_record("graph_ready_cpu_s", sha=CAND_SHA)
+        self.set_record("graph_resolve_s", sha=CAND_SHA)
         self.publish(self.summary())
         [created] = self.issues()
         self.assertIn(f"Диапазон пуст: `{CAND_SHA}..{CAND_SHA}`", created["body"])
@@ -149,20 +149,20 @@ class OneIssuePerMetric(RecordPublish):
         self.set_record("graph_ready_s", 90.0, 0.01)             # the candidate's 100 is over it too
         saved = self.summary()
         entries = self.publish(saved)
-        self.assertEqual(self.actions(entries), [("create", 1, WALL), ("create", 2, CPU)])
+        self.assertEqual(self.actions(entries), [("create", 1, WALL), ("create", 2, WORK)])
         again = self.publish(self.summary(NEXT), date=NEXT)
-        self.assertEqual(self.actions(again), [("comment", 1, WALL), ("comment", 2, CPU)])
+        self.assertEqual(self.actions(again), [("comment", 1, WALL), ("comment", 2, WORK)])
         self.assertEqual(len(self.issues()), 2)
 
     def test_a_night_with_nothing_over_the_record_says_nothing_to_github(self):
-        self.set_record("graph_ready_cpu_s", 100.0, 0.01)
+        self.set_record("graph_resolve_s", 100.0, 0.01)
         self.assertEqual(self.publish(self.summary()), [])
         self.assertEqual(self.gh.calls(), [])
 
     def test_a_run_that_did_not_hold_blocks_the_record_without_a_number_and_opens_no_issue(self):
         set_mode(*self.modes.split(","), "cand=cand_crash")
         saved = self.summary()
-        row = next(r for r in saved["record"]["rows"] if r["metric"] == "graph_ready_cpu_s")
+        row = next(r for r in saved["record"]["rows"] if r["metric"] == "graph_resolve_s")
         self.assertEqual((row["outcome"], row["delta"]), ("block", None))
         self.assertEqual(self.publish(saved), [])
         self.assertEqual(self.gh.calls(), [])
@@ -177,91 +177,91 @@ class FindingTheOpenIssue(RecordPublish):
         self.assertEqual(self.issues()[0]["comments"], [], "the night that opened the issue is its first report")
         night_two = self.summary(NEXT)
         entries = self.publish(night_two, date=NEXT)
-        self.assertEqual(self.actions(entries), [("comment", 1, CPU)])
+        self.assertEqual(self.actions(entries), [("comment", 1, WORK)])
         [comment] = self.issues()[0]["comments"]
         self.assertIn(f"{publish.NIGHT_PREFIX}record-{NEXT}-{SHA_12}", self.lines(comment))
-        self.assertIn("Δ = +33.33%", comment)
+        self.assertIn("Δ = +18.67%", comment)
         twice = self.publish(night_two, date=NEXT)
         self.assertEqual([e["action"] for e in twice], ["commented"])
         self.assertEqual((len(self.issues()), len(self.issues()[0]["comments"])), (1, 1))
 
     def test_an_open_issue_without_the_perf_label_is_found_by_its_marker(self):
-        self.gh.set([issue(4, "об этом", keyed(CPU), labels=())], [])
+        self.gh.set([issue(4, "об этом", keyed(WORK), labels=())], [])
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("comment", 4, CPU)] + [("label", 4, CPU)] * 3)
+        self.assertEqual(self.actions(entries), [("comment", 4, WORK)] + [("label", 4, WORK)] * 3)
         self.assertEqual(len(self.issues()), 1)
         added = [a for a in self.writes() if a[:2] == ["issue", "edit"]]
         self.assertEqual([a[-1] for a in added], ["perf", "regression", "release-blocker"], "its labels are completed")
 
     def test_the_old_release_title_without_any_marker_is_found_and_gets_the_marker_in_a_comment(self):
-        self.gh.set([issue(9, "Ночной релиз 0.4.3: гейт провален по graph_ready_cpu", "ничего про ключ", labels=())], [])
+        self.gh.set([issue(9, "Ночной релиз 0.4.3: гейт провален по graph_resolve", "ничего про ключ", labels=())], [])
         entries = self.publish(self.summary())
         self.assertEqual([e["action"] for e in entries][:1], ["comment"])
         self.assertEqual({e["issue"] for e in entries}, {9})
         [comment] = self.issues()[0]["comments"]
-        self.assertIn(f"{publish.KEY_PREFIX}{CPU}", self.lines(comment), "so that the next search finds it by the key")
+        self.assertIn(f"{publish.KEY_PREFIX}{WORK}", self.lines(comment), "so that the next search finds it by the key")
         self.assertEqual(len(self.issues()), 1)
 
     def test_a_title_names_one_metric_and_not_the_ones_that_share_its_letters(self):
         self.set_record("graph_ready_s", 90.0, 0.01)
         self.gh.set([issue(3, "Ночной релиз 0.4.3: гейт провален по graph_ready", "x")], [])
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("comment", 3, WALL), ("create", 4, CPU)],
+        self.assertEqual(self.actions(entries), [("comment", 3, WALL), ("create", 4, WORK)],
                          "`graph_ready` is the wall; the work metric has its own issue")
         self.gh.set([issue(3, "Ночной релиз 0.4.3: гейт провален по graph_ready_cpu", "x")], [])
         entries = self.publish(self.summary(NEXT), date=NEXT)
-        self.assertEqual(self.actions(entries), [("create", 4, WALL), ("comment", 3, CPU)],
-                         "`graph_ready_cpu` is the work metric; the wall has its own issue")
+        self.assertEqual(self.actions(entries), [("create", 4, WALL), ("create", 5, WORK)],
+                         "`graph_ready_cpu` names no metric that judges; the wall has its own issue")
 
     def test_a_marker_that_lives_only_in_a_comment_is_found(self):
-        self.gh.set([issue(6, "обычный заголовок", "тело без ключа", comments=[f"ранее\n{publish.KEY_PREFIX}{CPU}\n"])], [])
+        self.gh.set([issue(6, "обычный заголовок", "тело без ключа", comments=[f"ранее\n{publish.KEY_PREFIX}{WORK}\n"])], [])
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("comment", 6, CPU)])
+        self.assertEqual(self.actions(entries), [("comment", 6, WORK)])
         self.assertEqual(len(self.issues()), 1)
 
     def test_a_match_on_the_second_page_is_not_missed(self):
         others = [issue(n, "другое", f"тело {n}") for n in range(1, 5)]
-        self.gh.set([*others, issue(5, "найди меня", keyed(CPU))], [], page_size=2)
+        self.gh.set([*others, issue(5, "найди меня", keyed(WORK))], [], page_size=2)
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("comment", 5, CPU)])
+        self.assertEqual(self.actions(entries), [("comment", 5, WORK)])
         pages = [c for c in self.gh.calls() if c["args"][:2] == ["api", "--paginate"]]
         self.assertEqual(pages[0]["args"][2], "repos/itrous/bsl-analyzer/issues?state=all&per_page=100")
         self.assertEqual(len(self.issues()), 5)
 
     def test_among_several_open_issues_the_lowest_number_gets_the_comment(self):
-        self.gh.set([issue(8, "второй", keyed(CPU)), issue(3, "первый", keyed(CPU))], [])
+        self.gh.set([issue(8, "второй", keyed(WORK)), issue(3, "первый", keyed(WORK))], [])
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("comment", 3, CPU)])
+        self.assertEqual(self.actions(entries), [("comment", 3, WORK)])
 
     def test_an_open_issue_beats_a_closed_one_and_a_pull_request_is_no_issue(self):
-        self.gh.set([issue(2, "закрыт", keyed(CPU), state="CLOSED", reason="COMPLETED"),
-                     issue(5, "pr", keyed(CPU), pull=True), issue(7, "открыт", keyed(CPU))], [])
+        self.gh.set([issue(2, "закрыт", keyed(WORK), state="CLOSED", reason="COMPLETED"),
+                     issue(5, "pr", keyed(WORK), pull=True), issue(7, "открыт", keyed(WORK))], [])
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("comment", 7, CPU)])
-        self.gh.set([issue(5, "pr", keyed(CPU), pull=True)], [])
+        self.assertEqual(self.actions(entries), [("comment", 7, WORK)])
+        self.gh.set([issue(5, "pr", keyed(WORK), pull=True)], [])
         entries = self.publish(self.summary(NEXT), date=NEXT)
-        self.assertEqual(self.actions(entries), [("create", 6, CPU)], "the pull request does not stand for the issue")
+        self.assertEqual(self.actions(entries), [("create", 6, WORK)], "the pull request does not stand for the issue")
 
     def test_an_issue_of_another_metric_is_not_merged_into_this_one(self):
-        self.gh.set([issue(2, "другая метрика", keyed("perf-ratchet/graph_resolve_s"))], [])
+        self.gh.set([issue(2, "другая метрика", keyed("perf-ratchet/diagnostics_workspace_s"))], [])
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("create", 3, CPU)])
+        self.assertEqual(self.actions(entries), [("create", 3, WORK)])
         self.assertEqual(self.issues()[0]["comments"], [])
 
     def test_an_issue_the_owner_closed_stays_closed_and_the_block_stays_in_the_report(self):
         for reason in publish.OWNER_CLOSED:
             with self.subTest(reason=reason):
-                self.gh.set([issue(7, "закрыт владельцем", keyed(CPU), state="CLOSED", reason=reason)], [])
+                self.gh.set([issue(7, "закрыт владельцем", keyed(WORK), state="CLOSED", reason=reason)], [])
                 saved = self.summary(f"2026-11-0{publish.OWNER_CLOSED.index(reason) + 1}")
                 self.assertEqual(saved["record"]["verdict"], "block")
                 entries = self.publish(saved)
-                self.assertEqual(self.actions(entries), [("closed", 7, CPU)])
+                self.assertEqual(self.actions(entries), [("closed", 7, WORK)])
                 self.assertEqual(self.writes(), [])
 
     def test_a_completed_issue_that_came_back_is_a_new_issue_that_names_the_old_one(self):
-        self.gh.set([issue(7, "решён", keyed(CPU), state="CLOSED", reason="COMPLETED")], [])
+        self.gh.set([issue(7, "решён", keyed(WORK), state="CLOSED", reason="COMPLETED")], [])
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("create", 8, CPU)])
+        self.assertEqual(self.actions(entries), [("create", 8, WORK)])
         self.assertIn("повтор #7", self.lines(self.issues()[1]["body"]))
 
 
@@ -281,7 +281,7 @@ class WhenGhFails(RecordPublish):
     def test_comments_that_cannot_be_read_do_not_end_in_a_duplicate(self):
         self.gh.set([issue(2, "другое", "тело")], ["issues/comments"])
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("gh-error", None, CPU)])
+        self.assertEqual(self.actions(entries), [("gh-error", None, WORK)])
         self.assertEqual(self.writes(), [])
         self.assertEqual(len(self.issues()), 1)
         self.assertIn("comments", self.notices()[0])
@@ -295,23 +295,23 @@ class WhenGhFails(RecordPublish):
     def test_a_create_and_a_comment_that_fail_are_errors_and_not_publications(self):
         self.gh.set([], ["issue create"])
         entries = self.publish(self.summary())
-        self.assertEqual(self.actions(entries), [("gh-error", None, CPU)])
+        self.assertEqual(self.actions(entries), [("gh-error", None, WORK)])
         self.assertEqual(self.issues(), [])
         self.assertEqual(len(self.notices()), 1)
-        self.gh.set([issue(4, "открыт", keyed(CPU), labels=publish.BLOCK_LABELS)], ["issue comment"])
+        self.gh.set([issue(4, "открыт", keyed(WORK), labels=publish.BLOCK_LABELS)], ["issue comment"])
         entries = self.publish(self.summary(NEXT), date=NEXT)
-        self.assertEqual(self.actions(entries), [("gh-error", 4, CPU)])
+        self.assertEqual(self.actions(entries), [("gh-error", 4, WORK)])
         self.assertEqual(self.issues()[0]["comments"], [])
         self.assertEqual(len(self.notices(NEXT)), 1)
 
     def test_a_text_with_a_path_of_the_private_corpus_is_refused_in_an_issue_and_in_a_comment(self):
         forbidden = ["data/gates/record-night"]
         entries = self.publish(self.summary(), forbidden)
-        self.assertEqual(self.actions(entries), [("refused", None, CPU)])
+        self.assertEqual(self.actions(entries), [("refused", None, WORK)])
         self.assertEqual(self.issues(), [])
-        self.gh.set([issue(4, "открыт", keyed(CPU), labels=publish.BLOCK_LABELS)], [])
+        self.gh.set([issue(4, "открыт", keyed(WORK), labels=publish.BLOCK_LABELS)], [])
         entries = self.publish(self.summary(NEXT), forbidden, date=NEXT)
-        self.assertEqual(self.actions(entries), [("refused", 4, CPU)])
+        self.assertEqual(self.actions(entries), [("refused", 4, WORK)])
         self.assertEqual(self.issues()[0]["comments"], [])
 
 
@@ -335,10 +335,10 @@ class IncomparableProfile(RecordPublish):
         self.assertNotIn("Δ =", created["body"])
         self.assertNotIn(RECORD_SHA, created["body"], "no range of commits is named for a profile")
         self.assertNotIn("/compare/", created["body"])
-        self.assertNotIn(CPU, created["body"], "with another kernel no metric issue claims an excess")
+        self.assertNotIn(WORK, created["body"], "with another kernel no metric issue claims an excess")
 
     def test_a_changed_kernel_under_the_very_sha_of_the_record_is_a_profile_and_not_an_empty_range(self):
-        self.set_record("graph_ready_cpu_s", sha=CAND_SHA)
+        self.set_record("graph_resolve_s", sha=CAND_SHA)
         before = self.baseline_bytes()
         entries = self.publish(self.mismatch())
         self.assertEqual(self.actions(entries), [("create", 1, PROFILE)])
@@ -354,12 +354,12 @@ class IncomparableProfile(RecordPublish):
         self.assertEqual(len(self.issues()), 1)
 
     def test_a_tolerance_that_is_missing_is_the_same_kind_of_issue(self):
-        self.set_record("graph_resolve_s", noise=None)
+        self.set_record("diagnostics_workspace_s", noise=None)
         entries = self.publish(self.summary())
-        self.assertEqual([e["key"] for e in entries], [CPU, PROFILE])
+        self.assertEqual([e["key"] for e in entries], [WORK, PROFILE])
         profile = next(i for i in self.issues() if i["labels"] == ["perf"])
-        self.assertEqual(profile["title"], "perf: рекорд несопоставим — record_no_noise:graph_resolve_s")
-        self.assertIn("record_no_noise:graph_resolve_s", profile["body"])
+        self.assertEqual(profile["title"], "perf: рекорд несопоставим — record_no_noise:diagnostics_workspace_s")
+        self.assertIn("record_no_noise:diagnostics_workspace_s", profile["body"])
 
 
 if __name__ == "__main__":

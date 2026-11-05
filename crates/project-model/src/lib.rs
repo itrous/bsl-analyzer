@@ -4557,7 +4557,29 @@ mod tests {
         std::time::Duration::from_secs(10 * 60)
     };
 
-    fn helper_program(response: &str, exit_code: i32) -> SearchPostgresCredentialHelperConfig {
+    /// A helper that reads the request line, writes `response` and exits with `exit_code`.
+    /// Windows has no `python3` to rely on, and `cmd` cannot take a JSON response as an
+    /// argument, so there the helper is a script in `dir` that prints a response file.
+    fn helper_program(
+        dir: &Path,
+        response: &str,
+        exit_code: i32,
+    ) -> SearchPostgresCredentialHelperConfig {
+        if cfg!(windows) {
+            let script = dir.join("helper.cmd");
+            std::fs::write(dir.join("response.txt"), response).unwrap();
+            std::fs::write(
+                &script,
+                format!(
+                    "@echo off\r\nset /p request=\r\ntype \"%~dp0response.txt\"\r\nexit /b {exit_code}\r\n"
+                ),
+            )
+            .unwrap();
+            return SearchPostgresCredentialHelperConfig {
+                program: Some("cmd".to_owned()),
+                args: vec!["/C".to_owned(), script.to_string_lossy().into_owned()],
+            };
+        }
         SearchPostgresCredentialHelperConfig {
             program: Some("python3".to_owned()),
             args: vec![
@@ -4679,7 +4701,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             snake.platform_help_selection(Path::new("/root")).unwrap(),
-            Some(PlatformHelpSelection::Installed { path: Some(PathBuf::from("/opt/1cv8/x")) })
+            Some(PlatformHelpSelection::Installed {
+                path: Some(std::path::absolute("/opt/1cv8/x").unwrap())
+            })
         );
         // No config file: relative paths resolve against the project root.
         let relative: ProjectConfig =
@@ -4687,7 +4711,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             relative.platform_help_selection(Path::new("/root")).unwrap(),
-            Some(PlatformHelpSelection::ExternalPath(PathBuf::from("/root/c.json")))
+            Some(PlatformHelpSelection::ExternalPath(std::path::absolute("/root/c.json").unwrap()))
         );
     }
 
@@ -6671,7 +6695,7 @@ extensions = [{ name = "T" }]
             "Allowed.bsl",
             "temp/Hidden.bsl",
             ".tool/Hidden.bsl",
-            "Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "Reports/R/Templates/T/Ext/Generated.bsl",
             "Reports/R/Ext/ObjectModule.bsl",
             "temporary/Visible.bsl",
         ] {
@@ -6703,15 +6727,14 @@ extensions = [{ name = "T" }]
         assert_eq!(without.len(), 6, "positive control: every file is scanned without patterns");
 
         let (with, project) = scan(
-            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/*.Queries.bsl\"]\n",
+            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/Generated.bsl\"]\n",
         );
         assert_eq!(
             with,
             ["Allowed.bsl", "Reports/R/Ext/ObjectModule.bsl", "temporary/Visible.bsl"]
         );
         assert!(project.is_source_excluded(&root.join("temp/Hidden.bsl")));
-        assert!(project
-            .is_source_excluded(&root.join("Reports/R/Templates/T/Ext/Template.Queries.bsl")));
+        assert!(project.is_source_excluded(&root.join("Reports/R/Templates/T/Ext/Generated.bsl")));
         assert!(!project.is_source_excluded(&root.join("temporary/Visible.bsl")));
     }
 
@@ -8111,13 +8134,14 @@ include = ["main", "extension:Sales"]
 
     #[test]
     fn resolve_postgres_url_invalid_helper_response_is_protocol_error() {
+        let dir = tempdir().unwrap();
         let config = SearchPostgresConfig {
             host: Some("localhost".to_owned()),
             dbname: Some("testdb".to_owned()),
             schema: Some("public".to_owned()),
             port: None,
             vault_role_base: Some("search/base".to_owned()),
-            credential_helper: helper_program("just-a-plain-line", 0),
+            credential_helper: helper_program(dir.path(), "just-a-plain-line", 0),
         };
         let result = resolve_postgres_url(&config, PostgresAccessMode::Reader);
         assert!(matches!(result, Err(ResolvePostgresUrlError::HelperProtocol { .. })));
@@ -8125,6 +8149,7 @@ include = ["main", "extension:Sales"]
 
     #[test]
     fn resolve_postgres_url_helper_returns_wrong_protocol() {
+        let dir = tempdir().unwrap();
         let config = SearchPostgresConfig {
             host: Some("localhost".to_owned()),
             dbname: Some("testdb".to_owned()),
@@ -8132,6 +8157,7 @@ include = ["main", "extension:Sales"]
             port: None,
             vault_role_base: Some("search/base".to_owned()),
             credential_helper: helper_program(
+                dir.path(),
                 r#"{"protocol":"wrong","ok":true,"url":"postgres://localhost:5432/testdb"}"#,
                 0,
             ),
@@ -8142,6 +8168,7 @@ include = ["main", "extension:Sales"]
 
     #[test]
     fn resolve_postgres_url_helper_returns_unsupported_scheme() {
+        let dir = tempdir().unwrap();
         let config = SearchPostgresConfig {
             host: Some("localhost".to_owned()),
             dbname: Some("testdb".to_owned()),
@@ -8149,6 +8176,7 @@ include = ["main", "extension:Sales"]
             port: None,
             vault_role_base: Some("search/base".to_owned()),
             credential_helper: helper_program(
+                dir.path(),
                 r#"{"protocol":"bsl-analyzer.postgres-helper.v1","ok":true,"url":"mysql://localhost:5432/testdb"}"#,
                 0,
             ),
@@ -8159,6 +8187,7 @@ include = ["main", "extension:Sales"]
 
     #[test]
     fn resolve_postgres_url_target_mismatch_host() {
+        let dir = tempdir().unwrap();
         let config = SearchPostgresConfig {
             host: Some("expected-host".to_owned()),
             dbname: Some("testdb".to_owned()),
@@ -8166,6 +8195,7 @@ include = ["main", "extension:Sales"]
             port: None,
             vault_role_base: Some("search/base".to_owned()),
             credential_helper: helper_program(
+                dir.path(),
                 r#"{"protocol":"bsl-analyzer.postgres-helper.v1","ok":true,"url":"postgres://different-host:5432/testdb","lease_id":"l1","renewable":false}"#,
                 0,
             ),
@@ -8176,6 +8206,7 @@ include = ["main", "extension:Sales"]
 
     #[test]
     fn resolve_postgres_url_target_mismatch_dbname() {
+        let dir = tempdir().unwrap();
         let config = SearchPostgresConfig {
             host: Some("localhost".to_owned()),
             port: Some(5433),
@@ -8183,6 +8214,7 @@ include = ["main", "extension:Sales"]
             schema: Some("public".to_owned()),
             vault_role_base: Some("search/base".to_owned()),
             credential_helper: helper_program(
+                dir.path(),
                 r#"{"protocol":"bsl-analyzer.postgres-helper.v1","ok":true,"url":"postgres://localhost:5433/other-db","lease_id":"l1","renewable":false}"#,
                 0,
             ),
@@ -8193,6 +8225,7 @@ include = ["main", "extension:Sales"]
 
     #[test]
     fn resolve_postgres_url_resolves_via_tiny_helper_program() {
+        let dir = tempdir().unwrap();
         let config = SearchPostgresConfig {
             host: Some("localhost".to_owned()),
             port: Some(5433),
@@ -8200,6 +8233,7 @@ include = ["main", "extension:Sales"]
             schema: Some("bsl_search".to_owned()),
             vault_role_base: Some("search/base".to_owned()),
             credential_helper: helper_program(
+                dir.path(),
                 r#"{"protocol":"bsl-analyzer.postgres-helper.v1","ok":true,"url":"postgres://user:pass@localhost:5433/mydb","lease_id":"vault/lease/123","expires_at":"2026-06-01T00:00:00Z","renewable":false}"#,
                 0,
             ),
@@ -8212,6 +8246,7 @@ include = ["main", "extension:Sales"]
 
     #[test]
     fn resolve_postgres_url_rejected_by_helper_is_terminal() {
+        let dir = tempdir().unwrap();
         let config = SearchPostgresConfig {
             host: Some("localhost".to_owned()),
             dbname: Some("testdb".to_owned()),
@@ -8219,6 +8254,7 @@ include = ["main", "extension:Sales"]
             port: None,
             vault_role_base: Some("search/base".to_owned()),
             credential_helper: helper_program(
+                dir.path(),
                 r#"{"protocol":"bsl-analyzer.postgres-helper.v1","ok":false,"error":{"code":"vault_access_denied","message":"role not allowed","retryable":false}}"#,
                 1,
             ),

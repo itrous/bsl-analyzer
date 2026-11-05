@@ -38,8 +38,9 @@ fn analyze_writes_sarif_report() {
 }
 
 /// The calculation-register recorder rule reaches the report as a warning, and only for the
-/// history of an employee: a table without parameters stays with the neighbouring rule, an
-/// explicit `<>` exclusion and a filter by the document's own recorder are not reported.
+/// history of an employee. A table without parameters stays with the neighbouring rule and is
+/// a warning too; an explicit `<>` exclusion and a filter by the document's own recorder are
+/// not reported.
 #[test]
 fn analyze_sarif_reports_the_calculation_register_recorder_rule_as_a_warning() {
     let temp = TempDir::new().expect("tempdir");
@@ -112,7 +113,7 @@ fn analyze_sarif_reports_the_calculation_register_recorder_rule_as_a_warning() {
     assert_eq!(
         of_rule("VirtualTableCallWithoutParameters"),
         [(
-            "error".to_owned(),
+            "warning".to_owned(),
             line_of("ИЗ РегистрРасчета.Начисления.ФактическийПериодДействия КАК Т") as u64
         )],
     );
