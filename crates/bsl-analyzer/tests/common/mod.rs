@@ -188,6 +188,11 @@ impl Lsp {
         if let Some(mode) = mode {
             command.args(["--mode", mode]);
         }
+        Self::start_unbounded_command(command, root, capabilities)
+    }
+
+    /// [`Self::start_unbounded`] that runs `command` as the LSP child.
+    pub fn start_unbounded_command(command: Command, root: &Path, capabilities: Value) -> Self {
         let mut lsp = Self::start_command(command, root, capabilities, test_utils::wait::NO_BOUND);
         lsp.unbounded = true;
         lsp
@@ -469,10 +474,13 @@ impl Lsp {
         Some(utime + stime)
     }
 
-    /// Takes in everything left of the server's output, until the last process holding it closes
-    /// it. Without a bound, so call it after the server has exited.
+    /// Takes in everything left of the server's output, the queued messages first, until the last
+    /// process holding it closes it. Without a bound, so call it after the server has exited.
     pub fn finish_output(&self) {
-        for message in self.messages.iter() {
+        let queued = std::mem::take(
+            &mut *self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for message in queued.into_iter().chain(self.messages.iter()) {
             self.note_seen(&message);
         }
     }
@@ -559,6 +567,13 @@ impl Lsp {
         }
     }
 
+    /// Blocks until `ready` holds, without taking in what the server sends meanwhile.
+    ///
+    /// See [`observe_messages`]; an error means the server closed its output first.
+    pub fn observe(&self, ready: impl FnMut() -> bool) -> Result<(), mpsc::RecvError> {
+        observe_messages(&self.messages, &self.pending, ready)
+    }
+
     /// A notification the server has no work for, sent only to reach its main loop.
     ///
     /// What an editor produces constantly and what a stand needs when its subject is
@@ -575,6 +590,15 @@ impl Lsp {
         phase: &str,
     ) -> Result<Option<std::process::ExitStatus>, String> {
         let pid = self.child.id();
+        // Without a bound nothing is judged by the clock, so the exit itself ends the wait.
+        if timeout == test_utils::wait::NO_BOUND {
+            return self.child.wait().map(Some).map_err(|error| {
+                format!(
+                    "LSP child {pid} phase {phase}: process wait failed: {error}; recent messages: {}",
+                    self.recent_methods()
+                )
+            });
+        }
         let deadline = std::time::Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
@@ -674,6 +698,26 @@ impl Lsp {
         };
         status
     }
+}
+
+/// Blocks until `ready` holds, checking it first and again after each new message from
+/// `messages`.
+///
+/// For a state the server records somewhere other than its output, such as a log file: what
+/// wakes the check is the next message, so the state has to be written before the server says
+/// anything that depends on it. Every message read here is queued on `pending` in arrival order,
+/// after what was already queued, so later waits still take each of them in once. Closed output
+/// before `ready` holds is the error.
+pub fn observe_messages(
+    messages: &Receiver<Value>,
+    pending: &std::sync::Mutex<std::collections::VecDeque<Value>>,
+    mut ready: impl FnMut() -> bool,
+) -> Result<(), mpsc::RecvError> {
+    while !ready() {
+        let message = messages.recv()?;
+        pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push_back(message);
+    }
+    Ok(())
 }
 
 impl Drop for Lsp {

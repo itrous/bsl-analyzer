@@ -204,7 +204,17 @@ async fn mcp_client_mode(root: &Path, mode: &str) -> (Client, Child) {
 }
 
 async fn mcp_client_with_args(root: &Path, mode: &str, extra: &[&str]) -> (Client, Child) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+    mcp_client_from(Path::new(env!("CARGO_BIN_EXE_bsl-analyzer-app")), root, mode, extra).await
+}
+
+/// [`mcp_client_with_args`] that runs `program` as the MCP proxy.
+async fn mcp_client_from(
+    program: &Path,
+    root: &Path,
+    mode: &str,
+    extra: &[&str],
+) -> (Client, Child) {
+    let mut command = Command::new(program);
     command
         .args(["mcp", "serve", "--profile", "workspace", "--mode", mode, "-s"])
         .arg(root)
@@ -328,8 +338,12 @@ fn cache_contains_file_named(cache: &Path, name: &str) -> bool {
         .any(|entry| entry.file_type().is_file() && entry.file_name().to_string_lossy() == name)
 }
 
-async fn mcp_client_mode_with_synthetic_stderr(root: &Path, mode: &str) -> (Client, Child) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+async fn mcp_client_mode_with_synthetic_stderr(
+    program: &Path,
+    root: &Path,
+    mode: &str,
+) -> (Client, Child) {
+    let mut child = Command::new(program)
         .args(["mcp", "serve", "--profile", "workspace", "--mode", mode, "-s"])
         .arg(root)
         .current_dir(root)
@@ -372,6 +386,37 @@ async fn mcp_client_mode_with_synthetic_stderr(root: &Path, mode: &str) -> (Clie
     }
 }
 
+/// A copy of the server executable that belongs to the test.
+///
+/// An LSP adapter that rebinds starts the next shared daemon from its own executable; started
+/// from the build output, the adapter fails that rebind once a build elsewhere replaces or
+/// deletes the file. Create it before [`isolated_backend_env`] so it drops after the guard has
+/// stopped the daemons that run from it.
+struct OwnedExecutable {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl OwnedExecutable {
+    fn copy() -> Self {
+        Self::copy_from(Path::new(env!("CARGO_BIN_EXE_bsl-analyzer-app")))
+    }
+
+    fn copy_from(source: &Path) -> Self {
+        let dir = tempfile::tempdir().expect("directory for the owned server executable");
+        let path = dir.path().join(source.file_name().expect("server executable file name"));
+        // `fs::copy` carries the permission bits over, the executable bit included.
+        std::fs::copy(source, &path).expect("copy the server executable");
+        Self { path, _dir: dir }
+    }
+
+    fn lsp(&self) -> StdCommand {
+        let mut command = StdCommand::new(&self.path);
+        command.arg("lsp");
+        command
+    }
+}
+
 fn isolated_backend_env(cache: &Path, runtime: &Path) -> EnvGuard {
     let mut env = EnvGuard { saved: Vec::new(), daemon_runtime: Some(runtime.to_path_buf()) };
     env.set("BSL_CACHE_DIR", cache);
@@ -398,8 +443,7 @@ fn isolated_backend_env(cache: &Path, runtime: &Path) -> EnvGuard {
 async fn wait_for_owner_initializers(runtime: &Path, count: usize) -> Vec<String> {
     loop {
         let markers = backend_markers(runtime);
-        let starts = markers.iter().filter(|line| line.contains("owner_init_start")).count();
-        if starts >= count {
+        if owner_starts(&markers) >= count {
             return markers;
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -409,15 +453,60 @@ async fn wait_for_owner_initializers(runtime: &Path, count: usize) -> Vec<String
 async fn wait_for_lsp_attach_in_epoch(runtime: &Path, epoch: &str) -> Vec<String> {
     loop {
         let markers = backend_markers(runtime);
-        if markers.iter().any(|line| {
-            line.contains("session_attached")
-                && trace_field(line, "owner_epoch") == Some(epoch)
-                && trace_field(line, "adapter") == Some("lsp")
-        }) {
+        if has_lsp_attach_in_epoch(&markers, epoch) {
             return markers;
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
+}
+
+/// The backend markers once `ready` holds for them, read again after each message the editor
+/// receives.
+///
+/// The daemon writes a session's markers before that session answers anything, so the message
+/// that follows them is what wakes the check; messages read here stay for the editor's later
+/// waits. An editor that closes its output first fails with `phase`, the last markers and its
+/// stderr.
+fn observe_backend_markers(
+    editor: &Lsp,
+    runtime: &Path,
+    phase: &str,
+    ready: impl Fn(&[String]) -> bool,
+) -> Result<Vec<String>, String> {
+    let mut markers = Vec::new();
+    match editor.observe(|| {
+        markers = backend_markers(runtime);
+        ready(&markers)
+    }) {
+        Ok(()) => Ok(markers),
+        Err(_) => Err(format!(
+            "LSP child {} phase {phase}: output closed before the backend markers matched; markers: {markers:#?}; stderr: {}",
+            editor.child.id(),
+            editor.stderr_text()
+        )),
+    }
+}
+
+#[track_caller]
+fn wait_for_backend_markers_from(
+    editor: &Lsp,
+    runtime: &Path,
+    phase: &str,
+    ready: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
+    observe_backend_markers(editor, runtime, phase, ready).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn owner_starts(markers: &[String]) -> usize {
+    markers.iter().filter(|line| line.contains("owner_init_start")).count()
+}
+
+fn has_lsp_attach_in_epoch(markers: &[String], epoch: &str) -> bool {
+    markers.iter().any(|line| {
+        line.contains("session_attached")
+            && trace_field(line, "owner_epoch") == Some(epoch)
+            && trace_field(line, "adapter") == Some("lsp")
+    })
 }
 
 fn owner_epochs(markers: &[String]) -> Vec<&str> {
@@ -577,6 +666,118 @@ fn failure_artifact_copy_finds_nested_shared_logs_and_skips_unrelated_files() {
     assert!(!destination.path().join("runtime-logs/private/nested/shared-example.txt").exists());
 }
 
+fn observed_queue(queued: &[Value]) -> std::sync::Mutex<std::collections::VecDeque<Value>> {
+    std::sync::Mutex::new(queued.iter().cloned().collect())
+}
+
+#[test]
+fn message_observation_fails_when_output_closes_before_the_state_holds() {
+    let (sender, messages) = mpsc::channel();
+    let pending = observed_queue(&[]);
+    sender.send(json!({"method": "window/logMessage"})).unwrap();
+    drop(sender);
+
+    assert!(common::observe_messages(&messages, &pending, || false).is_err());
+    assert_eq!(
+        Vec::from(pending.into_inner().unwrap()),
+        [json!({"method": "window/logMessage"})],
+        "the message read before the close stays for later waits"
+    );
+}
+
+#[test]
+fn message_observation_ends_on_a_state_that_already_holds_without_reading() {
+    let (sender, messages) = mpsc::channel::<Value>();
+    drop(sender);
+    let pending = observed_queue(&[json!({"id": 3})]);
+
+    // A closed channel fails any read, so success here means none was made.
+    assert!(common::observe_messages(&messages, &pending, || true).is_ok());
+    assert_eq!(Vec::from(pending.into_inner().unwrap()), [json!({"id": 3})]);
+}
+
+#[test]
+fn message_observation_keeps_every_message_in_order_until_the_state_holds() {
+    let (sender, messages) = mpsc::channel();
+    let (permit, permits) = mpsc::channel::<()>();
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let producer_state = std::sync::Arc::clone(&state);
+    // Each step waits for the observer's previous check, so the state changes only while the
+    // observer is between a failed check and its next read.
+    let producer = std::thread::spawn(move || {
+        permits.recv().unwrap();
+        sender.send(json!({"method": "window/logMessage"})).unwrap();
+        permits.recv().unwrap();
+        producer_state.store(true, std::sync::atomic::Ordering::SeqCst);
+        sender.send(json!({"method": "textDocument/publishDiagnostics"})).unwrap();
+        permits.recv().ok();
+    });
+    let pending = observed_queue(&[json!({"id": 3})]);
+    let mut checks = 0;
+
+    let observed = common::observe_messages(&messages, &pending, || {
+        checks += 1;
+        let ready = state.load(std::sync::atomic::Ordering::SeqCst);
+        permit.send(()).ok();
+        ready
+    });
+
+    assert!(observed.is_ok());
+    assert_eq!(checks, 3, "an unrelated message does not end the wait while the state is false");
+    drop(permit);
+    producer.join().unwrap();
+    assert!(messages.try_recv().is_err(), "every message sent was read into the queue");
+    assert_eq!(
+        Vec::from(pending.into_inner().unwrap()),
+        [
+            json!({"id": 3}),
+            json!({"method": "window/logMessage"}),
+            json!({"method": "textDocument/publishDiagnostics"}),
+        ],
+        "earlier queued messages stay first and each message is queued once in arrival order"
+    );
+}
+
+#[test]
+fn marker_observation_fails_with_the_phase_and_markers_when_the_editor_exits() {
+    // The scenarios that hold this lock point TMPDIR and the backend variables at their own
+    // runtime; the temporary directories and the child here must not inherit those.
+    let _environment = PROTOCOL_ENV_LOCK.blocking_lock();
+    let root = tempfile::tempdir().expect("disposable workspace");
+    let runtime = tempfile::tempdir().expect("disposable runtime without a daemon log");
+    // A stdio server starts no daemon, so it needs no owned executable.
+    let mut editor = Lsp::start_unbounded(root.path(), Some("stdio"), json!({}));
+    // `exit` without `shutdown` ends the server at once, before any marker can appear.
+    editor.send(json!({"jsonrpc": "2.0", "method": "exit"}));
+
+    let error = observe_backend_markers(&editor, runtime.path(), "exited editor", |markers| {
+        owner_starts(markers) >= 1
+    })
+    .expect_err("closed output ends the observation");
+
+    assert!(error.contains("phase exited editor"), "{error}");
+    assert!(error.contains("markers: []"), "{error}");
+    assert!(error.contains("stderr:"), "{error}");
+}
+
+#[test]
+fn finished_output_counts_each_observed_message_once() {
+    // The scenarios that hold this lock point TMPDIR and the backend variables at their own
+    // runtime; the temporary directories and the child here must not inherit those.
+    let _environment = PROTOCOL_ENV_LOCK.blocking_lock();
+    let root = tempfile::tempdir().expect("disposable workspace");
+    // A stdio server starts no daemon, so it needs no owned executable.
+    let mut editor = Lsp::start_unbounded(root.path(), Some("stdio"), json!({}));
+    editor.send(json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": null}));
+    editor.send(json!({"jsonrpc": "2.0", "method": "exit"}));
+
+    // Reads every message, the shutdown answer included, into the queue until the output closes.
+    assert!(editor.observe(|| false).is_err());
+    editor.finish_output();
+
+    assert_eq!(editor.answer_count(5), 1, "the queued shutdown answer is counted once");
+}
+
 fn trace_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     line.split_whitespace()
         .find_map(|part| part.strip_prefix(&format!("{name}=")))
@@ -685,9 +886,10 @@ fn request_until_ready(
     let mut id = first_id;
     loop {
         let response = editor.request(id, method, params.clone());
+        // ContentModified answers a request a change overtook: the editor asks again at once,
+        // and each attempt waits for its own answer, so the server paces the loop.
         if response["error"]["code"] == -32801 {
             id += 1;
-            std::thread::sleep(Duration::from_millis(50));
             continue;
         }
         return (response, id);
@@ -1401,6 +1603,7 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
         attach_order: "s19-scope-rebind",
         phase: "setup".to_owned(),
     };
+    let executable = OwnedExecutable::copy();
     let _env = isolated_backend_env(cache.path(), runtime.path());
     let config = root.path().join("bsl-analyzer.toml");
     let full_config = "[source]\nroot = \".\"\n[platform_help]\nsource = \"bundled\"\n[features]\nworkspaceDiagnostics = \"all\"\n";
@@ -1432,8 +1635,9 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
         }
     });
 
-    let (mcp, mut mcp_process) = mcp_client(root.path()).await;
-    let mut editor = Lsp::start_unbounded(root.path(), None, caps);
+    let (mcp, mut mcp_process) =
+        mcp_client_from(&executable.path, root.path(), "broker", &[]).await;
+    let mut editor = Lsp::start_unbounded_command(executable.lsp(), root.path(), caps);
     artifacts.checkpoint("MCP and LSP attached; initialized capabilities captured");
     let initial_caps = &editor.initialize_response["result"]["capabilities"];
     assert!(!initial_caps["diagnosticProvider"].is_null(), "pull diagnostics is announced");
@@ -1535,7 +1739,10 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
         1,
         "one terminal response was observed in the retirement event batch: {retirement_events:?}"
     );
-    let markers = wait_for_owner_initializers(runtime.path(), 2).await;
+    let markers =
+        wait_for_backend_markers_from(&editor, runtime.path(), "excluded scope owner", |markers| {
+            owner_starts(markers) >= 2
+        });
     let epochs = owner_epochs(&markers);
     assert_eq!(epochs.len(), 2, "scope change starts one new owner: {markers:?}");
     artifacts.checkpoint("excluded scope rebind completed");
@@ -1591,12 +1798,17 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
         "jsonrpc": "2.0", "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
     }));
-    let third_generation = wait_for_owner_initializers(runtime.path(), 3).await;
+    let third_generation =
+        wait_for_backend_markers_from(&editor, runtime.path(), "unexclude owner", |markers| {
+            owner_starts(markers) >= 3
+        });
     let third_epochs = owner_epochs(&third_generation);
     assert_eq!(third_epochs.len(), 3, "unexclude starts another validated owner");
     let third_epoch =
         third_epochs.iter().find(|epoch| !epochs.contains(epoch)).expect("unexclude owner epoch");
-    wait_for_lsp_attach_in_epoch(runtime.path(), third_epoch).await;
+    wait_for_backend_markers_from(&editor, runtime.path(), "unexclude LSP attach", |markers| {
+        has_lsp_attach_in_epoch(markers, third_epoch)
+    });
     artifacts.checkpoint("unexclude rebind completed");
     let (rebound_definition, rebound_definition_id) =
         request_definition_until_ready(&mut editor, 1000, &caller_uri, 1, call_character);
@@ -1658,6 +1870,7 @@ async fn dotenv_configuration_root_change_rebinds_shared_lsp_and_retires_mcp() {
         attach_order: "s19-dotenv-rebind",
         phase: "setup".to_owned(),
     };
+    let executable = OwnedExecutable::copy();
     let mut env = isolated_backend_env(cache.path(), runtime.path());
     env.remove("ONEC_CONFIGURATIONS_ROOT");
     for key in [
@@ -1719,10 +1932,11 @@ async fn dotenv_configuration_root_change_rebinds_shared_lsp_and_retires_mcp() {
         "project_model resolves source.configuration through the synthetic .env root: {}",
         resolved_configuration.display()
     );
-    let (mcp, mut mcp_process) = mcp_client_mode_with_synthetic_stderr(root.path(), "broker").await;
-    let mut editor = Lsp::start_unbounded(
+    let (mcp, mut mcp_process) =
+        mcp_client_mode_with_synthetic_stderr(&executable.path, root.path(), "broker").await;
+    let mut editor = Lsp::start_unbounded_command(
+        executable.lsp(),
         root.path(),
-        None,
         json!({"general": {"positionEncodings": ["utf-8"]}}),
     );
     editor.open(&caller, CALLER);
@@ -1739,7 +1953,10 @@ async fn dotenv_configuration_root_change_rebinds_shared_lsp_and_retires_mcp() {
         &store_a.join("UT11/1.0.0/CommonModules/ОбщийМодуль/Ext/Module.bsl"),
         "the extension buffer initially resolves into configuration A",
     );
-    let initial_markers = wait_for_owner_initializers(runtime.path(), 1).await;
+    let initial_markers =
+        wait_for_backend_markers_from(&editor, runtime.path(), "initial .env owner", |markers| {
+            owner_starts(markers) >= 1
+        });
     let initial_epochs = owner_epochs(&initial_markers);
     assert_eq!(initial_epochs.len(), 1, "one shared owner before .env edit");
     artifacts.checkpoint("shared owner attached using first synthetic .env root");
@@ -1749,20 +1966,19 @@ async fn dotenv_configuration_root_change_rebinds_shared_lsp_and_retires_mcp() {
         "jsonrpc": "2.0", "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&dotenv).unwrap()}}
     }));
-    let next_markers = wait_for_owner_initializers(runtime.path(), 2).await;
+    let next_markers =
+        wait_for_backend_markers_from(&editor, runtime.path(), ".env rebind owner", |markers| {
+            owner_starts(markers) >= 2
+        });
     let epochs = owner_epochs(&next_markers);
     assert_eq!(epochs.len(), 2, "a .env project input creates the validated next owner");
     assert_ne!(epochs[0], epochs[1], "the configuration-root change advances owner epoch");
     artifacts.checkpoint("synthetic .env changed configuration root and LSP rebound");
 
-    let attached_markers = loop {
-        let markers = backend_markers(runtime.path());
-        let attached = markers.iter().filter(|line| line.contains("session_attached")).count();
-        if attached >= 3 {
-            break markers;
-        }
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    };
+    let attached_markers =
+        wait_for_backend_markers_from(&editor, runtime.path(), ".env rebind attach", |markers| {
+            markers.iter().filter(|line| line.contains("session_attached")).count() >= 3
+        });
 
     let mcp_terminal =
         mcp.call_tool(CallToolRequestParams::new("symbol_info").with_arguments(Map::from_iter([
@@ -1804,7 +2020,10 @@ async fn dotenv_configuration_root_change_rebinds_shared_lsp_and_retires_mcp() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "необязательный тест: после починки конфига второй владелец может не появиться, и ожидание его маркера не кончится; детерминированного шва этой гонки нет; запуск под внешним пределом: timeout 900 cargo test -p bsl-analyzer --test shared_workspace_backend invalid_project_config_reports_error_and_keeps_last_good_shared_view -- --ignored --exact"]
+#[cfg_attr(
+    windows,
+    ignore = "необязательный тест: на Windows ожидание маркеров владельца не завершается — тест висит больше 60 с (CI job 128036073538, шаг Shared LSP and MCP owner and editor lifecycle отменён по timeout-minutes: 60); запуск: cargo test -p bsl-analyzer --test shared_workspace_backend invalid_project_config_reports_error_and_keeps_last_good_shared_view -- --ignored --exact"
+)]
 async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() {
     let _environment = PROTOCOL_ENV_LOCK.lock().await;
     let root = fixture();
@@ -1816,6 +2035,7 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
         attach_order: "s19-invalid-config-last-good",
         phase: "setup".to_owned(),
     };
+    let executable = OwnedExecutable::copy();
     let mut env = isolated_backend_env(cache.path(), runtime.path());
     env.set("BSL_LOG", "info,bsl_analyzer=debug");
     let config = root.path().join("bsl-analyzer.toml");
@@ -1830,7 +2050,7 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
             "semanticTokens": {"refreshSupport": true}
         }
     });
-    let mut editor = Lsp::start_unbounded(root.path(), None, caps);
+    let mut editor = Lsp::start_unbounded_command(executable.lsp(), root.path(), caps);
     let initial_caps = &editor.initialize_response["result"]["capabilities"];
     assert_eq!(initial_caps["positionEncoding"], "utf-8");
     assert!(!initial_caps["diagnosticProvider"].is_null());
@@ -1846,7 +2066,10 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
     editor.open(&caller, caller_buffer);
     artifacts.checkpoint("opening the target buffer");
     editor.open(&target, target_buffer);
-    let first_owner = wait_for_owner_initializers(runtime.path(), 1).await;
+    let first_owner =
+        wait_for_backend_markers_from(&editor, runtime.path(), "last-good owner", |markers| {
+            owner_starts(markers) >= 1
+        });
     assert_eq!(owner_epochs(&first_owner).len(), 1, "the last-good owner is established");
     let old_epoch = owner_epochs(&first_owner)[0].to_owned();
     let call_character = caller_buffer.lines().nth(1).unwrap().find("ЧисловоеЗначение").unwrap();
@@ -1927,7 +2150,10 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
         "jsonrpc": "2.0", "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
     }));
-    let repaired_markers = wait_for_owner_initializers(runtime.path(), 2).await;
+    let repaired_markers =
+        wait_for_backend_markers_from(&editor, runtime.path(), "repaired owner", |markers| {
+            owner_starts(markers) >= 2
+        });
     let repaired_epochs = owner_epochs(&repaired_markers);
     assert_eq!(
         repaired_epochs.len(),
@@ -1940,7 +2166,10 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
         .find(|epoch| *epoch != old_epoch)
         .expect("repair uses a new owner epoch");
     assert_ne!(new_epoch, old_epoch, "the frozen owner is not resumed");
-    let repaired_markers = wait_for_lsp_attach_in_epoch(runtime.path(), new_epoch).await;
+    let repaired_markers =
+        wait_for_backend_markers_from(&editor, runtime.path(), "repaired LSP attach", |markers| {
+            has_lsp_attach_in_epoch(markers, new_epoch)
+        });
     artifacts.checkpoint("valid repair attached the preserved LSP session to a new owner epoch");
 
     let refresh = editor.wait_for(|message| {
@@ -1957,14 +2186,6 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
         "the replacement keeps the server request ID sequence: {refresh}"
     );
     editor.send(json!({"jsonrpc": "2.0", "id": refresh["id"], "result": null}));
-    assert!(
-        editor
-            .wait_for_within(Duration::from_millis(250), |message| {
-                message["id"] == 1 && message["method"].is_null()
-            })
-            .is_none(),
-        "the same LSP process does not receive a second initialize response"
-    );
 
     let (recovered, last_request_id) = request_definition_until_ready(
         &mut editor,
@@ -2013,6 +2234,95 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
         "the preserved LSP session attaches once to the replacement owner: {repaired_markers:?}"
     );
     assert!(editor.shutdown(last_request_id + 1).success(), "repaired editor shuts down");
+    editor.finish_output();
+    assert_eq!(
+        editor.answer_count(1),
+        1,
+        "the same LSP process does not receive a second initialize response"
+    );
+}
+
+/// The adapter starts the next daemon from its own executable, so a rebind after that file is
+/// gone has nothing to start. Here the file the owned copy was made from is removed before the
+/// repair; a copy that still ran from it would end the adapter at the rebind and fail the
+/// marker wait with its stderr instead of reaching the new owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "необязательный тест: на Windows ожидание маркеров владельца не завершается — тест висит больше 60 с (CI job 128036073538, шаг Shared LSP and MCP owner and editor lifecycle отменён по timeout-minutes: 60); запуск: cargo test -p bsl-analyzer --test shared_workspace_backend shared_lsp_rebind_does_not_depend_on_the_file_its_executable_was_copied_from -- --ignored --exact"
+)]
+async fn shared_lsp_rebind_does_not_depend_on_the_file_its_executable_was_copied_from() {
+    let _environment = PROTOCOL_ENV_LOCK.lock().await;
+    let root = fixture();
+    let cache = tempfile::tempdir().expect("disposable cache");
+    let runtime = tempfile::tempdir().expect("disposable runtime");
+    let mut artifacts = FailureArtifacts {
+        root: root.path().to_path_buf(),
+        runtime: runtime.path().to_path_buf(),
+        attach_order: "s19-owned-executable-rebind",
+        phase: "setup".to_owned(),
+    };
+    let build_output = OwnedExecutable::copy();
+    let executable = OwnedExecutable::copy_from(&build_output.path);
+    let _env = isolated_backend_env(cache.path(), runtime.path());
+    let config = root.path().join("bsl-analyzer.toml");
+    let valid_config = "[source]\nroot = \".\"\n[platform_help]\nsource = \"bundled\"\n[features]\nworkspaceDiagnostics = \"all\"\n";
+    std::fs::write(&config, valid_config).unwrap();
+    let caps = json!({
+        "general": {"positionEncodings": ["utf-8", "utf-16"]},
+        "workspace": {"semanticTokens": {"refreshSupport": true}}
+    });
+    let mut editor = Lsp::start_unbounded_command(executable.lsp(), root.path(), caps);
+
+    let caller = root.path().join("CommonModules/Потребитель/Ext/Module.bsl");
+    editor.open(
+        &caller,
+        "Функция Проверить() Экспорт\n    Возврат ОбщийМодуль.ЧисловоеЗначение();\nКонецФункции\n",
+    );
+    let first_owner =
+        wait_for_backend_markers_from(&editor, runtime.path(), "first owner", |markers| {
+            owner_starts(markers) >= 1
+        });
+    let old_epoch = owner_epochs(&first_owner)[0].to_owned();
+    artifacts
+        .checkpoint("the adapter runs from the owned copy; removing the file it was copied from");
+    std::fs::remove_file(&build_output.path).expect("remove the file the owned copy came from");
+
+    std::fs::write(&config, "[source\nthis is invalid\n").unwrap();
+    editor.send(json!({
+        "jsonrpc": "2.0", "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
+    }));
+    editor.wait_for(|message| {
+        message["method"] == "window/showMessage"
+            && message["params"]["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("project config reload failed"))
+    });
+    std::fs::write(&config, valid_config).unwrap();
+    editor.send(json!({
+        "jsonrpc": "2.0", "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
+    }));
+    let repaired =
+        wait_for_backend_markers_from(&editor, runtime.path(), "repaired owner", |markers| {
+            owner_starts(markers) >= 2
+        });
+    let new_epoch = owner_epochs(&repaired)
+        .into_iter()
+        .find(|epoch| *epoch != old_epoch)
+        .expect("the repair starts a new owner")
+        .to_owned();
+    wait_for_backend_markers_from(&editor, runtime.path(), "repaired LSP attach", |markers| {
+        has_lsp_attach_in_epoch(markers, &new_epoch)
+    });
+    artifacts.checkpoint("the adapter started the next owner after its copy source was removed");
+
+    let refresh = editor.wait_for(|message| {
+        message["method"] == "workspace/semanticTokens/refresh" && message["id"].is_number()
+    });
+    editor.send(json!({"jsonrpc": "2.0", "id": refresh["id"], "result": null}));
+    assert!(editor.shutdown(100).success(), "the rebound editor shuts down");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

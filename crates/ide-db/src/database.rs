@@ -3335,6 +3335,11 @@ impl hir::ConfigsDatabase for RootDatabaseImpl {
                 // above all) hang off `module_metadata`, so one representative
                 // still pays for them here rather than inside the pool.
                 let _ = hir::DefDatabase::module_metadata(self, *module);
+                // Inference resolves global names over every root the module sees, not
+                // only its own; a root reached only that way would otherwise load first
+                // inside a pool job, where the loader's `rayon::scope` lets the waiting
+                // worker steal a sibling job that carries another database clone.
+                let _ = RootDatabase::get_all_configurations(self, module.file_id);
             }
         }
     }

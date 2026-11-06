@@ -1777,9 +1777,13 @@ mod tests {
         let terminal_dir = tempfile::tempdir().unwrap();
         let old = crate::workspace_lease::WorkspaceLease::claim(terminal_dir.path());
         state.workspace_lease = old.clone();
+        // The lease's own heartbeat refreshes ownership every second under this lock; holding it
+        // keeps that refresh from latching the takeover before the cached view is checked.
+        let mut verdict = old.hold_lifecycle_lock_for_test();
         let newer = crate::workspace_lease::WorkspaceLease::claim(terminal_dir.path());
-        old.invalidate_verdict_for_test();
         assert!(!state.superseded(), "the cached view performs no ownership refresh");
+        *verdict = None;
+        drop(verdict);
         assert!(!old.owns_caches(), "the heartbeat-owned refresh observes takeover");
         assert!(state.superseded(), "the refreshed live foreign token is terminal");
         newer.release();
