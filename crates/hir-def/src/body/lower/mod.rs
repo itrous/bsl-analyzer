@@ -458,6 +458,19 @@ pub fn lower_method_with_externals(
             });
         }
 
+        // The 8.3.27 compiler rejects a function declared as `Найти` with «Ожидается имя
+        // функции». No other built-in name is known to be rejected, so the set is this one
+        // RU/EN pair rather than the platform's global function catalog.
+        if is_function
+            && token.kind() == SyntaxKind::IDENT
+            && matches!(name_text.fold_lower().as_str(), "найти" | "find")
+        {
+            ctx.emit(BodyDiagnostic::BuiltinFunctionNameAsDeclaration {
+                name: name_text.to_string(),
+                range: token.text_range(),
+            });
+        }
+
         if is_global_context_collision_8312(name_text) {
             ctx.emit(BodyDiagnostic::GlobalContextMethodCollision8312 {
                 method_name: name_text.to_string(),

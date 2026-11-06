@@ -3,6 +3,7 @@ pub mod ambiguous_field_in_query;
 pub mod assign_alias_fields_in_query;
 pub mod bad_words;
 pub mod begin_transaction_before_try_catch;
+pub mod builtin_function_name_as_declaration;
 pub mod cached_public;
 pub mod calculation_register_virtual_table_without_recorder;
 pub mod canonical_spelling_keywords;
@@ -323,6 +324,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::ReservedParameterNames => Some(&reserved_parameter_names::METADATA),
         DiagnosticCode::ReservedWordAsMethodName => Some(&reserved_word_as_method_name::METADATA),
+        DiagnosticCode::BuiltinFunctionNameAsDeclaration => {
+            Some(&builtin_function_name_as_declaration::METADATA)
+        }
         DiagnosticCode::RewriteMethodParameter => Some(&rewrite_method_parameter::METADATA),
         DiagnosticCode::UnusedLocalMethod => Some(&unused_local_method::METADATA),
         DiagnosticCode::ExportVariables => Some(&export_variables::METADATA),

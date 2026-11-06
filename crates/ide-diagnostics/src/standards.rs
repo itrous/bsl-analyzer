@@ -99,6 +99,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         // Проверяемое требование — std640 «Параметры процедур и функций»; остальные поясняют контекст.
         DiagnosticCode::ReservedParameterNames => &[640, 454],
         DiagnosticCode::ReservedWordAsMethodName => &[],
+        DiagnosticCode::BuiltinFunctionNameAsDeclaration => &[],
         DiagnosticCode::RewriteMethodParameter => &[],
         DiagnosticCode::UnusedLocalVariable => &[],
         DiagnosticCode::UnusedLocalMethod => &[456],

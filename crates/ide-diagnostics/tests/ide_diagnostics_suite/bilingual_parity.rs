@@ -149,6 +149,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     (DiagnosticCode::MissingReturnedValueDescription, "documentation diagnostic"),
     (DiagnosticCode::ReservedParameterNames, "reserved-name convention diagnostic"),
     (DiagnosticCode::ReservedWordAsMethodName, "reserved keyword diagnostic"),
+    (
+        DiagnosticCode::BuiltinFunctionNameAsDeclaration,
+        "fixed RU/EN name pair; message keeps the declared spelling",
+    ),
     (DiagnosticCode::RewriteMethodParameter, "parameter reassignment diagnostic"),
     (DiagnosticCode::UnusedLocalVariable, "dataflow liveness diagnostic"),
     (DiagnosticCode::UnusedLocalMethod, "symbol liveness diagnostic"),
@@ -732,7 +736,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 213, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 214, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

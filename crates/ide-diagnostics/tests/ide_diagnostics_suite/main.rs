@@ -3,6 +3,7 @@
 
 mod ambiguous_field_in_query;
 mod bilingual_parity;
+mod builtin_function_name_as_declaration;
 mod common_attributes_in_query;
 mod data_exchange_and_unused_method_fixes;
 mod diagnostic_quick_fixes;
