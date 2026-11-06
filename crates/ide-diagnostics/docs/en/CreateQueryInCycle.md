@@ -73,6 +73,11 @@ is unknown or mixed with other types, when the call could not be resolved, or fo
 module or a call by string. No finding does not mean the code stays away from the database.
 `ExecuteBatchWithIntermediateData` is not counted.
 
+A finding on a call to a local method from which a query execution is reachable carries its own
+code, `LocalCallWithQueryInCycle`, with a lower severity
+(see [LocalCallWithQueryInCycle](LocalCallWithQueryInCycle.md)); this code keeps the query execution
+itself in a loop body.
+
 ## A justified exception
 
 The standard allows justified exceptions. When a query in a helper is intended, suppress that
@@ -94,14 +99,15 @@ does not clear the finding. When a helper has two executions and one is suppress
 their findings because of the other.
 
 A suppression in the calling code hides only the finding at that place and does not clear the helper
-for other callers:
+for other callers. The finding on the call is reported as `LocalCallWithQueryInCycle`, so the directive
+names that code:
 
 ```bsl
-// bsl-analyzer:off CreateQueryInCycle
+// bsl-analyzer:off LocalCallWithQueryInCycle
 For Each Item In Items Do
     Read();
 EndDo;
-// bsl-analyzer:on CreateQueryInCycle
+// bsl-analyzer:on LocalCallWithQueryInCycle
 ```
 
 A directive on the loop header alone does not suppress the other lines of the body. An `off` without a

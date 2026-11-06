@@ -110,7 +110,7 @@ pub(crate) const SUPPRESSION_DIAGNOSTICS: &[DiagnosticCode] =
 /// `module_diagnostics` and the base-aware passes. Only the coverage-invariant test consumes this.
 #[cfg(test)]
 pub(crate) const INFERENCE_FOLD_DIAGNOSTICS: &[DiagnosticCode] =
-    &[DiagnosticCode::CreateQueryInCycle];
+    &[DiagnosticCode::CreateQueryInCycle, DiagnosticCode::LocalCallWithQueryInCycle];
 
 pub fn run_diagnostic<F>(
     name: &'static str,
