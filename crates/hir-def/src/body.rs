@@ -720,6 +720,11 @@ pub enum BodyDiagnostic<R = TextRange> {
         range: R,
     },
 
+    BuiltinFunctionNameAsDeclaration {
+        name: String,
+        range: R,
+    },
+
     RedundantAccessToObject {
         kind: RedundantAccessKind,
         range: R,
@@ -994,6 +999,9 @@ impl<R> BodyDiagnostic<R> {
             }
             BodyDiagnostic::ReservedWordAsMethodName { name, range } => {
                 BodyDiagnostic::ReservedWordAsMethodName { name, range: f(range) }
+            }
+            BodyDiagnostic::BuiltinFunctionNameAsDeclaration { name, range } => {
+                BodyDiagnostic::BuiltinFunctionNameAsDeclaration { name, range: f(range) }
             }
             BodyDiagnostic::RedundantAccessToObject { kind, range } => {
                 BodyDiagnostic::RedundantAccessToObject { kind, range: f(range) }
@@ -1329,6 +1337,7 @@ impl<R: Copy> BodyDiagnostic<R> {
             BodyDiagnostic::OSUsersMethod { range } => *range,
             BodyDiagnostic::ProcedureReturnsValue { range } => *range,
             BodyDiagnostic::ReservedWordAsMethodName { range, .. } => *range,
+            BodyDiagnostic::BuiltinFunctionNameAsDeclaration { range, .. } => *range,
             BodyDiagnostic::RedundantAccessToObject { range, .. } => *range,
             BodyDiagnostic::StyleElementConstructors { range, .. } => *range,
             BodyDiagnostic::TempFilesDir { range, .. } => *range,

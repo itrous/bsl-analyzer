@@ -66,6 +66,7 @@ pub enum DiagnosticCode {
     MissingReturnedValueDescription,
     ReservedParameterNames,
     ReservedWordAsMethodName,
+    BuiltinFunctionNameAsDeclaration,
     RewriteMethodParameter,
     UnusedLocalVariable,
     UnusedLocalMethod,
