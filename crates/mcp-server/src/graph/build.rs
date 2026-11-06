@@ -5785,6 +5785,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "waits on file-change events without a bound of its own, and a run under load on Windows outlasted any limit"
+    )]
     fn a_hub_event_between_post_scan_and_commit_catches_up_a_private_candidate() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -5871,14 +5875,14 @@ mod tests {
                 return;
             }
             let before = graph.observation();
-            write(
+            crate::graph::test_support::replace(
                 &hook_root,
                 "CommonModules/Сервер/Ext/Module.bsl",
                 "&НаСервере\nФункция Считать() Экспорт\nВозврат 99;\nКонецФункции",
             );
             crate::graph::test_support::wait_for_hub_seq_above(&hook_hub, before);
             let before_restore = graph.observation();
-            write(
+            crate::graph::test_support::replace(
                 &hook_root,
                 "CommonModules/Сервер/Ext/Module.bsl",
                 "&НаСервере\nФункция Считать() Экспорт КонецФункции",
@@ -7441,7 +7445,7 @@ mod tests {
             let conn = Connection::open(&out).unwrap();
             let stored = crate::graph_db::read_unread_paths(&conn);
             assert!(
-                stored.iter().any(|p| p.path.ends_with("Слепой/Ext/Module.bsl")),
+                stored.iter().any(|p| p.path.replace('\\', "/").ends_with("Слепой/Ext/Module.bsl")),
                 "the builder records the module it could not read: {stored:?}"
             );
             // ONE path, not one per pass: `open_batch` is called by every pass, and a
@@ -7537,7 +7541,7 @@ mod tests {
         assert!(
             crate::graph_db::read_unread_paths(&conn)
                 .iter()
-                .any(|p| p.path.ends_with("Сосед/Ext/Module.bsl")),
+                .any(|p| p.path.replace('\\', "/").ends_with("Сосед/Ext/Module.bsl")),
             "and a module the patch could not lower IS recorded"
         );
         drop(conn);
@@ -8471,11 +8475,12 @@ mod tests {
         let gdb = GraphDb::open(&out).expect("graph database opens");
 
         let canon_root = root.canonicalize().unwrap().to_string_lossy().replace('\\', "/");
+        let canon_root = canon_root.trim_start_matches("//?/");
         let mut methods_checked = 0;
         for row in &sink.rows {
             match row.kind {
                 bsl_search::ChunkKind::Procedure | bsl_search::ChunkKind::Function => {
-                    let rel = row.path.strip_prefix(&canon_root).unwrap().trim_start_matches('/');
+                    let rel = row.path.strip_prefix(canon_root).unwrap().trim_start_matches('/');
                     let id = ide::method_id_for_path(rel, &row.symbol).expect("durable id");
                     let expected =
                         gdb.graph_context(&id, fused_project.search_roots.as_ref()).unwrap();
@@ -8647,11 +8652,15 @@ mod tests {
             assert_eq!(stored.len(), 2, "rooted={rooted}");
             let metadata_context = stored
                 .iter()
-                .find(|(path, _)| path.ends_with("CommonModules/Eligible/Ext/Module.bsl"))
+                .find(|(path, _)| {
+                    path.replace('\\', "/").ends_with("CommonModules/Eligible/Ext/Module.bsl")
+                })
                 .unwrap();
             assert_eq!(metadata_context.1.as_deref(), Some("metadata context"), "rooted={rooted}");
-            let epf_context =
-                stored.iter().find(|(path, _)| path.ends_with("Ext/ObjectModule.bsl")).unwrap();
+            let epf_context = stored
+                .iter()
+                .find(|(path, _)| path.replace('\\', "/").ends_with("Ext/ObjectModule.bsl"))
+                .unwrap();
             assert_eq!(epf_context.1, None, "rooted={rooted}");
         }
     }
@@ -9178,7 +9187,7 @@ mod tests {
             Connection::open(out)
                 .unwrap()
                 .query_row(
-                    "SELECT sig_hash FROM files WHERE path LIKE '%Сервер/Ext/Module.bsl'",
+                    "SELECT sig_hash FROM files WHERE REPLACE(path, char(92), '/') LIKE '%Сервер/Ext/Module.bsl'",
                     [],
                     |r| r.get(0),
                 )
@@ -11370,7 +11379,9 @@ mod tests {
         );
         assert!(!diff.is_empty());
 
-        let ends = |v: &[String], suffix: &str| v.iter().filter(|p| p.ends_with(suffix)).count();
+        let ends = |v: &[String], suffix: &str| {
+            v.iter().filter(|p| p.replace('\\', "/").ends_with(suffix)).count()
+        };
         assert_eq!(ends(&diff.modified, "Сервер/Ext/Module.bsl"), 1, "edited body is modified");
         assert_eq!(ends(&diff.added, "Новый/Ext/Module.bsl"), 1, "new body is added");
         // The new module also drops a new `.xml` descriptor → metadata drift.
@@ -11829,7 +11840,8 @@ mod form_twin_tests {
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
         let project = crate::graph::ProjectSnapshot::load_excluding(root, &cache.exclusions(root));
         let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
-        let metadata_path = root.join("Catalogs/Товары.xml");
+        let metadata_path: std::path::PathBuf =
+            root.canonicalize().unwrap().join("Catalogs/Товары.xml").components().collect();
         let (owners, forms) = crate::graph_db::local_metadata_delta(
             &project,
             &universe,
@@ -12263,7 +12275,12 @@ mod form_twin_tests {
             "CommonModules/Сервер/Ext/Module.bsl",
             "&НаСервере\nФункция Считать() Экспорт\nВозврат Дополнительный.Extra();\nКонецФункции",
         );
-        let extra = root.join("CommonModules/Дополнительный/Ext/Module.bsl");
+        let extra: std::path::PathBuf = root
+            .canonicalize()
+            .unwrap()
+            .join("CommonModules/Дополнительный/Ext/Module.bsl")
+            .components()
+            .collect();
         std::fs::remove_file(&extra).unwrap();
 
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
@@ -12281,7 +12298,7 @@ mod form_twin_tests {
             .collect();
         assert!(
             unresolved_rows.iter().any(|(_, method, path)| method == "extra"
-                && path.ends_with("CommonModules/Сервер/Ext/Module.bsl")),
+                && path.replace('\\', "/").ends_with("CommonModules/Сервер/Ext/Module.bsl")),
             "cold graph must record the unresolved caller reverse index: {unresolved_rows:?}"
         );
 

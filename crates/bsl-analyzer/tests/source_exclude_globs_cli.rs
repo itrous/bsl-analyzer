@@ -10,7 +10,7 @@ const FILES: [&str; 6] = [
     "Allowed.bsl",
     "temp/Hidden.bsl",
     ".tool/Hidden.bsl",
-    "Reports/R/Templates/T/Ext/Template.Queries.bsl",
+    "Reports/R/Templates/T/Ext/Generated.bsl",
     "Reports/R/Ext/ObjectModule.bsl",
     "temporary/Visible.bsl",
 ];
@@ -59,7 +59,7 @@ fn files_with_findings(stdout: &str) -> Vec<&'static str> {
 #[test]
 fn analyze_command_leaves_out_files_matched_by_exclude_globs() {
     let dir = project(
-        "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/*.Queries.bsl\"]\n",
+        "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/Generated.bsl\"]\n",
     );
 
     let output = analyze(dir.path());

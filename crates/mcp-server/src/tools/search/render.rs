@@ -1463,6 +1463,10 @@ mod tests {
     /// graph keys common modules by name. Anchored with the configuration, an extension's form
     /// module would be named `src/cf/<путь расширения>`: a path that exists in neither root.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "the fixture spells POSIX absolute paths, which are not absolute on Windows"
+    )]
     fn an_extension_hit_is_anchored_with_its_own_root() {
         let roots = roots_with_an_extension();
         let graph_root = ide::StripRoot::pinned(Path::new("/repo"));
@@ -1522,6 +1526,10 @@ mod tests {
     /// it that way come from an external baseline serving while the engine is still building,
     /// and a path built from this workspace's root is not theirs to carry.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "the fixture spells POSIX absolute paths, which are not absolute on Windows"
+    )]
     fn without_a_root_table_both_spellings_answer_as_before() {
         let graph_root = ide::StripRoot::pinned(Path::new("/repo"));
         let mut absolute = code_hit(
@@ -1550,6 +1558,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "the fixture spells POSIX absolute paths, which are not absolute on Windows"
+    )]
     fn graph_id_bridges_method_hits_in_modules() {
         let roots = roots_with_an_extension();
         let engine_root = &roots;

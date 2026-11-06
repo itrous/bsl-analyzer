@@ -264,6 +264,14 @@ impl AnalysisProvider for SalsaProvider<'_> {
         hir::type_sets_overlap(self.db, left, right)
     }
 
+    fn kernel_union_member_labels(
+        &self,
+        id: bsl_types::kind::TypeId,
+        locale: base_db::Locale,
+    ) -> Option<Vec<String>> {
+        hir::kernel_union_member_labels(self.db, id, locale)
+    }
+
     fn kernel_type_includes_undefined(&self, id: bsl_types::kind::TypeId) -> bool {
         hir::kernel_type_includes_undefined(self.db, id)
     }

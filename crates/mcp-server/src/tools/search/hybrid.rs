@@ -742,6 +742,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "posix-fixture: the credential helper is an sh script")]
     fn code_search_surfaces_retry_exhausted_external_baseline_errors() {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
@@ -771,7 +772,7 @@ pub(super) mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR, "{}", error.message);
         assert!(error.message.contains("external baseline error"));
         assert_eq!(
             error
@@ -784,6 +785,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "posix-fixture: the credential helper is an sh script")]
     fn code_search_surfaces_retry_exhausted_errors_for_empty_queries() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("workspace-search.db");
@@ -807,7 +809,7 @@ pub(super) mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR, "{}", error.message);
         assert_eq!(
             error
                 .data

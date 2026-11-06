@@ -226,11 +226,12 @@ mod tests {
     /// auto-updating launcher.
     #[test]
     fn resolve_binary_prefers_launcher_over_app() {
+        let launcher = std::env::temp_dir().join("bsl-analyzer").to_string_lossy().into_owned();
         let bin = super::resolve_binary(
-            Some("/home/u/.local/bin/bsl-analyzer".to_owned()),
+            Some(launcher.clone()),
             Some("/home/u/.bsl-analyzer/bin/bsl-analyzer-app".to_owned()),
         );
-        assert_eq!(bin, "/home/u/.local/bin/bsl-analyzer");
+        assert_eq!(bin, launcher);
     }
 
     /// Without the launcher env (or with it empty), it falls back to the running app

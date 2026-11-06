@@ -15,7 +15,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Standard, MetadataTag::Lockinos],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
     clean_code_attribute: CleanCodeAttribute::Adaptable,
 };
 
@@ -139,13 +139,13 @@ mod tests {
             expect![[r#"
                 UsingObjectNotAvailableUnix @ 4:12..4:55
                   message: Проверить, что задействованы аналоги "COMОбъект" при работе в Unix-клиенте.
-                  severity: Critical
+                  severity: Warning
                 UsingObjectNotAvailableUnix @ 5:12..5:84
                   message: Проверить, что задействованы аналоги "COMОбъект" при работе в Unix-клиенте.
-                  severity: Critical
+                  severity: Warning
                 UsingObjectNotAvailableUnix @ 21:10..21:21
                   message: Проверить, что задействованы аналоги "Почта" при работе в Unix-клиенте.
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -162,7 +162,7 @@ mod tests {
             expect![[r#"
                 UsingObjectNotAvailableUnix @ 3:11..3:34
                   message: Проверить, что задействованы аналоги "COMОбъект" при работе в Unix-клиенте.
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -179,7 +179,7 @@ mod tests {
             expect![[r#"
                 UsingObjectNotAvailableUnix @ 3:13..3:24
                   message: Проверить, что задействованы аналоги "Почта" при работе в Unix-клиенте.
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -276,7 +276,7 @@ mod tests {
             expect![[r#"
                 UsingObjectNotAvailableUnix @ 3:9..3:17
                   message: Проверить, что задействованы аналоги "Mail" при работе в Unix-клиенте.
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -293,7 +293,7 @@ mod tests {
             expect![[r#"
                 UsingObjectNotAvailableUnix @ 3:11..3:32
                   message: Проверить, что задействованы аналоги "COMObject" при работе в Unix-клиенте.
-                  severity: Critical"#]],
+                  severity: Warning"#]],
         );
     }
 

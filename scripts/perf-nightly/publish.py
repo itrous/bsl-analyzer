@@ -389,11 +389,15 @@ def ratchet_facts(group: dict, saved: dict, ancestor) -> list[str]:
     row = group["row"]
     record, candidate = row["record"], row["candidate"]
     ceiling = next((c["limit"] for c in saved.get("ceilings") or [] if c["metric"] == row["metric"]), None)
+    limit = f"предел по бару 5 %, шум отсутствует: {_exact(row['limit'])}" if row["noise"] is None else \
+        f"ν = {row['noise'] * 100:.2f}%; предел R·(1+ν) = {_exact(row['limit'])}"
     lines = [f"Метрика: {row['metric']}, {row['unit']}, агрегат {row['aggregate']}.",
              f"Рекорд R = {_exact(record['value'])}; кандидат C = {_exact(candidate['value'])}.",
-             f"Δ = {row['delta'] * 100:+.2f}%; ν = {row['noise'] * 100:.2f}%; предел R·(1+ν) = {_exact(row['limit'])}; "
-             f"абсолютный потолок: {_exact(ceiling)}.",
+             f"Δ = {row['delta'] * 100:+.2f}%; {limit}; абсолютный потолок: {_exact(ceiling)}.",
              f"SHA рекордсмена: {record['sha']}; develop: {sha}."]
+    if row.get("basis") == "growth_not_repaid":
+        wall = "недоступна" if row["wall_delta"] is None else f"{row['wall_delta'] * 100:+.2f}%"
+        lines.append(f"Размен не выполнен: Δ стены против рекорда {wall} в том же раунде не окупает Δ метрики.")
     if (record.get("evidence") or {}).get("kind") == "owner_target":
         lines.append(OWNER_TARGET_TEXT)
     return lines + _candidates_text(record["sha"], sha, ancestor) + _profile_lines(saved) + \

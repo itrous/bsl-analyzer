@@ -97,13 +97,13 @@ class RecordNight(RecordCase):
         self.assertEqual(self.baseline_bytes(), before)
 
     def test_a_night_over_the_record_is_a_block_that_names_the_excess(self):
-        self.set_record("graph_ready_cpu_s", 30.0, 0.01)
+        self.set_record("graph_resolve_s", 15.0, 0.01)
         result = self.measure()
         self.assertEqual((result["verdict"], result["record_verdict"]), ("block", "block"))
-        self.assertIn("block: record:graph_ready_cpu_s", result["reasons"])
-        row = next(r for r in self.saved(result)["record"]["rows"] if r["metric"] == "graph_ready_cpu_s")
-        self.assertEqual((row["outcome"], row["candidate"]["value"]), ("block", 40.0))
-        self.assertAlmostEqual(row["delta"], 1 / 3)
+        self.assertIn("block: record:graph_resolve_s", result["reasons"])
+        row = next(r for r in self.saved(result)["record"]["rows"] if r["metric"] == "graph_resolve_s")
+        self.assertEqual((row["outcome"], row["candidate"]["value"]), ("block", 17.8))
+        self.assertAlmostEqual(row["delta"], 2.8 / 15)
 
     def test_a_window_that_ends_before_the_series_b_leaves_the_record_incomplete(self):
         # Three runs of A (each estimated at 319.58 s) end by 630 s on the clock; B would end at 1031.89 s.
@@ -114,7 +114,7 @@ class RecordNight(RecordCase):
         self.assertEqual([r["run"] for r in saved["runs"]], NAMES[:3])
         self.assertEqual(set(saved["durations"]), {"A"}, "a series of fewer than three held runs sets no estimate")
         rows = {r["metric"]: r for r in saved["record"]["rows"]}
-        self.assertEqual(rows["graph_ready_cpu_s"]["outcome"], "ok", "what was measured is compared")
+        self.assertEqual(rows["graph_resolve_s"]["outcome"], "ok", "what was measured is compared")
         for metric in ("references_1_s", "references_2_same_s", "references_3_other_s", "hwm_kb"):
             self.assertEqual((rows[metric]["outcome"], rows[metric]["reason"]),
                              ("incomplete", f"record_missing:{metric}"), metric)
@@ -304,11 +304,11 @@ class NightRecord(NightCase):
 
     def test_a_record_excess_blocks_the_night_whatever_the_warm_set_says(self):
         self.fresh_noise()
-        set_record_in(self.baseline_path, "graph_ready_cpu_s", 10.0, 0.01)
+        set_record_in(self.baseline_path, "graph_resolve_s", 10.0, 0.01)
         summary = self.run_night()
         self.assertEqual(summary["kind"], "night")
         self.assertEqual((summary["verdict"], summary["record"]["verdict"]), ("block", "block"))
-        self.assertIn("block: record:graph_ready_cpu_s", summary["reasons"])
+        self.assertIn("block: record:graph_resolve_s", summary["reasons"])
         with open(self.data.path("nights", DATE, "report.md"), encoding="utf-8") as fh:
             report = fh.read()
         self.assertIn("## Рекорд", report)
@@ -376,19 +376,19 @@ class NightRecord(NightCase):
     def test_a_published_night_opens_the_issue_with_the_range_and_the_notice_of_the_job_names_it(self):
         gh = FakeGh(self, self.tmp)
         self.fresh_noise()
-        set_record_in(self.baseline_path, "graph_ready_cpu_s", 10.0, 0.01, sha=self.sha["v0.3.2"])
+        set_record_in(self.baseline_path, "graph_resolve_s", 10.0, 0.01, sha=self.sha["v0.3.2"])
         summary = self.run_night(publish=True)
         self.assertEqual(summary["verdict"], "block")
         [created] = self.record_issues(gh)
-        self.assertEqual(created["title"], "perf: рекорд превышен — graph_ready_cpu_s")
+        self.assertEqual(created["title"], "perf: рекорд превышен — graph_resolve_s")
         self.assertIn(f"`{self.sha['v0.3.2']}..{self.sha['develop']}`", created["body"])
         self.assertNotIn("История разошлась", created["body"], "a release tag is an ancestor of develop")
         record = [e for e in summary["publish"] if e["key"].startswith("perf-ratchet/")]
         self.assertEqual([(e["action"], e["issue"], e["key"]) for e in record],
-                         [("create", created["number"], "perf-ratchet/graph_ready_cpu_s")])
+                         [("create", created["number"], "perf-ratchet/graph_resolve_s")])
         [notice, *_] = pio_module.night_notices(DATE, self.data.path("nights", DATE), summary)
         self.assertIn("block", notice["text"])
-        self.assertIn("record:graph_ready_cpu_s", notice["text"])
+        self.assertIn("record:graph_resolve_s", notice["text"])
         self.assertIn(f"#{created['number']}", notice["text"])
         # The next night of the same excess comments on the same issue.
         self.run_night(date="2026-10-23", publish=True)
@@ -398,7 +398,7 @@ class NightRecord(NightCase):
     def test_a_record_that_is_not_an_ancestor_of_develop_is_told_so_in_the_issue(self):
         gh = FakeGh(self, self.tmp)
         self.fresh_noise()
-        set_record_in(self.baseline_path, "graph_ready_cpu_s", 10.0, 0.01, sha="f" * 40)
+        set_record_in(self.baseline_path, "graph_resolve_s", 10.0, 0.01, sha="f" * 40)
         self.run_night(publish=True)
         [created] = self.record_issues(gh)
         self.assertIn(f"История разошлась: {'f' * 40} не предок {self.sha['develop']}", created["body"])
@@ -406,7 +406,7 @@ class NightRecord(NightCase):
     def test_a_gh_error_of_the_record_reaches_the_notices_of_the_job(self):
         FakeGh(self, self.tmp, fail=["issues?state=all"])
         self.fresh_noise()
-        set_record_in(self.baseline_path, "graph_ready_cpu_s", 10.0, 0.01)
+        set_record_in(self.baseline_path, "graph_resolve_s", 10.0, 0.01)
         summary = self.run_night(publish=True)
         self.assertEqual(summary["verdict"], "block", "the measured excess stands whatever gh does")
         texts = [n["text"] for n in pio_module.night_notices(DATE, self.data.path("nights", DATE), summary)]
@@ -416,7 +416,7 @@ class NightRecord(NightCase):
     def test_a_night_run_again_over_a_finished_record_does_not_comment_twice(self):
         gh = FakeGh(self, self.tmp)
         self.fresh_noise()
-        set_record_in(self.baseline_path, "graph_ready_cpu_s", 10.0, 0.01)
+        set_record_in(self.baseline_path, "graph_resolve_s", 10.0, 0.01)
         self.run_night(publish=True)
         os.remove(self.data.path("nights", DATE, "summary.json"))       # the night was killed before its summary
         again = self.run_night(publish=True)
@@ -431,7 +431,7 @@ class NightRecord(NightCase):
     def test_a_night_that_is_not_published_does_not_call_gh(self):
         gh = FakeGh(self, self.tmp)
         self.fresh_noise()
-        set_record_in(self.baseline_path, "graph_ready_cpu_s", 10.0, 0.01)
+        set_record_in(self.baseline_path, "graph_resolve_s", 10.0, 0.01)
         self.run_night(publish=False)
         self.assertEqual(gh.calls(), [])
 
