@@ -73,6 +73,11 @@ is unknown or mixed with other types, when the call could not be resolved, or fo
 module or a call by string. No finding does not mean the code stays away from the database.
 `ExecuteBatchWithIntermediateData` is not counted.
 
+A finding on a call to a local method from which a query execution is reachable carries its own
+code, `LocalCallWithQueryInCycle`, with a lower severity
+(see [LocalCallWithQueryInCycle](LocalCallWithQueryInCycle.md)); this code keeps the query execution
+itself in a loop body.
+
 ## A justified exception
 
 The standard allows justified exceptions. When a query in a helper is intended, suppress that

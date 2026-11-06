@@ -9,6 +9,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::BeginTransactionBeforeTryCatch,
     DiagnosticCode::CommitTransactionOutsideTryCatch,
     DiagnosticCode::CreateQueryInCycle,
+    DiagnosticCode::LocalCallWithQueryInCycle,
     DiagnosticCode::ImplicitDatabaseReadInCycle,
     DiagnosticCode::DataExchangeLoading,
     DiagnosticCode::DisableSafeMode,
@@ -444,6 +445,35 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        DiagnosticCode::LocalCallWithQueryInCycle,
+        r#"Функция НайтиПоЗначению(Значение)
+	Запрос = Новый Запрос("ВЫБРАТЬ 1 КАК Поле");
+	Запрос.УстановитьПараметр("Значение", Значение);
+	Выборка = Запрос.Выполнить().Выбрать();
+	Возврат ?(Выборка.Следующий(), Выборка.Поле, Неопределено);
+КонецФункции
+
+Процедура ЗаполнитьСтроки(Таблица, Чтение)
+	Пока Чтение.Прочитать() Цикл
+		НоваяСтрока = Таблица.Добавить();
+		НоваяСтрока.Поле = НайтиПоЗначению(Чтение.Значение);
+	КонецЦикла;
+КонецПроцедуры"#,
+        r#"Function FindByValue(Value)
+	Query = New Query("SELECT 1 AS Field");
+	Query.SetParameter("Value", Value);
+	Selection = Query.Execute().Select();
+	Return ?(Selection.Next(), Selection.Field, Undefined);
+EndFunction
+
+Procedure FillRows(Table, Reader)
+	While Reader.Read() Do
+		NewRow = Table.Add();
+		NewRow.Field = FindByValue(Reader.Value);
+	EndDo;
+EndProcedure"#,
+    ),
+    (
         DiagnosticCode::ImplicitDatabaseReadInCycle,
         r#"// Возвращаемое значение:
 //   Массив из СправочникСсылка.Товары
@@ -702,7 +732,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 212, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 213, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]
