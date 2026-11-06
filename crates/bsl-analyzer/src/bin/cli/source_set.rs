@@ -85,6 +85,7 @@ pub enum SourceSetArgsError {
     MalformedExternalDependsOn { value: String },
     UnknownExternalDependsOnOwner { name: String },
     UnknownExternalDependsOnTarget { owner: String, name: String },
+    NonUtf8SourceDir { path: PathBuf },
 }
 
 impl fmt::Display for SourceSetArgsError {
@@ -149,6 +150,12 @@ impl fmt::Display for SourceSetArgsError {
             Self::UnknownExternalDependsOnTarget { owner, name } => write!(
                 f,
                 "--external-depends-on {owner}={name}: {name} is not declared by any --extension NAME=PATH"
+            ),
+            Self::NonUtf8SourceDir { path } => write!(
+                f,
+                "--source-dir {}: source-set flags cannot be resolved against the project \
+                 config, because the path below the config directory is not valid UTF-8",
+                path.display()
             ),
         }
     }
@@ -513,6 +520,42 @@ impl SourceSetArgs {
     }
 }
 
+/// `relative` with `/` separators, the spelling config files use. `None` when it is not
+/// UTF-8: config paths are strings, and a lossy spelling names a different directory.
+pub fn slash_path(relative: &Path) -> Option<String> {
+    // Only the platform separator. On Unix `\` is a legal name character; rewriting
+    // it would turn a flag path that already resolved against `-s` into another path.
+    relative.to_str().map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
+}
+
+/// Flag paths are written relative to `-s`, but the project resolves them against `project_root`;
+/// prefixing keeps them meaning the same directories when a discovered config moved that root.
+pub fn rebase_override(
+    mut over: SourceSetOverride,
+    source_dir: &Path,
+    project_root: &Path,
+) -> Result<SourceSetOverride, SourceSetArgsError> {
+    let Ok(prefix) = source_dir.strip_prefix(project_root) else { return Ok(over) };
+    if prefix.as_os_str().is_empty() {
+        return Ok(over);
+    }
+    let prefixed = |path: &str| {
+        slash_path(&prefix.join(path))
+            .ok_or_else(|| SourceSetArgsError::NonUtf8SourceDir { path: source_dir.to_path_buf() })
+    };
+    over.configuration_root = over.configuration_root.map(|root| prefixed(&root)).transpose()?;
+    for decl in over.extensions.iter_mut().flatten() {
+        match decl {
+            ExtensionDecl::Path(path) => *path = prefixed(path)?,
+            ExtensionDecl::Structured(structured) => structured.path = prefixed(&structured.path)?,
+        }
+    }
+    for decl in over.externals.iter_mut().flatten() {
+        decl.path = prefixed(&decl.path)?;
+    }
+    Ok(over)
+}
+
 /// `NAME=PATH` splits on the first `=`; anything else is a bare path.
 ///
 /// The split is unconditional, which costs one case: a directory whose own name
@@ -563,6 +606,10 @@ fn split_extension_value(
 
 fn is_extension_dir(root: &Path, rel: &str) -> bool {
     root_configuration_xml(&root.join(rel)).is_some()
+}
+
+pub(crate) fn directory_has_configuration_xml(dir: &Path) -> bool {
+    root_configuration_xml(dir).is_some()
 }
 
 /// The directory's `Configuration.xml` as a real file, in whatever ASCII case
@@ -1331,5 +1378,40 @@ extensions = [
             configuration_root_provider(&args(&[]), None, dir.path()),
             SourceProvider::AutoDiscovery
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slash_path_keeps_a_literal_backslash_on_unix() {
+        let path = std::path::Path::new("src").join("Старый\\Модуль");
+        assert_eq!(super::slash_path(&path).as_deref(), Some("src/Старый\\Модуль"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slash_path_refuses_a_name_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::path::Path::new("src").join(std::ffi::OsStr::from_bytes(b"cf-\xff"));
+        assert_eq!(super::slash_path(&path), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebasing_flags_under_a_name_that_is_not_utf8_fails_instead_of_renaming() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = Path::new("/project");
+        let source_dir = root.join(std::ffi::OsStr::from_bytes(b"cf-\xff"));
+        let flags = || SourceSetOverride {
+            configuration_root: Some("cf".to_owned()),
+            extensions: None,
+            externals: None,
+        };
+        let err = rebase_override(flags(), &source_dir, root).unwrap_err();
+        assert!(matches!(err, SourceSetArgsError::NonUtf8SourceDir { .. }), "got {err}");
+        // Positive control: the same flags under a UTF-8 directory are rebased.
+        let rebased = rebase_override(flags(), &root.join("src"), root).unwrap();
+        assert_eq!(rebased.configuration_root.as_deref(), Some("src/cf"));
     }
 }

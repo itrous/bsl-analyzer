@@ -632,6 +632,7 @@ impl Project {
         // has no base at all, and both report the same unresolved calls.
         let subject = self
             .configuration_path()
+            .filter(|path| configuration_xml_in(path).is_some())
             .or(self.extension_in_config_location.as_deref())
             .or_else(|| self.extension_paths.first().map(|(_, path)| path.as_path()))
             .unwrap_or(&self.root);
@@ -653,7 +654,13 @@ impl Project {
     /// Unlike an extension, an external root cannot be mistaken for the base,
     /// so the subject is the declared list, not the resolved source path.
     pub fn standalone_external_notice(&self) -> Option<String> {
-        if self.configuration_path().is_some() || self.external_paths.is_empty() {
+        // A root that is an extension owns no external objects: their calls target the
+        // main configuration, which is just as absent as in a project with no root.
+        let has_configuration = self.configuration_path().is_some_and(|path| {
+            configuration_xml_in(path).is_some()
+                && configuration_kind(path) != ConfigurationKind::Extension
+        });
+        if has_configuration || self.external_paths.is_empty() {
             return None;
         }
         let names: Vec<&str> = self.external_paths.iter().map(|(name, _)| name.as_str()).collect();
@@ -830,8 +837,13 @@ impl Project {
         // The nesting check takes only a CONFIGURED base — deliberately narrower
         // than the scope above. An anonymous base at the workspace root contains
         // every extension by construction, so including it would make each of them
-        // look nested inside the base and reject the whole plan.
-        let mut canonical_roots = match self.configuration_path() {
+        // look nested inside the base and reject the whole plan. An anchored `-s`
+        // without a `Configuration.xml` is such a root too: it only bounds the walk.
+        let configured_base = self.configuration_path().filter(|base| {
+            self.config.source_anchor.as_deref() != Some(*base)
+                || configuration_xml_in(base).is_some()
+        });
+        let mut canonical_roots = match configured_base {
             Some(base) => vec![canonicalize_baseline_path(base)?],
             None => Vec::new(),
         };
@@ -1076,6 +1088,24 @@ impl Project {
             extension: None,
             excluded: false,
         };
+        // The caller already chose this directory (`analyze -s`). A missing
+        // `Configuration.xml` must not fall through to a search from `root`:
+        // that search replaces the directory the caller named.
+        if let Some(path) = config.source_anchor.clone() {
+            if exclusions.is_excluded_resolved(&path) {
+                tracing::info!(?path, "anchored source is excluded by [source].exclude");
+                return Ok(DiscoveredSource {
+                    configuration: None,
+                    extension: None,
+                    excluded: true,
+                });
+            }
+            return Ok(DiscoveredSource {
+                configuration: Some(path),
+                extension: config.anchored_extension.clone(),
+                excluded: false,
+            });
+        }
         // A directory that carries `Configuration.xml` where a MAIN configuration is
         // expected, but turned out to be an extension. It is not a base and does not
         // become a source root, yet it is what makes this project a base-less
@@ -2599,6 +2629,22 @@ pub struct ProjectConfig {
     #[doc(hidden)]
     pub config_file_path: Option<PathBuf>,
 
+    /// Directory the caller already chose as the source subject. Set by the CLI
+    /// when a discovered config would otherwise search from its own directory
+    /// and replace `-s`. Not a config-file field: a declared `[source].root`
+    /// that lacks `Configuration.xml` still warns and searches.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub source_anchor: Option<PathBuf>,
+
+    /// Extension the search under [`Self::source_anchor`] found. Kept so the
+    /// standalone-extension advisory still names it: the anchor itself has no
+    /// `Configuration.xml`, and treating that as the configuration subject
+    /// would hide the extension.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub anchored_extension: Option<PathBuf>,
+
     /// Parent files merged in through `extends` (TOML only), nearest first. Set by
     /// the loader; read it through [`Self::extends_chain`].
     #[serde(skip)]
@@ -2932,6 +2978,61 @@ impl ProjectConfig {
             }
         }
         Ok(None)
+    }
+
+    /// Finds the project config starting from any directory inside the project:
+    /// the nearest directory on the way up to the filesystem root that holds one of [`CONFIG_FILE_NAMES`] wins, and within
+    /// it the usual file-name precedence applies. Returns the config together
+    /// with the file it came from, so a caller can say which one a run used.
+    ///
+    /// [`ProjectConfig::load`] deliberately looks in one directory only; a batch
+    /// run is pointed at the configuration root (`<project>/src/cf`) while the
+    /// config sits at the project root, and `load` there silently yields defaults.
+    pub fn discover(start_dir: &Path) -> Result<Option<(Self, PathBuf)>, ConfigLoadError> {
+        for candidate in start_dir.ancestors() {
+            for filename in CONFIG_FILE_NAMES {
+                let path = candidate.join(filename);
+                // `exists`, as in `load`: a config path that is not a readable file is an
+                // error, not a reason to adopt an unrelated config further up.
+                if path.exists() {
+                    return Self::load_from_file(&path).map(|config| Some((config, path)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The main configuration a search from `start` adopts: `start` itself or at
+    /// most two levels below it. An extension is not a result. This is the search
+    /// [`Project::with_config`] runs when no root is declared, so a caller that
+    /// builds the project at a different directory can keep the configuration
+    /// that search would have found under `start`.
+    pub fn main_configuration_from(
+        &self,
+        start: &Path,
+        project_root: &Path,
+    ) -> Result<Option<PathBuf>, ConfigLoadError> {
+        let exclusions = self.source_exclusions(project_root)?;
+        let mut excluded = false;
+        Ok(match search_configuration(start, 2, &exclusions, &mut excluded) {
+            SearchOutcome::Configuration(path) => Some(path),
+            SearchOutcome::Extension(_) | SearchOutcome::None => None,
+        })
+    }
+
+    /// An extension the same search found when it found no main configuration.
+    /// `None` when a main configuration won, or when the search found neither.
+    pub fn extension_from(
+        &self,
+        start: &Path,
+        project_root: &Path,
+    ) -> Result<Option<PathBuf>, ConfigLoadError> {
+        let exclusions = self.source_exclusions(project_root)?;
+        let mut excluded = false;
+        Ok(match search_configuration(start, 2, &exclusions, &mut excluded) {
+            SearchOutcome::Extension(path) => Some(path),
+            SearchOutcome::Configuration(_) | SearchOutcome::None => None,
+        })
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self, ConfigLoadError> {
@@ -3958,6 +4059,8 @@ impl From<TomlConfig> for ProjectConfig {
         Self {
             diagnostics: toml.diagnostics,
             config_file_path: None,
+            source_anchor: None,
+            anchored_extension: None,
             extends_chain: Vec::new(),
             code_lens: toml.code_lens,
             formatting: toml.formatting,
@@ -8318,6 +8421,113 @@ type_narrowing = false
             "an invalid scope value must fail deserialization, never degrade to on"
         );
     }
+
+    fn write_config(dir: &Path, name: &str, text: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn discover_finds_the_config_in_an_ancestor_and_reports_its_path() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "");
+        let start = dir.path().join("src/cf");
+        fs::create_dir_all(&start).unwrap();
+
+        let (_, path) = ProjectConfig::discover(&start).unwrap().expect("config not found");
+        assert_eq!(path, dir.path().join("bsl-analyzer.toml"));
+        assert!(ProjectConfig::load(&start).unwrap().is_none(), "load must stay single-directory");
+    }
+
+    #[test]
+    fn discover_returns_none_when_no_directory_up_the_tree_has_a_config() {
+        let dir = tempdir().unwrap();
+        let start = dir.path().join("a/b");
+        fs::create_dir_all(&start).unwrap();
+        // The temp root may itself sit under a directory with a config; only
+        // assert on what this tree controls.
+        if let Some((_, path)) = ProjectConfig::discover(&start).unwrap() {
+            assert!(!path.starts_with(dir.path()), "found a config inside the empty tree");
+        }
+    }
+
+    #[test]
+    fn discover_prefers_the_nearest_directory() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "");
+        let start = dir.path().join("src/cf");
+        write_config(&start, ".bsl-analyzer.json", "{}");
+
+        let (_, path) = ProjectConfig::discover(&start).unwrap().expect("config not found");
+        assert_eq!(path, start.join(".bsl-analyzer.json"));
+    }
+
+    #[test]
+    fn discover_keeps_the_file_name_precedence_within_a_directory() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "");
+        write_config(dir.path(), ".bsl-analyzer.json", "{}");
+
+        let (_, path) = ProjectConfig::discover(dir.path()).unwrap().expect("config not found");
+        assert_eq!(path, dir.path().join("bsl-analyzer.toml"));
+    }
+
+    #[test]
+    fn discover_returns_the_parse_error_of_a_broken_ancestor_config() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "=\n");
+        let start = dir.path().join("src/cf");
+        fs::create_dir_all(&start).unwrap();
+
+        let error = ProjectConfig::discover(&start).unwrap_err();
+        assert_eq!(error.path.file_name().unwrap(), "bsl-analyzer.toml");
+    }
+
+    #[test]
+    fn discover_does_not_pass_over_a_nearer_config_path_it_cannot_read() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "bsl-analyzer.toml", "");
+        let nested = dir.path().join("nested");
+        fs::create_dir_all(nested.join("bsl-analyzer.toml")).unwrap();
+        let start = nested.join("src/cf");
+        fs::create_dir_all(&start).unwrap();
+
+        let error = ProjectConfig::discover(&start).unwrap_err();
+        assert_eq!(error.path, nested.join("bsl-analyzer.toml"));
+    }
+
+    #[test]
+    fn source_anchor_is_the_subject_even_when_a_configuration_sits_beside_it() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let cf = project.join("src/cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let loose = project.join("loose");
+        fs::create_dir_all(&loose).unwrap();
+
+        let config =
+            ProjectConfig { source_anchor: Some(loose.clone()), ..ProjectConfig::default() };
+        let built = Project::with_config(&project, config).unwrap();
+        assert_eq!(built.configuration_path(), Some(loose.as_path()));
+    }
+
+    #[test]
+    fn main_configuration_from_finds_a_configuration_nested_under_the_start() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let cf = project.join("src/cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        fs::create_dir_all(project.join("other/cf")).unwrap();
+        fs::write(project.join("other/cf/Configuration.xml"), "<Configuration/>").unwrap();
+
+        let found = ProjectConfig::default()
+            .main_configuration_from(&project.join("src"), &project)
+            .unwrap()
+            .expect("nested configuration");
+        assert_eq!(found, cf);
+    }
 }
 
 /// External data processors and reports (EPF/ERF exports) as source roots of
@@ -8728,10 +8938,21 @@ externals = [
         touch_base(dir.path(), "src/cf");
         let project = Project::with_config(
             dir.path(),
-            ProjectConfig { configuration_root: Some("src/cf".into()), ..config },
+            ProjectConfig { configuration_root: Some("src/cf".into()), ..config.clone() },
         )
         .unwrap();
         assert!(project.standalone_external_notice().is_none(), "with a base: silent");
+
+        touch_extension(dir.path(), "src/cfe/Ext");
+        let project = Project::with_config(
+            dir.path(),
+            ProjectConfig { configuration_root: Some("src/cfe/Ext".into()), ..config },
+        )
+        .unwrap();
+        assert!(
+            project.standalone_external_notice().is_some(),
+            "a root that is an extension is no base for an external"
+        );
     }
 
     /// An export kept inside the base's tree is refused by the partition plan
@@ -8752,6 +8973,43 @@ externals = [
         let project = Project::with_config(dir.path(), config).unwrap();
         let err = project.diagnostics_baseline_partition_plan().unwrap_err();
         assert_eq!(err, super::DiagnosticsBaselineProjectError::PathCollision("src/cf/epf".into()));
+    }
+
+    /// An anchored `-s` that holds no `Configuration.xml` only bounds the walk:
+    /// the extensions found under it are not nested in a base.
+    #[test]
+    fn an_extension_under_an_anchor_without_a_configuration_is_no_path_collision() {
+        let dir = tempdir().unwrap();
+        touch_extension(dir.path(), "src/cfe/E");
+        let config = ProjectConfig {
+            source_anchor: Some(dir.path().join("src")),
+            extensions: Some(vec![structured("E", "src/cfe/E", &[])]),
+            diagnostics: super::tests::partitioned_config("baselines", vec![]),
+            ..Default::default()
+        };
+        let project = Project::with_config(dir.path(), config).unwrap();
+        assert!(project.diagnostics_baseline_partition_plan().unwrap().is_some());
+    }
+
+    /// An anchor that is a configuration stays a base, so an extension inside it
+    /// is still refused.
+    #[test]
+    fn an_extension_under_an_anchored_configuration_is_a_path_collision() {
+        let dir = tempdir().unwrap();
+        touch_base(dir.path(), "src/cf");
+        touch_extension(dir.path(), "src/cf/cfe/E");
+        let config = ProjectConfig {
+            source_anchor: Some(dir.path().join("src/cf")),
+            extensions: Some(vec![structured("E", "src/cf/cfe/E", &[])]),
+            diagnostics: super::tests::partitioned_config("baselines", vec![]),
+            ..Default::default()
+        };
+        let project = Project::with_config(dir.path(), config).unwrap();
+        let err = project.diagnostics_baseline_partition_plan().unwrap_err();
+        assert_eq!(
+            err,
+            super::DiagnosticsBaselineProjectError::PathCollision("src/cf/cfe/E".into())
+        );
     }
 
     /// An object XML whose `MetaDataObject` carries no element is a truncated

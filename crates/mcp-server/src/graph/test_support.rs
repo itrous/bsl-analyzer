@@ -19,6 +19,18 @@ pub(super) fn write(root: &Path, rel: &str, text: &str) {
     fs::write(path, text).unwrap();
 }
 
+/// Replaces an existing file with one change event, so a wait for the hub to move past it
+/// covers the whole write. Rewriting in place truncates and then writes, and inotify merges
+/// the two modifications only when the watcher has not read the first yet; the file is
+/// therefore staged beside `root`, outside the watched tree, and moved in.
+pub(super) fn replace(root: &Path, rel: &str, text: &str) {
+    use std::io::Write as _;
+
+    let mut staged = tempfile::NamedTempFile::new_in(root.parent().unwrap()).unwrap();
+    staged.write_all(text.as_bytes()).unwrap();
+    staged.persist(root.join(rel)).unwrap();
+}
+
 /// Minimal common-module metadata descriptor so the module is declared in the
 /// configuration (the resolver refuses qualified calls to undeclared modules)
 /// and its client/server execution context is known.
