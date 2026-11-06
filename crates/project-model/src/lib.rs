@@ -837,8 +837,13 @@ impl Project {
         // The nesting check takes only a CONFIGURED base — deliberately narrower
         // than the scope above. An anonymous base at the workspace root contains
         // every extension by construction, so including it would make each of them
-        // look nested inside the base and reject the whole plan.
-        let mut canonical_roots = match self.configuration_path() {
+        // look nested inside the base and reject the whole plan. An anchored `-s`
+        // without a `Configuration.xml` is such a root too: it only bounds the walk.
+        let configured_base = self.configuration_path().filter(|base| {
+            self.config.source_anchor.as_deref() != Some(*base)
+                || configuration_xml_in(base).is_some()
+        });
+        let mut canonical_roots = match configured_base {
             Some(base) => vec![canonicalize_baseline_path(base)?],
             None => Vec::new(),
         };
@@ -8968,6 +8973,43 @@ externals = [
         let project = Project::with_config(dir.path(), config).unwrap();
         let err = project.diagnostics_baseline_partition_plan().unwrap_err();
         assert_eq!(err, super::DiagnosticsBaselineProjectError::PathCollision("src/cf/epf".into()));
+    }
+
+    /// An anchored `-s` that holds no `Configuration.xml` only bounds the walk:
+    /// the extensions found under it are not nested in a base.
+    #[test]
+    fn an_extension_under_an_anchor_without_a_configuration_is_no_path_collision() {
+        let dir = tempdir().unwrap();
+        touch_extension(dir.path(), "src/cfe/E");
+        let config = ProjectConfig {
+            source_anchor: Some(dir.path().join("src")),
+            extensions: Some(vec![structured("E", "src/cfe/E", &[])]),
+            diagnostics: super::tests::partitioned_config("baselines", vec![]),
+            ..Default::default()
+        };
+        let project = Project::with_config(dir.path(), config).unwrap();
+        assert!(project.diagnostics_baseline_partition_plan().unwrap().is_some());
+    }
+
+    /// An anchor that is a configuration stays a base, so an extension inside it
+    /// is still refused.
+    #[test]
+    fn an_extension_under_an_anchored_configuration_is_a_path_collision() {
+        let dir = tempdir().unwrap();
+        touch_base(dir.path(), "src/cf");
+        touch_extension(dir.path(), "src/cf/cfe/E");
+        let config = ProjectConfig {
+            source_anchor: Some(dir.path().join("src/cf")),
+            extensions: Some(vec![structured("E", "src/cf/cfe/E", &[])]),
+            diagnostics: super::tests::partitioned_config("baselines", vec![]),
+            ..Default::default()
+        };
+        let project = Project::with_config(dir.path(), config).unwrap();
+        let err = project.diagnostics_baseline_partition_plan().unwrap_err();
+        assert_eq!(
+            err,
+            super::DiagnosticsBaselineProjectError::PathCollision("src/cf/cfe/E".into())
+        );
     }
 
     /// An object XML whose `MetaDataObject` carries no element is a truncated
