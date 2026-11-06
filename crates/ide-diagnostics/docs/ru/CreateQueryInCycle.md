@@ -96,14 +96,15 @@
 в находках из-за второго.
 
 Подавление в вызывающем коде скрывает только находку на этом месте и не разрешает помощник другим
-вызывающим:
+вызывающим. Находка на вызове идёт кодом `LocalCallWithQueryInCycle`, поэтому директива называет
+его:
 
 ```bsl
-// bsl-analyzer:off CreateQueryInCycle
+// bsl-analyzer:off LocalCallWithQueryInCycle
 Для Каждого Элемент Из Элементы Цикл
     Прочитать();
 КонецЦикла;
-// bsl-analyzer:on CreateQueryInCycle
+// bsl-analyzer:on LocalCallWithQueryInCycle
 ```
 
 Директива на одной строке заголовка цикла остальные строки тела не подавляет. `off` без парного `on`

@@ -99,14 +99,15 @@ does not clear the finding. When a helper has two executions and one is suppress
 their findings because of the other.
 
 A suppression in the calling code hides only the finding at that place and does not clear the helper
-for other callers:
+for other callers. The finding on the call is reported as `LocalCallWithQueryInCycle`, so the directive
+names that code:
 
 ```bsl
-// bsl-analyzer:off CreateQueryInCycle
+// bsl-analyzer:off LocalCallWithQueryInCycle
 For Each Item In Items Do
     Read();
 EndDo;
-// bsl-analyzer:on CreateQueryInCycle
+// bsl-analyzer:on LocalCallWithQueryInCycle
 ```
 
 A directive on the loop header alone does not suppress the other lines of the body. An `off` without a
