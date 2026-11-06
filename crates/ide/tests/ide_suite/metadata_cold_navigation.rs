@@ -78,11 +78,7 @@ fn setup_with_role_substrate(fixture_text: &str) -> (Analysis, FileId, u32) {
         file_set.insert(*file_id, file.path.clone());
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_role_navigation_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_role_navigation");
     std::fs::create_dir_all(root.join("Roles/ПолныеПрава/Ext")).unwrap();
     std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
 
@@ -200,11 +196,7 @@ fn setup_with_http_service_substrate(fixture_text: &str) -> (Analysis, FileId, u
         file_set.insert(*file_id, file.path.clone());
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_http_service_navigation_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_http_service_navigation");
     std::fs::create_dir_all(root.join("HTTPServices/HTTPСервис1/Ext")).unwrap();
     std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
 
@@ -263,11 +255,7 @@ fn setup_with_web_service_substrate(fixture_text: &str) -> (Analysis, FileId, u3
         file_set.insert(*file_id, file.path.clone());
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_web_service_navigation_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_web_service_navigation");
     std::fs::create_dir_all(root.join("WebServices/WebСервис1/Ext")).unwrap();
     std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
 
@@ -328,11 +316,7 @@ fn setup_with_integration_service_substrate(fixture_text: &str) -> (Analysis, Fi
         file_set.insert(*file_id, file.path.clone());
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_integration_service_navigation_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_integration_service_navigation");
     std::fs::create_dir_all(root.join("IntegrationServices/ОбменСообщениями/Ext")).unwrap();
     std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
 
@@ -395,11 +379,7 @@ fn setup_with_scheduled_job_xml(
         file_set.insert(*file_id, file.path.clone());
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_scheduled_job_navigation_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_scheduled_job_navigation");
     let job_path = root.join("ScheduledJobs/РегламентноеЗадание1.xml");
     std::fs::create_dir_all(job_path.parent().unwrap()).unwrap();
     std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
