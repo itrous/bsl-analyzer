@@ -2901,9 +2901,11 @@ mod tests {
 mod trim_tests {
     use std::path::Path;
 
-    use super::super::test_support::{join_load, module_path, wait_ready, write_common_module};
+    use super::super::test_support::{
+        join_load, module_path, staged_designer_fixture, wait_ready, write, write_common_module,
+    };
     use super::super::{DiagnosticsState, ResidentOutcome, SweepOptions};
-    use super::DiagnosticsResident;
+    use super::{Analysis, DiagnosticsResident, FileId};
     use crate::cancel::RequestCancel;
 
     /// More modules than the sweep window of syntax trees (`parse_query`'s sweep cap is
@@ -3269,15 +3271,20 @@ mod trim_tests {
         });
         let (per_file, samples): (Vec<_>, Vec<T>) = walked.into_iter().unzip();
         let result = resident.with_request_handle(cancel, |_, analysis| {
-            ide::finish_references(analysis.database(), walk, per_file.concat())
+            ide::finish_references(
+                analysis.database(),
+                walk,
+                per_file.into_iter().flatten().collect(),
+            )
         });
         (result, samples)
     }
 
     /// Inside the chunked walk, never more than the interactive window plus one chunk of
-    /// syntax trees is held. Sampled INSIDE the walk, after every file: the walk trims
-    /// after its last chunk too, and a reading taken after it could not tell a trim
-    /// between chunks from one trim at the end — or from one chunk.
+    /// syntax trees is held, and the trim comes once per chunk, not oftener. Sampled
+    /// INSIDE the walk, after every file: the walk trims after its last chunk too, and a
+    /// reading taken after it could not tell a trim between chunks from one trim at the
+    /// end — or from one chunk.
     #[test]
     #[cfg_attr(
         windows,
@@ -3325,6 +3332,17 @@ mod trim_tests {
             "the walk keeps at most the window plus one chunk of syntax trees: \
              {parse_peak} of {parse_all} bytes"
         );
+        // And not less: a trim after fewer files than a sweep chunk, or one that goes
+        // down to the sweep caps, drops the memos a repeated request answers from, and
+        // the request pays for them again. The peak alone cannot tell them apart — it
+        // stands at the end of the first chunk, before any trim — but the end of the
+        // second chunk holds the window the first trim kept plus that whole chunk.
+        let after_two_chunks = samples[2 * CHUNK - 1];
+        assert!(
+            after_two_chunks >= parse_all * (PARSE_WINDOW + CHUNK - CHUNK / 10) / CANDIDATES,
+            "the walk trims once per sweep chunk, on the interactive caps: \
+             {after_two_chunks} of {parse_all} bytes at the end of the second chunk"
+        );
     }
 
     /// The chunked walk answers what the serial walk answers, field by field, on a stand
@@ -3357,6 +3375,148 @@ mod trim_tests {
         assert_eq!(chunked.files_capped, serial.files_capped);
         assert_eq!(chunked.declarations, serial.declarations);
         assert_eq!(chunked.outcome, serial.outcome);
+    }
+
+    /// The chunked walk answers what the serial walk answers for a method reached through
+    /// a typed receiver: each caller's hit rests on inferring `Объект`, half of them from
+    /// the catalog manager and half from the return type of a function in another module,
+    /// which the walk does not enter. The callers span three chunks, so a hit lost to a
+    /// trim between chunks changes the length.
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "waits on file-change events without a bound of its own, and a run under load on Windows outlasted any limit"
+    )]
+    fn references_walk_through_typed_receivers_answers_the_same_as_the_serial_walk() {
+        const TYPED_CALLERS: usize = CALLERS;
+        let _serialised = crate::walk_probe::WALK_GATE.blocking_lock();
+        let dir = staged_designer_fixture();
+        write(
+            dir.path(),
+            "Catalogs/Справочник1/Ext/ObjectModule.bsl",
+            "Процедура ПодготовитьОбъект() Экспорт\nКонецПроцедуры\n",
+        );
+        write_common_module(
+            dir.path(),
+            "Фабрика",
+            true,
+            "&НаСервере\nФункция Создать() Экспорт\n    \
+             Возврат Справочники.Справочник1.СоздатьЭлемент();\nКонецФункции\n",
+        );
+        for i in 0..TYPED_CALLERS {
+            let receiver = if i % 2 == 0 {
+                "Справочники.Справочник1.СоздатьЭлемент()"
+            } else {
+                "Фабрика.Создать()"
+            };
+            write_common_module(
+                dir.path(),
+                &format!("Типизированный{i:04}"),
+                true,
+                &format!(
+                    "&НаСервере\nПроцедура Тело() Экспорт\n    Объект = {receiver};\n    \
+                     Объект.ПодготовитьОбъект();\nКонецПроцедуры\n"
+                ),
+            );
+        }
+        let request = ide::ReferencesRequest {
+            anchor: ide::ReferenceAnchor::Name(
+                "Справочник.Справочник1.ПодготовитьОбъект".to_owned(),
+            ),
+            ..callers_request()
+        };
+        let state = joined_state(dir.path());
+
+        let serial = serial_walk(&state, &request);
+        assert_eq!(serial.outcome, ide::ReferencesOutcome::Resolved);
+        assert_eq!(
+            serial.hits.len(),
+            TYPED_CALLERS + 1,
+            "the control: every typed call, both routes, and the declaration"
+        );
+        assert!(serial.files_scanned > 2 * CHUNK, "the control: the walk spans three chunks");
+
+        let cancel = RequestCancel::default();
+        let (chunked, _) =
+            ready(state.read_mut(|resident, _| chunked_walk(resident, &cancel, &request, |_| ())));
+        assert_eq!(chunked.hits, serial.hits);
+        assert_eq!(chunked.per_file, serial.per_file);
+        assert_eq!(chunked.files_scanned, serial.files_scanned);
+        assert_eq!(chunked.files_capped, serial.files_capped);
+        assert_eq!(chunked.declarations, serial.declarations);
+        assert_eq!(chunked.outcome, serial.outcome);
+    }
+
+    /// A sweep's final trim holds per-method inference to its sweep cap, and the
+    /// interactive cap is back for what comes next. The stand infers more methods than
+    /// the sweep cap and than half the interactive one, and fewer than the interactive
+    /// one, so the control — the same inference trimmed on the interactive caps — keeps
+    /// every method, and a final trim that kept the interactive window, a cap left shrunk
+    /// after it, or a smaller interactive cap all show.
+    #[test]
+    fn a_sweeps_final_trim_holds_inference_to_the_sweep_cap_and_restores_the_interactive_one() {
+        const FILES: usize = 1100;
+        const METHODS_PER_FILE: usize = 4;
+        const METHODS: usize = FILES * METHODS_PER_FILE;
+        const INFER_SWEEP: usize = 2048;
+        const INFER_INTERACTIVE: usize = 8192;
+        const _: () = assert!(INFER_SWEEP < METHODS && METHODS < INFER_INTERACTIVE);
+        const _: () = assert!(METHODS > INFER_INTERACTIVE / 2);
+        const INFERENCE: &str = "BodyInferenceResult";
+
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..METHODS_PER_FILE)
+            .map(|i| {
+                format!(
+                    "Функция Метод{i}(Параметр) Экспорт\n    Значение = Параметр + 1;\n    \
+                     Возврат Значение;\nКонецФункции\n"
+                )
+            })
+            .collect();
+        for i in 0..FILES {
+            write_common_module(dir.path(), &format!("Модуль{i:04}"), true, &body);
+        }
+        let infer_all = |resident: &DiagnosticsResident| {
+            let mut files: Vec<FileId> = resident.by_path.values().copied().collect();
+            files.sort_by_key(|id| id.0);
+            let analysis: Analysis = resident.analysis();
+            files.iter().map(|&id| analysis.database().prime_module_inference(id, 0)).sum::<usize>()
+        };
+
+        let state = joined_state(dir.path());
+        let (inferred, inference_all, inference_kept) = ready(state.read_mut(|resident, _| {
+            let inferred = infer_all(resident);
+            let inference_all = heap_bytes(resident.db(), INFERENCE);
+            resident.trim_between_chunks();
+            (inferred, inference_all, heap_bytes(resident.db(), INFERENCE))
+        }));
+        assert_eq!(inferred, METHODS, "the control: every method of the stand is inferred");
+        assert!(inference_all > 0, "the control: the inference holds heap");
+        assert_eq!(
+            inference_kept, inference_all,
+            "the control: the interactive cap keeps every method of the stand"
+        );
+
+        let state = joined_state(dir.path());
+        let (inference_swept, inference_again) = ready(state.read_mut(|resident, _| {
+            infer_all(resident);
+            resident.trim_after_sweep();
+            let inference_swept = heap_bytes(resident.db(), INFERENCE);
+
+            infer_all(resident);
+            resident.trim_between_chunks();
+            (inference_swept, heap_bytes(resident.db(), INFERENCE))
+        }));
+        // The methods are alike, so their inference weighs alike — within one of slack.
+        assert!(
+            inference_swept <= inference_all * (INFER_SWEEP + 1) / METHODS,
+            "the sweep's final trim leaves at most the sweep cap of inference: \
+             {inference_swept} of {inference_all} bytes"
+        );
+        assert_eq!(
+            inference_again, inference_all,
+            "after the sweep the interactive cap keeps every method again"
+        );
     }
 
     /// A `references` call whose cancellation was requested before it started unwinds
@@ -3455,6 +3615,10 @@ mod trim_tests {
             "a cancel raised inside a job unwinds the walk with the request's cancellation"
         );
         assert_eq!(entered, 1, "the walk entered no file after the one that cancelled it");
+
+        let (repeated, entered, total) = walk(false);
+        assert!(repeated.is_ok(), "the same resident walks again after the cancel");
+        assert_eq!(entered, total, "the repeated walk enters every file");
     }
 
     /// A request cancelled before it takes its handle runs nothing on it: the closure

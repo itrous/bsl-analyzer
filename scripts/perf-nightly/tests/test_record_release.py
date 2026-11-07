@@ -22,7 +22,7 @@ PARAGRAPH = (
     "Оптимизацию закрепляет рекорд, а не релиз. Выпуск версии не повышает baseline и не прощает накопленные "
     "небольшие ухудшения. Подтверждённое двумя раундами улучшение сверх шума переносит исполнитель оптимизации "
     "из record_proposals в baseline отдельным обычным коммитом с SHA и ссылкой на summary. Один удачный прогон "
-    "рекорд не двигает; возврат памяти к 4 667 316 KB остаётся обязательным. Ночной develop проверяется заранее, "
+    "рекорд не двигает; возврат памяти к 4 787 080 KB остаётся обязательным. Ночной develop проверяется заранее, "
     "но его успешный отчёт не заменяет релизный гейт по обеим базам.")
 
 
@@ -186,8 +186,9 @@ class Readme(unittest.TestCase):
             self.assertIn(part, flat)
         for metric in verdict.GATE_RECORD:
             self.assertIn(f"`{metric}`", self.text, "the table of the record names every metric")
-        for aggregate in ("медиана A", "максимум A+B", "медиана B"):
+        for aggregate in ("медиана A", "| `hwm_kb` | максимум A |", "медиана B"):
             self.assertIn(aggregate, self.text)
+        self.assertNotIn("максимум A+B", self.text, "the peak of both series is compared with no record")
 
     def test_the_paragraph_that_ties_the_record_to_the_optimisation_is_there_word_for_word(self):
         self.assertIn(PARAGRAPH, self.text)

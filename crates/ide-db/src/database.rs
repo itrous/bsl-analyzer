@@ -334,7 +334,7 @@ impl RootDatabaseImpl {
     }
 
     /// Run one deep LRU trim: evict with the heaviest per-file caps (parse trees,
-    /// lowered bodies) shrunk to a small sweep profile, then restore the interactive
+    /// lowered bodies, inference) shrunk to a small sweep profile, then restore the interactive
     /// caps — restoring evicts nothing, the wide window simply repopulates on
     /// demand. For a whole-workspace sweep's final cleanup, where the swept files'
     /// memos are working set nothing will read again: a plain [`Self::enforce_lru`]
@@ -355,6 +355,7 @@ impl RootDatabaseImpl {
     fn set_sweep_lru(&mut self, sweep: bool) {
         base_db::set_parse_lru_sweep_mode(self, sweep);
         hir::set_lowering_lru_sweep_mode(self, sweep);
+        hir::set_infer_method_lru_sweep_mode(self, sweep);
         queries::set_dataflow_lru_sweep_mode(self, sweep);
     }
 

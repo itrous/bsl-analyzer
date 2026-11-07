@@ -2972,14 +2972,19 @@ pub fn rank_resolve_candidates(
         .filter_map(|(id, kind)| {
             let (rank, match_kind) = if id == query {
                 (0, "exact")
-            } else if id.fold_lower() == q_lower {
-                (1, "case_insensitive")
-            } else if resolve_name_segment(&id).fold_lower() == q_lower {
-                (2, "name")
-            } else if id.fold_lower().contains(&q_lower) {
-                (3, "substring")
             } else {
-                return None;
+                // Folded once: every node of the graph passes through here on a
+                // resolve, and the substring tier needs the same folding again.
+                let id_lower = id.fold_lower();
+                if id_lower == q_lower {
+                    (1, "case_insensitive")
+                } else if resolve_name_segment(&id).fold_lower() == q_lower {
+                    (2, "name")
+                } else if id_lower.contains(&q_lower) {
+                    (3, "substring")
+                } else {
+                    return None;
+                }
             };
             Some((rank, ResolveCandidate { id, kind, match_kind }))
         })
@@ -4419,6 +4424,86 @@ mod tests {
         assert!(none.is_empty());
         assert_eq!(total, 0);
         assert!(!ResolveResult::new("", none, total).truncated);
+    }
+
+    /// The ranker folds each id once and reuses it for the substring tier; the answer must
+    /// stay the one of the plain tier-by-tier reading, which folds the id per tier. Compared
+    /// whole — every candidate with its tier and kind, in order, and the total — on queries
+    /// that land in each tier, Cyrillic case pairs, a shared bare name, and caps at 0, 1 and
+    /// below the match count.
+    #[test]
+    fn rank_resolve_answers_as_the_tier_by_tier_reading() {
+        fn oracle(
+            nodes: &[(String, &'static str)],
+            query: &str,
+            limit: usize,
+        ) -> (Vec<(String, &'static str, &'static str)>, usize) {
+            if query.is_empty() {
+                return (Vec::new(), 0);
+            }
+            let q = query.fold_lower();
+            let mut ranked: Vec<(u8, String, &'static str, &'static str)> = nodes
+                .iter()
+                .filter_map(|(id, kind)| {
+                    let (rank, tier) = if id == query {
+                        (0, "exact")
+                    } else if id.fold_lower() == q {
+                        (1, "case_insensitive")
+                    } else if resolve_name_segment(id).fold_lower() == q {
+                        (2, "name")
+                    } else if id.fold_lower().contains(&q) {
+                        (3, "substring")
+                    } else {
+                        return None;
+                    };
+                    Some((rank, id.clone(), *kind, tier))
+                })
+                .collect();
+            let total = ranked.len();
+            ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            ranked.truncate(limit);
+            (ranked.into_iter().map(|(_, id, kind, tier)| (id, kind, tier)).collect(), total)
+        }
+
+        let nodes: Vec<(String, &'static str)> = [
+            ("method/common/Сервер/Считать", "method"),
+            ("method/common/Клиент/считать", "method"),
+            ("method/common/Прочее/СчитатьВсё", "method"),
+            ("method/common/ОБЩЕЕ/Ёлка", "method"),
+            ("module/common/Сервер", "module"),
+            ("module/common/сервер", "module"),
+            ("mdo/Catalog/Товары", "mdo"),
+            ("attribute/Catalog/Товары/Код", "attribute"),
+        ]
+        .into_iter()
+        .map(|(id, kind)| (id.to_owned(), kind))
+        .collect();
+
+        let mut tiers_seen = std::collections::HashSet::new();
+        for query in [
+            "method/common/Сервер/Считать",
+            "MODULE/COMMON/СЕРВЕР",
+            "Считать",
+            "ёлка",
+            "Товары",
+            "common",
+            "считать",
+            "нет-такого",
+            "",
+        ] {
+            for limit in [0, 1, 2, 3, 100] {
+                let (got, total) = rank_resolve_candidates(nodes.iter().cloned(), query, limit);
+                let got: Vec<_> = got.into_iter().map(|c| (c.id, c.kind, c.match_kind)).collect();
+                let want = oracle(&nodes, query, limit);
+                assert_eq!((got.clone(), total), want, "query {query:?}, limit {limit}");
+                tiers_seen.extend(got.into_iter().map(|(_, _, tier)| tier));
+            }
+        }
+        assert_eq!(
+            tiers_seen,
+            ["exact", "case_insensitive", "name", "substring"].into_iter().collect(),
+            "the control: the queries land in every tier, so a tier answered wrongly shows"
+        );
     }
 
     /// Forms never enter the in-memory `workspace_call_graph` (they are emitted only

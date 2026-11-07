@@ -215,7 +215,9 @@ pub use hir_ty::infer::{
     infer_effective, infer_module_code_query, infer_owner, infer_query, infer_weaving,
     type_of_expr_query,
 };
-pub use hir_ty::method_graph::{infer_method_query, method_return_type_query};
+pub use hir_ty::method_graph::{
+    infer_method_query, method_return_type_query, set_infer_method_lru_sweep_mode,
+};
 pub use hir_ty::method_resolution::{resolve_qualified_call, MethodResolution};
 pub use hir_ty::narrow::{
     narrow_or_base, narrow_or_base_indexed, narrow_query, narrowed_type_at, NarrowExprIndex,
