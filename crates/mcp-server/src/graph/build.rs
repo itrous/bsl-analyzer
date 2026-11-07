@@ -2251,7 +2251,7 @@ fn open_installed_replacement(
 ) -> Result<PreparedSnapshotPool, LoadFailure> {
     let mut last = None;
     for attempt in 0..OPEN_ATTEMPTS {
-        if attempt > 0 && graph.stop.sleep(std::time::Duration::from_secs(1)) {
+        if attempt > 0 && graph.pause(std::time::Duration::from_secs(1)) {
             break;
         }
         match graph.prepare_snapshot_pool(generation, fp_pre, force_stale) {
@@ -4368,8 +4368,8 @@ mod tests {
         WorkspaceDiff,
     };
     use super::super::test_support::{
-        meta_string, published_report, sample_workspace, seed_cache, wait_ready, wait_settled,
-        wait_until, wait_until_within, write, write_common_module, write_extension_config,
+        meta_string, published_report, sample_workspace, seed_cache, wait_ready, wait_until,
+        wait_until_within, write, write_common_module, write_extension_config,
         write_extension_workspace,
     };
     use super::*;
@@ -5364,24 +5364,29 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib original_transient_arms_withheld_build_until_trigger -- --ignored"]
     fn original_transient_arms_withheld_build_until_trigger() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
         cache.ensure().unwrap();
-        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&cache);
         let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
             .with_lease(lease.clone());
         let temp = cache.root().join("transient.building");
         let canonical = cache.root().join("transient.db");
         fs::write(&temp, b"candidate").unwrap();
 
-        let held = lease.hold_file_lock_for_test();
+        let graph = graph.with_manual_builds();
+        let clock = Arc::new(crate::test_clock::TestClock::default());
+        let _virtual = crate::workspace_lease::VirtualLockWait::install(Arc::clone(&clock));
+        let started = clock.now();
+
+        let held = lease.hold_file_lock_once_for_test();
         let error = publish_or_discard(&graph, &temp, &canonical, None, false).unwrap_err();
         drop(held);
 
         assert_eq!(error.reason, LoadFailureReason::TransientRefusal);
+        assert!(clock.now() > started, "the refusal was not the lock wait running out");
         graph.record_load_failure(false, error);
         assert!(graph.owes_failed());
         assert!(matches!(
@@ -5395,8 +5400,10 @@ mod tests {
 
         graph.ensure_loading();
         assert!(!matches!(graph.status(), GraphStatus::Failed(_)));
-        wait_ready(&graph);
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
         assert!(!graph.owes_failed());
+        assert_eq!(graph.queued_builds(), 0);
     }
 
     #[test]
@@ -6612,15 +6619,27 @@ mod tests {
     /// A retry the owner could not start — its lease could not be confirmed just then — keeps
     /// the failed reload owed: the graph still reads behind and the alarm stays armed.
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_failed_reload_whose_retry_is_held_stays_owed -- --ignored"]
     fn a_failed_reload_whose_retry_is_held_stays_owed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
-        let lease = crate::workspace_lease::WorkspaceLease::claim(root);
-        let graph = GraphState::for_workspace(root.to_path_buf()).with_lease(lease.clone());
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(
+            &crate::cache::WorkspaceCacheLayout::for_workspace(root),
+        );
+        // Two clocks: the graph's policy stays at t0 for the whole stand, while the lease's own
+        // lock wait plays its budget out on another.
+        let clock = Arc::new(crate::test_clock::TestClock::default());
+        let _virtual = crate::workspace_lease::VirtualLockWait::install(Arc::new(
+            crate::test_clock::TestClock::default(),
+        ));
+        let graph = GraphState::for_workspace(root.to_path_buf())
+            .with_lease(lease.clone())
+            .with_clock(Arc::clone(&clock))
+            .with_manual_builds();
         graph.ensure_loading();
-        wait_settled(&graph);
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
+        assert_eq!(graph.queued_builds(), 0);
         write(
             root,
             "CommonModules/Сервер/Ext/Module.bsl",
@@ -6631,17 +6650,29 @@ mod tests {
         // which is not a takeover.
         std::fs::remove_file(crate::cache::WorkspaceCacheLayout::for_workspace(root).lease_path())
             .unwrap();
-        let held = lease.hold_file_lock_for_test();
+        let held = lease.hold_file_lock_once_for_test();
         graph.drive();
         assert!(!lease.is_superseded(), "the probe took the workspace over");
+        assert_eq!(graph.queued_builds(), 0, "a retry the lease could not confirm was started");
         assert!(graph.owes_failed(), "the held retry dropped the debt");
-        if cfg!(timing_contract) {
-            // The alarm reads the debt only while the hold is still running, so this view of
-            // it holds only for a read made inside that window.
-            let now = std::time::Instant::now();
-            assert!(graph.wake_at(now).is_some(), "the held retry dropped the debt");
-        }
+        let wake = graph.wake_at(graph.now()).expect("the held retry dropped its alarm");
+        assert_eq!(
+            wake,
+            graph.now() + crate::graph::debt::HELD_RETRY,
+            "the held retry's alarm is not the end of its hold",
+        );
+        assert_eq!(graph.wake_at(graph.now()), Some(wake), "reading the alarm moved it");
+        // Halfway through the hold the alarm is still its end: an unconfirmed lease with no hold
+        // would look again one hold's time from now instead.
+        clock.advance(crate::graph::debt::HELD_RETRY / 2);
+        assert_eq!(graph.wake_at(graph.now()), Some(wake), "the hold did not hold the alarm");
+
+        // Control: at the end of the hold, with the lock free, the same retry is started.
+        clock.advance(wake.saturating_duration_since(clock.now()));
         drop(held);
+        graph.drive();
+        assert_eq!(graph.queued_builds(), 1, "the retry was not started once its hold ran out");
+        assert!(!lease.is_superseded());
     }
 
     /// A first build refused by the lease is retried by its owner, like a reload is: the

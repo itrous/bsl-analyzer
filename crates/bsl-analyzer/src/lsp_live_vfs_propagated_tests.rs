@@ -216,6 +216,109 @@ fn live_definition_fixture() -> (
     (dir, state, client_receiver, changed, caller_uri, result)
 }
 
+/// The project, VFS, database inputs and open document of [`live_definition_fixture`], filled
+/// in synchronously, with nothing dispatched: no loader progress and no baseline request, so no
+/// job is queued behind the stand and every answer it reads is already in the client queue.
+fn controller_fixture() -> (
+    tempfile::TempDir,
+    crate::global_state::GlobalState,
+    Receiver<Message>,
+    lsp_types::Url,
+) {
+    let dir = tempfile::tempdir().expect("create controller test workspace");
+    let (sender, client_receiver) = crossbeam_channel::unbounded();
+    let mut state = crate::global_state::GlobalState::new(sender);
+    *state.analysis_host.raw_database_mut() = ide_db::RootDatabaseImpl::new_with_salsa_events();
+    state.init_empty_source_root();
+
+    state.workspace_root = Some(dir.path().to_path_buf());
+    state.project = Some(project_model::Project::new(dir.path()).expect("load fixture project"));
+    let caller_dir = dir.path().join("Editor");
+    std::fs::create_dir_all(&caller_dir).expect("create open-document subtree");
+    let caller = caller_dir.join("Caller.bsl");
+    let caller_text = "Процедура TargetProcedure()\nКонецПроцедуры\n\nПроцедура Caller()\n    TargetProcedure();\nКонецПроцедуры\n";
+    std::fs::write(&caller, caller_text).expect("write caller fixture");
+    let caller_uri = lsp_types::Url::from_file_path(&caller).expect("caller file URI");
+    let vfs_path = vfs::VfsPath::new(caller.as_path());
+    let file_id = {
+        let mut vfs = state.vfs.write();
+        vfs.set_file_contents(vfs_path.clone(), Some(Arc::from(caller_text)));
+        vfs.file_id(&vfs_path).expect("caller VFS identity")
+    };
+    let mut file_set = vfs::file_set::FileSet::new();
+    file_set.insert(file_id, vfs_path);
+    {
+        let db = state.analysis_host.raw_database_mut();
+        db.set_source_root(BSL_SOURCE_ROOT, SourceRoot::new_local(file_set));
+        db.set_file_source_root(file_id, BSL_SOURCE_ROOT);
+    }
+    state.vfs_done = true;
+    state.mem_docs.insert(caller_uri.clone(), caller_text.to_owned(), 1);
+    state.open_files.insert(file_id);
+    (dir, state, client_receiver, caller_uri)
+}
+
+/// Hand the controller one finished attempt of a running definition request `id` and return the
+/// one response it put in the client queue. Only messages already queued are read: a missing or
+/// a second response fails here at once, never on a wait.
+fn controller_answer(
+    state: &mut crate::global_state::GlobalState,
+    client_receiver: &Receiver<Message>,
+    caller_uri: &lsp_types::Url,
+    id: i32,
+    outcome: impl FnOnce(salsa::Revision) -> crate::global_state::LatencyAttemptOutcome,
+) -> lsp_server::Response {
+    let request_id = lsp_server::RequestId::from(id);
+    let key = crate::global_state::RequestAttemptKey {
+        id: request_id.clone(),
+        generation: 1,
+        attempt: 1,
+    };
+    let origin = crate::global_state::RequestOriginGuard {
+        identity: state.mem_docs.identity(caller_uri).unwrap(),
+        uri: caller_uri.clone(),
+        workspace_root: state.workspace_root.clone(),
+        source_roots: state.project.as_ref().unwrap().source_roots(),
+    };
+    state.request_lifecycles.insert(
+        request_id.clone(),
+        crate::global_state::RequestLifecycle {
+            generation: key.generation,
+            method: GotoDefinition::METHOD.to_owned(),
+            request: Some(g1_definition_request(id, caller_uri.clone())),
+            attempt: key.attempt,
+            phase: RequestLifecyclePhase::Running,
+            retry_origin_revision: None,
+            retry_eligible: true,
+            origin: Some(origin),
+            client_cancelled: false,
+        },
+    );
+    // The token a dispatched attempt owns, as dispatch leaves it: the answer has to give it back.
+    let token = state.analysis_host.raw_database().cancellation_token();
+    state.request_tokens.insert(request_id.clone(), token);
+    state.request_token_owners.insert(request_id.clone(), key.clone());
+    let revision = salsa::plumbing::current_revision(state.analysis_host.raw_database());
+    handle_task(
+        state,
+        crate::global_state::Task::LatencyRequestFinished { key, outcome: outcome(revision) },
+    )
+    .expect("the controller decision passes through the production event loop");
+    assert!(!state.request_tokens.contains_key(&request_id), "the answer kept its token");
+    assert!(!state.request_token_owners.contains_key(&request_id));
+    let mut responses: Vec<_> = client_receiver
+        .try_iter()
+        .filter_map(|message| match message {
+            Message::Response(response) => Some(response),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(responses.len(), 1, "the controller answered other than once: {responses:?}");
+    let response = responses.pop().unwrap();
+    assert_eq!(response.id, request_id);
+    response
+}
+
 fn wait_until_blocked(db: &ide_db::RootDatabaseImpl, baseline: u64) {
     let deadline = Instant::now() + HANG_GUARD;
     loop {
@@ -761,53 +864,17 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
 }
 
 #[test]
-#[ignore = "the controller's refusal has answered -32603 instead of -32801 under load, with no established cause; the wait for the answer ends only at the hang guard; run: cargo test -p bsl-analyzer --lib g1_propagated_without_new_revision_is_refused_controller_control -- --ignored"]
 fn g1_propagated_without_new_revision_is_refused_controller_control() {
     g1_with_tracing(|| {
         let _panic_guard = crate::panic_watch::panic_test_guard();
-        let (_dir, mut state, client_receiver, _changed, caller_uri, _control) =
-            live_definition_fixture();
-        let task_receiver = state.task_pool.receiver.clone();
-        let request_id = lsp_server::RequestId::from(733);
-        let key = crate::global_state::RequestAttemptKey {
-            id: request_id.clone(),
-            generation: 1,
-            attempt: 1,
-        };
-        let origin = crate::global_state::RequestOriginGuard {
-            identity: state.mem_docs.identity(&caller_uri).unwrap(),
-            uri: caller_uri.clone(),
-            workspace_root: state.workspace_root.clone(),
-            source_roots: state.project.as_ref().unwrap().source_roots(),
-        };
-        state.request_lifecycles.insert(
-            request_id.clone(),
-            crate::global_state::RequestLifecycle {
-                generation: key.generation,
-                method: GotoDefinition::METHOD.to_owned(),
-                request: Some(g1_definition_request(733, caller_uri)),
-                attempt: key.attempt,
-                phase: RequestLifecyclePhase::Running,
-                retry_origin_revision: None,
-                retry_eligible: true,
-                origin: Some(origin),
-                client_cancelled: false,
-            },
-        );
-        let revision = salsa::plumbing::current_revision(state.analysis_host.raw_database());
-        handle_task(
-            &mut state,
-            crate::global_state::Task::LatencyRequestFinished {
-                key,
-                outcome: crate::global_state::LatencyAttemptOutcome::Cancelled {
-                    kind: salsa::Cancelled::PropagatedPanic,
-                    revision,
-                },
-            },
-        )
-        .expect("controller refusal passes through the production event-loop decision");
-        let response = recv_client_response(&client_receiver, request_id.clone());
-        assert_eq!(response.id, request_id);
+        let (_dir, mut state, client_receiver, caller_uri) = controller_fixture();
+
+        let response = controller_answer(&mut state, &client_receiver, &caller_uri, 733, |revision| {
+            crate::global_state::LatencyAttemptOutcome::Cancelled {
+                kind: salsa::Cancelled::PropagatedPanic,
+                revision,
+            }
+        });
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
             Some(lsp_server::ErrorCode::ContentModified as i32)
@@ -818,7 +885,16 @@ fn g1_propagated_without_new_revision_is_refused_controller_control() {
         );
         assert!(state.request_lifecycles.is_empty());
         assert!(state.pending_latency_retries.is_empty());
-        assert!(client_receiver.try_recv().is_err());
-        g1_wait_for_task_pool_quiescence(&mut state, &task_receiver);
+
+        // Control: the same lifecycle ending in a real panic keeps its own code.
+        let response = controller_answer(&mut state, &client_receiver, &caller_uri, 734, |revision| {
+            crate::global_state::LatencyAttemptOutcome::Panicked { revision }
+        });
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(lsp_server::ErrorCode::InternalError as i32)
+        );
+        assert!(state.request_lifecycles.is_empty());
+        assert!(state.pending_latency_retries.is_empty());
     });
 }

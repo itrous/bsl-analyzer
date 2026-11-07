@@ -2395,6 +2395,36 @@ mod tests {
     #[cfg(unix)]
     impl RetargetedLink {
         fn new() -> Self {
+            Self::assemble(|workspace| {
+                let graph = crate::graph::GraphState::for_workspace(workspace.to_path_buf());
+                graph.ensure_loading();
+                assert!(eventually(|| matches!(
+                    graph.status(),
+                    crate::graph::GraphStatus::Ready { .. }
+                )));
+                graph
+            })
+        }
+
+        /// [`Self::new`] whose graph builds once, on this thread, to its end.
+        fn built() -> Self {
+            Self::assemble(|workspace| {
+                let graph = crate::graph::GraphState::for_workspace(workspace.to_path_buf())
+                    .with_manual_builds();
+                graph.ensure_loading();
+                let built = graph.run_next_build();
+                assert!(
+                    matches!(built.status, crate::graph::GraphStatus::Ready { .. }),
+                    "{built:?}"
+                );
+                assert_eq!(graph.queued_builds(), 0);
+                graph
+            })
+        }
+
+        fn assemble(
+            first_build: impl FnOnce(&std::path::Path) -> crate::graph::GraphState,
+        ) -> Self {
             let dir = tempdir().unwrap();
             let workspace = dir.path().to_path_buf();
             let outside = tempdir().unwrap();
@@ -2436,12 +2466,7 @@ mod tests {
             engine.initialize_workspace_roots(boot_roots).unwrap();
             let engine: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
-            let graph = crate::graph::GraphState::for_workspace(workspace.clone());
-            graph.ensure_loading();
-            assert!(eventually(|| matches!(
-                graph.status(),
-                crate::graph::GraphStatus::Ready { .. }
-            )));
+            let graph = first_build(&workspace);
             let store = crate::graph::GraphStore::serving_file_for_test(
                 &crate::cache::graph_db_path(&workspace),
                 None,
@@ -2511,9 +2536,8 @@ mod tests {
     /// being replaced is what turns the retarget into a rebind.
     #[cfg(unix)]
     #[test]
-    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589; run: cargo test -p mcp-server --lib publish_hook_keeps_a_retargeted_roots_id -- --ignored"]
     fn publish_hook_keeps_a_retargeted_roots_id() {
-        let fixture = RetargetedLink::new();
+        let fixture = RetargetedLink::built();
         assert!(fixture.publish(), "the linked extension root must be installed");
         let before = fixture.engine_roots();
         let ext_id = RetargetedLink::extension_id(&before);
@@ -2612,7 +2636,6 @@ mod tests {
     /// provider keyed on the workspace instead of the layout would never find the artifact
     /// and the root table would stay frozen at its boot contents.
     #[test]
-    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589; run: cargo test -p mcp-server --lib publish_hook_transitions_roots_when_the_cache_lives_outside_the_workspace -- --ignored"]
     fn publish_hook_transitions_roots_when_the_cache_lives_outside_the_workspace() {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -2642,10 +2665,17 @@ mod tests {
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
-        let graph = graph.with_publish_hook(hook);
+        let graph = graph.with_publish_hook(hook).with_manual_builds();
+        let boot = engine.lock().unwrap().as_ref().unwrap().workspace_roots().unwrap().clone();
+        assert!(!boot.contains_id("ext/live"), "control: the boot table has no extension");
+        assert_eq!(boot.entries().count(), 1);
         graph.ensure_loading();
 
-        wait_for_root_count(&engine, 2);
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, crate::graph::GraphStatus::Ready { .. }), "{built:?}");
+        assert_eq!(graph.queued_builds(), 0);
+        let roots = engine.lock().unwrap().as_ref().unwrap().workspace_roots().unwrap().clone();
+        assert_eq!(roots.entries().count(), 2, "the publish pass left the boot table in place");
         assert!(engine
             .lock()
             .unwrap()

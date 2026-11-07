@@ -1626,7 +1626,7 @@ fn assert_vector_artifacts(layout: &mcp_server::WorkspaceCacheLayout) {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "drives two MCP daemons by polling HTTP readiness, graph nodes, search markers and embeddings, with no event to wait on; graph_overview retries graph_busy up to the hang guard; run: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restarts -- --ignored"]
+#[ignore = "необязательный тест: live independent daemons, OS file events, an external embedding HTTP server and warm restarts; a graph hand-over receipt does not prove search or vector readiness, and a silent process or a lost watcher event never closes the connection; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restarts -- --ignored"]
 fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restarts() {
     let root = workspace();
     source_composition(root.path());
@@ -1929,7 +1929,7 @@ fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restart
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "can block for the whole hang guard: graph_overview retries while the server answers graph_busy, with no event for the end of the ownership hand-over; run: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_linux_default_stdio_and_read_only_cli_stay_outside_sources -- --ignored"]
+#[ignore = "необязательный тест: a real daemon's stdio and a separate CLI analyze with read-only sources and a restart; after a ready event the next request or shutdown may still never end, and EOF comes only from a process that exited, so a live silent server has no finite negative outcome; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_linux_default_stdio_and_read_only_cli_stay_outside_sources -- --ignored"]
 fn workspace_cache_scope_linux_default_stdio_and_read_only_cli_stay_outside_sources() {
     let root = workspace();
     source_composition(root.path());
@@ -2119,7 +2119,7 @@ fn workspace_cache_scope_linux_default_stdio_and_read_only_cli_stay_outside_sour
 
 #[cfg(unix)]
 #[test]
-#[ignore = "can block for the whole hang guard: graph_overview retries while the server answers graph_busy, with no event for the end of the ownership hand-over; run: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_explicit_workspace_build_namespace_preserves_flat_canaries -- --ignored"]
+#[ignore = "необязательный тест: the real stdio transport plus embedding completion and lease release; graph readiness alone cannot end the test without dropping its runtime and store assertions; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_explicit_workspace_build_namespace_preserves_flat_canaries -- --ignored"]
 fn workspace_cache_scope_explicit_workspace_build_namespace_preserves_flat_canaries() {
     let root = workspace();
     source_composition(root.path());
@@ -2464,7 +2464,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "can block for the whole hang guard: graph_overview retries while the server answers graph_busy, with no event for the end of the ownership hand-over; run: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_optional_journal_overlap_keeps_source_clean -- --ignored"]
+#[ignore = "необязательный тест: MCP must stay available despite the journal failure and the tree must stay clean while the runtime lives and after shutdown, then stderr reaches EOF; the journal-failure event proves neither MCP readiness nor process exit; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_optional_journal_overlap_keeps_source_clean -- --ignored"]
 fn workspace_cache_scope_optional_journal_overlap_keeps_source_clean() {
     const JOURNAL_UNAVAILABLE: &str =
         "vector journal unavailable; diagnostic history may have gaps";
@@ -2596,7 +2596,7 @@ fn workspace_cache_scope_optional_journal_overlap_keeps_source_clean() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "can block for the whole hang guard: graph_overview retries while the server answers graph_busy, with no event for the end of the ownership hand-over; run: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_live_topology_drift_stops_stdio_and_http -- --ignored"]
+#[ignore = "необязательный тест: an external config edit must be noticed and the real stdio and HTTP process must close; a missed drift leaves the server alive with no kernel wake or exit promised, and a synthetic scope stop would replace the very link under test; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_live_topology_drift_stops_stdio_and_http -- --ignored"]
 fn workspace_cache_scope_live_topology_drift_stops_stdio_and_http() {
     const SCOPE_STOP: &str = "workspace source composition changed; restart/reconnect MCP";
 
@@ -2881,7 +2881,7 @@ fn workspace_cache_scope_live_topology_drift_stops_stdio_and_http() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "can block for the whole hang guard: graph_overview retries while the server answers graph_busy, with no event for the end of the ownership hand-over; run: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf -- --ignored"]
+#[ignore = "необязательный тест: a live broker and the real idle TTL and orphan grace, including a detached process; telling a silent daemon apart needs a deadline, and stopping it by hand instead of the idle shutdown changes the subject; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf -- --ignored"]
 fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf() {
     let root = workspace();
     source_composition(root.path());
@@ -3722,7 +3722,7 @@ fn s12_proxy_scope_mismatch_driver() {
 
 #[cfg(windows)]
 #[test]
-#[ignore = "can block for the whole hang guard: graph_overview retries while the server answers graph_busy, with no event for the end of the ownership hand-over; run: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_windows_source_delete_default_and_explicit -- --ignored"]
+#[ignore = "необязательный тест: deletes NTFS sources while a real subprocess holds them open, then shuts it down gracefully; an in-process fixture cannot stand for another process's handles, and a silent child may never answer the shutdown; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_windows_source_delete_default_and_explicit -- --ignored"]
 fn workspace_cache_scope_windows_source_delete_default_and_explicit() {
     fn run_case(cache_base: Option<&Path>, default_base: &Path) {
         let root = workspace();
