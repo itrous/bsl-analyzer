@@ -7,6 +7,20 @@ impl super::SharedState {
         self.graph = graph;
         self
     }
+
+    /// A workspace backend holding nothing but `lease`, a claim already made over `root`'s
+    /// caches. No owner is started — no graph, search or watcher — so with a lease from
+    /// [`crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat`] nothing else
+    /// asks the lease anything, or holds its lock, while a stand does.
+    pub(crate) fn leased_workspace_for_test(
+        root: std::path::PathBuf,
+        lease: crate::workspace_lease::WorkspaceLease,
+    ) -> Self {
+        let mut state = Self::shared();
+        state.workspace_root = Some(root);
+        state.workspace_lease = lease;
+        state
+    }
 }
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();

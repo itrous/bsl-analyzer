@@ -1365,6 +1365,9 @@ struct HubInner {
     /// re-arm only ever arms what is now desired), and an accumulated set would keep the
     /// hub degraded for the life of the daemon over a root nobody declares any more.
     blind_targets: Mutex<Vec<PathBuf>>,
+    /// A [`WorkspaceChangeHub::start_manual`] hub: no thread stands behind its declaration.
+    #[cfg(test)]
+    manual: bool,
 }
 
 impl HubInner {
@@ -2295,42 +2298,16 @@ impl WorkspaceChangeHub {
         #[cfg(test)] blind_poll_seam: BlindPollSeam,
     ) -> Self {
         let placed = ResolvedTargets::here(targets.clone());
-
-        let inner = Arc::new(HubInner {
-            acc: Mutex::new(Accumulator::new(cap)),
-            wake: Condvar::new(),
-            notifications: AtomicU64::new(0),
-            watching: AtomicBool::new(false),
-            channel_overflow: AtomicBool::new(false),
-            watched_roots: Mutex::new(Vec::new()),
-            // A starting value only; the hub thread re-derives it right before
-            // arming, so the relative spellings are resolved against the same
-            // current directory the backend will use.
-            scope: Mutex::new(Scope::from_targets_scoped(&placed, &excluded, &user_excluded)),
-            excluded,
-            user_excluded: Arc::new(RwLock::new(user_excluded)),
-            excluded_events: AtomicU64::new(0),
+        let inner = HubInner::new(
+            &placed,
+            cap,
             tick_period,
-            ticks: AtomicU64::new(0),
-            rearms: AtomicU64::new(0),
+            excluded,
+            user_excluded,
             poll,
-            polling: AtomicBool::new(false),
-            poll_state: Mutex::new(PollStatus::default()),
-            poll_expected_since: Mutex::new(None),
-            blind_poll: BlindPoll {
-                #[cfg(test)]
-                cannot_start: blind_poll_seam.cannot_start,
-                #[cfg(test)]
-                gate: blind_poll_seam.gate,
-                #[cfg(test)]
-                announce: blind_poll_seam.announce,
-                ..BlindPoll::default()
-            },
-            // Placed, like every later declaration: the record is compared against
-            // those, and a raw spelling would never equal its own placed form.
-            declared_published: Mutex::new(placed.as_slice().to_vec()),
-            blind_targets: Mutex::new(Vec::new()),
-        });
+            #[cfg(test)]
+            blind_poll_seam,
+        );
         let (tx, rx) = std::sync::mpsc::sync_channel::<HubMsg>(CHANNEL_BOUND);
 
         let thread_inner = Arc::clone(&inner);
@@ -2364,6 +2341,114 @@ impl WorkspaceChangeHub {
         }
     }
 
+    /// A hub with no thread, backend, tick or poll: the accumulator, cursors, scope and
+    /// exclusions of a real hub, standing on `targets` as armed, and taking facts only from
+    /// the `deliver_*_for_test` calls.
+    ///
+    /// For a stand about what a consumer does with a fact already delivered, not about whether
+    /// the platform delivers it. The declared coverage is the stand's input, never a proof of a
+    /// system watch, so a declaration that changes it fails the stand at once: there is no
+    /// thread to re-arm, and waiting for one would wait for ever.
+    #[cfg(test)]
+    pub(crate) fn start_manual(
+        targets: Vec<WatchTarget>,
+        excluded: Vec<PathBuf>,
+        user_excluded: ExcludedPaths,
+    ) -> Self {
+        let placed = ResolvedTargets::here(targets);
+        let mut inner = HubInner::new(
+            &placed,
+            DEFAULT_CAPACITY,
+            COVERAGE_TICK_PERIOD,
+            excluded,
+            user_excluded,
+            PollConfig::PRODUCTION,
+            BlindPollSeam::default(),
+        );
+        Arc::get_mut(&mut inner).expect("nothing else holds a new hub").manual = true;
+        inner.set_scope(inner.scope_from(&placed));
+        *inner.watched_roots.lock().unwrap_or_else(PoisonError::into_inner) =
+            dedup_targets(placed.as_slice().to_vec())
+                .into_iter()
+                .map(|(target, canonical)| (canonical, target.recursive))
+                .collect();
+        inner.watching.store(true, Ordering::SeqCst);
+        // Nobody reads the channel: a control message finds it disconnected and fails at once.
+        let (tx, _) = std::sync::mpsc::sync_channel::<HubMsg>(CHANNEL_BOUND);
+        let blind_stop = Arc::clone(&inner.blind_poll.stop);
+        Self {
+            inner,
+            thread: Arc::new(HubThread { control: tx, handle: Mutex::new(None), blind_stop }),
+        }
+    }
+
+    /// [`Self::ensure_scope`] on a [`Self::start_manual`] hub: the declaration it stands on
+    /// is the only one it can cover.
+    #[cfg(test)]
+    fn ensure_manual_scope(&self, targets: &[WatchTarget], user_excluded: &ExcludedPaths) -> bool {
+        let resolved = ResolvedTargets::here(targets.to_vec());
+        assert!(
+            self.inner.user_excluded() == *user_excluded
+                && same_declaration(&self.inner.accepted_declaration(), resolved.as_slice()),
+            "a manual hub was asked to change its coverage to {targets:?}; it has no watch to \
+             re-arm",
+        );
+        self.covers(&resolved)
+    }
+}
+
+impl HubInner {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        placed: &ResolvedTargets,
+        cap: usize,
+        tick_period: Duration,
+        excluded: Vec<PathBuf>,
+        user_excluded: ExcludedPaths,
+        poll: PollConfig,
+        #[cfg(test)] blind_poll_seam: BlindPollSeam,
+    ) -> Arc<Self> {
+        Arc::new(HubInner {
+            acc: Mutex::new(Accumulator::new(cap)),
+            wake: Condvar::new(),
+            notifications: AtomicU64::new(0),
+            watching: AtomicBool::new(false),
+            channel_overflow: AtomicBool::new(false),
+            watched_roots: Mutex::new(Vec::new()),
+            // A starting value only; the hub thread re-derives it right before
+            // arming, so the relative spellings are resolved against the same
+            // current directory the backend will use.
+            scope: Mutex::new(Scope::from_targets_scoped(placed, &excluded, &user_excluded)),
+            excluded,
+            user_excluded: Arc::new(RwLock::new(user_excluded)),
+            excluded_events: AtomicU64::new(0),
+            tick_period,
+            ticks: AtomicU64::new(0),
+            rearms: AtomicU64::new(0),
+            poll,
+            polling: AtomicBool::new(false),
+            poll_state: Mutex::new(PollStatus::default()),
+            poll_expected_since: Mutex::new(None),
+            blind_poll: BlindPoll {
+                #[cfg(test)]
+                cannot_start: blind_poll_seam.cannot_start,
+                #[cfg(test)]
+                gate: blind_poll_seam.gate,
+                #[cfg(test)]
+                announce: blind_poll_seam.announce,
+                ..BlindPoll::default()
+            },
+            // Placed, like every later declaration: the record is compared against
+            // those, and a raw spelling would never equal its own placed form.
+            declared_published: Mutex::new(placed.as_slice().to_vec()),
+            blind_targets: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            manual: false,
+        })
+    }
+}
+
+impl WorkspaceChangeHub {
     /// Declare `targets` as of now — a test-side convenience. Production always states the
     /// age of its composition ([`Self::rearm_with_epoch`]), because a declaration with no
     /// age cannot be ordered against the one in force (github#184).
@@ -2507,6 +2592,10 @@ impl WorkspaceChangeHub {
         user_excluded: &ExcludedPaths,
         epoch: u64,
     ) -> bool {
+        #[cfg(test)]
+        if self.inner.manual {
+            return self.ensure_manual_scope(targets, user_excluded);
+        }
         // The roots are declared whatever the rescope answered: a hub that polls answers
         // "not covered" to everything, and the new roots must reach it all the same.
         let rescoped = self.inner.user_excluded() == *user_excluded || {
@@ -6031,6 +6120,70 @@ mod tests {
     use super::*;
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
     use tempfile::tempdir;
+
+    /// A manual hub is armed on the coverage it was given, with no thread to wait for, and takes
+    /// facts only from its caller: a named path arrives in a batch of its own, the sequence moves
+    /// with it, and a path nobody delivered is in no batch.
+    #[test]
+    fn a_manual_hub_takes_only_the_facts_it_is_given() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let delivered = root.join("delivered.bsl");
+        let silent = root.join("silent.bsl");
+        std::fs::write(&delivered, "a").unwrap();
+        std::fs::write(&silent, "b").unwrap();
+        let hub = WorkspaceChangeHub::start_manual(
+            vec![WatchTarget::recursive(root.to_path_buf())],
+            Vec::new(),
+            ExcludedPaths::default(),
+        );
+        assert!(hub.is_watching(), "a manual hub stands on its coverage as armed");
+
+        let observer = hub.subscribe();
+        let before = hub.seq();
+        let idle = hub.drain(observer);
+        assert!(idle.entries.is_empty(), "a manual hub produced a fact nobody delivered");
+        assert_eq!(hub.seq(), before);
+
+        hub.deliver_modified_for_test(&delivered);
+        let batch = hub.drain(idle.cursor);
+        let named = std::fs::canonicalize(&delivered).unwrap();
+        let other = std::fs::canonicalize(&silent).unwrap();
+        assert!(batch.entries.iter().any(|entry| entry.canonical == named), "{:?}", batch.entries);
+        assert!(!batch.entries.iter().any(|entry| entry.canonical == other));
+        assert!(hub.seq() > before, "the delivery did not move the sequence");
+        hub.shutdown();
+    }
+
+    /// A manual hub covers the declaration it stands on, and that declaration alone.
+    #[test]
+    fn a_manual_hub_covers_the_declaration_it_stands_on() {
+        let dir = tempdir().unwrap();
+        let targets = vec![WatchTarget::recursive(dir.path().to_path_buf())];
+        let hub =
+            WorkspaceChangeHub::start_manual(targets.clone(), Vec::new(), ExcludedPaths::default());
+        assert!(hub.ensure_scope(&targets, &ExcludedPaths::default(), 1));
+        hub.shutdown();
+    }
+
+    /// A declaration that would change the coverage has no thread to re-arm it: the stand fails
+    /// at once instead of waiting for one.
+    #[test]
+    #[should_panic(expected = "a manual hub was asked to change its coverage")]
+    fn a_manual_hub_refuses_a_declaration_that_changes_its_coverage() {
+        let dir = tempdir().unwrap();
+        let elsewhere = tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start_manual(
+            vec![WatchTarget::recursive(dir.path().to_path_buf())],
+            Vec::new(),
+            ExcludedPaths::default(),
+        );
+        hub.ensure_scope(
+            &[WatchTarget::recursive(elsewhere.path().to_path_buf())],
+            &ExcludedPaths::default(),
+            1,
+        );
+    }
 
     fn change_event(kind: EventKind, path: PathBuf) -> Result<Event, notify::Error> {
         Ok(Event { kind, paths: vec![path], attrs: Default::default() })

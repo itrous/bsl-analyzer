@@ -518,6 +518,34 @@ pub(crate) struct GraphState {
     /// started — is what a test needs to be able to see.
     #[cfg(test)]
     pub(super) claim_is_held: Arc<std::sync::atomic::AtomicBool>,
+    /// The clock this graph's policy reads — debts, admissions, marks, holds, probes and the
+    /// freshness cache — when a test holds one; the system clock otherwise.
+    #[cfg(test)]
+    pub(super) clock: Option<Arc<crate::test_clock::TestClock>>,
+    /// Accepted builds a test runs one at a time with [`Self::run_next_build`] instead of on a
+    /// thread of their own. Admission and every refusal before the spawn stay production's;
+    /// only where the accepted body runs changes.
+    #[cfg(test)]
+    pub(super) manual_builds: Option<Arc<Mutex<std::collections::VecDeque<ManualBuild>>>>,
+}
+
+/// An accepted build waiting for its test to run it.
+#[cfg(test)]
+pub(super) struct ManualBuild {
+    is_reload: bool,
+    claim: Option<u64>,
+}
+
+/// What one build a test ran by hand ended in, read once its body — publication, publish pass
+/// and the ticket it carried — had returned.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct BuildReceipt {
+    pub(crate) is_reload: bool,
+    /// The admission this build was granted on, when it went through one.
+    pub(crate) claim: Option<u64>,
+    pub(crate) status: GraphStatus,
+    pub(crate) generation: Option<u64>,
 }
 
 pub(super) struct PendingCandidate {
@@ -649,6 +677,89 @@ impl GraphState {
             quiet_losses: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             claim_is_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            clock: None,
+            #[cfg(test)]
+            manual_builds: None,
+        }
+    }
+
+    /// The time this graph's policy decides on.
+    pub(super) fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock.now();
+        }
+        Instant::now()
+    }
+
+    /// Wait `delay` before this graph retries its own work, and say whether the daemon asked
+    /// every owner to leave meanwhile. On a held clock the delay is played out on it instead.
+    pub(super) fn pause(&self, delay: Duration) -> bool {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            clock.advance(delay);
+            return self.stop.is_stopped();
+        }
+        self.stop.sleep(delay)
+    }
+
+    /// Decide this graph's policy on `clock` instead of the system clock.
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, clock: Arc<crate::test_clock::TestClock>) -> Self {
+        self.store.set_clock(Arc::clone(&clock));
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Queue every accepted build of this graph for [`Self::run_next_build`] instead of
+    /// spawning its thread.
+    #[cfg(test)]
+    pub(crate) fn with_manual_builds(mut self) -> Self {
+        self.manual_builds = Some(Arc::new(Mutex::new(std::collections::VecDeque::new())));
+        self
+    }
+
+    /// Queue the build just accepted, when this graph's builds run by hand. Called where the
+    /// builder thread would be spawned, after every refusal that comes before it.
+    #[cfg(test)]
+    pub(super) fn queue_manual_build(&self, is_reload: bool) -> bool {
+        let Some(queue) = &self.manual_builds else {
+            return false;
+        };
+        let claim = lock_recover(&self.inner).claimed.as_ref().map(|ticket| ticket.claim);
+        lock_recover(queue).push_back(ManualBuild { is_reload, claim });
+        true
+    }
+
+    /// Accepted builds still waiting for [`Self::run_next_build`].
+    #[cfg(test)]
+    pub(crate) fn queued_builds(&self) -> usize {
+        lock_recover(self.manual_builds.as_ref().expect("this graph runs its builds by hand")).len()
+    }
+
+    /// Run the oldest accepted build to its end on this thread and report what it left.
+    ///
+    /// Work the build queued behind itself stays queued for the next explicit step. With
+    /// nothing queued the stand is wrong, and says so at once.
+    #[cfg(test)]
+    pub(crate) fn run_next_build(&self) -> BuildReceipt {
+        let queue = self.manual_builds.as_ref().expect("this graph runs its builds by hand");
+        let job = lock_recover(queue).pop_front();
+        let Some(job) = job else {
+            panic!(
+                "no accepted build is queued; {}",
+                super::test_support::graph_state_summary(self)
+            );
+        };
+        self.builders_started.fetch_add(1, Ordering::SeqCst);
+        self.run_load(job.is_reload);
+        let inner = lock_recover(&self.inner);
+        BuildReceipt {
+            is_reload: job.is_reload,
+            claim: job.claim,
+            status: inner.status.clone(),
+            generation: inner.published.as_ref().map(|published| published.generation),
         }
     }
 
@@ -703,7 +814,7 @@ impl GraphState {
     /// retry budget holding the next attempt off until `at`.
     #[cfg(test)]
     pub(crate) fn fail_with_retry_held_until(&self, at: Instant) {
-        let now = Instant::now();
+        let now = self.now();
         lock_recover(&self.debt).fail_held_until(now, at);
         lock_recover(&self.inner).status = GraphStatus::Failed("forced".to_owned());
         lock_recover(&self.debt).record_change(now, self.observation());
@@ -813,7 +924,7 @@ impl GraphState {
     }
 
     pub(crate) fn record_change_quietly(&self, fact: u64) {
-        lock_recover(&self.debt).record_change(Instant::now(), fact);
+        lock_recover(&self.debt).record_change(self.now(), fact);
         self.wake_watcher();
     }
 
@@ -822,7 +933,7 @@ impl GraphState {
     /// project. Identified by the loss itself, not by the fact number it happens to stand at.
     pub(crate) fn record_loss_quietly(&self, token: Option<u64>, fact: u64) {
         let horizon = self.loss_horizon(token);
-        lock_recover(&self.debt).record_loss(Instant::now(), token, fact, horizon);
+        lock_recover(&self.debt).record_loss(self.now(), token, fact, horizon);
         // Listed once the ledger HAS it: what a stand reads after this is the ledger this
         // delivery reached, not the one it was still waiting for.
         #[cfg(test)]
@@ -838,7 +949,7 @@ impl GraphState {
     }
 
     pub(crate) fn record_forced_quietly(&self, fact: u64) {
-        lock_recover(&self.debt).record_forced(Instant::now(), fact);
+        lock_recover(&self.debt).record_forced(self.now(), fact);
         self.wake_watcher();
     }
 
@@ -859,7 +970,7 @@ impl GraphState {
 
     /// A change of the scan universe was delivered under `fact`.
     pub(crate) fn record_change(&self, fact: u64) {
-        lock_recover(&self.debt).record_change(Instant::now(), fact);
+        lock_recover(&self.debt).record_change(self.now(), fact);
         self.wake_watcher();
         self.drive();
     }
@@ -869,13 +980,13 @@ impl GraphState {
     /// [`Self::record_loss_quietly`] for a caller that also drives.
     pub(crate) fn record_loss(&self, token: Option<u64>, fact: u64) {
         let horizon = self.loss_horizon(token);
-        lock_recover(&self.debt).record_loss(Instant::now(), token, fact, horizon);
+        lock_recover(&self.debt).record_loss(self.now(), token, fact, horizon);
         self.wake_watcher();
         self.drive();
     }
 
     pub(crate) fn record_forced(&self, fact: u64) {
-        lock_recover(&self.debt).record_forced(Instant::now(), fact);
+        lock_recover(&self.debt).record_forced(self.now(), fact);
         self.wake_watcher();
         self.drive();
     }
@@ -894,7 +1005,7 @@ impl GraphState {
     /// A request asked about this graph. It reads no disk: all it may do is pull a recovery
     /// probe forward, and the watcher is what runs it.
     pub(crate) fn note_request(&self) {
-        if lock_recover(&self.debt).note_request(Instant::now()) {
+        if lock_recover(&self.debt).note_request(self.now()) {
             self.wake_watcher();
         }
     }
@@ -947,7 +1058,7 @@ impl GraphState {
         if let Some(hook) = self.outcome_window_hook.clone() {
             hook(self);
         }
-        let rearmed = lock_recover(&self.debt).record_failure(Instant::now(), kind, sponsors);
+        let rearmed = lock_recover(&self.debt).record_failure(self.now(), kind, sponsors);
         self.wake_watcher();
         rearmed
     }
@@ -978,7 +1089,7 @@ impl GraphState {
         if self.workspace_root.is_none() {
             return;
         }
-        let now = Instant::now();
+        let now = self.now();
         let facts = self.facts();
         if facts.terminal {
             lock_recover(&self.debt).abandon();
@@ -1016,7 +1127,7 @@ impl GraphState {
             if facts.terminal || facts.stopping || facts.in_flight || !facts.owns {
                 return;
             }
-            let decision = lock_recover(&self.debt).decide(Instant::now(), facts);
+            let decision = lock_recover(&self.debt).decide(self.now(), facts);
             if let Some(start) = decision.start {
                 tracing::info!(
                     action = "build",
@@ -1144,7 +1255,7 @@ impl GraphState {
         // leaves the marks owed with no schedule left to answer them.
         let claimed = |graph: &Self| {
             if start.forced {
-                lock_recover(&graph.debt).spend_mark_attempt(Instant::now());
+                lock_recover(&graph.debt).spend_mark_attempt(graph.now());
             }
         };
         // Read before the claim — and then taken from the SCAN the comparison actually used,
@@ -1189,7 +1300,7 @@ impl GraphState {
                 ReloadClaim::Unsponsored => StartOutcome::Settled,
                 ReloadClaim::Running => StartOutcome::Settled,
                 ReloadClaim::Held => {
-                    self.hold_decision(Instant::now());
+                    self.hold_decision(self.now());
                     StartOutcome::Settled
                 }
             },
@@ -1219,7 +1330,7 @@ impl GraphState {
             // nothing about disk.
             ReloadClaim::Unsponsored => {}
             ReloadClaim::Running => {}
-            ReloadClaim::Held => self.hold_decision(Instant::now()),
+            ReloadClaim::Held => self.hold_decision(self.now()),
         }
     }
 
@@ -1253,7 +1364,7 @@ impl GraphState {
                 ..facts
             };
             let mut debt = lock_recover(&self.debt);
-            if !debt.decide(Instant::now(), live).probe {
+            if !debt.decide(self.now(), live).probe {
                 return;
             }
             debt.reserve_probe()
@@ -1278,11 +1389,11 @@ impl GraphState {
                     // refused, the token given back, and the revisit stays finite. A claim is
                     // NOT such a case — a walk whose basis still stands may finish while a
                     // build runs, and its credits simply land after that build's cutoff.
-                    debt.release_probe(Instant::now(), plan.token, false);
+                    debt.release_probe(self.now(), plan.token, false);
                     super::debt::ProbeResult::Obsolete
                 } else {
                     debt.finish_probe(
-                        Instant::now(),
+                        self.now(),
                         super::debt::ProbeReceipt {
                             token: plan.token,
                             basis: plan.basis,
@@ -1296,7 +1407,7 @@ impl GraphState {
             // attempt is paced all the same, or the watcher asks again every turn for as long
             // as the obstacle lasts.
             super::snapshot::ProbeOutcome::CouldNotLook => {
-                lock_recover(&self.debt).release_probe(Instant::now(), plan.token, false);
+                lock_recover(&self.debt).release_probe(self.now(), plan.token, false);
                 super::debt::ProbeResult::CouldNotLook
             }
         };
@@ -1371,7 +1482,7 @@ impl GraphState {
             // Offered and took nothing. That is not an action, and asking again this turn is
             // how a consumer that refuses for as long as it lives — a search engine that never
             // came up — turned the executor into a zero-wait loop.
-            debt.hook_refused(Instant::now(), revision);
+            debt.hook_refused(self.now(), revision);
             return false;
         }
         true
@@ -2027,7 +2138,7 @@ impl GraphState {
         }
         // Recorded even when ownership cannot be confirmed right now. A mark dropped here is
         // a re-render nobody will ever ask for again; a mark kept costs one decision.
-        lock_recover(&self.debt).place_marks(Instant::now(), mark_high, fact);
+        lock_recover(&self.debt).place_marks(self.now(), mark_high, fact);
         self.wake_watcher();
         self.consume_observed_marks();
         self.settle_mark_obligation();
@@ -2103,7 +2214,7 @@ impl GraphState {
             // while the consumer ran. Topology/root refresh debt is independent.
             debt.hook_handled(revision, HookDebt { topology: false, roots: false, marks: true });
         } else {
-            let now = Instant::now();
+            let now = self.now();
             let mut debt = lock_recover(&self.debt);
             debt.record_hook(HookDebt { topology: false, roots: false, marks: true });
             debt.pace_hook_refusal(now);
@@ -2116,7 +2227,7 @@ impl GraphState {
     pub(super) fn settle_mark_obligation(&self) {
         let in_flight = self.drift_pending();
         let observed = self.consuming_observation();
-        if lock_recover(&self.debt).settle_marks_through(Instant::now(), in_flight, observed) {
+        if lock_recover(&self.debt).settle_marks_through(self.now(), in_flight, observed) {
             self.wake_watcher();
         }
     }
@@ -2186,7 +2297,7 @@ impl GraphState {
                 // records what was refused, the executor it drives at the end finds that debt
                 // ripe NOW, and the consumer that has just said no is asked again in the same
                 // breath. Paced after the record, so it is the debt now standing that waits.
-                debt.pace_hook_refusal(Instant::now());
+                debt.pace_hook_refusal(self.now());
             }
             if let (Some(observed), Some(bound)) = (observed, bound) {
                 if outcome.topology_handled {
@@ -2676,12 +2787,12 @@ impl GraphState {
             // what paces the next look; a lease that is gone for good leaves nothing to ask.
             if !facts.terminal && !facts.stopping {
                 self.first_build_asked.store(true, Ordering::SeqCst);
-                self.hold_decision(Instant::now());
+                self.hold_decision(self.now());
             }
             return;
         }
         let forced = lock_recover(&self.debt)
-            .decide(Instant::now(), facts)
+            .decide(self.now(), facts)
             .start
             .is_some_and(|start| start.forced);
         self.ensure_loading_claimed(forced);
@@ -2691,7 +2802,7 @@ impl GraphState {
     /// restart a failed build the schedule is still holding off.
     fn debt_ripeness_of_failure(&self) -> Option<crate::graph::debt::Ripeness> {
         let facts = self.facts();
-        lock_recover(&self.debt).standing(Instant::now(), facts).failed
+        lock_recover(&self.debt).standing(self.now(), facts).failed
     }
 
     /// The build a REQUEST may ask for: the first one, and the retry the schedule says is due.
@@ -2764,9 +2875,9 @@ impl GraphState {
                     // An ask the decision put back under a hold is not due before the hold
                     // runs out. Waited out stop-aware, so a lease that stays unconfirmed is
                     // looked at on the hold's cadence and never in a loop.
-                    let held = lock_recover(&graph.debt).held_until(Instant::now());
+                    let held = lock_recover(&graph.debt).held_until(graph.now());
                     if let Some(until) = held {
-                        if graph.stop.sleep(until.saturating_duration_since(Instant::now())) {
+                        if graph.stop.sleep(until.saturating_duration_since(graph.now())) {
                             break;
                         }
                     }
@@ -2811,7 +2922,7 @@ impl GraphState {
             let mut debt = lock_recover(&self.debt);
             let forced_through = debt.forced_fact();
             let mode = forced || forced_through.is_some() || debt.owes_recovery_build();
-            let sponsors = debt.charge_admission(scan_cutoff, Instant::now(), mode);
+            let sponsors = debt.charge_admission(scan_cutoff, self.now(), mode);
             let recovery_cutoff = debt.capture_recovery();
             let ticket = super::debt::BuildTicket {
                 claim: self.next_claim_id(),
@@ -2833,6 +2944,10 @@ impl GraphState {
                     GraphStatus::Failed("could not spawn loader: refused by test".to_owned());
             });
             // Claimed all the same: the attempt happened, and it failed where it stands.
+            return true;
+        }
+        #[cfg(test)]
+        if self.queue_manual_build(false) {
             return true;
         }
         let spawned = std::thread::Builder::new()
@@ -2878,7 +2993,7 @@ impl GraphState {
         let mut debt = lock_recover(&self.debt);
         let forced_through = debt.forced_fact();
         let mode = forced_through.is_some() || debt.owes_recovery_build();
-        let sponsors = debt.charge_admission(scan_cutoff, Instant::now(), mode);
+        let sponsors = debt.charge_admission(scan_cutoff, self.now(), mode);
         let recovery_cutoff = debt.capture_recovery();
         let ticket = super::debt::BuildTicket {
             claim: self.next_claim_id(),
@@ -3001,7 +3116,7 @@ impl GraphState {
             // spending what paid for it is a free attempt, and free attempts are what the
             // whole account exists to make impossible. It can REFUSE — the walk above takes
             // seconds, and the only sponsor's deadline can pass inside it.
-            let sponsors = debt.charge_admission(scan_cutoff, Instant::now(), force);
+            let sponsors = debt.charge_admission(scan_cutoff, self.now(), force);
             if !sponsors.any() {
                 drop(debt);
                 // Back exactly where it was. Reporting this as an ordinary "nothing to do"
@@ -3071,6 +3186,10 @@ impl GraphState {
                 true,
                 super::build::LoadFailure::refused("could not spawn reload: refused by test"),
             );
+            return;
+        }
+        #[cfg(test)]
+        if self.queue_manual_build(true) {
             return;
         }
         let spawned = std::thread::Builder::new()
@@ -7264,7 +7383,6 @@ mod tests {
     /// went out beside it.
     #[cfg(unix)]
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_walk_that_outlived_its_episode_is_still_the_only_walk -- --ignored"]
     fn a_walk_that_outlived_its_episode_is_still_the_only_walk() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -7288,25 +7406,32 @@ mod tests {
                 // The chain ends and another one begins while this walk is out.
                 let sound = read_everything(graph, 1_000);
                 let mut debt = lock_recover(&graph.debt);
-                debt.record_publication(Instant::now(), Some(1), false, None, sound);
+                debt.record_publication(graph.now(), Some(1), false, None, sound);
                 debt.record_publication(
-                    Instant::now(),
+                    graph.now(),
                     Some(2),
                     false,
                     None,
                     left_unread(1_001, &["/ws/Другой.bsl"]),
                 );
-                debt.probe_now(Instant::now());
+                debt.probe_now(graph.now());
                 drop(debt);
                 // A second caller, while the first walk is still out.
                 graph.probe_recovery();
             }) as LatchWindowHook
         };
-        let graph = GraphState::for_workspace(root.to_path_buf()).with_probe_window_hook(hook);
+        let graph = GraphState::for_workspace(root.to_path_buf())
+            .with_clock(Arc::new(crate::test_clock::TestClock::default()))
+            .with_probe_window_hook(hook)
+            .with_manual_builds();
         graph.ensure_loading();
-        wait_settled(&graph);
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
+        assert_eq!(graph.queued_builds(), 0, "the first publication queued nothing after it");
+        assert!(!graph.walk_out(), "no walk is out before the test sends one");
+        assert!(!inside.load(Ordering::SeqCst), "the build itself already walked the tree");
         assert!(graph.owes_recovery(), "the fixture needs an outstanding obligation");
-        lock_recover(&graph.debt).probe_now(Instant::now());
+        lock_recover(&graph.debt).probe_now(graph.now());
         let before = graph.probe_walks.load(Ordering::SeqCst);
 
         graph.probe_recovery();
@@ -7859,7 +7984,6 @@ mod tests {
     /// path moved under it, the lease could not be taken, and the lease is gone for good.
     #[cfg(unix)]
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_refused_install_retires_nothing -- --ignored"]
     fn a_refused_install_retires_nothing() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -7879,11 +8003,17 @@ mod tests {
 
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
         cache.ensure().unwrap();
-        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&cache);
         let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
-            .with_lease(lease.clone());
+            .with_lease(lease.clone())
+            .with_manual_builds();
+        let _virtual = crate::workspace_lease::VirtualLockWait::install(Arc::new(
+            crate::test_clock::TestClock::default(),
+        ));
         graph.ensure_loading();
-        wait_ready(&graph);
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
+        assert_eq!(graph.queued_builds(), 0);
         let owed = lock_recover(&graph.debt).outstanding_recovery();
         assert_eq!(owed.keys.len(), 1, "the unreadable module is an obligation");
         let published =
@@ -7934,7 +8064,7 @@ mod tests {
 
         // 2. The lease could not be taken.
         let prepared = prepare();
-        let held = lease.hold_file_lock_for_test();
+        let held = lease.hold_file_lock_once_for_test();
         let refused = install(prepared);
         assert!(
             !matches!(refused, crate::workspace_lease::LeaseOperationOutcome::Applied(())),
@@ -7949,7 +8079,7 @@ mod tests {
 
         // 3. The lease is gone for good: another owner took the workspace.
         let prepared = prepare();
-        let _newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let _newer = crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&cache);
         assert!(!lease.owns_caches_now(), "the previous owner observes the takeover");
         let refused = install(prepared);
         assert!(
@@ -9603,7 +9733,6 @@ mod tests {
     /// rebuild loop the probe would itself create.
     #[cfg(unix)]
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_chronically_unreadable_subtree_is_probed_but_never_rebuilt -- --ignored"]
     fn a_chronically_unreadable_subtree_is_probed_but_never_rebuilt() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -9619,20 +9748,24 @@ mod tests {
             eprintln!("skipping: mode 0o000 is not an obstacle for this user");
             return;
         }
-        let graph = GraphState::for_workspace(root.to_path_buf());
+        let graph = GraphState::for_workspace(root.to_path_buf())
+            .with_clock(Arc::new(crate::test_clock::TestClock::default()))
+            .with_manual_builds();
         graph.ensure_loading();
-        wait_settled(&graph);
-        wait_until(&graph, "the initial build to leave its slot", || !graph.facts().in_flight);
-        let generation =
-            lock_recover(&graph.inner).published.as_ref().expect("the build published").generation;
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
+        assert!(!graph.facts().in_flight, "the initial build left its slot");
+        assert_eq!(graph.queued_builds(), 0);
+        let generation = built.generation.expect("the build published");
         let first_interval = lock_recover(&graph.debt).probe_interval().expect("a probe is owed");
 
-        // Each probe is this test's own: a background recovery walk holding the reservation
-        // would turn it into a no-op that leaves the interval where it was.
-        for _ in 0..5 {
-            wait_until(&graph, "the recovery walk to come back", || !graph.walk_out());
-            lock_recover(&graph.debt).probe_now(Instant::now());
+        // Each probe is this test's own and runs to its end inside `drive`: no walk is out
+        // between them, and none may leave a build behind.
+        for probe in 0..5 {
+            assert!(!graph.walk_out(), "a walk was still out before probe {probe}");
+            lock_recover(&graph.debt).probe_now(graph.now());
             graph.drive();
+            assert_eq!(graph.queued_builds(), 0, "probe {probe} queued a rebuild");
         }
 
         assert_eq!(
@@ -10507,23 +10640,24 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "waits for graph readiness and hub delivery against polling ceilings and sleeps through the owed-marks grace period; the graph has no status-change event and the grace period no controllable clock; run: cargo test -p mcp-server --lib deferred_context_mark_keeps_its_reported_fact -- --ignored"]
     fn deferred_context_mark_keeps_its_reported_fact() {
-        use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
-
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
         fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
-        let hub = super::super::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching());
+        let hub = super::super::test_support::manual_workspace_hub(root);
+        let clock = Arc::new(crate::test_clock::TestClock::default());
         let graph = GraphState::for_workspace(root.to_path_buf())
             .with_change_hub(hub.clone())
-            .with_publish_hook(Arc::new(|_| GraphPublishOutcome::HANDLED));
+            .with_publish_hook(Arc::new(|_| GraphPublishOutcome::HANDLED))
+            .with_clock(Arc::clone(&clock))
+            .with_manual_builds();
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
-        wait_ready(&graph);
-        wait_publish_pass_within(&graph, WAIT_CEILING, 1);
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
+        assert_eq!(graph.publish_passes.load(Ordering::SeqCst), 1);
+        assert_eq!(graph.queued_builds(), 0);
 
         let revision = graph.status_report().revision.expect("published graph revision");
         let full_builds = graph.full_builds_started.load(Ordering::SeqCst);
@@ -10532,10 +10666,8 @@ mod tests {
         let same_bytes = fs::read(&path).unwrap();
         let before = hub.seq().max(observed);
         fs::write(&path, &same_bytes).unwrap();
-        assert!(
-            crate::change_hub::test_support::eventually(|| { hub.seq() > before }),
-            "the first same-byte touch did not reach the hub"
-        );
+        hub.deliver_modified_for_test(&path);
+        assert!(hub.seq() > before, "the first same-byte touch did not reach the hub");
         let reported_fact = hub.seq();
         let owed = graph.owed_context_marks();
         owed.record(7);
@@ -10577,10 +10709,24 @@ mod tests {
         graph.check_against_disk();
         assert!(!graph.marks_pending(), "a complete later comparison should consume the mark");
 
-        std::thread::sleep(super::super::debt::OWED_MARKS_GRACE + Duration::from_millis(100));
+        // Exactly on the grace boundary, and past it: covered marks start nothing.
+        clock.advance(super::super::debt::OWED_MARKS_GRACE);
         graph.drive();
+        clock.advance(Duration::from_nanos(1));
+        graph.drive();
+        assert_eq!(graph.queued_builds(), 0, "the grace period started a covered graph reload");
         assert_eq!(graph.status_report().revision, Some(revision));
         assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), full_builds);
+
+        // Control: a mark no publication covers is what the grace period does start work for.
+        hub.deliver_modified_for_test(&path);
+        graph.marks_placed(9, hub.seq());
+        assert!(graph.owes_marks(), "the control mark is not covered by the publication");
+        graph.drive();
+        assert_eq!(graph.queued_builds(), 0, "the uncovered mark started work inside its grace");
+        clock.advance(super::super::debt::OWED_MARKS_GRACE);
+        graph.drive();
+        assert_eq!(graph.queued_builds(), 1, "the grace period ran out on an uncovered mark");
         hub.shutdown();
     }
 
@@ -10933,24 +11079,95 @@ mod tests {
         wait_ready(&graph);
     }
 
+    /// A stand that runs a build nobody was granted has the wrong premise, and fails at once
+    /// instead of waiting for one to appear.
+    #[test]
+    #[should_panic(expected = "no accepted build is queued")]
+    fn running_a_build_nobody_accepted_fails_the_stand_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_workspace(dir.path());
+        let graph = GraphState::for_workspace(dir.path().to_path_buf()).with_manual_builds();
+        graph.run_next_build();
+    }
+
+    /// Admission is the product's; only where the accepted body runs is the stand's. The build is
+    /// granted and queued with nothing run, a second ask queues no second build, and one explicit
+    /// step runs exactly that build to its end.
+    #[test]
+    fn an_accepted_build_waits_for_its_step_and_one_step_runs_exactly_it() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_workspace(dir.path());
+        let graph = GraphState::for_workspace(dir.path().to_path_buf()).with_manual_builds();
+
+        graph.ensure_loading();
+        assert!(matches!(graph.status(), GraphStatus::Loading));
+        assert_eq!(graph.queued_builds(), 1);
+        assert_eq!(graph.builders_started.load(Ordering::SeqCst), 0, "nothing ran it yet");
+        graph.ensure_loading();
+        assert_eq!(graph.queued_builds(), 1, "a second ask queued a second build");
+
+        let receipt = graph.run_next_build();
+        assert!(matches!(receipt.status, GraphStatus::Ready { .. }), "{receipt:?}");
+        assert_eq!(receipt.generation, Some(1));
+        assert_eq!(graph.builders_started.load(Ordering::SeqCst), 1);
+        assert!(!graph.build_in_flight(), "the receipt came back with the build's slot held");
+        assert_eq!(graph.queued_builds(), 0);
+    }
+
+    /// Without a stand's seams a graph keeps the system clock and spawns its own builders.
+    #[test]
+    fn a_graph_without_a_stands_seams_keeps_the_system_clock_and_its_own_builders() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphState::for_workspace(dir.path().to_path_buf());
+        assert!(graph.manual_builds.is_none() && graph.clock.is_none());
+
+        let before = Instant::now();
+        let read = graph.now();
+        let after = Instant::now();
+        assert!(before <= read && read <= after, "the graph's time is not the system's");
+        assert!(!graph.queue_manual_build(false), "a graph nobody asked to queue took a build");
+    }
+
+    /// A held clock decides the graph's time: reading it moves nothing, and an advance moves it
+    /// by exactly that much.
+    #[test]
+    fn a_held_clock_decides_the_graphs_time_and_reading_it_moves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(crate::test_clock::TestClock::default());
+        let graph = GraphState::for_workspace(dir.path().to_path_buf()).with_clock(clock.clone());
+
+        let t0 = graph.now();
+        assert_eq!(t0, clock.now());
+        for _ in 0..1_000 {
+            assert_eq!(graph.now(), t0, "a read moved the graph's time");
+        }
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(graph.now(), t0 + Duration::from_secs(5));
+    }
+
     /// [`a_refused_spawn_gives_its_claim_back`] for a reload.
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_refused_reload_spawn_gives_its_claim_back -- --ignored"]
     fn a_refused_reload_spawn_gives_its_claim_back() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
-        let graph = GraphState::for_workspace(root.to_path_buf());
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_manual_builds();
         graph.ensure_loading();
-        wait_settled(&graph);
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
+        assert_eq!(built.generation, Some(1), "control: the initial admission really built");
+        assert!(!graph.build_in_flight());
+        assert_eq!(graph.queued_builds(), 0);
 
         graph.loader_cannot_spawn.store(true, Ordering::SeqCst);
-        lock_recover(&graph.debt).record_forced(Instant::now(), 7);
+        lock_recover(&graph.debt).record_forced(graph.now(), 7);
         assert!(
             matches!(graph.try_claim_reload(true), ReloadClaim::Claimed),
             "the slot is granted"
         );
         graph.spawn_reload();
+        assert_eq!(graph.queued_builds(), 0, "the refused spawn queued a build all the same");
+        assert_eq!(graph.builders_started.load(Ordering::SeqCst), 1, "a refused reload ran");
         assert!(
             matches!(
                 lock_recover(&graph.inner).published.as_ref().map(|p| p.reload.clone()),
