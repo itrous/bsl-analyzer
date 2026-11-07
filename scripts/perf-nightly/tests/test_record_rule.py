@@ -7,6 +7,7 @@ time."""
 
 import math
 import os
+import statistics
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -188,34 +189,70 @@ class ShippedBaseline(unittest.TestCase):
         entry = self.doc["metrics"]["hwm_kb"]
         if entry["evidence"]["kind"] != "owner_target":
             self.skipTest("the target was replaced by a confirmed record")
-        self.assertEqual(entry["value"], 4667316)
+        self.assertEqual(entry["value"], 4787080)
         self.assertEqual((entry["aggregate"], entry["evidence"]["series"], entry["evidence"]["role"]),
-                         ("max_AB", "A", "base"))
+                         ("max_A", "A", "base"))
+        self.assertEqual(entry["record_sha"], "72143dd78de5ff067f0836d2642763d1f52e9a64", "the peak of A of v0.4.3")
         self.assertTrue(entry["evidence"]["note"], "the difference between the target and the measured A is written down")
+        self.assertIn("issues/785#issuecomment-6693139982", entry["evidence"]["note"], "the decision of the owner")
+        self.assertIn("issues/785#issuecomment-6705349235", entry["evidence"]["note"], "its move to v0.4.3")
+        self.assertEqual(entry["noise"]["statistic"], "(max-min)/median of five series max(A)",
+                         "the tolerance of the target is the noise of the peak it holds")
         self.assertIn("base_A_noise", entry["noise"], "A against A has its own tolerance")
+        for noise in (entry["noise"], entry["noise"]["base_A_noise"]):
+            self.assertEqual(noise["value"], 0.028, "the spread of the peak of A between gates, set by the owner")
+            self.assertIn("issues/785#issuecomment-6705767352", noise["note"], "the decision of the owner")
+            self.assertIn("0.012728440721518429", noise["note"], "the calibrated spread it replaced")
 
     def test_the_historical_values_are_the_extracted_ones(self):
         expected = {"graph_ready_s": 145.43540564802242, "graph_ready_cpu_s": 1245.29,
-                    "graph_resolve_s": 17.442752545000985, "diagnostics_workspace_s": 21.9344880010176,
-                    "hwm_kb": 4667316, "references_1_s": 56.56816865399014,
+                    "graph_resolve_s": 17.442752545000985, "diagnostics_workspace_s": 22.560848722991068,
+                    "hwm_kb": 4787080, "references_1_s": 56.56816865399014,
                     "references_2_same_s": 24.998699392017443, "references_3_other_s": 49.895538646000205}
         for metric, entry in self.doc["metrics"].items():
             if entry["evidence"]["kind"] != "confirmed":
                 self.assertEqual(entry["value"], expected[metric], metric)
+
+    def test_the_sweep_record_is_the_owners_level_of_develop_and_says_so(self):
+        entry = self.doc["metrics"]["diagnostics_workspace_s"]
+        if entry["evidence"]["kind"] != "owner_target":
+            self.skipTest("the level was replaced by a confirmed record")
+        observed = [22.576484093006002, 22.758767238003202, 22.52428385100211, 22.545213352976134]
+        self.assertEqual(entry["value"], statistics.median(observed), "the median of the four gates of the decision")
+        self.assertEqual((entry["evidence"]["series"], entry["evidence"]["role"]), ("A", "candidate"))
+        self.assertIn("issues/785#issuecomment-6705349235", entry["evidence"]["note"], "the decision of the owner")
+        self.assertIn("21.9344880010176", entry["evidence"]["note"], "the record it replaces")
+        self.assertIn("отдельная задача", entry["evidence"]["note"], "the slowdown is owed back")
+        self.assertEqual(entry["noise"]["statistic"], "(max-min)/median of five series medians of A")
 
     def test_a_missing_tolerance_is_named_and_never_replaced_by_a_number(self):
         baseline = gate.Baseline(self.path)
         self.assertEqual(baseline.reasons, [])
         for metric, entry in self.doc["metrics"].items():
             value = entry["noise"]["value"]
-            if metric == "hwm_kb":
-                self.assertIsNone(value, "the bar stands in for it and is not written down as one")
-                self.assertIsNone(baseline.problem(metric))
+            if metric == "hwm_kb" and value is None:
+                self.assertIsNone(baseline.problem(metric), "the bar stands in for it and is not written down as one")
             elif value is None:
                 self.assertEqual(baseline.problem(metric), f"record_no_noise:{metric}")
             else:
                 self.assertIsNone(baseline.problem(metric))
                 self.assertGreaterEqual(value, 0.0)
+
+    def test_every_record_carries_the_tolerance_measured_on_its_own_aggregate(self):
+        measured_on = {"median_A": "medians of A", "median_B": "medians of B", "max_A": "max(A)"}
+        baseline = gate.Baseline(self.path)
+        for metric, entry in self.doc["metrics"].items():
+            noise = entry["noise"]
+            with self.subTest(metric=metric):
+                self.assertTrue(noise["value"] is not None and math.isfinite(noise["value"]) and noise["value"] > 0,
+                                "a measured tolerance, not a gap that the bar or a missing noise fills")
+                self.assertIsNone(baseline.problem(metric))
+                self.assertTrue(noise["source"] and noise["created_at"] and noise["profile"], "the provenance is filled")
+                self.assertTrue(noise["statistic"].endswith(measured_on[entry["aggregate"]]),
+                                "the spread of the aggregate the record is judged by")
+        base_a = self.doc["metrics"]["hwm_kb"]["noise"]["base_A_noise"]
+        self.assertTrue(base_a["value"] is not None and math.isfinite(base_a["value"]) and base_a["value"] > 0)
+        self.assertTrue(base_a["statistic"].endswith("max(A)"), "A against A is judged on the peak of A")
 
     def test_it_describes_the_profile_and_the_protocol_the_harness_measures(self):
         self.assertEqual(set(self.doc["profile"]), PROFILE_KEYS)
@@ -482,14 +519,14 @@ class Aggregates(RecordCase):
             return (a_base if run.role == "b" else a_candidate)[run.n - 1]
         self.script.values["hwm_kb"] = hwm
 
-    def test_memory_is_the_peak_of_both_series_against_the_record_and_a_against_a_to_the_base(self):
-        self.set_record("hwm_kb", 8, 0.0, base_a_noise=0.0)
+    def test_memory_is_the_peak_of_a_against_the_record_and_against_the_peak_of_a_of_the_base(self):
+        self.set_record("hwm_kb", 4, 0.0, base_a_noise=0.0)
         self.peaks()
         code, summary, _ = self.gate()
         row = self.record_row(summary, "hwm_kb")
-        self.assertEqual((row["candidate"]["value"], row["outcome"], row["limit"]), (9.0, "block", 8.0),
-                         "the median of B (7) and the peak of A (5) would not block")
-        self.assertAlmostEqual(row["delta"], 0.125)
+        self.assertEqual((row["aggregate"], row["candidate"]["value"], row["outcome"], row["limit"]),
+                         ("max_A", 5.0, "block", 4.0), "the median of A (4) would not block")
+        self.assertAlmostEqual(row["delta"], 0.25)
         memory = summary["memory_base"]
         self.assertEqual((memory["base"]["value"], memory["candidate"]["value"], memory["outcome"]), (4.0, 5.0, "block"))
         self.assertAlmostEqual(memory["delta"], 0.25)
@@ -502,8 +539,8 @@ class Aggregates(RecordCase):
     def test_each_part_of_the_memory_rule_decides_on_its_own(self):
         self.peaks()
         for label, record, a_noise, record_outcome, base_outcome in (
-                ("both", 8, 0.0, "block", "block"), ("record only", 8, 0.25, "block", "ok"),
-                ("A against A only", 9, 0.0, "ok", "block"), ("neither", 9, 0.25, "ok", "ok")):
+                ("both", 4, 0.0, "block", "block"), ("record only", 4, 0.25, "block", "ok"),
+                ("A against A only", 5, 0.0, "ok", "block"), ("neither", 5, 0.25, "ok", "ok")):
             with self.subTest(case=label):
                 self.set_record("hwm_kb", record, 0.0, base_a_noise=a_noise)
                 _, summary, _ = self.gate(label=label.replace(" ", "-"))
@@ -650,23 +687,37 @@ class Priority(RecordCase):
                 self.assertNotEqual((code, summary["verdict"]), (0, "pass"))
                 self.assertEqual(summary["record"]["verdict"], record)
 
-    def test_the_known_peak_over_the_target_blocks_by_memory_though_the_previous_release_passes(self):
-        # 6 917 564 KB against the target 4 667 316 KB: +48.2128915 %.
+    def test_the_known_peak_of_a_over_the_target_blocks_by_memory_though_the_previous_release_passes(self):
+        # 4 739 312 KB of A against the target 4 667 316 KB: +1.5425568 %; B, with references, is not compared.
         self.set_record("hwm_kb", 4667316, 0.01, base_a_noise=1000.0)
         self.script.values["hwm_kb"] = lambda run: 6917564 if run.series == "B" else 4739312
         code, summary, _ = self.gate()
         row = self.record_row(summary, "hwm_kb")
-        self.assertEqual((row["candidate"]["value"], row["outcome"]), (6917564.0, "block"))
-        self.assertAlmostEqual(row["delta"], 0.48212891520522716, places=12)
+        self.assertEqual((row["candidate"]["value"], row["outcome"]), (4739312.0, "block"))
+        self.assertAlmostEqual(row["delta"], 0.015425567928119666, places=12)
         self.assertEqual(self.decided(summary), {"ok"}, "the previous release: pass")
-        self.assertEqual(self.row(summary, "hwm_kb")["outcome"], "ok", "under the old ceiling of 7 GiB")
+        self.assertEqual(self.row(summary, "hwm_kb")["outcome"], "ok", "B under the ceiling of 7 340 032 KB")
         self.assertEqual((code, summary["verdict"]), (1, "block"))
         self.assertIn("block: record:hwm_kb", summary["reasons"])
-        for nu, outcome in ((0.4821, "block"), (0.4822, "ok")):
+        for nu, outcome in ((0.0154, "block"), (0.0155, "ok")):
             with self.subTest(noise=nu):
                 self.set_record("hwm_kb", noise=nu)
                 _, summary, _ = self.gate(label=f"nu-{nu}")
                 self.assertEqual(self.record_row(summary, "hwm_kb")["outcome"], outcome)
+
+    def test_a_peak_of_b_over_the_target_answers_to_the_ceiling_alone(self):
+        # A under the target in every case; B over it by 50 % and more, at and over the ceiling of 7 340 032 KB.
+        self.set_record("hwm_kb", 4667316, 0.0, base_a_noise=1000.0)
+        for peak_b, ceiling, verdict_ in ((7340032, "ok", "pass"), (7340033, "block", "block")):
+            with self.subTest(peak_b=peak_b):
+                self.script.values["hwm_kb"] = lambda run, b=peak_b: b if run.series == "B" else 4600000
+                _, summary, _ = self.gate(label=f"b-{peak_b}")
+                row = self.record_row(summary, "hwm_kb")
+                self.assertEqual((row["candidate"]["value"], row["outcome"]), (4600000.0, "ok"))
+                self.assertEqual((self.row(summary, "hwm_kb")["candidate"]["value"],
+                                  self.row(summary, "hwm_kb")["outcome"]), (float(peak_b), ceiling))
+                self.assertEqual(summary["verdict"], verdict_)
+                self.assertNotIn("block: record:hwm_kb", summary["reasons"])
 
     def test_a_measured_excess_stands_when_the_second_round_is_cut_short(self):
         # Round one improves the work metric, which asks for a second round, and takes memory over its ceiling;

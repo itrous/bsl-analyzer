@@ -838,8 +838,8 @@ def new_round() -> dict:
 
 def _round_side(key: str, round_: dict) -> tuple[str, float | None]:
     aggregate = verdict.GATE_RECORD[key][1]
-    if aggregate == "max_AB":
-        return peak([round_["candidate"], round_["B"]])
+    if aggregate == "max_A":
+        return peak([round_["candidate"]])
     return side(round_["candidate" if aggregate == "median_A" else "B"], verdict.Metric(key, key))
 
 
@@ -986,10 +986,7 @@ def _improved_metrics(section: dict) -> list[str]:
 
 
 def _names(round_: dict, aggregate: str) -> list[str]:
-    names = round_["names"]
-    if aggregate == "max_AB":
-        return names["candidate"] + names["B"]
-    return names["candidate" if aggregate == "median_A" else "B"]
+    return round_["names"]["B" if aggregate == "median_B" else "candidate"]
 
 
 def _round_held(round_: dict) -> bool:
@@ -1014,7 +1011,7 @@ def record_proposals(section: dict, baseline: Baseline, rounds: list[dict], answ
             "rounds": values, "previous_value": row["record"]["value"], "record_sha": sha,
             "measured_at": verdict.now_iso(), "noise": baseline.metrics[row["metric"]]["noise"], "profile": print_,
             "evidence": {"kind": "confirmed", "summary": f"data/gates/{label}/summary.json", "role": "candidate",
-                         "series": {"median_A": "A", "median_B": "B", "max_AB": "A+B"}[aggregate],
+                         "series": {"median_A": "A", "median_B": "B", "max_A": "A"}[aggregate],
                          "runs": _names(rounds[0], aggregate), "confirmation": _names(rounds[1], aggregate)}})
     return found
 

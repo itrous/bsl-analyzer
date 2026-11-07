@@ -424,5 +424,73 @@ class OperatingCharacteristics(unittest.TestCase):
         self.assertLess(work_block, 0.5)
 
 
+def peaks(*values):
+    """Three runs whose peak memory is each of the given values."""
+    return [record(k + 1, hwm_kb=v) for k, v in enumerate(values)]
+
+
+class MemoryAgainstTheTargetAndTheCeiling(unittest.TestCase):
+    """The target of memory holds the peak of series A, which runs no references,
+    with its noise; the peak of series B answers to the absolute ceiling alone, and
+    the peak of A and B together is compared with nothing."""
+
+    TARGET = 4667316
+    CEILING = 7340032
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def baseline(self, noise):
+        path = os.path.join(self.tmp.name, f"baseline-{noise}.json")
+        tolerance = {"value": noise}
+        entry = {"value": self.TARGET, "unit": "KB", "aggregate": verdict.GATE_RECORD["hwm_kb"][1],
+                 "record_sha": "0" * 40, "measured_at": "2026-11-06T19:08:19+00:00",
+                 "evidence": {field: None for field in gate.EVIDENCE_FIELDS},
+                 "noise": {**tolerance, "base_A_noise": tolerance}}
+        gate.write_json(path, {"schema": gate.BASELINE_SCHEMA, "profile": {"cpu_model": "x"},
+                               "protocol": {"runs": 3}, "metrics": {"hwm_kb": entry}})
+        return gate.Baseline(path)
+
+    def round_(self, a, b):
+        round_ = gate.new_round()
+        round_["candidate"], round_["B"] = peaks(*a), peaks(*b)
+        return round_
+
+    def record(self, noise, a, b):
+        return gate.record_row("hwm_kb", self.baseline(noise), [], [self.round_(a, b)])
+
+    def test_the_target_holds_the_peak_of_a_with_its_noise(self):
+        # 4 667 316 · 1.02 = 4 760 662.32; B stays far over the target and under the ceiling in every case.
+        for peak_a, outcome in ((4760662, "ok"), (4760663, "block")):
+            with self.subTest(peak_a=peak_a):
+                row = self.record(0.02, (4600000, peak_a, 4650000), (7000000, 7100000, 6900000))
+                self.assertEqual((row["aggregate"], row["candidate"]["value"], row["outcome"], row["limit_basis"]),
+                                 ("max_A", peak_a, outcome, "noise"))
+                self.assertAlmostEqual(row["limit"], self.TARGET * 1.02)
+
+    def test_the_peak_of_b_answers_to_the_absolute_ceiling_alone(self):
+        self.assertEqual(verdict.GATE_HWM_LIMIT_KB, self.CEILING)
+        series_a = peaks(4600000, 4610000, 4620000)
+        for peak_b, outcome in ((self.CEILING, "ok"), (self.CEILING + 1, "block")):
+            with self.subTest(peak_b=peak_b):
+                series_b = peaks(6900000, peak_b, 7000000)
+                [ceiling] = [r for r in gate.ceiling_rows(series_a, series_b) if r["metric"] == "hwm_kb"]
+                self.assertEqual((ceiling["candidate"]["value"], ceiling["limit"], ceiling["outcome"]),
+                                 (peak_b, self.CEILING, outcome))
+                row = self.record(0.0, (4600000, 4610000, 4620000), (6900000, peak_b, 7000000))
+                self.assertEqual((row["candidate"]["value"], row["outcome"]), (4620000, "ok"),
+                                 "B over the target is no loss of the record")
+
+    def test_the_peak_of_a_and_b_together_is_compared_with_nothing(self):
+        self.assertNotIn("max_AB", {aggregate for _, aggregate in verdict.GATE_RECORD.values()})
+        # A at the target exactly and B over it: the peak of both would block at any noise under 57 %.
+        round_ = self.round_((4600000, self.TARGET, 4650000), (7300000, 7340032, 7200000))
+        self.assertEqual(gate._round_side("hwm_kb", round_), ("valid", self.TARGET))
+        self.assertEqual(gate._names({**round_, "names": {"candidate": ["A-c1"], "B": ["B-c1"]}}, "max_A"), ["A-c1"])
+        row = gate.record_row("hwm_kb", self.baseline(0.0), [], [round_])
+        self.assertEqual((row["candidate"]["value"], row["delta"], row["outcome"]), (self.TARGET, 0.0, "ok"))
+
+
 if __name__ == "__main__":
     unittest.main()

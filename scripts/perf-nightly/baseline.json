@@ -93,18 +93,19 @@
       }
     },
     "diagnostics_workspace_s": {
-      "value": 21.9344880010176,
+      "value": 22.560848722991068,
       "unit": "s",
       "aggregate": "median_A",
-      "record_sha": "1cb57b34ebebc4b7dfc6f78efb7d7bb8977cdc25",
-      "measured_at": "2026-10-31T03:39:33+00:00",
+      "record_sha": "2fbf243652cf89e69bd613298e9bbd7d2484ec6f",
+      "measured_at": "2026-11-07T05:27:04+00:00",
       "evidence": {
-        "kind": "historical_import",
-        "summary": "data/gates/0.4.2-2026-10-31/summary.json",
-        "role": "base",
+        "kind": "owner_target",
+        "summary": "data/gates/perf-gate-044-fixed-2fbf243652cf/summary.json",
+        "role": "candidate",
         "series": "A",
-        "runs": ["A-b1", "A-b2", "A-b3"],
-        "confirmation": null
+        "runs": ["A-c1", "A-c2", "A-c3"],
+        "confirmation": null,
+        "note": "Рекорд перенесён на уровень текущего develop решением владельца 2026-11-07 (https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6705349235). Число — медиана медиан A кандидата четырёх гейтов против v0.4.3 2026-11-07: perf-gate-044-fixed-2fbf243652cf 22.576484093006002, perf-gate-044-probe-interactive-5bdc42853286 22.758767238003202, perf-gate-044-probe-deep-c5bd868316f1 22.52428385100211, perf-gate-044-probe-sweepchunk-a2bfb4608dfd 22.545213352976134. Прежний рекорд 21.9344880010176 (v0.4.1, data/gates/0.4.2-2026-10-31) этим develop недостижим: узаконенное замедление на 2.86 %, вернуть метрику вниз — отдельная задача."
       },
       "noise": {
         "value": 0.009017533120752664,
@@ -115,32 +116,34 @@
       }
     },
     "hwm_kb": {
-      "value": 4667316,
+      "value": 4787080,
       "unit": "KB",
-      "aggregate": "max_AB",
-      "record_sha": "46533be7136107338be24b5bd6c96fad41e0fd61",
-      "measured_at": "2026-11-01T03:26:45+00:00",
+      "aggregate": "max_A",
+      "record_sha": "72143dd78de5ff067f0836d2642763d1f52e9a64",
+      "measured_at": "2026-11-06T04:11:07+00:00",
       "evidence": {
         "kind": "owner_target",
-        "summary": "data/gates/0.4.3-2026-11-01/summary.json",
+        "summary": "data/gates/0.4.4-2026-11-03-own/summary.json",
         "role": "base",
         "series": "A",
-        "runs": ["A-b1", "A-b2", "A-b3"],
+        "runs": ["A-b1.3", "A-b2", "A-b3"],
         "confirmation": null,
-        "note": "Цель владельца для общего пика A+B. Число — max(4616852,4667316,4662144) серии A базы v0.4.2, без references; измеренным пиком A+B этого бинарника оно не является."
+        "note": "Цель владельца для пика серии A, без references (решение владельца 2026-11-06, https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6693139982), перекалиброванная на уровень последнего релиза решением владельца 2026-11-07 (https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6705349235). Число — max(4371408,4787080,4762360) серии A базы v0.4.3, наибольший пик A v0.4.3 в его гейтах; прежняя цель 4667316 (серия A v0.4.2) с ν не проходила сама база. Пик серии B с references с целью не сравнивается: его держит абсолютный потолок 7340032 KB."
       },
       "noise": {
-        "value": null,
-        "source": null,
-        "created_at": null,
-        "profile": null,
-        "statistic": "(max-min)/median of five series max(A+B)",
+        "value": 0.028,
+        "source": "data/gate-noise.json",
+        "created_at": "2026-11-07T10:43:21+00:00",
+        "profile": "#/profile",
+        "statistic": "(max-min)/median of five series max(A)",
+        "note": "Допуск задан владельцем 2026-11-07 (https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6705767352): межгейтовый разброс пика A на семи полных гейтах против v0.4.3. Калиброванный разброс максимумов A пяти серий v0.4.2 из source — 0.012728440721518429.",
         "base_A_noise": {
-          "value": null,
-          "source": null,
-          "created_at": null,
-          "profile": null,
-          "statistic": "(max-min)/median of five series max(A)"
+          "value": 0.028,
+          "source": "data/gate-noise.json",
+          "created_at": "2026-11-07T10:43:21+00:00",
+          "profile": "#/profile",
+          "statistic": "(max-min)/median of five series max(A)",
+          "note": "Допуск задан владельцем 2026-11-07 (https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6705767352): межгейтовый разброс пика A на семи полных гейтах против v0.4.3. Калиброванный разброс максимумов A пяти серий v0.4.2 из source — 0.012728440721518429."
         }
       }
     },
@@ -159,10 +162,10 @@
         "confirmation": null
       },
       "noise": {
-        "value": null,
-        "source": null,
-        "created_at": null,
-        "profile": null,
+        "value": 0.036891099261083145,
+        "source": "data/gate-noise.json",
+        "created_at": "2026-11-07T03:54:39+00:00",
+        "profile": "#/profile",
         "statistic": "(max-min)/median of five series medians of B"
       }
     },
@@ -181,10 +184,10 @@
         "confirmation": null
       },
       "noise": {
-        "value": null,
-        "source": null,
-        "created_at": null,
-        "profile": null,
+        "value": 0.03320290774888753,
+        "source": "data/gate-noise.json",
+        "created_at": "2026-11-07T03:54:39+00:00",
+        "profile": "#/profile",
         "statistic": "(max-min)/median of five series medians of B"
       }
     },
@@ -203,10 +206,10 @@
         "confirmation": null
       },
       "noise": {
-        "value": null,
-        "source": null,
-        "created_at": null,
-        "profile": null,
+        "value": 0.04303570301900679,
+        "source": "data/gate-noise.json",
+        "created_at": "2026-11-07T03:54:39+00:00",
+        "profile": "#/profile",
         "statistic": "(max-min)/median of five series medians of B"
       }
     }

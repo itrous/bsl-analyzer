@@ -114,8 +114,9 @@ class RecordNight(RecordCase):
         self.assertEqual([r["run"] for r in saved["runs"]], NAMES[:3])
         self.assertEqual(set(saved["durations"]), {"A"}, "a series of fewer than three held runs sets no estimate")
         rows = {r["metric"]: r for r in saved["record"]["rows"]}
-        self.assertEqual(rows["graph_resolve_s"]["outcome"], "ok", "what was measured is compared")
-        for metric in ("references_1_s", "references_2_same_s", "references_3_other_s", "hwm_kb"):
+        for metric in ("graph_resolve_s", "hwm_kb"):
+            self.assertEqual(rows[metric]["outcome"], "ok", f"{metric}: what was measured in A is compared")
+        for metric in ("references_1_s", "references_2_same_s", "references_3_other_s"):
             self.assertEqual((rows[metric]["outcome"], rows[metric]["reason"]),
                              ("incomplete", f"record_missing:{metric}"), metric)
         self.assertEqual(saved["record"]["verdict"], "incomplete")
