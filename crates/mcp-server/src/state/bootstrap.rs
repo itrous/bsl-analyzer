@@ -6314,6 +6314,360 @@ mod tests {
         );
     }
 
+    /// Paid vectors of the code collection, by what each one embeds: `(root, path, semantic
+    /// key)` → the stored vector bytes (`None` while the row still waits for its vector).
+    type PaidVectors = std::collections::BTreeMap<(String, String, String), Option<Vec<u8>>>;
+
+    const BULK_MODULES: usize = 64;
+    const BULK_METHODS: usize = 64;
+
+    /// A configuration of independent common modules: every method has a name and a body of
+    /// its own and calls nothing, so changing one module changes the payload of its own
+    /// chunks only.
+    fn write_bulk_configuration(root: &std::path::Path, changed: Option<usize>) {
+        fs::write(
+            root.join("Configuration.xml"),
+            "<Configuration><Name>Объём</Name></Configuration>",
+        )
+        .unwrap();
+        for module in 0..BULK_MODULES {
+            let name = format!("Объём{module:02}");
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\">\n\
+                 \t<CommonModule uuid=\"00000000-0000-0000-0000-0000000{module:05}\">\n\
+                 \t\t<Properties><Name>{name}</Name><Server>true</Server></Properties>\n\
+                 \t</CommonModule>\n\
+                 </MetaDataObject>\n"
+            );
+            let edit = if changed == Some(module) { " + 1" } else { "" };
+            let body: String = (0..BULK_METHODS)
+                .map(|method| {
+                    format!(
+                        "Процедура Метод{module:02}_{method:02}() Экспорт\n\
+                         \tЗначение = {module} * 100 + {method}{edit};\n\
+                         КонецПроцедуры\n\n"
+                    )
+                })
+                .collect();
+            let ext = root.join("CommonModules").join(&name).join("Ext");
+            fs::create_dir_all(&ext).unwrap();
+            fs::write(root.join("CommonModules").join(format!("{name}.xml")), xml).unwrap();
+            fs::write(ext.join("Module.bsl"), body).unwrap();
+        }
+    }
+
+    fn paid_vectors(workspace: &std::path::Path) -> PaidVectors {
+        let conn = rusqlite::Connection::open_with_flags(
+            crate::cache::search_db_path(workspace),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT f.root_id, f.path, c.kind, c.symbol_name, c.graph_context, c.text, c.embedding
+                 FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.collection = 'code'",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                let document = IndexedDocument {
+                    collection: "code".to_owned(),
+                    root_id: row.get(0)?,
+                    path: row.get(1)?,
+                    kind: row.get(2)?,
+                    symbol_name: row.get(3)?,
+                    graph_context: row.get(4)?,
+                    text: row.get(5)?,
+                    line_start: 0,
+                    line_end: 0,
+                    content_hash: String::new(),
+                    source_span: None,
+                };
+                let key = bsl_search::semantic_key_for_indexed_document(&document);
+                Ok(((document.root_id, document.path, key), row.get::<_, Option<Vec<u8>>>(6)?))
+            })
+            .unwrap();
+        let mut vectors = PaidVectors::new();
+        for row in rows {
+            let (key, vector) = row.unwrap();
+            assert!(vectors.insert(key.clone(), vector).is_none(), "two chunks embed {key:?}");
+        }
+        vectors
+    }
+
+    fn graph_publication(graph: &GraphState) -> String {
+        let conn = rusqlite::Connection::open_with_flags(
+            graph.graph_db_path().unwrap(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.query_row("SELECT value FROM meta WHERE key = 'publication_id'", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// The semantic keys of the texts an embedding endpoint was sent since `from`.
+    fn embedded_keys(
+        requests: &Mutex<super::super::test_support::EmbeddingRequests>,
+        from: usize,
+    ) -> std::collections::BTreeSet<String> {
+        requests.lock().unwrap().inputs[from..]
+            .iter()
+            .map(|input| blake3::hash(input.as_bytes()).to_hex().to_string())
+            .collect()
+    }
+
+    /// One owner's start over `workspace`, the way the daemon boots it: the graph decision,
+    /// the search index and then the embedding pass the boot scheduled, run to its end. The
+    /// graph's builds run on this thread, one after another, so the start is over when the
+    /// calls return. Returns the owner still open; drop it with [`close_bulk_owner`].
+    fn boot_bulk_owner(
+        workspace: &std::path::Path,
+    ) -> (GraphState, super::super::types::WorkspaceSearchInit) {
+        let graph = GraphState::for_workspace(workspace.to_path_buf()).with_manual_builds();
+        let init = SharedState::init_workspace_search_engine_unmanaged(
+            workspace,
+            None,
+            WorkspaceSearchMode::SqliteLocal,
+            None,
+            &graph,
+        )
+        .expect("the local semantic boot produces an engine");
+        graph.ensure_loading();
+        while graph.queued_builds() > 0 {
+            let built = graph.run_next_build();
+            assert!(matches!(built.status, crate::graph::GraphStatus::Ready { .. }), "{built:?}");
+        }
+        assert!(
+            matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }),
+            "the boot left the graph {:?}",
+            graph.status()
+        );
+        if let Some(pending) = init.pending_embed.as_ref() {
+            SearchEngine::embed_pending_chunks_standalone(
+                &pending.db_path,
+                &pending.config,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        (graph, init)
+    }
+
+    /// Let an owner go: the engine, then the graph, which has no build out once its start is over.
+    fn close_bulk_owner(graph: GraphState, init: super::super::types::WorkspaceSearchInit) {
+        drop(init);
+        assert!(!graph.build_in_flight(), "a graph build is still out");
+        drop(graph);
+    }
+
+    /// Paid vectors survive every restart that leaves their payload alone — the plain one, one
+    /// that has to build the graph again, and one that also forgot every file hash — and a
+    /// changed module pays again for exactly the chunks whose payload it changed.
+    #[test]
+    fn bulk_restart_reuses_paid_vectors_across_graph_rebuilds() {
+        use super::super::test_support::spawn_recording_embedding_server;
+
+        let _env_lock = env_lock();
+        let (server, requests) = spawn_recording_embedding_server();
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
+        let _url = EnvVarGuard::set("EMBEDDING_URL", &server);
+        let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _dimension = EnvVarGuard::set("EMBEDDING_DIM", "3");
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        write_bulk_configuration(workspace, None);
+        let inputs = || requests.lock().unwrap().inputs.len();
+
+        // Cold: the embedder is really asked, for every chunk the store keeps.
+        let (graph, init) = boot_bulk_owner(workspace);
+        let cold_publication = graph_publication(&graph);
+        let seed = paid_vectors(workspace);
+        let cold_inputs = inputs();
+        eprintln!(
+            "BA115 leg=cold chunks={} inputs={cold_inputs} probes={} publication={cold_publication}",
+            seed.len(),
+            requests.lock().unwrap().probes,
+        );
+        assert!(seed.len() >= BULK_MODULES * BULK_METHODS, "only {} chunks stored", seed.len());
+        assert!(seed.values().all(Option::is_some), "the cold pass left chunks without vectors");
+        assert_eq!(cold_inputs, seed.len(), "the cold pass embeds every stored chunk once");
+        assert_eq!(
+            embedded_keys(&requests, 0),
+            seed.keys().map(|(_, _, key)| key.clone()).collect(),
+            "the cold pass embeds exactly the stored payloads"
+        );
+        close_bulk_owner(graph, init);
+
+        // A plain restart serves the cached graph and pays for nothing.
+        let before = inputs();
+        let (graph, init) = boot_bulk_owner(workspace);
+        let warm_publication = graph_publication(&graph);
+        let warm = paid_vectors(workspace);
+        eprintln!(
+            "BA115 leg=warm inputs={} publication={warm_publication} same_vectors={}",
+            inputs() - before,
+            warm == seed,
+        );
+        assert_eq!(warm_publication, cold_publication, "the plain restart rebuilt the graph");
+        assert_eq!(embedded_keys(&requests, before), Default::default());
+        assert!(warm == seed, "the plain restart changed paid vectors");
+        close_bulk_owner(graph, init);
+
+        // The graph is gone; the search store and the corpus are not.
+        let graph_db = crate::cache::WorkspaceCacheLayout::for_workspace(workspace).graph_db_path();
+        fs::remove_file(&graph_db).unwrap();
+        let before = inputs();
+        let (graph, init) = boot_bulk_owner(workspace);
+        let rebuilt_publication = graph_publication(&graph);
+        let rebuilt = paid_vectors(workspace);
+        eprintln!(
+            "BA115 leg=forced_rebuild inputs={} publication={rebuilt_publication} same_vectors={} lost={}",
+            inputs() - before,
+            rebuilt == seed,
+            seed.keys().filter(|key| !rebuilt.contains_key(*key)).count(),
+        );
+        assert_ne!(rebuilt_publication, cold_publication, "the graph was not built again");
+        assert_eq!(embedded_keys(&requests, before), Default::default());
+        assert!(rebuilt == seed, "the rebuilt graph changed paid vectors");
+
+        // The same, with every file hash forgotten: each file is written again and its rows
+        // keep their vectors through the replacement itself, not through the hash skip.
+        assert!(init.engine.clear_file_hashes("code").unwrap() > 0);
+        close_bulk_owner(graph, init);
+        fs::remove_file(&graph_db).unwrap();
+        let before = inputs();
+        let (graph, init) = boot_bulk_owner(workspace);
+        let cleared_publication = graph_publication(&graph);
+        let cleared = paid_vectors(workspace);
+        eprintln!(
+            "BA115 leg=cleared_hashes inputs={} publication={cleared_publication} same_vectors={} lost={}",
+            inputs() - before,
+            cleared == seed,
+            seed.keys().filter(|key| !cleared.contains_key(*key)).count(),
+        );
+        assert_ne!(cleared_publication, rebuilt_publication, "the graph was not built again");
+        assert_eq!(embedded_keys(&requests, before), Default::default());
+        assert!(cleared == seed, "the replacement lost paid vectors");
+        close_bulk_owner(graph, init);
+
+        // One module changes while the graph is rebuilt: only its changed payloads are paid.
+        const CHANGED: usize = 7;
+        write_bulk_configuration(workspace, Some(CHANGED));
+        fs::remove_file(&graph_db).unwrap();
+        let before = inputs();
+        let (graph, init) = boot_bulk_owner(workspace);
+        let changed = paid_vectors(workspace);
+        let changed_path = format!("Объём{CHANGED:02}");
+        let in_changed_file = |path: &str| path.contains(&changed_path);
+        let new_keys: std::collections::BTreeSet<String> = changed
+            .keys()
+            .filter(|key| !seed.contains_key(*key))
+            .map(|(_, _, key)| key.clone())
+            .collect();
+        let paid_again = embedded_keys(&requests, before);
+        eprintln!(
+            "BA115 leg=changed_file inputs={} new_keys={} new_keys_outside_file={}",
+            inputs() - before,
+            new_keys.len(),
+            changed
+                .keys()
+                .filter(|key| !seed.contains_key(*key) && !in_changed_file(&key.1))
+                .count(),
+        );
+        assert!(!new_keys.is_empty(), "the edit changed no payload");
+        assert!(
+            changed
+                .keys()
+                .filter(|key| !seed.contains_key(*key))
+                .all(|key| in_changed_file(&key.1)),
+            "a payload outside the changed module changed"
+        );
+        assert_eq!(paid_again, new_keys, "exactly the changed payloads are embedded again");
+        for (key, vector) in &seed {
+            if !in_changed_file(&key.1) {
+                assert_eq!(changed.get(key), Some(vector), "{key:?} lost its paid vector");
+            }
+        }
+        close_bulk_owner(graph, init);
+    }
+
+    /// An owner that dies without running a destructor, right after its paid start, leaves a
+    /// graph and vectors the next owner serves as they are.
+    #[test]
+    fn bulk_restart_after_a_crash_reuses_the_graph_and_the_paid_vectors() {
+        use super::super::test_support::spawn_recording_embedding_server;
+        const CHILD: &str = "BSL_BA115_CRASH_CHILD";
+        const TEST: &str = "state::bootstrap::tests::bulk_restart_after_a_crash_reuses_the_graph_and_the_paid_vectors";
+
+        let _env_lock = env_lock();
+        let (server, requests) = spawn_recording_embedding_server();
+        let _enabled = EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
+        let _url = EnvVarGuard::set("EMBEDDING_URL", &server);
+        let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _dimension = EnvVarGuard::set("EMBEDDING_DIM", "3");
+
+        if let Some(workspace) = std::env::var_os(CHILD) {
+            let workspace = PathBuf::from(workspace);
+            let (graph, init) = boot_bulk_owner(&workspace);
+            println!(
+                "READY {} {}",
+                requests.lock().unwrap().inputs.len(),
+                graph_publication(&graph)
+            );
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            drop((graph, init));
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        write_bulk_configuration(workspace, None);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads", "1"])
+            .env(CHILD, workspace)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        let announcement = loop {
+            let mut line = String::new();
+            let read = std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+            if read == 0 {
+                let _ = child.wait();
+                panic!("the child ended before its paid start was done");
+            }
+            if let Some((_, announcement)) = line.split_once("READY ") {
+                break announcement.trim().to_owned();
+            }
+        };
+        // SIGKILL on Unix, TerminateProcess on Windows: no destructor of the child runs.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (child_inputs, child_publication) = announcement.split_once(' ').unwrap();
+        let child_inputs: usize = child_inputs.parse().unwrap();
+        let seed = paid_vectors(workspace);
+        assert!(child_inputs >= BULK_MODULES * BULK_METHODS, "the child paid for {child_inputs}");
+        assert!(seed.values().all(Option::is_some), "the child left chunks without vectors");
+
+        let (graph, init) = boot_bulk_owner(workspace);
+        let publication = graph_publication(&graph);
+        let after = paid_vectors(workspace);
+        eprintln!(
+            "BA115 leg=crash child_inputs={child_inputs} inputs={} publication_kept={} same_vectors={}",
+            requests.lock().unwrap().inputs.len(),
+            publication == child_publication,
+            after == seed,
+        );
+        assert_eq!(publication, child_publication, "the restart rebuilt the graph");
+        assert_eq!(embedded_keys(&requests, 0), Default::default());
+        assert!(after == seed, "the restart after the crash changed paid vectors");
+        close_bulk_owner(graph, init);
+    }
+
     /// Deleted-while-down through the REAL init path on the STANDALONE (deferred-embedding) branch,
     /// a Clean branch: a semantic engine indexes two modules, the daemon stops, one module is
     /// deleted on disk, and a re-boot re-runs the deferred index — which only re-ingests files that
@@ -6448,7 +6802,7 @@ mod tests {
             .unwrap()
             .unwrap()
         };
-        let assert_pending_profile = |init: &super::WorkspaceSearchInit| {
+        let assert_pending_profile = |init: &super::super::types::WorkspaceSearchInit| {
             let pending = init.pending_embed.as_ref().expect("NULL chunks schedule embedding");
             let pending_embedder = bsl_search::Embedder::new(pending.config.embedder.clone());
             let pending_identity = pending_embedder.storage_identity();

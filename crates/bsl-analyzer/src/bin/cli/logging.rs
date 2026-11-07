@@ -12,12 +12,12 @@ pub const PID_PLACEHOLDER: &str = "{pid}";
 
 /// Expands every `{pid}` in an explicit `BSL_LOG_FILE` value to `pid`.
 ///
-/// An explicit log file is truncated on start, so processes started with the same
-/// value (several editor windows, an LSP server next to an MCP server) overwrite one
-/// another's log and a crashed worker's trail is lost. The placeholder is an opt-in
-/// to one file per process; a value without it is returned unchanged and keeps the
-/// single truncate-on-start file. A pid is unique only among live processes, so the
-/// file of a finished process is truncated once the OS hands its pid to a new one.
+/// An explicit log file is appended to, so processes started with the same value
+/// (several editor windows, an LSP server next to an MCP server) interleave their
+/// lines in one file. The placeholder is an opt-in to one file per live process; a
+/// value without it is returned unchanged. A pid is unique only among live processes:
+/// a new process the OS hands a finished one's pid appends to that file, and the
+/// earlier lines stay.
 pub fn expand_log_file_path(path: PathBuf, pid: u32) -> PathBuf {
     match path.to_str() {
         Some(text) if text.contains(PID_PLACEHOLDER) => {
@@ -27,23 +27,50 @@ pub fn expand_log_file_path(path: PathBuf, pid: u32) -> PathBuf {
     }
 }
 
-pub fn setup_logging(
+/// Set up the process's logging, failing the start when a log file the user named cannot
+/// be set up. `default_log` marks the daemon's own default log instead: it falls back to
+/// stderr. A failure never truncates the file; the reason is appended to it when it can
+/// be opened.
+pub fn start_logging(
     log_file: Option<PathBuf>,
-    append_file: bool,
+    default_log: bool,
+    profile_filter: Option<String>,
+    json_profile_filter: Option<String>,
+) -> anyhow::Result<JournalGuard> {
+    use std::io::Write;
+
+    match setup_logging(log_file.clone(), profile_filter.clone(), json_profile_filter.clone()) {
+        Ok(guard) => Ok(guard),
+        Err(error) => {
+            eprintln!("Failed to setup logging: {error}");
+            if default_log {
+                return setup_logging(None, profile_filter, json_profile_filter);
+            }
+            if let Some(path) = &log_file {
+                let _ =
+                    fs::OpenOptions::new().create(true).append(true).open(path).and_then(
+                        |mut file| writeln!(file, "ERROR: Failed to setup logging: {error}"),
+                    );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn setup_logging(
+    log_file: Option<PathBuf>,
     profile_filter: Option<String>,
     json_profile_filter: Option<String>,
 ) -> anyhow::Result<JournalGuard> {
     use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
-    // `append_file` is set for the daemon's default log: concurrent short-lived
-    // daemon candidates (the broker's spawn race) must not truncate the winner's
-    // live file. An explicit `BSL_LOG_FILE` keeps the historical truncate-on-start
-    // behaviour.
+    // A file log is appended to: a restart keeps the previous run's trail, and
+    // concurrent short-lived daemon candidates (the broker's spawn race) do not
+    // truncate the winner's live file.
     let writer: BoxMakeWriter = match log_file {
-        Some(file) if append_file => BoxMakeWriter::new(Arc::new(
+        Some(file) => BoxMakeWriter::new(Arc::new(
             fs::OpenOptions::new().create(true).append(true).open(&file)?,
         )),
-        Some(file) => BoxMakeWriter::new(Arc::new(fs::File::create(&file)?)),
         None => BoxMakeWriter::new(io::stderr),
     };
 
@@ -87,5 +114,151 @@ mod tests {
         for raw in ["logs/bsl.log", "logs/bsl-pid.log", "logs/{PID}.log", "logs/{pid.log"] {
             assert_eq!(expand_log_file_path(PathBuf::from(raw), 4242), PathBuf::from(raw));
         }
+    }
+
+    /// Set in a child this module's tests start: what the child does with its one process-wide
+    /// logging setup, `start:<marker>` or `default` / `explicit` for an unwritable destination.
+    const CHILD_ROLE: &str = "BSL_LOGGING_TEST_CHILD";
+    const CHILD_LOG: &str = "BSL_LOGGING_TEST_LOG";
+
+    /// Run `test` again in a child process as `role` over `log`: a process installs its global
+    /// subscriber once, so every start a test compares is a process of its own.
+    fn run_child(
+        test: &str,
+        role: &str,
+        log: &std::path::Path,
+        bsl_log: &str,
+    ) -> std::process::Output {
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args(["--exact", &format!("cli::logging::tests::{test}"), "--nocapture"])
+            .env(CHILD_ROLE, role)
+            .env(CHILD_LOG, log)
+            .env("BSL_LOG", bsl_log)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child {role} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// What a child of these tests does; `false` in the test's own process.
+    fn act_as_child() -> bool {
+        let Ok(role) = env::var(CHILD_ROLE) else { return false };
+        let log = PathBuf::from(env::var_os(CHILD_LOG).unwrap());
+        match role.split_once(':') {
+            Some(("start", marker)) => {
+                let _guard = start_logging(Some(log), false, None, None).unwrap();
+                tracing::warn!("{marker}");
+            }
+            Some(("fail", _)) => {
+                assert!(start_logging(Some(log), false, None, None).is_err());
+            }
+            Some(("default", marker)) => {
+                let _guard = start_logging(Some(log), true, None, None)
+                    .expect("the daemon's default log falls back to stderr");
+                tracing::warn!("{marker}");
+            }
+            Some(("explicit", _)) => {
+                assert!(
+                    start_logging(Some(log), false, None, None).is_err(),
+                    "an explicit log that cannot be opened must fail the start"
+                );
+            }
+            _ => panic!("unknown child role {role}"),
+        }
+        true
+    }
+
+    const SENTINEL: &str = "earlier run's last line\n";
+
+    fn assert_appended(log: &std::path::Path, markers: &[&str]) -> String {
+        let text = fs::read_to_string(log).unwrap();
+        assert!(text.starts_with(SENTINEL), "the earlier bytes were truncated:\n{text}");
+        let mut from = SENTINEL.len();
+        for marker in markers {
+            let at = text[from..]
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} is not appended in order:\n{text}"));
+            from += at + marker.len();
+        }
+        text
+    }
+
+    #[test]
+    fn an_explicit_log_file_is_appended_across_starts() {
+        if act_as_child() {
+            return;
+        }
+        const TEST: &str = "an_explicit_log_file_is_appended_across_starts";
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        fs::write(&log, SENTINEL).unwrap();
+
+        run_child(TEST, "start:first-start-line", &log, "warn");
+        run_child(TEST, "start:second-start-line", &log, "warn");
+
+        assert_appended(&log, &["first-start-line", "second-start-line"]);
+    }
+
+    #[test]
+    fn a_pid_log_file_a_new_process_inherits_is_appended() {
+        if act_as_child() {
+            return;
+        }
+        const TEST: &str = "a_pid_log_file_a_new_process_inherits_is_appended";
+        let dir = tempfile::tempdir().unwrap();
+        // Two processes the OS gave the same pid, one after the other.
+        let log = expand_log_file_path(dir.path().join("run-{pid}.log"), 4242);
+        assert_eq!(log, dir.path().join("run-4242.log"));
+        fs::write(&log, SENTINEL).unwrap();
+
+        run_child(TEST, "start:first-owner-of-4242", &log, "warn");
+        run_child(TEST, "start:second-owner-of-4242", &log, "warn");
+
+        assert_appended(&log, &["first-owner-of-4242", "second-owner-of-4242"]);
+    }
+
+    /// The setup fails after the file is already open (the log filter is invalid): the start
+    /// fails, and the file keeps its bytes with the reason appended.
+    #[test]
+    fn a_setup_error_after_the_file_is_opened_keeps_its_bytes() {
+        if act_as_child() {
+            return;
+        }
+        const TEST: &str = "a_setup_error_after_the_file_is_opened_keeps_its_bytes";
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        fs::write(&log, SENTINEL).unwrap();
+
+        run_child(TEST, "fail:", &log, "bsl_graph=[");
+
+        let text = assert_appended(&log, &["ERROR: Failed to setup logging"]);
+        assert!(text.contains("invalid log filter"), "{text}");
+    }
+
+    /// A destination that cannot be opened at all: an explicit log fails the start, the
+    /// daemon's default log falls back to stderr and the process runs on.
+    #[test]
+    fn an_unwritable_explicit_log_fails_and_a_default_one_falls_back_to_stderr() {
+        if act_as_child() {
+            return;
+        }
+        const TEST: &str =
+            "an_unwritable_explicit_log_fails_and_a_default_one_falls_back_to_stderr";
+        let dir = tempfile::tempdir().unwrap();
+        let unwritable = dir.path().join("a-directory");
+        fs::create_dir(&unwritable).unwrap();
+
+        let explicit = run_child(TEST, "explicit:", &unwritable, "warn");
+        let default = run_child(TEST, "default:served-from-stderr", &unwritable, "warn");
+
+        assert!(String::from_utf8_lossy(&explicit.stderr).contains("Failed to setup logging"));
+        let stderr = String::from_utf8_lossy(&default.stderr);
+        assert!(stderr.contains("Failed to setup logging"), "{stderr}");
+        assert!(stderr.contains("served-from-stderr"), "no stderr fallback:\n{stderr}");
+        assert!(unwritable.is_dir(), "the destination was replaced");
     }
 }

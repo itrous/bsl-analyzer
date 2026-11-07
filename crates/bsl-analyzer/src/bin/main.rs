@@ -47,7 +47,6 @@ mod cli;
 use std::{
     env,
     error::Error,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -62,7 +61,7 @@ use cli::{
     diagnostics_baseline::{self, DiagnosticsCommand},
     extension::{self, ExtensionCommands},
     format::run_format,
-    logging::{expand_log_file_path, setup_logging},
+    logging::{expand_log_file_path, start_logging},
     lsp::run_lsp_server,
     mcp::{self, McpCommand},
     platform_help::{self as platform_help_cli, PlatformHelpCommand},
@@ -270,7 +269,7 @@ enum Commands {
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
 
-    let (log_file, append_log) = match env::var("BSL_LOG_FILE")
+    let (log_file, default_log) = match env::var("BSL_LOG_FILE")
         .ok()
         .map(|value| expand_log_file_path(PathBuf::from(value), std::process::id()))
     {
@@ -285,25 +284,12 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let json_profile_filter =
         cli.profile_json.clone().or_else(|| env::var("BSL_PROFILE_JSON").ok());
 
-    let _journal_guard = match setup_logging(
+    let _journal_guard = start_logging(
         log_file.clone(),
-        append_log,
+        default_log,
         profile_filter.clone(),
         json_profile_filter.clone(),
-    ) {
-        Ok(guard) => guard,
-        Err(e) => {
-            eprintln!("Failed to setup logging: {}", e);
-            if append_log {
-                setup_logging(None, false, profile_filter, json_profile_filter)?
-            } else {
-                if let Some(ref path) = log_file {
-                    let _ = fs::write(path, format!("ERROR: Failed to setup logging: {}\n", e));
-                }
-                return Err(e.into());
-            }
-        }
-    };
+    )?;
 
     // A panic inside a Salsa query leaves no useful trace of *which* query blew
     // up once `catch_unwind` has unwound past the query stack: Salsa attaches the
@@ -322,8 +308,8 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         prev_hook(info);
     }));
 
-    if append_log && log_file.is_some() {
-        // Appended daemon logs concatenate runs; the separator must survive the
+    if log_file.is_some() {
+        // Appended file logs concatenate runs; the separator must survive the
         // default filter (`warn` + the `bsl_graph` diagnosis trail), so it rides
         // the `bsl_graph` target rather than plain info.
         tracing::info!(target: "bsl_graph", pid = std::process::id(), "log session started");

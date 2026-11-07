@@ -237,6 +237,8 @@ pub(super) fn on_disk_identity(path: &Path) -> std::io::Result<Option<OnDiskIden
 /// journal is never deleted by hand. A connection with write access rolls it back on its first
 /// read and removes it.
 pub(super) fn recover_hot_journal(path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let mut journal = path.as_os_str().to_owned();
     journal.push("-journal");
     let hot = std::fs::metadata(Path::new(&journal)).is_ok_and(|metadata| metadata.len() > 0);
@@ -244,8 +246,10 @@ pub(super) fn recover_hot_journal(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     tracing::warn!(path = %path.display(), "graph file has an interrupted journal; recovering it");
-    let conn = rusqlite::Connection::open(path)?;
-    conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))?;
+    let conn = rusqlite::Connection::open(path)
+        .with_context(|| format!("opening {} to recover its journal", path.display()))?;
+    conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
+        .with_context(|| format!("reading {} to recover its journal", path.display()))?;
     Ok(())
 }
 
