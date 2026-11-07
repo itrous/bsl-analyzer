@@ -227,3 +227,97 @@ async fn an_unregistered_root_id_fails_the_call_instead_of_degrading() {
 
     assert!(result.is_err(), "an unknown root_id is a bad request, not a reason to degrade");
 }
+
+/// The two queries of issue #82, byte for byte: D, where the derived table in `ИЗ` names the
+/// alias of the query around it, and C, the same name inside a correlated `ГДЕ ... В (...)`.
+const DERIVED_TABLE_NAMES_OUTER_ALIAS: &str =
+    include_str!("../../ide-diagnostics/tests/fixtures/derived_table_outer_alias/d.sdbl");
+const CORRELATED_IN_SUBQUERY: &str =
+    include_str!("../../ide-diagnostics/tests/fixtures/derived_table_outer_alias/c.sdbl");
+
+const UNAVAILABLE_ALIAS: &str = "UnavailableAliasInQuery";
+
+fn diagnostics_of<'a>(envelope: &'a Value, code: &str) -> Vec<&'a Value> {
+    local(envelope)["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .filter(|d| d["code"] == code)
+        .collect()
+}
+
+/// Zero-based line and character column of the first `needle` in `text`.
+fn position_of(text: &str, needle: &str) -> (usize, usize) {
+    let before = &text[..text.find(needle).expect("the needle is in the text")];
+    (before.matches('\n').count(), before.rsplit('\n').next().unwrap_or("").chars().count())
+}
+
+/// One answer per query, whatever backend gave it: the rule reads the query's own text, so the
+/// degraded answer of a cold resident and the one with metadata must agree. No waiting for the
+/// resident — a test that needed it would pass on a tool that never reached it.
+///
+/// C is asked in the same session as the control: a tool that lost the rule answers both
+/// queries without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_derived_table_naming_an_outer_alias_is_reported_and_a_correlated_subquery_is_not() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    stage(dir.path());
+    let client = client(dir.path()).await;
+
+    let d = validate(&client, args(DERIVED_TABLE_NAMES_OUTER_ALIAS)).await;
+    let c = validate(&client, args(CORRELATED_IN_SUBQUERY)).await;
+
+    let found = diagnostics_of(&d, UNAVAILABLE_ALIAS);
+    assert_eq!(found.len(), 1, "D must be reported exactly once: {d}");
+    let (line, column) = position_of(DERIVED_TABLE_NAMES_OUTER_ALIAS, "Внеш.Ссылка");
+    assert_eq!(
+        found[0]["message"],
+        "Псевдоним \"Внеш\" внешнего запроса недоступен внутри производной таблицы",
+        "{d}",
+    );
+    assert_eq!(
+        (
+            found[0]["start_line"].as_u64(),
+            found[0]["start_column"].as_u64(),
+            found[0]["end_line"].as_u64(),
+            found[0]["end_column"].as_u64(),
+        ),
+        (
+            Some(line as u64),
+            Some(column as u64),
+            Some(line as u64),
+            Some((column + "Внеш".chars().count()) as u64),
+        ),
+        "the range is the alias token of the inner reference, in the query's coordinates: {d}",
+    );
+    assert!(
+        codes(&d).iter().any(|c| c == "JoinWithSubQuery"),
+        "the performance warning stays beside the new error: {d}",
+    );
+
+    assert!(
+        diagnostics_of(&c, UNAVAILABLE_ALIAS).is_empty(),
+        "a correlated subquery in a condition is legal: {c}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_unavailable_alias_follows_the_projects_configuration() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    stage(dir.path());
+    write(
+        dir.path(),
+        "bsl-analyzer.toml",
+        "[diagnostics.parameters]\nUnavailableAliasInQuery = false\n",
+    );
+    let client = client(dir.path()).await;
+
+    let d = validate(&client, args(DERIVED_TABLE_NAMES_OUTER_ALIAS)).await;
+
+    assert!(
+        diagnostics_of(&d, UNAVAILABLE_ALIAS).is_empty(),
+        "a rule the project turned off must stay off: {d}",
+    );
+    // The control: only the named rule went silent, so an empty list is not a dead tool.
+    assert!(codes(&d).iter().any(|c| c == "JoinWithSubQuery"), "{d}");
+}

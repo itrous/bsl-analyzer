@@ -6406,14 +6406,30 @@ mod tests {
             .unwrap()
     }
 
-    /// The semantic keys of the texts an embedding endpoint was sent since `from`.
+    type PayloadKeys = std::collections::BTreeSet<String>;
+
+    fn payload_keys<'a>(vectors: impl IntoIterator<Item = &'a PaidVectors>) -> PayloadKeys {
+        vectors
+            .into_iter()
+            .flat_map(|vectors| vectors.keys().map(|(_, _, key)| key.clone()))
+            .collect()
+    }
+
+    /// The semantic keys of this workspace's payloads an embedding endpoint was sent since
+    /// `from`, one per text sent.
+    ///
+    /// The endpoint reaches the engine through the process environment, which every thread of
+    /// the test binary reads: a background pass another test left running can post its own
+    /// texts here. Only payloads the workspace stores, `own`, are what it paid for.
     fn embedded_keys(
         requests: &Mutex<super::super::test_support::EmbeddingRequests>,
         from: usize,
-    ) -> std::collections::BTreeSet<String> {
+        own: &PayloadKeys,
+    ) -> Vec<String> {
         requests.lock().unwrap().inputs[from..]
             .iter()
             .map(|input| blake3::hash(input.as_bytes()).to_hex().to_string())
+            .filter(|key| own.contains(key))
             .collect()
     }
 
@@ -6484,6 +6500,7 @@ mod tests {
         let (graph, init) = boot_bulk_owner(workspace);
         let cold_publication = graph_publication(&graph);
         let seed = paid_vectors(workspace);
+        let seed_keys = payload_keys([&seed]);
         let cold_inputs = inputs();
         eprintln!(
             "BA115 leg=cold chunks={} inputs={cold_inputs} probes={} publication={cold_publication}",
@@ -6492,10 +6509,11 @@ mod tests {
         );
         assert!(seed.len() >= BULK_MODULES * BULK_METHODS, "only {} chunks stored", seed.len());
         assert!(seed.values().all(Option::is_some), "the cold pass left chunks without vectors");
-        assert_eq!(cold_inputs, seed.len(), "the cold pass embeds every stored chunk once");
+        let cold_paid = embedded_keys(&requests, 0, &seed_keys);
+        assert_eq!(cold_paid.len(), seed.len(), "the cold pass embeds every stored chunk once");
         assert_eq!(
-            embedded_keys(&requests, 0),
-            seed.keys().map(|(_, _, key)| key.clone()).collect(),
+            cold_paid.into_iter().collect::<PayloadKeys>(),
+            seed_keys,
             "the cold pass embeds exactly the stored payloads"
         );
         close_bulk_owner(graph, init);
@@ -6511,7 +6529,7 @@ mod tests {
             warm == seed,
         );
         assert_eq!(warm_publication, cold_publication, "the plain restart rebuilt the graph");
-        assert_eq!(embedded_keys(&requests, before), Default::default());
+        assert_eq!(embedded_keys(&requests, before, &seed_keys), Vec::<String>::new());
         assert!(warm == seed, "the plain restart changed paid vectors");
         close_bulk_owner(graph, init);
 
@@ -6529,7 +6547,7 @@ mod tests {
             seed.keys().filter(|key| !rebuilt.contains_key(*key)).count(),
         );
         assert_ne!(rebuilt_publication, cold_publication, "the graph was not built again");
-        assert_eq!(embedded_keys(&requests, before), Default::default());
+        assert_eq!(embedded_keys(&requests, before, &seed_keys), Vec::<String>::new());
         assert!(rebuilt == seed, "the rebuilt graph changed paid vectors");
 
         // The same, with every file hash forgotten: each file is written again and its rows
@@ -6548,7 +6566,7 @@ mod tests {
             seed.keys().filter(|key| !cleared.contains_key(*key)).count(),
         );
         assert_ne!(cleared_publication, rebuilt_publication, "the graph was not built again");
-        assert_eq!(embedded_keys(&requests, before), Default::default());
+        assert_eq!(embedded_keys(&requests, before, &seed_keys), Vec::<String>::new());
         assert!(cleared == seed, "the replacement lost paid vectors");
         close_bulk_owner(graph, init);
 
@@ -6566,7 +6584,10 @@ mod tests {
             .filter(|key| !seed.contains_key(*key))
             .map(|(_, _, key)| key.clone())
             .collect();
-        let paid_again = embedded_keys(&requests, before);
+        let paid_again: PayloadKeys =
+            embedded_keys(&requests, before, &payload_keys([&seed, &changed]))
+                .into_iter()
+                .collect();
         eprintln!(
             "BA115 leg=changed_file inputs={} new_keys={} new_keys_outside_file={}",
             inputs() - before,
@@ -6663,7 +6684,10 @@ mod tests {
             after == seed,
         );
         assert_eq!(publication, child_publication, "the restart rebuilt the graph");
-        assert_eq!(embedded_keys(&requests, 0), Default::default());
+        assert_eq!(
+            embedded_keys(&requests, 0, &payload_keys([&seed, &after])),
+            Vec::<String>::new()
+        );
         assert!(after == seed, "the restart after the crash changed paid vectors");
         close_bulk_owner(graph, init);
     }

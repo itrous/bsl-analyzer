@@ -13,3 +13,6 @@ crates/bsl-analyzer/tests/fixtures/foreign_handler_bindings/** -text
 # (core.autocrlf=true) would fail them without any change in the code.
 crates/ide-diagnostics/src/handlers/fixtures/** -text
 crates/lexer/tests/fixtures/sdbl_golden_corpus.txt -text
+# The tests pin line and column of a finding inside a multi-line query string and compare the
+# query text byte for byte with the module that holds it; a CRLF checkout would shift both.
+crates/ide-diagnostics/tests/fixtures/derived_table_outer_alias/** -text

@@ -6,6 +6,7 @@ mod bilingual_parity;
 mod builtin_function_name_as_declaration;
 mod common_attributes_in_query;
 mod data_exchange_and_unused_method_fixes;
+mod derived_table_outer_alias;
 mod diagnostic_quick_fixes;
 mod fields_from_joins_issue_773;
 mod foreign_handler_bindings_scan;

@@ -6,11 +6,35 @@ use crate::standard_fields::{
 };
 use crate::SdblType;
 use bsl_metadata::{is_standard_attribute_name, MdoType};
+use rustc_hash::FxHashSet;
 use stdx::case::CaseExt;
 use syntax::ast::AstNode;
 use text_size::TextRange;
 
 use super::context::LoweringContext;
+
+/// The explicit aliases a query gives its sources in FROM and JOIN, folded to lower case. Nested
+/// queries declare their own and are not entered.
+pub(super) fn declared_source_aliases(
+    from_clause: Option<syntax::ast::SdblFromClause>,
+) -> FxHashSet<String> {
+    fn collect(ds: &syntax::ast::SdblDataSource, out: &mut FxHashSet<String>) {
+        if let Some(name) = ds.alias().and_then(|alias| alias.name()) {
+            out.insert(name.fold_lower());
+        }
+        for join in ds.join_clauses() {
+            if let Some(joined) = join.data_source() {
+                collect(&joined, out);
+            }
+        }
+    }
+
+    let mut aliases = FxHashSet::default();
+    for ds in from_clause.iter().flat_map(|from| from.data_sources()) {
+        collect(&ds, &mut aliases);
+    }
+    aliases
+}
 
 impl LoweringContext<'_> {
     pub(super) fn lower_from_clause(
@@ -85,7 +109,7 @@ impl LoweringContext<'_> {
             let has_union_siblings = queries.len() > 1;
 
             for (query_index, query) in queries.into_iter().enumerate() {
-                self.scope.push_frame();
+                self.scope.push_derived_table_frame();
 
                 let nested_hir = self.lower_query(&query, has_union_siblings, query_index == 0);
 

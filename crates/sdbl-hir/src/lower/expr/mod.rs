@@ -91,6 +91,17 @@ impl LoweringContext<'_> {
             (None, parts[0].as_str())
         };
 
+        // Behind a derived-table boundary the alias resolves to nothing, so neither a type nor a
+        // field or collision diagnostic can come from the hidden source.
+        if let Some(head) = table_alias_str {
+            if self.scope.is_inaccessible_alias(head) {
+                self.diagnostics.push(SdblDiagnostic::UnavailableAlias {
+                    alias: head.to_string(),
+                    range: ident_ranges[0],
+                });
+            }
+        }
+
         let mut ty = self.scope.resolve_column_type(table_alias_str, column_name_str);
 
         // `Алиас.Поле.ПодПоле…`: navigate through reference-typed fields so the

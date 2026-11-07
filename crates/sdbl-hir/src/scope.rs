@@ -53,6 +53,15 @@ struct ScopeFrame {
     /// The frame holds the select list's outputs: a name it offers is that output, whatever
     /// the output's type.
     outputs: bool,
+
+    /// The frame opens a nested query in `ИЗ`: the platform does not let it name the sources of
+    /// an enclosing query, while a nested query in a condition may.
+    alias_boundary: bool,
+
+    /// Explicit aliases of this query's FROM and JOIN, known before their sources are registered.
+    /// They only tell an alias hidden by a boundary from a name declared nowhere: the derived
+    /// table is lowered before the sources joined after it.
+    declared_aliases: FxHashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +102,12 @@ impl<'a> Scope<'a> {
     /// not see.
     pub fn push_outputs_frame(&mut self, opaque: bool) {
         self.frames.push(ScopeFrame { opaque, outputs: true, ..ScopeFrame::default() });
+    }
+
+    /// A frame for one query of a derived table, `ИЗ (...) КАК П`: an alias of an enclosing query
+    /// stops being visible here.
+    pub fn push_derived_table_frame(&mut self) {
+        self.frames.push(ScopeFrame { alias_boundary: true, ..ScopeFrame::default() });
     }
 
     pub fn pop_frame(&mut self) {
@@ -144,14 +159,39 @@ impl<'a> Scope<'a> {
         None
     }
 
+    pub(crate) fn set_declared_aliases(&mut self, aliases: FxHashSet<String>) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.declared_aliases = aliases;
+        }
+    }
+
+    /// Index of the outermost frame an alias can reach: the nearest derived-table boundary.
+    fn alias_visible_from(&self) -> usize {
+        self.frames.iter().rposition(|frame| frame.alias_boundary).unwrap_or(0)
+    }
+
+    /// Frames whose sources an alias can name, innermost first.
+    fn alias_visible_frames(&self) -> impl Iterator<Item = &ScopeFrame> {
+        self.frames[self.alias_visible_from()..].iter().rev()
+    }
+
     pub fn find_table(&self, name: &str) -> Option<&TableRef> {
         let name_lower = name.fold_lower();
-        for frame in self.frames.iter().rev() {
-            if let Some(table) = frame.tables.get(&name_lower) {
-                return Some(table);
-            }
-        }
-        None
+        self.alias_visible_frames().find_map(|frame| frame.tables.get(&name_lower))
+    }
+
+    /// Whether `name` is an alias of an enclosing query that a derived-table boundary hides.
+    ///
+    /// Every boundary is crossed here, unlike in resolution: an alias of the outermost query is
+    /// just as unavailable two derived tables deep. A name declared nowhere is not answered:
+    /// it stays an ordinary unknown name.
+    pub fn is_inaccessible_alias(&self, name: &str) -> bool {
+        let key = name.fold_lower();
+        let declares = |frame: &ScopeFrame| {
+            frame.tables.contains_key(&key) || frame.declared_aliases.contains(&key)
+        };
+        let from = self.alias_visible_from();
+        !self.frames[from..].iter().any(declares) && self.frames[..from].iter().any(declares)
     }
 
     pub fn current_tables(&self) -> impl Iterator<Item = &TableRef> {
@@ -166,16 +206,18 @@ impl<'a> Scope<'a> {
     /// holds a synthetic table so `УПОРЯДОЧИТЬ ПО` and `ИТОГИ` can name a result column, and
     /// counting that table would judge a bare name even when no source has a field set.
     pub(crate) fn source_has_metadata(&self, alias: Option<&str>) -> bool {
-        let sources = self.frames.iter().filter(|frame| !frame.outputs);
         match alias {
             Some(alias) => {
                 let key = alias.fold_lower();
-                sources
-                    .rev()
+                self.alias_visible_frames()
+                    .filter(|frame| !frame.outputs)
                     .find_map(|frame| frame.tables.get(&key))
                     .is_some_and(|table| table.metadata.is_some())
             }
-            None => sources
+            None => self
+                .frames
+                .iter()
+                .filter(|frame| !frame.outputs)
                 .flat_map(|frame| frame.tables.values())
                 .any(|table| table.metadata.is_some()),
         }
@@ -306,7 +348,7 @@ impl<'a> Scope<'a> {
     /// field the platform may not create cannot be the half of a collision it never sees.
     pub fn qualified_head_collision(&self, head: &str) -> Vec<String> {
         let head_lower = head.fold_lower();
-        for frame in self.frames.iter().rev() {
+        for frame in self.alias_visible_frames() {
             if !frame.tables.contains_key(&head_lower) {
                 continue;
             }
