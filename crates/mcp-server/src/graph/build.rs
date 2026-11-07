@@ -407,12 +407,17 @@ impl GraphState {
         // read-only handle opens it: the process that left it may have crashed mid-write.
         if let Some(path) = self.graph_db_path() {
             if let Err(error) = super::snapshot::recover_hot_journal(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %format_args!("{error:#}"),
+                    "the graph file's interrupted journal could not be recovered"
+                );
                 return self.record_load_failure(
                     is_reload,
                     LoadFailure::new(
                         LoadFailureReason::OperationError,
                         format!(
-                            "the graph file's interrupted journal could not be recovered: {error}"
+                            "the graph file's interrupted journal could not be recovered: {error:#}"
                         ),
                     ),
                 );
@@ -1318,8 +1323,8 @@ impl GraphState {
             Ok(inspected) => inspected,
             Err(error) => {
                 tracing::warn!(
-                    error = %error,
-                    "cached graph database cannot be reused: missing, incompatible format, or corrupted; rebuilding"
+                    error = %format_args!("{error:#}"),
+                    "cached graph database cannot be reused"
                 );
                 return PublishAttemptOutcome::FallBack;
             }
@@ -1328,7 +1333,7 @@ impl GraphState {
             (Ok(token), files) => (token, files),
             (Err(error), _) => {
                 tracing::warn!(
-                    error = %error,
+                    error = %format_args!("{error:#}"),
                     "cached graph database has no valid freshness token; rebuilding"
                 );
                 return PublishAttemptOutcome::FallBack;
@@ -1388,7 +1393,7 @@ impl GraphState {
             Ok(prepared) => prepared,
             Err(SnapshotPrepareError::Open(error)) => {
                 tracing::warn!(
-                    error = %error,
+                    error = %format_args!("{error:#}"),
                     "cached graph snapshot could not be prepared; rebuilding"
                 );
                 return PublishAttemptOutcome::FallBack;
@@ -12506,5 +12511,308 @@ mod form_twin_tests {
             full_builds_before,
             "extension version/comment changes publish without a full graph build"
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_refusal_tests {
+    use super::super::scan::workspace_fingerprint;
+    use super::super::test_support::{meta_string, sample_workspace, seed_cache};
+    use super::super::{GraphState, GraphStatus};
+    use super::PublishAttemptOutcome;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    /// Run `f` and keep every warning and error it logged on this thread, each as its message
+    /// followed by ` field=value` for every other field.
+    fn logged<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use tracing_subscriber::prelude::*;
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Line(String, String);
+                impl tracing::field::Visit for Line {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        } else {
+                            self.1.push_str(&format!(" {}={value:?}", field.name()));
+                        }
+                    }
+                }
+                if *event.metadata().level() > tracing::Level::WARN {
+                    return;
+                }
+                let mut line = Line(String::new(), String::new());
+                event.record(&mut line);
+                self.0.lock().unwrap().push(format!("{}{}", line.0, line.1));
+            }
+        }
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let result = test_utils::with_subscriber(
+            tracing_subscriber::registry().with(Capture(lines.clone())),
+            f,
+        );
+        // tracing-core briefly upgrades every registered dispatcher while another test thread
+        // registers a callsite, so the subscriber may still be shared here; take the lines.
+        let lines = std::mem::take(&mut *lines.lock().unwrap());
+        (result, lines)
+    }
+
+    /// The one refusal event the cached-graph check logged.
+    fn refusal(lines: &[String]) -> &str {
+        let refusals: Vec<&String> =
+            lines.iter().filter(|line| line.starts_with("cached graph database")).collect();
+        assert_eq!(refusals.len(), 1, "expected one cached-graph refusal in {lines:#?}");
+        refusals[0]
+    }
+
+    fn graph_path(root: &Path) -> std::path::PathBuf {
+        crate::cache::WorkspaceCacheLayout::for_workspace(root).graph_db_path()
+    }
+
+    /// A workspace with a complete cached build (revision 7) the loader would serve as is.
+    fn seeded(root: &Path) -> std::path::PathBuf {
+        sample_workspace(root);
+        seed_cache(root, workspace_fingerprint(root));
+        graph_path(root)
+    }
+
+    fn edit_meta(db: &Path, sql: &str) {
+        rusqlite::Connection::open(db).unwrap().execute_batch(sql).unwrap();
+    }
+
+    /// The loader's own start over `root`: the cached graph's verdict and whether it was served.
+    fn load(root: &Path) -> (GraphState, Vec<String>) {
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        let ((), lines) = logged(|| {
+            graph.run_load(false);
+        });
+        (graph, lines)
+    }
+
+    fn served_generation(graph: &GraphState) -> Option<u64> {
+        graph.snapshot().map(|snapshot| snapshot.generation)
+    }
+
+    /// Asked directly, not through the loader: a refused cache would still be served by the
+    /// loader as a stale one while it catches up, which looks the same from outside.
+    #[test]
+    fn a_complete_current_cache_is_published_as_current_without_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = seeded(root);
+
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        let (outcome, lines) = logged(|| graph.try_publish_cached(root, 0));
+
+        assert!(matches!(outcome, PublishAttemptOutcome::Published), "the cache was not reused");
+        assert_eq!(served_generation(&graph), Some(7), "the cached build was not served");
+        assert_eq!(meta_string(&db, "built_at"), "cached-build-sentinel");
+        assert!(
+            !lines.iter().any(|line| line.starts_with("cached graph database")),
+            "a usable cache was refused: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_graph_file_is_named_missing_with_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let db = graph_path(root);
+        assert!(!db.exists());
+
+        let (graph, lines) = load(root);
+
+        let refusal = refusal(&lines);
+        assert!(refusal.contains("cannot be reused"), "{refusal}");
+        assert!(
+            refusal.contains(&format!("graph database file {} does not exist", db.display())),
+            "{refusal}"
+        );
+        assert!(
+            !refusal.contains("corrupted") && !refusal.contains("incompatible"),
+            "the refusal still lists possible causes: {refusal}"
+        );
+        assert!(matches!(graph.status(), GraphStatus::Ready { .. }), "no fallback build");
+        assert_eq!(served_generation(&graph), Some(1), "the fallback did not build the graph");
+    }
+
+    /// A path the program cannot even look at is not reported as absent: only a definite answer
+    /// that the file is not there names it missing.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreachable_graph_file_is_not_named_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let db = graph_path(root);
+        // The cache directory is a plain file: the database path below it cannot be looked up.
+        let blocker = db.parent().unwrap();
+        fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        fs::write(blocker, b"not a directory").unwrap();
+        assert!(db.try_exists().is_err(), "the stand left the path answerable");
+
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        let (outcome, lines) = logged(|| graph.try_publish_cached(root, 0));
+
+        assert!(matches!(outcome, PublishAttemptOutcome::FallBack));
+        let refusal = refusal(&lines);
+        assert!(refusal.contains("opening graph database at"), "{refusal}");
+        assert!(!refusal.contains("does not exist"), "called missing: {refusal}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_sqlite_reports_the_sqlite_cause_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let db = graph_path(root);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, vec![0x5a_u8; 8192]).unwrap();
+
+        let (graph, lines) = load(root);
+
+        let refusal = refusal(&lines);
+        assert!(refusal.contains("reading meta key schema_version"), "{refusal}");
+        assert!(refusal.contains("file is not a database"), "no SQLite cause: {refusal}");
+        assert!(!refusal.contains("expected"), "blamed the format version: {refusal}");
+        assert!(!refusal.contains("does not exist"), "{refusal}");
+        assert_eq!(served_generation(&graph), Some(1), "the fallback did not build the graph");
+    }
+
+    #[test]
+    fn an_older_schema_names_found_and_expected_and_is_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = seeded(root);
+        let expected = crate::graph_db::SCHEMA_VERSION;
+        let found = expected - 1;
+        edit_meta(&db, &format!("UPDATE meta SET value = '{found}' WHERE key = 'schema_version'"));
+
+        let (graph, lines) = load(root);
+
+        let refusal = refusal(&lines);
+        assert!(
+            refusal.contains(&format!("schema_version {found} != expected {expected}")),
+            "{refusal}"
+        );
+        assert_eq!(served_generation(&graph), Some(1), "the old format was not rebuilt");
+        assert_eq!(meta_string(&db, "schema_version"), expected.to_string());
+    }
+
+    #[test]
+    fn a_newer_schema_names_found_and_expected_and_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = seeded(root);
+        let expected = crate::graph_db::SCHEMA_VERSION;
+        let found = expected + 1;
+        edit_meta(&db, &format!("UPDATE meta SET value = '{found}' WHERE key = 'schema_version'"));
+
+        let (graph, lines) = load(root);
+
+        let refusal = refusal(&lines);
+        assert!(
+            refusal.contains(&format!(
+                "schema_version {found} is newer than this program's {expected}"
+            )),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("rebuilding"), "a newer format is not rebuilt: {refusal}");
+        assert!(matches!(graph.status(), GraphStatus::Failed(_)), "{:?}", graph.status());
+        assert_eq!(served_generation(&graph), None);
+        assert_eq!(meta_string(&db, "schema_version"), found.to_string(), "overwritten");
+        assert_eq!(meta_string(&db, "built_at"), "cached-build-sentinel", "overwritten");
+    }
+
+    #[test]
+    fn each_missing_publication_marker_is_named() {
+        for (key, named) in [
+            ("schema_version", "has no schema_version (incomplete build)"),
+            ("publication_id", "has no publication_id (incomplete publication)"),
+            ("nodes", "is missing node/edge counts (incomplete build)"),
+            ("edges", "is missing node/edge counts (incomplete build)"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let db = seeded(root);
+            edit_meta(&db, &format!("DELETE FROM meta WHERE key = '{key}'"));
+
+            let (graph, lines) = load(root);
+
+            let refusal = refusal(&lines);
+            assert!(refusal.contains(named), "{key}: {refusal}");
+            assert_eq!(served_generation(&graph), Some(1), "{key}: served the incomplete cache");
+        }
+    }
+
+    #[test]
+    fn a_force_stale_cache_is_named_incomplete_and_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = seeded(root);
+        edit_meta(&db, "INSERT OR REPLACE INTO meta (key, value) VALUES ('force_stale', '1')");
+
+        let (graph, lines) = load(root);
+
+        let refusal = refusal(&lines);
+        assert!(refusal.contains("marked incomplete or changed during publication"), "{refusal}");
+        assert_eq!(served_generation(&graph), Some(1), "served the straddled cache");
+    }
+
+    /// A journal that cannot be finished stops the loader before any cached-graph check: the
+    /// refusal keeps SQLite's own cause, and nothing is published or declared usable.
+    #[test]
+    fn a_journal_that_cannot_be_recovered_keeps_its_sqlite_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let db = graph_path(root);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, vec![0x5a_u8; 8192]).unwrap();
+        let mut journal = db.clone().into_os_string();
+        journal.push("-journal");
+        fs::write(&journal, vec![0x5a_u8; 4096]).unwrap();
+
+        let (graph, lines) = load(root);
+
+        let failure = lines
+            .iter()
+            .find(|line| {
+                line.starts_with("the graph file's interrupted journal could not be recovered")
+            })
+            .unwrap_or_else(|| panic!("no recovery failure in {lines:#?}"));
+        assert!(failure.contains("file is not a database"), "no SQLite cause: {failure}");
+        assert!(failure.contains("to recover its journal"), "no operation: {failure}");
+        assert!(
+            !lines.iter().any(|line| line.starts_with("cached graph database")),
+            "the cached-graph check ran after a failed recovery: {lines:#?}"
+        );
+        match graph.status() {
+            GraphStatus::Failed(message) => {
+                assert!(
+                    message.contains("interrupted journal could not be recovered"),
+                    "{message}"
+                );
+                assert!(message.contains("file is not a database"), "{message}");
+            }
+            other => panic!("the loader did not fail: {other:?}"),
+        }
+        assert!(graph.owes_failed(), "the failure is not owed as an operation error");
+        assert_eq!(served_generation(&graph), None, "a graph was published");
+        assert_eq!(fs::read(&db).unwrap(), vec![0x5a_u8; 8192], "the graph file was replaced");
     }
 }

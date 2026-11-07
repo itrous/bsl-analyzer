@@ -1,5 +1,5 @@
 //! `BSL_LOG_FILE` through the real CLI entrypoint: the opt-in `{pid}` placeholder
-//! and the unchanged truncate-on-start behaviour without it.
+//! and the append-on-start behaviour without it; a log file that cannot be opened fails the start.
 use std::{fs, path::Path, process::Command};
 
 use tempfile::TempDir;
@@ -56,7 +56,7 @@ fn pid_placeholder_gives_each_process_its_own_log_file() {
 }
 
 #[test]
-fn log_file_without_placeholder_is_shared_and_truncated_on_start() {
+fn log_file_without_placeholder_is_shared_and_appended_on_start() {
     let (temp, module) = fixture();
     let log = temp.path().join("run.log");
 
@@ -64,8 +64,31 @@ fn log_file_without_placeholder_is_shared_and_truncated_on_start() {
     let second = run_with_log_file(&log, &module);
 
     let text = fs::read_to_string(&log).expect("read shared log");
-    assert!(text.contains(&start_line(second)), "the last run must own the file:\n{text}");
-    assert!(!text.contains(&start_line(first)), "the file must be truncated on start:\n{text}");
+    let first_at = text.find(&start_line(first));
+    let second_at = text.find(&start_line(second));
+    assert!(first_at.is_some(), "the earlier run's log must survive a restart:\n{text}");
+    assert!(first_at < second_at, "the later run must be appended after it:\n{text}");
     let entries = fs::read_dir(temp.path()).expect("read dir").count();
     assert_eq!(entries, 2, "only Module.bsl and run.log are expected");
+}
+
+#[test]
+fn an_explicit_log_file_that_cannot_be_opened_fails_the_start() {
+    let (temp, module) = fixture();
+    let unwritable = temp.path().join("a-directory");
+    fs::create_dir(&unwritable).expect("create directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .arg("format")
+        .arg(&module)
+        .env("BSL_LOG_FILE", &unwritable)
+        .env_remove("BSL_PROFILE")
+        .env_remove("BSL_PROFILE_JSON")
+        .output()
+        .expect("run bsl-analyzer-app");
+
+    assert!(!output.status.success(), "the start went on without the log file the user named");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Failed to setup logging"), "{stderr}");
+    assert!(unwritable.is_dir(), "the destination was replaced");
 }

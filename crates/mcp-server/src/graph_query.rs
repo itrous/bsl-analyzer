@@ -407,8 +407,19 @@ impl GraphDb {
     /// rows because they are written last) or a stale schema version is rejected so
     /// the caller rebuilds rather than serving a partial graph.
     pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("opening graph database at {}", path.display()))?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+            |error| {
+                let error = anyhow::Error::new(error)
+                    .context(format!("opening graph database at {}", path.display()));
+                // SQLite's cannot-open does not tell a missing file from any other reason; only
+                // a definite answer that the file is not there names it missing.
+                match path.try_exists() {
+                    Ok(false) => error
+                        .context(format!("graph database file {} does not exist", path.display())),
+                    _ => error,
+                }
+            },
+        )?;
         let db = Self::from_connection(conn);
         db.validate_meta()?;
         Ok(db)
@@ -437,7 +448,7 @@ impl GraphDb {
         }
         anyhow::ensure!(
             self.meta("publication_id")?.is_some_and(|id| !id.is_empty()),
-            "graph database has no publication_id"
+            "graph database has no publication_id (incomplete publication)"
         );
         // `nodes`/`edges` are the last meta rows finalize writes; their presence
         // means the build ran to completion.
@@ -2060,6 +2071,28 @@ mod tests {
             .unwrap();
         let newer = GraphDb::open(&path).err().expect("a newer format is refused").to_string();
         assert!(newer.contains("newer"), "{newer}");
+    }
+
+    /// Only a definite answer that the file is not there names it missing. A path the
+    /// filesystem cannot even be asked about (an interior NUL is refused on every platform
+    /// before any lookup) keeps the open failure alone.
+    #[test]
+    fn an_open_failure_names_the_file_missing_only_when_it_is_known_to_be_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent = dir.path().join("bsl-graph.db");
+        let error = format!("{:#}", GraphDb::open(&absent).err().expect("nothing to open"));
+        assert!(error.contains("opening graph database at"), "{error}");
+        assert!(
+            error.contains(&format!("graph database file {} does not exist", absent.display())),
+            "{error}"
+        );
+
+        let unanswerable = dir.path().join("bsl-graph\0.db");
+        assert!(unanswerable.try_exists().is_err(), "the stand left the path answerable");
+        let error = format!("{:#}", GraphDb::open(&unanswerable).err().expect("nothing to open"));
+        assert!(error.contains("opening graph database at"), "{error}");
+        assert!(!error.contains("does not exist"), "called missing: {error}");
     }
 
     /// A subsystem's `<Content>` puts a common module into the graph as an `mdo`
