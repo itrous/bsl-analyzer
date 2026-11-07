@@ -172,6 +172,7 @@ pub mod type_mismatch;
 pub mod type_mismatch_by_doc_comment;
 pub mod typo;
 pub mod unary_plus_in_concatenation;
+pub mod unavailable_alias_in_query;
 pub mod unavailable_in_environment;
 pub mod uninitialized_local_variable;
 pub mod union_all;
@@ -448,6 +449,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::AmbiguousFieldInQuery => Some(&ambiguous_field_in_query::METADATA),
         DiagnosticCode::DuplicateAliasInQuery => Some(&duplicate_alias_in_query::METADATA),
+        DiagnosticCode::UnavailableAliasInQuery => Some(&unavailable_alias_in_query::METADATA),
         DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder => {
             Some(&calculation_register_virtual_table_without_recorder::METADATA)
         }

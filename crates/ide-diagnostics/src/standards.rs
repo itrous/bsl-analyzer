@@ -236,6 +236,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::AmbiguousFieldInQuery => &[],
         DiagnosticCode::AssignAliasFieldsInQuery => &[437],
         DiagnosticCode::DuplicateAliasInQuery => &[],
+        DiagnosticCode::UnavailableAliasInQuery => &[],
         DiagnosticCode::FieldsFromJoinsWithoutIsNull => &[412],
         DiagnosticCode::FullOuterJoinQuery => &[435],
         DiagnosticCode::IncorrectUseLikeInQuery => &[726],

@@ -67,6 +67,7 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::AssignAliasFieldsInQuery,
     DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
     DiagnosticCode::DuplicateAliasInQuery,
+    DiagnosticCode::UnavailableAliasInQuery,
     DiagnosticCode::FieldsFromJoinsWithoutIsNull,
     DiagnosticCode::FullOuterJoinQuery,
     DiagnosticCode::IncorrectUseLikeInQuery,
@@ -360,6 +361,7 @@ pub fn collect_sdbl_hir_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic>
 pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispatchFn)] = &[
     (DiagnosticCode::AmbiguousFieldInQuery, handlers::ambiguous_field_in_query::dispatch),
     (DiagnosticCode::DuplicateAliasInQuery, handlers::duplicate_alias_in_query::dispatch),
+    (DiagnosticCode::UnavailableAliasInQuery, handlers::unavailable_alias_in_query::dispatch),
     (DiagnosticCode::AssignAliasFieldsInQuery, handlers::assign_alias_fields_in_query::dispatch),
     (
         DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,

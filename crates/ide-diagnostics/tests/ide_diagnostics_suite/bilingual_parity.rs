@@ -342,6 +342,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     ),
     (DiagnosticCode::DuplicateAliasInQuery, "SDBL source-alias policy; not BSL identifier parity"),
     (
+        DiagnosticCode::UnavailableAliasInQuery,
+        "SDBL source-alias visibility; not BSL identifier parity",
+    ),
+    (
         DiagnosticCode::FieldsFromJoinsWithoutIsNull,
         "SDBL join-field policy; not BSL identifier parity",
     ),
@@ -736,7 +740,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 214, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 215, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]
