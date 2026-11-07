@@ -5713,7 +5713,7 @@ impl SearchEngine {
                 FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
                 FenceOutcome::Released => return Ok(FenceOutcome::Released),
             }
-            let result = embedder.embed_batch_interactive(&inputs[range]);
+            let result = embedder.embed_batch_background(&inputs[range]);
             if !should_continue() {
                 return Ok(FenceOutcome::Released);
             }
