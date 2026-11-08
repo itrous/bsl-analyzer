@@ -226,7 +226,7 @@ pub const SCHEDULE_DATA_NULL_MESSAGE: &str = "Поле данных график
 /// the `ide-diagnostics` handler.
 pub fn query_order_by_document_date_message(reference_field: &str) -> String {
     format!(
-        "Упорядочивание по «{reference_field}.Дата» не задаёт однозначного порядка: у документов          с одной датой порядок произвольный. Упорядочивайте по «{reference_field}.МоментВремени»"
+        "Упорядочивание по «{reference_field}.Дата» не задаёт однозначного порядка: у документов с одной датой порядок произвольный. Упорядочивайте по «{reference_field}.МоментВремени»"
     )
 }
 
