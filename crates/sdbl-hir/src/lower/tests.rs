@@ -4016,3 +4016,177 @@ fn recorder_attribute_of_independent_information_register_is_not_reported() {
     let config = config_with_information_register_write_mode("Independent");
     assert_eq!(recorder_reads(config, code), 0);
 }
+mod order_by_document_date {
+    use std::sync::Arc;
+
+    use bsl_metadata::xml_parser::{
+        parse_accumulation_register_xml, parse_catalog_xml, parse_document_xml,
+    };
+    use bsl_metadata::Configuration;
+
+    use crate::diagnostics::SdblDiagnostic;
+    use crate::lower::lower_sdbl_to_hir;
+
+    const HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" version="2.10">"#;
+
+    fn configuration() -> Arc<Configuration> {
+        let mut config = Configuration::new("Тест");
+        config.add_metadata_object(
+            parse_catalog_xml(&format!(
+                r#"{HEADER}
+    <Catalog uuid="00000000-0000-0000-0000-000000000010">
+        <Properties><Name>Номенклатура</Name></Properties>
+    </Catalog>
+</MetaDataObject>"#
+            ))
+            .unwrap(),
+        );
+        config.add_metadata_object(
+            parse_document_xml(&format!(
+                r#"{HEADER}
+    <Document uuid="00000000-0000-0000-0000-000000000020">
+        <Properties><Name>Поступление</Name></Properties>
+    </Document>
+</MetaDataObject>"#
+            ))
+            .unwrap(),
+        );
+        config.add_register(
+            parse_accumulation_register_xml(&format!(
+                r#"{HEADER}
+    <AccumulationRegister uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>ПартииТоваров</Name><RegisterType>Balance</RegisterType></Properties>
+        <ChildObjects>
+            <Dimension uuid="00000000-0000-0000-0000-000000000101">
+                <Properties><Name>Номенклатура</Name><Type><v8:Type>cfg:CatalogRef.Номенклатура</v8:Type></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000102">
+                <Properties><Name>Партия</Name><Type><v8:Type>cfg:DocumentRef.Поступление</v8:Type></Type></Properties>
+            </Dimension>
+            <Resource uuid="00000000-0000-0000-0000-000000000200">
+                <Properties><Name>Количество</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties>
+            </Resource>
+        </ChildObjects>
+    </AccumulationRegister>
+</MetaDataObject>"#
+            ))
+            .unwrap(),
+        );
+        Arc::new(config)
+    }
+
+    fn findings(query: &str) -> Vec<(String, text_size::TextRange)> {
+        let ast = parser::parse_sdbl(query);
+        lower_sdbl_to_hir(&ast, Some(configuration()))
+            .all_diagnostics()
+            .filter_map(|diag| match diag {
+                SdblDiagnostic::QueryOrderByDocumentDate { reference_field, range } => {
+                    Some((reference_field.clone(), *range))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reports(query: &str) -> Vec<String> {
+        findings(query).into_iter().map(|(field, _)| field).collect()
+    }
+
+    fn balance(order_by: &str) -> Vec<String> {
+        reports(&format!(
+            "ВЫБРАТЬ Партии.Партия КАК Партия ИЗ РегистрНакопления.ПартииТоваров.Остатки(&Момент, Номенклатура = &Номенклатура) КАК Партии УПОРЯДОЧИТЬ ПО {order_by}"
+        ))
+    }
+
+    #[test]
+    fn ordering_by_the_date_of_a_document_reference_is_reported() {
+        assert_eq!(balance("Партии.Партия.Дата"), ["Партия"]);
+    }
+
+    #[test]
+    fn the_descending_direction_is_reported_too() {
+        assert_eq!(balance("Партии.Партия.Дата УБЫВ"), ["Партия"]);
+    }
+
+    #[test]
+    fn english_keywords_are_judged_the_same() {
+        assert_eq!(
+            reports(
+                "SELECT Партии.Партия AS Партия FROM AccumulationRegister.ПартииТоваров.Balance(&Момент) AS Партии ORDER BY Партии.Партия.Date"
+            ),
+            ["Партия"]
+        );
+    }
+
+    #[test]
+    fn a_document_reference_of_the_main_table_of_a_register_is_reported() {
+        assert_eq!(
+            reports(
+                "ВЫБРАТЬ Партии.Партия КАК Партия ИЗ РегистрНакопления.ПартииТоваров КАК Партии УПОРЯДОЧИТЬ ПО Партии.Партия.Дата"
+            ),
+            ["Партия"]
+        );
+    }
+
+    #[test]
+    fn the_reported_range_covers_exactly_the_order_by_key() {
+        let query = "ВЫБРАТЬ Партии.Партия КАК Партия ИЗ РегистрНакопления.ПартииТоваров КАК Партии УПОРЯДОЧИТЬ ПО Партии.Партия.Дата УБЫВ";
+        let found = findings(query);
+        assert_eq!(found.len(), 1);
+        let range = found[0].1;
+        assert_eq!(
+            &query[usize::from(range.start())..usize::from(range.end())],
+            "Партии.Партия.Дата"
+        );
+    }
+
+    #[test]
+    fn ordering_by_the_point_in_time_is_silent() {
+        assert!(balance("Партии.Партия.МоментВремени").is_empty());
+    }
+
+    #[test]
+    fn both_keys_over_the_same_reference_are_silent() {
+        assert!(balance("Партии.Партия.Дата, Партии.Партия.МоментВремени").is_empty());
+    }
+
+    #[test]
+    fn the_english_point_in_time_is_silent() {
+        assert!(balance("Партии.Партия.PointInTime").is_empty());
+    }
+
+    #[test]
+    fn ordering_by_the_date_of_a_catalog_reference_is_silent() {
+        assert!(balance("Партии.Номенклатура.Дата").is_empty());
+    }
+
+    #[test]
+    fn a_two_part_key_over_a_document_source_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ Док.Ссылка КАК Ссылка ИЗ Документ.Поступление КАК Док УПОРЯДОЧИТЬ ПО Док.Дата"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_unresolved_source_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ Т.Поле КАК Поле ИЗ НетТакойТаблицы КАК Т УПОРЯДОЧИТЬ ПО Т.Поле.Дата"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_four_part_key_is_silent() {
+        assert!(balance("Партии.Партия.Владелец.Дата").is_empty());
+    }
+
+    #[test]
+    fn a_condition_on_the_date_of_a_document_reference_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ Партии.Партия КАК Партия ИЗ РегистрНакопления.ПартииТоваров КАК Партии ГДЕ Партии.Партия.Дата = &Дата"
+        )
+        .is_empty());
+    }
+}

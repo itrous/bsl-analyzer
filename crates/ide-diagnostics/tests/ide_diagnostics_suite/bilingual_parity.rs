@@ -242,6 +242,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         DiagnosticCode::RegisterRecorderFieldInQuery,
         "needs register metadata with a recorder field; a bare query text resolves no register",
     ),
+    (
+        DiagnosticCode::QueryOrderByDocumentDate,
+        "needs register metadata whose dimension is a document reference; a bare query text resolves no source",
+    ),
     (DiagnosticCode::WrongDataPathForFormElements, "form metadata path diagnostic"),
     (DiagnosticCode::PublicMethodsDescription, "documentation/region diagnostic"),
     (DiagnosticCode::CachedPublic, "metadata return-value-reuse policy"),
