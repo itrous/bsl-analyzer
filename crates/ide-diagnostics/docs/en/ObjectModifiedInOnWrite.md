@@ -6,7 +6,7 @@ Standard #std465 says: «Запрещается в данном обработч
 
 Assigning to an attribute or a tabular section of the object itself inside the `OnWrite` / `ПриЗаписи` handler of an object module does not reach the database: the object is already written. Object attributes must be filled in the `BeforeWrite` / `ПередЗаписью` handler (#std464).
 
-The diagnostic fires on an assignment to a name that is an attribute, a common attribute or a tabular section of the object itself (`Warehouse = ...` or `ThisObject.Warehouse = ...`). These are not reported: procedure parameters, variables declared with `Var` / `Перем` in the procedure body (they shadow the attribute), platform properties (`AdditionalProperties`, `RegisterRecords`, `DataExchange`), and writing data of OTHER objects, which is exactly what the `OnWrite` handler is for.
+The diagnostic fires on an assignment to a name that is an attribute, a common attribute or a tabular section of the object itself (`Warehouse = ...` or `ThisObject.Warehouse = ...`). These are not reported: procedure parameters, variables declared with `Var` / `Перем` in the procedure body and `For` / `For Each` loop variables (they shadow the attribute; a write through `ThisObject.Warehouse` is still reported), platform properties (`AdditionalProperties`, `RegisterRecords`, `DataExchange`), and writing data of OTHER objects, which is exactly what the `OnWrite` handler is for.
 
 Standard attributes (`Description`, `Code`, `Date`, `Number`) are not seen by the diagnostic yet.
 

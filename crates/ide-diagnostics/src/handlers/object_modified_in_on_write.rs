@@ -41,7 +41,9 @@ const THIS_OBJECT_NAMES: &[&str] = &["этотобъект", "thisobject"];
 /// and the following assignment writes the local, leaving the attribute untouched.
 /// At module level the platform refuses such a declaration outright
 /// («Переменная с указанным именем уже определена»), so only the procedure body
-/// needs the shadowing check. A procedure parameter shadows the attribute too.
+/// needs the shadowing check. A procedure parameter and a loop variable shadow the
+/// attribute too, as in `bare_global_name_claim`. Shadowing affects only the bare
+/// name: `ЭтотОбъект.Склад` still writes the attribute.
 pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
     let code = DiagnosticCode::ObjectModifiedInOnWrite;
 
@@ -63,16 +65,15 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
     }
     let Some(mdo) = metadata.mdo.as_ref() else { return };
 
-    let params: FxHashSet<String> =
-        decl.params.iter().map(|p| fold_lower_per_char(p.name.as_str())).collect();
     let body = ctx.body();
-    let locals = declared_locals(body);
+    let shadowing: FxHashSet<String> =
+        body.bindings_iter().map(|(_, b)| fold_lower_per_char(b.name.as_str())).collect();
 
     for (_, stmt) in body.stmts_iter() {
         let Stmt::Assign { target, .. } = stmt else { continue };
-        let Some(name) = assigned_name(body, *target) else { continue };
+        let Some((name, qualified)) = assigned_name(body, *target) else { continue };
         let folded = fold_lower_per_char(name);
-        if params.contains(&folded) || locals.contains(&folded) {
+        if !qualified && shadowing.contains(&folded) {
             continue;
         }
         let Some(kind) = own_field_kind(mdo, &folded) else { continue };
@@ -103,33 +104,21 @@ enum FieldKind {
     TabularSection,
 }
 
-/// The name written by an assignment target: a bare name or `ЭтотОбъект.<Имя>`.
-fn assigned_name(body: &Body, target: hir::ExprIdx) -> Option<&str> {
+/// The name written by an assignment target and whether it is qualified:
+/// a bare name or `ЭтотОбъект.<Имя>`.
+fn assigned_name(body: &Body, target: hir::ExprIdx) -> Option<(&str, bool)> {
     match body.expr_idx(target) {
-        Expr::Path(name) => Some(name.as_str()),
+        Expr::Path(name) => Some((name.as_str(), false)),
         Expr::Field { base, field } => match body.expr_idx(*base) {
             Expr::Path(p)
                 if THIS_OBJECT_NAMES.contains(&fold_lower_per_char(p.as_str()).as_str()) =>
             {
-                Some(field.as_str())
+                Some((field.as_str(), true))
             }
             _ => None,
         },
         _ => None,
     }
-}
-
-/// Folded names declared by `Перем` anywhere in the body.
-fn declared_locals(body: &Body) -> FxHashSet<String> {
-    let mut locals = FxHashSet::default();
-    for (_, stmt) in body.stmts_iter() {
-        if let Stmt::VarDecl { bindings } = stmt {
-            for &id in bindings.iter() {
-                locals.insert(fold_lower_per_char(body.binding_idx(id).name.as_str()));
-            }
-        }
-    }
-    locals
 }
 
 fn matches_name(folded: &str, name: &str, name_en: Option<&str>) -> bool {
@@ -253,6 +242,31 @@ mod tests {
     #[test]
     fn silent_when_local_var_shadows_attribute() {
         let d = run("Процедура ПриЗаписи(Отказ)\n    Перем Склад;\n    Склад = 1;\nКонецПроцедуры");
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn fires_on_this_object_field_despite_local_of_same_name() {
+        let d = run("Процедура ПриЗаписи(Отказ)\n    Перем Склад;\n    ЭтотОбъект.Склад = 1;\nКонецПроцедуры");
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn fires_on_this_object_field_despite_parameter_of_same_name() {
+        let d = run("Процедура ПриЗаписи(Склад)\n    ЭтотОбъект.Склад = 1;\nКонецПроцедуры");
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn silent_when_loop_variable_shadows_attribute() {
+        let d = run("Процедура ПриЗаписи(Отказ)
+    Для Каждого Склад Из Коллекция Цикл
+        Склад = 1;
+    КонецЦикла;
+    Для Основная = 1 По 2 Цикл
+        Основная = 3;
+    КонецЦикла;
+КонецПроцедуры");
         assert!(d.is_empty(), "{d:?}");
     }
 
