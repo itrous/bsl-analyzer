@@ -3918,6 +3918,23 @@ fn standard_fields_of_recorder_are_not_reported() {
 }
 
 #[test]
+fn standard_attributes_that_documents_lack_are_reported_after_recorder() {
+    for field in ["Код", "Наименование", "Владелец", "Родитель", "Период", "Code", "Description"]
+    {
+        let code = format!("ВЫБРАТЬ Движения.Регистратор.{field} ИЗ {STOCK}");
+        assert_eq!(recorder_reads(config_with_stock_register(), &code), 1, "{field}");
+    }
+}
+
+#[test]
+fn english_standard_fields_of_recorder_are_not_reported() {
+    for field in ["Ref", "Date", "Number", "Posted", "DeletionMark", "PointInTime"] {
+        let code = format!("ВЫБРАТЬ Движения.Регистратор.{field} ИЗ {STOCK}");
+        assert_eq!(recorder_reads(config_with_stock_register(), &code), 0, "{field}");
+    }
+}
+
+#[test]
 fn recorder_read_as_last_part_is_not_reported() {
     let code = format!("ВЫБРАТЬ Движения.Регистратор ИЗ {STOCK}");
     assert_eq!(recorder_reads(config_with_stock_register(), &code), 0);

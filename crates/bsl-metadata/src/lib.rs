@@ -75,8 +75,8 @@ pub use loader::{
     DiscoveredScheduledJob, DiscoveredSubsystem, DiscoveredWebService,
 };
 pub use metadata_object::{
-    is_standard_attribute_name, Attribute, AttributeType, MdoType, MetadataObject, Name,
-    PlatformValueType,
+    is_document_standard_attribute_name, is_standard_attribute_name, Attribute, AttributeType,
+    MdoType, MetadataObject, Name, PlatformValueType,
 };
 pub use metadata_resolver::{
     resolve_defined_type_terminal, MetadataResolver, QueryMetadataResolver,

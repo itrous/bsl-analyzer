@@ -700,6 +700,21 @@ pub fn is_standard_attribute_name(name: &str) -> bool {
     names.contains(&name.fold_lower())
 }
 
+/// Whether `name` is the name (Russian or English) of a standard attribute of a document:
+/// the subset of [`is_standard_attribute_name`] the platform gives a document object, so
+/// `Код` or `Период` do not pass. Case-insensitive.
+pub fn is_document_standard_attribute_name(name: &str) -> bool {
+    bsl_platform::standard_attributes_for(
+        bsl_platform::MdoTemplateKind::Document,
+        bsl_platform::ObjectView::Object,
+    )
+    .iter()
+    .any(|spec| {
+        stdx::case::eq_ignore_case(spec.kind.russian_name(), name)
+            || stdx::case::eq_ignore_case(spec.kind.english_name(), name)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttributeType {
     String {

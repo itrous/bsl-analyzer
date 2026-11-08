@@ -250,8 +250,9 @@ impl LoweringContext<'_> {
             }
         }
         let name = attribute.as_str();
-        (!bsl_metadata::is_standard_attribute_name(name) && !is_document_virtual_query_field(name))
-            .then(|| name.to_string())
+        (!bsl_metadata::is_document_standard_attribute_name(name)
+            && !is_document_virtual_query_field(name))
+        .then(|| name.to_string())
     }
 
     fn report_dotted_paths_in_source(&mut self, table: &TableRef) {
