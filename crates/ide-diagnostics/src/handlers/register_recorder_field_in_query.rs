@@ -23,13 +23,11 @@ pub(crate) fn dispatch(
     query_text: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if let sdbl_hir::SdblDiagnostic::RegisterRecorderFieldInQuery { attribute, range } = diag {
+    if let sdbl_hir::SdblDiagnostic::RegisterRecorderFieldInQuery { range, .. } = diag {
         crate::sdbl_utils::dispatch_simple(
             config,
             DiagnosticCode::RegisterRecorderFieldInQuery,
-            &format!(
-                "В запросе к регистру читается реквизит «{attribute}» документа-регистратора. Регистр должен быть самодостаточен: нужные данные хранятся его измерениями и реквизитами (#std477)"
-            ),
+            &diag.message(),
             *range,
             mapper,
             query_text,

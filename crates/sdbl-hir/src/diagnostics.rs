@@ -379,7 +379,9 @@ impl SdblDiagnostic {
             }
             Self::RegisterRecorderFieldInQuery { attribute, .. } => {
                 format!(
-                    "В запросе к регистру читается реквизит «{attribute}» документа-регистратора.                      Регистр должен быть самодостаточен: нужные данные хранятся его измерениями                      и реквизитами (#std477)"
+                    "В запросе к регистру читается реквизит «{attribute}» документа-регистратора. \
+                     Регистр должен быть самодостаточен: нужные данные хранятся его измерениями \
+                     и реквизитами (#std477)"
                 )
             }
             Self::RefOveruse { .. } => {
@@ -553,5 +555,19 @@ mod tests {
         };
         assert!(diag.message().contains("НесуществующееПоле"));
         assert!(diag.message().contains("Справочник.Валюты"));
+    }
+
+    #[test]
+    fn register_recorder_message_has_single_spaces() {
+        let diag = SdblDiagnostic::RegisterRecorderFieldInQuery {
+            attribute: "Контрагент".to_string(),
+            range: syntax::MODULE_RANGE,
+        };
+        assert_eq!(
+            diag.message(),
+            "В запросе к регистру читается реквизит «Контрагент» документа-регистратора. \
+             Регистр должен быть самодостаточен: нужные данные хранятся его измерениями и \
+             реквизитами (#std477)"
+        );
     }
 }
