@@ -207,6 +207,7 @@ pub enum DiagnosticCode {
     LogicalOrInJoinQuerySection,
     LogicalOrInTheWhereSectionOfQuery,
     MultilineStringInQuery,
+    QueryConditionWithoutIndex,
     QueryNestedFieldsByDot,
     QueryOrderByDocumentDate,
     QueryParseError,
