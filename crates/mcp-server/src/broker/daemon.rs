@@ -199,6 +199,7 @@ where
     let mut idle_since = Some(Instant::now());
     let mut result = Ok(());
     let mut superseded = false;
+    let session_retirement = CancellationToken::new();
 
     tracing::info!(pid = std::process::id(), "shared broker listening");
     loop {
@@ -229,7 +230,7 @@ where
                 let callback = Arc::clone(&on_session);
                 let key = key.clone();
                 let shutdown = shutdown.clone();
-                let scope_retired_session = scope_retired.clone();
+                let scope_retired_session = session_retirement.clone();
                 let warmed = Arc::clone(&warmed);
                 sessions.spawn(async move {
                     let _active_guard = active_guard;
@@ -289,6 +290,13 @@ where
 
     let retired = scope_retired.is_cancelled();
     drop(listener);
+    // Sessions hear of a retirement only now: their client reconnects at once, and a connection
+    // waiting in the backlog of a listener about to close would be reset instead of launching the
+    // next backend.
+    let announce_retirement = tokio::spawn(async move {
+        scope_retired.cancelled().await;
+        session_retirement.cancel();
+    });
     if superseded {
         // A stop cuts graph reads short, as dying by the signal would, but the owner
         // still shuts down and releases the workspace lease.
@@ -317,6 +325,7 @@ where
             }
         }
     }
+    announce_retirement.abort();
     on_shutdown();
     result
 }
@@ -1134,6 +1143,132 @@ mod shared_tests {
                 .any(|w| w == b"initialize-marker"),
             "no public initialize payload is part of the rejected private handshake"
         );
+    }
+
+    /// Whether a client reaches the endpoint at this instant, without waiting for it to accept.
+    /// A Unix socket connect never waits. A Windows connect to a pipe whose instances are all
+    /// held by connected sessions would sit in `WaitNamedPipe` on a blocking thread that outlives
+    /// its caller's timeout and the session's drain, so the pipe is tried once instead.
+    async fn endpoint_reachable_now(key: &SharedBackendKey) -> bool {
+        #[cfg(unix)]
+        {
+            connect_endpoint(shared_backend_name(key).unwrap(), HANDSHAKE_TIMEOUT).await.is_ok()
+        }
+        #[cfg(windows)]
+        {
+            use interprocess::os::windows::named_pipe::{pipe_mode, tokio::DuplexPipeStream};
+
+            let path = format!(r"\\.\pipe\bsl-shared-{}.sock", key.digest());
+            DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path_with_wait_mode(
+                path,
+                interprocess::ConnectWaitMode::Timeout(Duration::ZERO),
+            )
+            .await
+            .is_ok()
+        }
+    }
+
+    /// A client told its scope retired reconnects at once. While the listener lives, that
+    /// connection only waits in its backlog, and closing the listener resets it: the rebind then
+    /// fails instead of launching the next backend. So a session must not hear of the retirement
+    /// before the endpoint is closed. The second session makes the accept loop register for the
+    /// retirement after the first one, which is woken first when nothing else orders them.
+    #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "необязательный тест на Windows: a client still reaches the named pipe when a session hears of the retirement, so the endpoint closing first is not observable there; запуск: cargo test -p mcp-server --lib broker::daemon::shared_tests::a_session_learns_of_retirement_only_after_the_endpoint_closed -- --exact --ignored"
+    )]
+    async fn a_session_learns_of_retirement_only_after_the_endpoint_closed() {
+        let source = tempfile::tempdir().unwrap();
+        let identity = SharedBackendIdentity::new(
+            source.path(),
+            source.path().join("cache"),
+            [5; 32],
+            [6; 32],
+            [7; 32],
+            [8; 32],
+        );
+        let key = SharedBackendKey::new(identity.clone());
+        let listener = bind_shared(&key).await.unwrap().unwrap();
+        let retired = CancellationToken::new();
+        let (attached_tx, mut attached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+        let endpoint_key = key.clone();
+        let daemon = tokio::spawn(serve_shared(
+            key.clone(),
+            listener,
+            Arc::new(
+                move |_handshake: Handshake,
+                      _context,
+                      _session,
+                      shutdown: CancellationToken,
+                      retired: CancellationToken| {
+                    let attached = attached_tx.clone();
+                    let reconnect = reconnect_tx.clone();
+                    let key = endpoint_key.clone();
+                    async move {
+                        attached.send(()).unwrap();
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {}
+                            _ = retired.cancelled() => {
+                                reconnect.send(endpoint_reachable_now(&key).await).unwrap();
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            ),
+            retired.clone(),
+            CancellationToken::new(),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            || (false, false),
+            || {},
+        ));
+
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client =
+                connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT)
+                    .await
+                    .unwrap();
+            tokio::time::timeout(test_utils::wait::hang_guard(HANDSHAKE_TIMEOUT), async {
+                client_handshake(
+                    &mut client,
+                    &Handshake { identity: identity.clone(), adapter: AdapterKind::Mcp },
+                )
+                .await
+                .unwrap();
+                write_session_context(&mut client, &[]).await.unwrap();
+            })
+            .await
+            .expect("the client's handshake and session context are bounded");
+            tokio::time::timeout(
+                test_utils::wait::hang_guard(Duration::from_secs(5)),
+                attached_rx.recv(),
+            )
+            .await
+            .expect("the session reaches the adapter")
+            .expect("the adapter callback is alive");
+            clients.push(client);
+        }
+
+        retired.cancel();
+        for _ in 0..2 {
+            let reached = tokio::time::timeout(
+                test_utils::wait::hang_guard(Duration::from_secs(5)),
+                reconnect_rx.recv(),
+            )
+            .await
+            .expect("a session hears of the retirement")
+            .expect("the session reports before the daemon cuts it off");
+            assert!(!reached, "the endpoint closes before a session hears of the retirement");
+        }
+        tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(5)), daemon)
+            .await
+            .expect("the daemon finishes once its sessions have ended")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

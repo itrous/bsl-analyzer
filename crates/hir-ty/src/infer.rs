@@ -57,6 +57,11 @@ pub(crate) mod heap_estimate {
 
     pub(crate) use stdx::heap::{map_table_bytes, vec_bytes};
 
+    fn query_facts_heap(facts: &crate::query_in_loop::BodyQueryFacts) -> usize {
+        vec_bytes::<crate::query_in_loop::QueryExecutionSite>(facts.executions.len())
+            + vec_bytes::<crate::query_in_loop::LocalQueryCall>(facts.local_calls.len())
+    }
+
     /// Heap of the `expr`/`binding`-keyed maps plus their owned-string and
     /// nested-vec payloads, shared by all three inference-result shapes.
     fn body_maps_heap(
@@ -111,6 +116,10 @@ pub(crate) mod heap_estimate {
         }
         b += vec_bytes::<(DefWithBodyId, InferenceDiagnostic)>(r.diagnostics.len());
         b += vec_bytes::<CallArgBinding>(r.call_arg_bindings.len());
+        b += map_table_bytes::<DefWithBodyId, crate::query_in_loop::BodyQueryFacts>(
+            r.query_facts_by_body.len(),
+        );
+        b += r.query_facts_by_body.values().map(query_facts_heap).sum::<usize>();
         b
     }
 
@@ -126,6 +135,7 @@ pub(crate) mod heap_estimate {
                 r.call_arg_bindings.len(),
             )
             + vec_bytes::<ExprId>(r.return_expr_ids.len())
+            + query_facts_heap(&r.query_facts)
     }
 
     pub(crate) fn module_code_inference_result_heap(v: &Arc<ModuleCodeInferenceResult>) -> usize {
@@ -139,6 +149,7 @@ pub(crate) mod heap_estimate {
                 r.diagnostics.len(),
                 r.call_arg_bindings.len(),
             )
+            + query_facts_heap(&r.query_facts)
     }
 }
 
@@ -155,6 +166,10 @@ pub struct InferenceResult {
     pub diagnostics: Vec<(DefWithBodyId, InferenceDiagnostic)>,
 
     pub call_arg_bindings: Vec<CallArgBinding>,
+
+    /// Every body of the module, the bodies whose other facts an effective fold leaves out
+    /// included: a query reached through a local call may sit in any of them.
+    pub query_facts_by_body: FxHashMap<DefWithBodyId, crate::query_in_loop::BodyQueryFacts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +212,9 @@ struct PathWalk {
     /// literal, a constructor or a global. The type of a metadata object such a value yields does
     /// not depend on the path that reached it, unlike a platform object's facets.
     inferred_leaves: bool,
+    /// Reaching definitions to answer local reads with, in place of the module's memoised ones.
+    /// A read in a branch or loop header is then answered too, by what that header reads.
+    own_defs: Option<Arc<dataflow::reaching_defs::ReachingDefsResult>>,
 }
 
 /// What a definition reaching a read takes its value from.
@@ -811,6 +829,11 @@ pub struct InferenceContext<'db> {
     /// accessibility check.
     local_callee_env: FxHashMap<hir_def::MethodKey, hir_def::execution_env::EnvFlags>,
 
+    /// Calls met in the walk, with whether a loop body enclosed them, for
+    /// [`Self::query_facts`] to judge once every type of the body is known. A branch
+    /// [`Self::in_dead_branch`] holds for is left out.
+    query_call_sites: Vec<(ExprId, bool)>,
+
     /// The path under inference is the callee of a bare call, not a value read.
     /// The cascade still classifies the name as a value — a method is not one —
     /// but `UnresolvedName` must stay silent when the call channel already leaves
@@ -837,6 +860,7 @@ pub struct BodyInferenceResult {
     /// `InferenceContext::in_dead_branch`): the argument checks of syntax-level
     /// call diagnostics read it.
     pub dead_stmts: Vec<StmtId>,
+    pub query_facts: crate::query_in_loop::BodyQueryFacts,
 
     pub(crate) return_expr_ids: Vec<ExprId>,
 }
@@ -853,6 +877,7 @@ impl BodyInferenceResult {
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
             dead_stmts: Vec::new(),
+            query_facts: Default::default(),
             return_expr_ids: Vec::new(),
         }
     }
@@ -871,6 +896,7 @@ pub struct ModuleCodeInferenceResult {
     pub uncompiled_stmts: Vec<StmtId>,
     /// See [`BodyInferenceResult::dead_stmts`].
     pub dead_stmts: Vec<StmtId>,
+    pub query_facts: crate::query_in_loop::BodyQueryFacts,
 }
 
 impl Default for ModuleCodeInferenceResult {
@@ -885,6 +911,7 @@ impl Default for ModuleCodeInferenceResult {
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
             dead_stmts: Vec::new(),
+            query_facts: Default::default(),
         }
     }
 }
@@ -905,6 +932,7 @@ impl ModuleCodeInferenceResult {
             call_arg_bindings: body.call_arg_bindings,
             uncompiled_stmts: body.uncompiled_stmts,
             dead_stmts: body.dead_stmts,
+            query_facts: body.query_facts,
         }
     }
 }
@@ -1113,6 +1141,7 @@ impl<'db> InferenceContext<'db> {
             structure_shapes: FxHashMap::default(),
             callee_module_env: FxHashMap::default(),
             local_callee_env: FxHashMap::default(),
+            query_call_sites: Vec::new(),
             reading_bare_call_callee: false,
         }
     }
@@ -2099,6 +2128,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     pub fn finish(self) -> BodyInferenceResult {
+        let query_facts = self.query_facts();
         BodyInferenceResult {
             owner: self.owner,
             // `var_types` is `NormName`-keyed internally (the hot lookup path during
@@ -2113,8 +2143,133 @@ impl<'db> InferenceContext<'db> {
             call_arg_bindings: self.call_arg_bindings,
             uncompiled_stmts: self.uncompiled_stmts,
             dead_stmts: self.dead_stmts,
+            query_facts,
             return_expr_ids: self.return_expr_ids,
         }
+    }
+
+    /// The query executions of the finished body. Judged only now: a local's type at a
+    /// call is read off the definitions that reach it, some of which the walk meets later.
+    fn query_facts(&self) -> crate::query_in_loop::BodyQueryFacts {
+        let bindings: FxHashMap<ExprId, &CallArgBinding> =
+            self.call_arg_bindings.iter().map(|binding| (binding.call_expr, binding)).collect();
+        let module = hir_def::ModuleId::new(self.context_file_id);
+        let mut facts = crate::query_in_loop::BodyQueryFacts::default();
+        let mut own_defs = None;
+        for &(call, in_loop_body) in &self.query_call_sites {
+            if self.body.is_recovered(call) {
+                continue;
+            }
+            if let Some(kind) = self.query_execution_kind(call, &bindings, &mut own_defs) {
+                facts.executions.push(crate::query_in_loop::QueryExecutionSite {
+                    call,
+                    kind,
+                    in_loop_body,
+                });
+            } else if let Some(target) =
+                self.called_user_method(call, &bindings).filter(|target| target.module == module)
+            {
+                facts.local_calls.push(crate::query_in_loop::LocalQueryCall {
+                    call,
+                    target,
+                    in_loop_body,
+                });
+            }
+        }
+        facts
+    }
+
+    /// The user method a call resolved to, by the identity inference chose and not by its
+    /// spelling.
+    fn called_user_method(
+        &self,
+        call: ExprId,
+        bindings: &FxHashMap<ExprId, &CallArgBinding>,
+    ) -> Option<hir_def::MethodId> {
+        let Expr::Call { callee, .. } = self.body.expr(call) else { return None };
+        let binding = bindings.get(&ExprId::from_idx(*callee))?;
+        crate::query_in_loop::selected_user_method(&binding.candidate.resolution.selection)
+    }
+
+    /// Over the body at hand, which in an effective module is not the one the module's memoised
+    /// definitions number, and without what only dead code carries: such a value is not one a
+    /// call can see.
+    fn executable_reaching_defs(&self) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>> {
+        let cfg =
+            cfg::CfgBuilder::new().build_graph_from_hir(self.body.body_stmts_typed(), &self.body);
+        dataflow::reaching_defs::solve_executable_reaching_definitions(
+            Arc::new(cfg),
+            &self.body,
+            matches!(self.owner, DefWithBodyId::Method(_)),
+        )
+    }
+
+    /// The operation a call proves to execute. Reaching definitions are solved on the first call
+    /// that names one, as most bodies have none.
+    fn query_execution_kind(
+        &self,
+        call: ExprId,
+        bindings: &FxHashMap<ExprId, &CallArgBinding>,
+        own_defs: &mut Option<Option<Arc<dataflow::reaching_defs::ReachingDefsResult>>>,
+    ) -> Option<crate::query_in_loop::QueryExecutionKind> {
+        use crate::query_in_loop::{selected_platform_method, QueryExecutionKind};
+
+        let (receiver, method, args, binding) = match self.body.expr(call) {
+            Expr::Call { callee, args } => {
+                let callee = ExprId::from_idx(*callee);
+                let Expr::Field { base, field } = self.body.expr(callee) else { return None };
+                if self.body.is_recovered(callee) {
+                    return None;
+                }
+                // Bound to the callee, so a nested call in an argument cannot answer for it.
+                (*base, field, args, bindings.get(&callee))
+            }
+            Expr::MethodCall { receiver, method, args } => (*receiver, method, args, None),
+            _ => return None,
+        };
+        let kind = QueryExecutionKind::of_method(method)?;
+        if binding.is_some_and(|binding| {
+            !selected_platform_method(&binding.candidate.resolution.selection)
+        }) {
+            return None;
+        }
+
+        let own_defs = own_defs.get_or_insert_with(|| self.executable_reaching_defs()).clone()?;
+        let mut walk =
+            PathWalk { inferred_leaves: true, own_defs: Some(own_defs), ..PathWalk::default() };
+        let receiver_types = self.types_on_every_path(ExprId::from_idx(receiver), &mut walk)?;
+        if receiver_types.is_empty()
+            || !receiver_types.iter().all(|ty| kind.proved_by(self.db, *ty))
+        {
+            return None;
+        }
+        // No binding: the walk typed the receiver by its textually last write, which may be one
+        // this call cannot see, so the call is judged on the types proved to reach it.
+        if binding.is_none() {
+            let argument_types = args
+                .iter()
+                .map(|arg| {
+                    self.expr_types
+                        .get(&ExprId::from_idx(*arg))
+                        .copied()
+                        .unwrap_or_else(|| self.db.unknown())
+                })
+                .collect::<Vec<_>>();
+            let resolves = |ty: &TypeId| {
+                crate::method_lookup::lookup_method(self.db, *ty, method).is_some_and(|info| {
+                    let projection = crate::call_binding::resolve_binding(
+                        self.db,
+                        info.candidates,
+                        &argument_types,
+                    );
+                    selected_platform_method(&projection.semantic.resolution.selection)
+                })
+            };
+            if !receiver_types.iter().all(resolves) {
+                return None;
+            }
+        }
+        Some(kind)
     }
 
     fn record_candidate_call_arg_binding(
@@ -2839,8 +2994,13 @@ impl<'db> InferenceContext<'db> {
                     .then(|| vec![ty]);
                 }
                 let use_stmt = self.body.enclosing_stmt(expr)?;
-                let reaching =
-                    self.reaching_assignment_types_at(self.read_point(use_stmt)?, &key)?;
+                let reaching = match &walk.own_defs {
+                    Some(defs) => self.reaching_defs_of(match self.header_read_expr(use_stmt) {
+                        Some(header) => defs.defs_for_var_at_header(&key, header)?,
+                        None => defs.defs_for_var_at_stmt(&key, use_stmt)?,
+                    }),
+                    None => self.reaching_assignment_types_at(self.read_point(use_stmt)?, &key)?,
+                };
                 let use_stmt = use_stmt.to_idx();
                 if !walk.inferred_leaves
                     && crate::narrow::local_may_change_unseen(&self.body, &key, use_stmt, None)
@@ -2914,6 +3074,20 @@ impl<'db> InferenceContext<'db> {
             }
             _ => Some(stmt),
         }
+    }
+
+    /// The expression naming the CFG header a read in `stmt` happens at, for a statement that
+    /// is a header. Nothing writes between an `Если` condition and an `ИначеЕсли` one, so the
+    /// first condition answers for all of them, and likewise a `Для` lower bound for the upper.
+    fn header_read_expr(&self, stmt: StmtId) -> Option<ExprId> {
+        let header = match self.body.stmt(stmt) {
+            Stmt::If(if_stmt) => if_stmt.condition,
+            Stmt::While { condition, .. } => *condition,
+            Stmt::For { from, .. } => *from,
+            Stmt::ForEach { collection, .. } => *collection,
+            _ => return None,
+        };
+        Some(ExprId::from_idx(header))
     }
 
     /// Where the definitions of `var_key` reaching `use_stmt` take their values, with loop
@@ -3014,34 +3188,34 @@ impl<'db> InferenceContext<'db> {
             }
         };
         let defs = body_defs.defs_for_var_at_stmt(var_key, stmt_id)?;
-        Some(
-            defs.into_iter()
-                .map(|def| match def.def_site {
-                    dataflow::reaching_defs::DefSite::Assignment(stmt_raw) => {
-                        let stmt = StmtId::from_raw(stmt_raw);
-                        let ty = match self.body.stmt(stmt) {
-                            Stmt::Assign { value, .. } => {
-                                self.expr_types.get(&ExprId::from_idx(*value)).copied()
-                            }
-                            _ => None,
-                        };
-                        ReachingDef { stmt: Some(stmt), ty }
-                    }
-                    // A binding is not a statement, but inference does record a
-                    // type for it when it could work one out — a `Для` counter
-                    // has one, a BSL parameter usually does not.
-                    dataflow::reaching_defs::DefSite::Parameter(binding)
-                    | dataflow::reaching_defs::DefSite::VarDecl(binding)
-                    | dataflow::reaching_defs::DefSite::ForLoop(binding)
-                    | dataflow::reaching_defs::DefSite::ForEachLoop(binding) => {
-                        ReachingDef { stmt: None, ty: self.binding_types.get(&binding).copied() }
-                    }
-                    dataflow::reaching_defs::DefSite::Unknown => {
-                        ReachingDef { stmt: None, ty: None }
-                    }
-                })
-                .collect(),
-        )
+        Some(self.reaching_defs_of(defs))
+    }
+
+    fn reaching_defs_of(&self, defs: Vec<dataflow::reaching_defs::Definition>) -> Vec<ReachingDef> {
+        defs.into_iter()
+            .map(|def| match def.def_site {
+                dataflow::reaching_defs::DefSite::Assignment(stmt_raw) => {
+                    let stmt = StmtId::from_raw(stmt_raw);
+                    let ty = match self.body.stmt(stmt) {
+                        Stmt::Assign { value, .. } => {
+                            self.expr_types.get(&ExprId::from_idx(*value)).copied()
+                        }
+                        _ => None,
+                    };
+                    ReachingDef { stmt: Some(stmt), ty }
+                }
+                // A binding is not a statement, but inference does record a
+                // type for it when it could work one out — a `Для` counter
+                // has one, a BSL parameter usually does not.
+                dataflow::reaching_defs::DefSite::Parameter(binding)
+                | dataflow::reaching_defs::DefSite::VarDecl(binding)
+                | dataflow::reaching_defs::DefSite::ForLoop(binding)
+                | dataflow::reaching_defs::DefSite::ForEachLoop(binding) => {
+                    ReachingDef { stmt: None, ty: self.binding_types.get(&binding).copied() }
+                }
+                dataflow::reaching_defs::DefSite::Unknown => ReachingDef { stmt: None, ty: None },
+            })
+            .collect()
     }
 
     /// A `&НаСервереБезКонтекста` / `&НаКлиентеНаСервереБезКонтекста` method has no
@@ -3555,12 +3729,14 @@ impl<'db> InferenceContext<'db> {
             }
 
             Expr::Call { callee, args } => {
+                self.note_query_call_site(expr_id);
                 let converted_args: Vec<ExprId> =
                     args.iter().map(|&arg| ExprId::from_idx(arg)).collect();
                 self.infer_call(expr_id, ExprId::from_idx(*callee), &converted_args)
             }
 
             Expr::MethodCall { receiver, method, args } => {
+                self.note_query_call_site(expr_id);
                 let receiver_ty = self.infer_expr(ExprId::from_idx(*receiver));
                 for &arg in args.iter() {
                     self.infer_expr(ExprId::from_idx(arg));
@@ -4469,6 +4645,12 @@ impl<'db> InferenceContext<'db> {
             mdo_name: mdo_name.clone(),
             args: arg_presence,
         });
+    }
+
+    fn note_query_call_site(&mut self, call: ExprId) {
+        if !self.in_dead_branch {
+            self.query_call_sites.push((call, self.loop_depth > 0));
+        }
     }
 
     fn infer_call(&mut self, call_expr: ExprId, callee: ExprId, args: &[ExprId]) -> TypeId {
@@ -6168,6 +6350,7 @@ pub fn infer_query<'db>(
         result.implicit_locals_by_body.insert(owner, body_result.implicit_locals.clone());
         result.diagnostics.extend(body_result.diagnostics.iter().map(|d| (owner, d.clone())));
         result.call_arg_bindings.extend(body_result.call_arg_bindings.iter().cloned());
+        result.query_facts_by_body.insert(owner, body_result.query_facts.clone());
     };
 
     let fold_module_code = |result: &mut InferenceResult,
@@ -6179,6 +6362,7 @@ pub fn infer_query<'db>(
         result.implicit_locals_by_body.insert(owner, module_code.implicit_locals.clone());
         result.diagnostics.extend(module_code.diagnostics.iter().map(|d| (owner, d.clone())));
         result.call_arg_bindings.extend(module_code.call_arg_bindings.iter().cloned());
+        result.query_facts_by_body.insert(owner, module_code.query_facts.clone());
     };
 
     {
@@ -6228,9 +6412,10 @@ pub fn infer_effective<'db>(
     // body is copied verbatim. A copied body's diagnostics are dropped by the orchestrator's
     // `#Вставка` remap, and its effective return equals the base return (identical body +
     // base-keyed sibling resolution), so `effective_returns` would hold exactly the value the
-    // base fallback already yields for it. Restricting both passes to the changed methods is
-    // therefore output-identical, while avoiding a re-inference of the whole — often large —
-    // base module twice per extension file (the dominant cost on heavily-extended configs).
+    // base fallback already yields for it. Restricting the returns pass and the fold of inferred
+    // facts to the changed methods is therefore output-identical. The query facts are the one
+    // exception: a loop in `#Вставка` reaches a query through a copied body too, in the same
+    // logical module.
     let changed_ids: rustc_hash::FxHashSet<hir_def::MethodKey> = {
         let ext_parse = db.parse(ext_file);
         let changed_targets: rustc_hash::FxHashSet<String> = ext_parse
@@ -6290,6 +6475,7 @@ pub fn infer_effective<'db>(
         result.implicit_locals_by_body.insert(owner, body_result.implicit_locals.clone());
         result.diagnostics.extend(body_result.diagnostics.iter().map(|d| (owner, d.clone())));
         result.call_arg_bindings.extend(body_result.call_arg_bindings.iter().cloned());
+        result.query_facts_by_body.insert(owner, body_result.query_facts.clone());
     };
 
     if let Some(body) = module_bodies.module_code() {
@@ -6307,20 +6493,24 @@ pub fn infer_effective<'db>(
     }
 
     for (local_id, body) in module_bodies.iter_bodies() {
-        if !changed_ids.contains(&local_id) {
-            continue;
-        }
+        let changed = changed_ids.contains(&local_id);
+        let owner = DefWithBodyId::Method(local_id);
         let mut ctx = InferenceContext::new_effective(
             db,
             base_file,
-            Some(ext_file),
+            changed.then_some(ext_file),
             interface.clone(),
-            DefWithBodyId::Method(local_id),
+            owner,
             &Arc::new(body.clone()),
         );
         ctx.set_local_effective_returns(Arc::clone(&effective_returns));
         ctx.infer_all();
-        fold_body(&mut result, &ctx.finish());
+        let body_result = ctx.finish();
+        if changed {
+            fold_body(&mut result, &body_result);
+        } else {
+            result.query_facts_by_body.insert(owner, body_result.query_facts);
+        }
     }
 
     Arc::new(result)
@@ -6435,6 +6625,7 @@ pub fn infer_weaving<'db>(
         result.implicit_locals_by_body.insert(owner, body_result.implicit_locals.clone());
         result.diagnostics.extend(body_result.diagnostics.iter().map(|d| (owner, d.clone())));
         result.call_arg_bindings.extend(body_result.call_arg_bindings.iter().cloned());
+        result.query_facts_by_body.insert(owner, body_result.query_facts.clone());
     };
 
     if let Some(body) = module_bodies.module_code() {

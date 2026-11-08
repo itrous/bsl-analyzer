@@ -4,6 +4,7 @@ pub mod fs;
 pub mod heap;
 pub mod par_guard;
 pub mod path_exclusion;
+pub mod test_temp;
 pub mod thread;
 
 pub use itertools::Itertools;

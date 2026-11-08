@@ -177,6 +177,24 @@ impl<'a> AnalysisContext<'a> {
         self.provider.kernel_type_display(id, locale)
     }
 
+    pub fn kernel_types_overlap(&self, left: hir::TypeId, right: hir::TypeId) -> bool {
+        self.provider.kernel_types_overlap(left, right)
+    }
+
+    /// Labels of a union's own members. `None` when `id` is not a union. A member label
+    /// may itself contain ` | `; callers must not split the whole-type string instead.
+    pub fn kernel_union_member_labels(
+        &self,
+        id: hir::TypeId,
+        locale: base_db::Locale,
+    ) -> Option<Vec<String>> {
+        self.provider.kernel_union_member_labels(id, locale)
+    }
+
+    pub fn kernel_type_includes_undefined(&self, id: hir::TypeId) -> bool {
+        self.provider.kernel_type_includes_undefined(id)
+    }
+
     /// The project's minimum platform release, parsed; `None` when unset or not a
     /// version.
     pub fn min_platform_version(&self) -> Option<bsl_platform::PlatformVersion> {

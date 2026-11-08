@@ -37,7 +37,8 @@ fn analyze(args: &[&str]) -> std::process::Output {
 /// the version, the elapsed time, the fixture's location, and the order of the file
 /// events, which follows the directory walk.
 fn normalize_jsonl(text: &str, root: &Path) -> Vec<Value> {
-    let root = root.to_string_lossy().replace('\\', "/");
+    let without_verbatim_prefix = |path: String| path.trim_start_matches("//?/").to_owned();
+    let root = without_verbatim_prefix(root.to_string_lossy().replace('\\', "/"));
     let mut events: Vec<Value> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -48,6 +49,7 @@ fn normalize_jsonl(text: &str, root: &Path) -> Vec<Value> {
             Some("start") => event["version"] = Value::from("<version>"),
             Some("file") => {
                 let path = event["path"].as_str().expect("file path").replace('\\', "/");
+                let path = without_verbatim_prefix(path);
                 let relative = path.strip_prefix(&format!("{root}/")).unwrap_or(&path).to_owned();
                 event["path"] = Value::from(relative);
             }

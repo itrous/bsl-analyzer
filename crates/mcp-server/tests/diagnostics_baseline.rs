@@ -184,7 +184,7 @@ fn args(action: &str) -> Map<String, Value> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "polls the MCP diagnostics tool until the resident reports the unreadable file, bounded only under timing_contract: the client gets no event when the resident observes a watcher change; run: cargo test -p mcp-server --test diagnostics_baseline -- --ignored"]
+#[ignore = "необязательный тест: the whole MCP client path through the real watcher and resident, including the unreadable-file leg and its recovery; a lost kernel event or an apply that never happens raises no event, and calling the resident's apply directly would skip the path under test; запуск: cargo test -p mcp-server --test diagnostics_baseline -- --ignored"]
 async fn baseline_parity_partial_stale_error_recovery_and_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

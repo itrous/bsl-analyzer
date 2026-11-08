@@ -171,8 +171,10 @@ pub struct DiagnosticMetadata {
     pub impacts: &'static [Impact],
 }
 
-pub fn parse_severity(s: &str) -> Severity {
-    match s.fold_lower().as_str() {
+// Two entry points: appliers of a severity want the `Warning` fallback, the project
+// config check wants to know that the name was not recognised.
+pub fn parse_severity_opt(s: &str) -> Option<Severity> {
+    Some(match s.fold_lower().as_str() {
         "error" => Severity::Error,
         "warning" => Severity::Warning,
         "information" | "info" => Severity::Information,
@@ -180,8 +182,12 @@ pub fn parse_severity(s: &str) -> Severity {
         "blocker" => Severity::Blocker,
         "critical" => Severity::Critical,
         "major" => Severity::Major,
-        _ => Severity::Warning,
-    }
+        _ => return None,
+    })
+}
+
+pub fn parse_severity(s: &str) -> Severity {
+    parse_severity_opt(s).unwrap_or(Severity::Warning)
 }
 
 impl DiagnosticMetadata {
@@ -314,6 +320,26 @@ macro_rules! define_metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_severity_opt_agrees_with_parse_severity() {
+        let known = [
+            ("error", Severity::Error),
+            ("Warning", Severity::Warning),
+            ("information", Severity::Information),
+            ("INFO", Severity::Information),
+            ("hint", Severity::Hint),
+            ("blocker", Severity::Blocker),
+            ("critical", Severity::Critical),
+            ("major", Severity::Major),
+        ];
+        for (name, severity) in known {
+            assert_eq!(parse_severity_opt(name), Some(severity), "{name}");
+            assert_eq!(parse_severity(name), severity, "{name}");
+        }
+        assert_eq!(parse_severity_opt("warnng"), None);
+        assert_eq!(parse_severity("warnng"), Severity::Warning);
+    }
 
     #[test]
     fn test_severity_mapping_code_smell() {

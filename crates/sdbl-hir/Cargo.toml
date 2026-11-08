@@ -8,6 +8,7 @@ description = "SDBL HIR - semantic representation of SDBL queries"
 
 [dependencies]
 stdx.workspace = true
+lexer.workspace = true
 base-db.workspace = true
 syntax.workspace = true
 bsl-metadata.workspace = true

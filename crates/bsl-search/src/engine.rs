@@ -5584,22 +5584,28 @@ impl SearchEngine {
         let embedder = Embedder::new(embedder_config);
         Self::ensure_store_token_layout_claim(&store, &embedder)?;
 
-        // Seed the warm cache from the persisted overlay embedding cache so a restart reuses
-        // vectors already paid for instead of re-embedding everything.
+        // Merge the persisted overlay embedding cache into the warm cache on every pass so a
+        // restart reuses vectors already paid for instead of re-embedding them. A non-empty
+        // live cache may hold only part of the persisted keys, so it cannot stand in for the
+        // disk; its values win on a shared key.
         let mut warm_embeddings = warm_embeddings;
-        if warm_embeddings.is_empty() {
-            match store.load_overlay_embedding_cache(embedder.model_id(), embedder.dim()) {
-                Ok(cached) if !cached.is_empty() => {
-                    info!(
-                        model_id = embedder.model_id(),
-                        dim = embedder.dim(),
-                        cached_embeddings = cached.len(),
-                        "loaded persisted overlay embedding cache for standalone prime"
-                    );
-                    warm_embeddings = cached;
+        match store.load_overlay_embedding_cache(embedder.model_id(), embedder.dim()) {
+            Ok(cached) if !cached.is_empty() => {
+                info!(
+                    model_id = embedder.model_id(),
+                    dim = embedder.dim(),
+                    cached_embeddings = cached.len(),
+                    "loaded persisted overlay embedding cache for standalone prime"
+                );
+                // The store filters rows by the profile's dimension column, not by the decoded
+                // length, so a row whose blob disagrees with it must be embedded again.
+                for (key, embedding) in cached {
+                    if embedding.len() == embedder.dim() {
+                        warm_embeddings.entry(key).or_insert(embedding);
+                    }
                 }
-                _ => {}
             }
+            _ => {}
         }
 
         let plan = if serves_external_baseline {
@@ -5707,7 +5713,7 @@ impl SearchEngine {
                 FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
                 FenceOutcome::Released => return Ok(FenceOutcome::Released),
             }
-            let result = embedder.embed_batch_interactive(&inputs[range]);
+            let result = embedder.embed_batch_background(&inputs[range]);
             if !should_continue() {
                 return Ok(FenceOutcome::Released);
             }
@@ -8465,6 +8471,123 @@ mod tests {
         assert_eq!(plan.missing_embeddings().len(), 1);
         assert_eq!(plan.reused_embeddings().len(), 1);
         assert_eq!(embeddings.len(), 2);
+    }
+
+    #[test]
+    fn standalone_overlay_merges_disk_vectors_into_a_partial_live_cache() {
+        use crate::workspace_overlay::WorkspaceOverlayCache;
+        use crate::{Embedder, EmbedderConfig, Store};
+
+        // A bound-then-dropped listener leaves an address that refuses connections, so any
+        // embedding request fails the prime with a transport error instead of passing silently.
+        let unreachable = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let embedder_config = EmbedderConfig {
+            base_url: format!("http://{unreachable}"),
+            model: "test".to_owned(),
+            dim: Some(3),
+            api_key: None,
+            provider: None,
+            ..Default::default()
+        };
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("search.db");
+        fs::write(
+            dir.path().join("Module.bsl"),
+            "Процедура Первая()\n    Сообщить(1);\nКонецПроцедуры\n\
+             Процедура Вторая()\n    Сообщить(2);\nКонецПроцедуры",
+        )
+        .unwrap();
+        let store = Store::open(&db_path).unwrap();
+        store
+            .save_baseline_manifest(&crate::WorkspaceBaselineManifest {
+                snapshot_id: "baseline".to_owned(),
+                snapshot_fingerprint: None,
+                files: Vec::new(),
+            })
+            .unwrap();
+        let roots = WorkspaceRoots::build(dir.path(), dir.path(), &[]).0;
+
+        let embedder = Embedder::new(embedder_config.clone());
+        let mut keys: Vec<String> =
+            WorkspaceOverlayCache::plan_full_refresh_from_manifest_with_embedder(
+                &HashMap::new(),
+                &roots,
+                &store,
+                &HashMap::new(),
+                None,
+                &HashSet::new(),
+                Some(&embedder),
+            )
+            .unwrap()
+            .missing_embeddings()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert!(keys.len() >= 2, "the fixture must plan at least two distinct inputs: {keys:?}");
+
+        let on_disk: HashMap<String, Vec<f32>> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.clone(), vec![index as f32 + 1.0, 0.0, 0.0]))
+            .collect();
+        store.save_overlay_embedding_cache(embedder.model_id(), embedder.dim(), &on_disk).unwrap();
+        drop(store);
+
+        let try_prime = |live: HashMap<String, Vec<f32>>| {
+            SearchEngine::prime_workspace_overlay_standalone_retrying(
+                &db_path,
+                embedder_config.clone(),
+                &roots,
+                true,
+                BaselineHashMode::NormalizedChunks,
+                live,
+                None,
+                &|| true,
+                |operation| FenceOutcome::Applied(operation()),
+                &HashSet::new(),
+                || false,
+            )
+        };
+        let prime = |live: HashMap<String, Vec<f32>>| {
+            let primed = try_prime(live)
+                .expect("every planned input is on disk, so no embedding request may be sent");
+            let FenceOutcome::Applied((plan, embeddings)) = primed else {
+                panic!("the overlay plan should be admitted")
+            };
+            assert!(plan.missing_embeddings().is_empty());
+            embeddings
+        };
+
+        // An unrelated key in memory must not hide the exact keys saved on disk.
+        let stray = "stray".to_owned();
+        let embeddings = prime(HashMap::from([(stray.clone(), vec![9.0, 9.0, 9.0])]));
+        for key in &keys {
+            assert_eq!(embeddings.get(key), on_disk.get(key), "disk vector for {key}");
+        }
+        assert!(!embeddings.contains_key(&stray));
+
+        // A key held in both caches keeps the in-memory value; the other still comes from disk.
+        let live_value = vec![7.0, 7.0, 7.0];
+        let embeddings = prime(HashMap::from([(keys[0].clone(), live_value.clone())]));
+        assert_eq!(embeddings.get(&keys[0]), Some(&live_value));
+        for key in &keys[1..] {
+            assert_eq!(embeddings.get(key), on_disk.get(key), "disk vector for {key}");
+        }
+
+        // A disk row whose vector length disagrees with the embedder dimension is no hit: the
+        // input is planned for embedding again, which fails against the unreachable endpoint.
+        let store = Store::open_existing(&db_path).unwrap();
+        store
+            .save_overlay_embedding_cache(
+                embedder.model_id(),
+                embedder.dim(),
+                &HashMap::from([(keys[1].clone(), vec![0.25, 0.75])]),
+            )
+            .unwrap();
+        drop(store);
+        assert!(try_prime(HashMap::from([(stray, vec![9.0, 9.0, 9.0])])).is_err());
     }
 
     /// Every chunk row of a store, in id order: what a boot ingest writes, including the

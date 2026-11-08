@@ -127,6 +127,17 @@ pub fn infer_method_query<'db>(
     Arc::new(ctx.finish())
 }
 
+/// Switch `infer_method_query`'s LRU cap between the interactive profile and the small
+/// sweep profile, in step with the per-method lowering chain it is inferred from
+/// (`hir_def::set_lowering_lru_sweep_mode`): files a batch walks once need their
+/// inference only while their chunk is analyzed. The interactive value must stay equal
+/// to the `lru` literal on the query. Takes effect at the next LRU trim.
+pub fn set_infer_method_lru_sweep_mode(db: &mut dyn HirDatabase, sweep: bool) {
+    const METHOD_INTERACTIVE: usize = 8192;
+    const METHOD_SWEEP: usize = 2048;
+    infer_method_query::set_lru_capacity(db, if sweep { METHOD_SWEEP } else { METHOD_INTERACTIVE });
+}
+
 #[allow(
     clippy::needless_lifetimes,
     reason = "Salsa callback signature requires explicit lifetimes"

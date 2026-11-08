@@ -13,6 +13,7 @@ pub use hir_ty::infer::CandidateCallBinding;
 pub use hir_ty::metadata_path::MissingMetadata;
 pub use hir_ty::method_lookup::platform_type_key_id;
 pub use hir_ty::min_platform;
+pub use hir_ty::subtype::type_sets_overlap;
 pub use hir_ty::this_object::coerce_to_metadata_ref_id;
 pub use hir_ty::TyLoweringContext;
 pub use hir_ty::{
@@ -27,10 +28,10 @@ pub use semantic_symbol::{
     SymbolDeclaration,
 };
 pub use type_facade::{
-    execution_environment_at, form_element_type, kernel_type_label, module_implicit_field_names,
-    module_implicit_fields, platform_name_entries, root_metadata_object_type,
-    root_metadata_ref_type, root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry,
-    PlatformNameKind, Type,
+    execution_environment_at, form_element_type, kernel_type_includes_undefined, kernel_type_label,
+    kernel_union_member_labels, module_implicit_field_names, module_implicit_fields,
+    platform_name_entries, root_metadata_object_type, root_metadata_ref_type,
+    root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry, PlatformNameKind, Type,
 };
 
 pub use hir_def::execution_env;
@@ -84,8 +85,8 @@ pub use hir_def::call_graph::{
     CALL_SITE_NOT_RECORDED, NO_CALL_SITE,
 };
 pub use hir_def::docs::{
-    doc_comment_tokens, is_dotted_type_reference, DocCommentToken, DocCommentTokenKind, MethodDocs,
-    ParameterDoc, TypeDoc, VariableDocs,
+    doc_comment_tokens, doc_lines_reshaped_by_replacement, is_dotted_type_reference,
+    DocCommentToken, DocCommentTokenKind, MethodDocs, ParameterDoc, TypeDoc, VariableDocs,
 };
 pub use hir_def::graph_index;
 pub use hir_def::graph_index::{call_hierarchy_method_digest, MethodCallDigest};
@@ -117,8 +118,8 @@ pub mod dataflow {
 
     pub mod reaching_defs {
         pub use ::dataflow::reaching_defs::{
-            DefSite, Definition, DefinitionIndex, ReachingDefs, ReachingDefsResult,
-            ReachingDefsTransfer,
+            solve_reaching_definitions, DefSite, Definition, DefinitionIndex, ReachingDefs,
+            ReachingDefsResult, ReachingDefsTransfer,
         };
     }
 
@@ -214,13 +215,19 @@ pub use hir_ty::infer::{
     infer_effective, infer_module_code_query, infer_owner, infer_query, infer_weaving,
     type_of_expr_query,
 };
-pub use hir_ty::method_graph::{infer_method_query, method_return_type_query};
+pub use hir_ty::method_graph::{
+    infer_method_query, method_return_type_query, set_infer_method_lru_sweep_mode,
+};
 pub use hir_ty::method_resolution::{resolve_qualified_call, MethodResolution};
 pub use hir_ty::narrow::{
     narrow_or_base, narrow_or_base_indexed, narrow_query, narrowed_type_at, NarrowExprIndex,
     NarrowState,
 };
 pub use hir_ty::proc_signature;
+pub use hir_ty::query_in_loop::{
+    query_in_loop_candidates, BodyQueryFacts, LocalQueryCall, QueryCallKey, QueryExecutionKind,
+    QueryExecutionSite, QueryInLoopCandidate,
+};
 pub use hir_ty::query_text_dataflow::{executed_query_texts, ExecutedQueryText};
 pub use hir_ty::{
     form_control_platform_type_chain, form_control_platform_type_name, form_element_kind_label,
@@ -421,15 +428,11 @@ impl<'db, DB: ConfigsDatabase + base_db::RootQueryDb> Semantics<'db, DB> {
         Module::new(self.db, module_id)
     }
 
+    /// The first declaration of `name` in the module, whichever kinds its namesakes are.
     pub fn find_method(&self, file_id: vfs::FileId, name: &str) -> Option<Method<'db, DB>> {
-        let module = self.module_from_file(file_id);
-        let search_name = Name::new(name);
-
-        module
-            .procedures()
-            .into_iter()
-            .chain(module.functions())
-            .find(|method| method.name().eq_ignore_case(&search_name))
+        self.db
+            .interface_method_named(ModuleId::new(file_id), &Name::new(name))
+            .map(|method| Method::new(self.db, method.id))
     }
 
     pub(crate) fn try_resolve_qualified_name_for_token(

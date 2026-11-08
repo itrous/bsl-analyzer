@@ -3,14 +3,18 @@
 
 mod ambiguous_field_in_query;
 mod bilingual_parity;
+mod builtin_function_name_as_declaration;
 mod common_attributes_in_query;
 mod data_exchange_and_unused_method_fixes;
+mod derived_table_outer_alias;
 mod diagnostic_quick_fixes;
+mod fields_from_joins_issue_773;
 mod foreign_handler_bindings_scan;
 mod handlers_bound_from_another_module;
 mod inline_extension_directives;
 mod lone_cr_ends_comment;
 mod name_resolution_correctness;
+mod other_codes_on_bsl_fixtures;
 mod platform_fact_characterization;
 mod platform_membership_characterization;
 mod platform_ui_fact_characterization;

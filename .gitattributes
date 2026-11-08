@@ -9,3 +9,10 @@ crates/bsl-metadata/fixtures/extension_common_attributes/**/*.xml -text whitespa
 # Expected analyze output pins line and column numbers of these sources; keep their
 # bytes identical on every checkout.
 crates/bsl-analyzer/tests/fixtures/foreign_handler_bindings/** -text
+# Tests pin byte offsets and LF-only needles against these sources; a CRLF checkout
+# (core.autocrlf=true) would fail them without any change in the code.
+crates/ide-diagnostics/src/handlers/fixtures/** -text
+crates/lexer/tests/fixtures/sdbl_golden_corpus.txt -text
+# The tests pin line and column of a finding inside a multi-line query string and compare the
+# query text byte for byte with the module that holds it; a CRLF checkout would shift both.
+crates/ide-diagnostics/tests/fixtures/derived_table_outer_alias/** -text

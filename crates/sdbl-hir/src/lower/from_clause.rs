@@ -6,11 +6,35 @@ use crate::standard_fields::{
 };
 use crate::SdblType;
 use bsl_metadata::{is_standard_attribute_name, MdoType};
+use rustc_hash::FxHashSet;
 use stdx::case::CaseExt;
 use syntax::ast::AstNode;
 use text_size::TextRange;
 
 use super::context::LoweringContext;
+
+/// The explicit aliases a query gives its sources in FROM and JOIN, folded to lower case. Nested
+/// queries declare their own and are not entered.
+pub(super) fn declared_source_aliases(
+    from_clause: Option<syntax::ast::SdblFromClause>,
+) -> FxHashSet<String> {
+    fn collect(ds: &syntax::ast::SdblDataSource, out: &mut FxHashSet<String>) {
+        if let Some(name) = ds.alias().and_then(|alias| alias.name()) {
+            out.insert(name.fold_lower());
+        }
+        for join in ds.join_clauses() {
+            if let Some(joined) = join.data_source() {
+                collect(&joined, out);
+            }
+        }
+    }
+
+    let mut aliases = FxHashSet::default();
+    for ds in from_clause.iter().flat_map(|from| from.data_sources()) {
+        collect(&ds, &mut aliases);
+    }
+    aliases
+}
 
 impl LoweringContext<'_> {
     pub(super) fn lower_from_clause(
@@ -85,7 +109,7 @@ impl LoweringContext<'_> {
             let has_union_siblings = queries.len() > 1;
 
             for (query_index, query) in queries.into_iter().enumerate() {
-                self.scope.push_frame();
+                self.scope.push_derived_table_frame();
 
                 let nested_hir = self.lower_query(&query, has_union_siblings, query_index == 0);
 
@@ -308,6 +332,7 @@ impl LoweringContext<'_> {
             Vec::new()
         };
 
+        let first_parameter_diagnostic = self.diagnostics.len();
         if let Some((mdo_type, vt_type)) = register_table.filter(|_| is_virtual) {
             self.check_virtual_table_params(
                 &full_name,
@@ -319,17 +344,25 @@ impl LoweringContext<'_> {
         }
 
         if let Some(slot) = recorder_condition_slot(&parts, register_table) {
+            let table_range = table_ref.syntax().text_range();
+            // A call without parameters is already reported with the right fix, moving the
+            // conditions into the parameters; asking for a recorder too would be wrong advice.
+            let reported_without_parameters =
+                self.diagnostics[first_parameter_diagnostic..].iter().any(|diag| {
+                    matches!(diag, SdblDiagnostic::VirtualTableCallWithoutParameters { range, .. }
+                        if *range == table_range)
+                });
             let filtered = match condition_slot(table_ref.syntax(), slot) {
                 ConditionSlot::Empty => false,
                 ConditionSlot::Unreadable => true,
                 ConditionSlot::Argument(argument) => has_recorder_filter(&argument),
             };
-            if !filtered {
+            if !filtered && !reported_without_parameters {
                 self.diagnostics.push(
                     SdblDiagnostic::CalculationRegisterVirtualTableWithoutRecorder {
                         table_name: full_name.clone(),
                         register_name: parts[1].clone(),
-                        range: table_ref.syntax().text_range(),
+                        range: table_range,
                     },
                 );
             }
@@ -1635,9 +1668,11 @@ fn condition_slot(table_ref: &syntax::SyntaxNode, index: usize) -> ConditionSlot
     ConditionSlot::Empty
 }
 
-/// Whether a condition narrows the table to a recorder: `Регистратор = <выражение>` either way
-/// round or `Регистратор В (...)`, alone or as a conjunct. A comparison under `ИЛИ` or `НЕ`
-/// does not narrow the table, and a disjunction of recorder comparisons is not unfolded.
+/// Whether a condition takes a stand on the recorder: `Регистратор = <выражение>` or
+/// `Регистратор <> <выражение>` either way round, or `Регистратор В (...)`, alone or as a
+/// conjunct. `<>` does not narrow the table to a recorder, but it shows that the records of other
+/// documents are wanted on purpose. A comparison under `ИЛИ` or `НЕ` does not count, and a
+/// disjunction of recorder comparisons is not unfolded.
 fn has_recorder_filter(condition: &syntax::SyntaxNode) -> bool {
     use syntax::SyntaxKind;
 
@@ -1647,7 +1682,9 @@ fn has_recorder_filter(condition: &syntax::SyntaxNode) -> bool {
         SyntaxKind::SDBL_LOGICAL_AND_EXPR => {
             node.children().any(|child| has_recorder_filter(&child))
         }
-        SyntaxKind::SDBL_COMPARISON_EXPR if has_token(SyntaxKind::EQ) => {
+        SyntaxKind::SDBL_COMPARISON_EXPR
+            if has_token(SyntaxKind::EQ) || has_token(SyntaxKind::NEQ) =>
+        {
             node.children().any(|operand| is_recorder_field(&operand))
         }
         SyntaxKind::SDBL_IN_EXPR if !has_token(SyntaxKind::KW_NOT) => {

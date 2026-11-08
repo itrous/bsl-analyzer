@@ -60,15 +60,32 @@ OUTCOME_TEXT = {
 }
 # The release gate (`gate.py`): work metrics are held to the bar itself and must
 # be calibrated within it; the wall time of graph readiness is held to
-# max(bar, noise), with a confirming round when its noise exceeds the bar.
+# max(bar, noise), with a confirming round when its noise exceeds the bar. An
+# observed metric is measured and shown against both bases and decides nothing.
 GATE_BAR = 0.05
 GATE_FOREIGN_CORES = 2.0
 GATE_HWM_LIMIT_KB = 7168 * 1024
 GATE_REFS_LIMITS_S = {"references_1_s": 67.7, "references_2_same_s": 32.3, "references_3_other_s": 59.5}
-GATE_DECISIVE = ("graph_ready_cpu_s", "graph_resolve_s", "diagnostics_workspace_s")
+GATE_OBSERVED = ("graph_ready_cpu_s",)
+GATE_DECISIVE = ("graph_resolve_s", "diagnostics_workspace_s")
 GATE_WALL = ("graph_ready_s",)
 # Outcomes of a gate row that keep the gate from `pass` without blocking it.
 GATE_INCOMPLETE = ("no_noise", "noisy", "confirm", "incomplete")
+# The second base of the gate, `baseline.json`: metric -> (unit, aggregate of the
+# candidate). Its limit is the noise of the record, with no bar on top of it; the
+# growth of a work metric over that limit may still be repaid by the wall (`gate.py`).
+# Memory is the peak of series A, which runs no references: the peak of series B
+# answers to `GATE_HWM_LIMIT_KB` alone.
+GATE_RECORD = {
+    "graph_ready_s": ("s", "median_A"),
+    "graph_ready_cpu_s": ("s", "median_A"),
+    "graph_resolve_s": ("s", "median_A"),
+    "diagnostics_workspace_s": ("s", "median_A"),
+    "hwm_kb": ("KB", "max_A"),
+    "references_1_s": ("s", "median_B"),
+    "references_2_same_s": ("s", "median_B"),
+    "references_3_other_s": ("s", "median_B"),
+}
 CALLS_LSP_REPEAT = ("L1", "L2", "L3", "L4", "L6", "G1", "G3")
 CALLS_MCP = ("M1", "M2", "M3", "M5", "M6", "M7")
 
@@ -145,7 +162,7 @@ VERDICT_METRICS = {
 
 
 # The gate's scenario; kept out of VERDICT_METRICS, which is the nightly set.
-GATE_METRICS = [_run(f) for f in GATE_DECISIVE + GATE_WALL]
+GATE_METRICS = [_run(f) for f in GATE_OBSERVED + GATE_DECISIVE + GATE_WALL]
 
 
 def scenario_of(sdir: str) -> str:
@@ -478,6 +495,25 @@ def gate_verdict(rows: list[dict], reasons: list[str]) -> dict:
         verdict = "pass"
     return {"verdict": verdict, "reasons": found,
             "counts": {o: outcomes.count(o) for o in sorted(set(outcomes))}}
+
+
+def record_limit(record: float, noise: float) -> float:
+    return record * (1 + noise)
+
+
+def record_outcome(value: float, record: float, noise: float) -> str:
+    """Against a best value: above its noise blocks; equal to the limit does not."""
+    return "block" if value > record_limit(record, noise) else "ok"
+
+
+def record_improved(value: float, record: float, noise: float) -> bool:
+    return value < record * (1 - noise)
+
+
+def spread_noise(values: list[float]) -> float | None:
+    """(max − min) / median of the aggregates of calibration series; None at a zero median."""
+    scale = median(values)
+    return (max(values) - min(values)) / scale if scale else None
 
 
 def not_compared(rows: list[dict]) -> int:

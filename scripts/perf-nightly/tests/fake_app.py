@@ -50,6 +50,15 @@ MODE = {m.split("=", 1)[-1] for m in filter(None, os.environ.get("FAKE_MODE", ""
 LOG = os.environ.get("FAKE_LOG")
 
 
+def measured_launches(log: bytes) -> int:
+    """Launches of measured runs; the help check (BSL_LOG=info) does not count.
+    A server started at the same moment may be in the middle of its own line,
+    cut anywhere, even inside a letter. The log is taken as one read of bytes:
+    iterating over the growing file would return the rest of that line as a
+    line of its own."""
+    return sum(1 for line in log.split(b"\n")[:-1] if "BSL_LOG" not in json.loads(line)["env"])
+
+
 def launch_number() -> int:
     path = os.path.join(LOG, "launches.jsonl")
     cache = os.environ.get("XDG_CACHE_HOME") or ""
@@ -60,9 +69,8 @@ def launch_number() -> int:
                              "cache": cache, "pid": os.getpid(), "had": had,
                              "had_build": os.path.exists(os.path.join(os.getcwd(), ".build"))},
                             ensure_ascii=False) + "\n")
-    with open(path, encoding="utf-8") as fh:
-        # Launches of measured runs; the help check (BSL_LOG=info) does not count.
-        return sum(1 for line in fh if "BSL_LOG" not in json.loads(line)["env"])
+    with open(path, "rb") as fh:
+        return measured_launches(fh.read())
 
 
 def side_effects(number: int) -> None:

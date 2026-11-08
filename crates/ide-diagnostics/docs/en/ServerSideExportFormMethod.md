@@ -9,6 +9,8 @@ The current implementation reports exported procedures and functions in managed 
 
 Server-side annotations such as `&AtServer` or `&AtServerNoContext`, as well as the absence of an annotation, are treated as errors for this rule.
 
+The exception is a method whose name starts with `Подключаемый_` or `Attachable_` (case-insensitive): these are the BSP pluggable command handlers, called by name from a client common module on the form passed in, and without `Export` that call does not work.
+
 ## Examples
 
 Incorrect:

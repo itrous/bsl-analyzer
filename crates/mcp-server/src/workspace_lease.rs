@@ -80,7 +80,7 @@ pub(crate) const VERDICT_TTL: Duration = Duration::from_secs(2);
 /// How long a claim waits for the lock file. The critical section is a read and one small
 /// write, so anything beyond this means a peer wedged holding the lock — give up on this
 /// attempt (the caller retries at its next check) rather than block a daemon's startup on it.
-const LOCK_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// Generation of a lease that has not (yet) written a record: it owns nothing, and every
 /// ownership check retries the claim.
@@ -317,6 +317,38 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The clock every lease lock wait made on this test thread runs on, while a
+    /// [`VirtualLockWait`] is installed.
+    static LOCK_WAIT_CLOCK: std::cell::RefCell<Option<Arc<crate::test_clock::TestClock>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Times every lease lock wait made on this thread by a test clock until dropped: a pause moves
+/// the clock instead of sleeping, and the wait keeps its full [`LOCK_WAIT`] budget even for a
+/// lock the test holds, so a refused wait is the production one played out in virtual time.
+/// Every attempt is still the real non-blocking lock call. Other threads and other leases keep
+/// the system clock.
+#[cfg(test)]
+pub(crate) struct VirtualLockWait {
+    previous: Option<Arc<crate::test_clock::TestClock>>,
+}
+
+#[cfg(test)]
+impl VirtualLockWait {
+    pub(crate) fn install(clock: Arc<crate::test_clock::TestClock>) -> Self {
+        Self { previous: LOCK_WAIT_CLOCK.with(|slot| slot.borrow_mut().replace(clock)) }
+    }
+}
+
+#[cfg(test)]
+impl Drop for VirtualLockWait {
+    fn drop(&mut self) {
+        LOCK_WAIT_CLOCK.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
 /// A lease lock file held by the test thread, listed in [`LOCKS_HELD_BY_THIS_THREAD`] until it
 /// is let go.
 #[cfg(test)]
@@ -464,7 +496,23 @@ impl WorkspaceLease {
         }
     }
 
+    /// [`Self::claim_cache`] with no heartbeat thread, for a stand that must be the only one to
+    /// ask this lease anything or take its lock. Nothing restamps the record, so the stand has to
+    /// be over well within [`STALE_AFTER`].
+    #[cfg(test)]
+    pub(crate) fn claim_cache_without_heartbeat(
+        cache: &crate::cache::WorkspaceCacheLayout,
+    ) -> Self {
+        Self::claim_cache_record(cache).expect("the stand's cache directory can be prepared")
+    }
+
     fn try_claim_cache(cache: &crate::cache::WorkspaceCacheLayout) -> io::Result<Self> {
+        let lease = Self::claim_cache_record(cache)?;
+        spawn_heartbeat(Arc::downgrade(&lease.inner));
+        Ok(lease)
+    }
+
+    fn claim_cache_record(cache: &crate::cache::WorkspaceCacheLayout) -> io::Result<Self> {
         // The directory is the one thing a lease cannot do without. Everything past it — the
         // lock, the record write — is retried later by `owns_caches`, so a moment's contention
         // does not cost this daemon its place in the coordination for good.
@@ -529,7 +577,6 @@ impl WorkspaceLease {
                 },
             }
         }
-        spawn_heartbeat(Arc::downgrade(&lease.inner));
         Ok(lease)
     }
 
@@ -1161,8 +1208,34 @@ impl WorkspaceLease {
         panic!("the lease file lock was never released by its other holders")
     }
 
+    /// Takes the lease file lock for the caller with ONE non-blocking attempt, and keeps it
+    /// until the guard drops. For a stand that owns every holder of the lock: an attempt that
+    /// finds it taken is a broken stand, reported at once instead of waited out.
+    #[cfg(test)]
+    pub(crate) fn hold_file_lock_once_for_test(&self) -> impl Send {
+        struct HeldByTest {
+            _guard: LockGuard,
+            inner: Arc<Inner>,
+        }
+        impl Drop for HeldByTest {
+            fn drop(&mut self) {
+                self.inner.lock_held_by_test.store(false, Ordering::SeqCst);
+            }
+        }
+        let path = self.inner.path.as_deref().expect("test lease is managed");
+        let lock_path = path.parent().expect("lease path has a parent").join(LEASE_LOCK_FILE);
+        let guard = LockGuard::try_acquire(&lock_path)
+            .unwrap_or_else(|error| panic!("the stand's lease file lock is not free: {error}"));
+        self.inner.lock_held_by_test.store(true, Ordering::SeqCst);
+        HeldByTest { _guard: guard, inner: Arc::clone(&self.inner) }
+    }
+
     /// How long this lease waits for the lock file at `lock`.
     fn lock_wait(&self, lock: &Path) -> Duration {
+        #[cfg(test)]
+        if LOCK_WAIT_CLOCK.with(|clock| clock.borrow().is_some()) {
+            return LOCK_WAIT;
+        }
         #[cfg(test)]
         if self.inner.lock_held_by_test.load(Ordering::SeqCst)
             || LOCKS_HELD_BY_THIS_THREAD.with(|held| held.borrow().iter().any(|path| path == lock))
@@ -1460,12 +1533,26 @@ impl LockGuard {
     /// Take the lock, retrying until `budget` runs out. Both platforms poll rather than block
     /// so a wedged peer degrades a claim into an unmanaged lease instead of hanging startup.
     fn acquire(path: &Path, budget: Duration) -> io::Result<Self> {
-        let deadline = Instant::now() + budget;
+        #[cfg(test)]
+        if let Some(clock) = LOCK_WAIT_CLOCK.with(|clock| clock.borrow().clone()) {
+            return Self::acquire_on(path, budget, || clock.now(), |pause| clock.advance(pause));
+        }
+        Self::acquire_on(path, budget, Instant::now, std::thread::sleep)
+    }
+
+    /// [`Self::acquire`] on the clock `now`, waiting with `pause` between attempts.
+    fn acquire_on(
+        path: &Path,
+        budget: Duration,
+        now: impl Fn() -> Instant,
+        mut pause: impl FnMut(Duration),
+    ) -> io::Result<Self> {
+        let deadline = now() + budget;
         loop {
             match Self::try_acquire(path) {
                 Ok(guard) => return Ok(guard),
-                Err(e) if Instant::now() >= deadline => return Err(e),
-                Err(e) if is_lock_contention(&e) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) if now() >= deadline => return Err(e),
+                Err(e) if is_lock_contention(&e) => pause(Duration::from_millis(20)),
                 Err(e) => return Err(e),
             }
         }
@@ -1569,6 +1656,138 @@ fn is_lock_contention(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lock wait on a clock the test holds: every attempt is the real non-blocking lock call
+    /// and only the pauses between attempts are virtual, so a held lock is waited out to exactly
+    /// its budget.
+    #[test]
+    fn a_held_lock_is_waited_out_to_exactly_its_budget_on_a_held_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(LEASE_LOCK_FILE);
+        let _held = LockGuard::try_acquire(&lock).expect("the stand takes the free lock");
+        let clock = crate::test_clock::TestClock::default();
+        let started = clock.now();
+        let mut pauses = 0u32;
+
+        let refused = LockGuard::acquire_on(
+            &lock,
+            LOCK_WAIT,
+            || clock.now(),
+            |pause| {
+                pauses += 1;
+                clock.advance(pause);
+            },
+        )
+        .err()
+        .expect("a held lock is never taken");
+
+        assert!(is_lock_contention(&refused), "{refused}");
+        assert_eq!(clock.now() - started, LOCK_WAIT, "the wait did not end at its budget");
+        assert_eq!(pauses, 100, "one 20 ms pause for every attempt that found the lock held");
+    }
+
+    /// Control: a free lock is taken by the first attempt, with no pause and no time spent.
+    #[test]
+    fn a_free_lock_is_taken_by_the_first_attempt_without_a_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(LEASE_LOCK_FILE);
+        let clock = crate::test_clock::TestClock::default();
+        let started = clock.now();
+        let mut pauses = 0u32;
+
+        let taken = LockGuard::acquire_on(
+            &lock,
+            LOCK_WAIT,
+            || clock.now(),
+            |pause| {
+                pauses += 1;
+                clock.advance(pause);
+            },
+        );
+
+        assert!(taken.is_ok(), "a free lock was refused");
+        assert_eq!(pauses, 0);
+        assert_eq!(clock.now(), started);
+    }
+
+    /// A failure that is not contention is the caller's answer at once: it spends none of the
+    /// contention budget.
+    #[test]
+    fn a_failure_that_is_not_contention_ends_the_wait_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("missing").join(LEASE_LOCK_FILE);
+        let clock = crate::test_clock::TestClock::default();
+        let started = clock.now();
+        let mut pauses = 0u32;
+
+        let refused = LockGuard::acquire_on(
+            &lock,
+            LOCK_WAIT,
+            || clock.now(),
+            |pause| {
+                pauses += 1;
+                clock.advance(pause);
+            },
+        )
+        .err()
+        .expect("a lock file in a missing directory cannot be taken");
+
+        assert!(!is_lock_contention(&refused), "{refused}");
+        assert_eq!(pauses, 0, "a failure that is not contention was waited on");
+        assert_eq!(clock.now(), started);
+    }
+
+    /// The test adapter is the one the production entry point takes while it is installed: its
+    /// clock, not the system's, carries the wait — for the thread that installed it only — and
+    /// dropping it gives the system clock back.
+    #[test]
+    fn a_virtual_lock_wait_carries_the_wait_on_its_clock_for_its_own_thread_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(LEASE_LOCK_FILE);
+        let _held = LockGuard::try_acquire(&lock).expect("the stand takes the free lock");
+        let clock = Arc::new(crate::test_clock::TestClock::default());
+        let started = clock.now();
+
+        let installed = VirtualLockWait::install(Arc::clone(&clock));
+        let refused = LockGuard::acquire(&lock, Duration::from_millis(100))
+            .err()
+            .expect("a held lock is never taken");
+        assert!(is_lock_contention(&refused), "{refused}");
+        assert_eq!(clock.now() - started, Duration::from_millis(100));
+
+        let elsewhere = std::thread::spawn(|| LOCK_WAIT_CLOCK.with(|slot| slot.borrow().is_none()))
+            .join()
+            .unwrap();
+        assert!(elsewhere, "another thread was put on the stand's clock");
+
+        drop(installed);
+        assert!(
+            LOCK_WAIT_CLOCK.with(|slot| slot.borrow().is_none()),
+            "dropping the wait left the clock installed"
+        );
+    }
+
+    /// A lock the stand holds shortens the lease's wait on it — except inside a virtual wait,
+    /// where the production budget is played out in full on the held clock.
+    #[test]
+    fn a_stand_held_lock_keeps_the_full_wait_only_inside_a_virtual_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        cache.ensure().unwrap();
+        let lease = WorkspaceLease::claim_cache_without_heartbeat(&cache);
+        let lock = lease
+            .inner
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .expect("a claimed lease is managed")
+            .join(LEASE_LOCK_FILE);
+        let _held = lease.hold_file_lock_once_for_test();
+
+        assert!(lease.lock_wait(&lock) < LOCK_WAIT, "a stand-held lock was waited out in full");
+        let _virtual = VirtualLockWait::install(Arc::new(crate::test_clock::TestClock::default()));
+        assert_eq!(lease.lock_wait(&lock), LOCK_WAIT);
+    }
 
     /// Stand helpers wait for the lease lock without a bound, and `flock` makes a second hold
     /// of the same file in this process wait on the first: a stand that holds the lock twice

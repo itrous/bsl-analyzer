@@ -237,6 +237,8 @@ pub(super) fn on_disk_identity(path: &Path) -> std::io::Result<Option<OnDiskIden
 /// journal is never deleted by hand. A connection with write access rolls it back on its first
 /// read and removes it.
 pub(super) fn recover_hot_journal(path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let mut journal = path.as_os_str().to_owned();
     journal.push("-journal");
     let hot = std::fs::metadata(Path::new(&journal)).is_ok_and(|metadata| metadata.len() > 0);
@@ -244,8 +246,10 @@ pub(super) fn recover_hot_journal(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     tracing::warn!(path = %path.display(), "graph file has an interrupted journal; recovering it");
-    let conn = rusqlite::Connection::open(path)?;
-    conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))?;
+    let conn = rusqlite::Connection::open(path)
+        .with_context(|| format!("opening {} to recover its journal", path.display()))?;
+    conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
+        .with_context(|| format!("reading {} to recover its journal", path.display()))?;
     Ok(())
 }
 
@@ -314,9 +318,27 @@ struct StoreShared {
     pool: Mutex<SnapshotPool>,
     /// Signalled whenever a handle returns, a use ends, or lending is allowed again.
     returned: Condvar,
+    /// The graph's held clock, when a test holds one: a checkout's deadline then runs out on
+    /// it instead of on a wait for a return.
+    #[cfg(test)]
+    clock: Mutex<Option<Arc<crate::test_clock::TestClock>>>,
 }
 
 impl GraphStore {
+    /// The time a checkout's deadline is measured on.
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = lock_recover(&self.shared.clock).as_ref() {
+            return clock.now();
+        }
+        Instant::now()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_clock(&self, clock: Arc<crate::test_clock::TestClock>) {
+        *lock_recover(&self.shared.clock) = Some(clock);
+    }
+
     /// Run `op` against the installed publication and return what it produced.
     ///
     /// `expected` names the generation the caller planned against; another one is
@@ -391,7 +413,7 @@ impl GraphStore {
                 hook();
             }
         });
-        let started = Instant::now();
+        let started = self.now();
         let handle_deadline = started.checked_add(handle_wait);
         let admission_deadline = started.checked_add(admission_wait);
         let mut pool = lock_recover(&self.shared.pool);
@@ -484,10 +506,16 @@ impl GraphStore {
             }
             let deadline = if held { admission_deadline } else { handle_deadline };
             let left = deadline
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .map(|deadline| deadline.saturating_duration_since(self.now()))
                 .unwrap_or(Duration::MAX);
             if left.is_zero() {
                 return Err(if held { GraphReadError::Busy } else { GraphReadError::Unavailable });
+            }
+            #[cfg(test)]
+            if let Some(clock) = lock_recover(&self.shared.clock).clone() {
+                // Nothing is waited for on a held clock: the deadline is played out on it.
+                clock.advance(left);
+                continue;
             }
             pool = self
                 .shared
@@ -1219,7 +1247,7 @@ impl GraphState {
             // Inside the publishing critical section, under `inner`: a reader holding it never
             // sees a publication whose debts still name what it has just discharged.
             *discard.borrow_mut() = lock_recover(&self.debt).record_publication(
-                std::time::Instant::now(),
+                self.now(),
                 observed_through,
                 forced_through.is_some(),
                 recovery_through,
@@ -1376,7 +1404,7 @@ impl GraphState {
         }
         drop(inner);
 
-        if claim_reload {
+        if claim_reload && !self.queue_manual_build(true) {
             let state = self.clone();
             let spawned = std::thread::Builder::new()
                 .name("bsl-graph-reload".to_owned())
@@ -1665,7 +1693,7 @@ impl GraphState {
         self.invalidate_scan_on_hub_drift();
         let mut cache = lock_recover(&self.scan);
         if let Some(c) = cache.as_ref() {
-            if c.at.elapsed() < self.drift_interval {
+            if self.now().saturating_duration_since(c.at) < self.drift_interval {
                 return Some((c.disk_fp, c.clean, c.observed_through));
             }
         }
@@ -1692,15 +1720,11 @@ impl GraphState {
             if let (Some(map), Some(roots), Some(walked_at)) =
                 (fp_state.map.as_ref(), fp_state.roots.as_ref(), fp_state.walked_at)
             {
-                if walked_at.elapsed() < WALK_VERIFY_INTERVAL {
+                if self.now().saturating_duration_since(walked_at) < WALK_VERIFY_INTERVAL {
                     let fp = fold_portable_fingerprint(map, fp_state.topology);
                     let clean = fp_state.clean && !roots.is_empty();
-                    *cache = Some(ScanCache {
-                        at: Instant::now(),
-                        disk_fp: fp,
-                        clean,
-                        observed_through,
-                    });
+                    *cache =
+                        Some(ScanCache { at: self.now(), disk_fp: fp, clean, observed_through });
                     return Some((fp, clean, observed_through));
                 }
             }
@@ -1743,11 +1767,11 @@ impl GraphState {
             let mut fp_state = lock_recover(&self.fp_map);
             fp_state.map = map;
             fp_state.roots = project.search_roots.clone();
-            fp_state.walked_at = Some(Instant::now());
+            fp_state.walked_at = Some(self.now());
             fp_state.topology = topology;
             fp_state.clean = clean;
         }
-        *cache = Some(ScanCache { at: Instant::now(), disk_fp: fp, clean, observed_through });
+        *cache = Some(ScanCache { at: self.now(), disk_fp: fp, clean, observed_through });
         Some((fp, clean, observed_through))
     }
 
@@ -2035,7 +2059,7 @@ mod tests {
     use super::super::scan::workspace_fingerprint;
     use super::super::state::{lock_recover, GraphState};
     use super::super::test_support::{
-        graph_state_summary, sample_workspace, seed_cache, wait_ready, wait_serving, wait_until,
+        graph_state_summary, sample_workspace, seed_cache, wait_ready, wait_until,
         wait_until_within, write,
     };
     use super::*;
@@ -2419,23 +2443,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on, and asserts that a call returns within 100 ms; run: cargo test -p mcp-server --lib a_request_miss_never_consults_the_lease -- --ignored"]
     fn a_request_miss_never_consults_the_lease() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
         cache.ensure().unwrap();
-        let old = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let old = crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&cache);
         let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
-            .with_lease(old.clone());
+            .with_lease(old.clone())
+            .with_manual_builds();
         graph.ensure_loading();
-        wait_ready(&graph);
+        assert!(matches!(graph.run_next_build().status, GraphStatus::Ready { .. }));
 
         let held: Vec<_> = (0..SNAPSHOT_POOL_CAP)
             .map(|_| graph.snapshot().expect("the prepared descriptor is available"))
             .collect();
-        let newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let newer = crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&cache);
         assert!(graph.snapshot().is_none(), "an empty pool never consults the foreign owner");
         newer.release();
         assert!(graph.snapshot().is_none(), "owner release cannot refill the empty pool");
@@ -2448,19 +2472,25 @@ mod tests {
         sample_workspace(transient_root);
         let transient_cache = crate::cache::WorkspaceCacheLayout::for_workspace(transient_root);
         transient_cache.ensure().unwrap();
-        let transient_lease = crate::workspace_lease::WorkspaceLease::claim_cache(&transient_cache);
+        let transient_lease =
+            crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&transient_cache);
         let transient = GraphState::for_workspace_with_cache(
             transient_root.to_path_buf(),
             transient_cache.clone(),
         )
-        .with_lease(transient_lease.clone());
+        .with_lease(transient_lease.clone())
+        .with_manual_builds();
         transient.ensure_loading();
-        wait_ready(&transient);
+        assert!(matches!(transient.run_next_build().status, GraphStatus::Ready { .. }));
         let occupied: Vec<_> = (0..SNAPSHOT_POOL_CAP)
             .map(|_| transient.snapshot().expect("prepared descriptor"))
             .collect();
-        let held_lock = transient_lease.hold_file_lock_for_test();
-        let started = Instant::now();
+        // A miss that did ask the lease would play its whole lock wait out here, not on the
+        // machine's clock, and the counter below would still say so.
+        let _virtual = crate::workspace_lease::VirtualLockWait::install(std::sync::Arc::new(
+            crate::test_clock::TestClock::default(),
+        ));
+        let held_lock = transient_lease.hold_file_lock_once_for_test();
         let fences = transient_lease.disk_checks_on_this_thread();
         assert!(transient.snapshot().is_none(), "the fifth request gets an immediate miss");
         assert_eq!(
@@ -2468,11 +2498,9 @@ mod tests {
             fences,
             "a request miss consulted the lease, so it would wait on a lock it does not need"
         );
-        if cfg!(timing_contract) {
-            assert!(started.elapsed() < Duration::from_millis(100), "a request miss waited");
-        }
         drop(held_lock);
         drop(occupied);
+        assert!(transient.snapshot().is_some(), "control: a returned handle serves again");
     }
 
     #[test]
@@ -2557,21 +2585,29 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on, and asserts that a call returns within 100 ms; run: cargo test -p mcp-server --lib background_snapshot_preserves_all_typed_outcomes -- --ignored"]
     fn background_snapshot_preserves_all_typed_outcomes() {
         use crate::workspace_lease::{LeaseOperationError, LeaseOperationOutcome};
 
+        // Every wait below — a background checkout's and the lease's lock wait — runs out on a
+        // held clock, so a refusal is the production deadline played out, not a slow machine.
+        let _virtual = crate::workspace_lease::VirtualLockWait::install(std::sync::Arc::new(
+            crate::test_clock::TestClock::default(),
+        ));
         let ready_graph = || {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             sample_workspace(root);
             let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
             cache.ensure().unwrap();
-            let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+            let lease =
+                crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&cache);
             let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache)
-                .with_lease(lease.clone());
+                .with_lease(lease.clone())
+                .with_clock(std::sync::Arc::new(crate::test_clock::TestClock::default()))
+                .with_manual_builds();
             graph.ensure_loading();
-            wait_ready(&graph);
+            let built = graph.run_next_build();
+            assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
             (dir, graph, lease)
         };
         let occupy = |graph: &GraphState| -> Vec<_> {
@@ -2581,8 +2617,7 @@ mod tests {
         };
 
         let (_dir, graph, lease) = ready_graph();
-        let held_lock = lease.hold_file_lock_for_test();
-        let started = Instant::now();
+        let held_lock = lease.hold_file_lock_once_for_test();
         let fences = lease.disk_checks_on_this_thread();
         assert!(matches!(graph.snapshot_blocking(), LeaseOperationOutcome::Applied(Some(_))));
         assert_eq!(
@@ -2590,17 +2625,16 @@ mod tests {
             fences,
             "pool checkout ran the preflight, which takes the lease lock it was just denied"
         );
-        if cfg!(timing_contract) {
-            assert!(
-                started.elapsed() < Duration::from_millis(100),
-                "pool checkout skips preflight"
-            );
-        }
         drop(held_lock);
 
         let _occupied = occupy(&graph);
-        let held_lock = lease.hold_file_lock_for_test();
+        let held_lock = lease.hold_file_lock_once_for_test();
+        let fences = lease.disk_checks_on_this_thread();
         assert!(matches!(graph.snapshot_blocking(), LeaseOperationOutcome::TransientRefusal));
+        assert!(
+            lease.disk_checks_on_this_thread() > fences,
+            "control: a background read past a full pool asks the lease before it waits",
+        );
         drop(held_lock);
 
         let (_dir, graph, _lease) = ready_graph();
@@ -2623,63 +2657,66 @@ mod tests {
         let (_dir, graph, old) = ready_graph();
         let _occupied = occupy(&graph);
         let cache = graph.cache().unwrap().clone();
-        let newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let newer = crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&cache);
         assert!(matches!(graph.snapshot_blocking(), LeaseOperationOutcome::Superseded));
         old.release();
         newer.release();
     }
 
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib publication_without_a_complete_descriptor_pool_cannot_be_ready -- --ignored"]
     fn publication_without_a_complete_descriptor_pool_cannot_be_ready() {
         use std::sync::atomic::Ordering;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
-        let graph = GraphState::for_workspace(root.to_path_buf());
+        // The failed publication retries its open after a pause, played out on this clock.
+        let graph = GraphState::for_workspace(root.to_path_buf())
+            .with_clock(std::sync::Arc::new(crate::test_clock::TestClock::default()))
+            .with_manual_builds();
         graph.set_background_snapshot_failure_for_test(Some(
             BackgroundSnapshotFailure::PrepareSecondChanged,
         ));
         graph.ensure_loading();
-        assert_eq!(
-            graph.builders_started.load(Ordering::SeqCst),
-            1,
-            "the first build was admitted"
-        );
-        // The status turns before the builder leaves its slot, and a retry asked in between is
-        // refused as a second build; so the wait is for the slot, whatever the build ended in.
-        wait_until(&graph, "the first build to end and free its slot", || {
-            !matches!(graph.status(), GraphStatus::Loading) && !graph.build_in_flight()
-        });
+        assert!(matches!(graph.status(), GraphStatus::Loading), "the first build was admitted");
+        assert_eq!(graph.queued_builds(), 1, "the admission queued exactly one build");
+        assert_eq!(graph.builders_started.load(Ordering::SeqCst), 0, "nothing ran it yet");
+
+        let failed = graph.run_next_build();
         assert!(
-            matches!(graph.status(), GraphStatus::Failed(_)),
-            "a publication whose descriptor pool could not be prepared became ready; {}",
+            matches!(failed.status, GraphStatus::Failed(_)),
+            "a publication whose descriptor pool could not be prepared became ready: {failed:?}; {}",
             graph_state_summary(&graph)
         );
+        assert_eq!(failed.generation, None);
+        assert!(!graph.build_in_flight(), "the failed build kept its slot");
         assert!(graph.snapshot().is_none());
+        assert_eq!(graph.queued_builds(), 0, "the failure queued nothing behind itself");
+
         graph.set_background_snapshot_failure_for_test(None);
         graph.ensure_loading();
-        assert_eq!(
-            graph.builders_started.load(Ordering::SeqCst),
-            2,
-            "the failed publication is retried at once; {}",
-            graph_state_summary(&graph)
-        );
-        wait_serving(&graph, 1);
+        assert_eq!(graph.queued_builds(), 1, "the failed publication is retried at once");
+        let served = graph.run_next_build();
+        assert!(matches!(served.status, GraphStatus::Ready { .. }), "{served:?}");
+        assert_eq!(served.generation, Some(1));
+        assert!(served.claim.is_some() && served.claim != failed.claim, "{served:?} {failed:?}");
+        assert_eq!(graph.builders_started.load(Ordering::SeqCst), 2);
+        assert_eq!(graph.snapshot().expect("the retry serves").generation, 1);
+        assert_eq!(graph.queued_builds(), 0);
     }
 
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib drift_marks_stale_and_async_reload_bumps_generation -- --ignored"]
     fn drift_marks_stale_and_async_reload_bumps_generation() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
 
-        let mut graph = GraphState::for_workspace(root.to_path_buf());
+        let mut graph = GraphState::for_workspace(root.to_path_buf()).with_manual_builds();
         graph.drift_interval = Duration::ZERO;
         graph.ensure_loading();
-        wait_ready(&graph);
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
+        assert_eq!(graph.queued_builds(), 0);
 
         let snap1 = graph.snapshot().expect("ready graph snapshots");
         let old_token = snap1.graph.freshness_token().unwrap();
@@ -2687,6 +2724,7 @@ mod tests {
         assert_eq!(fresh.revision, 1);
         assert!(!fresh.stale);
         assert_eq!(fresh.reload, "none");
+        assert_eq!(graph.queued_builds(), 0, "a fresh graph asks for no reload");
 
         write(
             root,
@@ -2696,77 +2734,91 @@ mod tests {
         let drifted = graph.freshness(&snap1);
         assert!(drifted.stale, "an on-disk edit must read as stale");
         assert_eq!(drifted.revision, 1, "the stale response still serves the old generation");
-        assert!(matches!(drifted.reload, "running" | "failed"));
+        assert_eq!(drifted.reload, "running");
+        assert_eq!(graph.queued_builds(), 1, "the drift queued one reload");
         // The read in flight stays whole for as long as it runs; the reload's installation
         // waits for it to return rather than replacing the file under it.
         assert_eq!(snap1.graph.freshness_token().unwrap(), old_token);
         drop(snap1);
 
-        wait_until_within(
-            &graph,
-            test_utils::wait::hang_guard(Duration::from_secs(2)),
-            "the reload to publish generation 2",
-            || graph.snapshot().is_some_and(|snap| snap.generation == 2),
-        );
+        let reloaded = graph.run_next_build();
+        assert!(reloaded.is_reload);
+        assert_eq!(reloaded.generation, Some(2), "{reloaded:?}");
         let settled = graph.freshness(&graph.snapshot().expect("the reload published"));
         assert!(!settled.stale);
         assert_eq!(settled.revision, 2);
         assert_eq!(settled.reload, "none");
+        assert_eq!(graph.queued_builds(), 0);
     }
 
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib graph_freshness_invalidates_on_hub_delivery -- --ignored"]
     fn graph_freshness_invalidates_on_hub_delivery() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
         sample_workspace(root);
-
-        let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching());
-        let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
-        graph.drift_interval = Duration::from_secs(120);
-        graph.ensure_loading();
-        wait_ready(&graph);
+        let (graph, hub) = built_on_a_manual_hub(root);
 
         let snap = graph.snapshot().expect("ready");
         assert!(!graph.freshness(&snap).stale, "a freshly built graph is not stale");
 
-        let mut observer = hub.subscribe();
-        std::thread::sleep(Duration::from_millis(10));
+        let module = root.join("CommonModules/Сервер/Ext/Module.bsl");
         write(
             root,
             "CommonModules/Сервер/Ext/Module.bsl",
             "&НаСервере\nФункция Считать() Экспорт Возврат 1; КонецФункции",
         );
-        // Waits on the hub's delivery queue, not on graph state: a graph-state summary
-        // would say nothing about whether inotify delivered.
-        let mut deadline = crate::change_hub::test_support::Patience::new(
-            crate::change_hub::test_support::STATE_CEILING,
-            std::time::Duration::from_millis(10),
+        assert!(
+            !graph.freshness(&snap).stale,
+            "control: with the throttle closed, an edit nobody delivered is not seen",
         );
-        let mut delivered = false;
-        while deadline.allows() {
-            let batch = hub.drain(observer);
-            observer = batch.cursor;
-            if batch.entries.iter().any(|e| e.raw.to_string_lossy().contains("Module.bsl")) {
-                delivered = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(delivered, "the hub delivered the edit");
+        deliver_one_write(&hub, &module);
         assert!(
             graph.freshness(&snap).stale,
             "a hub-delivered edit is seen without waiting out the drift throttle",
         );
     }
 
+    /// A graph over `root` fed by a manual hub and held still on a test clock, built once to
+    /// its end: the drift throttle stays closed for as long as the test does not move the clock,
+    /// so only a delivered fact can make the cached verdict stale.
+    fn built_on_a_manual_hub(
+        root: &std::path::Path,
+    ) -> (GraphState, crate::change_hub::WorkspaceChangeHub) {
+        let hub = crate::graph::test_support::manual_workspace_hub(root);
+        let mut graph = GraphState::for_workspace(root.to_path_buf())
+            .with_change_hub(hub.clone())
+            .with_clock(std::sync::Arc::new(crate::test_clock::TestClock::default()))
+            .with_manual_builds();
+        graph.drift_interval = Duration::from_secs(120);
+        graph.ensure_loading();
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, GraphStatus::Ready { .. }), "{built:?}");
+        assert_eq!(graph.queued_builds(), 0);
+        (graph, hub)
+    }
+
+    /// Deliver one content write of `path` to `hub` and drain `observer` once: the batch names
+    /// that path, and the hub's sequence moved past what it was before.
+    fn deliver_one_write(hub: &crate::change_hub::WorkspaceChangeHub, path: &std::path::Path) {
+        let observer = hub.subscribe();
+        let before = hub.seq();
+        hub.deliver_modified_for_test(path);
+        let batch = hub.drain(observer);
+        let canonical = std::fs::canonicalize(path).unwrap();
+        assert!(
+            batch.entries.iter().any(|entry| entry.canonical == canonical),
+            "the delivered write of {} is not in the batch: {:?}",
+            path.display(),
+            batch.entries,
+        );
+        assert!(hub.seq() > before, "the delivery did not move the hub's sequence");
+    }
+
     /// The full live-daemon chain for a topology-only change: a served graph must
     /// read stale after a `dependsOn`-only config edit (no `.bsl`/`.xml` touched),
     /// and the kicked reload must publish a fresh generation that reads clean.
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_depends_on_only_edit_marks_a_served_graph_stale_and_reloads -- --ignored"]
     fn a_depends_on_only_edit_marks_a_served_graph_stale_and_reloads() {
         use super::super::test_support::{write_extension_config, write_extension_workspace};
 
@@ -2774,22 +2826,31 @@ mod tests {
         let root = dir.path();
         write_extension_workspace(root, false);
 
-        let mut graph = GraphState::for_workspace(root.to_path_buf());
+        let mut graph = GraphState::for_workspace(root.to_path_buf()).with_manual_builds();
         graph.drift_interval = Duration::ZERO;
         graph.ensure_loading();
-        let snap = wait_serving(&graph, 1);
+        assert_eq!(graph.run_next_build().generation, Some(1));
+        let snap = graph.snapshot().expect("generation 1 serves");
+        assert_eq!(snap.generation, 1);
         assert!(!graph.freshness(&snap).stale, "a freshly built graph is not stale");
+        assert_eq!(graph.queued_builds(), 0);
 
         write_extension_config(root, true);
         let drifted = graph.freshness(&snap);
         assert!(drifted.stale, "a dependsOn-only edit must read as stale");
-        assert!(matches!(drifted.reload, "running" | "failed"));
+        assert_eq!(drifted.reload, "running");
+        assert_eq!(graph.queued_builds(), 1, "the drift queued one reload");
         // Returned, so the reload's installation need not wait for it.
         drop(snap);
 
-        let reloaded = wait_serving(&graph, 2);
+        let reloaded = graph.run_next_build();
+        assert!(reloaded.is_reload);
+        assert_eq!(reloaded.generation, Some(2), "{reloaded:?}");
+        let reloaded = graph.snapshot().expect("generation 2 serves");
+        assert_eq!(reloaded.generation, 2);
         let settled = graph.freshness(&reloaded);
         assert!(!settled.stale, "the reloaded graph reflects the new topology");
+        assert_eq!(graph.queued_builds(), 0);
     }
 
     /// End-to-end root re-arm: an extension root added by a topology reload lies
@@ -2797,7 +2858,7 @@ mod tests {
     /// under that root must be hub-delivered — proof the rebuild re-pointed the
     /// live watcher instead of leaving the new subtree to the reconciler.
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib a_topology_reload_rearms_the_hub_onto_the_new_extension_root -- --ignored"]
+    #[ignore = "необязательный тест: end-to-end proof that notify really registered the new external root and then delivered a new file in it; a fake event passes even with the backend re-arm missing, and a system watcher has no finite signal that an event will never come; запуск: cargo test -p mcp-server --lib a_topology_reload_rearms_the_hub_onto_the_new_extension_root -- --ignored"]
     fn a_topology_reload_rearms_the_hub_onto_the_new_extension_root() {
         use super::super::test_support::write;
 
@@ -2948,51 +3009,23 @@ mod tests {
     /// can only patch file stats, not the topology, so serving its fold after a
     /// config edit would keep a stale topology fresh for up to the walk interval.
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib graph_freshness_sees_a_config_edit_through_the_hub -- --ignored"]
     fn graph_freshness_sees_a_config_edit_through_the_hub() {
         use super::super::test_support::{write_extension_config, write_extension_workspace};
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write_extension_workspace(root, false);
-
-        let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching());
-        let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
-        graph.drift_interval = Duration::from_secs(120);
-        graph.ensure_loading();
-        wait_ready(&graph);
+        let (graph, hub) = built_on_a_manual_hub(root);
 
         let snap = graph.snapshot().expect("ready");
         assert!(!graph.freshness(&snap).stale, "a freshly built graph is not stale");
 
-        let mut observer = hub.subscribe();
-        std::thread::sleep(Duration::from_millis(10));
-        // Re-written per poll: under a fully parallel test run the inotify queue
-        // can lag well past a single write's event window.
-        // Waits on the hub's delivery queue, not on graph state: a graph-state summary
-        // would say nothing about whether inotify delivered.
-        let mut deadline = crate::change_hub::test_support::Patience::new(
-            crate::change_hub::test_support::STATE_CEILING,
-            std::time::Duration::from_millis(20),
-        );
-        let mut delivered = false;
-        while deadline.allows() {
-            write_extension_config(root, true);
-            std::thread::sleep(Duration::from_millis(20));
-            let batch = hub.drain(observer);
-            observer = batch.cursor;
-            if batch.entries.iter().any(|e| e.raw.to_string_lossy().contains("bsl-analyzer.toml")) {
-                delivered = true;
-                break;
-            }
-        }
+        write_extension_config(root, true);
         assert!(
-            delivered,
-            "the hub delivered the config edit (events_seen={}, health={:?})",
-            hub.events_seen(),
-            hub.health(),
+            !graph.freshness(&snap).stale,
+            "control: the cached topology answers until the config edit is delivered",
         );
+        deliver_one_write(&hub, &root.join("bsl-analyzer.toml"));
         assert!(
             graph.freshness(&snap).stale,
             "a hub-delivered config edit is seen without waiting out the drift throttle",
@@ -3000,50 +3033,34 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "waits for graph readiness by polling up to the hang guard (30 s under timing_contract): GraphState has no status-change event to wait on; run: cargo test -p mcp-server --lib graph_freshness_ignores_non_scan_files -- --ignored"]
     fn graph_freshness_ignores_non_scan_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
         sample_workspace(root);
-
-        let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching());
-        let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
-        graph.drift_interval = Duration::from_secs(120);
-        graph.ensure_loading();
-        wait_ready(&graph);
+        let (graph, hub) = built_on_a_manual_hub(root);
 
         let snap = graph.snapshot().expect("ready");
         assert!(!graph.freshness(&snap).stale, "a freshly built graph is not stale");
         let scans_after_prime = graph.scan_count();
 
-        let mut observer = hub.subscribe();
-        std::thread::sleep(Duration::from_millis(10));
         write(root, "CommonModules/Сервер/Ext/Module.bsl.tmp", "editor swap file");
-        // Waits on the hub's delivery queue, not on graph state: a graph-state summary
-        // would say nothing about whether inotify delivered.
-        let mut deadline = crate::change_hub::test_support::Patience::new(
-            crate::change_hub::test_support::STATE_CEILING,
-            std::time::Duration::from_millis(10),
-        );
-        let mut delivered = false;
-        while deadline.allows() {
-            let batch = hub.drain(observer);
-            observer = batch.cursor;
-            if batch.entries.iter().any(|e| e.raw.to_string_lossy().contains(".tmp")) {
-                delivered = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(delivered, "the hub delivered the .tmp file");
+        deliver_one_write(&hub, &root.join("CommonModules/Сервер/Ext/Module.bsl.tmp"));
         assert!(!graph.freshness(&snap).stale, "a temp file does not make the graph stale");
         assert_eq!(
             graph.scan_count(),
             scans_after_prime,
             "an irrelevant temp file must not invalidate the cache and re-trigger a scan",
         );
+
+        // Control: the same hub, the same directory, a scanned file — the hub is not deaf.
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "&НаСервере\nФункция Считать() Экспорт Возврат 2; КонецФункции",
+        );
+        deliver_one_write(&hub, &root.join("CommonModules/Сервер/Ext/Module.bsl"));
+        assert!(graph.freshness(&snap).stale, "a delivered .bsl edit in the same place is seen");
     }
 
     /// The three positive proofs, and everything that is NOT one of them.

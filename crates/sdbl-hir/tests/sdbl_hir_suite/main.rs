@@ -3,6 +3,8 @@
 
 mod clean_room_slice13_diagnostics;
 mod comment_invariance;
+mod derived_table_outer_alias;
 mod independent_hir_contracts;
 mod inline_extension_position;
 mod query_nested_fields_by_dot;
+mod unknown_query_function;

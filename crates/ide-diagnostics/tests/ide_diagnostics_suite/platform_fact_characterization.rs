@@ -90,7 +90,7 @@ fn get_form_keeps_deprecated_and_get_form_diagnostics() {
         &[DiagnosticCode::DeprecatedPlatformApi, DiagnosticCode::GetFormMethod],
         expect![[r#"
             GetFormMethod @ 2:13..2:20
-              message: Использование метода 'GetForm' приводит к ошибкам. Используйте 'ОткрытьФорму()' вместо него
+              message: Получение формы методом 'GetForm' перед открытием требует лишнего серверного вызова: для открытия формы используйте 'ОткрытьФорму()', она делает это за один вызов (стандарт 487, п. 4.1)
               severity: Major
             DeprecatedPlatformApi @ 2:13..2:29
               message: Method "GetForm" is deprecated. You should use "OpenForm".

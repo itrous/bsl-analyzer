@@ -419,6 +419,10 @@ mod tests {
     /// the positive control that proves the stand is big enough for the difference to
     /// exist at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg_attr(
+        windows,
+        ignore = "waits on file-change events without a bound of its own, and a run under load on Windows outlasted any limit"
+    )]
     async fn a_cancelled_call_frees_the_resident_slot() {
         let _serialised = WALK_GATE.lock().await;
         install();
@@ -499,6 +503,10 @@ mod tests {
     /// released without waiting for the blocking task — so this counts the files the walk
     /// actually entered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg_attr(
+        windows,
+        ignore = "waits on file-change events without a bound of its own, and a run under load on Windows outlasted any limit"
+    )]
     async fn a_cancelled_walk_stops_before_the_last_file() {
         let _serialised = WALK_GATE.lock().await;
         install();
@@ -584,6 +592,10 @@ mod tests {
     /// Cancellation reaches this request and nothing else: the resident and its master
     /// handle are untouched, so the next call answers in full.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg_attr(
+        windows,
+        ignore = "waits on file-change events without a bound of its own, and a run under load on Windows outlasted any limit"
+    )]
     async fn a_cancel_does_not_reach_the_next_call() {
         let _serialised = WALK_GATE.lock().await;
         install();

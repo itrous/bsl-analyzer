@@ -109,6 +109,7 @@ include = ["main"]
         event["path"]
             .as_str()
             .unwrap()
+            .replace('\\', "/")
             .ends_with(&format!("CommonModules/{EXT_MODULE}/Ext/Module.bsl"))
     });
     assert!(main.unwrap()["diagnostics"].as_array().unwrap().is_empty());

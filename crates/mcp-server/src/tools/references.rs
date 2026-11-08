@@ -139,8 +139,11 @@ pub(crate) fn answer(
             let per_file = resident.walk_files_in_chunks(cancel, walk.scanned(), |analysis, id| {
                 ide::walk_reference_file(analysis.database(), id, walk.symbol(), &request)
             });
+            // Consumed, not copied: the hits are owned values, and a copy would hold every
+            // one of them twice until the per-file lists are dropped.
+            let hits = per_file.into_iter().flatten().collect();
             resident.with_request_handle(cancel, |_, analysis| {
-                ide::finish_references(analysis.database(), walk, per_file.concat())
+                ide::finish_references(analysis.database(), walk, hits)
             })
         }
     };

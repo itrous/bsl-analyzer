@@ -9,6 +9,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::BeginTransactionBeforeTryCatch,
     DiagnosticCode::CommitTransactionOutsideTryCatch,
     DiagnosticCode::CreateQueryInCycle,
+    DiagnosticCode::LocalCallWithQueryInCycle,
     DiagnosticCode::ImplicitDatabaseReadInCycle,
     DiagnosticCode::DataExchangeLoading,
     DiagnosticCode::DisableSafeMode,
@@ -148,6 +149,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     (DiagnosticCode::MissingReturnedValueDescription, "documentation diagnostic"),
     (DiagnosticCode::ReservedParameterNames, "reserved-name convention diagnostic"),
     (DiagnosticCode::ReservedWordAsMethodName, "reserved keyword diagnostic"),
+    (
+        DiagnosticCode::BuiltinFunctionNameAsDeclaration,
+        "fixed RU/EN name pair; message keeps the declared spelling",
+    ),
     (DiagnosticCode::RewriteMethodParameter, "parameter reassignment diagnostic"),
     (DiagnosticCode::UnusedLocalVariable, "dataflow liveness diagnostic"),
     (DiagnosticCode::UnusedLocalMethod, "symbol liveness diagnostic"),
@@ -299,6 +304,7 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "known bug: message embeds argument counts from resolved callee",
     ),
     (DiagnosticCode::TypeMismatch, "known bug: message embeds localized type names"),
+    (DiagnosticCode::PossiblyUndefinedValue, "known bug: message embeds localized type names"),
     (DiagnosticCode::TypeMismatchByDocComment, "known bug: message embeds localized type names"),
     (DiagnosticCode::UnresolvedField, "known bug: message embeds field/type names"),
     (
@@ -335,6 +341,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "SDBL alias policy; query-language parity needs dedicated metadata/query harness",
     ),
     (DiagnosticCode::DuplicateAliasInQuery, "SDBL source-alias policy; not BSL identifier parity"),
+    (
+        DiagnosticCode::UnavailableAliasInQuery,
+        "SDBL source-alias visibility; not BSL identifier parity",
+    ),
     (
         DiagnosticCode::FieldsFromJoinsWithoutIsNull,
         "SDBL join-field policy; not BSL identifier parity",
@@ -375,6 +385,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     (
         DiagnosticCode::UnknownFieldInQuery,
         "SDBL field resolution diagnostic; requires configuration metadata fixture",
+    ),
+    (
+        DiagnosticCode::UnknownQueryFunction,
+        "SDBL function vocabulary check; the message names the misspelled function by design",
     ),
     (
         DiagnosticCode::InvalidVirtualTableParameters,
@@ -436,6 +450,35 @@ EndProcedure"#,
     For Index = 1 To 2 Do
         Query.Execute();
     EndDo;
+EndProcedure"#,
+    ),
+    (
+        DiagnosticCode::LocalCallWithQueryInCycle,
+        r#"Функция НайтиПоЗначению(Значение)
+	Запрос = Новый Запрос("ВЫБРАТЬ 1 КАК Поле");
+	Запрос.УстановитьПараметр("Значение", Значение);
+	Выборка = Запрос.Выполнить().Выбрать();
+	Возврат ?(Выборка.Следующий(), Выборка.Поле, Неопределено);
+КонецФункции
+
+Процедура ЗаполнитьСтроки(Таблица, Чтение)
+	Пока Чтение.Прочитать() Цикл
+		НоваяСтрока = Таблица.Добавить();
+		НоваяСтрока.Поле = НайтиПоЗначению(Чтение.Значение);
+	КонецЦикла;
+КонецПроцедуры"#,
+        r#"Function FindByValue(Value)
+	Query = New Query("SELECT 1 AS Field");
+	Query.SetParameter("Value", Value);
+	Selection = Query.Execute().Select();
+	Return ?(Selection.Next(), Selection.Field, Undefined);
+EndFunction
+
+Procedure FillRows(Table, Reader)
+	While Reader.Read() Do
+		NewRow = Table.Add();
+		NewRow.Field = FindByValue(Reader.Value);
+	EndDo;
 EndProcedure"#,
     ),
     (
@@ -697,7 +740,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 210, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 215, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

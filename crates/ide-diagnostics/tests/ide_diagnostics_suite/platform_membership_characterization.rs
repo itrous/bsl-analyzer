@@ -46,16 +46,16 @@ fn using_object_not_available_unix_membership_respects_platform_guards() {
     expect_test::expect![[r#"
         UsingObjectNotAvailableUnix line 2 `RuCom = Новый COMОбъект("Scripting.FileSystemObject");`
           message: Проверить, что задействованы аналоги "COMОбъект" при работе в Unix-клиенте.
-          severity: Critical
+          severity: Warning
         UsingObjectNotAvailableUnix line 3 `RuMail = Новый("Почта");`
           message: Проверить, что задействованы аналоги "Почта" при работе в Unix-клиенте.
-          severity: Critical
+          severity: Warning
         UsingObjectNotAvailableUnix line 4 `EnCom = Новый COMObject("Scripting.FileSystemObject");`
           message: Проверить, что задействованы аналоги "COMObject" при работе в Unix-клиенте.
-          severity: Critical
+          severity: Warning
         UsingObjectNotAvailableUnix line 5 `EnMail = Новый("Mail");`
           message: Проверить, что задействованы аналоги "Mail" при работе в Unix-клиенте.
-          severity: Critical"#]]
+          severity: Warning"#]]
     .assert_eq(&format_filtered(source, DiagnosticCode::UsingObjectNotAvailableUnix));
 }
 
@@ -114,16 +114,16 @@ fn get_form_method_membership_covers_global_and_member_calls() {
 
     expect_test::expect![[r#"
         GetFormMethod line 2 `GlobalRu = ПолучитьФорму("Форма");`
-          message: Использование метода 'ПолучитьФорму' приводит к ошибкам. Используйте 'ОткрытьФорму()' вместо него
+          message: Получение формы методом 'ПолучитьФорму' перед открытием требует лишнего серверного вызова: для открытия формы используйте 'ОткрытьФорму()', она делает это за один вызов (стандарт 487, п. 4.1)
           severity: Major
         GetFormMethod line 3 `ObjectRu = Док.ПолучитьФорму("Форма");`
-          message: Использование метода 'ПолучитьФорму' приводит к ошибкам. Используйте 'ОткрытьФорму()' вместо него
+          message: Получение формы методом 'ПолучитьФорму' перед открытием требует лишнего серверного вызова: для открытия формы используйте 'ОткрытьФорму()', она делает это за один вызов (стандарт 487, п. 4.1)
           severity: Major
         GetFormMethod line 4 `GlobalEn = GetForm("Form");`
-          message: Использование метода 'GetForm' приводит к ошибкам. Используйте 'ОткрытьФорму()' вместо него
+          message: Получение формы методом 'GetForm' перед открытием требует лишнего серверного вызова: для открытия формы используйте 'ОткрытьФорму()', она делает это за один вызов (стандарт 487, п. 4.1)
           severity: Major
         GetFormMethod line 5 `ObjectEn = Doc.GetForm("Form");`
-          message: Использование метода 'GetForm' приводит к ошибкам. Используйте 'ОткрытьФорму()' вместо него
+          message: Получение формы методом 'GetForm' перед открытием требует лишнего серверного вызова: для открытия формы используйте 'ОткрытьФорму()', она делает это за один вызов (стандарт 487, п. 4.1)
           severity: Major"#]]
     .assert_eq(&format_filtered(source, DiagnosticCode::GetFormMethod));
 }

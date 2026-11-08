@@ -151,6 +151,10 @@ pub(crate) fn module_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     result.extend(safe_collect("metadata", || collect_metadata_diagnostics(ctx)));
 
+    result.extend(safe_collect("create_query_in_cycle", || {
+        handlers::create_query_in_cycle::check(ctx)
+    }));
+
     result
 }
 
@@ -351,6 +355,7 @@ fn finalize_diagnostics(
 fn collect_base_sensitive(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let mut result = collect_inference_diagnostics(ctx);
     result.extend(handlers::unused_local_variable::check(ctx));
+    result.extend(handlers::create_query_in_cycle::check(ctx));
     result
 }
 

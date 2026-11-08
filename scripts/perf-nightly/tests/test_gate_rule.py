@@ -51,6 +51,12 @@ class DecisiveMetrics(unittest.TestCase):
                 self.assertEqual(outcome(key, 0.05, 0.01), "ok")
                 self.assertEqual(outcome(key, -0.20, 0.01), "ok")
 
+    def test_the_cpu_time_is_not_among_them(self):
+        self.assertEqual(DECISIVE, ("graph_resolve_s", "diagnostics_workspace_s"))
+        self.assertEqual(verdict.GATE_OBSERVED, ("graph_ready_cpu_s",))
+        self.assertNotIn("graph_ready_cpu_s", gate.TRADED_METRICS)
+        self.assertIn("graph_ready_cpu_s", gate.METRICS, "it is still measured and calibrated")
+
     def test_noisy_or_missing_noise_never_passes(self):
         for key in DECISIVE:
             with self.subTest(key=key):
@@ -73,9 +79,9 @@ class DecisiveMetrics(unittest.TestCase):
             self.assertIn(rows[-1]["outcome"], result["reasons"][0])
 
 
-class CpuTradedForWall(unittest.TestCase):
-    """More CPU time is accepted where the wall time fell by at least as much;
-    the machine has idle cores, the user waits for the wall."""
+class CpuIsObserved(unittest.TestCase):
+    """The CPU time is measured and shown, and decides nothing: neither a growth
+    nor a missing noise changes the verdict, with or without a faster wall."""
 
     NOISE = noise_of(graph_ready_s=0.03, graph_ready_cpu_s=0.01, graph_resolve_s=0.01, diagnostics_workspace_s=0.01)
 
@@ -86,49 +92,32 @@ class CpuTradedForWall(unittest.TestCase):
         rows = gate.rule_rows(base, cand, noise or self.NOISE, True)
         return {r["metric"]: r for r in rows}
 
-    def test_a_faster_wall_pays_for_the_growth_of_cpu(self):
-        rows = self.rows(-0.45, 0.24)
-        cpu = rows["graph_ready_cpu_s"]
-        self.assertEqual((cpu["outcome"], cpu["basis"]), ("ok", "growth_traded"))
-        self.assertAlmostEqual(cpu["delta"], 0.24)
-        self.assertAlmostEqual(cpu["wall_delta"], -0.45)
-        self.assertEqual(rows["graph_ready_s"]["outcome"], "ok")
-        self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "pass")
+    def test_a_growth_is_shown_with_its_numbers_and_with_no_trade(self):
+        for wall, growth in ((-0.45, 0.24), (0.01, 0.24), (0.0, 0.24), (-0.10, 0.30), (-0.45, 0.03), (0.0, -0.5)):
+            with self.subTest(wall=wall, growth=growth):
+                rows = self.rows(wall, growth)
+                cpu = rows["graph_ready_cpu_s"]
+                self.assertEqual((cpu["kind"], cpu["outcome"], cpu["limit"], cpu["reason"]),
+                                 ("observation", "observation", None, None))
+                self.assertAlmostEqual(cpu["delta"], growth)
+                self.assertAlmostEqual(cpu["noise"], 0.01)
+                self.assertNotIn("basis", cpu)
+                self.assertNotIn("wall_delta", cpu)
+                self.assertEqual(rows["graph_ready_s"]["outcome"], "ok" if wall <= 0.05 else "block")
+                self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "pass")
 
-    def test_growth_without_a_faster_wall_blocks(self):
-        for wall in (0.01, 0.0):
-            with self.subTest(wall=wall):
-                cpu = self.rows(wall, 0.24)["graph_ready_cpu_s"]
-                self.assertEqual((cpu["outcome"], cpu["basis"]), ("block", "growth_not_repaid"))
-
-    def test_growth_larger_than_the_gain_of_the_wall_blocks(self):
-        rows = self.rows(-0.10, 0.30)
-        self.assertEqual(rows["graph_ready_cpu_s"]["outcome"], "block")
-        self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "block")
-
-    def test_growth_within_the_bar_passes_without_a_note(self):
-        cpu = self.rows(-0.45, 0.03)["graph_ready_cpu_s"]
-        self.assertEqual((cpu["outcome"], cpu["basis"]), ("ok", None))
-        self.assertEqual(self.rows(0.0, 0.05)["graph_ready_cpu_s"]["outcome"], "ok")
-
-    def test_the_gain_of_the_wall_must_reach_the_growth(self):
-        # Equal: traded; a hair less gain: not. The wall at -24 % and at -23.9 % is far from the wall's own limit.
-        self.assertEqual(gate.traded_outcome("graph_ready_cpu_s", 0.24, -0.24, 0.01), ("ok", "growth_traded"))
-        self.assertEqual(gate.traded_outcome("graph_ready_cpu_s", 0.24, -0.239, 0.01), ("block", "growth_not_repaid"))
-        self.assertEqual(gate.traded_outcome("graph_ready_cpu_s", 0.0501, -0.0501, 0.01), ("ok", "growth_traded"))
-        self.assertEqual(gate.traded_outcome("graph_ready_cpu_s", 0.0501, None, 0.01), ("block", "growth_not_repaid"))
-
-    def test_a_noisy_cpu_time_never_passes_however_fast_the_wall(self):
-        for cpu_noise, expected in ((0.06, "noisy"), (None, "no_noise")):
+    def test_a_noise_that_is_missing_or_wide_leaves_the_verdict_as_it_is(self):
+        for cpu_noise, reason in ((0.06, None), (None, "no_noise")):
             with self.subTest(noise=cpu_noise):
                 noise = noise_of(graph_ready_s=0.03, graph_ready_cpu_s=cpu_noise)
                 for cpu_delta in (0.24, 0.03, 0.0):
                     rows = self.rows(-0.45, cpu_delta, noise)
-                    self.assertEqual(rows["graph_ready_cpu_s"]["outcome"], expected)
-                    self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "incomplete")
+                    self.assertEqual((rows["graph_ready_cpu_s"]["outcome"], rows["graph_ready_cpu_s"]["reason"]),
+                                     ("observation", reason))
+                    self.assertEqual(verdict.gate_verdict(list(rows.values()), [])["verdict"], "pass")
 
     def test_the_trade_is_the_same_rule_for_every_work_metric(self):
-        # CPU of readiness, resolve and sweep: +24 % against a wall at -45 % is paid for in each.
+        # Resolve and sweep: +24 % against a wall at -45 % is paid for in each; the CPU has no trade to be paid for.
         base, cand = side(40.0, 40.0, 40.0), side(49.6, 49.6, 49.6)
         for r in cand:
             r["metrics"]["graph_ready_s"] = 55.0
@@ -140,10 +129,12 @@ class CpuTradedForWall(unittest.TestCase):
                 self.assertEqual((rows[key]["outcome"], rows[key]["basis"]), ("ok", "growth_traded"))
                 self.assertAlmostEqual(rows[key]["wall_delta"], -0.45)
         self.assertNotIn("basis", rows["graph_ready_s"])
+        self.assertNotIn("basis", rows["graph_ready_cpu_s"])
 
 
 class ResolveAndSweepTradedForWall(unittest.TestCase):
-    """`graph_resolve_s` and `diagnostics_workspace_s` follow the rule of the CPU time."""
+    """More time of `graph_resolve_s` and `diagnostics_workspace_s` is accepted where the wall
+    time fell by at least as much; the machine has idle cores, the user waits for the wall."""
 
     NOISE = noise_of(graph_ready_s=0.03, graph_ready_cpu_s=0.01, graph_resolve_s=0.013, diagnostics_workspace_s=0.01)
 
@@ -236,8 +227,12 @@ class WallMetric(unittest.TestCase):
         for base, cand, expected in ((good, bad, "block"), (bad, good, "incomplete"), (empty, good, "incomplete"),
                                      (good, empty, "incomplete"), (bad, bad, "block"), (empty, empty, "incomplete")):
             with self.subTest(base=len(base), cand=len(cand)):
-                rows = gate.rule_rows(base, cand, noise, True)
-                self.assertEqual({r["outcome"] for r in rows}, {expected})
+                rows = gate.rule_rows(base, cand, noise, False)
+                self.assertEqual({r["outcome"] for r in rows if r["kind"] != "observation"}, {expected})
+                cpu = next(r for r in rows if r["kind"] == "observation")
+                self.assertEqual((cpu["metric"], cpu["outcome"], cpu["delta"], cpu["limit"]),
+                                 ("graph_ready_cpu_s", "observation", None, None))
+                self.assertTrue(cpu["reason"], "the row says why it has no numbers")
 
 
     def test_a_series_cut_short_keeps_the_failure_it_already_holds(self):
@@ -403,7 +398,7 @@ class OperatingCharacteristics(unittest.TestCase):
         if wall_outcome == "confirm":
             again = _median3(rng, sigma_wall, total) / _median3(rng, sigma_wall) - 1
             wall_outcome = verdict.gate_outcome(WALL, wall, noise_wall, again)
-        rows = [{"metric": "graph_ready_cpu_s", "outcome": verdict.gate_outcome("graph_ready_cpu_s", cpu, noise_cpu)},
+        rows = [{"metric": "graph_resolve_s", "outcome": verdict.gate_outcome("graph_resolve_s", cpu, noise_cpu)},
                 {"metric": WALL, "outcome": wall_outcome}]
         return verdict.gate_verdict(rows, [])["verdict"]
 
@@ -427,6 +422,74 @@ class OperatingCharacteristics(unittest.TestCase):
         with patch.object(verdict, "GATE_BAR", 0.40):
             work_block = self.rate(lambda rng, *a: self.new_rule(rng, *a) == "block", 0.11, 0.01, 0.078, 0.0)
         self.assertLess(work_block, 0.5)
+
+
+def peaks(*values):
+    """Three runs whose peak memory is each of the given values."""
+    return [record(k + 1, hwm_kb=v) for k, v in enumerate(values)]
+
+
+class MemoryAgainstTheTargetAndTheCeiling(unittest.TestCase):
+    """The target of memory holds the peak of series A, which runs no references,
+    with its noise; the peak of series B answers to the absolute ceiling alone, and
+    the peak of A and B together is compared with nothing."""
+
+    TARGET = 4667316
+    CEILING = 7340032
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def baseline(self, noise):
+        path = os.path.join(self.tmp.name, f"baseline-{noise}.json")
+        tolerance = {"value": noise}
+        entry = {"value": self.TARGET, "unit": "KB", "aggregate": verdict.GATE_RECORD["hwm_kb"][1],
+                 "record_sha": "0" * 40, "measured_at": "2026-11-06T19:08:19+00:00",
+                 "evidence": {field: None for field in gate.EVIDENCE_FIELDS},
+                 "noise": {**tolerance, "base_A_noise": tolerance}}
+        gate.write_json(path, {"schema": gate.BASELINE_SCHEMA, "profile": {"cpu_model": "x"},
+                               "protocol": {"runs": 3}, "metrics": {"hwm_kb": entry}})
+        return gate.Baseline(path)
+
+    def round_(self, a, b):
+        round_ = gate.new_round()
+        round_["candidate"], round_["B"] = peaks(*a), peaks(*b)
+        return round_
+
+    def record(self, noise, a, b):
+        return gate.record_row("hwm_kb", self.baseline(noise), [], [self.round_(a, b)])
+
+    def test_the_target_holds_the_peak_of_a_with_its_noise(self):
+        # 4 667 316 · 1.02 = 4 760 662.32; B stays far over the target and under the ceiling in every case.
+        for peak_a, outcome in ((4760662, "ok"), (4760663, "block")):
+            with self.subTest(peak_a=peak_a):
+                row = self.record(0.02, (4600000, peak_a, 4650000), (7000000, 7100000, 6900000))
+                self.assertEqual((row["aggregate"], row["candidate"]["value"], row["outcome"], row["limit_basis"]),
+                                 ("max_A", peak_a, outcome, "noise"))
+                self.assertAlmostEqual(row["limit"], self.TARGET * 1.02)
+
+    def test_the_peak_of_b_answers_to_the_absolute_ceiling_alone(self):
+        self.assertEqual(verdict.GATE_HWM_LIMIT_KB, self.CEILING)
+        series_a = peaks(4600000, 4610000, 4620000)
+        for peak_b, outcome in ((self.CEILING, "ok"), (self.CEILING + 1, "block")):
+            with self.subTest(peak_b=peak_b):
+                series_b = peaks(6900000, peak_b, 7000000)
+                [ceiling] = [r for r in gate.ceiling_rows(series_a, series_b) if r["metric"] == "hwm_kb"]
+                self.assertEqual((ceiling["candidate"]["value"], ceiling["limit"], ceiling["outcome"]),
+                                 (peak_b, self.CEILING, outcome))
+                row = self.record(0.0, (4600000, 4610000, 4620000), (6900000, peak_b, 7000000))
+                self.assertEqual((row["candidate"]["value"], row["outcome"]), (4620000, "ok"),
+                                 "B over the target is no loss of the record")
+
+    def test_the_peak_of_a_and_b_together_is_compared_with_nothing(self):
+        self.assertNotIn("max_AB", {aggregate for _, aggregate in verdict.GATE_RECORD.values()})
+        # A at the target exactly and B over it: the peak of both would block at any noise under 57 %.
+        round_ = self.round_((4600000, self.TARGET, 4650000), (7300000, 7340032, 7200000))
+        self.assertEqual(gate._round_side("hwm_kb", round_), ("valid", self.TARGET))
+        self.assertEqual(gate._names({**round_, "names": {"candidate": ["A-c1"], "B": ["B-c1"]}}, "max_A"), ["A-c1"])
+        row = gate.record_row("hwm_kb", self.baseline(0.0), [], [round_])
+        self.assertEqual((row["candidate"]["value"], row["delta"], row["outcome"]), (self.TARGET, 0.0, "ok"))
 
 
 if __name__ == "__main__":

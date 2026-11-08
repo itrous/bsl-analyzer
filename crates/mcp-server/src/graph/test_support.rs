@@ -19,6 +19,18 @@ pub(super) fn write(root: &Path, rel: &str, text: &str) {
     fs::write(path, text).unwrap();
 }
 
+/// Replaces an existing file with one change event, so a wait for the hub to move past it
+/// covers the whole write. Rewriting in place truncates and then writes, and inotify merges
+/// the two modifications only when the watcher has not read the first yet; the file is
+/// therefore staged beside `root`, outside the watched tree, and moved in.
+pub(super) fn replace(root: &Path, rel: &str, text: &str) {
+    use std::io::Write as _;
+
+    let mut staged = tempfile::NamedTempFile::new_in(root.parent().unwrap()).unwrap();
+    staged.write_all(text.as_bytes()).unwrap();
+    staged.persist(root.join(rel)).unwrap();
+}
+
 /// Minimal common-module metadata descriptor so the module is declared in the
 /// configuration (the resolver refuses qualified calls to undeclared modules)
 /// and its client/server execution context is known.
@@ -67,6 +79,19 @@ pub(crate) fn workspace_hub(root: &Path) -> crate::change_hub::WorkspaceChangeHu
     crate::change_hub::WorkspaceChangeHub::start_targets_excluding(
         vec![crate::change_hub::WatchTarget::recursive(root.to_path_buf())],
         cache.exclusions(root),
+    )
+}
+
+/// A [`crate::change_hub::WorkspaceChangeHub::start_manual`] hub over the coverage a build of
+/// `root` declares — the scan roots and exclusions [`GraphState`] hands its hub — so the build's
+/// own declaration finds it already standing there.
+pub(crate) fn manual_workspace_hub(root: &Path) -> crate::change_hub::WorkspaceChangeHub {
+    let excluded = crate::cache::WorkspaceCacheLayout::for_workspace(root).exclusions(root);
+    let project = crate::graph::ProjectSnapshot::load_excluding(root, &excluded);
+    crate::change_hub::WorkspaceChangeHub::start_manual(
+        crate::change_hub::watch_targets_for(root, &project.scan_roots),
+        excluded,
+        project.user_excluded,
     )
 }
 
@@ -328,49 +353,6 @@ pub(crate) fn published_report(graph: &GraphState) -> super::GraphStatusReport {
         published
     });
     sample.expect("the wait captured a published report")
-}
-
-/// The snapshot of `generation`, taken once the publication of it serves reads.
-///
-/// A publication turns the status and the published record before the replacement's pause on
-/// reads is let go, so a checkout right after either may still be refused. The wait is for the
-/// checkout itself. It fails at once on what it does not wait out: a failed build, a failed
-/// reload, and a newer generation served instead. Only the drift watcher's schedule retries a
-/// failure, so this is the wait of a stand that runs no watcher.
-#[track_caller]
-pub(crate) fn wait_serving(graph: &GraphState, generation: u64) -> super::GraphSnapshot {
-    let mut served = None;
-    wait_until(graph, &format!("generation {generation} to be served"), || {
-        let failed = {
-            let inner = lock_recover(&graph.inner);
-            matches!(inner.status, GraphStatus::Failed(_))
-                || inner.published.as_ref().is_some_and(|published| {
-                    matches!(published.reload, super::state::ReloadState::Failed(_))
-                })
-        };
-        if failed {
-            panic!(
-                "the publication of generation {generation} failed; {}",
-                graph_state_summary(graph)
-            );
-        }
-        let Some(snapshot) = graph.snapshot() else {
-            return false;
-        };
-        if snapshot.generation > generation {
-            panic!(
-                "generation {} was served instead of {generation}; {}",
-                snapshot.generation,
-                graph_state_summary(graph)
-            );
-        }
-        if snapshot.generation < generation {
-            return false;
-        }
-        served = Some(snapshot);
-        true
-    });
-    served.expect("the wait captured the served snapshot")
 }
 
 /// Wait until at least `passes` completed publish passes have been counted.

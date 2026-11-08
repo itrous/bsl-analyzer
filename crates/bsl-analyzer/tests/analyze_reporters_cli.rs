@@ -37,6 +37,88 @@ fn analyze_writes_sarif_report() {
     assert_eq!(report["runs"][0]["tool"]["driver"]["name"], "bsl-analyzer");
 }
 
+/// The calculation-register recorder rule reaches the report as a warning, and only for the
+/// history of an employee. A table without parameters stays with the neighbouring rule and is
+/// a warning too; an explicit `<>` exclusion and a filter by the document's own recorder are
+/// not reported.
+#[test]
+fn analyze_sarif_reports_the_calculation_register_recorder_rule_as_a_warning() {
+    let temp = TempDir::new().expect("tempdir");
+    let source_dir = temp.path().join("src");
+    let output_dir = temp.path().join("reports");
+    fs::create_dir_all(&source_dir).expect("source dir");
+    fs::create_dir_all(&output_dir).expect("output dir");
+
+    let table = "РегистрРасчета.Начисления.ФактическийПериодДействия";
+    let query = |name: &str, table_and_filter: &str| {
+        format!(
+            "Функция {name}(Сотрудник, Ссылка) Экспорт\n    Запрос = Новый Запрос;\n    Запрос.Текст = \"ВЫБРАТЬ Т.Результат КАК Результат\n    |ИЗ {table_and_filter}\";\n    Возврат Запрос;\nКонецФункции\n\n"
+        )
+    };
+    let module = [
+        "Процедура Запись()\n    Движения.Начисления.Записать();\nКонецПроцедуры\n\n".to_owned(),
+        query("История", &format!("{table}(Сотрудник = &Сотрудник) КАК Т")),
+        query("БезПараметров", &format!("{table} КАК Т\n    |ГДЕ Т.Регистратор <> &Ссылка")),
+        query(
+            "Исключение",
+            &format!("{table}(Сотрудник = &Сотрудник И Регистратор <> &Ссылка) КАК Т"),
+        ),
+        query("СвойНабор", &format!("{table}(Регистратор = &Ссылка) КАК Т")),
+    ]
+    .concat();
+    fs::write(source_dir.join("Module.bsl"), &module).expect("fixture");
+    let line_of = |needle: &str| {
+        module.lines().position(|line| line.contains(needle)).expect("needle in fixture") + 1
+    };
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+        .args(["analyze", "-s"])
+        .arg(&source_dir)
+        .args(["-r", "sarif", "-o"])
+        .arg(&output_dir)
+        .arg("-q")
+        .output()
+        .expect("run bsl-analyzer");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("bsl-analyzer.sarif")).expect("report contents"),
+    )
+    .expect("valid sarif json");
+    let results = report["runs"][0]["results"].as_array().expect("results array");
+    let of_rule = |rule: &str| -> Vec<(String, u64)> {
+        results
+            .iter()
+            .filter(|result| result["ruleId"] == rule)
+            .map(|result| {
+                (
+                    result["level"].as_str().expect("level").to_owned(),
+                    result["locations"][0]["physicalLocation"]["region"]["startLine"]
+                        .as_u64()
+                        .expect("start line"),
+                )
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        of_rule("CalculationRegisterVirtualTableWithoutRecorder"),
+        [("warning".to_owned(), line_of("Сотрудник = &Сотрудник) КАК Т") as u64)],
+    );
+    assert_eq!(
+        of_rule("VirtualTableCallWithoutParameters"),
+        [(
+            "warning".to_owned(),
+            line_of("ИЗ РегистрРасчета.Начисления.ФактическийПериодДействия КАК Т") as u64
+        )],
+    );
+}
+
 #[test]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn issue80_dom_sarif_accepts_valid_and_rejects_invalid_controls() {

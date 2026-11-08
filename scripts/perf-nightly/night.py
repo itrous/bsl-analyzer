@@ -10,6 +10,10 @@ on the machine do not stop or cancel anything: their load is part of what the
 night and its calibration measure. With `--publish` the night's perf issues
 are published (`publish.py`) before its summary is written. The diagnostics
 diff, its triage and diagnostics issues are not run here.
+
+Before the warm set and whatever the state of its noise, develop is measured
+cold against the record (`gate.record_night`), inside the same window; a night
+without a passed record is not `ok`.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import re
 import subprocess
 
 import corpus
+import gate as release_gate
 import perf_nightly
 import publish
 import verdict
@@ -384,13 +389,14 @@ def select_base(clone: str, cand_sha: str) -> str:
     tags = [t for t in git("tag", "--list", "v*", cwd=clone).split() if verdict.version_key(t)]
     for tag in sorted(tags, key=verdict.version_key, reverse=True):
         sha = git("rev-parse", f"{tag}^{{commit}}", cwd=clone)
-        if sha == cand_sha:
-            continue
-        ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", sha, cand_sha], cwd=clone,
-                                  capture_output=True)
-        if ancestor.returncode == 0:
+        if sha != cand_sha and is_ancestor(clone, sha, cand_sha):
             return tag
     raise HarnessError("no_base", "no release tag is an ancestor of the candidate")
+
+
+def is_ancestor(clone: str, sha: str, of: str) -> bool:
+    return subprocess.run(["git", "merge-base", "--is-ancestor", sha, of], cwd=clone,
+                          capture_output=True).returncode == 0
 
 
 def ensure_help(data: Data, binary: dict, help_section: dict, clock) -> None:
@@ -485,6 +491,11 @@ def write_report(out_dir: str, summary: dict, rows: list, table: dict | None) ->
                          f"{', '.join(str(v) for v in item['values']) or '-'} | {verdict.fmt(item['base'])} | "
                          f"{before} | {DIAG_STATE_TEXT[item['state']]} |")
         lines.append("")
+    if summary.get("record"):
+        record = summary["record"]
+        lines += ["## Рекорд", "", f"- итог: {record['verdict']}",
+                  f"- причины: {'; '.join(record['reasons']) or '-'}",
+                  f"- отчёт: {record['report'] or '-'}", ""]
     if summary.get("publish"):
         lines += ["## Публикация", ""] + [
             f"- {e['action']} {'-' if e['issue'] is None else '#' + str(e['issue'])} {e['key']}"
@@ -506,7 +517,18 @@ def write_report(out_dir: str, summary: dict, rows: list, table: dict | None) ->
         fh.write("\n".join(lines) + "\n")
 
 
-def run_night(args, clock, *, now: datetime.datetime | None = None, builder=None) -> dict:
+def with_record(result: dict, record: dict | None) -> dict:
+    """The verdict of a night with its record: block, issue, incomplete, ok. Only
+    a passed record lets a night be `ok`."""
+    if record is None:
+        return result
+    outcomes = (result["verdict"], record["verdict"])
+    found = next(v for v in ("block", "issue", "incomplete", "ok") if v in outcomes)
+    reasons = [r if r.startswith("block: ") else f"record incomplete: {r}" for r in record["reasons"]]
+    return {**result, "verdict": found, "reasons": result["reasons"] + reasons}
+
+
+def run_night(args, clock, *, now: datetime.datetime | None = None, builder=None, machine=None) -> dict:
     data = Data(args.data_dir)
     now = now or datetime.datetime.now()
     date = args.date or now.strftime("%Y-%m-%d")
@@ -529,12 +551,12 @@ def run_night(args, clock, *, now: datetime.datetime | None = None, builder=None
         lock.close()
         raise HarnessError("night_busy", "another night holds this data dir") from None
     try:
-        return _night(args, clock, data, now, date, gate, out_dir, builder)
+        return _night(args, clock, data, now, date, gate, out_dir, builder, machine)
     finally:
         lock.close()
 
 
-def _night(args, clock, data, now, date, gate, out_dir, builder) -> dict:
+def _night(args, clock, data, now, date, gate, out_dir, builder, machine) -> dict:
     manifest = corpus.load_manifest(args.corpora or data.path("corpora.toml"))
     corpora = [c for c in manifest["corpora"] if any(c in members for _, members in SUITE)]
     series = f"gate-{gate}" if gate else f"night-{date}"
@@ -547,6 +569,12 @@ def _night(args, clock, data, now, date, gate, out_dir, builder) -> dict:
                "noise": {"status": "-"}, "measured": False}
 
     def finish(rows, table, result):
+        record = summary.get("record")
+        result = with_record(result, record)
+        if getattr(args, "publish", False) and record and record["summary"]:
+            saved = read_json(data.path(*record["summary"].split("/")[1:]))
+            summary["publish"] = (summary.get("publish") or []) + publish.publish_record(
+                out_dir, saved, publish.forbidden_strings(data, corpora), lambda sha, of: is_ancestor(clone, sha, of))
         summary.update(finished_at=verdict.now_iso(), elapsed_s=clock.now() - began,
                        verdict=result["verdict"], reasons=result["reasons"],
                        counts=result.get("counts", {}), not_compared=verdict.not_compared(rows))
@@ -572,6 +600,8 @@ def _night(args, clock, data, now, date, gate, out_dir, builder) -> dict:
     summary["base"] = {"label": base["label"], "sha": base["sha"]}
     for binary in (cand, base):
         ensure_help(data, binary, manifest["platform_help"], clock)
+    if gate is None:
+        summary["record"] = release_gate.record_night(args, clock, data, date, cand, window, machine)
 
     estimates = Estimates(previous_history(data, date))
     session = Session(args, clock, data, corpora, window, estimates)

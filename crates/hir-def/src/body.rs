@@ -625,10 +625,6 @@ pub enum BodyDiagnostic<R = TextRange> {
         ident_range: R,
     },
 
-    CreateQueryInCycle {
-        range: R,
-    },
-
     DeletingCollectionItem {
         collection_text: String,
         range: R,
@@ -720,6 +716,11 @@ pub enum BodyDiagnostic<R = TextRange> {
     },
 
     ReservedWordAsMethodName {
+        name: String,
+        range: R,
+    },
+
+    BuiltinFunctionNameAsDeclaration {
         name: String,
         range: R,
     },
@@ -933,9 +934,6 @@ impl<R> BodyDiagnostic<R> {
                 stmt_range: f(stmt_range),
                 ident_range: f(ident_range),
             },
-            BodyDiagnostic::CreateQueryInCycle { range } => {
-                BodyDiagnostic::CreateQueryInCycle { range: f(range) }
-            }
             BodyDiagnostic::DeletingCollectionItem { collection_text, range } => {
                 BodyDiagnostic::DeletingCollectionItem { collection_text, range: f(range) }
             }
@@ -1001,6 +999,9 @@ impl<R> BodyDiagnostic<R> {
             }
             BodyDiagnostic::ReservedWordAsMethodName { name, range } => {
                 BodyDiagnostic::ReservedWordAsMethodName { name, range: f(range) }
+            }
+            BodyDiagnostic::BuiltinFunctionNameAsDeclaration { name, range } => {
+                BodyDiagnostic::BuiltinFunctionNameAsDeclaration { name, range: f(range) }
             }
             BodyDiagnostic::RedundantAccessToObject { kind, range } => {
                 BodyDiagnostic::RedundantAccessToObject { kind, range: f(range) }
@@ -1315,7 +1316,6 @@ impl<R: Copy> BodyDiagnostic<R> {
             BodyDiagnostic::CommonModuleAssign { range, .. } => *range,
             BodyDiagnostic::MissingCommonModuleMethod { range, .. } => *range,
             BodyDiagnostic::RewriteMethodParameter { ident_range, .. } => *ident_range,
-            BodyDiagnostic::CreateQueryInCycle { range } => *range,
             BodyDiagnostic::DeletingCollectionItem { range, .. } => *range,
             BodyDiagnostic::SelfInsertion { range } => *range,
             BodyDiagnostic::DeprecatedAttribute8312 { range, .. } => *range,
@@ -1337,6 +1337,7 @@ impl<R: Copy> BodyDiagnostic<R> {
             BodyDiagnostic::OSUsersMethod { range } => *range,
             BodyDiagnostic::ProcedureReturnsValue { range } => *range,
             BodyDiagnostic::ReservedWordAsMethodName { range, .. } => *range,
+            BodyDiagnostic::BuiltinFunctionNameAsDeclaration { range, .. } => *range,
             BodyDiagnostic::RedundantAccessToObject { range, .. } => *range,
             BodyDiagnostic::StyleElementConstructors { range, .. } => *range,
             BodyDiagnostic::TempFilesDir { range, .. } => *range,

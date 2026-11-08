@@ -21,8 +21,9 @@ pub enum SdblDiagnostic {
         range: TextRange,
     },
 
-    /// A calculation-register table whose condition parameter does not narrow it to a recorder,
-    /// so the platform builds it over every record of the register.
+    /// A calculation-register table whose condition parameter neither narrows it to a recorder nor
+    /// excludes one on purpose, so the platform builds it over every record of the register. A
+    /// table reported as [`Self::VirtualTableCallWithoutParameters`] is left to that report.
     CalculationRegisterVirtualTableWithoutRecorder {
         table_name: String,
         register_name: String,
@@ -85,6 +86,13 @@ pub enum SdblDiagnostic {
     },
 
     DuplicateAlias {
+        alias: String,
+        range: TextRange,
+    },
+
+    /// An alias of an enclosing query named inside a derived table, where the platform does not
+    /// see it. The range is the alias token alone.
+    UnavailableAlias {
         alias: String,
         range: TextRange,
     },
@@ -309,6 +317,12 @@ impl SdblDiagnostic {
                     alias
                 )
             }
+            Self::UnavailableAlias { alias, .. } => {
+                format!(
+                    "Псевдоним \"{}\" внешнего запроса недоступен внутри производной таблицы",
+                    alias
+                )
+            }
             Self::FullOuterJoin { .. } => {
                 "Использование FULL OUTER JOIN значительно снижает производительность запроса. \
                  Рассмотрите возможность переписать с использованием UNION и LEFT JOIN"
@@ -408,6 +422,7 @@ impl SdblDiagnostic {
             Self::InvalidArgumentCount { range, .. } => *range,
             Self::AliasRequired { range, .. } => *range,
             Self::DuplicateAlias { range, .. } => *range,
+            Self::UnavailableAlias { range, .. } => *range,
             Self::FullOuterJoin { range, .. } => *range,
             Self::JoinWithSubQuery { range, .. } => *range,
             Self::AliasWithoutAsKeyword { range, .. } => *range,
@@ -441,6 +456,7 @@ impl SdblDiagnostic {
             Self::CalculationRegisterVirtualTableWithoutRecorder { .. } => false,
             Self::AliasRequired { .. } => false,
             Self::DuplicateAlias { .. } => true,
+            Self::UnavailableAlias { .. } => true,
             Self::FullOuterJoin { .. } => false,
             Self::JoinWithSubQuery { .. } => false,
             Self::AliasWithoutAsKeyword { .. } => false,

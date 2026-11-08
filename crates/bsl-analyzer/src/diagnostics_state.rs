@@ -13,6 +13,7 @@ impl GlobalState {
     }
 
     pub fn update_diagnostics_config(&mut self) {
+        let fold_was_read = self.foreign_bindings_readers_enabled();
         let project_locale = self.project.as_ref().and_then(|p| Self::project_locale(&p.config));
         let locale = resolve_locale(project_locale, self.lsp_locale);
 
@@ -50,6 +51,12 @@ impl GlobalState {
                 "disabled diagnostics from config"
             );
         }
+
+        // The load's end skipped the priming while nothing read the fold; a reload that
+        // switches a reader on would leave the whole scan to the first form module.
+        if self.vfs_done && !fold_was_read && self.foreign_bindings_readers_enabled() {
+            self.prime_foreign_handler_bindings();
+        }
     }
 
     fn project_locale(config: &project_model::ProjectConfig) -> Option<Locale> {
@@ -61,32 +68,15 @@ impl GlobalState {
         locale: Locale,
     ) -> DiagnosticsConfigInput {
         let diagnostics = project.diagnostics_rules_json();
-        let config = ide::DiagnosticsConfig::from_project_file(
+        // `to_input` is the interned key the diagnostics query runs under. Listing the
+        // fields here instead would drop any field the list forgets, and the query
+        // would run without it.
+        ide::DiagnosticsConfig::from_project_file(
             &diagnostics,
             locale,
             project.config.config_file_path(),
-        );
-
-        let disabled: Vec<String> = config.disabled.iter().map(|code| code.to_string()).collect();
-        let enabled: Vec<String> = config.enabled.iter().map(|code| code.to_string()).collect();
-
-        let parameters: Vec<(String, String)> = config
-            .parameters
-            .iter()
-            .map(|(code, value)| {
-                (code.to_string(), serde_json::to_string(value).unwrap_or_default())
-            })
-            .collect();
-
-        DiagnosticsConfigInput::from_raw(
-            disabled,
-            enabled,
-            parameters,
-            config.ordinary_app_support,
-            config.dataflow_max_iterations,
-            locale,
-            config.bslls_suppression_compat,
         )
+        .to_input()
     }
 }
 
@@ -208,5 +198,45 @@ exclude = ["ТекущаяДата", "ТекущаяДатта"]
         let parameters: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert_eq!(parameters["exclude"], serde_json::json!(["ТекущаяДата", "ТекущаяДатта"]));
         assert!(!input.disabled.iter().any(|code| code == "DeprecatedPlatformApi"));
+    }
+
+    /// The LSP runs on the interned input, not on the `DiagnosticsConfig` the file
+    /// was parsed into. An override that the parser accepted must still be in that
+    /// input, or the findings keep the default grade.
+    #[test]
+    fn metadata_override_in_the_project_config_reaches_the_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bsl-analyzer.toml"),
+            r#"
+min_platform_version = "8.3.17"
+
+[diagnostics.metadataOverrides.CommonModuleInvalidType]
+lspSeverity = "hint"
+diagnosticType = "CodeSmell"
+"#,
+        )
+        .unwrap();
+        let project = project_model::Project::new(dir.path()).expect("valid test project");
+
+        assert_ne!(
+            ide::DiagnosticsConfig::default()
+                .severity(ide::DiagnosticCode::CommonModuleInvalidType),
+            ide::Severity::Hint,
+            "control: the default grade is not the override"
+        );
+        let input = GlobalState::config_from_project(&project, Locale::default());
+        let config = ide::DiagnosticsConfig::from_input(&input);
+        assert_eq!(
+            config.severity(ide::DiagnosticCode::CommonModuleInvalidType),
+            ide::Severity::Hint,
+            "loader dropped the override: {:?}",
+            input.metadata_overrides
+        );
+        let over = config
+            .metadata_overrides
+            .get(&ide::DiagnosticCode::CommonModuleInvalidType)
+            .expect("the override is in the input");
+        assert_eq!(over.diagnostic_type, Some(ide::DiagnosticType::CodeSmell));
     }
 }

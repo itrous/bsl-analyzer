@@ -15,7 +15,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Standard, MetadataTag::Badpractice],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 pub fn from_hir(
@@ -76,13 +76,13 @@ mod tests {
             expect![[r#"
                 StyleElementConstructors @ 2:20..2:43
                   message: Замените конструктор Цвет на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 3:15..3:40
                   message: Замените конструктор Шрифт на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 4:15..4:67
                   message: Замените конструктор Рамка на получение элемента стиля
-                  severity: Error"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -98,13 +98,13 @@ mod tests {
             expect![[r#"
                 StyleElementConstructors @ 1:22..1:48
                   message: Замените конструктор Цвет на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 2:19..2:38
                   message: Замените конструктор Шрифт на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 3:17..3:67
                   message: Замените конструктор Рамка на получение элемента стиля
-                  severity: Error"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -122,13 +122,13 @@ EndProcedure
             expect![[r#"
                 StyleElementConstructors @ 2:20..2:42
                   message: Замените конструктор Color на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 3:15..3:29
                   message: Замените конструктор Font на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 4:17..4:53
                   message: Замените конструктор Border на получение элемента стиля
-                  severity: Error"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -198,7 +198,7 @@ EndFunction
             expect![[r#"
                 StyleElementConstructors @ 6:9..6:28
                   message: Замените конструктор Цвет на получение элемента стиля
-                  severity: Error"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -217,7 +217,7 @@ EndFunction
             expect![[r#"
                 StyleElementConstructors @ 2:23..5:12
                   message: Замените конструктор Цвет на получение элемента стиля
-                  severity: Error"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -239,25 +239,25 @@ EndFunction
             expect![[r#"
                 StyleElementConstructors @ 2:23..2:45
                   message: Замените конструктор Цвет на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 3:17..3:40
                   message: Замените конструктор Шрифт на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 4:17..4:31
                   message: Замените конструктор Шрифт на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 5:18..5:29
                   message: Замените конструктор Рамка на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 6:22..6:41
                   message: Замените конструктор Цвет на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 7:32..7:51
                   message: Замените конструктор Цвет на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 8:10..8:33
                   message: Замените конструктор Color на получение элемента стиля
-                  severity: Error"#]],
+                  severity: Warning"#]],
         );
     }
 
@@ -274,13 +274,13 @@ EndFunction
             expect![[r#"
                 StyleElementConstructors @ 2:54..2:76
                   message: Замените конструктор Цвет на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 3:55..3:74
                   message: Замените конструктор Шрифт на получение элемента стиля
-                  severity: Error
+                  severity: Warning
                 StyleElementConstructors @ 4:60..4:108
                   message: Замените конструктор Рамка на получение элемента стиля
-                  severity: Error"#]],
+                  severity: Warning"#]],
         );
     }
 }

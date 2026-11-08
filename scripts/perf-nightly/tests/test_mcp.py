@@ -6,11 +6,20 @@ import os
 import unittest
 import warnings
 
+import fake_app
 from helpers import FakeClock, Workspace, set_mode
 
 from common import HarnessError
 
 CALLS = ["M1", "M2", "M3", "M5", "M6", "M7"]
+
+
+class FakeServerLaunchLog(unittest.TestCase):
+    def test_a_line_another_server_is_still_writing_is_not_counted_yet(self):
+        measured = b'{"env": {}}\n'
+        help_check = b'{"env": {"BSL_LOG": "info"}}\n'
+        cut_inside_a_letter = '{"env": {"PATH": "\u041c'.encode()[:-1]
+        self.assertEqual(fake_app.measured_launches(measured + help_check + measured + cut_inside_a_letter), 2)
 
 
 class McpMemory(Workspace):

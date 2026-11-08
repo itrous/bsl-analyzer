@@ -9,7 +9,7 @@
 
 use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
-use ide_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig, Severity};
+use ide_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig, MetadataOverride, Severity};
 use vfs::{FileId, FileSet, VfsPath};
 
 const CODE: DiagnosticCode = DiagnosticCode::FieldsFromJoinsWithoutIsNull;
@@ -319,8 +319,9 @@ fn issue_768_module_reports_only_the_unprotected_product() {
 
 const RATES: &str = "ИЗ Документ.Заказ.Товары КАК Товары ЛЕВОЕ СОЕДИНЕНИЕ РегистрСведений.Ставки КАК Ставки ПО Товары.Номенклатура = Ставки.Номенклатура";
 
-/// A field of the optional side used only in a condition does not reach the result; selecting
-/// it next to the same condition is still reported.
+/// A field of the optional side used only in a condition does not reach the result. Selected
+/// next to a condition on another source it is still reported, since that condition does not
+/// exclude the row without a pair; next to a condition on the side itself it is hidden.
 #[test]
 fn a_field_used_only_in_a_condition_is_not_reported() {
     assert_eq!(
@@ -330,8 +331,14 @@ fn a_field_used_only_in_a_condition_is_not_reported() {
         Vec::<String>::new()
     );
     assert_eq!(
-        reported(&module(&format!("ВЫБРАТЬ Ставки.Код {RATES} ГДЕ Ставки.Ставка = &Ставка"))),
+        reported(&module(&format!(
+            "ВЫБРАТЬ Ставки.Код {RATES} ГДЕ Товары.Номенклатура = &Номенклатура"
+        ))),
         vec!["Ставки.Код"]
+    );
+    assert_eq!(
+        reported(&module(&format!("ВЫБРАТЬ Ставки.Код {RATES} ГДЕ Ставки.Ставка = &Ставка"))),
+        Vec::<String>::new()
     );
 }
 
@@ -394,4 +401,112 @@ fn disabled_rule_reports_nothing() {
     assert_eq!(diagnostics(&join, &config), Vec::<Diagnostic>::new());
     assert_eq!(diagnostics(UNPROTECTED_PROCEDURE, &DiagnosticsConfig::default()).len(), 1);
     assert_eq!(diagnostics(UNPROTECTED_PROCEDURE, &config), Vec::<Diagnostic>::new());
+}
+
+/// What remains of the rule is what it always was: the wording, the level the configuration
+/// gives it, no tags and no fixes. A configured level is followed and disabling the code
+/// silences the report. The same field behind a `ГДЕ` that excludes the missing row is not
+/// reported, so the report above is not silent for another reason.
+#[test]
+fn a_remaining_report_keeps_its_message_level_tags_and_fixes() {
+    let field = module(&format!("ВЫБРАТЬ Ставки.Код {RATES}"));
+    let filtered = module(&format!("ВЫБРАТЬ Ставки.Код {RATES} ГДЕ Ставки.Ставка > 0"));
+    let level = |level: &str| DiagnosticsConfig {
+        metadata_overrides: std::collections::HashMap::from([(
+            CODE,
+            MetadataOverride { lsp_severity: Some(level.to_string()), ..Default::default() },
+        )]),
+        ..rule_enabled()
+    };
+
+    let found = diagnostics(&field, &rule_enabled());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(text_under(&field, &found[0]), "Ставки.Код");
+    assert_eq!(found[0].message, JOIN_MESSAGE);
+    assert_eq!(found[0].severity, Severity::Warning);
+    assert!(found[0].tags.is_empty(), "{:?}", found[0].tags);
+    assert!(found[0].fixes.is_empty(), "{:?}", found[0].fixes);
+
+    let found = diagnostics(&field, &level("Error"));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].severity, Severity::Error);
+    assert_eq!(found[0].message, JOIN_MESSAGE);
+    assert!(found[0].fixes.is_empty());
+
+    assert_eq!(diagnostics(&filtered, &level("Error")), Vec::<Diagnostic>::new());
+
+    let disabled = DiagnosticsConfig { disabled: vec![CODE], ..DiagnosticsConfig::default() };
+    assert_eq!(diagnostics(&field, &disabled), Vec::<Diagnostic>::new());
+}
+
+/// A schedule value is reported once, wherever it stands, with the wording it always had: the
+/// schedule one when its row is the schedule source itself or a comparison of the row number
+/// proves the row, the join one when it stands on an optional join side that nothing proves.
+/// Wrapped in ЕСТЬNULL it is silent in each of them.
+#[test]
+fn a_schedule_value_is_reported_once_whatever_proves_its_row() {
+    let left = format!(
+        "Документ.Движение КАК Движение ЛЕВОЕ СОЕДИНЕНИЕ {SCHEDULE_SOURCE} ПО Движение.Ссылка = ДанныеГрафика.Регистратор"
+    );
+    let queries = |value: &str| {
+        [
+            (format!("ВЫБРАТЬ {value} КАК Ч ИЗ {SCHEDULE_SOURCE}"), SCHEDULE_DATA_MESSAGE),
+            (format!("ВЫБРАТЬ {value} КАК Ч ИЗ {left}"), JOIN_MESSAGE),
+            (
+                format!("ВЫБРАТЬ ВЫБОР КОГДА ДанныеГрафика.НомерСтроки <> 0 ТОГДА {value} ИНАЧЕ 0 КОНЕЦ КАК Ч ИЗ {SCHEDULE_SOURCE}"),
+                SCHEDULE_DATA_MESSAGE,
+            ),
+            (
+                format!("ВЫБРАТЬ ВЫБОР КОГДА ДанныеГрафика.НомерСтроки <> 0 ТОГДА {value} ИНАЧЕ 0 КОНЕЦ КАК Ч ИЗ {left}"),
+                SCHEDULE_DATA_MESSAGE,
+            ),
+            (
+                format!("ВЫБРАТЬ {value} КАК Ч ИЗ {SCHEDULE_SOURCE} ГДЕ ДанныеГрафика.НомерСтроки <> 0"),
+                SCHEDULE_DATA_MESSAGE,
+            ),
+            (
+                format!("ВЫБРАТЬ {value} КАК Ч ИЗ {left} ГДЕ ДанныеГрафика.НомерСтроки <> 0"),
+                JOIN_MESSAGE,
+            ),
+        ]
+    };
+    let wrapped = format!("ЕСТЬNULL({SCHEDULE_FIELD}, 0)");
+    for ((query, message), (protected, _)) in
+        queries(SCHEDULE_FIELD).into_iter().zip(queries(&wrapped))
+    {
+        let source = module(&query);
+        let found = diagnostics(&source, &rule_enabled());
+        assert_eq!(found.len(), 1, "{query}: {found:?}");
+        assert_eq!(text_under(&source, &found[0]), SCHEDULE_FIELD, "{query}");
+        assert_eq!(found[0].message, message, "{query}");
+
+        assert_eq!(
+            diagnostics(&module(&protected), &rule_enabled()),
+            Vec::<Diagnostic>::new(),
+            "{protected}"
+        );
+    }
+}
+
+/// The proof that hides an ordinary field of an optional side does not hide a schedule value:
+/// in one query a `ГДЕ` on both sources leaves only the schedule value reported, and without
+/// the condition on the ordinary source its field is reported as well.
+#[test]
+fn a_proof_of_the_row_hides_an_ordinary_field_but_not_a_schedule_value() {
+    let query = |condition: &str| {
+        module(&format!(
+            "ВЫБРАТЬ {SCHEDULE_FIELD} КАК Ч, Ставки.Код КАК Код ИЗ Документ.Движение КАК Движение ЛЕВОЕ СОЕДИНЕНИЕ {SCHEDULE_SOURCE} ПО Движение.Ссылка = ДанныеГрафика.Регистратор ЛЕВОЕ СОЕДИНЕНИЕ РегистрСведений.Ставки КАК Ставки ПО Движение.Ссылка = Ставки.Регистратор ГДЕ {condition}"
+        ))
+    };
+    let texts = |source: &str| {
+        let mut found = diagnostics(source, &rule_enabled());
+        found.sort_by_key(|d| d.range.start());
+        found.iter().map(|d| text_under(source, d).to_string()).collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        texts(&query("ДанныеГрафика.НомерСтроки <> 0 И Ставки.Ставка <> 0")),
+        [SCHEDULE_FIELD]
+    );
+    assert_eq!(texts(&query("ДанныеГрафика.НомерСтроки <> 0")), [SCHEDULE_FIELD, "Ставки.Код"]);
 }

@@ -52,6 +52,12 @@ def parse_run(run_id: str) -> Run:
     return Run(found["series"], found["role"], int(found["n"]), int(found["attempt"] or 1))
 
 
+def timed(call: str, value):
+    """Script value of `elapsed`: the seconds of `call`, a number or a function
+    of the run; a function that returns None and any other call keep `ELAPSED`."""
+    return lambda run, name: (value(run) if callable(value) else value) if name == call else None
+
+
 class Script:
     """What the fake server cannot give deterministically. Each value is a
     constant or a function of the run: `wall` (seconds to graph readiness),
@@ -199,6 +205,8 @@ class GateCase(unittest.TestCase):
         self.cand_path = self.fake_binary(CAND_LABEL, CAND_SHA)
         self.builds: list = []
         self.write_noise()
+        self.baseline_path = os.path.join(self.tmp, "baseline.json")
+        self.write_baseline()
 
     def script_values(self) -> dict:
         return {}
@@ -266,12 +274,30 @@ class GateCase(unittest.TestCase):
         write_json(self.data.path("gate-noise.json"), noise)
         return noise
 
+    def write_baseline(self) -> None:
+        """A record of this world that judges nothing: a noise this wide neither
+        blocks nor lets anything count as an improvement."""
+        values = {"graph_ready_s": 100.0, "graph_ready_cpu_s": 40.0, "graph_resolve_s": 17.8,
+                  "diagnostics_workspace_s": 22.1, "hwm_kb": 4 << 20, "references_1_s": 56.5,
+                  "references_2_same_s": 24.9, "references_3_other_s": 50.3}
+        noise = {"value": 1000.0, "source": "test", "created_at": "2026-10-29T00:00:00+00:00", "profile": "#/profile",
+                 "statistic": "test"}
+        write_json(self.baseline_path, {
+            "schema": gate.BASELINE_SCHEMA, "profile": self.fingerprint(), "protocol": gate.measured_protocol(),
+            "metrics": {key: {"value": values[key], "unit": verdict.GATE_RECORD[key][0],
+                              "aggregate": verdict.GATE_RECORD[key][1], "record_sha": BASE_SHA,
+                              "measured_at": "2026-10-29T00:00:00+00:00",
+                              "evidence": {"kind": "historical_import", "summary": "test", "role": "base",
+                                           "series": "A", "runs": [], "confirmation": None},
+                              "noise": {**noise, "base_A_noise": noise} if key == "hwm_kb" else noise}
+                        for key in verdict.GATE_RECORD}})
+
     # -- running ----------------------------------------------------------------------
 
     def args(self, command="gate", label="g1", candidate="HEAD", *extra) -> argparse.Namespace:
         argv = [command, "--data-dir", self.data_dir, "--base", BASE_TAG]
         if command == "gate":
-            argv += ["--candidate", candidate, "--label", label]
+            argv += ["--candidate", candidate, "--label", label, "--baseline", self.baseline_path]
         return perf_nightly.parser().parse_args([*argv, *extra])
 
     def gate(self, *extra, label="g1", candidate="HEAD", builder=None, machine=None) -> tuple[int, dict, str]:
@@ -322,3 +348,7 @@ class GateCase(unittest.TestCase):
 
     def row(self, summary: dict, metric: str) -> dict:
         return next(r for r in summary["rows"] + summary["ceilings"] if r["metric"] == metric)
+
+    def decided(self, summary: dict) -> set:
+        """The outcomes of the rows against the previous release that judge anything."""
+        return {r["outcome"] for r in summary["rows"] if r["kind"] != "observation"}

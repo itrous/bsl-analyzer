@@ -3,6 +3,7 @@ pub mod ambiguous_field_in_query;
 pub mod assign_alias_fields_in_query;
 pub mod bad_words;
 pub mod begin_transaction_before_try_catch;
+pub mod builtin_function_name_as_declaration;
 pub mod cached_public;
 pub mod calculation_register_virtual_table_without_recorder;
 pub mod canonical_spelling_keywords;
@@ -87,6 +88,7 @@ pub mod join_with_sub_query;
 pub mod join_with_virtual_table;
 pub mod latin_and_cyrillic_symbol_in_word;
 pub mod line_length;
+pub mod local_call_with_query_in_cycle;
 pub mod logical_or_in_join_query_section;
 pub mod logical_or_in_the_where_section_of_query;
 pub mod magic_date;
@@ -129,6 +131,7 @@ pub mod pairing_broken_transaction;
 pub mod parse_error;
 pub mod platform_member_hidden_by_compatibility_mode;
 pub mod platform_member_newer_than_min_version;
+pub mod possibly_undefined_value;
 pub mod postfix_access_on_expression;
 pub mod privileged_module_method_call;
 pub mod procedure_returns_value;
@@ -169,11 +172,13 @@ pub mod type_mismatch;
 pub mod type_mismatch_by_doc_comment;
 pub mod typo;
 pub mod unary_plus_in_concatenation;
+pub mod unavailable_alias_in_query;
 pub mod unavailable_in_environment;
 pub mod uninitialized_local_variable;
 pub mod union_all;
 pub mod unknown_field_in_query;
 pub mod unknown_preprocessor_symbol;
+pub mod unknown_query_function;
 pub mod unknown_type_in_new;
 pub mod unlimited_length_string_usage_in_query;
 pub mod unreachable_code;
@@ -320,6 +325,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::ReservedParameterNames => Some(&reserved_parameter_names::METADATA),
         DiagnosticCode::ReservedWordAsMethodName => Some(&reserved_word_as_method_name::METADATA),
+        DiagnosticCode::BuiltinFunctionNameAsDeclaration => {
+            Some(&builtin_function_name_as_declaration::METADATA)
+        }
         DiagnosticCode::RewriteMethodParameter => Some(&rewrite_method_parameter::METADATA),
         DiagnosticCode::UnusedLocalMethod => Some(&unused_local_method::METADATA),
         DiagnosticCode::ExportVariables => Some(&export_variables::METADATA),
@@ -352,6 +360,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
             Some(&compilation_directive_need_less::METADATA)
         }
         DiagnosticCode::CreateQueryInCycle => Some(&create_query_in_cycle::METADATA),
+        DiagnosticCode::LocalCallWithQueryInCycle => {
+            Some(&local_call_with_query_in_cycle::METADATA)
+        }
         DiagnosticCode::ImplicitDatabaseReadInCycle => {
             Some(&implicit_database_read_in_cycle::METADATA)
         }
@@ -438,10 +449,12 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::AmbiguousFieldInQuery => Some(&ambiguous_field_in_query::METADATA),
         DiagnosticCode::DuplicateAliasInQuery => Some(&duplicate_alias_in_query::METADATA),
+        DiagnosticCode::UnavailableAliasInQuery => Some(&unavailable_alias_in_query::METADATA),
         DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder => {
             Some(&calculation_register_virtual_table_without_recorder::METADATA)
         }
         DiagnosticCode::UnknownFieldInQuery => Some(&unknown_field_in_query::METADATA),
+        DiagnosticCode::UnknownQueryFunction => Some(&unknown_query_function::METADATA),
         DiagnosticCode::InvalidVirtualTableParameters => {
             Some(&invalid_virtual_table_parameters::METADATA)
         }
@@ -524,6 +537,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::MismatchedArgCount => Some(&mismatched_arg_count::METADATA),
         DiagnosticCode::TypeMismatch => Some(&type_mismatch::METADATA),
         DiagnosticCode::TypeMismatchByDocComment => Some(&type_mismatch_by_doc_comment::METADATA),
+        DiagnosticCode::PossiblyUndefinedValue => Some(&possibly_undefined_value::METADATA),
         DiagnosticCode::UnresolvedField => Some(&unresolved_field::METADATA),
         DiagnosticCode::UnresolvedMetadataPath => Some(&unresolved_metadata_path::METADATA),
         DiagnosticCode::ReadOnlyPropertyAssignment => Some(&read_only_property::METADATA),
@@ -543,6 +557,10 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::SuppressionWithoutCode => Some(&crate::suppression::WITHOUT_CODE_METADATA),
     }
 }
+
+#[cfg(test)]
+#[path = "handlers/create_query_in_cycle_tests.rs"]
+mod create_query_in_cycle_tests;
 
 #[cfg(test)]
 #[path = "handlers/implicit_database_read_in_cycle_tests.rs"]

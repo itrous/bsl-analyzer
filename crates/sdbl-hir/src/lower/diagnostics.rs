@@ -1,7 +1,9 @@
 use super::context::LoweringContext;
+use super::missing_row::{AliasMatch, MissingRowConditions, QueryFacts};
 use crate::diagnostics::{SdblDiagnostic, UnprotectedFieldRef};
 use crate::hir::{
-    BinaryOp, ExprHir, FunctionKind, InValues, JoinType, Name, SdblHir, TableRef, UnaryOp,
+    BinaryOp, ExprHir, FunctionKind, InValues, JoinHir, JoinType, Name, SdblHir, TableRef, UnaryOp,
+    WhenClause,
 };
 use crate::standard_fields::{
     is_schedule_data_value_field, register_table_of_path, VirtualTableType,
@@ -9,6 +11,7 @@ use crate::standard_fields::{
 use crate::types::{MdoRef, SdblType};
 use bsl_metadata::MdoType;
 use stdx::case::CaseExt;
+use syntax::ast::AstNode;
 
 impl LoweringContext<'_> {
     /// Reports fields of the optional side of an outer join that reach the query result
@@ -16,13 +19,24 @@ impl LoweringContext<'_> {
     ///
     /// Rows of the preserved side that found no pair get NULL in every field of the
     /// optional side. NULL is neither zero nor an empty string: arithmetic with it yields
-    /// NULL, so a selected value has to be replaced through `ЕСТЬNULL` or reached only after
-    /// a test that the row is present. A use in a condition only filters the row out and is
-    /// not reported. The owner of a tabular section joined by its own ref always has a row,
-    /// so it is not an optional side. One diagnostic per join lists every unprotected use,
-    /// so the fix can be made in one place.
-    pub(super) fn check_joins_for_unprotected_fields(&mut self, hir: &SdblHir) {
-        let owner = owner_present_for_every_row(hir);
+    /// NULL, so a selected value has to be replaced through `ЕСТЬNULL` or reached only where
+    /// the missing row cannot arrive. A use in a condition only filters the row out and is
+    /// not reported. The owner of a tabular section joined by its own ref always has a row
+    /// while the section has one, so its own fields are not reported. One diagnostic per
+    /// join lists every unprotected use, so the fix can be made in one place.
+    pub(super) fn check_joins_for_unprotected_fields(
+        &mut self,
+        hir: &SdblHir,
+        query: &syntax::ast::SdblQuery,
+    ) {
+        let has_optional_side = |join: &JoinHir| {
+            matches!(join.join_type, JoinType::Left | JoinType::Right | JoinType::Full)
+        };
+        if !hir.joins.iter().any(has_optional_side) {
+            return;
+        }
+        let facts = QueryFacts::of(query);
+        let owners = owners_present_for_every_row(hir, query);
 
         for join in &hir.joins {
             // The preserved side of ПРАВОЕ and the other side of ПОЛНОЕ are the query's own
@@ -36,12 +50,8 @@ impl LoweringContext<'_> {
 
             let mut unprotected_fields = Vec::new();
             for side in optional_sides {
-                if owner.is_some_and(|owner| std::ptr::eq(owner, side)) {
-                    continue;
-                }
-                // A source without an alias is referred to by its table name.
-                NullableUses::new(side.effective_name(), NullSource::MissingRow)
-                    .collect(hir, &mut unprotected_fields);
+                let owner_present = owners.iter().any(|owner| std::ptr::eq(*owner, side));
+                collect_missing_row_uses(side, &facts, owner_present, hir, &mut unprotected_fields);
             }
 
             if !unprotected_fields.is_empty() {
@@ -673,7 +683,7 @@ enum PathStart<'t> {
 
 /// `ty` without the wrappers that do not change what it may hold: a defined type whose
 /// underlying type is known and an aggregate.
-fn expanded(ty: &SdblType) -> &SdblType {
+pub(super) fn expanded(ty: &SdblType) -> &SdblType {
     match ty {
         SdblType::DefinedType { underlying_type: Some(inner), .. } | SdblType::Aggregate(inner) => {
             expanded(inner)
@@ -720,25 +730,96 @@ fn direct_operands(expr: &ExprHir) -> Vec<&ExprHir> {
     }
 }
 
-/// The source in a query whose `ИЗ` list is one tabular section and whose one join is its
-/// owner, joined by nothing but the equality of their refs.
+/// One join with the sources of its two operands: everything joined so far on the left, the
+/// joined source with the joins nested in it on the right.
+struct JoinOperands<'h> {
+    join: &'h JoinHir,
+    left: Vec<&'h TableRef>,
+    right: Vec<&'h TableRef>,
+}
+
+impl JoinOperands<'_> {
+    fn makes_optional(&self, source: &TableRef) -> bool {
+        let contains = |sources: &[&TableRef]| sources.iter().any(|s| std::ptr::eq(*s, source));
+        match self.join.join_type {
+            JoinType::Inner | JoinType::Cross => false,
+            JoinType::Left => contains(&self.right),
+            JoinType::Right => contains(&self.left),
+            JoinType::Full => contains(&self.left) || contains(&self.right),
+        }
+    }
+}
+
+/// The sources whose row is present whenever the row of their tabular section is.
 ///
-/// Every row of a tabular section belongs to an existing owner, so the owner always has a
-/// row for it. Only this immediate pair is proven: in a chain of joins the flat join list
-/// does not tell which side a nested join preserves. Any other conjunct of the condition
-/// may filter the owner out, so it voids the proof.
-fn owner_present_for_every_row(hir: &SdblHir) -> Option<&TableRef> {
-    let ([source], [join]) = (hir.from.as_slice(), hir.joins.as_slice()) else {
-        return None;
+/// Every row of a tabular section belongs to an existing owner, so a join by nothing but the
+/// equality of their refs always finds the owner. The proof needs the owner to be a whole
+/// operand of that join, since a join nested with it could filter it out, and needs the
+/// section not to be optional because of any other join. Any other conjunct of the condition
+/// may filter the owner out as well, so it voids the proof. The flat join list does not say
+/// which side a join preserves, hence the walk over the syntax; a join that cannot be matched
+/// to its HIR leaves the proof out.
+fn owners_present_for_every_row<'h>(
+    hir: &'h SdblHir,
+    query: &syntax::ast::SdblQuery,
+) -> Vec<&'h TableRef> {
+    // Joins of a later `ИЗ` source are not lowered and cannot touch the rows of the first one.
+    let first_source = query.from_clause().and_then(|from| from.data_sources().next());
+    let (Some(first_source), Some(base)) = (first_source, hir.from.first()) else {
+        return Vec::new();
     };
-    let condition = join.condition.as_ref()?;
-    [(source, &join.table), (&join.table, source)]
-        .into_iter()
-        .find(|(section, owner)| {
-            owns_section(owner, section)
-                && joins_by_refs(condition, section.effective_name(), owner.effective_name())
-        })
-        .map(|(_, owner)| owner)
+    let mut joins = Vec::new();
+    if collect_join_operands(&first_source, base, hir, &mut joins).is_none() {
+        return Vec::new();
+    }
+
+    let mut owners = Vec::new();
+    for (index, operands) in joins.iter().enumerate() {
+        let Some(condition) = operands.join.condition.as_ref() else {
+            continue;
+        };
+        for (owner_side, section_side) in
+            [(&operands.left, &operands.right), (&operands.right, &operands.left)]
+        {
+            let [owner] = owner_side.as_slice() else {
+                continue;
+            };
+            let proven = section_side.iter().any(|section| {
+                owns_section(owner, section)
+                    && joins_by_refs(condition, section.effective_name(), owner.effective_name())
+                    && !joins
+                        .iter()
+                        .enumerate()
+                        .any(|(other, operands)| other != index && operands.makes_optional(section))
+            });
+            if proven {
+                owners.push(*owner);
+            }
+        }
+    }
+    owners
+}
+
+/// Records the joins of `source`, nested ones first, and returns all the sources under it.
+/// `None` when a join has no HIR or no source of its own.
+fn collect_join_operands<'h>(
+    source: &syntax::ast::SdblDataSource,
+    table: &'h TableRef,
+    hir: &'h SdblHir,
+    out: &mut Vec<JoinOperands<'h>>,
+) -> Option<Vec<&'h TableRef>> {
+    if !source.syntax().text_range().contains_range(table.range) {
+        return None;
+    }
+    let mut joined = vec![table];
+    for clause in source.join_clauses() {
+        let range = clause.syntax().text_range();
+        let join = hir.joins.iter().find(|join| join.range == range)?;
+        let right = collect_join_operands(&clause.data_source()?, &join.table, hir, out)?;
+        out.push(JoinOperands { join, left: joined.clone(), right: right.clone() });
+        joined.extend(right);
+    }
+    Some(joined)
 }
 
 /// `Документ.X` for `Документ.X.Секция`, and the same for a catalog, in either language.
@@ -779,55 +860,136 @@ fn is_ref_of(expr: &ExprHir, source: &str) -> bool {
                 || stdx::case::eq_ignore_case(field.as_str(), "Ref")))
 }
 
+/// The uses of an optional side that may observe the NULL of its missing row.
+///
+/// A schedule value is NULL in a present row too, and new proofs of the row must not change
+/// how it is treated, so it keeps its own patterns.
+fn collect_missing_row_uses(
+    side: &TableRef,
+    facts: &QueryFacts,
+    owner_present: bool,
+    hir: &SdblHir,
+    out: &mut Vec<UnprotectedFieldRef>,
+) {
+    let name = side.effective_name();
+    let row = MissingRow { side, facts, owner_present };
+    let mut uses = Vec::new();
+    NullableUses::new(name, NullSource::MissingRow(row)).collect(hir, &mut uses);
+
+    if register_table_of_path(&side.parts)
+        == Some((MdoType::CalculationRegister, VirtualTableType::ScheduleData))
+    {
+        uses.retain(|field| !is_schedule_data_value_field(&field.field_name));
+        let mut values = Vec::new();
+        NullableUses::new(name, NullSource::ScheduleRow).collect(hir, &mut values);
+        values.retain(|field| is_schedule_data_value_field(&field.field_name));
+        uses.append(&mut values);
+        uses.sort_by_key(|field| field.range.start());
+    }
+    out.append(&mut uses);
+}
+
+#[derive(Clone, Copy)]
+struct MissingRow<'a> {
+    side: &'a TableRef,
+    facts: &'a QueryFacts,
+    owner_present: bool,
+}
+
+impl<'a> MissingRow<'a> {
+    fn conditions(&self, aliases: AliasMatch) -> MissingRowConditions<'a> {
+        MissingRowConditions { side: self.side, facts: self.facts, aliases }
+    }
+}
+
 /// Why a side's field may be NULL, which decides where NULL can do harm and what proves the
 /// field is not NULL.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NullSource {
-    /// The row of an optional join side is missing. A condition on its field is false and
-    /// only filters the row out, so only the selected values are uses; a true comparison of
-    /// any of its fields proves the row is present.
-    MissingRow,
+#[derive(Clone, Copy)]
+enum NullSource<'a> {
+    /// The row of an optional join side is missing. A condition on its field only filters
+    /// the row out, so only the selected values are uses; whatever a condition evaluates to
+    /// without the row decides which of them the row can reach.
+    MissingRow(MissingRow<'a>),
+    /// The row of the `ДанныеГрафика` side is missing and the use is a schedule value: only
+    /// the explicit patterns below prove the row.
+    ScheduleRow,
     /// The value of a present row is empty, as a schedule value of `ДанныеГрафика` is. A
     /// condition on it is a use too, and the row's other fields say nothing about it.
     EmptyValue,
 }
 
+/// What keeps NULL away from an expression. Ordered by how much it hides.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Cover {
+    Nothing,
+    /// The row of the side is present. A field read through a reference may still be NULL,
+    /// so only the side's direct fields are safe.
+    DirectFields,
+    AllFields,
+}
+
 /// Uses of one side that may observe its NULL.
 ///
-/// A use is safe when NULL cannot reach it: inside `ЕСТЬNULL`, in a `ВЫБОР` branch that is
-/// taken only after a test has shown the side is present, next to an `ЕСТЬ NULL` test in a
-/// disjunction, or anywhere in a query whose selection condition already tests the side
-/// for presence. The null test itself is not a use.
+/// A use is safe when NULL cannot reach it: inside `ЕСТЬNULL`, in a `ВЫБОР` branch that
+/// the missing row cannot reach, next to an `ЕСТЬ NULL` test in a disjunction, or in a query
+/// whose selection condition excludes the missing row. The null test itself is not a use.
 struct NullableUses<'a> {
     side: &'a str,
-    source: NullSource,
+    source: NullSource<'a>,
 }
 
 impl<'a> NullableUses<'a> {
-    fn new(side: &'a str, source: NullSource) -> Self {
+    fn new(side: &'a str, source: NullSource<'a>) -> Self {
         Self { side, source }
     }
 
     fn collect(&self, hir: &SdblHir, out: &mut Vec<UnprotectedFieldRef>) {
-        let filtered_by_presence = hir
-            .where_clause
-            .as_ref()
-            .is_some_and(|condition| self.tests_presence_anywhere(condition));
+        let cover = self.cover_of_every_use(hir);
 
         for field in &hir.select.fields {
-            self.walk(&field.expr, filtered_by_presence, out);
+            self.walk(&field.expr, cover, out);
         }
-        if self.source == NullSource::EmptyValue {
+        if matches!(self.source, NullSource::EmptyValue) {
             if let Some(condition) = &hir.where_clause {
-                self.walk(condition, filtered_by_presence, out);
+                self.walk(condition, cover, out);
             }
         }
     }
 
-    fn walk(&self, expr: &ExprHir, protected: bool, out: &mut Vec<UnprotectedFieldRef>) {
+    fn cover_of_every_use(&self, hir: &SdblHir) -> Cover {
+        let filtered = hir.where_clause.as_ref();
+        match self.source {
+            // A conjunction lets the row through only if every conjunct does, so evaluating
+            // the whole condition asks whether any top-level conjunct excludes it.
+            NullSource::MissingRow(row) => {
+                let excluded = filtered.is_some_and(|condition| {
+                    !row.conditions(AliasMatch::Exact).of(condition).may_be_true()
+                });
+                if row.owner_present || excluded {
+                    Cover::DirectFields
+                } else {
+                    Cover::Nothing
+                }
+            }
+            NullSource::ScheduleRow | NullSource::EmptyValue => {
+                if filtered.is_some_and(|condition| self.tests_presence_anywhere(condition)) {
+                    Cover::AllFields
+                } else {
+                    Cover::Nothing
+                }
+            }
+        }
+    }
+
+    fn walk(&self, expr: &ExprHir, cover: Cover, out: &mut Vec<UnprotectedFieldRef>) {
         match expr {
             ExprHir::ColumnRef { parts, range, .. } => {
-                if !protected && self.is_side_field(parts) {
+                let hidden = match cover {
+                    Cover::Nothing => false,
+                    Cover::DirectFields => self.is_direct_field(parts, *range),
+                    Cover::AllFields => true,
+                };
+                if !hidden && self.is_side_field(parts) {
                     out.push(UnprotectedFieldRef {
                         table_alias: parts[0].to_string(),
                         field_name: parts[1].to_string(),
@@ -837,49 +999,113 @@ impl<'a> NullableUses<'a> {
             }
             ExprHir::IsNull { .. } => {}
             ExprHir::FunctionCall { function: FunctionKind::Isnull, .. } => {}
+            // `ВЫРАЗИТЬ(Поле КАК ...).Реквизит` reads through the field, as a dotted path does.
+            ExprHir::FunctionCall { member_access, .. } if !member_access.is_empty() => {
+                let cover = if cover == Cover::AllFields { cover } else { Cover::Nothing };
+                for operand in direct_operands(expr) {
+                    self.walk(operand, cover, out);
+                }
+            }
             ExprHir::Case { operand, when_clauses, else_expr, .. } => {
-                let conditions_are_uses = self.source == NullSource::EmptyValue;
-                // The operand of a simple `ВЫБОР` is compared implicitly; that equality is
-                // not taken as a proof.
-                let comparison_proves_row =
-                    self.source == NullSource::MissingRow && operand.is_none();
-                if conditions_are_uses {
-                    if let Some(operand) = operand {
-                        self.walk(operand, protected, out);
-                    }
-                }
-                let mut present = protected;
-                for clause in when_clauses {
-                    if conditions_are_uses {
-                        self.walk(&clause.condition, present, out);
-                    }
-                    let branch_present = present
-                        || self.proves_presence_when_true(&clause.condition, comparison_proves_row);
-                    self.walk(&clause.result, branch_present, out);
-                    present = present || self.proves_presence_when_false(&clause.condition);
-                }
-                if let Some(else_expr) = else_expr {
-                    self.walk(else_expr, present, out);
+                let operand = operand.as_deref();
+                let else_expr = else_expr.as_deref();
+                if let NullSource::MissingRow(row) = self.source {
+                    let conditions = row.conditions(AliasMatch::AsciiFold);
+                    self.walk_reachable_branches(
+                        conditions,
+                        operand,
+                        when_clauses,
+                        else_expr,
+                        cover,
+                        out,
+                    );
+                } else {
+                    self.walk_branches_by_patterns(operand, when_clauses, else_expr, cover, out);
                 }
             }
             ExprHir::BinaryOp { lhs, op: BinaryOp::Or, rhs, .. } => {
-                let guarded = protected || self.has_null_test(lhs) || self.has_null_test(rhs);
+                let guarded = if self.has_null_test(lhs) || self.has_null_test(rhs) {
+                    Cover::AllFields
+                } else {
+                    cover
+                };
                 self.walk(lhs, guarded, out);
                 self.walk(rhs, guarded, out);
             }
             ExprHir::In { values: InValues::Subquery(nested), .. } => {
                 for operand in direct_operands(expr) {
-                    self.walk(operand, protected, out);
+                    self.walk(operand, cover, out);
                 }
                 for field in &nested.select.fields {
-                    self.walk(&field.expr, protected, out);
+                    self.walk(&field.expr, cover, out);
                 }
             }
             _ => {
                 for operand in direct_operands(expr) {
-                    self.walk(operand, protected, out);
+                    self.walk(operand, cover, out);
                 }
             }
+        }
+    }
+
+    /// A branch whose condition cannot be true without the row is safe; so is everything
+    /// after a condition that is surely true without it.
+    fn walk_reachable_branches(
+        &self,
+        conditions: MissingRowConditions<'_>,
+        operand: Option<&ExprHir>,
+        when_clauses: &[WhenClause],
+        else_expr: Option<&ExprHir>,
+        cover: Cover,
+        out: &mut Vec<UnprotectedFieldRef>,
+    ) {
+        let mut cover = cover;
+        for clause in when_clauses {
+            let outcomes = conditions.of_when(operand, &clause.condition);
+            let branch_cover =
+                if outcomes.may_be_true() { cover } else { cover.max(Cover::DirectFields) };
+            self.walk(&clause.result, branch_cover, out);
+            if outcomes.is_always_true() {
+                cover = cover.max(Cover::DirectFields);
+            }
+        }
+        if let Some(else_expr) = else_expr {
+            self.walk(else_expr, cover, out);
+        }
+    }
+
+    fn walk_branches_by_patterns(
+        &self,
+        operand: Option<&ExprHir>,
+        when_clauses: &[WhenClause],
+        else_expr: Option<&ExprHir>,
+        cover: Cover,
+        out: &mut Vec<UnprotectedFieldRef>,
+    ) {
+        let conditions_are_uses = matches!(self.source, NullSource::EmptyValue);
+        // The operand of a simple `ВЫБОР` is compared implicitly; that equality is not taken
+        // as a proof.
+        let comparison_proves_row =
+            matches!(self.source, NullSource::ScheduleRow) && operand.is_none();
+        if conditions_are_uses {
+            if let Some(operand) = operand {
+                self.walk(operand, cover, out);
+            }
+        }
+        let mut present = cover;
+        for clause in when_clauses {
+            if conditions_are_uses {
+                self.walk(&clause.condition, present, out);
+            }
+            let proven = self.proves_presence_when_true(&clause.condition, comparison_proves_row);
+            let branch_present = if proven { Cover::AllFields } else { present };
+            self.walk(&clause.result, branch_present, out);
+            if self.proves_presence_when_false(&clause.condition) {
+                present = Cover::AllFields;
+            }
+        }
+        if let Some(else_expr) = else_expr {
+            self.walk(else_expr, present, out);
         }
     }
 
@@ -887,6 +1113,15 @@ impl<'a> NullableUses<'a> {
         // ASCII-only folding keeps the long-standing behaviour for Latin aliases; Cyrillic
         // aliases are matched as spelled.
         parts.len() >= 2 && parts[0].as_str().eq_ignore_ascii_case(self.side)
+    }
+
+    /// A field of the side itself rather than one read through a reference.
+    fn is_direct_field(&self, parts: &[Name], range: text_size::TextRange) -> bool {
+        parts.len() == 2
+            && match self.source {
+                NullSource::MissingRow(row) => !row.facts.is_dereferenced(range),
+                NullSource::ScheduleRow | NullSource::EmptyValue => true,
+            }
     }
 
     fn is_null_test(&self, expr: &ExprHir, negated_test: bool) -> bool {

@@ -3,18 +3,23 @@
 <!-- Блоки выше заполняются автоматически, не трогать -->
 ## Description
 
-Required parameters must not be omitted when calling procedures and functions.
+A call of a procedure or function must have at least as many positions as the
+method has required parameters. With fewer positions the platform rejects the call
+with `Недостаточно фактических параметров` ("not enough actual parameters"). The
+diagnostic reports such calls and names the parameters that have no position.
 
-If a required argument is skipped, the callee receives `Undefined`, which often
-does not match the intended contract of the method.
-
-If `Undefined` is actually a valid value, then it should be either:
-
-- passed explicitly;
-- or declared as a default value so the parameter becomes optional.
+A position left empty between commas is not a platform error: the callee receives
+`Undefined` there, even for a required parameter, and the diagnostic does not report
+that call. Standard #std640 still advises against skipping required parameters,
+because the callee may not cope with `Undefined`; this diagnostic does not check
+that advice.
 
 The current implementation reports only calls that were semantically resolved to
 their target, so the analyzer knows which parameters are required.
+
+Limitation: a call to a method of the same module that holds no expression at all,
+such as `Method(, )`, counts as one position shorter, so its last parameter is
+reported even though the platform accepts the call.
 ## Examples
 
 Given:
@@ -26,14 +31,15 @@ Procedure ChangeFormFieldColor(Form, FieldName, Color)
 Incorrect:
 
 ```bsl
-ChangeFormFieldColor(,"Result", StyleColors.ArthursShirtColor); // missing first parameter Form
-ChangeFormFieldColor(,,); // missing all required parameters
+ChangeFormFieldColor(ThisObject); // no position for FieldName and Color
+ChangeFormFieldColor(); // no position for any required parameter
 ```
 
 Correct:
 
 ```bsl
 ChangeFormFieldColor(ThisObject, "Result", Color);
+ChangeFormFieldColor(, "Result", Color); // Form receives Undefined
 ```
 
 ## Sources

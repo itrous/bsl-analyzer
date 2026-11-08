@@ -2353,7 +2353,10 @@ mod tests {
         wait_for_root_count(&engine, 2);
         let guard = engine.lock().unwrap();
         let published_engine = guard.as_ref().unwrap();
-        assert!(published_engine.workspace_roots().unwrap().contains_id("ext/live"));
+        assert!(published_engine
+            .workspace_roots()
+            .unwrap()
+            .contains_id(&"ext/live".replace('/', std::path::MAIN_SEPARATOR_STR)));
         let published_provider = published_engine.graph_context_provider().unwrap();
         assert!(
             !Arc::ptr_eq(&boot_provider, &published_provider),
@@ -2392,6 +2395,36 @@ mod tests {
     #[cfg(unix)]
     impl RetargetedLink {
         fn new() -> Self {
+            Self::assemble(|workspace| {
+                let graph = crate::graph::GraphState::for_workspace(workspace.to_path_buf());
+                graph.ensure_loading();
+                assert!(eventually(|| matches!(
+                    graph.status(),
+                    crate::graph::GraphStatus::Ready { .. }
+                )));
+                graph
+            })
+        }
+
+        /// [`Self::new`] whose graph builds once, on this thread, to its end.
+        fn built() -> Self {
+            Self::assemble(|workspace| {
+                let graph = crate::graph::GraphState::for_workspace(workspace.to_path_buf())
+                    .with_manual_builds();
+                graph.ensure_loading();
+                let built = graph.run_next_build();
+                assert!(
+                    matches!(built.status, crate::graph::GraphStatus::Ready { .. }),
+                    "{built:?}"
+                );
+                assert_eq!(graph.queued_builds(), 0);
+                graph
+            })
+        }
+
+        fn assemble(
+            first_build: impl FnOnce(&std::path::Path) -> crate::graph::GraphState,
+        ) -> Self {
             let dir = tempdir().unwrap();
             let workspace = dir.path().to_path_buf();
             let outside = tempdir().unwrap();
@@ -2433,12 +2466,7 @@ mod tests {
             engine.initialize_workspace_roots(boot_roots).unwrap();
             let engine: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
-            let graph = crate::graph::GraphState::for_workspace(workspace.clone());
-            graph.ensure_loading();
-            assert!(eventually(|| matches!(
-                graph.status(),
-                crate::graph::GraphStatus::Ready { .. }
-            )));
+            let graph = first_build(&workspace);
             let store = crate::graph::GraphStore::serving_file_for_test(
                 &crate::cache::graph_db_path(&workspace),
                 None,
@@ -2508,9 +2536,8 @@ mod tests {
     /// being replaced is what turns the retarget into a rebind.
     #[cfg(unix)]
     #[test]
-    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589; run: cargo test -p mcp-server --lib publish_hook_keeps_a_retargeted_roots_id -- --ignored"]
     fn publish_hook_keeps_a_retargeted_roots_id() {
-        let fixture = RetargetedLink::new();
+        let fixture = RetargetedLink::built();
         assert!(fixture.publish(), "the linked extension root must be installed");
         let before = fixture.engine_roots();
         let ext_id = RetargetedLink::extension_id(&before);
@@ -2609,7 +2636,6 @@ mod tests {
     /// provider keyed on the workspace instead of the layout would never find the artifact
     /// and the root table would stay frozen at its boot contents.
     #[test]
-    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589; run: cargo test -p mcp-server --lib publish_hook_transitions_roots_when_the_cache_lives_outside_the_workspace -- --ignored"]
     fn publish_hook_transitions_roots_when_the_cache_lives_outside_the_workspace() {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -2639,10 +2665,17 @@ mod tests {
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         );
-        let graph = graph.with_publish_hook(hook);
+        let graph = graph.with_publish_hook(hook).with_manual_builds();
+        let boot = engine.lock().unwrap().as_ref().unwrap().workspace_roots().unwrap().clone();
+        assert!(!boot.contains_id("ext/live"), "control: the boot table has no extension");
+        assert_eq!(boot.entries().count(), 1);
         graph.ensure_loading();
 
-        wait_for_root_count(&engine, 2);
+        let built = graph.run_next_build();
+        assert!(matches!(built.status, crate::graph::GraphStatus::Ready { .. }), "{built:?}");
+        assert_eq!(graph.queued_builds(), 0);
+        let roots = engine.lock().unwrap().as_ref().unwrap().workspace_roots().unwrap().clone();
+        assert_eq!(roots.entries().count(), 2, "the publish pass left the boot table in place");
         assert!(engine
             .lock()
             .unwrap()
@@ -3172,6 +3205,10 @@ mod tests {
     /// the shared embed pass re-embeds it into the live index. The refresh runs off the graph's
     /// own publish, not a hand-call, so the whole chain is exercised.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "waits on file-change events without a bound of its own, and a run under load on Windows outlasted any limit"
+    )]
     fn xml_drift_lifecycle_refreshes_context_and_reembeds_into_live_index() {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
@@ -3258,7 +3295,9 @@ mod tests {
             let guard = engine_arc.lock().unwrap();
             let dirty = guard.as_ref().unwrap().context_dirty_paths("code").unwrap();
             assert!(
-                dirty.contains(&bsl_search::FileKey::configuration(module_rel)),
+                dirty.contains(&bsl_search::FileKey::configuration(
+                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+                )),
                 "the owned module is marked context-dirty: {dirty:?}"
             );
         }
@@ -3558,7 +3597,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
-        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
+        let module_rel =
+            "CommonModules/Сервер/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR);
+        let module_rel = module_rel.as_str();
 
         // A chunk with a stale stored context and NO live embedding (so consumption needs no
         // embedder — the mark, not the vector, is under test).
@@ -3607,11 +3648,11 @@ mod tests {
         {
             let g = engine_arc.lock().unwrap();
             assert!(
-                g.as_ref()
-                    .unwrap()
-                    .context_dirty_paths("code")
-                    .unwrap()
-                    .contains(&bsl_search::FileKey::configuration(module_rel)),
+                g.as_ref().unwrap().context_dirty_paths("code").unwrap().contains(
+                    &bsl_search::FileKey::configuration(
+                        module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+                    )
+                ),
                 "the owned module is marked context-dirty",
             );
         }
@@ -3658,11 +3699,11 @@ mod tests {
         {
             let g = engine_arc.lock().unwrap();
             assert!(
-                g.as_ref()
-                    .unwrap()
-                    .context_dirty_paths("code")
-                    .unwrap()
-                    .contains(&bsl_search::FileKey::configuration(module_rel)),
+                g.as_ref().unwrap().context_dirty_paths("code").unwrap().contains(
+                    &bsl_search::FileKey::configuration(
+                        module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+                    )
+                ),
                 "a pending drift defers the refresh; the mark survives",
             );
         }
@@ -3690,11 +3731,11 @@ mod tests {
         {
             let g = engine_arc.lock().unwrap();
             assert!(
-                !g.as_ref()
-                    .unwrap()
-                    .context_dirty_paths("code")
-                    .unwrap()
-                    .contains(&bsl_search::FileKey::configuration(module_rel)),
+                !g.as_ref().unwrap().context_dirty_paths("code").unwrap().contains(
+                    &bsl_search::FileKey::configuration(
+                        module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+                    )
+                ),
                 "with no pending drift the mark is consumed",
             );
             // A publication that carries no root table (a stale cached graph adopted while its
@@ -3727,7 +3768,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
-        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
+        let module_rel =
+            "CommonModules/Сервер/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR);
+        let module_rel = module_rel.as_str();
 
         let db_path = workspace.join("search.db");
         {
@@ -3810,12 +3853,11 @@ mod tests {
 
         let guard = engine_arc.lock().unwrap();
         assert!(
-            guard
-                .as_ref()
-                .unwrap()
-                .context_dirty_paths("code")
-                .unwrap()
-                .contains(&bsl_search::FileKey::configuration(module_rel)),
+            guard.as_ref().unwrap().context_dirty_paths("code").unwrap().contains(
+                &bsl_search::FileKey::configuration(
+                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+                )
+            ),
             "a publication with nothing handed to it (bound 0) clears no marks; the mark survives",
         );
     }
@@ -3833,7 +3875,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
-        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
+        let module_rel =
+            "CommonModules/Сервер/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR);
+        let module_rel = module_rel.as_str();
 
         let db_path = workspace.join("search.db");
         {
@@ -3918,7 +3962,9 @@ mod tests {
                 .unwrap()
                 .context_dirty_paths("code")
                 .unwrap()
-                .contains(&bsl_search::FileKey::configuration(module_rel)),
+                .contains(&bsl_search::FileKey::configuration(
+                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+                )),
             "the leftover mark survives the boot publish nobody handed it to",
         );
 
@@ -3935,7 +3981,9 @@ mod tests {
                 .unwrap()
                 .context_dirty_paths("code")
                 .unwrap()
-                .contains(&bsl_search::FileKey::configuration(module_rel)),
+                .contains(&bsl_search::FileKey::configuration(
+                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+                )),
             "the leftover pickup consumed the mark with the wired bound",
         );
     }
@@ -4291,6 +4339,10 @@ mod tests {
     /// Deriving the refresh's early returns from `topology_changed` again makes the skip report
     /// success and the obligation vanishes.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "renames the graph database while it is open, which Windows refuses"
+    )]
     fn a_leftover_pickup_that_could_not_run_keeps_its_obligation() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
@@ -4362,6 +4414,10 @@ mod tests {
     /// they were handed over with; nothing else could clear the leftover mark, so the assertion
     /// cannot pass through another path by accident.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "renames the graph database while it is open, which Windows refuses"
+    )]
     fn a_kept_leftover_obligation_is_discharged_by_the_next_publish() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
@@ -4462,7 +4518,9 @@ mod tests {
                 .unwrap()
                 .context_dirty_paths("code")
                 .unwrap()
-                .contains(&bsl_search::FileKey::configuration(module_rel)),
+                .contains(&bsl_search::FileKey::configuration(
+                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+                )),
             "the discharged obligation cleared the leftover mark",
         );
     }

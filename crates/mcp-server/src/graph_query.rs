@@ -407,8 +407,19 @@ impl GraphDb {
     /// rows because they are written last) or a stale schema version is rejected so
     /// the caller rebuilds rather than serving a partial graph.
     pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("opening graph database at {}", path.display()))?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+            |error| {
+                let error = anyhow::Error::new(error)
+                    .context(format!("opening graph database at {}", path.display()));
+                // SQLite's cannot-open does not tell a missing file from any other reason; only
+                // a definite answer that the file is not there names it missing.
+                match path.try_exists() {
+                    Ok(false) => error
+                        .context(format!("graph database file {} does not exist", path.display())),
+                    _ => error,
+                }
+            },
+        )?;
         let db = Self::from_connection(conn);
         db.validate_meta()?;
         Ok(db)
@@ -437,7 +448,7 @@ impl GraphDb {
         }
         anyhow::ensure!(
             self.meta("publication_id")?.is_some_and(|id| !id.is_empty()),
-            "graph database has no publication_id"
+            "graph database has no publication_id (incomplete publication)"
         );
         // `nodes`/`edges` are the last meta rows finalize writes; their presence
         // means the build ran to completion.
@@ -783,11 +794,12 @@ impl GraphDb {
         let mut candidates: Vec<(String, &'static str)> = Vec::new();
         {
             let mut stmt = self.conn.prepare("SELECT id, kind FROM nodes")?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .context("scanning nodes for resolve")?;
-            for (id, kind) in rows {
+            // Row by row: the table holds every node of the workspace, and a list of
+            // all its rows beside the candidate list would only double the request's peak.
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (id, kind) = row.context("scanning nodes for resolve")?;
                 if seen.insert(id.clone()) {
                     candidates.push((id, node_kind(&kind)));
                 }
@@ -2061,6 +2073,28 @@ mod tests {
         assert!(newer.contains("newer"), "{newer}");
     }
 
+    /// Only a definite answer that the file is not there names it missing. A path the
+    /// filesystem cannot even be asked about (an interior NUL is refused on every platform
+    /// before any lookup) keeps the open failure alone.
+    #[test]
+    fn an_open_failure_names_the_file_missing_only_when_it_is_known_to_be_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent = dir.path().join("bsl-graph.db");
+        let error = format!("{:#}", GraphDb::open(&absent).err().expect("nothing to open"));
+        assert!(error.contains("opening graph database at"), "{error}");
+        assert!(
+            error.contains(&format!("graph database file {} does not exist", absent.display())),
+            "{error}"
+        );
+
+        let unanswerable = dir.path().join("bsl-graph\0.db");
+        assert!(unanswerable.try_exists().is_err(), "the stand left the path answerable");
+        let error = format!("{:#}", GraphDb::open(&unanswerable).err().expect("nothing to open"));
+        assert!(error.contains("opening graph database at"), "{error}");
+        assert!(!error.contains("does not exist"), "called missing: {error}");
+    }
+
     /// A subsystem's `<Content>` puts a common module into the graph as an `mdo`
     /// node. It is the same entity the resident publishes as a common module, and
     /// only a shared category lets the two rows meet.
@@ -2330,6 +2364,70 @@ mod tests {
             res.candidates.iter().filter(|c| c.id == "module/common/Сервер").collect();
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].match_kind, "exact");
+    }
+
+    /// The table read row by row answers what the shared ranker answers over the whole
+    /// candidate set — every stored node once, plus each owning module recovered from its
+    /// methods and not stored — compared whole, on queries in every tier and on caps
+    /// below the match count.
+    #[test]
+    fn resolve_answers_the_ranker_over_stored_and_recovered_nodes() {
+        let stored = [
+            ("module/common/Сервер", "module"),
+            ("method/common/Сервер/Считать", "method"),
+            ("method/common/Клиент/считать", "method"),
+            ("method/common/Клиент/Записать", "method"),
+            ("mdo/Catalog/Товары", "mdo"),
+            ("attribute/Catalog/Товары/Код", "attribute"),
+        ];
+        let db = graph_db_with_nodes(&stored);
+        let candidates: Vec<(String, &'static str)> = stored
+            .iter()
+            .map(|(id, kind)| ((*id).to_owned(), super::node_kind(kind)))
+            .chain([("module/common/Клиент".to_owned(), "module")])
+            .collect();
+
+        for query in ["Считать", "MODULE/COMMON/КЛИЕНТ", "Товары", "common", "нет", ""]
+        {
+            for limit in [0, 1, 3, 100] {
+                let res = db.resolve(query, limit).unwrap();
+                let (want, total) =
+                    ide::rank_resolve_candidates(candidates.iter().cloned(), query, limit);
+                assert_eq!(res, ide::ResolveResult::new(query, want, total), "{query:?}/{limit}");
+            }
+        }
+        let recovered = db.resolve("module/common/Клиент", 10).unwrap();
+        assert_eq!(
+            recovered.candidates.iter().map(|c| (c.id.as_str(), c.kind)).collect::<Vec<_>>(),
+            vec![("module/common/Клиент", "module")],
+            "the control: the unstored module is in the answer, recovered from its methods"
+        );
+    }
+
+    /// A row the scan cannot read fails the resolve instead of being skipped, even after
+    /// rows that read fine. The control is the same table without that row.
+    #[test]
+    fn resolve_reports_a_node_row_it_cannot_read() {
+        let db_with = |bad: bool| {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE nodes (id, kind);").unwrap();
+            conn.execute(
+                "INSERT INTO nodes (id, kind) VALUES ('method/common/А/Считать', 'method')",
+                [],
+            )
+            .unwrap();
+            if bad {
+                conn.execute("INSERT INTO nodes (id, kind) VALUES (X'00FF', 'method')", [])
+                    .unwrap();
+            }
+            GraphDb::from_connection(conn)
+        };
+
+        let control = db_with(false).resolve("Считать", 10).unwrap();
+        assert_eq!(control.total, 1, "the control: the readable row answers");
+
+        let err = db_with(true).resolve("Считать", 10).unwrap_err();
+        assert_eq!(err.to_string(), "scanning nodes for resolve");
     }
 
     /// The dictionary must not narrow what `resolve` accepts: all four id tiers

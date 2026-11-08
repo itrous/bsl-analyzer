@@ -286,9 +286,10 @@ class FakeGh:
         mock_env(case, {"PATH": bin_dir + os.pathsep + os.environ["PATH"],
                         "FAKE_GH_STATE": self.state_path, "FAKE_GH_LOG": self.log_path})
 
-    def set(self, issues: list, fail: list) -> None:
+    def set(self, issues: list, fail: list, **extra) -> None:
+        """The issues, the calls that fail, and `page_size`: how many items one page of `gh api --paginate` holds."""
         with open(self.state_path, "w", encoding="utf-8") as fh:
-            json.dump({"issues": issues, "fail": fail}, fh, ensure_ascii=False)
+            json.dump({"issues": issues, "fail": fail, **extra}, fh, ensure_ascii=False)
 
     def state(self) -> dict:
         with open(self.state_path, encoding="utf-8") as fh:

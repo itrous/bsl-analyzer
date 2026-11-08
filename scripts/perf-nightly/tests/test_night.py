@@ -59,6 +59,10 @@ class AdvancingClock(FakeClock):
 class NightCase(Workspace):
     def setUp(self):
         super().setUp()
+        # These nights judge the warm set; the record of a night has tests of its own.
+        passed = {"verdict": "ok", "record_verdict": "pass", "reasons": [], "summary": None, "report": None,
+                  "reused": False}
+        self.enterContext(patch.object(night.release_gate, "record_night", lambda *args: passed))
         self.clone = self.data.path("build")
         make_repo(self.clone)
         self.sha = {"v0.3.2": commit(self.clone, "release")}

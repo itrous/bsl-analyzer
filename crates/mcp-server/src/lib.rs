@@ -28,6 +28,8 @@ mod serve_stream_tests;
 mod state;
 mod tasks;
 #[cfg(test)]
+mod test_clock;
+#[cfg(test)]
 mod test_wait;
 mod tools;
 #[cfg(test)]
@@ -4820,14 +4822,13 @@ mod graph_supersession_contract {
     /// the lock. Recording that attempt as the answer makes `status` say this daemon does not
     /// own caches it is still maintaining, on the strength of a check that answered nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "holds the cache lease lock through the product's 2 s lock wait (LOCK_WAIT), which a loaded machine exceeds; run: cargo test -p mcp-server --lib a_failed_refresh_keeps_publishing_the_verdict_a_check_established -- --ignored"]
     async fn a_failed_refresh_keeps_publishing_the_verdict_a_check_established() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        crate::graph::test_support::sample_workspace(root);
-        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
-        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
+        cache.ensure().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&cache);
+        let state = SharedState::leased_workspace_for_test(root.to_path_buf(), lease.clone());
         let server = McpServer::new(McpProfile::Workspace, state.clone());
         let published = |server: &McpServer| {
             let server = server.clone();
@@ -4848,56 +4849,47 @@ mod graph_supersession_contract {
                 }
             }
         };
-        // Premise off disk: the boot's claim really went through, so what follows is a refresh
-        // of an established verdict and not the unknown window of the stand above.
-        assert!(cache.lease_path().exists(), "the boot's claim wrote no record");
+        // Premise off disk: the claim really went through and a check established it, so what
+        // follows is a refresh of an established verdict and not the unknown window.
+        assert!(cache.lease_path().exists(), "the claim wrote no record");
+        assert!(state.refresh_ownership_now(), "the stand needs a check that answered");
         assert_eq!(
             published(&server).await.get("owns_caches"),
             Some(&serde_json::json!(true)),
             "the stand needs a daemon that has been published as the owner",
         );
 
-        // The lock a re-claim needs is held by a peer, and only THEN does the record go missing:
-        // the refresh completes, and it answers nothing. The order is the premise. This daemon's
-        // own owners keep asking whether it still owns the workspace — the heartbeat about every
-        // second once the verdict is older than `VERDICT_TTL` — and one that finds no record
-        // re-claims it under this very lock, writing a record with this daemon's token. Removed
-        // before the lock is held, the record can be put back in between, and the refresh then
-        // reads its own record and answers without attempting any claim.
-        // Held until this stand ends it, for the same reason as above.
-        let (lock, release_the_lock) =
-            crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
+        // The lock a re-claim needs is taken, and only THEN does the record go missing: the
+        // refresh completes, and it answers nothing. No owner of this backend runs and the lease
+        // has no heartbeat, so nothing puts the record back in between — before the refusal or
+        // before the control below — and the lock wait plays its whole budget out on a held
+        // clock.
+        let clock = std::sync::Arc::new(crate::test_clock::TestClock::default());
+        let virtual_wait = crate::workspace_lease::VirtualLockWait::install(clock.clone());
+        let held = lease.hold_file_lock_once_for_test();
         std::fs::remove_file(cache.lease_path()).expect("the record is this daemon's to remove");
+        let this_thread = std::thread::current().name().map(str::to_owned);
         let before = state.lease_disk_check_threads().len();
-        // Read where it can no longer change: with the lock held, nothing can write it back.
-        assert!(
-            !cache.lease_path().exists(),
-            "premise: the record came back although the lock a re-claim needs is held",
-        );
-        let refreshed = {
-            let state = state.clone();
-            let check = std::thread::Builder::new()
-                .name("bsl-graph-reload".to_owned())
-                .spawn(move || state.refresh_ownership_now())
-                .expect("the background check starts");
-            crate::test_wait::join(check, "background ownership check returns")
-                .expect("the background check did not panic")
-        };
+        let started = clock.now();
+        let refreshed = state.refresh_ownership_now();
         assert!(
             !refreshed,
-            "the refresh took the lock after all, so it answered instead of failing",
+            "the refresh took the lock after all, so it answered instead of failing"
         );
-        let attempted: Vec<String> = state
+        let attempted = state
             .lease_disk_check_threads()
             .split_off(before)
             .into_iter()
-            .filter(|thread| thread == "bsl-graph-reload")
-            .collect();
+            .filter(|thread| Some(thread) == this_thread.as_ref())
+            .count();
         assert!(
-            attempted.len() >= 2,
-            "the refresh made {} attempts: it never reached the re-claim whose failure this \
-             stand is about",
-            attempted.len(),
+            attempted >= 2,
+            "the refresh made {attempted} attempts: it never reached the re-claim whose failure \
+             this stand is about",
+        );
+        assert!(
+            clock.now() - started >= crate::workspace_lease::LOCK_WAIT,
+            "the re-claim gave up before the production lock wait ran out",
         );
 
         let body = published(&server).await;
@@ -4906,8 +4898,44 @@ mod graph_supersession_contract {
             Some(&serde_json::json!(true)),
             "a refresh that answered nothing replaced the verdict a check established: {body}",
         );
-        release_the_lock.send(()).expect("the lock holder is still there to be released");
-        crate::test_wait::join(lock, "lease lock holder exits").unwrap();
+
+        // Control: once the lock is free the same refresh does answer, and writes the record
+        // back — the refusal above was the held lock and nothing else.
+        drop(held);
+        drop(virtual_wait);
+        assert!(state.refresh_ownership_now(), "a refresh with the lock free did not re-claim");
+        assert!(cache.lease_path().exists(), "the re-claim wrote no record");
+        assert_eq!(published(&server).await.get("owns_caches"), Some(&serde_json::json!(true)),);
+
+        // And a refresh that does answer replaces the verdict with its own typed answer.
+        let newer = crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&cache);
+        assert!(!state.refresh_ownership_now(), "a superseded lease still reads as owner");
+        assert_eq!(
+            published(&server).await.get("owns_caches"),
+            Some(&serde_json::json!(false)),
+            "a superseded verdict is not published",
+        );
+        newer.release();
+        server.shutdown();
+
+        let released_dir = tempfile::tempdir().unwrap();
+        let released_cache = crate::cache::WorkspaceCacheLayout::for_workspace(released_dir.path());
+        released_cache.ensure().unwrap();
+        let released =
+            crate::workspace_lease::WorkspaceLease::claim_cache_without_heartbeat(&released_cache);
+        let state = SharedState::leased_workspace_for_test(
+            released_dir.path().to_path_buf(),
+            released.clone(),
+        );
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+        assert!(state.refresh_ownership_now());
+        released.release();
+        assert!(!state.refresh_ownership_now(), "a released lease still reads as owner");
+        assert_eq!(
+            published(&server).await.get("owns_caches"),
+            Some(&serde_json::json!(false)),
+            "a released verdict is not published",
+        );
         server.shutdown();
     }
 

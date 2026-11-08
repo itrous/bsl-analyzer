@@ -4,10 +4,10 @@ use hir::{BodyDiagnostic, DefWithBodyId, LocalRange, MethodId, ModuleId};
 pub(crate) const HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::AllFunctionPathMustHaveReturn,
     DiagnosticCode::BeginTransactionBeforeTryCatch,
+    DiagnosticCode::BuiltinFunctionNameAsDeclaration,
     DiagnosticCode::CodeAfterAsyncCall,
     DiagnosticCode::CommitTransactionOutsideTryCatch,
     DiagnosticCode::CommonModuleAssign,
-    DiagnosticCode::CreateQueryInCycle,
     DiagnosticCode::DeletingCollectionItem,
     DiagnosticCode::DeprecatedPlatformApi,
     DiagnosticCode::DeprecatedMethodCall,
@@ -208,9 +208,6 @@ pub fn dispatch_hir_diagnostic(
                 ctx,
             )
         }
-        BodyDiagnostic::CreateQueryInCycle { range } => {
-            handlers::create_query_in_cycle::from_hir(*range, ctx)
-        }
         BodyDiagnostic::DeletingCollectionItem { collection_text, range } => {
             handlers::deleting_collection_item::from_hir(collection_text, *range, ctx)
         }
@@ -276,6 +273,9 @@ pub fn dispatch_hir_diagnostic(
         }
         BodyDiagnostic::ReservedWordAsMethodName { name, range } => {
             handlers::reserved_word_as_method_name::from_hir(name, *range, ctx)
+        }
+        BodyDiagnostic::BuiltinFunctionNameAsDeclaration { name, range } => {
+            handlers::builtin_function_name_as_declaration::from_hir(name, *range, ctx)
         }
         BodyDiagnostic::RedundantAccessToObject { kind, range } => {
             handlers::redundant_access_to_object::from_hir(kind, *range, ctx)

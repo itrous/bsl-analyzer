@@ -5,6 +5,10 @@ its corpora are listed in the body. A key line in the body finds the issue
 again: an open one gets one comment per night, a closed one is reopened by a
 new issue only when it was completed. Every action and every `gh` error is a
 line of `publish.log` in the night's directory.
+
+The record of the night (`publish_record`) has a group of its own: one open
+issue per metric over the record, one per incomparable profile, found among
+all issues of the repository, not only the labelled ones.
 """
 
 from __future__ import annotations
@@ -26,7 +30,30 @@ NIGHT_PREFIX = "perf-nightly-night: "
 OWNER_CLOSED = ("NOT_PLANNED", "DUPLICATE")
 LOG = "publish.log"
 WORD_RE = re.compile(r"[\w.-]+")
+RATCHET_KEY = "perf-ratchet/"
+PROFILE_KEY = RATCHET_KEY + "profile"
+BLOCK_LABELS = ["perf", "regression", "release-blocker"]
+INCOMPARABLE = ("baseline_missing", "baseline_invalid", "record_no_noise", "record_profile_mismatch",
+                "record_protocol_mismatch")
+# Older issues of the release job name the failed metric only in their title.
+RELEASE_TITLE_RE = re.compile(r"Ночной релиз .+: гейт (?:\w+ )?провален по (.+)")
+# The record of the sweep before the owner moved it to the level of develop.
+SWEEP_RECORD_V041_S = 21.9344880010176
 
+
+def owner_target_text(metric: str, value) -> str | None:
+    """What a record the owner set says of itself, built on its own value so the text and
+    `R` above it never name two numbers; `None` for a metric the owner never set."""
+    if metric == "hwm_kb":
+        target = f"{int(value):,}".replace(",", " ")
+        return (f"Цель {target} KB задана владельцем для пика серии A, без references. Пик серии B с "
+                "references держит абсолютный потолок 7 340 032 KB. Следующий релиз заблокирован до возврата с "
+                "допуском ν; исправление памяти — отдельная задача.")
+    if metric == "diagnostics_workspace_s":
+        slower = (value / SWEEP_RECORD_V041_S - 1) * 100
+        return (f"Рекорд {value:.2f} с задан владельцем на уровне develop: замедление на {slower:.2f} % против "
+                f"v0.4.1 ({SWEEP_RECORD_V041_S:.2f} с) узаконено. Вернуть метрику вниз — отдельная задача.")
+    return None
 
 def run_gh(args: list[str], stdin: str | None = None) -> tuple[int, str, str]:
     try:
@@ -254,3 +281,213 @@ def _comment(log, gh, number: int, key: str, marker: str, open_issue: dict, body
             log.add("gh-error", number, key, f"issue comment: {_error(code, out, err)}")
         else:
             log.add("comment", number, key)
+
+
+# -- the record of the night ----------------------------------------------------------
+
+
+def _pages(text: str) -> list:
+    """The items of `gh api --paginate`: one array, or one array per page."""
+    decoder = json.JSONDecoder()
+    items, position = [], 0
+    text = text.strip()
+    while position < len(text):
+        page, position = decoder.raw_decode(text, position)
+        if not isinstance(page, list):
+            raise ValueError("a page is not an array")
+        items += page
+        while position < len(text) and text[position].isspace():
+            position += 1
+    return items
+
+
+def _read_issues(gh) -> list[dict]:
+    """Every issue of the repository, in the states and reasons of `gh issue list`."""
+    code, out, err = gh(["api", "--paginate", f"repos/{REPO}/issues?state=all&per_page=100"])
+    if code != 0:
+        raise HarnessError("gh_error", f"issues: {_error(code, out, err)}")
+    try:
+        items = _pages(out)
+    except ValueError:
+        raise HarnessError("gh_error", "issues: output is not JSON") from None
+    return [{"number": i["number"], "state": i["state"].upper(), "stateReason": (i.get("state_reason") or "").upper(),
+             "title": i.get("title") or "", "body": i.get("body") or "", "labels": i.get("labels") or []}
+            for i in items if "pull_request" not in i]
+
+
+def _read_comments(gh) -> dict[int, list[str]]:
+    """{issue number: its comments} of the whole repository."""
+    code, out, err = gh(["api", "--paginate", f"repos/{REPO}/issues/comments?per_page=100"])
+    if code != 0:
+        raise HarnessError("gh_error", f"comments: {_error(code, out, err)}")
+    found: dict = {}
+    try:
+        for item in _pages(out):
+            found.setdefault(int(item["issue_url"].rsplit("/", 1)[-1]), []).append(item.get("body") or "")
+    except (ValueError, KeyError, TypeError):
+        raise HarnessError("gh_error", "comments: output is not JSON") from None
+    return found
+
+
+def _title_names(title: str, metric: str) -> bool:
+    found = RELEASE_TITLE_RE.fullmatch(title.strip())
+    if not found:
+        return False
+    # The release job writes `graph_ready`, without the unit of the metric.
+    words = set(WORD_RE.findall(found[1]))
+    return metric in words or metric.removesuffix("_s") in words
+
+
+def ratchet_groups(saved: dict) -> list[dict]:
+    """What a record night has to say on GitHub. Only a comparison that was made
+    claims an excess; a failed run has no number, and an incomparable profile
+    says nothing about the product."""
+    record = saved.get("record") or {}
+    groups = [{"key": f"{RATCHET_KEY}{row['metric']}", "metric": row["metric"], "row": row, "labels": BLOCK_LABELS,
+               "title": f"perf: рекорд превышен — {row['metric']}"}
+              for row in record.get("rows") or [] if row["outcome"] == "block" and row["delta"] is not None]
+    reasons = [r for r in record.get("reasons") or [] if r.startswith(INCOMPARABLE)]
+    if reasons:
+        groups.append({"key": PROFILE_KEY, "metric": None, "reasons": reasons, "labels": ["perf"],
+                       "title": f"perf: рекорд несопоставим — {', '.join(reasons)}"})
+    return groups
+
+
+def _exact(value) -> str:
+    return "-" if value is None else str(value)
+
+
+def _candidates_text(record_sha: str, sha: str, ancestor) -> list[str]:
+    """The range to look through. It names candidates, never a culprit."""
+    uri = f"https://github.com/{REPO}/compare/{record_sha}...{sha}"
+    notation = f"`{record_sha}..{sha}`"
+    if record_sha == sha:
+        return [f"Диапазон пуст: {notation}, кандидат — сам рекордсмен. Превышение воспроизводится на рекордсмене: "
+                "проверить окружение и калибровку, последующих коммитов здесь нет."]
+    lines = [f"Кандидаты для поиска причины (не найденный виновник): {notation}", uri]
+    if not ancestor(record_sha, sha):
+        lines.append(f"История разошлась: {record_sha} не предок {sha}, диапазон не линеен.")
+    return lines + ["Если тот же холодный A/B на SHA рекордсмена при том же профиле тоже выше предела, разбор идёт к "
+                    "окружению и калибровке, а не к этим коммитам."]
+
+
+def _run_table(saved: dict, row: dict) -> list[str]:
+    # `max_AB` is the memory of summaries written before the record of memory held A alone.
+    series = {"median_A": ("A",), "median_B": ("B",), "max_A": ("A",), "max_AB": ("A", "B")}[row["aggregate"]]
+    lines = ["| запуск | серия | удержан | значение |", "|---|---|---|---|"]
+    return lines + [f"| {r['run']} | {r['series']} | {str(r['held']).lower()} | {_exact(r['metrics'].get(row['metric']))} |"
+                    for r in saved.get("run_values") or [] if r["series"] in series]
+
+
+def _artifacts(saved: dict) -> list[str]:
+    baseline, artifacts = saved.get("baseline") or {}, saved.get("artifacts") or {}
+    return [f"Baseline: {baseline.get('path', '-')} в коммите харнесса {baseline.get('commit') or '-'}.",
+            f"Отчёт: {artifacts.get('summary', '-')}, {artifacts.get('report', '-')} (каталог задания perf-nightly)."]
+
+
+def _profile_lines(saved: dict) -> list[str]:
+    record = saved.get("record") or {}
+    measured, expected = record.get("profile") or {}, record.get("baseline_profile") or {}
+    differ = sorted(k for k in measured.keys() | expected.keys() if measured.get(k) != expected.get(k))
+    return [f"Профиль замера: {json.dumps(measured, ensure_ascii=False, sort_keys=True)}.",
+            f"Отличия от профиля рекорда: {', '.join(differ) or 'нет'}."]
+
+
+def ratchet_facts(group: dict, saved: dict, ancestor) -> list[str]:
+    sha = saved["candidate"]["sha"]
+    if group["metric"] is None:
+        return [f"Рекорд не сравнивался с develop {sha}: {'; '.join(group['reasons'])}.",
+                "Это несопоставимость замера, а не регрессия продукта. Значения рекорда не повышать: вернуть прежний "
+                "профиль, заполнить шум измерением или вынести миграцию профиля отдельным решением."] + \
+            _profile_lines(saved) + _artifacts(saved)
+    row = group["row"]
+    record, candidate = row["record"], row["candidate"]
+    ceiling = next((c["limit"] for c in saved.get("ceilings") or [] if c["metric"] == row["metric"]), None)
+    limit = f"предел по бару 5 %, шум отсутствует: {_exact(row['limit'])}" if row["noise"] is None else \
+        f"ν = {row['noise'] * 100:.2f}%; предел R·(1+ν) = {_exact(row['limit'])}"
+    lines = [f"Метрика: {row['metric']}, {row['unit']}, агрегат {row['aggregate']}.",
+             f"Рекорд R = {_exact(record['value'])}; кандидат C = {_exact(candidate['value'])}.",
+             f"Δ = {row['delta'] * 100:+.2f}%; {limit}; абсолютный потолок: {_exact(ceiling)}.",
+             f"SHA рекордсмена: {record['sha']}; develop: {sha}."]
+    if row.get("basis") == "growth_not_repaid":
+        wall = "недоступна" if row["wall_delta"] is None else f"{row['wall_delta'] * 100:+.2f}%"
+        lines.append(f"Размен не выполнен: Δ стены против рекорда {wall} в том же раунде не окупает Δ метрики.")
+    owner = owner_target_text(row["metric"], record["value"])
+    if (record.get("evidence") or {}).get("kind") == "owner_target" and owner is not None:
+        lines.append(owner)
+    return lines + _candidates_text(record["sha"], sha, ancestor) + _profile_lines(saved) + \
+        _artifacts(saved) + ["", *_run_table(saved, row)]
+
+
+def _ensure_labels(log, gh, number: int, key: str, have: set, wanted: list[str]) -> None:
+    for label in wanted:
+        if label in have:
+            continue
+        check_labels([label])
+        code, out, err = gh(["issue", "edit", str(number), "-R", REPO, "--add-label", label])
+        if code != 0:
+            log.add("gh-error", number, key, f"issue edit: {_error(code, out, err)}")
+            return
+        log.add("label", number, key, label)
+
+
+def publish_record(out_dir: str, saved: dict, forbidden: list[str], ancestor, gh=run_gh) -> list[dict]:
+    """Publishes one record night. A list that could not be read in full creates nothing."""
+    log = Log(out_dir)
+    groups = ratchet_groups(saved)
+    if not groups:
+        return log.entries
+    try:
+        issues = _read_issues(gh)
+    except HarnessError as exc:
+        log.add("gh-error", None, "*", exc.detail)
+        return log.entries
+    comments = None
+    event = f"record-{saved['date']}-{saved['candidate']['sha'][:12]}"
+    for group in groups:
+        key, line = group["key"], KEY_PREFIX + group["key"]
+        marker = NIGHT_PREFIX + event
+        same = [i for i in issues if has_line(i["body"], line) or (
+            group["metric"] is not None and _title_names(i["title"], group["metric"]))]
+        found = [i for i in same if i["state"] == "OPEN"]
+        keyed = []
+        if not found:
+            # A marker that lives only in a comment counts as well, here and for a decision of the owner.
+            if comments is None:
+                try:
+                    comments = _read_comments(gh)
+                except HarnessError as exc:
+                    log.add("gh-error", None, key, exc.detail)
+                    continue
+            keyed = sorted((i for i in issues if i in same or
+                            any(has_line(c, line) for c in comments.get(i["number"], []))), key=lambda i: i["number"])
+            found = [i for i in keyed if i["state"] == "OPEN"]
+        facts_lines = ratchet_facts(group, saved, ancestor)
+        if found:
+            target = min(found, key=lambda i: i["number"])
+            adopt = [line] if not has_line(target["body"], line) else []
+            body = "\n".join([f"Ночь {event}: {group['title']}.", "", *facts_lines, "", *adopt, marker]) + "\n"
+            _comment(log, gh, target["number"], key, marker, target, body, forbidden)
+            _ensure_labels(log, gh, target["number"], key, {label["name"] for label in target["labels"]},
+                           group["labels"])
+            continue
+        if keyed and keyed[-1]["stateReason"] in OWNER_CLOSED:
+            log.add("closed", keyed[-1]["number"], key, keyed[-1]["stateReason"])
+            continue
+        repeat = [f"повтор #{keyed[-1]['number']}"] if keyed else []
+        body = "\n".join([f"{group['title']}, ночь {event}.", *repeat, "", *facts_lines, "", line, marker]) + "\n"
+        if leaked(group["title"] + body, forbidden):
+            log.add("refused", None, key, "forbidden text")
+            continue
+        check_labels(group["labels"])
+        args = ["issue", "create", "-R", REPO, "--title", group["title"], "--body-file", "-"]
+        for label in group["labels"]:
+            args += ["--label", label]
+        code, out, err = gh(args, body)
+        if code != 0:
+            log.add("gh-error", None, key, f"issue create: {_error(code, out, err)}")
+            continue
+        tail = out.strip().rstrip("/").rsplit("/", 1)[-1]
+        log.add("create", int(tail) if tail.isdigit() else None, key,
+                f"repeat of #{keyed[-1]['number']}" if keyed else "")
+    return log.entries

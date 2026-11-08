@@ -612,6 +612,101 @@ mod tests {
         assert_eq!(target.kind, SymbolKind::Function);
     }
 
+    /// Pairs of `Дважды` told apart by what navigation returns: their parameters and
+    /// ranges differ, and so does their kind, so a lookup that prefers one kind of method
+    /// over the other would settle on the wrong declaration for one of the pairs.
+    const NAMESAKE_PAIRS: [(&str, &str, &str); 3] = [
+        (
+            "two functions",
+            "Функция Дважды(Первый) Экспорт\n    Возврат 1;\nКонецФункции",
+            "Функция Дважды(Второй, Третий) Экспорт\n    Возврат 2;\nКонецФункции",
+        ),
+        (
+            "a function over a procedure",
+            "Функция Дважды(Первый) Экспорт\n    Возврат 1;\nКонецФункции",
+            "Процедура Дважды(Второй, Третий) Экспорт\nКонецПроцедуры",
+        ),
+        (
+            "a procedure over a function",
+            "Процедура Дважды(Первый) Экспорт\nКонецПроцедуры",
+            "Функция Дважды(Второй, Третий) Экспорт\n    Возврат 2;\nКонецФункции",
+        ),
+    ];
+
+    fn namesakes(top: &str, lower: &str) -> String {
+        format!("{top}\n\n{lower}\n")
+    }
+
+    fn range_of(text: &str, part: &str) -> TextRange {
+        let start = text.find(part).unwrap() as u32;
+        TextRange::new(TextSize::from(start), TextSize::from(start + part.len() as u32))
+    }
+
+    #[test]
+    fn test_goto_definition_namesake_local_call_opens_the_top_declaration() {
+        for (label, top, lower) in NAMESAKE_PAIRS {
+            for callee in ["Дважды", "ДВАЖДЫ", "дважды"] {
+                let namesakes = namesakes(top, lower);
+                let source =
+                    format!("{namesakes}\nПроцедура Тест()\n    {callee}(1);\nКонецПроцедуры\n");
+                let (db, file_id) = create_db_with_file(&source);
+
+                let offset = TextSize::from(source.rfind(callee).unwrap() as u32);
+                let target = goto_definition(&db, file_id, offset).expect("the call resolves");
+
+                assert_eq!(target.file_id, file_id, "{label}: {callee}");
+                assert_eq!(target.range, range_of(&source, top), "{label}: {callee}");
+                assert_ne!(target.range, range_of(&source, lower), "{label}: {callee}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_goto_definition_namesake_cross_file_call_opens_the_top_declaration() {
+        for (label, top, lower) in NAMESAKE_PAIRS {
+            for callee in ["Дважды", "ДВАЖДЫ", "дважды"] {
+                let namesakes = namesakes(top, lower);
+                let caller =
+                    format!("Процедура Тест()\n    ОбщийМодуль.{callee}(1);\nКонецПроцедуры\n");
+                let files: &[(&str, &str)] = &[
+                    ("CommonModules/ОбщийМодуль/Ext/Module.bsl", &namesakes),
+                    ("Forms/Form1/Ext/Form/Module.bsl", &caller),
+                ];
+                let (db, file_ids) = create_multi_file_db(files);
+
+                let offset = TextSize::from(caller.rfind(callee).unwrap() as u32);
+                let target = goto_definition(&db, file_ids[1], offset).expect("the call resolves");
+
+                assert_eq!(target.file_id, file_ids[0], "{label}: {callee}");
+                assert_eq!(target.range, range_of(&namesakes, top), "{label}: {callee}");
+                assert_ne!(target.range, range_of(&namesakes, lower), "{label}: {callee}");
+            }
+        }
+    }
+
+    /// Only a name is settled by first-wins: a definition that already names the lower
+    /// declaration by its own key stays on that declaration.
+    #[test]
+    fn test_goto_definition_namesake_key_keeps_its_own_declaration() {
+        for (label, top, lower) in NAMESAKE_PAIRS {
+            let source = namesakes(top, lower);
+            let (db, file_id) = create_db_with_file(&source);
+            let method = |ordinal| {
+                Definition::Method(hir::MethodId {
+                    module: hir::ModuleId::new(file_id),
+                    local_id: hir::MethodKey::nth("Дважды", ordinal),
+                })
+            };
+
+            let upper = definition_to_navigation_target(&db, &method(0)).expect("the top key");
+            let lower_target =
+                definition_to_navigation_target(&db, &method(1)).expect("the lower key");
+
+            assert_eq!(upper.range, range_of(&source, top), "{label}: ordinal 0");
+            assert_eq!(lower_target.range, range_of(&source, lower), "{label}: ordinal 1");
+        }
+    }
+
     #[test]
     fn test_goto_definition_cross_file_case_insensitive() {
         let common_module = r#"

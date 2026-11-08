@@ -377,3 +377,38 @@ fn payload_transport_response_limit_and_timeout_are_independent() {
     assert_eq!(server.requests().len(), 1);
     answer.send(()).unwrap();
 }
+
+/// The budgets the tests below and the callers rely on, checked without waiting for any of them.
+#[test]
+fn interactive_budget_stays_short_and_background_budget_stays_long() {
+    assert_eq!(Embedder::INTERACTIVE_TIMEOUT, Duration::from_secs(12));
+    assert_eq!(Embedder::BACKGROUND_TIMEOUT, Duration::from_secs(120));
+}
+
+/// A provider answering in 15 s: past the 12 s interactive budget, well inside the 120 s
+/// background one. The delay is a plain sleep, so the order of the two outcomes cannot flip.
+#[test]
+#[ignore = "необязательный тест: завязан на реальное время (ответ сервера через 15 с, два запроса ~30 с); запуск: cargo test -p bsl-search --lib embedder::payload_tests::slow_provider_answer_fits_the_background_budget_but_not_the_interactive_one -- --exact --ignored"]
+fn slow_provider_answer_fits_the_background_budget_but_not_the_interactive_one() {
+    let server = PayloadServer::new(|i, body| {
+        std::thread::sleep(Duration::from_secs(15));
+        success(i, body)
+    });
+    let embedder = Embedder::new(server.config(4096));
+    assert_eq!(embedder.embed_batch_background(&["slow"]).unwrap(), vec![vector("slow")]);
+    assert_eq!(
+        embedder.embed_batch_interactive(&["slow"]).unwrap_err().to_string(),
+        "embedding_timeout"
+    );
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[test]
+fn background_batch_makes_one_attempt_and_returns_a_provider_refusal_as_is() {
+    let server = PayloadServer::new(|_, _| (503, "overloaded".into()));
+    let embedder = Embedder::new(server.config(4096));
+    let error = embedder.embed_batch_background(&["a", "b"]).unwrap_err();
+    assert_eq!(error.to_string(), "embedding_provider_error");
+    assert_eq!(server.requests().len(), 1);
+    assert!(embedder.embed_batch_background(&[]).unwrap().is_empty());
+}

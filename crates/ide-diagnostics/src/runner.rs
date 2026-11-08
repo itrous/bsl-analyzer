@@ -67,6 +67,7 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::AssignAliasFieldsInQuery,
     DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
     DiagnosticCode::DuplicateAliasInQuery,
+    DiagnosticCode::UnavailableAliasInQuery,
     DiagnosticCode::FieldsFromJoinsWithoutIsNull,
     DiagnosticCode::FullOuterJoinQuery,
     DiagnosticCode::IncorrectUseLikeInQuery,
@@ -81,6 +82,7 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::QueryParameterSourceWithoutInto,
     DiagnosticCode::QueryTotalsInValueTableInto,
     DiagnosticCode::UnknownFieldInQuery,
+    DiagnosticCode::UnknownQueryFunction,
     DiagnosticCode::UnlimitedLengthStringUsageInQuery,
     DiagnosticCode::RefOveruse,
     DiagnosticCode::SelectTopWithoutOrderBy,
@@ -104,6 +106,12 @@ pub(crate) const WEAVING_DIAGNOSTICS: &[DiagnosticCode] =
 #[cfg(test)]
 pub(crate) const SUPPRESSION_DIAGNOSTICS: &[DiagnosticCode] =
     &[DiagnosticCode::UnknownSuppressionCode, DiagnosticCode::SuppressionWithoutCode];
+
+/// Diagnostics a file-level handler judges from the module's inference fold, called directly from
+/// `module_diagnostics` and the base-aware passes. Only the coverage-invariant test consumes this.
+#[cfg(test)]
+pub(crate) const INFERENCE_FOLD_DIAGNOSTICS: &[DiagnosticCode] =
+    &[DiagnosticCode::CreateQueryInCycle, DiagnosticCode::LocalCallWithQueryInCycle];
 
 pub fn run_diagnostic<F>(
     name: &'static str,
@@ -353,6 +361,7 @@ pub fn collect_sdbl_hir_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic>
 pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispatchFn)] = &[
     (DiagnosticCode::AmbiguousFieldInQuery, handlers::ambiguous_field_in_query::dispatch),
     (DiagnosticCode::DuplicateAliasInQuery, handlers::duplicate_alias_in_query::dispatch),
+    (DiagnosticCode::UnavailableAliasInQuery, handlers::unavailable_alias_in_query::dispatch),
     (DiagnosticCode::AssignAliasFieldsInQuery, handlers::assign_alias_fields_in_query::dispatch),
     (
         DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
@@ -382,6 +391,7 @@ pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispat
     (DiagnosticCode::QueryNestedFieldsByDot, handlers::query_nested_fields_by_dot::dispatch),
     (DiagnosticCode::QueryToMissingMetadata, handlers::query_to_missing_metadata::dispatch),
     (DiagnosticCode::UnknownFieldInQuery, handlers::unknown_field_in_query::dispatch),
+    (DiagnosticCode::UnknownQueryFunction, handlers::unknown_query_function::dispatch),
     (
         DiagnosticCode::UnlimitedLengthStringUsageInQuery,
         handlers::unlimited_length_string_usage_in_query::dispatch,
@@ -417,7 +427,7 @@ fn collect_sdbl_hir_single_pass(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         .config_bool(
             DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
             handlers::calculation_register_virtual_table_without_recorder::ONLY_IN_MODULES_WRITING_REGISTER,
-            false,
+            true,
         )
         .then(|| ctx.parse().syntax_node());
 
@@ -508,6 +518,7 @@ mod tests {
             ("INFERENCE_DIAGNOSTICS", crate::hir_inference_dispatch::INFERENCE_DIAGNOSTICS),
             ("WEAVING_DIAGNOSTICS", WEAVING_DIAGNOSTICS),
             ("SUPPRESSION_DIAGNOSTICS", SUPPRESSION_DIAGNOSTICS),
+            ("INFERENCE_FOLD_DIAGNOSTICS", INFERENCE_FOLD_DIAGNOSTICS),
         ];
 
         let mut code_to_arrays: HashMap<DiagnosticCode, Vec<&str>> = HashMap::new();

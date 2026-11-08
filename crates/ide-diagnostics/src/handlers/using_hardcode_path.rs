@@ -16,7 +16,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Standard],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 const DEFAULT_SEARCH_WORDS_STD_PATHS_UNIX: &str =
@@ -204,61 +204,61 @@ mod tests {
             expect![[r#"
             UsingHardcodePath @ 6:17..6:39
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 7:17..7:51
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 8:17..8:44
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 9:17..9:60
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 10:17..10:39
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 11:17..11:51
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 12:17..12:28
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 13:17..13:28
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 14:17..14:29
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 16:17..16:42
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 17:17..17:45
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 19:17..19:28
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 20:17..20:37
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 21:17..21:38
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 22:17..22:39
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 33:11..33:28
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 34:24..34:61
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 38:16..38:31
               message: Используется хранение в коде пути к файлу
-              severity: Critical
+              severity: Warning
             UsingHardcodePath @ 40:23..40:49
               message: Используется хранение в коде пути к файлу
-              severity: Critical"#]],
+              severity: Warning"#]],
         );
     }
 
@@ -342,7 +342,7 @@ mod tests {
             expect![[r#"
             UsingHardcodePath @ 3:12..3:32
               message: Используется хранение в коде пути к файлу
-              severity: Critical"#]],
+              severity: Warning"#]],
         );
     }
 
@@ -359,7 +359,7 @@ mod tests {
             expect![[r#"
             UsingHardcodePath @ 3:12..3:33
               message: Используется хранение в коде пути к файлу
-              severity: Critical"#]],
+              severity: Warning"#]],
         );
     }
 
@@ -376,7 +376,7 @@ mod tests {
             expect![[r#"
             UsingHardcodePath @ 3:12..3:35
               message: Используется хранение в коде пути к файлу
-              severity: Critical"#]],
+              severity: Warning"#]],
         );
     }
 
@@ -393,7 +393,7 @@ mod tests {
             expect![[r#"
             UsingHardcodePath @ 3:12..3:34
               message: Используется хранение в коде пути к файлу
-              severity: Critical"#]],
+              severity: Warning"#]],
         );
     }
 
@@ -410,7 +410,7 @@ mod tests {
             expect![[r#"
             UsingHardcodePath @ 3:12..3:46
               message: Используется хранение в коде пути к файлу
-              severity: Critical"#]],
+              severity: Warning"#]],
         );
     }
 

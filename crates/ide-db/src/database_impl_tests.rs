@@ -8274,6 +8274,53 @@ fn warming_loads_the_attributed_root_of_a_service_module() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+/// Inference resolves global names over every root a module sees, so the warm-up must load
+/// them all, not only the root that owns the representative. Here the representative is an
+/// object module of a nested configuration: its own root and its metadata never read the
+/// declared root above it, which the module still sees.
+#[test]
+fn warming_loads_every_root_the_representative_sees() {
+    use hir::ConfigsDatabase as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().to_path_buf();
+    let src = ws.join("src");
+    let object_module = src.join("DataProcessors/Обработка/Ext/ObjectModule.bsl");
+    let common_module = src.join("CommonModules/Модуль/Ext/Module.bsl");
+    for module in [&object_module, &common_module] {
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(module, "").unwrap();
+    }
+
+    let mut db = RootDatabaseImpl::new();
+    let cache = Arc::new(crate::GraphConfigCache::default());
+    db.set_graph_config_cache(Arc::clone(&cache));
+
+    let object_file = FileId(0);
+    let common_file = FileId(1);
+    let mut file_set = FileSet::new();
+    let path_of = |p: &std::path::Path| VfsPath::new(p.to_string_lossy().into_owned());
+    file_set.insert(object_file, path_of(&object_module));
+    file_set.insert(common_file, path_of(&common_module));
+    db.set_source_root(SourceRootId(1), SourceRoot::new_local(file_set));
+    db.set_file_source_root(object_file, SourceRootId(1));
+    db.set_file_source_root(common_file, SourceRootId(1));
+    db.set_all_config_paths(vec![(None, ws.clone())], None);
+
+    db.warm_config_roots(&[ModuleId::new(object_file), ModuleId::new(common_file)]);
+
+    let key = |path: &std::path::Path| {
+        std::path::PathBuf::from(crate::metadata::canonicalize_configuration_path(
+            &path.to_string_lossy(),
+        ))
+    };
+    assert!(cache.contains_key(&key(&src)), "sanity: the representative's own root is loaded");
+    assert!(
+        cache.contains_key(&key(&ws)),
+        "the declared root the representative sees must be loaded by the warm-up"
+    );
+}
+
 #[test]
 fn a_case_variant_configuration_xml_names_the_configuration_root() {
     let dir = tempfile::tempdir().unwrap();
