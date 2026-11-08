@@ -56,7 +56,8 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
         return;
     }
     let Some(decl) = ctx.decl() else { return };
-    if decl.is_function || !HANDLER_NAMES.contains(&fold_lower_per_char(decl.name.as_str()).as_str())
+    if decl.is_function
+        || !HANDLER_NAMES.contains(&fold_lower_per_char(decl.name.as_str()).as_str())
     {
         return;
     }
@@ -153,8 +154,9 @@ mod tests {
     use crate::DiagnosticCode;
 
     fn run(code: &str) -> Vec<crate::Diagnostic> {
-        let mut metadata =
-            crate::test_utils::make_non_common_module_metadata(bsl_metadata::ModuleType::ObjectModule);
+        let mut metadata = crate::test_utils::make_non_common_module_metadata(
+            bsl_metadata::ModuleType::ObjectModule,
+        );
         let mut mdo = bsl_metadata::MetadataObject::new(bsl_metadata::MdoType::Catalog, "Товары");
         mdo.attributes.push(bsl_metadata::Attribute {
             name: "Склад".to_string(),
@@ -166,7 +168,8 @@ mod tests {
             name_en: None,
             attr_type: bsl_metadata::AttributeType::String { length: Some(10) },
         });
-        mdo.tabular_sections.push(bsl_metadata::TabularSection::new(uuid::Uuid::new_v4(), "Состав"));
+        mdo.tabular_sections
+            .push(bsl_metadata::TabularSection::new(uuid::Uuid::new_v4(), "Состав"));
         metadata.mdo = Some(std::sync::Arc::new(mdo));
         crate::test_utils::check_metadata_diagnostic(metadata, code, |_m, ctx| {
             crate::diagnostics(ctx)
@@ -249,36 +252,30 @@ mod tests {
 
     #[test]
     fn silent_when_local_var_shadows_attribute() {
-        let d = run(
-            "Процедура ПриЗаписи(Отказ)\n    Перем Склад;\n    Склад = 1;\nКонецПроцедуры",
-        );
+        let d = run("Процедура ПриЗаписи(Отказ)\n    Перем Склад;\n    Склад = 1;\nКонецПроцедуры");
         assert!(d.is_empty(), "{d:?}");
     }
 
     #[test]
     fn fires_inside_if_block() {
-        let d = run(
-            "Процедура ПриЗаписи(Отказ)
+        let d = run("Процедура ПриЗаписи(Отказ)
     Если ДополнительныеСвойства.Свойство(\"Данные\") Тогда
         Склад = 1;
         Основная = Ложь;
         Записать();
     КонецЕсли;
-КонецПроцедуры",
-        );
+КонецПроцедуры");
         assert_eq!(d.len(), 2, "{d:?}");
         assert!(d.iter().all(|x| x.message.starts_with("Реквизит")), "{d:?}");
     }
 
     #[test]
     fn fires_inside_for_each_body() {
-        let d = run(
-            "Процедура ПриЗаписи(Отказ)
+        let d = run("Процедура ПриЗаписи(Отказ)
     Для Каждого Элемент Из Коллекция Цикл
         Склад = Элемент;
     КонецЦикла;
-КонецПроцедуры",
-        );
+КонецПроцедуры");
         assert_eq!(d.len(), 1, "{d:?}");
     }
 }
