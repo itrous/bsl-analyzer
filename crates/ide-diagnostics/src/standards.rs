@@ -117,6 +117,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::MissingTempStorageDeletion => &[642, 487],
         DiagnosticCode::MissingTemporaryFileDeletion => &[542],
         DiagnosticCode::MisplacedLoopControl => &[],
+        DiagnosticCode::ObjectModifiedInOnWrite => &[465, 464],
         DiagnosticCode::UseLessForEach => &[],
         DiagnosticCode::IteratorCollidesCollection => &[],
         DiagnosticCode::UsingGoto => &[547],

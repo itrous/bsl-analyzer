@@ -83,6 +83,7 @@ pub enum DiagnosticCode {
     MissingTempStorageDeletion,
     MissingTemporaryFileDeletion,
     MisplacedLoopControl,
+    ObjectModifiedInOnWrite,
     UseLessForEach,
     IteratorCollidesCollection,
     UsingGoto,

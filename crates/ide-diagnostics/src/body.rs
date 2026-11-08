@@ -31,6 +31,7 @@ pub(crate) const BODY_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::PairingBrokenTransaction,
     DiagnosticCode::UnreachableCode,
     DiagnosticCode::MissingTemporaryFileDeletion,
+    DiagnosticCode::ObjectModifiedInOnWrite,
     DiagnosticCode::MissingTempStorageDeletion,
     DiagnosticCode::SetPrivilegedMode,
     DiagnosticCode::DisableSafeMode,
@@ -77,6 +78,7 @@ pub fn body_diagnostics(ctx: &BodyContext) -> Vec<Diagnostic<LocalRange>> {
         handlers::pairing_broken_transaction::check_body(ctx, &mut acc);
         handlers::unreachable_code::check_body(ctx, &mut acc);
         handlers::missing_temporary_file_deletion::check_body(ctx, &mut acc);
+        handlers::object_modified_in_on_write::check_body(ctx, &mut acc);
         handlers::missing_temp_storage_deletion::check_body(ctx, &mut acc);
         handlers::set_privileged_mode::check_body(ctx, &mut acc);
         handlers::disable_safe_mode::check_body(ctx, &mut acc);

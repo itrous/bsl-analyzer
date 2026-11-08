@@ -122,6 +122,7 @@ pub mod non_standard_region;
 pub mod number_of_optional_params;
 pub mod number_of_params;
 pub mod number_of_values_in_structure_constructor;
+pub mod object_modified_in_on_write;
 pub mod one_statement_per_line;
 pub mod order_of_params;
 pub mod ordinary_app_support;
@@ -346,6 +347,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
             Some(&missing_temporary_file_deletion::METADATA)
         }
         DiagnosticCode::MisplacedLoopControl => Some(&misplaced_loop_control::METADATA),
+        DiagnosticCode::ObjectModifiedInOnWrite => Some(&object_modified_in_on_write::METADATA),
         DiagnosticCode::UseLessForEach => Some(&useless_for_each::METADATA),
         DiagnosticCode::IteratorCollidesCollection => Some(&iterator_collides_collection::METADATA),
         DiagnosticCode::UsingGoto => Some(&using_goto::METADATA),

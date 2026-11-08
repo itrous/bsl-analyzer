@@ -234,6 +234,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         DiagnosticCode::WrongWebServiceHandler,
         "metadata handler-name resolution; requires service metadata fixture",
     ),
+    (
+        DiagnosticCode::ObjectModifiedInOnWrite,
+        "identifier-aware (handler name, ЭтотОбъект/ThisObject, attribute name_en) but needs object metadata, which the plain-source fixture cannot supply; the English path is covered by the handler unit tests",
+    ),
     (DiagnosticCode::WrongDataPathForFormElements, "form metadata path diagnostic"),
     (DiagnosticCode::PublicMethodsDescription, "documentation/region diagnostic"),
     (DiagnosticCode::CachedPublic, "metadata return-value-reuse policy"),
@@ -740,7 +744,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 215, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 216, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]
