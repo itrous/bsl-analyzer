@@ -141,6 +141,13 @@ pub enum SdblDiagnostic {
         parts_count: Option<u32>,
     },
 
+    /// A path through a register's `Регистратор` that reads something other than a standard
+    /// field of the document: a declared attribute, a common attribute or a tabular section.
+    RegisterRecorderFieldInQuery {
+        attribute: String,
+        range: TextRange,
+    },
+
     RefOveruse {
         range: TextRange,
     },
@@ -370,6 +377,11 @@ impl SdblDiagnostic {
                  соединение с таблицей, на которую указывает ссылка"
                     .to_string()
             }
+            Self::RegisterRecorderFieldInQuery { attribute, .. } => {
+                format!(
+                    "В запросе к регистру читается реквизит «{attribute}» документа-регистратора.                      Регистр должен быть самодостаточен: нужные данные хранятся его измерениями                      и реквизитами (#std477)"
+                )
+            }
             Self::RefOveruse { .. } => {
                 "Поле «Ссылка», полученное через точку от ссылочного поля, совпадает с самим \
                  этим полем: лишнее соединение можно убрать"
@@ -432,6 +444,7 @@ impl SdblDiagnostic {
             Self::ScheduleDataFieldWithoutNullCheck { range, .. } => *range,
             Self::MultilineString { range } => *range,
             Self::QueryNestedFieldsByDot { range, .. } => *range,
+            Self::RegisterRecorderFieldInQuery { range, .. } => *range,
             Self::RefOveruse { range } => *range,
             Self::UnionWithoutAll { range } => *range,
             Self::LikeUsage { range, .. } => *range,
@@ -466,6 +479,7 @@ impl SdblDiagnostic {
             Self::ScheduleDataFieldWithoutNullCheck { .. } => false,
             Self::MultilineString { .. } => false,
             Self::QueryNestedFieldsByDot { .. } => false,
+            Self::RegisterRecorderFieldInQuery { .. } => false,
             Self::RefOveruse { .. } => false,
             Self::UnionWithoutAll { .. } => false,
             Self::LikeUsage { kind: LikeUsageKind::Allowed, .. } => false,

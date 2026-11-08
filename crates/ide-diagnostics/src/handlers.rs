@@ -146,6 +146,7 @@ pub mod query_totals_in_value_table_into;
 pub mod read_only_property;
 pub mod redundant_access_to_object;
 pub mod ref_overuse;
+pub mod register_recorder_field_in_query;
 pub mod reserved_parameter_names;
 pub mod reserved_word_as_method_name;
 pub mod rewrite_method_parameter;
@@ -464,6 +465,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
             Some(&unlimited_length_string_usage_in_query::METADATA)
         }
         DiagnosticCode::RefOveruse => Some(&ref_overuse::METADATA),
+        DiagnosticCode::RegisterRecorderFieldInQuery => {
+            Some(&register_recorder_field_in_query::METADATA)
+        }
         DiagnosticCode::SelectTopWithoutOrderBy => Some(&select_top_without_order_by::METADATA),
         DiagnosticCode::UnionAll => Some(&union_all::METADATA),
         DiagnosticCode::UsingLikeInQuery => Some(&using_like_in_query::METADATA),

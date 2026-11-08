@@ -3828,3 +3828,149 @@ fn an_owner_join_that_the_syntax_cannot_confirm_is_not_exempt() {
     hir.joins[0].range = text_size::TextRange::empty(0.into());
     assert_eq!(check(&hir), 1);
 }
+
+fn recorder_reads(config: bsl_metadata::Configuration, code: &str) -> usize {
+    let ast = parser::parse_sdbl(code);
+    let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+    package
+        .all_diagnostics()
+        .filter(|d| {
+            matches!(d, crate::diagnostics::SdblDiagnostic::RegisterRecorderFieldInQuery { .. })
+        })
+        .count()
+}
+
+fn config_with_stock_register() -> bsl_metadata::Configuration {
+    let xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+<AccumulationRegister uuid="11111111-1111-1111-1111-111111111111">
+<Properties><Name>ТоварыНаСкладах</Name></Properties>
+<ChildObjects>
+<Dimension uuid="22222222-2222-2222-2222-222222222222"><Properties><Name>Склад</Name></Properties></Dimension>
+</ChildObjects>
+</AccumulationRegister></MetaDataObject>"#;
+    let register = bsl_metadata::xml_parser::parse_accumulation_register_xml(xml)
+        .expect("accumulation register fixture must parse");
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_register(register);
+    config.add_metadata_object(bsl_metadata::MetadataObject::new(
+        bsl_metadata::MdoType::Catalog,
+        "Контрагенты",
+    ));
+    config
+}
+
+const STOCK: &str = "РегистрНакопления.ТоварыНаСкладах КАК Движения";
+
+#[test]
+fn recorder_attribute_in_select_list_is_reported() {
+    let code = format!("ВЫБРАТЬ Движения.Регистратор.Контрагент ИЗ {STOCK}");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn recorder_attribute_in_where_is_reported() {
+    let code =
+        format!("ВЫБРАТЬ Движения.Склад ИЗ {STOCK} ГДЕ Движения.Регистратор.Контрагент = &К");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn recorder_attribute_in_order_by_is_reported() {
+    let code =
+        format!("ВЫБРАТЬ Движения.Склад ИЗ {STOCK} УПОРЯДОЧИТЬ ПО Движения.Регистратор.Контрагент");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn english_recorder_attribute_is_reported() {
+    let code =
+        "SELECT Records.Recorder.Counterparty FROM AccumulationRegister.ТоварыНаСкладах AS Records";
+    assert_eq!(recorder_reads(config_with_stock_register(), code), 1);
+}
+
+#[test]
+fn deeper_path_through_recorder_is_reported_once() {
+    let code = format!("ВЫБРАТЬ Движения.Регистратор.Контрагент.ИНН ИЗ {STOCK}");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn recorder_attribute_in_virtual_table_source_is_reported() {
+    let code = "ВЫБРАТЬ Т.Склад ИЗ РегистрНакопления.ТоварыНаСкладах.Обороты(,,, Регистратор.Контрагент = &К) КАК Т";
+    assert_eq!(recorder_reads(config_with_stock_register(), code), 1);
+}
+
+#[test]
+fn standard_fields_of_recorder_are_not_reported() {
+    for field in [
+        "Ссылка",
+        "Дата",
+        "Номер",
+        "Проведен",
+        "ПометкаУдаления",
+        "Представление",
+        "МоментВремени",
+        "ВерсияДанных",
+    ] {
+        let code = format!("ВЫБРАТЬ Движения.Регистратор.{field} ИЗ {STOCK}");
+        assert_eq!(recorder_reads(config_with_stock_register(), &code), 0, "{field}");
+    }
+}
+
+#[test]
+fn recorder_read_as_last_part_is_not_reported() {
+    let code = format!("ВЫБРАТЬ Движения.Регистратор ИЗ {STOCK}");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 0);
+}
+
+#[test]
+fn own_dimension_of_register_is_not_reported() {
+    let code = format!("ВЫБРАТЬ Движения.Склад ИЗ {STOCK} ГДЕ Движения.Склад.Наименование = &Н");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 0);
+}
+
+#[test]
+fn recorder_attribute_of_temp_table_is_not_reported() {
+    let code = format!(
+        "ВЫБРАТЬ Движения.Склад КАК Регистратор ПОМЕСТИТЬ Врем ИЗ {STOCK}; \
+         ВЫБРАТЬ Т.Регистратор.Контрагент ИЗ Врем КАК Т"
+    );
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 0);
+}
+
+#[test]
+fn recorder_attribute_over_catalog_is_not_reported() {
+    let code = "ВЫБРАТЬ К.Регистратор.Контрагент ИЗ Справочник.Контрагенты КАК К";
+    assert_eq!(recorder_reads(config_with_stock_register(), code), 0);
+}
+
+fn config_with_information_register_write_mode(write_mode: &str) -> bsl_metadata::Configuration {
+    let xml = format!(
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+<InformationRegister uuid="59f8d329-f39c-4999-b470-ae9fc74511ac">
+<Properties><Name>Курсы</Name><WriteMode>{write_mode}</WriteMode></Properties>
+<ChildObjects>
+<Dimension uuid="532f2a7f-4c1e-4a49-8281-3c21232da2d7"><Properties><Name>Валюта</Name></Properties></Dimension>
+</ChildObjects>
+</InformationRegister></MetaDataObject>"#
+    );
+    let register = bsl_metadata::xml_parser::parse_information_register_xml(&xml)
+        .expect("information register fixture must parse");
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_register(register);
+    config
+}
+
+#[test]
+fn recorder_attribute_of_subordinate_information_register_is_reported() {
+    let code = "ВЫБРАТЬ Т.Регистратор.Контрагент ИЗ РегистрСведений.Курсы КАК Т";
+    let config = config_with_information_register_write_mode("RecorderSubordinate");
+    assert_eq!(recorder_reads(config, code), 1);
+}
+
+#[test]
+fn recorder_attribute_of_independent_information_register_is_not_reported() {
+    let code = "ВЫБРАТЬ Т.Регистратор.Контрагент ИЗ РегистрСведений.Курсы КАК Т";
+    let config = config_with_information_register_write_mode("Independent");
+    assert_eq!(recorder_reads(config, code), 0);
+}

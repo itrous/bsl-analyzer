@@ -256,6 +256,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::InvalidVirtualTableParameters => &[],
         DiagnosticCode::UnlimitedLengthStringUsageInQuery => &[432],
         DiagnosticCode::RefOveruse => &[654],
+        DiagnosticCode::RegisterRecorderFieldInQuery => &[477],
         DiagnosticCode::SelectTopWithoutOrderBy => &[412],
         DiagnosticCode::UnionAll => &[434],
         DiagnosticCode::UsingLikeInQuery => &[726],

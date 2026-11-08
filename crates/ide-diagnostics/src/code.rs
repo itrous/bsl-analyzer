@@ -216,6 +216,7 @@ pub enum DiagnosticCode {
     UnknownQueryFunction,
     UnlimitedLengthStringUsageInQuery,
     RefOveruse,
+    RegisterRecorderFieldInQuery,
     SelectTopWithoutOrderBy,
     UnionAll,
     UsingLikeInQuery,

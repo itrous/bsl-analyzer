@@ -85,6 +85,7 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::UnknownQueryFunction,
     DiagnosticCode::UnlimitedLengthStringUsageInQuery,
     DiagnosticCode::RefOveruse,
+    DiagnosticCode::RegisterRecorderFieldInQuery,
     DiagnosticCode::SelectTopWithoutOrderBy,
     DiagnosticCode::UnionAll,
     DiagnosticCode::UsingLikeInQuery,
@@ -397,6 +398,10 @@ pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispat
         handlers::unlimited_length_string_usage_in_query::dispatch,
     ),
     (DiagnosticCode::RefOveruse, handlers::ref_overuse::dispatch),
+    (
+        DiagnosticCode::RegisterRecorderFieldInQuery,
+        handlers::register_recorder_field_in_query::dispatch,
+    ),
     (DiagnosticCode::SelectTopWithoutOrderBy, handlers::select_top_without_order_by::dispatch),
     (DiagnosticCode::UnionAll, handlers::union_all::dispatch),
     (DiagnosticCode::UsingLikeInQuery, handlers::using_like_in_query::dispatch),

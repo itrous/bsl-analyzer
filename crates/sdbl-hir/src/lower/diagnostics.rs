@@ -1,4 +1,5 @@
 use super::context::LoweringContext;
+use super::from_clause::is_document_virtual_query_field;
 use super::missing_row::{AliasMatch, MissingRowConditions, QueryFacts};
 use crate::diagnostics::{SdblDiagnostic, UnprotectedFieldRef};
 use crate::hir::{
@@ -148,6 +149,109 @@ impl LoweringContext<'_> {
                 self.report_dotted_paths(&item.expr, PathStart::SourceAlias);
             }
         }
+    }
+
+    /// Reports a path that reads a non-standard member through a register's `Регистратор`.
+    ///
+    /// #std477: a register carries what its logic needs in its own dimensions and resources.
+    /// The standard fields of the document identify and present the recorder and stay allowed;
+    /// any other name after it is a declared attribute, a common attribute or a tabular
+    /// section. The registrar's concrete documents are not known to the query layer, so a name
+    /// no document declares is reported too — the unknown-field rule covers the typo.
+    pub(super) fn check_register_recorder_fields(&mut self, hir: &SdblHir) {
+        let mut found = Vec::new();
+        let mut visit = |this: &Self, expr: &ExprHir, table: Option<&TableRef>| {
+            this.collect_recorder_reads(expr, table, &mut found);
+        };
+        for field in &hir.select.fields {
+            visit(self, &field.expr, None);
+        }
+        for table in hir.from.iter().chain(hir.joins.iter().map(|join| &join.table)) {
+            for param in &table.virtual_table_params {
+                visit(self, param, Some(table));
+            }
+        }
+        for join in &hir.joins {
+            if let Some(condition) = &join.condition {
+                visit(self, condition, None);
+            }
+        }
+        if let Some(where_expr) = &hir.where_clause {
+            visit(self, where_expr, None);
+        }
+        if let Some(group_by) = &hir.group_by {
+            for expr in &group_by.exprs {
+                visit(self, expr, None);
+            }
+        }
+        if let Some(having) = &hir.having {
+            visit(self, having, None);
+        }
+        if let Some(order_by) = &hir.order_by {
+            for item in &order_by.items {
+                visit(self, &item.expr, None);
+            }
+        }
+        for (attribute, range) in found {
+            self.diagnostics
+                .push(SdblDiagnostic::RegisterRecorderFieldInQuery { attribute, range });
+        }
+    }
+
+    /// `table` is set for a virtual-table parameter, where the path starts from a field.
+    fn collect_recorder_reads(
+        &self,
+        expr: &ExprHir,
+        table: Option<&TableRef>,
+        found: &mut Vec<(String, text_size::TextRange)>,
+    ) {
+        if let ExprHir::ColumnRef { parts, range, .. } = expr {
+            if let Some(attribute) = self.recorder_attribute_read(parts, table) {
+                found.push((attribute, *range));
+            }
+            return;
+        }
+        for child in direct_operands(expr) {
+            self.collect_recorder_reads(child, table, found);
+        }
+    }
+
+    fn recorder_attribute_read(&self, parts: &[Name], table: Option<&TableRef>) -> Option<String> {
+        let (table, rest) = match table {
+            Some(table) => (table, parts),
+            None => {
+                if parts.len() < 3 || crate::is_mdo_type(parts[0].as_str()) {
+                    return None;
+                }
+                (self.scope.find_table(parts[0].as_str())?, &parts[1..])
+            }
+        };
+        let [recorder, attribute, ..] = rest else {
+            return None;
+        };
+        let metadata = table.metadata.as_ref()?;
+        let crate::hir::ResolvedTable::Register { mdo_type, name, .. } = metadata else {
+            return None;
+        };
+        let field = metadata.find_field(recorder.as_str())?;
+        if !field.is_standard || !field.matches_name("Регистратор") {
+            return None;
+        }
+        if field.provisional {
+            // The parser reads the write mode, so for a subordinate information register the
+            // recorder field is unconditional and the provisional mark does not apply.
+            let subordinate = *mdo_type == bsl_metadata::MdoType::InformationRegister
+                && self
+                    .resolver
+                    .and_then(|resolver| resolver.resolve_register(*mdo_type, name))
+                    .is_some_and(|register| register.is_recorder_subordinate());
+            if !subordinate {
+                return None;
+            }
+        }
+        let name = attribute.as_str();
+        (!bsl_metadata::is_standard_attribute_name(name) && !is_document_virtual_query_field(name))
+            .then(|| name.to_string())
     }
 
     fn report_dotted_paths_in_source(&mut self, table: &TableRef) {

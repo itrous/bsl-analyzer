@@ -71,6 +71,7 @@ pub const METADATA_DEPENDENT_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::AmbiguousFieldInQuery,
     DiagnosticCode::QueryNestedFieldsByDot,
     DiagnosticCode::QueryToMissingMetadata,
+    DiagnosticCode::RegisterRecorderFieldInQuery,
     DiagnosticCode::UnknownFieldInQuery,
 ];
 
