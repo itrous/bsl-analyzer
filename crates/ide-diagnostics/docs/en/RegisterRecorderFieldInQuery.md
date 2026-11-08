@@ -33,6 +33,8 @@ It does not fire:
 
 Any non-standard name after the recorder is reported, including a name no document declares:
 it is still a recorder dereference, and the unknown-field diagnostic covers the typo separately.
+A read through a cast of the recorder is reported the same way:
+`CAST(Records.Recorder AS Document.Sale).Counterparty`.
 
 The path is checked in every query section: the select list, join sources and conditions,
 `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` and virtual table parameters.

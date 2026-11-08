@@ -3935,6 +3935,31 @@ fn english_standard_fields_of_recorder_are_not_reported() {
 }
 
 #[test]
+fn recorder_attribute_read_through_cast_is_reported() {
+    let code = format!(
+        "ВЫБРАТЬ ВЫРАЗИТЬ(Движения.Регистратор КАК Документ.Реализация).Контрагент ИЗ {STOCK}"
+    );
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn recorder_standard_field_read_through_cast_is_not_reported() {
+    for field in ["Дата", "Ссылка"] {
+        let code = format!(
+            "ВЫБРАТЬ ВЫРАЗИТЬ(Движения.Регистратор КАК Документ.Реализация).{field} ИЗ {STOCK}"
+        );
+        assert_eq!(recorder_reads(config_with_stock_register(), &code), 0, "{field}");
+    }
+}
+
+#[test]
+fn recorder_attribute_read_through_cast_in_virtual_table_source_is_reported() {
+    let code = "ВЫБРАТЬ Т.Склад ИЗ РегистрНакопления.ТоварыНаСкладах.Обороты(,,, \
+                ВЫРАЗИТЬ(Регистратор КАК Документ.Реализация).Контрагент = &К) КАК Т";
+    assert_eq!(recorder_reads(config_with_stock_register(), code), 1);
+}
+
+#[test]
 fn recorder_read_as_last_part_is_not_reported() {
     let code = format!("ВЫБРАТЬ Движения.Регистратор ИЗ {STOCK}");
     assert_eq!(recorder_reads(config_with_stock_register(), &code), 0);

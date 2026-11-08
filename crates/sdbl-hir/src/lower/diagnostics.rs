@@ -206,29 +206,55 @@ impl LoweringContext<'_> {
         found: &mut Vec<(String, text_size::TextRange)>,
     ) {
         if let ExprHir::ColumnRef { parts, range, .. } = expr {
-            if let Some(attribute) = self.recorder_attribute_read(parts, table) {
+            let attribute = self.members_after_recorder(parts, table).and_then(<[Name]>::first);
+            if let Some(attribute) = attribute.and_then(recorder_data_member) {
                 found.push((attribute, *range));
             }
             return;
+        }
+        // `ВЫРАЗИТЬ(Источник.Регистратор КАК Документ.Х).Реквизит` reads the document through
+        // the recorder just as a dotted path does.
+        if let ExprHir::FunctionCall {
+            function: FunctionKind::Cast,
+            args,
+            member_access,
+            range,
+            ..
+        } = expr
+        {
+            let casts_recorder = matches!(
+                args.first(),
+                Some(ExprHir::ColumnRef { parts, .. })
+                    if self.members_after_recorder(parts, table).is_some_and(<[Name]>::is_empty)
+            );
+            if let Some(attribute) =
+                member_access.first().filter(|_| casts_recorder).and_then(recorder_data_member)
+            {
+                found.push((attribute, *range));
+            }
         }
         for child in direct_operands(expr) {
             self.collect_recorder_reads(child, table, found);
         }
     }
 
-    fn recorder_attribute_read(&self, parts: &[Name], table: Option<&TableRef>) -> Option<String> {
+    /// The members that follow a register's `Регистратор` in `parts`, or `None` when the path
+    /// does not go through that field.
+    fn members_after_recorder<'a>(
+        &self,
+        parts: &'a [Name],
+        table: Option<&TableRef>,
+    ) -> Option<&'a [Name]> {
         let (table, rest) = match table {
             Some(table) => (table, parts),
             None => {
-                if parts.len() < 3 || crate::is_mdo_type(parts[0].as_str()) {
+                if parts.len() < 2 || crate::is_mdo_type(parts[0].as_str()) {
                     return None;
                 }
                 (self.scope.find_table(parts[0].as_str())?, &parts[1..])
             }
         };
-        let [recorder, attribute, ..] = rest else {
-            return None;
-        };
+        let (recorder, members) = rest.split_first()?;
         let metadata = table.metadata.as_ref()?;
         let crate::hir::ResolvedTable::Register { mdo_type, name, .. } = metadata else {
             return None;
@@ -249,10 +275,7 @@ impl LoweringContext<'_> {
                 return None;
             }
         }
-        let name = attribute.as_str();
-        (!bsl_metadata::is_document_standard_attribute_name(name)
-            && !is_document_virtual_query_field(name))
-        .then(|| name.to_string())
+        Some(members)
     }
 
     fn report_dotted_paths_in_source(&mut self, table: &TableRef) {
@@ -1328,4 +1351,13 @@ impl<'a> NullableUses<'a> {
                 .into_iter()
                 .any(|operand| self.tests_presence_anywhere(operand))
     }
+}
+
+/// The member read through the recorder when it is data rather than a standard field of the
+/// document.
+fn recorder_data_member(member: &Name) -> Option<String> {
+    let name = member.as_str();
+    (!bsl_metadata::is_document_standard_attribute_name(name)
+        && !is_document_virtual_query_field(name))
+    .then(|| name.to_string())
 }
