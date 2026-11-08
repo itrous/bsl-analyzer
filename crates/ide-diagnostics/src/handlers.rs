@@ -107,6 +107,7 @@ pub mod missing_returned_value_description;
 pub mod missing_space;
 pub mod missing_temp_storage_deletion;
 pub mod missing_temporary_file_deletion;
+pub mod object_modified_in_on_write;
 pub mod missing_variables_description;
 pub mod module_accessibility;
 pub mod multiline_preprocessor_instruction;
@@ -346,6 +347,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
             Some(&missing_temporary_file_deletion::METADATA)
         }
         DiagnosticCode::MisplacedLoopControl => Some(&misplaced_loop_control::METADATA),
+        DiagnosticCode::ObjectModifiedInOnWrite => Some(&object_modified_in_on_write::METADATA),
         DiagnosticCode::UseLessForEach => Some(&useless_for_each::METADATA),
         DiagnosticCode::IteratorCollidesCollection => Some(&iterator_collides_collection::METADATA),
         DiagnosticCode::UsingGoto => Some(&using_goto::METADATA),
