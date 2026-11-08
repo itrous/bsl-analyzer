@@ -4052,6 +4052,16 @@ mod order_by_document_date {
             ))
             .unwrap(),
         );
+        config.add_metadata_object(
+            parse_document_xml(&format!(
+                r#"{HEADER}
+    <Document uuid="00000000-0000-0000-0000-000000000021">
+        <Properties><Name>Возврат</Name></Properties>
+    </Document>
+</MetaDataObject>"#
+            ))
+            .unwrap(),
+        );
         config.add_register(
             parse_accumulation_register_xml(&format!(
                 r#"{HEADER}
@@ -4063,6 +4073,12 @@ mod order_by_document_date {
             </Dimension>
             <Dimension uuid="00000000-0000-0000-0000-000000000102">
                 <Properties><Name>Партия</Name><Type><v8:Type>cfg:DocumentRef.Поступление</v8:Type></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000103">
+                <Properties><Name>ОснованиеДокумент</Name><Type><v8:Type>cfg:DocumentRef.Поступление</v8:Type><v8:Type>cfg:DocumentRef.Возврат</v8:Type></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000104">
+                <Properties><Name>ОснованиеСмешанное</Name><Type><v8:Type>cfg:DocumentRef.Поступление</v8:Type><v8:Type>cfg:CatalogRef.Номенклатура</v8:Type></Type></Properties>
             </Dimension>
             <Resource uuid="00000000-0000-0000-0000-000000000200">
                 <Properties><Name>Количество</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties>
@@ -4139,6 +4155,16 @@ mod order_by_document_date {
             &query[usize::from(range.start())..usize::from(range.end())],
             "Партии.Партия.Дата"
         );
+    }
+
+    #[test]
+    fn a_composite_of_two_documents_is_reported() {
+        assert_eq!(balance("Партии.ОснованиеДокумент.Дата"), ["ОснованиеДокумент"]);
+    }
+
+    #[test]
+    fn a_composite_of_a_document_and_a_catalog_is_silent() {
+        assert!(balance("Партии.ОснованиеСмешанное.Дата").is_empty());
     }
 
     #[test]
