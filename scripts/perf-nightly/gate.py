@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from datetime import datetime
 
 import corpus
 import perf_nightly
@@ -69,6 +70,9 @@ RESOLVE_ANSWERS = ("c-graph-resolve", *[f"c-graph-resolve-extra-{i}" for i in ra
                    "d-graph-resolve-3")
 SWEEP_ANSWER = "f-diagnostics-workspace"
 LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# The graph build marks of the daemon log that bound readiness, in their order.
+PHASES = ("done", "validation", "published")
+PHASE_RE = re.compile(r"^(\S+)\s.*graph build: (done|validation|published) elapsed_ms=(\d+)")
 METRICS = {m.key: m for m in verdict.GATE_METRICS}
 READY_ONLY_METRICS = ("graph_ready_s", "graph_ready_cpu_s")
 REFS_METRICS = tuple(verdict.GATE_REFS_LIMITS_S)
@@ -313,7 +317,8 @@ def _kill(processes: list) -> list:
     return []
 
 
-def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sampler, live: _Live) -> None:
+def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sampler, live: _Live,
+             trace: procs.ResourceTrace | None = None) -> None:
     m = ctx.out["metrics"]
     run_dir = ctx.run_dir
     extra = ("--enable-tool", "references") if series == "B" else ()
@@ -342,6 +347,8 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
         if backend != "graph":
             return
         m["graph_ready_s"] = ctx.clock.now() - run.spawned_at
+        if trace is not None:
+            trace.event("graph_ready")
         burned = 0.0
         exclude = [proc.pid for proc in live.burners]
         if live.burners:
@@ -361,13 +368,24 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
         return
 
     def call(name: str, tool: str, arguments: dict, answer: tuple | None = None, metric: str | None = None):
-        elapsed, result, error = run.tool(tool, arguments, CALL_TIMEOUT_S)
+        if trace is not None:
+            trace.event("call_start", call_id=name)
+        try:
+            elapsed, result, error = run.tool(tool, arguments, CALL_TIMEOUT_S)
+        except Exception:
+            # The server went away during the call: its end is when that was seen.
+            if trace is not None:
+                trace.event("call_end", call_id=name, ok=False)
+            raise
+        ended = ctx.clock.now()
         if error is None:
             error = scenarios.check_tool_result(result)
         value = _answer(result, answer[1]) if answer is not None and error is None else None
         # An answer without its list would make two missing answers compare equal.
         if answer is not None and error is None and not isinstance(value, list):
             error = f"no `{answer[1]}` list in the answer"
+        if trace is not None:
+            trace.event("call_end", ended, call_id=name, ok=error is None)
         ctx.call({"id": name, "elapsed": elapsed, "ok": error is None, "error": error})
         if error is not None:
             raise scenarios.NotHeld("call_failed", f"{name}: {error}")
@@ -401,12 +419,42 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
         ctx.clock.sleep(PAUSE_SWEEP_S)
 
 
+def trace_phases(trace: procs.ResourceTrace, log_path: str | None) -> None:
+    """Every graph build mark of the daemon log, repeated builds included, as a
+    `phase` at the log line's own UTC time: the server shares no monotonic clock
+    with the trace. A mark that is missing or unreadable is a loss of the trace,
+    never stood in for by another time."""
+    seen: set[str] = set()
+    try:
+        with open(log_path or "", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                found = PHASE_RE.match(scenarios.ANSI_RE.sub("", line))
+                if found is None:
+                    continue
+                stamp, name, elapsed_ms = found.groups()
+                seen.add(name)
+                try:
+                    when = datetime.fromisoformat(stamp)
+                    wall_s = when.timestamp() if when.tzinfo is not None else None
+                except ValueError:
+                    wall_s = None
+                if wall_s is None:
+                    trace.loss(f"daemon.log: `{name}` mark without a UTC time: {stamp}")
+                trace.phase(name, int(elapsed_ms), wall_s)
+    except OSError as exc:
+        trace.loss(f"daemon.log: {exc}")
+    for name in PHASES:
+        if name not in seen:
+            trace.loss(f"daemon.log: no `{name}` mark")
+
+
 def run_pass(ctx, series: str, ready_only: bool, *, record: dict, controls: dict | None = None,
-             machine=None) -> dict:
+             machine=None, trace: bool = False) -> dict:
     """One run of the gate on `ctx` (root = the ERP clone): series A or B,
     up to readiness only with `ready_only`. Writes and returns the run's
     record (`<run dir>/r.json`); `record` carries its identity (binary,
-    fingerprint, k, runs)."""
+    fingerprint, k, runs). With `trace` the run also writes its resource
+    series (`procs.TRACE_NAME`) and the record says how complete it is."""
     machine = machine or Machine()
     controls = controls or {}
     out = ctx.out
@@ -414,10 +462,15 @@ def run_pass(ctx, series: str, ready_only: bool, *, record: dict, controls: dict
     load_before = procs.machine_load()
     started_at = verdict.now_iso()
     began = ctx.clock.now()
-    sampler = procs.Sampler(ctx.run_id)
+    sink = None
+    if trace:
+        sink = procs.ResourceTrace(os.path.join(ctx.run_dir, procs.TRACE_NAME), {
+            "run_id": ctx.run_id, "binary_sha": record["binary"]["sha"], "role": record["role"],
+            "series": series, "attempt": record["attempt"]}, ctx.clock)
+    sampler = procs.Sampler(ctx.run_id, sink=sink)
     live = _Live()
     try:
-        _measure(ctx, series, ready_only, controls, machine, sampler, live)
+        _measure(ctx, series, ready_only, controls, machine, sampler, live, sink)
         out["held"], out["reason"] = True, None
     except scenarios.NotHeld as exc:
         out["held"], out["reason"] = False, exc.reason
@@ -433,13 +486,20 @@ def run_pass(ctx, series: str, ready_only: bool, *, record: dict, controls: dict
         sampled = sampler.stop()
         out["metrics"].update(hwm_kb=sampled["hwm_kb"], rss_peak_kb=sampled["rss_peak_kb"],
                               cpu_s=sampled["cpu_s"])
-    final = procs.stop(ctx.run_id, ctx.clock)
+    try:
+        final = procs.stop(ctx.run_id, ctx.clock)
+    finally:
+        if sink is not None:
+            trace_phases(sink, ctx.env.get("BSL_MCP_DAEMON_LOG"))
+            traced = sink.finish()
     found = {**record, "schema": HARNESS_SCHEMA, "run_id": ctx.run_id, "series": series,
              "metrics": out["metrics"], "calls": out["calls"], "errors": list(out["errors"]),
              "held": out["held"], "reason": out["reason"], "exit_code": out.get("exit_code"),
              "controls": {name: controls[name] for name in sorted(ctx.applied)} or None,
              "load_before": load_before, "load_after": procs.machine_load(), "started_at": started_at,
              "duration_s": ctx.clock.now() - began, "stop": {"first": out.get("stop"), "final": final}}
+    if sink is not None:
+        found["resource_trace"] = traced
     if final["left"]:
         found.update(held=False, reason="stop_incomplete")
         found["errors"].append(f"stop_incomplete: {len(final['left'])} tracked process(es) survive")
@@ -460,7 +520,8 @@ class Runner:
     the machine is waited for and after that, and a run that does not fit never
     starts."""
 
-    def __init__(self, clock, machine, source: dict, print_: dict, budget_min: float, fits=None):
+    def __init__(self, clock, machine, source: dict, print_: dict, budget_min: float, fits=None,
+                 trace: bool = False):
         self.clock = clock
         self.machine = machine
         self.source = source
@@ -469,6 +530,7 @@ class Runner:
         self.spent_s = 0.0
         self.launches: list[dict] = []
         self.fits = fits
+        self.trace = trace
 
     def check_window(self, series: str) -> None:
         if self.fits is not None and not self.fits(series):
@@ -502,7 +564,8 @@ class Runner:
             identity = {"binary": {"label": binary["label"], "sha": binary["sha"], "sha256": binary["sha256"]},
                         "role": role, "k": k, "runs": RUNS, "attempt": attempt, "env_fingerprint": self.print,
                         "corpus": {"id": CORPUS, "commit": self.source["commit"]}, "temp": TEMP}
-            record = run_pass(ctx, series, ready_only, record=identity, controls=controls, machine=self.machine)
+            record = run_pass(ctx, series, ready_only, record=identity, controls=controls, machine=self.machine,
+                              trace=self.trace)
             self.launches.append({"run": os.path.basename(this_dir), "dir": this_dir, "role": role,
                                   "series": series, "k": k, "held": record["held"], "reason": record["reason"],
                                   "foreign_cores": record["metrics"].get("foreign_cores")})
@@ -1098,7 +1161,7 @@ def _gate(args, clock, builder, machine, data: Data, out_dir: str, summary: dict
     if "control_burn_cpu_s" in controls:
         controls["burners"] = burn_count(controls["control_burn_cpu_s"], noise)
     spin = {k: v for k, v in controls.items() if k == "control_foreign_burn"}
-    runner = Runner(clock, machine, source, print_, _budget(args))
+    runner = Runner(clock, machine, source, print_, _budget(args), trace=args.trace_resources)
     runs = os.path.join(out_dir, "runs")
     reasons: list[str] = []
     rounds: list[dict] = []

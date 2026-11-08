@@ -1021,6 +1021,10 @@ def parser() -> argparse.ArgumentParser:
                       help="control: the candidate server starts this many seconds later")
     gate.add_argument("--control-foreign-burn", type=int,
                       help="control: this many busy processes outside the run live through readiness")
+    gate.add_argument("--trace-resources", action="store_true",
+                      help="write resources.jsonl into every run dir: CPU, RSS, HWM and I/O of the run's "
+                           "processes each second, the calls, readiness and the graph build marks; "
+                           "decides nothing")
     gate.add_argument("--baseline", help="the record file (default: baseline.json next to gate.py)")
     gate.set_defaults(func=cmd_gate)
 
