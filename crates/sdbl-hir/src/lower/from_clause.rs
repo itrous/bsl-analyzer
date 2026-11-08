@@ -36,6 +36,24 @@ pub(super) fn declared_source_aliases(
     aliases
 }
 
+const POINT_IN_TIME: &str = "МоментВремени";
+
+/// Query-only fields of a reference table that `StandardAttributeKind` does not list: present
+/// on every reference table (ITS ch.18 / §8.3), and `МоментВремени` (date + ref) on documents
+/// only, with no BSL object-model counterpart.
+const DOCUMENT_VIRTUAL_QUERY_FIELDS: [(&str, &str); 3] = [
+    ("Представление", "Presentation"),
+    ("ВерсияДанных", "DataVersion"),
+    (POINT_IN_TIME, "PointInTime"),
+];
+
+/// Whether `name` is one of the query-only virtual fields of a reference table, in either language.
+pub(super) fn is_document_virtual_query_field(name: &str) -> bool {
+    DOCUMENT_VIRTUAL_QUERY_FIELDS.iter().any(|(ru, en)| {
+        stdx::case::eq_ignore_case(ru, name) || stdx::case::eq_ignore_case(en, name)
+    })
+}
+
 impl LoweringContext<'_> {
     pub(super) fn lower_from_clause(
         &mut self,
@@ -1078,29 +1096,14 @@ impl LoweringContext<'_> {
                         ));
                     }
 
-                    // Virtual query fields present on every reference table but
-                    // absent from StandardAttributeKind (ITS ch.18 / §8.3).
-                    fields.push(FieldDef::standard(
-                        "Представление",
-                        "Presentation",
-                        SdblType::string(),
-                    ));
-                    fields.push(FieldDef::standard(
-                        "ВерсияДанных",
-                        "DataVersion",
-                        SdblType::string(),
-                    ));
-
-                    // МоментВремени is a query-only virtual field of document
-                    // tables (date + ref); it has no BSL object-model
-                    // counterpart, so it lives here rather than in the
-                    // standard-attribute synthesiser.
-                    if mdo_type == MdoType::Document {
-                        fields.push(FieldDef::standard(
-                            "МоментВремени",
-                            "PointInTime",
-                            SdblType::DateTime,
-                        ));
+                    for (name, name_en) in DOCUMENT_VIRTUAL_QUERY_FIELDS {
+                        let is_point_in_time = name == POINT_IN_TIME;
+                        if is_point_in_time && mdo_type != MdoType::Document {
+                            continue;
+                        }
+                        let ty =
+                            if is_point_in_time { SdblType::DateTime } else { SdblType::string() };
+                        fields.push(FieldDef::standard(name, name_en, ty));
                     }
 
                     for common in &obj.common_attributes {

@@ -349,6 +349,8 @@ impl LoweringContext<'_> {
 
         self.check_nested_fields_by_dot(&hir);
 
+        self.check_register_recorder_fields(&hir);
+
         self.check_ref_overuse(&hir);
 
         self.check_unlimited_string_usage(&hir);
