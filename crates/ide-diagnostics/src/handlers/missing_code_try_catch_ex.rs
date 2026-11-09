@@ -300,6 +300,39 @@ mod tests {
     }
 
     #[test]
+    fn issue_table_logging_calls_do_not_emit_in_either_language() {
+        for (try_, except_, end_try) in
+            [("Try", "Except", "EndTry"), ("Попытка", "Исключение", "КонецПопытки")]
+        {
+            for call in [
+                "WriteErrorToLog(E, T)",
+                "WriteErrorToEventLog(E, T)",
+                "LogError(E, T)",
+                "EventLogClient.AddMessageForEventLog(E, \"Error\", T)",
+                "WriteLogEvent(\"E\", EventLogLevel.Error, , , T)",
+                "ЗаписатьОшибкуВЖурнал(E, T)",
+                "ЖурналРегистрацииКлиент.ДобавитьСообщениеДляЖурналаРегистрации(E, \"Ошибка\", T)",
+            ] {
+                let code = format!(
+                    "Procedure P(E, T) Export\n\t{try_}\n\t\tA = 1 / 0;\n\t{except_}\n\t\t{call};\n\t{end_try};\nEndProcedure\n"
+                );
+                check(&code, expect![[r#""#]]);
+            }
+        }
+    }
+
+    #[test]
+    fn log_inside_a_word_does_not_hide_the_swallow() {
+        for call in ["AddToCatalog(E, T)", "ShowDialog(E, T)"] {
+            let code = format!(
+                "Procedure P(E, T) Export\n\tTry\n\t\tA = 1 / 0;\n\tExcept\n\t\t{call};\n\tEndTry;\nEndProcedure\n"
+            );
+            let diagnostics = check_body_diagnostic(&code, check_body);
+            assert_eq!(diagnostics.len(), 1, "`{call}` must leave the swallow flagged");
+        }
+    }
+
+    #[test]
     fn mixed_does_not_emit() {
         let code = r#"Процедура ОтправитьВыгрузку(Файл)
 	Попытка

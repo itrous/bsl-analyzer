@@ -33,9 +33,13 @@ Reporting covers both the platform logging API (`Message`, `WriteLogEvent`,
 `Сообщить`, `ЗаписьЖурналаРегистрации`) and application/BSP helpers
 recognized by name: a record-or-notify verb together with an error, log, or
 event noun — `ЗаписатьОшибкуВЖурналРегистрации`,
-`ДобавитьСообщениеДляЖурналаРегистрации`, `СообщитьОбОшибке`, `ShowMessageBox`,
-`ЗаписатьСобытиеПодсистемы`, etc. The callee body is not read: the decision
-depends only on the name. Pure formatters
+`ДобавитьСообщениеДляЖурналаРегистрации`, `СообщитьОбОшибке`,
+`ЗаписатьСобытиеПодсистемы`, `WriteErrorToLog`, `AddMessageForEventLog`,
+`LogError`, `ShowWarning`, etc. English names are split into words
+(`WriteErrorToLog` → write, error, to, log) and the verb and the noun must be
+whole words, so `log` inside `Catalog` or `Dialog` does not count; `log` is a
+verb only as the first word (`LogError`, not `ReadEventLog`). The callee body
+is not read: the decision depends only on the name. Pure formatters
 (`ПодробноеПредставлениеОшибки`, `ErrorDescription`) do not count as
 reporting: a block that only formats the error stays "silent".
 
