@@ -1,8 +1,8 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::utils::nstr::{
-    extract_language_keys, get_assigned_variable_name, has_template_in_parents, is_nstr_call,
-    is_variable_used_in_template, NstrConfig,
+    extract_language_entries, extract_language_keys, get_assigned_variable_name,
+    has_template_in_parents, is_nstr_call, is_variable_used_in_template, NstrConfig,
 };
 use crate::BodyContext;
 use crate::{sdbl_utils, Diagnostic, DiagnosticCode};
@@ -23,12 +23,60 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     lsp_severity_override: "",
 };
 
+/// `MultilingualStringHasEmptyTranslation` is emitted by this same handler: it reuses the
+/// `НСтр` call recognition and the declared-language list, and the language list stays a
+/// single setting (`declaredLanguages` of `MultilingualStringHasAllDeclaredLanguages`).
+pub const EMPTY_TRANSLATION_METADATA: DiagnosticMetadata = define_metadata! {
+    diagnostic_type: DiagnosticType::Error,
+    severity: DiagnosticSeverityLevel::Minor,
+    scope: DiagnosticScope::Bsl,
+    modules: &[],
+    minutes_to_fix: 2,
+    activated_by_default: true,
+    compatibility_mode: DiagnosticCompatibilityMode::Undefined,
+    tags: &[MetadataTag::Error, MetadataTag::Localize],
+    can_locate_on_project: false,
+    extra_min_for_complexity: 0.0,
+    lsp_severity_override: "warning",
+};
+
+const EMPTY_TRANSLATION_MESSAGE: &str =
+    "Объявленный язык с пустым переводом: текст в интерфейсе будет пустым";
+
+/// The first `НСтр` argument when it is exactly one string literal, so its text is known
+/// statically; concatenations and variables are not.
+fn static_literal_content(first_arg: &syntax::SyntaxNode) -> Option<String> {
+    let literal = first_arg.descendants().find(|n| n.kind() == SyntaxKind::LITERAL)?;
+    if first_arg.text().to_string().trim() != literal.text().to_string().trim() {
+        return None;
+    }
+    sdbl_utils::extract_string_content(&literal)
+}
+
+/// A declared language present in the literal with a value that is empty or whitespace only,
+/// while another entry of the same literal carries text: the text exists, but not for this
+/// language. A literal blank in every language (`ru=''; uk=''`) loses nothing and is a
+/// deliberate empty string.
+fn has_empty_declared_translation(content: &str, config: &NstrConfig) -> bool {
+    let entries = extract_language_entries(content);
+    let has_text =
+        entries.iter().any(|(_, value)| value.as_deref().is_some_and(|v| !v.trim().is_empty()));
+    has_text
+        && entries.iter().any(|(lang, value)| {
+            config.declared_languages.contains(lang)
+                && value.as_deref().is_some_and(|v| v.trim().is_empty())
+        })
+}
+
 pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
     let _span = tracing::debug_span!("MultilingualStringHasAllDeclaredLanguages::check").entered();
 
     let code = DiagnosticCode::MultilingualStringHasAllDeclaredLanguages;
+    let empty_code = DiagnosticCode::MultilingualStringHasEmptyTranslation;
 
-    if ctx.is_disabled_with_metadata(code) {
+    let missing_enabled = !ctx.is_disabled_with_metadata(code);
+    let empty_enabled = !ctx.is_disabled_with_metadata(empty_code);
+    if !missing_enabled && !empty_enabled {
         return;
     }
 
@@ -53,6 +101,9 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
         let arg_list = match arg_list {
             Some(al) => al,
             None => {
+                if !missing_enabled {
+                    continue;
+                }
                 diagnostics.push(Diagnostic {
                     code,
                     message: format!(
@@ -68,6 +119,31 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
             }
         };
 
+        let first_arg = arg_list.children().find(|n| n.kind() == SyntaxKind::EXPR);
+
+        // An empty translation is lost in a `СтрШаблон` flow too, so this runs before the
+        // template skips that only silence the missing-language finding.
+        if empty_enabled {
+            let is_empty = first_arg
+                .as_ref()
+                .and_then(static_literal_content)
+                .is_some_and(|content| has_empty_declared_translation(&content, &config));
+            if is_empty {
+                diagnostics.push(Diagnostic {
+                    code: empty_code,
+                    message: EMPTY_TRANSLATION_MESSAGE.to_string(),
+                    severity: ctx.severity(empty_code),
+                    range: LocalRange::of_detached_node(call_expr.text_range()),
+                    tags: ctx.tags(empty_code),
+                    fixes: vec![],
+                });
+            }
+        }
+
+        if !missing_enabled {
+            continue;
+        }
+
         if has_template_in_parents(&call_expr) {
             continue;
         }
@@ -78,7 +154,6 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
             }
         }
 
-        let first_arg = arg_list.children().find(|n| n.kind() == SyntaxKind::EXPR);
         let first_arg = match first_arg {
             Some(a) => a,
             None => {
@@ -358,5 +433,127 @@ mod tests {
 
         let diagnostics = check_body_diagnostic_with_config(code, config, check_body);
         expect![[r#""#]].assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    fn codes_for(body: &str) -> Vec<(DiagnosticCode, String)> {
+        let code = format!("Процедура Тест()\n{body}\nКонецПроцедуры\n");
+        let mut config = DiagnosticsConfig::default();
+        config.parameters.insert(
+            DiagnosticCode::MultilingualStringHasAllDeclaredLanguages,
+            serde_json::json!({
+                "declaredLanguages": "ru,uk"
+            }),
+        );
+        check_body_diagnostic_with_config(&code, config, check_body)
+            .into_iter()
+            .map(|d| (d.code, d.message))
+            .collect()
+    }
+
+    const EMPTY_MESSAGE: &str =
+        "Объявленный язык с пустым переводом: текст в интерфейсе будет пустым";
+
+    #[test]
+    fn empty_value_for_declared_language_is_flagged() {
+        let found = codes_for(r#"    Текст = НСтр("ru = 'Остаток'; uk = ''");"#);
+        assert_eq!(
+            found,
+            vec![(
+                DiagnosticCode::MultilingualStringHasEmptyTranslation,
+                EMPTY_MESSAGE.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn whitespace_only_value_is_flagged_as_empty() {
+        let found = codes_for(r#"    Текст = НСтр("ru = 'Остаток'; uk = '   '");"#);
+        assert_eq!(
+            found,
+            vec![(
+                DiagnosticCode::MultilingualStringHasEmptyTranslation,
+                EMPTY_MESSAGE.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn non_empty_value_is_not_flagged() {
+        let found = codes_for(r#"    Текст = НСтр("ru = 'Остаток'; uk = 'Залишок'");"#);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn missing_entry_gives_only_the_missing_language_diagnostic() {
+        let found = codes_for(r#"    Текст = НСтр("ru = 'Остаток'");"#);
+        assert_eq!(
+            found.iter().map(|(code, _)| *code).collect::<Vec<_>>(),
+            vec![DiagnosticCode::MultilingualStringHasAllDeclaredLanguages]
+        );
+    }
+
+    #[test]
+    fn literal_that_is_not_statically_known_yields_nothing() {
+        let found = codes_for(
+            "    Текст = НСтр(ИсходнаяСтрока);\n    Другой = НСтр(\"ru = 'Остаток'; uk = '\" + Хвост + \"'\");",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn english_spelling_behaves_the_same() {
+        let found = codes_for(
+            "    Text = NStr(\"ru = 'Остаток'; uk = ''\");\n    Other = NStr(\"ru = 'Остаток'; uk = 'Залишок'\");",
+        );
+        assert_eq!(
+            found,
+            vec![(
+                DiagnosticCode::MultilingualStringHasEmptyTranslation,
+                EMPTY_MESSAGE.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn empty_value_of_undeclared_language_is_not_flagged() {
+        let found = codes_for(r#"    Текст = НСтр("ru = 'Остаток'; uk = 'Залишок'; en = ''");"#);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn empty_value_inside_str_template_is_flagged() {
+        let found =
+            codes_for(r#"    Текст = СтрШаблон(НСтр("ru = 'Остаток %1'; uk = ''"), Значение);"#);
+        assert_eq!(
+            found,
+            vec![(
+                DiagnosticCode::MultilingualStringHasEmptyTranslation,
+                EMPTY_MESSAGE.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn doubled_quote_is_an_escaped_quote_not_an_empty_value() {
+        let found = codes_for(r#"    Текст = НСтр("ru = 'Остаток'; uk = '''Залишок'''");"#);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn literal_blank_in_every_language_is_not_flagged() {
+        let found = codes_for(r#"    Текст = НСтр("ru = ''; uk = ''");"#);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn quote_pair_followed_by_text_is_not_read_as_an_empty_value() {
+        let found =
+            codes_for(r#"    Текст = НСтр("ru='' на '") + НСтр("ru='Остаток'; uk=''Залишок'");"#);
+        assert!(
+            found
+                .iter()
+                .all(|(code, _)| *code != DiagnosticCode::MultilingualStringHasEmptyTranslation),
+            "{found:?}"
+        );
     }
 }
