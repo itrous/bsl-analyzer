@@ -124,7 +124,13 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
     if config.scope.is_some() && state.scope_dirty_docs.contains(uri) {
         config.scope = None;
     }
-    let baseline_applies = crate::diagnostics_baseline::applies_under_scope(config.scope.is_some());
+    // A file without a path cannot be placed in the scope after the fact, so it keeps
+    // the ordinary gate.
+    let late_scope = config.scope.clone().filter(|_| {
+        path.is_some()
+            && crate::diagnostics_baseline::defers_scope_line_gate(&diagnostics_baseline, true)
+    });
+    config.defer_scope_line_gate = late_scope.is_some();
     let position_encoding = state.position_encoding;
     let code_descriptions = crate::lsp::to_proto::CodeDescriptions::from_client_support(
         state.supports_code_description,
@@ -145,17 +151,14 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
             let file_id_input = FileIdInput::new(&db, file_id);
             let config_id = base_db::DiagnosticsConfigId::new(&db, config);
             let ide_diagnostics = file_diagnostics_query(&db, file_id_input, config_id);
-            let ide_diagnostics =
-                match (workspace_root.as_deref().filter(|_| baseline_applies), path.as_deref()) {
-                    (Some(root), Some(path)) => crate::diagnostics_baseline::active_for_file(
-                        &diagnostics_baseline,
-                        root,
-                        path,
-                        &text,
-                        ide_diagnostics.iter().cloned().collect(),
-                    ),
-                    _ => ide_diagnostics.iter().cloned().collect(),
-                };
+            let ide_diagnostics = crate::diagnostics_baseline::active_for_publication(
+                &diagnostics_baseline,
+                workspace_root.as_deref(),
+                path.as_deref(),
+                &text,
+                ide_diagnostics.iter().cloned().collect(),
+                late_scope.as_deref(),
+            );
             let line_index = LineIndex::new(&text);
             crate::lsp::diagnostics_with_encoding(
                 &line_index,
@@ -1743,5 +1746,82 @@ mod tests {
             !state.interactive_analysis_quiescent(),
             "a cancelled-but-running request must still defer trims"
         );
+    }
+
+    /// Schedules the push for the fixture module and waits for its published report.
+    fn pushed_self_assign_lines(state: &mut GlobalState, uri: &Url) -> Vec<u32> {
+        use crate::diagnostics_baseline::finality_fixture::published_self_assign_lines;
+
+        schedule_diagnostics(state, uri);
+        assert!(state.diagnostics_tokens.contains_key(uri), "the push must be scheduled");
+        let bound = test_utils::wait::ceiling(std::time::Duration::from_secs(60));
+        loop {
+            match state.task_pool.receiver.recv_timeout(bound).expect("the push reports") {
+                crate::global_state::Task::DiagnosticsReady { uri: ready, diagnostics, .. }
+                    if &ready == uri =>
+                {
+                    return published_self_assign_lines(&diagnostics);
+                }
+                crate::global_state::Task::DiagnosticsCancelled {
+                    uri: cancelled, kind, ..
+                } if &cancelled == uri => {
+                    panic!("the push was cancelled: {kind:?}")
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// The counterexample on the push: recorded a and b stay hidden and c is published,
+    /// for the v1 baseline and both partition policies (`Unsuppressed` shows b and c).
+    /// Without recorded entries b and c both show.
+    #[test]
+    fn finality_scoped_baseline() {
+        use crate::diagnostics_baseline::finality_fixture::{Form, Workspace};
+
+        for form in [Form::V1, Form::Set, Form::Unsuppressed] {
+            let workspace = Workspace::new(form);
+            let uri = workspace.uri();
+            let scope = Some(workspace.scope(Some(vec![[3, 4]])));
+            let mut state = workspace.state(workspace.snapshot(2), scope.clone(), true);
+            let expected = if form == Form::Unsuppressed { vec![3, 4] } else { vec![4] };
+            assert_eq!(pushed_self_assign_lines(&mut state, &uri), expected, "{form:?}");
+
+            let mut unrecorded = workspace.state(workspace.snapshot(0), scope, true);
+            assert_eq!(pushed_self_assign_lines(&mut unrecorded, &uri), vec![3, 4], "{form:?}");
+        }
+    }
+
+    /// A clean buffer is pushed cut to the disk-derived hunks, a dirty one whole, both under
+    /// the baseline: with a recorded and line 4 in the scope, c against b and c.
+    #[test]
+    fn finality_file_and_overlay_scope() {
+        use crate::diagnostics_baseline::finality_fixture::{Form, Workspace};
+
+        let workspace = Workspace::new(Form::V1);
+        let uri = workspace.uri();
+        let mut state =
+            workspace.state(workspace.snapshot(1), Some(workspace.scope(Some(vec![[4, 4]]))), true);
+        assert_eq!(pushed_self_assign_lines(&mut state, &uri), vec![4], "clean buffer");
+        state.scope_dirty_docs.insert(uri.clone());
+        assert_eq!(pushed_self_assign_lines(&mut state, &uri), vec![3, 4], "dirty buffer");
+    }
+
+    /// Without a project root the push applies no baseline, yet still cuts the whole-file
+    /// computation to the scope: b and c, never a; without a scope all three.
+    #[test]
+    fn finality_missing_root_still_projects_scope() {
+        use crate::diagnostics_baseline::finality_fixture::{Form, Workspace};
+
+        let workspace = Workspace::new(Form::V1);
+        let uri = workspace.uri();
+        let mut state =
+            workspace.state(workspace.snapshot(2), Some(workspace.scope(Some(vec![[3, 4]]))), true);
+        state.workspace_root = None;
+        assert_eq!(pushed_self_assign_lines(&mut state, &uri), vec![3, 4]);
+
+        let mut unscoped = workspace.state(workspace.snapshot(2), None, true);
+        unscoped.workspace_root = None;
+        assert_eq!(pushed_self_assign_lines(&mut unscoped, &uri), vec![2, 3, 4], "control");
     }
 }

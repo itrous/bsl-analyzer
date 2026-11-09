@@ -637,6 +637,10 @@ fn analyze_salsa(
     }
 
     config.scope = scope.clone();
+    // The baseline numbers repeated findings over the whole file, so under a scope it is
+    // handed every finding and the scope's lines are cut after the classification.
+    config.defer_scope_line_gate = scope.is_some()
+        && loaded_baseline.as_ref().is_some_and(|snapshot| snapshot.affects_diagnostics());
     // No reporter of this run shows a fix.
     config.quick_fixes = false;
 
@@ -695,8 +699,15 @@ fn analyze_salsa(
         && !config.is_disabled(ide::DiagnosticCode::CognitiveComplexity)
         && !config.is_disabled(ide::DiagnosticCode::CyclomaticComplexity);
 
-    type FileResult =
-        (Option<FileAnalysis>, Option<FileTiming>, Option<FileMetrics>, Option<String>);
+    // The last member is the deferred scope's verdict per finding of the file, index-aligned
+    // with its diagnostics; present only when the line gate was deferred.
+    type FileResult = (
+        Option<FileAnalysis>,
+        Option<FileTiming>,
+        Option<FileMetrics>,
+        Option<String>,
+        Option<Vec<bool>>,
+    );
     let mut results: Vec<FileResult> = Vec::with_capacity(file_ids.len());
     let report_mem = std::env::var_os("BSL_MEM_REPORT").is_some();
     let chunk_profile = std::env::var_os("BSL_CHUNK_PROFILE").is_some();
@@ -789,7 +800,7 @@ fn analyze_salsa(
                         Err(e) => {
                             let message = panic_message(e.as_ref());
                             tracing::error!("Panic analyzing {:?}: {}", path, message);
-                            return (None, None, None, Some(message));
+                            return (None, None, None, Some(message), None);
                         }
                     };
 
@@ -834,7 +845,7 @@ fn analyze_salsa(
                         ));
                     }
 
-                    let file_analysis = if !diagnostics.is_empty() {
+                    let (file_analysis, scope_mask) = if !diagnostics.is_empty() {
                         let file_text = match fs::read_to_string(path) {
                             Ok(text) => text,
                             Err(e) => {
@@ -850,6 +861,7 @@ fn analyze_salsa(
                                     Some(format!(
                                         "failed to read file for diagnostic conversion: {e}"
                                     )),
+                                    None,
                                 );
                             }
                         };
@@ -860,9 +872,24 @@ fn analyze_salsa(
                             .iter()
                             .map(|d| d.to_output_with_index(&file_text, &file_line_index))
                             .collect();
+                        // Only marked here, not removed: the baseline numbers findings over
+                        // the whole file, and the mask is applied after it has.
+                        let scope_mask = config.defer_scope_line_gate.then(|| {
+                            diagnostics
+                                .iter()
+                                .map(|diagnostic| {
+                                    ide::diagnostic_in_scope(
+                                        config.scope.as_deref(),
+                                        Some(path),
+                                        &file_line_index,
+                                        diagnostic,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        });
 
                         if diagnostic_outputs.is_empty() {
-                            None
+                            (None, None)
                         } else {
                             // Capture the source line per finding while the text is
                             // still hot (this pass runs in parallel across files),
@@ -882,7 +909,8 @@ fn analyze_salsa(
                             // Counted here, over the FULL set: suppression by the
                             // baseline removes entries later, and a reporter counting
                             // afterwards would give an active finding the ordinal — and
-                            // so the fingerprint — of a suppressed one.
+                            // so the fingerprint — of a suppressed one. A baseline
+                            // classification replaces them with its own numbers.
                             let mut seen: std::collections::HashMap<(&str, &str), u32> =
                                 std::collections::HashMap::new();
                             let occurrences: Vec<u32> = diagnostic_outputs
@@ -897,7 +925,7 @@ fn analyze_salsa(
                                     current
                                 })
                                 .collect();
-                            Some(FileAnalysis {
+                            let analysis = FileAnalysis {
                                 path: path.clone(),
                                 relative_path: path
                                     .strip_prefix(&*workspace_dir_arc)
@@ -906,13 +934,14 @@ fn analyze_salsa(
                                 diagnostics: diagnostic_outputs,
                                 line_snippets,
                                 occurrences,
-                            })
+                            };
+                            (Some(analysis), scope_mask)
                         }
                     } else {
-                        None
+                        (None, None)
                     };
 
-                    (file_analysis, timing, metrics, None)
+                    (file_analysis, timing, metrics, None, scope_mask)
                 })
                 .collect()
         };
@@ -988,13 +1017,15 @@ fn analyze_salsa(
     let mut all_timings: Vec<FileTiming> = Vec::new();
     let mut metrics_list: Vec<Option<FileMetrics>> = Vec::with_capacity(results.len());
     let mut errors_list: Vec<Option<String>> = Vec::with_capacity(results.len());
-    for (analysis, timing, metrics, error) in results {
+    let mut scope_masks: Vec<Option<Vec<bool>>> = Vec::with_capacity(results.len());
+    for (analysis, timing, metrics, error, scope_mask) in results {
         file_analyses.push(analysis);
         if let Some(timing) = timing {
             all_timings.push(timing);
         }
         metrics_list.push(metrics);
         errors_list.push(error);
+        scope_masks.push(scope_mask);
     }
 
     let baseline_summary = if baseline_command.is_none() {
@@ -1036,6 +1067,7 @@ fn analyze_salsa(
             coverage,
             can_prove_partition_completion.then_some(&all_project_files),
             loaded_baseline.as_ref().expect("normal analysis loads one baseline snapshot"),
+            config.defer_scope_line_gate.then_some(scope_masks.as_slice()),
         )?)
     } else {
         None

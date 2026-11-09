@@ -457,30 +457,31 @@ fn compute_chunk(
     // Diagnostics — the heavy per-file work — run in parallel on the bounded pool when one
     // is available, else serially. The LSP conversion below stays serial (cheap relative to
     // diagnostics), reading disk-backed text from the shared snapshot.
+    // Under a baseline the files are computed whole and cut to the scope after their
+    // classification; every swept file has a path, so the deferral applies to all.
+    let late_scope = config
+        .scope
+        .as_deref()
+        .filter(|_| crate::diagnostics_baseline::defers_scope_line_gate(baseline.0, true));
+    let config = config.clone().with_defer_scope_line_gate(late_scope.is_some());
     let computed = match pool {
-        Some(pool) => analysis.workspace_diagnostics_parallel(chunk, config.clone(), pool),
-        None => analysis.workspace_diagnostics(chunk, config.clone()),
+        Some(pool) => analysis.workspace_diagnostics_parallel(chunk, config, pool),
+        None => analysis.workspace_diagnostics(chunk, config),
     };
-    let baseline_applies = crate::diagnostics_baseline::applies_under_scope(config.scope.is_some());
     computed
         .into_iter()
         .filter_map(|(file_id, diagnostics)| {
             let uri = file_paths.url_for_file_id(file_id).ok()?;
             let converted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let text = analysis.file_text(file_id);
-                let diagnostics = match (
-                    baseline.1.filter(|_| baseline_applies),
+                let diagnostics = crate::diagnostics_baseline::active_for_publication(
+                    baseline.0,
+                    baseline.1,
                     file_paths.path_for_file_id(file_id),
-                ) {
-                    (Some(root), Some(path)) => crate::diagnostics_baseline::active_for_file(
-                        baseline.0,
-                        root,
-                        path,
-                        &text,
-                        diagnostics.to_vec(),
-                    ),
-                    _ => diagnostics.to_vec(),
-                };
+                    &text,
+                    diagnostics.to_vec(),
+                    late_scope,
+                );
                 let result_id = crate::lsp::diagnostics_result_id(&diagnostics);
                 let line_index = LineIndex::new(&text);
                 let diagnostics = crate::lsp::to_proto::diagnostics_with_encoding(
@@ -805,5 +806,107 @@ mod shared_owner_tests {
         drop(state);
         drop(owner);
         drop(backend);
+    }
+}
+
+#[cfg(test)]
+mod finality_tests {
+    use super::*;
+    use crate::diagnostics_baseline::finality_fixture::{
+        published_self_assign_lines, Form, Workspace,
+    };
+    use crate::global_state::GlobalState;
+    use crate::lsp::to_proto::{ClientTags, CodeDescriptions};
+
+    /// The background push of the fixture module as the sweep computes it.
+    fn pushed(state: &mut GlobalState) -> WorkspaceBatchItem {
+        let plan = build_batch_plan(state).expect("the closed module is swept");
+        let analysis = state.analysis_host.analysis();
+        let mut items = compute_chunk(
+            &analysis,
+            &plan.file_ids,
+            &plan.config,
+            (&plan.diagnostics_baseline, plan.workspace_root.as_deref()),
+            &plan.file_paths,
+            (
+                plan.position_encoding,
+                CodeDescriptions::from_client_support(plan.supports_code_description),
+                ClientTags::NONE,
+            ),
+            None,
+        );
+        assert_eq!(items.len(), 1, "the sweep holds the module alone");
+        items.remove(0)
+    }
+
+    /// The counterexample on the background push, for the v1 baseline and both partition
+    /// policies: c alone (b and c under `Unsuppressed`), with c's own range; without
+    /// recorded entries b and c.
+    #[test]
+    fn finality_scoped_baseline() {
+        for form in [Form::V1, Form::Set, Form::Unsuppressed] {
+            let workspace = Workspace::new(form);
+            let scope = Some(workspace.scope(Some(vec![[3, 4]])));
+            let item = pushed(&mut workspace.state(workspace.snapshot(2), scope.clone(), false));
+            assert_eq!(item.uri, workspace.uri());
+            if form == Form::Unsuppressed {
+                assert_eq!(published_self_assign_lines(&item.diagnostics), vec![3, 4], "{form:?}");
+            } else {
+                assert_eq!(published_self_assign_lines(&item.diagnostics), vec![4], "{form:?}");
+                let c = &item.diagnostics[0];
+                assert_eq!((c.range.start.line, c.range.start.character), (3, 4), "{c:#?}");
+            }
+
+            let unrecorded = pushed(&mut workspace.state(workspace.snapshot(0), scope, false));
+            assert_eq!(published_self_assign_lines(&unrecorded.diagnostics), vec![3, 4]);
+        }
+    }
+
+    /// The background push's result id follows the published set: a hidden change keeps
+    /// it, a scope reaching c or a snapshot releasing the visible b changes it.
+    #[test]
+    fn finality_result_id_after_projection() {
+        let workspace = Workspace::new(Form::V1);
+        let id = |recorded: u32, hunks: Vec<[u32; 2]>| {
+            let mut state = workspace.state(
+                workspace.snapshot(recorded),
+                Some(workspace.scope(Some(hunks))),
+                false,
+            );
+            let item = pushed(&mut state);
+            (item.result_id, published_self_assign_lines(&item.diagnostics))
+        };
+
+        let (shown_c, lines) = id(2, vec![[3, 4]]);
+        assert_eq!(lines, vec![4]);
+        assert_eq!(id(2, vec![[2, 4]]).0, shown_c, "a hidden change must keep the id");
+        let (released, lines) = id(1, vec![[3, 4]]);
+        assert_eq!(lines, vec![3, 4]);
+        assert_ne!(released, shown_c, "a visible change must change the id");
+        let (nothing, lines) = id(2, vec![[2, 3]]);
+        assert!(lines.is_empty());
+        assert_ne!(nothing, shown_c, "the scope reaching c must change the id");
+    }
+
+    /// Without a project root the background push still cuts the whole-file computation
+    /// to the scope: b and c, never a; without a scope all three.
+    #[test]
+    fn finality_missing_root_still_projects_scope() {
+        let workspace = Workspace::new(Form::V1);
+        let mut state = workspace.state(
+            workspace.snapshot(2),
+            Some(workspace.scope(Some(vec![[3, 4]]))),
+            false,
+        );
+        state.workspace_root = None;
+        assert_eq!(published_self_assign_lines(&pushed(&mut state).diagnostics), vec![3, 4]);
+
+        let mut unscoped = workspace.state(workspace.snapshot(2), None, false);
+        unscoped.workspace_root = None;
+        assert_eq!(
+            published_self_assign_lines(&pushed(&mut unscoped).diagnostics),
+            vec![2, 3, 4],
+            "control"
+        );
     }
 }

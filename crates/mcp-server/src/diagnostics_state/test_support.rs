@@ -400,3 +400,197 @@ pub(super) fn wait_for_delivery(
         }
     });
 }
+
+/// The module of the finality counterexample, relative to its workspace.
+pub(crate) const FINALITY_MODULE_REL: &str = "src/cf/CommonModules/М/Ext/Module.bsl";
+
+/// The baseline a finality workspace carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinalityForm {
+    /// No baseline configured at all.
+    Off,
+    V1,
+    Set,
+    /// A partition set whose selection leaves the module's partition unsuppressed.
+    Unsuppressed,
+}
+
+fn finality_git(dir: &Path, args: &[&str]) {
+    let mut command = std::process::Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(&key);
+        }
+    }
+    let output = command
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// A workspace for the finality counterexample, scoped by `[analysis].diff_base`.
+///
+/// The vendor commit holds the self-assignments a and b on 1-based lines 2 and 3, and the
+/// baseline records the first `recorded` of them by occurrence. The working tree re-indents
+/// b and adds c below it, so the diff scope is lines 3–4: b and c. A normalised snippet
+/// ignores the indentation, so b keeps its recorded identity.
+pub(crate) fn finality_workspace(form: FinalityForm, recorded: u32) -> tempfile::TempDir {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/cf/Configuration.xml", "<Configuration/>");
+    write(root, "src/cfe/Ext/Configuration.xml", "<Configuration/>");
+    write(root, FINALITY_MODULE_REL, "Процедура Тест()\n    А = А;\n    А = А;\nКонецПроцедуры\n");
+    let baseline = match form {
+        FinalityForm::Off => "",
+        FinalityForm::V1 => "[diagnostics.baseline]\npath = \"baseline.json\"\n",
+        FinalityForm::Set => "[diagnostics.baseline]\ndirectory = \"baselines\"\n",
+        FinalityForm::Unsuppressed => {
+            "[diagnostics.baseline]\ndirectory = \"baselines\"\ninclude = [\"extension:Ext\"]\n"
+        }
+    };
+    write(
+        root,
+        "bsl-analyzer.toml",
+        &format!(
+            "[source]\nroot = \"src/cf\"\n\
+             extensions = [{{ name = \"Ext\", path = \"src/cfe/Ext\", scope = \"InfoBase\" }}]\n\n\
+             [analysis]\ndiff_base = \"vendor\"\n\n\
+             [diagnostics.parameters]\nSelfAssign = true\n\n{baseline}"
+        ),
+    );
+
+    let entries: Vec<_> = (0..recorded)
+        .map(|occurrence| ide::diagnostics_baseline::DiagnosticsBaselineEntry {
+            fingerprint: ide::diagnostics_baseline::diagnostic_fingerprint(
+                FINALITY_MODULE_REL,
+                "SelfAssign",
+                "А = А;",
+                occurrence,
+            ),
+            path: FINALITY_MODULE_REL.to_owned(),
+            code: "SelfAssign".to_owned(),
+            snippet: "А = А;".to_owned(),
+            occurrence,
+            message: "SelfAssign".to_owned(),
+            severity: "warning".to_owned(),
+            range: ide::diagnostics_baseline::DiagnosticsBaselineRange {
+                start_line: occurrence + 1,
+                start_column: 4,
+                end_line: occurrence + 1,
+                end_column: 9,
+            },
+        })
+        .collect();
+    let project = project_model::Project::new(root).unwrap();
+    match form {
+        FinalityForm::Off => {}
+        FinalityForm::V1 => {
+            let resolved = project.diagnostics_baseline().unwrap().unwrap();
+            let baseline = ide::diagnostics_baseline::DiagnosticsBaseline {
+                schema_version: ide::diagnostics_baseline::DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+                scope: ide::diagnostics_baseline::DiagnosticsBaselineScope {
+                    source_root: resolved.scope.source_root.clone(),
+                    extensions: resolved.scope.extensions.clone(),
+                },
+                diagnostics: entries,
+            };
+            fs::write(
+                root.join("baseline.json"),
+                ide::diagnostics_baseline::diagnostics_baseline_json(&baseline).unwrap(),
+            )
+            .unwrap();
+        }
+        FinalityForm::Set | FinalityForm::Unsuppressed => {
+            use ide::partitioned_diagnostics_baseline::{
+                diagnostics_manifest, diagnostics_manifest_json, diagnostics_partition_json,
+                partition_object_path, DiagnosticsBaselineManifestEntry,
+            };
+            let plan = project.diagnostics_baseline_partition_plan().unwrap().unwrap();
+            let directory =
+                project_model::ManagedBaselineDirectory::open(root, "baselines", true).unwrap();
+            let mut manifest_entries = Vec::new();
+            for partition in &plan.partitions {
+                if !plan.enabled_partition_ids.contains(&partition.id) {
+                    continue;
+                }
+                let diagnostics = if partition.id == "main" { entries.clone() } else { vec![] };
+                let bytes =
+                    diagnostics_partition_json(partition.identity.clone(), diagnostics).unwrap();
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                let path = partition_object_path(&partition.id, &partition.key, &hash).unwrap();
+                directory.create_file_new(&path).unwrap().write_all(&bytes).unwrap();
+                manifest_entries.push(DiagnosticsBaselineManifestEntry {
+                    partition_id: partition.id.clone(),
+                    file: path,
+                    blake3: hash,
+                });
+            }
+            let manifest =
+                diagnostics_manifest(plan.project_scope_fingerprint.clone(), manifest_entries);
+            directory
+                .create_file_new("manifest.json")
+                .unwrap()
+                .write_all(&diagnostics_manifest_json(&manifest).unwrap())
+                .unwrap();
+        }
+    }
+
+    finality_git(root, &["init", "-q"]);
+    finality_git(root, &["add", "."]);
+    finality_git(root, &["commit", "-q", "-m", "vendor"]);
+    finality_git(root, &["branch", "vendor"]);
+    write(
+        root,
+        FINALITY_MODULE_REL,
+        "Процедура Тест()\n    А = А;\n\tА = А;\n\tА = А;\nКонецПроцедуры\n",
+    );
+    dir
+}
+
+/// Adds to the finality workspace's v1 baseline a recorded occurrence of the module that
+/// the current text does not produce: only a run that proves the module analysed in full
+/// may report it resolved.
+pub(crate) fn finality_add_phantom(root: &Path) {
+    let path = root.join("baseline.json");
+    let mut baseline: ide::diagnostics_baseline::DiagnosticsBaseline =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut phantom = baseline.diagnostics[0].clone();
+    phantom.occurrence = 7;
+    phantom.fingerprint = ide::diagnostics_baseline::diagnostic_fingerprint(
+        FINALITY_MODULE_REL,
+        "SelfAssign",
+        "А = А;",
+        7,
+    );
+    baseline.diagnostics.push(phantom);
+    fs::write(&path, ide::diagnostics_baseline::diagnostics_baseline_json(&baseline).unwrap())
+        .unwrap();
+}
+
+/// Drops `[analysis].diff_base` from the finality workspace: the same files, unscoped.
+pub(crate) fn finality_unscope(root: &Path) {
+    let path = root.join("bsl-analyzer.toml");
+    let config = fs::read_to_string(&path).unwrap().replace("diff_base = \"vendor\"\n", "");
+    fs::write(path, config).unwrap();
+}
+
+/// A state of the finality workspace whose first load has finished. The loader thread is
+/// joined, not polled for: it publishes the resident before it returns, so no wait on a
+/// clock stands between the test and the loaded state.
+pub(crate) fn finality_ready_state(root: &Path) -> DiagnosticsState {
+    let state = DiagnosticsState::for_workspace(root.to_path_buf());
+    let loader = state.ensure_loading().expect("the first load starts a build");
+    loader.join().expect("the loader thread does not panic");
+    assert!(
+        matches!(state.status(), DiagnosticsStatus::Ready { .. }),
+        "the load ended without publishing a resident: {:?}",
+        state.status()
+    );
+    state
+}

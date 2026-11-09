@@ -465,10 +465,17 @@ pub(crate) fn file_findings(
     // database to salsa.
     let file_text = analysis.file_text(file_id);
     // Analyse against the project's effective config (the single source of truth shared
-    // with LSP and CLI), so disabled rules and tuned thresholds are honoured.
-    let diagnostics = analysis.diagnostics(file_id, resident.config());
+    // with LSP and CLI), so disabled rules and tuned thresholds are honoured. Under a
+    // baseline the scope's lines are cut only after the classification has numbered the
+    // file's whole set.
+    let late_scope = crate::diagnostics_state::deferred_scope(
+        resident.config(),
+        resident.diagnostics_baseline(),
+    );
+    let config = crate::diagnostics_state::computation_config(resident.config(), late_scope);
+    let diagnostics = analysis.diagnostics(file_id, &config);
     let (diagnostics, baseline) =
-        match classify_file_baseline(resident, path, &file_text, diagnostics) {
+        match classify_file_baseline(resident, path, &file_text, diagnostics, late_scope) {
             Ok(result) => result,
             Err(baseline) => {
                 return (
@@ -796,16 +803,30 @@ fn bounded_baseline_value(summary: &DiagnosticsBaselineSummary, preferred: Optio
     value
 }
 
+/// Classifies the file's whole finalized set against the resident's baseline and returns the
+/// active findings with the summary. Under `late_scope` — the scope whose line gate the
+/// computation deferred — the active findings are then cut to the scope; the summary keeps
+/// counting the whole classified set.
 fn classify_file_baseline(
     resident: &DiagnosticsResident,
     path: &Path,
     file_text: &str,
     diagnostics: Vec<ide::Diagnostic>,
+    late_scope: Option<&base_db::AnalysisScope>,
 ) -> Result<(Vec<ide::Diagnostic>, DiagnosticsBaselineSummary), Box<DiagnosticsBaselineSummary>> {
     use ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot;
     let relative = baseline_project_path(resident.workspace_root(), path);
     let source_lines: Vec<_> = file_text.lines().collect();
     let line_index = line_index::LineIndex::new(file_text);
+    let scope_path = late_scope.map(|_| resident.abs_path_for(path));
+    let in_scope = |diagnostic: &ide::Diagnostic| match late_scope {
+        Some(scope) => {
+            #[cfg(test)]
+            SCOPE_PROJECTIONS.with(|count| count.set(count.get() + 1));
+            ide::diagnostic_in_scope(Some(scope), scope_path.as_deref(), &line_index, diagnostic)
+        }
+        None => true,
+    };
     let candidates: Vec<_> = diagnostics
         .into_iter()
         .enumerate()
@@ -875,7 +896,12 @@ fn classify_file_baseline(
                 })
             })?;
             Ok((
-                classified.new.into_iter().map(|item| item.diagnostic.1).collect(),
+                classified
+                    .new
+                    .into_iter()
+                    .map(|item| item.diagnostic.1)
+                    .filter(|diagnostic| in_scope(diagnostic))
+                    .collect(),
                 classified.summary,
             ))
         }
@@ -946,6 +972,7 @@ fn classify_file_baseline(
                     .into_iter()
                     .chain(classified.unsuppressed)
                     .map(|item| item.diagnostic.1)
+                    .filter(|diagnostic| in_scope(diagnostic))
                     .collect(),
                 classified.summary,
             ))
@@ -954,6 +981,13 @@ fn classify_file_baseline(
             unreachable!()
         }
     }
+}
+
+// Counts the findings the file action judged against a deferred scope, so a test tells
+// the disabled path, which must judge none, from the work by the count.
+#[cfg(test)]
+thread_local! {
+    static SCOPE_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The `workspace` action's result body: whole-config diagnostics aggregated per code
@@ -2624,6 +2658,128 @@ mod tests {
                 &default_filters(),
             );
             assert!(!has_line_length(&loose_body), "huge threshold suppresses LineLength");
+        }
+
+        fn self_assign_lines(body: &Value) -> Vec<u64> {
+            body["findings"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no findings: {body}"))
+                .iter()
+                .filter(|finding| finding["code"] == "SelfAssign")
+                .map(|finding| finding["range"]["start_line"].as_u64().unwrap())
+                .collect()
+        }
+
+        fn finality_file(
+            form: crate::diagnostics_state::test_support::FinalityForm,
+            recorded: u32,
+        ) -> Value {
+            use crate::diagnostics_state::test_support::{finality_workspace, FINALITY_MODULE_REL};
+            let dir = finality_workspace(form, recorded);
+            let state = crate::diagnostics_state::test_support::finality_ready_state(dir.path());
+            let body = run(&state, &dir.path().join(FINALITY_MODULE_REL), &default_filters());
+            state.shutdown();
+            body
+        }
+
+        /// The counterexample on the file action, for the v1 baseline and both partition
+        /// policies: with a and b recorded and the diff scope on b and c, the response
+        /// shows c alone — the same finding, at the same place, the unrecorded control
+        /// shows last — while an `Unsuppressed` partition and a project without a baseline
+        /// show b and c.
+        #[test]
+        fn finality_scoped_baseline() {
+            use crate::diagnostics_state::test_support::FinalityForm;
+
+            let control = self_assign_lines(&finality_file(FinalityForm::Off, 0));
+            assert_eq!(control.len(), 2, "control: b and c are in the scope: {control:?}");
+            let c = *control.last().unwrap();
+            assert_eq!(self_assign_lines(&finality_file(FinalityForm::V1, 0)), control);
+
+            for form in [FinalityForm::V1, FinalityForm::Set] {
+                assert_eq!(self_assign_lines(&finality_file(form, 2)), vec![c], "{form:?}");
+            }
+            assert_eq!(
+                self_assign_lines(&finality_file(FinalityForm::Unsuppressed, 2)),
+                control,
+                "Unsuppressed"
+            );
+        }
+
+        /// The file action's summary counts the module's whole classified set — a and b
+        /// known, c new — under a scope that shows c alone, and it resolves nothing: the
+        /// module is not proven analysed in full. The unscoped control resolves the
+        /// recorded occurrence the text no longer produces.
+        #[test]
+        fn finality_scoped_coverage() {
+            use crate::diagnostics_state::test_support::{
+                finality_add_phantom, finality_unscope, finality_workspace, FinalityForm,
+                FINALITY_MODULE_REL,
+            };
+
+            let summary = |scoped: bool| {
+                let dir = finality_workspace(FinalityForm::V1, 2);
+                finality_add_phantom(dir.path());
+                if !scoped {
+                    finality_unscope(dir.path());
+                }
+                let state =
+                    crate::diagnostics_state::test_support::finality_ready_state(dir.path());
+                let body = run(&state, &dir.path().join(FINALITY_MODULE_REL), &default_filters());
+                state.shutdown();
+                body
+            };
+            let scoped = summary(true);
+            assert_eq!(self_assign_lines(&scoped).len(), 1, "{scoped}");
+            let baseline = &scoped["baseline"];
+            assert_eq!(baseline["known"], 2, "{baseline}");
+            assert_eq!(baseline["complete"], false, "{baseline}");
+            assert_eq!(baseline["resolved"], 0, "{baseline}");
+
+            let unscoped = summary(false);
+            assert_eq!(unscoped["baseline"]["resolved"], 1, "control: {}", unscoped["baseline"]);
+            assert_eq!(
+                baseline["new"], unscoped["baseline"]["new"],
+                "the scoped summary counts the whole set, c and the module's other findings"
+            );
+        }
+
+        /// A project without a baseline keeps the ordinary scoped computation: no deferral
+        /// and no late projection of a single finding, counted rather than timed. The
+        /// `Ready` run beside it does project. A malformed baseline still answers with its
+        /// error instead of findings.
+        #[test]
+        fn finality_disabled_keeps_fast_path() {
+            use crate::diagnostics_state::test_support::{finality_workspace, FinalityForm};
+
+            let projected = || SCOPE_PROJECTIONS.with(std::cell::Cell::get);
+            let before = projected();
+            let off = finality_workspace(FinalityForm::Off, 0);
+            let state = crate::diagnostics_state::test_support::finality_ready_state(off.path());
+            assert!(matches!(
+                state.read(|resident, _| crate::diagnostics_state::deferred_scope(
+                    resident.config(),
+                    resident.diagnostics_baseline()
+                )
+                .is_none()),
+                ResidentOutcome::Ready(true, _)
+            ));
+            state.shutdown();
+            let body = finality_file(FinalityForm::Off, 0);
+            assert_eq!(self_assign_lines(&body).len(), 2);
+            assert_eq!(projected(), before, "a project without a baseline must not project");
+
+            let _ = finality_file(FinalityForm::V1, 2);
+            assert!(projected() > before, "control: a ready baseline projects");
+
+            use crate::diagnostics_state::test_support::FINALITY_MODULE_REL;
+            let broken = finality_workspace(FinalityForm::V1, 2);
+            fs::write(broken.path().join("baseline.json"), "not json").unwrap();
+            let state = crate::diagnostics_state::test_support::finality_ready_state(broken.path());
+            let body = run(&state, &broken.path().join(FINALITY_MODULE_REL), &default_filters());
+            state.shutdown();
+            assert_eq!(body["baseline"]["state"], "error", "{body}");
+            assert!(body.get("findings").is_none(), "an error answers without findings: {body}");
         }
 
         #[test]

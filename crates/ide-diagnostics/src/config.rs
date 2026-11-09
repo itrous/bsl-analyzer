@@ -64,6 +64,13 @@ pub struct DiagnosticsConfig {
     /// prepare facts of the whole module for it. Set programmatically by the driving
     /// surface, never from the `[diagnostics]` project config.
     pub quick_fixes: bool,
+    /// Keep the findings on lines outside `scope` in the computed set, leaving the line
+    /// filter to the caller. A baseline fingerprint numbers repeated findings within the
+    /// file, so a caller that classifies against a baseline needs the file's whole set:
+    /// classifying only the scoped lines would let a new finding inherit the number of a
+    /// recorded one. The file gate still applies. Set programmatically by the driving
+    /// surface for one computation, never from the `[diagnostics]` project config.
+    pub defer_scope_line_gate: bool,
 }
 
 /// `serde_json::Value` is only `PartialEq` (floats); a configuration is still
@@ -84,6 +91,7 @@ impl Default for DiagnosticsConfig {
             bslls_suppression_compat: true,
             scope: None,
             quick_fixes: true,
+            defer_scope_line_gate: false,
         }
     }
 }
@@ -231,6 +239,7 @@ impl DiagnosticsConfig {
             bslls_suppression_compat: true,
             scope: None,
             quick_fixes: true,
+            defer_scope_line_gate: false,
         }
     }
 
@@ -730,6 +739,7 @@ impl<'de> serde::Deserialize<'de> for DiagnosticsConfig {
                     bslls_suppression_compat,
                     scope: None,
                     quick_fixes: true,
+                    defer_scope_line_gate: false,
                 })
             }
         }
@@ -837,6 +847,7 @@ impl DiagnosticsConfig {
             bslls_suppression_compat: input.bslls_suppression_compat,
             scope: input.scope.clone(),
             quick_fixes: input.quick_fixes,
+            defer_scope_line_gate: input.defer_scope_line_gate,
         }
     }
 
@@ -862,6 +873,7 @@ impl DiagnosticsConfig {
         )
         .with_scope(self.scope.clone())
         .with_quick_fixes(self.quick_fixes)
+        .with_defer_scope_line_gate(self.defer_scope_line_gate)
     }
 
     pub fn apply_cli_filters(&mut self, only_diagnostic: &[String], disable_diagnostic: &[String]) {

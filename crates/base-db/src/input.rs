@@ -232,6 +232,11 @@ pub struct DiagnosticsConfigInput {
     /// Whether findings carry their quick fixes. Part of the key: the fixes are
     /// part of the memoised answer.
     pub quick_fixes: bool,
+
+    /// Whether the finalization keeps findings on lines outside `scope`. Part of the
+    /// key: the deferred answer holds the file's whole set, the ordinary one only the
+    /// scoped lines, and the two must never share a memo.
+    pub defer_scope_line_gate: bool,
 }
 
 impl DiagnosticsConfigInput {
@@ -268,6 +273,7 @@ impl DiagnosticsConfigInput {
             only_enabled: None,
             metadata_overrides: Vec::new(),
             quick_fixes: true,
+            defer_scope_line_gate: false,
         }
     }
 
@@ -296,6 +302,11 @@ impl DiagnosticsConfigInput {
 
     pub fn with_quick_fixes(mut self, quick_fixes: bool) -> Self {
         self.quick_fixes = quick_fixes;
+        self
+    }
+
+    pub fn with_defer_scope_line_gate(mut self, defer: bool) -> Self {
+        self.defer_scope_line_gate = defer;
         self
     }
 
