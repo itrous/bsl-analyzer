@@ -470,6 +470,33 @@ mod tests {
     }
 
     #[test]
+    fn a_number_in_a_boolean_documented_parameter_is_silent_and_a_date_is_still_reported() {
+        // The language itself turns a number into a Boolean where one is expected (a
+        // condition, a logical operator, a Boolean attribute), so a configuration
+        // procedure documented as taking Булево accepts it as a platform method does.
+        let code = r#"
+// Параметры:
+//   Флаг - Булево - флаг.
+Процедура Принять(Флаг) Экспорт
+КонецПроцедуры
+
+Процедура Тест()
+    Принять(5);
+    Принять(0);
+    Принять(ТекущаяДата());
+КонецПроцедуры
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::TypeMismatchByDocComment,
+            expect![[r#"
+                TypeMismatchByDocComment @ 10:13..10:26
+                  message: Несоответствие типов: ожидалось 'Булево', получено 'ДатаВремя' (тип параметра из описания)
+                  severity: Error"#]],
+        );
+    }
+
+    #[test]
     fn a_documented_slot_reports_its_first_incompatible_argument_as_before() {
         let code = r#"
 // Параметры:
