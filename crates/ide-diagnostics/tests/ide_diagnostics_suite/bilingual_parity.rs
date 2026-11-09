@@ -242,6 +242,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         DiagnosticCode::RegisterRecorderFieldInQuery,
         "needs register metadata with a recorder field; a bare query text resolves no register",
     ),
+    (
+        DiagnosticCode::QueryOrderByDocumentDate,
+        "needs register metadata whose dimension is a document reference; a bare query text resolves no source",
+    ),
     (DiagnosticCode::WrongDataPathForFormElements, "form metadata path diagnostic"),
     (DiagnosticCode::PublicMethodsDescription, "documentation/region diagnostic"),
     (DiagnosticCode::CachedPublic, "metadata return-value-reuse policy"),
@@ -748,7 +752,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 217, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 218, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

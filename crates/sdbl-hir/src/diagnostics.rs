@@ -148,6 +148,13 @@ pub enum SdblDiagnostic {
         range: TextRange,
     },
 
+    /// An `ORDER BY` key that orders by the `Дата` of a document reference field. Documents of
+    /// one date come in arbitrary order, so the chronological key is `МоментВремени`.
+    QueryOrderByDocumentDate {
+        reference_field: String,
+        range: TextRange,
+    },
+
     RefOveruse {
         range: TextRange,
     },
@@ -214,6 +221,14 @@ pub enum VirtualTableParameterProblem {
 /// `ide-diagnostics` handler. It offers no inner join: the NULL comes from an unfilled schedule,
 /// not from a join.
 pub const SCHEDULE_DATA_NULL_MESSAGE: &str = "Поле данных графика может быть NULL, если график за период не заполнен: добавьте проверку через ЕСТЬ NULL или функцию ЕСТЬNULL";
+
+/// The one wording of the `ORDER BY` document-date finding, shared by the enum rendering and
+/// the `ide-diagnostics` handler.
+pub fn query_order_by_document_date_message(reference_field: &str) -> String {
+    format!(
+        "Упорядочивание по «{reference_field}.Дата» не задаёт однозначного порядка: у документов с одной датой порядок произвольный. Упорядочивайте по «{reference_field}.МоментВремени»"
+    )
+}
 
 /// The one wording of a parameter-list error, shared by the enum rendering and the
 /// `ide-diagnostics` handler.
@@ -384,6 +399,9 @@ impl SdblDiagnostic {
                      и реквизитами (#std477)"
                 )
             }
+            Self::QueryOrderByDocumentDate { reference_field, .. } => {
+                query_order_by_document_date_message(reference_field)
+            }
             Self::RefOveruse { .. } => {
                 "Поле «Ссылка», полученное через точку от ссылочного поля, совпадает с самим \
                  этим полем: лишнее соединение можно убрать"
@@ -447,6 +465,7 @@ impl SdblDiagnostic {
             Self::MultilineString { range } => *range,
             Self::QueryNestedFieldsByDot { range, .. } => *range,
             Self::RegisterRecorderFieldInQuery { range, .. } => *range,
+            Self::QueryOrderByDocumentDate { range, .. } => *range,
             Self::RefOveruse { range } => *range,
             Self::UnionWithoutAll { range } => *range,
             Self::LikeUsage { range, .. } => *range,
@@ -482,6 +501,7 @@ impl SdblDiagnostic {
             Self::MultilineString { .. } => false,
             Self::QueryNestedFieldsByDot { .. } => false,
             Self::RegisterRecorderFieldInQuery { .. } => false,
+            Self::QueryOrderByDocumentDate { .. } => false,
             Self::RefOveruse { .. } => false,
             Self::UnionWithoutAll { .. } => false,
             Self::LikeUsage { kind: LikeUsageKind::Allowed, .. } => false,

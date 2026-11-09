@@ -247,6 +247,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::LogicalOrInTheWhereSectionOfQuery => &[658],
         DiagnosticCode::MultilineStringInQuery => &[],
         DiagnosticCode::QueryNestedFieldsByDot => &[654],
+        DiagnosticCode::QueryOrderByDocumentDate => &[412],
         DiagnosticCode::QueryParseError => &[437],
         DiagnosticCode::QueryToMissingMetadata => &[],
         DiagnosticCode::QueryParameterSourceWithoutInto => &[],

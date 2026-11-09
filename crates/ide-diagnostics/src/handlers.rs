@@ -139,6 +139,7 @@ pub mod procedure_returns_value;
 pub mod protected_module;
 pub mod public_methods_description;
 pub mod query_nested_fields_by_dot;
+pub mod query_order_by_document_date;
 pub mod query_parameter_source_without_into;
 pub mod query_parse_error;
 pub mod query_to_missing_metadata;
@@ -442,6 +443,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::ProtectedModule => Some(&protected_module::METADATA),
         DiagnosticCode::PublicMethodsDescription => Some(&public_methods_description::METADATA),
         DiagnosticCode::QueryNestedFieldsByDot => Some(&query_nested_fields_by_dot::METADATA),
+        DiagnosticCode::QueryOrderByDocumentDate => Some(&query_order_by_document_date::METADATA),
         DiagnosticCode::QueryParseError => Some(&query_parse_error::METADATA),
         DiagnosticCode::QueryToMissingMetadata => Some(&query_to_missing_metadata::METADATA),
         DiagnosticCode::QueryParameterSourceWithoutInto => {
