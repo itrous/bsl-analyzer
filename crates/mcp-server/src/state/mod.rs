@@ -794,6 +794,14 @@ impl SharedState {
         self.workspace_lease.owns_caches()
     }
 
+    /// What a newer daemon generation taking the workspace over leaves behind: the lease
+    /// superseded and the graph retired.
+    #[cfg(test)]
+    pub(crate) fn supersede_for_test(&self) {
+        self.workspace_lease.supersede_for_test();
+        self.graph.retire_for_test();
+    }
+
     /// Whether this backend has handed the graph over after losing the workspace.
     pub(crate) fn graph_released(&self) -> bool {
         self.graph.released()

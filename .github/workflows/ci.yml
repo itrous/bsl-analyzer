@@ -825,6 +825,7 @@ jobs:
             shared_workspace_defers_workspace_and_reference_credentials_until_activation
             broker::transport::
             broker::daemon::shared_tests::
+            broker::daemon::idle_boundary_tests::
           )
           run_tests -p mcp-server --lib -- "${mcp_server_filters[@]}"
       - name: MCP transports, broker and baselines

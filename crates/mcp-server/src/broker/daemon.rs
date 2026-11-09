@@ -17,6 +17,7 @@
 //!
 //! [`SharedState`]: crate::SharedState
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -91,7 +92,7 @@ where
             }
             accepted = listener.accept() => {
                 let conn = accepted?;
-                if !peer_authorized(&conn) {
+                if !listener.peer_authorized(&conn) {
                     tracing::warn!("rejected backend connection from an unauthorized peer");
                 } else if parked.len() >= MAX_PARKED_DURING_BUILD {
                     // Keep draining the backlog past the cap so a concurrent liveness
@@ -167,9 +168,9 @@ where
 }
 
 #[allow(clippy::too_many_arguments)] // Each callback belongs to the upper adapter owner.
-async fn serve_shared<F, Fut>(
+async fn serve_shared<L, F, Fut>(
     key: SharedBackendKey,
-    listener: TokioListener,
+    listener: L,
     on_session: Arc<F>,
     scope_retired: CancellationToken,
     stop: CancellationToken,
@@ -179,6 +180,7 @@ async fn serve_shared<F, Fut>(
     on_shutdown: impl FnOnce() + Send + 'static,
 ) -> anyhow::Result<()>
 where
+    L: BrokerListener,
     F: Fn(Handshake, Vec<u8>, SharedSession, CancellationToken, CancellationToken) -> Fut
         + Send
         + Sync
@@ -199,6 +201,7 @@ where
     let mut idle_since = Some(Instant::now());
     let mut result = Ok(());
     let mut superseded = false;
+    let mut reservation: Option<L::Reservation> = None;
     let session_retirement = CancellationToken::new();
 
     tracing::info!(pid = std::process::id(), "shared broker listening");
@@ -218,7 +221,7 @@ where
                     Ok(conn) => conn,
                     Err(error) => { result = Err(error.into()); break; }
                 };
-                if !peer_authorized(&conn) {
+                if !listener.peer_authorized(&conn) {
                     tracing::warn!("rejected shared broker connection from an unauthorized peer");
                     continue;
                 }
@@ -282,7 +285,12 @@ where
                 } else {
                     let since = *idle_since.get_or_insert_with(Instant::now);
                     let grace = if warmed.load(Ordering::SeqCst) { idle_ttl } else { orphan_grace };
-                    if since.elapsed() >= grace { break; }
+                    if since.elapsed() >= grace {
+                        if let Some(held) = reserve_for_idle_exit(&listener) {
+                            reservation = Some(held);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -290,6 +298,7 @@ where
 
     let retired = scope_retired.is_cancelled();
     drop(listener);
+    drop(reservation);
     // Sessions hear of a retirement only now: their client reconnects at once, and a connection
     // waiting in the backlog of a listener about to close would be reset instead of launching the
     // next backend.
@@ -330,10 +339,10 @@ where
     result
 }
 
-async fn serve(
+async fn serve<L: BrokerListener>(
     server: McpServer,
-    listener: TokioListener,
-    parked: Vec<TokioStream>,
+    listener: L,
+    parked: Vec<L::Stream>,
     orphan_grace: Duration,
     idle_ttl: Duration,
 ) -> anyhow::Result<()> {
@@ -375,15 +384,15 @@ async fn serve(
     let mut ticker = interval(poll);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await; // consume the immediate first tick
+    let mut reservation: Option<L::Reservation> = None;
 
     let result = loop {
         tokio::select! {
-            // Poll accept before the idle tick: a proxy's `connect()` returns only once the
-            // connection sits in the listener backlog (so `accept()` is ready), so biasing
-            // accept guarantees a client that just connected is taken in before a
-            // simultaneously-expiring idle tick can drop it — the proxy treats its successful
-            // connect as non-retryable. This cannot starve the idle check: accept is only
-            // continuously ready while connections are actively arriving, which is not idle.
+            // Poll accept before the idle tick so a connection already waiting is taken in
+            // first. That alone does not keep an idle exit from dropping a client: on Windows a
+            // client's connect completes on the listener's free pipe instance before accept can
+            // see it, so the exit below first reserves that instance. This cannot starve the
+            // idle check: accept is only continuously ready while connections keep arriving.
             biased;
             _ = scope_shutdown.cancelled() => {
                 tracing::info!("workspace cache scope retired; closing the broker endpoint");
@@ -394,7 +403,7 @@ async fn serve(
                     Ok(conn) => conn,
                     Err(error) => break Err(error),
                 };
-                if !peer_authorized(&conn) {
+                if !listener.peer_authorized(&conn) {
                     tracing::warn!("rejected backend connection from an unauthorized peer");
                     continue;
                 }
@@ -424,12 +433,15 @@ async fn serve(
                     let grace = if warmed.load(Ordering::SeqCst) { idle_ttl } else { orphan_grace };
                     let since = *idle_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= grace {
-                        tracing::info!(
-                            warmed = warmed.load(Ordering::SeqCst),
-                            grace_secs = grace.as_secs(),
-                            "backend idle past its grace; shutting down"
-                        );
-                        break Ok(());
+                        if let Some(held) = reserve_for_idle_exit(&listener) {
+                            tracing::info!(
+                                warmed = warmed.load(Ordering::SeqCst),
+                                grace_secs = grace.as_secs(),
+                                "backend idle past its grace; shutting down"
+                            );
+                            reservation = Some(held);
+                            break Ok(());
+                        }
                     }
                 }
             }
@@ -439,7 +451,10 @@ async fn serve(
     // Teardown cascade: stop accepting and sever every still-connected session, so each
     // proxy gets an EOF and exits. Dropping the listener frees the rendezvous name;
     // each RMCP service must finish closing its transport before the daemon returns.
+    // An idle exit's reservation outlives the listener, so no client can attach to it while
+    // it closes.
     drop(listener);
+    drop(reservation);
     if superseded {
         // The name is free for the current owner already. The graph reads in flight finish
         // first — none is cut, however long — and whatever else is being answered gets a
@@ -466,13 +481,16 @@ async fn serve(
 /// peer sends any data, so a session carrying real MCP traffic promotes the backend to the
 /// long idle TTL while a no-data liveness probe (connect-then-close) never does. Returns the
 /// task handle so the serve loop can await transport cleanup during shutdown.
-fn spawn_session(
+fn spawn_session<S>(
     server: &McpServer,
     active: &Arc<AtomicU64>,
     warmed: &Arc<AtomicBool>,
-    conn: TokioStream,
+    conn: S,
     shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let guard = ActiveGuard::new(Arc::clone(active));
     tracing::debug!(active = active.load(Ordering::SeqCst), "broker accepted a session");
     let session = server.clone();
@@ -558,6 +576,120 @@ impl Drop for ActiveGuard {
     }
 }
 
+/// The owner loops' view of their endpoint: production serves a bound [`Endpoint`], and the
+/// same loops run in tests against a scripted listener.
+trait BrokerListener: Send + Sync {
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+    /// Held from an idle exit's decision until the listener is gone.
+    type Reservation: Send;
+
+    fn accept(&self) -> impl Future<Output = io::Result<Self::Stream>> + Send;
+    fn peer_authorized(&self, conn: &Self::Stream) -> bool;
+    /// Claim the right to close the listener for idleness. Called only after accept was found
+    /// pending, so a granted reservation means no client is waiting and none can still attach.
+    fn reserve_idle_exit(&self) -> IdleReservation<Self::Reservation>;
+}
+
+// Only the Windows reservation can be refused: a Unix production build grants every idle exit.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug)]
+enum IdleReservation<G> {
+    Held(G),
+    /// A client is attached and accept takes it next.
+    Busy,
+    /// Nothing proves the endpoint is empty.
+    Failed(io::Error),
+}
+
+/// `None` keeps the loop serving with its idle clock as it is, so a later tick asks again.
+fn reserve_for_idle_exit<L: BrokerListener>(listener: &L) -> Option<L::Reservation> {
+    match listener.reserve_idle_exit() {
+        IdleReservation::Held(held) => Some(held),
+        IdleReservation::Busy => {
+            tracing::debug!("a client attached as the backend idled out; serving it");
+            None
+        }
+        IdleReservation::Failed(error) => {
+            tracing::warn!(%error, "could not reserve the endpoint for an idle exit; still serving");
+            None
+        }
+    }
+}
+
+/// A bound rendezvous.
+struct Endpoint {
+    listener: TokioListener,
+    #[cfg(windows)]
+    pipe_path: String,
+}
+
+#[cfg(windows)]
+type PipeReservation = interprocess::os::windows::named_pipe::DuplexPipeStream<
+    interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+>;
+
+impl BrokerListener for Endpoint {
+    type Stream = TokioStream;
+    #[cfg(windows)]
+    type Reservation = PipeReservation;
+    // A Unix client's connect lands in the backlog, which closes with the listener; the
+    // backlog is drained by the accept polled just before.
+    #[cfg(not(windows))]
+    type Reservation = ();
+
+    fn accept(&self) -> impl Future<Output = io::Result<TokioStream>> + Send {
+        self.listener.accept()
+    }
+
+    fn peer_authorized(&self, conn: &TokioStream) -> bool {
+        peer_authorized(conn)
+    }
+
+    fn reserve_idle_exit(&self) -> IdleReservation<Self::Reservation> {
+        #[cfg(windows)]
+        {
+            reserve_pipe_instance(&self.pipe_path)
+        }
+        #[cfg(not(windows))]
+        {
+            IdleReservation::Held(())
+        }
+    }
+}
+
+/// Connect once, without waiting, to the listener's one free pipe instance. A client that
+/// attached to it first makes this busy; otherwise the instance stays ours, and no client can
+/// complete a connect to the listener, until the reservation is dropped. Accept is not
+/// called again, so the listener never creates another free instance.
+#[cfg(windows)]
+fn reserve_pipe_instance(path: &str) -> IdleReservation<PipeReservation> {
+    match PipeReservation::connect_by_path_with_wait_mode(
+        path,
+        interprocess::ConnectWaitMode::Timeout(Duration::ZERO),
+    ) {
+        Ok(stream) => {
+            let peer = stream.peer_process_id();
+            own_instance(stream, peer)
+        }
+        // A zero wait makes exactly one attempt, and interprocess reports a busy pipe as this.
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => IdleReservation::Busy,
+        Err(error) => IdleReservation::Failed(error),
+    }
+}
+
+/// Only an instance this process serves reserves its listener: a connection to another
+/// server of the same name says nothing about ours.
+#[cfg(any(windows, test))]
+fn own_instance<S>(stream: S, peer_pid: io::Result<u32>) -> IdleReservation<S> {
+    match peer_pid {
+        Ok(pid) if pid == std::process::id() => IdleReservation::Held(stream),
+        Ok(pid) => IdleReservation::Failed(io::Error::other(format!(
+            "the endpoint's free instance is served by process {pid}"
+        ))),
+        Err(error) => IdleReservation::Failed(error),
+    }
+}
+
 /// Bind the rendezvous, winner-takes-all.
 ///
 /// - `Ok(Some(listener))` — we own the name and should serve.
@@ -570,7 +702,16 @@ impl Drop for ActiveGuard {
 /// a concurrent cold-starter beats us to the rebind, we defer to it). On Windows the
 /// named pipe instance vanishes with its owner, so a stale name just means the pipe is
 /// already gone and we rebind directly.
-async fn bind(key: &BackendKey) -> anyhow::Result<Option<TokioListener>> {
+async fn bind(key: &BackendKey) -> anyhow::Result<Option<Endpoint>> {
+    let endpoint = |listener| Endpoint {
+        listener,
+        #[cfg(windows)]
+        pipe_path: crate::broker::name::backend_pipe_path(key),
+    };
+    Ok(bind_listener(key).await?.map(endpoint))
+}
+
+async fn bind_listener(key: &BackendKey) -> anyhow::Result<Option<TokioListener>> {
     match listener_options(key)?.create_tokio() {
         Ok(listener) => Ok(Some(listener)),
         Err(e) if is_name_in_use(&e) => {
@@ -617,7 +758,16 @@ async fn bind(key: &BackendKey) -> anyhow::Result<Option<TokioListener>> {
     }
 }
 
-async fn bind_shared(key: &SharedBackendKey) -> anyhow::Result<Option<TokioListener>> {
+async fn bind_shared(key: &SharedBackendKey) -> anyhow::Result<Option<Endpoint>> {
+    let endpoint = |listener| Endpoint {
+        listener,
+        #[cfg(windows)]
+        pipe_path: crate::broker::name::shared_backend_pipe_path(key),
+    };
+    Ok(bind_shared_listener(key).await?.map(endpoint))
+}
+
+async fn bind_shared_listener(key: &SharedBackendKey) -> anyhow::Result<Option<TokioListener>> {
     match listener_options_shared(key)?.create_tokio() {
         Ok(listener) => Ok(Some(listener)),
         Err(error) if is_name_in_use(&error) => {
@@ -828,6 +978,926 @@ fn peer_authorized(conn: &TokioStream) -> bool {
 #[cfg(not(unix))]
 fn peer_authorized(_conn: &TokioStream) -> bool {
     true
+}
+
+/// The idle exits of both owner loops, driven through a scripted listener whose one free
+/// instance behaves as a Windows named pipe keeps it: a client's connect completes on it before
+/// accept hands it out, and a held reservation keeps every later connect from completing.
+#[cfg(test)]
+mod idle_boundary_tests {
+    use super::*;
+    use crate::broker::transport::{client_handshake, write_session_context, AdapterKind};
+    use crate::broker::{SharedBackendIdentity, SharedBackendKey};
+    use crate::{McpProfile, SharedState};
+    use rmcp::service::RunningService;
+    use rmcp::{RoleClient, ServiceExt};
+    use std::collections::VecDeque;
+    use tokio::io::DuplexStream;
+    use tokio::sync::watch;
+
+    const GRACE: Duration = Duration::from_secs(1);
+    /// The loops tick at a quarter of the shorter grace.
+    const POLL: Duration = Duration::from_millis(250);
+
+    type Client = RunningService<RoleClient, ()>;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Event {
+        AcceptPending,
+        ClientAttached,
+        ClientRefused,
+        Accepted,
+        ReserveBusy,
+        ReserveFailed,
+        Reserved,
+        ListenerDropped,
+        ReservationDropped,
+        SessionRetired,
+    }
+
+    enum Slot {
+        Free,
+        /// A client's connect completed; the server half waits for accept.
+        Attached(DuplexStream),
+        Reserved,
+        Closed,
+    }
+
+    /// What the next reservation answers instead of the instance's own state.
+    enum Refusal {
+        Busy,
+        Error,
+        ForeignProcess,
+    }
+
+    struct Pipe {
+        slot: Slot,
+        accept_open: bool,
+        refusals: VecDeque<Refusal>,
+        attach_as_listener_closes: bool,
+        events: Vec<(Event, Instant)>,
+    }
+
+    impl Pipe {
+        fn log(&mut self, event: Event) {
+            self.events.push((event, Instant::now()));
+        }
+
+        fn attach(&mut self) -> io::Result<DuplexStream> {
+            if !matches!(self.slot, Slot::Free) {
+                self.log(Event::ClientRefused);
+                return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "no free instance"));
+            }
+            let (client, server) = tokio::io::duplex(1 << 20);
+            self.slot = Slot::Attached(server);
+            self.log(Event::ClientAttached);
+            Ok(client)
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakePipe(Arc<watch::Sender<Pipe>>);
+
+    impl FakePipe {
+        fn new() -> Self {
+            Self(Arc::new(watch::Sender::new(Pipe {
+                slot: Slot::Free,
+                accept_open: false,
+                refusals: VecDeque::new(),
+                attach_as_listener_closes: false,
+                events: Vec::new(),
+            })))
+        }
+
+        fn listener(&self) -> FakeListener {
+            FakeListener(self.clone())
+        }
+
+        fn connect(&self) -> io::Result<DuplexStream> {
+            let mut attached = None;
+            self.0.send_modify(|pipe| attached = Some(pipe.attach()));
+            attached.expect("send_modify runs its closure")
+        }
+
+        fn open_accept(&self) {
+            self.0.send_modify(|pipe| pipe.accept_open = true);
+        }
+
+        fn refuse(&self, refusals: impl IntoIterator<Item = Refusal>) {
+            self.0.send_modify(|pipe| pipe.refusals.extend(refusals));
+        }
+
+        fn attach_as_listener_closes(&self) {
+            self.0.send_modify(|pipe| pipe.attach_as_listener_closes = true);
+        }
+
+        fn log(&self, event: Event) {
+            self.0.send_modify(|pipe| pipe.log(event));
+        }
+
+        fn events(&self) -> Vec<Event> {
+            self.0.borrow().events.iter().map(|(event, _)| *event).collect()
+        }
+
+        fn count(&self, wanted: &[Event]) -> usize {
+            self.0.borrow().events.iter().filter(|(event, _)| wanted.contains(event)).count()
+        }
+
+        fn times_of(&self, wanted: &[Event]) -> Vec<Instant> {
+            let pipe = self.0.borrow();
+            pipe.events
+                .iter()
+                .filter(|(event, _)| wanted.contains(event))
+                .map(|(_, at)| *at)
+                .collect()
+        }
+
+        /// Wait until one of `wanted` has happened `count` times in all.
+        async fn wait_for(&self, wanted: &[Event], count: usize) {
+            let mut events = self.0.subscribe();
+            tokio::time::timeout(
+                test_utils::wait::hang_guard(Duration::from_secs(60)),
+                events.wait_for(|pipe| {
+                    pipe.events.iter().filter(|(event, _)| wanted.contains(event)).count() >= count
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{wanted:?} never happened; events: {:?}", self.events()))
+            .expect("the pipe outlives its observers");
+        }
+    }
+
+    struct FakeListener(FakePipe);
+
+    impl BrokerListener for FakeListener {
+        type Stream = DuplexStream;
+        type Reservation = FakeReservation;
+
+        fn accept(&self) -> impl Future<Output = io::Result<DuplexStream>> + Send {
+            let pipe = self.0.clone();
+            async move {
+                let mut changes = pipe.0.subscribe();
+                let mut announced = false;
+                loop {
+                    changes.borrow_and_update();
+                    let mut taken = None;
+                    pipe.0.send_if_modified(|state| {
+                        if state.accept_open && matches!(state.slot, Slot::Attached(_)) {
+                            if let Slot::Attached(server) =
+                                std::mem::replace(&mut state.slot, Slot::Free)
+                            {
+                                taken = Some(server);
+                            }
+                            state.log(Event::Accepted);
+                            return true;
+                        }
+                        if announced {
+                            return false;
+                        }
+                        state.log(Event::AcceptPending);
+                        true
+                    });
+                    if let Some(server) = taken {
+                        return Ok(server);
+                    }
+                    announced = true;
+                    if changes.changed().await.is_err() {
+                        return Err(io::ErrorKind::BrokenPipe.into());
+                    }
+                }
+            }
+        }
+
+        fn peer_authorized(&self, _conn: &DuplexStream) -> bool {
+            true
+        }
+
+        fn reserve_idle_exit(&self) -> IdleReservation<FakeReservation> {
+            let mut answer = None;
+            self.0 .0.send_modify(|pipe| {
+                let decision = match pipe.refusals.pop_front() {
+                    Some(Refusal::Busy) => IdleReservation::Busy,
+                    Some(Refusal::Error) => {
+                        IdleReservation::Failed(io::Error::other("probe failed"))
+                    }
+                    Some(Refusal::ForeignProcess) => {
+                        own_instance((), Ok(std::process::id().wrapping_add(1)))
+                    }
+                    None => match pipe.slot {
+                        Slot::Free => {
+                            pipe.slot = Slot::Reserved;
+                            IdleReservation::Held(())
+                        }
+                        Slot::Attached(_) => IdleReservation::Busy,
+                        Slot::Reserved | Slot::Closed => {
+                            IdleReservation::Failed(io::Error::other("no instance to reserve"))
+                        }
+                    },
+                };
+                pipe.log(match decision {
+                    IdleReservation::Held(()) => Event::Reserved,
+                    IdleReservation::Busy => Event::ReserveBusy,
+                    IdleReservation::Failed(_) => Event::ReserveFailed,
+                });
+                answer = Some(match decision {
+                    IdleReservation::Held(()) => {
+                        IdleReservation::Held(FakeReservation(self.0.clone()))
+                    }
+                    IdleReservation::Busy => IdleReservation::Busy,
+                    IdleReservation::Failed(error) => IdleReservation::Failed(error),
+                });
+            });
+            answer.expect("send_modify runs its closure")
+        }
+    }
+
+    impl Drop for FakeListener {
+        fn drop(&mut self) {
+            self.0 .0.send_modify(|pipe| {
+                if pipe.attach_as_listener_closes {
+                    let _ = pipe.attach();
+                }
+                // An attached instance nobody accepted closes with the listener: its client
+                // reads EOF.
+                pipe.slot = Slot::Closed;
+                pipe.log(Event::ListenerDropped);
+            });
+        }
+    }
+
+    struct FakeReservation(FakePipe);
+
+    impl Drop for FakeReservation {
+        fn drop(&mut self) {
+            self.0.log(Event::ReservationDropped);
+        }
+    }
+
+    fn reference_server() -> McpServer {
+        McpServer::new(McpProfile::Reference, SharedState::shared())
+    }
+
+    fn spawn_serve(
+        pipe: &FakePipe,
+        orphan_grace: Duration,
+        idle_ttl: Duration,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        tokio::spawn(serve(reference_server(), pipe.listener(), Vec::new(), orphan_grace, idle_ttl))
+    }
+
+    struct Shared {
+        _source: tempfile::TempDir,
+        identity: SharedBackendIdentity,
+        retired: CancellationToken,
+        stop: CancellationToken,
+        sessions: Arc<AtomicU64>,
+        daemon: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    fn spawn_serve_shared(pipe: &FakePipe, orphan_grace: Duration, idle_ttl: Duration) -> Shared {
+        spawn_serve_shared_leased(pipe, orphan_grace, idle_ttl, || (false, false))
+    }
+
+    /// The shared loop with an adapter that serves MCP and records when its session hears of
+    /// a retirement. `lease_state` answers as the workspace lease does: superseded, and its
+    /// graph reads released.
+    fn spawn_serve_shared_leased(
+        pipe: &FakePipe,
+        orphan_grace: Duration,
+        idle_ttl: Duration,
+        lease_state: impl Fn() -> (bool, bool) + Send + 'static,
+    ) -> Shared {
+        let source = tempfile::tempdir().unwrap();
+        let identity = SharedBackendIdentity::new(
+            source.path(),
+            source.path().join("cache"),
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        );
+        let retired = CancellationToken::new();
+        let stop = CancellationToken::new();
+        let sessions = Arc::new(AtomicU64::new(0));
+        let (adapter_pipe, adapter_sessions) = (pipe.clone(), Arc::clone(&sessions));
+        let daemon = tokio::spawn(serve_shared(
+            SharedBackendKey::new(identity.clone()),
+            pipe.listener(),
+            Arc::new(move |_handshake, _context, session, shutdown, retired: CancellationToken| {
+                adapter_sessions.fetch_add(1, Ordering::SeqCst);
+                let pipe = adapter_pipe.clone();
+                async move {
+                    let SharedSession::Mcp(stream) = session else {
+                        anyhow::bail!("MCP adapter expected")
+                    };
+                    tokio::select! {
+                        served = serve_stream_with_shutdown(reference_server(), stream, shutdown) => served,
+                        _ = retired.cancelled() => {
+                            pipe.log(Event::SessionRetired);
+                            Ok(())
+                        }
+                    }
+                }
+            }),
+            retired.clone(),
+            stop.clone(),
+            orphan_grace,
+            idle_ttl,
+            lease_state,
+            || {},
+        ));
+        Shared { _source: source, identity, retired, stop, sessions, daemon }
+    }
+
+    async fn initialize(stream: DuplexStream) -> anyhow::Result<Client> {
+        Ok(().serve(stream).await?)
+    }
+
+    async fn initialize_shared(
+        mut stream: DuplexStream,
+        identity: &SharedBackendIdentity,
+    ) -> anyhow::Result<Client> {
+        client_handshake(
+            &mut stream,
+            &Handshake { identity: identity.clone(), adapter: AdapterKind::Mcp },
+        )
+        .await?;
+        write_session_context(&mut stream, &[]).await?;
+        initialize(stream).await
+    }
+
+    fn assert_served(client: &anyhow::Result<Client>) {
+        assert!(
+            client.as_ref().is_ok_and(|client| client.peer_info().is_some()),
+            "a client whose connect succeeded must be served: {:?}",
+            client.as_ref().err()
+        );
+    }
+
+    async fn join(daemon: tokio::task::JoinHandle<anyhow::Result<()>>) {
+        tokio::time::timeout(test_utils::wait::hang_guard(Duration::from_secs(60)), daemon)
+            .await
+            .expect("the daemon leaves")
+            .expect("the daemon task joins")
+            .expect("the daemon exits cleanly");
+    }
+
+    /// The client attaches after accept was found pending and before the expired grace is
+    /// acted on, and accept learns of it only after that decision.
+    async fn attach_as_the_grace_runs_out(pipe: &FakePipe) -> DuplexStream {
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        let client = pipe.connect().expect("the free instance takes the client");
+        tokio::time::advance(GRACE).await;
+        pipe.wait_for(&[Event::ReserveBusy, Event::ListenerDropped], 1).await;
+        pipe.open_accept();
+        client
+    }
+
+    /// The tail every idle exit must have: the reservation was held when the listener closed.
+    fn assert_reserved_exit(pipe: &FakePipe) {
+        let events = pipe.events();
+        let tail: Vec<_> = events
+            .iter()
+            .copied()
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::Reserved | Event::ListenerDropped | Event::ReservationDropped
+                )
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            [Event::Reserved, Event::ListenerDropped, Event::ReservationDropped],
+            "events: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_serves_a_client_that_attached_as_the_grace_ran_out() {
+        let pipe = FakePipe::new();
+        let daemon = spawn_serve(&pipe, GRACE, GRACE);
+        let stream = attach_as_the_grace_runs_out(&pipe).await;
+        let client = initialize(stream).await;
+        assert_served(&client);
+        client.unwrap().cancel().await.unwrap();
+        join(daemon).await;
+        assert_reserved_exit(&pipe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_shared_serves_a_client_that_attached_as_the_grace_ran_out() {
+        let pipe = FakePipe::new();
+        let shared = spawn_serve_shared(&pipe, GRACE, GRACE);
+        let stream = attach_as_the_grace_runs_out(&pipe).await;
+        let client = initialize_shared(stream, &shared.identity).await;
+        assert_served(&client);
+        client.unwrap().cancel().await.unwrap();
+        join(shared.daemon).await;
+        assert_reserved_exit(&pipe);
+    }
+
+    /// Nothing reaches the loop between the reservation and the listener closing: a connect
+    /// made as it closes is refused, no second accept runs and the reservation never reaches
+    /// a session.
+    fn assert_no_client_reached_the_closing_listener(pipe: &FakePipe) {
+        let events = pipe.events();
+        let served: Vec<_> =
+            events.iter().copied().filter(|event| *event != Event::AcceptPending).collect();
+        assert_eq!(
+            served,
+            [
+                Event::Reserved,
+                Event::ClientRefused,
+                Event::ListenerDropped,
+                Event::ReservationDropped
+            ],
+            "events: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_holds_its_free_instance_until_the_listener_closes() {
+        let pipe = FakePipe::new();
+        pipe.attach_as_listener_closes();
+        join(spawn_serve(&pipe, GRACE, GRACE)).await;
+        assert_no_client_reached_the_closing_listener(&pipe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_shared_holds_its_free_instance_until_the_listener_closes() {
+        let pipe = FakePipe::new();
+        pipe.attach_as_listener_closes();
+        let shared = spawn_serve_shared(&pipe, GRACE, GRACE);
+        join(shared.daemon).await;
+        assert_no_client_reached_the_closing_listener(&pipe);
+        assert_eq!(shared.sessions.load(Ordering::SeqCst), 0, "the reservation is no session");
+    }
+
+    /// A refused reservation leaves the loop serving with its idle state as it was: it asks
+    /// again on the next tick, not after the grace anew, and not after the longer orphan grace
+    /// of a backend that never served. A client is then served, and the backend still idles out.
+    async fn refused_reservations_keep_serving(
+        pipe: &FakePipe,
+        connect: impl AsyncFn(DuplexStream) -> anyhow::Result<Client>,
+    ) {
+        pipe.open_accept();
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        let warm = connect(pipe.connect().unwrap()).await;
+        assert_served(&warm);
+        warm.unwrap().cancel().await.unwrap();
+
+        pipe.refuse([Refusal::Busy, Refusal::Error, Refusal::ForeignProcess]);
+        let refusals = [Event::ReserveBusy, Event::ReserveFailed];
+        pipe.wait_for(&refusals, 3).await;
+        let asked = pipe.times_of(&refusals);
+        assert_eq!(
+            asked.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>(),
+            [POLL, POLL],
+            "events: {:?}",
+            pipe.events()
+        );
+
+        let client = connect(pipe.connect().expect("the listener still serves")).await;
+        assert_served(&client);
+        client.unwrap().cancel().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_keeps_serving_when_the_reservation_is_refused() {
+        let pipe = FakePipe::new();
+        let daemon = spawn_serve(&pipe, 4 * GRACE, GRACE);
+        refused_reservations_keep_serving(&pipe, initialize).await;
+        join(daemon).await;
+        assert_reserved_exit(&pipe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_shared_keeps_serving_when_the_reservation_is_refused() {
+        let pipe = FakePipe::new();
+        let shared = spawn_serve_shared(&pipe, 4 * GRACE, GRACE);
+        let identity = shared.identity.clone();
+        refused_reservations_keep_serving(&pipe, async |stream| {
+            initialize_shared(stream, &identity).await
+        })
+        .await;
+        join(shared.daemon).await;
+        assert_reserved_exit(&pipe);
+    }
+
+    /// A retirement closes the endpoint before any session hears of it, and is no idle exit.
+    #[tokio::test(start_paused = true)]
+    async fn serve_shared_retirement_closes_the_listener_before_sessions_hear_of_it() {
+        let pipe = FakePipe::new();
+        let long = Duration::from_secs(60);
+        let shared = spawn_serve_shared(&pipe, long, long);
+        pipe.open_accept();
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        let client = initialize_shared(pipe.connect().unwrap(), &shared.identity).await;
+        assert_served(&client);
+        shared.retired.cancel();
+        join(shared.daemon).await;
+        let events = pipe.events();
+        let order: Vec<_> = events
+            .iter()
+            .copied()
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::ListenerDropped
+                        | Event::SessionRetired
+                        | Event::Reserved
+                        | Event::ReserveBusy
+                        | Event::ReserveFailed
+                )
+            })
+            .collect();
+        assert_eq!(order, [Event::ListenerDropped, Event::SessionRetired], "events: {events:?}");
+    }
+
+    const ASKED_TO_RESERVE: [Event; 3] =
+        [Event::Reserved, Event::ReserveBusy, Event::ReserveFailed];
+
+    /// Loop turns, a tick of virtual time each, that outlast the grace three times over.
+    const TURNS_PAST_THE_GRACE: usize = 12;
+
+    /// A grace no run reaches: only the shorter orphan grace can end a backend that has this
+    /// idle TTL.
+    const NEVER: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// Let the owner loop turn `turns` more times. Every turn polls a fresh accept, which the
+    /// pipe records, so the wait ends on the loop having acted on that many ticks.
+    async fn let_the_loop_turn(pipe: &FakePipe, turns: usize) {
+        let seen = pipe.count(&[Event::AcceptPending]);
+        pipe.wait_for(&[Event::AcceptPending], seen + turns).await;
+    }
+
+    /// What tells a forced exit from an idle one: the listener closed and nobody asked to
+    /// reserve its instance.
+    fn forced_exit(pipe: &FakePipe) -> Vec<Event> {
+        pipe.events()
+            .into_iter()
+            .filter(|event| *event == Event::ListenerDropped || ASKED_TO_RESERVE.contains(event))
+            .collect()
+    }
+
+    /// A connected session holds the backend through every grace that passes, and the idle exit
+    /// comes only once it has left.
+    async fn a_connected_session_holds_the_backend(
+        pipe: &FakePipe,
+        connect: impl AsyncFn(DuplexStream) -> anyhow::Result<Client>,
+    ) {
+        pipe.open_accept();
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        let client = connect(pipe.connect().unwrap()).await;
+        assert_served(&client);
+        let client = client.unwrap();
+        let_the_loop_turn(pipe, TURNS_PAST_THE_GRACE).await;
+        assert_eq!(pipe.count(&ASKED_TO_RESERVE), 0, "events: {:?}", pipe.events());
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_holds_the_backend_while_a_session_is_connected() {
+        let pipe = FakePipe::new();
+        let daemon = spawn_serve(&pipe, GRACE, GRACE);
+        a_connected_session_holds_the_backend(&pipe, initialize).await;
+        join(daemon).await;
+        assert_reserved_exit(&pipe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_shared_holds_the_backend_while_a_session_is_connected() {
+        let pipe = FakePipe::new();
+        let shared = spawn_serve_shared(&pipe, GRACE, GRACE);
+        let identity = shared.identity.clone();
+        a_connected_session_holds_the_backend(&pipe, async |stream| {
+            initialize_shared(stream, &identity).await
+        })
+        .await;
+        join(shared.daemon).await;
+        assert_reserved_exit(&pipe);
+    }
+
+    /// Background work the state accounts for holds the backend without any session, and the
+    /// idle exit comes once the work is done.
+    #[tokio::test(start_paused = true)]
+    async fn serve_holds_the_backend_while_background_work_runs() {
+        let pipe = FakePipe::new();
+        let state = SharedState::shared();
+        let mut pass = state.index_progress().begin_pass();
+        let daemon = tokio::spawn(serve(
+            McpServer::new(McpProfile::Reference, state.clone()),
+            pipe.listener(),
+            Vec::new(),
+            GRACE,
+            GRACE,
+        ));
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        let_the_loop_turn(&pipe, TURNS_PAST_THE_GRACE).await;
+        assert_eq!(pipe.count(&ASKED_TO_RESERVE), 0, "events: {:?}", pipe.events());
+        pass.finish(bsl_search::IndexPassState::Ready);
+        join(daemon).await;
+        assert_reserved_exit(&pipe);
+    }
+
+    /// A connection that sends no payload leaves the backend unwarmed, so the orphan grace
+    /// ends it even though its idle TTL is out of reach.
+    #[tokio::test(start_paused = true)]
+    async fn serve_is_not_warmed_by_a_connection_that_sends_nothing() {
+        let pipe = FakePipe::new();
+        let daemon = spawn_serve(&pipe, GRACE, NEVER);
+        pipe.open_accept();
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        drop(pipe.connect().unwrap());
+        pipe.wait_for(&[Event::Accepted], 1).await;
+        join(daemon).await;
+        assert_reserved_exit(&pipe);
+    }
+
+    /// A private handshake that no MCP payload follows is a probe, and warms nothing.
+    #[tokio::test(start_paused = true)]
+    async fn serve_shared_is_not_warmed_by_a_probe_that_sends_nothing() {
+        let pipe = FakePipe::new();
+        let shared = spawn_serve_shared(&pipe, GRACE, NEVER);
+        pipe.open_accept();
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        let mut probe = pipe.connect().unwrap();
+        client_handshake(
+            &mut probe,
+            &Handshake { identity: shared.identity.clone(), adapter: AdapterKind::Mcp },
+        )
+        .await
+        .unwrap();
+        write_session_context(&mut probe, &[]).await.unwrap();
+        drop(probe);
+        join(shared.daemon).await;
+        assert_reserved_exit(&pipe);
+    }
+
+    /// A retired workspace scope closes the endpoint with a client still connected, and no
+    /// idle reservation is asked for.
+    #[tokio::test(start_paused = true)]
+    async fn serve_scope_retirement_closes_the_listener_without_reserving() {
+        let pipe = FakePipe::new();
+        let state = SharedState::shared();
+        let long = Duration::from_secs(60);
+        let daemon = tokio::spawn(serve(
+            McpServer::new(McpProfile::Reference, state.clone()),
+            pipe.listener(),
+            Vec::new(),
+            long,
+            long,
+        ));
+        pipe.open_accept();
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        let client = initialize(pipe.connect().unwrap()).await;
+        assert_served(&client);
+        state.scope_transport_stop().cancel();
+        join(daemon).await;
+        assert_eq!(forced_exit(&pipe), [Event::ListenerDropped], "events: {:?}", pipe.events());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_supersession_closes_the_listener_without_reserving() {
+        let pipe = FakePipe::new();
+        let state = SharedState::shared();
+        let long = Duration::from_secs(60);
+        let daemon = tokio::spawn(serve(
+            McpServer::new(McpProfile::Reference, state.clone()),
+            pipe.listener(),
+            Vec::new(),
+            long,
+            long,
+        ));
+        pipe.open_accept();
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        let client = initialize(pipe.connect().unwrap()).await;
+        assert_served(&client);
+        state.supersede_for_test();
+        join(daemon).await;
+        assert_eq!(forced_exit(&pipe), [Event::ListenerDropped], "events: {:?}", pipe.events());
+    }
+
+    async fn serve_shared_with_a_session(pipe: &FakePipe, shared: &Shared) -> Client {
+        pipe.open_accept();
+        pipe.wait_for(&[Event::AcceptPending], 1).await;
+        let client = initialize_shared(pipe.connect().unwrap(), &shared.identity).await;
+        assert_served(&client);
+        client.unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_shared_stop_closes_the_listener_without_reserving() {
+        let pipe = FakePipe::new();
+        let long = Duration::from_secs(60);
+        let shared = spawn_serve_shared(&pipe, long, long);
+        let _client = serve_shared_with_a_session(&pipe, &shared).await;
+        shared.stop.cancel();
+        join(shared.daemon).await;
+        assert_eq!(forced_exit(&pipe), [Event::ListenerDropped], "events: {:?}", pipe.events());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_shared_supersession_closes_the_listener_without_reserving() {
+        let pipe = FakePipe::new();
+        let long = Duration::from_secs(60);
+        let superseded = Arc::new(AtomicBool::new(false));
+        let lease = Arc::clone(&superseded);
+        let shared = spawn_serve_shared_leased(&pipe, long, long, move || {
+            (lease.load(Ordering::SeqCst), true)
+        });
+        let _client = serve_shared_with_a_session(&pipe, &shared).await;
+        superseded.store(true, Ordering::SeqCst);
+        join(shared.daemon).await;
+        assert_eq!(forced_exit(&pipe), [Event::ListenerDropped], "events: {:?}", pipe.events());
+    }
+
+    /// A reservation that cannot be made says why, while a busy one is routine: a client is
+    /// attached and accept takes it next.
+    #[test]
+    fn a_failed_reservation_is_diagnosed_and_a_busy_one_is_not() {
+        use std::sync::Mutex;
+        use tracing_subscriber::prelude::*;
+
+        struct Warnings(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() > tracing::Level::WARN {
+                    return;
+                }
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?} ", field.name()));
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+
+        let pipe = FakePipe::new();
+        pipe.refuse([Refusal::Busy, Refusal::Error, Refusal::ForeignProcess]);
+        let listener = pipe.listener();
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        test_utils::with_subscriber(
+            tracing_subscriber::registry().with(Warnings(warnings.clone())),
+            || {
+                for _ in 0..3 {
+                    assert!(reserve_for_idle_exit(&listener).is_none(), "a refusal keeps serving");
+                }
+            },
+        );
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(warnings.len(), 2, "only the failures warn: {warnings:?}");
+        assert!(warnings[0].contains("probe failed"), "{warnings:?}");
+        assert!(
+            warnings[1]
+                .contains(&format!("served by process {}", std::process::id().wrapping_add(1))),
+            "{warnings:?}"
+        );
+    }
+
+    /// Both endpoint kinds, each bound for real, with the spelling of its name that clients of
+    /// earlier releases connect by.
+    #[cfg(windows)]
+    struct BoundEndpoint {
+        _source: tempfile::TempDir,
+        endpoint: Endpoint,
+        earlier_name: interprocess::local_socket::Name<'static>,
+        rebind: std::pin::Pin<Box<dyn Future<Output = Option<Endpoint>>>>,
+    }
+
+    #[cfg(windows)]
+    async fn bound_endpoints() -> Vec<BoundEndpoint> {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+
+        let backend_source = tempfile::tempdir().unwrap();
+        let backend = crate::broker::BackendKey::new(
+            backend_source.path(),
+            backend_source.path().join("cache"),
+            McpProfile::Workspace,
+            0,
+            0,
+            std::collections::BTreeSet::new(),
+        );
+        let shared_source = tempfile::tempdir().unwrap();
+        let shared = SharedBackendKey::new(SharedBackendIdentity::new(
+            shared_source.path(),
+            shared_source.path().join("cache"),
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        ));
+        vec![
+            BoundEndpoint {
+                endpoint: bind(&backend).await.unwrap().expect("a fresh name binds"),
+                earlier_name: format!("bsl-mcp-{}.sock", backend.digest())
+                    .to_ns_name::<GenericNamespaced>()
+                    .unwrap(),
+                rebind: Box::pin(async move { bind(&backend).await.unwrap() }),
+                _source: backend_source,
+            },
+            BoundEndpoint {
+                endpoint: bind_shared(&shared).await.unwrap().expect("a fresh name binds"),
+                earlier_name: format!("bsl-shared-{}.sock", shared.digest())
+                    .to_ns_name::<GenericNamespaced>()
+                    .unwrap(),
+                rebind: Box::pin(async move { bind_shared(&shared).await.unwrap() }),
+                _source: shared_source,
+            },
+        ]
+    }
+
+    /// A client whose connect completed before accept holds the free instance: the reservation
+    /// is refused at once, and accept then hands that client over.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_client_attached_before_accept_makes_the_pipe_reservation_busy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for bound in bound_endpoints().await {
+            let mut client = connect_endpoint(
+                bound.earlier_name.clone(),
+                test_utils::wait::hang_guard(Duration::from_secs(5)),
+            )
+            .await
+            .expect("a client of an earlier release reaches the endpoint");
+            let asked = std::time::Instant::now();
+            let reservation = bound.endpoint.reserve_idle_exit();
+            let waited = asked.elapsed();
+            assert!(
+                matches!(reservation, IdleReservation::Busy),
+                "an attached client makes the reservation busy: {reservation:?}"
+            );
+            if cfg!(timing_contract) {
+                assert!(waited < Duration::from_millis(500), "the reservation waited {waited:?}");
+            }
+            let mut server = tokio::time::timeout(
+                test_utils::wait::hang_guard(Duration::from_secs(5)),
+                bound.endpoint.accept(),
+            )
+            .await
+            .expect("accept takes the attached client")
+            .unwrap();
+            client.write_all(b"ping").await.unwrap();
+            let mut ping = [0; 4];
+            server.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            server.write_all(b"pong").await.unwrap();
+            let mut pong = [0; 4];
+            client.read_exact(&mut pong).await.unwrap();
+            assert_eq!(&pong, b"pong");
+        }
+    }
+
+    /// A held reservation keeps the listener's free instance: no client completes a connect
+    /// until the listener is gone, and once the reservation is dropped too the name binds again.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_pipe_reservation_holds_the_free_instance_until_the_listener_is_gone() {
+        for bound in bound_endpoints().await {
+            let reservation = match bound.endpoint.reserve_idle_exit() {
+                IdleReservation::Held(reservation) => reservation,
+                other => panic!("an empty listener is reserved: {other:?}"),
+            };
+            let second = PipeReservation::connect_by_path_with_wait_mode(
+                bound.endpoint.pipe_path.as_str(),
+                interprocess::ConnectWaitMode::Timeout(Duration::ZERO),
+            );
+            assert!(
+                second.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::TimedOut),
+                "a second connect finds the reserved instance busy: {second:?}"
+            );
+            drop(bound.endpoint);
+            drop(reservation);
+            assert!(bound.rebind.await.is_some(), "the closed name binds again");
+        }
+    }
+
+    #[test]
+    fn only_an_instance_of_this_process_reserves_the_endpoint() {
+        assert!(matches!(own_instance((), Ok(std::process::id())), IdleReservation::Held(())));
+        assert!(matches!(
+            own_instance((), Ok(std::process::id().wrapping_add(1))),
+            IdleReservation::Failed(_)
+        ));
+        assert!(matches!(
+            own_instance((), Err(io::Error::other("no server process"))),
+            IdleReservation::Failed(_)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1158,9 +2228,8 @@ mod shared_tests {
         {
             use interprocess::os::windows::named_pipe::{pipe_mode, tokio::DuplexPipeStream};
 
-            let path = format!(r"\\.\pipe\bsl-shared-{}.sock", key.digest());
             DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path_with_wait_mode(
-                path,
+                crate::broker::name::shared_backend_pipe_path(key),
                 interprocess::ConnectWaitMode::Timeout(Duration::ZERO),
             )
             .await
