@@ -86,11 +86,11 @@ fn t12_type_rejection_uses_best_candidate_and_first_incompatible_argument() {
     let db = InMemoryDb::new();
     let number = db.number(None, None);
     let string = db.string(None, false);
-    let boolean = db.boolean();
+    let structure = db.structure(None);
     let date = db.date(bsl_types::facet::DateComponent::DateTime);
     let binding = binding(
         &db,
-        &[&[boolean, boolean], &[number, date], &[number, boolean]],
+        &[&[structure, structure], &[number, date], &[number, structure]],
         &[number, string],
     );
 
