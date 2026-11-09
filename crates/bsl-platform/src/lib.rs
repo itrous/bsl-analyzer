@@ -43,7 +43,10 @@ pub use help::{
     PlatformHelpStatus, RestartRequired, BUNDLED_PLATFORM_VERSION, CORPUS_ENV,
 };
 pub use parameter_series::ParameterSeries;
-pub use snapshot::{MemberSurfaceAttestation, PlatformSnapshot, SnapshotDecodeError};
+pub use snapshot::{
+    AttestedSurfaces, MemberSurface, MemberSurfaceAttestation, PlatformSnapshot,
+    SnapshotDecodeError,
+};
 pub use types::*;
 
 pub fn split_type_alternatives(raw: &str) -> Vec<&str> {

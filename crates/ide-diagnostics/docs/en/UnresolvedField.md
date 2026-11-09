@@ -25,7 +25,7 @@ Metadata collections are checked the same way:
 
 Platform types are checked only where the completeness of their member surface is attested (`type_member_surface_attestations` in `crates/bsl-platform/data/platform_overlays.json`):
 
-- the type must be one of the attested ones, and the platform data the analyzer serves must be of the release the surface was verified against or newer. When that version cannot be determined, the check stays silent;
+- the type must be attested for its properties, and the platform data the analyzer serves must be of the release the surface was verified against or newer. When that version cannot be determined, the check stays silent. An attestation can cover the methods only (`"verified_surface": ["methods"]`): a collection that addresses its elements by name answers an element name as a property, so a type like that stays open here even though its methods are closed;
 - for any other platform type a miss proves nothing: the extract is not guaranteed to list every member (some types yielded no members at all, individual help pages are missing from the archive, and a type name may belong to two namesakes), so the access stays silent.
 
 ```bsl

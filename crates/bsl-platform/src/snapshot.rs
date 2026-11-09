@@ -41,6 +41,46 @@ pub struct PlatformSnapshot {
     pub member_surface_attestations: Vec<MemberSurfaceAttestation>,
 }
 
+/// One of the two member surfaces of a platform type an attestation can cover.
+/// Each consumer of an attestation asks about the surface its verdict rests on,
+/// at its own call site: the absent-method check about [`Methods`], the
+/// absent-field check and the system-enumeration check (whose values are listed
+/// among the properties) about [`Fields`].
+///
+/// [`Methods`]: MemberSurface::Methods
+/// [`Fields`]: MemberSurface::Fields
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemberSurface {
+    /// The methods of the type: the `"methods"` value of `verified_surface`.
+    Methods,
+    /// The properties of the type: the `"fields"` value of `verified_surface`.
+    Fields,
+}
+
+/// The surfaces one attestation covers, `verified_surface` resolved. An entry
+/// without the field covers both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttestedSurfaces {
+    methods: bool,
+    fields: bool,
+}
+
+impl AttestedSurfaces {
+    /// Both surfaces: what an entry without `verified_surface` attests.
+    pub const BOTH: Self = Self { methods: true, fields: true };
+
+    pub(crate) fn from_flags(methods: bool, fields: bool) -> Self {
+        Self { methods, fields }
+    }
+
+    pub fn contains(self, surface: MemberSurface) -> bool {
+        match surface {
+            MemberSurface::Methods => self.methods,
+            MemberSurface::Fields => self.fields,
+        }
+    }
+}
+
 /// One `type_member_surface_attestations` entry, resolved to the corpus it was
 /// applied to: the extract lists every method and property the named type has,
 /// so a member the extract does not know is genuinely absent from the platform
@@ -51,6 +91,8 @@ pub struct MemberSurfaceAttestation {
     pub type_name: String,
     /// The platform release the completeness was verified against, `8.3.27`.
     pub verified_against_version: String,
+    /// The surfaces the extract is attested complete for.
+    pub surfaces: AttestedSurfaces,
 }
 
 /// Why a corpus could not become a snapshot. Nothing is published on error: the
@@ -134,6 +176,7 @@ impl PlatformSnapshot {
             .map(|attestation| MemberSurfaceAttestation {
                 type_name: attestation.type_name,
                 verified_against_version: attestation.verified_against_version,
+                surfaces: attestation.surfaces,
             })
             .collect();
         snapshot.validate()?;

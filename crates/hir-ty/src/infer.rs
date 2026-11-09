@@ -1,6 +1,7 @@
 use base_db::FileIdInput;
 use bsl_platform::deprecation::{self, ElementKind, Lookup};
 use bsl_platform::security::Category as SecurityCategory;
+use bsl_platform::MemberSurface;
 use bsl_types::builders::Builders;
 use bsl_types::facet::{DateComponent, FormDataFacet, MdoRefFacet, ProjectionSource};
 use bsl_types::intern::TypeKernelDb;
@@ -2695,7 +2696,7 @@ impl<'db> InferenceContext<'db> {
         field: &hir_def::Name,
     ) -> bool {
         self.miss_holds_on_every_path(receiver_expr, |ty| {
-            self.is_closed_platform_object(ty) && self.lacks_field(ty, field)
+            self.is_closed_platform_object(ty, MemberSurface::Fields) && self.lacks_field(ty, field)
         })
     }
 
@@ -2708,7 +2709,7 @@ impl<'db> InferenceContext<'db> {
         method: &hir_def::Name,
     ) -> bool {
         self.miss_holds_on_every_path(receiver_expr, |ty| {
-            self.is_closed_platform_object(ty)
+            self.is_closed_platform_object(ty, MemberSurface::Methods)
                 && crate::method_lookup::lookup_method(self.db, ty, method).is_none()
         })
     }
@@ -2823,15 +2824,16 @@ impl<'db> InferenceContext<'db> {
         (!names.is_empty()).then(|| hir_def::Name::new(&names.join(", ")))
     }
 
-    /// A platform object whose extracted member surface is attested as complete for the
-    /// served corpus. A homonym is refused here as well as by the verification itself, so the
-    /// verdict does not rest on an unseen detail of the other module's contract.
-    fn is_closed_platform_object(&self, ty: TypeId) -> bool {
+    /// A platform object whose extracted `surface` (its methods or its properties, as the
+    /// caller's verdict needs) is attested as complete for the served corpus. A homonym is
+    /// refused here as well as by the verification itself, so the verdict does not rest on an
+    /// unseen detail of the other module's contract.
+    fn is_closed_platform_object(&self, ty: TypeId, surface: MemberSurface) -> bool {
         let Some(name) = self.closed_platform_type_candidate(ty) else {
             return false;
         };
         let platform = bsl_platform::PlatformData::instance();
-        platform.platform_type_member_surface_verified(&name)
+        platform.platform_type_member_surface_verified(&name, surface)
             && !platform.is_ambiguous_type_name(&name)
     }
 
@@ -2850,7 +2852,8 @@ impl<'db> InferenceContext<'db> {
         bsl_platform::PlatformGlobalCatalog::instance()
             .lookup(&facet.name)
             .is_some_and(|symbol| symbol.kind == bsl_platform::PlatformGlobalKind::SystemEnum)
-            && self.is_closed_platform_object(ty)
+            // The values of a system enumeration are listed among its properties.
+            && self.is_closed_platform_object(ty, MemberSurface::Fields)
     }
 
     /// The platform type name a receiver answers to when its member surface may be judged
@@ -3858,7 +3861,8 @@ impl<'db> InferenceContext<'db> {
                     // receiver must hold such a type on every path reaching the
                     // read, not only on the one the walk saw last.
                     let base_id = ExprId::from_idx(*base);
-                    let closed_platform_object = self.is_closed_platform_object(base_ty)
+                    let closed_platform_object = self
+                        .is_closed_platform_object(base_ty, MemberSurface::Fields)
                         && self.platform_field_miss_holds_on_every_path(base_id, field);
                     // A metadata object read through a local is typed by the local's textually
                     // latest write; after `Если … ИначеЕсли` another branch may have written an
@@ -4970,7 +4974,7 @@ impl<'db> InferenceContext<'db> {
                         // only on the one the walk saw last. The name is the
                         // receiver to the reader — the platform type in the
                         // spelling the corpus uses.
-                        if self.is_closed_platform_object(receiver_ty) {
+                        if self.is_closed_platform_object(receiver_ty, MemberSurface::Methods) {
                             if self.platform_method_miss_holds_on_every_path(base_id, &method_name)
                             {
                                 self.push_inference_diagnostic(

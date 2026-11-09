@@ -198,15 +198,23 @@ curated entries are guarded by `crates/bsl-platform/tests/bundled_facts.rs`.
       "verified_against_version": "8.3.27",
       "evidence_source": "the help corpus page of the type lists every member it has",
       "rationale": "the surface is complete at that release, so a miss is a defect"
+    },
+    {
+      "type": "SpreadsheetDocumentDrawingCollection",
+      "verified_against_version": "8.3.27",
+      "verified_surface": ["methods"],
+      "evidence_source": "the help corpus page lists every method; a live run finds no `Найти` on the collection and resolves an element by its name",
+      "rationale": "the collection addresses its elements by name, so an element name is answered as a property and only the methods are complete"
     }
   ]
 }
 ```
 
 Attests that the extracted member surface of a type — every method and property
-— is complete for the named platform release. The absent-member checks
-(`UnresolvedField`, `UnresolvedMethodCall`) judge a platform type only where an
-attestation like this allows it: for the other types the extract is not known to
+by default, or the surfaces `verified_surface` names — is complete for the named
+platform release. The absent-member checks (`UnresolvedField`,
+`UnresolvedMethodCall`) and the system-enumeration check of `hir-ty` judge a
+platform type only where an attestation like this allows it: for the other types the extract is not known to
 list every member, and a member missing from it proves nothing about the
 platform. `type` may be spelled in either language; `verified_against_version`
 is a dotted numeric version of at least three components (`8`, `8.3` and
@@ -216,6 +224,22 @@ version of the served corpus is that release or newer — an older corpus, or on
 whose version the analyzer cannot determine, keeps the receiver open. A homonym
 is never attested: its two namesakes share a name but not a surface, so the
 lookup cannot tell which one a receiver denotes.
+
+`verified_surface` is optional: a list of `"methods"` and `"fields"` naming what
+the attestation covers. Without it both surfaces are attested, so an entry
+written before the field existed reads as it always did; `schema_version` stays 1.
+An empty list, a value other than those two and a value listed twice are refused
+at load time, the error naming the type. Each consumer asks about the surface its
+verdict rests on, at its own call site: `UnresolvedMethodCall` asks whether the
+methods are complete, `UnresolvedField` whether the properties are, and the check
+of a system enumeration whether the values are, which the corpus keeps among the
+properties. The field is a statement about the extract, not about the type's
+behaviour: a collection that addresses its elements by name (a drawing collection
+of a spreadsheet document, the descriptions of standard attributes) answers an
+element name as a property, so its property list is not the whole of what
+`Collection.<name>` can be, while its method list is. Such a type is attested for
+`["methods"]`, and the reason (with the live run that shows it) belongs in the
+entry's `rationale` and `evidence_source`.
 
 One type is attested once, and attestations are deduplicated after their type
 names are resolved: two entries naming one type through different spellings
@@ -234,11 +258,18 @@ per-MDO extensions, and those members are not in the platform extract. As with a
 correction, an attestation whose type a corpus does not have is dropped and the
 corpus still loads.
 
+The rule is per surface. A type a `DOCS_GAP_*` overlay patches is attested for
+neither surface. A type a configuration extends (a form, say) and a type that
+addresses its elements by name are attested for `["methods"]` only: their
+properties are open, their methods are the platform's own.
+
 All of this is checked, not merely written down: `crates/bsl-platform/tests/bundled_facts.rs`
 asserts over the curated attestations that each named type exists in the built-in
 facts, is not one the docs-gap overlays synthesize members for
-(`docs_gap_synthesized_member_types`) and carries no form/extension marker — so
-attesting such a type fails the tests instead of passing review.
+(`docs_gap_synthesized_member_types`), and, when its name carries a form/extension
+marker or it is on the test's list of types that address their elements by name,
+is attested for `["methods"]` only — so attesting such a type for its properties
+fails the tests instead of passing review.
 
 ## Method-local scope
 

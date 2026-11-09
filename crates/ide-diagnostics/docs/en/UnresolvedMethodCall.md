@@ -18,7 +18,7 @@ The current implementation is conservative and focuses on qualified calls such a
 
 A method call on a value of a platform type is checked only where the completeness of that type's member surface is attested (`type_member_surface_attestations` in `crates/bsl-platform/data/platform_overlays.json`). Such a type counts as closed: the platform data is known to list every method it has, so calling a method it does not have is a defect of the code rather than a gap in the data.
 
-- the type must be attested, and the platform data the analyzer serves must be of the release the surface was verified against or newer; when that version cannot be determined, the check stays silent;
+- the type must be attested for its methods, and the platform data the analyzer serves must be of the release the surface was verified against or newer; when that version cannot be determined, the check stays silent. An attestation can cover the methods only (`"verified_surface": ["methods"]`), as it does for the collections that address their elements by name: this check judges such a type, the absent-property check does not;
 - a homonymous type name (one spelling shared by two different platform types) stays silent as well: which of them a receiver denotes is unknown;
 - a call on a platform type that is not attested stays silent: its surface is not known to be complete.
 
