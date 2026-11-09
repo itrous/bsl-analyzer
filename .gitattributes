@@ -16,3 +16,8 @@ crates/lexer/tests/fixtures/sdbl_golden_corpus.txt -text
 # The tests pin line and column of a finding inside a multi-line query string and compare the
 # query text byte for byte with the module that holds it; a CRLF checkout would shift both.
 crates/ide-diagnostics/tests/fixtures/derived_table_outer_alias/** -text
+# The CFG contract compares an expect dump that pins byte offsets of these sources, and every
+# parser fixture is compared byte for byte: the licence header of the module corpus, the CST
+# dump and the recorded trivia ranges. A CRLF checkout shifts every offset by one per line.
+crates/hir/tests/fixtures/cfg_contract/** -text
+crates/parser/tests/fixtures/** -text
