@@ -316,6 +316,9 @@ pub trait AnalysisProvider {
 
     /// Whether the type is a `ФиксированнаяСтруктура`; a union is not.
     fn kernel_type_is_fixed_structure(&self, id: bsl_types::kind::TypeId) -> bool;
+    /// Whether the type is the data of a form's object attribute (`ДанныеФормыСтруктура`);
+    /// a union is not.
+    fn kernel_type_is_form_data_structure(&self, id: bsl_types::kind::TypeId) -> bool;
 
     /// The project's `min_platform_version`; `None` (the default for providers
     /// without project settings) keeps the min-platform check silent.

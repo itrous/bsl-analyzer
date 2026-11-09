@@ -61,6 +61,7 @@ pub mod extra_commas;
 pub mod fields_from_joins_without_is_null;
 pub mod file_system_access;
 pub mod forbidden_metadata_name;
+pub mod form_data_has_no_metadata_method;
 pub mod form_data_to_value;
 pub mod form_event_handler_directive;
 pub mod full_outer_join_query;
@@ -364,6 +365,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::StructureKeyIsNotIdentifier => {
             Some(&structure_key_is_not_identifier::METADATA)
+        }
+        DiagnosticCode::FormDataHasNoMetadataMethod => {
+            Some(&form_data_has_no_metadata_method::METADATA)
         }
         DiagnosticCode::UseLessForEach => Some(&useless_for_each::METADATA),
         DiagnosticCode::IteratorCollidesCollection => Some(&iterator_collides_collection::METADATA),

@@ -2,6 +2,7 @@ use bsl_metadata::{Form, FormElement, MdoType};
 use bsl_platform::{PlatformData, PlatformMethod};
 use bsl_types::builders::Builders;
 use bsl_types::display::{display_name as kernel_display, Locale as KernelLocale, PlainDisplayCtx};
+use bsl_types::facet::FormDataFacet;
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::{Projection, TypeId, TypeKind};
 use hir_def::configs::ConfigsDatabase;
@@ -447,6 +448,17 @@ pub fn kernel_type_is_fixed_structure(db: &dyn TypeKernelDb, id: TypeId) -> bool
     matches!(db.lookup_type(id), TypeKind::PlatformObject(object)
         if object.name.fold_lower() == "фиксированнаяструктура"
             || object.name.eq_ignore_ascii_case("FixedStructure"))
+}
+/// Whether the type is the data of a form's object attribute (`ДанныеФормыСтруктура`, with or
+/// without a collection); a union is not, even one made only of such types.
+pub fn kernel_type_is_form_data_structure(db: &dyn TypeKernelDb, id: TypeId) -> bool {
+    matches!(
+        db.lookup_type(id),
+        TypeKind::FormData {
+            kind: FormDataFacet::Structure | FormDataFacet::StructureWithCollection,
+            ..
+        }
+    )
 }
 
 fn field_from_info(info: FieldInfo) -> Field {

@@ -29,10 +29,11 @@ pub use semantic_symbol::{
 };
 pub use type_facade::{
     execution_environment_at, form_element_type, kernel_type_includes_undefined,
-    kernel_type_is_fixed_structure, kernel_type_is_structure, kernel_type_label,
-    kernel_union_member_labels, module_implicit_field_names, module_implicit_fields,
-    platform_name_entries, root_metadata_object_type, root_metadata_ref_type,
-    root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry, PlatformNameKind, Type,
+    kernel_type_is_fixed_structure, kernel_type_is_form_data_structure, kernel_type_is_structure,
+    kernel_type_label, kernel_union_member_labels, module_implicit_field_names,
+    module_implicit_fields, platform_name_entries, root_metadata_object_type,
+    root_metadata_ref_type, root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry,
+    PlatformNameKind, Type,
 };
 
 pub use hir_def::execution_env;
