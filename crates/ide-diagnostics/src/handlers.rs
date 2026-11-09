@@ -167,6 +167,7 @@ pub mod set_permissions_for_new_objects;
 pub mod set_privileged_mode;
 pub mod several_compiler_directives;
 pub mod space_at_start_comment;
+pub mod structure_key_is_not_identifier;
 pub mod style_element_constructors;
 pub mod temp_files_dir;
 pub mod ternary_operator_usage;
@@ -357,6 +358,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::ObjectModifiedInOnWrite => Some(&object_modified_in_on_write::METADATA),
         DiagnosticCode::PostingWhileDataExchangeLoading => {
             Some(&posting_while_data_exchange_loading::METADATA)
+        }
+        DiagnosticCode::StructureKeyIsNotIdentifier => {
+            Some(&structure_key_is_not_identifier::METADATA)
         }
         DiagnosticCode::UseLessForEach => Some(&useless_for_each::METADATA),
         DiagnosticCode::IteratorCollidesCollection => Some(&iterator_collides_collection::METADATA),

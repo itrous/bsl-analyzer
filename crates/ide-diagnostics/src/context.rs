@@ -195,6 +195,10 @@ impl<'a> AnalysisContext<'a> {
         self.provider.kernel_type_includes_undefined(id)
     }
 
+    pub fn kernel_type_is_structure(&self, id: hir::TypeId) -> bool {
+        self.provider.kernel_type_is_structure(id)
+    }
+
     /// The project's minimum platform release, parsed; `None` when unset or not a
     /// version.
     pub fn min_platform_version(&self) -> Option<bsl_platform::PlatformVersion> {

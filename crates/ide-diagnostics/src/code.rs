@@ -85,6 +85,7 @@ pub enum DiagnosticCode {
     MisplacedLoopControl,
     ObjectModifiedInOnWrite,
     PostingWhileDataExchangeLoading,
+    StructureKeyIsNotIdentifier,
     UseLessForEach,
     IteratorCollidesCollection,
     UsingGoto,

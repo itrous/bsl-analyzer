@@ -436,6 +436,11 @@ pub fn kernel_type_includes_undefined(db: &dyn TypeKernelDb, id: TypeId) -> bool
     }
 }
 
+/// Whether the type is a plain structure; a union is not, even one made only of structures.
+pub fn kernel_type_is_structure(db: &dyn TypeKernelDb, id: TypeId) -> bool {
+    matches!(db.lookup_type(id), TypeKind::Structure(_))
+}
+
 fn field_from_info(info: FieldInfo) -> Field {
     Field {
         env: match info.origin {
