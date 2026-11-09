@@ -208,6 +208,7 @@ pub enum DiagnosticCode {
     LogicalOrInTheWhereSectionOfQuery,
     MultilineStringInQuery,
     QueryNestedFieldsByDot,
+    QueryOrderByDocumentDate,
     QueryParseError,
     QueryToMissingMetadata,
     QueryParameterSourceWithoutInto,

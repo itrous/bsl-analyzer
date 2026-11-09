@@ -11,7 +11,7 @@ use crate::standard_fields::{
 };
 use crate::types::{MdoRef, SdblType};
 use bsl_metadata::MdoType;
-use stdx::case::CaseExt;
+use stdx::case::{eq_ignore_case, CaseExt};
 use syntax::ast::AstNode;
 
 impl LoweringContext<'_> {
@@ -436,6 +436,80 @@ impl LoweringContext<'_> {
         }
     }
 
+    /// Reports an `ORDER BY` key `<источник>.<поле>.Дата` where `<поле>` is a document
+    /// reference (#std412).
+    ///
+    /// Documents of the same date come in arbitrary order, so the date is not a definite
+    /// chronological key; `МоментВремени` is. The rule judges only a three-part key whose
+    /// first part names a resolved source of this query, whose second part is a field of
+    /// that source typed as a document reference (a single document reference, "any
+    /// document reference", or a composite made of nothing else), and whose last part is
+    /// `Дата`/`Date`. A key accompanied by `<источник>.<поле>.МоментВремени` in the same
+    /// `ORDER BY` is silent. Two-part keys, longer paths and expressions are not judged; the
+    /// other query sections are not looked at.
+    pub(super) fn check_order_by_document_date(&mut self, hir: &SdblHir) {
+        let Some(order_by) = &hir.order_by else { return };
+        fn path_of(expr: &ExprHir) -> Option<&[Name]> {
+            match expr {
+                ExprHir::ColumnRef { parts, .. } if parts.len() == 3 => Some(parts),
+                _ => None,
+            }
+        }
+        for item in &order_by.items {
+            let Some(parts) = path_of(&item.expr) else { continue };
+            if !is_name_of(&parts[2], "Дата", "Date") {
+                continue;
+            }
+            let has_point_in_time =
+                order_by.items.iter().filter_map(|key| path_of(&key.expr)).any(|other| {
+                    eq_ignore_case(&other[0], &parts[0])
+                        && eq_ignore_case(&other[1], &parts[1])
+                        && is_name_of(&other[2], "МоментВремени", "PointInTime")
+                });
+            if has_point_in_time {
+                continue;
+            }
+            let Some(table) = hir
+                .from
+                .iter()
+                .chain(hir.joins.iter().map(|join| &join.table))
+                .find(|table| eq_ignore_case(table.effective_name(), &parts[0]))
+            else {
+                continue;
+            };
+            let Some(field) = table.metadata.as_ref().and_then(|meta| meta.find_field(&parts[1]))
+            else {
+                continue;
+            };
+            if !self.is_document_reference(&field.ty) {
+                continue;
+            }
+            self.diagnostics.push(SdblDiagnostic::QueryOrderByDocumentDate {
+                reference_field: parts[1].to_string(),
+                range: item.expr.range(),
+            });
+        }
+    }
+
+    /// Whether `ty` is a document reference: a single one, "any document reference", or a
+    /// composite in which every arm is one of those. An arm may be a defined type that
+    /// expands to a composite of its own, so arms are judged the same way.
+    fn is_document_reference(&self, ty: &SdblType) -> bool {
+        self.is_document_arm(ty, true)
+    }
+
+    fn is_document_arm(&self, ty: &SdblType, may_resolve: bool) -> bool {
+        let (ty, may_resolve) = self.expanded_resolving(ty, may_resolve);
+        match ty.as_ref() {
+            SdblType::Ref(MdoRef { mdo_type: MdoType::Document, .. })
+            | SdblType::AnyObjectRef { mdo_type: MdoType::Document } => true,
+            SdblType::Composite { types } => {
+                !types.is_empty() && types.iter().all(|arm| self.is_document_arm(arm, may_resolve))
+            }
+            _ => false,
+        }
+    }
+
     /// Reports selected fields whose result-column name is not given with `КАК`.
     ///
     /// The name of a result column is what the code reading the result relies on. Without
@@ -807,6 +881,11 @@ enum PathStart<'t> {
     SourceAlias,
     /// A parameter of this virtual table: the path's head is one of its fields.
     VirtualTableField(&'t TableRef),
+}
+
+/// Whether `name` is the Russian or the English spelling of a query word, ignoring case.
+fn is_name_of(name: &str, russian: &str, english: &str) -> bool {
+    eq_ignore_case(name, russian) || eq_ignore_case(name, english)
 }
 
 /// `ty` without the wrappers that do not change what it may hold: a defined type whose

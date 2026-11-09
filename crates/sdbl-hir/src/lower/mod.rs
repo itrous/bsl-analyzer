@@ -353,6 +353,8 @@ impl LoweringContext<'_> {
 
         self.check_ref_overuse(&hir);
 
+        self.check_order_by_document_date(&hir);
+
         self.check_unlimited_string_usage(&hir);
 
         hir.diagnostics.extend(std::mem::take(&mut self.diagnostics));

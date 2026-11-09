@@ -70,6 +70,7 @@ pub fn validate_query_text(
 pub const METADATA_DEPENDENT_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::AmbiguousFieldInQuery,
     DiagnosticCode::QueryNestedFieldsByDot,
+    DiagnosticCode::QueryOrderByDocumentDate,
     DiagnosticCode::QueryToMissingMetadata,
     DiagnosticCode::RegisterRecorderFieldInQuery,
     DiagnosticCode::UnknownFieldInQuery,
