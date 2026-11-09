@@ -29,6 +29,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::SetPrivilegedMode,
     DiagnosticCode::StructureKeyIsNotIdentifier,
     DiagnosticCode::TryNumber,
+    DiagnosticCode::TypeNameComparedAsText,
     DiagnosticCode::UnsafeSafeModeMethodCall,
     DiagnosticCode::UseSystemInformation,
     DiagnosticCode::UsingExternalCodeTools,
@@ -708,6 +709,17 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        DiagnosticCode::TypeNameComparedAsText,
+        r#"Процедура Тест(Значение)
+    Если Строка(ТипЗнч(Значение)) = "Табличное поле" Тогда
+    КонецЕсли;
+КонецПроцедуры"#,
+        r#"Procedure Test(Value)
+    If String(TypeOf(Value)) = "Table field" Then
+    EndIf;
+EndProcedure"#,
+    ),
+    (
         DiagnosticCode::UnsafeSafeModeMethodCall,
         r#"Процедура Тест()
     Если БезопасныйРежим() Тогда
@@ -794,7 +806,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 225, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 226, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

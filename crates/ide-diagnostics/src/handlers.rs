@@ -178,6 +178,7 @@ pub mod transferring_parameters_between_client_and_server;
 pub mod try_number;
 pub mod type_mismatch;
 pub mod type_mismatch_by_doc_comment;
+pub mod type_name_compared_as_text;
 pub mod typo;
 pub mod unary_plus_in_concatenation;
 pub mod unavailable_alias_in_query;
@@ -365,6 +366,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::StructureKeyIsNotIdentifier => {
             Some(&structure_key_is_not_identifier::METADATA)
         }
+        DiagnosticCode::TypeNameComparedAsText => Some(&type_name_compared_as_text::METADATA),
         DiagnosticCode::UseLessForEach => Some(&useless_for_each::METADATA),
         DiagnosticCode::IteratorCollidesCollection => Some(&iterator_collides_collection::METADATA),
         DiagnosticCode::UsingGoto => Some(&using_goto::METADATA),
