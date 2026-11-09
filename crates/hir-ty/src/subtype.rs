@@ -386,9 +386,7 @@ pub fn is_coercible_to(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool 
     // 0 and 5. Argument-position policy only, NOT subtype truth: a number is not a
     // Boolean in the lattice, so is_assignable keeps them apart. Number only: how
     // strictly a Boolean slot treats other types differs from method to method.
-    if matches!(db.lookup_type(from), TypeKind::Number(_))
-        && matches!(db.lookup_type(to), TypeKind::Boolean)
-    {
+    if matches!(db.lookup_type(from), TypeKind::Number(_)) && slot_admits_boolean(db, to) {
         return true;
     }
     // СообщитьПользователю and friends document the parameter as ЛюбаяСсылка
@@ -528,6 +526,15 @@ fn to_admits_bare_value_table(db: &dyn TypeKernelDb, to: TypeId) -> bool {
     match db.lookup_type(to) {
         TypeKind::ValueTable(facet) => facet.projection.is_none(),
         TypeKind::Union(parts) => parts.iter().any(|p| to_admits_bare_value_table(db, *p)),
+        _ => false,
+    }
+}
+
+/// The slot itself, or one member of a union (`Булево, Неопределено`), is Boolean.
+fn slot_admits_boolean(db: &dyn TypeKernelDb, to: TypeId) -> bool {
+    match db.lookup_type(to) {
+        TypeKind::Boolean => true,
+        TypeKind::Union(parts) => parts.iter().any(|p| slot_admits_boolean(db, *p)),
         _ => false,
     }
 }
@@ -834,6 +841,19 @@ mod tests {
             db.date(bsl_types::facet::DateComponent::DateTime)
         ));
         assert!(!is_coercible_to(&db, db.string(None, false), db.boolean()));
+    }
+
+    #[test]
+    fn a_number_fits_a_boolean_slot_alone_or_as_a_union_member() {
+        let db = InMemoryDb::new();
+        let number = db.number(None, None);
+        let date = db.date(bsl_types::facet::DateComponent::DateTime);
+        let optional_boolean = db.union(vec![db.boolean(), db.undefined()]);
+        assert!(is_coercible_to(&db, number, db.boolean()));
+        assert!(is_coercible_to(&db, number, optional_boolean));
+        assert!(!is_coercible_to(&db, date, optional_boolean));
+        assert!(!is_coercible_to(&db, number, db.union(vec![date, db.undefined()])));
+        assert!(!is_assignable(&db, number, db.boolean()));
     }
 
     #[test]
