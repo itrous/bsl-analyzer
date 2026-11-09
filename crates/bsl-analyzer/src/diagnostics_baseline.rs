@@ -1,30 +1,79 @@
 use std::path::Path;
 
+use base_db::AnalysisScope;
 use ide::diagnostics_baseline::{
     BaselineDiagnosticCandidate, DiagnosticsBaselineCoverage, DiagnosticsBaselineRange,
 };
 use ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot;
 
+#[cfg(test)]
+pub(crate) mod finality_fixture;
 pub mod transaction;
 
-/// Whether the baseline may be applied to a diagnostics set produced under `scope`.
+/// Whether a file's diagnostics must be computed with the scope's line gate deferred.
 ///
-/// A fingerprint carries the ordinal of a repeated diagnostic, and that ordinal is only
-/// stable when the classifier sees every diagnostic of the file. Under `[analysis]
-/// diff_base` the set reaching it is already line-gated, so a NEW diagnostic can inherit
-/// the ordinal — and therefore the fingerprint — of a recorded one and be suppressed as
-/// known. The CLI refuses baseline operations under a scope for the same reason; here
-/// the baseline is simply not applied, which can only show more diagnostics, never fewer.
-pub(crate) fn applies_under_scope(scope_is_active: bool) -> bool {
-    !scope_is_active
+/// A fingerprint carries the ordinal of a repeated diagnostic among the identical ones of
+/// its file, so the classifier has to see every diagnostic of the file: handed only the
+/// scoped lines, a NEW diagnostic could inherit the ordinal — and the fingerprint — of a
+/// recorded one and be hidden as known. Only a snapshot that can change the set needs that;
+/// for `Disabled` and `Error` the ordinary scoped computation stays, and with it the early
+/// return of [`active_for_file`].
+pub(crate) fn defers_scope_line_gate(
+    snapshot: &DiagnosticsBaselineSnapshot,
+    scope_is_active: bool,
+) -> bool {
+    scope_is_active && snapshot.affects_diagnostics()
 }
 
+/// The diagnostics a publication shows for one file: the baseline's active ones, then the
+/// scope's line gate when the computation deferred it (`late_scope`).
+///
+/// Without a project root there is no baseline to classify against, but a deferred
+/// computation still holds the whole file, so the scope is applied all the same. Without
+/// a path neither can be done; callers do not defer the gate for such a file.
+pub(crate) fn active_for_publication(
+    snapshot: &DiagnosticsBaselineSnapshot,
+    project_root: Option<&Path>,
+    path: Option<&Path>,
+    text: &str,
+    diagnostics: Vec<ide::Diagnostic>,
+    late_scope: Option<&AnalysisScope>,
+) -> Vec<ide::Diagnostic> {
+    match (project_root, path) {
+        (Some(root), Some(path)) => {
+            active_for_file(snapshot, root, path, text, diagnostics, late_scope)
+        }
+        (None, Some(path)) => {
+            let Some(scope) = late_scope else { return diagnostics };
+            let line_index = line_index::LineIndex::new(text);
+            diagnostics
+                .into_iter()
+                .filter(|diagnostic| {
+                    ide::diagnostic_in_scope(Some(scope), Some(path), &line_index, diagnostic)
+                })
+                .collect()
+        }
+        (_, None) => diagnostics,
+    }
+}
+
+/// The file's diagnostics that stay active under `snapshot`, cut to `late_scope` after the
+/// classification.
+///
+/// `late_scope` is the scope whose line gate the computation deferred
+/// ([`defers_scope_line_gate`]), and then `diagnostics` is the file's whole finalized set:
+/// the classifier numbers identical findings over all of it, and only the active ones are
+/// cut to the scope afterwards. A classification that cannot be applied shows every
+/// finding rather than hide one by the baseline, but still only those the scope admits —
+/// the whole-file set is an intermediate result, never an answer. `Disabled` and `Error`
+/// return before any preparation: their input was computed with the ordinary line gate.
 pub(crate) fn active_for_file(
     snapshot: &DiagnosticsBaselineSnapshot,
     project_root: &Path,
     path: &Path,
     text: &str,
     diagnostics: Vec<ide::Diagnostic>,
+    late_scope: Option<&AnalysisScope>,
 ) -> Vec<ide::Diagnostic> {
     // Before any work: a project without a baseline — the default — must not pay for
     // one. Both states below return the input unchanged, and preparing candidates for
@@ -35,11 +84,19 @@ pub(crate) fn active_for_file(
     ) {
         return diagnostics;
     }
-    let Ok(relative) = path.strip_prefix(project_root) else { return diagnostics };
-    let relative = relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
-    let source_lines: Vec<_> = text.lines().collect();
+    #[cfg(test)]
+    CANDIDATE_PREPARATIONS.with(|count| count.set(count.get() + 1));
     // One index for the file, not one per diagnostic: `to_output` builds its own.
     let line_index = line_index::LineIndex::new(text);
+    let in_scope = |diagnostic: &ide::Diagnostic| {
+        ide::diagnostic_in_scope(late_scope, Some(path), &line_index, diagnostic)
+    };
+    let fail_open = |diagnostics: Vec<ide::Diagnostic>| -> Vec<ide::Diagnostic> {
+        diagnostics.into_iter().filter(|diagnostic| in_scope(diagnostic)).collect()
+    };
+    let Ok(relative) = path.strip_prefix(project_root) else { return fail_open(diagnostics) };
+    let relative = relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    let source_lines: Vec<_> = text.lines().collect();
     // Diagnostics whose range runs past the text are dropped rather than converted:
     // `to_output` panics on them, and this runs inside the publication worker, where a
     // panic costs the whole file's diagnostics. The LSP converter beside it drops such a
@@ -85,12 +142,14 @@ pub(crate) fn active_for_file(
                 &coverage,
                 ide::diagnostics_baseline::ResolvedPolicy::Skip,
             ) else {
-                return diagnostics;
+                return fail_open(diagnostics);
             };
             classified.new.into_iter().map(|item| item.diagnostic).collect()
         }
         DiagnosticsBaselineSnapshot::ReadySet { baseline, plan, project_path, .. } => {
-            let Some(owner) = plan.owner_for_project_path(&relative) else { return diagnostics };
+            let Some(owner) = plan.owner_for_project_path(&relative) else {
+                return fail_open(diagnostics);
+            };
             let candidates = candidates
                 .into_iter()
                 .map(|candidate| {
@@ -103,7 +162,7 @@ pub(crate) fn active_for_file(
             let Ok(coverage) =
                 ide::partitioned_diagnostics_baseline::partitioned_coverage(plan, &coverage, None)
             else {
-                return diagnostics;
+                return fail_open(diagnostics);
             };
             // Only this file's active diagnostics are wanted; `resolved` would walk
             // every entry of every enabled partition on each publication and be
@@ -118,7 +177,7 @@ pub(crate) fn active_for_file(
                     ide::diagnostics_baseline::ResolvedPolicy::Skip,
                 )
             else {
-                return diagnostics;
+                return fail_open(diagnostics);
             };
             classified
                 .new
@@ -134,8 +193,19 @@ pub(crate) fn active_for_file(
     diagnostics
         .into_iter()
         .enumerate()
-        .filter_map(|(index, diagnostic)| active.contains(&index).then_some(diagnostic))
+        .filter_map(|(index, diagnostic)| {
+            (active.contains(&index) && in_scope(&diagnostic)).then_some(diagnostic)
+        })
         .collect()
+}
+
+// Counts the publications that went past the early return of `active_for_file` and
+// prepared candidates, so a test can tell the disabled fast path from the work by the
+// count rather than by the clock.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CANDIDATE_PREPARATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -182,56 +252,8 @@ mod tests {
             epoch: "e".to_owned(),
             ground: Default::default(),
         };
-        let active = active_for_file(&snapshot, root, &path, text, vec![beyond]);
+        let active = active_for_file(&snapshot, root, &path, text, vec![beyond], None);
         assert!(active.is_empty(), "the desynchronised finding must not reach the converter");
-    }
-
-    /// The ordinal in a fingerprint counts repetitions within the file, so it is only
-    /// stable when the classifier sees the whole file. Under an analysis scope the set
-    /// is already line-gated, and a NEW diagnostic would inherit the ordinal — and the
-    /// fingerprint — of a recorded one. The guard is what keeps that from happening.
-    #[test]
-    fn a_scoped_set_must_not_be_classified_against_the_baseline() {
-        assert!(applies_under_scope(false), "without a scope the baseline applies");
-        assert!(!applies_under_scope(true), "under a scope it must not");
-
-        // The suppression the guard prevents, shown directly: the second occurrence of
-        // an identical line, handed over alone, takes the first one's fingerprint.
-        let root = Path::new("/workspace");
-        let path = root.join("Module.bsl");
-        let text = "Сообщить(А);\nX = 1;\nСообщить(А);\n";
-        let snippet = normalize_diagnostic_snippet("Сообщить(А);");
-        let code = DiagnosticCode::EmptyCodeBlock;
-        let baseline = DiagnosticsBaseline {
-            schema_version: DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
-            scope: DiagnosticsBaselineScope { source_root: None, extensions: vec![] },
-            diagnostics: vec![DiagnosticsBaselineEntry {
-                fingerprint: diagnostic_fingerprint("Module.bsl", code.as_str(), &snippet, 0),
-                path: "Module.bsl".to_owned(),
-                code: code.as_str().to_owned(),
-                snippet,
-                occurrence: 0,
-                message: code.as_str().to_owned(),
-                severity: "Warning".to_owned(),
-                range: DiagnosticsBaselineRange {
-                    start_line: 0,
-                    start_column: 0,
-                    end_line: 0,
-                    end_column: 12,
-                },
-            }],
-        };
-        let snapshot = DiagnosticsBaselineSnapshot::Ready {
-            baseline,
-            project_path: "baseline.json".to_owned(),
-            path: root.join("baseline.json"),
-            epoch: "e".to_owned(),
-            ground: Default::default(),
-        };
-        let mut third_line = diagnostic(code);
-        third_line.range = TextRange::new(20.into(), 32.into());
-        let gated = active_for_file(&snapshot, root, &path, text, vec![third_line]);
-        assert!(gated.is_empty(), "documents the very suppression the guard exists to prevent");
     }
 
     /// A project without a baseline is the default, and its publications must not pay
@@ -258,7 +280,7 @@ mod tests {
                 .map(|_| {
                     let input = diagnostics.clone();
                     let started = std::time::Instant::now();
-                    let out = active_for_file(snapshot, root, &path, &text, input);
+                    let out = active_for_file(snapshot, root, &path, &text, input, None);
                     (started.elapsed(), out.len())
                 })
                 .min_by_key(|(elapsed, _)| *elapsed)
@@ -331,6 +353,7 @@ mod tests {
                 diagnostic(DiagnosticCode::UnreachableCode),
                 diagnostic(DiagnosticCode::UnknownSuppressionCode),
             ],
+            None,
         );
         let codes: Vec<_> = active.iter().map(|item| item.code).collect();
         assert!(!codes.contains(&known));
@@ -415,6 +438,7 @@ directory = "baselines"
             &root.join(relative),
             text,
             vec![diagnostic(known), diagnostic(DiagnosticCode::UnknownSuppressionCode)],
+            None,
         );
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].code, DiagnosticCode::UnknownSuppressionCode);
@@ -443,7 +467,154 @@ directory = "baselines"
             &root.join(relative),
             text,
             vec![diagnostic(known)],
+            None,
         );
         assert_eq!(all.len(), 1, "LSP fails open for an invalid partition set");
+    }
+
+    fn diagnostic_on(text: &str, line: usize, code: DiagnosticCode) -> Diagnostic {
+        let start: usize = text.split_inclusive('\n').take(line - 1).map(str::len).sum();
+        let len = text.split_inclusive('\n').nth(line - 1).unwrap().trim_end().len();
+        let mut diagnostic = diagnostic(code);
+        diagnostic.range = TextRange::new((start as u32).into(), ((start + len) as u32).into());
+        diagnostic
+    }
+
+    fn empty_ready(root: &Path) -> DiagnosticsBaselineSnapshot {
+        DiagnosticsBaselineSnapshot::Ready {
+            baseline: DiagnosticsBaseline {
+                schema_version: DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+                scope: DiagnosticsBaselineScope { source_root: None, extensions: vec![] },
+                diagnostics: vec![],
+            },
+            project_path: "baseline.json".to_owned(),
+            path: root.join("baseline.json"),
+            epoch: "e".to_owned(),
+            ground: Default::default(),
+        }
+    }
+
+    /// The baseline applies under a scope now, and safely: handed the file's whole set it
+    /// numbers c as 2 and keeps it, hides the recorded a and b, and cuts the result to the
+    /// scope afterwards. Classifying the scoped set — what the removed refusal guarded
+    /// against — would number c as 1 and hide it.
+    #[test]
+    fn finality_scoped_baseline() {
+        use finality_fixture::{self_assign_lines, Form, Workspace, MODULE};
+
+        let workspace = Workspace::new(Form::V1);
+        let snapshot = workspace.snapshot(2);
+        let scope = workspace.scope(Some(vec![[3, 4]]));
+        let full: Vec<_> =
+            (2..=4).map(|line| diagnostic_on(MODULE, line, DiagnosticCode::SelfAssign)).collect();
+
+        let active = active_for_file(
+            &snapshot,
+            &workspace.root,
+            &workspace.module,
+            MODULE,
+            full.clone(),
+            Some(&scope),
+        );
+        assert_eq!(self_assign_lines(&active), vec![4], "only c stays: {active:#?}");
+
+        let scoped_first: Vec<_> = full[1..].to_vec();
+        let renumbered = active_for_file(
+            &snapshot,
+            &workspace.root,
+            &workspace.module,
+            MODULE,
+            scoped_first,
+            None,
+        );
+        assert!(renumbered.is_empty(), "control: the scoped set alone loses c: {renumbered:#?}");
+
+        let unrecorded = active_for_file(
+            &workspace.snapshot(0),
+            &workspace.root,
+            &workspace.module,
+            MODULE,
+            full,
+            Some(&scope),
+        );
+        assert_eq!(self_assign_lines(&unrecorded), vec![3, 4], "control: no baseline shows b, c");
+    }
+
+    /// A classification that cannot be applied — here the file lies outside the project
+    /// root — hides nothing by the baseline, yet the answer is still cut to the scope:
+    /// the in-hunk finding and the broken-directive meta stay, the off-hunk one does not.
+    #[test]
+    fn finality_failed_classification_still_projects_scope() {
+        let root = Path::new("/workspace");
+        let path = Path::new("/elsewhere/Module.bsl");
+        let text = "Процедура П()\n    А = А;\n    Б = Б;\n    // bsl-analyzer:off NoSuchRule\nКонецПроцедуры\n";
+        let full = vec![
+            diagnostic_on(text, 2, DiagnosticCode::SelfAssign),
+            diagnostic_on(text, 3, DiagnosticCode::SelfAssign),
+            diagnostic_on(text, 4, DiagnosticCode::UnknownSuppressionCode),
+        ];
+        let scope = base_db::AnalysisScope::from_report(
+            "vendor",
+            Path::new("/elsewhere"),
+            [("Module.bsl".to_owned(), Some(vec![[2, 2]]))],
+        );
+        let snapshot = empty_ready(root);
+
+        let shown = active_for_file(&snapshot, root, path, text, full.clone(), Some(&scope));
+        let shown: Vec<_> = shown.iter().map(|d| (d.code, d.range)).collect();
+        assert_eq!(
+            shown,
+            vec![(full[0].code, full[0].range), (full[2].code, full[2].range)],
+            "the in-hunk finding and the meta stay, the off-hunk one does not"
+        );
+
+        let unscoped = active_for_file(&snapshot, root, path, text, full.clone(), None);
+        assert_eq!(unscoped.len(), full.len(), "control: without a scope everything stays");
+    }
+
+    /// `Disabled` and `Error` keep the fast path: the gate is not deferred for them, and
+    /// `active_for_file` returns their (already scoped) input before preparing anything —
+    /// counted, not timed. The `Ready` run beside them prepares for real.
+    #[test]
+    fn finality_disabled_keeps_fast_path() {
+        let root = Path::new("/workspace");
+        let path = root.join("Module.bsl");
+        let text = "Процедура П()\n    А = А;\n    Б = Б;\nКонецПроцедуры\n";
+        let input = vec![diagnostic_on(text, 2, DiagnosticCode::SelfAssign)];
+        let scope = base_db::AnalysisScope::from_report(
+            "vendor",
+            root,
+            [("Module.bsl".to_owned(), Some(vec![[3, 3]]))],
+        );
+        let error = DiagnosticsBaselineSnapshot::Error {
+            path: None,
+            project_path: None,
+            observation_paths: vec![],
+            selection: None,
+            partitions_enabled: None,
+            partitions_unsuppressed: None,
+            code: "invalid".to_owned(),
+            detail: "broken".to_owned(),
+            epoch: "error".to_owned(),
+            errors: vec![],
+            ground: Default::default(),
+            read_empty: false,
+        };
+        let prepared = || CANDIDATE_PREPARATIONS.with(std::cell::Cell::get);
+
+        for snapshot in [DiagnosticsBaselineSnapshot::Disabled, error] {
+            assert!(!defers_scope_line_gate(&snapshot, true), "{snapshot:?} must not defer");
+            let before = prepared();
+            let out = active_for_file(&snapshot, root, &path, text, input.clone(), Some(&scope));
+            assert_eq!(out, input, "{snapshot:?} returns its input unchanged");
+            assert_eq!(prepared(), before, "{snapshot:?} must not prepare candidates");
+        }
+
+        let ready = empty_ready(root);
+        assert!(defers_scope_line_gate(&ready, true));
+        assert!(!defers_scope_line_gate(&ready, false));
+        let before = prepared();
+        let _ = active_for_file(&ready, root, &path, text, input, Some(&scope));
+        assert_eq!(prepared(), before + 1, "control: Ready prepares candidates");
     }
 }

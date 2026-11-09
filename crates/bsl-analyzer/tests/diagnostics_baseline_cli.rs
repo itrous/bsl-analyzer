@@ -279,3 +279,179 @@ fn protected_diagnostics_do_not_block_baseline_create_and_update() {
 
     assert_success(&run(root, &["diagnostics", "baseline", "update", "-s", "."]));
 }
+
+const RECORDED_AB: &str = "Процедура Тест()\n    А = А;\n    А = А;\nКонецПроцедуры\n";
+const CURRENT_ABC: &str = "Процедура Тест()\n    А = А;\n    А = А;\n    А = А;\nКонецПроцедуры\n";
+const FINALITY_MODULE: &str = "src/cf/CommonModules/М/Ext/Module.bsl";
+
+/// A project whose module holds the recorded self-assignments a and b on 1-based lines 2
+/// and 3, with `SelfAssign` named explicitly so the fixture does not rest on its default.
+fn finality_project(baseline: &str) -> TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    for root in ["src/cf", "src/cfe/ext"] {
+        fs::create_dir_all(temp.path().join(root)).unwrap();
+        fs::write(temp.path().join(root).join("Configuration.xml"), "<Configuration/>").unwrap();
+    }
+    let module = temp.path().join(FINALITY_MODULE);
+    fs::create_dir_all(module.parent().unwrap()).unwrap();
+    fs::write(&module, RECORDED_AB).unwrap();
+    fs::write(
+        temp.path().join("bsl-analyzer.toml"),
+        format!(
+            "[source]\nroot = \"src/cf\"\n\
+             extensions = [{{ name = \"Ext\", path = \"src/cfe/ext\", scope = \"InfoBase\" }}]\n\n\
+             [diagnostics.parameters]\nSelfAssign = true\n\n\
+             {baseline}"
+        ),
+    )
+    .unwrap();
+    temp
+}
+
+/// The self-assignments a JSONL run reports, as 0-based start lines, with the baseline
+/// summary of its `done` event; scoped to `hunks` of the module when given.
+fn reported_self_assigns(root: &Path, hunks: Option<&str>) -> (Vec<u64>, serde_json::Value) {
+    let report = root.join("diff-report.json");
+    let mut args = vec!["analyze", "-s", ".", "--format", "jsonl", "-q"];
+    if let Some(hunks) = hunks {
+        fs::write(
+            &report,
+            format!(
+                r#"{{"base_ref": "vendor", "head_ref": "HEAD", "files": {{"{FINALITY_MODULE}": {{"hunks": {hunks}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        args.extend(["--diff-filter", report.to_str().unwrap()]);
+    }
+    let output = run(root, &args);
+    assert_success(&output);
+    let mut lines = Vec::new();
+    let mut done = serde_json::Value::Null;
+    for event in String::from_utf8(output.stdout).unwrap().lines() {
+        let event: serde_json::Value = serde_json::from_str(event).unwrap();
+        match event["type"].as_str() {
+            Some("file") => lines.extend(
+                event["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|d| d["code"] == "SelfAssign")
+                    .map(|d| d["start_line"].as_u64().unwrap()),
+            ),
+            Some("done") => done = event,
+            _ => {}
+        }
+    }
+    (lines, done["baseline"].clone())
+}
+
+/// The counterexample end to end: the baseline records a and b, c is added, and a run
+/// scoped to the lines of b and c shows c alone — numbered on the whole file, not
+/// renumbered into b's place — for the v1 baseline and a partition set; an `Unsuppressed`
+/// partition shows b and c, as does a project without a baseline.
+#[test]
+fn finality_scoped_baseline() {
+    let cases = [
+        ("[diagnostics.baseline]\npath = \".bsl-diagnostics-baseline.json\"\n", vec![3]),
+        ("[diagnostics.baseline]\ndirectory = \"baselines\"\n", vec![3]),
+        (
+            "[diagnostics.baseline]\ndirectory = \"baselines\"\ninclude = [\"extension:Ext\"]\n",
+            vec![2, 3],
+        ),
+        ("", vec![2, 3]),
+    ];
+    for (baseline, expected) in cases {
+        let temp = finality_project(baseline);
+        let root = temp.path();
+        if !baseline.is_empty() {
+            assert_success(&run(root, &["diagnostics", "baseline", "create", "-s", "."]));
+        }
+        fs::write(root.join(FINALITY_MODULE), CURRENT_ABC).unwrap();
+
+        let (shown, summary) = reported_self_assigns(root, Some("[[3, 4]]"));
+        assert_eq!(shown, expected, "{baseline}");
+        // A scope of a and b leaves c, the new finding, outside it.
+        let (cut, _) = reported_self_assigns(root, Some("[[2, 3]]"));
+        let expected_cut: Vec<u64> = if expected == vec![3] { vec![] } else { vec![1, 2] };
+        assert_eq!(cut, expected_cut, "{baseline}: the scope must cut c");
+        if expected == vec![3] {
+            let (_, whole) = reported_self_assigns(root, None);
+            assert_eq!(summary["known"], whole["known"], "the summary counts the whole set");
+            assert_eq!(summary["new"], 1, "{summary}");
+            assert_eq!(summary["complete"], false, "{summary}");
+        }
+    }
+}
+
+/// Runs git in `dir` without the ambient `GIT_*` environment: inside a pre-commit hook it
+/// would point at the real repository instead of the fixture.
+fn run_git(dir: &Path, args: &[&str]) {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(&key);
+        }
+    }
+    let output = command
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// Baseline commands keep refusing a scoped analysis: the scoped run classifies the whole
+/// file only to decide what is shown, and that grants no right to write or check a
+/// baseline from it. The refusal is the coverage one it always was, and the baseline an
+/// unscoped `create` wrote stays byte for byte.
+#[test]
+fn finality_scoped_coverage() {
+    let temp =
+        finality_project("[diagnostics.baseline]\npath = \".bsl-diagnostics-baseline.json\"\n");
+    let root = temp.path();
+    run_git(root, &["init", "-q"]);
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-q", "-m", "vendor"]);
+    run_git(root, &["branch", "vendor"]);
+    fs::write(root.join(FINALITY_MODULE), CURRENT_ABC).unwrap();
+
+    let config = root.join("bsl-analyzer.toml");
+    let unscoped = fs::read_to_string(&config).unwrap();
+    let scoped = format!("{unscoped}\n[analysis]\ndiff_base = \"vendor\"\n");
+    let baseline_command = |command: &str| {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                process.env_remove(&key);
+            }
+        }
+        process
+            .current_dir(root)
+            .args(["diagnostics", "baseline", command, "-s", "."])
+            .output()
+            .unwrap()
+    };
+    let assert_refused = |command: &str| {
+        let output = baseline_command(command);
+        assert!(!output.status.success(), "{command} must refuse a scoped analysis");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("full diagnostics coverage required"), "{command}: {stderr}");
+    };
+    let baseline = root.join(".bsl-diagnostics-baseline.json");
+
+    fs::write(&config, &scoped).unwrap();
+    assert_refused("create");
+    assert!(!baseline.exists(), "a refused create must not write");
+
+    fs::write(&config, &unscoped).unwrap();
+    assert_success(&baseline_command("create"));
+    let written = fs::read(&baseline).unwrap();
+
+    fs::write(&config, &scoped).unwrap();
+    for command in ["check", "update"] {
+        assert_refused(command);
+        assert_eq!(fs::read(&baseline).unwrap(), written, "{command} touched the baseline");
+    }
+}

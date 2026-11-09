@@ -68,12 +68,13 @@ pub use ide_db::{
     CommonModuleBodies, GraphConfigCache, RootDatabase, RootDatabaseImpl, SymbolKind, TextRange,
 };
 pub use ide_diagnostics::{
-    all_diagnostic_codes, apply_extension_merge, diagnostics as compute_diagnostics, docs,
-    file_diagnostics, file_diagnostics_query, get_metadata, load_vendor_support,
-    message_with_standards, slab_verify_mismatches, standard_url, standards, validate_query_text,
-    CleanCodeAttribute, Diagnostic, DiagnosticCode, DiagnosticOutput, DiagnosticSeverityLevel,
-    DiagnosticTag, DiagnosticType, DiagnosticsConfig, DiagnosticsContext, Fix, ImpactSeverity,
-    MetadataTag, Severity, SoftwareQuality, TextEdit, METADATA_DEPENDENT_CODES,
+    all_diagnostic_codes, apply_extension_merge, diagnostic_in_scope,
+    diagnostics as compute_diagnostics, docs, file_diagnostics, file_diagnostics_query,
+    get_metadata, load_vendor_support, message_with_standards, slab_verify_mismatches,
+    standard_url, standards, validate_query_text, CleanCodeAttribute, Diagnostic, DiagnosticCode,
+    DiagnosticOutput, DiagnosticSeverityLevel, DiagnosticTag, DiagnosticType, DiagnosticsConfig,
+    DiagnosticsContext, Fix, ImpactSeverity, MetadataTag, Severity, SoftwareQuality, TextEdit,
+    METADATA_DEPENDENT_CODES,
 };
 pub use inlay_hints::{InlayHint, InlayHintKind};
 pub use name_lookup::{
@@ -150,6 +151,9 @@ impl Analysis {
         salsa::attach(&self.db, || f(self))
     }
 
+    /// A file's final diagnostics under `config`. With `config.defer_scope_line_gate` the
+    /// answer keeps the findings on lines outside the scope, for a caller that classifies
+    /// the complete set against a baseline and then applies [`diagnostic_in_scope`].
     pub fn diagnostics(&self, file_id: FileId, config: &DiagnosticsConfig) -> Vec<Diagnostic> {
         ide_diagnostics::file_diagnostics(&self.db, file_id, config)
     }

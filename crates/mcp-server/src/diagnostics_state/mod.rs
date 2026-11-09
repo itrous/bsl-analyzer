@@ -42,7 +42,9 @@ mod types;
 mod workspace_sweep;
 
 pub(crate) use lifecycle::{lock_recover, DiagnosticsState};
-pub(crate) use resident::{diagnostic_survives_authors, DiagnosticsResident};
+pub(crate) use resident::{
+    computation_config, deferred_scope, diagnostic_survives_authors, DiagnosticsResident,
+};
 pub(crate) use session::{resident_call, CallOutcome, ResidentSession};
 pub(crate) use snapshot::ResidentModuleSnapshotSource;
 #[allow(

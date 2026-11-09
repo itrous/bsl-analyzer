@@ -1553,25 +1553,29 @@ pub fn handle_document_diagnostic(
     if config.scope.is_some() && ctx.scope_dirty_docs.contains(&uri) {
         config.scope = None;
     }
-    let baseline_applies = crate::diagnostics_baseline::applies_under_scope(config.scope.is_some());
+    let path = uri.to_file_path().ok();
+    // A file without a path cannot be placed in the scope after the fact, so it keeps
+    // the ordinary gate.
+    let late_scope = config.scope.clone().filter(|_| {
+        path.is_some()
+            && crate::diagnostics_baseline::defers_scope_line_gate(&ctx.diagnostics_baseline, true)
+    });
+    config.defer_scope_line_gate = late_scope.is_some();
     let ide_diagnostics = ctx.analysis.file_diagnostics_cached(file_id, config);
     let text = match ctx.mem_docs.get(&uri) {
         Some(doc) => std::borrow::Cow::Borrowed(doc.text()),
         None => std::borrow::Cow::Owned(ctx.analysis.file_text(file_id).to_string()),
     };
-    let ide_diagnostics = match (
-        ctx.workspace_root.as_deref().filter(|_| baseline_applies),
-        uri.to_file_path().ok().as_deref(),
-    ) {
-        (Some(root), Some(path)) => crate::diagnostics_baseline::active_for_file(
-            &ctx.diagnostics_baseline,
-            root,
-            path,
-            &text,
-            ide_diagnostics.iter().cloned().collect(),
-        ),
-        _ => ide_diagnostics.iter().cloned().collect(),
-    };
+    // The result id is taken from what is published — after the baseline and the
+    // deferred scope — so a change hidden by either leaves the report unchanged.
+    let ide_diagnostics = crate::diagnostics_baseline::active_for_publication(
+        &ctx.diagnostics_baseline,
+        ctx.workspace_root.as_deref(),
+        path.as_deref(),
+        &text,
+        ide_diagnostics.iter().cloned().collect(),
+        late_scope.as_deref(),
+    );
     let result_id = crate::lsp::diagnostics_result_id(&ide_diagnostics);
 
     if params.previous_result_id.as_deref() == Some(result_id.as_str()) {
@@ -1816,18 +1820,24 @@ pub fn handle_workspace_diagnostic(
     // Compute in chunks so streaming clients see progress and the heavy per-file memos fall out
     // of the Salsa LRU between chunks instead of all piling up at once.
     const CHUNK: usize = 64;
+    // A clean file under a baseline is computed whole and cut to the scope after its
+    // classification; the swept files all have a path, so the deferral applies to all.
+    let late_scope = analysis_scope.as_deref().filter(|_| {
+        crate::diagnostics_baseline::defers_scope_line_gate(&ctx.diagnostics_baseline, true)
+    });
+    let scoped_config =
+        ctx.diagnostics_config.clone().with_defer_scope_line_gate(late_scope.is_some());
     let mut collected = Vec::new();
     let mut done = 0usize;
     for chunk in file_ids.chunks(CHUNK) {
         let computed = if dirty_ids.is_empty() {
-            ctx.analysis.workspace_diagnostics(chunk, ctx.diagnostics_config.clone())
+            ctx.analysis.workspace_diagnostics(chunk, scoped_config.clone())
         } else {
             // Dirty buffers analyze without the scope (their disk hunks are
             // stale); everything else keeps the filtered config.
             let (dirty, clean): (Vec<vfs::FileId>, Vec<vfs::FileId>) =
                 chunk.iter().copied().partition(|file_id| dirty_ids.contains(file_id));
-            let mut computed =
-                ctx.analysis.workspace_diagnostics(&clean, ctx.diagnostics_config.clone());
+            let mut computed = ctx.analysis.workspace_diagnostics(&clean, scoped_config.clone());
             let mut unscoped = ctx.diagnostics_config.clone();
             unscoped.scope = None;
             computed.extend(ctx.analysis.workspace_diagnostics(&dirty, unscoped));
@@ -1836,7 +1846,10 @@ pub fn handle_workspace_diagnostic(
         let chunk_items: Vec<_> = computed
             .into_iter()
             .filter_map(|(file_id, diagnostics)| {
-                workspace_report_item(ctx, file_id, diagnostics.to_vec(), &previous)
+                // Each file is projected through the scope it was computed under: a dirty
+                // one has none, so the shared scope must not reach it here either.
+                let late_scope = late_scope.filter(|_| !dirty_ids.contains(&file_id));
+                workspace_report_item(ctx, file_id, diagnostics.to_vec(), &previous, late_scope)
             })
             .collect();
         done += chunk.len();
@@ -1882,6 +1895,7 @@ fn workspace_report_item(
     file_id: vfs::FileId,
     diagnostics: Vec<ide::Diagnostic>,
     previous: &FxHashMap<lsp_types::Url, String>,
+    late_scope: Option<&base_db::AnalysisScope>,
 ) -> Option<lsp_types::WorkspaceDocumentDiagnosticReport> {
     use lsp_types::{
         FullDocumentDiagnosticReport, UnchangedDocumentDiagnosticReport,
@@ -1910,10 +1924,8 @@ fn workspace_report_item(
     // When the baseline cannot change the set, the result id is known without the file
     // text — and an unchanged document then costs neither a read nor an index. The
     // whole-config sweep goes through here once per file, so that read is not free.
-    // The baseline is not applied under an analysis scope — see `applies_under_scope`.
-    let baseline_applies = ctx.diagnostics_baseline.affects_diagnostics()
-        && crate::diagnostics_baseline::applies_under_scope(ctx.diagnostics_config.scope.is_some());
-    if !baseline_applies {
+    // Such a snapshot never defers the scope either, so the set is already final.
+    if !ctx.diagnostics_baseline.affects_diagnostics() {
         let result_id = crate::lsp::diagnostics_result_id(&diagnostics);
         if previous.get(&url).map(String::as_str) == Some(result_id.as_str()) {
             return Some(WorkspaceDocumentDiagnosticReport::Unchanged(
@@ -1933,19 +1945,14 @@ fn workspace_report_item(
             Some(doc) => std::borrow::Cow::Borrowed(doc.text()),
             None => std::borrow::Cow::Owned(ctx.analysis.file_text(file_id).to_string()),
         };
-        let diagnostics = match (
-            ctx.workspace_root.as_deref().filter(|_| baseline_applies),
+        let diagnostics = crate::diagnostics_baseline::active_for_publication(
+            &ctx.diagnostics_baseline,
+            ctx.workspace_root.as_deref(),
             ctx.file_paths.path_for_file_id(file_id),
-        ) {
-            (Some(root), Some(path)) => crate::diagnostics_baseline::active_for_file(
-                &ctx.diagnostics_baseline,
-                root,
-                path,
-                &text,
-                diagnostics,
-            ),
-            _ => diagnostics,
-        };
+            &text,
+            diagnostics,
+            late_scope,
+        );
         let result_id = crate::lsp::diagnostics_result_id(&diagnostics);
         if previous.get(&url).map(String::as_str) == Some(result_id.as_str()) {
             return (result_id, None);
@@ -2475,6 +2482,7 @@ mod tests {
     use crate::task_pool::TaskPool;
 
     mod call_hierarchy_trace_tests;
+    mod finality_tests;
     mod inlay_hint_tests;
     mod position_race_tests;
 

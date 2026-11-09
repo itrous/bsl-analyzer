@@ -374,6 +374,7 @@ pub enum ResolvedPolicy {
     Skip,
 }
 
+/// [`classify_diagnostics_with`] that also computes `resolved`.
 pub fn classify_diagnostics<T>(
     baseline: &DiagnosticsBaseline,
     baseline_path: String,
@@ -383,6 +384,18 @@ pub fn classify_diagnostics<T>(
     classify_diagnostics_with(baseline, baseline_path, current, coverage, ResolvedPolicy::Compute)
 }
 
+/// Classifies `current` against `baseline`, fixing each finding's identity in its
+/// [`ClassifiedDiagnostic::entry`].
+///
+/// The `occurrence` in a fingerprint numbers a finding among the identical ones of its
+/// file, so `current` must hold every finalized finding of each file it mentions — a
+/// scope's line filter, an author filter, a requested range or an output cap applied
+/// before this call would renumber the survivors and let a new finding take a recorded
+/// one's fingerprint. Callers shape the result afterwards: they may drop entries of
+/// `new` or `known` for presentation, and the `entry` of every survivor stays what this
+/// call made it. Classifying a reduced set again is what they must not do. The order of
+/// `current` does not matter; findings are numbered in a sort over path, range, code and
+/// message.
 pub fn classify_diagnostics_with<T>(
     baseline: &DiagnosticsBaseline,
     baseline_path: String,
@@ -894,6 +907,162 @@ mod tests {
             end_line: line,
             end_column: 1,
         }
+    }
+
+    /// The shared counterexample: three identical findings a, b, c in range order, the
+    /// baseline holding occurrences 0 and 1 (a and b), the scope keeping lines of b and c.
+    fn counterexample() -> (DiagnosticsBaseline, Vec<BaselineDiagnosticCandidate<&'static str>>) {
+        let snippet = "А = А;";
+        (
+            baseline(vec![entry(snippet, 0, 1), entry(snippet, 1, 2)]),
+            vec![
+                candidate(snippet, 1, "a"),
+                candidate(snippet, 2, "b"),
+                candidate(snippet, 3, "c"),
+            ],
+        )
+    }
+
+    /// The identity a finding gets from the classification of the file's whole set is the
+    /// one it keeps through every later projection: c is new with occurrence 2 whatever
+    /// the order of the input and however the classified result is filtered. Handing the
+    /// classifier only the scoped findings instead renumbers c to 1 and hides it as known.
+    #[test]
+    fn finality_projection_keeps_occurrence() {
+        let (base, full) = counterexample();
+        let coverage = DiagnosticsBaselineCoverage::Partial { completed_files: BTreeSet::new() };
+        let classified =
+            classify_diagnostics(&base, "b.json".to_owned(), full.clone(), &coverage).unwrap();
+        let known: Vec<_> =
+            classified.known.iter().map(|item| (item.diagnostic, item.entry.occurrence)).collect();
+        assert_eq!(known, vec![("a", 0), ("b", 1)]);
+        assert_eq!(classified.new.len(), 1);
+        let c = &classified.new[0];
+        assert_eq!((c.diagnostic, c.entry.occurrence), ("c", 2));
+        assert_eq!(c.entry.fingerprint, diagnostic_fingerprint("a.bsl", "Rule", "А = А;", 2));
+        assert_eq!(c.entry.range, range(3), "the surviving finding is the one on line 3");
+
+        let mut reversed = full.clone();
+        reversed.reverse();
+        let permuted =
+            classify_diagnostics(&base, "b.json".to_owned(), reversed, &coverage).unwrap();
+        assert_eq!(permuted.new, classified.new, "the input order must not matter");
+        assert_eq!(permuted.known, classified.known);
+
+        let in_scope = |item: &&ClassifiedDiagnostic<&str>| item.entry.range.start_line >= 2;
+        let visible: Vec<_> = classified.new.iter().filter(in_scope).collect();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].entry, c.entry, "a projection must not touch the identity");
+
+        // Negative control: scope before identity renumbers c and hides it.
+        let scoped_first: Vec<_> =
+            full.iter().filter(|c| c.range.start_line >= 2).cloned().collect();
+        let renumbered =
+            classify_diagnostics(&base, "b.json".to_owned(), scoped_first, &coverage).unwrap();
+        assert!(
+            renumbered.new.iter().all(|item| item.diagnostic != "c"),
+            "control: classifying the scoped set must lose c: {renumbered:#?}"
+        );
+
+        // Positive control: without the baseline both scoped findings are visible.
+        let unrecorded =
+            classify_diagnostics(&baseline(vec![]), "b.json".to_owned(), full, &coverage).unwrap();
+        let shown: Vec<_> =
+            unrecorded.new.iter().filter(in_scope).map(|item| item.diagnostic).collect();
+        assert_eq!(shown, vec!["b", "c"]);
+    }
+
+    /// A superseded loser stays gone when its winner is hidden by the baseline: the pair is
+    /// decided on the complete set before the classification, so the classifier never sees
+    /// the loser at all.
+    #[test]
+    fn finality_late_scope_preserves_policy() {
+        use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+        use vfs::{FileId, FileSet, VfsPath};
+
+        let text = "Процедура Тест()\n    Справочники =\n        Справочники;\nКонецПроцедуры\n";
+        let mut db = ide_db::RootDatabaseImpl::default();
+        let file_id = FileId(0);
+        let mut file_set = FileSet::new();
+        file_set.insert(file_id, VfsPath::new("/test.bsl"));
+        db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+        db.set_file_source_root(file_id, SourceRootId(0));
+        db.set_file_text(file_id, text);
+        let mut config = ide_diagnostics::DiagnosticsConfig::all_enabled();
+        config.scope = Some(std::sync::Arc::new(ide_db::base_db::AnalysisScope::from_report(
+            "vendor",
+            std::path::Path::new("/"),
+            [("test.bsl".to_string(), Some(vec![[2, 3]]))],
+        )));
+        config.defer_scope_line_gate = true;
+
+        let mut without_winner = config.clone();
+        without_winner.disabled.push(ide_diagnostics::DiagnosticCode::GlobalPropertyNotWritable);
+        let loser_only = ide_diagnostics::file_diagnostics(&db, file_id, &without_winner);
+        assert!(
+            loser_only.iter().any(|d| d.code == ide_diagnostics::DiagnosticCode::SelfAssign),
+            "control: the fixture must emit the loser: {loser_only:#?}"
+        );
+
+        let full = ide_diagnostics::file_diagnostics(&db, file_id, &config);
+        let candidates = |diagnostics: &[ide_diagnostics::Diagnostic]| -> Vec<_> {
+            let lines: Vec<_> = text.lines().collect();
+            let index = line_index::LineIndex::new(text);
+            diagnostics
+                .iter()
+                .map(|d| {
+                    let out = d.to_output(text);
+                    BaselineDiagnosticCandidate {
+                        diagnostic: d.code,
+                        path: "test.bsl".to_owned(),
+                        code: out.code,
+                        snippet: Some(diagnostic_line_snippet(&lines, &index, out.start_line)),
+                        message: out.message,
+                        severity: out.severity,
+                        range: DiagnosticsBaselineRange {
+                            start_line: out.start_line as u32,
+                            start_column: out.start_column as u32,
+                            end_line: out.end_line as u32,
+                            end_column: out.end_column as u32,
+                        },
+                    }
+                })
+                .collect()
+        };
+        let coverage = DiagnosticsBaselineCoverage::Partial { completed_files: BTreeSet::new() };
+        let recorded = classify_diagnostics(
+            &baseline(vec![]),
+            "b.json".to_owned(),
+            candidates(&full),
+            &coverage,
+        )
+        .unwrap();
+        let winner: Vec<_> = recorded
+            .new
+            .iter()
+            .filter(|item| {
+                item.diagnostic == ide_diagnostics::DiagnosticCode::GlobalPropertyNotWritable
+            })
+            .map(|item| item.entry.clone())
+            .collect();
+        assert_eq!(winner.len(), 1, "the fixture must emit the winner: {full:#?}");
+
+        let classified = classify_diagnostics(
+            &baseline(winner),
+            "b.json".to_owned(),
+            candidates(&full),
+            &coverage,
+        )
+        .unwrap();
+        assert_eq!(classified.known.len(), 1, "the baseline must hide the winner");
+        assert!(
+            classified
+                .new
+                .iter()
+                .all(|item| item.diagnostic != ide_diagnostics::DiagnosticCode::SelfAssign),
+            "the loser must not come back when its winner is hidden: {:#?}",
+            classified.new
+        );
     }
 
     fn state_string(state: DiagnosticsBaselineState) -> &'static str {

@@ -492,6 +492,34 @@ pub(crate) fn build_author_filter(
     }
 }
 
+/// The scope whose line gate a computation under `snapshot` defers, or `None` when it keeps
+/// the ordinary one.
+///
+/// A baseline numbers repeated findings over the whole file, so a snapshot that can change
+/// the set is handed every finding and the scope's lines are cut after its classification.
+/// `Disabled` and `Error` cannot change it, and keep the ordinary scoped computation.
+pub(crate) fn deferred_scope<'a>(
+    config: &'a ide::DiagnosticsConfig,
+    snapshot: &ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot,
+) -> Option<&'a base_db::AnalysisScope> {
+    config.scope.as_deref().filter(|_| snapshot.affects_diagnostics())
+}
+
+/// The configuration a computation under `late_scope` runs with: the line gate deferred
+/// exactly when there is a scope to apply afterwards.
+pub(crate) fn computation_config<'a>(
+    config: &'a ide::DiagnosticsConfig,
+    late_scope: Option<&base_db::AnalysisScope>,
+) -> std::borrow::Cow<'a, ide::DiagnosticsConfig> {
+    match late_scope {
+        Some(_) => std::borrow::Cow::Owned(ide::DiagnosticsConfig {
+            defer_scope_line_gate: true,
+            ..config.clone()
+        }),
+        None => std::borrow::Cow::Borrowed(config),
+    }
+}
+
 /// Whether a diagnostic on `range` survives the author filter: any covered
 /// line kept → survives. Uses the scope-gate line mapping (half-open range →
 /// last line from `end - 1`, empty range anchors at `start`).
@@ -864,8 +892,13 @@ impl DiagnosticsResident {
         // Compute the unfiltered candidates in parallel. Baseline classification happens
         // before severity/code/author shaping, so those presentation filters cannot hide
         // a new finding or manufacture a resolved entry.
+        // The last member is whether the deferred scope admits the finding. It travels with
+        // the candidate instead of filtering it: the classifier numbers the whole file.
         type Candidate =
-            ide::diagnostics_baseline::BaselineDiagnosticCandidate<(FileId, ide::Diagnostic)>;
+            ide::diagnostics_baseline::BaselineDiagnosticCandidate<(FileId, ide::Diagnostic, bool)>;
+        let late_scope = deferred_scope(config, &self.diagnostics_baseline);
+        let computation_config = computation_config(config, late_scope);
+        let computation_config = computation_config.as_ref();
         // The pool takes an owned db clone: `&self` is not `Sync` (the resident holds a
         // `RefCell` VFS), and each worker clones its own handle from this seed anyway.
         // Borrow what the jobs read, so `move` takes the references and leaves the values
@@ -930,7 +963,8 @@ impl DiagnosticsResident {
                                 return None;
                             }
                             let caught = salsa::Cancelled::catch(AssertUnwindSafe(|| {
-                                let diagnostics = worker.analysis.diagnostics(file_id, config);
+                                let diagnostics =
+                                    worker.analysis.diagnostics(file_id, computation_config);
                                 let text = worker.analysis.file_text(file_id);
                                 let path =
                                     path_of.get(&file_id).expect("swept file has a resident path");
@@ -945,8 +979,16 @@ impl DiagnosticsResident {
                                     .into_iter()
                                     .map(|d| {
                                         let output = d.to_output(&text);
+                                        let visible = late_scope.is_none_or(|scope| {
+                                            ide::diagnostic_in_scope(
+                                                Some(scope),
+                                                Some(Path::new(path)),
+                                                &line_index,
+                                                &d,
+                                            )
+                                        });
                                         ide::diagnostics_baseline::BaselineDiagnosticCandidate {
-                                        diagnostic: (file_id, d),
+                                        diagnostic: (file_id, d, visible),
                                         path: relative.clone(),
                                         code: output.code,
                                         snippet: Some(
@@ -1111,9 +1153,12 @@ impl DiagnosticsResident {
                 ide::diagnostics_baseline::DiagnosticsBaselineSummary::disabled(),
             )
         };
+        // The classification is done, so the scope's cut cannot renumber anything now.
         let mut active_by_file: HashMap<FileId, Vec<ide::Diagnostic>> = HashMap::new();
-        for (file_id, diagnostic) in active {
-            active_by_file.entry(file_id).or_default().push(diagnostic);
+        for (file_id, diagnostic, visible) in active {
+            if visible {
+                active_by_file.entry(file_id).or_default().push(diagnostic);
+            }
         }
 
         // The author pass queries Salsa through its own db clones, so it observes
@@ -3709,5 +3754,73 @@ mod trim_tests {
                 panic!("the empty sweep did not return: its final trim waits on a live db handle")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod finality_tests {
+    use super::super::test_support::{
+        finality_add_phantom, finality_ready_state, finality_unscope, finality_workspace,
+        FinalityForm,
+    };
+    use super::super::{ResidentOutcome, SweepOptions, WorkspaceSweep};
+
+    fn sweep(root: &std::path::Path) -> WorkspaceSweep {
+        let state = finality_ready_state(root);
+        let outcome = state.read_mut(|resident, _| {
+            resident.workspace_aggregates(
+                &resident.config().clone(),
+                &SweepOptions {
+                    min_severity: ide::SeverityBucket::Hint,
+                    codes: Vec::new(),
+                    max_files: 100,
+                },
+                &crate::cancel::RequestCancel::default(),
+            )
+        });
+        state.shutdown();
+        match outcome {
+            ResidentOutcome::Ready(sweep, _) => sweep,
+            _ => panic!("expected a ready sweep"),
+        }
+    }
+
+    fn self_assigns(sweep: &WorkspaceSweep) -> usize {
+        sweep.aggregates.iter().find(|a| a.code == "SelfAssign").map_or(0, |a| a.count)
+    }
+
+    /// The counterexample on the workspace sweep and its statistics: with a and b recorded
+    /// and the diff scope on b and c, the aggregate counts c alone; an `Unsuppressed`
+    /// partition and a project without a baseline count b and c.
+    #[test]
+    fn finality_scoped_baseline() {
+        let count =
+            |form, recorded| self_assigns(&sweep(finality_workspace(form, recorded).path()));
+        assert_eq!(count(FinalityForm::Off, 0), 2, "control: b and c are in the scope");
+        assert_eq!(count(FinalityForm::V1, 0), 2, "control: nothing recorded");
+        assert_eq!(count(FinalityForm::V1, 2), 1, "v1");
+        assert_eq!(count(FinalityForm::Set, 2), 1, "partition set");
+        assert_eq!(count(FinalityForm::Unsuppressed, 2), 2, "Unsuppressed");
+    }
+
+    /// The sweep's summary counts the whole classified set of the swept files — a and b
+    /// known, c new — under a scope that shows c alone, and resolves nothing; unscoped,
+    /// the same workspace is fully covered and resolves the recorded occurrence the text
+    /// no longer produces.
+    #[test]
+    fn finality_scoped_coverage() {
+        let dir = finality_workspace(FinalityForm::V1, 2);
+        finality_add_phantom(dir.path());
+        let scoped = sweep(dir.path());
+        assert_eq!(self_assigns(&scoped), 1);
+        assert_eq!(scoped.baseline.known, Some(2), "{:?}", scoped.baseline);
+        assert!(!scoped.baseline.complete);
+        assert_eq!(scoped.baseline.resolved, Some(0));
+
+        finality_unscope(dir.path());
+        let whole = sweep(dir.path());
+        assert!(whole.baseline.complete, "control: {:?}", whole.baseline);
+        assert_eq!(whole.baseline.resolved, Some(1), "control: {:?}", whole.baseline);
+        assert_eq!(scoped.baseline.new, whole.baseline.new, "the summary counts the whole set");
     }
 }
