@@ -87,6 +87,7 @@ pub enum DiagnosticCode {
     ObjectModifiedInOnWrite,
     PostingWhileDataExchangeLoading,
     StructureKeyIsNotIdentifier,
+    ValueIsFilledOfBoolean,
     UseLessForEach,
     IteratorCollidesCollection,
     UsingGoto,

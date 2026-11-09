@@ -218,6 +218,7 @@ pub mod using_object_not_available_unix;
 pub mod using_service_tag;
 pub mod using_synchronous_calls;
 pub mod using_this_form;
+pub mod value_is_filled_of_boolean;
 pub mod virtual_table_call_without_parameters;
 pub mod weaving_annotation_not_applicable;
 pub mod weaving_signature_mismatch;
@@ -365,6 +366,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::StructureKeyIsNotIdentifier => {
             Some(&structure_key_is_not_identifier::METADATA)
         }
+        DiagnosticCode::ValueIsFilledOfBoolean => Some(&value_is_filled_of_boolean::METADATA),
         DiagnosticCode::UseLessForEach => Some(&useless_for_each::METADATA),
         DiagnosticCode::IteratorCollidesCollection => Some(&iterator_collides_collection::METADATA),
         DiagnosticCode::UsingGoto => Some(&using_goto::METADATA),

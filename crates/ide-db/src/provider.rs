@@ -316,6 +316,11 @@ pub trait AnalysisProvider {
 
     /// Whether the type is a `ФиксированнаяСтруктура`; a union is not.
     fn kernel_type_is_fixed_structure(&self, id: bsl_types::kind::TypeId) -> bool;
+    /// Whether the type is exactly `Boolean`; a union is not.
+    fn kernel_type_is_boolean(&self, id: bsl_types::kind::TypeId) -> bool;
+
+    /// Whether the type is a reference to a metadata object; a union is not.
+    fn kernel_type_is_metadata_reference(&self, id: bsl_types::kind::TypeId) -> bool;
 
     /// The project's `min_platform_version`; `None` (the default for providers
     /// without project settings) keeps the min-platform check silent.

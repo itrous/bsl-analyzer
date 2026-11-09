@@ -34,6 +34,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::UsingExternalCodeTools,
     DiagnosticCode::UsingFindElementByString,
     DiagnosticCode::UsingHardcodeSecretInformation,
+    DiagnosticCode::ValueIsFilledOfBoolean,
     DiagnosticCode::WrongUseFunctionProceedWithCall,
     DiagnosticCode::WrongUseOfRollbackTransactionMethod,
 ];
@@ -772,6 +773,21 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        DiagnosticCode::ValueIsFilledOfBoolean,
+        r#"Процедура Тест()
+    Флаг = Истина;
+    Если ЗначениеЗаполнено(Флаг) Тогда
+        Значение = 1;
+    КонецЕсли;
+КонецПроцедуры"#,
+        r#"Procedure Test()
+    Flag = True;
+    If ValueIsFilled(Flag) Then
+        Value = 1;
+    EndIf;
+EndProcedure"#,
+    ),
+    (
         DiagnosticCode::WrongUseFunctionProceedWithCall,
         r#"Процедура Тест()
     ПродолжитьВызов();
@@ -794,7 +810,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 225, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 226, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]
