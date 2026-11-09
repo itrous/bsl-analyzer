@@ -492,24 +492,21 @@ impl LoweringContext<'_> {
     }
 
     /// Whether `ty` is a document reference: a single one, "any document reference", or a
-    /// composite in which every arm is one of those.
+    /// composite in which every arm is one of those. An arm may be a defined type that
+    /// expands to a composite of its own, so arms are judged the same way.
     fn is_document_reference(&self, ty: &SdblType) -> bool {
-        fn document_arm(ty: &SdblType) -> bool {
-            matches!(
-                ty,
-                SdblType::Ref(MdoRef { mdo_type: MdoType::Document, .. })
-                    | SdblType::AnyObjectRef { mdo_type: MdoType::Document }
-            )
-        }
-        let (ty, may_resolve) = self.expanded_resolving(ty, true);
+        self.is_document_arm(ty, true)
+    }
+
+    fn is_document_arm(&self, ty: &SdblType, may_resolve: bool) -> bool {
+        let (ty, may_resolve) = self.expanded_resolving(ty, may_resolve);
         match ty.as_ref() {
+            SdblType::Ref(MdoRef { mdo_type: MdoType::Document, .. })
+            | SdblType::AnyObjectRef { mdo_type: MdoType::Document } => true,
             SdblType::Composite { types } => {
-                !types.is_empty()
-                    && types.iter().all(|arm| {
-                        document_arm(self.expanded_resolving(arm, may_resolve).0.as_ref())
-                    })
+                !types.is_empty() && types.iter().all(|arm| self.is_document_arm(arm, may_resolve))
             }
-            other => document_arm(other),
+            _ => false,
         }
     }
 

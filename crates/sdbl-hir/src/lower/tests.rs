@@ -4215,4 +4215,58 @@ mod order_by_document_date {
         )
         .is_empty());
     }
+
+    /// The `Ключ` ordering of a register whose `Значение` is a composite of a defined type
+    /// with the arms `nested` and a `Возврат` document reference.
+    fn nested_defined_type(nested: Vec<bsl_metadata::AttributeType>) -> Vec<String> {
+        use bsl_metadata::{AttributeType, MdoType};
+        let document =
+            |name: &str| AttributeType::Ref { mdo_type: MdoType::Document, name: name.into() };
+        let config = super::register_config(
+            AttributeType::Composite {
+                types: vec![
+                    AttributeType::DefinedType { name: "Основание".into() },
+                    document("Возврат"),
+                ],
+            },
+            &[("Основание", AttributeType::Composite { types: nested })],
+        );
+        let ast = parser::parse_sdbl(
+            "ВЫБРАТЬ Т.Ключ КАК Ключ ИЗ РегистрСведений.Курсы КАК Т УПОРЯДОЧИТЬ ПО Т.Значение.Дата",
+        );
+        lower_sdbl_to_hir(&ast, Some(config))
+            .all_diagnostics()
+            .filter_map(|diag| match diag {
+                SdblDiagnostic::QueryOrderByDocumentDate { reference_field, .. } => {
+                    Some(reference_field.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_composite_arm_expanding_to_documents_only_is_reported() {
+        use bsl_metadata::{AttributeType, MdoType};
+        let document =
+            |name: &str| AttributeType::Ref { mdo_type: MdoType::Document, name: name.into() };
+        assert_eq!(
+            nested_defined_type(vec![document("Поступление"), document("Возврат")]),
+            ["Значение"]
+        );
+    }
+
+    #[test]
+    fn a_composite_arm_expanding_to_a_catalog_too_is_silent() {
+        use bsl_metadata::{AttributeType, MdoType};
+        assert!(nested_defined_type(vec![
+            AttributeType::Ref {
+                mdo_type: MdoType::Document, name: "Поступление".into()
+            },
+            AttributeType::Ref {
+                mdo_type: MdoType::Catalog, name: "Номенклатура".into()
+            },
+        ])
+        .is_empty());
+    }
 }
