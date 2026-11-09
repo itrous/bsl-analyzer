@@ -155,6 +155,15 @@ pub enum SdblDiagnostic {
         range: TextRange,
     },
 
+    /// A condition in the parameters of an accumulation register virtual table whose fields are not
+    /// the leading dimensions of the register: no index of the totals table serves it (#std652).
+    /// `missing_dimension` is the first dimension, in configuration order, that is absent from the
+    /// condition while a later one is present.
+    QueryConditionWithoutIndex {
+        missing_dimension: String,
+        range: TextRange,
+    },
+
     RefOveruse {
         range: TextRange,
     },
@@ -249,6 +258,14 @@ pub fn invalid_virtual_table_parameters_message(
              параметры читаются строго по порядку"
         ),
     }
+}
+
+/// The one wording of an unindexed virtual-table condition, shared by the enum rendering and the
+/// `ide-diagnostics` handler.
+pub fn query_condition_without_index_message(missing_dimension: &str) -> String {
+    format!(
+        "Условие в параметрах виртуальной таблицы не опирается на индекс: поля условия должны быть начальными и идти подряд в порядке измерений регистра. Пропущено измерение «{missing_dimension}»"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,6 +419,9 @@ impl SdblDiagnostic {
             Self::QueryOrderByDocumentDate { reference_field, .. } => {
                 query_order_by_document_date_message(reference_field)
             }
+            Self::QueryConditionWithoutIndex { missing_dimension, .. } => {
+                query_condition_without_index_message(missing_dimension)
+            }
             Self::RefOveruse { .. } => {
                 "Поле «Ссылка», полученное через точку от ссылочного поля, совпадает с самим \
                  этим полем: лишнее соединение можно убрать"
@@ -466,6 +486,7 @@ impl SdblDiagnostic {
             Self::QueryNestedFieldsByDot { range, .. } => *range,
             Self::RegisterRecorderFieldInQuery { range, .. } => *range,
             Self::QueryOrderByDocumentDate { range, .. } => *range,
+            Self::QueryConditionWithoutIndex { range, .. } => *range,
             Self::RefOveruse { range } => *range,
             Self::UnionWithoutAll { range } => *range,
             Self::LikeUsage { range, .. } => *range,
@@ -502,6 +523,7 @@ impl SdblDiagnostic {
             Self::QueryNestedFieldsByDot { .. } => false,
             Self::RegisterRecorderFieldInQuery { .. } => false,
             Self::QueryOrderByDocumentDate { .. } => false,
+            Self::QueryConditionWithoutIndex { .. } => false,
             Self::RefOveruse { .. } => false,
             Self::UnionWithoutAll { .. } => false,
             Self::LikeUsage { kind: LikeUsageKind::Allowed, .. } => false,

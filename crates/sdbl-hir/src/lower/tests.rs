@@ -4270,3 +4270,294 @@ mod order_by_document_date {
         .is_empty());
     }
 }
+
+mod condition_index_coverage {
+    use std::sync::Arc;
+
+    use bsl_metadata::xml_parser::{
+        parse_accounting_register_xml, parse_accumulation_register_xml,
+        parse_information_register_xml,
+    };
+    use bsl_metadata::Configuration;
+
+    use crate::diagnostics::SdblDiagnostic;
+    use crate::lower::lower_sdbl_to_hir;
+
+    fn dimensions(indexed: Option<&str>) -> String {
+        ["Склад", "Номенклатура", "Качество"]
+            .iter()
+            .enumerate()
+            .map(|(position, name)| {
+                let indexing = if indexed == Some(*name) { "Index" } else { "DontIndex" };
+                format!(
+                    r#"<Dimension uuid="00000000-0000-0000-0000-00000000010{position}">
+                <Properties><Name>{name}</Name><Type><v8:Type>xs:string</v8:Type></Type><Indexing>{indexing}</Indexing></Properties>
+            </Dimension>"#
+                )
+            })
+            .collect()
+    }
+
+    fn register_xml(kind: &str, name: &str, body: &str, indexed: Option<&str>) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
+    <{kind} uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>{name}</Name>{body}</Properties>
+        <ChildObjects>
+            {dimensions}
+            <Resource uuid="00000000-0000-0000-0000-000000000200">
+                <Properties><Name>Количество</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties>
+            </Resource>
+        </ChildObjects>
+    </{kind}>
+</MetaDataObject>"#,
+            dimensions = dimensions(indexed)
+        )
+    }
+
+    fn configuration() -> Arc<Configuration> {
+        let mut config = Configuration::new("Тест");
+        let balance = "<RegisterType>Balance</RegisterType>";
+        config.add_register(
+            parse_accumulation_register_xml(&register_xml(
+                "AccumulationRegister",
+                "ТоварыНаСкладах",
+                balance,
+                None,
+            ))
+            .unwrap(),
+        );
+        config.add_register(
+            parse_accumulation_register_xml(&register_xml(
+                "AccumulationRegister",
+                "ТоварыИндексированные",
+                balance,
+                Some("Номенклатура"),
+            ))
+            .unwrap(),
+        );
+        config.add_register(
+            parse_information_register_xml(&register_xml(
+                "InformationRegister",
+                "СведенияОТоварах",
+                "<InformationRegisterPeriodicity>Day</InformationRegisterPeriodicity>",
+                None,
+            ))
+            .unwrap(),
+        );
+        config.add_register(
+            parse_accounting_register_xml(&register_xml(
+                "AccountingRegister",
+                "Бухгалтерский",
+                "<Correspondence>false</Correspondence>",
+                None,
+            ))
+            .unwrap(),
+        );
+        Arc::new(config)
+    }
+
+    /// The reported missing dimensions of one query: empty when the rule stays silent.
+    fn reports(query: &str) -> Vec<String> {
+        let ast = parser::parse_sdbl(query);
+        lower_sdbl_to_hir(&ast, Some(configuration()))
+            .all_diagnostics()
+            .filter_map(|diag| match diag {
+                SdblDiagnostic::QueryConditionWithoutIndex { missing_dimension, .. } => {
+                    Some(missing_dimension.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn balance(condition: &str) -> Vec<String> {
+        reports(&format!(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, {condition}) КАК Остатки"
+        ))
+    }
+
+    #[test]
+    fn a_condition_on_the_second_dimension_only_is_reported() {
+        assert_eq!(balance("Номенклатура = &Номенклатура"), ["Склад"]);
+    }
+
+    #[test]
+    fn a_gap_between_the_first_and_the_third_dimension_is_reported() {
+        assert_eq!(balance("Склад = &Склад И Качество = &Качество"), ["Номенклатура"]);
+    }
+
+    #[test]
+    fn english_keywords_are_judged_the_same() {
+        assert_eq!(
+            reports(
+                "SELECT 1 FROM AccumulationRegister.ТоварыНаСкладах.Balance(, Склад = &Склад AND Качество = &Качество) AS Balance"
+            ),
+            ["Номенклатура"]
+        );
+    }
+
+    #[test]
+    fn the_condition_of_turnovers_is_judged() {
+        assert_eq!(
+            reports(
+                "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Обороты(, , , Качество = &Качество) КАК Обороты"
+            ),
+            ["Склад"]
+        );
+    }
+
+    #[test]
+    fn the_condition_of_balance_and_turnovers_is_judged() {
+        assert_eq!(
+            reports(
+                "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.ОстаткиИОбороты(, , , , Номенклатура = &Номенклатура) КАК Данные"
+            ),
+            ["Склад"]
+        );
+    }
+
+    #[test]
+    fn a_field_qualified_by_the_source_alias_is_read_as_the_field() {
+        assert_eq!(balance("Остатки.Качество = &Качество"), ["Склад"]);
+    }
+
+    #[test]
+    fn the_leading_dimension_alone_is_silent() {
+        assert!(balance("Склад = &Склад").is_empty());
+    }
+
+    #[test]
+    fn the_first_two_dimensions_are_silent() {
+        assert!(balance("Склад = &Склад И Номенклатура = &Номенклатура").is_empty());
+    }
+
+    #[test]
+    fn all_dimensions_are_silent() {
+        assert!(balance("Склад = &Склад И Номенклатура = &Номенклатура И Качество = &Качество")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_single_indexed_dimension_that_is_not_the_first_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыИндексированные.Остатки(, Номенклатура = &Номенклатура) КАК Остатки"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_indexed_dimension_does_not_excuse_a_gap_in_a_longer_condition() {
+        assert_eq!(
+            reports(
+                "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыИндексированные.Остатки(, Номенклатура = &Номенклатура И Качество = &Качество) КАК Остатки"
+            ),
+            ["Склад"]
+        );
+    }
+
+    fn indexed_balance(condition: &str) -> Vec<String> {
+        reports(&format!(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыИндексированные.Остатки(, {condition}) КАК Остатки"
+        ))
+    }
+
+    #[test]
+    fn an_indexed_dimension_with_the_leading_one_of_the_rest_is_silent() {
+        assert!(indexed_balance("Номенклатура = &Номенклатура И Склад = &Склад").is_empty());
+    }
+
+    #[test]
+    fn an_indexed_dimension_with_a_non_leading_one_is_reported() {
+        assert_eq!(
+            indexed_balance("Номенклатура = &Номенклатура И Качество = &Качество"),
+            ["Склад"]
+        );
+    }
+
+    #[test]
+    fn all_dimensions_of_the_indexed_register_are_silent() {
+        assert!(indexed_balance(
+            "Номенклатура = &Номенклатура И Склад = &Склад И Качество = &Качество"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_condition_with_or_is_silent() {
+        assert!(balance("Номенклатура = &Номенклатура ИЛИ Качество = &Качество").is_empty());
+    }
+
+    #[test]
+    fn a_condition_with_a_comparison_other_than_equality_is_silent() {
+        assert!(balance("Номенклатура > &Номенклатура").is_empty());
+        assert!(balance("Склад = &Склад И Качество <> &Качество").is_empty());
+    }
+
+    #[test]
+    fn a_condition_with_in_not_or_between_is_silent() {
+        assert!(balance("Номенклатура В (&Список)").is_empty());
+        assert!(balance("НЕ Номенклатура = &Номенклатура").is_empty());
+        assert!(balance("Номенклатура МЕЖДУ &А И &Б").is_empty());
+    }
+
+    #[test]
+    fn a_condition_naming_a_resource_or_an_unknown_field_is_silent() {
+        assert!(balance("Количество = &Количество").is_empty());
+        assert!(balance("Номенклатура = &Номенклатура И Количество = &Количество").is_empty());
+        assert!(balance("Номенклатура = &Номенклатура И НетТакогоПоля = 1").is_empty());
+    }
+
+    #[test]
+    fn an_empty_condition_slot_is_silent() {
+        assert!(reports("ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, ) КАК Остатки")
+            .is_empty());
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(&Период) КАК Остатки"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_information_register_slice_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрСведений.СведенияОТоварах.СрезПоследних(, Качество = &Качество) КАК Срез"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_accounting_register_balance_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрБухгалтерии.Бухгалтерский.Остатки(, , , Качество = &Качество) КАК Остатки"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_condition_in_where_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки() КАК Остатки ГДЕ Остатки.Качество = &Качество"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_finding_covers_the_condition_argument() {
+        let query =
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, Номенклатура = &Номенклатура) КАК Остатки";
+        let ast = parser::parse_sdbl(query);
+        let package = lower_sdbl_to_hir(&ast, Some(configuration()));
+        let range = package
+            .all_diagnostics()
+            .find_map(|diag| match diag {
+                SdblDiagnostic::QueryConditionWithoutIndex { range, .. } => Some(*range),
+                _ => None,
+            })
+            .expect("a finding");
+        let start = usize::from(range.start());
+        let end = usize::from(range.end());
+        assert_eq!(&query[start..end], "Номенклатура = &Номенклатура");
+    }
+}
