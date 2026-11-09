@@ -732,6 +732,12 @@ impl GraphState {
         true
     }
 
+    /// Retire the store as a lost workspace does, without a lease to lose it.
+    #[cfg(test)]
+    pub(crate) fn retire_for_test(&self) {
+        self.store.set_admission(super::snapshot::Admission::Retired);
+    }
+
     /// Accepted builds still waiting for [`Self::run_next_build`].
     #[cfg(test)]
     pub(crate) fn queued_builds(&self) -> usize {

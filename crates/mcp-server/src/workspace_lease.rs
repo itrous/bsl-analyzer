@@ -1248,6 +1248,11 @@ impl WorkspaceLease {
     }
 
     #[cfg(test)]
+    pub(crate) fn supersede_for_test(&self) {
+        self.inner.superseded.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     pub(crate) fn invalidate_verdict_for_test(&self) {
         *lock_recover(&self.inner.checked_at) = None;
     }

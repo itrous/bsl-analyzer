@@ -426,6 +426,7 @@ async fn background_work_holds_the_backend_and_then_lets_it_go() {
 /// Such a never-used backend exits via the short orphan grace instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg(any(unix, windows))]
+#[ignore = "необязательный тест: прогрев различается только стеночным запасом между orphan grace и idle TTL отдельного процесса backend, поэтому вердикт зависит от скорости машины, событийной замены нет; детерминированно это держат broker::daemon::idle_boundary_tests::serve_is_not_warmed_by_a_connection_that_sends_nothing и serve_shared_is_not_warmed_by_a_probe_that_sends_nothing; запуск: cargo test -p mcp-server --test broker -- --ignored --exact silent_connection_does_not_warm_the_backend"]
 async fn silent_connection_does_not_warm_the_backend() {
     let src = TempDir::new().unwrap();
     let key = key_for(&src);
@@ -557,14 +558,16 @@ async fn client_closing_input_ends_session_and_backend_idles_out() {
 }
 
 /// Regression for the accept-vs-idle-expiry race: a client whose `connect` succeeds must
-/// always be served, even if it lands exactly as the idle timer fires. The biased select
-/// in the serve loop guarantees a backlogged connection is accepted before a simultaneous
-/// idle tick can drop it — the proxy treats its successful connect as non-retryable.
-/// Hammered around the idle boundary, every successful connect must complete its
-/// initialize handshake; a backend that has already idled out merely refuses the connect
-/// (retryable) and is relaunched.
+/// always be served, even if it lands exactly as the idle timer fires — the proxy treats its
+/// successful connect as non-retryable. A Unix connect waits in the backlog, which the serve
+/// loop drains before it acts on an expired grace; a Windows connect completes on the
+/// listener's free pipe instance, which the idle exit reserves before it closes the listener.
+/// Each backend is warmed by one real session first, so the attempts race its short idle TTL
+/// rather than the long orphan grace. A backend that has already idled out merely refuses the
+/// connect (retryable); only then is it relaunched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg(any(unix, windows))]
+#[ignore = "необязательный тест: connect на границу простоя наводит реальная пауза длиной в idle TTL, а выход и перезапуск отдельного процесса backend ждутся по стеночным часам, так что попадание в окно и длительность зависят от скорости машины, событийной замены у отдельного процесса нет; инвариант детерминированно держат broker::daemon::idle_boundary_tests; запуск: cargo test -p mcp-server --test broker -- --ignored --exact successful_connect_is_always_served_at_idle_boundary"]
 async fn successful_connect_is_always_served_at_idle_boundary() {
     let src = TempDir::new().unwrap();
     let key = key_for(&src);
@@ -574,15 +577,20 @@ async fn successful_connect_is_always_served_at_idle_boundary() {
     let launch = || {
         tokio::spawn(broker::daemon::run(|| Ok(reference_server()), key_for(&src), grace, idle_ttl))
     };
+    let warm = || async {
+        let stream = connect_within(&key, Duration::from_secs(25)).await;
+        let client = ().serve(stream).await.expect("the warming session initializes");
+        client.cancel().await.ok();
+    };
     let mut backend = launch();
+    warm().await;
 
-    let attempts = if cfg!(windows) { 1 } else { 10 };
-    for _ in 0..attempts {
+    for _ in 0..10 {
         // Sleep to around the idle boundary so the next connect races a possible expiry.
         tokio::time::sleep(idle_ttl).await;
         match connect(&key).await {
-            // The connect succeeded → the connection is in the backlog → the backend MUST
-            // serve it. A connection dropped on a racing expiry would fail this handshake.
+            // The connect succeeded → the backend MUST serve it. A connection dropped on a
+            // racing expiry would fail this handshake.
             Ok(stream) => {
                 let client = tokio::time::timeout(common::STATE_CEILING, ().serve(stream))
                     .await
@@ -591,12 +599,16 @@ async fn successful_connect_is_always_served_at_idle_boundary() {
                 assert!(client.peer_info().is_some(), "session saw server info");
                 client.cancel().await.ok();
             }
-            // The backend idled out before this connect — expected and retryable. Relaunch
-            // so later iterations keep exercising the boundary.
+            // The backend idled out before this connect. Relaunch once it is gone, so later
+            // iterations keep exercising the boundary.
             Err(_) => {
-                if backend.is_finished() {
-                    backend = launch();
-                }
+                tokio::time::timeout(common::STATE_CEILING, &mut backend)
+                    .await
+                    .expect("a backend that refused a connect has idled out")
+                    .expect("backend task joined")
+                    .expect("backend exits cleanly");
+                backend = launch();
+                warm().await;
             }
         }
     }
