@@ -752,7 +752,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 217, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 218, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]
