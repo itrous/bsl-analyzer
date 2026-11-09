@@ -1792,9 +1792,14 @@ impl<'db> InferenceContext<'db> {
             return *cached;
         }
         let resolver = self.get_resolver();
-        let claimed =
-            crate::platform_global_lookup::bare_global_name_claim(self.db, &resolver, None, name)
-                .is_some();
+        let claimed = crate::platform_global_lookup::bare_global_name_claim(
+            self.db,
+            &resolver,
+            None,
+            name,
+            self.body_env,
+        )
+        .is_some();
         self.shadowed_root_names.insert(key, claimed);
         claimed
     }
@@ -3423,7 +3428,12 @@ impl<'db> InferenceContext<'db> {
                     .clone()
                 };
                 let forwarder = crate::structure_param_keys::Forwarder::new(
-                    self.db, &resolver, module, &self.body, &summarize,
+                    self.db,
+                    &resolver,
+                    module,
+                    &self.body,
+                    self.body_env,
+                    &summarize,
                 );
                 collect_structure_shapes(&self.body, SeedRoots::NewLiterals, Some(&forwarder))
             } else {
@@ -3504,9 +3514,15 @@ impl<'db> InferenceContext<'db> {
                         } else {
                             crate::form_self::resolve_form_self_property(self.db, &resolver, name)
                         };
+                        let unwritable =
+                            crate::platform_global_lookup::unassignable_global_property(
+                                name,
+                                self.body_env,
+                            )
+                            .filter(|_| !self.manager_collection_shadowed(name));
                         let unheld_collection = bsl_metadata::MdoType::from_plural(name.as_str())
                             .filter(|mdo| mdo.manager_type_prefix().is_some())
-                            .filter(|_| !self.manager_collection_shadowed(name));
+                            .filter(|_| unwritable.is_some());
                         match form_self_resolution {
                             Some(prop) => {
                                 if prop.is_readonly {
@@ -3523,23 +3539,26 @@ impl<'db> InferenceContext<'db> {
                                 }
                             }
                             None if existing_module_variable => {}
-                            // Writing to an unheld metadata-collection name targets a
-                            // Global-context property, which the platform refuses — no
-                            // local is declared. Type the target as the collection and
-                            // stop: the availability check belongs to READING a member,
-                            // and the illegal write is a different defect, not yet
-                            // reported.
-                            None if unheld_collection.is_some() => {
+                            // The platform refuses a write to a Global-context property it
+                            // defines in every environment of this body and declares no local;
+                            // where the name is missing from an environment it IS a plain
+                            // local, so that case falls through to the implicit-local arm.
+                            None if unwritable.is_some() => {
                                 self.push_inference_diagnostic(
                                     InferenceDiagnostic::GlobalPropertyNotWritable {
                                         lhs: target_id,
                                         name: name.clone(),
                                     },
                                 );
-                                let collection = self
-                                    .db
-                                    .manager_collection(unheld_collection.expect("just checked"));
-                                self.expr_types.insert(target_id, collection);
+                                if let Some(mdo) = unheld_collection {
+                                    let collection = self.db.manager_collection(mdo);
+                                    self.expr_types.insert(target_id, collection);
+                                } else if let Some(value_type) =
+                                    unwritable.and_then(|symbol| symbol.value_type.as_deref())
+                                {
+                                    let ty = self.db.platform_object(value_type.to_string());
+                                    self.expr_types.insert(target_id, ty);
+                                }
                                 infer_target = false;
                             }
                             None => {

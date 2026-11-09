@@ -40,3 +40,24 @@ pub(crate) fn possible_method_env(
     }
     Some(environment & (decl.preproc_env | decl.preproc_undecided))
 }
+
+/// [`effective_method_env`] or the module-code environment, by body owner —
+/// the one answer position-based IDE queries share with inference.
+pub fn owner_body_env(
+    db: &dyn HirDatabase,
+    file_id: vfs::FileId,
+    owner: hir_def::DefWithBodyId,
+) -> EnvFlags {
+    let options = db.env_options();
+    match owner {
+        hir_def::DefWithBodyId::Method(local_id) => effective_method_env(
+            db,
+            MethodId { module: hir_def::ModuleId { file_id }, local_id },
+            &options,
+        ),
+        hir_def::DefWithBodyId::ModuleCode => {
+            let metadata = db.module_metadata(hir_def::ModuleId { file_id });
+            execution_env::module_code_env(&metadata, &options)
+        }
+    }
+}

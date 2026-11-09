@@ -81,6 +81,32 @@ pub fn manager_collection_env(mdo_type: bsl_metadata::MdoType) -> EnvFlags {
     )
 }
 
+/// A bare name that denotes a Global-context property the platform refuses to
+/// write in EVERY environment this body runs in. Where the property is missing
+/// from some of those environments the platform declares a plain local instead
+/// (the thin client answers "Переменная не определена" for `Справочники`), so the
+/// name is not claimed there and no write diagnostic is due.
+pub fn unassignable_global_property(
+    name: &Name,
+    body_env: EnvFlags,
+) -> Option<&'static bsl_platform::PlatformGlobalSymbol> {
+    let symbol = bsl_platform::PlatformGlobalCatalog::instance().lookup(name.as_str())?;
+    if symbol.kind != bsl_platform::PlatformGlobalKind::Property
+        || symbol.capabilities.assignable != Some(false)
+    {
+        return None;
+    }
+    if body_env.is_empty() {
+        // An unknown environment keeps the behaviour it had:
+        // the measurement only overrode the client case.
+        return bsl_metadata::MdoType::from_plural(name.as_str())
+            .is_some_and(|mdo| mdo.manager_type_prefix().is_some())
+            .then_some(symbol);
+    }
+    let availability = EnvFlags::from_platform_context(symbol.context.as_ref());
+    (!availability.is_empty() && body_env.without(availability).is_empty()).then_some(symbol)
+}
+
 /// Body scope for judging a claim at a specific read position.
 pub struct BodyShadowScope<'a> {
     pub body: &'a Body,
@@ -126,6 +152,7 @@ pub fn bare_global_name_claim(
     resolver: &Resolver,
     scope: Option<&BodyShadowScope<'_>>,
     name: &Name,
+    body_env: EnvFlags,
 ) -> Option<BareGlobalClaim> {
     // Data members own a write: assigning over a module variable or a form /
     // object member stores into that member — a value inference deliberately
@@ -168,8 +195,7 @@ pub fn bare_global_name_claim(
     // owner takes it; the positional search below then merely supplies that
     // owner's value at the read. Other globals keep the older rule until the
     // platform's verdict on them is measured the same way.
-    let names_a_collection = bsl_metadata::MdoType::from_plural(name.as_str())
-        .is_some_and(|mdo| mdo.manager_type_prefix().is_some());
+    let names_a_collection = unassignable_global_property(name, body_env).is_some();
     if names_a_collection && !body_declares && !read_only_claim() {
         return None;
     }
@@ -242,6 +268,21 @@ mod tests {
         let id = resolve_platform_global_property_type(&db, &Name::new("Метаданные"))
             .expect("`Метаданные` must resolve via platform data");
         assert_ne!(id, db.unknown(), "expected non-Unknown type id");
+    }
+
+    #[test]
+    fn unknown_environment_keeps_every_manager_collection_unassignable() {
+        for mdo in bsl_metadata::MdoType::all().iter().filter(|m| m.manager_type_prefix().is_some())
+        {
+            let Some(prop) = mdo.hbk_global_property() else { continue };
+            for name in [prop.name.as_str(), prop.english_name.as_str()] {
+                assert!(
+                    unassignable_global_property(&Name::new(name), EnvFlags::EMPTY).is_some(),
+                    "`{name}` must stay refused where the environment is unknown"
+                );
+            }
+        }
+        assert!(unassignable_global_property(&Name::new("Метаданные"), EnvFlags::EMPTY).is_none());
     }
 
     #[test]
