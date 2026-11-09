@@ -67,8 +67,8 @@ pub use infer::{
     BareNameGap, BareNameOrigin, BareNameResolution, BareNameUse, BodyInferenceResult,
     CallArgBinding, CandidateCallBinding, EnvCalleeKind, EnvMemberKind, ImplicitDatabaseReadKind,
     ImplicitLocalAssignment, ImplicitLocalInfo, InferOwnerResult, InferenceContext,
-    InferenceDiagnostic, InferenceResult, ModuleCodeInferenceResult, UninitializedPath,
-    UnresolvedMethodKind,
+    InferenceDiagnostic, InferenceResult, ModuleCodeInferenceResult, RefPresentationCause,
+    UninitializedPath, UnresolvedMethodKind,
 };
 pub use lower::TyLoweringContext;
 pub use manager_lookup::{lookup_manager_field, ManagerMemberInfo};

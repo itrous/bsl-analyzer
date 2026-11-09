@@ -234,8 +234,8 @@ pub use hir_ty::{
     form_element_kind_sort_band, BareNameGap, BareNameOrigin, BareNameResolution, BareNameUse,
     BodyInferenceResult, CallArgBinding, EnvCalleeKind, EnvMemberKind, FormElementKind,
     ImplicitDatabaseReadKind, InferOwnerResult, InferenceContext, InferenceDiagnostic,
-    InferenceResult, MetadataKind, ModuleCodeInferenceResult, UninitializedPath,
-    UnresolvedMethodKind,
+    InferenceResult, MetadataKind, ModuleCodeInferenceResult, RefPresentationCause,
+    UninitializedPath, UnresolvedMethodKind,
 };
 
 pub use bsl_types::builders::Builders;

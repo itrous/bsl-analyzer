@@ -362,11 +362,22 @@ fn classify_bare_name_miss(
     }
 }
 
+/// What made the platform take the presentation of a reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefPresentationCause {
+    /// `Строка(ссылка)`.
+    Cast,
+    /// `+` with a string operand.
+    Concat,
+    /// A platform global that prints its argument (`Сообщить`, `СтрШаблон`).
+    Call { name: Name },
+}
+
 /// The implicit database operation a typed expression may perform in a loop body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImplicitDatabaseReadKind {
     RefAttribute { field: Name },
-    RefPresentation,
+    RefPresentation { cause: RefPresentationCause },
     ManagerFind { method: Name },
 }
 
@@ -4498,6 +4509,23 @@ impl<'db> InferenceContext<'db> {
         let lhs_ty = self.infer_expr(lhs);
         let rhs_ty = self.infer_expr(rhs);
 
+        if op == BinaryOp::Add && self.loop_depth > 0 {
+            let lhs_is_string = matches!(self.db.lookup_type(lhs_ty), TypeKind::String(_));
+            let rhs_is_string = matches!(self.db.lookup_type(rhs_ty), TypeKind::String(_));
+            for (operand, operand_ty, other_is_string) in
+                [(lhs, lhs_ty, rhs_is_string), (rhs, rhs_ty, lhs_is_string)]
+            {
+                if other_is_string && self.is_object_reference(operand_ty) {
+                    self.push_inference_diagnostic(InferenceDiagnostic::ImplicitDatabaseRead {
+                        expr: operand,
+                        kind: ImplicitDatabaseReadKind::RefPresentation {
+                            cause: RefPresentationCause::Concat,
+                        },
+                    });
+                }
+            }
+        }
+
         match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                 let lhs_kind = self.db.lookup_type(lhs_ty);
@@ -5114,8 +5142,52 @@ impl<'db> InferenceContext<'db> {
                 {
                     self.push_inference_diagnostic(InferenceDiagnostic::ImplicitDatabaseRead {
                         expr: call_expr,
-                        kind: ImplicitDatabaseReadKind::RefPresentation,
+                        kind: ImplicitDatabaseReadKind::RefPresentation {
+                            cause: RefPresentationCause::Cast,
+                        },
                     });
+                }
+                if self.loop_depth > 0 {
+                    // `СтрШаблон` takes the template first; every later argument is printed.
+                    let first_printed = if crate::method_lookup::is_platform_name_str(
+                        name.as_str(),
+                        "СтрШаблон",
+                        "StrTemplate",
+                    ) {
+                        Some(1)
+                    } else if crate::method_lookup::is_platform_name_str(
+                        name.as_str(),
+                        "Сообщить",
+                        "Message",
+                    ) {
+                        Some(0)
+                    } else {
+                        None
+                    };
+                    if let Some(first) = first_printed {
+                        if !self.is_call_name_shadowed(&name)
+                            && self.platform_read_call_is_resolved(callee, true)
+                        {
+                            for &arg in args.iter().skip(first) {
+                                if self
+                                    .expr_types
+                                    .get(&arg)
+                                    .is_some_and(|ty| self.is_object_reference(*ty))
+                                {
+                                    self.push_inference_diagnostic(
+                                        InferenceDiagnostic::ImplicitDatabaseRead {
+                                            expr: arg,
+                                            kind: ImplicitDatabaseReadKind::RefPresentation {
+                                                cause: RefPresentationCause::Call {
+                                                    name: name.clone(),
+                                                },
+                                            },
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 let ret = self.refine_first_argument_return(&name, args, ret);
                 if is_proceed_with_call_name(&name) {
