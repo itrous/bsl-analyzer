@@ -449,15 +449,24 @@ impl LoweringContext<'_> {
     /// other query sections are not looked at.
     pub(super) fn check_order_by_document_date(&mut self, hir: &SdblHir) {
         let Some(order_by) = &hir.order_by else { return };
-        let path_of = |expr: &ExprHir| match expr {
-            ExprHir::ColumnRef { parts, .. } if parts.len() == 3 => Some(parts.clone()),
-            _ => None,
-        };
-        let keys: Vec<Vec<Name>> =
-            order_by.items.iter().filter_map(|item| path_of(&item.expr)).collect();
+        fn path_of(expr: &ExprHir) -> Option<&[Name]> {
+            match expr {
+                ExprHir::ColumnRef { parts, .. } if parts.len() == 3 => Some(parts),
+                _ => None,
+            }
+        }
         for item in &order_by.items {
             let Some(parts) = path_of(&item.expr) else { continue };
             if !is_name_of(&parts[2], "Дата", "Date") {
+                continue;
+            }
+            let has_point_in_time =
+                order_by.items.iter().filter_map(|key| path_of(&key.expr)).any(|other| {
+                    eq_ignore_case(&other[0], &parts[0])
+                        && eq_ignore_case(&other[1], &parts[1])
+                        && is_name_of(&other[2], "МоментВремени", "PointInTime")
+                });
+            if has_point_in_time {
                 continue;
             }
             let Some(table) = hir
@@ -473,14 +482,6 @@ impl LoweringContext<'_> {
                 continue;
             };
             if !self.is_document_reference(&field.ty) {
-                continue;
-            }
-            let has_point_in_time = keys.iter().any(|other| {
-                eq_ignore_case(&other[0], &parts[0])
-                    && eq_ignore_case(&other[1], &parts[1])
-                    && is_name_of(&other[2], "МоментВремени", "PointInTime")
-            });
-            if has_point_in_time {
                 continue;
             }
             self.diagnostics.push(SdblDiagnostic::QueryOrderByDocumentDate {
