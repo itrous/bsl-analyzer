@@ -88,7 +88,9 @@ pub fn from_hir(
 #[cfg(test)]
 mod tests {
     use super::shorten_union_members;
-    use crate::test_utils::check_diagnostics_snapshot_for;
+    use crate::test_utils::{
+        built_in_facts_are_served, check_config_files, check_diagnostics_snapshot_for, format_diags,
+    };
     use crate::DiagnosticCode;
     use expect_test::expect;
 
@@ -372,6 +374,99 @@ mod tests {
                   message: Несоответствие типов: ожидалось 'Булево | Число | Строка | ТаблицаЗначений', получено 'Булево | Число | Строка | Неопределено' (тип параметра из описания)
                   severity: Error"#]],
         );
+    }
+
+    const BOOLEAN_SLOT_MODULE: &str = "CommonModules/Проба/Ext/Module.bsl";
+
+    const BOOLEAN_SLOT_CONFIGURATION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>Тест</Name></Properties>
+        <ChildObjects>
+            <Catalog>Товары</Catalog>
+            <CommonModule>Проба</CommonModule>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+
+    const BOOLEAN_SLOT_CATALOG_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Catalog uuid="00000000-0000-0000-0000-000000000002">
+        <Properties>
+            <Name>Товары</Name>
+            <Hierarchical>true</Hierarchical>
+            <CodeLength>9</CodeLength>
+            <DescriptionLength>100</DescriptionLength>
+        </Properties>
+    </Catalog>
+</MetaDataObject>"#;
+
+    const BOOLEAN_SLOT_MODULE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000008">
+        <Properties>
+            <Name>Проба</Name>
+            <Server>true</Server>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#;
+
+    fn boolean_slot_mismatches(body: &str) -> (String, Vec<crate::Diagnostic>) {
+        let source = format!("Процедура Тест()\n{body}КонецПроцедуры\n");
+        let files = [
+            ("Configuration.xml", BOOLEAN_SLOT_CONFIGURATION_XML),
+            ("Catalogs/Товары.xml", BOOLEAN_SLOT_CATALOG_XML),
+            ("CommonModules/Проба.xml", BOOLEAN_SLOT_MODULE_XML),
+            (BOOLEAN_SLOT_MODULE, source.as_str()),
+        ];
+        let found = check_config_files(&files, BOOLEAN_SLOT_MODULE)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::TypeMismatch)
+            .collect();
+        (source, found)
+    }
+
+    #[test]
+    fn a_number_in_a_boolean_platform_parameter_of_a_manager_method_is_silent() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = boolean_slot_mismatches(
+            "    Первый = Справочники.Товары.НайтиПоКоду(\"001\", 5);\n    \
+             Второй = Справочники.Товары.НайтиПоКоду(\"001\", 0);\n",
+        );
+        expect![[""]].assert_eq(&format_diags(&source, &found));
+    }
+
+    #[test]
+    fn a_number_in_a_boolean_parameter_of_a_global_function_is_silent() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = boolean_slot_mismatches(
+            "    Первый = СтрРазделить(\"a,b\", \",\", 5);\n    \
+             Второй = СтрРазделить(\"a,b\", \",\", 0);\n",
+        );
+        expect![[""]].assert_eq(&format_diags(&source, &found));
+    }
+
+    #[test]
+    fn a_date_and_an_array_in_a_boolean_platform_parameter_are_still_reported() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = boolean_slot_mismatches(
+            "    Первый = Справочники.Товары.НайтиПоКоду(\"001\", ТекущаяДата());\n    \
+             Второй = Справочники.Товары.НайтиПоКоду(\"001\", Новый Массив);\n",
+        );
+        expect![[r#"
+            TypeMismatch @ 2:52..2:65
+              message: Несоответствие типов: ожидалось 'Булево', получено 'ДатаВремя'
+              severity: Major
+            TypeMismatch @ 3:52..3:64
+              message: Несоответствие типов: ожидалось 'Булево', получено 'Массив'
+              severity: Major"#]]
+        .assert_eq(&format_diags(&source, &found));
     }
 
     #[test]
