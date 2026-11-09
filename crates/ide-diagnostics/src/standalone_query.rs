@@ -69,6 +69,7 @@ pub fn validate_query_text(
 /// does not: an alias collision is visible in the query text.
 pub const METADATA_DEPENDENT_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::AmbiguousFieldInQuery,
+    DiagnosticCode::QueryConditionWithoutIndex,
     DiagnosticCode::QueryNestedFieldsByDot,
     DiagnosticCode::QueryOrderByDocumentDate,
     DiagnosticCode::QueryToMissingMetadata,
