@@ -551,11 +551,15 @@ EndProcedure"#,
         assert_eq!(fixture_lines(listed.clone()).len(), 8);
 
         let mut disabled = listed.clone();
-        disabled.apply_cli_filters(&[], &["DeprecatedPlatformApi".to_owned()]);
+        disabled
+            .apply_cli_filters(&[], &["DeprecatedPlatformApi".to_owned()])
+            .expect("a live diagnostic code");
         assert_eq!(fixture_lines(disabled), Vec::<u32>::new(), "the rule is disabled");
 
         let mut only_other = listed;
-        only_other.apply_cli_filters(&["LineLength".to_owned()], &[]);
+        only_other
+            .apply_cli_filters(&["LineLength".to_owned()], &[])
+            .expect("a live diagnostic code");
         assert_eq!(fixture_lines(only_other), Vec::<u32>::new(), "the rule is not enabled");
     }
 

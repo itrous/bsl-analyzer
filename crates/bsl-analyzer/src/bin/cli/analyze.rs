@@ -633,7 +633,12 @@ fn analyze_salsa(
     );
 
     if let Some(ref diag_name) = only_diagnostic {
-        config.apply_cli_filters(std::slice::from_ref(diag_name), &[]);
+        if let Err(message) = config.apply_cli_filters(std::slice::from_ref(diag_name), &[]) {
+            eprintln!("Error: {message}");
+            // Argument misuse is not an analysis failure, and the runtime's Debug print of a
+            // returned error would mangle the multi-line hint.
+            std::process::exit(2);
+        }
     }
 
     config.scope = scope.clone();
