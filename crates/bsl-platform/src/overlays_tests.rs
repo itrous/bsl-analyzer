@@ -1,4 +1,5 @@
 use super::*;
+use crate::snapshot::{AttestedSurfaces, MemberSurface};
 use serde_json::json;
 
 fn base_data() -> Value {
@@ -727,6 +728,89 @@ fn an_attestation_needs_a_dotted_numeric_version() {
         error.to_string(),
         "type member surface attestation 0 verified_against_version must be a dotted numeric version"
     );
+}
+
+fn range_attestation_with_surface(surface: Value) -> Value {
+    let mut attestation = range_attestation();
+    attestation["verified_surface"] = surface;
+    attestation
+}
+
+#[test]
+fn an_attestation_without_verified_surface_attests_both_surfaces() {
+    let attestations = parse_resolved_member_surface_attestations(
+        &range_data(),
+        &attestation_overlay(json!([range_attestation()])),
+    )
+    .unwrap();
+
+    assert_eq!(attestations[0].surfaces, AttestedSurfaces::BOTH);
+    assert!(attestations[0].surfaces.contains(MemberSurface::Methods));
+    assert!(attestations[0].surfaces.contains(MemberSurface::Fields));
+}
+
+#[test]
+fn verified_surface_names_the_surfaces_an_attestation_covers() {
+    for (surface, methods, fields) in [
+        (json!(["methods"]), true, false),
+        (json!(["fields"]), false, true),
+        (json!(["methods", "fields"]), true, true),
+        (json!(["fields", "methods"]), true, true),
+    ] {
+        let attestations = parse_resolved_member_surface_attestations(
+            &range_data(),
+            &attestation_overlay(json!([range_attestation_with_surface(surface.clone())])),
+        )
+        .unwrap();
+
+        assert_eq!(
+            (
+                attestations[0].surfaces.contains(MemberSurface::Methods),
+                attestations[0].surfaces.contains(MemberSurface::Fields)
+            ),
+            (methods, fields),
+            "verified_surface {surface}"
+        );
+    }
+}
+
+/// An empty list, a repeated value, an unknown value and a value that is not
+/// a list at all are each refused at load time, and the error names the type
+/// and the content it refuses, so the author of the entry can find it.
+#[test]
+fn a_malformed_verified_surface_is_rejected_with_the_type_and_the_content() {
+    let prefix =
+        "type member surface attestation 0 (ОбластьЯчеекТабличногоДокумента) verified_surface";
+    for (surface, expected) in [
+        (json!([]), format!("{prefix} must not be empty: omit it to attest both surfaces")),
+        (json!(["methods", "methods"]), format!("{prefix} lists \"methods\" more than once")),
+        (
+            json!(["methods", "fields", "fields"]),
+            format!("{prefix} lists \"fields\" more than once"),
+        ),
+        (
+            json!(["methods", "properties"]),
+            format!(
+                "{prefix} has an unknown value \"properties\", expected \"methods\" or \"fields\""
+            ),
+        ),
+        (
+            json!([1]),
+            format!("{prefix} has an unknown value 1, expected \"methods\" or \"fields\""),
+        ),
+        (
+            json!("methods"),
+            format!("{prefix} must be an array of \"methods\" and \"fields\", got \"methods\""),
+        ),
+    ] {
+        let error = parse_resolved_member_surface_attestations(
+            &range_data(),
+            &attestation_overlay(json!([range_attestation_with_surface(surface.clone())])),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), expected, "verified_surface {surface}");
+    }
 }
 
 #[test]

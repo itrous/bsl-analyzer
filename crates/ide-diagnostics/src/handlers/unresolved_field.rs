@@ -534,6 +534,23 @@ mod tests {
         assert!(unresolved_fields(code).is_empty(), "{:?}", unresolved_fields(code));
     }
 
+    /// The drawings collection of a spreadsheet document is attested for its methods only:
+    /// it addresses its elements by name, so `Рисунки.<имя рисунка>` is a property read the
+    /// platform answers, and the absent-field check must stay silent on it.
+    #[test]
+    fn a_name_read_from_a_methods_only_attested_collection_stays_silent() {
+        let unresolved = unresolved_fields(
+            r#"Процедура Тест()
+    ТабДок = Новый ТабличныйДокумент;
+    Рисунок = ТабДок.Рисунки.Диаграмма1;
+КонецПроцедуры"#,
+        );
+        assert!(
+            unresolved.is_empty(),
+            "an element name of a name-addressed collection is no miss: {unresolved:?}"
+        );
+    }
+
     /// `ТекущаяОбласть` belongs to the spreadsheet document, not to the range it returns.
     /// The range is a platform type whose member surface the curated overlays attest as
     /// complete (`type_member_surface_attestations`), so the miss is a defect of the code
@@ -573,8 +590,10 @@ mod tests {
             // same miss is silent. The control says the silence is that gate and not a
             // corpus that went missing — which is what a failure here would mean.
             assert!(
-                !bsl_platform::PlatformData::instance()
-                    .platform_type_member_surface_verified("ОбластьЯчеекТабличногоДокумента"),
+                !bsl_platform::PlatformData::instance().platform_type_member_surface_verified(
+                    "ОбластьЯчеекТабличногоДокумента",
+                    bsl_platform::MemberSurface::Fields,
+                ),
                 "a corpus without a version must leave the gate shut"
             );
             let unresolved = unresolved_fields(code);
@@ -606,7 +625,10 @@ mod tests {
             "the member the positive test misses must still be absent from the corpus"
         );
         assert!(
-            !data.platform_type_member_surface_verified("ОбластьЯчеекТабличногоДокумента"),
+            !data.platform_type_member_surface_verified(
+                "ОбластьЯчеекТабличногоДокумента",
+                bsl_platform::MemberSurface::Fields
+            ),
             "a corpus without a version must leave the gate shut"
         );
 

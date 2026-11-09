@@ -107,7 +107,7 @@ pub struct PlatformDataInner {
     /// may be treated as closed receivers: for any other type the extract is
     /// not known to list every member, and a member missing from it proves
     /// nothing about the platform.
-    member_surface_versions: FxHashMap<SmolStr, Vec<u32>>,
+    member_surface_versions: FxHashMap<SmolStr, (Vec<u32>, crate::snapshot::AttestedSurfaces)>,
     /// The served corpus's own platform release, parsed once: the gate above
     /// compares it on every member miss, and re-reading the origin string there
     /// would parse it again per miss.
@@ -203,7 +203,10 @@ impl PlatformDataInner {
             .and_then(|origin| origin.platform_version.as_deref())
             .and_then(crate::overlays::parse_version);
 
-        let mut member_surface_versions: FxHashMap<SmolStr, Vec<u32>> = FxHashMap::default();
+        let mut member_surface_versions: FxHashMap<
+            SmolStr,
+            (Vec<u32>, crate::snapshot::AttestedSurfaces),
+        > = FxHashMap::default();
         for attestation in &member_surface_attestations {
             let Some(version) =
                 crate::overlays::parse_version(&attestation.verified_against_version)
@@ -223,7 +226,7 @@ impl PlatformDataInner {
             // ([`Self::platform_type_member_surface_verified`]).
             for alias in [&ty.name, &ty.english_name] {
                 let folded: SmolStr = alias.fold_lower().into();
-                member_surface_versions.insert(folded, version.clone());
+                member_surface_versions.insert(folded, (version.clone(), attestation.surfaces));
             }
         }
 
@@ -429,10 +432,13 @@ impl PlatformDataInner {
         self.ambiguous_type_names.contains(&key)
     }
 
-    /// Whether the curated overlays attest that the extracted member surface of
-    /// the type `name` names is complete — that is, that the served corpus
-    /// lists every method and property the type has, so a member absent from it
-    /// is absent from the platform too.
+    /// Whether the curated overlays attest that the extracted `surface` of the
+    /// type `name` names is complete — that is, that the served corpus lists
+    /// every method (or every property) the type has, so a member of that kind
+    /// absent from it is absent from the platform too. The surface is the
+    /// caller's to name: an attestation may cover the methods alone, for a type
+    /// whose properties are open (a collection answers an element name as a
+    /// property).
     ///
     /// Two facts must hold beyond the attestation itself, and both fail closed:
     /// the served corpus has to be of the attested release or newer (a member
@@ -440,14 +446,21 @@ impl PlatformDataInner {
     /// corpus of an unknown version proves nothing either way), and the name
     /// must denote a single type (the member surface of an arbitrary namesake
     /// answers for the wrong one).
-    pub fn platform_type_member_surface_verified(&self, name: &str) -> bool {
+    pub fn platform_type_member_surface_verified(
+        &self,
+        name: &str,
+        surface: crate::snapshot::MemberSurface,
+    ) -> bool {
         if self.is_ambiguous_type_name(name) {
             return false;
         }
         let key: SmolStr = name.fold_lower().into();
-        let Some(attested) = self.member_surface_versions.get(&key) else {
+        let Some((attested, surfaces)) = self.member_surface_versions.get(&key) else {
             return false;
         };
+        if !surfaces.contains(surface) {
+            return false;
+        }
         match self.served_platform_version.as_deref() {
             Some(active) => version_at_least(active, attested),
             None => false,

@@ -927,10 +927,32 @@ mod tests {
             // same call is silent. The control says the silence is that gate and not a
             // corpus that went missing.
             assert!(
-                !bsl_platform::PlatformData::instance()
-                    .platform_type_member_surface_verified("JSONWriter"),
+                !bsl_platform::PlatformData::instance().platform_type_member_surface_verified(
+                    "JSONWriter",
+                    bsl_platform::MemberSurface::Methods,
+                ),
                 "a corpus without a version must leave the gate shut"
             );
+            assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
+        }
+    }
+
+    /// A collection that addresses its elements by name is attested for its methods only:
+    /// a call the collection does not have is reported, where the element name read
+    /// from it (see the field handler's test) is not.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn a_miss_on_a_methods_only_attested_collection_is_reported() {
+        let umc = platform_umc(
+            "Процедура Тест()\n    ТабДок = Новый ТабличныйДокумент;\n    Рисунок = ТабДок.Рисунки.Найти(\"Р\");\n    Число = ТабДок.Рисунки.Количество();\nКонецПроцедуры",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(umc.len(), 1, "expected one UnresolvedMethodCall, got: {umc:?}");
+            assert!(umc[0].contains("Найти"), "message must name the method: {umc:?}");
+        } else {
             assert!(umc.is_empty(), "an unknown platform version keeps the miss silent: {umc:?}");
         }
     }
@@ -956,7 +978,10 @@ mod tests {
             "the method the positive test misses must still be absent from the corpus"
         );
         assert!(
-            !data.platform_type_member_surface_verified("JSONWriter"),
+            !data.platform_type_member_surface_verified(
+                "JSONWriter",
+                bsl_platform::MemberSurface::Methods
+            ),
             "a corpus without a version must leave the gate shut"
         );
 

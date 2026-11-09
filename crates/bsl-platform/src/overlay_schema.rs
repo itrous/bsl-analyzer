@@ -99,6 +99,8 @@ pub(crate) struct TypeMemberSurfaceAttestation {
     /// The platform release the surface was verified against, `8.3.27` — the
     /// check runs only where the served corpus is of that version or newer.
     pub(crate) verified_against_version: String,
+    /// The surfaces the attestation covers: `verified_surface`, both when absent.
+    pub(crate) surfaces: crate::snapshot::AttestedSurfaces,
 }
 
 const OVERLAY_ROOT_FIELDS: &[&str] = &[
@@ -415,10 +417,11 @@ fn parse_member_surface_attestation(
         entry.as_object().ok_or_else(|| OverlayError(format!("{context} must be an object")))?;
     require_only_fields(
         object,
-        &["type", "verified_against_version", "evidence_source", "rationale"],
+        &["type", "verified_against_version", "verified_surface", "evidence_source", "rationale"],
         &context,
     )?;
     let type_name = required_string(object, "type", index)?;
+    let surfaces = parse_verified_surface(object, &type_name, &context)?;
     let verified_against_version = required_string(object, "verified_against_version", index)?;
     match parse_version(&verified_against_version) {
         // A release, not a version line: `8` or `8.3` would stand for every
@@ -439,7 +442,48 @@ fn parse_member_surface_attestation(
     required_string(object, "evidence_source", index)?;
     required_string(object, "rationale", index)?;
 
-    Ok(TypeMemberSurfaceAttestation { type_name, verified_against_version })
+    Ok(TypeMemberSurfaceAttestation { type_name, verified_against_version, surfaces })
+}
+
+/// The optional `verified_surface`: a non-empty list of `"methods"` and
+/// `"fields"`, each at most once. Absent, both surfaces are attested, which
+/// keeps the entries written before the field existed as they were.
+fn parse_verified_surface(
+    object: &Map<String, Value>,
+    type_name: &str,
+    context: &str,
+) -> Result<crate::snapshot::AttestedSurfaces, OverlayError> {
+    let Some(value) = object.get("verified_surface") else {
+        return Ok(crate::snapshot::AttestedSurfaces::BOTH);
+    };
+    let items = value.as_array().ok_or_else(|| {
+        OverlayError(format!(
+            "{context} ({type_name}) verified_surface must be an array of \"methods\" and \"fields\", got {value}"
+        ))
+    })?;
+    if items.is_empty() {
+        return Err(OverlayError(format!(
+            "{context} ({type_name}) verified_surface must not be empty: omit it to attest both surfaces"
+        )));
+    }
+    let (mut methods, mut fields) = (false, false);
+    for item in items {
+        let seen = match item.as_str() {
+            Some("methods") => &mut methods,
+            Some("fields") => &mut fields,
+            _ => {
+                return Err(OverlayError(format!(
+                    "{context} ({type_name}) verified_surface has an unknown value {item}, expected \"methods\" or \"fields\""
+                )))
+            }
+        };
+        if std::mem::replace(seen, true) {
+            return Err(OverlayError(format!(
+                "{context} ({type_name}) verified_surface lists {item} more than once"
+            )));
+        }
+    }
+    Ok(crate::snapshot::AttestedSurfaces::from_flags(methods, fields))
 }
 
 fn validate_schema_version(object: &Map<String, Value>) -> Result<(), OverlayError> {

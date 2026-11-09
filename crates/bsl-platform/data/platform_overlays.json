@@ -333,6 +333,20 @@
       "verified_against_version": "8.3.27",
       "evidence_source": "The pinned 8.3.27 corpus documents РежимДиалогаВопрос / QuestionDialogMode as a system enumeration with exactly 6 values (ids 3107-3112: ПрерватьПовторитьПропустить, ОК, ОКОтмена, ПовторитьОтмена, ДаНет, ДаНетОтмена) and no method; platform_facts.json holds exactly these records. The type is not among the corpus types without members, its name is unique, and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it. A live run on 8.3.17.1549 and 8.3.27.2214 answers `РежимДиалогаВопрос.НетТакогоЗначения` with «Поле объекта не обнаружено (НетТакогоЗначения)», while each of the listed values works.",
       "rationale": "A system enumeration has no members beyond its values, so the extracted list is the platform's own value set and a miss on it fails at run time. Attesting it lets the absent-field check judge the enumeration read by its global name, where before the receiver was open."
+    },
+    {
+      "type": "SpreadsheetDocumentDrawingCollection",
+      "verified_against_version": "8.3.27",
+      "verified_surface": ["methods"],
+      "evidence_source": "The pinned 8.3.27 corpus documents КоллекцияРисунковТабличногоДокумента / SpreadsheetDocumentDrawingCollection with exactly 6 methods (ids 6355-6360: Удалить, Очистить, Получить, Количество, Добавить, Индекс) and no property; platform_facts.json holds exactly these records. The type is not among the corpus types without members, its name is unique, and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it. The collection addresses its elements by name, so an element name is answered as a property, which is why only the method surface is attested. A live run on 8.3.17.1549 and 8.3.27.2214 finds no method `Найти` on the collection, measured live, while `ТабДок.Рисунки.<имя рисунка>` resolves to the drawing of that name.",
+      "rationale": "The collection has no property of its own, and a name read from it is the name of an element, not a miss in the extract: attesting the property surface would make the absent-field check report every element name. The method list is the platform's own, so a call like `Рисунки.Найти(...)` is a call the platform does not answer, and the method-miss check may say so. The field surface is deliberately left unattested."
+    },
+    {
+      "type": "StandardAttributeDescriptions",
+      "verified_against_version": "8.3.27",
+      "verified_surface": ["methods"],
+      "evidence_source": "The pinned 8.3.27 corpus documents ОписанияСтандартныхРеквизитов / StandardAttributeDescriptions with exactly one method (id 5746: Количество) and no property; platform_facts.json holds exactly this record. The type is not among the corpus types without members, its name is unique, and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it. The collection addresses its elements by name, so an element name is answered as a property, which is why only the method surface is attested. A live run on 8.3.17.1549 and 8.3.27.2214 finds no method `Найти` on the collection, measured live, while `<объект>.СтандартныеРеквизиты.<имя реквизита>` resolves to the description of that attribute.",
+      "rationale": "The collection has no property of its own, and a name read from it is the name of a standard attribute, not a miss in the extract: attesting the property surface would make the absent-field check report every attribute name. The single method is the platform's own surface, so a call such as `СтандартныеРеквизиты.Найти(...)` is a call the platform does not answer, and the method-miss check may say so. The field surface is deliberately left unattested."
     }
   ]
 }
