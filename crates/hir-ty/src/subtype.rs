@@ -381,6 +381,16 @@ pub fn is_coercible_to(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool 
     if matches!(db.lookup_type(to), TypeKind::String(_)) {
         return true;
     }
+    // A number in a Boolean slot is converted by the platform: measured on 8.3.27.2214
+    // against two platform methods (a manager's FindByCode, СтрРазделить), both accept
+    // 0 and 5. Argument-position policy only, NOT subtype truth: a number is not a
+    // Boolean in the lattice, so is_assignable keeps them apart. Number only: how
+    // strictly a Boolean slot treats other types differs from method to method.
+    if matches!(db.lookup_type(from), TypeKind::Number(_))
+        && matches!(db.lookup_type(to), TypeKind::Boolean)
+    {
+        return true;
+    }
     // СообщитьПользователю and friends document the parameter as ЛюбаяСсылка
     // yet are canonically called with ЭтотОбъект — БСП resolves the object to
     // its ref internally. Argument-position policy only: in the lattice an
