@@ -5147,7 +5147,7 @@ impl<'db> InferenceContext<'db> {
                         },
                     });
                 }
-                if self.loop_depth > 0 && !self.is_call_name_shadowed(&name) {
+                if self.loop_depth > 0 {
                     // `СтрШаблон` takes the template first; every later argument is printed.
                     let first_printed = if crate::method_lookup::is_platform_name_str(
                         name.as_str(),
@@ -5165,7 +5165,9 @@ impl<'db> InferenceContext<'db> {
                         None
                     };
                     if let Some(first) = first_printed {
-                        if self.platform_read_call_is_resolved(callee, true) {
+                        if !self.is_call_name_shadowed(&name)
+                            && self.platform_read_call_is_resolved(callee, true)
+                        {
                             for &arg in args.iter().skip(first) {
                                 if self
                                     .expr_types
