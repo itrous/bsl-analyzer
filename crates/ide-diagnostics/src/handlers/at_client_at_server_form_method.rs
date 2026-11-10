@@ -24,7 +24,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     tags: &[MetadataTag::Error, MetadataTag::Suspicious],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
-    lsp_severity_override: "",
+    lsp_severity_override: "warning",
 };
 
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
@@ -127,10 +127,10 @@ mod tests {
         expect![[r#"
             AtClientAtServerFormMethod @ 2:11..2:25
               message: Метод формы с директивой &НаКлиентеНаСервере недоступен ни клиенту, ни серверу — вызвать его нельзя ниоткуда
-              severity: Critical
+              severity: Warning
             AtClientAtServerFormMethod @ 6:9..6:21
               message: Метод формы с директивой &НаКлиентеНаСервере недоступен ни клиенту, ни серверу — вызвать его нельзя ниоткуда
-              severity: Critical"#]].assert_eq(&format_diags(code, &diagnostics));
+              severity: Warning"#]].assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]
