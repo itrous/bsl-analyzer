@@ -62,6 +62,7 @@ pub mod fields_from_joins_without_is_null;
 pub mod file_system_access;
 pub mod forbidden_metadata_name;
 pub mod form_data_to_value;
+pub mod form_event_handler_directive;
 pub mod full_outer_join_query;
 pub mod function_name_starts_with_get;
 pub mod function_out_parameter;
@@ -383,6 +384,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::AtClientAtServerFormMethod => {
             Some(&at_client_at_server_form_method::METADATA)
         }
+        DiagnosticCode::FormEventHandlerDirective => Some(&form_event_handler_directive::METADATA),
         DiagnosticCode::StyleElementConstructors => Some(&style_element_constructors::METADATA),
         DiagnosticCode::DeprecatedPlatformApi => Some(&deprecated_platform_api::METADATA),
         DiagnosticCode::DeprecatedMethodCall => Some(&deprecated_method_call::METADATA),
