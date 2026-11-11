@@ -644,6 +644,57 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
+    /// The member surface of the attribute description is attested at 8.3.27, so a member
+    /// the platform does not have is a defect of the code. The verdict is of a known release:
+    /// a versionless corpus keeps the gate shut by contract, and the member is then silent.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn an_unknown_member_of_an_attribute_description_is_reported() {
+        let found = description_misses(
+            "    А = Метаданные.Справочники.Товары.Реквизиты.Артикул.ИспользованиеРеквизита;
+                 Описание = Метаданные.Справочники.Товары.Реквизиты.Артикул;
+                 Б = Описание.НетТакогоПоляВовсе;
+",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(found.len(), 2, "{found:?}");
+            assert!(found[0].contains("'ИспользованиеРеквизита'"), "{found:?}");
+            assert!(found[0].contains("ОбъектМетаданных: Реквизит"), "{found:?}");
+            assert!(found[1].contains("'НетТакогоПоляВовсе'"), "{found:?}");
+        } else {
+            assert!(
+                found.is_empty(),
+                "an unknown platform version keeps the miss silent: {found:?}"
+            );
+        }
+    }
+
+    /// The ten members the corpus scan found on attribute descriptions, in both spellings
+    /// of the type's own members, resolve silently: each is a member of the extract.
+    #[test]
+    fn each_member_the_corpus_uses_on_an_attribute_description_resolves_silently() {
+        let found = description_misses(
+            "    Описание = Метаданные.Справочники.Товары.Реквизиты.Артикул;
+                 А = Описание.Тип;
+                 Б = Описание.ПараметрыВыбора;
+                 В = Описание.Имя;
+                 Г = Описание.Подсказка;
+                 Д = Описание.Синоним;
+                 Е = Описание.ЗначениеЗаполнения;
+                 Ж = Описание.ПолноеИмя();
+                 З = Описание.Представление();
+                 И = Описание.СвязиПараметровВыбора;
+                 К = Описание.МаксимальноеЗначение;
+                 Л = Описание.Использование;
+                 М = Описание.Name;
+",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
     #[test]
     fn an_unknown_object_name_gives_no_finding_on_its_attribute_access() {
         // The missing catalog is the one finding; its attributes are not judged. A name
