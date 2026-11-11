@@ -2,6 +2,7 @@
 //! target: each file a module, so the crate links one test binary instead of one per file.
 
 mod ambiguous_field_in_query;
+mod at_client_at_server_form_method;
 mod bilingual_parity;
 mod builtin_function_name_as_declaration;
 mod common_attributes_in_query;

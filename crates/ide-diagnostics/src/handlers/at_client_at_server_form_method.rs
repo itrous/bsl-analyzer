@@ -185,4 +185,46 @@ mod tests {
         metadata.form = None;
         assert!(run(metadata, code).is_empty());
     }
+
+    #[test]
+    fn managed_common_form_flags_the_name_with_and_without_a_call() {
+        const MODULE: &str = "CommonForms/Общая/Ext/Form/Module.bsl";
+        const CONFIG: &str = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Configuration uuid="00000000-0000-0000-0000-000000000000">
+        <Properties><Name>TestConfiguration</Name></Properties>
+    </Configuration>
+</MetaDataObject>"#;
+        const DESCRIPTOR: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <CommonForm uuid="00000000-0000-0000-0000-000000000040">
+        <Properties>
+            <Name>Общая</Name>
+            <FormType>Managed</FormType>
+        </Properties>
+    </CommonForm>
+</MetaDataObject>"#;
+        const FORM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20"></Form>"#;
+        let called = "&НаСервере\nПроцедура Пересчитать()\n    Общая();\nКонецПроцедуры\n\n\
+                      &НаКлиентеНаСервере\nПроцедура Общая()\nКонецПроцедуры\n";
+        let not_called = "&НаКлиентеНаСервере\nФункция Сумма()\n    Возврат 1;\nКонецФункции\n";
+
+        for (source, name) in [(called, "Общая"), (not_called, "Сумма")] {
+            let found = crate::test_utils::check_config_files(
+                &[
+                    ("Configuration.xml", CONFIG),
+                    ("CommonForms/Общая.xml", DESCRIPTOR),
+                    ("CommonForms/Общая/Ext/Form.xml", FORM_XML),
+                    (MODULE, source),
+                ],
+                MODULE,
+            )
+            .into_iter()
+            .filter(|d| d.code == crate::DiagnosticCode::AtClientAtServerFormMethod)
+            .collect::<Vec<_>>();
+            assert_eq!(found.len(), 1, "{source}");
+            assert_eq!(&source[found[0].range], name);
+            assert_eq!(found[0].severity, crate::Severity::Warning);
+        }
+    }
 }
