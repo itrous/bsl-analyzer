@@ -262,8 +262,12 @@ impl<'a> DocumentedValues<'a> {
                 CandidateProvenance::UserMethod(id) => {
                     self.db.interface_method(MethodId::from(id)).is_some_and(|decl| {
                         decl.is_function
-                            && crate::method_resolution::materialise_signature(self.db, &decl).ret
-                                != self.db.unknown()
+                            && crate::method_resolution::materialise_signature(
+                                self.db,
+                                &decl,
+                                self.db.map_key_types_enabled(),
+                            )
+                            .ret != self.db.unknown()
                     })
                 }
                 CandidateProvenance::PlatformMethod { .. }

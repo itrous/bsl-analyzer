@@ -285,6 +285,7 @@ impl RootDatabaseImpl {
         let defaults = project_model::FeaturesConfig::default();
         let _ = FeaturesInput::builder(
             defaults.type_narrowing,
+            defaults.map_key_types,
             hir::execution_env::EnvOptions::default(),
             None,
             None,
@@ -2771,6 +2772,16 @@ impl RootDatabaseImpl {
         input.set_type_narrowing(self).to(enabled);
     }
 
+    pub fn map_key_types_enabled(&self) -> bool {
+        self.features().map_key_types(self)
+    }
+
+    pub fn set_map_key_types_enabled(&mut self, enabled: bool) {
+        use salsa::Setter;
+        let input = self.features();
+        input.set_map_key_types(self).to(enabled);
+    }
+
     pub fn env_options(&self) -> hir::execution_env::EnvOptions {
         self.features().env_options(self)
     }
@@ -3691,6 +3702,10 @@ impl hir::HirDatabase for RootDatabaseImpl {
 
     fn type_narrowing_enabled(&self) -> bool {
         RootDatabaseImpl::type_narrowing_enabled(self)
+    }
+
+    fn map_key_types_enabled(&self) -> bool {
+        RootDatabaseImpl::map_key_types_enabled(self)
     }
 
     fn env_options(&self) -> hir::execution_env::EnvOptions {

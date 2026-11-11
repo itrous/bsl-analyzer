@@ -810,6 +810,30 @@ CommentedCode = false
 такая находка указывает на код, который не скомпилируется во внешнем соединении к
 клиент-серверной базе.
 
+### `[features]`
+
+Флаги возможностей анализа. Ключи пишутся в camelCase, snake_case-алиасы тоже принимаются.
+
+```toml
+[features]
+typeNarrowing = true
+mapKeyTypes = true
+workspaceDiagnostics = "off"
+checkedEnvironments = ["ТонкийКлиент", "Сервер"]
+```
+
+- `typeNarrowing` (`type_narrowing`), по умолчанию `true` — сужение типов по проверкам в коде.
+- `mapKeyTypes` (`map_key_types`), по умолчанию `true` — тип результата
+  `Соответствие.Получить("ключ")` по конструктору и записям `Вставить` в теле и по пунктам с
+  ключами в кавычках в документирующем комментарии. `false` возвращает прежний тип результата
+  (`Неопределено` на встроенных фактах) и прежние находки. Условия и пределы — в
+  [`docs/features/MAP_KEY_TYPES.md`](../features/MAP_KEY_TYPES.md).
+- `workspaceDiagnostics` (`workspace_diagnostics`): `off` (по умолчанию), `extensions`, `all`.
+- `checkedEnvironments` (`checked_environments`) — среды исполнения, для которых диагностики
+  доступности сообщают о нарушениях; без ключа — набор по умолчанию.
+
+В JSON-конфигах ключ пишется так же: `"features": { "mapKeyTypes": false }`.
+
 ### `[code_lens]`
 
 Поддерживаются два булевых флага:

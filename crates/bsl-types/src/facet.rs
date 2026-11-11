@@ -198,6 +198,9 @@ pub struct ArrayFacet {
 pub struct MapFacet {
     pub key: Option<TypeId>,
     pub value: Option<TypeId>,
+    /// Value types of known string keys, documented as quoted key items; `None` for a map whose
+    /// keys are unknown. Display ignores it: a keyed map is still shown as `Соответствие`.
+    pub entries: Option<Arc<crate::kind::Projection>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
