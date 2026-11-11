@@ -292,6 +292,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     (DiagnosticCode::ScheduledJobHandler, "metadata scheduled-job handler diagnostic"),
     (DiagnosticCode::ServerCallsInFormEvents, "metadata form event/cross-module diagnostic"),
     (DiagnosticCode::ServerSideExportFormMethod, "form module export policy"),
+    (
+        DiagnosticCode::AtClientAtServerFormMethod,
+        "checks a method's compilation directive in a form module; no BSL identifier lookup",
+    ),
     (DiagnosticCode::SetPermissionsForNewObjects, "metadata managed-application policy"),
     (
         DiagnosticCode::TransferringParametersBetweenClientAndServer,
@@ -756,7 +760,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 219, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 220, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

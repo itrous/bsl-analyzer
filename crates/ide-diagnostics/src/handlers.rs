@@ -1,6 +1,7 @@
 pub mod all_function_path_must_have_return;
 pub mod ambiguous_field_in_query;
 pub mod assign_alias_fields_in_query;
+pub mod at_client_at_server_form_method;
 pub mod bad_words;
 pub mod begin_transaction_before_try_catch;
 pub mod builtin_function_name_as_declaration;
@@ -374,6 +375,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::DeletingCollectionItem => Some(&deleting_collection_item::METADATA),
         DiagnosticCode::SelfInsertion => Some(&self_insertion::METADATA),
         DiagnosticCode::SeveralCompilerDirectives => Some(&several_compiler_directives::METADATA),
+        DiagnosticCode::AtClientAtServerFormMethod => {
+            Some(&at_client_at_server_form_method::METADATA)
+        }
         DiagnosticCode::StyleElementConstructors => Some(&style_element_constructors::METADATA),
         DiagnosticCode::DeprecatedPlatformApi => Some(&deprecated_platform_api::METADATA),
         DiagnosticCode::DeprecatedMethodCall => Some(&deprecated_method_call::METADATA),

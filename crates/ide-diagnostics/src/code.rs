@@ -99,6 +99,7 @@ pub enum DiagnosticCode {
     DeletingCollectionItem,
     SelfInsertion,
     SeveralCompilerDirectives,
+    AtClientAtServerFormMethod,
     StyleElementConstructors,
     DeprecatedPlatformApi,
     DeprecatedMethodCall,

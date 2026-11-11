@@ -134,6 +134,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::DeletingCollectionItem => &[],
         DiagnosticCode::SelfInsertion => &[],
         DiagnosticCode::SeveralCompilerDirectives => &[],
+        DiagnosticCode::AtClientAtServerFormMethod => &[],
         DiagnosticCode::StyleElementConstructors => &[667],
         DiagnosticCode::DeprecatedPlatformApi => &[],
         DiagnosticCode::DeprecatedMethodCall => &[453],
