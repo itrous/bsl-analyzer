@@ -208,6 +208,60 @@ fn bare_kind_parameter_is_narrowed_only_for_a_concrete_receiver() {
     assert_eq!(known_receiver.as_slice()[0].params[1].ty, db.unknown());
 }
 
+#[test]
+fn object_kind_parameter_is_not_narrowed_but_reference_kind_is() {
+    use super::ParamReceiver;
+    use bsl_types::kind::ConfigId;
+    use bsl_types::testing::RootConfigCtx;
+    use hir_def::ty::MetadataKind;
+
+    let db = InMemoryDb::new();
+    // `УстановитьСсылкуНового` of a chart of accounts is declared with an OBJECT
+    // kind name in the platform data (method id 659), of a catalog with a
+    // reference kind name; it takes a reference on both.
+    let method = |param_type: &str| PlatformMethod {
+        id: 11,
+        type_name: "ChartOfAccountsObject".into(),
+        name: "УстановитьСсылкуНового".into(),
+        english_name: "SetNewObjectRef".into(),
+        return_type: None,
+        parameters: vec![MethodParam {
+            name: "Ссылка".into(),
+            param_type: Some(param_type.into()),
+            is_optional: false,
+            is_variadic: false,
+        }],
+        variants: Vec::new(),
+        min_version: None,
+        context: None,
+    };
+    let name = Name::new("Хозрасчетный");
+    let receiver = ParamReceiver {
+        mdo_type: MdoType::ChartOfAccounts,
+        name: &name,
+        config_id: &ConfigId::Root,
+    };
+    let param_ty = |param_type: &str| {
+        CallCandidateSet::from_platform_method(
+            &db,
+            &method(param_type),
+            db.undefined(),
+            Some(receiver),
+        )
+        .as_slice()[0]
+            .params[0]
+            .ty
+    };
+
+    assert_eq!(param_ty("ПланСчетовОбъект"), db.unknown());
+    let own_ref = db.metadata_ref(
+        MetadataKind::ChartOfAccountsRef,
+        "Хозрасчетный".to_string(),
+        &RootConfigCtx,
+    );
+    assert_eq!(param_ty("ПланСчетовСсылка"), db.union(vec![own_ref, db.undefined()]));
+}
+
 include!("tests/applicability.rs");
 include!("tests/arity.rs");
 include!("tests/rejections.rs");

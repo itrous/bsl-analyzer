@@ -3,7 +3,7 @@ use bsl_platform::{MethodParam, PlatformMethod};
 use bsl_types::builders::Builders;
 use bsl_types::facet::{ArgArity, FunctionFacet};
 use bsl_types::intern::TypeKernelDb;
-use bsl_types::kind::{ConfigId, TypeId};
+use bsl_types::kind::{ConfigId, TypeId, TypeKind};
 use hir_def::execution_env::EnvFlags;
 use hir_def::module_interface::MethodDecl;
 use hir_def::ty::FunctionSignature;
@@ -156,6 +156,13 @@ fn names_a_reference_of_the_receiver(param_name: &str) -> bool {
 }
 
 impl PlatformCandidateContext<'_> {
+    fn is_reference_kind(&self, ty: TypeId) -> bool {
+        matches!(
+            self.db.lookup_type(ty),
+            TypeKind::MetadataRef(facet) if facet.kind.ref_mdo_type().is_some()
+        )
+    }
+
     fn lower_param_type(&self, param_name: &str, raw: &str) -> TypeId {
         // Only a concrete receiver can say which object a bare kind name stands
         // for; without one the slot stays as permissive as the plain lowering.
@@ -165,13 +172,24 @@ impl PlatformCandidateContext<'_> {
                 && names_a_reference_of_the_receiver(param_name)
             {
                 let bare = lower_platform_type_name_typeid(self.db, raw.trim());
-                if let Some(narrowed) = specialize_self_ref_ty(
+                // `specialize_self_ref_ty` also maps a name to the receiver's OBJECT
+                // kind; this check judges REFERENCE arguments only, so an object-kind
+                // result is dropped here (and the property caller stays untouched).
+                // The platform data itself declares the slot inconsistently:
+                // `УстановитьСсылкуНового` takes `СправочникСсылка`, `ДокументСсылка`
+                // and so on on seven receivers, but `ПланСчетовОбъект` (method id 659)
+                // and `ЗадачаОбъект` (id 1067) on two, though it takes a reference on
+                // all of them. The corpus happens never to call it there; that is luck,
+                // which is why this predicate, not the corpus, has to be right.
+                let narrowed = specialize_self_ref_ty(
                     self.db,
                     receiver.mdo_type,
                     receiver.name,
                     receiver.config_id,
                     bare,
-                ) {
+                )
+                .filter(|&ty| self.is_reference_kind(ty));
+                if let Some(narrowed) = narrowed {
                     // The platform accepts `Неопределено` where it takes a reference.
                     return self.db.union(vec![narrowed, self.db.undefined()]);
                 }
