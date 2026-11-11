@@ -170,6 +170,7 @@ pub enum DiagnosticCode {
     ScheduledJobHandler,
     ServerCallsInFormEvents,
     ServerSideExportFormMethod,
+    UnboundFormEventHandler,
     SetPermissionsForNewObjects,
     SetPrivilegedMode,
     TransferringParametersBetweenClientAndServer,

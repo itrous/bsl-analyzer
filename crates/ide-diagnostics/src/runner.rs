@@ -54,6 +54,7 @@ const MODULE_BODIES_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::DataExchangeLoading,
     DiagnosticCode::TransferringParametersBetweenClientAndServer,
     DiagnosticCode::UnusedLocalMethod,
+    DiagnosticCode::UnboundFormEventHandler,
 ];
 
 const CONFIGURATION_DIAGNOSTICS: &[DiagnosticCode] = &[
@@ -311,6 +312,11 @@ pub fn collect_module_bodies_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagno
         "UnusedLocalMethod",
         ctx,
         handlers::unused_local_method::check,
+    ));
+    diagnostics.extend(run_diagnostic(
+        "UnboundFormEventHandler",
+        ctx,
+        handlers::unbound_form_event_handler::check,
     ));
     diagnostics.extend(run_diagnostic(
         "ServerCallsInFormEvents",

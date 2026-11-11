@@ -51,6 +51,89 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let item_tree = ctx.item_tree();
 
+    let Some(called_methods) = collect_called_methods(ctx, true) else {
+        return Vec::new();
+    };
+
+    let mut diagnostics = Vec::new();
+
+    // A declaration `UnboundFormEventHandler` reports says something more precise about the
+    // same defect: one declaration must not carry two findings.
+    let unbound: Vec<TextRange> =
+        super::unbound_form_event_handler::check(ctx).into_iter().map(|d| d.range).collect();
+
+    let owner = peh::ModuleOwner {
+        module_type: metadata.module_type,
+        mdo_type: metadata.mdo.as_ref().map(|mdo| mdo.mdo_type),
+    };
+
+    // What the fix needs - the tree and every string literal of the module - is
+    // gathered only for a surface that shows fixes: it walks the whole module.
+    let fix_facts = ctx.config.quick_fixes.then(|| {
+        let root = ctx.parse().syntax_node();
+        let string_literals = string_literal_texts(&root);
+        (root, string_literals)
+    });
+
+    for (_, proc) in item_tree.procedures() {
+        if unbound.contains(&proc.name_range) {
+            continue;
+        }
+        if let Some(mut diag) = check_method_unused(
+            &proc.name,
+            proc.name_range,
+            proc.is_export,
+            &proc.annotations,
+            &attachable_prefixes,
+            &called_methods,
+            owner,
+            code,
+            ctx,
+        ) {
+            if let Some((root, string_literals)) = &fix_facts {
+                diag.fixes =
+                    remove_method_fix(root, proc.source_range, &proc.name, string_literals);
+            }
+            diagnostics.push(diag);
+        }
+    }
+
+    for (_, func) in item_tree.functions() {
+        if unbound.contains(&func.name_range) {
+            continue;
+        }
+        if let Some(mut diag) = check_method_unused(
+            &func.name,
+            func.name_range,
+            func.is_export,
+            &func.annotations,
+            &attachable_prefixes,
+            &called_methods,
+            owner,
+            code,
+            ctx,
+        ) {
+            if let Some((root, string_literals)) = &fix_facts {
+                diag.fixes =
+                    remove_method_fix(root, func.source_range, &func.name, string_literals);
+            }
+            diagnostics.push(diag);
+        }
+    }
+
+    diagnostics
+}
+
+/// Every name the module is known to reach: calls, notification and wait-handler
+/// registrations, form bindings, name literals. `None` when the form bindings are unknown.
+/// `member_calls_count` decides whether a method name called on another module or manager
+/// counts as a use of the local method of that name: true for `UnusedLocalMethod`, false
+/// where only local reachability is meant.
+pub(crate) fn collect_called_methods(
+    ctx: &DiagnosticsContext,
+    member_calls_count: bool,
+) -> Option<FxHashSet<String>> {
+    let metadata = ctx.module_metadata();
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
 
@@ -73,14 +156,20 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             // — so the local procedure sharing that name is reachable even
             // though the module contains no bare call to it. Matching by name is
             // the only signal available without cross-module flow.
-            hir::call_graph::CallTarget::QualifiedModule { method_name, .. }
-            | hir::call_graph::CallTarget::ThisObjectMethod { method_name } => {
+            hir::call_graph::CallTarget::QualifiedModule { method_name, .. } => {
+                if member_calls_count {
+                    called_methods.insert(method_name.as_str().fold_lower());
+                }
+            }
+            hir::call_graph::CallTarget::ThisObjectMethod { method_name } => {
                 called_methods.insert(method_name.as_str().fold_lower());
             }
             hir::call_graph::CallTarget::ManagerAccess {
                 method_name: Some(method_name), ..
             } => {
-                called_methods.insert(method_name.as_str().fold_lower());
+                if member_calls_count {
+                    called_methods.insert(method_name.as_str().fold_lower());
+                }
             }
             hir::call_graph::CallTarget::ManagerAccess { method_name: None, .. }
             | hir::call_graph::CallTarget::RegisterMovement { .. }
@@ -135,7 +224,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         // false findings over every handler of the form, so stay silent here and let
         // `OrdinaryFormDialogUnread` say why the check was dropped.
         if form.is_ordinary() && !form.ordinary_dialog_known() {
-            return Vec::new();
+            return None;
         }
         for handler in form.event_handlers() {
             called_methods.insert(handler.handler_name.fold_lower());
@@ -167,62 +256,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         }
     }
 
-    let mut diagnostics = Vec::new();
-
-    let owner = peh::ModuleOwner {
-        module_type: metadata.module_type,
-        mdo_type: metadata.mdo.as_ref().map(|mdo| mdo.mdo_type),
-    };
-
-    // What the fix needs - the tree and every string literal of the module - is
-    // gathered only for a surface that shows fixes: it walks the whole module.
-    let fix_facts = ctx.config.quick_fixes.then(|| {
-        let root = ctx.parse().syntax_node();
-        let string_literals = string_literal_texts(&root);
-        (root, string_literals)
-    });
-
-    for (_, proc) in item_tree.procedures() {
-        if let Some(mut diag) = check_method_unused(
-            &proc.name,
-            proc.name_range,
-            proc.is_export,
-            &proc.annotations,
-            &attachable_prefixes,
-            &called_methods,
-            owner,
-            code,
-            ctx,
-        ) {
-            if let Some((root, string_literals)) = &fix_facts {
-                diag.fixes =
-                    remove_method_fix(root, proc.source_range, &proc.name, string_literals);
-            }
-            diagnostics.push(diag);
-        }
-    }
-
-    for (_, func) in item_tree.functions() {
-        if let Some(mut diag) = check_method_unused(
-            &func.name,
-            func.name_range,
-            func.is_export,
-            &func.annotations,
-            &attachable_prefixes,
-            &called_methods,
-            owner,
-            code,
-            ctx,
-        ) {
-            if let Some((root, string_literals)) = &fix_facts {
-                diag.fixes =
-                    remove_method_fix(root, func.source_range, &func.name, string_literals);
-            }
-            diagnostics.push(diag);
-        }
-    }
-
-    diagnostics
+    Some(called_methods)
 }
 
 /// Deletes the method together with the doc comment directly above it and the rest

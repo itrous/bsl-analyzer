@@ -211,6 +211,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::ServerCallsInFormEvents => &[487, 630],
         // Проверяемое требование — std630 «Правила создания модулей форм»; остальные поясняют контекст.
         DiagnosticCode::ServerSideExportFormMethod => &[630, 544],
+        DiagnosticCode::UnboundFormEventHandler => &[],
         // Проверяемое требование — std532 «Установка прав для новых объектов и полей объектов»; остальные поясняют контекст.
         DiagnosticCode::SetPermissionsForNewObjects => &[532, 689],
         // Проверяемое требование — std485 «Использование привилегированного режима»; остальные поясняют контекст.
