@@ -831,6 +831,10 @@ pub struct InferenceContext<'db> {
     /// construction → byte-identical default typing. See [`crate::structure_keys`].
     structure_shapes: FxHashMap<String, crate::structure_keys::StructureShape>,
 
+    /// Literal-key `Соответствие` facts of the body; `None` when the `mapKeyTypes` profile is off
+    /// or the body never reads a map by a literal key. See [`crate::map_keys`].
+    map_key_facts: Option<crate::map_keys::MapKeyFacts>,
+
     /// Physical-flag accessibility verdict per callee common module, so a body
     /// calling the same module many times reads its metadata once instead of
     /// recording a salsa dependency per call. `None` — not a common module
@@ -1151,6 +1155,7 @@ impl<'db> InferenceContext<'db> {
             global_surface_partly_unknown: false,
             global_surface_incomplete: false,
             structure_shapes: FxHashMap::default(),
+            map_key_facts: None,
             callee_module_env: FxHashMap::default(),
             local_callee_env: FxHashMap::default(),
             query_call_sites: Vec::new(),
@@ -1891,6 +1896,72 @@ impl<'db> InferenceContext<'db> {
         }
         let named = crate::lower::type_string::lower_constructed_type_name_typeid(self.db, text);
         (named != self.db.unknown()).then_some(named)
+    }
+
+    /// The result of `Соответствие.Получить("ключ")` when the body's own construction proves the
+    /// key's value types (see [`crate::map_keys`]), or else when the receiver's type carries the
+    /// key from documentation. `None` keeps the platform signature.
+    fn map_key_answer(
+        &mut self,
+        call_expr: ExprId,
+        base_id: ExprId,
+        receiver_ty: TypeId,
+        method_name: &Name,
+        args: &[ExprId],
+    ) -> Option<TypeId> {
+        if !self.db.map_key_types_enabled()
+            || !crate::method_lookup::is_platform_name(method_name, "Получить", "Get")
+        {
+            return None;
+        }
+        let [key] = args else { return None };
+        let Expr::Literal(Literal::String(key)) = self.body.expr(*key) else { return None };
+        let TypeKind::Map(facet) = self.db.lookup_type(receiver_ty) else { return None };
+        let facts = self.map_key_facts.as_ref()?;
+        if let Some(answer) = facts.answer(call_expr) {
+            return Some(crate::map_keys::answer_type(self.db, answer));
+        }
+
+        let entries = facet.entries.clone()?;
+        // The same folding that merged the documented items, so a lookup lands on the key the
+        // merge built.
+        let key = key.fold_lower();
+        if !self.documented_map_receiver_is_intact(base_id) {
+            return None;
+        }
+        let field = entries.fields.iter().find(|field| field.name.fold_lower() == key)?;
+        if matches!(self.db.lookup_type(field.ty), TypeKind::Unknown) {
+            return None;
+        }
+        // A documented key is not proven present.
+        Some(self.db.union(vec![field.ty, self.db.undefined()]))
+    }
+
+    /// Whether the receiver still holds the map its documented type describes: a call result, or a
+    /// name the body neither mutates, lets escape, nor reassigns. A local must have taken its value
+    /// from a call: one copied from another name shares that name's map, and a mutation through
+    /// the other name would be invisible here.
+    fn documented_map_receiver_is_intact(&mut self, base_id: ExprId) -> bool {
+        let name = match self.body.expr(base_id) {
+            Expr::Call { .. } | Expr::MethodCall { .. } => return true,
+            Expr::Path(name) => name.clone(),
+            _ => return false,
+        };
+        let Some(facts) = self.map_key_facts.as_ref() else { return false };
+        let stats = facts.name_stats(&name);
+        if facts.opaque() || stats.touched || stats.written {
+            return false;
+        }
+        let folded = name.as_str().fold_lower();
+        let is_param = self
+            .body
+            .params()
+            .any(|binding| self.body.binding(binding).name.as_str().fold_lower() == folded);
+        if is_param {
+            stats.assignments == 0
+        } else {
+            stats.assignments <= 1 && !stats.aliased && !self.owned_outside_body(&name)
+        }
     }
 
     /// The result of the managed form's own `РеквизитФормыВЗначение(Имя[, Тип])`:
@@ -3277,7 +3348,11 @@ impl<'db> InferenceContext<'db> {
             return;
         }
 
-        let signature = crate::method_resolution::materialise_signature(self.db, &method_symbol);
+        let signature = crate::method_resolution::materialise_signature(
+            self.db,
+            &method_symbol,
+            self.db.map_key_types_enabled(),
+        );
         // A parameter documented by pointing at another method is seeded from that method's
         // documentation; one documented inline keeps the type the signature already lowered.
         let referenced = crate::doc_see::doc_see_signature_query(
@@ -3288,13 +3363,38 @@ impl<'db> InferenceContext<'db> {
             self.body.params().zip(signature.params.iter().copied()).enumerate()
         {
             let ty = referenced.param(index).unwrap_or(ty);
-            if !crate::lower::doc_structure::is_doc_structure(self.db, ty) {
+            if !crate::lower::doc_structure::is_doc_structure(self.db, ty)
+                && !crate::lower::doc_structure::is_doc_keyed_map(self.db, ty)
+            {
                 continue;
             }
             self.binding_types.insert(binding, ty);
             let name = NormName::intern(self.body.binding(binding).name.as_str());
             self.var_types.insert(name, ty);
         }
+    }
+
+    /// Collects the body's literal-key map facts and keeps constructor answers only for roots
+    /// that are locals of this body: a parameter or a name owned outside the body was something
+    /// else before the constructor ran.
+    fn collect_map_key_facts(&mut self) -> Option<crate::map_keys::MapKeyFacts> {
+        if !self.db.map_key_types_enabled() || !crate::map_keys::body_reads_literal_key(&self.body)
+        {
+            return None;
+        }
+        let mut facts = crate::map_keys::collect_map_key_facts(&self.body);
+        let params: FxHashSet<String> = self
+            .body
+            .params()
+            .map(|binding| self.body.binding(binding).name.as_str().fold_lower())
+            .collect();
+        let rejected: FxHashSet<String> = facts
+            .answer_roots()
+            .into_iter()
+            .filter(|root| params.contains(root) || self.owned_outside_body(&Name::new(root)))
+            .collect();
+        facts.retain_roots(|root| !rejected.contains(root));
+        Some(facts)
     }
 
     pub fn infer_all(&mut self) {
@@ -3330,6 +3430,8 @@ impl<'db> InferenceContext<'db> {
                 collect_structure_shapes(&self.body, SeedRoots::NewLiterals, None)
             }
         };
+
+        self.map_key_facts = self.collect_map_key_facts();
 
         self.seed_documented_structure_parameters();
 
@@ -4869,6 +4971,13 @@ impl<'db> InferenceContext<'db> {
                             for signature in candidates.signatures_mut() {
                                 signature.return_ty = value_ty;
                             }
+                        }
+                    }
+                    if let Some(value_ty) =
+                        self.map_key_answer(call_expr, base_id, receiver_ty, &method_name, args)
+                    {
+                        for signature in candidates.signatures_mut() {
+                            signature.return_ty = value_ty;
                         }
                     }
                     // Same coercion the user cascade dispatched on: the manager

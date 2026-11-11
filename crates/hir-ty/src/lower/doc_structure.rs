@@ -25,8 +25,9 @@ use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::{
     Projection, ProjectionField, ProjectionFieldSource, ProjectionOrigin, TypeId, TypeOrigin,
 };
-use hir_def::docs::{DocField, DocTypeExpr};
+use hir_def::docs::{DocField, DocMapEntry, DocTypeExpr};
 use hir_def::QualifiedName;
+use stdx::case::CaseExt;
 
 use crate::lower::TyLoweringContext;
 
@@ -80,12 +81,18 @@ pub(crate) fn doc_structure_ty(
         DocTypeExpr::Structure { fields } if !fields.is_empty() => {
             Some(DocumentedStructure { ty: structure_ty(db, fields, policy), depth: 0 })
         }
+        DocTypeExpr::Map { entries } if !entries.is_empty() => {
+            Some(DocumentedStructure { ty: keyed_map_ty(db, entries, policy), depth: 0 })
+        }
         DocTypeExpr::Array(inner) => doc_structure_ty(db, inner, policy)
             .map(|documented| DocumentedStructure { depth: documented.depth + 1, ..documented }),
         // A `См.` slot keeps the permissive `Any` the existing lowering gives it, a plain type
         // keeps its existing lowering, and a structure without documented fields is the untyped
         // structure it always was.
-        DocTypeExpr::Structure { .. } | DocTypeExpr::TypeRef(_) | DocTypeExpr::See(_) => None,
+        DocTypeExpr::Structure { .. }
+        | DocTypeExpr::Map { .. }
+        | DocTypeExpr::TypeRef(_)
+        | DocTypeExpr::See(_) => None,
     }
 }
 
@@ -106,10 +113,28 @@ pub(crate) fn substitute(
 /// Union arms are all candidates — the documentation does not say which arm it describes — but the
 /// collection depth must match: bullets written under `Массив из Структура` belong to the element
 /// of an array, never to a bare structure standing beside it.
+///
+/// The documented type replaces only its own kind: a structure fills an untyped structure, a keyed
+/// map fills a plain map. A slot documenting both never puts one into the other.
 fn substitute_at(db: &dyn TypeKernelDb, base: TypeId, structure: TypeId, depth: usize) -> TypeId {
     use bsl_types::kind::TypeKind;
     match db.lookup_type(base) {
-        TypeKind::Structure(facet) if depth == 0 && facet.fields.is_none() => structure,
+        TypeKind::Structure(facet)
+            if depth == 0
+                && facet.fields.is_none()
+                && matches!(db.lookup_type(structure), TypeKind::Structure(_)) =>
+        {
+            structure
+        }
+        TypeKind::Map(facet)
+            if depth == 0
+                && facet.key.is_none()
+                && facet.value.is_none()
+                && facet.entries.is_none()
+                && matches!(db.lookup_type(structure), TypeKind::Map(keyed) if keyed.entries.is_some()) =>
+        {
+            structure
+        }
         TypeKind::Array(facet) if depth > 0 => match facet.element {
             Some(element) => {
                 let replaced = substitute_at(db, element, structure, depth - 1);
@@ -200,6 +225,75 @@ pub(crate) fn is_doc_structure(db: &dyn TypeKernelDb, ty: TypeId) -> bool {
     }
 }
 
+/// Whether a type is a map whose keys come from documentation, itself or as a union arm. Not
+/// through an array: key items are read only directly under the slot.
+pub(crate) fn is_doc_keyed_map(db: &dyn TypeKernelDb, ty: TypeId) -> bool {
+    use bsl_types::kind::TypeKind;
+    match db.lookup_type(ty) {
+        TypeKind::Map(facet) => facet
+            .entries
+            .as_ref()
+            .is_some_and(|projection| projection.origin == ProjectionOrigin::DocComment),
+        TypeKind::Union(members) => members.iter().any(|member| is_doc_keyed_map(db, *member)),
+        _ => false,
+    }
+}
+
+/// A map typed by its documented key items. Keys equal without regard to case are one key: the
+/// first spelling names it and its type joins every item's alternatives. A key with an
+/// alternative that lowers to `Unknown` is `Unknown` as a whole — the union would drop that arm
+/// and narrow the key. More distinct keys than the limit leave the plain map.
+fn keyed_map_ty(db: &dyn TypeKernelDb, entries: &[DocMapEntry], policy: &SeePolicy<'_>) -> TypeId {
+    use bsl_types::kind::TypeKind;
+    struct Key {
+        name: String,
+        folded: String,
+        types: Vec<TypeId>,
+        unknown: bool,
+    }
+    let mut keys: Vec<Key> = Vec::new();
+    for entry in entries {
+        let folded = entry.key.fold_lower();
+        let index = match keys.iter().position(|key| key.folded == folded) {
+            Some(index) => index,
+            None => {
+                keys.push(Key {
+                    name: entry.key.clone(),
+                    folded,
+                    types: Vec::new(),
+                    unknown: false,
+                });
+                keys.len() - 1
+            }
+        };
+        let key = &mut keys[index];
+        if entry.types.is_empty() {
+            key.unknown = true;
+        }
+        for expr in &entry.types {
+            let ty = lower_expr(db, expr, policy);
+            key.unknown |= matches!(db.lookup_type(ty), TypeKind::Unknown);
+            key.types.push(ty);
+        }
+    }
+    if keys.is_empty() || keys.len() > crate::map_keys::MAX_MAP_KEYS {
+        return db.map(None, None);
+    }
+    let fields: Vec<ProjectionField> = keys
+        .into_iter()
+        .map(|key| {
+            let ty = match key.types.as_slice() {
+                _ if key.unknown => db.unknown(),
+                [single] => *single,
+                _ => db.union(key.types),
+            };
+            ProjectionField::new(key.name, ty, ProjectionFieldSource::DocComment)
+        })
+        .collect();
+    let projection = Projection::new(fields.into(), ProjectionOrigin::DocComment, None);
+    db.map_keyed(Arc::new(projection))
+}
+
 fn structure_ty(db: &dyn TypeKernelDb, fields: &[DocField], policy: &SeePolicy<'_>) -> TypeId {
     let lowered: Vec<ProjectionField> = fields
         .iter()
@@ -245,6 +339,7 @@ pub(crate) fn lower_expr(
         DocTypeExpr::Structure { fields } if !fields.is_empty() => structure_ty(db, fields, policy),
         DocTypeExpr::Structure { .. } => db.structure(None),
         DocTypeExpr::Array(inner) => db.array(Some(lower_expr(db, inner, policy))),
+        DocTypeExpr::Map { entries } => keyed_map_ty(db, entries, policy),
     }
 }
 
@@ -418,5 +513,241 @@ mod tests {
 
         assert!(is_doc_structure(&db, db.union(vec![db.undefined(), rich])));
         assert!(!is_doc_structure(&db, db.union(vec![db.undefined(), db.structure(None)])));
+    }
+
+    // ---- keyed maps ---------------------------------------------------------------------
+
+    fn type_ref(name: &str) -> DocTypeExpr {
+        DocTypeExpr::TypeRef(hir_def::TypeRef::from_bare_name(name).expect("a platform type name"))
+    }
+
+    fn unreadable() -> DocTypeExpr {
+        DocTypeExpr::TypeRef(hir_def::TypeRef::Unknown)
+    }
+
+    fn entry(key: &str, types: Vec<DocTypeExpr>) -> DocMapEntry {
+        DocMapEntry { key: key.to_owned(), types }
+    }
+
+    fn keyed(db: &InMemoryDb, entries: Vec<DocMapEntry>) -> TypeId {
+        lower_expr(db, &DocTypeExpr::Map { entries }, &SeePolicy::Permissive)
+    }
+
+    /// `(name, type)` of the fields of a keyed map; `None` for a map without entries.
+    fn entries_of(db: &InMemoryDb, ty: TypeId) -> Option<Vec<(String, TypeId)>> {
+        let TypeKind::Map(facet) = db.lookup_type(ty) else { panic!("a map expected") };
+        let projection = facet.entries.as_ref()?;
+        assert_eq!(projection.origin, ProjectionOrigin::DocComment);
+        Some(
+            projection
+                .fields
+                .iter()
+                .inspect(|field| assert_eq!(field.source, ProjectionFieldSource::DocComment))
+                .map(|field| (field.name.to_string(), field.ty))
+                .collect(),
+        )
+    }
+
+    fn plain_map(db: &InMemoryDb) -> TypeId {
+        db.map(None, None)
+    }
+
+    #[test]
+    fn items_become_the_entries_of_a_map_with_no_key_or_value_type_of_its_own() {
+        let db = InMemoryDb::new();
+        let ty = keyed(&db, vec![entry("сумма", vec![type_ref("Число")])]);
+        assert_eq!(entries_of(&db, ty), Some(vec![("сумма".to_owned(), db.number(None, None))]));
+        let TypeKind::Map(facet) = db.lookup_type(ty) else { panic!("a map expected") };
+        assert!(facet.key.is_none() && facet.value.is_none());
+    }
+
+    #[test]
+    fn keys_equal_without_regard_to_case_merge_under_the_first_spelling() {
+        let db = InMemoryDb::new();
+        let ty = keyed(
+            &db,
+            vec![
+                entry("Сумма", vec![type_ref("Число")]),
+                entry("сумма", vec![type_ref("Строка")]),
+                entry("СУММА", vec![type_ref("Число")]),
+            ],
+        );
+        let fields = entries_of(&db, ty).expect("entries");
+        assert_eq!(fields.len(), 1, "{fields:?}");
+        assert_eq!(fields[0].0, "Сумма", "the first spelling names the key");
+        assert_eq!(
+            fields[0].1,
+            db.union(vec![db.number(None, None), db.string(None, false)]),
+            "every item's alternatives join the key"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_alternative_makes_the_whole_key_unknown() {
+        // The kernel drops an unknown arm of a union, so leaving it in would narrow the key to the
+        // alternatives that did parse.
+        let db = InMemoryDb::new();
+        let ty = keyed(
+            &db,
+            vec![
+                entry("смешанный", vec![type_ref("Число"), unreadable()]),
+                entry("пустой", vec![]),
+                entry("Дубль", vec![type_ref("Число")]),
+                entry("дубль", vec![unreadable()]),
+                entry("целый", vec![type_ref("Строка")]),
+            ],
+        );
+        let fields = entries_of(&db, ty).expect("entries");
+        let by_name = |name: &str| fields.iter().find(|(n, _)| n == name).expect(name).1;
+        assert_eq!(by_name("смешанный"), db.unknown());
+        assert_eq!(by_name("пустой"), db.unknown());
+        assert_eq!(
+            by_name("Дубль"),
+            db.unknown(),
+            "a folded duplicate with an unknown alternative"
+        );
+        assert_eq!(by_name("целый"), db.string(None, false), "an unrelated key is not affected");
+    }
+
+    #[test]
+    fn a_single_alternative_is_not_wrapped_in_a_union() {
+        let db = InMemoryDb::new();
+        let ty = keyed(&db, vec![entry("а", vec![type_ref("Число")])]);
+        assert_eq!(entries_of(&db, ty).expect("entries")[0].1, db.number(None, None));
+    }
+
+    #[test]
+    fn keys_that_differ_only_by_a_final_sigma_are_two_keys() {
+        use stdx::case::CaseExt;
+        let (capital, small) = ("\u{39F}\u{3A3}", "\u{3BF}\u{3C3}");
+        assert_ne!(
+            capital.fold_lower(),
+            small.fold_lower(),
+            "the premise: folding keeps the final sigma apart from the medial one"
+        );
+        let db = InMemoryDb::new();
+        let ty = keyed(
+            &db,
+            vec![entry(capital, vec![type_ref("Число")]), entry(small, vec![type_ref("Строка")])],
+        );
+        let fields = entries_of(&db, ty).expect("entries");
+        assert_eq!(fields.len(), 2, "{fields:?}");
+        assert_eq!(fields[0], (capital.to_owned(), db.number(None, None)));
+        assert_eq!(fields[1], (small.to_owned(), db.string(None, false)));
+    }
+
+    #[test]
+    fn sixty_four_distinct_keys_are_kept_and_sixty_five_leave_a_plain_map() {
+        let db = InMemoryDb::new();
+        let items = |count: usize| -> Vec<DocMapEntry> {
+            (0..count).map(|index| entry(&format!("к{index}"), vec![type_ref("Число")])).collect()
+        };
+        let limit = crate::map_keys::MAX_MAP_KEYS;
+        assert_eq!(limit, 64, "the limit the plan names");
+
+        let within = keyed(&db, items(64));
+        assert_eq!(entries_of(&db, within).expect("entries").len(), 64);
+
+        let beyond = keyed(&db, items(65));
+        assert_eq!(beyond, plain_map(&db), "no truncated projection: the plain map");
+        assert_eq!(entries_of(&db, beyond), None);
+
+        let mut folded = items(64);
+        folded.push(entry("К0", vec![type_ref("Строка")]));
+        let spent_nothing = keyed(&db, folded);
+        assert_eq!(
+            entries_of(&db, spent_nothing).expect("65 items but 64 keys keep the answer").len(),
+            64
+        );
+    }
+
+    #[test]
+    fn a_map_without_items_is_the_plain_map() {
+        let db = InMemoryDb::new();
+        assert_eq!(keyed(&db, vec![]), plain_map(&db));
+    }
+
+    #[test]
+    fn a_keyed_map_is_a_documented_structure_at_the_depth_of_its_collection() {
+        let db = InMemoryDb::new();
+        let map = DocTypeExpr::Map { entries: vec![entry("а", vec![type_ref("Число")])] };
+        let direct =
+            doc_structure_ty(&db, &map, &SeePolicy::Permissive).expect("a keyed map is documented");
+        assert_eq!(direct.depth, 0);
+        assert!(entries_of(&db, direct.ty).is_some());
+
+        let in_array =
+            doc_structure_ty(&db, &DocTypeExpr::Array(Box::new(map)), &SeePolicy::Permissive)
+                .expect("the element of an array is documented too");
+        assert_eq!(in_array.depth, 1);
+
+        let empty = DocTypeExpr::Map { entries: vec![] };
+        assert!(doc_structure_ty(&db, &empty, &SeePolicy::Permissive).is_none());
+    }
+
+    #[test]
+    fn a_keyed_map_fills_only_an_empty_plain_map_at_its_own_depth() {
+        let db = InMemoryDb::new();
+        let rich = keyed(&db, vec![entry("а", vec![type_ref("Число")])]);
+
+        assert_eq!(substitute(&db, plain_map(&db), &bare(rich)), rich);
+        let typed = db.map(Some(db.string(None, false)), Some(db.number(None, None)));
+        assert_eq!(substitute(&db, typed, &bare(rich)), typed, "a typed map is not replaced");
+        assert_eq!(substitute(&db, rich, &bare(rich)), rich, "a keyed map is not replaced again");
+
+        let in_union = db.union(vec![db.undefined(), plain_map(&db)]);
+        let result = substitute(&db, in_union, &bare(rich));
+        assert_eq!(result, db.union(vec![db.undefined(), rich]), "the other arm survives");
+
+        let array = db.array(Some(plain_map(&db)));
+        assert_eq!(substitute(&db, array, &bare(rich)), array, "depth 0 does not enter an array");
+        assert_eq!(substitute(&db, array, &in_array(rich)), db.array(Some(rich)));
+    }
+
+    #[test]
+    fn a_slot_documenting_both_never_puts_one_kind_into_the_other() {
+        let db = InMemoryDb::new();
+        let structure = documented(&db);
+        let map = keyed(&db, vec![entry("а", vec![type_ref("Число")])]);
+        let both = db.union(vec![db.structure(None), plain_map(&db)]);
+
+        let with_structure = substitute(&db, both, &bare(structure));
+        assert_eq!(with_structure, db.union(vec![structure, plain_map(&db)]));
+
+        let with_map = substitute(&db, both, &bare(map));
+        assert_eq!(with_map, db.union(vec![db.structure(None), map]));
+
+        assert_eq!(substitute(&db, db.structure(None), &bare(map)), db.structure(None));
+        assert_eq!(substitute(&db, plain_map(&db), &bare(structure)), plain_map(&db));
+    }
+
+    #[test]
+    fn only_a_map_with_documented_entries_is_a_keyed_map() {
+        let db = InMemoryDb::new();
+        let rich = keyed(&db, vec![entry("а", vec![type_ref("Число")])]);
+
+        assert!(is_doc_keyed_map(&db, rich));
+        assert!(is_doc_keyed_map(&db, db.union(vec![db.undefined(), rich])), "a union arm");
+        assert!(!is_doc_keyed_map(&db, plain_map(&db)));
+        assert!(!is_doc_keyed_map(&db, db.array(Some(rich))), "not through an array");
+        assert!(!is_doc_keyed_map(&db, db.number(None, None)));
+
+        let foreign = db.map_keyed(Arc::new(Projection::new(
+            vec![ProjectionField::new(
+                "а".to_string(),
+                db.number(None, None),
+                ProjectionFieldSource::DocComment,
+            )]
+            .into(),
+            ProjectionOrigin::StructureLiteral,
+            None,
+        )));
+        assert!(!is_doc_keyed_map(&db, foreign), "entries of another origin are not documented");
+    }
+
+    #[test]
+    fn a_documented_structure_is_not_a_keyed_map() {
+        let db = InMemoryDb::new();
+        assert!(!is_doc_keyed_map(&db, documented(&db)));
     }
 }

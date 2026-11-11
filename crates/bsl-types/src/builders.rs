@@ -70,7 +70,11 @@ pub trait Builders: TypeKernelDb {
     }
 
     fn map(&self, key: Option<TypeId>, value: Option<TypeId>) -> TypeId {
-        self.intern_type(TypeKind::Map(MapFacet { key, value }))
+        self.intern_type(TypeKind::Map(MapFacet { key, value, entries: None }))
+    }
+
+    fn map_keyed(&self, entries: Arc<Projection>) -> TypeId {
+        self.intern_type(TypeKind::Map(MapFacet { key: None, value: None, entries: Some(entries) }))
     }
 
     fn structure(&self, keys: Option<Arc<[Name]>>) -> TypeId {

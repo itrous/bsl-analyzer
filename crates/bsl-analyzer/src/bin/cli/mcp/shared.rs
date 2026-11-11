@@ -104,7 +104,7 @@ fn safe_config_fingerprint(config: &project_model::ProjectConfig) -> Vec<u8> {
             "workspace_code": format!("{:?}", config.search.baseline.workspace_code),
             "reference": format!("{:?}", config.search.baseline.reference),
         },
-        "features": [config.features.type_narrowing, format!("{:?}", config.features.workspace_diagnostics), format!("{:?}", config.features.checked_environments)],
+        "features": [config.features.type_narrowing, config.features.map_key_types, format!("{:?}", config.features.workspace_diagnostics), format!("{:?}", config.features.checked_environments)],
         "output_language": config.output.display_language,
         "analysis": format!("{:?}", config.analysis),
     });
@@ -948,6 +948,31 @@ mod tests {
         let second = project_model::ProjectConfig::load_from_file(&second).unwrap();
 
         assert_eq!(safe_config_fingerprint(&first), safe_config_fingerprint(&second));
+    }
+
+    #[test]
+    fn the_map_key_types_flag_alone_forks_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |body: &str| {
+            let path = dir.path().join("bsl-analyzer.toml");
+            std::fs::write(&path, body).unwrap();
+            project_model::ProjectConfig::load_from_file(&path).unwrap()
+        };
+        let on = load("[features]\nmap_key_types = true\n");
+        let on_again = load("[features]\nmapKeyTypes = true\n");
+        let off = load("[features]\nmap_key_types = false\n");
+
+        assert_ne!(safe_config_fingerprint(&on), safe_config_fingerprint(&off));
+        assert_eq!(
+            safe_config_fingerprint(&on),
+            safe_config_fingerprint(&on_again),
+            "equal flags give equal identities, whatever the spelling"
+        );
+        assert_eq!(
+            safe_config_fingerprint(&on),
+            safe_config_fingerprint(&project_model::ProjectConfig::default()),
+            "the default is the profile on"
+        );
     }
 
     #[test]
