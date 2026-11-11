@@ -151,13 +151,51 @@ fn platform_candidate_preserves_incomplete_variadic_metadata() {
         context: None,
     };
 
-    let candidates = CallCandidateSet::from_platform_method(&db, &method, db.undefined());
+    let candidates = CallCandidateSet::from_platform_method(&db, &method, db.undefined(), None);
     let candidate = &candidates.as_slice()[0];
 
     assert_eq!(candidate.required_args, 1);
     assert_eq!(candidate.max_args, None);
     assert_eq!(candidate.variadic_param().map(|param| param.ty), Some(db.unknown()));
     assert_eq!(candidate.params[1].mode, CallParamMode::Variadic);
+}
+
+#[test]
+fn bare_kind_parameter_is_narrowed_only_for_a_concrete_receiver() {
+    use super::ParamReceiver;
+    use bsl_types::kind::ConfigId;
+    use bsl_types::testing::RootConfigCtx;
+    use hir_def::ty::MetadataKind;
+
+    let db = InMemoryDb::new();
+    let method = PlatformMethod {
+        id: 10,
+        type_name: "CatalogManager.<Catalog name>".into(),
+        name: "Проба".into(),
+        english_name: "Probe".into(),
+        return_type: None,
+        parameters: vec![MethodParam {
+            name: "Родитель".into(),
+            param_type: Some("СправочникСсылка".into()),
+            is_optional: true,
+            is_variadic: false,
+        }],
+        variants: Vec::new(),
+        min_version: None,
+        context: None,
+    };
+
+    let unknown_receiver =
+        CallCandidateSet::from_platform_method(&db, &method, db.undefined(), None);
+    assert_eq!(unknown_receiver.as_slice()[0].params[0].ty, db.unknown());
+
+    let name = Name::new("Товары");
+    let receiver =
+        ParamReceiver { mdo_type: MdoType::Catalog, name: &name, config_id: &ConfigId::Root };
+    let known_receiver =
+        CallCandidateSet::from_platform_method(&db, &method, db.undefined(), Some(receiver));
+    let own_ref = db.metadata_ref(MetadataKind::CatalogRef, "Товары".to_string(), &RootConfigCtx);
+    assert_eq!(known_receiver.as_slice()[0].params[0].ty, db.union(vec![own_ref, db.undefined()]));
 }
 
 include!("tests/applicability.rs");

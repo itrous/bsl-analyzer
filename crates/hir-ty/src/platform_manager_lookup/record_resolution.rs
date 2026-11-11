@@ -2,7 +2,7 @@ use bsl_metadata::MdoType;
 use bsl_platform::PlatformMethod;
 use bsl_types::builders::Builders;
 use bsl_types::intern::TypeKernelDb;
-use bsl_types::kind::TypeId;
+use bsl_types::kind::{ConfigId, TypeId};
 use hir_def::ty::FunctionSignature;
 use hir_def::Name;
 
@@ -10,7 +10,7 @@ use super::{
     map_generic_metadata_return_type, map_generic_metadata_return_type_typeid,
     PlatformMethodRecordResolution,
 };
-use crate::call_resolution::CallCandidateSet;
+use crate::call_resolution::{CallCandidateSet, ParamReceiver};
 use crate::lower::type_string::{lower_param_type_string_typeid, lower_platform_type_name_typeid};
 use crate::method_lookup::lower_overloads_typeid;
 
@@ -55,7 +55,12 @@ pub(super) fn build_method_record_resolution(
         return_ty,
         overloads: lower_overloads_typeid(db, method),
         env: hir_def::execution_env::EnvFlags::from_platform_context(method.context.as_ref()),
-        candidates: CallCandidateSet::from_platform_method(db, method, return_ty),
+        candidates: CallCandidateSet::from_platform_method(
+            db,
+            method,
+            return_ty,
+            Some(ParamReceiver { mdo_type, name: mdo_name, config_id: &ConfigId::Root }),
+        ),
     }
 }
 
@@ -100,6 +105,6 @@ pub(super) fn build_any_metadata_ref_method_record(
         return_ty,
         overloads: lower_overloads_typeid(db, method),
         env: hir_def::execution_env::EnvFlags::from_platform_context(method.context.as_ref()),
-        candidates: CallCandidateSet::from_platform_method(db, method, return_ty),
+        candidates: CallCandidateSet::from_platform_method(db, method, return_ty, None),
     }
 }

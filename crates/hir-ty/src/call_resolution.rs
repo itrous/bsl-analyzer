@@ -7,6 +7,7 @@ use vfs::FileId;
 
 mod applicability;
 mod candidate_builders;
+pub(crate) use candidate_builders::ParamReceiver;
 mod candidate_set;
 mod resolution;
 
