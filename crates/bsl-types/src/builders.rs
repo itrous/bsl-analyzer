@@ -3,10 +3,10 @@ use std::sync::Arc;
 use bsl_metadata::Name;
 
 use crate::facet::{
-    ArrayFacet, CommonModuleFacet, DateFacet, FormBindingFacet, FormDataFacet, FormElementFacet,
-    FunctionFacet, ManagerFacet, MapFacet, MdoRefFacet, MetaObjFacet, MetaRefFacet, NumberFacet,
-    PlatformObjectFacet, ProjectionFacet, ProjectionSource, StringFacet, StructureFacet,
-    TableFacet, TableSource,
+    ArrayFacet, CommonModuleFacet, DateFacet, DescribedObject, FormBindingFacet, FormDataFacet,
+    FormElementFacet, FunctionFacet, ManagerFacet, MapFacet, MdoRefFacet, MetaObjFacet,
+    MetaRefFacet, NumberFacet, PlatformObjectFacet, ProjectionFacet, ProjectionSource, StringFacet,
+    StructureFacet, TableFacet, TableSource,
 };
 use crate::intern::TypeKernelDb;
 use crate::kind::{
@@ -244,7 +244,15 @@ pub trait Builders: TypeKernelDb {
     }
 
     fn platform_object(&self, name: Name) -> TypeId {
-        self.intern_type(TypeKind::PlatformObject(PlatformObjectFacet { name }))
+        self.intern_type(TypeKind::PlatformObject(PlatformObjectFacet { name, described: None }))
+    }
+
+    /// A platform object that also remembers which configuration object it describes.
+    fn described_platform_object(&self, name: Name, described: DescribedObject) -> TypeId {
+        self.intern_type(TypeKind::PlatformObject(PlatformObjectFacet {
+            name,
+            described: Some(described),
+        }))
     }
 
     fn union(&self, members: Vec<TypeId>) -> TypeId {

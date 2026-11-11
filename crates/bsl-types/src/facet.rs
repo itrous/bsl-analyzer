@@ -261,6 +261,36 @@ impl SdblTypeShadowFacet {
 #[non_exhaustive]
 pub struct PlatformObjectFacet {
     pub name: Name,
+    /// The model object this value is a description of, when the producer knew it.
+    /// It refines the value without changing what the platform type is: the name
+    /// above still decides members, methods, display and assignability.
+    pub described: Option<DescribedObject>,
+}
+
+/// The configuration object a metadata-description value belongs to
+/// (`Метаданные.Справочники.Товары` and what hangs off it).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct DescribedObject {
+    pub kind: MdoType,
+    pub name: Name,
+    pub part: DescribedPart,
+}
+
+impl DescribedObject {
+    pub fn new(kind: MdoType, name: Name, part: DescribedPart) -> Self {
+        Self { kind, name, part }
+    }
+}
+
+/// Which description of the object a value is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DescribedPart {
+    /// The object's own description (`ОбъектМетаданных: Справочник`).
+    Description,
+    /// The collection of its attribute descriptions (`….Реквизиты`).
+    Attributes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

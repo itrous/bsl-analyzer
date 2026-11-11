@@ -160,7 +160,7 @@ fn render(kind: &TypeKind, ctx: &dyn DisplayCtx, db: &dyn TypeKernelDb, buf: &mu
             Locale::Ru => "Тип",
             Locale::En => "Type",
         }),
-        TypeKind::PlatformObject(PlatformObjectFacet { name }) => {
+        TypeKind::PlatformObject(PlatformObjectFacet { name, .. }) => {
             buf.push_str(platform_object_label(name, ctx.locale()));
         }
         TypeKind::MetadataRef(facet) => render_meta_ref(facet, ctx, buf),
