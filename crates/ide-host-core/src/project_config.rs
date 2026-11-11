@@ -12,6 +12,7 @@ use project_model::{FeaturesConfig, ProjectConfig};
 
 pub fn apply_features_to_db(db: &mut RootDatabaseImpl, features: &FeaturesConfig) {
     set_type_narrowing(db, features.type_narrowing);
+    set_map_key_types(db, features.map_key_types);
     set_env_options(db, env_options_from_features(features));
 }
 
@@ -30,6 +31,7 @@ pub fn apply_project_settings_to_db(
     project: Option<&project_model::Project>,
 ) {
     set_type_narrowing(db, config.features.type_narrowing);
+    set_map_key_types(db, config.features.map_key_types);
     let mut options = env_options_from_features(&config.features);
     options.ordinary_forms_in_managed_app = crate::ordinary_forms_in_managed_app(project);
     options.ordinary_app_support = ordinary_app_support(project);
@@ -43,6 +45,13 @@ fn set_type_narrowing(db: &mut RootDatabaseImpl, enabled: bool) {
     if db.type_narrowing_enabled() != enabled {
         tracing::info!(type_narrowing = enabled, "updated feature flags");
         db.set_type_narrowing_enabled(enabled);
+    }
+}
+
+fn set_map_key_types(db: &mut RootDatabaseImpl, enabled: bool) {
+    if db.map_key_types_enabled() != enabled {
+        tracing::info!(map_key_types = enabled, "updated feature flags");
+        db.set_map_key_types_enabled(enabled);
     }
 }
 
@@ -249,7 +258,7 @@ fn env_options_from_features(features: &FeaturesConfig) -> hir::execution_env::E
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_features_to_db, apply_project_config_to_db};
+    use super::{apply_features_to_db, apply_project_config_to_db, apply_project_settings_to_db};
     use ide_db::RootDatabaseImpl;
     use project_model::{FeaturesConfig, Project, ProjectConfig};
     use std::fs;
@@ -311,6 +320,64 @@ type_narrowing = false
         assert!(default_project_config.features.type_narrowing);
         apply_features_to_db(&mut db, &default_project_config.features);
         assert!(db.type_narrowing_enabled());
+    }
+
+    #[test]
+    fn apply_features_flips_map_key_types_both_ways_through_both_entry_points() {
+        let mut db = RootDatabaseImpl::new();
+        assert!(db.map_key_types_enabled(), "a fresh database has the profile on");
+        let off = FeaturesConfig { map_key_types: false, ..FeaturesConfig::default() };
+
+        apply_features_to_db(&mut db, &off);
+        assert!(!db.map_key_types_enabled(), "features: true -> false");
+        assert!(db.type_narrowing_enabled(), "the other flag is not touched");
+        apply_features_to_db(&mut db, &FeaturesConfig::default());
+        assert!(db.map_key_types_enabled(), "features: false -> true");
+
+        let config_off = ProjectConfig { features: off, ..ProjectConfig::default() };
+        apply_project_settings_to_db(&mut db, &config_off, None);
+        assert!(!db.map_key_types_enabled(), "project settings: true -> false");
+        assert!(db.type_narrowing_enabled(), "the other flag is not touched");
+        apply_project_settings_to_db(&mut db, &ProjectConfig::default(), None);
+        assert!(db.map_key_types_enabled(), "project settings: false -> true");
+    }
+
+    #[test]
+    fn applying_the_same_map_key_types_value_does_not_write_the_input() {
+        // A write of an unchanged value would invalidate every dependent query. The revision
+        // moves only when the value does.
+        let mut db = RootDatabaseImpl::new();
+        let revision = |db: &RootDatabaseImpl| salsa::plumbing::current_revision(db);
+        let off = FeaturesConfig { map_key_types: false, ..FeaturesConfig::default() };
+
+        let before = revision(&db);
+        apply_features_to_db(&mut db, &FeaturesConfig::default());
+        assert_eq!(revision(&db), before, "default over default writes nothing");
+
+        apply_features_to_db(&mut db, &off);
+        let after_change = revision(&db);
+        assert_ne!(after_change, before, "a changed value is written");
+        apply_features_to_db(&mut db, &off);
+        assert_eq!(revision(&db), after_change, "the same value over itself writes nothing");
+
+        let config_off = ProjectConfig { features: off, ..ProjectConfig::default() };
+        apply_project_settings_to_db(&mut db, &config_off, None);
+        let settled = revision(&db);
+        apply_project_settings_to_db(&mut db, &config_off, None);
+        assert_eq!(revision(&db), settled, "nor does the project-settings entry point");
+    }
+
+    #[test]
+    fn update_features_pipeline_threads_the_toml_map_key_types_flag() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("bsl-analyzer.toml"), "[features]\nmap_key_types = false\n")
+            .unwrap();
+        let project = Project::new(dir.path()).expect("valid test project");
+        assert!(!project.config.features.map_key_types);
+
+        let mut db = RootDatabaseImpl::new();
+        apply_features_to_db(&mut db, &resolve_features(Some(&project)));
+        assert!(!db.map_key_types_enabled());
     }
 
     #[test]

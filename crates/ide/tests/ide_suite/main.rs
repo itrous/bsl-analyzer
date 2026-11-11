@@ -88,6 +88,7 @@ mod inlay_hints_shadowed_root;
 mod inline_extension_query_surface;
 mod issue80_union_receiver;
 mod managed_form_items;
+mod map_key_types;
 mod metadata_cold_navigation;
 mod method_body_query;
 mod method_increment_churn;

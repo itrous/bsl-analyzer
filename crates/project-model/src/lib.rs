@@ -3434,6 +3434,11 @@ pub struct FeaturesConfig {
     #[serde(default, alias = "workspace_diagnostics")]
     pub workspace_diagnostics: WorkspaceDiagnosticsScope,
 
+    /// Infer the value type of `Соответствие.Получить("key")` from a local
+    /// constructor with literal `Вставить` writes and from quoted BSLDoc key items.
+    #[serde(default = "default_true", alias = "map_key_types")]
+    pub map_key_types: bool,
+
     /// Execution environments the availability diagnostics
     /// (`UnavailableInEnvironment`, `ModuleAccessibility`) report violations
     /// for, named like preprocessor symbols (`ВебКлиент`/`WebClient`,
@@ -3449,6 +3454,7 @@ impl Default for FeaturesConfig {
         Self {
             type_narrowing: true,
             workspace_diagnostics: WorkspaceDiagnosticsScope::default(),
+            map_key_types: true,
             checked_environments: None,
         }
     }
@@ -8427,6 +8433,48 @@ type_narrowing = false
             !config.features.type_narrowing,
             "`[features] type_narrowing = false` in TOML must round-trip to FeaturesConfig"
         );
+    }
+
+    #[test]
+    fn map_key_types_defaults_to_true_without_a_key_and_with_an_empty_section() {
+        assert!(FeaturesConfig::default().map_key_types, "the profile is on by default");
+        let omitted: ProjectConfig = serde_json::from_str("{}").unwrap();
+        assert!(omitted.features.map_key_types, "an omitted `features` section");
+        let empty: ProjectConfig = serde_json::from_str(r#"{"features": {}}"#).unwrap();
+        assert!(empty.features.map_key_types, "a `features` section without the key");
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("bsl-analyzer.toml"), "[features]\n").unwrap();
+        let config = ProjectConfig::load(dir.path()).unwrap().unwrap();
+        assert!(config.features.map_key_types, "an empty `[features]` table");
+    }
+
+    #[test]
+    fn map_key_types_reads_the_camel_and_the_snake_spellings_in_toml() {
+        for key in ["mapKeyTypes", "map_key_types"] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("bsl-analyzer.toml"), format!("[features]\n{key} = false\n"))
+                .unwrap();
+            let config = ProjectConfig::load(dir.path()).unwrap().unwrap();
+            assert!(!config.features.map_key_types, "`{key} = false`");
+            assert!(config.features.type_narrowing, "the neighbour flag keeps its default");
+        }
+    }
+
+    #[test]
+    fn map_key_types_reads_json_and_does_not_disturb_the_other_flag() {
+        let off: ProjectConfig =
+            serde_json::from_str(r#"{"features": {"mapKeyTypes": false}}"#).unwrap();
+        assert!(!off.features.map_key_types);
+        assert!(off.features.type_narrowing);
+
+        let narrowing_off: ProjectConfig =
+            serde_json::from_str(r#"{"features": {"typeNarrowing": false}}"#).unwrap();
+        assert!(narrowing_off.features.map_key_types, "the other flag does not switch it off");
+
+        let on: ProjectConfig =
+            serde_json::from_str(r#"{"features": {"mapKeyTypes": true}}"#).unwrap();
+        assert!(on.features.map_key_types);
     }
 
     #[test]

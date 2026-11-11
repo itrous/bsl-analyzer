@@ -32,6 +32,9 @@ pub trait HirDatabase: ConfigsDatabase + bsl_types::intern::TypeKernelDb {
 
     fn type_narrowing_enabled(&self) -> bool;
 
+    /// The `mapKeyTypes` profile: typed `Соответствие.Получить("key")` results.
+    fn map_key_types_enabled(&self) -> bool;
+
     /// Project-level execution-environment settings for API-availability
     /// checks (which client environments the configuration targets).
     fn env_options(&self) -> hir_def::execution_env::EnvOptions;

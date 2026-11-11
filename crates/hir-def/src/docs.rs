@@ -99,11 +99,28 @@ pub struct TypeDoc {
     pub parameters: Vec<ParameterDoc>,
 
     pub is_hyperlink: bool,
+
+    /// Items `* "ключ" - Тип` written directly under the slot: keys of a documented map.
+    pub map_entries: Vec<MapEntryDoc>,
+}
+
+/// One quoted key item of a documented `Соответствие`: the unquoted key as written and its types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapEntryDoc {
+    pub key: String,
+
+    pub types: Vec<TypeDoc>,
 }
 
 impl TypeDoc {
     pub fn simple(name: String, description: Option<String>) -> Self {
-        Self { name, description, parameters: Vec::new(), is_hyperlink: false }
+        Self {
+            name,
+            description,
+            parameters: Vec::new(),
+            is_hyperlink: false,
+            map_entries: Vec::new(),
+        }
     }
 
     pub fn structured(
@@ -111,11 +128,17 @@ impl TypeDoc {
         description: Option<String>,
         parameters: Vec<ParameterDoc>,
     ) -> Self {
-        Self { name, description, parameters, is_hyperlink: false }
+        Self { name, description, parameters, is_hyperlink: false, map_entries: Vec::new() }
     }
 
     pub fn hyperlink(link: String) -> Self {
-        Self { name: link, description: None, parameters: Vec::new(), is_hyperlink: true }
+        Self {
+            name: link,
+            description: None,
+            parameters: Vec::new(),
+            is_hyperlink: true,
+            map_entries: Vec::new(),
+        }
     }
 
     /// Separates the full documented type from prose without changing the legacy representation
@@ -705,10 +728,11 @@ fn parse_parameters_with_roles(
 
         if trimmed.starts_with('*') {
             cursor -= 1;
-            let fields = fields::parse_fields(lines, &mut cursor, roles.as_deref_mut());
+            let (fields, entries) = fields::parse_fields(lines, &mut cursor, roles.as_deref_mut());
             if let Some((_, types)) = &mut current_param {
                 if let Some(last_type) = types.last_mut() {
                     last_type.parameters.extend(fields);
+                    last_type.map_entries.extend(entries);
                 }
             }
             continue;
@@ -776,21 +800,25 @@ fn parse_parameter_line(line: &str) -> Option<(String, Vec<TypeDoc>)> {
     // Tabs are frequently used to align the separator (`Имя\t\t- Тип`); the split
     // below only recognizes a space-flanked dash, so normalize tabs to spaces first.
     let normalized = line.replace('\t', " ");
-    let parts: Vec<&str> = normalized.splitn(3, " - ").collect();
+    let (param_name, types) = normalized.split_once(" - ")?;
 
-    if parts.len() < 2 {
-        return None;
-    }
-
-    let param_name = parts[0].trim().to_string();
+    let param_name = param_name.trim().to_string();
     if !is_likely_parameter_doc_name(&param_name) {
         return None;
     }
 
-    let type_part = parts[1].trim();
-    let description = parts.get(2).map(|s| s.trim().to_string());
+    Some((param_name, parse_parameter_types(types)))
+}
 
-    let types = if type_part.contains(',') {
+/// The `Тип1, Тип2 - описание` part of a parameter or field line, after the name's separator.
+fn parse_parameter_types(text: &str) -> Vec<TypeDoc> {
+    let normalized = text.replace('\t', " ");
+    let (type_part, description) = match normalized.split_once(" - ") {
+        Some((types, description)) => (types.trim(), Some(description.trim().to_string())),
+        None => (normalized.trim(), None),
+    };
+
+    if type_part.contains(',') {
         type_part
             .split(',')
             .filter(|t| !t.trim().is_empty())
@@ -798,9 +826,7 @@ fn parse_parameter_line(line: &str) -> Option<(String, Vec<TypeDoc>)> {
             .collect()
     } else {
         vec![TypeDoc::simple(type_part.to_string(), description)]
-    };
-
-    Some((param_name, types))
+    }
 }
 
 fn is_likely_parameter_doc_name(name: &str) -> bool {
@@ -854,9 +880,10 @@ fn parse_returns(lines: &[String]) -> Vec<TypeDoc> {
 
         if trimmed.starts_with('*') {
             cursor -= 1;
-            let fields = fields::parse_fields(lines, &mut cursor, None);
+            let (fields, entries) = fields::parse_fields(lines, &mut cursor, None);
             if let Some(ref mut type_doc) = current_type {
                 type_doc.parameters.extend(fields);
+                type_doc.map_entries.extend(entries);
             }
             continue;
         }

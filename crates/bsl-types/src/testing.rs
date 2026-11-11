@@ -429,7 +429,7 @@ mod canon_tests {
             TypeKind::Date(DateFacet::datetime()),
             TypeKind::Array(ArrayFacet { element: None }),
             TypeKind::Array(ArrayFacet { element: Some(n) }),
-            TypeKind::Map(MapFacet { key: None, value: Some(n) }),
+            TypeKind::Map(MapFacet { key: None, value: Some(n), entries: None }),
             TypeKind::FormData { kind: FormDataFacet::Structure, underlying: Some(owner.clone()) },
             TypeKind::FormControl {
                 kind: FormElementFacet::Table,

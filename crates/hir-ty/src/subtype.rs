@@ -88,6 +88,18 @@ pub fn is_assignable(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool {
         return true;
     }
 
+    // Documented keys describe values, not a different kind of map: a keyed and a plain map are
+    // compared by their key and value types alone.
+    if let (TypeKind::Map(from_map), TypeKind::Map(to_map)) = (from_kind, to_kind) {
+        if from_map.entries.is_some() || to_map.entries.is_some() {
+            return is_assignable(
+                db,
+                db.map(from_map.key, from_map.value),
+                db.map(to_map.key, to_map.value),
+            );
+        }
+    }
+
     if matches!(from_kind, TypeKind::Null) && is_ref_kind(to_kind) {
         return true;
     }
@@ -1546,6 +1558,91 @@ mod tests {
                 db.platform_object("ОбъектМетаданныхСправочник".to_string())
             ),
             "the colon prefix must match the generic exactly, not merely share a stem"
+        );
+    }
+
+    // ---- keyed maps -----------------------------------------------------------------------
+
+    fn keyed_map(db: &dyn TypeKernelDb) -> TypeId {
+        use bsl_types::kind::{
+            Projection, ProjectionField, ProjectionFieldSource, ProjectionOrigin,
+        };
+        let field = ProjectionField::new(
+            "сумма".to_string(),
+            db.number(None, None),
+            ProjectionFieldSource::DocComment,
+        );
+        db.map_keyed(Arc::new(Projection::new(
+            vec![field].into(),
+            ProjectionOrigin::DocComment,
+            None,
+        )))
+    }
+
+    #[test]
+    fn a_keyed_map_and_a_plain_map_fit_each_other() {
+        let db = InMemoryDb::new();
+        let keyed = keyed_map(&db);
+        let plain = db.map(None, None);
+        assert!(is_assignable(&db, keyed, plain), "keyed into plain");
+        assert!(is_assignable(&db, plain, keyed), "plain into keyed");
+        assert!(is_assignable(&db, keyed, keyed));
+    }
+
+    #[test]
+    fn keyed_maps_are_compared_by_their_key_and_value_types_exactly_as_plain_ones() {
+        // The comparison erases the entries and nothing else: a keyed map has no key or value
+        // type, so it answers what an untyped plain map answers — "yes" to an untyped map and
+        // "no" to a typed one, and the same from the other side. Both answers occur, so a rule
+        // that says "yes" whenever entries are present cannot pass.
+        let db = InMemoryDb::new();
+        let string = db.string(None, false);
+        let number = db.number(None, None);
+        let by_text = db.map(Some(string), Some(number));
+        let by_number = db.map(Some(number), Some(string));
+        let untyped = db.map(None, None);
+        let keyed = keyed_map(&db);
+
+        assert!(is_assignable(&db, untyped, untyped));
+        assert!(!is_assignable(&db, untyped, by_text));
+        assert!(!is_assignable(&db, by_text, untyped));
+
+        assert!(is_assignable(&db, keyed, untyped), "keyed -> untyped, like untyped -> untyped");
+        assert!(is_assignable(&db, untyped, keyed), "untyped -> keyed");
+        for typed in [by_text, by_number] {
+            assert!(!is_assignable(&db, keyed, typed), "keyed -> typed, like untyped -> typed");
+            assert!(!is_assignable(&db, typed, keyed), "typed -> keyed, like typed -> untyped");
+        }
+    }
+
+    #[test]
+    fn a_keyed_map_does_not_fit_what_a_plain_map_does_not_fit() {
+        let db = InMemoryDb::new();
+        let keyed = keyed_map(&db);
+        let string = db.string(None, false);
+        let typed = db.map(Some(string), Some(db.number(None, None)));
+        let number = db.number(None, None);
+        assert_eq!(
+            is_assignable(&db, keyed, number),
+            is_assignable(&db, db.map(None, None), number)
+        );
+        assert!(!is_assignable(&db, keyed, number));
+        assert!(!is_assignable(&db, number, keyed));
+        assert_eq!(is_assignable(&db, typed, keyed), is_assignable(&db, typed, db.map(None, None)),);
+    }
+
+    #[test]
+    fn a_keyed_map_does_not_fit_a_structure_and_a_structure_does_not_fit_it() {
+        let db = InMemoryDb::new();
+        let keyed = keyed_map(&db);
+        let structure = db.structure(None);
+        assert_eq!(
+            is_assignable(&db, keyed, structure),
+            is_assignable(&db, db.map(None, None), structure)
+        );
+        assert_eq!(
+            is_assignable(&db, structure, keyed),
+            is_assignable(&db, structure, db.map(None, None))
         );
     }
 }

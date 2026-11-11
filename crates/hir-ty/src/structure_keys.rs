@@ -47,7 +47,7 @@ pub(crate) enum ValueSource {
 }
 
 /// Scalar literal kinds we can type without consulting inference.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScalarKind {
     String,
     Number,
@@ -398,7 +398,7 @@ fn invalidate_every_shape(shapes: &mut FxHashMap<String, StructureShape>) {
 /// Decompose a method/qualified call into `(receiver, method_name, args)`. A BSL `recv.Method(args)`
 /// lowers to `Expr::Call { callee: Field { base, field }, .. }`; the dedicated `Expr::MethodCall`
 /// form is also accepted defensively.
-fn as_method_call<'b>(
+pub(crate) fn as_method_call<'b>(
     body: &'b Body,
     expr: &'b Expr,
 ) -> Option<(ExprId, &'b hir_def::Name, &'b [hir_def::hir::ExprIdx])> {
@@ -474,7 +474,7 @@ pub(crate) fn shape_to_projection(
     Some(Arc::new(Projection::new(fields.into(), ProjectionOrigin::StructureLiteral, None)))
 }
 
-fn scalar_type(db: &dyn HirDatabase, kind: ScalarKind) -> TypeId {
+pub(crate) fn scalar_type(db: &dyn HirDatabase, kind: ScalarKind) -> TypeId {
     match kind {
         ScalarKind::String => db.string(None, false),
         ScalarKind::Number => db.number(None, None),
@@ -517,19 +517,25 @@ fn value_source_of(body: &Body, expr: ExprId, depth: usize) -> ValueSource {
     if let Some(nested) = constructor_shape_of(body, expr, depth + 1) {
         return ValueSource::Literal(nested);
     }
-    match body.expr(expr) {
-        Expr::Literal(lit) => match lit {
-            Literal::String(_) => ValueSource::Scalar(ScalarKind::String),
-            Literal::Number(_) => ValueSource::Scalar(ScalarKind::Number),
-            Literal::Bool(_) => ValueSource::Scalar(ScalarKind::Boolean),
-            Literal::Date(_) => ValueSource::Scalar(ScalarKind::Date),
-            Literal::Null => ValueSource::Scalar(ScalarKind::Null),
-            Literal::Undefined => ValueSource::Scalar(ScalarKind::Undefined),
-        },
+    match scalar_kind_of(body, expr) {
+        Some(kind) => ValueSource::Scalar(kind),
         // A non-literal value (variable, call, …): surface the key name but do not pin a type, so
         // the structure's interned type stays stable across inference iterations.
-        _ => ValueSource::Unknown,
+        None => ValueSource::Unknown,
     }
+}
+
+/// The scalar kind of a literal value expression; `None` for anything that is not a literal.
+pub(crate) fn scalar_kind_of(body: &Body, expr: ExprId) -> Option<ScalarKind> {
+    let Expr::Literal(lit) = body.expr(expr) else { return None };
+    Some(match lit {
+        Literal::String(_) => ScalarKind::String,
+        Literal::Number(_) => ScalarKind::Number,
+        Literal::Bool(_) => ScalarKind::Boolean,
+        Literal::Date(_) => ScalarKind::Date,
+        Literal::Null => ScalarKind::Null,
+        Literal::Undefined => ScalarKind::Undefined,
+    })
 }
 
 fn apply_insert(body: &Body, shape: &mut StructureShape, args: &[hir_def::hir::ExprIdx]) {
@@ -686,7 +692,7 @@ pub(crate) fn body_constructs_structure(body: &Body) -> bool {
     })
 }
 
-fn is_insert_method(name: &hir_def::Name) -> bool {
+pub(crate) fn is_insert_method(name: &hir_def::Name) -> bool {
     crate::method_lookup::is_platform_name(name, "Вставить", "Insert")
 }
 
