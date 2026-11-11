@@ -174,12 +174,20 @@ fn bare_kind_parameter_is_narrowed_only_for_a_concrete_receiver() {
         name: "Проба".into(),
         english_name: "Probe".into(),
         return_type: None,
-        parameters: vec![MethodParam {
-            name: "Родитель".into(),
-            param_type: Some("СправочникСсылка".into()),
-            is_optional: true,
-            is_variadic: false,
-        }],
+        parameters: vec![
+            MethodParam {
+                name: "Родитель".into(),
+                param_type: Some("СправочникСсылка".into()),
+                is_optional: true,
+                is_variadic: false,
+            },
+            MethodParam {
+                name: "Владелец".into(),
+                param_type: Some("СправочникСсылка".into()),
+                is_optional: true,
+                is_variadic: false,
+            },
+        ],
         variants: Vec::new(),
         min_version: None,
         context: None,
@@ -196,6 +204,8 @@ fn bare_kind_parameter_is_narrowed_only_for_a_concrete_receiver() {
         CallCandidateSet::from_platform_method(&db, &method, db.undefined(), Some(receiver));
     let own_ref = db.metadata_ref(MetadataKind::CatalogRef, "Товары".to_string(), &RootConfigCtx);
     assert_eq!(known_receiver.as_slice()[0].params[0].ty, db.union(vec![own_ref, db.undefined()]));
+    // The owner is a reference to a different catalog: never narrowed.
+    assert_eq!(known_receiver.as_slice()[0].params[1].ty, db.unknown());
 }
 
 include!("tests/applicability.rs");

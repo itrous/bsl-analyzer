@@ -495,9 +495,13 @@ mod tests {
     // The 3rd parameter of `НайтиПоКоду` is `Родитель`, declared as the bare kind
     // name `СправочникСсылка`.
     fn reference_slot_mismatches(argument: &str) -> (String, Vec<crate::Diagnostic>) {
+        reference_call_mismatches(&format!("\"001\", Истина, {argument}"))
+    }
+
+    fn reference_call_mismatches(arguments: &str) -> (String, Vec<crate::Diagnostic>) {
         let source = format!(
             "Процедура Тест()
-    Значение = Справочники.Товары.НайтиПоКоду(\"001\", Истина, {argument});
+    Значение = Справочники.Товары.НайтиПоКоду({arguments});
 КонецПроцедуры
 "
         );
@@ -555,6 +559,31 @@ mod tests {
             TypeMismatch @ 2:62..2:100
               message: Несоответствие типов: ожидалось 'СправочникСсылка.Товары | Неопределено', получено 'СправочникСсылка.Контрагенты'
               severity: Major"#]].assert_eq(&format_diags(&source, &found));
+    }
+
+    // Regression: the owner is a reference to a DIFFERENT catalog (one of the
+    // catalog's `Владельцы`), so it must not be narrowed to the receiver's own
+    // reference. Measured: 239 correct calls in the corpus.
+    #[test]
+    fn a_reference_of_another_catalog_in_the_owner_slot_is_not_reported() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) =
+            reference_call_mismatches("\"001\", , , Справочники.Контрагенты.ПустаяСсылка()");
+        expect![[""]].assert_eq(&format_diags(&source, &found));
+    }
+
+    // KNOWN GAP, not the desired end state: the owner slot is not narrowed at all,
+    // so a number there is silent too. Judging the owner needs the object's
+    // `Владельцы` composition, which is a separate change.
+    #[test]
+    fn a_number_in_the_owner_slot_is_silent_for_now() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = reference_call_mismatches("\"001\", , , 5");
+        expect![[""]].assert_eq(&format_diags(&source, &found));
     }
 
     #[test]

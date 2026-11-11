@@ -8,6 +8,7 @@ use hir_def::execution_env::EnvFlags;
 use hir_def::module_interface::MethodDecl;
 use hir_def::ty::FunctionSignature;
 use hir_def::Name;
+use stdx::case::CaseExt;
 
 use super::{
     CallCandidateSet, CallParam, CallParamMode, CallSignature, CandidateId, CandidateOrigin,
@@ -127,12 +128,42 @@ struct PlatformCandidateContext<'a> {
     environment: EnvFlags,
 }
 
+/// Whether a kind-name parameter means "a reference of this very object".
+///
+/// Keyed on the parameter name of the platform signature itself (platform
+/// metadata, not user text). A kind-name parameter whose name is not listed
+/// keeps the permissive lowering: the safe direction, a missed mismatch rather
+/// than a false accusation.
+///
+/// `Владелец` / `Owner` is deliberately absent. Its declared type is the same
+/// bare `СправочникСсылка`, but it is a reference to the catalog's OWNER, a
+/// different object (one of the catalog's `Владельцы`). Narrowing it to the
+/// receiver's own reference was measured to flag 239 correct calls in the
+/// corpus (`Справочники.СерийныеНомера.НайтиПоКоду(Код, , , Номенклатура)`).
+/// Do not "simplify" this away until the owner is checked against `Владельцы`.
+fn names_a_reference_of_the_receiver(param_name: &str) -> bool {
+    const NAMES: [&str; 8] = [
+        "родитель",
+        "parent",
+        "элемент",
+        "item",
+        "ссылка",
+        "ref",
+        "значениеперечисления",
+        "enumvalue",
+    ];
+    NAMES.contains(&param_name.fold_lower().as_str())
+}
+
 impl PlatformCandidateContext<'_> {
-    fn lower_param_type(&self, raw: &str) -> TypeId {
+    fn lower_param_type(&self, param_name: &str, raw: &str) -> TypeId {
         // Only a concrete receiver can say which object a bare kind name stands
         // for; without one the slot stays as permissive as the plain lowering.
         if let Some(receiver) = self.receiver {
-            if !receiver.name.as_str().is_empty() && !raw.contains(',') {
+            if !receiver.name.as_str().is_empty()
+                && !raw.contains(',')
+                && names_a_reference_of_the_receiver(param_name)
+            {
                 let bare = lower_platform_type_name_typeid(self.db, raw.trim());
                 if let Some(narrowed) = specialize_self_ref_ty(
                     self.db,
@@ -157,7 +188,7 @@ impl PlatformCandidateContext<'_> {
                 ty: param
                     .param_type
                     .as_deref()
-                    .map(|raw| self.lower_param_type(raw))
+                    .map(|raw| self.lower_param_type(param.name.as_str(), raw))
                     .unwrap_or_else(|| self.db.unknown()),
                 has_default: param.is_optional,
                 mode: if param.is_variadic {
