@@ -237,7 +237,9 @@ fn check_method(
         return;
     }
 
-    let actual = actual_directive(annotations);
+    let Some(actual) = actual_directive(annotations) else {
+        return;
+    };
     if !is_dead(required, actual) {
         return;
     }
@@ -257,20 +259,19 @@ fn check_method(
     });
 }
 
-fn actual_directive(annotations: &[hir::Annotation]) -> ActualDirective {
-    for a in annotations {
-        match a.kind {
-            AnnotationKind::AtServer => return ActualDirective::Server,
-            AnnotationKind::AtClient => return ActualDirective::Client,
-            AnnotationKind::AtServerNoContext => return ActualDirective::ServerNoContext,
-            AnnotationKind::AtClientAtServerNoContext => {
-                return ActualDirective::ClientServerNoContext;
-            }
-            AnnotationKind::AtClientAtServer => return ActualDirective::ClientServer,
-            _ => {}
-        }
-    }
-    ActualDirective::None
+/// `None` when the method carries several compilation directives: the module does not compile
+/// then (`SeveralCompilerDirectives`), so no single directive says where the handler lives.
+fn actual_directive(annotations: &[hir::Annotation]) -> Option<ActualDirective> {
+    let mut directives = annotations.iter().filter_map(|a| match a.kind {
+        AnnotationKind::AtServer => Some(ActualDirective::Server),
+        AnnotationKind::AtClient => Some(ActualDirective::Client),
+        AnnotationKind::AtServerNoContext => Some(ActualDirective::ServerNoContext),
+        AnnotationKind::AtClientAtServerNoContext => Some(ActualDirective::ClientServerNoContext),
+        AnnotationKind::AtClientAtServer => Some(ActualDirective::ClientServer),
+        _ => None,
+    });
+    let first = directives.next().unwrap_or(ActualDirective::None);
+    directives.next().is_none().then_some(first)
 }
 
 /// Only the combinations verified by a live probe. `&НаКлиентеНаСервере` is never reported:
@@ -451,6 +452,13 @@ mod tests {
         let events = [("OnOpen", "ПриОткрытии")];
         let code = "&НаСервере\nФункция ПриОткрытии()\n\tВозврат 1;\nКонецФункции\n";
         assert_eq!(run(form_metadata(&events), code).len(), 1);
+    }
+
+    #[test]
+    fn handler_with_several_directives_is_skipped() {
+        let events = [("OnCreateAtServer", "ПриСозданииНаСервере")];
+        let code = "&НаКлиенте\n&НаСервере\nПроцедура ПриСозданииНаСервере()\nКонецПроцедуры\n";
+        assert!(run(form_metadata(&events), code).is_empty());
     }
 
     #[test]
