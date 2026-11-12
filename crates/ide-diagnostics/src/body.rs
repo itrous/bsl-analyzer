@@ -45,6 +45,7 @@ pub(crate) const BODY_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::NumberOfParams,
     DiagnosticCode::NumberOfOptionalParams,
     DiagnosticCode::MultilingualStringHasAllDeclaredLanguages,
+    DiagnosticCode::MultilingualStringHasEmptyTranslation,
     DiagnosticCode::MultilingualStringUsingWithTemplate,
     DiagnosticCode::ExcessiveAutoTestCheck,
     DiagnosticCode::LatinAndCyrillicSymbolInWord,

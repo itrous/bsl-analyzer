@@ -126,6 +126,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         DiagnosticCode::MultilingualStringHasAllDeclaredLanguages,
         "localized string literal diagnostic",
     ),
+    (
+        DiagnosticCode::MultilingualStringHasEmptyTranslation,
+        "localized string literal diagnostic; matches the fixed NStr/НСтр spelling, no platform identifier lookup",
+    ),
     (DiagnosticCode::MultilingualStringUsingWithTemplate, "localized string/template diagnostic"),
     (DiagnosticCode::NestedFunctionInParameters, "call-shape diagnostic with configurable names"),
     (DiagnosticCode::Typo, "spellcheck diagnostic"),
@@ -790,7 +794,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 224, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 225, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

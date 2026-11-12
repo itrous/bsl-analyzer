@@ -300,6 +300,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::MultilingualStringHasAllDeclaredLanguages => {
             Some(&multilingual_string_has_all_declared_languages::METADATA)
         }
+        DiagnosticCode::MultilingualStringHasEmptyTranslation => {
+            Some(&multilingual_string_has_all_declared_languages::EMPTY_TRANSLATION_METADATA)
+        }
         DiagnosticCode::MultilingualStringUsingWithTemplate => {
             Some(&multilingual_string_using_with_template::METADATA)
         }

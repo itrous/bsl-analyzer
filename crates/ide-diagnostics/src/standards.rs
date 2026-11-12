@@ -77,6 +77,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::IfElseDuplicatedCondition => &[],
         DiagnosticCode::IfElseIfEndsWithElse => &[],
         DiagnosticCode::MultilingualStringHasAllDeclaredLanguages => &[763],
+        DiagnosticCode::MultilingualStringHasEmptyTranslation => &[763],
         DiagnosticCode::MultilingualStringUsingWithTemplate => &[763],
         DiagnosticCode::NestedConstructorsInStructureDeclaration => &[],
         DiagnosticCode::NestedFunctionInParameters => &[640],

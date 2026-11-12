@@ -44,6 +44,7 @@ pub enum DiagnosticCode {
     IfElseDuplicatedCondition,
     IfElseIfEndsWithElse,
     MultilingualStringHasAllDeclaredLanguages,
+    MultilingualStringHasEmptyTranslation,
     MultilingualStringUsingWithTemplate,
     NestedConstructorsInStructureDeclaration,
     NestedFunctionInParameters,
