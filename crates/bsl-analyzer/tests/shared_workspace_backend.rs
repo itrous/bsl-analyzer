@@ -2087,7 +2087,7 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
     editor.send(json!({"jsonrpc": "2.0", "id": initial_server_request_id, "result": null}));
     artifacts.checkpoint("last-good shared owner resolves the known definition");
 
-    std::fs::write(&config, "[source\nthis is invalid\n").unwrap();
+    common::replace_config(&config, "[source\nthis is invalid\n");
     editor.send(json!({
         "jsonrpc": "2.0", "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
@@ -2142,7 +2142,7 @@ async fn invalid_project_config_reports_error_and_keeps_last_good_shared_view() 
     );
     artifacts.checkpoint("frozen last-good owner still answers definition and hover");
 
-    std::fs::write(&config, valid_config).unwrap();
+    common::replace_config(&config, valid_config);
     editor.send(json!({
         "jsonrpc": "2.0", "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
@@ -2285,7 +2285,11 @@ async fn shared_lsp_rebind_does_not_depend_on_the_file_its_executable_was_copied
         .checkpoint("the adapter runs from the owned copy; removing the file it was copied from");
     std::fs::remove_file(&build_output.path).expect("remove the file the owned copy came from");
 
-    std::fs::write(&config, "[source\nthis is invalid\n").unwrap();
+    // Only an owner whose resident has published its first build holds the last good view over
+    // an invalid config; before that the invalid config retires the scope, and the rebind then
+    // fails on parsing it.
+    wait_for_resident_bootstrap(runtime.path()).await;
+    common::replace_config(&config, "[source\nthis is invalid\n");
     editor.send(json!({
         "jsonrpc": "2.0", "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}
@@ -2296,7 +2300,7 @@ async fn shared_lsp_rebind_does_not_depend_on_the_file_its_executable_was_copied
                 .as_str()
                 .is_some_and(|text| text.contains("project config reload failed"))
     });
-    std::fs::write(&config, valid_config).unwrap();
+    common::replace_config(&config, valid_config);
     editor.send(json!({
         "jsonrpc": "2.0", "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": lsp_types::Url::from_file_path(&config).unwrap()}}

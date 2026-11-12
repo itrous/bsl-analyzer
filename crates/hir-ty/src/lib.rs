@@ -73,6 +73,7 @@ pub use infer::{
 };
 pub use lower::TyLoweringContext;
 pub use manager_lookup::{lookup_manager_field, ManagerMemberInfo};
+pub use method_environment::owner_body_env;
 pub use method_lookup::{lookup_method, MethodInfo};
 pub use method_resolution::{resolve_qualified_call, MethodResolution};
 pub use module_implicit::module_implicit_fields;
@@ -81,7 +82,7 @@ pub use object_resolver::{
 };
 pub use platform_global_lookup::{
     bare_global_name_claim, manager_collection_env, resolve_platform_global_property_type,
-    BareGlobalClaim, BodyShadowScope,
+    unassignable_global_property, BareGlobalClaim, BodyShadowScope,
 };
 pub use platform_manager_lookup::{
     platform_methods_for_manager, platform_methods_for_metadata_kind,
