@@ -616,6 +616,10 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         hir::kernel_type_is_structure(&self.db, id)
     }
 
+    fn kernel_type_is_fixed_structure(&self, id: hir::TypeId) -> bool {
+        hir::kernel_type_is_fixed_structure(&self.db, id)
+    }
+
     fn parse(&self, file_id: vfs::FileId) -> syntax::Parse<syntax::SyntaxNode> {
         use ide_db::base_db::RootQueryDb;
         self.db.parse(file_id)

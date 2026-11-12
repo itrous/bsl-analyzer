@@ -11,7 +11,7 @@ Measured on platform build 8.3.27.2214:
 - The methods `Insert`, `Property` and `Delete` take ONE key, with no splitting on commas and no empty key; whitespace around the key (space, tab, no-break space, line feed) is trimmed: `Insert("a ")` and `Insert(" a")` are accepted with the key `a`, and a key of whitespace only counts as empty. `Insert("a.b")`, `("a b")`, `("a-b")`, `("1a")`, `("a, b")`, `("")` and `("   ")` are refused with «Ошибка при вызове метода контекста (Вставить): Задано неправильное имя атрибута структуры» (“Error calling the context method (Insert): invalid structure attribute name”); `Property` and `Delete` give the same text with their own method name.
 - `_a`, `a_1`, `Name1`, a bare `_` and `ЁЙ` are accepted.
 
-A `Map` does not restrict its keys: `New Map` followed by `Map.Insert("a.b", 1)` is legal and very common, so the methods are checked only on a receiver whose type is inferred as `Structure` or `FixedStructure`. A receiver of unknown type, a `Map` and any other type are not reported.
+A `Map` does not restrict its keys: `New Map` followed by `Map.Insert("a.b", 1)` is legal and very common, so the methods are checked only on a receiver whose type is inferred as `Structure` or `FixedStructure`. A `FixedStructure` has no `Insert` or `Delete`, so only its `Property` is checked. A receiver of unknown type, a `Map` and any other type are not reported.
 
 The diagnostic fires on the string literal that holds the key, once per call: for the constructor, when at least one non-empty entry of the list (after trimming) is not an identifier. A key that comes from a variable or an expression is not statically known and is not reported.
 

@@ -26,6 +26,8 @@ const MESSAGE: &str = "Ключ структуры не является иде�
 const CONSTRUCTED_TYPES: &[&str] =
     &["структура", "structure", "фиксированнаяструктура", "fixedstructure"];
 const KEY_METHODS: &[&str] = &["вставить", "insert", "свойство", "property", "удалить", "delete"];
+/// A fixed structure has no `Вставить` / `Удалить`; only its key lookup is judged.
+const FIXED_STRUCTURE_KEY_METHODS: &[&str] = &["свойство", "property"];
 
 /// Reports a string literal that names a structure key but is not an identifier: the
 /// platform refuses it at runtime (measured on 8.3.27.2214).
@@ -35,8 +37,9 @@ const KEY_METHODS: &[&str] = &["вставить", "insert", "свойство",
 ///   entirely empty literal is legal. One finding per call, on the literal.
 /// * `Вставить` / `Свойство` / `Удалить` take ONE key, unsplit; whitespace around it is
 ///   trimmed (`"Ключ "` is legal, a key of whitespace only is refused like an empty one).
-///   Judged only when the receiver is known to be a structure: a `Соответствие` does
-///   not restrict its keys, so an unknown or any other receiver type yields nothing.
+///   Judged only when the receiver is known to be a structure (for a fixed structure,
+///   only `Свойство`): a `Соответствие` does not restrict its keys, so an unknown or any
+///   other receiver type yields nothing.
 ///
 /// A key that is not a string literal is not statically known and is never reported.
 pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
@@ -105,15 +108,19 @@ fn key_method_call_is_bad(
     if is_identifier(key.trim()) {
         return false;
     }
-    receiver_is_structure(ctx, receiver)
+    receiver_takes_key(ctx, receiver, method)
 }
 
-/// The receiver is typed by the inference engine and must come out as exactly a structure
-/// (not a union, not unknown, not a map).
-fn receiver_is_structure(ctx: &BodyContext, receiver: ExprIdx) -> bool {
-    ctx.infer()
-        .type_id_of_expr(ExprId::from_idx(receiver))
-        .is_some_and(|ty| ctx.kernel_type_is_structure(ty))
+/// The receiver is typed by the inference engine and must come out as exactly a structure or
+/// a fixed structure (not a union, not unknown, not a map) that has the method.
+fn receiver_takes_key(ctx: &BodyContext, receiver: ExprIdx, method: &str) -> bool {
+    let Some(ty) = ctx.infer().type_id_of_expr(ExprId::from_idx(receiver)) else {
+        return false;
+    };
+    if ctx.kernel_type_is_structure(ty) {
+        return true;
+    }
+    ctx.kernel_type_is_fixed_structure(ty) && is_one_of(method, FIXED_STRUCTURE_KEY_METHODS)
 }
 
 /// A literal that spans lines (`|` continuation) is not judged: its value is not the text
@@ -247,6 +254,30 @@ mod tests {
     #[test]
     fn insert_of_a_valid_key_on_a_structure_is_not_flagged() {
         let d = run("    С = Новый Структура;\n    С.Вставить(\"Ключ\", 1);");
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn property_of_a_bad_key_on_a_fixed_structure_is_flagged() {
+        let d = run("    С = Новый ФиксированнаяСтруктура(\"а\", 1);
+    С.Свойство(\"а.б\");
+    С.Свойство(\"\");
+    F = New FixedStructure(\"a\", 1);
+    F.Property(\"a b\");");
+        assert_eq!(d.len(), 3, "{d:?}");
+    }
+
+    #[test]
+    fn insert_and_delete_on_a_fixed_structure_are_not_judged() {
+        let d = run("    С = Новый ФиксированнаяСтруктура(\"а\", 1);
+    С.Вставить(\"а.б\", 1);
+    С.Удалить(\"а б\");");
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn property_of_a_valid_key_on_a_fixed_structure_is_not_flagged() {
+        let d = run("    С = Новый ФиксированнаяСтруктура(\"а\", 1);\n    С.Свойство(\" а \");");
         assert!(d.is_empty(), "{d:?}");
     }
 
