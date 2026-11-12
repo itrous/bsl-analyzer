@@ -301,6 +301,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         DiagnosticCode::UnboundFormEventHandler,
         "checks a form procedure name against the form event bindings; no BSL identifier lookup",
     ),
+    (
+        DiagnosticCode::FormEventHandlerDirective,
+        "checks a handler's compilation directive against the form events; no BSL identifier lookup",
+    ),
     (DiagnosticCode::SetPermissionsForNewObjects, "metadata managed-application policy"),
     (
         DiagnosticCode::TransferringParametersBetweenClientAndServer,
@@ -776,7 +780,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 222, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 223, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

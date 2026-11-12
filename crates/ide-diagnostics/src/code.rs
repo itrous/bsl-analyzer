@@ -101,6 +101,7 @@ pub enum DiagnosticCode {
     SelfInsertion,
     SeveralCompilerDirectives,
     AtClientAtServerFormMethod,
+    FormEventHandlerDirective,
     StyleElementConstructors,
     DeprecatedPlatformApi,
     DeprecatedMethodCall,
