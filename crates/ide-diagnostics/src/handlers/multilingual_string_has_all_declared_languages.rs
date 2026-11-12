@@ -43,14 +43,25 @@ pub const EMPTY_TRANSLATION_METADATA: DiagnosticMetadata = define_metadata! {
 const EMPTY_TRANSLATION_MESSAGE: &str =
     "Объявленный язык с пустым переводом: текст в интерфейсе будет пустым";
 
-/// The first `НСтр` argument when it is exactly one string literal, so its text is known
-/// statically; concatenations and variables are not.
+/// The first `НСтр` argument when it is exactly one string literal, possibly in parentheses,
+/// so its text is known statically; concatenations and variables are not.
 fn static_literal_content(first_arg: &syntax::SyntaxNode) -> Option<String> {
-    let literal = first_arg.descendants().find(|n| n.kind() == SyntaxKind::LITERAL)?;
-    if first_arg.text().to_string().trim() != literal.text().to_string().trim() {
+    let mut node = first_arg.clone();
+    while matches!(node.kind(), SyntaxKind::EXPR | SyntaxKind::PAREN_EXPR) {
+        let only_parens = node.children_with_tokens().filter_map(|it| it.into_token()).all(|t| {
+            t.kind().is_trivia() || matches!(t.kind(), SyntaxKind::L_PAREN | SyntaxKind::R_PAREN)
+        });
+        let mut children = node.children();
+        let inner = children.next()?;
+        if !only_parens || children.next().is_some() {
+            return None;
+        }
+        node = inner;
+    }
+    if node.kind() != SyntaxKind::LITERAL {
         return None;
     }
-    sdbl_utils::extract_string_content(&literal)
+    sdbl_utils::extract_string_content(&node)
 }
 
 /// A declared language present in the literal with a value that is empty or whitespace only,
@@ -489,6 +500,31 @@ mod tests {
         assert_eq!(
             found.iter().map(|(code, _)| *code).collect::<Vec<_>>(),
             vec![DiagnosticCode::MultilingualStringHasAllDeclaredLanguages]
+        );
+    }
+
+    #[test]
+    fn parenthesized_literal_is_statically_known() {
+        let found = codes_for(r#"    Текст = НСтр((("ru = 'Остаток'; uk = ''")));"#);
+        assert_eq!(
+            found,
+            vec![(
+                DiagnosticCode::MultilingualStringHasEmptyTranslation,
+                EMPTY_MESSAGE.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn literal_with_empty_translation_inside_a_wider_expression_is_not_known() {
+        let found = codes_for(
+            "    Текст = НСтр((\"ru = 'Остаток'; uk = ''\") + Хвост);\n    Другой = НСтр(-\"ru = 'Остаток'; uk = ''\");",
+        );
+        assert!(
+            found
+                .iter()
+                .all(|(code, _)| *code != DiagnosticCode::MultilingualStringHasEmptyTranslation),
+            "{found:?}"
         );
     }
 
