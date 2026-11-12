@@ -1,4 +1,5 @@
 use hir::{Body, Expr, ExprId, ExprIdx, IdConversion, Literal, LocalRange};
+use lexer::is_identifier_letter;
 use stdx::case::fold_lower_per_char;
 
 use crate::define_metadata;
@@ -132,11 +133,12 @@ fn constructor_list_is_bad(list: &str) -> bool {
         .any(|entry| !is_identifier(entry))
 }
 
-/// First character a letter or `_`; the rest letters, digits or `_`. A bare `_` is valid.
+/// First character a letter or `_`; the rest letters, ASCII digits or `_`. A bare `_` is valid.
 fn is_identifier(text: &str) -> bool {
     let mut chars = text.chars();
     let Some(first) = chars.next() else { return false };
-    (first.is_alphabetic() || first == '_') && chars.all(|c| c.is_alphanumeric() || c == '_')
+    (first == '_' || is_identifier_letter(first))
+        && chars.all(|c| c == '_' || c.is_ascii_digit() || is_identifier_letter(c))
 }
 
 fn is_one_of(name: &str, folded_options: &[&str]) -> bool {
@@ -192,6 +194,18 @@ mod tests {
         for key in ["_а", "а_1", "Name1", "_", "ЁЙ", "Ключ"] {
             let d = constructor(key);
             assert!(d.is_empty(), "{key}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn non_ascii_digits_and_number_signs_are_not_identifier_characters() {
+        // Arabic-Indic digit, Roman numeral, superscript two: numeric to `char::is_alphanumeric`,
+        // but not BSL identifier characters.
+        for key in ["Ключ٢", "КлючⅫ", "Ключ²"] {
+            let d = constructor(key);
+            assert_eq!(d.len(), 1, "{key}: {d:?}");
+            let d = run(&format!("    С = Новый Структура;\n    С.Вставить(\"{key}\", 1);"));
+            assert_eq!(d.len(), 1, "{key}: {d:?}");
         }
     }
 
