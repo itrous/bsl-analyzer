@@ -90,9 +90,12 @@ fn walk(body: &Body, stmts: &[StmtIdx], flagged: &mut Vec<String>, writes: &mut 
                     nested(body, branch.stmts, flagged, writes);
                 }
             }
-            Stmt::While { body: inner, .. }
-            | Stmt::For { body: inner, .. }
-            | Stmt::ForEach { body: inner, .. } => nested(body, inner, flagged, writes),
+            Stmt::While { body: inner, .. } => nested(body, inner, flagged, writes),
+            Stmt::For { var, body: inner, .. } | Stmt::ForEach { var, body: inner, .. } => {
+                let name = fold_lower_per_char(body.binding_idx(*var).name.as_str());
+                flagged.retain(|n| *n != name);
+                nested(body, inner, flagged, writes);
+            }
             Stmt::Try { body: inner, except } => {
                 nested(body, inner, flagged, writes);
                 nested(body, except, flagged, writes);
@@ -258,6 +261,12 @@ mod tests {
     fn load_flag_set_before_a_condition_is_flagged_inside_it() {
         let d = run("    Д.ОбменДанными.Загрузка = Истина;\n    Если Условие Тогда\n        Д.Записать(РежимЗаписиДокумента.Проведение);\n    КонецЕсли;");
         assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn loop_variable_rebinding_the_flagged_name_drops_the_flag() {
+        let d = run("    Д.ОбменДанными.Загрузка = Истина;\n    Для Каждого Д Из Документы Цикл\n        Д.Записать(РежимЗаписиДокумента.Проведение);\n    КонецЦикла;\n    Д.Записать(РежимЗаписиДокумента.Проведение);");
+        assert!(d.is_empty(), "{d:?}");
     }
 
     #[test]
