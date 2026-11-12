@@ -32,6 +32,7 @@ const ITEM_TREE_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::ReservedParameterNames,
     DiagnosticCode::SeveralCompilerDirectives,
     DiagnosticCode::AtClientAtServerFormMethod,
+    DiagnosticCode::FormEventHandlerDirective,
     DiagnosticCode::NonExportMethodsInApiRegion,
     DiagnosticCode::CachedPublic,
     DiagnosticCode::CompilationDirectiveLost,
@@ -210,6 +211,12 @@ pub fn collect_item_tree_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic
         "AtClientAtServerFormMethod",
         ctx,
         handlers::at_client_at_server_form_method::check,
+    ));
+
+    diagnostics.extend(run_diagnostic(
+        "FormEventHandlerDirective",
+        ctx,
+        handlers::form_event_handler_directive::check,
     ));
 
     diagnostics.extend(run_diagnostic(
