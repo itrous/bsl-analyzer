@@ -434,7 +434,9 @@ fn finish_identifier(lexer: &mut logos::Lexer<TokenKind>, original_kind: TokenKi
     }
 }
 
-fn is_identifier_letter(ch: char) -> bool {
+/// Whether `ch` is a letter of a BSL identifier (`\p{L}`); `_` and ASCII digits are the only
+/// other characters an identifier may contain, and digits not in first position.
+pub fn is_identifier_letter(ch: char) -> bool {
     if ch.is_ascii_alphabetic() {
         return true;
     }

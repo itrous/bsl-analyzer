@@ -436,6 +436,19 @@ pub fn kernel_type_includes_undefined(db: &dyn TypeKernelDb, id: TypeId) -> bool
     }
 }
 
+/// Whether the type is a plain structure; a union is not, even one made only of structures.
+pub fn kernel_type_is_structure(db: &dyn TypeKernelDb, id: TypeId) -> bool {
+    matches!(db.lookup_type(id), TypeKind::Structure(_))
+}
+
+/// Whether the type is a `ФиксированнаяСтруктура`; a union is not. The kernel has no facet
+/// for it, so a construction or annotation names it as a platform object.
+pub fn kernel_type_is_fixed_structure(db: &dyn TypeKernelDb, id: TypeId) -> bool {
+    matches!(db.lookup_type(id), TypeKind::PlatformObject(object)
+        if object.name.fold_lower() == "фиксированнаяструктура"
+            || object.name.eq_ignore_ascii_case("FixedStructure"))
+}
+
 fn field_from_info(info: FieldInfo) -> Field {
     Field {
         env: match info.origin {

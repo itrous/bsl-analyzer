@@ -27,6 +27,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::OSUsersMethod,
     DiagnosticCode::PostingWhileDataExchangeLoading,
     DiagnosticCode::SetPrivilegedMode,
+    DiagnosticCode::StructureKeyIsNotIdentifier,
     DiagnosticCode::TryNumber,
     DiagnosticCode::UnsafeSafeModeMethodCall,
     DiagnosticCode::UseSystemInformation,
@@ -650,6 +651,15 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        DiagnosticCode::StructureKeyIsNotIdentifier,
+        r#"Процедура Тест()
+    Результат = Новый Структура("а.б");
+КонецПроцедуры"#,
+        r#"Procedure Test()
+    Result = New Structure("a.b");
+EndProcedure"#,
+    ),
+    (
         DiagnosticCode::OSUsersMethod,
         r#"Процедура Тест()
     ПользователиОС();
@@ -780,7 +790,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 223, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 224, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]
