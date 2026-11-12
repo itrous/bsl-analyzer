@@ -118,6 +118,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::MissingTemporaryFileDeletion => &[542],
         DiagnosticCode::MisplacedLoopControl => &[],
         DiagnosticCode::ObjectModifiedInOnWrite => &[465, 464],
+        DiagnosticCode::PostingWhileDataExchangeLoading => &[],
         DiagnosticCode::UseLessForEach => &[],
         DiagnosticCode::IteratorCollidesCollection => &[],
         DiagnosticCode::UsingGoto => &[547],
