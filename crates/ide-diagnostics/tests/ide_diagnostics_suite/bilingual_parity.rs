@@ -25,6 +25,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::NestedConstructorsInStructureDeclaration,
     DiagnosticCode::NumberOfValuesInStructureConstructor,
     DiagnosticCode::OSUsersMethod,
+    DiagnosticCode::PostingWhileDataExchangeLoading,
     DiagnosticCode::SetPrivilegedMode,
     DiagnosticCode::TryNumber,
     DiagnosticCode::UnsafeSafeModeMethodCall,
@@ -650,6 +651,17 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        DiagnosticCode::PostingWhileDataExchangeLoading,
+        r#"Процедура Тест(Документ)
+    Документ.ОбменДанными.Загрузка = Истина;
+    Документ.Записать(РежимЗаписиДокумента.Проведение);
+КонецПроцедуры"#,
+        r#"Procedure Test(Document)
+    Document.DataExchange.Load = True;
+    Document.Write(DocumentWriteMode.Posting);
+EndProcedure"#,
+    ),
+    (
         DiagnosticCode::SetPrivilegedMode,
         r#"Процедура Тест()
     УстановитьПривилегированныйРежим(Истина);
@@ -760,7 +772,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 220, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 221, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

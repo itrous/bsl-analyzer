@@ -135,6 +135,7 @@ pub mod platform_member_hidden_by_compatibility_mode;
 pub mod platform_member_newer_than_min_version;
 pub mod possibly_undefined_value;
 pub mod postfix_access_on_expression;
+pub mod posting_while_data_exchange_loading;
 pub mod privileged_module_method_call;
 pub mod procedure_returns_value;
 pub mod protected_module;
@@ -352,6 +353,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::MisplacedLoopControl => Some(&misplaced_loop_control::METADATA),
         DiagnosticCode::ObjectModifiedInOnWrite => Some(&object_modified_in_on_write::METADATA),
+        DiagnosticCode::PostingWhileDataExchangeLoading => {
+            Some(&posting_while_data_exchange_loading::METADATA)
+        }
         DiagnosticCode::UseLessForEach => Some(&useless_for_each::METADATA),
         DiagnosticCode::IteratorCollidesCollection => Some(&iterator_collides_collection::METADATA),
         DiagnosticCode::UsingGoto => Some(&using_goto::METADATA),
