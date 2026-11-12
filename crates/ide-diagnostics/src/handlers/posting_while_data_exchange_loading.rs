@@ -77,18 +77,13 @@ fn walk(body: &Body, stmts: &[StmtIdx], flagged: &mut Vec<String>, writes: &mut 
                 }
             }
             Stmt::If(if_stmt) => {
-                nested(body, &if_stmt.then_branch, flagged, writes);
-                for (_, branch) in if_stmt.elsif_branches.iter() {
-                    nested(body, branch, flagged, writes);
-                }
-                if let Some(branch) = &if_stmt.else_branch {
-                    nested(body, branch, flagged, writes);
-                }
+                let branches = std::iter::once(&*if_stmt.then_branch)
+                    .chain(if_stmt.elsif_branches.iter().map(|(_, branch)| &**branch))
+                    .chain(if_stmt.else_branch.as_deref());
+                alternatives(body, branches, flagged, writes);
             }
             Stmt::PreprocIf(preproc) => {
-                for branch in preproc.branches() {
-                    nested(body, branch.stmts, flagged, writes);
-                }
+                alternatives(body, preproc.branches().map(|branch| branch.stmts), flagged, writes);
             }
             Stmt::While { body: inner, .. } => nested(body, inner, flagged, writes),
             Stmt::For { var, body: inner, .. } | Stmt::ForEach { var, body: inner, .. } => {
@@ -111,6 +106,23 @@ fn nested(body: &Body, stmts: &[StmtIdx], flagged: &mut Vec<String>, writes: &mu
     let mut inner = flagged.clone();
     walk(body, stmts, &mut inner, writes);
     flagged.retain(|name| inner.contains(name));
+}
+
+/// Walks mutually exclusive branches, each from the state before them: a branch
+/// that cleared a flag does not hide a write in a sibling branch, while after the
+/// branches the flag survives only if no branch cleared it.
+fn alternatives<'a>(
+    body: &Body,
+    branches: impl Iterator<Item = &'a [StmtIdx]>,
+    flagged: &mut Vec<String>,
+    writes: &mut Vec<ExprIdx>,
+) {
+    let before = flagged.clone();
+    for branch in branches {
+        let mut inner = before.clone();
+        walk(body, branch, &mut inner, writes);
+        flagged.retain(|name| inner.contains(name));
+    }
 }
 
 fn apply_assignment(body: &Body, target: ExprIdx, value: ExprIdx, flagged: &mut Vec<String>) {
@@ -266,6 +278,18 @@ mod tests {
     #[test]
     fn loop_variable_rebinding_the_flagged_name_drops_the_flag() {
         let d = run("    Д.ОбменДанными.Загрузка = Истина;\n    Для Каждого Д Из Документы Цикл\n        Д.Записать(РежимЗаписиДокумента.Проведение);\n    КонецЦикла;\n    Д.Записать(РежимЗаписиДокумента.Проведение);");
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn reset_in_one_branch_does_not_hide_a_write_in_a_sibling_branch() {
+        let d = run("    Д.ОбменДанными.Загрузка = Истина;\n    Если Условие Тогда\n        Д.ОбменДанными.Загрузка = Ложь;\n    ИначеЕсли ДругоеУсловие Тогда\n        Д.Записать(РежимЗаписиДокумента.Проведение);\n    Иначе\n        Д.Записать(РежимЗаписиДокумента.ОтменаПроведения);\n    КонецЕсли;");
+        assert_eq!(d.len(), 2, "{d:?}");
+    }
+
+    #[test]
+    fn reset_in_any_branch_drops_the_flag_after_the_condition() {
+        let d = run("    Д.ОбменДанными.Загрузка = Истина;\n    Если Условие Тогда\n        Д.ОбменДанными.Загрузка = Ложь;\n    КонецЕсли;\n    Д.Записать(РежимЗаписиДокумента.Проведение);");
         assert!(d.is_empty(), "{d:?}");
     }
 
