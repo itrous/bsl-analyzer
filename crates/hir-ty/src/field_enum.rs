@@ -282,7 +282,7 @@ fn push_platform_prefix_properties(
     }
 }
 
-fn specialize_self_ref_ty(
+pub(crate) fn specialize_self_ref_ty(
     db: &dyn TypeKernelDb,
     mdo_type: MdoType,
     mdo_name: &Name,
