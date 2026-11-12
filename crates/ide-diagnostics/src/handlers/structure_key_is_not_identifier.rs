@@ -123,11 +123,11 @@ fn receiver_takes_key(ctx: &BodyContext, receiver: ExprIdx, method: &str) -> boo
     ctx.kernel_type_is_fixed_structure(ty) && is_one_of(method, FIXED_STRUCTURE_KEY_METHODS)
 }
 
-/// A literal that spans lines (`|` continuation) is not judged: its value is not the text
-/// between the quotes.
+/// The literal's value: a `|`-continued literal is already joined by line breaks, and a line
+/// break around a key is trimmed like any other whitespace.
 fn string_literal(body: &Body, expr: ExprIdx) -> Option<&str> {
     match body.expr_idx(expr) {
-        Expr::Literal(Literal::String(text)) if !text.contains(['\n', '\r']) => Some(text.as_str()),
+        Expr::Literal(Literal::String(text)) => Some(text.as_str()),
         _ => None,
     }
 }
@@ -306,6 +306,20 @@ mod tests {
     fn insert_on_a_receiver_of_unknown_type_is_not_flagged() {
         let d = run("    Неизвестно.Вставить(\"а.б\", 1);\n    Параметр.Вставить(\"\", 1);");
         assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn multiline_literal_is_judged_by_its_value() {
+        let d = run("    С = Новый Структура(\"а,
+    |б,
+    |в\");
+    Д = Новый Структура(\"а
+    |.б\");
+    Д.Вставить(\"Ключ
+    |\", 1);
+    Д.Вставить(\"Ключ
+    |Другой\", 1);");
+        assert_eq!(d.len(), 2, "{d:?}");
     }
 
     #[test]
