@@ -8464,9 +8464,9 @@ mod tests {
         );
     }
 
-    /// Only `UnusedLocalMethod` and `UnusedParameters` read the fold. The inputs switch them
-    /// off through each setting that can, and keep one of them on through each, so a gate
-    /// that always primes and one that never does both fail.
+    /// Only `UnusedLocalMethod`, `UnusedParameters` and `UnboundFormEventHandler` read the
+    /// fold. The inputs switch them off through each setting that can, and keep one of them
+    /// on through each, so a gate that always primes and one that never does both fail.
     #[test]
     fn priming_runs_while_a_rule_that_reads_the_fold_can_run() {
         let strings = |codes: &[&str]| codes.iter().map(|c| c.to_string()).collect::<Vec<_>>();
@@ -8474,9 +8474,16 @@ mod tests {
         let cases: &[Case] = &[
             ("by default", &[], None, true),
             ("one disabled", &["UnusedLocalMethod"], None, true),
-            ("the other disabled", &["UnusedParameters"], None, true),
-            ("both disabled", &["UnusedLocalMethod", "UnusedParameters"], None, false),
+            ("another disabled", &["UnusedParameters"], None, true),
+            ("only the form rule on", &["UnusedLocalMethod", "UnusedParameters"], None, true),
+            (
+                "all disabled",
+                &["UnusedLocalMethod", "UnusedParameters", "UnboundFormEventHandler"],
+                None,
+                false,
+            ),
             ("restricted to a reader", &[], Some(&["UnusedParameters"]), true),
+            ("restricted to the form rule", &[], Some(&["UnboundFormEventHandler"]), true),
             ("restricted to another rule", &[], Some(&["LineLength"]), false),
         ];
         for &(name, disabled, only, primes) in cases {
@@ -8493,14 +8500,17 @@ mod tests {
         }
     }
 
-    /// The load's end skips the priming while both readers are off, so the reload that
+    /// The load's end skips the priming while every reader is off, so the reload that
     /// switches one on is what asks for it. A reload that leaves the readers as they were,
     /// and one during the load, whose end primes anyway, do not.
     #[test]
     fn a_reload_that_switches_a_reader_on_primes_the_fold() {
         let readers_off = |state: &mut crate::global_state::GlobalState| {
-            state.diagnostics_config.disabled =
-                vec!["UnusedLocalMethod".to_owned(), "UnusedParameters".to_owned()];
+            state.diagnostics_config.disabled = vec![
+                "UnusedLocalMethod".to_owned(),
+                "UnusedParameters".to_owned(),
+                "UnboundFormEventHandler".to_owned(),
+            ];
         };
 
         let mut state = state_with_a_source_root();

@@ -72,6 +72,15 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let item_tree = ctx.item_tree();
 
+    let bound: Vec<String> = form
+        .event_handlers()
+        .iter()
+        .map(|h| h.handler_name.fold_lower())
+        .chain(form.command_handlers().iter().map(|h| h.fold_lower()))
+        .collect();
+
+    // The form's own bindings settle most candidates; what follows walks the module and
+    // reads a fold over the whole source root, so it runs only for the rest.
     let candidates: Vec<_> = item_tree
         .procedures()
         .filter(|(_, p)| !p.is_export)
@@ -82,19 +91,15 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 .filter(|(_, f)| !f.is_export)
                 .map(|(_, f)| (f.name.as_str(), f.name_range)),
         )
-        .filter(|(name, _)| FORM_EVENT_HANDLER_NAMES.contains(&name.fold_lower().as_str()))
+        .map(|(name, range)| (name, name.fold_lower(), range))
+        .filter(|(_, lower, _)| {
+            FORM_EVENT_HANDLER_NAMES.contains(&lower.as_str()) && !bound.contains(lower)
+        })
         .collect();
 
     if candidates.is_empty() {
         return Vec::new();
     }
-
-    let bound: Vec<String> = form
-        .event_handlers()
-        .iter()
-        .map(|h| h.handler_name.fold_lower())
-        .chain(form.command_handlers().iter().map(|h| h.fold_lower()))
-        .collect();
 
     // Calls, wait and notification handlers, bindings by name: the same set
     // `UnusedLocalMethod` works from.
@@ -102,16 +107,19 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         return Vec::new();
     };
 
+    let candidates: Vec<_> =
+        candidates.into_iter().filter(|(_, lower, _)| !called.contains(lower)).collect();
+
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
     let root = ctx.parse().syntax_node();
     let literals = super::unused_local_method::string_literal_texts(&root);
 
     let mut diagnostics = Vec::new();
 
-    for (name, name_range) in candidates {
-        let lower = name.fold_lower();
-        if bound.contains(&lower) || called.contains(&lower) {
-            continue;
-        }
+    for (name, lower, name_range) in candidates {
         if literals.iter().any(|text| super::unused_local_method::mentions_identifier(text, &lower))
         {
             continue;

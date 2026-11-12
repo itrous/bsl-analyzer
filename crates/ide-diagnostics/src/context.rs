@@ -361,7 +361,8 @@ impl<'a> AnalysisContext<'a> {
 
     /// Handler names some module of this file's source root binds by string to
     /// another module's object - `Форма.ПодключитьОбработчикОжидания("Имя", …)` in a
-    /// helper handed the form.
+    /// helper handed the form. Only the rules of [`FOREIGN_HANDLER_BINDINGS_READERS`]
+    /// read it.
     pub fn workspace_foreign_handler_bindings(&self) -> Arc<hir::ForeignHandlerBindings> {
         let source_root_id = self.source_root_id();
         self.query(|p| p.workspace_foreign_handler_bindings(source_root_id))
@@ -535,3 +536,12 @@ impl<'a> AnalysisContext<'a> {
         self.config.is_disabled(code)
     }
 }
+
+/// Rules that read [`DiagnosticsContext::workspace_foreign_handler_bindings`]. The fold scans
+/// every file of the source root, so a host builds it ahead of the first form module
+/// whenever one of these rules can run; a rule that reads the fold belongs here.
+pub const FOREIGN_HANDLER_BINDINGS_READERS: &[crate::DiagnosticCode] = &[
+    crate::DiagnosticCode::UnusedLocalMethod,
+    crate::DiagnosticCode::UnusedParameters,
+    crate::DiagnosticCode::UnboundFormEventHandler,
+];

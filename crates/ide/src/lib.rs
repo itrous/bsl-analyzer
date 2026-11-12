@@ -74,7 +74,7 @@ pub use ide_diagnostics::{
     standard_url, standards, validate_query_text, CleanCodeAttribute, Diagnostic, DiagnosticCode,
     DiagnosticOutput, DiagnosticSeverityLevel, DiagnosticTag, DiagnosticType, DiagnosticsConfig,
     DiagnosticsContext, Fix, ImpactSeverity, MetadataTag, Severity, SoftwareQuality, TextEdit,
-    METADATA_DEPENDENT_CODES,
+    FOREIGN_HANDLER_BINDINGS_READERS, METADATA_DEPENDENT_CODES,
 };
 pub use inlay_hints::{InlayHint, InlayHintKind};
 pub use name_lookup::{
