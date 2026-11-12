@@ -728,8 +728,7 @@ fn analyze_salsa(
     // its per-file work spreads over the pool. The candidates' trees fit the interactive
     // parse window, so only a deep trim drops them before the first chunk grows its own
     // working set.
-    let prime_bindings = !config.is_disabled(ide::DiagnosticCode::UnusedLocalMethod)
-        || !config.is_disabled(ide::DiagnosticCode::UnusedParameters);
+    let prime_bindings = config.any_enabled(ide::FOREIGN_HANDLER_BINDINGS_READERS);
     // A panic here (a file changed under the run) resurfaces in the chunk, where the
     // asking file's own boundary reports it, as it would without the warm-up.
     if prime_bindings

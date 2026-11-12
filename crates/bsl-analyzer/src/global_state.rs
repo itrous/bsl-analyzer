@@ -1282,12 +1282,10 @@ impl GlobalState {
         self.start_foreign_handler_bindings_priming();
     }
 
-    /// Only two rules consult the fold; with both switched off nothing would read it.
+    /// Only a few rules consult the fold; with all of them switched off nothing would read it.
     pub(crate) fn foreign_bindings_readers_enabled(&self) -> bool {
-        ide::DiagnosticsConfig::from_input(&self.diagnostics_config).any_enabled(&[
-            ide::DiagnosticCode::UnusedLocalMethod,
-            ide::DiagnosticCode::UnusedParameters,
-        ])
+        ide::DiagnosticsConfig::from_input(&self.diagnostics_config)
+            .any_enabled(ide::FOREIGN_HANDLER_BINDINGS_READERS)
     }
 
     pub(crate) fn start_foreign_handler_bindings_priming(&mut self) {
@@ -1299,7 +1297,7 @@ impl GlobalState {
             return;
         }
         if !self.foreign_bindings_readers_enabled() {
-            tracing::debug!("foreign handler bindings: both consumers disabled, priming skipped");
+            tracing::debug!("foreign handler bindings: every consumer disabled, priming skipped");
             self.foreign_bindings_priming.pending = false;
             return;
         }

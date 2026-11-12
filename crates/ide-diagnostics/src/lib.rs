@@ -30,7 +30,7 @@ pub mod test_utils;
 pub use body_context::BodyContext;
 pub use code::DiagnosticCode;
 pub use config::{DiagnosticsConfig, EffectiveMetadata, MetadataOverride};
-pub use context::{AnalysisContext, DiagnosticsContext};
+pub use context::{AnalysisContext, DiagnosticsContext, FOREIGN_HANDLER_BINDINGS_READERS};
 pub use handlers::get_metadata;
 pub use metadata::{
     CleanCodeAttribute, DiagnosticCompatibilityMode, DiagnosticMetadata, DiagnosticScope,

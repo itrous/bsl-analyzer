@@ -180,6 +180,7 @@ pub mod typo;
 pub mod unary_plus_in_concatenation;
 pub mod unavailable_alias_in_query;
 pub mod unavailable_in_environment;
+pub mod unbound_form_event_handler;
 pub mod uninitialized_local_variable;
 pub mod union_all;
 pub mod unknown_field_in_query;
@@ -493,6 +494,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::ServerSideExportFormMethod => {
             Some(&server_side_export_form_method::METADATA)
         }
+        DiagnosticCode::UnboundFormEventHandler => Some(&unbound_form_event_handler::METADATA),
         DiagnosticCode::SetPermissionsForNewObjects => {
             Some(&set_permissions_for_new_objects::METADATA)
         }
