@@ -391,7 +391,8 @@ fn has_user_attribute_collection(kind: MdoType) -> bool {
 }
 
 /// The element of an attribute collection: the platform type of one attribute
-/// description. Its own member surface is not attested yet, so it is not closed.
+/// description. Whether a member missing from it is reported is decided by the
+/// platform member-surface attestation of this type, like any platform object.
 const ATTRIBUTE_DESCRIPTION_TYPE: &str = "ОбъектМетаданных: Реквизит";
 
 fn is_attributes_property(field_name: &Name) -> bool {
