@@ -2,7 +2,7 @@ pub use crate::field_enum::FieldInfo;
 
 use bsl_metadata::{MdoType, ModuleType};
 use bsl_types::builders::Builders;
-use bsl_types::facet::FormDataFacet;
+use bsl_types::facet::{DescribedObject, DescribedPart, FormDataFacet};
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::{MetadataKind, MetadataReferenceKind, TypeId, TypeKind};
 use bsl_types::testing::RootConfigCtx;
@@ -188,6 +188,16 @@ fn lookup_field_raw(
         return lookup_metadata_object_collection_member(db, resolver, *kind, field_name);
     }
 
+    if let TypeKind::PlatformObject(facet) = db.lookup_type(effective_ty) {
+        if let Some(described) = &facet.described {
+            if let Some(info) =
+                lookup_described_member(db, resolver, effective_ty, described, field_name)
+            {
+                return Some(info);
+            }
+        }
+    }
+
     if let TypeKind::Structure(facet) = db.lookup_type(effective_ty) {
         // A known literal key resolves here. A miss is classified by inference from the facet's
         // explicit completeness proof; lookup itself stays unchanged for completion/hover callers.
@@ -330,8 +340,22 @@ fn lookup_metadata_object_collection_member(
     if !crate::manager_lookup::collection_member_exists(resolver, kind, field_name.as_str()) {
         return None;
     }
-    let ty = metadata_description_type_name(kind)
-        .map_or_else(|| db.unknown(), |name| db.platform_object(name));
+    let ty = match metadata_description_type_name(kind) {
+        Some(platform_name) => {
+            let described = has_user_attribute_collection(kind)
+                .then(|| resolver.resolve_metadata_object(kind, field_name.as_str()))
+                .flatten();
+            match described {
+                // The canonical spelling, so `товары` and `Товары` are one type.
+                Some(mdo) => db.described_platform_object(
+                    platform_name,
+                    DescribedObject::new(kind, mdo.name.clone(), DescribedPart::Description),
+                ),
+                None => db.platform_object(platform_name),
+            }
+        }
+        None => db.unknown(),
+    };
     Some(FieldInfo {
         name: field_name.clone(),
         name_en: None,
@@ -340,6 +364,102 @@ fn lookup_metadata_object_collection_member(
         is_readonly: true,
         origin: crate::field_enum::FieldOrigin::MetadataReference,
     })
+}
+
+/// The kinds whose description has a `Реквизиты` collection that the model can vouch for.
+///
+/// The model keeps one flat attribute list per object: it holds every attribute the
+/// platform lists in `Реквизиты`, plus standard attributes, addressing attributes and
+/// accounting flags. The list is therefore a superset of the platform's collection: a
+/// misspelled name is missing from it, while a name only the superset has goes
+/// unreported, which is the safe direction. Enumerations, constants and registers are
+/// left out: their collection is not what that list describes.
+fn has_user_attribute_collection(kind: MdoType) -> bool {
+    matches!(
+        kind,
+        MdoType::Catalog
+            | MdoType::Document
+            | MdoType::ChartOfAccounts
+            | MdoType::ChartOfCharacteristicTypes
+            | MdoType::ChartOfCalculationTypes
+            | MdoType::ExchangePlan
+            | MdoType::BusinessProcess
+            | MdoType::Task
+            | MdoType::DataProcessor
+            | MdoType::Report
+    )
+}
+
+/// The element of an attribute collection: the platform type of one attribute
+/// description. Its own member surface is not attested yet, so it is not closed.
+const ATTRIBUTE_DESCRIPTION_TYPE: &str = "ОбъектМетаданных: Реквизит";
+
+fn is_attributes_property(field_name: &Name) -> bool {
+    stdx::case::eq_ignore_case(field_name.as_str(), "Реквизиты")
+        || stdx::case::eq_ignore_case(field_name.as_str(), "Attributes")
+}
+
+/// A member that only the model can answer on a description that remembers its
+/// object: `Реквизиты` of the description (typed as that object's attribute collection
+/// instead of the bare platform collection), and a named attribute of that collection.
+fn lookup_described_member(
+    db: &dyn TypeKernelDb,
+    resolver: &dyn MetadataResolution,
+    receiver: TypeId,
+    described: &DescribedObject,
+    field_name: &Name,
+) -> Option<FieldInfo> {
+    if !has_user_attribute_collection(described.kind) {
+        return None;
+    }
+    match described.part {
+        DescribedPart::Description if is_attributes_property(field_name) => {
+            resolver.resolve_metadata_object(described.kind, described.name.as_str())?;
+            let info = lookup_field_via_platform_property(db, receiver, field_name)?;
+            let collection = db.described_platform_object(
+                "КоллекцияОбъектовМетаданных".to_string(),
+                DescribedObject::new(
+                    described.kind,
+                    described.name.clone(),
+                    DescribedPart::Attributes,
+                ),
+            );
+            Some(FieldInfo { ty: collection, ..info })
+        }
+        DescribedPart::Attributes => {
+            let mdo = resolver.resolve_metadata_object(described.kind, described.name.as_str())?;
+            let attribute = mdo.find_attribute(field_name.as_str())?;
+            Some(FieldInfo {
+                name: Name::new(attribute.name.as_str()),
+                name_en: None,
+                ty: db.platform_object(ATTRIBUTE_DESCRIPTION_TYPE.to_string()),
+                value_ty: None,
+                is_readonly: true,
+                origin: crate::field_enum::FieldOrigin::MetadataReference,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether `ty` is the attribute collection of an object the configuration declares,
+/// so a name it lacks is a defect rather than an unknown shape. A collection that does
+/// not remember its object (a bare platform value, a runtime-computed name), or whose
+/// object this file cannot see, is never judged.
+pub(crate) fn is_checked_attribute_collection(
+    db: &dyn TypeKernelDb,
+    resolver: &dyn MetadataResolution,
+    ty: TypeId,
+) -> bool {
+    let TypeKind::PlatformObject(facet) = db.lookup_type(ty) else {
+        return false;
+    };
+    let Some(described) = &facet.described else {
+        return false;
+    };
+    described.part == DescribedPart::Attributes
+        && has_user_attribute_collection(described.kind)
+        && resolver.resolve_metadata_object(described.kind, described.name.as_str()).is_some()
 }
 
 pub(crate) fn is_configuration_metadata_root(db: &dyn TypeKernelDb, receiver: TypeId) -> bool {

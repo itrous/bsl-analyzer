@@ -524,6 +524,200 @@ mod tests {
         assert!(unresolved.is_empty(), "untrusted metadata shapes must stay soft: {unresolved:?}");
     }
 
+    const DESCRIPTION_MODULE: &str = "CommonModules/Проба/Ext/Module.bsl";
+
+    const DESCRIPTION_CONFIGURATION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>Тест</Name></Properties>
+        <ChildObjects>
+            <Catalog>Товары</Catalog>
+            <CommonModule>Проба</CommonModule>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+
+    const DESCRIPTION_CATALOG_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.20">
+    <Catalog uuid="00000000-0000-0000-0000-000000000002">
+        <Properties>
+            <Name>Товары</Name>
+            <CodeLength>9</CodeLength>
+            <DescriptionLength>100</DescriptionLength>
+        </Properties>
+        <ChildObjects>
+            <Attribute uuid="00000000-0000-0000-0000-000000000003">
+                <Properties>
+                    <Name>Артикул</Name>
+                    <Type>
+                        <v8:Type>xs:string</v8:Type>
+                        <v8:StringQualifiers>
+                            <v8:Length>50</v8:Length>
+                            <v8:AllowedLength>Variable</v8:AllowedLength>
+                        </v8:StringQualifiers>
+                    </Type>
+                </Properties>
+            </Attribute>
+        </ChildObjects>
+    </Catalog>
+</MetaDataObject>"#;
+
+    const DESCRIPTION_MODULE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000008">
+        <Properties>
+            <Name>Проба</Name>
+            <Server>true</Server>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#;
+
+    /// Findings of `UnresolvedField` over a body checked in a configuration that holds the
+    /// catalog `Товары` with one attribute, `Артикул`.
+    fn description_misses(body: &str) -> Vec<String> {
+        let source = format!("Процедура Тест(Имя)\n{body}КонецПроцедуры\n");
+        let files = [
+            ("Configuration.xml", DESCRIPTION_CONFIGURATION_XML),
+            ("Catalogs/Товары.xml", DESCRIPTION_CATALOG_XML),
+            ("CommonModules/Проба.xml", DESCRIPTION_MODULE_XML),
+            (DESCRIPTION_MODULE, source.as_str()),
+        ];
+        crate::test_utils::check_config_files(&files, DESCRIPTION_MODULE)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnresolvedField)
+            .map(|diag| diag.message)
+            .collect()
+    }
+
+    #[test]
+    fn a_declared_attribute_of_a_catalog_description_resolves_silently() {
+        let found = description_misses(
+            "    А = Метаданные.Справочники.Товары.Реквизиты.Артикул;\n    \
+             Б = Метаданные.Справочники.товары.Реквизиты.артикул;\n    \
+             В = Метаданные.Справочники.Товары.Реквизиты.Артикул.Имя;\n",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_misspelled_attribute_of_a_catalog_description_is_reported() {
+        let found = description_misses("    А = Метаданные.Справочники.Товары.Реквизиты.Артикл;\n");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("'Артикл'"), "{found:?}");
+        assert!(found[0].contains("КоллекцияОбъектовМетаданных"), "{found:?}");
+    }
+
+    #[test]
+    fn a_misspelled_attribute_is_reported_through_a_local_description() {
+        let found = description_misses(
+            "    Описание = Метаданные.Справочники.Товары;\n    Нет = Описание.Реквизиты.Артикл;\n",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("'Артикл'"), "{found:?}");
+    }
+
+    #[test]
+    fn the_description_keeps_answering_for_its_own_members_as_the_bare_one_did() {
+        // An own member resolves; an unknown one is reported with the platform description
+        // type in the message, exactly as before the description remembered its object.
+        let found = description_misses(
+            "    А = Метаданные.Справочники.Товары.Имя;\n    \
+             Б = Метаданные.Справочники.Товары.Синоним;\n    \
+             Нет = Метаданные.Справочники.Товары.ТакогоСвойстваНет;\n",
+        );
+        assert_eq!(
+            found,
+            vec!["Поле 'ТакогоСвойстваНет' не найдено у типа 'ОбъектМетаданных: Справочник'"
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn a_description_rebound_on_another_path_does_not_judge_its_attributes() {
+        // After the `Если` the local may hold a description of an object the walk cannot
+        // name, and that object may well own the attribute.
+        let found = description_misses(
+            "    Описание = Метаданные.Справочники.Товары;\n    \
+             Если Имя = 1 Тогда\n        Описание = Метаданные.Справочники[Имя];\n    \
+             КонецЕсли;\n    Нет = Описание.Реквизиты.Артикл;\n",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// The member surface of the attribute description is attested at 8.3.27, so a member
+    /// the platform does not have is a defect of the code. The verdict is of a known release:
+    /// a versionless corpus keeps the gate shut by contract, and the member is then silent.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn an_unknown_member_of_an_attribute_description_is_reported() {
+        let found = description_misses(
+            "    А = Метаданные.Справочники.Товары.Реквизиты.Артикул.ИспользованиеРеквизита;
+                 Описание = Метаданные.Справочники.Товары.Реквизиты.Артикул;
+                 Б = Описание.НетТакогоПоляВовсе;
+",
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(found.len(), 2, "{found:?}");
+            assert!(found[0].contains("'ИспользованиеРеквизита'"), "{found:?}");
+            assert!(found[0].contains("ОбъектМетаданных: Реквизит"), "{found:?}");
+            assert!(found[1].contains("'НетТакогоПоляВовсе'"), "{found:?}");
+        } else {
+            assert!(
+                found.is_empty(),
+                "an unknown platform version keeps the miss silent: {found:?}"
+            );
+        }
+    }
+
+    /// The ten members the corpus scan found on attribute descriptions, in both spellings
+    /// of the type's own members, resolve silently: each is a member of the extract.
+    #[test]
+    fn each_member_the_corpus_uses_on_an_attribute_description_resolves_silently() {
+        let found = description_misses(
+            "    Описание = Метаданные.Справочники.Товары.Реквизиты.Артикул;
+                 А = Описание.Тип;
+                 Б = Описание.ПараметрыВыбора;
+                 В = Описание.Имя;
+                 Г = Описание.Подсказка;
+                 Д = Описание.Синоним;
+                 Е = Описание.ЗначениеЗаполнения;
+                 Ж = Описание.ПолноеИмя();
+                 З = Описание.Представление();
+                 И = Описание.СвязиПараметровВыбора;
+                 К = Описание.МаксимальноеЗначение;
+                 Л = Описание.Использование;
+                 М = Описание.Name;
+",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_unknown_object_name_gives_no_finding_on_its_attribute_access() {
+        // The missing catalog is the one finding; its attributes are not judged. A name
+        // computed at runtime leaves the object unknown, and nothing is reported at all.
+        let found = description_misses(
+            "    А = Метаданные.Справочники.НетТакогоСправочника.Реквизиты.Артикл;\n    \
+             Б = Метаданные.Справочники[Имя].Реквизиты.Артикл;\n    \
+             В = Метаданные.НайтиПоПолномуИмени(Имя).Реквизиты.Артикл;\n",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("'НетТакогоСправочника'"), "{found:?}");
+    }
+
+    #[test]
+    fn a_description_whose_object_is_not_visible_does_not_judge_its_attributes() {
+        // Outside a configuration the description does not remember an object, so the
+        // attribute collection stays the bare platform one.
+        let code = r#"Процедура Тест()
+    Нет = Метаданные.Справочники.Товары.Реквизиты.Артикл;
+КонецПроцедуры"#;
+        assert!(unresolved_fields(code).is_empty(), "{:?}", unresolved_fields(code));
+    }
+
     #[test]
     fn metadata_collection_miss_is_silent_without_a_visible_configuration() {
         // An external processor or a loose module may name objects of a configuration it

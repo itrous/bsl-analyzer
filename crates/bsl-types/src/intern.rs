@@ -82,8 +82,11 @@ pub fn canonicalise(db: &dyn TypeKernelDb, kind: TypeKind) -> TypeKind {
 
         TypeKind::Union(members) => canonicalise_union(db, members),
 
-        TypeKind::PlatformObject(PlatformObjectFacet { name }) => {
-            TypeKind::PlatformObject(PlatformObjectFacet { name: canonical_platform_name(name) })
+        TypeKind::PlatformObject(PlatformObjectFacet { name, described }) => {
+            TypeKind::PlatformObject(PlatformObjectFacet {
+                name: canonical_platform_name(name),
+                described,
+            })
         }
 
         other => other,
