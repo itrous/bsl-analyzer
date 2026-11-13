@@ -67,6 +67,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     ),
     (DiagnosticCode::LineLength, "formatting-only diagnostic"),
     (
+        DiagnosticCode::FormDataHasNoMetadataMethod,
+        "judged by the inferred type of a form attribute, which needs a form module and form metadata on disk; this fixture harness has neither, so no fixture can emit it - the English spelling is covered by a handler test with form metadata",
+    ),
+    (
         DiagnosticCode::GlobalContextMethodConflict,
         "form declaration checked against the platform global catalog; does not inspect a bilingual use-site",
     ),
@@ -794,7 +798,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 225, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 226, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]
