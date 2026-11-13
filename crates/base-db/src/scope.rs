@@ -40,6 +40,8 @@ type FileHunks = Option<Vec<Hunk>>;
 pub struct AnalysisScope {
     /// Human-readable reference the scope was built against (e.g. `vendor`).
     base_ref: String,
+    /// Keys in the spelling [`normalize_path`] produces, which is also the spelling every
+    /// lookup is normalized to; see [`AnalysisScope::build`].
     files: HashMap<PathBuf, FileHunks>,
     /// Basename → keys sharing it, for suffix matching of relative keys.
     filename_index: HashMap<String, Vec<PathBuf>>,
@@ -120,6 +122,16 @@ impl AnalysisScope {
     }
 
     fn build(base_ref: String, files: HashMap<PathBuf, FileHunks>, relative_keys: bool) -> Self {
+        // A key is reachable only in the spelling `find` normalizes its argument to, so the
+        // normalization belongs here, where every constructor passes, rather than in three of
+        // the four. The absolute constructors normalized the relative part alone and joined it
+        // onto the workdir as given: a workdir spelled with `\`, or a canonicalized one on
+        // Windows (`\\?\C:\...`, where `/` is not a separator at all), produced keys no lookup
+        // could reach, and every file silently fell out of scope.
+        let files: HashMap<PathBuf, FileHunks> = files
+            .into_iter()
+            .map(|(path, hunks)| (normalize_path(&path.to_string_lossy()), hunks))
+            .collect();
         let mut filename_index: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for path in files.keys() {
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
@@ -411,6 +423,22 @@ mod tests {
             [(".\\src\\Module.bsl".to_string(), None)],
         );
         assert!(scope.is_file_in_scope(Path::new("/repo/src/Module.bsl")));
+    }
+
+    /// A workdir in a spelling the lookup side normalizes away — Windows separators, or the
+    /// verbatim prefix `canonicalize` returns there — must still resolve to its files.
+    #[test]
+    fn a_workdir_in_another_spelling_still_matches_its_files() {
+        let scope = AnalysisScope::from_report(
+            "vendor",
+            Path::new(r"\\?\C:\repo"),
+            [("src/Module.bsl".to_string(), Some(vec![[3, 4]]))],
+        );
+
+        let file = Path::new(r"\\?\C:\repo\src\Module.bsl");
+        assert!(scope.is_file_in_scope(file), "the file is in scope: {scope:?}");
+        assert!(scope.lines_in_scope(file, 2, 2), "line 3 (0-based 2) is in a hunk");
+        assert!(!scope.lines_in_scope(file, 0, 0), "control: line 1 is not");
     }
 
     #[test]
