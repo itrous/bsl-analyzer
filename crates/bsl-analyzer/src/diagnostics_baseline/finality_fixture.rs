@@ -43,7 +43,9 @@ pub(crate) struct Workspace {
 impl Workspace {
     pub(crate) fn new(form: Form) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        // The spelling a walk, an LSP root URI and the libgit2 workdir all use: a bare
+        // `canonicalize` answers with the Windows verbatim prefix, which none of them carry.
+        let root = stdx::path_exclusion::resolve(dir.path()).unwrap();
         for source in ["src/cf", "src/cfe/Ext"] {
             std::fs::create_dir_all(root.join(source)).unwrap();
             std::fs::write(root.join(source).join("Configuration.xml"), "<Configuration/>")
