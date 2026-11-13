@@ -357,8 +357,7 @@ impl AuthorFilter {
         }
         // The workdir is a realpath while callers may hold a lexical path
         // (symlinked analysis roots) — retry against the canonical file path.
-        let canonical =
-            stdx::path_exclusion::simplify_verbatim(std::fs::canonicalize(abs_path).ok()?);
+        let canonical = stdx::path_exclusion::resolve(abs_path).ok()?;
         canonical.strip_prefix(&self.workdir).ok().map(Path::to_path_buf)
     }
 }
