@@ -1,7 +1,8 @@
 //! Members of the configuration's metadata descriptions (`Метаданные.Справочники.X.<член>`)
 //! are checked against the platform's description of that kind.
 
-use hir::{HirDatabase, InferenceDiagnostic};
+use hir::{Builders, HirDatabase, InferenceDiagnostic};
+use ide::Analysis;
 use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
 use std::path::PathBuf;
@@ -113,8 +114,10 @@ fn description_reassigned_to_an_unknown_value_stays_soft() {
 
 #[test]
 fn untrusted_metadata_shapes_stay_silent() {
-    // Nested collections, generic descriptions, the configuration root and the kinds whose
-    // platform member lists are not trusted as complete must not accuse anything.
+    // Generic descriptions, the configuration root and the kinds whose platform member
+    // lists are not trusted as complete must not accuse anything. The attribute collection
+    // of a declared catalog is the one nested collection judged: it lists exactly the
+    // attributes the configuration declares.
     let found = unresolved_fields(
         r#"Процедура Тест()
     А = Метаданные.Справочники.Справочник1.Реквизиты.НетТакогоРеквизита;
@@ -125,7 +128,7 @@ fn untrusted_metadata_shapes_stay_silent() {
 КонецПроцедуры
 "#,
     );
-    assert!(found.is_empty(), "untrusted metadata shapes must stay soft: {found:?}");
+    assert_eq!(found, vec!["НетТакогоРеквизита".to_string()], "untrusted shapes must stay soft");
 }
 
 fn var_type(code: &str, var_lower: &str) -> Option<hir::TypeId> {
@@ -462,4 +465,78 @@ fn a_local_copied_through_a_long_chain_of_branches_is_resolved_once_per_read() {
     }
     code.push_str("    Нет = Л12.Измерения;\nКонецПроцедуры\n");
     assert_eq!(unresolved_fields(&code), vec!["Измерения".to_string()]);
+}
+
+/// Hover markup and completion labels at `$0` in `code`.
+fn hover_and_completion(code: &str) -> (String, Vec<String>) {
+    let offset = code.find("$0").expect("code must contain $0") as u32;
+    let fixture = format!("//- /test.bsl\n{}", code.replacen("$0", "", 1));
+    let (db, file_id) = setup(&fixture);
+    let analysis = Analysis::from_database(db);
+    let hover = analysis
+        .hover(file_id, offset, ide::Locale::Ru)
+        .map(|hover| hover.markup)
+        .unwrap_or_default();
+    let labels = analysis
+        .completions(file_id, offset, None, ide::Locale::Ru)
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+    (hover, labels)
+}
+
+const DESCRIPTION_OF_EITHER_CATALOG: &str = r#"Функция ОписаниеОдногоИз(Условие)
+    Если Условие Тогда
+        Возврат Метаданные.Справочники.Справочник1;
+    КонецЕсли;
+    Возврат Метаданные.Справочники.СправочникСМенеджером;
+КонецФункции
+
+"#;
+
+#[test]
+fn descriptions_of_two_catalogs_meet_as_the_catalog_description() {
+    // Every catalog description is `ОбъектМетаданных: Справочник`, so `?(…)` over two of
+    // them and a function returning either are that one platform type.
+    let code = format!(
+        r#"{DESCRIPTION_OF_EITHER_CATALOG}Процедура Тест(Условие)
+    ВТернарном = ?(Условие, Метаданные.Справочники.Справочник1, Метаданные.Справочники.СправочникСМенеджером);
+    ИзФункции = ОписаниеОдногоИз(Условие);
+КонецПроцедуры
+"#
+    );
+    let (db, file_id) = setup(&format!("//- /test.bsl\n{code}"));
+    let description = db.platform_object("ОбъектМетаданных: Справочник".to_string());
+    let inferred = db.infer(file_id);
+    for var in ["втернарном", "изфункции"] {
+        assert_eq!(inferred.var_types.get(var).copied(), Some(description), "{var}");
+    }
+}
+
+#[test]
+fn hover_and_completion_show_the_catalog_description_where_two_catalogs_meet() {
+    for (place, read) in [
+        (
+            "?(…)",
+            "Описание = ?(Условие, Метаданные.Справочники.Справочник1, Метаданные.Справочники.СправочникСМенеджером);",
+        ),
+        ("a function returning either", "Описание = ОписаниеОдногоИз(Условие);"),
+    ] {
+        let (hover, labels) = hover_and_completion(&format!(
+            "{DESCRIPTION_OF_EITHER_CATALOG}Процедура Тест(Условие)\n    {read}\n    Описание.$0\nКонецПроцедуры\n"
+        ));
+        let (variable_hover, _) = hover_and_completion(&format!(
+            "{DESCRIPTION_OF_EITHER_CATALOG}Процедура Тест(Условие)\n    {read}\n    А = Опи$0сание;\nКонецПроцедуры\n"
+        ));
+        assert!(
+            variable_hover.contains("ОбъектМетаданных: Справочник") && !variable_hover.contains('|'),
+            "{place}: {variable_hover}"
+        );
+        assert!(!hover.contains('|'), "{place}: {hover}");
+        assert!(
+            labels.iter().any(|label| label == "Иерархический")
+                && labels.iter().any(|label| label == "Реквизиты"),
+            "{place}: {labels:?}"
+        );
+    }
 }

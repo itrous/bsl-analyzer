@@ -271,6 +271,10 @@ fn the_curated_overlays_reach_the_built_in_facts() {
             "{name} is attested and the built-in facts are of the attested release"
         );
     }
+    for name in ["ОбъектМетаданных: Реквизит", "MetadataObject: Attribute"]
+    {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
     for name in ["ЗаписьJSON", "JSONWriter", "ТаблицаЗначений", "ValueTable"] {
         assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
     }

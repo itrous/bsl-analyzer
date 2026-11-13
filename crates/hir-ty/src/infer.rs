@@ -2759,6 +2759,22 @@ impl<'db> InferenceContext<'db> {
         })
     }
 
+    /// True when `receiver_expr` holds, on every path reaching it, the attribute collection
+    /// of a declared object lacking `field`. The walk types a local by its textually latest
+    /// write, so another path may hold the collection of an object that owns the name.
+    fn attribute_miss_holds_on_every_path(
+        &self,
+        receiver_expr: ExprId,
+        field: &hir_def::Name,
+    ) -> bool {
+        let obj_resolver =
+            crate::object_resolver::DbObjectResolver::new(self.db, self.context_file_id);
+        self.miss_holds_on_every_path(receiver_expr, |ty| {
+            crate::field_lookup::is_checked_attribute_collection(self.db, &obj_resolver, ty)
+                && self.lacks_field(ty, field)
+        })
+    }
+
     /// True when `receiver_expr` holds, on every path reaching it, a platform object whose
     /// member surface the curated overlays attest as complete, and none of those objects has
     /// `field`.
@@ -3859,7 +3875,12 @@ impl<'db> InferenceContext<'db> {
                 if then_ty == else_ty {
                     then_ty
                 } else {
-                    self.db.unknown()
+                    let joined = self.db.forget_described(then_ty);
+                    if joined == self.db.forget_described(else_ty) {
+                        joined
+                    } else {
+                        self.db.unknown()
+                    }
                 }
             }
 
@@ -4038,6 +4059,16 @@ impl<'db> InferenceContext<'db> {
                     let closed_description =
                         crate::field_lookup::is_closed_metadata_description(self.db, base_ty)
                             && self.description_miss_holds_on_every_path(base_id, field);
+                    // The attribute collection of a described object lists exactly the
+                    // attributes the configuration declares for it. As with the
+                    // description itself, the receiver must be such a collection on every
+                    // path reaching the read.
+                    let closed_attribute_collection =
+                        crate::field_lookup::is_checked_attribute_collection(
+                            self.db,
+                            &obj_resolver,
+                            base_ty,
+                        ) && self.attribute_miss_holds_on_every_path(base_id, field);
                     // An ordinary form's controls are exactly the ones its dialog lists,
                     // unless the module adds controls or lets other code at the form.
                     let closed_ordinary_controls =
@@ -4059,6 +4090,7 @@ impl<'db> InferenceContext<'db> {
                         && (closed_receiver
                             || closed_metadata_collection
                             || closed_description
+                            || closed_attribute_collection
                             || closed_ordinary_controls
                             || closed_managed_items)
                     {

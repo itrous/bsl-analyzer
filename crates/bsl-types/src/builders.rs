@@ -3,10 +3,10 @@ use std::sync::Arc;
 use bsl_metadata::Name;
 
 use crate::facet::{
-    ArrayFacet, CommonModuleFacet, DateFacet, FormBindingFacet, FormDataFacet, FormElementFacet,
-    FunctionFacet, ManagerFacet, MapFacet, MdoRefFacet, MetaObjFacet, MetaRefFacet, NumberFacet,
-    PlatformObjectFacet, ProjectionFacet, ProjectionSource, StringFacet, StructureFacet,
-    TableFacet, TableSource,
+    ArrayFacet, CommonModuleFacet, DateFacet, DescribedObject, FormBindingFacet, FormDataFacet,
+    FormElementFacet, FunctionFacet, ManagerFacet, MapFacet, MdoRefFacet, MetaObjFacet,
+    MetaRefFacet, NumberFacet, PlatformObjectFacet, ProjectionFacet, ProjectionSource, StringFacet,
+    StructureFacet, TableFacet, TableSource,
 };
 use crate::intern::TypeKernelDb;
 use crate::kind::{
@@ -244,7 +244,29 @@ pub trait Builders: TypeKernelDb {
     }
 
     fn platform_object(&self, name: Name) -> TypeId {
-        self.intern_type(TypeKind::PlatformObject(PlatformObjectFacet { name }))
+        self.intern_type(TypeKind::PlatformObject(PlatformObjectFacet { name, described: None }))
+    }
+
+    /// A platform object that also remembers which configuration object it describes.
+    fn described_platform_object(&self, name: Name, described: DescribedObject) -> TypeId {
+        self.intern_type(TypeKind::PlatformObject(PlatformObjectFacet {
+            name,
+            described: Some(described),
+        }))
+    }
+
+    /// `ty` without the configuration object a platform object remembers.
+    ///
+    /// Two values that differ only in that remembered object are one platform type, so
+    /// wherever values of separate origins meet (a union, both arms of `?(…)`, an
+    /// argument against its parameter) they are compared and joined through this.
+    fn forget_described(&self, ty: TypeId) -> TypeId {
+        match self.lookup_type(ty) {
+            TypeKind::PlatformObject(PlatformObjectFacet { name, described: Some(_) }) => {
+                self.platform_object(name.clone())
+            }
+            _ => ty,
+        }
     }
 
     fn union(&self, members: Vec<TypeId>) -> TypeId {
