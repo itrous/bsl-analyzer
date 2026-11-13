@@ -286,6 +286,13 @@ impl AnalysisProvider for SalsaProvider<'_> {
     fn kernel_type_is_form_data_structure(&self, id: bsl_types::kind::TypeId) -> bool {
         hir::kernel_type_is_form_data_structure(self.db, id)
     }
+    fn kernel_type_is_boolean(&self, id: bsl_types::kind::TypeId) -> bool {
+        hir::kernel_type_is_boolean(self.db, id)
+    }
+
+    fn kernel_type_is_metadata_reference(&self, id: bsl_types::kind::TypeId) -> bool {
+        hir::kernel_type_is_metadata_reference(self.db, id)
+    }
 
     fn min_platform_version(&self) -> Option<Arc<str>> {
         HirDatabase::min_platform_version(self.db)

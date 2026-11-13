@@ -78,7 +78,10 @@ jobs:
             # compiles. The workflow forces colour on cargo, and a coloured `Running` line
             # would hide every section from the pattern, so these listings ask for none.
             local exact=() binary selection=() filters=() listed ignored runnable disabled status match what filter missing=0
-            local pick='/ Running /{b=$0; sub(/.*\//,"",b); sub(/-[0-9a-f]+\)$/,"",b); cur=b; next} cur==want && /: test$/{sub(/: test$/,""); print}'
+            # A test executable sits at `<dir>/<bin>-<hash>`: `<dir>` is `deps` on some
+            # toolchains and `build/<package>/<hash>/out` on others, so the binary name is
+            # the stem of the last path component under either layout.
+            local pick='/ Running /{b=$0; sub(/\)$/,"",b); sub(/.*\//,"",b); sub(/-[0-9a-f]+$/,"",b); cur=b; next} cur==want && /: test$/{sub(/: test$/,""); print}'
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             binary=$1; shift
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
@@ -367,7 +370,10 @@ jobs:
             # compiles. The workflow forces colour on cargo, and a coloured `Running` line
             # would hide every section from the pattern, so these listings ask for none.
             local exact=() binary selection=() filters=() listed ignored runnable disabled status match what filter missing=0
-            local pick='/ Running /{b=$0; sub(/.*\//,"",b); sub(/-[0-9a-f]+\)$/,"",b); cur=b; next} cur==want && /: test$/{sub(/: test$/,""); print}'
+            # A test executable sits at `<dir>/<bin>-<hash>`: `<dir>` is `deps` on some
+            # toolchains and `build/<package>/<hash>/out` on others, so the binary name is
+            # the stem of the last path component under either layout.
+            local pick='/ Running /{b=$0; sub(/\)$/,"",b); sub(/.*\//,"",b); sub(/-[0-9a-f]+$/,"",b); cur=b; next} cur==want && /: test$/{sub(/: test$/,""); print}'
             if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
             binary=$1; shift
             while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
