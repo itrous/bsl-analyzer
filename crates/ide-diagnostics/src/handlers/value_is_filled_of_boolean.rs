@@ -40,9 +40,9 @@ const MESSAGE: &str = "ЗначениеЗаполнено от Булево вс
 ///   platform has no empty value for it, unlike a query selection or a value-table row whose
 ///   Boolean column can be `NULL` (`ЗначениеЗаполнено(NULL)` is false);
 /// * a local variable all of whose assignments in this body are such values, whose FIRST
-///   assignment stands at the top level of the body before the call (no path leaves it
-///   unset), and which is never handed to another call (it could be an out-parameter,
-///   like `Структура.Свойство("Ключ", Переменная)`).
+///   assignment stands at the top level of the body before the call in a body without
+///   `Перейти` (no path leaves it unset), and which is never handed to another call (it
+///   could be an out-parameter, like `Структура.Свойство("Ключ", Переменная)`).
 ///
 /// Parameters, module variables, other fields, indexes and call results are never reported.
 pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
@@ -169,6 +169,11 @@ fn local_flag_is_boolean(ctx: &BodyContext, name: &str, before: LocalOffset, dep
     }
     assignments.sort_by_key(|(order, ..)| *order);
     let Some(&(_, first, _)) = assignments.first() else { return false };
+    // A top-level assignment before the call lies on every path to it only while
+    // control flows in text order; a `Перейти` may jump past it.
+    if body.stmts_iter().any(|(_, stmt)| matches!(stmt, Stmt::Goto(_))) {
+        return false;
+    }
     if !body.body_stmts_typed().contains(&first) {
         return false;
     }
@@ -326,6 +331,12 @@ mod tests {
     fn value_is_filled_of_a_parameter_is_not_flagged() {
         let code = "Процедура Проба(Флаг)\n    А = ЗначениеЗаполнено(Флаг);\nКонецПроцедуры\n";
         let d = check_diagnostics_for(code, DiagnosticCode::ValueIsFilledOfBoolean);
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn value_is_filled_of_a_variable_whose_assignment_a_goto_may_skip_is_not_flagged() {
+        let d = run("    Если Условие Тогда\n        Перейти ~Метка;\n    КонецЕсли;\n    Флаг = Истина;\n~Метка:\n    А = ЗначениеЗаполнено(Флаг);");
         assert!(d.is_empty(), "{d:?}");
     }
 
