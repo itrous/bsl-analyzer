@@ -27,6 +27,18 @@ pub fn expand_log_file_path(path: PathBuf, pid: u32) -> PathBuf {
     }
 }
 
+/// Reads an environment variable, treating a blanked-out value (`VAR=`) as unset.
+///
+/// A launcher that cannot remove a variable from a child's environment blanks it
+/// instead, so an empty value means "no value", never a zero-length path or filter.
+pub fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name).ok().and_then(non_empty)
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
 /// Set up the process's logging, failing the start when a log file the user named cannot
 /// be set up. `default_log` marks the daemon's own default log instead: it falls back to
 /// stderr. A failure never truncates the file; the reason is appended to it when it can
@@ -74,7 +86,7 @@ fn setup_logging(
         None => BoxMakeWriter::new(io::stderr),
     };
 
-    let user_filter = env::var("BSL_LOG").ok().unwrap_or_else(|| "warn".to_owned());
+    let user_filter = non_empty_env("BSL_LOG").unwrap_or_else(|| "warn".to_owned());
     // The graph-build heartbeat (target `bsl_graph`) stays visible at the default
     // `warn` level: it is the only trail that localises a wedged cold build. The
     // directive precedes the user filter, so an explicit `bsl_graph=off` wins.
@@ -92,6 +104,19 @@ fn setup_logging(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blank_value_is_read_as_no_value() {
+        assert_eq!(non_empty(String::new()), None);
+        assert_eq!(non_empty("   ".to_owned()), None);
+        assert_eq!(non_empty("\t\n".to_owned()), None);
+    }
+
+    #[test]
+    fn a_value_with_content_is_kept_verbatim() {
+        assert_eq!(non_empty("warn".to_owned()), Some("warn".to_owned()));
+        assert_eq!(non_empty(" warn ".to_owned()), Some(" warn ".to_owned()));
+    }
 
     #[test]
     fn pid_placeholder_is_replaced_with_the_process_id() {

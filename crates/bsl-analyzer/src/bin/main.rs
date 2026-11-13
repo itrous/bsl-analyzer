@@ -61,7 +61,7 @@ use cli::{
     diagnostics_baseline::{self, DiagnosticsCommand},
     extension::{self, ExtensionCommands},
     format::run_format,
-    logging::{expand_log_file_path, start_logging},
+    logging::{expand_log_file_path, non_empty_env, start_logging},
     lsp::run_lsp_server,
     mcp::{self, McpCommand},
     platform_help::{self as platform_help_cli, PlatformHelpCommand},
@@ -269,8 +269,7 @@ enum Commands {
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
 
-    let (log_file, default_log) = match env::var("BSL_LOG_FILE")
-        .ok()
+    let (log_file, default_log) = match non_empty_env("BSL_LOG_FILE")
         .map(|value| expand_log_file_path(PathBuf::from(value), std::process::id()))
     {
         Some(file) => (Some(file), false),
@@ -280,9 +279,9 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         },
     };
 
-    let profile_filter = cli.profile.clone().or_else(|| env::var("BSL_PROFILE").ok());
+    let profile_filter = cli.profile.clone().or_else(|| non_empty_env("BSL_PROFILE"));
     let json_profile_filter =
-        cli.profile_json.clone().or_else(|| env::var("BSL_PROFILE_JSON").ok());
+        cli.profile_json.clone().or_else(|| non_empty_env("BSL_PROFILE_JSON"));
 
     let _journal_guard = start_logging(
         log_file.clone(),
