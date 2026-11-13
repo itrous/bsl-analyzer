@@ -42,13 +42,21 @@ fn output_text(output: &Output) -> String {
     )
 }
 
+/// Exit code 2 marks argument misuse, and nothing reaches stdout: the JSONL stream
+/// does not even start, so no consumer mistakes the run for an empty result.
+fn assert_rejected(output: &Output) -> String {
+    let text = output_text(output);
+    assert_eq!(output.status.code(), Some(2), "{text}");
+    assert!(output.stdout.is_empty(), "{text}");
+    text
+}
+
 #[test]
 fn an_unknown_name_fails_the_run_and_is_named() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
     let output = analyze(dir.path(), "NoSuchDiagnosticCode");
-    let text = output_text(&output);
-    assert!(!output.status.success(), "exit code {:?}: {text}", output.status.code());
+    let text = assert_rejected(&output);
     assert!(text.contains("NoSuchDiagnosticCode"), "{text}");
     assert!(text.contains("--only-diagnostic"), "{text}");
 }
@@ -58,8 +66,7 @@ fn a_comma_list_is_one_unknown_name_and_fails_the_run() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
     let output = analyze(dir.path(), "LineLength,UnusedLocalVariable");
-    let text = output_text(&output);
-    assert!(!output.status.success(), "exit code {:?}: {text}", output.status.code());
+    let text = assert_rejected(&output);
     assert!(text.contains("LineLength,UnusedLocalVariable"), "{text}");
 }
 
