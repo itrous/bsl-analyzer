@@ -862,9 +862,6 @@ fn listener_options(key: &BackendKey) -> io::Result<ListenerOptions<'static>> {
 /// `CreateNamedPipe` of an already-existing instance with `ERROR_ACCESS_DENIED` (5)
 /// instead, so we map that to the same "name in use" decision.
 fn is_name_in_use(e: &std::io::Error) -> bool {
-    if e.kind() == std::io::ErrorKind::AddrInUse {
-        return true;
-    }
     #[cfg(windows)]
     {
         const ERROR_ACCESS_DENIED: i32 = 5;
@@ -872,7 +869,7 @@ fn is_name_in_use(e: &std::io::Error) -> bool {
             return true;
         }
     }
-    false
+    e.kind() == std::io::ErrorKind::AddrInUse
 }
 
 /// Is a backend actually accepting on this name? A successful connect proves a live

@@ -1603,8 +1603,8 @@ impl SharedState {
                                                 error,
                                             ) => error.to_string(),
                                             crate::workspace_lease::LeaseOperationError::Operation(
-                                                error,
-                                            ) => error.to_string(),
+                                                never,
+                                            ) => match never {},
                                         };
                                         Self::set_semantic_runtime_status(
                                             &runtime,
