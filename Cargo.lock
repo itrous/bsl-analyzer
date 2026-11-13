@@ -5981,6 +5981,7 @@ dependencies = [
  "git2",
  "serde",
  "serde_json",
+ "stdx",
  "tempfile",
  "tracing",
 ]
