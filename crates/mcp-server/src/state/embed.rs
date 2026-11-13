@@ -1598,13 +1598,15 @@ impl SharedState {
                                         // Debug reaches `search status` verbatim — the
                                         // variant name and its braces where a message
                                         // belongs. The error inside is what a reader needs.
+                                        // The publication closure returns `Infallible`, so an
+                                        // operation error cannot arise here.
                                         let error = match error {
                                             crate::workspace_lease::LeaseOperationError::Lease(
                                                 error,
                                             ) => error.to_string(),
                                             crate::workspace_lease::LeaseOperationError::Operation(
-                                                error,
-                                            ) => error.to_string(),
+                                                never,
+                                            ) => match never {},
                                         };
                                         Self::set_semantic_runtime_status(
                                             &runtime,
