@@ -572,9 +572,9 @@ mod tests {
     </CommonModule>
 </MetaDataObject>"#;
 
-    /// Findings of `UnresolvedField` over a body checked in a configuration that holds the
-    /// catalog `Товары` with one attribute, `Артикул`.
-    fn description_misses(body: &str) -> Vec<String> {
+    /// Findings of `code` over a body checked in a configuration that holds the catalog
+    /// `Товары` with one attribute, `Артикул`.
+    fn description_findings(body: &str, code: DiagnosticCode) -> Vec<String> {
         let source = format!("Процедура Тест(Имя)\n{body}КонецПроцедуры\n");
         let files = [
             ("Configuration.xml", DESCRIPTION_CONFIGURATION_XML),
@@ -584,9 +584,13 @@ mod tests {
         ];
         crate::test_utils::check_config_files(&files, DESCRIPTION_MODULE)
             .into_iter()
-            .filter(|diag| diag.code == DiagnosticCode::UnresolvedField)
+            .filter(|diag| diag.code == code)
             .map(|diag| diag.message)
             .collect()
+    }
+
+    fn description_misses(body: &str) -> Vec<String> {
+        description_findings(body, DiagnosticCode::UnresolvedField)
     }
 
     #[test]
@@ -670,6 +674,47 @@ mod tests {
                 "an unknown platform version keeps the miss silent: {found:?}"
             );
         }
+    }
+
+    /// The method surface of the attribute description is attested too, so a call the
+    /// platform does not have is reported against the description type. As with the
+    /// fields, a versionless corpus keeps the gate shut by contract.
+    #[test]
+    #[cfg_attr(
+        corpus_contract,
+        ignore = "the corpus profile serves a versionless corpus: the completeness gate is shut by contract"
+    )]
+    fn an_unknown_method_of_an_attribute_description_is_reported() {
+        let found = description_findings(
+            "    Метаданные.Справочники.Товары.Реквизиты.Артикул.НетТакогоМетода();\n",
+            DiagnosticCode::UnresolvedMethodCall,
+        );
+        if crate::test_utils::built_in_facts_are_served() {
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].contains("'НетТакогоМетода'"), "{found:?}");
+            assert!(found[0].contains("ОбъектМетаданных: Реквизит"), "{found:?}");
+        } else {
+            assert!(
+                found.is_empty(),
+                "an unknown platform version keeps the miss silent: {found:?}"
+            );
+        }
+    }
+
+    /// The methods the 8.3.27 extract lists for the attribute description never report,
+    /// whether called on the chain itself or through a local.
+    #[test]
+    fn each_method_of_an_attribute_description_resolves_silently() {
+        let found = description_findings(
+            "    А = Метаданные.Справочники.Товары.Реквизиты.Артикул.ПолноеИмя();
+                 Описание = Метаданные.Справочники.Товары.Реквизиты.Артикул;
+                 Б = Описание.Представление();
+                 В = Описание.Родитель();
+                 Г = Описание.FullName();
+",
+            DiagnosticCode::UnresolvedMethodCall,
+        );
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// The ten members the corpus scan found on attribute descriptions, in both spellings
