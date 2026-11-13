@@ -93,9 +93,9 @@ fn collection_reached_through_a_local_keeps_its_kind() {
 
 #[test]
 fn collection_methods_and_untrusted_shapes_stay_silent() {
-    // The collection keeps the platform's methods; kinds without a manager, the
-    // configuration root and the nested collections of an existing object
-    // (`Реквизиты.<имя>` depends on the object, not on the platform) are not judged here.
+    // The collection keeps the platform's methods; kinds without a manager and the
+    // configuration root are not judged here. The attribute collection of an existing
+    // catalog is judged by the attributes the configuration declares for it.
     let found = unresolved_fields(
         r#"Процедура Тест(Описание)
     Есть = Метаданные.Справочники.Содержит(Описание);
@@ -108,7 +108,7 @@ fn collection_methods_and_untrusted_shapes_stay_silent() {
 КонецПроцедуры
 "#,
     );
-    assert!(found.is_empty(), "these shapes must stay silent: {found:?}");
+    assert_eq!(found, vec!["НетТакогоРеквизита".to_string()], "these shapes must stay silent");
 }
 
 #[test]

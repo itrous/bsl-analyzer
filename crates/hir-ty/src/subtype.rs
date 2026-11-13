@@ -1645,4 +1645,34 @@ mod tests {
             is_assignable(&db, structure, db.map(None, None))
         );
     }
+
+    #[test]
+    fn a_description_remembering_its_object_is_the_platform_description() {
+        // The remembered object refines the value, not the platform type: it is assignable
+        // to and from the bare description, and a description of another object still
+        // differs from it only by what it remembers.
+        use bsl_metadata::MdoType;
+        use bsl_types::facet::{DescribedObject, DescribedPart};
+
+        let db = InMemoryDb::new();
+        let name = "ОбъектМетаданных: Справочник".to_string();
+        let bare = db.platform_object(name.clone());
+        let described = |object: &str| {
+            db.described_platform_object(
+                name.clone(),
+                DescribedObject::new(
+                    MdoType::Catalog,
+                    object.to_string(),
+                    DescribedPart::Description,
+                ),
+            )
+        };
+        let goods = described("Товары");
+        let partners = described("Контрагенты");
+        assert_ne!(goods, bare);
+        assert_ne!(goods, partners);
+        assert!(is_assignable(&db, goods, bare));
+        assert!(is_assignable(&db, bare, goods));
+        assert!(is_assignable(&db, goods, partners));
+    }
 }

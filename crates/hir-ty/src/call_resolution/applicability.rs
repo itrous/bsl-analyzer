@@ -1,3 +1,4 @@
+use bsl_types::builders::Builders as _;
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::{TypeId, TypeKind};
 
@@ -169,7 +170,12 @@ fn classify_argument(
         (false, true) => {
             ArgumentApplicability::Indeterminate(ArgumentIndeterminateReason::UnknownParameter)
         }
-        (false, false) if argument_ty == parameter_ty => ArgumentApplicability::Exact,
+        (false, false)
+            if argument_ty == parameter_ty
+                || db.forget_described(argument_ty) == db.forget_described(parameter_ty) =>
+        {
+            ArgumentApplicability::Exact
+        }
         (false, false) if crate::subtype::is_assignable(db, argument_ty, parameter_ty) => {
             ArgumentApplicability::Assignable
         }

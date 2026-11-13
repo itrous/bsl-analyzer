@@ -88,6 +88,7 @@ pub enum DiagnosticCode {
     PostingWhileDataExchangeLoading,
     StructureKeyIsNotIdentifier,
     FormDataHasNoMetadataMethod,
+    ValueIsFilledOfBoolean,
     UseLessForEach,
     IteratorCollidesCollection,
     UsingGoto,

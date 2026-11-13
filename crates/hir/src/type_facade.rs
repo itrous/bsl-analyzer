@@ -461,6 +461,17 @@ pub fn kernel_type_is_form_data_structure(db: &dyn TypeKernelDb, id: TypeId) -> 
     )
 }
 
+/// Whether the type is exactly `Boolean`; a union that merely contains it is not.
+pub fn kernel_type_is_boolean(db: &dyn TypeKernelDb, id: TypeId) -> bool {
+    matches!(db.lookup_type(id), TypeKind::Boolean)
+}
+
+/// Whether the type is a reference to a metadata object (a catalog item, a document and the
+/// like), known by kind or only by object kind; a union is not.
+pub fn kernel_type_is_metadata_reference(db: &dyn TypeKernelDb, id: TypeId) -> bool {
+    matches!(db.lookup_type(id), TypeKind::MetadataRef(_) | TypeKind::AnyMetadataRef { .. })
+}
+
 fn field_from_info(info: FieldInfo) -> Field {
     Field {
         env: match info.origin {

@@ -622,6 +622,13 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
     fn kernel_type_is_form_data_structure(&self, id: hir::TypeId) -> bool {
         hir::kernel_type_is_form_data_structure(&self.db, id)
     }
+    fn kernel_type_is_boolean(&self, id: hir::TypeId) -> bool {
+        hir::kernel_type_is_boolean(&self.db, id)
+    }
+
+    fn kernel_type_is_metadata_reference(&self, id: hir::TypeId) -> bool {
+        hir::kernel_type_is_metadata_reference(&self.db, id)
+    }
 
     fn parse(&self, file_id: vfs::FileId) -> syntax::Parse<syntax::SyntaxNode> {
         use ide_db::base_db::RootQueryDb;
