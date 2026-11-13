@@ -863,7 +863,6 @@ fn listener_options(key: &BackendKey) -> io::Result<ListenerOptions<'static>> {
 /// instead, so we map that to the same "name in use" decision.
 fn is_name_in_use(e: &std::io::Error) -> bool {
     const ERROR_ACCESS_DENIED: i32 = 5;
-
     e.kind() == std::io::ErrorKind::AddrInUse
         || (cfg!(windows) && e.raw_os_error() == Some(ERROR_ACCESS_DENIED))
 }
