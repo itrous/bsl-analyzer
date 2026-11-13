@@ -210,6 +210,8 @@ fn canonicalise_union(db: &dyn TypeKernelDb, members: Arc<[TypeId]>) -> TypeKind
         flat.retain(|&m| !matches!(db.lookup_type(m), TypeKind::Unknown));
     }
 
+    join_divergent_descriptions(db, &mut flat);
+
     // Order members by a deterministic structural key, NOT the raw `TypeId`
     // (whose value follows interning order, which is scheduler-dependent under
     // parallel analysis). This keeps a union's canonical member order — and thus
@@ -227,6 +229,33 @@ fn canonicalise_union(db: &dyn TypeKernelDb, members: Arc<[TypeId]>) -> TypeKind
     }
 
     TypeKind::Union(flat.into())
+}
+
+/// Members that are one platform object and differ in the configuration object they
+/// remember become that bare platform object: the union holds one value type, and
+/// which object a given path describes is no longer known.
+fn join_divergent_descriptions(db: &dyn TypeKernelDb, flat: &mut [TypeId]) {
+    use crate::builders::Builders as _;
+
+    let platform_names: Vec<Option<&str>> = flat
+        .iter()
+        .map(|&id| match db.lookup_type(id) {
+            TypeKind::PlatformObject(PlatformObjectFacet { name, .. }) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    for i in 0..flat.len() {
+        let Some(name) = platform_names[i] else {
+            continue;
+        };
+        let diverges = flat
+            .iter()
+            .zip(&platform_names)
+            .any(|(&other, &other_name)| other != flat[i] && other_name == Some(name));
+        if diverges {
+            flat[i] = db.forget_described(flat[i]);
+        }
+    }
 }
 
 /// Deterministic structural ordering key for union members, independent of
@@ -578,5 +607,42 @@ mod tests {
             assert_eq!(forward.len(), 2);
             assert_eq!(db.union(vec![a, b]), db.union(vec![b, a]));
         }
+    }
+
+    #[test]
+    fn descriptions_of_different_objects_join_into_the_one_platform_description() {
+        // Before descriptions remembered their object, every catalog description was one
+        // type; a union of them must still be that one type, not a pair of equal labels.
+        use crate::facet::{DescribedObject, DescribedPart};
+        use bsl_metadata::MdoType;
+
+        let db = InMemoryDb::new();
+        let name = "ОбъектМетаданных: Справочник".to_string();
+        let bare = db.platform_object(name.clone());
+        let described = |object: &str| {
+            db.described_platform_object(
+                name.clone(),
+                DescribedObject::new(
+                    MdoType::Catalog,
+                    object.to_string(),
+                    DescribedPart::Description,
+                ),
+            )
+        };
+        let goods = described("Товары");
+        let partners = described("Контрагенты");
+
+        assert_eq!(db.union(vec![goods, partners]), bare);
+        assert_eq!(db.union(vec![goods, bare]), bare);
+        assert_eq!(db.union(vec![goods, goods]), goods, "one object keeps what it remembers");
+
+        let number = db.number(None, None);
+        let TypeKind::Union(members) =
+            db.lookup_type(db.union(vec![goods, number, partners])).clone()
+        else {
+            panic!("a union expected");
+        };
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&bare) && members.contains(&number), "{members:?}");
     }
 }

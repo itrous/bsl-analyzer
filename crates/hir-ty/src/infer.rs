@@ -3875,7 +3875,12 @@ impl<'db> InferenceContext<'db> {
                 if then_ty == else_ty {
                     then_ty
                 } else {
-                    self.db.unknown()
+                    let joined = self.db.forget_described(then_ty);
+                    if joined == self.db.forget_described(else_ty) {
+                        joined
+                    } else {
+                        self.db.unknown()
+                    }
                 }
             }
 
