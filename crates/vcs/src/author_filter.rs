@@ -346,9 +346,19 @@ impl AuthorFilter {
         if let Ok(rel) = abs_path.strip_prefix(&self.workdir) {
             return Some(rel.to_path_buf());
         }
+        // A caller that went through `canonicalize` holds the Windows verbatim
+        // spelling (`\\?\C:\...`) while libgit2 spells its workdir plainly, and
+        // `strip_prefix` compares components: the same file then looks like a file
+        // outside the repository, and every line of it comes back kept. Simplifying is
+        // lexical, so this costs nothing and runs before the stat below.
+        let simplified = stdx::path_exclusion::simplify_verbatim(abs_path.to_path_buf());
+        if let Ok(rel) = simplified.strip_prefix(&self.workdir) {
+            return Some(rel.to_path_buf());
+        }
         // The workdir is a realpath while callers may hold a lexical path
         // (symlinked analysis roots) — retry against the canonical file path.
-        let canonical = std::fs::canonicalize(abs_path).ok()?;
+        let canonical =
+            stdx::path_exclusion::simplify_verbatim(std::fs::canonicalize(abs_path).ok()?);
         canonical.strip_prefix(&self.workdir).ok().map(Path::to_path_buf)
     }
 }
@@ -641,5 +651,29 @@ mod tests {
         assert_eq!(count_lines(b"a\n"), 1);
         assert_eq!(count_lines(b"a\nb"), 2);
         assert_eq!(count_lines(b"a\nb\n"), 2);
+    }
+
+    /// A file addressed in the spelling `canonicalize` answers with on Windows is the
+    /// same file as the plainly spelled workdir, not a file outside the repository:
+    /// attribution must still apply. Spelled verbatim, every line used to come back
+    /// kept, and an author-filtered run dropped nothing at all.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_file_path_is_still_inside_the_workdir() {
+        let t = TestRepo::new();
+        t.write("Module.bsl", &vendor_file());
+        t.commit_as(VENDOR.0, VENDOR.1, "vendor");
+
+        let verbatim = std::fs::canonicalize(t.root().join("Module.bsl")).unwrap();
+        assert!(
+            verbatim.to_string_lossy().starts_with(r"\\?\"),
+            "the fixture must exercise the verbatim spelling: {}",
+            verbatim.display()
+        );
+
+        let f = filter(&t, &[VENDOR.0]);
+        let repo = f.open_repo().unwrap();
+        let keep = f.lines_kept(&repo, &verbatim, vendor_file().as_bytes()).unwrap();
+        assert_eq!(keep.ignored_line_count(), 3, "every vendor line is attributed and dropped");
     }
 }

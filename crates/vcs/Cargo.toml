@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 bsl-conventions.workspace = true
+stdx.workspace = true
 anyhow.workspace = true
 git2.workspace = true
 serde.workspace = true
