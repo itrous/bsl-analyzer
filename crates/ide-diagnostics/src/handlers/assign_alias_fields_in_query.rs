@@ -18,28 +18,17 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     lsp_severity_override: "",
 };
 
-/// A text not attested as 1C's own query language may be a foreign dialect that opens
-/// with `SELECT`: the edit stays an opt-in quick fix, so a `fixAll` batch can never
-/// append `КАК Caption` to a WQL literal and break it at runtime.
-fn alias_fix(attested: bool, label: String, edits: Vec<TextEdit>) -> Fix {
-    if attested {
-        Fix::safe(label, edits)
-    } else {
-        Fix::manual(label, edits)
-    }
-}
-
+/// The edit is safe for `fixAll` because `dispatch` reports only texts attested as 1C's
+/// own query language, so it never lands in a WQL or T-SQL literal.
 pub(crate) fn build_alias_fix(
     field_name: &Option<String>,
     raw_name: &Option<String>,
     bsl_range: TextRange,
-    attested: bool,
 ) -> Vec<Fix> {
     match (field_name, raw_name) {
         (None, Some(name)) => {
             let insert = bsl_range.end();
-            vec![alias_fix(
-                attested,
+            vec![Fix::safe(
                 format!("Добавить псевдоним КАК {}", name),
                 vec![TextEdit {
                     range: TextRange::new(insert, insert),
@@ -50,8 +39,7 @@ pub(crate) fn build_alias_fix(
         (Some(name), _) => {
             let alias_byte_len = name.len() as u32;
             let insert = bsl_range.end() - line_index::TextSize::from(alias_byte_len);
-            vec![alias_fix(
-                attested,
+            vec![Fix::safe(
                 format!("Добавить ключевое слово КАК перед '{}'", name),
                 vec![TextEdit {
                     range: TextRange::new(insert, insert),
@@ -71,6 +59,20 @@ pub(crate) fn dispatch(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if let sdbl_hir::SdblDiagnostic::AliasWithoutAsKeyword { field_name, raw_name, range } = diag {
+        // A literal that names no 1C vocabulary at all is most likely a foreign dialect
+        // that merely opens with `SELECT` — WQL handed to `ExecQuery`, or T-SQL handed to
+        // an external DBMS — and this rule has nothing to say about it. Measured over
+        // three production configurations: all 39 findings this guard removes sit in WMI
+        // or raw T-SQL literals, and not one finding on a 1C query is lost (693 -> 665,
+        // 12114 -> 12105, 14249 -> 14247; no new finding appears anywhere).
+        //
+        // The gap this leaves is narrow and pinned by a test below: a 1C query written
+        // with English keywords whose only source is a temp table carries no attesting
+        // word, so it is skipped. Such a query resolves to no metadata either, so the
+        // alias the rule would ask for could not be checked against anything.
+        if !crate::sdbl_utils::sdbl_dialect_attested(query_text) {
+            return;
+        }
         let code = DiagnosticCode::AssignAliasFieldsInQuery;
         let bsl_range = mapper.map_range(*range, query_text);
         let message = if let Some(name) = field_name {
@@ -78,8 +80,7 @@ pub(crate) fn dispatch(
         } else {
             "Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК".to_string()
         };
-        let attested = crate::sdbl_utils::sdbl_dialect_attested(query_text);
-        let fixes = build_alias_fix(field_name, raw_name, bsl_range, attested);
+        let fixes = build_alias_fix(field_name, raw_name, bsl_range);
         diagnostics.push(Diagnostic {
             code,
             message,
@@ -122,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_field_without_as_keyword() {
-        let query = "SELECT Shelf ShelfCode FROM Library";
+        let query = "SELECT Shelf ShelfCode FROM Catalog.Library";
         check_standalone_query_snapshot(
             query,
             expect![[r#"
@@ -134,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_field_without_alias() {
-        let query = "SELECT Shelf FROM Library";
+        let query = "SELECT Shelf FROM Catalog.Library";
         check_standalone_query_snapshot(
             query,
             expect![[r#"
@@ -158,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_multiple_fields_mixed() {
-        let query = "SELECT Author, Title AS BookTitle, Year Published FROM Library";
+        let query = "SELECT Author, Title AS BookTitle, Year Published FROM Catalog.Library";
         check_standalone_query_snapshot(
             query,
             expect![[r#"
@@ -631,13 +632,6 @@ mod tests {
         fix.safe_for_fix_all
     }
 
-    // A WQL text opens with SELECT and names no 1C vocabulary at all. Appending `КАК
-    // Caption` to it breaks the WMI call at runtime, so the fix must stay out of fixAll.
-    #[test]
-    fn a_foreign_dialect_keeps_its_fix_out_of_fix_all() {
-        assert!(!fix_is_safe_for_fix_all("SELECT Caption, ProcessId FROM Win32_Process"));
-    }
-
     #[test]
     fn a_query_with_a_cyrillic_keyword_keeps_an_auto_applicable_fix() {
         assert!(fix_is_safe_for_fix_all(
@@ -651,15 +645,49 @@ mod tests {
         assert!(fix_is_safe_for_fix_all("SELECT Shelf FROM Catalog.Library"));
     }
 
+    fn finding_count(query_text: &str) -> usize {
+        let config = DiagnosticsConfig {
+            only_enabled: Some(vec![DiagnosticCode::AssignAliasFieldsInQuery]),
+            ..Default::default()
+        };
+        crate::validate_query_text(&config, None, query_text).len()
+    }
+
+    // These texts open with `SELECT` and name no 1C vocabulary: WQL on the way to
+    // `ExecQuery`, and T-SQL on the way to an external DBMS. Both used to report every
+    // selected field.
     #[test]
-    fn a_foreign_dialect_naming_a_metadata_type_keeps_its_fix_out_of_fix_all() {
-        assert!(!fix_is_safe_for_fix_all("SELECT Caption, Role FROM Win32_Process"));
-        assert!(!fix_is_safe_for_fix_all(
-            "SELECT Caption, ProcessId FROM Win32_Process WHERE Caption = 'Task'"
-        ));
-        assert!(!fix_is_safe_for_fix_all("SELECT Report.Name FROM Report"));
-        assert!(!fix_is_safe_for_fix_all(
-            "SELECT Caption, ProcessId FROM Win32_Process -- выгрузка из базы"
-        ));
+    fn a_foreign_dialect_reports_nothing() {
+        assert_eq!(finding_count("SELECT Caption, ProcessId FROM Win32_Process"), 0);
+        assert_eq!(finding_count("SELECT _SettingsKey, _ObjectKey FROM _CommonSettings"), 0);
+        assert_eq!(
+            finding_count("SELECT Caption, ProcessId FROM Win32_Process WHERE Caption = 'Task'"),
+            0
+        );
+        assert_eq!(finding_count("SELECT Report.Name FROM Report"), 0);
+        assert_eq!(
+            finding_count("SELECT Caption, ProcessId FROM Win32_Process -- выгрузка из базы"),
+            0
+        );
+    }
+
+    // The control pair for the test above: one detail differs — the source is a metadata
+    // table instead of a name the configuration knows nothing about — and the finding is
+    // back. English keywords alone never were the signal.
+    #[test]
+    fn an_english_query_over_a_metadata_table_still_reports() {
+        assert!(finding_count("SELECT Shelf, Floor FROM Catalog.Library") > 0);
+    }
+
+    #[test]
+    fn a_cyrillic_query_still_reports() {
+        assert!(finding_count("ВЫБРАТЬ Должность, Оклад ИЗ Справочник.Сотрудники") > 0);
+    }
+
+    // The known gap, written down rather than left unsaid: English keywords plus a temp
+    // table leave no attesting word, so a real 1C query is skipped here.
+    #[test]
+    fn an_english_query_over_a_temp_table_is_knowingly_skipped() {
+        assert_eq!(finding_count("SELECT Field1, Field2 FROM VT_Data"), 0);
     }
 }
