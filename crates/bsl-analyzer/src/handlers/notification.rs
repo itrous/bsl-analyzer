@@ -326,10 +326,10 @@ pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParam
         }
     }
 
-    // Dependency discovery walks the (still cold and incomplete) database
-    // synchronously on the event-loop thread, so during the initial load it
-    // both stalls VFS batch draining and warms caches the next revision bump
-    // throws away. The vfs_done finalize preloads open documents instead.
+    // During the initial load dependency discovery walks a cold, incomplete
+    // database and warms caches the next revision bump throws away, while the
+    // pool is busy with the load itself. The vfs_done finalize preloads open
+    // documents instead.
     let preload_start = Instant::now();
     if vfs_done {
         preload_dependencies(state, file_id);

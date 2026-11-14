@@ -802,8 +802,10 @@ impl GlobalState {
     }
 
     /// The exclusion test as a value a background job can own, so work queued against a
-    /// `FileId` can apply it where it runs instead of on the event loop. It holds the
-    /// VFS and the exclusions by handle, so it reads them as they are when it runs.
+    /// `FileId` can apply it where it runs instead of on the event loop. It shares the
+    /// VFS, so paths are read as they are when it runs; the exclusions are the ones in
+    /// force when it was made: a reload installs new ones rather than editing these, and
+    /// the revision it bumps for the sources it takes out cancels a job still running.
     pub fn exclusion_filter(&self) -> ExclusionFilter {
         ExclusionFilter {
             vfs: Arc::clone(&self.vfs),
