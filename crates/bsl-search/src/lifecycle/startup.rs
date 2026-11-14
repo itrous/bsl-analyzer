@@ -36,9 +36,7 @@ fn observe(path: &Path, mode: &str) -> Record {
         state: "unavailable",
         mode: Some(bounded(mode, 64)),
         build_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-        // The previous environment variable was set by nothing in this workspace, so the
-        // field was always absent.
-        build_sha: stdx::build_info::commit().map(str::to_owned),
+        build_sha: build_info::commit().map(str::to_owned),
         ..Snapshot::default()
     };
     ROOTS.with(|slot| {

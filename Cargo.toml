@@ -51,6 +51,7 @@ vfs = { path = "crates/vfs" }
 project-model = { path = "crates/project-model" }
 intern = { path = "crates/intern" }
 stdx = { path = "crates/stdx" }
+build-info = { path = "crates/build-info" }
 profile = { path = "crates/profile" }
 test-fixture = { path = "crates/test-fixture" }
 test-utils = { path = "crates/test-utils" }

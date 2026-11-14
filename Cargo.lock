@@ -531,6 +531,7 @@ version = "0.4.6"
 dependencies = [
  "blake3",
  "bsl-conventions",
+ "build-info",
  "code-chunk",
  "crossbeam-channel",
  "expect-test",
@@ -578,6 +579,10 @@ dependencies = [
  "memchr",
  "serde",
 ]
+
+[[package]]
+name = "build-info"
+version = "0.4.6"
 
 [[package]]
 name = "bumpalo"
@@ -3176,6 +3181,7 @@ dependencies = [
  "bsl-metadata",
  "bsl-platform",
  "bsl-search",
+ "build-info",
  "check-contract",
  "chrono",
  "dirs",

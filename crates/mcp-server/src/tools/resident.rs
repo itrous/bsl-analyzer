@@ -36,7 +36,7 @@ pub(crate) fn status(
     // Which commit this binary came from, so an observation can be dated to the code that
     // produced it: the version number is the same across a day of builds. Absent when the
     // build could not determine it.
-    if let Some(build) = build_body(stdx::build_info::commit(), stdx::build_info::committed()) {
+    if let Some(build) = build_body(build_info::commit(), build_info::committed()) {
         body["build"] = build;
     }
     // The project is analyzed without its main configuration — the workspace is
@@ -285,7 +285,7 @@ mod tests {
 
         // Conditional on purpose: the stamp is a compile-time property of the running test
         // binary, so one binary cannot exercise both branches.
-        match stdx::build_info::commit() {
+        match build_info::commit() {
             Some(commit) => assert_eq!(body["build"]["commit"], commit),
             None => assert!(body["build"].is_null(), "no stamp, no build object: {body}"),
         }

@@ -2,6 +2,10 @@
 //!
 //! A version number does not change between a day's builds, so a report that names only
 //! the version cannot date the code it describes.
+//!
+//! A crate of its own, depended on only by the code that reports the identity: the stamp
+//! changes on every commit and every branch switch, and cargo rebuilds every dependent of a
+//! crate whose build script output changed.
 
 /// The short commit hash the crate was built from, or `None` when the build could not
 /// determine it (no git, or a source tree that is not a repository).
