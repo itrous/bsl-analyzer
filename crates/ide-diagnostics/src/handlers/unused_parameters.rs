@@ -54,6 +54,15 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let metadata = ctx.module_metadata();
     let mut fixed_signature_handlers: FxHashSet<String> = FxHashSet::default();
     if let Some(ref form) = metadata.form {
+        // An ordinary form keeps its dialog in the binary `Ext/Form.bin`; without a usable
+        // `Ext/Form/Form.json` its bindings are unknown, so ANY local method may be a handler
+        // whose signature the platform fixes and the author cannot trim. Reporting their
+        // parameters turns one unread file into a pack of false findings over every handler
+        // of the form, so stay silent here, exactly as `UnusedLocalMethod` does, and let
+        // `OrdinaryFormDialogUnread` say why the check was dropped.
+        if form.is_ordinary() && !form.ordinary_dialog_known() {
+            return Vec::new();
+        }
         for handler in form.event_handlers() {
             fixed_signature_handlers.insert(handler.handler_name.fold_lower());
         }
@@ -631,6 +640,71 @@ mod tests {
         assert!(
             !unused.iter().any(|m| m.contains("Элемент")),
             "name-literal-bound handler keeps its fixed signature: {unused:?}"
+        );
+        assert!(
+            unused.iter().any(|m| m.contains("Лишний")),
+            "an ordinary unused parameter must stay flagged: {unused:?}"
+        );
+    }
+
+    const ORDINARY_FORM_HANDLERS: &str = r#"
+Процедура СуммаПриИзменении(Элемент)
+    Сообщить("х");
+КонецПроцедуры
+
+Процедура Обычная(Лишний)
+    Сообщить("х");
+КонецПроцедуры
+"#;
+
+    fn ordinary_form_module_metadata(form: bsl_metadata::Form) -> hir::ModuleMetadata {
+        let mut metadata = form_module_metadata();
+        metadata.form = Some(std::sync::Arc::new(form));
+        metadata
+    }
+
+    #[test]
+    fn ordinary_form_with_unknown_dialog_reports_no_unused_parameters() {
+        // The dialog lives in the binary `Ext/Form.bin`; with no usable sidecar the bindings
+        // are unknown, so any parameter here may be the platform's. `UnusedLocalMethod`
+        // already drops its check in this state.
+        let form = bsl_metadata::Form::ordinary_without_dialog("Форма");
+        let diagnostics = crate::test_utils::check_metadata_diagnostic(
+            ordinary_form_module_metadata(form),
+            ORDINARY_FORM_HANDLERS,
+            |_metadata, ctx| super::check(ctx),
+        );
+        let unused: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::UnusedParameters)
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(unused.is_empty(), "unknown dialog must stay silent: {unused:?}");
+    }
+
+    #[test]
+    fn ordinary_form_with_known_dialog_still_reports_unused_parameters() {
+        // The control: with the dialog read, a bound handler keeps its fixed signature and an
+        // ordinary method's unused parameter is reported exactly as before.
+        let mut form = bsl_metadata::Form::ordinary_without_dialog("Форма");
+        form.ordinary_dialog_known = true;
+        form.event_handlers.push(bsl_metadata::FormEventHandler {
+            event_type: "Привязка".to_string(),
+            handler_name: "СуммаПриИзменении".to_string(),
+        });
+        let diagnostics = crate::test_utils::check_metadata_diagnostic(
+            ordinary_form_module_metadata(form),
+            ORDINARY_FORM_HANDLERS,
+            |_metadata, ctx| super::check(ctx),
+        );
+        let unused: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::UnusedParameters)
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            !unused.iter().any(|m| m.contains("Элемент")),
+            "a bound handler keeps its fixed signature: {unused:?}"
         );
         assert!(
             unused.iter().any(|m| m.contains("Лишний")),
