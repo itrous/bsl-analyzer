@@ -1340,7 +1340,7 @@ impl Counts {
 
 fn schema_json() -> Value {
     json!({
-        "schema_version": "18",
+        "schema_version": "19",
         "actions": ["catalog", "schema", "status", "file", "snippet", "workspace"],
         "severities": ["error", "warning", "info", "hint"],
         "status_result": {
@@ -1352,7 +1352,8 @@ fn schema_json() -> Value {
             "elapsed_ms": "u64 — ms since the current build started (present while loading)",
             "error": "string — failure message (present when failed)",
             "standalone_extension": "string — present when the project is analyzed without its main configuration: the workspace root is itself a configuration extension, or the project declares external data processors/reports (EPF/ERF) and no base; calls into that configuration are reported unresolved. Both conditions can hold at once, one line each",
-            "owns_caches": "bool — false when a newer daemon generation owns this workspace's derived caches; this backend still answers from what it holds but produces no new derived state. Absent until this daemon's ownership verdict has been established at all, which a background check does on its own"
+            "owns_caches": "bool — false when a newer daemon generation owns this workspace's derived caches; this backend still answers from what it holds but produces no new derived state. Absent until this daemon's ownership verdict has been established at all, which a background check does on its own",
+            "build": "object — {commit, committed}: the short commit hash this binary was built from and that commit's RFC 3339 date. Absent when the build could not determine it (no git at build time, or a source tree that is not a repository); a version number alone does not change between builds of one day"
         },
         "catalog_entry": {
             "code": "string — stable diagnostic code (e.g. CyclomaticComplexity)",
@@ -1515,7 +1516,7 @@ mod tests {
         let result = schema();
         assert_structured_mirrors_text(&result);
         let body = body_of(&result);
-        assert_eq!(body["schema_version"], "18");
+        assert_eq!(body["schema_version"], "19");
         let actions = body["actions"].as_array().unwrap();
         assert!(actions.iter().any(|a| a == "catalog"));
         assert!(actions.iter().any(|a| a == "status"));
@@ -1531,6 +1532,7 @@ mod tests {
             body["status_result"]["unread_files"].is_string(),
             "unreadable-file count advertised"
         );
+        assert!(body["status_result"]["build"].is_string(), "build identity advertised");
         assert!(
             body["workspace_result"]["files_unread"].is_string(),
             "sweep coverage gap advertised"
@@ -1630,7 +1632,7 @@ mod tests {
     #[test]
     fn diagnostics_selective_baseline_response_advertises_schema_15() {
         let body = schema_json();
-        assert_eq!(body["schema_version"], "18");
+        assert_eq!(body["schema_version"], "19");
         for field in ["selection", "partitions_enabled", "partitions_unsuppressed", "unsuppressed"]
         {
             assert!(body["baseline_result"][field].is_string());
@@ -1640,7 +1642,7 @@ mod tests {
     #[test]
     fn diagnostics_schema_json() {
         let body = schema_json();
-        assert_eq!(body["schema_version"], "18");
+        assert_eq!(body["schema_version"], "19");
         assert!(body["baseline_result"]["selection"].is_string());
         assert!(body["baseline_result"]["unsuppressed"].is_string());
     }

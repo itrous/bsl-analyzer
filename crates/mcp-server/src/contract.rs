@@ -195,7 +195,7 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
         name: "diagnostics",
         actions: DIAGNOSTICS_ACTIONS,
         note: None,
-        output_schema_version: Some("18"),
+        output_schema_version: Some("19"),
         default_enabled: true,
     },
     tool("outline", &[]),
@@ -1931,7 +1931,7 @@ mod tests {
                         ],
                         "name": "diagnostics",
                         "output_schema_fingerprint": "blake3:2de7d4aa984c1a12c46e892e51dd64097a7087221b705850d7ebd90b609e1031",
-                        "output_schema_version": "18",
+                        "output_schema_version": "19",
                         "params": [
                           {
                             "name": "action",

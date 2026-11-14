@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod build_info;
 pub mod case;
 pub mod fs;
 pub mod heap;
