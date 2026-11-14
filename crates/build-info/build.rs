@@ -53,13 +53,17 @@ fn commit_identity() -> Option<(String, String)> {
 /// worktree `.git` is a FILE pointing elsewhere, so a hand-built path never exists and the
 /// stamped commit would go stale when HEAD moves.
 fn track_head() {
-    if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
-        println!("cargo:rerun-if-changed={head}");
+    for name in ["HEAD", "logs/HEAD"] {
+        if let Some(path) = existing_git_path(name) {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
     // HEAD itself does not change on a commit to a branch; the branch ref does. A packed
-    // ref has no file of its own, so fall back to `packed-refs`.
-    if let Some(branch) = git(&["symbolic-ref", "-q", "--short", "HEAD"]) {
-        if let Some(path) = git(&["rev-parse", "--git-path", &format!("refs/heads/{branch}")]) {
+    // ref has no file of its own, so fall back to `packed-refs`. A commit on a packed branch
+    // writes a new loose ref and leaves `packed-refs` alone; the reflog above records it,
+    // unless reflogs are disabled.
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git(&["rev-parse", "--git-path", &branch]) {
             if Path::new(&path).exists() {
                 println!("cargo:rerun-if-changed={path}");
             } else if let Some(packed) = git(&["rev-parse", "--git-path", "packed-refs"]) {
@@ -67,4 +71,10 @@ fn track_head() {
             }
         }
     }
+}
+
+/// A path inside the git directory of this worktree, only when the file exists: cargo
+/// reruns the script on every build for a tracked path that does not exist.
+fn existing_git_path(name: &str) -> Option<String> {
+    git(&["rev-parse", "--git-path", name]).filter(|path| Path::new(path).exists())
 }
