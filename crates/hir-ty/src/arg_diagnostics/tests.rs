@@ -33,6 +33,8 @@ fn candidates(db: &InMemoryDb, parameter_sets: &[&[TypeId]]) -> CallCandidateSet
                             ty,
                             has_default: false,
                             mode: CallParamMode::Positional,
+                            passing: None,
+                            result_follows_argument_text: false,
                         })
                         .collect(),
                     required_args: parameter_types.len(),

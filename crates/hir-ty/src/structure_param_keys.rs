@@ -247,6 +247,9 @@ impl<'a> Forwarder<'a> {
     /// Whether this syntactic call resolves to a user method whose corresponding parameter is
     /// explicitly passed by value. Only that case proves that the caller's structure cannot be
     /// mutated through the argument.
+    ///
+    /// Not answerable from `argument_passing_of`: this pass runs inside `infer_all` before
+    /// `infer_stmts`, which is what builds `call_arg_bindings`, so no bindings exist yet.
     pub(crate) fn argument_is_by_value(&self, body: &Body, call: &Expr, arg_index: usize) -> bool {
         let Expr::Call { callee, .. } = call else { return false };
         let Some(mid) = self.resolve_callee(body, body.expr_idx(*callee)) else { return false };

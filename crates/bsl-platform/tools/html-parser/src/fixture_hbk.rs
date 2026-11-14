@@ -50,33 +50,96 @@ fn version_page(title: &str, version: Option<&str>, params: usize) -> String {
     page
 }
 
+/// An overlay target and what its records together require of its page.
+struct Target {
+    owner: String,
+    russian: String,
+    english: String,
+    params: usize,
+    version: Option<String>,
+}
+
+/// The earliest availability a set of records agrees on. A record without a
+/// `min_version` states no lower bound at all, so it wins over any version.
+fn earliest(left: Option<String>, right: Option<String>) -> Option<String> {
+    let (left, right) = (left?, right?);
+    let parts = |version: &str| {
+        version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>()
+    };
+    Some(if parts(&left) <= parts(&right) { left } else { right })
+}
+
+/// Collects a record into its TARGET rather than into a page of its own:
+/// several records name one method, a different parameter each, and a second
+/// page of the same name would make the target ambiguous and reject the whole
+/// corpus. The page declares as many parameters as the highest index needs and
+/// the earliest version any of its records names.
+fn merge_target(targets: &mut Vec<Target>, target: Target) {
+    match targets
+        .iter_mut()
+        .find(|known| known.owner == target.owner && known.english == target.english)
+    {
+        Some(known) => {
+            known.params = known.params.max(target.params);
+            known.version = earliest(known.version.take(), target.version);
+        }
+        None => targets.push(target),
+    }
+}
+
 fn overlay_target_pages() -> Vec<(String, String)> {
     let overlays: serde_json::Value = serde_json::from_str(OVERLAYS).expect("curated overlay");
     let entries = |section: &str| overlays[section].as_array().cloned().unwrap_or_default();
     let text = |entry: &serde_json::Value, field: &str| entry[field].as_str().map(str::to_owned);
     let mut pages = Vec::new();
     let mut types = std::collections::BTreeSet::new();
-    for (index, entry) in entries("method_parameter_overrides").iter().enumerate() {
-        let ty = text(entry, "canonical_type").unwrap();
-        let (ru, en) = (text(entry, "russian_name").unwrap(), text(entry, "english_name").unwrap());
-        let params = entry["parameter_index"].as_u64().unwrap() as usize + 1;
-        let version = text(entry, "min_version");
+    let mut methods: Vec<Target> = Vec::new();
+    for entry in entries("method_parameter_overrides") {
+        let ty = text(&entry, "canonical_type").unwrap();
+        types.insert(ty.clone());
+        merge_target(
+            &mut methods,
+            Target {
+                owner: ty,
+                russian: text(&entry, "russian_name").unwrap(),
+                english: text(&entry, "english_name").unwrap(),
+                params: entry["parameter_index"].as_u64().unwrap() as usize + 1,
+                version: text(&entry, "min_version"),
+            },
+        );
+    }
+    for (index, target) in methods.iter().enumerate() {
+        let (ty, ru, en) = (&target.owner, &target.russian, &target.english);
         pages.push((
             format!("objects/catalog2/{ty}/methods/{en}{index}.html"),
-            version_page(&format!("{ty}.{ru} ({ty}.{en})"), version.as_deref(), params),
+            version_page(
+                &format!("{ty}.{ru} ({ty}.{en})"),
+                target.version.as_deref(),
+                target.params,
+            ),
         ));
-        types.insert(ty);
     }
-    for (index, entry) in entries("global_function_parameter_overrides").iter().enumerate() {
-        let (ru, en) = (text(entry, "russian_name").unwrap(), text(entry, "english_name").unwrap());
-        let params = entry["parameter_index"].as_u64().unwrap() as usize + 1;
-        let version = text(entry, "min_version");
+    let mut functions: Vec<Target> = Vec::new();
+    for entry in entries("global_function_parameter_overrides") {
+        merge_target(
+            &mut functions,
+            Target {
+                owner: String::new(),
+                russian: text(&entry, "russian_name").unwrap(),
+                english: text(&entry, "english_name").unwrap(),
+                params: entry["parameter_index"].as_u64().unwrap() as usize + 1,
+                version: text(&entry, "min_version"),
+            },
+        );
+    }
+    for (index, target) in functions.iter().enumerate() {
+        let (ru, en) = (&target.russian, &target.english);
         pages.push((
             format!("objects/Global context/methods/catalog8/{en}{index}.html"),
             version_page(
                 &format!("Глобальный контекст.{ru} (Global context.{en})"),
-                version.as_deref(),
-                params,
+                target.version.as_deref(),
+                target.params,
             ),
         ));
     }
@@ -119,5 +182,27 @@ pub fn write_pair(dir: &Path, shcntx_pages: &[(String, String)], chunk: usize) {
             chunk,
         );
         std::fs::write(dir.join(name), container).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    /// Two pages under one path or one title make an overlay target ambiguous,
+    /// and the help loader then rejects the entire corpus. The failure surfaces
+    /// far from here — in every crate that loads help from this archive — so the
+    /// invariant is named where the pages are built.
+    #[test]
+    fn no_two_fixture_pages_share_a_path_or_a_title() {
+        let mut paths = BTreeSet::new();
+        let mut titles = BTreeSet::new();
+        for (path, page) in super::shcntx_pages() {
+            assert!(paths.insert(path.clone()), "two fixture pages share the path {path}");
+            let Some(rest) = page.split_once("V8SH_pagetitle\">") else { continue };
+            let title = rest.1.split('<').next().unwrap_or_default().to_owned();
+            assert!(titles.insert(title.clone()), "two fixture pages share the title {title}");
+        }
+        assert!(titles.len() > 4, "the fixture lost its pages: only {} titles", titles.len());
     }
 }

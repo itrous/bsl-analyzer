@@ -257,14 +257,49 @@ fn unproven_call_or_execute_suppresses() {
     };
     let input = with_call("НеизвестныйМетод(ПозднееЗначение);");
     check(&input, expect![[""]]);
-    let input = with_call("СтрДлина(ПозднееЗначение);");
-    check(&input, expect![[""]]);
     let input = with_call("Выполнить(\"ПозднееЗначение = 1\");");
     check(&input, expect![[""]]);
     check(
         ISSUE_EXAMPLE,
         expect![[r#"
         UninitializedLocalVariable @ 3:17..3:32
+          message: Переменная 'ПозднееЗначение' может быть не инициализирована: на первой итерации цикла значение ей ещё не присвоено, присваивание в цикле действует только на следующих итерациях
+          severity: Warning"#]],
+    );
+}
+
+#[test]
+fn platform_function_argument_follows_the_corpus() {
+    let with_call = |call: &str| {
+        ISSUE_EXAMPLE.replace(
+            "        Копия = ПозднееЗначение;",
+            &format!("        {call}\n        Копия = ПозднееЗначение;"),
+        )
+    };
+    // Attested by value: the call reads the variable, so the read before the assignment stands.
+    let input = with_call("СтрДлина(ПозднееЗначение);");
+    check(
+        &input,
+        expect![[r#"
+        UninitializedLocalVariable @ 3:18..3:33
+          message: Переменная 'ПозднееЗначение' может быть не инициализирована: на первой итерации цикла значение ей ещё не присвоено, присваивание в цикле действует только на следующих итерациях
+          severity: Warning
+        UninitializedLocalVariable @ 4:17..4:32
+          message: Переменная 'ПозднееЗначение' может быть не инициализирована: на первой итерации цикла значение ей ещё не присвоено, присваивание в цикле действует только на следующих итерациях
+          severity: Warning"#]],
+    );
+    // Of one function, a recorded by-reference parameter initializes the variable ...
+    let input = with_call("ПоместитьФайл(ПозднееЗначение);");
+    check(&input, expect![[""]]);
+    // ... while its neighbour, silent in the corpus, is attested by value and reads it.
+    let input = with_call("ПоместитьФайл(\"\", ПозднееЗначение);");
+    check(
+        &input,
+        expect![[r#"
+        UninitializedLocalVariable @ 3:27..3:42
+          message: Переменная 'ПозднееЗначение' может быть не инициализирована: на первой итерации цикла значение ей ещё не присвоено, присваивание в цикле действует только на следующих итерациях
+          severity: Warning
+        UninitializedLocalVariable @ 4:17..4:32
           message: Переменная 'ПозднееЗначение' может быть не инициализирована: на первой итерации цикла значение ей ещё не присвоено, присваивание в цикле действует только на следующих итерациях
           severity: Warning"#]],
     );
@@ -447,8 +482,18 @@ fn unreachable_read_is_not_reported() {
 
 #[test]
 fn argument_and_read_in_one_statement() {
+    // A platform function whose parameter the corpus attests as passed by value reads it.
     let input = BASE.replace("    Б = Х;", "    Б = СтрДлина(Х) + Х;");
-    check(&input, expect![[""]]);
+    check(
+        &input,
+        expect![[r#"
+        UninitializedLocalVariable @ 5:18..5:19
+          message: Переменная 'Х' может быть не инициализирована: на пути через ветвь условия значение ей не присваивается
+          severity: Warning
+        UninitializedLocalVariable @ 5:23..5:24
+          message: Переменная 'Х' может быть не инициализирована: на пути через ветвь условия значение ей не присваивается
+          severity: Warning"#]],
+    );
     check(
         &format!(
             "{}\nФункция ЗнчФ(Знач П)\n    Возврат П;\nКонецФункции\n",

@@ -280,12 +280,22 @@ impl<'a> DocumentedValues<'a> {
         let Some(stmt) = self.body.enclosing_stmt(expr) else {
             return false;
         };
-        // A write reaching definitions do not see leaves a value nothing documented.
-        // shortcut: every call the local is passed to counts as a possible writer, platform
-        // callables included (`ТипЗнч(Х)`, `Формат(Х, …)`), as inference counts them; telling
-        // apart callees that cannot rebind an argument would relieve those values as well.
+        // A write reaching definitions do not see leaves a value nothing documented. A call
+        // the local is passed to counts as a possible writer unless the callee is proven to
+        // take that argument by value (`ТипЗнч(Х)`, `Формат(Х, …)`): an unresolved callee proves
+        // nothing, so it stays a writer.
         let key = name.fold_lower();
-        if crate::narrow::local_may_change_unseen(self.body, &key, stmt.to_idx(), Some(call_expr)) {
+        let passed_by_value = |arg| {
+            crate::infer::argument_passing_of(self.db, self.bindings, arg)
+                == crate::definite_init::ArgPassing::ByVal
+        };
+        if crate::narrow::local_may_be_rewritten(
+            self.body,
+            &key,
+            stmt.to_idx(),
+            Some(call_expr),
+            &passed_by_value,
+        ) {
             return false;
         }
         let Some(defs) =

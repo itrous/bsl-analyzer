@@ -503,6 +503,21 @@ pub struct ReachingDefsResult {
     body: Arc<Body>,
 }
 
+/// The expression naming the CFG header a read in `stmt` happens at, when `stmt` is a header
+/// (`defs_for_var_at_header` takes it). Nothing writes between an `Если` condition and an
+/// `ИначеЕсли` one, so the first condition answers for all of them, and likewise a `Для` lower
+/// bound for the upper. `None` for a statement that is not a header: ask `defs_for_var_at_stmt`.
+pub fn header_read_expr(body: &Body, stmt: hir_def::StmtId) -> Option<hir_def::ExprId> {
+    let header = match body.stmt(stmt) {
+        Stmt::If(if_stmt) => if_stmt.condition,
+        Stmt::While { condition, .. } => *condition,
+        Stmt::For { from, .. } => *from,
+        Stmt::ForEach { collection, .. } => *collection,
+        _ => return None,
+    };
+    Some(hir_def::ExprId::from_idx(header))
+}
+
 impl ReachingDefsResult {
     pub fn new(dataflow: crate::DataflowResult<ReachingDefs>, body: Arc<Body>) -> Self {
         use cfg::CfgVertex;

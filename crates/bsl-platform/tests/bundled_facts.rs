@@ -530,3 +530,85 @@ fn every_readonly_correction_changes_a_built_in_property() {
         }
     }
 }
+
+/// The folded names of the functions the shipped passing attestation leaves out.
+fn shipped_unverified_functions() -> std::collections::BTreeSet<String> {
+    use stdx::case::CaseExt;
+    let document: Value =
+        serde_json::from_str(include_str!("../data/platform_overlays.json")).expect("overlay JSON");
+    let attestations = document["parameter_passing_attestations"]
+        .as_array()
+        .expect("the curated document carries the passing attestation");
+    assert_eq!(attestations.len(), 1, "the guards below are written for one global attestation");
+    attestations[0]["unverified_functions"]
+        .as_array()
+        .expect("the attestation lists its unverified functions")
+        .iter()
+        .map(|name| name.as_str().expect("a function is named").fold_lower())
+        .collect()
+}
+
+/// The exclusion list must be exactly the functions that carry call variants. The extract
+/// flattens a function's variants into one parameter list and leaves the merged ones
+/// undescribed, so a function that gains variants later must be added to the list, or the
+/// attestation would start claiming "by value" for parameters nothing ever verified.
+#[test]
+fn the_unverified_functions_are_exactly_the_global_functions_with_call_variants() {
+    use stdx::case::CaseExt;
+    let facts: Value = serde_json::from_str(FACTS).expect("the built-in corpus is JSON");
+    let with_variants: std::collections::BTreeSet<String> = facts["global_functions"]
+        .as_array()
+        .expect("global functions are an array")
+        .iter()
+        .filter(|function| {
+            function["variants"].as_array().is_some_and(|variants| !variants.is_empty())
+        })
+        .map(|function| function["name"].as_str().expect("a function is named").fold_lower())
+        .collect();
+    let listed = shipped_unverified_functions();
+    assert!(!listed.is_empty(), "the guard would be vacuous without listed functions");
+
+    let missing: Vec<_> = with_variants.difference(&listed).collect();
+    let superfluous: Vec<_> = listed.difference(&with_variants).collect();
+    assert!(
+        missing.is_empty() && superfluous.is_empty(),
+        "the extract flattens a function's call variants into one parameter list and leaves the \
+         merged ones undescribed, so every global function with variants must be listed in \
+         unverified_functions, or the attestation would claim \"by value\" for parameters \
+         nothing ever verified. With variants but not listed: {missing:?}; listed but without \
+         variants: {superfluous:?}"
+    );
+}
+
+/// The attestation's effect on the shipped corpus, computed from the data: outside the list
+/// every parameter has a verdict, inside it none has.
+#[test]
+fn the_passing_attestation_covers_every_parameter_outside_its_exclusion_list() {
+    use stdx::case::CaseExt;
+    let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+    let data = PlatformData::from_help(help);
+    let listed = shipped_unverified_functions();
+
+    let mut attested = 0;
+    for function in data.all_global_functions() {
+        let excluded = listed.contains(&function.name.fold_lower());
+        for parameter in &function.parameters {
+            if excluded {
+                assert_eq!(
+                    parameter.passing, None,
+                    "{}: parameter {} of an unverified function must stay unknown",
+                    function.name, parameter.name
+                );
+            } else {
+                attested += 1;
+                assert!(
+                    parameter.passing.is_some(),
+                    "{}: parameter {} has no passing verdict although the function is attested",
+                    function.name,
+                    parameter.name
+                );
+            }
+        }
+    }
+    assert!(attested > 0, "the guard would be vacuous without attested parameters");
+}

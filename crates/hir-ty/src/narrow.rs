@@ -840,11 +840,28 @@ fn push_branch_guards(
 /// `own_call` is the call the use is an argument of, as its binding names it (the call, or
 /// its callee): its write happens after the argument is read, so it reaches the use only
 /// round a loop around it.
-pub(crate) fn local_may_change_unseen(
+///
+/// An argument passed BY VALUE cannot be rewritten by the callee, so it does not count as a
+/// possible rewrite. `passed_by_value` answers "this argument expression is passed by
+/// value, PROVEN". An unresolved or unattested call must map to `false`: only a proven
+/// by-value answer is allowed to weaken the verdict, so an oracle that always says `false`
+/// treats every call as a possible rewrite.
+pub fn local_may_be_rewritten(
     body: &Body,
     key: &str,
     use_stmt: StmtIdx,
     own_call: Option<ExprId>,
+    passed_by_value: &dyn Fn(ExprId) -> bool,
+) -> bool {
+    local_rewrite_scan(body, key, use_stmt, own_call, passed_by_value)
+}
+
+fn local_rewrite_scan(
+    body: &Body,
+    key: &str,
+    use_stmt: StmtIdx,
+    own_call: Option<ExprId>,
+    passed_by_value: &dyn Fn(ExprId) -> bool,
 ) -> bool {
     let names_local = |expr: &hir_def::hir::ExprIdx| matches!(body.expr_idx(*expr), Expr::Path(arg) if arg.as_str().fold_lower() == key);
     let covers = |outer: StmtIdx, inner: StmtIdx| stmt_covers_stmt(body, outer, inner);
@@ -865,7 +882,9 @@ pub(crate) fn local_may_change_unseen(
             Expr::MethodCall { args, .. } => (args, None),
             _ => return false,
         };
-        args.iter().any(names_local) && (!is_own_call(id, callee) || in_loop())
+        let rewritable =
+            args.iter().any(|arg| names_local(arg) && !passed_by_value(ExprId::from_idx(*arg)));
+        rewritable && (!is_own_call(id, callee) || in_loop())
     });
     if passed_to_call {
         return true;
@@ -1280,6 +1299,156 @@ mod tests {
 
         fn set_top_level(&mut self, stmts: Vec<StmtIdx>) {
             self.body.set_body_stmts(stmts.into_boxed_slice());
+        }
+    }
+
+    /// A hand-built body for the rewrite fact: the local `х`, the statement that uses it and
+    /// the call that use is an argument of, if any.
+    struct RewriteFixture {
+        body: Body,
+        use_stmt: StmtIdx,
+        own_call: Option<ExprId>,
+    }
+
+    impl RewriteFixture {
+        fn without_proof(&self) -> bool {
+            local_may_be_rewritten(&self.body, "х", self.use_stmt, self.own_call, &|_| false)
+        }
+
+        fn refined_fact(&self, by_value: bool) -> bool {
+            local_may_be_rewritten(&self.body, "х", self.use_stmt, self.own_call, &|_| by_value)
+        }
+    }
+
+    /// `Ф(х)` then, elsewhere, the use `у = х`: the local is an argument of ANOTHER call.
+    fn local_passed_to_another_call() -> RewriteFixture {
+        let mut b = ExprBuilder::new();
+        let callee = b.path("Ф");
+        let arg = b.path("х");
+        let call = b.call(callee, vec![arg]);
+        let call_stmt = b.body.stmts_mut().alloc(Stmt::Expr(call));
+        let target = b.path("у");
+        let read = b.path("х");
+        let use_stmt = b.assign(target, read);
+        b.set_top_level(vec![call_stmt, use_stmt]);
+        RewriteFixture { body: b.body, use_stmt, own_call: None }
+    }
+
+    /// `Пока … Цикл Ф(х) КонецЦикла`: the use is an argument of its own call, inside a loop.
+    fn local_passed_to_own_call(in_loop: bool) -> RewriteFixture {
+        let mut b = ExprBuilder::new();
+        let callee = b.path("Ф");
+        let arg = b.path("х");
+        let call = b.call(callee, vec![arg]);
+        let use_stmt = b.body.stmts_mut().alloc(Stmt::Expr(call));
+        if in_loop {
+            let condition = b.path("Условие");
+            let loop_stmt = b.while_stmt(condition, use_stmt);
+            b.set_top_level(vec![loop_stmt]);
+        } else {
+            b.set_top_level(vec![use_stmt]);
+        }
+        RewriteFixture { body: b.body, use_stmt, own_call: Some(ExprId::from_idx(call)) }
+    }
+
+    /// `Выполнить("…")` ahead of the use `у = х`.
+    fn body_with_execute() -> RewriteFixture {
+        let mut b = ExprBuilder::new();
+        let text = b.string_lit("х = 1");
+        let execute = b.body.stmts_mut().alloc(Stmt::Execute { expr: text });
+        let target = b.path("у");
+        let read = b.path("х");
+        let use_stmt = b.assign(target, read);
+        b.set_top_level(vec![execute, use_stmt]);
+        RewriteFixture { body: b.body, use_stmt, own_call: None }
+    }
+
+    /// `Попытка х = 1 Исключение КонецПопытки`, then the use `у = х` outside it.
+    fn write_inside_try_use_outside() -> RewriteFixture {
+        let mut b = ExprBuilder::new();
+        let target = b.path("х");
+        let value = b.string_lit("1");
+        let write = b.assign(target, value);
+        let try_stmt =
+            b.body.stmts_mut().alloc(Stmt::Try { body: Box::from([write]), except: Box::from([]) });
+        let use_target = b.path("у");
+        let read = b.path("х");
+        let use_stmt = b.assign(use_target, read);
+        b.set_top_level(vec![try_stmt, use_stmt]);
+        RewriteFixture { body: b.body, use_stmt, own_call: None }
+    }
+
+    /// `у = х` alone: no call and no write of the local anywhere.
+    fn body_without_call_or_write() -> RewriteFixture {
+        let mut b = ExprBuilder::new();
+        let target = b.path("у");
+        let read = b.path("х");
+        let use_stmt = b.assign(target, read);
+        b.set_top_level(vec![use_stmt]);
+        RewriteFixture { body: b.body, use_stmt, own_call: None }
+    }
+
+    #[test]
+    fn rewrite_fact_ignores_a_local_proven_passed_by_value_to_another_call() {
+        let fixture = local_passed_to_another_call();
+        assert!(fixture.without_proof());
+        assert!(!fixture.refined_fact(true));
+    }
+
+    #[test]
+    fn rewrite_fact_keeps_a_local_not_proven_passed_by_value_to_another_call() {
+        assert!(local_passed_to_another_call().refined_fact(false));
+    }
+
+    #[test]
+    fn rewrite_fact_in_a_loop_follows_the_direction_of_the_own_call_argument() {
+        let fixture = local_passed_to_own_call(true);
+        assert!(fixture.refined_fact(false));
+        assert!(!fixture.refined_fact(true));
+    }
+
+    #[test]
+    fn rewrite_fact_exempts_the_own_call_outside_a_loop_either_way() {
+        let fixture = local_passed_to_own_call(false);
+        assert!(!fixture.refined_fact(false));
+        assert!(!fixture.refined_fact(true));
+    }
+
+    #[test]
+    fn rewrite_fact_stays_true_after_execute_even_when_passed_by_value() {
+        let fixture = body_with_execute();
+        assert!(fixture.refined_fact(true));
+        assert!(fixture.refined_fact(false));
+    }
+
+    #[test]
+    fn rewrite_fact_stays_true_for_a_write_in_try_with_the_use_outside_even_by_value() {
+        let fixture = write_inside_try_use_outside();
+        assert!(fixture.refined_fact(true));
+        assert!(fixture.refined_fact(false));
+    }
+
+    #[test]
+    fn rewrite_fact_is_false_without_a_call_or_a_write() {
+        let fixture = body_without_call_or_write();
+        assert!(!fixture.refined_fact(true));
+        assert!(!fixture.refined_fact(false));
+    }
+
+    #[test]
+    fn rewrite_fact_with_an_oracle_that_proves_nothing_counts_every_call_as_a_rewrite() {
+        // Verdicts fixed by hand, not derived from the scan under test: a call counts as a
+        // rewrite unless it is the use's own call outside a loop.
+        let fixtures = [
+            (local_passed_to_another_call(), true),
+            (local_passed_to_own_call(true), true),
+            (local_passed_to_own_call(false), false),
+            (body_with_execute(), true),
+            (write_inside_try_use_outside(), true),
+            (body_without_call_or_write(), false),
+        ];
+        for (n, (fixture, expected)) in fixtures.iter().enumerate() {
+            assert_eq!(fixture.without_proof(), *expected, "fixture {n}");
         }
     }
 
