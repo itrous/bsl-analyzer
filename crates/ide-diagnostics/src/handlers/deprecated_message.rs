@@ -5,7 +5,8 @@ use hir::LocalRange;
 
 use super::deprecated_platform_api;
 use super::deprecated_platform_facts::{
-    canonical_name_for, global_function_fact, is_russian_alias, replacement_for_name,
+    canonical_name_for, global_function_fact, is_russian_alias,
+    replacement_absent_from_configuration, replacement_for_name,
 };
 
 pub fn from_hir(
@@ -23,7 +24,7 @@ pub fn from_hir(
     }
 
     let fact = global_function_fact(name, LifecycleGroup::UserNotification)?;
-    let message = get_message(name, fact)?;
+    let message = get_message(name, fact, ctx)?;
 
     Some(Diagnostic {
         code,
@@ -35,10 +36,29 @@ pub fn from_hir(
     })
 }
 
-fn get_message(method_name: &str, fact: &DeprecationEntry) -> Option<String> {
+fn get_message(
+    method_name: &str,
+    fact: &DeprecationEntry,
+    ctx: &AnalysisContext,
+) -> Option<String> {
     let replacement = replacement_for_name(fact, method_name)?;
     let deprecated = canonical_name_for(fact, method_name)?;
-    if is_russian_alias(fact, method_name) {
+    let russian = is_russian_alias(fact, method_name);
+    // Do not advise a replacement this configuration provably does not have.
+    if replacement_absent_from_configuration(replacement, ctx) {
+        return Some(if russian {
+            format!(
+                "Устаревшее \"{}\": рекомендуемой замены \"{}\" в этой конфигурации нет",
+                deprecated, replacement
+            )
+        } else {
+            format!(
+                "Deprecated \"{}\": the recommended replacement \"{}\" is absent from this configuration",
+                deprecated, replacement
+            )
+        });
+    }
+    if russian {
         Some(format!("Используйте \"{}\" вместо устаревшего \"{}\"", replacement, deprecated))
     } else {
         Some(format!("Use \"{}\" instead of deprecated \"{}\"", replacement, deprecated))
@@ -161,6 +181,60 @@ EndProcedure
               severity: Warning"#]]
         .assert_eq(&format_diags(code, &diags));
         assert!(diags[0].message.contains("MessageToUser"));
+    }
+
+    const CLIENT_SERVER_MODULE_XML: &str = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000104">
+        <Properties>
+            <Name>ОбщегоНазначения</Name>
+            <Server>true</Server>
+            <ClientManagedApplication>true</ClientManagedApplication>
+            <ServerCall>false</ServerCall>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#;
+
+    const OTHER_EXPORT: &str = "Процедура ДругойМетод() Экспорт\nКонецПроцедуры\n";
+    const REPLACEMENT_EXPORT: &str = "Процедура СообщитьПользователю() Экспорт\nКонецПроцедуры\n";
+    const CALL_SITE: &str = "&НаКлиенте\nПроцедура Тест()\n    Сообщить(\"х\");\nКонецПроцедуры\n";
+
+    const ABSENT_MESSAGE: &str = "Устаревшее \"Сообщить\": рекомендуемой замены \"ОбщегоНазначения.СообщитьПользователю\" в этой конфигурации нет";
+    const NAMED_MESSAGE: &str =
+        "Используйте \"ОбщегоНазначения.СообщитьПользователю\" вместо устаревшего \"Сообщить\"";
+
+    fn deprecated_messages(modules: &[(&str, &str, &str)]) -> Vec<String> {
+        check_form_with_common_modules(CALL_SITE, modules)
+            .into_iter()
+            .filter(|d| d.code == DiagnosticCode::DeprecatedPlatformApi)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn replacement_absent_from_the_configuration_is_not_named() {
+        let messages =
+            deprecated_messages(&[("ОбщегоНазначения", OTHER_EXPORT, CLIENT_SERVER_MODULE_XML)]);
+        assert_eq!(messages, vec![ABSENT_MESSAGE.to_string()]);
+        assert!(!messages[0].contains("Используйте"));
+    }
+
+    #[test]
+    fn replacement_present_in_the_configuration_is_still_named() {
+        let messages = deprecated_messages(&[(
+            "ОбщегоНазначения",
+            REPLACEMENT_EXPORT,
+            CLIENT_SERVER_MODULE_XML,
+        )]);
+        assert_eq!(messages, vec![NAMED_MESSAGE.to_string()]);
+    }
+
+    // Control: a receiver that is not a common module of the configuration keeps its
+    // name. This stops the gate from stripping platform-spelled replacements (a chart
+    // property path, say), whose absence from the configuration proves nothing.
+    #[test]
+    fn a_receiver_that_is_not_a_common_module_keeps_its_name() {
+        let messages = deprecated_messages(&[]);
+        assert_eq!(messages, vec![NAMED_MESSAGE.to_string()]);
     }
 
     #[test]
