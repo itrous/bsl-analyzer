@@ -120,6 +120,7 @@ mod sdbl_literal_highlighting;
 mod signature_help_shadowed_root;
 mod symbol_info;
 mod type_mismatch_access_right_form_items;
+mod type_mismatch_xml_string_argument;
 mod type_of_expr;
 mod type_system_invariants;
 mod unload_arg_narrowing;
