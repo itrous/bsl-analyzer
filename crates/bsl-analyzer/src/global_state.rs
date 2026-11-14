@@ -402,8 +402,9 @@ pub struct GlobalState {
     pub workspace_root: Option<PathBuf>,
     pub project: Option<Project>,
     /// The project's `[source].exclude`, also spelled under each source root the
-    /// loader walks — the one test every way into the VFS asks.
-    pub(crate) source_exclusions: stdx::path_exclusion::ExcludedPaths,
+    /// loader walks — the one test every way into the VFS asks. Shared so a request's
+    /// frozen view carries it without re-deriving it.
+    pub(crate) source_exclusions: Arc<stdx::path_exclusion::ExcludedPaths>,
     /// Parent configs the workspace `bsl-analyzer.toml` inherits through `extends`
     /// (best effort, missing ones included): watched like the config itself, so an
     /// edit to a shared parent reloads the project.

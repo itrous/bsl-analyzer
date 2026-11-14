@@ -458,7 +458,7 @@ impl RequestDispatcher<'_> {
         } else {
             FrozenFilePaths::freeze(&state.vfs.read())
         };
-        let file_paths = file_paths.with_source_exclusions(state.project.as_ref());
+        let file_paths = file_paths.with_source_exclusions(Arc::clone(&state.source_exclusions));
         let ctx = LatencyRequestContext {
             analysis,
             workspace_root: state.workspace_root.clone(),

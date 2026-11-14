@@ -88,7 +88,7 @@ impl GlobalState {
         let diff_base_changed = previous_diff_base != project.config.analysis.diff_base.as_ref();
 
         self.source_exclusions =
-            project.source_exclusions().respelled_under(&project.source_roots());
+            Arc::new(project.source_exclusions().respelled_under(&project.source_roots()));
         self.workspace_root = Some(root);
         self.project = Some(project);
         self.project_rejected = false;
@@ -167,7 +167,7 @@ impl GlobalState {
         let diagnostics_baseline =
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project);
         self.source_exclusions =
-            project.source_exclusions().respelled_under(&project.source_roots());
+            Arc::new(project.source_exclusions().respelled_under(&project.source_roots()));
         self.workspace_root = Some(root.clone());
         self.project = Some(project);
         self.install_diagnostics_baseline(diagnostics_baseline);
@@ -239,7 +239,7 @@ impl GlobalState {
                 paths::AbsPathBuf::assert_utf8(root.join("build")),
                 paths::AbsPathBuf::assert_utf8(root.join(".vscode")),
             ],
-            hard_exclude: self.source_exclusions.clone(),
+            hard_exclude: stdx::path_exclusion::ExcludedPaths::clone(&self.source_exclusions),
             rules: vec![loader::FileRule {
                 extensions: project_model::METADATA_WATCHED_EXTENSIONS
                     .iter()

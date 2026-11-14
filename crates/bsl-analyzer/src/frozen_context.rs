@@ -24,8 +24,8 @@ pub struct FrozenFilePaths {
     open_urls: Arc<FxHashMap<FileId, Url>>,
     /// The project's exclusions, carried only so a lookup that misses can tell its two
     /// causes apart: a path the user took out of the project, and a path that is simply
-    /// not there. They used to answer with the same sentence.
-    source_exclusions: Option<Arc<project_model::ExcludedPaths>>,
+    /// not there.
+    source_exclusions: Arc<project_model::ExcludedPaths>,
 }
 
 impl FrozenFilePaths {
@@ -89,20 +89,12 @@ impl FrozenFilePaths {
         self
     }
 
-    /// Records the exclusions the project was resolved with, so a miss on an excluded
-    /// path can name the reason instead of reading as an absent file. Called once per
-    /// frozen view; `None` leaves the message as it was.
-    pub fn with_source_exclusions(mut self, project: Option<&Project>) -> Self {
-        self.source_exclusions = project.map(|project| {
-            Arc::new(project.source_exclusions().respelled_under(&project.source_roots()))
-        });
+    /// Records the exclusions the server already holds for the current project, so a
+    /// miss on an excluded path names the reason instead of reading as an absent file.
+    /// Shared rather than re-derived: re-spelling them resolves every source root.
+    pub fn with_source_exclusions(mut self, exclusions: Arc<project_model::ExcludedPaths>) -> Self {
+        self.source_exclusions = exclusions;
         self
-    }
-
-    fn is_excluded(&self, path: &Path) -> bool {
-        self.source_exclusions
-            .as_ref()
-            .is_some_and(|exclusions| exclusions.is_excluded_resolved(path))
     }
 
     pub fn file_id_for_url(&self, url: &Url) -> anyhow::Result<FileId> {
@@ -116,7 +108,7 @@ impl FrozenFilePaths {
             .or_else(|| self.forward.get(&crate::workspace::canonicalize_shared_path(&path)))
             .copied()
             .ok_or_else(|| {
-                if self.is_excluded(&path) {
+                if self.source_exclusions.is_excluded_resolved(&path) {
                     crate::excluded_document::excluded_from_project(url)
                 } else {
                     anyhow::anyhow!("File not in frozen VFS snapshot: {}", url)
@@ -305,5 +297,41 @@ mod tests {
         assert_eq!(ambiguous.file_id_for_url(&alias_uri).unwrap(), file_id);
         assert_eq!(ambiguous.url_for_file_id(file_id).unwrap(), canonical_uri);
         assert_eq!(ambiguous.path_for_file_id(file_id), Some(path.as_path()));
+    }
+
+    #[test]
+    fn a_miss_names_the_exclusion_only_for_an_excluded_document() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("src");
+        std::fs::create_dir_all(source.join("excluded")).unwrap();
+        std::fs::write(
+            root.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \"src\"\nexclude = [\"src/excluded\"]\nexclude_globs = [\"**/Generated.bsl\"]\n",
+        )
+        .unwrap();
+        let project = Project::new(root.path()).unwrap();
+        let exclusions =
+            Arc::new(project.source_exclusions().respelled_under(&project.source_roots()));
+        let frozen = FrozenFilePaths::default().with_source_exclusions(exclusions);
+        let url = |name: &str| Url::from_file_path(source.join(name)).unwrap();
+
+        // One excluded by a directory, one by a pattern: both keys lead to the same text.
+        for excluded in [url("excluded/Module.bsl"), url("Generated.bsl")] {
+            assert_eq!(
+                frozen.file_id_for_url(&excluded).unwrap_err().to_string(),
+                crate::excluded_document::excluded_from_project(&excluded).to_string(),
+            );
+            // Without the exclusions the same document is an ordinary miss.
+            assert_eq!(
+                FrozenFilePaths::default().file_id_for_url(&excluded).unwrap_err().to_string(),
+                format!("File not in frozen VFS snapshot: {excluded}"),
+            );
+        }
+        let absent = url("Absent.bsl");
+        assert_eq!(
+            frozen.file_id_for_url(&absent).unwrap_err().to_string(),
+            format!("File not in frozen VFS snapshot: {absent}"),
+            "a document no exclusion covers keeps the old message byte for byte"
+        );
     }
 }
