@@ -43,6 +43,7 @@ pub mod this_object;
 pub mod this_object_attr;
 mod type_literal;
 mod user_call_candidates;
+pub mod value_origin;
 
 pub use bsl_config::VisibleConfig;
 pub use call_resolution::{
