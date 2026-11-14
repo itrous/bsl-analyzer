@@ -237,6 +237,67 @@ EndProcedure
         assert_eq!(messages, vec![NAMED_MESSAGE.to_string()]);
     }
 
+    // `Module.Method` reaches only an exported method, so a non-exported one of that
+    // name is as good as absent.
+    #[test]
+    fn a_non_exported_replacement_is_not_named() {
+        let messages = deprecated_messages(&[(
+            "ОбщегоНазначения",
+            "Процедура СообщитьПользователю()\nКонецПроцедуры\n",
+            CLIENT_SERVER_MODULE_XML,
+        )]);
+        assert_eq!(messages, vec![ABSENT_MESSAGE.to_string()]);
+    }
+
+    fn deprecated_messages_in_configuration(unreadable: &[&str]) -> Vec<String> {
+        const CONFIGURATION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>Тест</Name></Properties>
+        <ChildObjects>
+            <CommonModule>ОбщегоНазначения</CommonModule>
+            <CommonModule>Проба</CommonModule>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+        const CALLER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000003">
+        <Properties><Name>Проба</Name><Server>true</Server></Properties>
+    </CommonModule>
+</MetaDataObject>"#;
+        const CALLER_PATH: &str = "CommonModules/Проба/Ext/Module.bsl";
+
+        check_config_files_with_unreadable(
+            &[
+                ("Configuration.xml", CONFIGURATION_XML),
+                ("CommonModules/ОбщегоНазначения.xml", CLIENT_SERVER_MODULE_XML),
+                ("CommonModules/Проба.xml", CALLER_XML),
+                ("CommonModules/ОбщегоНазначения/Ext/Module.bsl", OTHER_EXPORT),
+                (CALLER_PATH, "Процедура Тест() Экспорт\n    Сообщить(\"х\");\nКонецПроцедуры\n"),
+            ],
+            CALLER_PATH,
+            unreadable,
+        )
+        .into_iter()
+        .filter(|d| d.code == DiagnosticCode::DeprecatedPlatformApi)
+        .map(|d| d.message)
+        .collect()
+    }
+
+    // The module body could not be read, so the method may well be declared there:
+    // the replacement keeps its name. Only the unreadable flag differs from the control.
+    #[test]
+    fn an_unread_module_body_keeps_the_replacement_named() {
+        let control = deprecated_messages_in_configuration(&[]);
+        assert_eq!(control, vec![ABSENT_MESSAGE.to_string()]);
+
+        let unread = deprecated_messages_in_configuration(&[
+            "CommonModules/ОбщегоНазначения/Ext/Module.bsl",
+        ]);
+        assert_eq!(unread, vec![NAMED_MESSAGE.to_string()]);
+    }
+
     #[test]
     fn test_module_level_call() {
         let code = r#"
