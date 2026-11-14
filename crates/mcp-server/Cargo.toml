@@ -31,6 +31,7 @@ vfs.workspace = true
 walkdir.workspace = true
 rayon.workspace = true
 stdx.workspace = true
+build-info.workspace = true
 check-contract = { path = "../check-contract" }
 
 rmcp = { version = "3.5.1", features = [

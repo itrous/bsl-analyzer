@@ -36,7 +36,7 @@ fn observe(path: &Path, mode: &str) -> Record {
         state: "unavailable",
         mode: Some(bounded(mode, 64)),
         build_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-        build_sha: option_env!("VERGEN_GIT_SHA").map(str::to_owned),
+        build_sha: build_info::commit().map(str::to_owned),
         ..Snapshot::default()
     };
     ROOTS.with(|slot| {
