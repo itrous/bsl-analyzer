@@ -22,6 +22,10 @@ pub struct FrozenFilePaths {
     reverse: Arc<FxHashMap<FileId, PathBuf>>,
     open_uris: Arc<FxHashMap<Url, FileId>>,
     open_urls: Arc<FxHashMap<FileId, Url>>,
+    /// The project's exclusions, carried only so a lookup that misses can tell its two
+    /// causes apart: a path the user took out of the project, and a path that is simply
+    /// not there. They used to answer with the same sentence.
+    source_exclusions: Option<Arc<project_model::ExcludedPaths>>,
 }
 
 impl FrozenFilePaths {
@@ -85,6 +89,22 @@ impl FrozenFilePaths {
         self
     }
 
+    /// Records the exclusions the project was resolved with, so a miss on an excluded
+    /// path can name the reason instead of reading as an absent file. Called once per
+    /// frozen view; `None` leaves the message as it was.
+    pub fn with_source_exclusions(mut self, project: Option<&Project>) -> Self {
+        self.source_exclusions = project.map(|project| {
+            Arc::new(project.source_exclusions().respelled_under(&project.source_roots()))
+        });
+        self
+    }
+
+    fn is_excluded(&self, path: &Path) -> bool {
+        self.source_exclusions
+            .as_ref()
+            .is_some_and(|exclusions| exclusions.is_excluded_resolved(path))
+    }
+
     pub fn file_id_for_url(&self, url: &Url) -> anyhow::Result<FileId> {
         let path = url.to_file_path().map_err(|_| anyhow::anyhow!("Invalid file URL: {}", url))?;
         if !project_model::is_bsl_source_path(&path) {
@@ -95,7 +115,17 @@ impl FrozenFilePaths {
             .or_else(|| self.forward.get(&path))
             .or_else(|| self.forward.get(&crate::workspace::canonicalize_shared_path(&path)))
             .copied()
-            .ok_or_else(|| anyhow::anyhow!("File not in frozen VFS snapshot: {}", url))
+            .ok_or_else(|| {
+                if self.is_excluded(&path) {
+                    anyhow::anyhow!(
+                        "File is excluded from the project by [source].exclude or \
+                         [source].exclude_globs, so it is not analysed: {}",
+                        url
+                    )
+                } else {
+                    anyhow::anyhow!("File not in frozen VFS snapshot: {}", url)
+                }
+            })
     }
 
     pub fn url_for_file_id(&self, file_id: FileId) -> anyhow::Result<Url> {
