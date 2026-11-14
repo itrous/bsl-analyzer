@@ -1,4 +1,4 @@
-use crate::BodyContext;
+use crate::{AnalysisContext, BodyContext};
 use bsl_platform::deprecation::{
     self, CompatibilityBucket, DeprecationEntry, DisplayKind, ElementKind, LifecycleGroup, Lookup,
 };
@@ -105,6 +105,42 @@ pub(crate) fn replacement_compiles_here(replacement: &str, ctx: &BodyContext) ->
         }
     }
     !replacement_missing_from_call_env(replacement, ctx)
+}
+
+/// Whether `replacement` is spelled `Receiver.Member`, a common module of THIS
+/// configuration is named `Receiver`, and that module provably exports no `Member`.
+///
+/// A library (BSP) replacement's home moves between library releases, so naming a
+/// method the module lacks trades a warning for a run-time error ("method not
+/// found"). The gate acts only where the replacement names a common module of this
+/// configuration: a receiver that is not one — every platform-spelled replacement,
+/// chart property paths included — is left alone precisely because its absence
+/// cannot be proven. Nor is the name withheld for a spelling without exactly one
+/// `.`, for a method that is there, or for `Unread`, a module body that could not
+/// be read: absence of data is not evidence of absence.
+pub(crate) fn replacement_absent_from_configuration(
+    replacement: &str,
+    ctx: &AnalysisContext,
+) -> bool {
+    let Some((receiver, member)) = replacement.split_once('.') else {
+        return false;
+    };
+    if member.contains('.') {
+        return false;
+    }
+    let bodies = ctx.common_module_bodies(receiver);
+    if bodies.is_empty() {
+        return false;
+    }
+    let member_name = hir::Name::new(member);
+    matches!(
+        bodies.search_merged_surface(|file_id| {
+            let tree = ctx.symbol_tree_for(hir::ModuleId::new(file_id));
+            let method = tree.find_method(&member_name)?;
+            method.is_export.then_some(())
+        }),
+        hir::BodySearch::Absent
+    )
 }
 
 /// A method of this module named `name` owns a bare call of that spelling, ahead

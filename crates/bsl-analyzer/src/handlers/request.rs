@@ -2704,7 +2704,8 @@ mod tests {
         std::fs::create_dir_all(&hidden_dir).unwrap();
         let hidden = hidden_dir.join("Hidden.bsl");
         let uri = lsp_types::Url::from_file_path(&hidden).unwrap();
-        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+        state.source_exclusions =
+            std::sync::Arc::new(project_model::ExcludedPaths::new([hidden_dir]));
 
         crate::handlers::handle_did_open(
             &mut state,
