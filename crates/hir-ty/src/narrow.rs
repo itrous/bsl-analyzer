@@ -840,24 +840,12 @@ fn push_branch_guards(
 /// `own_call` is the call the use is an argument of, as its binding names it (the call, or
 /// its callee): its write happens after the argument is read, so it reaches the use only
 /// round a loop around it.
-pub(crate) fn local_may_change_unseen(
-    body: &Body,
-    key: &str,
-    use_stmt: StmtIdx,
-    own_call: Option<ExprId>,
-) -> bool {
-    local_rewrite_scan(body, key, use_stmt, own_call, &|_| false)
-}
-
-/// [`local_may_change_unseen`] refined by the direction an argument is passed in: an
-/// argument passed BY VALUE cannot be rewritten by the callee, so it no longer counts as a
-/// possible rewrite. Everything else is unchanged: the `own_call` exemption and its loop
-/// re-inclusion, `Выполнить`, and the `Попытка` rule over assignments.
 ///
-/// `passed_by_value` answers "this argument expression is passed by value, PROVEN". An
-/// unresolved or unattested call must map to `false`: only a proven by-value answer is
-/// allowed to weaken the verdict, so an oracle that always says `false` reproduces
-/// [`local_may_change_unseen`] exactly.
+/// An argument passed BY VALUE cannot be rewritten by the callee, so it does not count as a
+/// possible rewrite. `passed_by_value` answers "this argument expression is passed by
+/// value, PROVEN". An unresolved or unattested call must map to `false`: only a proven
+/// by-value answer is allowed to weaken the verdict, so an oracle that always says `false`
+/// treats every call as a possible rewrite.
 pub fn local_may_be_rewritten(
     body: &Body,
     key: &str,
@@ -1323,8 +1311,8 @@ mod tests {
     }
 
     impl RewriteFixture {
-        fn old_fact(&self) -> bool {
-            local_may_change_unseen(&self.body, "х", self.use_stmt, self.own_call)
+        fn without_proof(&self) -> bool {
+            local_may_be_rewritten(&self.body, "х", self.use_stmt, self.own_call, &|_| false)
         }
 
         fn refined_fact(&self, by_value: bool) -> bool {
@@ -1403,7 +1391,7 @@ mod tests {
     #[test]
     fn rewrite_fact_ignores_a_local_proven_passed_by_value_to_another_call() {
         let fixture = local_passed_to_another_call();
-        assert!(fixture.old_fact());
+        assert!(fixture.without_proof());
         assert!(!fixture.refined_fact(true));
     }
 
@@ -1448,17 +1436,19 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_fact_with_an_oracle_that_proves_nothing_agrees_with_the_old_fact() {
+    fn rewrite_fact_with_an_oracle_that_proves_nothing_counts_every_call_as_a_rewrite() {
+        // Verdicts fixed by hand, not derived from the scan under test: a call counts as a
+        // rewrite unless it is the use's own call outside a loop.
         let fixtures = [
-            local_passed_to_another_call(),
-            local_passed_to_own_call(true),
-            local_passed_to_own_call(false),
-            body_with_execute(),
-            write_inside_try_use_outside(),
-            body_without_call_or_write(),
+            (local_passed_to_another_call(), true),
+            (local_passed_to_own_call(true), true),
+            (local_passed_to_own_call(false), false),
+            (body_with_execute(), true),
+            (write_inside_try_use_outside(), true),
+            (body_without_call_or_write(), false),
         ];
-        for (n, fixture) in fixtures.iter().enumerate() {
-            assert_eq!(fixture.refined_fact(false), fixture.old_fact(), "fixture {n}");
+        for (n, (fixture, expected)) in fixtures.iter().enumerate() {
+            assert_eq!(fixture.without_proof(), *expected, "fixture {n}");
         }
     }
 
