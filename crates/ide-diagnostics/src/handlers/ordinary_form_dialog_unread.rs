@@ -42,7 +42,7 @@ pub fn from_metadata(
         return Vec::new();
     };
 
-    if !form.is_ordinary() || form.ordinary_dialog_known() {
+    if !form.handler_bindings_unknown() {
         return Vec::new();
     }
 

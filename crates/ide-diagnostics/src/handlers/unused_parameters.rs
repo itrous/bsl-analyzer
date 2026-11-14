@@ -60,7 +60,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         // parameters turns one unread file into a pack of false findings over every handler
         // of the form, so stay silent here, exactly as `UnusedLocalMethod` does, and let
         // `OrdinaryFormDialogUnread` say why the check was dropped.
-        if form.is_ordinary() && !form.ordinary_dialog_known() {
+        if form.handler_bindings_unknown() {
             return Vec::new();
         }
         for handler in form.event_handlers() {
