@@ -44,8 +44,8 @@ pub use help::{
 };
 pub use parameter_series::ParameterSeries;
 pub use snapshot::{
-    AttestedSurfaces, MemberSurface, MemberSurfaceAttestation, PlatformSnapshot,
-    SnapshotDecodeError,
+    AttestedSurfaces, MemberSurface, MemberSurfaceAttestation, ParameterPassingAttestationRecord,
+    PlatformSnapshot, SnapshotDecodeError,
 };
 pub use types::*;
 

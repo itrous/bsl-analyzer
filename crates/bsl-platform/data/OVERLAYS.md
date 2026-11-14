@@ -70,6 +70,43 @@ global-context functions are extracted apart from type methods and resolve by
 their RU/EN names alone. The section is optional; validation and the effect of
 applying an entry are those of method parameter overrides.
 
+## Parameter passing in an override
+
+<!-- overlay-document -->
+```json
+{
+  "schema_version": 1,
+  "method_parameter_overrides": [],
+  "global_function_parameter_overrides": [
+    {
+      "russian_name": "РусскоеИмяФункции",
+      "english_name": "EnglishFunctionName",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "passing": "by_ref",
+      "evidence_source": "the help page says the call writes the result into the argument",
+      "rationale": "a rule about the origin of a value must know the call overwrites the variable"
+    }
+  ]
+}
+```
+
+`passing` states how the platform passes the parameter, which the help extract does
+not record: `"by_ref"` means the call can write a value back into the caller's
+variable (`ВвестиСтроку(Текст)` overwrites `Текст`), `"by_value"` that it only reads
+the argument. The literals map to `ParamPassing::ByRef` and `ParamPassing::ByVal`, the
+same enum the source-level `Знач` of a user method uses. Both `replacement_type_list`
+and `passing` are optional, but a record needs at least one of them: an entry that
+states neither is refused. A record with `passing` alone leaves the extracted type
+list as it is, and its target is still resolved, version-checked and index-checked, so a
+misspelt function fails the load. Two records for one parameter are refused as before.
+
+The fact is carried into the loaded corpus as a `passing` key of the parameter and
+nowhere else: `platform_facts.json` stays an unchanged extract, and nothing writes the
+key back to disk. Records are curated one by one, not harvested from the prose: the
+asynchronous twin of a function repeats the sentence of its synchronous namesake and
+writes nothing back.
+
 ## Type property addition schema
 
 <!-- overlay-document -->
@@ -270,6 +307,43 @@ facts, is not one the docs-gap overlays synthesize members for
 marker or it is on the test's list of types that address their elements by name,
 is attested for `["methods"]` only — so attesting such a type for its properties
 fails the tests instead of passing review.
+
+## Parameter passing attestation schema
+
+<!-- overlay-document -->
+```json
+{
+  "schema_version": 1,
+  "method_parameter_overrides": [],
+  "parameter_passing_attestations": [
+    {
+      "scope": "global_context",
+      "verified_against_version": "8.3.27",
+      "unverified_functions": ["РусскоеИмяФункции"],
+      "evidence_source": "the sweep of every parameter description of the scope in the corpus",
+      "rationale": "the scope is judged in full except for the functions the extract documents in part"
+    }
+  ]
+}
+```
+
+A `passing` record says one parameter is passed by reference. The attestation is what
+lets the absence of a record mean «passed by value» for the rest of the scope: without
+it a parameter with no record is simply unknown, and a rule has to treat it so.
+`scope` is `global_context` for the global functions (the loader supports only that
+scope for now and refuses any other, though the schema is general), otherwise a platform
+type by its Russian or English spelling. `verified_against_version` follows the rule of
+the member surface attestation: a dotted numeric version of at least three components.
+
+`unverified_functions` is the honest hole in the claim: the functions of the scope whose
+parameters the sweep could not judge, because the extract documents fewer parameters than
+it declares (it merges call variants, so a by-reference parameter of an undocumented
+variant is invisible to it). A consumer must treat the arguments of those functions as
+unknown rather than as passed by value. Each name is resolved against the extracted
+global functions by its Russian or English spelling, and a name that matches none is
+refused: a typo there would silently shrink the hole and widen the verified set, which is
+the dangerous direction. The list is optional, but not empty when present (omit it when
+the scope is judged in full) and repeats no function. One scope is attested once.
 
 ## Method-local scope
 

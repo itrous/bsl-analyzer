@@ -450,6 +450,70 @@
    ]
   },
   {
+   "id": 6,
+   "name": "ВвестиСтроку",
+   "english_name": "InputString",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false},
+    {"name": "Подсказка", "param_type": "Строка", "is_optional": true},
+    {"name": "Длина", "param_type": "Число", "is_optional": true},
+    {"name": "Многострочность", "param_type": "Булево", "is_optional": true}
+   ]
+  },
+  {
+   "id": 7,
+   "name": "ВвестиЧисло",
+   "english_name": "InputNumber",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Число", "param_type": "Число", "is_optional": false},
+    {"name": "Подсказка", "param_type": "Строка", "is_optional": true},
+    {"name": "Длина", "param_type": "Число", "is_optional": true},
+    {"name": "Точность", "param_type": "Число", "is_optional": true}
+   ]
+  },
+  {
+   "id": 8,
+   "name": "ВвестиДату",
+   "english_name": "InputDate",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Дата", "param_type": "Дата", "is_optional": false},
+    {"name": "Подсказка", "param_type": "Строка", "is_optional": true},
+    {"name": "ЧастьДаты", "param_type": "ЧастиДаты", "is_optional": true}
+   ]
+  },
+  {
+   "id": 9,
+   "name": "ВвестиЗначение",
+   "english_name": "InputValue",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Значение", "param_type": "Произвольный", "is_optional": false},
+    {"name": "Подсказка", "param_type": "Строка", "is_optional": true},
+    {"name": "Тип", "param_type": "Тип, ОписаниеТипов", "is_optional": true}
+   ]
+  },
+  {
+   "id": 10,
+   "name": "ПоместитьФайл",
+   "english_name": "PutFile",
+   "min_version": "8.2",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Адрес", "param_type": "Строка", "is_optional": true},
+    {"name": "НачальноеИмяФайла", "param_type": "Строка", "is_optional": true},
+    {"name": "ВыбранноеИмяФайла", "param_type": "Строка", "is_optional": true},
+    {"name": "Интерактивно", "param_type": "Булево", "is_optional": true},
+    {"name": "УникальныйИдентификаторФормы", "param_type": "УникальныйИдентификатор", "is_optional": true}
+   ]
+  },
+  {
    "id": 5,
    "name": "СтрДлина",
    "english_name": "StrLen",

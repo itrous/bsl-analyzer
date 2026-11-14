@@ -178,6 +178,16 @@ impl PlatformProperty {
     }
 }
 
+/// How a parameter is passed: `ByVal` copies the argument, `ByRef` can write back into the
+/// caller's variable. One notion for both the `Знач` of a user method in the source and the
+/// curated fact about a platform parameter, so the two sides cannot drift into two enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ParamPassing {
+    ByVal,
+    ByRef,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodParam {
     pub name: SmolStr,

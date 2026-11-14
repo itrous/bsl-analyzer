@@ -8,7 +8,7 @@ use bsl_types::kind::{Projection, TypeId, TypeKind};
 use hir_def::configs::ConfigsDatabase;
 use hir_def::ty::MetadataKind;
 use hir_def::Name;
-use hir_ty::lower::type_string::{lower_param_type_string_typeid, lower_return_type_string_typeid};
+use hir_ty::lower::type_string::lower_return_type_string_typeid;
 use hir_ty::method_lookup::platform_type_key_id;
 use hir_ty::{
     enumerate_fields, is_assignable, is_ref_ty, lookup_field, lookup_manager_field, lookup_method,
@@ -23,15 +23,9 @@ pub struct Method {
     pub name: Name,
     pub english_name: Name,
     pub return_ty: Option<TypeId>,
-    pub params: Vec<MethodParam>,
+    /// The platform record on purpose: a facade copy would have to grow every new parameter fact.
+    pub params: Vec<bsl_platform::MethodParam>,
     pub env: Option<hir_def::execution_env::EnvFlags>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MethodParam {
-    pub name: Name,
-    pub ty: Option<TypeId>,
-    pub optional: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,15 +515,6 @@ pub fn module_implicit_field_names(
 }
 
 fn method_dto_from_platform(db: &dyn TypeKernelDb, method: &PlatformMethod) -> Method {
-    let params = method
-        .parameters
-        .iter()
-        .map(|param| MethodParam {
-            name: Name::new(param.name.as_str()),
-            ty: param.param_type.as_ref().map(|ty| lower_param_type_string_typeid(db, ty)),
-            optional: param.is_optional,
-        })
-        .collect();
     // Имена берутся у каталога, а не у сырых полей: у шаблонных записей менеджера `name`
     // усечено до `&lt;Имя`, и карточка показала бы двадцать два одинаковых члена с этим
     // именем вместо `СоздатьЭлемент`, `СоздатьГруппу` и остальных.
@@ -538,7 +523,7 @@ fn method_dto_from_platform(db: &dyn TypeKernelDb, method: &PlatformMethod) -> M
         name: Name::new(russian.as_str()),
         english_name: fallback_name(english.as_str(), russian.as_str()),
         return_ty: method.return_type.as_ref().map(|ret| lower_return_type_string_typeid(db, ret)),
-        params,
+        params: method.parameters.clone(),
         env: Some(hir_def::execution_env::EnvFlags::from_platform_context(method.context.as_ref())),
     }
 }

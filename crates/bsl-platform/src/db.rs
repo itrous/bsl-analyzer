@@ -155,6 +155,9 @@ impl PlatformDataInner {
             constructor_docs,
             property_docs,
             member_surface_attestations,
+            // Nothing consumes the passing attestation yet; the full destructure stays so a
+            // new snapshot field cannot be forgotten here silently.
+            parameter_passing_attestations: _,
         } = snapshot;
 
         apply_docs_gap_iter_types_overlay(&mut types);

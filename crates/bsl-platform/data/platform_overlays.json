@@ -213,6 +213,60 @@
       ],
       "evidence_source": "platform_data.json: RefreshObjectsNumbering (global function id 279), parameter «Метаданные»: param_type «Массив, ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
       "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "russian_name": "ВвестиСтроку",
+      "english_name": "InputString",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "passing": "by_ref",
+      "evidence_source": "Pinned 8.3.27 corpus (PROVENANCE.md), global function id 64, parameter «Строка»: «Тип: Строка . Доступная в модуле переменная. В эту переменную будет помещена введенная в диалоге строка. Начальное значение переменной будет использовано в качестве начального значения в диалоге.» The function returns Булево — the entered value cannot come back as the result — and the documented example of the same help page passes a variable and reads it afterwards: «Текст = \"\"; Подсказка = \"Введите текст напоминания\"; Если ВвестиСтроку(Текст, Подсказка, 0, Истина) Тогда // запомнить текст напоминания КонецЕсли;» (shcntx_ru.hbk:objects/Global context/methods/catalog21/InputString24.html).",
+      "rationale": "A rule that decides by the origin of a value has to know that this call overwrites the caller's variable: treating the argument as passed by value would keep the value the variable held before the dialog and report a finding about a value the code never uses. The asynchronous twin ВвестиСтрокуАсинх is a separate global function and is not recorded: it returns Обещание and writes nothing back."
+    },
+    {
+      "russian_name": "ВвестиЧисло",
+      "english_name": "InputNumber",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "passing": "by_ref",
+      "evidence_source": "Pinned 8.3.27 corpus (PROVENANCE.md), global function id 62, parameter «Число»: «Тип: Число . Имя доступной в модуле переменной. В эту переменную будет помещено введенное число. Начальное значение переменной будет использовано в качестве начального значения в диалоге.» The function returns Булево, and the documented example reads the variable after the call: «Количество = 1; Если ВвестиЧисло(Количество, \"Введите количество\", 10, 2) Тогда» (shcntx_ru.hbk:objects/Global context/methods/catalog21/InputNumber23.html).",
+      "rationale": "Same reason as InputString. ВвестиЧислоАсинх carries the very same sentence in the corpus although it writes nothing back, which is why these records are curated one by one instead of harvested from the prose."
+    },
+    {
+      "russian_name": "ВвестиДату",
+      "english_name": "InputDate",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "passing": "by_ref",
+      "evidence_source": "Pinned 8.3.27 corpus (PROVENANCE.md), global function id 60, parameter «Дата»: «Тип: Дата . Имя доступной в модуле переменной. В эту переменную будет помещено введенное значение даты. Начальное значение переменной будет использовано в качестве начального значения в диалоге.» The function returns Булево.",
+      "rationale": "Same reason as InputString. ВвестиДатуАсинх repeats the sentence and is not recorded."
+    },
+    {
+      "russian_name": "ВвестиЗначение",
+      "english_name": "InputValue",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "passing": "by_ref",
+      "evidence_source": "Pinned 8.3.27 corpus (PROVENANCE.md), global function id 66, parameter «Значение»: «Тип: Произвольный. Имя доступной в модуле переменной. В эту переменную будет помещено введенное значение. Если параметр <Тип> не задан или имеет значение Неопределено , тип данной переменной используется в качестве типа вводимого в диалоге данного. Начальное значение переменной будет использовано в качестве начального значения в диалоге.» The function returns Булево.",
+      "rationale": "Same reason as InputString. Here the variable is read twice over: its value seeds the dialog and its type chooses the type of the input when the third parameter is omitted."
+    },
+    {
+      "russian_name": "ПоместитьФайл",
+      "english_name": "PutFile",
+      "min_version": "8.2",
+      "parameter_index": 0,
+      "passing": "by_ref",
+      "evidence_source": "Pinned 8.3.27 corpus (PROVENANCE.md), global function id 488, parameter «Адрес»: «Тип: Строка . Адрес во временном хранилище, по которому должны быть помещены данные. Если значение параметра не задано или является пустой строкой, то будет создан новый файл. Расположение нового файла возвращается в данном параметре.» The function returns Булево, so the new address has nowhere else to come back through.",
+      "rationale": "The call that passes an empty address and reads it afterwards is the ordinary way to put a file into temporary storage, so a rule that assumed the argument is passed by value would misjudge the commonest file-upload shape in configuration code."
+    },
+    {
+      "russian_name": "ПоместитьФайл",
+      "english_name": "PutFile",
+      "min_version": "8.2",
+      "parameter_index": 2,
+      "passing": "by_ref",
+      "evidence_source": "Pinned 8.3.27 corpus (PROVENANCE.md), global function id 488, parameter «ВыбранноеИмяФайла»: «Тип: Строка . В параметре возвращается путь к файлу, указанный в диалоге выбора файла. Для неинтерактивного режима выбранное имя файла соответствует начальному имени файла.В веб-клиенте значение параметра зависит от типа браузера.Для FireFox 3 в параметре возвращается только имя файла без пути.Для Internet Explorer возвращаемое значение зависит от настроек безопасности.»",
+      "rationale": "The second output of the same call: the name the user picked in the dialog reaches the caller only through this parameter."
     }
   ],
   "type_property_additions": [
@@ -353,6 +407,39 @@
       "verified_against_version": "8.3.27",
       "evidence_source": "The pinned 8.3.27 corpus documents ОбъектМетаданных: Реквизит / MetadataObject: Attribute with 5 methods (ids 5617-5621: Родитель, ПолноеИмя, Представление, ЕстьИзмененияРасширениямиКонфигурации, РасширениеКонфигурации) and 33 properties (ids 11463-11495, among them Имя, Синоним, Комментарий, Тип, Подсказка, ПараметрыВыбора, СвязиПараметровВыбора, ЗначениеЗаполнения, МаксимальноеЗначение, Использование); platform_facts.json holds exactly those records, and no constructor. The type is not among the 57 corpus types with neither a method nor a property, its name is unique (ОбъектМетаданных: Реквизит / MetadataObject: Attribute resolve to one type; the sibling descriptions of an addressing attribute, a dimension, a resource and a tabular section are types of their own), and no docs-gap overlay of crates/bsl-platform/src/db.rs synthesizes, clones or withholds a member of it. A live run on 8.3.17.1549 and 8.3.27.2214 on the description of a catalog attribute answers `Рек.Использование` normally, and answers `Рек.ИспользованиеРеквизита` and `Рек.НетТакогоПоляВовсе` with «Поле объекта не обнаружено (...)», an execution error. A scan of 50 configurations (167268 modules) found 1453 uses of 10 members on a chain whose receiver is provable from the text (`Тип` 828, `ПараметрыВыбора` 256, `Имя` 172, `Подсказка` 95, `Синоним` 52, `ЗначениеЗаполнения` 33, `ПолноеИмя` 12, `Представление` 3, `СвязиПараметровВыбора` 1, `МаксимальноеЗначение` 1), every one of them a member of the extract: no misses.",
       "rationale": "Without the attestation a member spelled wrongly on a description of an attribute is an unknown shape and reads silently. The extract lists the platform's own surface of the description at 8.3.27, its name carries none of the markers of a type a configuration extends (form, extension, data composition), and the live run answers a member outside it with an execution error, so a miss is a defect of the checked code. The corpus evidence has a stated limit: only chains whose receiver is provable from the text were counted (the attribute collection of a named object read by member), while the bulk of the real use is indirect, through a loop variable, `Найти` or an index of the collection (the collection is mentioned 5192 times in 36 configurations), and the zero misses say nothing about those. The decisive check is a run of the analyzer over whole configurations, which the entry's author does not replace by this count."
+    }
+  ],
+  "parameter_passing_attestations": [
+    {
+      "scope": "global_context",
+      "verified_against_version": "8.3.27",
+      "unverified_functions": [
+        "ПолучитьНавигационнуюСсылку",
+        "НачатьПомещениеФайловНаСервер",
+        "НачатьПомещениеФайлаНаСервер",
+        "ПоместитьФайлыНаСерверАсинх",
+        "ПоместитьФайлНаСерверАсинх",
+        "ЗаписатьXML",
+        "Дата",
+        "НачатьПодключениеВнешнейКомпоненты",
+        "ПодключитьВнешнююКомпоненту",
+        "НачатьПолучениеФайловССервера",
+        "НачатьПолучениеФайлаССервера",
+        "ПолучитьФайлыССервераАсинх",
+        "СоздатьФабрикуXDTO",
+        "ИзXMLТипа",
+        "ОткрытьФорму",
+        "ПолучитьФайлССервераАсинх",
+        "ОбъединитьФайлы",
+        "ДокументЗащищенПаролем",
+        "ДокументЗащищенПаролемАсинх",
+        "ОповеститьОбИзменении",
+        "ОткрытьФормуМодально",
+        "ПодключитьВнешнююКомпонентуАсинх",
+        "ОчиститьНастройкиПользователя"
+      ],
+      "evidence_source": "Sweep of every parameter description of the global context in the pinned 8.3.27 corpus (PROVENANCE.md): 500 global functions, 859 declared parameters, 732 of them described. Every description was matched against a wide net of write-back wordings (возвращается, возвращаются, будет помещен, помещено, помещена, помещены, присваивается, записывается, выходной, заполняется, устанавливается значение, после выполнения, в данный параметр, в этот параметр, в эту переменную, имя доступной в модуле, доступная в модуле), which left 38 descriptions to read by hand. Six of them state a write-back and are recorded here: parameter 0 of ВвестиСтроку, ВвестиЧисло, ВвестиДату and ВвестиЗначение, and parameters 0 and 2 of ПоместитьФайл. The remaining 32 account for themselves in full. Four are the asynchronous twins: ВвестиЧислоАсинх and ВвестиДатуАсинх carry the write-back sentence of their synchronous namesake verbatim although they return Обещание and write nothing back, while ВвестиСтрокуАсинх and ВвестиЗначениеАсинх match only on the sentence about the variable's initial value seeding the dialog, which is a read and not a write. Six are ОписаниеОповещения parameters whose prose documents the parameters of the CALLBACK rather than their own: НачатьПомещениеФайла 0, НачатьПомещениеФайловНаСервер 1, НачатьПомещениеФайлаНаСервер 1, НачатьПомещениеФайлов 5, ПоместитьФайлыНаСерверАсинх 0, ПоместитьФайлНаСерверАсинх 0. Eight speak of data placed into temporary storage or into a directory, or of a different parameter of the same call: ПолучитьНавигационнуюСсылку 1 and 2, НачатьПомещениеФайла 1, 2 and 3, ПоместитьФайл 1 and 3, РазделитьФайл 2. Seven match on «Записывается при следующих обстоятельствах», which says when the event-log event is written and nothing about the parameter: ОчиститьЖурналРегистрации, СкопироватьЖурналРегистрации, ВыгрузитьЖурналРегистрации, ПредставлениеСобытияЖурналаРегистрации, ПолучитьИспользованиеСобытияЖурналаРегистрации, УстановитьИспользованиеСобытияЖурналаРегистрации, ПолучитьЗначенияОтбораЖурналаРегистрации. Three use «возвращается» of the function's own result: ПравоДоступа 2, ПараметрыДоступа 3, ПолучитьСклоненияСтрокиПоЧислу 4. Four assign the value to a property of the form the call returns or use it as a lookup key: ПолучитьФорму 5, ОткрытьФорму 5, ОткрытьФормуМодально 3, ПолучитьОбщуюФорму 2. Six recorded and 32 discharged are the 38 read in full. The 23 functions listed in unverified_functions declare 127 parameters the extract leaves undescribed, because the extract merges call variants: ПолучитьНавигационнуюСсылку declares 31 parameters across variants and describes 3. Prose cannot judge those, so they are excluded from the claim.",
+      "rationale": "A record says that one parameter is passed by reference; this attestation is what lets the absence of a record mean «passed by value» for the rest of the scope, which is the inference a rule about the origin of a value needs. The claim is deliberately narrower than the scope: for the 23 listed functions the extract does not document every parameter, so a consumer must treat their arguments as unknown rather than as passed by value. Without the exclusion list the same silence would read as proof, and a by-reference parameter hidden in an undocumented call variant would turn into a false finding."
     }
   ]
 }

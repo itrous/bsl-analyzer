@@ -39,6 +39,10 @@ pub struct PlatformSnapshot {
     /// lives on the corpus side of the overlay, so every source ends up here
     /// with it. Empty when no overlay attests anything.
     pub member_surface_attestations: Vec<MemberSurfaceAttestation>,
+    /// Scopes whose parameters with no `passing` record are attested as passed by value,
+    /// carried by the curated overlays (`parameter_passing_attestations`). Empty when no
+    /// overlay attests anything.
+    pub parameter_passing_attestations: Vec<ParameterPassingAttestationRecord>,
 }
 
 /// One of the two member surfaces of a platform type an attestation can cover.
@@ -93,6 +97,20 @@ pub struct MemberSurfaceAttestation {
     pub verified_against_version: String,
     /// The surfaces the extract is attested complete for.
     pub surfaces: AttestedSurfaces,
+}
+
+/// One `parameter_passing_attestations` entry, resolved to the corpus it was applied to: in
+/// `scope` a parameter with no `passing` record is passed by value, except for the arguments
+/// of `unverified_functions`, whose parameters the extract does not document in full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterPassingAttestationRecord {
+    /// `global_context` for the global functions.
+    pub scope: String,
+    /// The platform release the claim was verified against, `8.3.27`.
+    pub verified_against_version: String,
+    /// The functions of the scope that stay unknown instead of by value, each by the Russian
+    /// name the extract spells it with.
+    pub unverified_functions: Vec<String>,
 }
 
 /// Why a corpus could not become a snapshot. Nothing is published on error: the
@@ -169,6 +187,9 @@ impl PlatformSnapshot {
         let member_surface_attestations =
             crate::overlays::parse_resolved_member_surface_attestations(&data, overlays)
                 .map_err(overlay_error)?;
+        let parameter_passing_attestations =
+            crate::overlays::parse_resolved_parameter_passing_attestations(&data, overlays)
+                .map_err(overlay_error)?;
 
         let mut snapshot = decode(&data)?;
         snapshot.member_surface_attestations = member_surface_attestations
@@ -179,6 +200,7 @@ impl PlatformSnapshot {
                 surfaces: attestation.surfaces,
             })
             .collect();
+        snapshot.parameter_passing_attestations = parameter_passing_attestations;
         snapshot.validate()?;
         Ok(snapshot)
     }

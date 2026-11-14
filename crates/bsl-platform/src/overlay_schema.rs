@@ -1,3 +1,4 @@
+use crate::types::ParamPassing;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::fmt;
@@ -23,7 +24,10 @@ pub(crate) struct MethodParameterOverride {
     pub(crate) min_version: Option<Vec<u32>>,
     pub(crate) max_version: Option<Vec<u32>>,
     pub(crate) parameter_index: usize,
-    pub(crate) replacement_type_list: Vec<String>,
+    /// `Some` replaces the whole extracted type list, `None` leaves it as extracted.
+    pub(crate) replacement_type_list: Option<Vec<String>>,
+    /// How the parameter is passed; `None` states nothing about it.
+    pub(crate) passing: Option<ParamPassing>,
 }
 
 impl MethodParameterOverride {
@@ -103,6 +107,22 @@ pub(crate) struct TypeMemberSurfaceAttestation {
     pub(crate) surfaces: crate::snapshot::AttestedSurfaces,
 }
 
+/// Attests that a platform parameter of `scope` with no `passing` record is passed by value,
+/// which is what turns the silence of the overlay into a statement rather than a gap; a
+/// scope without an attestation leaves such a parameter unknown. `unverified_functions` is
+/// the honest hole in the claim: the extract documents fewer parameters of those functions
+/// than they declare, so a consumer must treat their arguments as unknown, not by value.
+#[derive(Debug)]
+pub(crate) struct ParameterPassingAttestation {
+    /// `global_context` for the global functions, otherwise a platform type by
+    /// its Russian or English spelling.
+    pub(crate) scope: String,
+    pub(crate) verified_against_version: String,
+    /// The functions of the scope whose parameter surface the sweep could not
+    /// judge, because the extract documents fewer parameters than it declares.
+    pub(crate) unverified_functions: Vec<String>,
+}
+
 const OVERLAY_ROOT_FIELDS: &[&str] = &[
     "schema_version",
     "method_parameter_overrides",
@@ -111,6 +131,7 @@ const OVERLAY_ROOT_FIELDS: &[&str] = &[
     "type_property_corrections",
     "method_return_type_corrections",
     "type_member_surface_attestations",
+    "parameter_passing_attestations",
 ];
 
 pub(crate) fn parse_overrides(
@@ -304,6 +325,119 @@ pub(crate) fn parse_member_surface_attestations(
         }
     }
     Ok(attestations)
+}
+
+/// Parses the optional `parameter_passing_attestations` section. An absent
+/// section yields no attestations; the root schema is validated the same way as
+/// [`parse_overrides`].
+pub(crate) fn parse_parameter_passing_attestations(
+    overlay_source: &str,
+) -> Result<Vec<ParameterPassingAttestation>, OverlayError> {
+    let root: Value = serde_json::from_str(overlay_source)
+        .map_err(|error| OverlayError(format!("malformed overlay JSON: {error}")))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| OverlayError("overlay root must be an object".to_owned()))?;
+    require_only_fields(object, OVERLAY_ROOT_FIELDS, "overlay root")?;
+    validate_schema_version(object)?;
+    let entries = match object.get("parameter_passing_attestations") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_array().ok_or_else(|| {
+            OverlayError("overlay parameter_passing_attestations must be an array".to_owned())
+        })?,
+    };
+
+    let attestations: Vec<ParameterPassingAttestation> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_parameter_passing_attestation(index, entry))
+        .collect::<Result<_, _>>()?;
+    let mut seen: HashSet<String> = HashSet::new();
+    for attestation in &attestations {
+        if !seen.insert(attestation.scope.to_lowercase()) {
+            return Err(OverlayError(format!(
+                "duplicate parameter passing attestation for {}",
+                attestation.scope
+            )));
+        }
+    }
+    Ok(attestations)
+}
+
+fn parse_parameter_passing_attestation(
+    index: usize,
+    entry: &Value,
+) -> Result<ParameterPassingAttestation, OverlayError> {
+    let context = format!("parameter passing attestation {index}");
+    let object =
+        entry.as_object().ok_or_else(|| OverlayError(format!("{context} must be an object")))?;
+    require_only_fields(
+        object,
+        &[
+            "scope",
+            "verified_against_version",
+            "unverified_functions",
+            "evidence_source",
+            "rationale",
+        ],
+        &context,
+    )?;
+    let scope = required_string(object, "scope", index)?;
+    let verified_against_version = required_string(object, "verified_against_version", index)?;
+    match parse_version(&verified_against_version) {
+        // Same rule as the member surface attestation: a version line would stand for
+        // every release of it, so the attestation names at least major.minor.patch.
+        Some(components) if components.len() >= 3 => {}
+        Some(_) => {
+            return Err(OverlayError(format!(
+                "{context} verified_against_version must be at least major.minor.patch"
+            )))
+        }
+        None => {
+            return Err(OverlayError(format!(
+                "{context} verified_against_version must be a dotted numeric version"
+            )))
+        }
+    }
+    let unverified_functions = match object.get("unverified_functions") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => {
+            let names = value
+                .as_array()
+                .ok_or_else(|| {
+                    OverlayError(format!("{context} unverified_functions must be an array"))
+                })?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            OverlayError(format!(
+                                "{context} unverified_functions must contain non-empty strings"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if names.is_empty() {
+                return Err(OverlayError(format!(
+                    "{context} unverified_functions must not be empty: omit it when the scope is judged in full"
+                )));
+            }
+            let unique: HashSet<_> = names.iter().map(|name| name.fold_lower()).collect();
+            if unique.len() != names.len() {
+                return Err(OverlayError(format!(
+                    "{context} unverified_functions contains duplicate functions"
+                )));
+            }
+            names
+        }
+    };
+    required_string(object, "evidence_source", index)?;
+    required_string(object, "rationale", index)?;
+
+    Ok(ParameterPassingAttestation { scope, verified_against_version, unverified_functions })
 }
 
 fn parse_property_correction(
@@ -630,6 +764,7 @@ fn parse_override(
         "max_version",
         "parameter_index",
         "replacement_type_list",
+        "passing",
         "evidence_source",
         "rationale",
     ];
@@ -658,32 +793,56 @@ fn parse_override(
         .ok_or_else(|| {
             OverlayError(format!("overlay entry {index} parameter_index must be an integer"))
         })?;
-    let replacement_type_list = object
-        .get("replacement_type_list")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            OverlayError(format!("overlay entry {index} replacement_type_list must be an array"))
-        })?
-        .iter()
-        .map(|value| {
-            value.as_str().filter(|name| !name.trim().is_empty()).map(str::to_owned).ok_or_else(
-                || {
+    let replacement_type_list = match object.get("replacement_type_list") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let types = value
+                .as_array()
+                .ok_or_else(|| {
                     OverlayError(format!(
-                    "overlay entry {index} replacement_type_list must contain non-empty strings"
-                ))
-                },
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if replacement_type_list.is_empty() {
+                        "overlay entry {index} replacement_type_list must be an array"
+                    ))
+                })?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            OverlayError(format!(
+                                "overlay entry {index} replacement_type_list must contain non-empty strings"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if types.is_empty() {
+                return Err(OverlayError(format!(
+                    "overlay entry {index} replacement_type_list must not be empty"
+                )));
+            }
+            let unique_types: HashSet<&str> = types.iter().map(String::as_str).collect();
+            if unique_types.len() != types.len() {
+                return Err(OverlayError(format!(
+                    "overlay entry {index} replacement_type_list contains duplicate types"
+                )));
+            }
+            Some(types)
+        }
+    };
+    let passing = match object.get("passing") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value == "by_value" => Some(ParamPassing::ByVal),
+        Some(Value::String(value)) if value == "by_ref" => Some(ParamPassing::ByRef),
+        Some(value) => {
+            return Err(OverlayError(format!(
+                "overlay entry {index} passing must be \"by_value\" or \"by_ref\", got {value}"
+            )))
+        }
+    };
+    if replacement_type_list.is_none() && passing.is_none() {
         return Err(OverlayError(format!(
-            "overlay entry {index} replacement_type_list must not be empty"
-        )));
-    }
-    let unique_types: HashSet<&str> = replacement_type_list.iter().map(String::as_str).collect();
-    if unique_types.len() != replacement_type_list.len() {
-        return Err(OverlayError(format!(
-            "overlay entry {index} replacement_type_list contains duplicate types"
+            "overlay entry {index} changes nothing: it needs replacement_type_list or passing"
         )));
     }
     required_string(object, "evidence_source", index)?;
@@ -697,6 +856,7 @@ fn parse_override(
         max_version,
         parameter_index,
         replacement_type_list,
+        passing,
     })
 }
 
