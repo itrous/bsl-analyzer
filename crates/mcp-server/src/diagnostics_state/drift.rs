@@ -3166,6 +3166,54 @@ mod tests {
         assert!(matches!(state.status(), DiagnosticsStatus::Ready { .. }), "stays Ready, no churn");
     }
 
+    /// A form attribute added to `Ext/Form.xml` on disk while the resident runs must
+    /// silence `UnusedLocalVariable` for the same-named assignment in the form module.
+    #[test]
+    fn form_xml_attribute_added_on_disk_reaches_the_running_resident() {
+        const FORM_XML_REL: &str = "Catalogs/Товары/Forms/Форма/Ext/Form.xml";
+        const MODULE_REL: &str = "Catalogs/Товары/Forms/Форма/Ext/Form/Module.bsl";
+        let form_xml = |attrs: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Form xmlns=\"http://v8.1c.ru/8.3/xcf/logform\" version=\"2.10\">\n<Attributes>{attrs}</Attributes>\n</Form>\n"
+            )
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        write_catalog(root, "Товары", 9);
+        write(
+            root,
+            MODULE_REL,
+            "&НаСервере\nПроцедура Заполнить()\n    СостояниеПриемки = 1;\nКонецПроцедуры\n",
+        );
+        write(root, FORM_XML_REL, &form_xml("<Attribute name=\"Объект\"/>"));
+
+        let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.drift_interval = Duration::from_millis(0);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        let module = root.join(MODULE_REL);
+        let baseline = module_diag_fingerprint(&state, &module);
+        if !baseline.iter().any(|l| l.contains("UnusedLocalVariable")) {
+            panic!("stand is wrong, baseline lacks UnusedLocalVariable: {baseline:#?}");
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+        write(
+            root,
+            FORM_XML_REL,
+            &form_xml("<Attribute name=\"Объект\"/><Attribute name=\"СостояниеПриемки\"/>"),
+        );
+
+        let after = module_diag_fingerprint(&state, &module);
+        assert!(
+            !after.iter().any(|l| l.contains("UnusedLocalVariable")),
+            "form attribute added on disk did not reach the resident; baseline: {baseline:#?}; after: {after:#?}"
+        );
+    }
+
     /// Removing a metadata `.xml` tombstones the object through a point-refresh — it no
     /// longer resolves — with no full rebuild.
     #[test]

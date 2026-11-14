@@ -702,6 +702,19 @@ impl EditorView {
         if self.db.workspace_load_complete() != snapshot.metadata_ready {
             self.db.set_workspace_load_complete(snapshot.metadata_ready);
         }
+        // A form's dialog is read from disk inside the metadata query, so no replayed
+        // source batch can invalidate it; the config revision is the only tracked input
+        // that can. Bump only for flagged changes: each bump re-parses the configuration.
+        // A flagged publication also lists module bodies, which the owner never bumps for.
+        let metadata_paths: Vec<&Path> = changes
+            .iter()
+            .filter(|change| change.metadata_changed)
+            .flat_map(|change| change.paths.iter().map(PathBuf::as_path))
+            .filter(|path| project_model::is_metadata_path(path))
+            .collect();
+        if !metadata_paths.is_empty() {
+            self.db.bump_config_for_paths(metadata_paths);
+        }
         self.generation = snapshot.generation;
         self.disk = snapshot;
         for file_id in changed {
@@ -1263,6 +1276,156 @@ mod tests {
         assert!(!view.catch_up_deltas(backend.snapshot(), &[second]));
         assert_eq!(view.generation(), first.generation - 1);
         assert_eq!(base_db::SourceDatabase::file_text(view.database(), FileId(0)).as_ref(), "disk");
+    }
+
+    struct OwnerVfs(std::cell::RefCell<Vfs>);
+    impl crate::VfsWrite for OwnerVfs {
+        fn with_write<R>(&self, f: impl FnOnce(&mut Vfs) -> R) -> R {
+            f(&mut self.0.borrow_mut())
+        }
+    }
+
+    struct FormStand {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        form_xml: PathBuf,
+        module: PathBuf,
+        module_id: FileId,
+        backend: WorkspaceBackend,
+    }
+
+    fn form_xml_with(attributes: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Form xmlns=\"http://v8.1c.ru/8.3/xcf/logform\" version=\"2.10\">\n<Attributes>{attributes}</Attributes>\n</Form>\n"
+        )
+    }
+
+    /// An owner over a configuration with one catalog form whose module assigns a
+    /// variable that only the form's dialog data can make "used".
+    fn form_stand() -> FormStand {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let form_dir = root.join("Catalogs/Товары/Forms/Форма/Ext");
+        std::fs::create_dir_all(form_dir.join("Form")).unwrap();
+        std::fs::write(
+            root.join("Catalogs/Товары.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Catalog uuid="00000000-0000-0000-0000-000000000072">
+        <Properties><Name>Товары</Name><CodeLength>9</CodeLength></Properties>
+    </Catalog>
+</MetaDataObject>"#,
+        )
+        .unwrap();
+        let form_xml = form_dir.join("Form.xml");
+        std::fs::write(&form_xml, form_xml_with("<Attribute name=\"Объект\"/>")).unwrap();
+        let module = form_dir.join("Form/Module.bsl");
+        std::fs::write(
+            &module,
+            "&НаСервере\nПроцедура Заполнить()\n    СостояниеПриемки = 1;\nКонецПроцедуры\n",
+        )
+        .unwrap();
+
+        let mut host = AnalysisHost::default();
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())], None);
+        let vfs = OwnerVfs(std::cell::RefCell::new(Vfs::new()));
+        host.bootstrap_metadata_substrate(&vfs);
+        let module_id = vfs.0.borrow_mut().alloc_file_id(VfsPath::new(module.clone()));
+        let mut backend = WorkspaceBackend::from_database_with_catalog(
+            host.into_database(),
+            WorkspaceCatalog::new(),
+        );
+        let unreadable = crate::register_files_disk_backed(
+            backend.database_mut(),
+            BSL_SOURCE_ROOT,
+            &[(module_id, module.clone())],
+        );
+        assert!(unreadable.is_empty(), "the form module must be readable: {unreadable:?}");
+        backend.publish_full_rebuild_from(0);
+        FormStand { _dir: dir, root, form_xml, module, module_id, backend }
+    }
+
+    fn module_diagnostics(view: &EditorView, module_id: FileId) -> Vec<String> {
+        view.analysis()
+            .diagnostics(module_id, &ide::DiagnosticsConfig::all_enabled())
+            .iter()
+            .map(|d| format!("{:?}: {}", d.code, d.message))
+            .collect()
+    }
+
+    #[test]
+    fn a_changed_form_dialog_reaches_a_caught_up_view() {
+        let mut stand = form_stand();
+        let mut view = EditorView::new(stand.backend.snapshot());
+
+        let baseline = module_diagnostics(&view, stand.module_id);
+        if !baseline.iter().any(|line| line.starts_with("UnusedLocalVariable")) {
+            panic!("stand is wrong, baseline lacks UnusedLocalVariable: {baseline:#?}");
+        }
+        let root = stand.root.to_string_lossy().into_owned();
+        let revision_before = view.database().config_revision(&root);
+
+        // The form dialog is read from disk inside the metadata query: no source
+        // batch is replayed for it, only the publication flag travels.
+        std::fs::write(
+            &stand.form_xml,
+            form_xml_with("<Attribute name=\"Объект\"/><Attribute name=\"СостояниеПриемки\"/>"),
+        )
+        .unwrap();
+        let change = stand
+            .backend
+            .publish_change([], [stand.form_xml.clone()], true)
+            .expect("a metadata change publishes a generation");
+        assert!(view.catch_up_deltas(stand.backend.snapshot(), std::slice::from_ref(&change)));
+
+        assert_ne!(
+            view.database().config_revision(&root),
+            revision_before,
+            "a flagged change must bump the root's config revision"
+        );
+        let after = module_diagnostics(&view, stand.module_id);
+        assert!(
+            !after.iter().any(|line| line.starts_with("UnusedLocalVariable")),
+            "form attribute added on disk did not reach the caught-up view; baseline: {baseline:#?}; after: {after:#?}"
+        );
+    }
+
+    #[test]
+    fn a_publication_without_metadata_change_leaves_the_config_revision_alone() {
+        let mut stand = form_stand();
+        let mut view = EditorView::new(stand.backend.snapshot());
+        let root = stand.root.to_string_lossy().into_owned();
+        // Reading the module's diagnostics registers the root's revision input.
+        let _ = module_diagnostics(&view, stand.module_id);
+        let before = view.database().config_revision(&root);
+
+        let change = stand
+            .backend
+            .publish_change([stand.module_id], [stand.module.clone()], false)
+            .expect("a source change publishes a generation");
+        assert!(!change.metadata_changed);
+        assert!(view.catch_up_deltas(stand.backend.snapshot(), std::slice::from_ref(&change)));
+
+        assert_eq!(view.database().config_revision(&root), before);
+    }
+
+    /// A flagged publication can carry only module bodies: a listed body appearing or a
+    /// hole healing refreshes the substrate, yet the owner leaves the config revision alone.
+    #[test]
+    fn a_flagged_publication_of_module_bodies_leaves_the_config_revision_alone() {
+        let mut stand = form_stand();
+        let mut view = EditorView::new(stand.backend.snapshot());
+        let root = stand.root.to_string_lossy().into_owned();
+        let _ = module_diagnostics(&view, stand.module_id);
+        let before = view.database().config_revision(&root);
+
+        let change = stand
+            .backend
+            .publish_change([stand.module_id], [stand.module.clone()], true)
+            .expect("a flagged body change publishes a generation");
+        assert!(view.catch_up_deltas(stand.backend.snapshot(), std::slice::from_ref(&change)));
+
+        assert_eq!(view.database().config_revision(&root), before);
     }
 
     #[test]
