@@ -532,16 +532,22 @@ impl WarmCachesTask {
         salsa::Database::cancellation_token(&self.db)
     }
 
+    /// Runs as one attach scope, so a cancel of the token that lands inside one query
+    /// stops the warming at the next instead of being wiped on that query's way out
+    /// (see [`Analysis::attached`]).
     pub fn run(self) -> usize {
-        use hir::{DefDatabase, ModuleId};
-
-        for file_id in &self.file_ids {
-            let module_id = ModuleId::new(*file_id);
-            let _ = self.db.symbol_tree(module_id);
-            let _ = self.db.module_bodies(module_id);
-        }
-
+        salsa::attach(&self.db, || warm_files(&self.db, &self.file_ids));
         self.file_ids.len()
+    }
+}
+
+fn warm_files(db: &RootDatabaseImpl, file_ids: &[FileId]) {
+    use hir::{DefDatabase, ModuleId};
+
+    for file_id in file_ids {
+        let module_id = ModuleId::new(*file_id);
+        let _ = db.symbol_tree(module_id);
+        let _ = db.module_bodies(module_id);
     }
 }
 
@@ -568,21 +574,23 @@ where
         salsa::Database::cancellation_token(&self.db)
     }
 
+    /// Runs as one attach scope from discovery to the last warmed file, so a cancel of
+    /// the token that lands inside one query stops the job at the next instead of being
+    /// wiped on that query's way out (see [`Analysis::attached`]).
     pub fn run(self) -> WarmedDependencies {
         use hir::{DefDatabase, ModuleId};
 
-        let discover_start = std::time::Instant::now();
-        let discovered = self.db.file_dependencies(ModuleId::new(self.file_id));
-        let deps = (self.retain)(discovered.as_ref().clone());
-        let discover_ms = discover_start.elapsed().as_millis() as u64;
+        let Self { db, file_id, retain } = self;
+        salsa::attach(&db, || {
+            let discover_start = std::time::Instant::now();
+            let discovered = db.file_dependencies(ModuleId::new(file_id));
+            let deps = retain(discovered.as_ref().clone());
+            let discover_ms = discover_start.elapsed().as_millis() as u64;
 
-        for file_id in &deps {
-            let module_id = ModuleId::new(*file_id);
-            let _ = self.db.symbol_tree(module_id);
-            let _ = self.db.module_bodies(module_id);
-        }
+            warm_files(&db, &deps);
 
-        WarmedDependencies { discover_ms, warmed: deps.len() }
+            WarmedDependencies { discover_ms, warmed: deps.len() }
+        })
     }
 }
 
@@ -744,6 +752,43 @@ mod attached_scope_tests {
         assert!(
             matches!(outcome, Err(salsa::Cancelled::Local)),
             "the cancel was wiped before the checkpoint: {outcome:?}"
+        );
+    }
+
+    /// A dependency-warming job is one attach scope from discovery to the last warmed
+    /// file. Input: `retain` lands a cancel inside a nested scope on the job's own
+    /// handle, the way a cancel lands inside a query body, and hands back a file whose
+    /// warming is the next checkpoint. Outside one scope there is no handle attached to
+    /// land it on, and the job would warm on.
+    #[test]
+    fn a_cancel_landing_inside_the_dependency_job_stops_it() {
+        use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+        use ide_db::vfs::{file_set::FileSet, VfsPath};
+        use std::{cell::OnceCell, rc::Rc};
+
+        let mut db = ide_db::RootDatabaseImpl::new();
+        let file_id = super::FileId(0);
+        let mut file_set = FileSet::new();
+        file_set.insert(file_id, VfsPath::new("/test.bsl"));
+        db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+        db.set_file_source_root(file_id, SourceRootId(0));
+        db.set_file_text(file_id, "Процедура Тест()\nКонецПроцедуры\n");
+        let analysis = Analysis::from_database(db);
+
+        let token = Rc::new(OnceCell::<salsa::CancellationToken>::new());
+        let job_token = Rc::clone(&token);
+        let task = analysis.warm_dependencies_task(file_id, move |_| {
+            salsa::with_attached_database(|db| {
+                salsa::attach(db, || job_token.get().expect("token set before run").cancel())
+            });
+            vec![file_id]
+        });
+        assert!(token.set(task.cancellation_token()).is_ok(), "token set once");
+
+        let outcome = salsa::Cancelled::catch(AssertUnwindSafe(|| task.run().warmed));
+        assert!(
+            matches!(outcome, Err(salsa::Cancelled::Local)),
+            "the job warmed past a cancel that landed inside it: {outcome:?}"
         );
     }
 
