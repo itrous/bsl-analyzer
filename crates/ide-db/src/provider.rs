@@ -415,6 +415,17 @@ pub trait AnalysisProvider {
         }
     }
 
+    /// Where the value of `expr` came from, proven on every path reaching it. A provider that
+    /// knows nothing proves nothing.
+    fn value_origin(
+        &self,
+        _file_id: FileId,
+        _owner: DefWithBodyId,
+        _expr: hir::ExprId,
+    ) -> hir::ValueOrigin {
+        hir::ValueOrigin::Unproven(hir::Unproven::OpaqueDefinition)
+    }
+
     /// The query literals executed as a whole `Запрос` text in the method.
     fn executed_query_texts(&self, _method_id: MethodId) -> Arc<[hir::ExecutedQueryText]> {
         Arc::from(Vec::new())

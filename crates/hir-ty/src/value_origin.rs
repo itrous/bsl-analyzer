@@ -308,6 +308,52 @@ impl<'a> ValueOriginWalk<'a> {
     }
 }
 
+/// The value origin of one expression of one body, with the walk assembled from the database:
+/// the body and the inference result are fetched here, so a caller outside this crate needs
+/// neither. A body that cannot be found proves nothing.
+pub fn value_origin_of(
+    db: &dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    expr: ExprId,
+) -> ValueOrigin {
+    match owner {
+        DefWithBodyId::Method(local_id) => {
+            let method = MethodId { module: ModuleId::new(file_id), local_id };
+            let input = MethodIdInput::new(db, method);
+            let body = db.method_body_ref(input);
+            let infer = db.infer_method_ref(input);
+            ValueOriginWalk::new(
+                db,
+                file_id,
+                owner,
+                body,
+                &infer.call_arg_bindings,
+                &infer.expr_types,
+                &infer.binding_types,
+            )
+            .value_origin_on_every_path(expr)
+        }
+        DefWithBodyId::ModuleCode => {
+            let module_bodies = db.module_bodies_ref(ModuleId::new(file_id));
+            let Some(body) = module_bodies.module_code_arc() else {
+                return ValueOrigin::Unproven(Unproven::OpaqueDefinition);
+            };
+            let infer = db.infer_module_code_ref(file_id);
+            ValueOriginWalk::new(
+                db,
+                file_id,
+                owner,
+                body,
+                &infer.call_arg_bindings,
+                &infer.expr_types,
+                &infer.binding_types,
+            )
+            .value_origin_on_every_path(expr)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
