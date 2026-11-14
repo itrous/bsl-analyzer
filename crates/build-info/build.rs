@@ -53,22 +53,29 @@ fn commit_identity() -> Option<(String, String)> {
 /// worktree `.git` is a FILE pointing elsewhere, so a hand-built path never exists and the
 /// stamped commit would go stale when HEAD moves.
 fn track_head() {
-    for name in ["HEAD", "logs/HEAD"] {
-        if let Some(path) = existing_git_path(name) {
-            println!("cargo:rerun-if-changed={path}");
-        }
+    let reflog = existing_git_path("logs/HEAD");
+    for path in existing_git_path("HEAD").into_iter().chain(reflog.clone()) {
+        println!("cargo:rerun-if-changed={path}");
     }
-    // HEAD itself does not change on a commit to a branch; the branch ref does. A packed
-    // ref has no file of its own, so fall back to `packed-refs`. A commit on a packed branch
-    // writes a new loose ref and leaves `packed-refs` alone; the reflog above records it,
-    // unless reflogs are disabled.
-    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(path) = git(&["rev-parse", "--git-path", &branch]) {
-            if Path::new(&path).exists() {
-                println!("cargo:rerun-if-changed={path}");
-            } else if let Some(packed) = git(&["rev-parse", "--git-path", "packed-refs"]) {
-                println!("cargo:rerun-if-changed={packed}");
-            }
+    // HEAD itself does not change on a commit to a branch; the branch ref does.
+    let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) else {
+        return;
+    };
+    if let Some(path) = existing_git_path(&branch) {
+        println!("cargo:rerun-if-changed={path}");
+        return;
+    }
+    // A packed ref has no file of its own. A commit on it writes a new loose ref and leaves
+    // `packed-refs` alone, which the reflog above records; without a reflog the new file is
+    // the only trace, so watch the directory it appears in. Cargo scans a tracked directory
+    // recursively, so other branches' commits rerun the script too — the cost of a stamp
+    // that does not go stale.
+    if let Some(packed) = existing_git_path("packed-refs") {
+        println!("cargo:rerun-if-changed={packed}");
+    }
+    if reflog.is_none() {
+        if let Some(heads) = existing_git_path("refs/heads") {
+            println!("cargo:rerun-if-changed={heads}");
         }
     }
 }
