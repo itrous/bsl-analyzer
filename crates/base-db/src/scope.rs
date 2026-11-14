@@ -254,8 +254,22 @@ fn convert_hunks(hunks: Option<Vec<[u32; 2]>>) -> FileHunks {
     hunks.map(|ranges| ranges.into_iter().map(|[start, end]| Hunk { start, end }).collect())
 }
 
+/// The spelling every scope key and every lookup is reduced to: `/` separators, no
+/// leading `./`, and no Windows verbatim prefix.
+///
+/// The prefix matters because the two sides of a lookup are produced by different
+/// code. A diff report names a file `C:\repo\src\Module.bsl`, while anything that
+/// went through `canonicalize` names the same file `\\?\C:\repo\src\Module.bsl`, and
+/// under a verbatim prefix `/` is not even a separator. Exact matching is all an
+/// absolute-key scope has, so a lookup spelled verbatim put every file out of scope
+/// and the report came back empty.
 fn normalize_path(path: &str) -> PathBuf {
-    let trimmed = path.strip_prefix("./").or_else(|| path.strip_prefix(".\\")).unwrap_or(path);
+    let simplified = stdx::path_exclusion::simplify_verbatim(PathBuf::from(path));
+    let simplified = simplified.to_string_lossy();
+    let trimmed = simplified
+        .strip_prefix("./")
+        .or_else(|| simplified.strip_prefix(".\\"))
+        .unwrap_or(&simplified);
     PathBuf::from(trimmed.replace('\\', "/"))
 }
 
@@ -488,5 +502,23 @@ mod tests {
         );
         // …and more files/hunks mean strictly more accounted heap.
         assert!(large_bytes > small_bytes, "{large_bytes} vs {small_bytes}");
+    }
+
+    /// The lookup side is the one that went through `canonicalize`: a walked file
+    /// addressed through the Windows verbatim prefix must still find the key the diff
+    /// report spelled plainly. Both spellings name the same file.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_lookup_finds_a_plainly_spelled_key() {
+        let scope = AnalysisScope::from_report(
+            "vendor",
+            Path::new(r"C:\repo"),
+            [("src/Module.bsl".to_string(), Some(vec![[3, 4]]))],
+        );
+
+        let file = Path::new(r"\\?\C:\repo\src\Module.bsl");
+        assert!(scope.is_file_in_scope(file), "the file is in scope: {scope:?}");
+        assert!(scope.lines_in_scope(file, 2, 2), "line 3 (0-based 2) is in a hunk");
+        assert!(!scope.lines_in_scope(file, 0, 0), "control: line 1 is not");
     }
 }
