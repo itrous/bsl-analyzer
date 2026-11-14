@@ -1244,7 +1244,7 @@ impl GlobalState {
             return Err(anyhow!("File is not BSL, LSP unsupported: {}", url));
         }
         if self.is_source_excluded_resolved(&path) {
-            return Err(anyhow!("File is excluded by [source].exclude: {}", url));
+            return Err(crate::excluded_document::excluded_from_project(url));
         }
 
         if self.analysis_host.owner().is_some() && self.mem_docs.contains(url) {

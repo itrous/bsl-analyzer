@@ -13,6 +13,7 @@ mod call_hierarchy_index_service;
 pub mod call_hierarchy_index_state;
 pub mod diagnostics_baseline;
 pub mod diagnostics_state;
+pub mod excluded_document;
 pub mod features_state;
 pub mod frozen_context;
 pub mod global_state;
