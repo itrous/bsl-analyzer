@@ -709,8 +709,8 @@ fn validate_relative_key_path(path: &str) -> Option<()> {
     if path.is_empty() || path.contains('\0') {
         return None;
     }
-    // Durable keys are emitted with the current platform's separator, but a key
-    // may have been persisted on Windows and inspected on another platform.  Do
+    // Durable keys are emitted with `/`, but a store written before that carries
+    // the Windows separator and may be inspected on another platform.  Do
     // the security check for both separator conventions before asking `Path` to
     // validate the native spelling; otherwise Linux treats `..\\outside` as one
     // ordinary filename and Windows can later escape the declared root with it.

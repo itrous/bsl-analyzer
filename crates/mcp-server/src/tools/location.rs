@@ -188,7 +188,9 @@ impl Location {
     pub fn from_key(root_id: &str, rel_path: &str) -> Self {
         Self {
             root_id: root_id.to_string(),
-            path: normalize_separators(rel_path),
+            // A caller may hold the path in the host spelling (a request echoed back); the
+            // contract publishes the store's.
+            path: bsl_search::spell_as_key(rel_path),
             range: None,
             enclosing_range: None,
             module: None,
@@ -242,18 +244,6 @@ impl Location {
             map.insert("module".into(), json!({ "kind": module.kind, "name": module.name }));
         }
         body
-    }
-}
-
-/// Windows spells a stored relative path with `\`, and the contract publishes `/`. On
-/// UNIX a backslash is an ordinary character in a file name, so rewriting it there would
-/// mint an address that looks right and points elsewhere — the exact failure this contract
-/// exists to prevent.
-fn normalize_separators(path: &str) -> String {
-    if cfg!(windows) {
-        path.replace('\\', "/")
-    } else {
-        path.to_owned()
     }
 }
 
