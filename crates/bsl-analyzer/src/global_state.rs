@@ -402,8 +402,9 @@ pub struct GlobalState {
     pub workspace_root: Option<PathBuf>,
     pub project: Option<Project>,
     /// The project's `[source].exclude`, also spelled under each source root the
-    /// loader walks — the one test every way into the VFS asks.
-    pub(crate) source_exclusions: stdx::path_exclusion::ExcludedPaths,
+    /// loader walks — the one test every way into the VFS asks. Shared so a request's
+    /// frozen view carries it without re-deriving it.
+    pub(crate) source_exclusions: Arc<stdx::path_exclusion::ExcludedPaths>,
     /// Parent configs the workspace `bsl-analyzer.toml` inherits through `extends`
     /// (best effort, missing ones included): watched like the config itself, so an
     /// edit to a shared parent reloads the project.
@@ -1502,7 +1503,7 @@ impl GlobalStateSnapshot {
         // An excluded document keeps the FileId it had before the exclusion, tombstoned;
         // it must not be answered for as if it were still analysed.
         if self.project.as_ref().is_some_and(|project| project.is_source_excluded(&path)) {
-            return Err(anyhow::anyhow!("File is excluded by [source].exclude: {}", url));
+            return Err(crate::excluded_document::excluded_from_project(url));
         }
 
         if self.mem_docs.contains(url) {

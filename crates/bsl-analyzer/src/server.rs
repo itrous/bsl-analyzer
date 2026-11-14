@@ -5958,6 +5958,18 @@ mod tests {
             "subdirectory exclusion must not rely on a root-list change"
         );
         assert!(!request_origin_matches(&state, &excluded_origin));
+        // Every entry point must explain an excluded document with the same text and name both
+        // configuration keys.
+        let synchronous = state.vfs_file_for_url(&excluded_uri).expect_err("an excluded document");
+        assert_eq!(
+            synchronous.to_string(),
+            crate::excluded_document::excluded_from_project(&excluded_uri).to_string(),
+            "a synchronous request must give the shared excluded-document wording"
+        );
+        assert!(
+            synchronous.to_string().contains("[source].exclude or [source].exclude_globs"),
+            "{synchronous}"
+        );
         let excluded_id = lsp_server::RequestId::from(606);
         let excluded_key = crate::global_state::RequestAttemptKey {
             id: excluded_id.clone(),
@@ -6428,7 +6440,8 @@ mod tests {
         let hidden_xml = hidden_dir.join("Hidden.xml");
         let allowed_bsl = dir.path().join("Allowed.bsl");
         let allowed_xml = dir.path().join("Allowed.xml");
-        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+        state.source_exclusions =
+            std::sync::Arc::new(project_model::ExcludedPaths::new([hidden_dir]));
         let abs = |path: std::path::PathBuf| paths::AbsPathBuf::assert_utf8(path);
 
         handle_loader_msg(
@@ -6491,7 +6504,8 @@ mod tests {
             .expect("positive control: an allowed file starts cache warming");
         allowed_token.cancel();
 
-        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+        state.source_exclusions =
+            std::sync::Arc::new(project_model::ExcludedPaths::new([hidden_dir]));
         handle_task(&mut state, Task::PreloadExternalFiles { files: vec![hidden_id] }).unwrap();
 
         assert!(
