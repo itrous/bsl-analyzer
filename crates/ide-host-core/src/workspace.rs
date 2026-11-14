@@ -705,10 +705,12 @@ impl EditorView {
         // A form's dialog is read from disk inside the metadata query, so no replayed
         // source batch can invalidate it; the config revision is the only tracked input
         // that can. Bump only for flagged changes: each bump re-parses the configuration.
+        // A flagged publication also lists module bodies, which the owner never bumps for.
         let metadata_paths: Vec<&Path> = changes
             .iter()
             .filter(|change| change.metadata_changed)
             .flat_map(|change| change.paths.iter().map(PathBuf::as_path))
+            .filter(|path| project_model::is_metadata_path(path))
             .collect();
         if !metadata_paths.is_empty() {
             self.db.bump_config_for_paths(metadata_paths);
@@ -1402,6 +1404,25 @@ mod tests {
             .publish_change([stand.module_id], [stand.module.clone()], false)
             .expect("a source change publishes a generation");
         assert!(!change.metadata_changed);
+        assert!(view.catch_up_deltas(stand.backend.snapshot(), std::slice::from_ref(&change)));
+
+        assert_eq!(view.database().config_revision(&root), before);
+    }
+
+    /// A flagged publication can carry only module bodies: a listed body appearing or a
+    /// hole healing refreshes the substrate, yet the owner leaves the config revision alone.
+    #[test]
+    fn a_flagged_publication_of_module_bodies_leaves_the_config_revision_alone() {
+        let mut stand = form_stand();
+        let mut view = EditorView::new(stand.backend.snapshot());
+        let root = stand.root.to_string_lossy().into_owned();
+        let _ = module_diagnostics(&view, stand.module_id);
+        let before = view.database().config_revision(&root);
+
+        let change = stand
+            .backend
+            .publish_change([stand.module_id], [stand.module.clone()], true)
+            .expect("a flagged body change publishes a generation");
         assert!(view.catch_up_deltas(stand.backend.snapshot(), std::slice::from_ref(&change)));
 
         assert_eq!(view.database().config_revision(&root), before);
