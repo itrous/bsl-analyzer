@@ -1023,6 +1023,7 @@ fn apply_docs_gap_predefined_item_name_overlay(methods: &mut Vec<PlatformMethod>
                 is_optional: false,
                 is_variadic: false,
                 passing: None,
+                result_follows_argument_text: false,
             }],
             variants: Vec::new(),
             min_version: None,
@@ -1114,6 +1115,7 @@ fn apply_docs_gap_method_variant_overlay(methods: &mut [PlatformMethod]) {
                 is_optional: *is_optional,
                 is_variadic: false,
                 passing: None,
+                result_follows_argument_text: false,
             })
             .collect();
         match method
@@ -2562,6 +2564,7 @@ mod passing_attestation_tests {
             is_optional: false,
             is_variadic: false,
             passing,
+            result_follows_argument_text: false,
         }
     }
 

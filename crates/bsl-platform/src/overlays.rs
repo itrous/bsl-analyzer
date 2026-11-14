@@ -154,6 +154,10 @@ fn apply_parameter_overrides(
             };
             parameter_object.insert("passing".to_owned(), Value::String(literal.to_owned()));
         }
+        if let Some(follows) = overlay.result_follows_argument_text {
+            parameter_object
+                .insert("result_follows_argument_text".to_owned(), Value::Bool(follows));
+        }
     }
 
     Ok(())

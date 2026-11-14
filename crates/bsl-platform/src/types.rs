@@ -197,6 +197,10 @@ pub struct MethodParam {
     /// How the platform passes this parameter. `None` means unknown: the corpus states nothing
     /// about it and no attestation covers it. That is not the same as `ByVal`.
     pub passing: Option<ParamPassing>,
+    /// The call's result is the text of this argument, or text derived from it by a transformation
+    /// that preserves what the text says. Curated, additive: `false` means "not known to", never
+    /// "known not to", so a missing record cannot produce a finding that is not there.
+    pub result_follows_argument_text: bool,
 }
 
 impl MethodParam {
@@ -343,6 +347,7 @@ mod tests {
                     is_optional: false,
                     is_variadic: false,
                     passing: None,
+                    result_follows_argument_text: false,
                 },
                 MethodParam {
                     name: SmolStr::new("Второй"),
@@ -350,6 +355,7 @@ mod tests {
                     is_optional: true,
                     is_variadic: false,
                     passing: None,
+                    result_follows_argument_text: false,
                 },
             ],
             variants: vec![],

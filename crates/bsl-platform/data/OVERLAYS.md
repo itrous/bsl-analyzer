@@ -107,6 +107,50 @@ key back to disk. Records are curated one by one, not harvested from the prose: 
 asynchronous twin of a function repeats the sentence of its synchronous namesake and
 writes nothing back.
 
+## Result that follows an argument's text in an override
+
+<!-- overlay-document -->
+```json
+{
+  "schema_version": 1,
+  "method_parameter_overrides": [],
+  "global_function_parameter_overrides": [
+    {
+      "russian_name": "РусскоеИмяФункции",
+      "english_name": "EnglishFunctionName",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "result_follows_argument_text": true,
+      "evidence_source": "the declared signature and the documented meaning of the function",
+      "rationale": "the call returns the text of its argument, or that text with its case or edges changed"
+    }
+  ]
+}
+```
+
+`result_follows_argument_text` is a boolean on a parameter override. `true` says that the
+result of the call is the text of this argument, or text derived from it by a transformation
+that preserves what the text says: `Строка(Текст)` returns the text itself, `ВРег`, `НРег`
+and `ТРег` change only its letter case, `СокрЛП`, `СокрЛ` and `СокрП` cut only its edge
+whitespace. A transformation that changes what the text says (`СтрЗаменить`, `Лев`) is not
+this fact. A rule that follows where a text came from can look through such a call instead
+of losing the value at it. The field joins `replacement_type_list` and `passing` in the
+"at least one of" rule: a record needs one of the three, a value that is not a boolean is
+refused, and a record carrying only this field keeps the extracted type list, with its
+target still resolved, version-checked and index-checked. Two records for one parameter are
+refused as before.
+
+The fact needs no attestation, unlike `passing`. There the absence of a record was read as
+a positive claim («passed by value»), so a scope had to be attested before silence could
+mean anything. Here the absence of a record means only «not known to follow the argument's
+text», and a consumer that does not know simply loses a finding: it never gains a false one.
+The fact is additive, and its coverage does not have to be complete. A parameter nobody
+recorded reads as `false`, and `false` is never «known not to follow».
+
+The fact is carried into the loaded corpus as a `result_follows_argument_text` key of the
+parameter and nowhere else: `platform_facts.json` stays an unchanged extract, whose key set
+`tests/bundled_facts.rs` keeps closed, and nothing writes the key back to disk.
+
 ## Type property addition schema
 
 <!-- overlay-document -->

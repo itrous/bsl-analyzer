@@ -602,6 +602,76 @@
     "examples": [],
     "notes": "Fixture note."
    }
+  },
+  {
+   "id": 16,
+   "name": "Строка",
+   "english_name": "String",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Значение", "param_type": "Произвольный", "is_optional": false}
+   ]
+  },
+  {
+   "id": 17,
+   "name": "ВРег",
+   "english_name": "Upper",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 18,
+   "name": "НРег",
+   "english_name": "Lower",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 19,
+   "name": "ТРег",
+   "english_name": "Title",
+   "min_version": "8.1",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 20,
+   "name": "СокрЛП",
+   "english_name": "TrimAll",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 21,
+   "name": "СокрЛ",
+   "english_name": "TrimL",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 22,
+   "name": "СокрП",
+   "english_name": "TrimR",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
   }
  ],
  "constructors": [

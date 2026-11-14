@@ -312,6 +312,69 @@
       "passing": "by_ref",
       "evidence_source": "Pinned 8.3.27 corpus (PROVENANCE.md), global function id 337, parameter «НайденныеДанные»: «Тип: ТаблицаЗначений . Содержит ссылки на найденные объекты в виде ТаблицаЗначений , состоящей из колонок с индексами: 0 - искомая ссылка; 1 - ссылка на объект, если найденная ссылка соответствует объектной таблице или значение, идентифицирующее запись необъектной таблицы; 2 - объект метаданных, которому соответствуют данные, в которых найдена ссылка.» Parameter 1 of the same call states what fills it: «Если есть, то объект не удаляется, а ссылки помещаются в таблицу значений <НайденныеДанные>.» The procedure has no result.",
       "rationale": "An output whose write-back is stated in a sibling's description, which is how it was found: a scan for a parameter named in angle brackets inside another parameter's prose beside a write-back verb. Of eleven such hits this was the only new one; the rest describe an input or a parameter of a callback."
+    },
+    {
+      "russian_name": "Строка",
+      "english_name": "String",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "result_follows_argument_text": true,
+      "evidence_source": "the declared signature `Строка(<Значение>)` and the documented meaning of the function: it returns the string representation of its argument, which for a text argument is that text itself",
+      "rationale": "a text argument comes back as it is, so a rule that follows where a text came from can look through the call instead of losing the value at it; a consumer that does not know a function's record simply loses a finding, it never gains a false one"
+    },
+    {
+      "russian_name": "ВРег",
+      "english_name": "Upper",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "result_follows_argument_text": true,
+      "evidence_source": "the declared signature `ВРег(<Строка>)` and the documented meaning of the function: it returns its argument's text with the letter case changed, which preserves what the text names",
+      "rationale": "a text keeps what it names when only its case changes, so a rule that follows where a text came from can look through the call; a consumer that does not know a function's record simply loses a finding, it never gains a false one"
+    },
+    {
+      "russian_name": "НРег",
+      "english_name": "Lower",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "result_follows_argument_text": true,
+      "evidence_source": "the declared signature `НРег(<Строка>)` and the documented meaning of the function: it returns its argument's text with the letter case changed, which preserves what the text names",
+      "rationale": "a text keeps what it names when only its case changes, so a rule that follows where a text came from can look through the call; a consumer that does not know a function's record simply loses a finding, it never gains a false one"
+    },
+    {
+      "russian_name": "ТРег",
+      "english_name": "Title",
+      "min_version": "8.1",
+      "parameter_index": 0,
+      "result_follows_argument_text": true,
+      "evidence_source": "the declared signature `ТРег(<Строка>)` and the documented meaning of the function: it returns its argument's text with the letter case changed, which preserves what the text names",
+      "rationale": "a text keeps what it names when only its case changes, so a rule that follows where a text came from can look through the call; a consumer that does not know a function's record simply loses a finding, it never gains a false one"
+    },
+    {
+      "russian_name": "СокрЛП",
+      "english_name": "TrimAll",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "result_follows_argument_text": true,
+      "evidence_source": "the declared signature `СокрЛП(<Строка>)` and the documented meaning of the function: it returns its argument's text with whitespace cut from the edges, which preserves what the text says",
+      "rationale": "a text keeps what it says when only its edge whitespace is cut, so a rule that follows where a text came from can look through the call; a consumer that does not know a function's record simply loses a finding, it never gains a false one"
+    },
+    {
+      "russian_name": "СокрЛ",
+      "english_name": "TrimL",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "result_follows_argument_text": true,
+      "evidence_source": "the declared signature `СокрЛ(<Строка>)` and the documented meaning of the function: it returns its argument's text with whitespace cut from the edges, which preserves what the text says",
+      "rationale": "a text keeps what it says when only its edge whitespace is cut, so a rule that follows where a text came from can look through the call; a consumer that does not know a function's record simply loses a finding, it never gains a false one"
+    },
+    {
+      "russian_name": "СокрП",
+      "english_name": "TrimR",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "result_follows_argument_text": true,
+      "evidence_source": "the declared signature `СокрП(<Строка>)` and the documented meaning of the function: it returns its argument's text with whitespace cut from the edges, which preserves what the text says",
+      "rationale": "a text keeps what it says when only its edge whitespace is cut, so a rule that follows where a text came from can look through the call; a consumer that does not know a function's record simply loses a finding, it never gains a false one"
     }
   ],
   "type_property_additions": [

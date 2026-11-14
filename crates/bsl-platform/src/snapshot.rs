@@ -632,6 +632,18 @@ fn passing(param: &Value) -> Result<Option<ParamPassing>, SnapshotDecodeError> {
     }
 }
 
+/// Absent is `false`: the fact is additive, so a parameter nobody recorded claims nothing. A value
+/// that is not a boolean can only come from our own overlay writer, so it is an error.
+fn result_follows_argument_text(param: &Value) -> Result<bool, SnapshotDecodeError> {
+    match param.get("result_follows_argument_text") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(SnapshotDecodeError(format!(
+            "parameter result_follows_argument_text `{other}` is not a boolean"
+        ))),
+    }
+}
+
 fn param_list(params: &[Value]) -> Result<Vec<MethodParam>, SnapshotDecodeError> {
     params
         .iter()
@@ -642,6 +654,7 @@ fn param_list(params: &[Value]) -> Result<Vec<MethodParam>, SnapshotDecodeError>
                 is_optional: param.get("is_optional").and_then(Value::as_bool).unwrap_or(false),
                 is_variadic: param.get("is_variadic").and_then(Value::as_bool).unwrap_or(false),
                 passing: passing(param)?,
+                result_follows_argument_text: result_follows_argument_text(param)?,
             })
         })
         .collect()

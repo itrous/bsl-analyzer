@@ -18,6 +18,7 @@ fn constructor(id: u32, parameter_count: usize) -> PlatformConstructor {
                 is_optional: false,
                 is_variadic: false,
                 passing: None,
+                result_follows_argument_text: false,
             })
             .collect(),
         min_version: None,

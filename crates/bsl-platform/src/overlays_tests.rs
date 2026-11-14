@@ -1579,7 +1579,7 @@ fn a_record_carrying_a_type_list_and_passing_applies_both() {
 }
 
 #[test]
-fn a_record_that_states_neither_a_type_list_nor_passing_is_refused() {
+fn a_record_that_states_none_of_the_three_facts_is_refused() {
     let mut data = passing_data();
     let mut entry = input_string_passing();
     entry.as_object_mut().unwrap().remove("passing");
@@ -1590,7 +1590,7 @@ fn a_record_that_states_neither_a_type_list_nor_passing_is_refused() {
 
     assert_eq!(
         error.to_string(),
-        "overlay entry 0 changes nothing: it needs replacement_type_list or passing"
+        "overlay entry 0 changes nothing: it needs replacement_type_list, passing or result_follows_argument_text"
     );
 }
 
@@ -2005,4 +2005,180 @@ fn the_snapshot_carries_an_attestation_without_stamping_it() {
     assert!(message.variants[0].parameters.iter().all(|parameter| parameter.passing.is_none()));
     assert_eq!(snapshot.methods[0].parameters[0].passing, None);
     assert_eq!(snapshot.parameter_passing_attestations.len(), 1);
+}
+
+fn follows_text_record() -> Value {
+    json!({
+        "russian_name": "ВвестиСтроку",
+        "english_name": "InputString",
+        "min_version": "8.0",
+        "parameter_index": 0,
+        "result_follows_argument_text": true,
+        "evidence_source": "the declared signature and the documented meaning of the function",
+        "rationale": "the call returns the text of its argument"
+    })
+}
+
+fn follows_text_overlay(entries: Vec<Value>) -> String {
+    json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "global_function_parameter_overrides": entries
+    })
+    .to_string()
+}
+
+fn follows_text_snapshot() -> crate::snapshot::PlatformSnapshot {
+    let corpus = serde_json::to_vec(&stamped_corpus()).unwrap();
+    crate::snapshot::PlatformSnapshot::from_corpus_json_with_overlays(
+        &corpus,
+        &follows_text_overlay(vec![follows_text_record()]),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_record_carrying_only_result_follows_argument_text_decodes_and_reaches_the_parameter() {
+    let mut data = passing_data();
+
+    apply_global_function_parameter_overlays(
+        &mut data,
+        &global_function_overlay(follows_text_record()),
+    )
+    .unwrap();
+
+    let parameters = &data["global_functions"][0]["parameters"];
+    assert_eq!(parameters[0]["result_follows_argument_text"], true);
+    assert_eq!(parameters[0]["param_type"], "Строка", "a record without a type list rewrites none");
+    assert!(parameters[0].get("passing").is_none(), "and states nothing about passing");
+    assert!(parameters[1].get("result_follows_argument_text").is_none());
+
+    let snapshot = follows_text_snapshot();
+    let parameters = &global_function(&snapshot, "ВвестиСтроку").parameters;
+    assert!(parameters[0].result_follows_argument_text);
+    assert_eq!(parameters[0].passing, None, "the two facts are independent");
+}
+
+#[test]
+fn a_record_stating_none_of_the_three_facts_is_refused_and_each_one_alone_is_accepted() {
+    let mut bare = follows_text_record();
+    bare.as_object_mut().unwrap().remove("result_follows_argument_text");
+    let mut data = passing_data();
+    let error = apply_global_function_parameter_overlays(&mut data, &global_function_overlay(bare))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "overlay entry 0 changes nothing: it needs replacement_type_list, passing or result_follows_argument_text"
+    );
+
+    let mut with_list = follows_text_record();
+    with_list.as_object_mut().unwrap().remove("result_follows_argument_text");
+    with_list["replacement_type_list"] = json!(["Число"]);
+    for entry in [follows_text_record(), with_list, input_string_passing()] {
+        let mut data = passing_data();
+        apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry))
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_result_follows_argument_text_that_is_not_a_boolean_is_refused() {
+    for given in [json!("true"), json!(1), json!("by_value"), json!([true])] {
+        let mut data = passing_data();
+        let mut entry = follows_text_record();
+        entry["result_follows_argument_text"] = given.clone();
+
+        let error =
+            apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry))
+                .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("overlay entry 0 result_follows_argument_text must be a boolean, got {given}"),
+        );
+    }
+}
+
+#[test]
+fn two_result_follows_argument_text_records_for_one_parameter_are_refused() {
+    let mut data = passing_data();
+    let overlay = follows_text_overlay(vec![follows_text_record(), follows_text_record()]);
+
+    let error = apply_global_function_parameter_overlays(&mut data, &overlay).unwrap_err();
+
+    assert_eq!(error.to_string(), "duplicate override for InputString parameter 0");
+}
+
+#[test]
+fn every_parameter_no_record_names_reads_false() {
+    let snapshot = follows_text_snapshot();
+
+    let mut flagged = Vec::new();
+    for function in &snapshot.global_functions {
+        let variants = function.variants.iter().flat_map(|variant| variant.parameters.iter());
+        for (index, parameter) in function.parameters.iter().chain(variants).enumerate() {
+            if parameter.result_follows_argument_text {
+                flagged.push((function.name.to_string(), index));
+            }
+        }
+    }
+    assert_eq!(flagged, vec![("ВвестиСтроку".to_owned(), 0)]);
+    assert!(snapshot
+        .methods
+        .iter()
+        .flat_map(|method| method.parameters.iter())
+        .all(|parameter| !parameter.result_follows_argument_text));
+}
+
+#[test]
+fn the_snapshot_round_trip_preserves_the_flag_and_refuses_a_non_boolean() {
+    let mut data = stamped_corpus();
+    data["global_functions"][0]["parameters"][0]["result_follows_argument_text"] = json!(true);
+    data["global_functions"][0]["parameters"][1]["result_follows_argument_text"] = json!(false);
+    let corpus = serde_json::to_vec(&data).unwrap();
+    let overlays = passing_attestation_overlay(Value::Null);
+
+    let snapshot =
+        crate::snapshot::PlatformSnapshot::from_corpus_json_with_overlays(&corpus, &overlays)
+            .unwrap();
+
+    let parameters = &global_function(&snapshot, "ВвестиСтроку").parameters;
+    assert!(parameters[0].result_follows_argument_text);
+    assert!(!parameters[1].result_follows_argument_text);
+
+    data["global_functions"][0]["parameters"][0]["result_follows_argument_text"] = json!("true");
+    let corpus = serde_json::to_vec(&data).unwrap();
+    let error =
+        crate::snapshot::PlatformSnapshot::from_corpus_json_with_overlays(&corpus, &overlays)
+            .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "parameter result_follows_argument_text `\"true\"` is not a boolean"
+    );
+}
+
+#[test]
+fn the_shipped_overlay_marks_exactly_the_seven_text_functions() {
+    let facts = include_str!("../data/platform_facts.json");
+    let overlays = include_str!("../data/platform_overlays.json");
+
+    let mut data: Value = serde_json::from_str(facts).unwrap();
+    apply_global_function_parameter_overlays(&mut data, overlays).unwrap();
+    let mut marked: Vec<(String, usize)> = Vec::new();
+    for function in data["global_functions"].as_array().unwrap() {
+        let parameters = function.get("parameters").and_then(Value::as_array);
+        for (index, parameter) in parameters.into_iter().flatten().enumerate() {
+            if parameter.get("result_follows_argument_text") == Some(&json!(true)) {
+                marked.push((function["name"].as_str().unwrap().to_owned(), index));
+            }
+        }
+    }
+    marked.sort();
+    let mut expected: Vec<(String, usize)> =
+        ["Строка", "ВРег", "НРег", "ТРег", "СокрЛП", "СокрЛ", "СокрП"]
+            .into_iter()
+            .map(|name| (name.to_owned(), 0))
+            .collect();
+    expected.sort();
+    assert_eq!(marked, expected);
 }

@@ -61,6 +61,11 @@ impl BuiltinSignature {
                 // Global platform functions reach the resolver as builtin signatures, not through
                 // `PlatformMethod`; the fact is carried along or it never gets here.
                 passing: self.passing.get(index).copied().flatten(),
+                result_follows_argument_text: self
+                    .result_follows_argument_text
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false),
             })
             .collect();
         CallSignature {
