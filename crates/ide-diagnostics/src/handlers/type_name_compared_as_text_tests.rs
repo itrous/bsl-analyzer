@@ -135,6 +135,16 @@ fn a_write_through_a_call_proven_by_reference_is_not_flagged() {
 }
 
 #[test]
+fn a_value_a_call_may_have_rewritten_without_attestation_is_not_flagged() {
+    // Measured over five real configurations: reporting this shape gives 11582 findings against
+    // 10 without it, and the extra ones are plain string comparisons (`Если ИмяЭлемента =
+    // "КодБанка"`), because the walk answers this reason before it looks at the value's origin.
+    let body = "    Имя = Строка(ТипЗнч(Объект));\n    НеизвестнаяПроцедура(Имя);\n    Если Имя = \"Документ\" Тогда\n    КонецЕсли;";
+    let d = run(body);
+    assert!(d.is_empty(), "{d:?}");
+}
+
+#[test]
 fn a_local_assigned_a_type_name_and_something_else_is_not_flagged() {
     let d = run("    Имя = Строка(ТипЗнч(Объект));\n    Имя = \"Документ\";\n    Если Имя = \"Документ\" Тогда\n    КонецЕсли;");
     assert!(d.is_empty(), "{d:?}");

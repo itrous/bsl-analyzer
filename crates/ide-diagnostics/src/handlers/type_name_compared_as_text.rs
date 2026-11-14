@@ -1,15 +1,8 @@
-use hir::{
-    BinaryOp, Expr, ExprId, ExprIdx, IdConversion, Literal, LocalRange, Unproven, ValueOrigin,
-};
+use hir::{BinaryOp, Expr, ExprId, ExprIdx, IdConversion, Literal, LocalRange, ValueOrigin};
 
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::{BodyContext, Diagnostic, DiagnosticCode};
-
-/// Whether a value whose only obstacle is an unattested passing direction still counts as the
-/// text of a type name. The corpus is measured both ways before this is settled; see the plan of
-/// issue #854, item 5.
-const UNKNOWN_DIRECTION_SUPPRESSES: bool = true;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::CodeSmell,
@@ -71,13 +64,12 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
     }
 }
 
-/// The one place the policy knob is read.
+/// Only a proven type-name text is reported; no `Unproven` reason is. The weakest reason,
+/// `RewriteDirectionUnknown`, means nothing is proven about the value (the walk returns it before
+/// it looks at the origin), so reporting it would flood the rule: 11582 findings against 10 over
+/// the same five configurations.
 fn is_reportable(origin: ValueOrigin) -> bool {
-    match origin {
-        ValueOrigin::TypeNameText => true,
-        ValueOrigin::Unproven(Unproven::RewriteDirectionUnknown) => !UNKNOWN_DIRECTION_SUPPRESSES,
-        ValueOrigin::Other | ValueOrigin::Unproven(_) => false,
-    }
+    matches!(origin, ValueOrigin::TypeNameText)
 }
 
 fn is_string_literal(body: &hir::Body, idx: ExprIdx) -> bool {
