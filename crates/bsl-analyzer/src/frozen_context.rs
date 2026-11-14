@@ -117,11 +117,7 @@ impl FrozenFilePaths {
             .copied()
             .ok_or_else(|| {
                 if self.is_excluded(&path) {
-                    anyhow::anyhow!(
-                        "File is excluded from the project by [source].exclude or \
-                         [source].exclude_globs, so it is not analysed: {}",
-                        url
-                    )
+                    crate::excluded_document::excluded_from_project(url)
                 } else {
                     anyhow::anyhow!("File not in frozen VFS snapshot: {}", url)
                 }

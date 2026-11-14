@@ -5958,6 +5958,18 @@ mod tests {
             "subdirectory exclusion must not rely on a root-list change"
         );
         assert!(!request_origin_matches(&state, &excluded_origin));
+        // Every entry point must explain an excluded document with the same text and name both
+        // configuration keys: a synchronous request used to answer with a different wording.
+        let synchronous = state.vfs_file_for_url(&excluded_uri).expect_err("an excluded document");
+        assert_eq!(
+            synchronous.to_string(),
+            crate::excluded_document::excluded_from_project(&excluded_uri).to_string(),
+            "a synchronous request must give the shared excluded-document wording"
+        );
+        assert!(
+            synchronous.to_string().contains("[source].exclude or [source].exclude_globs"),
+            "{synchronous}"
+        );
         let excluded_id = lsp_server::RequestId::from(606);
         let excluded_key = crate::global_state::RequestAttemptKey {
             id: excluded_id.clone(),
