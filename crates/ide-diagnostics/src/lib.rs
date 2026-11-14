@@ -135,6 +135,18 @@ pub fn diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 pub(crate) fn module_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let mut result = Vec::new();
 
+    // The fold is shared by several rules, and whichever asks first pays for all of it,
+    // so the slow-collector log would blame that rule. Build it here, only where a reader
+    // would have asked anyway: a reader is enabled and this is a form module.
+    if ctx.config.any_enabled(FOREIGN_HANDLER_BINDINGS_READERS) {
+        safe_collect("foreign_handler_bindings", || {
+            if ctx.module_metadata().module_type == bsl_metadata::ModuleType::FormModule {
+                let _ = ctx.workspace_foreign_handler_bindings();
+            }
+            Vec::new()
+        });
+    }
+
     result.extend(safe_collect("line", || collect_line_diagnostics(ctx)));
 
     result.extend(safe_collect("syntax", || collect_syntax_diagnostics(ctx)));
