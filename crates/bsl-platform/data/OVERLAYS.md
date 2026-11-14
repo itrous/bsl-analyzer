@@ -349,6 +349,18 @@ asserts that the list is exactly the set of global functions that carry call var
 list is optional, but not empty when present (omit it when the scope is judged in full)
 and repeats no function. One scope is attested once.
 
+What earns the attestation is not the reading of the prose. A sweep of the parameter
+descriptions is where it starts, but the prose hides a write-back in at least three ways,
+and each of them cost a record here: a net built from whole word forms misses «возвращает»
+while matching «возвращается»; a parameter's description can be a near copy of its
+neighbour's and so decide nothing, while the declared types differ and decide it
+(`ОписаниеПередаваемогоФайла` in against `ОписаниеПереданногоФайла` back); and an output
+can be documented only inside another parameter's description. So the claim is held to a
+run of the analyzer over real configurations, with the fact in place and without it: every
+callee and parameter index the new findings land on is judged, and that run is what found
+the one wrong record three readings of the prose had left behind. A record added on prose
+alone is not attested, it is guessed.
+
 ## Method-local scope
 
 A fragment of a document — an illustration, not a document — is free to be

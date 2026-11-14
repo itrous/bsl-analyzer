@@ -1825,7 +1825,7 @@ fn a_passing_attestation_of_another_scope_is_not_supported_yet() {
 }
 
 #[test]
-fn the_shipped_overlay_records_six_passing_parameters_and_one_attestation() {
+fn the_shipped_overlay_records_eleven_passing_parameters_and_one_attestation() {
     let facts = include_str!("../data/platform_facts.json");
     let overlays = include_str!("../data/platform_overlays.json");
 
@@ -1852,6 +1852,11 @@ fn the_shipped_overlay_records_six_passing_parameters_and_one_attestation() {
         ("ВвестиЗначение", 0),
         ("ПоместитьФайл", 0),
         ("ПоместитьФайл", 2),
+        ("ПоместитьФайлы", 1),
+        ("ПолучитьФайлы", 1),
+        ("ЗапуститьПриложение", 3),
+        ("ЗапуститьСистему", 2),
+        ("УдалитьОбъекты", 2),
     ]
     .into_iter()
     .map(|(name, index)| (name.to_owned(), index, "by_ref".to_owned()))
