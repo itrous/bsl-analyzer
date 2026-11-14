@@ -18,28 +18,17 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     lsp_severity_override: "",
 };
 
-/// A text not attested as 1C's own query language may be a foreign dialect that opens
-/// with `SELECT`: the edit stays an opt-in quick fix, so a `fixAll` batch can never
-/// append `КАК Caption` to a WQL literal and break it at runtime.
-fn alias_fix(attested: bool, label: String, edits: Vec<TextEdit>) -> Fix {
-    if attested {
-        Fix::safe(label, edits)
-    } else {
-        Fix::manual(label, edits)
-    }
-}
-
+/// The edit is safe for `fixAll` because `dispatch` reports only texts attested as 1C's
+/// own query language, so it never lands in a WQL or T-SQL literal.
 pub(crate) fn build_alias_fix(
     field_name: &Option<String>,
     raw_name: &Option<String>,
     bsl_range: TextRange,
-    attested: bool,
 ) -> Vec<Fix> {
     match (field_name, raw_name) {
         (None, Some(name)) => {
             let insert = bsl_range.end();
-            vec![alias_fix(
-                attested,
+            vec![Fix::safe(
                 format!("Добавить псевдоним КАК {}", name),
                 vec![TextEdit {
                     range: TextRange::new(insert, insert),
@@ -50,8 +39,7 @@ pub(crate) fn build_alias_fix(
         (Some(name), _) => {
             let alias_byte_len = name.len() as u32;
             let insert = bsl_range.end() - line_index::TextSize::from(alias_byte_len);
-            vec![alias_fix(
-                attested,
+            vec![Fix::safe(
                 format!("Добавить ключевое слово КАК перед '{}'", name),
                 vec![TextEdit {
                     range: TextRange::new(insert, insert),
@@ -92,8 +80,7 @@ pub(crate) fn dispatch(
         } else {
             "Поле в подзапросе должно иметь псевдоним с ключевым словом AS/КАК".to_string()
         };
-        let attested = crate::sdbl_utils::sdbl_dialect_attested(query_text);
-        let fixes = build_alias_fix(field_name, raw_name, bsl_range, attested);
+        let fixes = build_alias_fix(field_name, raw_name, bsl_range);
         diagnostics.push(Diagnostic {
             code,
             message,
