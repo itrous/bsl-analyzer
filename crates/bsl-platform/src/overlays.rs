@@ -146,7 +146,7 @@ fn apply_parameter_overrides(
         if let Some(replacement) = replacement {
             parameter_object.insert("param_type".to_owned(), Value::String(replacement.join(", ")));
         }
-        // Carried as data in the corpus: the typed `MethodParam` carrier is the next step.
+        // The literal is the single medium; the snapshot decoder parses it into `MethodParam`.
         if let Some(passing) = overlay.passing {
             let literal = match passing {
                 ParamPassing::ByVal => "by_value",

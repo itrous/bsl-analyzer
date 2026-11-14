@@ -120,6 +120,9 @@ pub struct CallParam {
     pub ty: TypeId,
     pub has_default: bool,
     pub mode: CallParamMode,
+    /// The platform corpus's fact about how this parameter is passed; `None` is unknown and is
+    /// all that anything but a platform signature carries.
+    pub passing: Option<bsl_platform::ParamPassing>,
 }
 
 /// Complete, Salsa-safe signature metadata for one call candidate.

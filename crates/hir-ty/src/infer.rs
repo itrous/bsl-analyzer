@@ -2493,12 +2493,16 @@ impl<'db> InferenceContext<'db> {
             || is_self_name(&name.as_str().fold_lower())
     }
 
-    /// How the call holding `arg` passes it, from the `Знач` flag of the parameter
-    /// at the argument's position. Known only when the call settles on one user
-    /// method: the unique candidate, or the sole survivor whose argument types are
+    /// How the call holding `arg` passes it, known only when the call settles on one
+    /// callee: the unique candidate, or the sole survivor whose argument types are
     /// undecided (an undocumented parameter leaves the selection `Ambiguous`).
+    /// For a user method the answer is the `Знач` flag of the parameter at the
+    /// argument's position. For a platform callable it is the curated corpus's fact,
+    /// where silence means "by value" only inside a scope the corpus attests as
+    /// verified (decided once, when the snapshot is built) and "unknown" otherwise.
     fn argument_passing(&self, arg: ExprId) -> definite_init::ArgPassing {
-        use crate::call_resolution::{CallSelection, CandidateId};
+        use crate::call_resolution::{BuiltinCallableId, CallSelection, CandidateId};
+        use bsl_platform::ParamPassing;
         use definite_init::ArgPassing;
 
         let Some((binding, position)) = self.call_arg_bindings.iter().find_map(|binding| {
@@ -2511,8 +2515,26 @@ impl<'db> InferenceContext<'db> {
             CallSelection::Ambiguous { candidates } if candidates.len() == 1 => candidates[0],
             _ => return ArgPassing::Unknown,
         };
-        let CandidateId::User { method, .. } = candidate else {
-            return ArgPassing::Unknown;
+        let method = match candidate {
+            CandidateId::User { method, .. } => method,
+            CandidateId::Platform { .. }
+            | CandidateId::Builtin { callable: BuiltinCallableId::PlatformGlobal(_), .. } => {
+                let passing = binding
+                    .candidate
+                    .candidates
+                    .as_slice()
+                    .iter()
+                    .find(|signature| signature.id == candidate)
+                    .and_then(|signature| signature.params.get(position))
+                    .and_then(|param| param.passing);
+                return match passing {
+                    Some(ParamPassing::ByVal) => ArgPassing::ByVal,
+                    Some(ParamPassing::ByRef) => ArgPassing::ByRef,
+                    // `ParamPassing` is non-exhaustive: a future variant is unknown to us.
+                    Some(_) | None => ArgPassing::Unknown,
+                };
+            }
+            _ => return ArgPassing::Unknown,
         };
         let Some(decl) = self.db.interface_method(hir_def::MethodId::from(method)) else {
             return ArgPassing::Unknown;

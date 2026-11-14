@@ -194,11 +194,14 @@ pub struct MethodParam {
     pub param_type: Option<SmolStr>,
     pub is_optional: bool,
     pub is_variadic: bool,
+    /// How the platform passes this parameter. `None` means unknown: the corpus states nothing
+    /// about it and no attestation covers it. That is not the same as `ByVal`.
+    pub passing: Option<ParamPassing>,
 }
 
 impl MethodParam {
     /// Heap bytes owned by this parameter: its name/type `SmolStr`s (spilled
-    /// ones only). `is_optional`/`is_variadic` are `Copy` and own no heap.
+    /// ones only). `is_optional`/`is_variadic`/`passing` are `Copy` and own no heap.
     pub fn estimated_heap_size(&self) -> usize {
         stdx::heap::smol_str_bytes(self.name.len())
             + self.param_type.as_ref().map_or(0, |s| stdx::heap::smol_str_bytes(s.len()))
@@ -339,12 +342,14 @@ mod tests {
                     param_type: Some(SmolStr::new(long_type_name)),
                     is_optional: false,
                     is_variadic: false,
+                    passing: None,
                 },
                 MethodParam {
                     name: SmolStr::new("Второй"),
                     param_type: None,
                     is_optional: true,
                     is_variadic: false,
+                    passing: None,
                 },
             ],
             variants: vec![],

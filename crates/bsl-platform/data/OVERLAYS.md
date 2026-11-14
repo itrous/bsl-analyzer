@@ -333,7 +333,9 @@ it a parameter with no record is simply unknown, and a rule has to treat it so.
 `scope` is `global_context` for the global functions (the loader supports only that
 scope for now and refuses any other, though the schema is general), otherwise a platform
 type by its Russian or English spelling. `verified_against_version` follows the rule of
-the member surface attestation: a dotted numeric version of at least three components.
+the member surface attestation: a dotted numeric version of at least three components,
+and it gates the claim the same way: it is applied only when the served help is that
+release or a newer one, and a help of unknown version gets none.
 
 `unverified_functions` is the honest hole in the claim: the functions of the scope whose
 parameters the sweep could not judge, because the extract documents fewer parameters than
@@ -341,9 +343,11 @@ it declares (it merges call variants, so a by-reference parameter of an undocume
 variant is invisible to it). A consumer must treat the arguments of those functions as
 unknown rather than as passed by value. Each name is resolved against the extracted
 global functions by its Russian or English spelling, and a name that matches none is
-refused: a typo there would silently shrink the hole and widen the verified set, which is
-the dangerous direction. The list is optional, but not empty when present (omit it when
-the scope is judged in full) and repeats no function. One scope is attested once.
+dropped. A typo there would silently shrink the hole and widen the verified set, which is
+the dangerous direction, so the shipped list is held to the corpus by a test instead: it
+asserts that the list is exactly the set of global functions that carry call variants. The
+list is optional, but not empty when present (omit it when the scope is judged in full)
+and repeats no function. One scope is attested once.
 
 ## Method-local scope
 

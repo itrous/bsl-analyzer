@@ -15,8 +15,8 @@ use smol_str::SmolStr;
 
 use crate::types::{
     CodeExample, ConstructorDocs, ContextAvailability, GlobalFunction, GlobalFunctionVariant,
-    MethodDocs, MethodParam, MethodVariant, ParamDocs, PlatformConstructor, PlatformMethod,
-    PlatformProperty, PlatformType, PropertyDocs,
+    MethodDocs, MethodParam, MethodVariant, ParamDocs, ParamPassing, PlatformConstructor,
+    PlatformMethod, PlatformProperty, PlatformType, PropertyDocs,
 };
 use crate::GLOBAL_CONTEXT_OWNER;
 
@@ -492,8 +492,9 @@ fn decode(data: &Value) -> Result<PlatformSnapshot, SnapshotDecodeError> {
             name: string(method, "name"),
             english_name: string(method, "english_name"),
             return_type: opt_string(method, "return_type"),
-            parameters: params(method),
-            variants: variants(method)
+            parameters: params(method)?,
+            variants: variants(method)?
+                .into_iter()
                 .map(|(variant_name, parameters)| MethodVariant { variant_name, parameters })
                 .collect(),
             min_version: opt_string(method, "min_version"),
@@ -511,8 +512,9 @@ fn decode(data: &Value) -> Result<PlatformSnapshot, SnapshotDecodeError> {
             name: string(function, "name"),
             english_name: string(function, "english_name"),
             return_type: opt_string(function, "return_type"),
-            parameters: params(function),
-            variants: variants(function)
+            parameters: params(function)?,
+            variants: variants(function)?
+                .into_iter()
                 .map(|(variant_name, parameters)| GlobalFunctionVariant {
                     variant_name,
                     parameters,
@@ -532,7 +534,7 @@ fn decode(data: &Value) -> Result<PlatformSnapshot, SnapshotDecodeError> {
             id,
             type_name: string(ctor, "type_name"),
             variant_name: opt_string(ctor, "variant_name"),
-            parameters: params(ctor),
+            parameters: params(ctor)?,
             min_version: opt_string(ctor, "min_version"),
             context: context(ctor),
         });
@@ -617,29 +619,52 @@ fn context(entry: &Value) -> Option<ContextAvailability> {
     })
 }
 
-fn param_list(params: &[Value]) -> Vec<MethodParam> {
+/// A literal this decoder does not know can only come from our own overlay writer, so it is an
+/// error: reading it as unknown would hide a typo behind a plausible answer.
+fn passing(param: &Value) -> Result<Option<ParamPassing>, SnapshotDecodeError> {
+    match param.get("passing") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(literal)) if literal == "by_value" => Ok(Some(ParamPassing::ByVal)),
+        Some(Value::String(literal)) if literal == "by_ref" => Ok(Some(ParamPassing::ByRef)),
+        Some(other) => Err(SnapshotDecodeError(format!(
+            "parameter passing `{other}` is not one of `by_value`, `by_ref`"
+        ))),
+    }
+}
+
+fn param_list(params: &[Value]) -> Result<Vec<MethodParam>, SnapshotDecodeError> {
     params
         .iter()
-        .map(|param| MethodParam {
-            name: string(param, "name"),
-            param_type: opt_string(param, "param_type"),
-            is_optional: param.get("is_optional").and_then(Value::as_bool).unwrap_or(false),
-            is_variadic: param.get("is_variadic").and_then(Value::as_bool).unwrap_or(false),
+        .map(|param| {
+            Ok(MethodParam {
+                name: string(param, "name"),
+                param_type: opt_string(param, "param_type"),
+                is_optional: param.get("is_optional").and_then(Value::as_bool).unwrap_or(false),
+                is_variadic: param.get("is_variadic").and_then(Value::as_bool).unwrap_or(false),
+                passing: passing(param)?,
+            })
         })
         .collect()
 }
 
-fn params(entry: &Value) -> Vec<MethodParam> {
-    entry.get("parameters").and_then(Value::as_array).map(|p| param_list(p)).unwrap_or_default()
+fn params(entry: &Value) -> Result<Vec<MethodParam>, SnapshotDecodeError> {
+    entry
+        .get("parameters")
+        .and_then(Value::as_array)
+        .map(|p| param_list(p))
+        .unwrap_or_else(|| Ok(Vec::new()))
 }
 
-fn variants(entry: &Value) -> impl Iterator<Item = (Option<SmolStr>, Vec<MethodParam>)> + '_ {
+type DecodedVariant = (Option<SmolStr>, Vec<MethodParam>);
+
+fn variants(entry: &Value) -> Result<Vec<DecodedVariant>, SnapshotDecodeError> {
     entry
         .get("variants")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|variant| (opt_string(variant, "variant_name"), params(variant)))
+        .map(|variant| Ok((opt_string(variant, "variant_name"), params(variant)?)))
+        .collect()
 }
 
 fn text(docs: &Map<String, Value>, field: &str) -> String {

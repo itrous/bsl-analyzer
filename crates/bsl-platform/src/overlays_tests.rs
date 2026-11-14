@@ -1877,3 +1877,127 @@ fn the_shipped_overlay_records_six_passing_parameters_and_one_attestation() {
         }]
     );
 }
+
+fn stamped_corpus() -> Value {
+    json!({
+        "types": [{"name": "Массив", "english_name": "Array", "min_version": "8.0"}],
+        "methods": [{
+            "id": 1,
+            "type_name": "Array",
+            "name": "Добавить",
+            "english_name": "Add",
+            "min_version": "8.0",
+            "parameters": [{"name": "Значение", "param_type": "Произвольный"}]
+        }],
+        "global_functions": [
+            {
+                "id": 64,
+                "name": "ВвестиСтроку",
+                "english_name": "InputString",
+                "min_version": "8.0",
+                "parameters": [
+                    {"name": "Строка", "param_type": "Строка"},
+                    {"name": "Подсказка", "param_type": "Строка"}
+                ]
+            },
+            {
+                "id": 488,
+                "name": "ПоместитьФайл",
+                "english_name": "PutFile",
+                "min_version": "8.2",
+                "parameters": [
+                    {"name": "Адрес", "param_type": "Строка"},
+                    {"name": "Описание", "param_type": "Строка"}
+                ]
+            },
+            {
+                "id": 70,
+                "name": "Сообщить",
+                "english_name": "Message",
+                "min_version": "8.0",
+                "parameters": [{"name": "Текст", "param_type": "Строка"}],
+                "variants": [{
+                    "variant_name": "Вариант1",
+                    "parameters": [
+                        {"name": "Текст", "param_type": "Строка"},
+                        {"name": "Статус", "param_type": "Строка"}
+                    ]
+                }]
+            }
+        ]
+    })
+}
+
+fn stamped_overlays() -> String {
+    json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "global_function_parameter_overrides": [input_string_passing()],
+        "parameter_passing_attestations": [global_passing_attestation()]
+    })
+    .to_string()
+}
+
+fn stamped_snapshot() -> crate::snapshot::PlatformSnapshot {
+    let corpus = serde_json::to_vec(&stamped_corpus()).unwrap();
+    crate::snapshot::PlatformSnapshot::from_corpus_json_with_overlays(&corpus, &stamped_overlays())
+        .unwrap()
+}
+
+fn global_function<'a>(
+    snapshot: &'a crate::snapshot::PlatformSnapshot,
+    name: &str,
+) -> &'a crate::types::GlobalFunction {
+    snapshot.global_functions.iter().find(|function| function.name == name).unwrap()
+}
+
+#[test]
+fn both_passing_literals_decode_into_their_variants() {
+    let mut data = stamped_corpus();
+    data["global_functions"][0]["parameters"][0]["passing"] = json!("by_ref");
+    data["global_functions"][0]["parameters"][1]["passing"] = json!("by_value");
+    let corpus = serde_json::to_vec(&data).unwrap();
+    let overlays = passing_attestation_overlay(Value::Null);
+
+    let snapshot =
+        crate::snapshot::PlatformSnapshot::from_corpus_json_with_overlays(&corpus, &overlays)
+            .unwrap();
+
+    let parameters = &global_function(&snapshot, "ВвестиСтроку").parameters;
+    assert_eq!(parameters[0].passing, Some(ParamPassing::ByRef));
+    assert_eq!(parameters[1].passing, Some(ParamPassing::ByVal));
+}
+
+#[test]
+fn an_unrecognised_passing_literal_is_refused_naming_the_value() {
+    let mut data = stamped_corpus();
+    data["global_functions"][0]["parameters"][0]["passing"] = json!("byref");
+    let corpus = serde_json::to_vec(&data).unwrap();
+    let overlays = passing_attestation_overlay(Value::Null);
+
+    let error =
+        crate::snapshot::PlatformSnapshot::from_corpus_json_with_overlays(&corpus, &overlays)
+            .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "parameter passing `\"byref\"` is not one of `by_value`, `by_ref`"
+    );
+}
+
+/// The attestation is applied by the database, once the served platform version is known; the
+/// snapshot only carries it. A snapshot that stamped it would apply it to a corpus the claim
+/// was never verified against.
+#[test]
+fn the_snapshot_carries_an_attestation_without_stamping_it() {
+    let snapshot = stamped_snapshot();
+
+    let input = &global_function(&snapshot, "ВвестиСтроку").parameters;
+    assert_eq!(input[0].passing, Some(ParamPassing::ByRef), "an explicit record decodes");
+    assert_eq!(input[1].passing, None, "no stamping before the version is known");
+    let message = global_function(&snapshot, "Сообщить");
+    assert_eq!(message.parameters[0].passing, None);
+    assert!(message.variants[0].parameters.iter().all(|parameter| parameter.passing.is_none()));
+    assert_eq!(snapshot.methods[0].parameters[0].passing, None);
+    assert_eq!(snapshot.parameter_passing_attestations.len(), 1);
+}

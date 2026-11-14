@@ -58,6 +58,9 @@ impl BuiltinSignature {
                 } else {
                     CallParamMode::Positional
                 },
+                // Global platform functions reach the resolver as builtin signatures, not through
+                // `PlatformMethod`; the fact is carried along or it never gets here.
+                passing: self.passing.get(index).copied().flatten(),
             })
             .collect();
         CallSignature {

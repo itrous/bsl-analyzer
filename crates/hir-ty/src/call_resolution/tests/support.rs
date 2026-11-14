@@ -46,9 +46,15 @@ pub(super) fn signature(
 }
 
 pub(super) fn positional(name: &str, ty: TypeId, has_default: bool) -> CallParam {
-    CallParam { name: name.into(), ty, has_default, mode: CallParamMode::Positional }
+    CallParam { name: name.into(), ty, has_default, mode: CallParamMode::Positional, passing: None }
 }
 
 pub(super) fn variadic(name: &str, ty: TypeId) -> CallParam {
-    CallParam { name: name.into(), ty, has_default: false, mode: CallParamMode::Variadic }
+    CallParam {
+        name: name.into(),
+        ty,
+        has_default: false,
+        mode: CallParamMode::Variadic,
+        passing: None,
+    }
 }

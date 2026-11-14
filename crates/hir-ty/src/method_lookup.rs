@@ -856,6 +856,7 @@ mod tests {
                 param_type: param_type.map(Into::into),
                 is_optional: false,
                 is_variadic: false,
+                passing: None,
             }],
             variants: Vec::new(),
             min_version: None,
