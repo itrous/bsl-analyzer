@@ -72,6 +72,36 @@ fn origin(source: &str) -> ValueOrigin {
     walk.value_origin_on_every_path(value)
 }
 
+/// The origin of the local `Имя` as read inside the condition of the first `Если` / `Пока` of
+/// procedure `П` that reads it: a read at a header, which is not a statement of any block.
+fn origin_in_condition(source: &str) -> ValueOrigin {
+    let (db, file_id) = setup(source);
+    let mid = method(&db, file_id, "П");
+    let input = MethodIdInput::new(&db, mid);
+    let infer = db.infer_method_ref(input);
+    let body = db.method_body_ref(input);
+    let is_header = |id| {
+        body.enclosing_stmt(id)
+            .is_some_and(|stmt| matches!(body.stmt(stmt), Stmt::If(_) | Stmt::While { .. }))
+    };
+    let read = body
+        .exprs_iter()
+        .filter(|(id, expr)| matches!(expr, Expr::Path(n) if n.as_str() == "Имя") && is_header(*id))
+        .map(|(id, _)| id)
+        .next()
+        .expect("a read of Имя in an Если or Пока condition");
+    let mut walk = ValueOriginWalk::new(
+        &db,
+        file_id,
+        DefWithBodyId::Method(mid.local_id),
+        body,
+        &infer.call_arg_bindings,
+        &infer.expr_types,
+        &infer.binding_types,
+    );
+    walk.value_origin_on_every_path(read)
+}
+
 const TEXT: ValueOrigin = ValueOrigin::TypeNameText;
 const OTHER: ValueOrigin = ValueOrigin::Other;
 
@@ -214,4 +244,42 @@ fn a_type_description_is_not_a_type_name_text() {
 ";
     assert_ne!(origin(src), TEXT);
     assert_eq!(origin(src), OTHER);
+}
+
+#[test]
+fn a_read_in_an_if_condition_is_walked() {
+    let src = "Процедура П(О)
+    Имя = Строка(ТипЗнч(О));
+    Если Имя = \"X\" Тогда
+    КонецЕсли;
+КонецПроцедуры
+";
+    assert_eq!(origin_in_condition(src), TEXT);
+}
+
+#[test]
+fn a_read_in_a_while_condition_is_walked() {
+    let src = "Процедура П(О)
+    Имя = Строка(ТипЗнч(О));
+    Пока Имя = \"X\" Цикл
+        Прервать;
+    КонецЦикла;
+КонецПроцедуры
+";
+    assert_eq!(origin_in_condition(src), TEXT);
+}
+
+#[test]
+fn one_branch_a_type_name_the_other_a_literal_read_in_a_later_condition_is_other() {
+    let src = "Процедура П(О)
+    Если О = 1 Тогда
+        Имя = Строка(ТипЗнч(О));
+    Иначе
+        Имя = \"текст\";
+    КонецЕсли;
+    Если Имя = \"X\" Тогда
+    КонецЕсли;
+КонецПроцедуры
+";
+    assert_eq!(origin_in_condition(src), OTHER);
 }

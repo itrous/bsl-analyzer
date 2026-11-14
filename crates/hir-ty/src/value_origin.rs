@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use dataflow::reaching_defs::{DefSite, ReachingDefsResult};
+use dataflow::reaching_defs::{header_read_expr, DefSite, ReachingDefsResult};
 use hir_def::body::Body;
 use hir_def::hir::{Expr, Stmt};
 use hir_def::{
@@ -254,9 +254,14 @@ impl<'a> ValueOriginWalk<'a> {
             });
         }
 
-        let Some(defs) =
-            self.reaching().and_then(|reaching| reaching.defs_for_var_at_stmt(name, stmt))
-        else {
+        // A read inside an `Если` / `Пока` condition or a `Для` bound happens at the header, which
+        // is not a statement of any block: its definitions are asked by the expression the header
+        // evaluates first, as inference does.
+        let header = header_read_expr(self.body, stmt);
+        let Some(defs) = self.reaching().and_then(|reaching| match header {
+            Some(header) => reaching.defs_for_var_at_header(name, header),
+            None => reaching.defs_for_var_at_stmt(name, stmt),
+        }) else {
             return ValueOrigin::Unproven(Unproven::OpaqueDefinition);
         };
         if defs.is_empty() {

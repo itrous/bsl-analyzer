@@ -3169,14 +3169,7 @@ impl<'db> InferenceContext<'db> {
     /// is a header. Nothing writes between an `Если` condition and an `ИначеЕсли` one, so the
     /// first condition answers for all of them, and likewise a `Для` lower bound for the upper.
     fn header_read_expr(&self, stmt: StmtId) -> Option<ExprId> {
-        let header = match self.body.stmt(stmt) {
-            Stmt::If(if_stmt) => if_stmt.condition,
-            Stmt::While { condition, .. } => *condition,
-            Stmt::For { from, .. } => *from,
-            Stmt::ForEach { collection, .. } => *collection,
-            _ => return None,
-        };
-        Some(ExprId::from_idx(header))
+        dataflow::reaching_defs::header_read_expr(&self.body, stmt)
     }
 
     /// Where the definitions of `var_key` reaching `use_stmt` take their values, with loop
