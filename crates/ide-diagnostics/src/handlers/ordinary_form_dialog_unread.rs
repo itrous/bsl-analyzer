@@ -1,8 +1,8 @@
 //! An ORDINARY form whose existing sidecar was rejected: the dialog lives in the binary
 //! `Ext/Form.bin`, and `Ext/Form/Form.json` is stale, unreadable or malformed. Its
-//! button bindings are then unknown, so checks that depend on them (`UnusedLocalMethod`)
-//! are dropped for the module - this diagnostic says why. A missing sidecar is a normal,
-//! documented state and stays silent.
+//! button bindings are then unknown, so the checks that depend on them - both
+//! `UnusedLocalMethod` and `UnusedParameters` - are dropped for the module, and this
+//! diagnostic says why. A missing sidecar is a normal, documented state and stays silent.
 
 use super::missing_form_event_handler::first_line_range;
 use crate::define_metadata;
@@ -42,7 +42,7 @@ pub fn from_metadata(
         return Vec::new();
     };
 
-    if !form.is_ordinary() || form.ordinary_dialog_known() {
+    if !form.handler_bindings_unknown() {
         return Vec::new();
     }
 
@@ -52,7 +52,8 @@ pub fn from_metadata(
 
     let message = format!(
         "Диалог обычной формы не прочитан ({reason}): привязки обработчиков диалога неизвестны, \
-         поэтому поиск неиспользуемых локальных методов в этом модуле отключён. \
+         поэтому поиск неиспользуемых локальных методов и неиспользуемых параметров \
+         в этом модуле отключён. \
          Обновите Ext/Form/Form.json тем инструментом, который его создаёт, - \
          описание файла в docs/configuration/ordinary-form-sidecar.md",
         reason = rejection.reason_ru()
@@ -113,8 +114,9 @@ mod tests {
             diagnostics[0].message,
             "Диалог обычной формы не прочитан (сайдкар Ext/Form/Form.json не разбирается): \
              привязки обработчиков диалога неизвестны, поэтому поиск неиспользуемых локальных \
-             методов в этом модуле отключён. Обновите Ext/Form/Form.json тем инструментом, \
-             который его создаёт, - описание файла в docs/configuration/ordinary-form-sidecar.md"
+             методов и неиспользуемых параметров в этом модуле отключён. Обновите \
+             Ext/Form/Form.json тем инструментом, который его создаёт, - описание файла в \
+             docs/configuration/ordinary-form-sidecar.md"
         );
     }
 

@@ -384,6 +384,13 @@ impl Form {
         self.ordinary_dialog_known
     }
 
+    /// An ORDINARY form whose dialog was not read: its handler bindings are unknown, so
+    /// any local method of its module may be bound to a control of the dialog. Checks
+    /// that need the bindings (unused methods, unused handler parameters) drop out here.
+    pub fn handler_bindings_unknown(&self) -> bool {
+        self.is_ordinary() && !self.ordinary_dialog_known
+    }
+
     pub fn ordinary_dialog_rejection(&self) -> Option<OrdinaryDialogRejection> {
         self.ordinary_dialog_rejection
     }
