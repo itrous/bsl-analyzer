@@ -273,6 +273,7 @@ enum Commands {
 /// run is lost, and no file is named. Measured on this tree: 1 MiB aborts at 600 links,
 /// 8 MiB carries them, 64 MiB carries 2000. The reservation is virtual and is committed
 /// only as it is used, so the cost of the headroom is address space, not memory.
+/// `analyze` gives the same stack to the rayon workers it analyses files on.
 ///
 /// This is headroom, not a bound: a deep enough expression still overflows. A depth
 /// limit in the recursive walks is the real answer and is tracked separately.
