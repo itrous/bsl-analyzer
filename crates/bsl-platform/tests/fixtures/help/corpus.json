@@ -514,6 +514,70 @@
    ]
   },
   {
+   "id": 11,
+   "name": "ПоместитьФайлы",
+   "english_name": "PutFiles",
+   "min_version": "8.2",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "ПомещаемыеФайлы", "param_type": "Строка", "is_optional": true},
+    {"name": "ПомещенныеФайлы", "param_type": "Массив", "is_optional": true},
+    {"name": "НаборПомещаемыхФайлов", "param_type": "ДиалогВыбораФайла, Строка", "is_optional": true},
+    {"name": "Интерактивно", "param_type": "Булево", "is_optional": true},
+    {"name": "УникальныйИдентификаторФормы", "param_type": "УникальныйИдентификатор", "is_optional": true}
+   ]
+  },
+  {
+   "id": 12,
+   "name": "ПолучитьФайлы",
+   "english_name": "GetFiles",
+   "min_version": "8.2",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "ПолучаемыеФайлы", "param_type": "Массив", "is_optional": false},
+    {"name": "ПолученныеФайлы", "param_type": "Массив", "is_optional": true},
+    {"name": "РасположениеФайлов", "param_type": "ДиалогВыбораФайла, Строка", "is_optional": true},
+    {"name": "Интерактивно", "param_type": "Булево", "is_optional": true}
+   ]
+  },
+  {
+   "id": 13,
+   "name": "ЗапуститьПриложение",
+   "english_name": "RunApp",
+   "min_version": "8.0",
+   "parameters": [
+    {"name": "СтрокаКоманды", "param_type": "Строка", "is_optional": false},
+    {"name": "ТекущийКаталог", "param_type": "Строка", "is_optional": true},
+    {"name": "ДождатьсяЗавершения", "param_type": "Булево", "is_optional": true},
+    {"name": "КодВозврата", "param_type": "Число, Неопределено", "is_optional": true}
+   ]
+  },
+  {
+   "id": 14,
+   "name": "ЗапуститьСистему",
+   "english_name": "RunSystem",
+   "min_version": "8.1",
+   "parameters": [
+    {"name": "ДополнительныеПараметрыКоманднойСтроки", "param_type": "Строка", "is_optional": true},
+    {"name": "ДождатьсяЗавершения", "param_type": "Булево", "is_optional": true},
+    {"name": "КодВозврата", "param_type": "Число, Неопределено", "is_optional": true}
+   ]
+  },
+  {
+   "id": 15,
+   "name": "УдалитьОбъекты",
+   "english_name": "DeleteObjects",
+   "min_version": "8.0",
+   "parameters": [
+    {"name": "СписокСсылок", "param_type": "Массив", "is_optional": false},
+    {"name": "Проверять", "param_type": "Булево", "is_optional": true},
+    {"name": "НайденныеДанные", "param_type": "ТаблицаЗначений", "is_optional": true},
+    {"name": "ОбластьПоиска", "param_type": "Массив", "is_optional": true},
+    {"name": "ВключитьОбъекты", "param_type": "Массив", "is_optional": true},
+    {"name": "ИсключитьОбъекты", "param_type": "Массив", "is_optional": true}
+   ]
+  },
+  {
    "id": 5,
    "name": "СтрДлина",
    "english_name": "StrLen",
