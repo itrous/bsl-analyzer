@@ -266,7 +266,32 @@ enum Commands {
     },
 }
 
+/// Analysis is recursive: lowering and inference walk an expression tree whose depth
+/// follows the shape of the source, so a single statement with a long chain of calls or
+/// a long chain of `+` costs stack in proportion to its length. The main thread gets
+/// 1 MiB on Windows, and 600 chained calls overflow it — the process aborts, the whole
+/// run is lost, and no file is named. Measured on this tree: 1 MiB aborts at 600 links,
+/// 8 MiB carries them, 64 MiB carries 2000. The reservation is virtual and is committed
+/// only as it is used, so the cost of the headroom is address space, not memory.
+///
+/// This is headroom, not a bound: a deep enough expression still overflows. A depth
+/// limit in the recursive walks is the real answer and is tracked separately.
+const ANALYSIS_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let worker = std::thread::Builder::new()
+        .name("bsl-analyzer-main".to_string())
+        .stack_size(ANALYSIS_STACK_BYTES)
+        .spawn(run)?;
+    match worker.join() {
+        Ok(result) => result,
+        // The thread already printed the panic through the hook `run` installs; resuming
+        // the unwind here keeps the process's exit behaviour exactly as it was.
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
 
     let (log_file, default_log) = match non_empty_env("BSL_LOG_FILE")
