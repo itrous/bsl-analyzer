@@ -223,7 +223,7 @@ pub(crate) fn collect_called_methods(
         // button's handler. Reporting them unused turns one unread file into a pack of
         // false findings over every handler of the form, so stay silent here and let
         // `OrdinaryFormDialogUnread` say why the check was dropped.
-        if form.is_ordinary() && !form.ordinary_dialog_known() {
+        if form.handler_bindings_unknown() {
             return None;
         }
         for handler in form.event_handlers() {
