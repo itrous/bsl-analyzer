@@ -213,6 +213,17 @@
       ],
       "evidence_source": "platform_data.json: RefreshObjectsNumbering (global function id 279), parameter «Метаданные»: param_type «Массив, ОбъектМетаданных: ТаблицаИзмерения, ОбъектМетаданных: ВнешнийИсточникДанных, ОбъектМетаданных: Поле, ОбъектМетаданных: Таблица»; its description lists further kinds (…, ОбъектМетаданных: Функция, ОбъектМетаданных: ШаблонURLHTTPСервиса, ОбъектМетаданных: ОпределяемыйТип, ОбъектМетаданных: Бот, …) and ends cut mid-list",
       "rationale": "The extract keeps only the first five entries of a parameter's type list. Here the help lists every metadata-object kind (the parameter description repeats the list up to its own cut), so the five kinds that survive read as a narrowing the platform does not make, and a description of any other kind — the usual `Метаданные.НайтиПоТипу(...)` or `Ссылка.Метаданные()` argument — is reported as a type mismatch. `ОбъектМетаданных: *` restores the whole family as the extracted types name it; types that are not metadata objects keep their place."
+    },
+    {
+      "russian_name": "XMLСтрока",
+      "english_name": "XMLString",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "Произвольный"
+      ],
+      "evidence_source": "platform_facts.json: XMLСтрока / XMLString (global function id 417), parameter «Значение»: param_type «Неопределено, Null, Булево, Число, Строка» — five entries. The help's parameter rubric does not enumerate the admissible set at all; it lives in the prose of the description, which runs «Строка - как есть; Булево: Истина - как \"true\", Ложь - как \"false\"; Дата - XML представление соответствует представлению типа dateTime схемы XML; Число - … decimal …; Значение системного перечисления (для перечисле…» and is cut mid-list. Live run on 8.3.17.1549 and 8.3.27.2214: XMLСтрока(Дата(2026, 11, 14)) → «2026-11-14T00:00:00», XMLСтрока(Новый УникальныйИдентификатор) → the uuid, XMLСтрока(ПолучитьДвоичныеДанныеИзСтроки(\"x\")) → «eA==», alongside Строка, Число, Булево, Неопределено and Null; XMLСтрока(Тип(\"Строка\")) and XMLСтрока(Новый Массив) raise «Ошибка преобразования данных XML» at run time, never statically.",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list, so Дата — the first type the help documents after the scalars, and the one most often written here — is reported as a type mismatch at Error severity. Enumerating the admissible set in its place is not possible: it includes every configuration reference type and every system enumeration value, which the extract has no name for. «Произвольный» states what the platform states — this parameter carries no static constraint — and leaves the arguments that really are wrong (Массив, Структура, Тип) to the run-time conversion error, where the platform itself leaves them."
     }
   ],
   "type_property_additions": [

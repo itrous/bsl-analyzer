@@ -474,6 +474,20 @@
     "examples": [],
     "notes": "Fixture note."
    }
+  },
+  {
+   "id": 6,
+   "name": "XMLСтрока",
+   "english_name": "XMLString",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {
+     "name": "Значение",
+     "param_type": "Неопределено, Null, Булево, Число, Строка",
+     "is_optional": false
+    }
+   ]
   }
  ],
  "constructors": [
