@@ -389,14 +389,17 @@ fn analyze_salsa(
     let profiling_enabled = only_diagnostic.is_some();
     let jsonl = matches!(format, OutputFormat::Jsonl);
 
-    // Honour `--workers` by sizing the global rayon pool before any rayon use
-    // (metadata load and the per-chunk `par_iter` both draw from it). Must run
-    // before `load_metadata`, which initialises the pool on first parallel read;
-    // best-effort because the pool can only be built once per process.
+    // Configure the global rayon pool before any rayon use (metadata load and the
+    // per-chunk `par_iter` both draw from it): its workers analyse the files, so they
+    // get the same stack as the thread `run` executes on, and `--workers` sizes it.
+    // Must run before `load_metadata`, which initialises the pool on first parallel
+    // read; best-effort because the pool can only be built once per process.
+    let mut pool = rayon::ThreadPoolBuilder::new().stack_size(crate::ANALYSIS_STACK_BYTES);
     if let Some(w) = workers.filter(|w| *w > 0) {
-        if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(w).build_global() {
-            tracing::warn!("Failed to set worker count to {w}: {e}");
-        }
+        pool = pool.num_threads(w);
+    }
+    if let Err(e) = pool.build_global() {
+        tracing::warn!("Failed to configure the analysis thread pool: {e}");
     }
 
     tracing::info!("Analyzing project: {:?}", source_dir);
