@@ -184,11 +184,9 @@ pub(crate) fn answer_location(
     let rooted_spelling =
         root_id.zip(path_as_given.to_str().filter(|spelling| !Path::new(spelling).is_absolute()));
     match rooted_spelling {
-        // The pair is fed back by consumers and has to match the store, which is `/`-spelled
-        // however the request was.
-        Some((root_id, relative)) => {
-            Ok(loc::Location::from_key(&bsl_search::spell_as_key(root_id), relative))
-        }
+        // `from_key` answers in the store's `/` spelling however the request was spelled: the
+        // pair is fed back by consumers and has to match the store.
+        Some((root_id, relative)) => Ok(loc::Location::from_key(root_id, relative)),
         None => loc::Location::from_path(roots, abs),
     }
 }
