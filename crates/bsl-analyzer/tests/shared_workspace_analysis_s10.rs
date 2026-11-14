@@ -619,8 +619,8 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
     assert!(
         excluded_definition["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("File not in frozen VFS snapshot")),
-        "excluded didOpen is retained only in the editor buffer, not the analyzed VFS: {excluded_definition}"
+            .is_some_and(|message| message.contains("excluded from the project")),
+        "excluded didOpen is retained only in the editor buffer, not the analyzed VFS, and the error says which of the two it is: {excluded_definition}"
     );
     assert_eq!(
         excluded_definition["error"]["code"],
