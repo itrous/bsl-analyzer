@@ -565,10 +565,12 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
         "&НаСервере\nФункция ДатьСтроку() Экспорт\n    Возврат \"excluded base\";\nКонецФункции\n",
     )
     .expect("create an excluded base copy with the provider's relative path");
-    let excluded_config = CONFIG.replace(
-        "[source]\nroot = \"base\"\n",
-        "[source]\nroot = \"base\"\nexclude = [\"base/CommonModules/Общий\"]\n",
-    );
+    // The needle must not span a line: CONFIG is the fixture's bytes as checked out, and on a
+    // checkout with core.autocrlf=true its newlines are CRLF, so an "\n" inside the needle
+    // matches nothing and the edit silently becomes no edit. The sibling test s6 writes the same
+    // exclusion with a single-line needle for the same reason.
+    let excluded_config = CONFIG
+        .replace("root = \"base\"", "root = \"base\"\nexclude = [\"base/CommonModules/Общий\"]");
     assert_ne!(excluded_config, CONFIG, "the exclusion was added to the project config");
     std::fs::write(&config_path, &excluded_config).expect("write explicit source exclusion");
 
@@ -617,8 +619,8 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
     assert!(
         excluded_definition["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("File not in frozen VFS snapshot")),
-        "excluded didOpen is retained only in the editor buffer, not the analyzed VFS: {excluded_definition}"
+            .is_some_and(|message| message.contains("excluded from the project")),
+        "excluded didOpen is retained only in the editor buffer, not the analyzed VFS, and the error says which of the two it is: {excluded_definition}"
     );
     assert_eq!(
         excluded_definition["error"]["code"],

@@ -6,6 +6,15 @@ Reports calls and references to 1C:Enterprise platform APIs that are marked as d
 
 The diagnostic covers deprecated global functions, global methods, platform types, and platform attributes that have a known replacement. Message text names the specific deprecated API and keeps the replacement suggested by the platform fact registry.
 
+There is one exception: a replacement spelled `CommonModule.Method` where a common
+module of that name does exist in this configuration and exports no method of that
+name. Such a replacement is a library one, and a library method's home moves between
+library releases; naming a method the configuration lacks would trade a warning for a
+run-time error ("method not found"). The message then says that no recommended
+replacement is available here, and still names the deprecated API itself. A receiver
+that is not a common module of this configuration is not covered by the exception:
+its absence proves nothing.
+
 `DeprecatedMethodCall` is a separate diagnostic for project source methods deprecated by documentation comments. `GetFormMethod` is also separate and can be reported together with this diagnostic for `GetForm()` / `ПолучитьФорму()`.
 
 ## Parameters

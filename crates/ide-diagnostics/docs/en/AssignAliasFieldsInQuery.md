@@ -12,6 +12,8 @@ The diagnostic also reports implicit aliases without `AS`, for example `Items.Pr
 
 In `UNION` queries, result column names are defined by the first `SELECT`, so secondary `UNION` branches do not require selected-field aliases.
 
+A string with no sign of the 1C query language — neither a metadata table such as `Catalog.Products` nor a Cyrillic keyword outside string literals and comments — is not checked: it is usually WQL for `ExecQuery` or SQL for an external DBMS. As a consequence, a query written with English keywords that reads only a temporary table is skipped as well.
+
 ## Examples
 
 ```bsl   

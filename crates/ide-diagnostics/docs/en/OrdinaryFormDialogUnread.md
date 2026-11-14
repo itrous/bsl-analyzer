@@ -28,7 +28,7 @@ as well, but no finding is reported for it.
 Message:
 
 ```text
-Диалог обычной формы не прочитан (сайдкар Ext/Form/Form.json старше Ext/Form.bin): привязки обработчиков диалога неизвестны, поэтому поиск неиспользуемых локальных методов в этом модуле отключён. Обновите Ext/Form/Form.json тем инструментом, который его создаёт, - описание файла в docs/configuration/ordinary-form-sidecar.md
+Диалог обычной формы не прочитан (сайдкар Ext/Form/Form.json старше Ext/Form.bin): привязки обработчиков диалога неизвестны, поэтому поиск неиспользуемых локальных методов и неиспользуемых параметров в этом модуле отключён. Обновите Ext/Form/Form.json тем инструментом, который его создаёт, - описание файла в docs/configuration/ordinary-form-sidecar.md
 ```
 
 Fix: regenerate `Ext/Form/Form.json` with the tool that produces it (the analyzer

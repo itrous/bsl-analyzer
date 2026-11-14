@@ -375,6 +375,17 @@
       "result_follows_argument_text": true,
       "evidence_source": "the declared signature `СокрП(<Строка>)` and the documented meaning of the function: it returns its argument's text with whitespace cut from the edges, which preserves what the text says",
       "rationale": "a text keeps what it says when only its edge whitespace is cut, so a rule that follows where a text came from can look through the call; a consumer that does not know a function's record simply loses a finding, it never gains a false one"
+    },
+    {
+      "russian_name": "XMLСтрока",
+      "english_name": "XMLString",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "replacement_type_list": [
+        "Произвольный"
+      ],
+      "evidence_source": "platform_facts.json: XMLСтрока / XMLString (global function id 417), parameter «Значение»: param_type «Неопределено, Null, Булево, Число, Строка» — five entries. The help's parameter rubric does not enumerate the admissible set at all; it lives in the prose of the description, which runs «Строка - как есть; Булево: Истина - как \"true\", Ложь - как \"false\"; Дата - XML представление соответствует представлению типа dateTime схемы XML; Число - … decimal …; Значение системного перечисления (для перечисле…» and is cut mid-list. Live run on 8.3.17.1549 and 8.3.27.2214: XMLСтрока(Дата(2026, 11, 14)) → «2026-11-14T00:00:00», XMLСтрока(Новый УникальныйИдентификатор) → the uuid, XMLСтрока(ПолучитьДвоичныеДанныеИзСтроки(\"x\")) → «eA==», alongside Строка, Число, Булево, Неопределено and Null; XMLСтрока(Тип(\"Строка\")) and XMLСтрока(Новый Массив) raise «Ошибка преобразования данных XML» at run time, never statically.",
+      "rationale": "The extract keeps only the first five entries of a parameter's type list, so Дата — the first type the help documents after the scalars, and the one most often written here — is reported as a type mismatch at Error severity. Enumerating the admissible set in its place is not possible: it includes every configuration reference type and every system enumeration value, which the extract has no name for. «Произвольный» states what the platform states — this parameter carries no static constraint — and leaves the arguments that really are wrong (Массив, Структура, Тип) to the run-time conversion error, where the platform itself leaves them."
     }
   ],
   "type_property_additions": [
