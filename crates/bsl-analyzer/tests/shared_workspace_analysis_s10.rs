@@ -565,10 +565,12 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
         "&НаСервере\nФункция ДатьСтроку() Экспорт\n    Возврат \"excluded base\";\nКонецФункции\n",
     )
     .expect("create an excluded base copy with the provider's relative path");
-    let excluded_config = CONFIG.replace(
-        "[source]\nroot = \"base\"\n",
-        "[source]\nroot = \"base\"\nexclude = [\"base/CommonModules/Общий\"]\n",
-    );
+    // The needle must not span a line: CONFIG is the fixture's bytes as checked out, and on a
+    // checkout with core.autocrlf=true its newlines are CRLF, so an "\n" inside the needle
+    // matches nothing and the edit silently becomes no edit. The sibling test s6 writes the same
+    // exclusion with a single-line needle for the same reason.
+    let excluded_config = CONFIG
+        .replace("root = \"base\"", "root = \"base\"\nexclude = [\"base/CommonModules/Общий\"]");
     assert_ne!(excluded_config, CONFIG, "the exclusion was added to the project config");
     std::fs::write(&config_path, &excluded_config).expect("write explicit source exclusion");
 
