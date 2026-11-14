@@ -40,6 +40,8 @@ type FileHunks = Option<Vec<Hunk>>;
 pub struct AnalysisScope {
     /// Human-readable reference the scope was built against (e.g. `vendor`).
     base_ref: String,
+    /// Keys in the spelling [`normalize_path`] produces, which is also the spelling every
+    /// lookup is normalized to; see [`AnalysisScope::build`].
     files: HashMap<PathBuf, FileHunks>,
     /// Basename → keys sharing it, for suffix matching of relative keys.
     filename_index: HashMap<String, Vec<PathBuf>>,
@@ -68,7 +70,7 @@ impl AnalysisScope {
         let files = files
             .into_iter()
             .map(|(rel, hunks)| (workdir.join(normalize_path(&rel)), convert_hunks(hunks)));
-        Self::build(base_ref.into(), files.collect(), false)
+        Self::build(base_ref.into(), files, false)
     }
 
     /// Like [`Self::from_report`], but for a caller that addresses files
@@ -83,17 +85,14 @@ impl AnalysisScope {
         files: impl IntoIterator<Item = (String, Option<Vec<[u32; 2]>>)>,
     ) -> Self {
         let root_real = lexical_root.canonicalize().unwrap_or_else(|_| lexical_root.to_path_buf());
-        let files = files
-            .into_iter()
-            .map(|(rel, hunks)| {
-                let abs = workdir.join(normalize_path(&rel));
-                let abs = match abs.strip_prefix(&root_real) {
-                    Ok(suffix) => lexical_root.join(suffix),
-                    Err(_) => abs,
-                };
-                (abs, convert_hunks(hunks))
-            })
-            .collect();
+        let files = files.into_iter().map(|(rel, hunks)| {
+            let abs = workdir.join(normalize_path(&rel));
+            let abs = match abs.strip_prefix(&root_real) {
+                Ok(suffix) => lexical_root.join(suffix),
+                Err(_) => abs,
+            };
+            (abs, convert_hunks(hunks))
+        });
         Self::build(base_ref.into(), files, false)
     }
 
@@ -104,8 +103,8 @@ impl AnalysisScope {
         files: impl IntoIterator<Item = (String, Option<Vec<[u32; 2]>>)>,
     ) -> Self {
         let files =
-            files.into_iter().map(|(rel, hunks)| (normalize_path(&rel), convert_hunks(hunks)));
-        Self::build(base_ref.into(), files.collect(), true)
+            files.into_iter().map(|(rel, hunks)| (PathBuf::from(rel), convert_hunks(hunks)));
+        Self::build(base_ref.into(), files, true)
     }
 
     /// Scope listing whole files only (`--changed-files`): every listed file is
@@ -114,12 +113,24 @@ impl AnalysisScope {
         base_ref: impl Into<String>,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Self {
-        let files =
-            paths.into_iter().map(|p| (normalize_path(&p.to_string_lossy()), None)).collect();
-        Self::build(base_ref.into(), files, true)
+        Self::build(base_ref.into(), paths.into_iter().map(|p| (p, None)), true)
     }
 
-    fn build(base_ref: String, files: HashMap<PathBuf, FileHunks>, relative_keys: bool) -> Self {
+    fn build(
+        base_ref: String,
+        files: impl IntoIterator<Item = (PathBuf, FileHunks)>,
+        relative_keys: bool,
+    ) -> Self {
+        // A key is reachable only in the spelling `find` normalizes its argument to, so the
+        // normalization belongs here, where every constructor passes, and before the keys are
+        // collected, so spellings of one file collapse in input order. The absolute constructors normalized the relative part alone and joined it
+        // onto the workdir as given: a workdir spelled with `\`, or a canonicalized one on
+        // Windows (`\\?\C:\...`, where `/` is not a separator at all), produced keys no lookup
+        // could reach, and every file silently fell out of scope.
+        let files: HashMap<PathBuf, FileHunks> = files
+            .into_iter()
+            .map(|(path, hunks)| (normalize_path(&path.to_string_lossy()), hunks))
+            .collect();
         let mut filename_index: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for path in files.keys() {
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
@@ -244,9 +255,8 @@ fn convert_hunks(hunks: Option<Vec<[u32; 2]>>) -> FileHunks {
 }
 
 fn normalize_path(path: &str) -> PathBuf {
-    let normalized = path.replace('\\', "/");
-    let trimmed = normalized.strip_prefix("./").unwrap_or(&normalized);
-    PathBuf::from(trimmed)
+    let trimmed = path.strip_prefix("./").or_else(|| path.strip_prefix(".\\")).unwrap_or(path);
+    PathBuf::from(trimmed.replace('\\', "/"))
 }
 
 impl PartialEq for AnalysisScope {
@@ -411,6 +421,39 @@ mod tests {
             [(".\\src\\Module.bsl".to_string(), None)],
         );
         assert!(scope.is_file_in_scope(Path::new("/repo/src/Module.bsl")));
+    }
+
+    /// A workdir in a spelling the lookup side normalizes away — Windows separators, or the
+    /// verbatim prefix `canonicalize` returns there — must still resolve to its files.
+    #[test]
+    fn a_workdir_in_another_spelling_still_matches_its_files() {
+        let scope = AnalysisScope::from_report(
+            "vendor",
+            Path::new(r"\\?\C:\repo"),
+            [("src/Module.bsl".to_string(), Some(vec![[3, 4]]))],
+        );
+
+        let file = Path::new(r"\\?\C:\repo\src\Module.bsl");
+        assert!(scope.is_file_in_scope(file), "the file is in scope: {scope:?}");
+        assert!(scope.lines_in_scope(file, 2, 2), "line 3 (0-based 2) is in a hunk");
+        assert!(!scope.lines_in_scope(file, 0, 0), "control: line 1 is not");
+    }
+
+    /// Two spellings of one file are one key, and the later entry of the report wins, the
+    /// same on every build of the scope.
+    #[test]
+    fn spellings_of_one_file_collapse_to_the_last_entry() {
+        let scope = AnalysisScope::from_relative_report(
+            "vendor",
+            [
+                (r"src\Module.bsl".to_string(), Some(vec![[1, 1]])),
+                ("./src/Module.bsl".to_string(), Some(vec![[5, 5]])),
+            ],
+        );
+
+        let file = Path::new("/repo/src/Module.bsl");
+        assert!(scope.lines_in_scope(file, 4, 4), "line 5 of the later entry: {scope:?}");
+        assert!(!scope.lines_in_scope(file, 0, 0), "line 1 of the earlier entry is replaced");
     }
 
     #[test]

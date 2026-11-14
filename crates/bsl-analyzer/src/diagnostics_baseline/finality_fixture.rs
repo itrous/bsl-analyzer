@@ -43,7 +43,11 @@ pub(crate) struct Workspace {
 impl Workspace {
     pub(crate) fn new(form: Form) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        // Resolved, because the temp directory may sit behind a link (`/var` on macOS), and in
+        // the spelling the rest of the server uses: `canonicalize` alone answers with the
+        // Windows verbatim prefix, which a `file:` URL round-trip drops — the scope key and the
+        // path the pull handlers derive from the URI would then name the same file differently.
+        let root = stdx::path_exclusion::resolve(dir.path()).unwrap();
         for source in ["src/cf", "src/cfe/Ext"] {
             std::fs::create_dir_all(root.join(source)).unwrap();
             std::fs::write(root.join(source).join("Configuration.xml"), "<Configuration/>")
