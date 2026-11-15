@@ -3231,7 +3231,7 @@ mod tests {
         remove_stale_prev_log(Path::new("no-such-dir/daemon.log"), std::time::SystemTime::now());
         remove_stale_prev_log(Path::new(""), std::time::SystemTime::now());
         let dir = tempfile::tempdir().unwrap();
-        remove_stale_prev_log(&dir.path().join("da emon.log"), std::time::SystemTime::now());
+        remove_stale_prev_log(&dir.path().join("da\0emon.log"), std::time::SystemTime::now());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
