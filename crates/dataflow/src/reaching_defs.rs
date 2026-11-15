@@ -403,12 +403,54 @@ fn collect_stmt_defs<F: FnMut(Definition)>(
 
 /// The definitions the protected statements of a `Попытка` may have produced when its handler
 /// starts: the union, over those statements, of what holds immediately BEFORE each of them.
+/// [`walk_interruptible`] decides which statements contribute and which are in tail position.
+fn collect_interruptible_defs<F: FnMut(Definition)>(
+    stmts: &[hir_def::hir::StmtIdx],
+    body: &Body,
+    live: &crate::LiveStatements,
+    add_def: &mut F,
+) {
+    walk_interruptible(stmts, body, live, true, &mut |stmt_id, in_tail| {
+        match body.stmt_idx(stmt_id) {
+            Stmt::Assign { target, .. } if !in_tail => {
+                if let Some(var_name) =
+                    extract_var_name_from_expr(hir_def::ExprId::from_idx(*target), body)
+                {
+                    add_def(Definition::assignment(var_name, stmt_id.into_raw()));
+                }
+            }
+            Stmt::VarDecl { bindings } if !in_tail => {
+                for &binding_id in bindings.iter() {
+                    let binding = body.binding_idx(binding_id);
+                    add_def(Definition::var_decl(&binding.name, BindingId::from_idx(binding_id)));
+                }
+            }
+            // The loop variable is written before the body and the next condition run, both of
+            // which can raise, so it contributes even in tail position.
+            Stmt::For { var, .. } => {
+                let binding = body.binding_idx(*var);
+                add_def(Definition::for_loop(&binding.name, BindingId::from_idx(*var)));
+            }
+            Stmt::ForEach { var, .. } => {
+                let binding = body.binding_idx(*var);
+                add_def(Definition::for_each_loop(&binding.name, BindingId::from_idx(*var)));
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Visits every live protected statement of a `Попытка`, nested ones included, with whether it
+/// stands in TAIL position: once it completes, nothing that can raise runs before the region
+/// ends.
 ///
 /// The handler is entered only if something inside the region raised, so what it sees is the
 /// state at a point where an exception can STILL be raised. A statement therefore contributes
-/// its own definitions only when something that can raise runs after it while the region is
-/// still open; the region's TAIL contributes nothing, because once it completes the region ends
-/// normally and the handler is not entered at all.
+/// its own writes only when something that can raise runs after it while the region is still
+/// open; a statement in tail position contributes nothing, because once it completes the region
+/// ends normally and the handler is not entered at all. The statements after it may still run,
+/// but when each of them is an assignment that cannot raise
+/// ([`crate::is_non_raising_assignment`]) none of them can send control to the handler either.
 ///
 /// `tail` says that the region ends, with nothing left that could raise, once `stmts` completes.
 /// It carries into the places where that remains true - a trailing `Если` branch, the body and
@@ -419,68 +461,43 @@ fn collect_stmt_defs<F: FnMut(Definition)>(
 ///
 /// `live` drops a statement no execution reaches. The tail rule does not subsume it: a dead
 /// statement standing LAST in the protected body of a nested `Попытка` that is itself followed
-/// by more region statements is not in tail position, and only liveness keeps its write out of
-/// the outer handler.
-fn collect_interruptible_defs<F: FnMut(Definition)>(
+/// by more region statements that can raise is not in tail position, and only liveness keeps its
+/// write out of the outer handler.
+fn walk_interruptible(
     stmts: &[hir_def::hir::StmtIdx],
     body: &Body,
     live: &crate::LiveStatements,
     tail: bool,
-    add_def: &mut F,
+    visit: &mut impl FnMut(hir_def::hir::StmtIdx, bool),
 ) {
+    let tail_from = stmts
+        .iter()
+        .rposition(|&stmt_id| !crate::is_non_raising_assignment(body, stmt_id))
+        .unwrap_or(0);
     for (position, &stmt_id) in stmts.iter().enumerate() {
-        let opaque_id = hir_def::StmtId::from_idx(stmt_id);
-        if !live.contains(opaque_id) {
+        if !live.contains(hir_def::StmtId::from_idx(stmt_id)) {
             continue;
         }
-        let in_tail = tail && position + 1 == stmts.len();
-        match body.stmt(opaque_id) {
-            Stmt::Assign { target, .. } => {
-                if in_tail {
-                    continue;
-                }
-                if let Some(var_name) =
-                    extract_var_name_from_expr(hir_def::ExprId::from_idx(*target), body)
-                {
-                    add_def(Definition::assignment(var_name, stmt_id.into_raw()));
-                }
-            }
-            Stmt::VarDecl { bindings } => {
-                if in_tail {
-                    continue;
-                }
-                for &binding_id in bindings.iter() {
-                    let binding = body.binding_idx(binding_id);
-                    add_def(Definition::var_decl(&binding.name, BindingId::from_idx(binding_id)));
-                }
-            }
-            // The loop variable is written before the body and the next condition run, both of
-            // which can raise, so it contributes even in tail position.
-            Stmt::For { var, body: loop_body, .. } => {
-                let binding = body.binding_idx(*var);
-                add_def(Definition::for_loop(&binding.name, BindingId::from_idx(*var)));
-                collect_interruptible_defs(loop_body, body, live, false, add_def);
-            }
-            Stmt::ForEach { var, body: loop_body, .. } => {
-                let binding = body.binding_idx(*var);
-                add_def(Definition::for_each_loop(&binding.name, BindingId::from_idx(*var)));
-                collect_interruptible_defs(loop_body, body, live, false, add_def);
-            }
-            Stmt::While { body: loop_body, .. } => {
-                collect_interruptible_defs(loop_body, body, live, false, add_def);
+        let in_tail = tail && position >= tail_from;
+        visit(stmt_id, in_tail);
+        match body.stmt_idx(stmt_id) {
+            Stmt::For { body: loop_body, .. }
+            | Stmt::ForEach { body: loop_body, .. }
+            | Stmt::While { body: loop_body, .. } => {
+                walk_interruptible(loop_body, body, live, false, visit);
             }
             Stmt::If(if_stmt) => {
-                collect_interruptible_defs(&if_stmt.then_branch, body, live, in_tail, add_def);
+                walk_interruptible(&if_stmt.then_branch, body, live, in_tail, visit);
                 for (_cond, branch) in if_stmt.elsif_branches.iter() {
-                    collect_interruptible_defs(branch, body, live, in_tail, add_def);
+                    walk_interruptible(branch, body, live, in_tail, visit);
                 }
                 if let Some(ref else_stmts) = if_stmt.else_branch {
-                    collect_interruptible_defs(else_stmts, body, live, in_tail, add_def);
+                    walk_interruptible(else_stmts, body, live, in_tail, visit);
                 }
             }
             Stmt::Try { body: try_body, except, .. } => {
-                collect_interruptible_defs(try_body, body, live, in_tail, add_def);
-                collect_interruptible_defs(except, body, live, in_tail, add_def);
+                walk_interruptible(try_body, body, live, in_tail, visit);
+                walk_interruptible(except, body, live, in_tail, visit);
             }
             _ => {}
         }
@@ -1077,7 +1094,7 @@ impl Transfer<ReachingDefs> for ReachingDefsTransfer {
         live: &crate::LiveStatements,
     ) {
         if let Stmt::Try { body: protected, .. } = body.stmt(try_stmt) {
-            collect_interruptible_defs(protected, body, live, true, &mut |def| state.insert(&def));
+            collect_interruptible_defs(protected, body, live, &mut |def| state.insert(&def));
         }
     }
 }
@@ -1587,20 +1604,20 @@ mod tests {
 
     /// The case the liveness filter still catches once the tail rule is in place: a dead write
     /// standing LAST in the protected body of a nested `Попытка` that is itself followed by more
-    /// region statements. It is not in tail position of the outer region - the statement after
+    /// region statements. It is not in tail position of the outer region - the call after
     /// `КонецПопытки` can raise - so only liveness keeps it out of the outer handler. The live
     /// write of the same inner body does reach it.
     #[test]
     fn a_dead_write_last_in_an_inner_protected_body_does_not_reach_the_outer_handler() {
         // Попытка Попытка х = Истина; Возврат; д = Истина; Исключение г = Истина; КонецПопытки;
-        // е = Истина; Исключение у = Истина; КонецПопытки;
+        // Ф(е); Исключение у = Истина; КонецПопытки;
         let mut fixture = Fixture::new();
         let live_write = fixture.assign("х");
         let ret = fixture.ret();
         let dead_write = fixture.assign("д");
         let inner_handler = fixture.assign("г");
         let inner_try = fixture.try_except(&[live_write, ret, dead_write], &[inner_handler]);
-        let after_inner = fixture.assign("е");
+        let after_inner = fixture.call("ф", "е");
         let outer_handler_read = fixture.assign("у");
         let outer_try = fixture.try_except(&[inner_try, after_inner], &[outer_handler_read]);
         let body = fixture.finish(&[outer_try]);
@@ -1629,15 +1646,16 @@ mod tests {
     /// The handler is entered only when the region raised, so a write after which the region
     /// can no longer raise is not on any path into it: once the LAST protected statement
     /// completes, the region ends normally and the handler is skipped. The write before it is
-    /// on such a path, because the tail statement itself can raise.
+    /// on such a path, because the call between them can raise.
     #[test]
     fn a_write_in_tail_position_does_not_reach_the_handler_but_one_before_it_does() {
-        // Попытка х = Истина; г = Истина; Исключение у = Истина; КонецПопытки;
+        // Попытка х = Истина; Ф(з); г = Истина; Исключение у = Истина; КонецПопытки;
         let mut fixture = Fixture::new();
         let before_tail = fixture.assign("х");
+        let raising = fixture.call("ф", "з");
         let tail_write = fixture.assign("г");
         let handler_read = fixture.assign("у");
-        let try_stmt = fixture.try_except(&[before_tail, tail_write], &[handler_read]);
+        let try_stmt = fixture.try_except(&[before_tail, raising, tail_write], &[handler_read]);
         let body = fixture.finish(&[try_stmt]);
 
         let result = solve_plain(&body);
@@ -1646,7 +1664,7 @@ mod tests {
         assert_eq!(
             assignment_sites(&before),
             vec![before_tail.into_raw()],
-            "the tail statement can raise, so the write before it may have happened"
+            "the call after it can raise, so the write before it may have happened"
         );
 
         let tail = result.defs_for_var_at_stmt("г", handler_read).expect("state in the handler");
@@ -1655,6 +1673,29 @@ mod tests {
             Vec::new(),
             "once the last protected statement completes, the region ends and the handler is              not entered"
         );
+    }
+
+    /// An assignment of a literal cannot raise, so a region that ends in such assignments ends
+    /// normally once the write before them completes: neither write is on a path into the
+    /// handler. The test above is the control - a call in between can raise, and the first write
+    /// then does reach.
+    #[test]
+    fn writes_followed_only_by_assignments_that_cannot_raise_do_not_reach_the_handler() {
+        // Попытка х = Истина; г = Истина; Исключение у = Истина; КонецПопытки;
+        let mut fixture = Fixture::new();
+        let first = fixture.assign("х");
+        let second = fixture.assign("г");
+        let handler_read = fixture.assign("у");
+        let try_stmt = fixture.try_except(&[first, second], &[handler_read]);
+        let body = fixture.finish(&[try_stmt]);
+
+        let result = solve_plain(&body);
+
+        for name in ["х", "г"] {
+            let defs =
+                result.defs_for_var_at_stmt(name, handler_read).expect("state in the handler");
+            assert_eq!(assignment_sites(&defs), Vec::new(), "{name}: nothing after it can raise");
+        }
     }
 
     /// A trailing LOOP is not a tail: after the last statement of its body the loop's own
@@ -1727,11 +1768,11 @@ mod tests {
     /// by then - and may equally not have happened, which is why BOTH definitions reach.
     #[test]
     fn a_write_among_protected_statements_reaches_the_handler_beside_the_earlier_definition() {
-        // х = Истина; Попытка х = Истина; г = Истина; Исключение у = Истина; КонецПопытки;
+        // х = Истина; Попытка х = Истина; Ф(г); Исключение у = Истина; КонецПопытки;
         let mut fixture = Fixture::new();
         let before_try = fixture.assign("х");
         let inside_try = fixture.assign("х");
-        let after_write = fixture.assign("г");
+        let after_write = fixture.call("ф", "г");
         let handler_read = fixture.assign("у");
         let try_stmt = fixture.try_except(&[inside_try, after_write], &[handler_read]);
         let body = fixture.finish(&[before_try, try_stmt]);
@@ -1761,14 +1802,15 @@ mod tests {
     /// on the exception edge, a value written and overwritten inside a `Попытка` reaches nothing.
     #[test]
     fn a_write_overwritten_later_in_the_protected_body_reaches_the_code_after_it() {
-        // х = Истина; Попытка х = Истина; х = Истина; Исключение г = Истина; КонецПопытки;
+        // х = Истина; Попытка х = Истина; Ф(з); х = Истина; Исключение г = Истина; КонецПопытки;
         // у = Истина;
         let mut fixture = Fixture::new();
         let before_try = fixture.assign("х");
         let interrupted = fixture.assign("х");
+        let raising = fixture.call("ф", "з");
         let overwrite = fixture.assign("х");
         let handler_stmt = fixture.assign("г");
-        let try_stmt = fixture.try_except(&[interrupted, overwrite], &[handler_stmt]);
+        let try_stmt = fixture.try_except(&[interrupted, raising, overwrite], &[handler_stmt]);
         let read_after = fixture.assign("у");
         let body = fixture.finish(&[before_try, try_stmt, read_after]);
 
@@ -1807,20 +1849,20 @@ mod tests {
 
     /// The statements of a nested `Попытка` are protected by the outer handler as well: an
     /// exception raised there and not caught inside propagates outwards. The inner write needs
-    /// something after it that can still raise - here the statement following the inner
+    /// something after it that can still raise - here the call following the inner
     /// `КонецПопытки` - or it would stand in tail position of the outer region and
     /// contribute nothing, which is what the single-statement region of `security_balanced`
     /// records.
     #[test]
     fn a_write_in_an_inner_protected_body_reaches_the_outer_handler() {
         // х = Истина; Попытка Попытка х = Истина; Исключение г = Истина; КонецПопытки;
-        // д = Истина; Исключение у = Истина; КонецПопытки;
+        // Ф(д); Исключение у = Истина; КонецПопытки;
         let mut fixture = Fixture::new();
         let before_try = fixture.assign("х");
         let inner_write = fixture.assign("х");
         let inner_handler = fixture.assign("г");
         let inner_try = fixture.try_except(&[inner_write], &[inner_handler]);
-        let after_inner = fixture.assign("д");
+        let after_inner = fixture.call("ф", "д");
         let outer_handler_read = fixture.assign("у");
         let outer_try = fixture.try_except(&[inner_try, after_inner], &[outer_handler_read]);
         let body = fixture.finish(&[before_try, outer_try]);

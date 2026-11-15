@@ -195,6 +195,21 @@ fn a_write_through_a_by_reference_call_in_dead_code_does_not_silence_the_finding
     assert_eq!(d.len(), 1, "{d:?}");
 }
 
+/// The handler is entered only when something protected raised. A plain assignment cannot
+/// raise, so after `Имя = "обычный текст"` nothing can send control to the handler, and the
+/// type name assigned before it never reaches the comparison there. The control has a call
+/// after the plain assignment instead, which can raise while `Имя` still holds that name.
+#[test]
+fn a_write_followed_only_by_plain_assignments_does_not_reach_the_handler() {
+    let safe_tail = "    Попытка\n        Имя = Строка(ТипЗнч(Объект));\n        Имя = \"обычный текст\";\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(safe_tail);
+    assert!(d.is_empty(), "{d:?}");
+
+    let raising_tail = "    Попытка\n        Имя = Строка(ТипЗнч(Объект));\n        Ф();\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(raising_tail);
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
 #[test]
 fn a_local_assigned_a_type_name_and_something_else_is_not_flagged() {
     let d = run("    Имя = Строка(ТипЗнч(Объект));\n    Имя = \"Документ\";\n    Если Имя = \"Документ\" Тогда\n    КонецЕсли;");

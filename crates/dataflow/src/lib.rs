@@ -8,7 +8,7 @@ pub mod temp_resource;
 pub mod value_state;
 
 use cfg::{CfgEdgeType, ControlFlowGraph};
-use hir_def::body::Body;
+use hir_def::{body::Body, hir::StmtIdx, Expr, Literal, Stmt, UnaryOp};
 use la_arena::RawIdx;
 use petgraph::graph::NodeIndex;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -75,6 +75,27 @@ impl LiveStatements {
 
     pub fn contains(&self, stmt: hir_def::StmtId) -> bool {
         self.stmts.contains(&stmt)
+    }
+}
+
+/// `Имя = Имя` or `Имя = <literal>`: the only assignments that provably cannot raise.
+/// Deliberately conservative - when in doubt the statement CAN raise. The target must be a
+/// bare variable (an index or property write can fail on the receiver). The value must be a
+/// bare name read, a literal, or a minus on a number literal; a call, `Новый`, a ternary, a
+/// property access or an index can raise, and so can arithmetic: `A + B` raises on a type
+/// mismatch and `A / B` on a zero divisor, so it is NOT safe. A minus on a name is not safe
+/// either - it raises when the name holds a string.
+pub(crate) fn is_non_raising_assignment(body: &Body, stmt: StmtIdx) -> bool {
+    let Stmt::Assign { target, value } = body.stmt_idx(stmt) else { return false };
+    if !matches!(body.expr_idx(*target), Expr::Path(_)) {
+        return false;
+    }
+    match body.expr_idx(*value) {
+        Expr::Path(_) | Expr::Literal(_) => true,
+        Expr::UnaryOp { expr, op: UnaryOp::Neg } => {
+            matches!(body.expr_idx(*expr), Expr::Literal(Literal::Number(_)))
+        }
+        _ => false,
     }
 }
 

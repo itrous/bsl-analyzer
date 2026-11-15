@@ -10,14 +10,14 @@ use std::sync::Arc;
 
 use cfg::{CfgEdgeType, CfgVertex, ControlFlowGraph};
 use fixedbitset::FixedBitSet;
-use hir_def::{
-    body::Body, hir::StmtIdx, BindingId, Expr, ExprId, IdConversion, Literal, Stmt, StmtId, UnaryOp,
-};
+use hir_def::{body::Body, BindingId, ExprId, IdConversion, Stmt, StmtId};
 use la_arena::RawIdx;
 use petgraph::graph::NodeIndex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{DataflowResult, DataflowSolver, Lattice, LiveStatements, Transfer};
+use crate::{
+    is_non_raising_assignment, DataflowResult, DataflowSolver, Lattice, LiveStatements, Transfer,
+};
 
 /// Where a read is evaluated: before a statement of a basic block, or inside a
 /// header root (`Если`/`ИначеЕсли`/`Пока` condition, `Для` bounds, `Для Каждого`
@@ -154,27 +154,6 @@ impl Transfer<DefiniteInit> for DefiniteInitTransfer {
                 state.add(bits);
             }
         }
-    }
-}
-
-/// `Имя = Имя` or `Имя = <literal>`: the only assignments that provably cannot raise.
-/// Deliberately conservative - when in doubt the statement CAN raise. The target must be a
-/// bare variable (an index or property write can fail on the receiver). The value must be a
-/// bare name read, a literal, or a minus on a number literal; a call, `Новый`, a ternary, a
-/// property access or an index can raise, and so can arithmetic: `A + B` raises on a type
-/// mismatch and `A / B` on a zero divisor, so it is NOT safe. A minus on a name is not safe
-/// either - it raises when the name holds a string.
-fn is_non_raising_assignment(body: &Body, stmt: StmtIdx) -> bool {
-    let Stmt::Assign { target, value } = body.stmt_idx(stmt) else { return false };
-    if !matches!(body.expr_idx(*target), Expr::Path(_)) {
-        return false;
-    }
-    match body.expr_idx(*value) {
-        Expr::Path(_) | Expr::Literal(_) => true,
-        Expr::UnaryOp { expr, op: UnaryOp::Neg } => {
-            matches!(body.expr_idx(*expr), Expr::Literal(Literal::Number(_)))
-        }
-        _ => false,
     }
 }
 
@@ -371,6 +350,8 @@ mod tests {
         BasicBlockVertex, ConditionalVertex, ForEachHeaderVertex, ForHeaderVertex,
         WhileHeaderVertex,
     };
+
+    use hir_def::{hir::StmtIdx, Expr, Literal};
 
     use super::*;
     use crate::DEFAULT_MAX_ITERATIONS;
