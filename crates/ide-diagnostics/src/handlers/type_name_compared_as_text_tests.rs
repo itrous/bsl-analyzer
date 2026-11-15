@@ -210,6 +210,20 @@ fn a_write_followed_only_by_plain_assignments_does_not_reach_the_handler() {
     assert_eq!(d.len(), 1, "{d:?}");
 }
 
+/// A call that writes back through its argument, followed by a statement that can raise: the
+/// handler may be entered after the write, so the value it compares is not proven to be the
+/// type name. The control without the by-reference call keeps the finding.
+#[test]
+fn a_by_reference_write_before_a_raising_statement_reaches_the_handler() {
+    let written = "    Имя = Строка(ТипЗнч(Объект));\n    Попытка\n        ВвестиСтроку(Имя);\n        Ф();\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(written);
+    assert!(d.is_empty(), "{d:?}");
+
+    let not_written = "    Имя = Строка(ТипЗнч(Объект));\n    Попытка\n        Ф();\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(not_written);
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
 #[test]
 fn a_local_assigned_a_type_name_and_something_else_is_not_flagged() {
     let d = run("    Имя = Строка(ТипЗнч(Объект));\n    Имя = \"Документ\";\n    Если Имя = \"Документ\" Тогда\n    КонецЕсли;");

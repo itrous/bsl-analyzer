@@ -220,6 +220,23 @@ impl ForeignWriteGen {
         bytes
     }
 
+    /// Adds, without killing, the foreign writes of one protected statement that the handler of
+    /// its `Попытка` may see. The statement's own writes follow the tail rule of
+    /// [`walk_interruptible`]; the writes of its header do not, because the header is evaluated
+    /// before the statement's own body, which can raise or run the header again.
+    fn apply_interrupted(&self, stmt_id: hir_def::StmtId, in_tail: bool, state: &mut ReachingDefs) {
+        if !in_tail {
+            self.apply_stmt(stmt_id, state);
+        }
+        for event in self.writes.header.values().flatten().filter(|event| event.site == stmt_id) {
+            state.insert(&Definition::foreign_write(
+                event.var_name.clone(),
+                event.site.into_raw(),
+                event.kind,
+            ));
+        }
+    }
+
     fn apply_header(&self, header: hir_def::ExprId, state: &mut ReachingDefs) {
         if let Some(events) = self.writes.header.get(&header) {
             for event in events {
@@ -1004,6 +1021,11 @@ impl Transfer<ReachingDefs> for WritesAwareTransfer {
         live: &crate::LiveStatements,
     ) {
         ExecutableReachingDefsTransfer.transfer_exception_edge(try_stmt, state, body, live);
+        if let Stmt::Try { body: protected, .. } = body.stmt(try_stmt) {
+            walk_interruptible(protected, body, live, true, &mut |stmt_id, in_tail| {
+                self.foreign.apply_interrupted(hir_def::StmtId::from_idx(stmt_id), in_tail, state);
+            });
+        }
     }
 }
 
@@ -1519,6 +1541,57 @@ mod tests {
             Vec::new(),
             "an error can interrupt before the call, so its write is not on the handler's path"
         );
+    }
+
+    /// The control for the test above: a statement that can raise follows the call, so the
+    /// handler may be entered after the call wrote back through its argument, and that write
+    /// reaches the handler beside the earlier definition.
+    #[test]
+    fn a_foreign_write_before_a_statement_that_can_raise_reaches_the_handler() {
+        // х = 1; Попытка Ф(х); Г(з); Исключение у = 2; КонецПопытки;
+        let mut fixture = Fixture::new();
+        let assign = fixture.assign("х");
+        let site = fixture.call("ф", "х");
+        let raising = fixture.call("г", "з");
+        let handler_read = fixture.assign("у");
+        let try_stmt = fixture.try_except(&[site, raising], &[handler_read]);
+        let body = fixture.finish(&[assign, try_stmt]);
+
+        let mut writes = ForeignWriteEvents::default();
+        writes.push_stmt(site, SmolStr::new("х"), ForeignWrite::ByRefArgument);
+        let result = solve_foreign(&body, writes);
+
+        let defs = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
+        assert_eq!(assignment_sites(&defs), vec![assign.into_raw()]);
+        assert_eq!(foreign_kinds(&defs), vec![ForeignWrite::ByRefArgument]);
+    }
+
+    /// A header is evaluated before the statement's own body, so its write is on the handler's
+    /// path even when the statement stands last in the region: the branch after it can raise.
+    #[test]
+    fn a_foreign_write_in_the_condition_of_a_trailing_branch_reaches_the_handler() {
+        // Попытка Если Ф(х) Тогда Г(з); КонецЕсли; Исключение у = 2; КонецПопытки;
+        let mut fixture = Fixture::new();
+        let in_branch = fixture.call("г", "з");
+        let callee = fixture.path("ф");
+        let arg = fixture.path("х");
+        let call = fixture.body.alloc_expr(Expr::Call { callee, args: Box::new([arg]) });
+        let branch = fixture.body.alloc_stmt(Stmt::If(Box::new(hir_def::hir::IfStmt {
+            condition: call.to_idx(),
+            then_branch: Box::new([in_branch.to_idx()]),
+            elsif_branches: Box::new([]),
+            else_branch: None,
+        })));
+        let handler_read = fixture.assign("у");
+        let try_stmt = fixture.try_except(&[branch], &[handler_read]);
+        let body = fixture.finish(&[try_stmt]);
+
+        let mut writes = ForeignWriteEvents::default();
+        writes.push_header(call, branch, SmolStr::new("х"), ForeignWrite::ByRefArgument);
+        let result = solve_foreign(&body, writes);
+
+        let defs = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
+        assert_eq!(foreign_kinds(&defs), vec![ForeignWrite::ByRefArgument]);
     }
 
     #[test]
