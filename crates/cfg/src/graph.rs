@@ -98,6 +98,18 @@ impl ControlFlowGraph {
         bytes
     }
 
+    /// An `Exception` edge only saying the point may fail: the point also has
+    /// its own continuation, so the edge is no decision of the text. The edge
+    /// from the entry of `Попытка` and the edge of `ВызватьИсключение` are not
+    /// such edges.
+    pub fn is_possible_failure(&self, from: NodeIndex, kind: CfgEdgeType) -> bool {
+        kind == CfgEdgeType::Exception
+            && !matches!(self.vertex(from), Some(CfgVertex::Try))
+            && self
+                .outgoing_edges(from)
+                .any(|(_, kind)| kind.is_executable() && *kind != CfgEdgeType::Exception)
+    }
+
     pub fn vertex(&self, index: NodeIndex) -> Option<&CfgVertex> {
         self.graph.node_weight(index)
     }

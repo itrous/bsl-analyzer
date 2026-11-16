@@ -349,7 +349,7 @@ impl<'b> Collector<'b> {
                 self.visit_expr(*index, false, path);
             }
             Expr::Field { base, .. } => self.visit_expr(*base, false, path),
-            _ => crate::narrow::for_each_expr_child(body, expr, &mut |child| {
+            _ => hir_def::body::events::for_each_expr_child(body, expr, &mut |child| {
                 self.visit_expr(child, escapes, path);
             }),
         }
@@ -478,7 +478,7 @@ fn values_of(body: &Body, expr: ExprIdx, out: &mut Vec<Name>) {
         | Expr::Literal(_)
         | Expr::Array(_)
         | Expr::Missing => {}
-        _ => crate::narrow::for_each_expr_child(body, expr, &mut |child| {
+        _ => hir_def::body::events::for_each_expr_child(body, expr, &mut |child| {
             values_of(body, child, out);
         }),
     }

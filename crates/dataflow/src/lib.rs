@@ -73,6 +73,14 @@ pub trait Transfer<L: Lattice> {
 
     fn transfer_loop_var_bind(&self, _loop_var: hir_def::BindingId, _state: &mut L, _body: &Body) {}
 
+    /// Whether states cross the `Exception` edges that only say a protected point
+    /// may fail ([`ControlFlowGraph::is_possible_failure`]). An analysis that does
+    /// not model such failures sees a handler entered from the entry of `Попытка`
+    /// and from `ВызватьИсключение` only.
+    fn follows_possible_failures(&self) -> bool {
+        false
+    }
+
     /// Transfer through the `Попытка` vertex. In a forward analysis the state
     /// computed here flows both into the protected statements and along the
     /// exception edge into the handler; a backward analysis receives the join
@@ -195,6 +203,9 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             } else {
                 let mut state: Option<L> = None;
                 for (pred_idx, edge_kind) in self.cfg.incoming_edges(block_idx) {
+                    if !self.crosses(pred_idx, *edge_kind) {
+                        continue;
+                    }
                     if let Some(pred_out) = self.block_out.get(&pred_idx) {
                         let edge_state = self.transfer.transfer_edge(*edge_kind, pred_out);
                         match &mut state {
@@ -306,6 +317,9 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             } else {
                 let mut state: Option<L> = None;
                 for (succ_idx, edge_kind) in self.cfg.outgoing_edges(block_idx) {
+                    if !self.crosses(block_idx, *edge_kind) {
+                        continue;
+                    }
                     if let Some(succ_in) = self.block_in.get(&succ_idx) {
                         let edge_state = self.transfer.transfer_edge(*edge_kind, succ_in);
                         match &mut state {
@@ -374,6 +388,10 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         })
     }
 
+    fn crosses(&self, from: NodeIndex, kind: CfgEdgeType) -> bool {
+        self.transfer.follows_possible_failures() || !self.cfg.is_possible_failure(from, kind)
+    }
+
     fn transfer_block(&self, block_idx: NodeIndex, in_state: &L) -> L {
         use cfg::CfgVertex;
 
@@ -414,21 +432,22 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                 state
             }
 
+            CfgVertex::LoopEntry(entry) => {
+                let mut state = in_state.clone();
+                for &root in entry.roots() {
+                    self.transfer.transfer_expr_in_place(root, &mut state, &self.body);
+                }
+                state
+            }
+
             CfgVertex::ForHeader(for_vertex) => {
                 let mut state = in_state.clone();
-                self.transfer.transfer_expr_in_place(for_vertex.from, &mut state, &self.body);
-                self.transfer.transfer_expr_in_place(for_vertex.to, &mut state, &self.body);
                 self.transfer.transfer_loop_var_bind(for_vertex.loop_var, &mut state, &self.body);
                 state
             }
 
             CfgVertex::ForEachHeader(foreach_vertex) => {
                 let mut state = in_state.clone();
-                self.transfer.transfer_expr_in_place(
-                    foreach_vertex.collection,
-                    &mut state,
-                    &self.body,
-                );
                 self.transfer.transfer_loop_var_bind(
                     foreach_vertex.loop_var,
                     &mut state,
@@ -602,6 +621,66 @@ mod tests {
                 _ => state.clone(),
             }
         }
+    }
+
+    /// Adds the number of every statement it passes.
+    struct RecordingTransfer {
+        follows_possible_failures: bool,
+    }
+
+    impl Transfer<IntSetLattice> for RecordingTransfer {
+        fn transfer_stmt(&self, stmt: RawIdx, state: &IntSetLattice, _: &Body) -> IntSetLattice {
+            let mut values = state.values.clone();
+            values.push(u32::from(stmt) as i32);
+            IntSetLattice { values }
+        }
+
+        fn follows_possible_failures(&self) -> bool {
+            self.follows_possible_failures
+        }
+    }
+
+    /// `[s0]` → `Попытка` → `[s1]` → exit, with the protected `[s1]` and the entry of
+    /// `Попытка` both leaving for the handler: only an analysis following possible
+    /// failures sees in the handler what `[s1]` did.
+    #[test]
+    fn possible_failure_edges_are_crossed_only_on_request() {
+        use cfg::{BasicBlockVertex, CfgVertex, ControlFlowGraph};
+        use hir_def::StmtId;
+
+        let block = |stmt: u32| {
+            let mut block = BasicBlockVertex::new();
+            block.add_statement(StmtId::from_raw(RawIdx::from(stmt)));
+            CfgVertex::BasicBlock(block)
+        };
+        let mut cfg = ControlFlowGraph::new();
+        let start = cfg.add_vertex(block(0));
+        let try_vertex = cfg.add_vertex(CfgVertex::Try);
+        let point = cfg.add_vertex(block(1));
+        let handler = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        let exit = cfg.exit();
+        cfg.set_start(start);
+        cfg.add_edge(start, try_vertex, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, point, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, handler, CfgEdgeType::Exception);
+        cfg.add_edge(point, exit, CfgEdgeType::Unconditional);
+        cfg.add_edge(point, handler, CfgEdgeType::Exception);
+        cfg.add_edge(handler, exit, CfgEdgeType::Unconditional);
+        assert!(cfg.is_possible_failure(point, CfgEdgeType::Exception));
+        assert!(!cfg.is_possible_failure(try_vertex, CfgEdgeType::Exception));
+        let cfg = Arc::new(cfg);
+
+        let handler_in = |follows_possible_failures| {
+            let transfer = RecordingTransfer { follows_possible_failures };
+            let mut solver = DataflowSolver::new(cfg.clone(), Body::default(), transfer);
+            solver.set_bottom_factory(|| IntSetLattice { values: vec![] });
+            solver.set_initial_state(IntSetLattice { values: vec![] });
+            let mut values = solver.solve().unwrap().block_in(handler).unwrap().values.clone();
+            values.sort_unstable();
+            values
+        };
+        assert_eq!(handler_in(false), vec![0]);
+        assert_eq!(handler_in(true), vec![0, 1]);
     }
 
     #[test]

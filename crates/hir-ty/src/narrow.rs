@@ -1,5 +1,6 @@
 use cfg::CfgEdgeType;
 use dataflow::{Lattice, Transfer};
+use hir_def::body::events::{for_each_expr_child, for_each_stmt_expr_root};
 use hir_def::body::Body;
 use hir_def::hir::{BinaryOp, Expr, Literal, Stmt};
 use hir_def::{DefWithBodyId, ExprId, IdConversion, MethodIdInput, ModuleId, Name};
@@ -435,12 +436,13 @@ fn ty_difference_array_aware(db: &dyn TypeKernelDb, base: TypeId) -> Box<[TypeId
     }
 }
 
+/// Narrowing over `body` along `cfg`, the graph its caller holds for it.
 pub fn narrow_body(
     db: &dyn TypeKernelDb,
     body: Body,
+    cfg: Arc<cfg::ControlFlowGraph>,
     base_types: FxHashMap<Name, TypeId>,
 ) -> Option<dataflow::DataflowResult<NarrowState>> {
-    let cfg = Arc::new(cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body));
     let mut solver =
         dataflow::DataflowSolver::new(cfg, body, NarrowingTransfer::new(db, base_types));
     solver.set_bottom_factory(NarrowState::new);
@@ -457,20 +459,21 @@ pub fn narrow_query(
 
     let resolve_start = Instant::now();
     let module_id = ModuleId { file_id };
-    // A method's body comes from its own memo: reading the file fold here
-    // would tie every caller keyed by the method to the whole file.
+    // A method's body and graph come from its own memos: reading the file
+    // fold here would tie every caller keyed by the method to the whole file.
     let method_body;
     let module_bodies;
-    let body: &Body = match owner {
+    let (body, cfg): (&Body, _) = match owner {
         DefWithBodyId::ModuleCode => {
             module_bodies = db.module_bodies(module_id);
-            module_bodies.module_code()?
+            (module_bodies.module_code()?, db.module_code_cfg(file_id))
         }
         DefWithBodyId::Method(local_id) => {
             let method = hir_def::MethodId { module: module_id, local_id };
             db.interface_method(method)?;
-            method_body = db.method_body(MethodIdInput::new(db, method));
-            &method_body
+            let input = MethodIdInput::new(db, method);
+            method_body = db.method_body(input);
+            (&method_body, db.method_cfg(input))
         }
     };
     let resolve_ns = resolve_start.elapsed().as_nanos();
@@ -488,12 +491,6 @@ pub fn narrow_query(
     let body_owned = body.clone();
     let body_clone_ns = body_clone_start.elapsed().as_nanos();
 
-    let cfg_build_start = Instant::now();
-    let cfg = Arc::new(
-        cfg::CfgBuilder::new().build_graph_from_hir(body_owned.body_stmts_typed(), &body_owned),
-    );
-    let cfg_build_ns = cfg_build_start.elapsed().as_nanos();
-
     let solve_start = Instant::now();
     let mut solver =
         dataflow::DataflowSolver::new(cfg, body_owned, NarrowingTransfer::new(db, base_types));
@@ -507,7 +504,6 @@ pub fn narrow_query(
         infer_ns,
         base_types_ns,
         body_clone_ns,
-        cfg_build_ns,
         solve_ns,
     };
     log_narrow_query_stages(owner, &stages);
@@ -521,7 +517,6 @@ struct NarrowQueryStages {
     infer_ns: u128,
     base_types_ns: u128,
     body_clone_ns: u128,
-    cfg_build_ns: u128,
     solve_ns: u128,
 }
 
@@ -538,7 +533,6 @@ fn log_narrow_query_stages(owner: DefWithBodyId, stages: &NarrowQueryStages) {
         infer_us = to_us(stages.infer_ns),
         base_types_us = to_us(stages.base_types_ns),
         body_clone_us = to_us(stages.body_clone_ns),
-        cfg_build_us = to_us(stages.cfg_build_ns),
         solve_us = to_us(stages.solve_ns),
         "narrow_query stages",
     );
@@ -1017,80 +1011,20 @@ fn containing_vertex(
                 .any(|stmt_id| stmt_covers_expr(body, stmt_id.to_idx(), expr_idx)),
             CfgVertex::Conditional(v) => expr_covers_expr(body, v.condition.to_idx(), expr_idx),
             CfgVertex::WhileHeader(v) => expr_covers_expr(body, v.condition.to_idx(), expr_idx),
-            CfgVertex::ForHeader(v) => {
-                expr_covers_expr(body, v.from.to_idx(), expr_idx)
-                    || expr_covers_expr(body, v.to.to_idx(), expr_idx)
+            CfgVertex::LoopEntry(v) => {
+                v.roots().iter().any(|root| expr_covers_expr(body, root.to_idx(), expr_idx))
             }
-            CfgVertex::ForEachHeader(v) => expr_covers_expr(body, v.collection.to_idx(), expr_idx),
-            CfgVertex::Try | CfgVertex::PreprocCondition(_) | CfgVertex::Exit => false,
+            CfgVertex::ForHeader(_)
+            | CfgVertex::ForEachHeader(_)
+            | CfgVertex::Try
+            | CfgVertex::PreprocCondition(_)
+            | CfgVertex::Exit => false,
         };
         if covers {
             return Some(node_idx);
         }
     }
     None
-}
-
-/// Expression roots a statement contributes to its basic block, i.e. the
-/// trees [`stmt_covers_expr`] searches. Control statements contribute none:
-/// their conditions live on dedicated CFG vertices.
-pub(crate) fn for_each_stmt_expr_root(body: &Body, stmt_idx: StmtIdx, f: &mut impl FnMut(ExprIdx)) {
-    match body.stmt_idx(stmt_idx) {
-        Stmt::Expr(e) => f(*e),
-        Stmt::Assign { target: lhs, value } => {
-            f(*lhs);
-            f(*value);
-        }
-        Stmt::Return { value } | Stmt::Raise { value } => {
-            if let Some(v) = value {
-                f(*v);
-            }
-        }
-        Stmt::Execute { expr } => f(*expr),
-        Stmt::AddHandler { event, handler } | Stmt::RemoveHandler { event, handler } => {
-            f(*event);
-            f(*handler);
-        }
-        Stmt::VarDecl { .. } | Stmt::Break | Stmt::Continue | Stmt::Goto(_) | Stmt::Label(_) => {}
-        Stmt::If(_)
-        | Stmt::PreprocIf(_)
-        | Stmt::While { .. }
-        | Stmt::For { .. }
-        | Stmt::ForEach { .. }
-        | Stmt::Try { .. } => {}
-    }
-}
-
-pub(crate) fn for_each_expr_child(body: &Body, root: ExprIdx, f: &mut impl FnMut(ExprIdx)) {
-    match body.expr_idx(root) {
-        Expr::Missing | Expr::Path(_) | Expr::Literal(_) => {}
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            f(*lhs);
-            f(*rhs);
-        }
-        Expr::UnaryOp { expr, .. } => f(*expr),
-        Expr::Ternary { condition, then_expr, else_expr } => {
-            f(*condition);
-            f(*then_expr);
-            f(*else_expr);
-        }
-        Expr::Call { callee, args } => {
-            f(*callee);
-            args.iter().copied().for_each(f);
-        }
-        Expr::MethodCall { receiver, args, .. } => {
-            f(*receiver);
-            args.iter().copied().for_each(f);
-        }
-        Expr::Index { base, index } => {
-            f(*base);
-            f(*index);
-        }
-        Expr::Field { base, .. } => f(*base),
-        Expr::New { args, .. } => args.iter().copied().for_each(f),
-        Expr::Array(elems) => elems.iter().copied().for_each(f),
-        Expr::Await { expr } => f(*expr),
-    }
 }
 
 fn stmt_covers_expr(body: &Body, stmt_idx: StmtIdx, target: ExprIdx) -> bool {
@@ -1144,12 +1078,16 @@ impl NarrowExprIndex {
                 }
                 CfgVertex::Conditional(v) => add_tree(v.condition.to_idx()),
                 CfgVertex::WhileHeader(v) => add_tree(v.condition.to_idx()),
-                CfgVertex::ForHeader(v) => {
-                    add_tree(v.from.to_idx());
-                    add_tree(v.to.to_idx());
+                CfgVertex::LoopEntry(v) => {
+                    for root in v.roots() {
+                        add_tree(root.to_idx());
+                    }
                 }
-                CfgVertex::ForEachHeader(v) => add_tree(v.collection.to_idx()),
-                CfgVertex::Try | CfgVertex::PreprocCondition(_) | CfgVertex::Exit => {}
+                CfgVertex::ForHeader(_)
+                | CfgVertex::ForEachHeader(_)
+                | CfgVertex::Try
+                | CfgVertex::PreprocCondition(_)
+                | CfgVertex::Exit => {}
             }
         }
         Self { expr_to_vertex }
@@ -1175,6 +1113,17 @@ mod tests {
     use super::*;
     use bsl_types::testing::InMemoryDb;
     use hir_def::hir::UnaryOp;
+
+    /// Narrowing over the graph built from `body` itself.
+    fn narrow_own_graph(
+        db: &dyn TypeKernelDb,
+        body: Body,
+        base_types: FxHashMap<Name, TypeId>,
+    ) -> Option<dataflow::DataflowResult<NarrowState>> {
+        let cfg =
+            Arc::new(cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body));
+        narrow_body(db, body, cfg, base_types)
+    }
 
     fn kdb() -> InMemoryDb {
         InMemoryDb::new()
@@ -2300,8 +2249,8 @@ mod tests {
 
         let db = kdb();
         let body = b.body.clone();
-        let result =
-            narrow_body(&db, body, FxHashMap::default()).expect("narrowing analysis must converge");
+        let result = narrow_own_graph(&db, body, FxHashMap::default())
+            .expect("narrowing analysis must converge");
         let cfg = result.cfg();
 
         use cfg::CfgVertex;
@@ -2357,7 +2306,7 @@ mod tests {
             fold_name(&Name::new("Х")),
             db.union(vec![db.number(None, None), db.string(None, false)]),
         );
-        let result = narrow_body(&db, body, bases).expect("narrowing analysis must converge");
+        let result = narrow_own_graph(&db, body, bases).expect("narrowing analysis must converge");
         let cfg = result.cfg();
 
         use cfg::CfgVertex;
@@ -2404,8 +2353,8 @@ mod tests {
 
         let db = kdb();
         let body = b.body.clone();
-        let result =
-            narrow_body(&db, body, FxHashMap::default()).expect("narrowing analysis must converge");
+        let result = narrow_own_graph(&db, body, FxHashMap::default())
+            .expect("narrowing analysis must converge");
         let cfg = result.cfg();
 
         use cfg::CfgVertex;
@@ -2461,8 +2410,8 @@ mod tests {
 
         let db = kdb();
         let body = b.body.clone();
-        let result =
-            narrow_body(&db, body, FxHashMap::default()).expect("narrowing analysis must converge");
+        let result = narrow_own_graph(&db, body, FxHashMap::default())
+            .expect("narrowing analysis must converge");
         let cfg = result.cfg();
 
         use cfg::CfgVertex;
@@ -2517,7 +2466,7 @@ mod tests {
 
         let body = b.body.clone();
         let result =
-            narrow_body(&db, body.clone(), bases).expect("narrowing analysis must converge");
+            narrow_own_graph(&db, body.clone(), bases).expect("narrowing analysis must converge");
         NarrowProbe { db, result, body, then_body_path, else_body_path: Some(else_body_path) }
     }
 
@@ -2541,7 +2490,7 @@ mod tests {
         b.set_top_level(vec![if_stmt]);
 
         let body = b.body.clone();
-        let result = narrow_body(&db, body.clone(), FxHashMap::default())
+        let result = narrow_own_graph(&db, body.clone(), FxHashMap::default())
             .expect("narrowing analysis must converge");
         NarrowProbe { db, result, body, then_body_path, else_body_path: None }
     }
@@ -2571,8 +2520,8 @@ mod tests {
 
         let db = kdb();
         let body = b.body.clone();
-        let result =
-            narrow_body(&db, body, FxHashMap::default()).expect("narrowing analysis must converge");
+        let result = narrow_own_graph(&db, body, FxHashMap::default())
+            .expect("narrowing analysis must converge");
 
         assert_eq!(
             narrowed_type_at(&db, &result, &b.body,receiver, &Name::new("Х")),
@@ -2706,7 +2655,7 @@ mod tests {
             fold_name(&Name::new("Х")),
             db.union(vec![db.number(None, None), db.string(None, false)]),
         );
-        let result = narrow_body(&db, body, bases).expect("narrowing analysis must converge");
+        let result = narrow_own_graph(&db, body, bases).expect("narrowing analysis must converge");
 
         assert_eq!(
             narrowed_type_at(&db, &result, &b.body,elsif_receiver, &Name::new("Х")),
@@ -2746,8 +2695,8 @@ mod tests {
 
         let db = kdb();
         let body = b.body.clone();
-        let result =
-            narrow_body(&db, body, FxHashMap::default()).expect("narrowing analysis must converge");
+        let result = narrow_own_graph(&db, body, FxHashMap::default())
+            .expect("narrowing analysis must converge");
 
         assert_eq!(
             narrowed_type_at(&db, &result, &b.body,receiver, &Name::new("Х")),

@@ -1,4 +1,5 @@
 pub mod arg_diagnostics;
+pub mod body_flow;
 pub mod builtin;
 mod call_binding;
 pub mod call_resolution;
@@ -44,6 +45,7 @@ pub mod this_object_attr;
 mod type_literal;
 mod user_call_candidates;
 
+pub use body_flow::BodyFlow;
 pub use bsl_config::VisibleConfig;
 pub use call_resolution::{
     ArityFallback, BuiltinCallableId, CallCandidateSet, CallParam, CallParamMode, CallRejection,

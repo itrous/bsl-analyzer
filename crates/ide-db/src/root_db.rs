@@ -139,8 +139,6 @@ pub trait RootDatabase:
         file_id: FileId,
     ) -> Option<Arc<hir::dataflow::DataflowResult<hir::dataflow::security_state::SecurityModeState>>>;
 
-    fn method_cfg(&self, method_id: hir::MethodId) -> Arc<hir::cfg::ControlFlowGraph>;
-
     fn module_level_cfg(&self, module_id: hir::ModuleId) -> Arc<hir::cfg::ControlFlowGraph>;
 
     fn line_index(&self, file_id_input: base_db::FileIdInput) -> Arc<line_index::LineIndex>;
