@@ -16,6 +16,8 @@ const SWEEP_ENTRY_LIMIT: usize = 10_000;
 
 pub(crate) const LEASE_LOCK_FILE: &str = "writer.lease.lock";
 pub(crate) const STALL_REPORT_FILE: &str = "bsl-graph-stall-report.txt";
+/// Records which workspace a cache directory was derived for; see `write_workspace_marker`.
+pub(crate) const WORKSPACE_MARKER_FILE: &str = "workspace.path";
 pub const WORKSPACE_CACHE_SCOPE_ENV: &str = "BSL_MCP_CACHE_SCOPE";
 pub const WORKSPACE_CACHE_BASE_ENV: &str = "BSL_CACHE_DIR";
 const SCOPE_DOMAIN: &[u8] = b"bsl-analyzer/workspace-derived-cache/v1";
@@ -282,8 +284,31 @@ impl WorkspaceCacheLayout {
         if self.root.canonicalize()? != self.root {
             return Err(invalid("workspace cache path changed during startup"));
         }
+        self.write_workspace_marker();
         self.sweep_abandoned_siblings();
         Ok(())
+    }
+
+    /// Record the workspace this directory was derived for, so it stays identifiable without a
+    /// lease.
+    ///
+    /// Identity used to come only from `writer.lease`, which only a process that becomes the
+    /// cache writer ever writes. Measured on one machine: of 1080 cache directories (16 GB) just
+    /// 5 held a lease, and none of those named a missing tree, so the sweep could prove almost
+    /// nothing abandoned. Short CLI runs, tests and degraded runs create the directory here and
+    /// never write a lease, which made them unidentifiable rather than abandoned.
+    ///
+    /// Best effort: a read-only or full disk must not stop a startup. The path is written as
+    /// the OS string's encoded bytes, so nothing is lost on a non-UTF-8 name; the reader treats
+    /// anything it cannot decode as no evidence at all.
+    fn write_workspace_marker(&self) {
+        let Some(workspace) = self.workspace.as_deref() else { return };
+        let marker = self.root.join(WORKSPACE_MARKER_FILE);
+        let content = workspace.as_os_str().as_encoded_bytes();
+        if std::fs::read(&marker).is_ok_and(|existing| existing == content) {
+            return;
+        }
+        let _ = std::fs::write(&marker, content);
     }
 
     /// `ensure` can run more than once per process and a scan of thousands of entries is not
@@ -395,20 +420,34 @@ impl WorkspaceCacheLayout {
     }
 }
 
+/// Liveness comes from the lease (a fresh one always wins); identity comes from the lease's
+/// workspace and, failing that, from the marker `ensure` leaves in every directory.
 fn is_abandoned(dir: &Path) -> bool {
     match inspect_lease_dir(dir) {
         LeaseSnapshot::Fresh => false,
-        // A record of an older program names no tree and so proves nothing; an unanswerable
-        // existence check (e.g. access denied) is not evidence of absence either. Neither is
-        // an unreachable volume: on Windows an absent one (detached USB disk, unmapped network
-        // drive, unattached VHD) answers `Ok(false)` for EVERY path on it, so without the
-        // volume check a detached drive would delete the indexes of all its projects.
-        LeaseSnapshot::Stale { workspace } => workspace.is_some_and(|tree| {
-            volume_root(&tree).is_some_and(|volume| matches!(volume.try_exists(), Ok(true)))
-                && matches!(tree.try_exists(), Ok(false))
-        }),
-        LeaseSnapshot::Unreadable => is_lone_stale_log(dir),
+        LeaseSnapshot::Stale { workspace: Some(tree) } => tree_is_gone(&tree),
+        // A record of an older program names no tree: fall back to the marker.
+        LeaseSnapshot::Stale { workspace: None } => marked_tree_is_gone(dir),
+        LeaseSnapshot::Unreadable => marked_tree_is_gone(dir) || is_lone_stale_log(dir),
     }
+}
+
+/// The tree recorded in `dir`'s marker is provably gone. No marker, an empty or undecodable
+/// one, or a relative path proves nothing.
+fn marked_tree_is_gone(dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(dir.join(WORKSPACE_MARKER_FILE)) else { return false };
+    let Ok(text) = String::from_utf8(bytes) else { return false };
+    !text.is_empty() && tree_is_gone(Path::new(&text))
+}
+
+/// The single proof of absence shared by the lease and marker paths, so they cannot drift.
+/// An unanswerable existence check (e.g. access denied) is not evidence of absence. Neither is
+/// an unreachable volume: on Windows an absent one (detached USB disk, unmapped network
+/// drive, unattached VHD) answers `Ok(false)` for EVERY path on it, so without the volume
+/// check a detached drive would delete the indexes of all its projects.
+fn tree_is_gone(tree: &Path) -> bool {
+    volume_root(tree).is_some_and(|volume| matches!(volume.try_exists(), Ok(true)))
+        && matches!(tree.try_exists(), Ok(false))
 }
 
 /// Root of the volume `path` lives on: `C:\x\y` -> `C:\`, `\\server\share\x` ->
@@ -1406,6 +1445,94 @@ mod tests {
             let dir = sibling(&family, "a", 1, Some(&gone_tree(&family)));
             family.layout.sweep_family();
             assert!(!dir.exists());
+        }
+
+        /// A sibling with NO lease, optionally carrying a marker with the given content.
+        fn leaseless(family: &Family, name: &str, marker: Option<&str>) -> PathBuf {
+            let dir = family.dir.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            if let Some(content) = marker {
+                std::fs::write(dir.join(WORKSPACE_MARKER_FILE), content).unwrap();
+            }
+            dir
+        }
+
+        fn gone_str(family: &Family) -> String {
+            gone_tree(family).to_string_lossy().into_owned()
+        }
+
+        #[test]
+        fn ensure_writes_the_workspace_marker() {
+            let workspace = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let project = project(workspace.path());
+            let layout = WorkspaceCacheLayout::for_project(
+                &project,
+                Some(&cache.path().join("c")),
+                workspace.path(),
+                None,
+            )
+            .unwrap();
+            layout.ensure().unwrap();
+            let marker = layout.root().join(WORKSPACE_MARKER_FILE);
+            let expected = layout.workspace().unwrap().as_os_str().as_encoded_bytes();
+            assert_eq!(std::fs::read(&marker).unwrap(), expected);
+            // A second startup leaves it intact.
+            layout.ensure().unwrap();
+            assert_eq!(std::fs::read(&marker).unwrap(), expected);
+        }
+
+        #[test]
+        fn leaseless_sibling_whose_marker_names_a_missing_tree_is_removed() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = leaseless(&family, "a", Some(&gone_str(&family)));
+            family.layout.sweep_family();
+            assert!(!dir.exists());
+        }
+
+        #[test]
+        fn stale_lease_without_a_tree_defers_to_the_marker() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = sibling(&family, "a", 1, None);
+            std::fs::write(dir.join(WORKSPACE_MARKER_FILE), gone_str(&family)).unwrap();
+            family.layout.sweep_family();
+            assert!(!dir.exists());
+        }
+
+        #[test]
+        fn leaseless_sibling_whose_marker_names_an_existing_tree_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let tree = tempfile::tempdir().unwrap();
+            let dir = leaseless(&family, "a", Some(&tree.path().to_string_lossy()));
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn leaseless_sibling_without_a_marker_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = leaseless(&family, "a", None);
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn fresh_lease_wins_over_a_marker_naming_a_missing_tree() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = sibling(&family, "a", now(), None);
+            std::fs::write(dir.join(WORKSPACE_MARKER_FILE), gone_str(&family)).unwrap();
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn marker_that_is_empty_or_relative_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let empty = leaseless(&family, "a", Some(""));
+            let relative = leaseless(&family, "b", Some("no-such-relative-tree/x"));
+            family.layout.sweep_family();
+            assert!(empty.exists(), "an empty marker proves nothing");
+            assert!(relative.exists(), "a relative path names no volume");
         }
 
         #[test]
