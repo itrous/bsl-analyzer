@@ -103,11 +103,7 @@ impl WorkspaceCacheLayout {
         let base_declared = match selected {
             Some(path) if path.is_absolute() => path,
             Some(path) => current_dir()?.join(path),
-            None => dirs::cache_dir()
-                .ok_or_else(|| {
-                    invalid("OS cache directory is unavailable; set --cache-dir or BSL_CACHE_DIR")
-                })?
-                .join("bsl-analyzer"),
+            None => default_base(&std::env::temp_dir(), &project.root)?,
         };
         let base = canonicalize_nearest(&base_declared)?;
         let scope = project_scope(project)?;
@@ -553,6 +549,40 @@ fn canonicalize_nearest(path: &Path) -> std::io::Result<PathBuf> {
         resolved.push(component);
     }
     Ok(lexical_normalize(&resolved))
+}
+
+/// Name of the throwaway cache family used for workspaces that are themselves throwaway.
+const TEMP_WORKSPACE_CACHE_DIR: &str = "bsl-analyzer-cache";
+
+/// Pick the default cache base for a workspace nobody named a cache directory for.
+///
+/// A workspace under the OS temp dir dies with the run that made it, so its derived cache is
+/// put under the temp dir too: in the user's real cache it would leave one entry per run that
+/// only the sweep ever removes. Anything else keeps the OS cache directory.
+fn default_base(temp_dir: &Path, workspace_root: &Path) -> std::io::Result<PathBuf> {
+    let os_cache = || {
+        dirs::cache_dir()
+            .ok_or_else(|| {
+                invalid("OS cache directory is unavailable; set --cache-dir or BSL_CACHE_DIR")
+            })
+            .map(|dir| dir.join("bsl-analyzer"))
+    };
+    let (Ok(temp), Ok(workspace)) =
+        (canonicalize_nearest(temp_dir), canonicalize_nearest(workspace_root))
+    else {
+        return os_cache();
+    };
+    // Equality, not just containment: a workspace that IS the temp dir would hold its own
+    // cache, which the placement checks rightly refuse for a default base.
+    if !workspace.starts_with(&temp) || workspace == temp {
+        return os_cache();
+    }
+    let candidate = temp.join(TEMP_WORKSPACE_CACHE_DIR);
+    // A workspace rooted inside the throwaway family itself would again contain its own cache.
+    if workspace.starts_with(&candidate) {
+        return os_cache();
+    }
+    Ok(candidate)
 }
 
 fn validate_base_ancestor(declared: &Path, resolved: &Path) -> std::io::Result<()> {
@@ -1260,6 +1290,45 @@ mod tests {
         assert!(accepted
             .root()
             .starts_with(workspace.path().canonicalize().unwrap().join("explicit-cache")));
+    }
+
+    #[test]
+    fn workspace_cache_default_base_for_temp_workspace_stays_in_temp() {
+        let workspace = tempfile::tempdir().unwrap();
+        let project = project(workspace.path());
+        let layout =
+            WorkspaceCacheLayout::for_project(&project, None, workspace.path(), None).unwrap();
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert!(layout.base().starts_with(&temp), "{:?} not under {:?}", layout.base(), temp);
+        if let Some(os_cache) = dirs::cache_dir() {
+            assert!(!layout.base().starts_with(os_cache));
+        }
+        layout.ensure().unwrap();
+        assert!(layout.root().is_dir());
+    }
+
+    #[test]
+    fn workspace_cache_default_base_control_non_temp_workspace_uses_os_cache() {
+        let claimed_temp = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let base = default_base(claimed_temp.path(), workspace.path()).unwrap();
+        assert_eq!(base, dirs::cache_dir().unwrap().join("bsl-analyzer"));
+    }
+
+    #[test]
+    fn workspace_cache_default_base_declines_when_workspace_is_the_temp_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = default_base(dir.path(), dir.path()).unwrap();
+        assert_eq!(base, dirs::cache_dir().unwrap().join("bsl-analyzer"));
+    }
+
+    #[test]
+    fn workspace_cache_default_base_declines_a_workspace_inside_the_cache_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let inside = temp.path().join("bsl-analyzer-cache/ws");
+        std::fs::create_dir_all(&inside).unwrap();
+        let base = default_base(temp.path(), &inside).unwrap();
+        assert_eq!(base, dirs::cache_dir().unwrap().join("bsl-analyzer"));
     }
 
     mod sweep {
