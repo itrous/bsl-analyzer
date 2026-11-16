@@ -476,7 +476,7 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn method_cfg(&self, method_id: hir::MethodId) -> Arc<hir::cfg::ControlFlowGraph> {
-        self.db.method_cfg(method_id)
+        self.db.method_cfg(hir::MethodIdInput::new(self.db, method_id))
     }
 
     fn method_path_terminates(

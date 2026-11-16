@@ -15,6 +15,7 @@ pub use hir_ty::method_lookup::platform_type_key_id;
 pub use hir_ty::min_platform;
 pub use hir_ty::subtype::type_sets_overlap;
 pub use hir_ty::this_object::coerce_to_metadata_ref_id;
+pub use hir_ty::BodyFlow;
 pub use hir_ty::TyLoweringContext;
 pub use hir_ty::{
     bare_global_name_claim, manager_collection_env, resolve_platform_global_property_type,
@@ -48,6 +49,7 @@ pub use hir_def::{
 pub use hir_def::{ExecutionContext, QualifiedName};
 pub use hir_def::{RedundantAccessKind, SdblExprId};
 
+pub use hir_def::body::events::BodyEvents;
 pub use hir_def::body::SourceMapAt;
 pub use hir_def::body::{
     DeprecatedKind8312, ExistingBindingKind, ExternalRef, MagicNumberContext, ManagerType,
@@ -103,8 +105,8 @@ pub use hir_def::metrics;
 pub mod cfg {
     pub use ::cfg::{
         cyclomatic_complexity, BasicBlockVertex, CfgBuilder, CfgEdgeType, CfgVertex,
-        ConditionalVertex, ControlFlowGraph, ForEachHeaderVertex, ForHeaderVertex, NodeIndex,
-        PreprocConditionVertex, WhileHeaderVertex,
+        ConditionalVertex, ControlFlowGraph, ForEachHeaderVertex, ForHeaderVertex, LoopEntryVertex,
+        NodeIndex, PreprocConditionVertex, WhileHeaderVertex,
     };
 }
 

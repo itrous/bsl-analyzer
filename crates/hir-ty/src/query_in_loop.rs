@@ -30,6 +30,11 @@ pub struct QueryExecutionSite {
     pub kind: QueryExecutionKind,
     /// The call sits in a loop body. A header of the outermost loop does not count.
     pub in_loop_body: bool,
+    /// The receiver holds a query on every path even where a call or `Выполнить` may have
+    /// rebound it first. Only such an execution is a finding in its own loop; any proved
+    /// execution makes its method one that runs a query for its callers, as code that turns the
+    /// receiver into something else and still runs `Выполнить` is wrong either way.
+    pub proved_through_rebinding: bool,
 }
 
 /// A call inference resolved to a method of the module under analysis.
@@ -105,7 +110,7 @@ pub fn query_in_loop_candidates(
             facts
                 .executions
                 .iter()
-                .filter(|execution| execution.in_loop_body)
+                .filter(|execution| execution.in_loop_body && execution.proved_through_rebinding)
                 .map(|execution| QueryCallKey { owner, call: execution.call })
                 .filter(|site| active.contains(site))
                 .map(QueryInLoopCandidate::Execution),
@@ -212,7 +217,12 @@ mod tests {
     }
 
     fn execution(call: u32, in_loop_body: bool) -> QueryExecutionSite {
-        QueryExecutionSite { call: expr(call), kind: QueryExecutionKind::Execute, in_loop_body }
+        QueryExecutionSite {
+            call: expr(call),
+            kind: QueryExecutionKind::Execute,
+            in_loop_body,
+            proved_through_rebinding: true,
+        }
     }
 
     /// `main` calls `entry` in a loop; every body gets its own execution ids.

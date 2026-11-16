@@ -16,6 +16,7 @@ use bsl_types::builders::Builders;
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::TypeId;
 
+use crate::body_flow::BodyFlow;
 use crate::call_resolution::{
     resolve_candidates, ArgumentApplicability, ArgumentEvaluation, ArgumentParameter,
     CallRejection, CallResolution, CallSelection, CandidateDisposition, CandidateId,
@@ -39,12 +40,12 @@ pub fn method_arg_diagnostics_query<'db>(
     let _span = tracing::info_span!("method_arg_diagnostics", ?method).entered();
     let method_id = method.method_id(db);
     let infer = db.infer_method_ref(method);
-    let body = db.method_body_ref(method);
+    let flow = BodyFlow::for_method(db, method, db.method_body_ref(method));
     Arc::new(body_arg_diagnostics(
         db,
         method_id.module.file_id,
         DefWithBodyId::Method(method_id.local_id),
-        body,
+        &flow,
         &infer.call_arg_bindings,
         &infer.expr_types,
         &infer.binding_types,
@@ -67,14 +68,15 @@ pub fn module_code_arg_diagnostics_query<'db>(
     let _span = tracing::info_span!("module_code_arg_diagnostics", ?file_id).entered();
     let infer = db.infer_module_code_ref(file_id);
     let module_bodies = db.module_bodies_ref(ModuleId { file_id });
-    let Some(body) = module_bodies.module_code() else {
+    let Some(body) = module_bodies.module_code_arc() else {
         return Arc::new(Vec::new());
     };
+    let flow = BodyFlow::for_module_code(db, file_id, body);
     Arc::new(body_arg_diagnostics(
         db,
         file_id,
         DefWithBodyId::ModuleCode,
-        body,
+        &flow,
         &infer.call_arg_bindings,
         &infer.expr_types,
         &infer.binding_types,
@@ -112,7 +114,7 @@ fn body_arg_diagnostics(
     db: &dyn HirDatabase,
     file_id: FileId,
     owner: DefWithBodyId,
-    body: &Body,
+    flow: &BodyFlow,
     bindings: &[CallArgBinding],
     expr_types: &FxHashMap<ExprId, TypeId>,
     binding_types: &FxHashMap<BindingId, TypeId>,
@@ -120,13 +122,14 @@ fn body_arg_diagnostics(
     if bindings.is_empty() {
         return Vec::new();
     }
+    let body: &Body = flow.body();
     let narrowing_enabled = db.type_narrowing_enabled();
     let start = Instant::now();
 
     // Narrowing is asked for once per body, and only once a call passes a
     // bare name as an argument — the only shape narrowing can refine.
     let mut narrow: Option<Option<Arc<dataflow::DataflowResult<NarrowState>>>> = None;
-    let mut values = DocumentedValues::new(db, file_id, owner, body, bindings, binding_types);
+    let mut values = DocumentedValues::new(db, flow, bindings, binding_types);
     let mut out = Vec::new();
     for binding in bindings {
         // A branch no environment of this body compiles never reaches the
@@ -201,8 +204,7 @@ fn narrow_arg(
 /// is such a value. Answered lazily, and only for arguments a call was rejected on.
 struct DocumentedValues<'a> {
     db: &'a dyn HirDatabase,
-    file_id: FileId,
-    owner: DefWithBodyId,
+    flow: &'a BodyFlow,
     body: &'a Body,
     bindings: &'a [CallArgBinding],
     binding_types: &'a FxHashMap<BindingId, TypeId>,
@@ -213,17 +215,14 @@ struct DocumentedValues<'a> {
 impl<'a> DocumentedValues<'a> {
     fn new(
         db: &'a dyn HirDatabase,
-        file_id: FileId,
-        owner: DefWithBodyId,
-        body: &'a Body,
+        flow: &'a BodyFlow,
         bindings: &'a [CallArgBinding],
         binding_types: &'a FxHashMap<BindingId, TypeId>,
     ) -> Self {
         Self {
             db,
-            file_id,
-            owner,
-            body,
+            flow,
+            body: flow.body(),
             bindings,
             binding_types,
             reaching: None,
@@ -305,23 +304,13 @@ impl<'a> DocumentedValues<'a> {
                 DefSite::VarDecl(_)
                 | DefSite::ForLoop(_)
                 | DefSite::ForEachLoop(_)
-                | DefSite::Unknown => false,
+                | DefSite::Unknown
+                | DefSite::MayWrite(_) => false,
             })
     }
 
     fn reaching(&mut self) -> Option<Arc<ReachingDefsResult>> {
-        self.reaching
-            .get_or_insert_with(|| match self.owner {
-                DefWithBodyId::Method(local_id) => {
-                    let module = ModuleId::new(self.file_id);
-                    self.db.method_reaching_definitions(MethodIdInput::new(
-                        self.db,
-                        MethodId { module, local_id },
-                    ))
-                }
-                DefWithBodyId::ModuleCode => self.db.module_code_reaching_definitions(self.file_id),
-            })
-            .clone()
+        self.reaching.get_or_insert_with(|| self.flow.reaching_defs(self.db)).clone()
     }
 }
 

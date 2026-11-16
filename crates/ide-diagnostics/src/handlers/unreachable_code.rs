@@ -205,7 +205,7 @@ fn get_vertex_range(
                 last_range.in_root().end(),
             )))
         }
-        CfgVertex::Conditional(_) => None,
+        CfgVertex::Conditional(_) | CfgVertex::LoopEntry(_) => None,
         CfgVertex::WhileHeader(loop_vertex) => source_map.expr_range(loop_vertex.condition),
         CfgVertex::ForHeader(loop_vertex) => source_map.binding_range(loop_vertex.loop_var),
         CfgVertex::ForEachHeader(loop_vertex) => source_map.binding_range(loop_vertex.loop_var),
