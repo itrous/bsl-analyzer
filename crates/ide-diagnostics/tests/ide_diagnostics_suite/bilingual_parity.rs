@@ -21,6 +21,7 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::IsInRoleMethod,
     DiagnosticCode::IteratorCollidesCollection,
     DiagnosticCode::MissingTempStorageDeletion,
+    DiagnosticCode::MissingNotifyHandler,
     DiagnosticCode::MissingTemporaryFileDeletion,
     DiagnosticCode::NestedConstructorsInStructureDeclaration,
     DiagnosticCode::NumberOfValuesInStructureConstructor,
@@ -821,12 +822,21 @@ EndProcedure"#,
     RollbackTransaction();
 EndProcedure"#,
     ),
+    (
+        DiagnosticCode::MissingNotifyHandler,
+        r#"Процедура Тест()
+    Оповещение = Новый ОписаниеОповещения("Обработчик", ЭтотОбъект);
+КонецПроцедуры"#,
+        r#"Procedure Test()
+    Notification = New NotifyDescription("Handler", ThisObject);
+EndProcedure"#,
+    ),
 ];
 
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 228, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 229, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]
