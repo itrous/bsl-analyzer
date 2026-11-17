@@ -3148,7 +3148,14 @@ impl<'db> InferenceContext<'db> {
                         }
                         self.reaching_defs_of(found)
                     }
-                    None => self.reaching_assignment_types_at(self.read_point(use_stmt)?, &key)?,
+                    None => {
+                        let point = self.read_point(use_stmt)?;
+                        let mut defs = self.reaching_definitions_at(point, &key)?;
+                        let interrupted =
+                            self.writes_reaching_through_a_handler(point, &key, &defs)?;
+                        defs.extend(interrupted);
+                        self.reaching_defs_of(defs)
+                    }
                 };
                 // A write the analysis cannot read leaves a value no definition accounts for:
                 // the executable reaching definitions carry it as a possible write at the place
@@ -3323,6 +3330,41 @@ impl<'db> InferenceContext<'db> {
         stmt_id: StmtId,
         var_key: &str,
     ) -> Option<Vec<ReachingDef>> {
+        Some(self.reaching_defs_of(self.reaching_definitions_at(stmt_id, var_key)?))
+    }
+
+    /// The assignments of `var_key` that reach the start of `stmt_id` only through the handler
+    /// of a `Попытка`, absent from `seen`. Reaching definitions over every edge hand the handler
+    /// the state before the protected statements, so an assignment an exception interrupts part
+    /// way through them is missing there; the executable solution follows the exceptional exit
+    /// of each protected point and carries it. Only assignments are taken: the executable
+    /// solution also sees a loop header rebind its variable, which the caller puts back itself.
+    /// A statement no execution reaches has no state there and no write reaches it this way.
+    /// `None` when the executable solution is unavailable: the set of writes is then unproven.
+    fn writes_reaching_through_a_handler(
+        &self,
+        stmt_id: StmtId,
+        var_key: &str,
+        seen: &[dataflow::reaching_defs::Definition],
+    ) -> Option<Vec<dataflow::reaching_defs::Definition>> {
+        use dataflow::reaching_defs::DefSite;
+
+        let executable = self.flow.executable_reaching_defs(self.db)?;
+        let defs = executable.defs_for_var_at_stmt(var_key, stmt_id).unwrap_or_default();
+        Some(
+            defs.into_iter()
+                .filter(|def| matches!(def.def_site, DefSite::Assignment(_)))
+                .filter(|def| !seen.contains(def))
+                .collect(),
+        )
+    }
+
+    /// The definitions of `var_key` reaching the start of `stmt_id`, over every edge.
+    fn reaching_definitions_at(
+        &self,
+        stmt_id: StmtId,
+        var_key: &str,
+    ) -> Option<Vec<dataflow::reaching_defs::Definition>> {
         let module = hir_def::ModuleId::new(self.context_file_id);
         let body_defs = match self.owner {
             DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
@@ -3332,8 +3374,7 @@ impl<'db> InferenceContext<'db> {
                 self.db.module_code_reaching_definitions(self.context_file_id)?
             }
         };
-        let defs = body_defs.defs_for_var_at_stmt(var_key, stmt_id)?;
-        Some(self.reaching_defs_of(defs))
+        body_defs.defs_for_var_at_stmt(var_key, stmt_id)
     }
 
     /// Whether a call or `Выполнить` may have rebound `key` before `read` in `stmt`. A body
