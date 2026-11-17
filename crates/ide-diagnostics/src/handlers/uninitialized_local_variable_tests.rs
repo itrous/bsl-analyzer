@@ -271,7 +271,7 @@ fn unproven_call_or_execute_suppresses() {
 /// A local handed to a platform function counts as initialized by the call, whatever the corpus
 /// says of the parameter: the check judges a read only on the code's own `Знач`. `СтрДлина`
 /// and the second parameter of `ПоместитьФайл` are attested by value, the first one of
-/// `ПоместитьФайл` by reference; none of them reports.
+/// `ПоместитьФайл` by reference; none of them reports (#889).
 #[test]
 fn platform_function_argument_suppresses_whatever_the_corpus_says() {
     let with_call = |call: &str| {

@@ -6501,7 +6501,8 @@ pub(crate) fn argument_passing_of(
 /// parameter, and `None` for any other callee. A platform callable's direction comes from the
 /// help corpus; it settles whether the callee can rebind the local, but an uninitialized read
 /// is reported only on the code's own declaration, so a local handed to a platform callable
-/// stays unjudged and counts as initialized by the call.
+/// stays unjudged and counts as initialized by the call. Whether the corpus facts join this
+/// check is an open decision with its condition stated in #889.
 pub(crate) fn declared_argument_passing_of(
     db: &dyn HirDatabase,
     bindings: &[CallArgBinding],

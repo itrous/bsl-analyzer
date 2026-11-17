@@ -172,17 +172,17 @@ fn a_write_through_a_call_proven_by_reference_is_not_flagged() {
 
 #[test]
 fn a_value_a_call_may_have_rewritten_without_attestation_is_not_flagged() {
-    // Measured over five real configurations: reporting this shape gives 11582 findings against
-    // 10 without it, and the extra ones are plain string comparisons (`Если ИмяЭлемента =
-    // "КодБанка"`), because the walk answers this reason before it looks at the value's origin.
+    // The call's passing direction is not attested, so it may have written something else into
+    // the local: the walk meets the assignment's type-name text with `RewriteDirectionUnknown`,
+    // and an unproven value is not reported.
     let body = "    Имя = Строка(ТипЗнч(Объект));\n    НеизвестнаяПроцедура(Имя);\n    Если Имя = \"Документ\" Тогда\n    КонецЕсли;";
     let d = run(body);
     assert!(d.is_empty(), "{d:?}");
 }
 
-/// Order, which the body-wide scan this replaced could not see: the write happens AFTER the
-/// comparison, so the value compared is the one the assignment gave, and the finding stands.
-/// The control is the same write one statement earlier, which does silence it.
+/// Order matters: the write happens AFTER the comparison, so the value compared is the one the
+/// assignment gave, and the finding stands. The control is the same write one statement
+/// earlier, which does silence it.
 #[test]
 fn a_write_through_a_by_reference_call_after_the_read_does_not_silence_the_finding() {
     let after = "    Имя = Строка(ТипЗнч(Объект));\n    Если Имя = \"Документ\" Тогда\n    КонецЕсли;\n    ВвестиСтроку(Имя);";
@@ -242,11 +242,12 @@ fn plain_string_comparison_without_a_type_name_is_not_flagged() {
     assert!(d.is_empty(), "{d:?}");
 }
 
-// ---- shapes of the earlier name-matching rule that are deliberately NOT caught yet -------
+// ---- shapes of a type-name text comparison that are deliberately NOT caught yet -----------
 //
 // Each needs a function identified by its NAME (or a literal that arrives indirectly), which
 // this rule may not do. Identifying them needs new curated platform data - a separate step.
-// The cases stay here, ignored, so that the knowledge of what is not caught is not lost.
+// The cases stay here, ignored, so that the knowledge of what is not caught is not lost; each
+// is unignored once its shape is a platform or value-origin fact (#888).
 
 #[test]
 #[ignore = "not caught yet: Найти(<имя типа>, \"литерал\") compared with a number needs the function identified by name; needs curated platform data, a separate step"]

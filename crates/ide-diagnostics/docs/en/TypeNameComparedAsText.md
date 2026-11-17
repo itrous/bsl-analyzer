@@ -4,7 +4,7 @@
 
 The expression `String(TypeOf(Value))` turns a type name into text, and that text depends on the interface language: the same value renders differently in the Russian and the English interface. If a decision is taken on such text, then when the language changes the condition silently stops matching: there is no error, the intended branch just no longer runs.
 
-The platform does not catch it: the comparison runs without an error and gives the expected result in the developer's language. This is a code-standards finding, not a runtime error.
+The platform does not catch it: the comparison runs without an error and gives the expected result in the developer's language. This is a code-quality finding, not a runtime error.
 
 The correct way to compare types is `Type()`: `TypeOf(Value) = Type("CatalogRef.Products")`. Such a comparison does not depend on the interface language.
 

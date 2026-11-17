@@ -12,7 +12,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     minutes_to_fix: 5,
     activated_by_default: false,
     compatibility_mode: DiagnosticCompatibilityMode::Undefined,
-    tags: &[MetadataTag::Standard, MetadataTag::Badpractice],
+    tags: &[MetadataTag::Badpractice],
     can_locate_on_project: false,
     extra_min_for_complexity: 0.0,
     lsp_severity_override: "",
@@ -64,10 +64,10 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
     }
 }
 
-/// Only a proven type-name text is reported; no `Unproven` reason is. The weakest reason,
-/// `RewriteDirectionUnknown`, means nothing is proven about the value (the walk returns it before
-/// it looks at the origin), so reporting it would flood the rule: 11582 findings against 10 over
-/// the same five configurations.
+/// Only a proven type-name text is reported; no `Unproven` reason is. Even the weakest one,
+/// `RewriteDirectionUnknown`, leaves the value unproven: a call whose passing direction is not
+/// attested may have written something else into the local between the assignment and the
+/// comparison, so the text the comparison reads is not known to be a type name.
 fn is_reportable(origin: ValueOrigin) -> bool {
     matches!(origin, ValueOrigin::TypeNameText)
 }

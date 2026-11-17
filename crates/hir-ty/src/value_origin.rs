@@ -18,9 +18,7 @@ use std::sync::Arc;
 use dataflow::reaching_defs::{DefSite, ReachingDefsResult};
 use hir_def::body::Body;
 use hir_def::hir::{Expr, Stmt};
-use hir_def::{
-    BindingId, DefWithBodyId, ExprId, IdConversion, MethodId, MethodIdInput, ModuleId, StmtId,
-};
+use hir_def::{DefWithBodyId, ExprId, IdConversion, MethodId, MethodIdInput, ModuleId, StmtId};
 use rustc_hash::FxHashMap;
 use stdx::case::CaseExt;
 use vfs::FileId;
@@ -95,26 +93,17 @@ pub struct ValueOriginWalk<'a> {
     body: &'a Body,
     bindings: &'a [CallArgBinding],
     expr_types: &'a FxHashMap<ExprId, TypeId>,
-    // Kept for parity with the other walks over one inference result; a parameter has no
-    // assigned value to follow, so the walk reads no binding type.
-    #[allow(dead_code)]
-    binding_types: &'a FxHashMap<BindingId, TypeId>,
     implicit_locals: &'a FxHashMap<String, ImplicitLocalInfo>,
     reaching: Option<Option<Arc<ReachingDefsResult>>>,
     memo: FxHashMap<ExprId, ValueOrigin>,
 }
 
 impl<'a> ValueOriginWalk<'a> {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the fields of one inference result, passed as they are held"
-    )]
     pub fn new(
         db: &'a dyn HirDatabase,
         flow: &'a BodyFlow,
         bindings: &'a [CallArgBinding],
         expr_types: &'a FxHashMap<ExprId, TypeId>,
-        binding_types: &'a FxHashMap<BindingId, TypeId>,
         implicit_locals: &'a FxHashMap<String, ImplicitLocalInfo>,
     ) -> Self {
         Self {
@@ -123,7 +112,6 @@ impl<'a> ValueOriginWalk<'a> {
             body: flow.body(),
             bindings,
             expr_types,
-            binding_types,
             implicit_locals,
             reaching: None,
             memo: FxHashMap::default(),
@@ -256,9 +244,10 @@ impl<'a> ValueOriginWalk<'a> {
                 | DefSite::ForLoop(_)
                 | DefSite::ForEachLoop(_) => ValueOrigin::Other,
                 // A writer the walk cannot see through. `Выполнить` and a PROVEN by-reference
-                // argument certainly can write, so they are not a matter of an unknown
-                // direction and do not fall under the policy knob. The meet below settles what
-                // happens when such a write reaches a read beside an ordinary definition.
+                // argument certainly can write: `Rewritten`. A call whose direction is not
+                // attested may write or not: `RewriteDirectionUnknown`. One proven to take the
+                // argument by value writes nothing and gives no definition. The meet below
+                // settles what happens when such a write reaches a read beside an ordinary one.
                 DefSite::MayWrite(_) => match crate::possible_writes::rebinding(
                     self.db,
                     self.body,
@@ -317,7 +306,6 @@ pub fn value_origin_of(
                 &flow,
                 &infer.call_arg_bindings,
                 &infer.expr_types,
-                &infer.binding_types,
                 &infer.implicit_locals,
             )
             .value_origin_on_every_path(expr)
@@ -334,7 +322,6 @@ pub fn value_origin_of(
                 &flow,
                 &infer.call_arg_bindings,
                 &infer.expr_types,
-                &infer.binding_types,
                 &infer.implicit_locals,
             )
             .value_origin_on_every_path(expr)
