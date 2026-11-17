@@ -15,8 +15,8 @@ use smol_str::SmolStr;
 
 use crate::types::{
     CodeExample, ConstructorDocs, ContextAvailability, GlobalFunction, GlobalFunctionVariant,
-    MethodDocs, MethodParam, MethodVariant, ParamDocs, PlatformConstructor, PlatformMethod,
-    PlatformProperty, PlatformType, PropertyDocs,
+    MethodDocs, MethodParam, MethodVariant, ParamDocs, ParamPassing, PlatformConstructor,
+    PlatformMethod, PlatformProperty, PlatformType, PropertyDocs,
 };
 use crate::GLOBAL_CONTEXT_OWNER;
 
@@ -39,6 +39,10 @@ pub struct PlatformSnapshot {
     /// lives on the corpus side of the overlay, so every source ends up here
     /// with it. Empty when no overlay attests anything.
     pub member_surface_attestations: Vec<MemberSurfaceAttestation>,
+    /// Scopes whose parameters with no `passing` record are attested as passed by value,
+    /// carried by the curated overlays (`parameter_passing_attestations`). Empty when no
+    /// overlay attests anything.
+    pub parameter_passing_attestations: Vec<ParameterPassingAttestationRecord>,
 }
 
 /// One of the two member surfaces of a platform type an attestation can cover.
@@ -93,6 +97,20 @@ pub struct MemberSurfaceAttestation {
     pub verified_against_version: String,
     /// The surfaces the extract is attested complete for.
     pub surfaces: AttestedSurfaces,
+}
+
+/// One `parameter_passing_attestations` entry, resolved to the corpus it was applied to: in
+/// `scope` a parameter with no `passing` record is passed by value, except for the arguments
+/// of `unverified_functions`, whose parameters the extract does not document in full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterPassingAttestationRecord {
+    /// `global_context` for the global functions.
+    pub scope: String,
+    /// The platform release the claim was verified against, `8.3.27`.
+    pub verified_against_version: String,
+    /// The functions of the scope that stay unknown instead of by value, each by the Russian
+    /// name the extract spells it with.
+    pub unverified_functions: Vec<String>,
 }
 
 /// Why a corpus could not become a snapshot. Nothing is published on error: the
@@ -169,6 +187,9 @@ impl PlatformSnapshot {
         let member_surface_attestations =
             crate::overlays::parse_resolved_member_surface_attestations(&data, overlays)
                 .map_err(overlay_error)?;
+        let parameter_passing_attestations =
+            crate::overlays::parse_resolved_parameter_passing_attestations(&data, overlays)
+                .map_err(overlay_error)?;
 
         let mut snapshot = decode(&data)?;
         snapshot.member_surface_attestations = member_surface_attestations
@@ -179,6 +200,7 @@ impl PlatformSnapshot {
                 surfaces: attestation.surfaces,
             })
             .collect();
+        snapshot.parameter_passing_attestations = parameter_passing_attestations;
         snapshot.validate()?;
         Ok(snapshot)
     }
@@ -470,8 +492,9 @@ fn decode(data: &Value) -> Result<PlatformSnapshot, SnapshotDecodeError> {
             name: string(method, "name"),
             english_name: string(method, "english_name"),
             return_type: opt_string(method, "return_type"),
-            parameters: params(method),
-            variants: variants(method)
+            parameters: params(method)?,
+            variants: variants(method)?
+                .into_iter()
                 .map(|(variant_name, parameters)| MethodVariant { variant_name, parameters })
                 .collect(),
             min_version: opt_string(method, "min_version"),
@@ -489,8 +512,9 @@ fn decode(data: &Value) -> Result<PlatformSnapshot, SnapshotDecodeError> {
             name: string(function, "name"),
             english_name: string(function, "english_name"),
             return_type: opt_string(function, "return_type"),
-            parameters: params(function),
-            variants: variants(function)
+            parameters: params(function)?,
+            variants: variants(function)?
+                .into_iter()
                 .map(|(variant_name, parameters)| GlobalFunctionVariant {
                     variant_name,
                     parameters,
@@ -510,7 +534,7 @@ fn decode(data: &Value) -> Result<PlatformSnapshot, SnapshotDecodeError> {
             id,
             type_name: string(ctor, "type_name"),
             variant_name: opt_string(ctor, "variant_name"),
-            parameters: params(ctor),
+            parameters: params(ctor)?,
             min_version: opt_string(ctor, "min_version"),
             context: context(ctor),
         });
@@ -595,29 +619,65 @@ fn context(entry: &Value) -> Option<ContextAvailability> {
     })
 }
 
-fn param_list(params: &[Value]) -> Vec<MethodParam> {
+/// A literal this decoder does not know can only come from our own overlay writer, so it is an
+/// error: reading it as unknown would hide a typo behind a plausible answer.
+fn passing(param: &Value) -> Result<Option<ParamPassing>, SnapshotDecodeError> {
+    match param.get("passing") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(literal)) if literal == "by_value" => Ok(Some(ParamPassing::ByVal)),
+        Some(Value::String(literal)) if literal == "by_ref" => Ok(Some(ParamPassing::ByRef)),
+        Some(other) => Err(SnapshotDecodeError(format!(
+            "parameter passing `{other}` is not one of `by_value`, `by_ref`"
+        ))),
+    }
+}
+
+/// Absent is `false`: the fact is additive, so a parameter nobody recorded claims nothing. A value
+/// that is not a boolean can only come from our own overlay writer, so it is an error.
+fn result_follows_argument_text(param: &Value) -> Result<bool, SnapshotDecodeError> {
+    match param.get("result_follows_argument_text") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(SnapshotDecodeError(format!(
+            "parameter result_follows_argument_text `{other}` is not a boolean"
+        ))),
+    }
+}
+
+fn param_list(params: &[Value]) -> Result<Vec<MethodParam>, SnapshotDecodeError> {
     params
         .iter()
-        .map(|param| MethodParam {
-            name: string(param, "name"),
-            param_type: opt_string(param, "param_type"),
-            is_optional: param.get("is_optional").and_then(Value::as_bool).unwrap_or(false),
-            is_variadic: param.get("is_variadic").and_then(Value::as_bool).unwrap_or(false),
+        .map(|param| {
+            Ok(MethodParam {
+                name: string(param, "name"),
+                param_type: opt_string(param, "param_type"),
+                is_optional: param.get("is_optional").and_then(Value::as_bool).unwrap_or(false),
+                is_variadic: param.get("is_variadic").and_then(Value::as_bool).unwrap_or(false),
+                passing: passing(param)?,
+                result_follows_argument_text: result_follows_argument_text(param)?,
+            })
         })
         .collect()
 }
 
-fn params(entry: &Value) -> Vec<MethodParam> {
-    entry.get("parameters").and_then(Value::as_array).map(|p| param_list(p)).unwrap_or_default()
+fn params(entry: &Value) -> Result<Vec<MethodParam>, SnapshotDecodeError> {
+    entry
+        .get("parameters")
+        .and_then(Value::as_array)
+        .map(|p| param_list(p))
+        .unwrap_or_else(|| Ok(Vec::new()))
 }
 
-fn variants(entry: &Value) -> impl Iterator<Item = (Option<SmolStr>, Vec<MethodParam>)> + '_ {
+type DecodedVariant = (Option<SmolStr>, Vec<MethodParam>);
+
+fn variants(entry: &Value) -> Result<Vec<DecodedVariant>, SnapshotDecodeError> {
     entry
         .get("variants")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|variant| (opt_string(variant, "variant_name"), params(variant)))
+        .map(|variant| Ok((opt_string(variant, "variant_name"), params(variant)?)))
+        .collect()
 }
 
 fn text(docs: &Map<String, Value>, field: &str) -> String {

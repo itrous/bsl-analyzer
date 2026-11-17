@@ -2124,10 +2124,14 @@ mod tests {
                 Path::new(SHARED_MODULE_REL),
                 &default_filters(),
             );
-            let from_the_extension =
-                run(&state, &extension.join(SHARED_MODULE_REL), &default_filters());
-            let from_the_configuration =
-                run(&state, &workspace.join(SHARED_MODULE_REL), &default_filters());
+            // The result id carries the path text, and the rooted answer resolves a key into a
+            // host path component by component: the files on disk are named the same way here,
+            // not by joining the `/`-spelled constant whole (a mixed spelling on Windows).
+            let on_disk = |base: &Path| {
+                SHARED_MODULE_REL.split('/').fold(base.to_path_buf(), |path, part| path.join(part))
+            };
+            let from_the_extension = run(&state, &on_disk(&extension), &default_filters());
+            let from_the_configuration = run(&state, &on_disk(&workspace), &default_filters());
 
             assert_eq!(
                 rooted["result_id"], from_the_extension["result_id"],

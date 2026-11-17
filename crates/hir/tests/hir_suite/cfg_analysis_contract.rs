@@ -113,12 +113,9 @@ fn observation(source: &str) -> String {
         let payload = match vertex {
             CfgVertex::Conditional(v) => format!("condition={:?}", v.condition),
             CfgVertex::WhileHeader(v) => format!("condition={:?}", v.condition),
-            CfgVertex::ForHeader(v) => {
-                format!("from={:?}; to={:?}; binding={:?}", v.from, v.to, v.loop_var)
-            }
-            CfgVertex::ForEachHeader(v) => {
-                format!("collection={:?}; binding={:?}", v.collection, v.loop_var)
-            }
+            CfgVertex::LoopEntry(v) => format!("entry={:?}", v.roots()),
+            CfgVertex::ForHeader(v) => format!("binding={:?}", v.loop_var),
+            CfgVertex::ForEachHeader(v) => format!("each binding={:?}", v.loop_var),
             CfgVertex::PreprocCondition(v) => format!(
                 "condition={:?}; directive={:?}; full={:?}",
                 v.condition_range, v.directive_range, v.full_range
@@ -150,13 +147,18 @@ fn observation(source: &str) -> String {
         writeln!(out, "  {transition}").unwrap();
     }
 
-    let index = DefinitionIndex::from_body(body);
+    let events = Arc::new(hir_def::body::events::BodyEvents::collect(body));
+    let index = DefinitionIndex::from_body(body, &events);
     for limit in [3, DEFAULT_MAX_ITERATIONS] {
         let mut solver = DataflowSolver::new(graph.clone(), body.clone(), ReachingDefsTransfer);
         solver.set_max_iterations(limit);
         solver.set_bottom_factory(|| ReachingDefs::new(index.clone()));
         solver.set_initial_state(ReachingDefs::new(index.clone()));
-        let result = ReachingDefsResult::new(solver.solve().unwrap(), Arc::new(body.clone()));
+        let result = ReachingDefsResult::new(
+            solver.solve().unwrap(),
+            Arc::new(body.clone()),
+            events.clone(),
+        );
         writeln!(out, "definitions (limit {limit}):").unwrap();
         for (id, stmt) in body.stmts_iter() {
             // Labels route control but perform no transfer. Their standalone

@@ -2196,7 +2196,10 @@ mod tests {
             db.referencing_files("mdo/Catalog/Товары", Some(&roots)).unwrap(),
             vec![dir
                 .path()
-                .join("CommonModules/Вызов/Ext/Module.bsl")
+                .join("CommonModules")
+                .join("Вызов")
+                .join("Ext")
+                .join("Module.bsl")
                 .to_string_lossy()
                 .into_owned()],
         );
@@ -2316,11 +2319,17 @@ mod tests {
             files,
             vec![
                 dir.path()
-                    .join("CommonModules/Б/Ext/Module.bsl")
+                    .join("CommonModules")
+                    .join("Б")
+                    .join("Ext")
+                    .join("Module.bsl")
                     .to_string_lossy()
                     .into_owned(),
                 dir.path()
-                    .join("CommonModules/Г/Ext/Module.bsl")
+                    .join("CommonModules")
+                    .join("Г")
+                    .join("Ext")
+                    .join("Module.bsl")
                     .to_string_lossy()
                     .into_owned(),
             ],

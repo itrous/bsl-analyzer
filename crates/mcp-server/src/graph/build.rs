@@ -11440,7 +11440,11 @@ mod tests {
         let configuration = workspace.path().join("src/cf");
         fs::create_dir_all(&configuration).unwrap();
         let external = tempfile::tempdir().unwrap();
-        let external_file = external.path().join("CommonModules/Ext/Ext/Module.bsl");
+        // Assembled by component: a stored key resolves back to a host path, and a mixed
+        // spelling of the same file (host and `/` separators together) would not equal it.
+        let external_file = ["CommonModules", "Ext", "Ext", "Module.bsl"]
+            .iter()
+            .fold(external.path().to_path_buf(), |path, part| path.join(part));
         fs::create_dir_all(external_file.parent().unwrap()).unwrap();
         fs::write(&external_file, "&НаСервере\nПроцедура Внешняя() КонецПроцедуры").unwrap();
         let (roots, rejected) = bsl_search::WorkspaceRoots::build(

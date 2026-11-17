@@ -2,13 +2,13 @@ use crate::edge::CfgEdgeType;
 use crate::graph::ControlFlowGraph;
 use crate::vertex::{
     BasicBlockVertex, CfgVertex, ConditionalVertex, ForEachHeaderVertex, ForHeaderVertex,
-    PreprocConditionVertex, WhileHeaderVertex,
+    LoopEntryVertex, PreprocConditionVertex, WhileHeaderVertex,
 };
 use cfg_types::{BindingId, ExprId, IdConversion, StmtId};
 use hir_def::hir::StmtIdx;
 use hir_def::{Body, Name, Stmt};
 use petgraph::graph::NodeIndex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 struct LoopFrame {
     header: NodeIndex,
@@ -26,6 +26,11 @@ pub struct CfgBuilder {
     label_table: FxHashMap<Name, NodeIndex>,
 
     pending_gotos: Vec<(NodeIndex, Name)>,
+
+    /// Evaluation points inside `Попытка`, each with the handler an error
+    /// there reaches. Their exception edges are added once the graph is
+    /// complete, from the points execution can reach.
+    protected_points: Vec<(NodeIndex, NodeIndex)>,
 }
 
 impl CfgBuilder {
@@ -37,6 +42,7 @@ impl CfgBuilder {
             loop_stack: Vec::new(),
             label_table: FxHashMap::default(),
             pending_gotos: Vec::new(),
+            protected_points: Vec::new(),
         }
     }
 
@@ -65,7 +71,45 @@ impl CfgBuilder {
             }
         }
 
+        self.link_protected_points();
         self.cfg
+    }
+
+    /// An error may interrupt any evaluation inside `Попытка`, so each live
+    /// point there also leaves for the nearest handler. Dead points get no
+    /// such edge: what they would carry never executes. Handlers are reached
+    /// from the entry of `Попытка` already, so these edges change no point's
+    /// liveness.
+    fn link_protected_points(&mut self) {
+        let live = self.live_vertices();
+        for (point, handler) in std::mem::take(&mut self.protected_points) {
+            if live.contains(&point) {
+                self.cfg.add_edge(point, handler, CfgEdgeType::Exception);
+            }
+        }
+    }
+
+    fn live_vertices(&self) -> FxHashSet<NodeIndex> {
+        let mut live = FxHashSet::default();
+        let mut stack: Vec<NodeIndex> = self.cfg.start().into_iter().collect();
+        while let Some(vertex) = stack.pop() {
+            if live.insert(vertex) {
+                stack.extend(
+                    self.cfg
+                        .outgoing_edges(vertex)
+                        .filter(|(_, kind)| kind.is_executable())
+                        .map(|(target, _)| target),
+                );
+            }
+        }
+        live
+    }
+
+    /// Records `point` as evaluated inside the innermost active `Попытка`.
+    fn protect(&mut self, point: NodeIndex) {
+        if let Some(&handler) = self.except_stack.last() {
+            self.protected_points.push((point, handler));
+        }
     }
 
     fn walk_statement_hir(&mut self, stmt_id: StmtIdx, body: &Body) {
@@ -76,32 +120,28 @@ impl CfgBuilder {
             }
         }
         match stmt {
-            Stmt::Return { .. } => self.walk_return_statement_hir(stmt_id),
+            Stmt::Return { value } => self.walk_return_statement_hir(stmt_id, value.is_some()),
             Stmt::Raise { .. } => self.walk_raise_statement_hir(stmt_id),
             Stmt::If(_) => self.walk_if_statement_hir(stmt_id, body),
             Stmt::PreprocIf(_) => self.walk_preproc_if_statement_hir(stmt_id, body),
             Stmt::While { condition, body: loop_body } => self.walk_loop(
                 stmt_id,
+                None,
                 CfgVertex::WhileHeader(WhileHeaderVertex::new(ExprId::from_idx(*condition))),
                 loop_body,
                 body,
             ),
             Stmt::For { var, from, to, body: loop_body } => self.walk_loop(
                 stmt_id,
-                CfgVertex::ForHeader(ForHeaderVertex::new(
-                    BindingId::from_idx(*var),
-                    ExprId::from_idx(*from),
-                    ExprId::from_idx(*to),
-                )),
+                Some(LoopEntryVertex::For([ExprId::from_idx(*from), ExprId::from_idx(*to)])),
+                CfgVertex::ForHeader(ForHeaderVertex::new(BindingId::from_idx(*var))),
                 loop_body,
                 body,
             ),
             Stmt::ForEach { var, collection, body: loop_body } => self.walk_loop(
                 stmt_id,
-                CfgVertex::ForEachHeader(ForEachHeaderVertex::new(
-                    BindingId::from_idx(*var),
-                    ExprId::from_idx(*collection),
-                )),
+                Some(LoopEntryVertex::ForEach(ExprId::from_idx(*collection))),
+                CfgVertex::ForEachHeader(ForEachHeaderVertex::new(BindingId::from_idx(*var))),
                 loop_body,
                 body,
             ),
@@ -112,6 +152,9 @@ impl CfgBuilder {
             Stmt::Label(_) => self.walk_label_statement_hir(stmt_id, body),
             _ => {
                 self.add_to_current_block_hir(stmt_id);
+                if evaluates(stmt) {
+                    self.protect_current_block();
+                }
             }
         }
     }
@@ -120,11 +163,29 @@ impl CfgBuilder {
         self.cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()))
     }
 
+    /// Inside `Попытка` every statement gets a block of its own, so the state
+    /// between two protected statements is a block boundary an exception edge
+    /// can leave from.
     fn add_to_current_block_hir(&mut self, stmt_id: StmtIdx) {
+        let Some(mut block_idx) = self.current_block else { return };
+        if !self.except_stack.is_empty() && !self.block_is_empty(block_idx) {
+            let next = self.new_block();
+            self.link_to(block_idx, next);
+            block_idx = next;
+            self.current_block = Some(next);
+        }
+        if let Some(CfgVertex::BasicBlock(block)) = self.cfg.vertex_mut(block_idx) {
+            block.add_statement(StmtId::from_idx(stmt_id));
+        }
+    }
+
+    fn block_is_empty(&self, block_idx: NodeIndex) -> bool {
+        !matches!(self.cfg.vertex(block_idx), Some(CfgVertex::BasicBlock(block)) if !block.is_empty())
+    }
+
+    fn protect_current_block(&mut self) {
         if let Some(block_idx) = self.current_block {
-            if let Some(CfgVertex::BasicBlock(block)) = self.cfg.vertex_mut(block_idx) {
-                block.add_statement(StmtId::from_idx(stmt_id));
-            }
+            self.protect(block_idx);
         }
     }
 
@@ -149,8 +210,12 @@ impl CfgBuilder {
         self.cfg.add_edge(from, to, kind);
     }
 
-    fn walk_return_statement_hir(&mut self, stmt_id: StmtIdx) {
+    /// The returned expression is evaluated before the jump, in the same block.
+    fn walk_return_statement_hir(&mut self, stmt_id: StmtIdx, has_value: bool) {
         self.add_to_current_block_hir(stmt_id);
+        if has_value {
+            self.protect_current_block();
+        }
 
         if let Some(block_idx) = self.current_block {
             let exit = self.cfg.exit();
@@ -255,6 +320,7 @@ impl CfgBuilder {
                 CfgVertex::Conditional(ConditionalVertex::new(ExprId::from_idx(if_stmt.condition))),
                 StmtId::from_idx(stmt_id),
             );
+            self.protect(cond_vertex);
 
             if let Some(current) = self.current_block {
                 self.cfg.add_edge(current, cond_vertex, CfgEdgeType::Unconditional);
@@ -283,6 +349,7 @@ impl CfgBuilder {
                     ))),
                     StmtId::from_idx(stmt_id),
                 );
+                self.protect(elsif_cond);
 
                 self.cfg.add_edge(current_cond, elsif_cond, CfgEdgeType::FalseBranch);
 
@@ -392,21 +459,33 @@ impl CfgBuilder {
         }
     }
 
-    /// The header holds what the loop computes before each pass and tests the
-    /// continuation. The block after the loop exists before the body is walked
-    /// because `Прервать` inside the body needs it as a target.
+    /// What a counted or collection loop evaluates once sits in its entry,
+    /// which only the text before the loop reaches; the header holds what the
+    /// loop does before each pass and tests the continuation. The body's end
+    /// and `Продолжить` return to the header. The block after the loop exists
+    /// before the body is walked because `Прервать` inside the body needs it
+    /// as a target.
     fn walk_loop(
         &mut self,
         stmt_id: StmtIdx,
+        entry: Option<LoopEntryVertex>,
         header: CfgVertex,
         loop_body: &[StmtIdx],
         body: &Body,
     ) {
-        let header = self.cfg.add_vertex_with_origin(header, StmtId::from_idx(stmt_id));
+        let origin = StmtId::from_idx(stmt_id);
+        let entry =
+            entry.map(|entry| self.cfg.add_vertex_with_origin(CfgVertex::LoopEntry(entry), origin));
+        let header = self.cfg.add_vertex_with_origin(header, origin);
 
         if let Some(current) = self.current_block {
-            self.link_to(current, header);
+            self.link_to(current, entry.unwrap_or(header));
         }
+        if let Some(entry) = entry {
+            self.protect(entry);
+            self.link_to(entry, header);
+        }
+        self.protect(header);
 
         let body_block = self.new_block();
         self.cfg.add_edge(header, body_block, CfgEdgeType::TrueBranch);
@@ -480,6 +559,12 @@ impl CfgBuilder {
             self.current_block = Some(merge_block);
         }
     }
+}
+
+/// A plain statement that evaluates something an error may interrupt; `Перем`
+/// only declares names.
+fn evaluates(stmt: &Stmt) -> bool {
+    !matches!(stmt, Stmt::VarDecl { .. })
 }
 
 impl Default for CfgBuilder {
@@ -824,6 +909,356 @@ mod tests {
             jump_from_goto,
             "Forward `Перейти` must be patched with an edge once the label arrives",
         );
+    }
+
+    fn block_of(cfg: &ControlFlowGraph, stmt: StmtIdx) -> NodeIndex {
+        cfg.vertices()
+            .find(|(_, v)| {
+                matches!(v, CfgVertex::BasicBlock(bb) if bb.statements().contains(&StmtId::from_idx(stmt)))
+            })
+            .map(|(idx, _)| idx)
+            .expect("the statement must sit in a block")
+    }
+
+    fn only_vertex(cfg: &ControlFlowGraph, predicate: impl Fn(&CfgVertex) -> bool) -> NodeIndex {
+        let found: Vec<_> =
+            cfg.vertices().filter(|(_, v)| predicate(v)).map(|(idx, _)| idx).collect();
+        assert_eq!(found.len(), 1, "expected exactly one such vertex, got {found:?}");
+        found[0]
+    }
+
+    fn has_edge(cfg: &ControlFlowGraph, from: NodeIndex, to: NodeIndex, kind: CfgEdgeType) -> bool {
+        cfg.outgoing_edges(from).any(|(target, edge)| target == to && *edge == kind)
+    }
+
+    fn executable_out(cfg: &ControlFlowGraph, from: NodeIndex) -> Vec<(NodeIndex, CfgEdgeType)> {
+        let mut out: Vec<_> = cfg
+            .outgoing_edges(from)
+            .filter(|(_, kind)| kind.is_executable())
+            .map(|(target, kind)| (target, *kind))
+            .collect();
+        out.sort_by_key(|(target, _)| target.index());
+        out
+    }
+
+    fn incoming(cfg: &ControlFlowGraph, to: NodeIndex) -> Vec<(NodeIndex, CfgEdgeType)> {
+        cfg.incoming_edges(to).map(|(source, kind)| (source, *kind)).collect()
+    }
+
+    fn literal(body: &mut Body) -> hir_def::hir::ExprIdx {
+        body.exprs_mut().alloc(hir_def::Expr::Literal(hir_def::Literal::Bool(true)))
+    }
+
+    fn expr_stmt(body: &mut Body) -> StmtIdx {
+        let value = literal(body);
+        body.stmts_mut().alloc(Stmt::Expr(value))
+    }
+
+    /// `before; <loop> (Если c Тогда Продолжить; КонецЕсли; tail)`: the loop is
+    /// made by `make_loop` from its body.
+    struct LoopShape {
+        cfg: ControlFlowGraph,
+        before: StmtIdx,
+        cont: StmtIdx,
+        tail: StmtIdx,
+    }
+
+    fn loop_shape(make_loop: impl FnOnce(&mut Body, Box<[StmtIdx]>) -> Stmt) -> LoopShape {
+        let mut body = Body::default();
+        let before = expr_stmt(&mut body);
+        let cont = body.stmts_mut().alloc(Stmt::Continue);
+        let condition = literal(&mut body);
+        let guard = body.stmts_mut().alloc(Stmt::If(Box::new(hir_def::IfStmt {
+            condition,
+            then_branch: vec![cont].into(),
+            elsif_branches: Box::default(),
+            else_branch: None,
+        })));
+        let tail = expr_stmt(&mut body);
+        let looped = make_loop(&mut body, vec![guard, tail].into());
+        let loop_stmt = body.stmts_mut().alloc(looped);
+        body.set_body_stmts(vec![before, loop_stmt].into());
+        let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
+        LoopShape { cfg, before, cont, tail }
+    }
+
+    /// The entry is reached only from the text before the loop and leads only to
+    /// the header; the body's end and `Продолжить` return to the header.
+    fn assert_entered_once(shape: &LoopShape, header: NodeIndex, entry: NodeIndex) {
+        let LoopShape { cfg, before, cont, tail } = shape;
+        assert_eq!(
+            incoming(cfg, entry),
+            vec![(block_of(cfg, *before), CfgEdgeType::Unconditional)]
+        );
+        assert_eq!(executable_out(cfg, entry), vec![(header, CfgEdgeType::Unconditional)]);
+        assert!(has_edge(cfg, block_of(cfg, *tail), header, CfgEdgeType::Unconditional));
+        assert!(has_edge(cfg, block_of(cfg, *cont), header, CfgEdgeType::Unconditional));
+        assert_eq!(cfg.source_stmt_id(entry), cfg.source_stmt_id(header));
+    }
+
+    #[test]
+    fn for_bounds_are_evaluated_once_on_entry() {
+        let mut bounds = None;
+        let mut loop_var = None;
+        let shape = loop_shape(|body, loop_body| {
+            let var = body.bindings_mut().alloc(hir_def::Binding::var(Name::new("И")));
+            let (from, to) = (literal(body), literal(body));
+            bounds = Some([ExprId::from_idx(from), ExprId::from_idx(to)]);
+            loop_var = Some(BindingId::from_idx(var));
+            Stmt::For { var, from, to, body: loop_body }
+        });
+        let cfg = &shape.cfg;
+        let entry = only_vertex(cfg, |v| matches!(v, CfgVertex::LoopEntry(_)));
+        let header = only_vertex(cfg, |v| matches!(v, CfgVertex::ForHeader(_)));
+        assert!(matches!(
+            cfg.vertex(entry),
+            Some(CfgVertex::LoopEntry(LoopEntryVertex::For(roots))) if Some(*roots) == bounds
+        ));
+        assert!(matches!(
+            cfg.vertex(header),
+            Some(CfgVertex::ForHeader(h)) if Some(h.loop_var) == loop_var
+        ));
+        assert_entered_once(&shape, header, entry);
+    }
+
+    #[test]
+    fn for_each_collection_is_evaluated_once_on_entry() {
+        let mut collection = None;
+        let shape = loop_shape(|body, loop_body| {
+            let var = body.bindings_mut().alloc(hir_def::Binding::var(Name::new("Э")));
+            let items = literal(body);
+            collection = Some(ExprId::from_idx(items));
+            Stmt::ForEach { var, collection: items, body: loop_body }
+        });
+        let cfg = &shape.cfg;
+        let entry = only_vertex(cfg, |v| matches!(v, CfgVertex::LoopEntry(_)));
+        let header = only_vertex(cfg, |v| matches!(v, CfgVertex::ForEachHeader(_)));
+        assert!(matches!(
+            cfg.vertex(entry),
+            Some(CfgVertex::LoopEntry(LoopEntryVertex::ForEach(root))) if Some(*root) == collection
+        ));
+        assert_entered_once(&shape, header, entry);
+    }
+
+    #[test]
+    fn while_condition_is_evaluated_before_every_pass() {
+        let mut condition = None;
+        let shape = loop_shape(|body, loop_body| {
+            let tested = literal(body);
+            condition = Some(ExprId::from_idx(tested));
+            Stmt::While { condition: tested, body: loop_body }
+        });
+        let LoopShape { cfg, before, cont, tail } = &shape;
+        assert!(cfg.vertices().all(|(_, v)| !matches!(v, CfgVertex::LoopEntry(_))));
+        let header = only_vertex(cfg, |v| matches!(v, CfgVertex::WhileHeader(_)));
+        assert!(matches!(
+            cfg.vertex(header),
+            Some(CfgVertex::WhileHeader(h)) if Some(h.condition) == condition
+        ));
+        assert!(has_edge(cfg, block_of(cfg, *before), header, CfgEdgeType::Unconditional));
+        assert!(has_edge(cfg, block_of(cfg, *tail), header, CfgEdgeType::Unconditional));
+        assert!(has_edge(cfg, block_of(cfg, *cont), header, CfgEdgeType::Unconditional));
+    }
+
+    #[test]
+    fn each_elsif_condition_is_evaluated_at_its_own_vertex() {
+        let mut body = Body::default();
+        let conditions = [literal(&mut body), literal(&mut body), literal(&mut body)];
+        let branches: Vec<StmtIdx> = (0..3).map(|_| expr_stmt(&mut body)).collect();
+        let if_stmt = body.stmts_mut().alloc(Stmt::If(Box::new(hir_def::IfStmt {
+            condition: conditions[0],
+            then_branch: vec![branches[0]].into(),
+            elsif_branches: vec![
+                (conditions[1], vec![branches[1]].into()),
+                (conditions[2], vec![branches[2]].into()),
+            ]
+            .into(),
+            else_branch: None,
+        })));
+        body.set_body_stmts(vec![if_stmt].into());
+        let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
+
+        let vertex_of = |condition: hir_def::hir::ExprIdx| {
+            only_vertex(
+                &cfg,
+                |v| matches!(v, CfgVertex::Conditional(c) if c.condition == ExprId::from_idx(condition)),
+            )
+        };
+        let vertices = conditions.map(vertex_of);
+        assert!(has_edge(&cfg, vertices[0], vertices[1], CfgEdgeType::FalseBranch));
+        assert!(has_edge(&cfg, vertices[1], vertices[2], CfgEdgeType::FalseBranch));
+        for (vertex, branch) in vertices.iter().zip(&branches) {
+            assert!(has_edge(&cfg, *vertex, block_of(&cfg, *branch), CfgEdgeType::TrueBranch));
+            assert_eq!(cfg.source_stmt_id(*vertex), Some(StmtId::from_idx(if_stmt)));
+        }
+    }
+
+    /// `Попытка a; Если c Тогда b; Пока w Цикл d; Для И = f По t Цикл e; Возврат v;
+    /// Исключение h; КонецПопытки`.
+    #[test]
+    fn every_live_protected_point_may_reach_the_handler() {
+        let mut body = Body::default();
+        let a = expr_stmt(&mut body);
+        let b = expr_stmt(&mut body);
+        let condition = literal(&mut body);
+        let if_stmt = body.stmts_mut().alloc(Stmt::If(Box::new(hir_def::IfStmt {
+            condition,
+            then_branch: vec![b].into(),
+            elsif_branches: Box::default(),
+            else_branch: None,
+        })));
+        let d = expr_stmt(&mut body);
+        let tested = literal(&mut body);
+        let while_stmt =
+            body.stmts_mut().alloc(Stmt::While { condition: tested, body: vec![d].into() });
+        let e = expr_stmt(&mut body);
+        let var = body.bindings_mut().alloc(hir_def::Binding::var(Name::new("И")));
+        let (from, to) = (literal(&mut body), literal(&mut body));
+        let for_stmt = body.stmts_mut().alloc(Stmt::For { var, from, to, body: vec![e].into() });
+        let returned = literal(&mut body);
+        let ret = body.stmts_mut().alloc(Stmt::Return { value: Some(returned) });
+        let h = expr_stmt(&mut body);
+        let try_stmt = body.stmts_mut().alloc(Stmt::Try {
+            body: vec![a, if_stmt, while_stmt, for_stmt, ret].into(),
+            except: vec![h].into(),
+        });
+        body.set_body_stmts(vec![try_stmt].into());
+        let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
+
+        let handler = block_of(&cfg, h);
+        let try_vertex = only_vertex(&cfg, |v| matches!(v, CfgVertex::Try));
+        assert!(has_edge(&cfg, try_vertex, handler, CfgEdgeType::Exception));
+        for stmt in [a, b, d, e, ret] {
+            let block = block_of(&cfg, stmt);
+            assert!(
+                has_edge(&cfg, block, handler, CfgEdgeType::Exception),
+                "statement {stmt:?} must reach the handler"
+            );
+        }
+        let evaluations: [fn(&CfgVertex) -> bool; 4] = [
+            |v| matches!(v, CfgVertex::Conditional(_)),
+            |v| matches!(v, CfgVertex::WhileHeader(_)),
+            |v| matches!(v, CfgVertex::LoopEntry(_)),
+            |v| matches!(v, CfgVertex::ForHeader(_)),
+        ];
+        for evaluation in evaluations {
+            let vertex = only_vertex(&cfg, evaluation);
+            assert!(
+                has_edge(&cfg, vertex, handler, CfgEdgeType::Exception),
+                "{:?} must reach the handler",
+                cfg.vertex(vertex)
+            );
+        }
+        assert!(cfg.outgoing_edges(handler).all(|(_, kind)| *kind != CfgEdgeType::Exception));
+    }
+
+    #[test]
+    fn protected_statements_get_blocks_of_their_own() {
+        let mut body = Body::default();
+        let [x1, x2, p1, p2] = [(); 4].map(|_| expr_stmt(&mut body));
+        let try_stmt =
+            body.stmts_mut().alloc(Stmt::Try { body: vec![p1, p2].into(), except: Box::default() });
+        body.set_body_stmts(vec![x1, x2, try_stmt].into());
+        let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
+
+        assert_eq!(block_of(&cfg, x1), block_of(&cfg, x2), "unprotected text is not split");
+        let (first, second) = (block_of(&cfg, p1), block_of(&cfg, p2));
+        assert_ne!(first, second);
+        assert!(has_edge(&cfg, first, second, CfgEdgeType::Unconditional));
+    }
+
+    /// `Попытка Возврат; dead; Исключение h; КонецПопытки`: neither the bare
+    /// return, which evaluates nothing, nor the dead statement reach the handler.
+    #[test]
+    fn dead_and_non_evaluating_points_do_not_reach_the_handler() {
+        let mut body = Body::default();
+        let ret = body.stmts_mut().alloc(Stmt::Return { value: None });
+        let dead = expr_stmt(&mut body);
+        let h = expr_stmt(&mut body);
+        let try_stmt = body
+            .stmts_mut()
+            .alloc(Stmt::Try { body: vec![ret, dead].into(), except: vec![h].into() });
+        body.set_body_stmts(vec![try_stmt].into());
+        let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
+
+        let handler = block_of(&cfg, h);
+        assert!(!has_edge(&cfg, block_of(&cfg, ret), handler, CfgEdgeType::Exception));
+        assert!(!has_edge(&cfg, block_of(&cfg, dead), handler, CfgEdgeType::Exception));
+        assert_eq!(
+            executable_out(&cfg, block_of(&cfg, ret)),
+            vec![(cfg.exit(), CfgEdgeType::Unconditional)]
+        );
+    }
+
+    /// `Попытка Пока c Цикл Прервать; КонецЦикла; Возврат v; Исключение h; КонецПопытки`:
+    /// the jumps keep their single target and the return evaluates before it jumps.
+    #[test]
+    fn protected_jumps_keep_no_fall_through() {
+        let mut body = Body::default();
+        let brk = body.stmts_mut().alloc(Stmt::Break);
+        let condition = literal(&mut body);
+        let while_stmt = body.stmts_mut().alloc(Stmt::While { condition, body: vec![brk].into() });
+        let returned = literal(&mut body);
+        let ret = body.stmts_mut().alloc(Stmt::Return { value: Some(returned) });
+        let h = expr_stmt(&mut body);
+        let try_stmt = body
+            .stmts_mut()
+            .alloc(Stmt::Try { body: vec![while_stmt, ret].into(), except: vec![h].into() });
+        body.set_body_stmts(vec![try_stmt].into());
+        let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
+
+        let header = only_vertex(&cfg, |v| matches!(v, CfgVertex::WhileHeader(_)));
+        let after_loop = cfg
+            .outgoing_edges(header)
+            .find(|(_, kind)| **kind == CfgEdgeType::FalseBranch)
+            .map(|(target, _)| target)
+            .unwrap();
+        assert_eq!(
+            executable_out(&cfg, block_of(&cfg, brk)),
+            vec![(after_loop, CfgEdgeType::Unconditional)]
+        );
+        let mut expected = vec![
+            (cfg.exit(), CfgEdgeType::Unconditional),
+            (block_of(&cfg, h), CfgEdgeType::Exception),
+        ];
+        expected.sort_by_key(|(target, _)| target.index());
+        assert_eq!(executable_out(&cfg, block_of(&cfg, ret)), expected);
+    }
+
+    /// `Попытка Попытка p; Исключение q; КонецПопытки; Исключение r; КонецПопытки`.
+    #[test]
+    fn inner_handler_points_reach_the_outer_handler() {
+        let mut body = Body::default();
+        let [p, q, r] = [(); 3].map(|_| expr_stmt(&mut body));
+        let inner =
+            body.stmts_mut().alloc(Stmt::Try { body: vec![p].into(), except: vec![q].into() });
+        let outer =
+            body.stmts_mut().alloc(Stmt::Try { body: vec![inner].into(), except: vec![r].into() });
+        body.set_body_stmts(vec![outer].into());
+        let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
+
+        let (p, q, r) = (block_of(&cfg, p), block_of(&cfg, q), block_of(&cfg, r));
+        assert!(has_edge(&cfg, p, q, CfgEdgeType::Exception));
+        assert!(!has_edge(&cfg, p, r, CfgEdgeType::Exception));
+        assert!(has_edge(&cfg, q, r, CfgEdgeType::Exception));
+    }
+
+    /// Complexity counts the decisions of the text: `Для` and `Попытка` one each,
+    /// whatever the loop entry and the protected points add to the graph.
+    #[test]
+    fn loop_entry_and_possible_failures_add_no_complexity() {
+        let mut body = Body::default();
+        let [a, b, c] = [(); 3].map(|_| expr_stmt(&mut body));
+        let var = body.bindings_mut().alloc(hir_def::Binding::var(Name::new("И")));
+        let (from, to) = (literal(&mut body), literal(&mut body));
+        let for_stmt = body.stmts_mut().alloc(Stmt::For { var, from, to, body: vec![c].into() });
+        let try_stmt = body
+            .stmts_mut()
+            .alloc(Stmt::Try { body: vec![a, b, for_stmt].into(), except: Box::default() });
+        body.set_body_stmts(vec![try_stmt].into());
+        let cfg = CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body);
+
+        assert_eq!(crate::cyclomatic_complexity(&cfg), 3);
     }
 
     #[test]

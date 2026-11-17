@@ -73,6 +73,22 @@ pub enum CallSelection {
     Rejected(CallRejection),
 }
 
+impl CallSelection {
+    /// The one callee the call settles on: the unique candidate, or the sole survivor of a
+    /// selection that stayed undecided (an undocumented parameter leaves it `Ambiguous`).
+    /// `None` when more than one callee is possible - then the call proves nothing.
+    pub(crate) fn sole_candidate(&self) -> Option<CandidateId> {
+        match self {
+            CallSelection::Unique { candidate } => Some(*candidate),
+            CallSelection::Ambiguous { candidates } => match candidates.as_ref() {
+                [only] => Some(*only),
+                _ => None,
+            },
+            CallSelection::Rejected(_) => None,
+        }
+    }
+}
+
 /// Complete deterministic result of resolving one candidate set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallResolution {
@@ -312,4 +328,54 @@ fn aggregate_return(
         return db.unknown();
     }
     db.union(returns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_unique_candidate_is_the_sole_one() {
+        let selection = CallSelection::Unique { candidate: CandidateId::FunctionValue };
+
+        assert_eq!(selection.sole_candidate(), Some(CandidateId::FunctionValue));
+    }
+
+    #[test]
+    fn an_ambiguous_selection_with_one_survivor_is_decided() {
+        let selection =
+            CallSelection::Ambiguous { candidates: Box::new([CandidateId::FunctionValue]) };
+
+        assert_eq!(selection.sole_candidate(), Some(CandidateId::FunctionValue));
+    }
+
+    #[test]
+    fn an_ambiguous_selection_with_two_survivors_proves_nothing() {
+        let selection = CallSelection::Ambiguous {
+            candidates: Box::new([CandidateId::FunctionValue, CandidateId::FunctionValue]),
+        };
+
+        assert_eq!(selection.sole_candidate(), None);
+    }
+
+    #[test]
+    fn an_ambiguous_selection_without_candidates_proves_nothing() {
+        let selection = CallSelection::Ambiguous { candidates: Box::new([]) };
+
+        assert_eq!(selection.sole_candidate(), None);
+    }
+
+    #[test]
+    fn a_rejected_selection_proves_nothing_whatever_the_reason() {
+        let fallback = ArityFallback {
+            candidate: CandidateId::FunctionValue,
+            mismatch: ArityMismatch::TooFew { actual: 0, required: 1 },
+            distance: 1,
+        };
+        for rejection in
+            [CallRejection::NoCandidates, CallRejection::Arity { fallback }, CallRejection::Type]
+        {
+            assert_eq!(CallSelection::Rejected(rejection).sole_candidate(), None);
+        }
+    }
 }

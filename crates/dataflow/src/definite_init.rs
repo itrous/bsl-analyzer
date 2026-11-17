@@ -186,14 +186,12 @@ pub fn analyze_definite_init(
             CfgVertex::WhileHeader(header) => {
                 record(InitPoint::Header(header.condition), vertex, entry);
             }
-            CfgVertex::ForHeader(header) => {
-                record(InitPoint::Header(header.from), vertex, entry);
+            CfgVertex::LoopEntry(loop_entry) => {
                 let mut state = entry.clone();
-                header_events(&mut state, header.from);
-                record(InitPoint::Header(header.to), vertex, &state);
-            }
-            CfgVertex::ForEachHeader(header) => {
-                record(InitPoint::Header(header.collection), vertex, entry);
+                for &root in loop_entry.roots() {
+                    record(InitPoint::Header(root), vertex, &state);
+                    header_events(&mut state, root);
+                }
             }
             _ => {}
         }
@@ -270,7 +268,10 @@ impl DefiniteInitResult {
         while let Some(pair) = queue.pop_front() {
             let (vertex, back_only) = pair;
             for (from, &edge) in cfg.incoming_edges(vertex) {
-                if !edge.is_executable() || (back_only && !self.is_back_edge(from, vertex)) {
+                if !edge.is_executable()
+                    || cfg.is_possible_failure(from, edge)
+                    || (back_only && !self.is_back_edge(from, vertex))
+                {
                     continue;
                 }
                 if !self.inner.block_out(from).is_some_and(|state| state.lacks(bit)) {
@@ -320,7 +321,7 @@ fn steps_to(
 #[cfg(test)]
 mod tests {
     use cfg::{
-        BasicBlockVertex, ConditionalVertex, ForEachHeaderVertex, ForHeaderVertex,
+        BasicBlockVertex, ConditionalVertex, ForEachHeaderVertex, ForHeaderVertex, LoopEntryVertex,
         WhileHeaderVertex,
     };
 
@@ -452,11 +453,7 @@ mod tests {
             let mut cfg = ControlFlowGraph::new();
             let start = cfg.add_vertex(block(&[0]));
             let header = cfg.add_vertex_with_origin(
-                CfgVertex::ForHeader(ForHeaderVertex::new(
-                    BindingId::from_raw(RawIdx::from(0)),
-                    expr(0),
-                    expr(1),
-                )),
+                CfgVertex::ForHeader(ForHeaderVertex::new(BindingId::from_raw(RawIdx::from(0)))),
                 stmt(10),
             );
             let body = cfg.add_vertex(block(&[1]));
@@ -537,33 +534,38 @@ mod tests {
         assert_eq!(DefiniteInit::Unreached.is_initialized(1), None);
     }
 
-    /// `[s0]` → `Для` (bounds e0, e1; statement 10) → body `[s1]`, back; false →
-    /// `Для Каждого` (collection e2; statement 11) → body `[s2]`, back; false →
-    /// `Если` (e3; statement 12) → `[s3]` / `[s4]` → merge `[s5]`.
+    /// `[s0]` → `Для` entry (bounds e0, e1; statement 10) → header → body `[s1]`,
+    /// back to the header; false → `Для Каждого` entry (collection e2; statement 11)
+    /// → header → body `[s2]`, back; false → `Если` (e3; statement 12) → `[s3]` /
+    /// `[s4]` → merge `[s5]`.
     struct HeaderCfg {
         cfg: ControlFlowGraph,
+        for_entry: NodeIndex,
         for_header: NodeIndex,
-        for_each_header: NodeIndex,
+        for_each_entry: NodeIndex,
         conditional: NodeIndex,
     }
 
     fn header_cfg() -> HeaderCfg {
         let mut cfg = ControlFlowGraph::new();
         let start = cfg.add_vertex(block(&[0]));
+        let for_entry = cfg.add_vertex_with_origin(
+            CfgVertex::LoopEntry(LoopEntryVertex::For([expr(0), expr(1)])),
+            stmt(10),
+        );
         let for_header = cfg.add_vertex_with_origin(
-            CfgVertex::ForHeader(ForHeaderVertex::new(
-                BindingId::from_raw(RawIdx::from(0)),
-                expr(0),
-                expr(1),
-            )),
+            CfgVertex::ForHeader(ForHeaderVertex::new(BindingId::from_raw(RawIdx::from(0)))),
             stmt(10),
         );
         let for_body = cfg.add_vertex(block(&[1]));
+        let for_each_entry = cfg.add_vertex_with_origin(
+            CfgVertex::LoopEntry(LoopEntryVertex::ForEach(expr(2))),
+            stmt(11),
+        );
         let for_each_header = cfg.add_vertex_with_origin(
-            CfgVertex::ForEachHeader(ForEachHeaderVertex::new(
-                BindingId::from_raw(RawIdx::from(1)),
-                expr(2),
-            )),
+            CfgVertex::ForEachHeader(ForEachHeaderVertex::new(BindingId::from_raw(RawIdx::from(
+                1,
+            )))),
             stmt(11),
         );
         let for_each_body = cfg.add_vertex(block(&[2]));
@@ -576,10 +578,12 @@ mod tests {
         let merge = cfg.add_vertex(block(&[5]));
         let exit = cfg.exit();
         cfg.set_start(start);
-        cfg.add_edge(start, for_header, CfgEdgeType::Unconditional);
+        cfg.add_edge(start, for_entry, CfgEdgeType::Unconditional);
+        cfg.add_edge(for_entry, for_header, CfgEdgeType::Unconditional);
         cfg.add_edge(for_header, for_body, CfgEdgeType::TrueBranch);
         cfg.add_edge(for_body, for_header, CfgEdgeType::Unconditional);
-        cfg.add_edge(for_header, for_each_header, CfgEdgeType::FalseBranch);
+        cfg.add_edge(for_header, for_each_entry, CfgEdgeType::FalseBranch);
+        cfg.add_edge(for_each_entry, for_each_header, CfgEdgeType::Unconditional);
         cfg.add_edge(for_each_header, for_each_body, CfgEdgeType::TrueBranch);
         cfg.add_edge(for_each_body, for_each_header, CfgEdgeType::Unconditional);
         cfg.add_edge(for_each_header, conditional, CfgEdgeType::FalseBranch);
@@ -588,12 +592,12 @@ mod tests {
         cfg.add_edge(then_block, merge, CfgEdgeType::Unconditional);
         cfg.add_edge(else_block, merge, CfgEdgeType::Unconditional);
         cfg.add_edge(merge, exit, CfgEdgeType::Unconditional);
-        HeaderCfg { cfg, for_header, for_each_header, conditional }
+        HeaderCfg { cfg, for_entry, for_header, for_each_entry, conditional }
     }
 
     #[test]
     fn header_points_are_recorded_with_their_events() {
-        let HeaderCfg { cfg, for_header, for_each_header, conditional } = header_cfg();
+        let HeaderCfg { cfg, for_entry, for_each_entry, conditional, .. } = header_cfg();
         let mut events = events(1, &[]);
         events.header.insert(expr(0), vec![0]);
         let result = solve(cfg, events);
@@ -603,9 +607,9 @@ mod tests {
         assert_eq!(initialized(InitPoint::Header(expr(1))), Some(true));
         assert_eq!(initialized(InitPoint::Header(expr(2))), Some(true));
         assert_eq!(initialized(InitPoint::Header(expr(3))), Some(true));
-        assert_eq!(result.vertex_of(InitPoint::Header(expr(0))), Some(for_header));
-        assert_eq!(result.vertex_of(InitPoint::Header(expr(1))), Some(for_header));
-        assert_eq!(result.vertex_of(InitPoint::Header(expr(2))), Some(for_each_header));
+        assert_eq!(result.vertex_of(InitPoint::Header(expr(0))), Some(for_entry));
+        assert_eq!(result.vertex_of(InitPoint::Header(expr(1))), Some(for_entry));
+        assert_eq!(result.vertex_of(InitPoint::Header(expr(2))), Some(for_each_entry));
         assert_eq!(result.vertex_of(InitPoint::Header(expr(3))), Some(conditional));
         assert_eq!(result.state_before(InitPoint::Header(expr(99))), None);
         assert_eq!(result.vertex_of(InitPoint::Stmt(stmt(99))), None);

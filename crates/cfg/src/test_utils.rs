@@ -124,6 +124,7 @@ fn first_stmt_kind(body: &Body, vertex: &CfgVertex) -> &'static str {
             }
         }
         CfgVertex::Conditional(_) => "IF_STMT",
+        CfgVertex::LoopEntry(_) => "LOOP_ENTRY",
         CfgVertex::WhileHeader(_) => "WHILE_STMT",
         CfgVertex::ForHeader(_) => "FOR_STMT",
         CfgVertex::ForEachHeader(_) => "FOR_EACH_STMT",

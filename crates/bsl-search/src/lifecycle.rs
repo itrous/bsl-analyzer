@@ -45,6 +45,7 @@ pub enum Reason {
     ContextChanged,
     FileDeleted,
     SchemaReset,
+    KeySpelling,
     EmbedTextVersion,
     RootTransition,
     ModeTransition,
