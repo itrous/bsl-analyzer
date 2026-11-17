@@ -1123,7 +1123,7 @@ impl GraphState {
             let sql_budget = if injected_budget {
                 std::time::Duration::ZERO
             } else {
-                crate::graph_db::PATCH_SQL_BUDGET
+                crate::graph_db::PATCH_SQL_BUDGET_NOT_UNDER_TEST
             };
             #[cfg(not(test))]
             let sql_budget = crate::graph_db::PATCH_SQL_BUDGET;
@@ -5782,7 +5782,7 @@ mod tests {
             &fixture.db,
             &fixture.plan,
             fixture.graph.observation(),
-            crate::graph_db::PATCH_SQL_BUDGET,
+            crate::graph_db::PATCH_SQL_BUDGET_NOT_UNDER_TEST,
             pause,
             &mut None,
         ) else {
@@ -6219,7 +6219,7 @@ mod tests {
             &fixture.patch,
             &fixture.meta,
             false,
-            crate::graph_db::PATCH_SQL_BUDGET,
+            crate::graph_db::PATCH_SQL_BUDGET_NOT_UNDER_TEST,
         );
 
         assert!(matches!(refused, Err(crate::graph_db::PatchError::Busy)));
@@ -6315,7 +6315,7 @@ mod tests {
                 &fixture.patch,
                 &fixture.meta,
                 false,
-                crate::graph_db::PATCH_SQL_BUDGET,
+                crate::graph_db::PATCH_SQL_BUDGET_NOT_UNDER_TEST,
             ) else {
                 panic!("the child could not write the patch");
             };
@@ -6341,7 +6341,7 @@ mod tests {
             &patch,
             &meta,
             false,
-            crate::graph_db::PATCH_SQL_BUDGET,
+            crate::graph_db::PATCH_SQL_BUDGET_NOT_UNDER_TEST,
         ) else {
             panic!("the patch cannot be written after the crash");
         };
@@ -6460,7 +6460,7 @@ mod tests {
                 &fixture.patch,
                 &fixture.meta,
                 false,
-                crate::graph_db::PATCH_SQL_BUDGET,
+                crate::graph_db::PATCH_SQL_BUDGET_NOT_UNDER_TEST,
             ) else {
                 panic!("the child could not write the patch");
             };

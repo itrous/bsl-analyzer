@@ -798,14 +798,19 @@ impl GlobalState {
         file_id: FileId,
         resolved: &mut stdx::path_exclusion::ResolvedDirs,
     ) -> bool {
-        let path = {
-            let vfs = self.vfs.read();
-            if file_id.0 >= vfs.num_file_ids() {
-                return true;
-            }
-            vfs.file_path(file_id).clone()
-        };
-        self.is_source_excluded(path.as_path(), resolved)
+        is_file_id_excluded_in(&self.vfs, &self.source_exclusions, file_id, resolved)
+    }
+
+    /// The exclusion test as a value a background job can own, so work queued against a
+    /// `FileId` can apply it where it runs instead of on the event loop. It shares the
+    /// VFS, so paths are read as they are when it runs; the exclusions are the ones in
+    /// force when it was made: a reload installs new ones rather than editing these, and
+    /// the revision it bumps for the sources it takes out cancels a job still running.
+    pub fn exclusion_filter(&self) -> ExclusionFilter {
+        ExclusionFilter {
+            vfs: Arc::clone(&self.vfs),
+            source_exclusions: Arc::clone(&self.source_exclusions),
+        }
     }
 
     /// [`Self::is_source_excluded`] that also resolves `path` through the file system:
@@ -1345,6 +1350,46 @@ fn path_in_workspace(
         return true;
     }
     open_paths.contains(path)
+}
+
+/// The one body that decides whether a `FileId` is excluded, shared by [`GlobalState`]
+/// and by [`ExclusionFilter`] so the two can never drift apart.
+fn is_file_id_excluded_in(
+    vfs: &parking_lot::RwLock<vfs::Vfs>,
+    source_exclusions: &stdx::path_exclusion::ExcludedPaths,
+    file_id: FileId,
+    resolved: &mut stdx::path_exclusion::ResolvedDirs,
+) -> bool {
+    let path = {
+        let vfs = vfs.read();
+        if file_id.0 >= vfs.num_file_ids() {
+            return true;
+        }
+        vfs.file_path(file_id).clone()
+    };
+    source_exclusions.is_excluded_resolving(path.as_path(), resolved)
+}
+
+/// [`GlobalState`]'s exclusion test, detached from the state so a pooled job can carry
+/// it. Cheap to make: both fields are handles, not copies.
+#[derive(Clone)]
+pub struct ExclusionFilter {
+    vfs: Arc<parking_lot::RwLock<vfs::Vfs>>,
+    source_exclusions: Arc<stdx::path_exclusion::ExcludedPaths>,
+}
+
+impl ExclusionFilter {
+    /// Those of `file_ids` the project still covers, in the order given. One
+    /// `ResolvedDirs` serves the whole batch, so each parent directory resolves once.
+    pub fn retain_included(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
+        file_ids
+            .into_iter()
+            .filter(|&file_id| {
+                !is_file_id_excluded_in(&self.vfs, &self.source_exclusions, file_id, &mut resolved)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

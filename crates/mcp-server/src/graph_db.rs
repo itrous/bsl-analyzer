@@ -2066,6 +2066,11 @@ pub(crate) enum PatchError {
 
 /// How long applying a patch's SQL may take, and how long the write lock is waited for.
 pub(crate) const PATCH_SQL_BUDGET: Duration = Duration::from_secs(5);
+/// [`PATCH_SQL_BUDGET`] for a test that is not about the budget: on a loaded machine the durable
+/// writes alone can outlast the production bound, and an overrun sends the patch down another path.
+#[cfg(test)]
+pub(crate) const PATCH_SQL_BUDGET_NOT_UNDER_TEST: Duration =
+    test_utils::wait::hang_guard(PATCH_SQL_BUDGET);
 const PATCH_LOCK_WAIT: Duration = Duration::from_millis(250);
 
 /// A patch written to the graph database and not yet committed. Dropping it rolls the
