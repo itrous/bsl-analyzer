@@ -847,6 +847,43 @@ impl Store {
         Ok(ControlFlow::Continue(()))
     }
 
+    /// Whether any root-keyed table holds a key spelled with a backslash.
+    ///
+    /// Keys are `/`-spelled on every platform; a store written before that held the host
+    /// separator on Windows, and those rows are unreachable by any lookup yet still served,
+    /// so the cache cannot be reconciled and is rebuilt. The table shape did not change, hence
+    /// no `SCHEMA_VERSION` bump (which would also re-index Linux needlessly).
+    ///
+    /// Asked on Windows only, and that is not a half-measure. The stale spelling arose only
+    /// there: on any other host a pre-fix key was already `/`-spelled, so there is nothing to
+    /// migrate, and a backslash in a Unix file name is an ordinary character that must be left
+    /// alone (probing there would wipe such a store at every open, for ever). On Windows a
+    /// backslash cannot occur inside a file name, so after the reset the rebuilt rows are
+    /// `/`-spelled and the probe never fires again: idempotent where it applies, inapplicable
+    /// elsewhere. One `LIMIT 1` per table and no counting, since this runs at every open.
+    fn holds_host_separator_key(conn: &Connection) -> Result<bool, SearchError> {
+        if !cfg!(windows) {
+            return Ok(false);
+        }
+        for table in ROOT_KEYED_TABLES {
+            let columns = Self::column_names(conn, table.name);
+            let tests: Vec<String> = ["root_id", "path"]
+                .into_iter()
+                .filter(|key| columns.iter().any(|column| column == key))
+                .map(|key| format!("instr({key}, char(92)) > 0"))
+                .collect();
+            if tests.is_empty() {
+                continue;
+            }
+            let sql =
+                format!("SELECT 1 FROM \"{}\" WHERE {} LIMIT 1", table.name, tests.join(" OR "));
+            if conn.query_row(&sql, [], |_| Ok(())).optional()?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Reconcile the structural schema in a single transaction: wipe a stale cache,
     /// (re)create the current tables, and stamp the version atomically. Under WAL a
     /// crash mid-reconcile rolls back to the prior consistent state, so the next open
@@ -865,14 +902,27 @@ impl Store {
         observation.record.from_version = stored;
         observation.record.to_version = Some(SCHEMA_VERSION);
         if let Some(stored) = stored {
-            if stored != SCHEMA_VERSION {
-                observation.record.reason = Reason::SchemaReset;
+            let schema_changed = stored != SCHEMA_VERSION;
+            // Only asked when the version matches: a mismatch wipes anyway, and the log line
+            // must name the reason that actually fired.
+            let spelled_with_host_separator =
+                !schema_changed && Self::holds_host_separator_key(&tx)?;
+            if schema_changed || spelled_with_host_separator {
+                observation.record.reason =
+                    if schema_changed { Reason::SchemaReset } else { Reason::KeySpelling };
                 observation.record.emit(crate::lifecycle::Context::current().is_some());
-                tracing::warn!(
-                    from = stored,
-                    to = SCHEMA_VERSION,
-                    "search index schema changed; wiping derived cache to rebuild"
-                );
+                if schema_changed {
+                    tracing::warn!(
+                        from = stored,
+                        to = SCHEMA_VERSION,
+                        "search index schema changed; wiping derived cache to rebuild"
+                    );
+                } else {
+                    tracing::warn!(
+                        reason = "key_spelling",
+                        "search index keys are spelled with a host separator; wiping derived cache to rebuild"
+                    );
+                }
                 for (table, target) in [
                     ("chunks", &mut counts.sqlite_vectors_removed),
                     ("overlay_chunks", &mut counts.overlay_vectors_removed),
@@ -9599,6 +9649,111 @@ mod tests {
                 });
                 assert!(resets(&lines).is_empty(), "a current store was reset: {lines:#?}");
             }
+        }
+
+        /// A store written when Windows keys carried the host separator is rebuilt, though its
+        /// schema version is current: the rows are unreachable by any `/`-spelled lookup and
+        /// still served, so nothing else would ever retire them. The log names this reason, not
+        /// a schema change that did not happen.
+        ///
+        /// Windows only: the probe is inapplicable elsewhere, where a backslash is just a
+        /// character in a file name (see `a_backslash_key_is_reset_at_most_once_on_any_host`).
+        #[cfg(windows)]
+        #[test]
+        fn a_backslash_spelled_key_resets_the_store_on_the_next_open() {
+            for (root_id, key_path) in
+                [(r"cfe\one", "Module.bsl"), ("cfe/one", r"Common\Module.bsl")]
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("search.db");
+                paid_store(&path);
+                Connection::open(&path)
+                    .unwrap()
+                    .execute("UPDATE files SET root_id = ?1, path = ?2", params![root_id, key_path])
+                    .unwrap();
+
+                let lines = visible_at_default_logging(|| {
+                    let store = Store::open(&path).unwrap();
+                    assert_eq!(store.file_count().unwrap(), 0, "{root_id:?} {key_path:?} was kept");
+                    assert_eq!(store.file_hash(root_id, key_path).unwrap(), None);
+                    assert_eq!(
+                        Store::stored_schema_version(&store.conn).unwrap(),
+                        Some(SCHEMA_VERSION)
+                    );
+                });
+                let fired = resets(&lines);
+                assert_eq!(fired.len(), 1, "expected one reset message in {lines:#?}");
+                assert!(fired[0].contains("key_spelling"), "{}", fired[0]);
+                assert!(!fired[0].contains("schema changed"), "{}", fired[0]);
+
+                let again = visible_at_default_logging(|| {
+                    Store::open(&path).unwrap();
+                });
+                assert!(resets(&again).is_empty(), "the rebuilt store reset again");
+            }
+        }
+
+        /// Idempotence, the property a probe that fires on a surviving row would break: a store
+        /// is reset by a backslash key at most once, and every open after the first leaves it
+        /// alone. On Windows the first open resets (and the rebuilt store is clean); elsewhere
+        /// the backslash is an ordinary file-name character and the row is never touched.
+        #[test]
+        fn a_backslash_key_is_reset_at_most_once_on_any_host() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("search.db");
+            paid_store(&path);
+            Connection::open(&path)
+                .unwrap()
+                .execute("UPDATE files SET root_id = ?1", params![r"cfe\one"])
+                .unwrap();
+
+            let first = visible_at_default_logging(|| {
+                let store = Store::open(&path).unwrap();
+                let kept = if cfg!(windows) { 0 } else { 1 };
+                assert_eq!(store.file_count().unwrap(), kept);
+            });
+            assert_eq!(resets(&first).len(), usize::from(cfg!(windows)), "{first:#?}");
+
+            for reopen in 0..3 {
+                let again = visible_at_default_logging(|| {
+                    Store::open(&path).unwrap();
+                });
+                assert!(resets(&again).is_empty(), "reopen {reopen} reset again: {again:#?}");
+            }
+        }
+
+        /// The control: a current store whose keys are all `/`-spelled is left alone. Without it
+        /// a probe that resets unconditionally would pass the test above.
+        #[test]
+        fn slash_spelled_keys_at_the_current_version_are_not_reset() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("search.db");
+            {
+                let mut store = Store::open(&path).unwrap();
+                store
+                    .reindex_file_with_identity(
+                        "cfe/one",
+                        "CommonModules/М/Ext/Module.bsl",
+                        b"hash",
+                        &[sample_chunk("Method")],
+                        Some(&[VECTOR.to_vec()]),
+                        None,
+                        MODEL,
+                        3,
+                    )
+                    .unwrap();
+            }
+
+            let lines = visible_at_default_logging(|| {
+                let store = Store::open(&path).unwrap();
+                assert_eq!(store.file_count().unwrap(), 1, "the file was dropped");
+                assert_eq!(
+                    store.file_hash("cfe/one", "CommonModules/М/Ext/Module.bsl").unwrap(),
+                    Some(b"hash".to_vec()),
+                    "the file hash did not survive"
+                );
+            });
+            assert!(resets(&lines).is_empty(), "a /-spelled store was reset: {lines:#?}");
         }
 
         /// The preserving migration stamps the current schema inside its own transaction, so

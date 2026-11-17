@@ -18,6 +18,7 @@ expr ExprId(12): Some(LocalRange(329..330))
 transitions:
   s0 -> s2
   s2 -> s3
+  s2 -> s7
   s3 -> s7
   s5 -> s0
   s5 -> s2
@@ -29,7 +30,7 @@ definitions (limit 3):
   s0: Some([])
   s1: Some([])
   s2: Some([])
-  s3: Some(["Definition { var_name: \"inner\", def_site: Assignment(2) }"])
+  s3: Some([])
   s4: Some([])
   s5: None
   s6: Some([])

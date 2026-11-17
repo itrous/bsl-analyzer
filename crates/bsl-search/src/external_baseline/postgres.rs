@@ -3500,7 +3500,7 @@ pub fn ensure_the_roots_mean_the_same_elsewhere(
     let unportable: BTreeSet<&str> = documents
         .iter()
         .map(|document| document.root_id.as_str())
-        .filter(|root_id| std::path::Path::new(root_id).is_absolute())
+        .filter(|root_id| names_an_absolute_place(root_id))
         .collect();
     if unportable.is_empty() {
         return Ok(());
@@ -3512,6 +3512,20 @@ pub fn ensure_the_roots_mean_the_same_elsewhere(
          the project directory, or publish the configuration alone.",
         unportable.into_iter().collect::<Vec<_>>().join(", ")
     )))
+}
+
+/// Whether a root id, read as the platform-independent string it is, names an absolute place.
+///
+/// Not `Path::is_absolute`: that judges the HOST, and an id is spelled with `/` on every host.
+/// On Windows `/srv/extensions/X` has no drive prefix and passes as relative, so the gate
+/// would let through exactly the Unix-absolute id it exists to stop; on Unix `C:/Users/x` is
+/// an ordinary relative path, and the Windows-absolute id slips through the other way. A `cfg`
+/// would fix one direction only. So the id's own spelling decides: a leading `/` or `\` (which
+/// covers UNC), or a drive letter followed by `:` at the very start.
+fn names_an_absolute_place(root_id: &str) -> bool {
+    let bytes = root_id.as_bytes();
+    matches!(bytes.first(), Some(b'/' | b'\\'))
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 #[cfg(test)]
@@ -4865,6 +4879,65 @@ mod tests {
              that decides which vectors are live cannot see it, and would delete what it \
              cannot match"
         );
+    }
+
+    /// Whether an id is refused is a fact about its spelling, not about the host running this.
+    ///
+    /// Judged through the public gate, so the table holds if the predicate behind it is
+    /// renamed. The accepted rows include the near misses a drive-letter check could get
+    /// wrong: a single-letter directory, and a colon that is not at the start.
+    #[test]
+    fn a_root_id_is_refused_by_its_own_spelling_on_every_host() {
+        let refused = [
+            "/srv/extensions/Расш",
+            "C:/Users/x",
+            "c:\\Users\\x",
+            "\\\\server\\share",
+            "//?/C:/Users/x",
+        ];
+        let accepted = ["src/cfe/Расш", "cfe/one", ".", "c", "c/d", "ab:c", "cfe/one:two"];
+        for id in refused {
+            assert!(
+                super::ensure_the_roots_mean_the_same_elsewhere(&[document_under(id)]).is_err(),
+                "{id:?} names an absolute place and must be refused"
+            );
+        }
+        for id in accepted {
+            assert!(
+                super::ensure_the_roots_mean_the_same_elsewhere(&[document_under(id)]).is_ok(),
+                "{id:?} is relative and must be accepted"
+            );
+        }
+    }
+
+    /// The refusal names every offending id and only those.
+    #[test]
+    fn the_refusal_names_each_unportable_root_and_a_clean_set_passes() {
+        let documents = [
+            document_under("src/cfe/Расш"),
+            document_under("/srv/extensions/Расш"),
+            document_under("C:/Users/x"),
+            document_under("/srv/extensions/Расш"),
+        ];
+        let text =
+            super::ensure_the_roots_mean_the_same_elsewhere(&documents).unwrap_err().to_string();
+        assert!(text.contains("root_id_not_portable"), "{text}");
+        assert!(text.contains("/srv/extensions/Расш"), "{text}");
+        assert!(text.contains("C:/Users/x"), "{text}");
+        assert!(!text.contains("src/cfe/Расш"), "a portable id is not blamed: {text}");
+
+        assert!(super::ensure_the_roots_mean_the_same_elsewhere(&[
+            document_under("src/cfe/Расш"),
+            document_under(""),
+        ])
+        .is_ok());
+    }
+
+    fn document_under(root_id: &str) -> IndexedDocument {
+        IndexedDocument {
+            root_id: root_id.to_owned(),
+            ..indexed_document("code", "CommonModules/Общий/Ext/Module.bsl", "Общий", 1, "h", "t")
+        }
     }
 
     /// A root identified by an absolute path is refused before the adapter reaches the database.

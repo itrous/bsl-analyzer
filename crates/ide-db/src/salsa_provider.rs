@@ -415,6 +415,15 @@ impl AnalysisProvider for SalsaProvider<'_> {
         hir::infer_owner(self.db, file_id, owner)
     }
 
+    fn value_origin(
+        &self,
+        file_id: FileId,
+        owner: DefWithBodyId,
+        expr: hir::ExprId,
+    ) -> hir::ValueOrigin {
+        hir::value_origin_of(self.db, file_id, owner, expr)
+    }
+
     fn executed_query_texts(&self, method_id: MethodId) -> Arc<[hir::ExecutedQueryText]> {
         hir::executed_query_texts(self.db, method_id).into()
     }
@@ -476,7 +485,7 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn method_cfg(&self, method_id: hir::MethodId) -> Arc<hir::cfg::ControlFlowGraph> {
-        self.db.method_cfg(method_id)
+        self.db.method_cfg(hir::MethodIdInput::new(self.db, method_id))
     }
 
     fn method_path_terminates(

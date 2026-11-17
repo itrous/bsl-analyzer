@@ -327,16 +327,11 @@ pub fn open_events(result: &DataflowResult<SecurityModeState>, body: &Body) -> V
                 walk_expr_for_calls(body, v.condition.to_idx(), &mut calls_buf);
                 emit_for_calls(body, &calls_buf, vertex_overlay, None, &mut events);
             }
-            CfgVertex::ForHeader(v) => {
+            CfgVertex::LoopEntry(v) => {
                 calls_buf.clear();
-                walk_expr_for_calls(body, v.from.to_idx(), &mut calls_buf);
-                walk_expr_for_calls(body, v.to.to_idx(), &mut calls_buf);
-                let origin = result.cfg().source_stmt_id(vertex_idx);
-                emit_for_calls(body, &calls_buf, vertex_overlay, origin, &mut events);
-            }
-            CfgVertex::ForEachHeader(v) => {
-                calls_buf.clear();
-                walk_expr_for_calls(body, v.collection.to_idx(), &mut calls_buf);
+                for root in v.roots() {
+                    walk_expr_for_calls(body, root.to_idx(), &mut calls_buf);
+                }
                 let origin = result.cfg().source_stmt_id(vertex_idx);
                 emit_for_calls(body, &calls_buf, vertex_overlay, origin, &mut events);
             }

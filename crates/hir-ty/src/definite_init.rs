@@ -5,46 +5,23 @@
 //! The functions see only the body, its CFG and the analysis result; whatever
 //! needs the resolver arrives from `InferenceContext` as data or a closure.
 
+use bsl_platform::ParamPassing;
 use cfg_types::IdConversion;
 use dataflow::definite_init::{
     DefiniteInitResult, EnteringHeader, InitEvents, InitPoint, WitnessStep,
 };
+use hir_def::body::events::{BodyEvents, EvalPoint, WriteKind};
 use hir_def::body::Body;
-use hir_def::hir::{Expr, ExprIdx, Literal, Stmt, StmtIdx};
+use hir_def::hir::{Expr, Literal, Stmt};
 use hir_def::{ExprId, Name, StmtId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use stdx::case::CaseExt;
 
 use crate::infer::{assignment_target_base, UninitializedPath};
-use crate::narrow::{for_each_expr_child, for_each_stmt_expr_root, stmt_covers_stmt};
+use crate::narrow::stmt_covers_stmt;
 
-/// How a call passes one argument, as far as the resolved callee proves it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ArgPassing {
-    ByVal,
-    ByRef,
-    Unknown,
-}
-
-/// The body may be missing statements or edges, so no path through it is proven.
-pub(crate) fn hir_suppressed(body: &Body) -> bool {
-    if body.is_lowering_incomplete() {
-        return true;
-    }
-    let mut labels = FxHashSet::default();
-    let mut gotos = Vec::new();
-    for (_, stmt) in body.stmts_iter() {
-        match stmt {
-            Stmt::Expr(expr) if body.is_recovered(ExprId::from_idx(*expr)) => return true,
-            Stmt::Label(label) => {
-                labels.insert(label);
-            }
-            Stmt::Goto(label) => gotos.push(label),
-            _ => {}
-        }
-    }
-    gotos.into_iter().any(|label| !labels.contains(label))
-}
+#[cfg(test)]
+mod tests;
 
 /// Names the body may initialize itself: implicit locals, bases of indexed
 /// assignment targets and loop variables, one per `fold_lower` key.
@@ -139,13 +116,126 @@ pub(crate) struct Collected {
     pub(crate) candidates: Vec<Candidate>,
 }
 
-/// One pass over the statements: the reads to judge and every initialization event.
+/// The reads to judge and every initialization event, read off the body's
+/// shared syntactic events: what is tracked, which reads count and how a
+/// call passes its arguments are this check's own policy.
 pub(crate) fn collect(
+    body: &Body,
+    body_events: &BodyEvents,
+    tracked: &Tracked,
+    local_reads: &FxHashSet<ExprId>,
+    passing: &impl Fn(ExprId) -> Option<ParamPassing>,
+) -> Collected {
+    let mut events = InitEvents { width: tracked.width(), ..InitEvents::default() };
+    let mut during: FxHashMap<InitPoint, FxHashSet<u32>> = FxHashMap::default();
+    let mut candidates = Vec::new();
+
+    for stmt_events in body_events.stmts() {
+        let stmt_id = stmt_events.stmt;
+        // Indexing stores into the value the base holds: the base is not read
+        // before it is written.
+        let index_base = stmt_events
+            .write
+            .filter(|write| write.kind == WriteKind::Index)
+            .and_then(|write| write.base);
+
+        for root in stmt_events.roots.iter() {
+            let point = init_point(root.point);
+            let callees: FxHashSet<ExprId> =
+                root.calls.iter().filter_map(|call| call.callee).collect();
+            let arguments: FxHashSet<ExprId> = root
+                .calls
+                .iter()
+                .flat_map(|call| call.path_args.iter().map(|arg| arg.expr))
+                .collect();
+
+            for &expr in root.nodes.iter() {
+                let Expr::Path(name) = body.expr(expr) else { continue };
+                let Some(bit) = tracked.name_bit(name) else { continue };
+                let judged = if arguments.contains(&expr) {
+                    if passing(expr) == Some(ParamPassing::ByVal) {
+                        true
+                    } else {
+                        during.entry(point).or_default().insert(bit);
+                        false
+                    }
+                } else {
+                    !callees.contains(&expr) && index_base != Some(expr)
+                };
+                if judged && local_reads.contains(&expr) {
+                    candidates.push(Candidate {
+                        expr,
+                        name: name.clone(),
+                        bit,
+                        point,
+                        owner: stmt_id,
+                    });
+                }
+            }
+        }
+
+        let mut after: Vec<u32> = if stmt_events.execute {
+            (0..tracked.width() as u32).collect()
+        } else {
+            stmt_events
+                .write
+                .and_then(|write| write.base)
+                .and_then(|base| match body.expr(base) {
+                    Expr::Path(name) => tracked.name_bit(name),
+                    _ => None,
+                })
+                .into_iter()
+                .collect()
+        };
+        if let Some(bits) = during.get(&InitPoint::Stmt(stmt_id)) {
+            after.extend(bits);
+        }
+        if !after.is_empty() {
+            after.sort_unstable();
+            after.dedup();
+            events.stmt.insert(stmt_id, after);
+        }
+
+        if let Some(var) = stmt_events.loop_binding {
+            if let Some(bit) = tracked.name_bit(&body.binding(var).name) {
+                events.loop_var.insert(var, bit);
+            }
+        }
+        if let Some(entering) = entering_header(body, body.stmt(stmt_id)) {
+            events.entering_headers.insert(stmt_id, entering);
+        }
+    }
+
+    for (point, bits) in &during {
+        if let InitPoint::Header(root) = point {
+            let mut bits: Vec<u32> = bits.iter().copied().collect();
+            bits.sort_unstable();
+            events.header.insert(*root, bits);
+        }
+    }
+
+    Collected { events, during, candidates }
+}
+
+fn init_point(point: EvalPoint) -> InitPoint {
+    match point {
+        EvalPoint::Stmt(stmt) => InitPoint::Stmt(stmt),
+        EvalPoint::Header(root) => InitPoint::Header(root),
+    }
+}
+
+/// The collector as it was before the shared syntactic events: the reference
+/// [`collect`] is compared against.
+#[cfg(test)]
+pub(crate) fn collect_legacy(
     body: &Body,
     tracked: &Tracked,
     local_reads: &FxHashSet<ExprId>,
-    passing: &impl Fn(ExprId) -> ArgPassing,
+    passing: &impl Fn(ExprId) -> Option<ParamPassing>,
 ) -> Collected {
+    use hir_def::body::events::{for_each_expr_child, for_each_stmt_expr_root};
+    use hir_def::hir::{ExprIdx, StmtIdx};
+
     let mut events = InitEvents { width: tracked.width(), ..InitEvents::default() };
     let mut during: FxHashMap<InitPoint, FxHashSet<u32>> = FxHashMap::default();
     let mut candidates = Vec::new();
@@ -209,7 +299,7 @@ pub(crate) fn collect(
                 let Some(bit) = tracked.name_bit(name) else { continue };
                 let expr = ExprId::from_idx(node);
                 let judged = if arguments.contains(&node) {
-                    if passing(expr) == ArgPassing::ByVal {
+                    if passing(expr) == Some(ParamPassing::ByVal) {
                         true
                     } else {
                         during.entry(point).or_default().insert(bit);

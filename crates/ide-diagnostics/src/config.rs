@@ -216,6 +216,7 @@ impl DiagnosticsConfig {
             DiagnosticCode::TernaryOperatorUsage,
             DiagnosticCode::TooManyReturns,
             DiagnosticCode::TypeMismatchByDocComment,
+            DiagnosticCode::TypeNameComparedAsText,
             DiagnosticCode::UnresolvedName,
             DiagnosticCode::UseSystemInformation,
             DiagnosticCode::UsingLikeInQuery,

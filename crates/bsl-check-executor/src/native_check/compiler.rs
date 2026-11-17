@@ -53,6 +53,14 @@ pub(crate) fn current_stop_clock() -> StopClock {
     STOP_CLOCK.try_with(Clone::clone).unwrap_or_else(|_| StopClock::new(DEFAULT_STOP_GRACE_MS))
 }
 
+/// Stop clock for a cleanup that tests something other than its deadline: the production grace
+/// is short enough that a loaded machine turns slow scheduling into a spurious cleanup failure,
+/// so only a hang ends the cleanup early.
+#[cfg(all(test, unix))]
+pub(super) fn stop_clock_not_under_test() -> StopClock {
+    StopClock::new(u64::try_from(super::tests::HANG_GUARD.as_millis()).unwrap())
+}
+
 struct StopWatch {
     task: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
@@ -1188,7 +1196,6 @@ fn schedule_process_group_cleanup(pid: u32, deadline: Instant) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     #[test]
@@ -1250,16 +1257,14 @@ mod tests {
 
     fn script(directory: &Path, body: &str) -> std::path::PathBuf {
         let path = directory.join("designer-stub");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        test_utils::write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
 
     #[cfg(target_os = "linux")]
     fn python_script(directory: &Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = directory.join(name);
-        std::fs::write(&path, format!("#!/usr/bin/python3\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        test_utils::write_executable(&path, &format!("#!/usr/bin/python3\n{body}\n"));
         path
     }
 
