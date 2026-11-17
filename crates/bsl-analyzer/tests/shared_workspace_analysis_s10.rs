@@ -149,14 +149,15 @@ async fn rooted_symbol_info(
 }
 
 async fn wait_mcp_target(client: &Client, source_path: &Path) -> Value {
-    let provider_a_root_id = Path::new("extensions").join("provider-a");
+    // The answer carries the root id as stored, `/`-spelled on every host.
+    let provider_a_root_id = "extensions/provider-a";
     let card = symbol_info(client, source_path, "ДатьСтроку").await;
     assert_eq!(card["status"], "ok", "provider A symbol resolves: {card}");
     assert_eq!(card["return_type"], "Строка", "provider A semantic type: {card}");
     let definitions = card["definitions"].as_array().expect("definition list");
     assert!(
         definitions.iter().any(|definition| {
-            definition["location"]["root_id"] == provider_a_root_id.to_string_lossy().as_ref()
+            definition["location"]["root_id"] == provider_a_root_id
                 && definition["location"]["path"] == "CommonModules/Общий/Ext/Module.bsl"
         }),
         "provider A resolves through the expected source root and path: {card}"
@@ -674,7 +675,10 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
     let (client, task, state) = mcp_session(root.path(), cache).await;
 
     let provider_a_relative = Path::new("CommonModules/Общий/Ext/Module.bsl");
+    // Sent with the host separator on purpose: the server accepts either spelling and answers
+    // with the one the store uses.
     let provider_a_root_id = Path::new("extensions").join("provider-a");
+    let provider_a_stored_root_id = "extensions/provider-a";
     let active_provider = rooted_symbol_info(
         &client,
         provider_a_root_id.to_str().expect("UTF-8 fixture root id"),
@@ -688,7 +692,7 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
     assert!(
         active_provider["definitions"].as_array().is_some_and(|definitions| {
             definitions.iter().any(|definition| {
-                definition["location"]["root_id"] == provider_a_root_id.to_string_lossy().as_ref()
+                definition["location"]["root_id"] == provider_a_stored_root_id
                     && definition["location"]["path"] == provider_a_relative.to_string_lossy().as_ref()
             })
         }),

@@ -2352,10 +2352,7 @@ mod tests {
         wait_for_root_count(&engine, 2);
         let guard = engine.lock().unwrap();
         let published_engine = guard.as_ref().unwrap();
-        assert!(published_engine
-            .workspace_roots()
-            .unwrap()
-            .contains_id(&"ext/live".replace('/', std::path::MAIN_SEPARATOR_STR)));
+        assert!(published_engine.workspace_roots().unwrap().contains_id("ext/live"));
         let published_provider = published_engine.graph_context_provider().unwrap();
         assert!(
             !Arc::ptr_eq(&boot_provider, &published_provider),
@@ -3294,9 +3291,7 @@ mod tests {
             let guard = engine_arc.lock().unwrap();
             let dirty = guard.as_ref().unwrap().context_dirty_paths("code").unwrap();
             assert!(
-                dirty.contains(&bsl_search::FileKey::configuration(
-                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
-                )),
+                dirty.contains(&bsl_search::FileKey::configuration(module_rel)),
                 "the owned module is marked context-dirty: {dirty:?}"
             );
         }
@@ -3596,9 +3591,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
-        let module_rel =
-            "CommonModules/Сервер/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR);
-        let module_rel = module_rel.as_str();
+        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
 
         // A chunk with a stale stored context and NO live embedding (so consumption needs no
         // embedder — the mark, not the vector, is under test).
@@ -3647,11 +3640,11 @@ mod tests {
         {
             let g = engine_arc.lock().unwrap();
             assert!(
-                g.as_ref().unwrap().context_dirty_paths("code").unwrap().contains(
-                    &bsl_search::FileKey::configuration(
-                        module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
-                    )
-                ),
+                g.as_ref()
+                    .unwrap()
+                    .context_dirty_paths("code")
+                    .unwrap()
+                    .contains(&bsl_search::FileKey::configuration(module_rel)),
                 "the owned module is marked context-dirty",
             );
         }
@@ -3698,11 +3691,11 @@ mod tests {
         {
             let g = engine_arc.lock().unwrap();
             assert!(
-                g.as_ref().unwrap().context_dirty_paths("code").unwrap().contains(
-                    &bsl_search::FileKey::configuration(
-                        module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
-                    )
-                ),
+                g.as_ref()
+                    .unwrap()
+                    .context_dirty_paths("code")
+                    .unwrap()
+                    .contains(&bsl_search::FileKey::configuration(module_rel)),
                 "a pending drift defers the refresh; the mark survives",
             );
         }
@@ -3730,11 +3723,11 @@ mod tests {
         {
             let g = engine_arc.lock().unwrap();
             assert!(
-                !g.as_ref().unwrap().context_dirty_paths("code").unwrap().contains(
-                    &bsl_search::FileKey::configuration(
-                        module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
-                    )
-                ),
+                !g.as_ref()
+                    .unwrap()
+                    .context_dirty_paths("code")
+                    .unwrap()
+                    .contains(&bsl_search::FileKey::configuration(module_rel)),
                 "with no pending drift the mark is consumed",
             );
             // A publication that carries no root table (a stale cached graph adopted while its
@@ -3767,9 +3760,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
-        let module_rel =
-            "CommonModules/Сервер/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR);
-        let module_rel = module_rel.as_str();
+        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
 
         let db_path = workspace.join("search.db");
         {
@@ -3852,11 +3843,12 @@ mod tests {
 
         let guard = engine_arc.lock().unwrap();
         assert!(
-            guard.as_ref().unwrap().context_dirty_paths("code").unwrap().contains(
-                &bsl_search::FileKey::configuration(
-                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
-                )
-            ),
+            guard
+                .as_ref()
+                .unwrap()
+                .context_dirty_paths("code")
+                .unwrap()
+                .contains(&bsl_search::FileKey::configuration(module_rel)),
             "a publication with nothing handed to it (bound 0) clears no marks; the mark survives",
         );
     }
@@ -3874,9 +3866,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module(&workspace, "Сервер", "Функция Считать() Экспорт КонецФункции");
-        let module_rel =
-            "CommonModules/Сервер/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR);
-        let module_rel = module_rel.as_str();
+        let module_rel = "CommonModules/Сервер/Ext/Module.bsl";
 
         let db_path = workspace.join("search.db");
         {
@@ -3961,9 +3951,7 @@ mod tests {
                 .unwrap()
                 .context_dirty_paths("code")
                 .unwrap()
-                .contains(&bsl_search::FileKey::configuration(
-                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
-                )),
+                .contains(&bsl_search::FileKey::configuration(module_rel)),
             "the leftover mark survives the boot publish nobody handed it to",
         );
 
@@ -3980,9 +3968,7 @@ mod tests {
                 .unwrap()
                 .context_dirty_paths("code")
                 .unwrap()
-                .contains(&bsl_search::FileKey::configuration(
-                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
-                )),
+                .contains(&bsl_search::FileKey::configuration(module_rel)),
             "the leftover pickup consumed the mark with the wired bound",
         );
     }
@@ -4517,9 +4503,7 @@ mod tests {
                 .unwrap()
                 .context_dirty_paths("code")
                 .unwrap()
-                .contains(&bsl_search::FileKey::configuration(
-                    module_rel.replace('/', std::path::MAIN_SEPARATOR_STR)
-                )),
+                .contains(&bsl_search::FileKey::configuration(module_rel)),
             "the discharged obligation cleared the leftover mark",
         );
     }

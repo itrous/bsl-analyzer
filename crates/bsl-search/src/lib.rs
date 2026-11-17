@@ -95,7 +95,7 @@ pub use workspace_overlay::{
     BaselineHashMode, PublicationBaseline, PublishOutcome, RefreshPlan, WorkspaceOverlayStats,
 };
 pub use workspace_roots::{
-    FileKey, RejectedRoot, Rejection, WorkspaceRoots, CONFIGURATION_ROOT_ID,
+    spell_as_key, FileKey, RejectedRoot, Rejection, WorkspaceRoots, CONFIGURATION_ROOT_ID,
 };
 
 mod progress;

@@ -3514,7 +3514,7 @@ mod tests {
     /// shape, and the shape is the whole point — the dictionary resolves this
     /// against the scanned universe.
     fn expected_file(_root: &Path, relative: &str) -> (String, String) {
-        (String::new(), relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+        (String::new(), relative.to_owned())
     }
 
     /// Every batch database goes to the drop thread, so a build of several batches
