@@ -121,6 +121,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::ObjectModifiedInOnWrite => &[465, 464],
         DiagnosticCode::PostingWhileDataExchangeLoading => &[],
         DiagnosticCode::StructureKeyIsNotIdentifier => &[],
+        DiagnosticCode::TypeNameComparedAsText => &[],
         DiagnosticCode::FormDataHasNoMetadataMethod => &[],
         DiagnosticCode::ValueIsFilledOfBoolean => &[],
         DiagnosticCode::UseLessForEach => &[],

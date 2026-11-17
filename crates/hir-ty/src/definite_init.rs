@@ -5,6 +5,7 @@
 //! The functions see only the body, its CFG and the analysis result; whatever
 //! needs the resolver arrives from `InferenceContext` as data or a closure.
 
+use bsl_platform::ParamPassing;
 use cfg_types::IdConversion;
 use dataflow::definite_init::{
     DefiniteInitResult, EnteringHeader, InitEvents, InitPoint, WitnessStep,
@@ -21,14 +22,6 @@ use crate::narrow::stmt_covers_stmt;
 
 #[cfg(test)]
 mod tests;
-
-/// How a call passes one argument, as far as the resolved callee proves it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ArgPassing {
-    ByVal,
-    ByRef,
-    Unknown,
-}
 
 /// Names the body may initialize itself: implicit locals, bases of indexed
 /// assignment targets and loop variables, one per `fold_lower` key.
@@ -131,7 +124,7 @@ pub(crate) fn collect(
     body_events: &BodyEvents,
     tracked: &Tracked,
     local_reads: &FxHashSet<ExprId>,
-    passing: &impl Fn(ExprId) -> ArgPassing,
+    passing: &impl Fn(ExprId) -> Option<ParamPassing>,
 ) -> Collected {
     let mut events = InitEvents { width: tracked.width(), ..InitEvents::default() };
     let mut during: FxHashMap<InitPoint, FxHashSet<u32>> = FxHashMap::default();
@@ -160,7 +153,7 @@ pub(crate) fn collect(
                 let Expr::Path(name) = body.expr(expr) else { continue };
                 let Some(bit) = tracked.name_bit(name) else { continue };
                 let judged = if arguments.contains(&expr) {
-                    if passing(expr) == ArgPassing::ByVal {
+                    if passing(expr) == Some(ParamPassing::ByVal) {
                         true
                     } else {
                         during.entry(point).or_default().insert(bit);
@@ -238,7 +231,7 @@ pub(crate) fn collect_legacy(
     body: &Body,
     tracked: &Tracked,
     local_reads: &FxHashSet<ExprId>,
-    passing: &impl Fn(ExprId) -> ArgPassing,
+    passing: &impl Fn(ExprId) -> Option<ParamPassing>,
 ) -> Collected {
     use hir_def::body::events::{for_each_expr_child, for_each_stmt_expr_root};
     use hir_def::hir::{ExprIdx, StmtIdx};
@@ -306,7 +299,7 @@ pub(crate) fn collect_legacy(
                 let Some(bit) = tracked.name_bit(name) else { continue };
                 let expr = ExprId::from_idx(node);
                 let judged = if arguments.contains(&node) {
-                    if passing(expr) == ArgPassing::ByVal {
+                    if passing(expr) == Some(ParamPassing::ByVal) {
                         true
                     } else {
                         during.entry(point).or_default().insert(bit);

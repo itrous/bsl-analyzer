@@ -2529,37 +2529,6 @@ impl<'db> InferenceContext<'db> {
             || is_self_name(&name.as_str().fold_lower())
     }
 
-    /// How the call holding `arg` passes it, from the `Знач` flag of the parameter
-    /// at the argument's position. Known only when the call settles on one user
-    /// method: the unique candidate, or the sole survivor whose argument types are
-    /// undecided (an undocumented parameter leaves the selection `Ambiguous`).
-    fn argument_passing(&self, arg: ExprId) -> definite_init::ArgPassing {
-        use crate::call_resolution::{CallSelection, CandidateId};
-        use definite_init::ArgPassing;
-
-        let Some((binding, position)) = self.call_arg_bindings.iter().find_map(|binding| {
-            binding.args.iter().position(|a| *a == arg).map(|position| (binding, position))
-        }) else {
-            return ArgPassing::Unknown;
-        };
-        let candidate = match &binding.candidate.resolution.selection {
-            CallSelection::Unique { candidate } => *candidate,
-            CallSelection::Ambiguous { candidates } if candidates.len() == 1 => candidates[0],
-            _ => return ArgPassing::Unknown,
-        };
-        let CandidateId::User { method, .. } = candidate else {
-            return ArgPassing::Unknown;
-        };
-        let Some(decl) = self.db.interface_method(hir_def::MethodId::from(method)) else {
-            return ArgPassing::Unknown;
-        };
-        match decl.params.get(position) {
-            Some(param) if param.is_val => ArgPassing::ByVal,
-            Some(_) => ArgPassing::ByRef,
-            None => ArgPassing::Unknown,
-        }
-    }
-
     /// Reports every local read that some executable path reaches with the
     /// variable unassigned. A body that may be missing statements or edges, or
     /// whose analysis did not converge, proves nothing and reports nothing.
@@ -2582,7 +2551,7 @@ impl<'db> InferenceContext<'db> {
         let body_events = self.flow.events(self.db);
         let definite_init::Collected { events, during, mut candidates } =
             definite_init::collect(&body, &body_events, &tracked, &self.local_reads, &|arg| {
-                self.argument_passing(arg)
+                declared_argument_passing_of(self.db, &self.call_arg_bindings, arg)
             });
         if candidates.is_empty()
             || (events.stmt.is_empty() && events.header.is_empty() && events.loop_var.is_empty())
@@ -3153,12 +3122,22 @@ impl<'db> InferenceContext<'db> {
                             !matches!(def.def_site, dataflow::reaching_defs::DefSite::Unknown)
                         });
                         if walk.weigh_possible_writes {
-                            found.extend(
-                                defs.possible_writes_at(point, &key)
-                                    .into_iter()
-                                    .filter(|def| self.may_write_before(defs, def, expr)),
-                            );
-                            found.retain(|def| !self.cannot_rebind(defs, def));
+                            found.extend(defs.possible_writes_at(point, &key).into_iter().filter(
+                                |def| {
+                                    crate::possible_writes::may_write_before(
+                                        &self.body, defs, def, expr,
+                                    )
+                                },
+                            ));
+                            found.retain(|def| {
+                                crate::possible_writes::rebinding(
+                                    self.db,
+                                    &self.body,
+                                    &self.call_arg_bindings,
+                                    defs,
+                                    def,
+                                ) != Some(crate::possible_writes::Rebinding::Cannot)
+                            });
                         } else {
                             found.retain(|def| {
                                 !matches!(
@@ -3171,12 +3150,13 @@ impl<'db> InferenceContext<'db> {
                     }
                     None => self.reaching_assignment_types_at(self.read_point(use_stmt)?, &key)?,
                 };
-                let use_stmt = use_stmt.to_idx();
-                if !walk.inferred_leaves
-                    && crate::narrow::local_may_change_unseen(&self.body, &key, use_stmt, None)
-                {
+                // A write the analysis cannot read leaves a value no definition accounts for:
+                // the executable reaching definitions carry it as a possible write at the place
+                // that may perform it, so it reaches a read ordered after it and no other.
+                if !walk.inferred_leaves && self.rebinding_write_may_reach(expr, &key, use_stmt) {
                     return None;
                 }
+                let use_stmt = use_stmt.to_idx();
                 let sources = self.loop_aware_definitions(&key, use_stmt, reaching)?;
                 walk.active.push(expr);
                 let types = self.types_of_definitions(&sources, walk);
@@ -3356,56 +3336,24 @@ impl<'db> InferenceContext<'db> {
         Some(self.reaching_defs_of(defs))
     }
 
-    /// Whether a possible write made at the point that evaluates `read` may happen before it.
-    /// The calls of one point are not ordered, so any call may write first, except one holding
-    /// the read: it writes only after its arguments are read. `Выполнить` runs after its own
-    /// expression.
-    fn may_write_before(
-        &self,
-        defs: &dataflow::reaching_defs::ReachingDefsResult,
-        def: &dataflow::reaching_defs::Definition,
-        read: ExprId,
-    ) -> bool {
-        let dataflow::reaching_defs::DefSite::MayWrite(id) = def.def_site else {
-            return false;
-        };
-        match defs.write(id).map(|write| write.kind) {
-            Some(dataflow::reaching_defs::WriteEventKind::Argument { call, .. }) => {
-                !self.expr_contains(call, read)
-            }
-            Some(dataflow::reaching_defs::WriteEventKind::Execute) | None => false,
-        }
-    }
-
-    fn expr_contains(&self, root: ExprId, target: ExprId) -> bool {
-        if root == target {
+    /// Whether a call or `Выполнить` may have rebound `key` before `read` in `stmt`. A body
+    /// whose lowering may have lost a write proves no absence of one.
+    fn rebinding_write_may_reach(&self, read: ExprId, key: &str, stmt: StmtId) -> bool {
+        if hir_def::body::events::hir_suppressed(&self.body) {
             return true;
         }
-        let mut found = false;
-        hir_def::body::events::for_each_expr_child(&self.body, root.to_idx(), &mut |child| {
-            found = found || self.expr_contains(ExprId::from_idx(child), target);
-        });
-        found
-    }
-
-    /// Whether `def` is a possible write that cannot rebind the caller's local: an argument of
-    /// a constructor, which only builds a new object from its arguments, or of a call whose
-    /// parameter takes the name `Знач`.
-    fn cannot_rebind(
-        &self,
-        defs: &dataflow::reaching_defs::ReachingDefsResult,
-        def: &dataflow::reaching_defs::Definition,
-    ) -> bool {
-        let dataflow::reaching_defs::DefSite::MayWrite(id) = def.def_site else {
-            return false;
+        let Some(defs) = self.flow.executable_reaching_defs(self.db) else {
+            return true;
         };
-        let Some(dataflow::reaching_defs::WriteEventKind::Argument { call, arg, .. }) =
-            defs.write(id).map(|write| write.kind)
-        else {
-            return false;
-        };
-        matches!(self.body.expr(call), Expr::New { .. })
-            || self.argument_passing(arg) == definite_init::ArgPassing::ByVal
+        crate::possible_writes::rebinding_write_reaches(
+            self.db,
+            &self.body,
+            &self.call_arg_bindings,
+            &defs,
+            key,
+            read,
+            stmt,
+        )
     }
 
     /// The values the definitions give, for typing a read. A possible write
@@ -5917,7 +5865,7 @@ impl<'db> InferenceContext<'db> {
 
             ModuleType::FormModule => match metadata.form.as_deref() {
                 Some(form) if form.is_managed() => ImplicitSelfSurface::PlatformTypes(
-                    crate::form_self::managed_form_self_method_types(form),
+                    crate::form_self::managed_form_self_types(form),
                 ),
                 _ => ImplicitSelfSurface::Unreadable,
             },
@@ -6510,6 +6458,89 @@ impl<'db> InferenceContext<'db> {
             }
         }
     }
+}
+
+/// How the call holding `arg` passes it, as far as the resolved callee proves it; `None` is
+/// unknown. Known only when the call settles on one callee: the unique candidate, or the sole
+/// survivor whose argument types are undecided (an undocumented parameter leaves the selection
+/// `Ambiguous`).
+/// For a user method the answer is the `Знач` flag of the parameter at the
+/// argument's position. For a platform callable it is the curated corpus's fact,
+/// where silence means "by value" only inside a scope the corpus attests as
+/// verified (decided once, when the snapshot is built) and "unknown" otherwise.
+///
+/// Free of `InferenceContext` so that a consumer holding only the bindings, such as the
+/// argument diagnostics, reads the same verdict inference does.
+pub(crate) fn argument_passing_of(
+    db: &dyn HirDatabase,
+    bindings: &[CallArgBinding],
+    arg: ExprId,
+) -> Option<bsl_platform::ParamPassing> {
+    use crate::call_resolution::{BuiltinCallableId, CandidateId};
+
+    let (binding, position, candidate) = sole_callee_of_argument(bindings, arg)?;
+    match candidate {
+        CandidateId::User { method, .. } => user_param_passing(db, method, position),
+        CandidateId::Platform { .. }
+        | CandidateId::Builtin { callable: BuiltinCallableId::PlatformGlobal(_), .. } => {
+            // Forwarded as it is: every consumer reads a variant it cannot name like `None`.
+            binding
+                .candidate
+                .candidates
+                .as_slice()
+                .iter()
+                .find(|signature| signature.id == candidate)
+                .and_then(|signature| signature.params.get(position))
+                .and_then(|param| param.passing)
+        }
+        _ => None,
+    }
+}
+
+/// [`argument_passing_of`] as the code itself declares it: the `Знач` flag of a user method's
+/// parameter, and `None` for any other callee. A platform callable's direction comes from the
+/// help corpus; it settles whether the callee can rebind the local, but an uninitialized read
+/// is reported only on the code's own declaration, so a local handed to a platform callable
+/// stays unjudged and counts as initialized by the call.
+pub(crate) fn declared_argument_passing_of(
+    db: &dyn HirDatabase,
+    bindings: &[CallArgBinding],
+    arg: ExprId,
+) -> Option<bsl_platform::ParamPassing> {
+    match sole_callee_of_argument(bindings, arg)? {
+        (_, position, crate::call_resolution::CandidateId::User { method, .. }) => {
+            user_param_passing(db, method, position)
+        }
+        _ => None,
+    }
+}
+
+fn sole_callee_of_argument(
+    bindings: &[CallArgBinding],
+    arg: ExprId,
+) -> Option<(&CallArgBinding, usize, crate::call_resolution::CandidateId)> {
+    let (binding, position) = bindings.iter().find_map(|binding| {
+        binding.args.iter().position(|a| *a == arg).map(|position| (binding, position))
+    })?;
+    let candidate = binding.candidate.resolution.selection.sole_candidate()?;
+    Some((binding, position, candidate))
+}
+
+fn user_param_passing(
+    db: &dyn HirDatabase,
+    method: crate::call_resolution::UserMethodId,
+    position: usize,
+) -> Option<bsl_platform::ParamPassing> {
+    use bsl_platform::ParamPassing;
+
+    let decl = db.interface_method(hir_def::MethodId::from(method))?;
+    decl.params.get(position).map(|param| {
+        if param.is_val {
+            ParamPassing::ByVal
+        } else {
+            ParamPassing::ByRef
+        }
+    })
 }
 
 /// Whether help of the `served` release lists every type of the project's

@@ -4,7 +4,7 @@ use cfg_types::StmtId;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::{DfsPostOrder, EdgeRef, Reversed};
 use petgraph::Direction;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Debug, Clone)]
 pub struct ControlFlowGraph {
@@ -180,6 +180,30 @@ impl ControlFlowGraph {
         self.graph.edges_directed(vertex, Direction::Incoming).count()
     }
 
+    /// The vertices `entry` reaches over the edges `can_traverse` accepts, `entry` itself
+    /// included. Reach is the GRAPH's own knowledge, so every analysis that needs it asks
+    /// here instead of walking the edges again - one walk cannot forget to exclude the dead
+    /// links ([`CfgEdgeType::is_executable`]), nor exclude them where it must not.
+    pub fn reachable_vertices(
+        &self,
+        entry: NodeIndex,
+        can_traverse: impl Fn(&CfgEdgeType) -> bool,
+    ) -> FxHashSet<NodeIndex> {
+        let mut reached = FxHashSet::default();
+        let mut stack = vec![entry];
+        while let Some(vertex) = stack.pop() {
+            if !reached.insert(vertex) {
+                continue;
+            }
+            stack.extend(
+                self.outgoing_edges(vertex)
+                    .filter(|(_, kind)| can_traverse(kind))
+                    .map(|(target, _)| target),
+            );
+        }
+        reached
+    }
+
     pub fn reverse_postorder(&self) -> Vec<NodeIndex> {
         let Some(start) = self.start else {
             return vec![];
@@ -223,6 +247,47 @@ mod tests {
     use crate::vertex::BasicBlockVertex;
     use cfg_types::StmtId;
     use la_arena::RawIdx;
+
+    #[test]
+    fn reachable_vertices_skips_what_only_an_unexecutable_edge_leads_to() {
+        let mut cfg = ControlFlowGraph::new();
+        let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        let live = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        let dead = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        cfg.add_edge(entry, live, CfgEdgeType::Unconditional);
+        cfg.add_edge(entry, dead, CfgEdgeType::Unexecutable);
+
+        let all = cfg.reachable_vertices(entry, |_| true);
+        let executable = cfg.reachable_vertices(entry, |kind| kind.is_executable());
+
+        assert!(all.contains(&dead));
+        assert!(!executable.contains(&dead));
+        assert!(executable.contains(&live) && executable.contains(&entry));
+    }
+
+    #[test]
+    fn reachable_vertices_of_a_sink_is_just_the_entry() {
+        let mut cfg = ControlFlowGraph::new();
+        let entry = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+
+        let reached = cfg.reachable_vertices(entry, |_| true);
+
+        assert_eq!(reached.len(), 1);
+        assert!(reached.contains(&entry));
+    }
+
+    #[test]
+    fn reachable_vertices_terminates_on_a_cycle() {
+        let mut cfg = ControlFlowGraph::new();
+        let first = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        let second = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        cfg.add_edge(first, second, CfgEdgeType::Unconditional);
+        cfg.add_edge(second, first, CfgEdgeType::Unconditional);
+
+        let reached = cfg.reachable_vertices(first, |_| true);
+
+        assert_eq!(reached.len(), 2);
+    }
 
     #[test]
     fn test_graph_creation() {

@@ -179,6 +179,7 @@ pub mod transferring_parameters_between_client_and_server;
 pub mod try_number;
 pub mod type_mismatch;
 pub mod type_mismatch_by_doc_comment;
+pub mod type_name_compared_as_text;
 pub mod typo;
 pub mod unary_plus_in_concatenation;
 pub mod unavailable_alias_in_query;
@@ -367,6 +368,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::StructureKeyIsNotIdentifier => {
             Some(&structure_key_is_not_identifier::METADATA)
         }
+        DiagnosticCode::TypeNameComparedAsText => Some(&type_name_compared_as_text::METADATA),
         DiagnosticCode::FormDataHasNoMetadataMethod => {
             Some(&form_data_has_no_metadata_method::METADATA)
         }
@@ -606,6 +608,10 @@ mod implicit_database_read_in_cycle_tests;
 #[cfg(test)]
 #[path = "handlers/uninitialized_local_variable_tests.rs"]
 mod uninitialized_local_variable_tests;
+
+#[cfg(test)]
+#[path = "handlers/type_name_compared_as_text_tests.rs"]
+mod type_name_compared_as_text_tests;
 
 #[cfg(test)]
 mod metadata_tests {
