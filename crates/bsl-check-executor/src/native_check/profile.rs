@@ -4542,7 +4542,7 @@ mod tests {
         symlink(&foreign, &link).unwrap();
 
         super::super::tests::guard_future(
-            cleanup_owned_jobs(&jobs, &super::super::compiler::current_stop_clock()),
+            cleanup_owned_jobs(&jobs, &super::super::compiler::stop_clock_not_under_test()),
             "startup cleanup of dead owned job",
         )
         .await
@@ -4573,7 +4573,7 @@ mod tests {
         fs::set_permissions(marker, fs::Permissions::from_mode(0o600)).unwrap();
 
         super::super::tests::guard_future(
-            cleanup_owned_jobs(&jobs, &super::super::compiler::current_stop_clock()),
+            cleanup_owned_jobs(&jobs, &super::super::compiler::stop_clock_not_under_test()),
             "startup cleanup with live creator",
         )
         .await
@@ -4775,7 +4775,7 @@ mod tests {
         );
 
         super::super::tests::guard_future(
-            cleanup_owned_jobs(&jobs, &super::super::compiler::current_stop_clock()),
+            cleanup_owned_jobs(&jobs, &super::super::compiler::stop_clock_not_under_test()),
             "leaderless owned-group startup cleanup",
         )
         .await

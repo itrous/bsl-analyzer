@@ -53,6 +53,14 @@ pub(crate) fn current_stop_clock() -> StopClock {
     STOP_CLOCK.try_with(Clone::clone).unwrap_or_else(|_| StopClock::new(DEFAULT_STOP_GRACE_MS))
 }
 
+/// Stop clock for a cleanup that tests something other than its deadline: the production grace
+/// is short enough that a loaded machine turns slow scheduling into a spurious cleanup failure,
+/// so only a hang ends the cleanup early.
+#[cfg(all(test, unix))]
+pub(super) fn stop_clock_not_under_test() -> StopClock {
+    StopClock::new(u64::try_from(super::tests::HANG_GUARD.as_millis()).unwrap())
+}
+
 struct StopWatch {
     task: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
