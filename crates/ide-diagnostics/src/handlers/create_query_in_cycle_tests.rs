@@ -97,6 +97,185 @@ fn create_query_in_cycle_i08_unknown_receivers_prove_nothing() {
 }
 
 #[test]
+fn create_query_in_cycle_i08_possible_write_proves_nothing() {
+    const RESET: &str = "Процедура Сбросить(Ссылка)\n\tСсылка = Неопределено;\nКонецПроцедуры\n\n";
+    let with = |body: &str| format!("{RESET}{}", in_procedure(body));
+
+    // The callee may replace the query: the loop is not proved to run one.
+    let reset = with("\tЗ = Новый Запрос;\n\tСбросить(З);\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;");
+    assert_eq!(count(&reset), 0, "{reset}");
+    // Only on one path is it still a possible write, and that path is enough.
+    let one_branch = with("\tЗ = Новый Запрос;\n\tЕсли Параметр Тогда\n\t\tСбросить(З);\n\tКонецЕсли;\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;");
+    assert_eq!(count(&one_branch), 0, "{one_branch}");
+    // `Выполнить` may assign any name of the body.
+    let execute = in_procedure("\tЗ = Новый Запрос;\n\tВыполнить(Параметр);\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;");
+    assert_eq!(count(&execute), 0, "{execute}");
+
+    // Positive controls: without the call the query is proved, and an ordinary write after
+    // the call replaces the possible one.
+    let without_call = with(
+        "\tЗ = Новый Запрос;\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;",
+    );
+    assert_eq!(count(&without_call), 1, "{without_call}");
+    let rewritten = with("\tЗ = Новый Запрос;\n\tСбросить(З);\n\tЗ = Новый Запрос;\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;");
+    assert_eq!(count(&rewritten), 1, "{rewritten}");
+    let other_name = with("\tЗ = Новый Запрос;\n\tД = 1;\n\tСбросить(Д);\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;");
+    assert_eq!(count(&other_name), 1, "{other_name}");
+    // A `Знач` parameter cannot rebind the caller's local.
+    let by_value = format!(
+        "Процедура Прочитать(Знач Ссылка)\nКонецПроцедуры\n\n{}",
+        in_procedure("\tЗ = Новый Запрос;\n\tПрочитать(З);\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;")
+    );
+    assert_eq!(count(&by_value), 1, "{by_value}");
+    // A constructor builds a new object from its arguments and cannot rebind them, nor can a
+    // platform function the corpus attests as taking its argument by value; a method whose
+    // passing is unknown still may.
+    let before_loop = |stmt: &str| {
+        in_procedure(&format!("\tЗ = Новый Запрос;\n{stmt}\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;"))
+    };
+    let constructor = before_loop("\tС = Новый Структура(\"З\", З);");
+    assert_eq!(count(&constructor), 1, "{constructor}");
+    let method = before_loop("\tС = Новый Структура;\n\tС.Вставить(\"З\", З);");
+    assert_eq!(count(&method), 0, "{method}");
+    let function = before_loop("\tТипЗнч(З);");
+    assert_eq!(count(&function), 1, "{function}");
+    // A call's possible write follows the reads of its arguments.
+    let after_read = format!(
+        "Процедура Потребить(Знач Результат, Ссылка)\nКонецПроцедуры\n\n{}",
+        in_procedure("\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ = Новый Запрос;\n\t\tПотребить(З.Выполнить(), З);\n\tКонецЦикла;")
+    );
+    assert_eq!(count(&after_read), 1, "{after_read}");
+}
+
+#[test]
+fn create_query_in_cycle_i08_earlier_header_root_may_write() {
+    const RESET: &str =
+        "Функция Сбросить(Ссылка)\n\tСсылка = Неопределено;\n\tВозврат 1;\nКонецФункции\n\n";
+    let with = |body: &str| format!("{RESET}{}", in_procedure(body));
+    // The query is made afresh on each pass, so only the earlier root of the same header can
+    // have replaced it before the read.
+    let elsif = |first: &str| {
+        with(&format!("\tПока Параметр Цикл\n\t\tЗ = Новый Запрос;\n\t\tЕсли {first} Тогда\n\t\tИначеЕсли З.Выполнить() <> Неопределено Тогда\n\t\tКонецЕсли;\n\tКонецЦикла;"))
+    };
+    let bounds = |lower: &str| {
+        with(&format!("\tПока Параметр Цикл\n\t\tЗ = Новый Запрос;\n\t\tДля Сч = {lower} По З.Выполнить().Выгрузить().Количество() Цикл\n\t\tКонецЦикла;\n\tКонецЦикла;"))
+    };
+
+    assert_eq!(count(&elsif("Сбросить(З) = 0")), 0, "ИначеЕсли after a condition that may write");
+    assert_eq!(count(&bounds("Сбросить(З)")), 0, "upper bound after a lower bound that may write");
+    // Positive controls: the same headers without the possible write prove the query.
+    assert_eq!(count(&elsif("Параметр")), 1);
+    assert_eq!(count(&bounds("1")), 1);
+}
+
+#[test]
+fn create_query_in_cycle_i09_same_point_order() {
+    const HELPERS: &str = "Функция Сбросить(Ссылка)\n\tСсылка = Неопределено;\n\tВозврат 1;\nКонецФункции\n\nФункция Прочитать(Знач Ссылка)\n\tВозврат 1;\nКонецФункции\n\nПроцедура Потребить(Знач Результат, Ссылка)\nКонецПроцедуры\n\n";
+    // The query is made afresh on each pass, so only the point holding the read can have
+    // replaced it.
+    let point = |stmt: &str| {
+        format!(
+            "{HELPERS}{}",
+            in_procedure(&format!(
+                "\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ = Новый Запрос;\n\t\t{stmt}\n\tКонецЦикла;"
+            ))
+        )
+    };
+    let run = "З.Выполнить().Выгрузить().Количество()";
+
+    // A neighbouring call of the same statement or condition may write before the read.
+    let neighbour = point(&format!("Р = Сбросить(З) + {run};"));
+    assert_eq!(count(&neighbour), 0, "{neighbour}");
+    let condition = point(&format!("Если Сбросить(З) = 0 И {run} = 0 Тогда\n\t\tКонецЕсли;"));
+    assert_eq!(count(&condition), 0, "{condition}");
+    // The calls of one point are taken as unordered, so a neighbour written after the read
+    // counts too.
+    let neighbour_after = point(&format!("Р = {run} + Сбросить(З);"));
+    assert_eq!(count(&neighbour_after), 0, "{neighbour_after}");
+
+    // Positive controls: the call holding the read writes only after it, `Знач` cannot write,
+    // `Выполнить` runs after its own expression, and no call leaves the query proved.
+    let holding = point("Потребить(З.Выполнить(), З);");
+    assert_eq!(count(&holding), 1, "{holding}");
+    let by_value = point(&format!("Р = Прочитать(З) + {run};"));
+    assert_eq!(count(&by_value), 1, "{by_value}");
+    let execute = point(&format!("Выполнить(Строка({run}));"));
+    assert_eq!(count(&execute), 1, "{execute}");
+    let plain = point(&format!("Р = 1 + {run};"));
+    assert_eq!(count(&plain), 1, "{plain}");
+}
+
+#[test]
+fn create_query_in_cycle_i09_previous_turn_write_survives() {
+    const HELPERS: &str = "Функция Сбросить(Ссылка)\n\tСсылка = Неопределено;\n\tВозврат 1;\nКонецФункции\n\nПроцедура Потребить(Знач Результат, Ссылка)\nКонецПроцедуры\n\n";
+    let loop_of = |body: &str| {
+        format!(
+            "{HELPERS}{}",
+            in_procedure(&format!(
+                "\tЗ = Новый Запрос;\n\tДля Каждого Э Из Коллекция Цикл\n{body}\n\tКонецЦикла;"
+            ))
+        )
+    };
+    // The query is made once, before the loop: the call that holds the read, or one after it,
+    // may have rebound it on the previous turn.
+    let holding = loop_of("\t\tПотребить(З.Выполнить(), З);");
+    assert_eq!(count(&holding), 0, "{holding}");
+    let neighbour_after = loop_of("\t\tЗ.Выполнить();\n\t\tСбросить(З);");
+    assert_eq!(count(&neighbour_after), 0, "{neighbour_after}");
+    // Controls: without the call the same loop proves the query, and a write of the name
+    // before the read on every turn removes the previous turn's.
+    let plain = loop_of("\t\tЗ.Выполнить();");
+    assert_eq!(count(&plain), 1, "{plain}");
+    let rewritten = loop_of("\t\tЗ = Новый Запрос;\n\t\tПотребить(З.Выполнить(), З);");
+    assert_eq!(count(&rewritten), 1, "{rewritten}");
+}
+
+#[test]
+fn create_query_in_cycle_i08_query_on_one_path_is_still_run() {
+    // A path that never assigns the local leaves no value of its own: the query it holds on the
+    // other path is what the loop runs.
+    let one_path = in_procedure("\tЕсли Параметр Тогда\n\t\tЗ = Новый Запрос;\n\tКонецЕсли;\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;");
+    assert_eq!(count(&one_path), 1, "{one_path}");
+    // Control: a value of unknown type on the other path still proves nothing.
+    let unknown_path = in_procedure("\tЕсли Параметр Тогда\n\t\tЗ = Новый Запрос;\n\tИначе\n\t\tЗ = Параметр;\n\tКонецЕсли;\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;");
+    assert_eq!(count(&unknown_path), 0, "{unknown_path}");
+}
+
+#[test]
+fn create_query_in_cycle_i08_possible_write_still_marks_the_helper() {
+    const HELPERS: &str = "Процедура Настроить(Запрос)\n\tЗапрос.УстановитьПараметр(\"П\", 1);\nКонецПроцедуры\n\nФункция Помощник()\n\tЗапрос = Новый Запрос;\n\tНастроить(Запрос);\n\tВозврат Запрос.Выполнить();\nКонецФункции\n\nФункция НеЗапрос()\n\tД = Новый Массив;\n\tНастроить(Д);\n\tВозврат Д.Выполнить();\nКонецФункции\n\n";
+    // A helper that may rebind its query and still runs `Выполнить` is wrong either way: calling
+    // it in a loop is reported.
+    let helper = format!(
+        "{HELPERS}{}",
+        in_procedure("\tДля Каждого Э Из Коллекция Цикл\n\t\tПомощник();\n\tКонецЦикла;")
+    );
+    assert_eq!(count_call(&helper), 1, "{helper}");
+    // Controls: the same execution in the loop itself is not reported, and a helper whose
+    // receiver is no query is not marked.
+    let direct = format!("{HELPERS}{}", in_procedure("\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ = Новый Запрос;\n\t\tНастроить(З);\n\t\tЗ.Выполнить();\n\tКонецЦикла;"));
+    assert_eq!(count(&direct), 0, "{direct}");
+    let not_query = format!(
+        "{HELPERS}{}",
+        in_procedure("\tДля Каждого Э Из Коллекция Цикл\n\t\tНеЗапрос();\n\tКонецЦикла;")
+    );
+    assert_eq!(count_call(&not_query), 0, "{not_query}");
+}
+
+#[test]
+fn create_query_in_cycle_i12_unresolved_jump_proves_nothing() {
+    let jump = |label: &str| {
+        in_procedure(&format!("\tЕсли Параметр Тогда\n\t\tПерейти ~Нет;\n\t\tЗ = Новый Массив;\n\tИначе\n\t\tЗ = Новый Запрос;\n\tКонецЕсли;\n{label}\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;"))
+    };
+    // The label is missing: where the jump leads is unknown, so the array may still reach.
+    let unresolved = jump("");
+    assert_eq!(count(&unresolved), 0, "{unresolved}");
+    // Control: with the label the jump skips the array and only the query reaches the loop.
+    let resolved = jump("~Нет:\n");
+    assert_eq!(count(&resolved), 1, "{resolved}");
+}
+
+#[test]
 fn create_query_in_cycle_i08_recovered_call_keeps_its_neighbour() {
     let source = in_procedure("\tЗ = Новый Запрос;\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить(;\n\t\tЗ.ВыполнитьПакет();\n\tКонецЦикла;");
     let reported: Vec<_> =

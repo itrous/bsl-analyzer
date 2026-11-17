@@ -3774,7 +3774,7 @@ mod tests {
         let dirty = engine.context_dirty_paths("code").unwrap();
         assert!(
             dirty.contains(&bsl_search::FileKey::configuration(
-                "Catalogs/Товары/Ext/ObjectModule.bsl".replace('/', std::path::MAIN_SEPARATOR_STR)
+                "Catalogs/Товары/Ext/ObjectModule.bsl"
             )),
             "the owned module is marked context-dirty: {dirty:?}",
         );
@@ -4031,15 +4031,11 @@ mod tests {
         let engine = guard.as_ref().unwrap();
         let dirty = engine.context_dirty_paths("code").unwrap();
         assert!(
-            dirty.contains(&bsl_search::FileKey::configuration(
-                "Catalogs/Х/Ext/ObjectModule.bsl".replace('/', std::path::MAIN_SEPARATOR_STR)
-            )),
+            dirty.contains(&bsl_search::FileKey::configuration("Catalogs/Х/Ext/ObjectModule.bsl")),
             "the owned module is marked context-dirty: {dirty:?}",
         );
         assert!(
-            dirty.contains(&bsl_search::FileKey::configuration(
-                "CommonModules/Б/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR)
-            )),
+            dirty.contains(&bsl_search::FileKey::configuration("CommonModules/Б/Ext/Module.bsl")),
             "the referencing module (reads the catalog) is marked context-dirty: {dirty:?}",
         );
         assert!(
@@ -4248,9 +4244,7 @@ mod tests {
         let engine = guard.as_ref().unwrap();
         let dirty = engine.context_dirty_paths("code").unwrap();
         assert!(
-            dirty.contains(&bsl_search::FileKey::configuration(
-                "Catalogs/Х/Ext/ObjectModule.bsl".replace('/', std::path::MAIN_SEPARATOR_STR)
-            )),
+            dirty.contains(&bsl_search::FileKey::configuration("Catalogs/Х/Ext/ObjectModule.bsl")),
             "the owned module is still marked without a published graph: {dirty:?}",
         );
         assert!(
@@ -4674,10 +4668,7 @@ mod tests {
         fn a_referencing_module_of_an_extension_is_marked_under_its_own_root() {
             let dir = tempdir().unwrap();
             let marks = referencing_marks_in(dir.path(), &dir.path().join("ws"));
-            let reader = FileKey::new(
-                "cfe",
-                "CommonModules/Б/Ext/Module.bsl".replace('/', std::path::MAIN_SEPARATOR_STR),
-            );
+            let reader = FileKey::new("cfe", "CommonModules/Б/Ext/Module.bsl");
             assert!(
                 marks.dirty.contains(&reader),
                 "the extension's reader is marked under its own root: {marks:?}",
@@ -4817,10 +4808,7 @@ mod tests {
             let guard = engine.lock().unwrap();
             let dirty = guard.as_ref().unwrap().context_dirty_paths("code").unwrap();
             assert!(
-                dirty.contains(&FileKey::new(
-                    "cfe",
-                    "Catalogs/Т/Ext/ObjectModule.bsl".replace('/', std::path::MAIN_SEPARATOR_STR)
-                )),
+                dirty.contains(&FileKey::new("cfe", "Catalogs/Т/Ext/ObjectModule.bsl")),
                 "the extension's owned module is marked under its own root: {dirty:?}",
             );
         }

@@ -87,6 +87,7 @@ pub enum DiagnosticCode {
     ObjectModifiedInOnWrite,
     PostingWhileDataExchangeLoading,
     StructureKeyIsNotIdentifier,
+    TypeNameComparedAsText,
     FormDataHasNoMetadataMethod,
     ValueIsFilledOfBoolean,
     UseLessForEach,

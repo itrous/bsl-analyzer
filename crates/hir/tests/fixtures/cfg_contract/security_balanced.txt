@@ -17,6 +17,7 @@ expr ExprId(11): Some(LocalRange(198..272))
 transitions:
   s0 -> s1
   s1 -> s4
+  s2 -> s3
   s2 -> s5
   s3 -> s5
   s4 -> s2
@@ -25,8 +26,8 @@ transitions:
 definitions (limit 3):
   s0: Some([])
   s1: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
-  s2: Some([])
-  s3: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s2: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }"])
+  s3: Some([])
   s4: None
   s5: Some([])
 definitions (limit 10000):

@@ -152,7 +152,7 @@ where
     }
 
     fn transfer_edge(&self, edge_kind: CfgEdgeType, state: &OpenSet<R>) -> OpenSet<R> {
-        if matches!(edge_kind, CfgEdgeType::Unexecutable) {
+        if !edge_kind.is_executable() {
             OpenSet::bottom()
         } else {
             state.clone()

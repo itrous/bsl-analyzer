@@ -22,6 +22,7 @@ use stdx::case::CaseExt;
 use tracing::{debug, info, trace};
 use vfs::FileId;
 
+use crate::body_flow::BodyFlow;
 use crate::builtin;
 use crate::db::HirDatabase;
 use crate::definite_init;
@@ -191,13 +192,16 @@ pub struct ImplicitLocalAssignment {
 /// inference recorded for the value it puts in the variable.
 ///
 /// `stmt` is `None` for a definition that is not a statement at all — a
-/// parameter, a bare `Перем`, a loop binding. `ty` is `None` when inference
-/// recorded no type for it, which is the ordinary answer for a BSL parameter:
-/// the language declares none.
+/// parameter, a bare `Перем`, a loop binding, a possible write. `ty` is `None`
+/// when inference recorded no type for it, which is the ordinary answer for a
+/// BSL parameter: the language declares none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReachingDef {
     stmt: Option<StmtId>,
     ty: Option<TypeId>,
+    /// A call taking the name bare or a `Выполнить` may have rebound it to a
+    /// value this body does not show, or may have left it as it was.
+    possible_write: bool,
 }
 
 /// The state of one [`InferenceContext::types_on_every_path`] query.
@@ -216,6 +220,9 @@ struct PathWalk {
     /// Reaching definitions to answer local reads with, in place of the module's memoised ones.
     /// A read in a branch or loop header is then answered too, by what that header reads.
     own_defs: Option<Arc<dataflow::reaching_defs::ReachingDefsResult>>,
+    /// Whether a call or `Выполнить` that may rebind a local read through
+    /// [`Self::own_defs`] vouches for nothing, or is passed over.
+    weigh_possible_writes: bool,
 }
 
 /// What a definition reaching a read takes its value from.
@@ -718,6 +725,10 @@ pub struct InferenceContext<'db> {
 
     body: Arc<Body>,
 
+    /// The flow inputs of `body`, shared by every analysis this inference runs
+    /// over it.
+    flow: BodyFlow,
+
     return_expr_ids: Vec<ExprId>,
 
     var_types: FxHashMap<NormName, TypeId>,
@@ -1055,22 +1066,29 @@ pub fn infer_owner(
 }
 
 impl<'db> InferenceContext<'db> {
+    /// Inference over a body the database does not memoise under `owner`, such
+    /// as a synthetic one: its flow is built from the body itself.
     pub fn new(
         db: &'db dyn HirDatabase,
         file_id: FileId,
         owner: DefWithBodyId,
         body: &Arc<Body>,
     ) -> Self {
-        Self::new_impl(db, file_id, owner, body, true)
+        Self::new_impl(db, file_id, owner, Self::own_flow(owner, body), true)
+    }
+
+    fn own_flow(owner: DefWithBodyId, body: &Arc<Body>) -> BodyFlow {
+        BodyFlow::detached(Arc::clone(body), matches!(owner, DefWithBodyId::Method(_)))
     }
 
     fn new_impl(
         db: &'db dyn HirDatabase,
         file_id: FileId,
         owner: DefWithBodyId,
-        body: &Arc<Body>,
+        flow: BodyFlow,
         with_body_env: bool,
     ) -> Self {
+        let body = flow.body();
         let opts = db.env_options();
         let assignment_target_names = body
             .stmts_iter()
@@ -1122,6 +1140,7 @@ impl<'db> InferenceContext<'db> {
             proceed_arity: None,
             owner,
             body: Arc::clone(body),
+            flow,
             var_types: FxHashMap::default(),
             reset_vars: rustc_hash::FxHashSet::default(),
             implicit_locals: FxHashMap::default(),
@@ -1163,13 +1182,27 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
+    /// Inference over a method's body; when `body` is the method's memoised
+    /// body, its flow reads the method's memos.
     pub fn new_for_method(
         db: &'db dyn HirDatabase,
         method: MethodIdInput<'db>,
         body: &Arc<Body>,
     ) -> Self {
         let mid = method.method_id(db);
-        Self::new(db, mid.module.file_id, DefWithBodyId::Method(mid.local_id), body)
+        let flow = BodyFlow::for_method(db, method, body);
+        Self::new_impl(db, mid.module.file_id, DefWithBodyId::Method(mid.local_id), flow, true)
+    }
+
+    /// Inference over the module-level code of `file_id`; when `body` is its
+    /// memoised body, its flow reads the module-code memos.
+    pub fn new_for_module_code(
+        db: &'db dyn HirDatabase,
+        file_id: FileId,
+        body: &Arc<Body>,
+    ) -> Self {
+        let flow = BodyFlow::for_module_code(db, file_id, body);
+        Self::new_impl(db, file_id, DefWithBodyId::ModuleCode, flow, true)
     }
 
     /// Inference over an effective `&ИзменениеИКонтроль` module: local bodies/symbols come
@@ -1190,7 +1223,7 @@ impl<'db> InferenceContext<'db> {
         // computed against the base file's item tree may belong to a woven
         // method rather than the one being inferred — disable availability
         // checks rather than misattribute them.
-        let mut ctx = Self::new_impl(db, base_file_id, owner, body, false);
+        let mut ctx = Self::new_impl(db, base_file_id, owner, Self::own_flow(owner, body), false);
         ctx.local_symbols = Some(local_symbols);
         ctx.effective_extension = ext_file_id.map(hir_def::ModuleId::new);
         ctx
@@ -1210,7 +1243,7 @@ impl<'db> InferenceContext<'db> {
     ) -> Self {
         // A weaving interceptor's effective directive comes from the base
         // method it intercepts, unknown at this layer — no availability checks.
-        let mut ctx = Self::new_impl(db, ext_file_id, owner, body, false);
+        let mut ctx = Self::new_impl(db, ext_file_id, owner, Self::own_flow(owner, body), false);
         ctx.weaving_base = Some(base_module);
         ctx
     }
@@ -2243,16 +2276,19 @@ impl<'db> InferenceContext<'db> {
             self.call_arg_bindings.iter().map(|binding| (binding.call_expr, binding)).collect();
         let module = hir_def::ModuleId::new(self.context_file_id);
         let mut facts = crate::query_in_loop::BodyQueryFacts::default();
-        let mut own_defs = None;
         for &(call, in_loop_body) in &self.query_call_sites {
             if self.body.is_recovered(call) {
                 continue;
             }
-            if let Some(kind) = self.query_execution_kind(call, &bindings, &mut own_defs) {
+            let through_rebinding = self.query_execution_kind(call, &bindings, true);
+            if let Some(kind) =
+                through_rebinding.or_else(|| self.query_execution_kind(call, &bindings, false))
+            {
                 facts.executions.push(crate::query_in_loop::QueryExecutionSite {
                     call,
                     kind,
                     in_loop_body,
+                    proved_through_rebinding: through_rebinding.is_some(),
                 });
             } else if let Some(target) =
                 self.called_user_method(call, &bindings).filter(|target| target.module == module)
@@ -2279,26 +2315,17 @@ impl<'db> InferenceContext<'db> {
         crate::query_in_loop::selected_user_method(&binding.candidate.resolution.selection)
     }
 
-    /// Over the body at hand, which in an effective module is not the one the module's memoised
-    /// definitions number, and without what only dead code carries: such a value is not one a
-    /// call can see.
-    fn executable_reaching_defs(&self) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>> {
-        let cfg =
-            cfg::CfgBuilder::new().build_graph_from_hir(self.body.body_stmts_typed(), &self.body);
-        dataflow::reaching_defs::solve_executable_reaching_definitions(
-            Arc::new(cfg),
-            &self.body,
-            matches!(self.owner, DefWithBodyId::Method(_)),
-        )
-    }
-
     /// The operation a call proves to execute. Reaching definitions are solved on the first call
-    /// that names one, as most bodies have none.
+    /// that names one, as most bodies have none. They are those of the body at hand, which in
+    /// an effective module is not the one the module's memoised definitions number, and
+    /// without what only dead code carries: such a value is not one a call can see.
+    /// `weigh_possible_writes` decides whether a call or `Выполнить` that may rebind the
+    /// receiver first leaves it unproved.
     fn query_execution_kind(
         &self,
         call: ExprId,
         bindings: &FxHashMap<ExprId, &CallArgBinding>,
-        own_defs: &mut Option<Option<Arc<dataflow::reaching_defs::ReachingDefsResult>>>,
+        weigh_possible_writes: bool,
     ) -> Option<crate::query_in_loop::QueryExecutionKind> {
         use crate::query_in_loop::{selected_platform_method, QueryExecutionKind};
 
@@ -2322,9 +2349,18 @@ impl<'db> InferenceContext<'db> {
             return None;
         }
 
-        let own_defs = own_defs.get_or_insert_with(|| self.executable_reaching_defs()).clone()?;
-        let mut walk =
-            PathWalk { inferred_leaves: true, own_defs: Some(own_defs), ..PathWalk::default() };
+        // The executable definitions are solved over a body with a syntax error too, but a jump
+        // to a label the body lacks leaves the paths themselves unknown.
+        if hir_def::body::events::has_unresolved_jump(&self.body) {
+            return None;
+        }
+        let own_defs = self.flow.executable_reaching_defs(self.db)?;
+        let mut walk = PathWalk {
+            inferred_leaves: true,
+            own_defs: Some(own_defs),
+            weigh_possible_writes,
+            ..PathWalk::default()
+        };
         let receiver_types = self.types_on_every_path(ExprId::from_idx(receiver), &mut walk)?;
         if receiver_types.is_empty()
             || !receiver_types.iter().all(|ty| kind.proved_by(self.db, *ty))
@@ -2493,44 +2529,13 @@ impl<'db> InferenceContext<'db> {
             || is_self_name(&name.as_str().fold_lower())
     }
 
-    /// How the call holding `arg` passes it, from the `Знач` flag of the parameter
-    /// at the argument's position. Known only when the call settles on one user
-    /// method: the unique candidate, or the sole survivor whose argument types are
-    /// undecided (an undocumented parameter leaves the selection `Ambiguous`).
-    fn argument_passing(&self, arg: ExprId) -> definite_init::ArgPassing {
-        use crate::call_resolution::{CallSelection, CandidateId};
-        use definite_init::ArgPassing;
-
-        let Some((binding, position)) = self.call_arg_bindings.iter().find_map(|binding| {
-            binding.args.iter().position(|a| *a == arg).map(|position| (binding, position))
-        }) else {
-            return ArgPassing::Unknown;
-        };
-        let candidate = match &binding.candidate.resolution.selection {
-            CallSelection::Unique { candidate } => *candidate,
-            CallSelection::Ambiguous { candidates } if candidates.len() == 1 => candidates[0],
-            _ => return ArgPassing::Unknown,
-        };
-        let CandidateId::User { method, .. } = candidate else {
-            return ArgPassing::Unknown;
-        };
-        let Some(decl) = self.db.interface_method(hir_def::MethodId::from(method)) else {
-            return ArgPassing::Unknown;
-        };
-        match decl.params.get(position) {
-            Some(param) if param.is_val => ArgPassing::ByVal,
-            Some(_) => ArgPassing::ByRef,
-            None => ArgPassing::Unknown,
-        }
-    }
-
     /// Reports every local read that some executable path reaches with the
     /// variable unassigned. A body that may be missing statements or edges, or
     /// whose analysis did not converge, proves nothing and reports nothing.
     fn check_definite_init(&mut self) {
         use dataflow::definite_init::analyze_definite_init;
 
-        if self.local_reads.is_empty() || definite_init::hir_suppressed(&self.body) {
+        if self.local_reads.is_empty() || hir_def::body::events::hir_suppressed(&self.body) {
             return;
         }
         let body = Arc::clone(&self.body);
@@ -2543,19 +2548,18 @@ impl<'db> InferenceContext<'db> {
         if tracked.width() == 0 {
             return;
         }
+        let body_events = self.flow.events(self.db);
         let definite_init::Collected { events, during, mut candidates } =
-            definite_init::collect(&body, &tracked, &self.local_reads, &|arg| {
-                self.argument_passing(arg)
+            definite_init::collect(&body, &body_events, &tracked, &self.local_reads, &|arg| {
+                declared_argument_passing_of(self.db, &self.call_arg_bindings, arg)
             });
         if candidates.is_empty()
             || (events.stmt.is_empty() && events.header.is_empty() && events.loop_var.is_empty())
         {
             return;
         }
-        let cfg =
-            Arc::new(cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body));
         let Some(result) = analyze_definite_init(
-            cfg,
+            self.flow.cfg(self.db),
             (*body).clone(),
             Arc::new(events),
             dataflow::DEFAULT_MAX_ITERATIONS,
@@ -3054,8 +3058,9 @@ impl<'db> InferenceContext<'db> {
     /// target (`Описание = Описание.Родитель` in a loop) — vouches for nothing. With
     /// [`PathWalk::inferred_leaves`] a method call is vouched for like a member read, and any
     /// other call, a literal, a constructor and a global by their own inferred type, and a
-    /// local by the writes reaching it alone, without the values a call or `Выполнить` may give
-    /// it unseen.
+    /// local by the writes reaching it, without the entry value of a path that never assigns
+    /// it. A call or `Выполнить` that may have rebound the local unseen vouches for nothing
+    /// when [`PathWalk::weigh_possible_writes`] is set, and is passed over otherwise.
     fn types_on_every_path(&self, expr: ExprId, walk: &mut PathWalk) -> Option<Vec<TypeId>> {
         const MAX_DEPTH: usize = 16;
         let through_receiver = |receiver: &hir_def::hir::ExprIdx, walk: &mut PathWalk| {
@@ -3101,18 +3106,64 @@ impl<'db> InferenceContext<'db> {
                 }
                 let use_stmt = self.body.enclosing_stmt(expr)?;
                 let reaching = match &walk.own_defs {
-                    Some(defs) => self.reaching_defs_of(match self.header_read_expr(use_stmt) {
-                        Some(header) => defs.defs_for_var_at_header(&key, header)?,
-                        None => defs.defs_for_var_at_stmt(&key, use_stmt)?,
-                    }),
-                    None => self.reaching_assignment_types_at(self.read_point(use_stmt)?, &key)?,
+                    Some(defs) => {
+                        use hir_def::body::events::EvalPoint;
+                        let point =
+                            defs.events().point_of(expr).unwrap_or(EvalPoint::Stmt(use_stmt));
+                        let mut found = match point {
+                            EvalPoint::Header(header) => {
+                                defs.defs_for_var_at_header(&key, header)?
+                            }
+                            EvalPoint::Stmt(_) => defs.defs_for_var_at_stmt(&key, use_stmt)?,
+                        };
+                        // A path that never assigns the local gives no value of its own: what
+                        // the walk vouches for is the values the body gives it.
+                        found.retain(|def| {
+                            !matches!(def.def_site, dataflow::reaching_defs::DefSite::Unknown)
+                        });
+                        if walk.weigh_possible_writes {
+                            found.extend(defs.possible_writes_at(point, &key).into_iter().filter(
+                                |def| {
+                                    crate::possible_writes::may_write_before(
+                                        &self.body, defs, def, expr,
+                                    )
+                                },
+                            ));
+                            found.retain(|def| {
+                                crate::possible_writes::rebinding(
+                                    self.db,
+                                    &self.body,
+                                    &self.call_arg_bindings,
+                                    defs,
+                                    def,
+                                ) != Some(crate::possible_writes::Rebinding::Cannot)
+                            });
+                        } else {
+                            found.retain(|def| {
+                                !matches!(
+                                    def.def_site,
+                                    dataflow::reaching_defs::DefSite::MayWrite(_)
+                                )
+                            });
+                        }
+                        self.reaching_defs_of(found)
+                    }
+                    None => {
+                        let point = self.read_point(use_stmt)?;
+                        let mut defs = self.reaching_definitions_at(point, &key)?;
+                        let interrupted =
+                            self.writes_reaching_through_a_handler(point, &key, &defs)?;
+                        defs.extend(interrupted);
+                        self.reaching_defs_of(defs)
+                    }
                 };
-                let use_stmt = use_stmt.to_idx();
-                if !walk.inferred_leaves
-                    && crate::narrow::local_may_change_unseen(&self.body, &key, use_stmt, None)
-                {
+                // A write the analysis cannot read leaves a value no definition accounts for:
+                // the executable reaching definitions carry it as a possible write at the place
+                // that may perform it, so it reaches a read ordered after it and no other.
+                if !walk.inferred_leaves && self.rebinding_write_may_reach(expr, &key, use_stmt) {
                     return None;
                 }
+                let use_stmt = use_stmt.to_idx();
                 let sources = self.loop_aware_definitions(&key, use_stmt, reaching)?;
                 walk.active.push(expr);
                 let types = self.types_of_definitions(&sources, walk);
@@ -3182,20 +3233,6 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
-    /// The expression naming the CFG header a read in `stmt` happens at, for a statement that
-    /// is a header. Nothing writes between an `Если` condition and an `ИначеЕсли` one, so the
-    /// first condition answers for all of them, and likewise a `Для` lower bound for the upper.
-    fn header_read_expr(&self, stmt: StmtId) -> Option<ExprId> {
-        let header = match self.body.stmt(stmt) {
-            Stmt::If(if_stmt) => if_stmt.condition,
-            Stmt::While { condition, .. } => *condition,
-            Stmt::For { from, .. } => *from,
-            Stmt::ForEach { collection, .. } => *collection,
-            _ => return None,
-        };
-        Some(ExprId::from_idx(header))
-    }
-
     /// Where the definitions of `var_key` reaching `use_stmt` take their values, with loop
     /// variables put back. `None` when no set can be vouched for.
     ///
@@ -3255,13 +3292,22 @@ impl<'db> InferenceContext<'db> {
         definitions.extend(
             reaching
                 .iter()
-                .filter(|def| def.stmt.is_some_and(|stmt| covers(innermost, stmt.to_idx())))
+                // A possible write comes only from the executable solution, where the loop
+                // header rebinds the name outright: one reaching a read inside the loop was
+                // made in it.
+                .filter(|def| {
+                    def.possible_write
+                        || def.stmt.is_some_and(|stmt| covers(innermost, stmt.to_idx()))
+                })
                 .map(|def| self.definition_source(def)),
         );
         Some(definitions)
     }
 
     fn definition_source(&self, def: &ReachingDef) -> DefinitionSource {
+        if def.possible_write {
+            return DefinitionSource::Opaque;
+        }
         match def.stmt.map(|stmt| self.body.stmt(stmt)) {
             Some(Stmt::Assign { value, .. }) => DefinitionSource::Value(ExprId::from_idx(*value)),
             _ => DefinitionSource::Opaque,
@@ -3284,6 +3330,41 @@ impl<'db> InferenceContext<'db> {
         stmt_id: StmtId,
         var_key: &str,
     ) -> Option<Vec<ReachingDef>> {
+        Some(self.reaching_defs_of(self.reaching_definitions_at(stmt_id, var_key)?))
+    }
+
+    /// The assignments of `var_key` that reach the start of `stmt_id` only through the handler
+    /// of a `Попытка`, absent from `seen`. Reaching definitions over every edge hand the handler
+    /// the state before the protected statements, so an assignment an exception interrupts part
+    /// way through them is missing there; the executable solution follows the exceptional exit
+    /// of each protected point and carries it. Only assignments are taken: the executable
+    /// solution also sees a loop header rebind its variable, which the caller puts back itself.
+    /// A statement no execution reaches has no state there and no write reaches it this way.
+    /// `None` when the executable solution is unavailable: the set of writes is then unproven.
+    fn writes_reaching_through_a_handler(
+        &self,
+        stmt_id: StmtId,
+        var_key: &str,
+        seen: &[dataflow::reaching_defs::Definition],
+    ) -> Option<Vec<dataflow::reaching_defs::Definition>> {
+        use dataflow::reaching_defs::DefSite;
+
+        let executable = self.flow.executable_reaching_defs(self.db)?;
+        let defs = executable.defs_for_var_at_stmt(var_key, stmt_id).unwrap_or_default();
+        Some(
+            defs.into_iter()
+                .filter(|def| matches!(def.def_site, DefSite::Assignment(_)))
+                .filter(|def| !seen.contains(def))
+                .collect(),
+        )
+    }
+
+    /// The definitions of `var_key` reaching the start of `stmt_id`, over every edge.
+    fn reaching_definitions_at(
+        &self,
+        stmt_id: StmtId,
+        var_key: &str,
+    ) -> Option<Vec<dataflow::reaching_defs::Definition>> {
         let module = hir_def::ModuleId::new(self.context_file_id);
         let body_defs = match self.owner {
             DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
@@ -3293,10 +3374,33 @@ impl<'db> InferenceContext<'db> {
                 self.db.module_code_reaching_definitions(self.context_file_id)?
             }
         };
-        let defs = body_defs.defs_for_var_at_stmt(var_key, stmt_id)?;
-        Some(self.reaching_defs_of(defs))
+        body_defs.defs_for_var_at_stmt(var_key, stmt_id)
     }
 
+    /// Whether a call or `Выполнить` may have rebound `key` before `read` in `stmt`. A body
+    /// whose lowering may have lost a write proves no absence of one.
+    fn rebinding_write_may_reach(&self, read: ExprId, key: &str, stmt: StmtId) -> bool {
+        if hir_def::body::events::hir_suppressed(&self.body) {
+            return true;
+        }
+        let Some(defs) = self.flow.executable_reaching_defs(self.db) else {
+            return true;
+        };
+        crate::possible_writes::rebinding_write_reaches(
+            self.db,
+            &self.body,
+            &self.call_arg_bindings,
+            &defs,
+            key,
+            read,
+            stmt,
+        )
+    }
+
+    /// The values the definitions give, for typing a read. A possible write
+    /// gives no known value: whether the callee or `Выполнить` wrote anything
+    /// is not known here, so it stays among the definitions as a source of
+    /// unknown type, and no value is proved on a path it reaches.
     fn reaching_defs_of(&self, defs: Vec<dataflow::reaching_defs::Definition>) -> Vec<ReachingDef> {
         defs.into_iter()
             .map(|def| match def.def_site {
@@ -3308,7 +3412,7 @@ impl<'db> InferenceContext<'db> {
                         }
                         _ => None,
                     };
-                    ReachingDef { stmt: Some(stmt), ty }
+                    ReachingDef { stmt: Some(stmt), ty, possible_write: false }
                 }
                 // A binding is not a statement, but inference does record a
                 // type for it when it could work one out — a `Для` counter
@@ -3316,10 +3420,17 @@ impl<'db> InferenceContext<'db> {
                 dataflow::reaching_defs::DefSite::Parameter(binding)
                 | dataflow::reaching_defs::DefSite::VarDecl(binding)
                 | dataflow::reaching_defs::DefSite::ForLoop(binding)
-                | dataflow::reaching_defs::DefSite::ForEachLoop(binding) => {
-                    ReachingDef { stmt: None, ty: self.binding_types.get(&binding).copied() }
+                | dataflow::reaching_defs::DefSite::ForEachLoop(binding) => ReachingDef {
+                    stmt: None,
+                    ty: self.binding_types.get(&binding).copied(),
+                    possible_write: false,
+                },
+                dataflow::reaching_defs::DefSite::Unknown => {
+                    ReachingDef { stmt: None, ty: None, possible_write: false }
                 }
-                dataflow::reaching_defs::DefSite::Unknown => ReachingDef { stmt: None, ty: None },
+                dataflow::reaching_defs::DefSite::MayWrite(_) => {
+                    ReachingDef { stmt: None, ty: None, possible_write: true }
+                }
             })
             .collect()
     }
@@ -5795,7 +5906,7 @@ impl<'db> InferenceContext<'db> {
 
             ModuleType::FormModule => match metadata.form.as_deref() {
                 Some(form) if form.is_managed() => ImplicitSelfSurface::PlatformTypes(
-                    crate::form_self::managed_form_self_method_types(form),
+                    crate::form_self::managed_form_self_types(form),
                 ),
                 _ => ImplicitSelfSurface::Unreadable,
             },
@@ -6390,6 +6501,90 @@ impl<'db> InferenceContext<'db> {
     }
 }
 
+/// How the call holding `arg` passes it, as far as the resolved callee proves it; `None` is
+/// unknown. Known only when the call settles on one callee: the unique candidate, or the sole
+/// survivor whose argument types are undecided (an undocumented parameter leaves the selection
+/// `Ambiguous`).
+/// For a user method the answer is the `Знач` flag of the parameter at the
+/// argument's position. For a platform callable it is the curated corpus's fact,
+/// where silence means "by value" only inside a scope the corpus attests as
+/// verified (decided once, when the snapshot is built) and "unknown" otherwise.
+///
+/// Free of `InferenceContext` so that a consumer holding only the bindings, such as the
+/// argument diagnostics, reads the same verdict inference does.
+pub(crate) fn argument_passing_of(
+    db: &dyn HirDatabase,
+    bindings: &[CallArgBinding],
+    arg: ExprId,
+) -> Option<bsl_platform::ParamPassing> {
+    use crate::call_resolution::{BuiltinCallableId, CandidateId};
+
+    let (binding, position, candidate) = sole_callee_of_argument(bindings, arg)?;
+    match candidate {
+        CandidateId::User { method, .. } => user_param_passing(db, method, position),
+        CandidateId::Platform { .. }
+        | CandidateId::Builtin { callable: BuiltinCallableId::PlatformGlobal(_), .. } => {
+            // Forwarded as it is: every consumer reads a variant it cannot name like `None`.
+            binding
+                .candidate
+                .candidates
+                .as_slice()
+                .iter()
+                .find(|signature| signature.id == candidate)
+                .and_then(|signature| signature.params.get(position))
+                .and_then(|param| param.passing)
+        }
+        _ => None,
+    }
+}
+
+/// [`argument_passing_of`] as the code itself declares it: the `Знач` flag of a user method's
+/// parameter, and `None` for any other callee. A platform callable's direction comes from the
+/// help corpus; it settles whether the callee can rebind the local, but an uninitialized read
+/// is reported only on the code's own declaration, so a local handed to a platform callable
+/// stays unjudged and counts as initialized by the call. Whether the corpus facts join this
+/// check is an open decision with its condition stated in #889.
+pub(crate) fn declared_argument_passing_of(
+    db: &dyn HirDatabase,
+    bindings: &[CallArgBinding],
+    arg: ExprId,
+) -> Option<bsl_platform::ParamPassing> {
+    match sole_callee_of_argument(bindings, arg)? {
+        (_, position, crate::call_resolution::CandidateId::User { method, .. }) => {
+            user_param_passing(db, method, position)
+        }
+        _ => None,
+    }
+}
+
+fn sole_callee_of_argument(
+    bindings: &[CallArgBinding],
+    arg: ExprId,
+) -> Option<(&CallArgBinding, usize, crate::call_resolution::CandidateId)> {
+    let (binding, position) = bindings.iter().find_map(|binding| {
+        binding.args.iter().position(|a| *a == arg).map(|position| (binding, position))
+    })?;
+    let candidate = binding.candidate.resolution.selection.sole_candidate()?;
+    Some((binding, position, candidate))
+}
+
+fn user_param_passing(
+    db: &dyn HirDatabase,
+    method: crate::call_resolution::UserMethodId,
+    position: usize,
+) -> Option<bsl_platform::ParamPassing> {
+    use bsl_platform::ParamPassing;
+
+    let decl = db.interface_method(hir_def::MethodId::from(method))?;
+    decl.params.get(position).map(|param| {
+        if param.is_val {
+            ParamPassing::ByVal
+        } else {
+            ParamPassing::ByRef
+        }
+    })
+}
+
 /// Whether help of the `served` release lists every type of the project's
 /// `target` release. A set target needs a served release that is known and not
 /// older: an unversioned corpus, or a target that does not parse, may be older
@@ -6926,12 +7121,11 @@ pub fn infer_module_code_query<'db>(
     let module_id = hir_def::ModuleId { file_id };
     let module_bodies = db.module_bodies_ref(module_id);
 
-    let Some(body) = module_bodies.module_code() else {
+    let Some(body) = module_bodies.module_code_arc() else {
         return Arc::new(ModuleCodeInferenceResult::default());
     };
 
-    let mut ctx =
-        InferenceContext::new(db, file_id, DefWithBodyId::ModuleCode, &Arc::new(body.clone()));
+    let mut ctx = InferenceContext::new_for_module_code(db, file_id, body);
     ctx.infer_all();
     let body_result = ctx.finish();
     Arc::new(ModuleCodeInferenceResult::from_body(body_result))

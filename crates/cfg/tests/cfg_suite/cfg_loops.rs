@@ -73,32 +73,34 @@ fn nested_for_and_while_back_edges() {
         expect![[r#"
             blocks:
               ENTRY:EMPTY:0
-              EXIT:EMPTY:3
-              NORMAL:BREAK_STMT:4
+              EXIT:EMPTY:4
               NORMAL:BREAK_STMT:5
-              NORMAL:CONTINUE_STMT:4
-              NORMAL:EMPTY:2:#eb5a85f6
-              NORMAL:EMPTY:2:#fae6e901
-              NORMAL:EMPTY:5
+              NORMAL:BREAK_STMT:6
+              NORMAL:CONTINUE_STMT:5
+              NORMAL:EMPTY:3:#c3ebc090
+              NORMAL:EMPTY:3:#f02317bc
               NORMAL:EMPTY:6
-              NORMAL:FOR_STMT:1
-              NORMAL:WHILE_STMT:3
+              NORMAL:EMPTY:7
+              NORMAL:FOR_STMT:2
+              NORMAL:LOOP_ENTRY:1
+              NORMAL:WHILE_STMT:4
             edges:
-              ENTRY:EMPTY:0 -> NORMAL:FOR_STMT:1 [Unconditional]
-              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:2:#eb5a85f6 [Unconditional]
-              NORMAL:BREAK_STMT:4 -> NORMAL:EMPTY:5 [Unexecutable]
-              NORMAL:BREAK_STMT:5 -> NORMAL:BREAK_STMT:4 [Unconditional]
+              ENTRY:EMPTY:0 -> NORMAL:LOOP_ENTRY:1 [Unconditional]
+              NORMAL:BREAK_STMT:5 -> NORMAL:EMPTY:3:#f02317bc [Unconditional]
               NORMAL:BREAK_STMT:5 -> NORMAL:EMPTY:6 [Unexecutable]
-              NORMAL:CONTINUE_STMT:4 -> NORMAL:BREAK_STMT:5 [Unexecutable]
-              NORMAL:CONTINUE_STMT:4 -> NORMAL:WHILE_STMT:3 [Unconditional]
-              NORMAL:EMPTY:2:#eb5a85f6 -> EXIT:EMPTY:3 [Unconditional]
-              NORMAL:EMPTY:2:#fae6e901 -> NORMAL:WHILE_STMT:3 [Unconditional]
-              NORMAL:EMPTY:5 -> NORMAL:FOR_STMT:1 [Unconditional]
-              NORMAL:EMPTY:6 -> NORMAL:WHILE_STMT:3 [Unconditional]
-              NORMAL:FOR_STMT:1 -> NORMAL:EMPTY:2:#eb5a85f6 [FalseBranch]
-              NORMAL:FOR_STMT:1 -> NORMAL:EMPTY:2:#fae6e901 [TrueBranch]
-              NORMAL:WHILE_STMT:3 -> NORMAL:BREAK_STMT:4 [FalseBranch]
-              NORMAL:WHILE_STMT:3 -> NORMAL:CONTINUE_STMT:4 [TrueBranch]
+              NORMAL:BREAK_STMT:6 -> NORMAL:BREAK_STMT:5 [Unconditional]
+              NORMAL:BREAK_STMT:6 -> NORMAL:EMPTY:7 [Unexecutable]
+              NORMAL:CONTINUE_STMT:5 -> NORMAL:BREAK_STMT:6 [Unexecutable]
+              NORMAL:CONTINUE_STMT:5 -> NORMAL:WHILE_STMT:4 [Unconditional]
+              NORMAL:EMPTY:3:#c3ebc090 -> NORMAL:WHILE_STMT:4 [Unconditional]
+              NORMAL:EMPTY:3:#f02317bc -> EXIT:EMPTY:4 [Unconditional]
+              NORMAL:EMPTY:6 -> NORMAL:FOR_STMT:2 [Unconditional]
+              NORMAL:EMPTY:7 -> NORMAL:WHILE_STMT:4 [Unconditional]
+              NORMAL:FOR_STMT:2 -> NORMAL:EMPTY:3:#c3ebc090 [TrueBranch]
+              NORMAL:FOR_STMT:2 -> NORMAL:EMPTY:3:#f02317bc [FalseBranch]
+              NORMAL:LOOP_ENTRY:1 -> NORMAL:FOR_STMT:2 [Unconditional]
+              NORMAL:WHILE_STMT:4 -> NORMAL:BREAK_STMT:5 [FalseBranch]
+              NORMAL:WHILE_STMT:4 -> NORMAL:CONTINUE_STMT:5 [TrueBranch]
         "#]],
     );
 }

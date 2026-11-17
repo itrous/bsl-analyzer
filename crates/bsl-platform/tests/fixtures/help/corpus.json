@@ -450,6 +450,134 @@
    ]
   },
   {
+   "id": 6,
+   "name": "ВвестиСтроку",
+   "english_name": "InputString",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false},
+    {"name": "Подсказка", "param_type": "Строка", "is_optional": true},
+    {"name": "Длина", "param_type": "Число", "is_optional": true},
+    {"name": "Многострочность", "param_type": "Булево", "is_optional": true}
+   ]
+  },
+  {
+   "id": 7,
+   "name": "ВвестиЧисло",
+   "english_name": "InputNumber",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Число", "param_type": "Число", "is_optional": false},
+    {"name": "Подсказка", "param_type": "Строка", "is_optional": true},
+    {"name": "Длина", "param_type": "Число", "is_optional": true},
+    {"name": "Точность", "param_type": "Число", "is_optional": true}
+   ]
+  },
+  {
+   "id": 8,
+   "name": "ВвестиДату",
+   "english_name": "InputDate",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Дата", "param_type": "Дата", "is_optional": false},
+    {"name": "Подсказка", "param_type": "Строка", "is_optional": true},
+    {"name": "ЧастьДаты", "param_type": "ЧастиДаты", "is_optional": true}
+   ]
+  },
+  {
+   "id": 9,
+   "name": "ВвестиЗначение",
+   "english_name": "InputValue",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Значение", "param_type": "Произвольный", "is_optional": false},
+    {"name": "Подсказка", "param_type": "Строка", "is_optional": true},
+    {"name": "Тип", "param_type": "Тип, ОписаниеТипов", "is_optional": true}
+   ]
+  },
+  {
+   "id": 10,
+   "name": "ПоместитьФайл",
+   "english_name": "PutFile",
+   "min_version": "8.2",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "Адрес", "param_type": "Строка", "is_optional": true},
+    {"name": "НачальноеИмяФайла", "param_type": "Строка", "is_optional": true},
+    {"name": "ВыбранноеИмяФайла", "param_type": "Строка", "is_optional": true},
+    {"name": "Интерактивно", "param_type": "Булево", "is_optional": true},
+    {"name": "УникальныйИдентификаторФормы", "param_type": "УникальныйИдентификатор", "is_optional": true}
+   ]
+  },
+  {
+   "id": 11,
+   "name": "ПоместитьФайлы",
+   "english_name": "PutFiles",
+   "min_version": "8.2",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "ПомещаемыеФайлы", "param_type": "Строка", "is_optional": true},
+    {"name": "ПомещенныеФайлы", "param_type": "Массив", "is_optional": true},
+    {"name": "НаборПомещаемыхФайлов", "param_type": "ДиалогВыбораФайла, Строка", "is_optional": true},
+    {"name": "Интерактивно", "param_type": "Булево", "is_optional": true},
+    {"name": "УникальныйИдентификаторФормы", "param_type": "УникальныйИдентификатор", "is_optional": true}
+   ]
+  },
+  {
+   "id": 12,
+   "name": "ПолучитьФайлы",
+   "english_name": "GetFiles",
+   "min_version": "8.2",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "ПолучаемыеФайлы", "param_type": "Массив", "is_optional": false},
+    {"name": "ПолученныеФайлы", "param_type": "Массив", "is_optional": true},
+    {"name": "РасположениеФайлов", "param_type": "ДиалогВыбораФайла, Строка", "is_optional": true},
+    {"name": "Интерактивно", "param_type": "Булево", "is_optional": true}
+   ]
+  },
+  {
+   "id": 13,
+   "name": "ЗапуститьПриложение",
+   "english_name": "RunApp",
+   "min_version": "8.0",
+   "parameters": [
+    {"name": "СтрокаКоманды", "param_type": "Строка", "is_optional": false},
+    {"name": "ТекущийКаталог", "param_type": "Строка", "is_optional": true},
+    {"name": "ДождатьсяЗавершения", "param_type": "Булево", "is_optional": true},
+    {"name": "КодВозврата", "param_type": "Число, Неопределено", "is_optional": true}
+   ]
+  },
+  {
+   "id": 14,
+   "name": "ЗапуститьСистему",
+   "english_name": "RunSystem",
+   "min_version": "8.1",
+   "parameters": [
+    {"name": "ДополнительныеПараметрыКоманднойСтроки", "param_type": "Строка", "is_optional": true},
+    {"name": "ДождатьсяЗавершения", "param_type": "Булево", "is_optional": true},
+    {"name": "КодВозврата", "param_type": "Число, Неопределено", "is_optional": true}
+   ]
+  },
+  {
+   "id": 15,
+   "name": "УдалитьОбъекты",
+   "english_name": "DeleteObjects",
+   "min_version": "8.0",
+   "parameters": [
+    {"name": "СписокСсылок", "param_type": "Массив", "is_optional": false},
+    {"name": "Проверять", "param_type": "Булево", "is_optional": true},
+    {"name": "НайденныеДанные", "param_type": "ТаблицаЗначений", "is_optional": true},
+    {"name": "ОбластьПоиска", "param_type": "Массив", "is_optional": true},
+    {"name": "ВключитьОбъекты", "param_type": "Массив", "is_optional": true},
+    {"name": "ИсключитьОбъекты", "param_type": "Массив", "is_optional": true}
+   ]
+  },
+  {
    "id": 5,
    "name": "СтрДлина",
    "english_name": "StrLen",
@@ -476,7 +604,77 @@
    }
   },
   {
-   "id": 6,
+   "id": 16,
+   "name": "Строка",
+   "english_name": "String",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Значение", "param_type": "Произвольный", "is_optional": false}
+   ]
+  },
+  {
+   "id": 17,
+   "name": "ВРег",
+   "english_name": "Upper",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 18,
+   "name": "НРег",
+   "english_name": "Lower",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 19,
+   "name": "ТРег",
+   "english_name": "Title",
+   "min_version": "8.1",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 20,
+   "name": "СокрЛП",
+   "english_name": "TrimAll",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 21,
+   "name": "СокрЛ",
+   "english_name": "TrimL",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 22,
+   "name": "СокрП",
+   "english_name": "TrimR",
+   "min_version": "8.0",
+   "return_type": "Строка",
+   "parameters": [
+    {"name": "Строка", "param_type": "Строка", "is_optional": false}
+   ]
+  },
+  {
+   "id": 23,
    "name": "XMLСтрока",
    "english_name": "XMLString",
    "min_version": "8.0",
