@@ -136,7 +136,7 @@ whitespace. A transformation that changes what the text says (`СтрЗамен�
 this fact. A rule that follows where a text came from can look through such a call instead
 of losing the value at it. The field joins `replacement_type_list` and `passing` in the
 "at least one of" rule: a record needs one of the three, a value that is not a boolean is
-refused, and a record carrying only this field keeps the extracted type list, with its
+refused, `false` alone counts as none of them, and a record carrying only this field keeps the extracted type list, with its
 target still resolved, version-checked and index-checked. Two records for one parameter are
 refused as before.
 

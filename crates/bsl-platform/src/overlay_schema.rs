@@ -853,9 +853,10 @@ fn parse_override(
             )))
         }
     };
+    // `false` is what a parameter nobody recorded reads as, so alone it states nothing.
     if replacement_type_list.is_none()
         && passing.is_none()
-        && result_follows_argument_text.is_none()
+        && result_follows_argument_text != Some(true)
     {
         return Err(OverlayError(format!(
             "overlay entry {index} changes nothing: it needs replacement_type_list, passing or result_follows_argument_text"
