@@ -289,7 +289,7 @@ fn invalid_manifest() -> io::Error {
 fn process_identity(pid: u32) -> io::Result<Option<(u32, u64)>> {
     let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if super::process_gone(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     let close = stat

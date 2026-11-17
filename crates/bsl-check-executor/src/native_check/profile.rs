@@ -3152,7 +3152,7 @@ fn job_creator_may_be_live(id: &str, start: u64) -> Result<bool, NativeProfileEr
     {
         match fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => Ok(parse_proc_identity(&stat).is_some_and(|(_, actual)| actual == start)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) if super::process_gone(&error) => Ok(false),
             Err(_) => Err(NativeProfileError::CleanupFailed),
         }
     }
@@ -3313,30 +3313,28 @@ fn recover_process_group(
 ) -> Result<(), NativeProfileError> {
     let pgid = libc::pid_t::try_from(pid).map_err(|_| NativeProfileError::CleanupFailed)?;
     let stat_path = format!("/proc/{pid}/stat");
-    match fs::read_to_string(&stat_path) {
-        Ok(stat) => {
-            let (group, actual_start) =
-                parse_proc_identity(&stat).ok_or(NativeProfileError::CleanupFailed)?;
-            if group != pid || actual_start != start_time {
-                return Err(NativeProfileError::CleanupFailed);
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if unsafe { libc::kill(-pgid, 0) } != 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                    return Ok(());
-                }
-                return Err(NativeProfileError::CleanupFailed);
-            }
-            return recover_leaderless_owned_group(
-                pid,
-                start_time,
-                owned_directory,
-                deadline,
-                cancelled,
-            );
-        }
+    let leader = match fs::read_to_string(&stat_path) {
+        Ok(stat) => proc_scan_identity(&stat)?,
+        Err(error) if super::process_gone(&error) => None,
         Err(_) => return Err(NativeProfileError::CleanupFailed),
+    };
+    let Some((_, group, actual_start)) = leader else {
+        if unsafe { libc::kill(-pgid, 0) } != 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(NativeProfileError::CleanupFailed);
+        }
+        return recover_leaderless_owned_group(
+            pid,
+            start_time,
+            owned_directory,
+            deadline,
+            cancelled,
+        );
+    };
+    if group != pid || actual_start != start_time {
+        return Err(NativeProfileError::CleanupFailed);
     }
     if cancelled.load(Ordering::Acquire)
         || Instant::now() >= deadline
@@ -3394,11 +3392,11 @@ fn process_group_has_live_member(pgid: libc::pid_t) -> Result<bool, NativeProfil
         }
         let stat = match fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if super::process_gone(&error) => continue,
             Err(_) => return Err(NativeProfileError::CleanupFailed),
         };
-        let Some((state, group, _)) = parse_proc_state_identity(&stat) else {
-            return Err(NativeProfileError::CleanupFailed);
+        let Some((state, group, _)) = proc_scan_identity(&stat)? else {
+            continue;
         };
         if group == pgid as u32 && !matches!(state, b'Z' | b'X') {
             return Ok(true);
@@ -3546,11 +3544,11 @@ fn leaderless_group_members(
         let stat_path = entry.path().join("stat");
         let stat = match fs::read_to_string(&stat_path) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if super::process_gone(&error) => continue,
             Err(_) => return Err(NativeProfileError::CleanupFailed),
         };
-        let Some((state, member_group, member_start)) = parse_proc_state_identity(&stat) else {
-            return Err(NativeProfileError::CleanupFailed);
+        let Some((state, member_group, member_start)) = proc_scan_identity(&stat)? else {
+            continue;
         };
         if member_group != pgid {
             continue;
@@ -3587,7 +3585,7 @@ fn leaderless_member_is_owned(
 
     let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if super::process_gone(&error) => return Ok(false),
         Err(_) => return Err(NativeProfileError::CleanupFailed),
     };
     if parse_proc_identity(&stat) != Some((pgid, start_time)) {
@@ -3610,6 +3608,21 @@ fn leaderless_member_is_owned(
         return Err(NativeProfileError::CleanupFailed);
     }
     Ok(true)
+}
+
+/// The state, process group and start time of a `/proc/<pid>/stat` entry, or `None` for a task
+/// that is already dead (`X`): while it is reaped the kernel reports its process group as `-1`,
+/// and a dead task neither belongs to a group that still runs nor can be signalled.
+#[cfg(target_os = "linux")]
+fn proc_scan_identity(stat: &str) -> Result<Option<(u8, u32, u64)>, NativeProfileError> {
+    let dead = stat
+        .rfind(')')
+        .and_then(|close| stat[close + 1..].split_whitespace().next())
+        .is_some_and(|state| state == "X");
+    if dead {
+        return Ok(None);
+    }
+    parse_proc_state_identity(stat).map(Some).ok_or(NativeProfileError::CleanupFailed)
 }
 
 #[cfg(target_os = "linux")]
@@ -4776,5 +4789,23 @@ mod tests {
                 group == pgid && start == descendant_start && !matches!(state, b'Z' | b'X')
             });
         assert!(!still_running, "startup cleanup left the owned orphan running");
+    }
+
+    /// Every process on the machine passes through a `/proc` scan, including one that has just
+    /// died: while it is reaped the kernel reports it in state `X` with process group `-1`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proc_scan_passes_over_a_task_being_reaped() {
+        let reaped = "1416293 (true) X 0 -1 -1 0 -1 4227084 60 0 0 0 0 0 0 0 20 0 0 0 68553836 0 \
+                      0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 27 0 0 0 0 0 0\n";
+        let live = "1416293 (true) S 1 1416290 1416290 0 -1 4227084 60 0 0 0 0 0 0 0 20 0 1 0 \
+                    68553836 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 27 0 0 0 0 0 0\n";
+
+        assert_eq!(proc_scan_identity(reaped), Ok(None));
+        assert_eq!(proc_scan_identity(live), Ok(Some((b'S', 1416290, 68553836))));
+        assert_eq!(
+            proc_scan_identity("1416293 (true) S 1"),
+            Err(NativeProfileError::CleanupFailed)
+        );
     }
 }
