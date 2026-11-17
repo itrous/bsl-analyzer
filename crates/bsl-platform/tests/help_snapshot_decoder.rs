@@ -215,3 +215,49 @@ fn synthesized_docs_gap_method_needs_a_free_id() {
         data.get_method("XMLStringProcessingManager", "УдалитьНедопустимыеСимволыXML");
     assert_eq!(synthesized.map(|m| m.id), Some(8));
 }
+
+/// Every curated overlay target must exist in this fixture, with enough parameters for the
+/// index the overlay corrects. A target the fixture lacks is not a local failure: the loader
+/// refuses the corpus whole, and the tests that then fail are in other crates and name
+/// neither the overlay nor this file. So the invariant is asserted where the fixture lives.
+#[test]
+fn the_fixture_corpus_carries_every_curated_overlay_target() {
+    let overlays: Value =
+        serde_json::from_str(include_str!("../data/platform_overlays.json")).unwrap();
+    let fixture = fixture_value();
+    let mut absent = Vec::new();
+    for (section, owner_field, bucket) in [
+        ("method_parameter_overrides", Some("canonical_type"), "methods"),
+        ("global_function_parameter_overrides", None, "global_functions"),
+    ] {
+        for entry in overlays[section].as_array().into_iter().flatten() {
+            let russian = entry["russian_name"].as_str().unwrap();
+            let english = entry["english_name"].as_str().unwrap();
+            let needed = entry["parameter_index"].as_u64().unwrap() as usize + 1;
+            let owner = owner_field.map(|field| entry[field].as_str().unwrap());
+            let found = fixture[bucket].as_array().into_iter().flatten().find(|item| {
+                owner.is_none_or(|owner| item["type_name"] == owner)
+                    && item["english_name"] == english
+                    && item["name"] == russian
+            });
+            match found {
+                Some(item) => {
+                    let declared = item["parameters"].as_array().map_or(0, Vec::len);
+                    if declared < needed {
+                        absent.push(format!(
+                            "{russian} ({english}) declares {declared} parameters, \
+                             the overlay corrects index {}",
+                            needed - 1
+                        ));
+                    }
+                }
+                None => absent.push(format!("{russian} ({english}) is absent from {bucket}")),
+            }
+        }
+    }
+    assert!(
+        absent.is_empty(),
+        "the fixture corpus must carry every overlay target, or the help loader refuses it \
+         whole and the failure surfaces far from here: {absent:#?}"
+    );
+}

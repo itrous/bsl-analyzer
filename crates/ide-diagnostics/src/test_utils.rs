@@ -759,6 +759,15 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         hir::infer_owner(&self.db, file_id, owner)
     }
 
+    fn value_origin(
+        &self,
+        file_id: vfs::FileId,
+        owner: hir::DefWithBodyId,
+        expr: hir::ExprId,
+    ) -> hir::ValueOrigin {
+        hir::value_origin_of(&self.db, file_id, owner, expr)
+    }
+
     fn executed_query_texts(
         &self,
         method_id: hir::MethodId,

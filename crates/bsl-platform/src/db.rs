@@ -2,9 +2,9 @@ use crate::help::{
     InstallOutcome, PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpStatus,
     RestartRequired,
 };
-use crate::snapshot::PlatformSnapshot;
+use crate::snapshot::{ParameterPassingAttestationRecord, PlatformSnapshot};
 use crate::types::{
-    ConstructorDocs, GlobalFunction, MethodDocs, PlatformConstructor, PlatformMethod,
+    ConstructorDocs, GlobalFunction, MethodDocs, ParamPassing, PlatformConstructor, PlatformMethod,
     PlatformProperty, PlatformType, PropertyDocs,
 };
 use once_cell::sync::OnceCell;
@@ -155,6 +155,7 @@ impl PlatformDataInner {
             constructor_docs,
             property_docs,
             member_surface_attestations,
+            parameter_passing_attestations,
         } = snapshot;
 
         apply_docs_gap_iter_types_overlay(&mut types);
@@ -230,6 +231,13 @@ impl PlatformDataInner {
             }
         }
 
+        // Before the docs-gap overlays: `apply_docs_gap_method_overlay` copies a global
+        // function's parameters into a manager method, and the copy must carry the verdict.
+        apply_parameter_passing_attestations(
+            &mut global_functions,
+            &parameter_passing_attestations,
+            served_platform_version.as_deref(),
+        );
         apply_docs_gap_method_overlay(&mut methods, &global_functions);
         apply_docs_gap_cloned_method_overlay(&mut methods);
         apply_docs_gap_predefined_item_name_overlay(&mut methods);
@@ -786,6 +794,40 @@ fn apply_docs_gap_member_context_overlay(
     }
 }
 
+/// Marks the parameters of the attested global functions that carry no `passing` of their own as
+/// passed by value. Gated like the member surface attestations: the claim was verified against
+/// one release, so it holds only when the served help is that release or a newer one, and a help
+/// of unknown version gets nothing. An explicit record is never overwritten; a function in
+/// `unverified_functions` and anything outside the attested scope stay unknown. The exclusion
+/// covers the call variants too, which is why they are stamped here and not skipped wholesale.
+fn apply_parameter_passing_attestations(
+    global_functions: &mut [GlobalFunction],
+    attestations: &[ParameterPassingAttestationRecord],
+    served_version: Option<&[u32]>,
+) {
+    let Some(served_version) = served_version else { return };
+    for attestation in attestations.iter().filter(|a| a.scope == "global_context") {
+        let Some(attested) = crate::overlays::parse_version(&attestation.verified_against_version)
+        else {
+            continue;
+        };
+        if !version_at_least(served_version, &attested) {
+            continue;
+        }
+        let unverified: rustc_hash::FxHashSet<String> =
+            attestation.unverified_functions.iter().map(|name| name.fold_lower()).collect();
+        for function in global_functions.iter_mut() {
+            if unverified.contains(&function.name.fold_lower()) {
+                continue;
+            }
+            let variants = function.variants.iter_mut().flat_map(|v| v.parameters.iter_mut());
+            for parameter in function.parameters.iter_mut().chain(variants) {
+                parameter.passing.get_or_insert(ParamPassing::ByVal);
+            }
+        }
+    }
+}
+
 /// Types whose type page lists the thin client while every member page (8.3.17
 /// and 8.3.27 help alike) lists only the server, the thick client and the
 /// external connection. The members run in the thin client: a live run in the
@@ -980,6 +1022,8 @@ fn apply_docs_gap_predefined_item_name_overlay(methods: &mut Vec<PlatformMethod>
                 param_type: ref_type,
                 is_optional: false,
                 is_variadic: false,
+                passing: None,
+                result_follows_argument_text: false,
             }],
             variants: Vec::new(),
             min_version: None,
@@ -1070,6 +1114,8 @@ fn apply_docs_gap_method_variant_overlay(methods: &mut [PlatformMethod]) {
                 param_type: Some(SmolStr::new(*param_type)),
                 is_optional: *is_optional,
                 is_variadic: false,
+                passing: None,
+                result_follows_argument_text: false,
             })
             .collect();
         match method
@@ -2503,5 +2549,195 @@ mod tests {
         let m1 = prefixed_method_query(&db, input1).expect("must resolve");
         let m2 = prefixed_method_query(&db, input2).expect("must resolve");
         assert_eq!(m1.id, m2.id);
+    }
+}
+
+#[cfg(test)]
+mod passing_attestation_tests {
+    use super::*;
+    use crate::types::{GlobalFunctionVariant, MethodParam};
+
+    fn param(name: &str, passing: Option<ParamPassing>) -> MethodParam {
+        MethodParam {
+            name: name.into(),
+            param_type: None,
+            is_optional: false,
+            is_variadic: false,
+            passing,
+            result_follows_argument_text: false,
+        }
+    }
+
+    fn function(name: &str, parameters: Vec<MethodParam>) -> GlobalFunction {
+        GlobalFunction {
+            id: 1,
+            name: name.into(),
+            english_name: name.into(),
+            return_type: None,
+            parameters,
+            variants: Vec::new(),
+            min_version: None,
+            context: None,
+        }
+    }
+
+    fn corpus() -> Vec<GlobalFunction> {
+        let mut with_variant = function("Сообщить", vec![param("Текст", None)]);
+        with_variant.variants = vec![GlobalFunctionVariant {
+            variant_name: None,
+            parameters: vec![param("Текст", None), param("Статус", None)],
+        }];
+        vec![
+            function(
+                "ВвестиСтроку",
+                vec![param("Строка", Some(ParamPassing::ByRef)), param("Подсказка", None)],
+            ),
+            function("ПоместитьФайл", vec![param("Адрес", None), param("Описание", None)]),
+            with_variant,
+        ]
+    }
+
+    fn attestation(version: &str, scope: &str) -> ParameterPassingAttestationRecord {
+        ParameterPassingAttestationRecord {
+            scope: scope.to_owned(),
+            verified_against_version: version.to_owned(),
+            unverified_functions: vec!["ПоместитьФайл".to_owned()],
+        }
+    }
+
+    fn apply(
+        functions: &mut [GlobalFunction],
+        attestation: ParameterPassingAttestationRecord,
+        served: Option<&str>,
+    ) {
+        let served = served.map(|v| crate::overlays::parse_version(v).unwrap());
+        apply_parameter_passing_attestations(functions, &[attestation], served.as_deref());
+    }
+
+    fn passings(function: &GlobalFunction) -> Vec<Option<ParamPassing>> {
+        function.parameters.iter().map(|p| p.passing).collect()
+    }
+
+    #[test]
+    fn an_attested_function_without_a_record_is_by_value() {
+        let mut functions = corpus();
+
+        apply(&mut functions, attestation("8.3.27", "global_context"), Some("8.3.27.2214"));
+
+        assert_eq!(functions[0].parameters[1].passing, Some(ParamPassing::ByVal));
+    }
+
+    #[test]
+    fn stamping_does_not_overwrite_an_explicit_record() {
+        let mut functions = corpus();
+
+        apply(&mut functions, attestation("8.3.27", "global_context"), Some("8.3.27.2214"));
+
+        assert_eq!(functions[0].parameters[0].passing, Some(ParamPassing::ByRef));
+    }
+
+    #[test]
+    fn a_function_listed_as_unverified_stays_unknown_on_all_its_parameters() {
+        let mut functions = corpus();
+
+        apply(&mut functions, attestation("8.3.27", "global_context"), Some("8.3.27.2214"));
+
+        assert_eq!(passings(&functions[1]), vec![None, None]);
+    }
+
+    #[test]
+    fn the_exclusion_matches_the_name_regardless_of_case() {
+        let mut functions = corpus();
+        let mut attested = attestation("8.3.27", "global_context");
+        attested.unverified_functions = vec!["поместитьфайл".to_owned()];
+
+        apply(&mut functions, attested, Some("8.3.27.2214"));
+
+        assert_eq!(passings(&functions[1]), vec![None, None]);
+    }
+
+    #[test]
+    fn the_parameters_of_a_variant_are_stamped_too() {
+        let mut functions = corpus();
+
+        apply(&mut functions, attestation("8.3.27", "global_context"), Some("8.3.27.2214"));
+
+        assert_eq!(functions[2].parameters[0].passing, Some(ParamPassing::ByVal));
+        let variant = &functions[2].variants[0].parameters;
+        assert_eq!(variant.len(), 2);
+        assert!(variant.iter().all(|p| p.passing == Some(ParamPassing::ByVal)));
+    }
+
+    #[test]
+    fn the_variants_of_an_unverified_function_stay_unknown() {
+        let mut functions = corpus();
+        let mut attested = attestation("8.3.27", "global_context");
+        attested.unverified_functions = vec!["Сообщить".to_owned()];
+
+        apply(&mut functions, attested, Some("8.3.27.2214"));
+
+        assert_eq!(passings(&functions[2]), vec![None]);
+        assert!(functions[2].variants[0].parameters.iter().all(|p| p.passing.is_none()));
+    }
+
+    #[test]
+    fn another_scope_stamps_nothing() {
+        let mut functions = corpus();
+
+        apply(&mut functions, attestation("8.3.27", "XMLWriter"), Some("8.3.27.2214"));
+
+        assert_eq!(functions[0].parameters[1].passing, None);
+    }
+
+    #[test]
+    fn an_attestation_newer_than_the_served_help_is_not_applied() {
+        let mut functions = corpus();
+
+        apply(&mut functions, attestation("8.3.28", "global_context"), Some("8.3.27.2214"));
+
+        assert_eq!(functions, {
+            let mut expected = corpus();
+            expected[0].parameters[0].passing = Some(ParamPassing::ByRef);
+            expected
+        });
+        let stamped = functions
+            .iter()
+            .flat_map(|f| f.parameters.iter().chain(f.variants.iter().flat_map(|v| &v.parameters)))
+            .filter(|p| p.passing == Some(ParamPassing::ByVal))
+            .count();
+        assert_eq!(stamped, 0, "the gate must keep the claim off a release it was not verified on");
+    }
+
+    #[test]
+    fn an_attestation_equal_to_or_older_than_the_served_help_is_applied() {
+        for served in ["8.3.27.2214", "8.3.27", "8.3.28.1"] {
+            let mut functions = corpus();
+
+            apply(&mut functions, attestation("8.3.27", "global_context"), Some(served));
+
+            assert_eq!(
+                functions[0].parameters[1].passing,
+                Some(ParamPassing::ByVal),
+                "served {served}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_help_of_unknown_version_gets_no_attestation() {
+        let mut functions = corpus();
+
+        apply(&mut functions, attestation("8.3.27", "global_context"), None);
+
+        assert_eq!(functions[0].parameters[1].passing, None);
+    }
+
+    #[test]
+    fn an_unparsable_attested_version_is_not_applied() {
+        let mut functions = corpus();
+
+        apply(&mut functions, attestation("eight", "global_context"), Some("8.3.27.2214"));
+
+        assert_eq!(functions[0].parameters[1].passing, None);
     }
 }

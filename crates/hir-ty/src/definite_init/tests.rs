@@ -23,28 +23,28 @@ fn body_of(source: &str) -> Arc<Body> {
 /// Passing by the callee's spelling, standing in for resolution: `Знач…` takes
 /// its arguments by value, `Неизв…` and every method or constructor call leave
 /// the direction unknown, any other bare call takes them by reference.
-fn passing_of(body: &Body, arg: ExprId) -> ArgPassing {
+fn passing_of(body: &Body, arg: ExprId) -> Option<ParamPassing> {
     let arg_idx = arg.to_idx();
     for (_, expr) in body.exprs_iter() {
         match expr {
             Expr::Call { callee, args } if args.contains(&arg_idx) => {
-                let Expr::Path(name) = body.expr_idx(*callee) else { return ArgPassing::Unknown };
+                let Expr::Path(name) = body.expr_idx(*callee) else { return None };
                 let name = name.as_str();
                 return if name.starts_with("Знач") {
-                    ArgPassing::ByVal
+                    Some(ParamPassing::ByVal)
                 } else if name.starts_with("Неизв") {
-                    ArgPassing::Unknown
+                    None
                 } else {
-                    ArgPassing::ByRef
+                    Some(ParamPassing::ByRef)
                 };
             }
             Expr::MethodCall { args, .. } | Expr::New { args, .. } if args.contains(&arg_idx) => {
-                return ArgPassing::Unknown
+                return None
             }
             _ => {}
         }
     }
-    ArgPassing::Unknown
+    None
 }
 
 /// Every bare name is offered as an implicit local; `Tracked` drops the

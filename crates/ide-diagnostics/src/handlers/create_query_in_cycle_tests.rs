@@ -127,8 +127,9 @@ fn create_query_in_cycle_i08_possible_write_proves_nothing() {
         in_procedure("\tЗ = Новый Запрос;\n\tПрочитать(З);\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;")
     );
     assert_eq!(count(&by_value), 1, "{by_value}");
-    // A constructor builds a new object from its arguments and cannot rebind them; a method or
-    // a platform function whose passing is unknown still may.
+    // A constructor builds a new object from its arguments and cannot rebind them, nor can a
+    // platform function the corpus attests as taking its argument by value; a method whose
+    // passing is unknown still may.
     let before_loop = |stmt: &str| {
         in_procedure(&format!("\tЗ = Новый Запрос;\n{stmt}\n\tДля Каждого Э Из Коллекция Цикл\n\t\tЗ.Выполнить();\n\tКонецЦикла;"))
     };
@@ -137,7 +138,7 @@ fn create_query_in_cycle_i08_possible_write_proves_nothing() {
     let method = before_loop("\tС = Новый Структура;\n\tС.Вставить(\"З\", З);");
     assert_eq!(count(&method), 0, "{method}");
     let function = before_loop("\tТипЗнч(З);");
-    assert_eq!(count(&function), 0, "{function}");
+    assert_eq!(count(&function), 1, "{function}");
     // A call's possible write follows the reads of its arguments.
     let after_read = format!(
         "Процедура Потребить(Знач Результат, Ссылка)\nКонецПроцедуры\n\n{}",

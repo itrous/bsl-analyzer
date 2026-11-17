@@ -137,9 +137,9 @@ fn compute_dead_tail_vertices(
     cfg: &hir::cfg::ControlFlowGraph,
     entry: hir::cfg::NodeIndex,
 ) -> std::collections::HashSet<hir::cfg::NodeIndex> {
-    let reachable_with_all_edges = compute_reachable_vertices(cfg, entry, |_| true);
+    let reachable_with_all_edges = cfg.reachable_vertices(entry, |_| true);
     let reachable_without_dead_edges =
-        compute_reachable_vertices(cfg, entry, |edge_type| edge_type.is_executable());
+        cfg.reachable_vertices(entry, |edge_type| edge_type.is_executable());
     let exit = cfg.exit();
 
     reachable_with_all_edges
@@ -147,32 +147,6 @@ fn compute_dead_tail_vertices(
         .copied()
         .filter(|&vertex| vertex != entry && vertex != exit)
         .collect()
-}
-
-fn compute_reachable_vertices<F>(
-    cfg: &hir::cfg::ControlFlowGraph,
-    entry: hir::cfg::NodeIndex,
-    can_traverse: F,
-) -> std::collections::HashSet<hir::cfg::NodeIndex>
-where
-    F: Fn(&hir::cfg::CfgEdgeType) -> bool,
-{
-    let mut reachable = std::collections::HashSet::new();
-    let mut worklist = vec![entry];
-
-    while let Some(node) = worklist.pop() {
-        if !reachable.insert(node) {
-            continue;
-        }
-
-        for (target, edge_type) in cfg.outgoing_edges(node) {
-            if can_traverse(edge_type) && !reachable.contains(&target) {
-                worklist.push(target);
-            }
-        }
-    }
-
-    reachable
 }
 
 fn get_vertex_range(

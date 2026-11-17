@@ -31,6 +31,7 @@ pub mod platform_manager_lookup;
 pub mod platform_property_lookup;
 pub mod platform_resolution;
 pub mod platform_type_name;
+mod possible_writes;
 pub mod proc_signature;
 pub mod proc_signature_lookup;
 pub mod query_in_loop;
@@ -44,6 +45,7 @@ pub mod this_object;
 pub mod this_object_attr;
 mod type_literal;
 mod user_call_candidates;
+pub mod value_origin;
 
 pub use body_flow::BodyFlow;
 pub use bsl_config::VisibleConfig;

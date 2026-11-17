@@ -279,12 +279,9 @@ impl<'a> DocumentedValues<'a> {
         let Some(stmt) = self.body.enclosing_stmt(expr) else {
             return false;
         };
-        // A write reaching definitions do not see leaves a value nothing documented.
-        // shortcut: every call the local is passed to counts as a possible writer, platform
-        // callables included (`ТипЗнч(Х)`, `Формат(Х, …)`), as inference counts them; telling
-        // apart callees that cannot rebind an argument would relieve those values as well.
-        let key = name.fold_lower();
-        if crate::narrow::local_may_change_unseen(self.body, &key, stmt.to_idx(), Some(call_expr)) {
+        // A call or `Выполнить` that may have rebound the local leaves a value nothing
+        // documented. Its own call does not: it writes only after the argument is read.
+        if self.rebinding_write_may_reach(expr, name, stmt) {
             return false;
         }
         let Some(defs) =
@@ -307,6 +304,24 @@ impl<'a> DocumentedValues<'a> {
                 | DefSite::Unknown
                 | DefSite::MayWrite(_) => false,
             })
+    }
+
+    fn rebinding_write_may_reach(&self, read: ExprId, name: &str, stmt: StmtId) -> bool {
+        if hir_def::body::events::hir_suppressed(self.body) {
+            return true;
+        }
+        let Some(defs) = self.flow.executable_reaching_defs(self.db) else {
+            return true;
+        };
+        crate::possible_writes::rebinding_write_reaches(
+            self.db,
+            self.body,
+            self.bindings,
+            &defs,
+            &name.fold_lower(),
+            read,
+            stmt,
+        )
     }
 
     fn reaching(&mut self) -> Option<Arc<ReachingDefsResult>> {
