@@ -18,7 +18,7 @@ The finding sits on the call when the text is produced in place, and on the comp
 
 - The text of a type name is only printed, logged, put into an exception text, concatenated, returned or stored: nothing depends on the text there.
 - The other side of the comparison is not a literal but a parameter, a variable or any other expression: the comparison may well be type-to-type.
-- Between producing the text and the comparison the value may have been overwritten in a way the walk cannot see through: a call PROVEN to take the argument by reference, or `Execute`. A call the platform data attests as taking its argument by value does not suppress the finding.
+- Between producing the text and the comparison the value may have been overwritten in a way the walk cannot see through: a call PROVEN to take the argument by reference, a call whose passing direction for the argument is not established (for example, a procedure the walk could not resolve), or `Execute`. A call the platform data attests as taking its argument by value does not suppress the finding.
 - The value comes from a parameter, a module variable, a loop variable, or a call the walk could not resolve.
 
 ### What the diagnostic does NOT catch yet
