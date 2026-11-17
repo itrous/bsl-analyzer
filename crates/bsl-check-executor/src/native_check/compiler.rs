@@ -1196,7 +1196,6 @@ fn schedule_process_group_cleanup(pid: u32, deadline: Instant) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     #[test]
@@ -1258,16 +1257,14 @@ mod tests {
 
     fn script(directory: &Path, body: &str) -> std::path::PathBuf {
         let path = directory.join("designer-stub");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        test_utils::write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
 
     #[cfg(target_os = "linux")]
     fn python_script(directory: &Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = directory.join(name);
-        std::fs::write(&path, format!("#!/usr/bin/python3\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        test_utils::write_executable(&path, &format!("#!/usr/bin/python3\n{body}\n"));
         path
     }
 

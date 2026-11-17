@@ -4063,7 +4063,7 @@ mod tests {
         let designer = root.path().join("1cv8");
         let ibcmd = root.path().join("ibcmd");
         fs::write(&designer, b"stub").unwrap();
-        fs::write(
+        test_utils::write_executable(
             &ibcmd,
             concat!(
                 "#!/bin/sh\n",
@@ -4085,10 +4085,8 @@ mod tests {
                 "  *) exit 2 ;;\n",
                 "esac\n"
             ),
-        )
-        .unwrap();
+        );
         fs::set_permissions(&designer, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::set_permissions(&ibcmd, fs::Permissions::from_mode(0o755)).unwrap();
 
         let profile = NativeProfile {
             designer_path: designer,
