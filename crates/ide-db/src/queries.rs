@@ -45,8 +45,16 @@ pub(crate) mod heap_estimate {
         v.estimated_heap()
     }
 
-    /// The result shares its `Body` with the lowering memo, and its own
-    /// estimate leaves the body out.
+    pub(super) fn body_events_heap(v: &Arc<hir::BodyEvents>) -> usize {
+        v.estimated_heap()
+    }
+
+    pub(super) fn module_code_body_events_heap(v: &Option<Arc<hir::BodyEvents>>) -> usize {
+        v.as_ref().map_or(0, |events| events.estimated_heap())
+    }
+
+    /// The result shares its `Body` with the lowering memo and its events with
+    /// the events memo, and its own estimate leaves both out.
     pub(super) fn reaching_defs_heap(
         v: &Option<Arc<hir::dataflow::reaching_defs::ReachingDefsResult>>,
     ) -> usize {
@@ -425,6 +433,15 @@ pub fn method_cfg_query<'db>(
     Arc::new(hir::cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), body))
 }
 
+#[salsa::tracked(lru = 8192, heap_size = heap_estimate::body_events_heap, returns(clone))]
+pub fn method_body_events_query<'db>(
+    db: &'db dyn RootDatabase,
+    method_id_input: hir::MethodIdInput<'db>,
+) -> Arc<hir::BodyEvents> {
+    let _span = tracing::info_span!("method_body_events", ?method_id_input).entered();
+    Arc::new(hir::BodyEvents::collect(db.method_body_ref(method_id_input)))
+}
+
 #[salsa::tracked(lru = 8192, heap_size = heap_estimate::reaching_defs_heap, returns(clone))]
 pub fn reaching_definitions_query<'db>(
     db: &'db dyn RootDatabase,
@@ -435,6 +452,7 @@ pub fn reaching_definitions_query<'db>(
     hir::dataflow::reaching_defs::solve_reaching_definitions(
         cfg,
         db.method_body_ref(method_id_input),
+        method_body_events_query(db, method_id_input),
         true,
     )
 }
@@ -448,8 +466,20 @@ pub fn module_code_reaching_definitions_query<'db>(
     let _span = tracing::info_span!("module_code_reaching_definitions", ?file_id).entered();
     let module_bodies = db.module_bodies_ref(ModuleId::new(file_id));
     let body_arc = module_bodies.module_code_arc()?;
+    let events = module_code_body_events_query(db, file_id_input)?;
     let cfg = module_level_cfg_query(db, file_id_input);
-    hir::dataflow::reaching_defs::solve_reaching_definitions(cfg, body_arc, false)
+    hir::dataflow::reaching_defs::solve_reaching_definitions(cfg, body_arc, events, false)
+}
+
+#[salsa::tracked(lru = 128, heap_size = heap_estimate::module_code_body_events_heap, returns(clone))]
+pub fn module_code_body_events_query<'db>(
+    db: &'db dyn RootDatabase,
+    file_id_input: FileIdInput<'db>,
+) -> Option<Arc<hir::BodyEvents>> {
+    let file_id = file_id_input.file_id(db);
+    let _span = tracing::info_span!("module_code_body_events", ?file_id).entered();
+    let module_bodies = db.module_bodies_ref(ModuleId::new(file_id));
+    module_bodies.module_code().map(|body| Arc::new(hir::BodyEvents::collect(body)))
 }
 
 #[salsa::tracked(lru = 8192, heap_size = heap_estimate::path_terminates_heap, returns(clone))]
@@ -690,6 +720,7 @@ pub fn set_dataflow_lru_sweep_mode(db: &mut dyn RootDatabase, sweep: bool) {
     const METHOD_SWEEP: usize = 2048;
     let cap = if sweep { METHOD_SWEEP } else { METHOD_INTERACTIVE };
     method_cfg_query::set_lru_capacity(db, cap);
+    method_body_events_query::set_lru_capacity(db, cap);
     reaching_definitions_query::set_lru_capacity(db, cap);
     method_path_terminates_query::set_lru_capacity(db, cap);
     method_hir_metrics_query::set_lru_capacity(db, cap);

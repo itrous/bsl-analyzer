@@ -1,12 +1,14 @@
 #[path = "overlay_schema.rs"]
 mod overlay_schema;
 
+use crate::snapshot::ParameterPassingAttestationRecord;
+use crate::types::ParamPassing;
 pub(crate) use overlay_schema::OverlayError;
 use overlay_schema::{
     parse_global_function_overrides, parse_member_surface_attestations,
-    parse_method_return_type_corrections, parse_overrides, parse_property_additions,
-    parse_property_corrections, validate_version_bounds, MethodParameterOverride,
-    TypeMemberSurfaceAttestation, TypePropertyAddition,
+    parse_method_return_type_corrections, parse_overrides, parse_parameter_passing_attestations,
+    parse_property_additions, parse_property_corrections, validate_version_bounds,
+    MethodParameterOverride, TypeMemberSurfaceAttestation, TypePropertyAddition,
 };
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -67,10 +69,11 @@ fn extracted_type_names(data: &Value) -> Vec<String> {
 /// extract once it is regenerated with new kinds.
 fn expand_replacement(
     overlay: &MethodParameterOverride,
+    replacement_type_list: &[String],
     type_names: &[String],
 ) -> Result<Vec<String>, OverlayError> {
     let mut expanded = Vec::new();
-    for entry in &overlay.replacement_type_list {
+    for entry in replacement_type_list {
         let Some(family) = entry.strip_suffix('*').filter(|family| family.ends_with(": ")) else {
             if !expanded.contains(entry) {
                 expanded.push(entry.clone());
@@ -115,7 +118,11 @@ fn apply_parameter_overrides(
             )));
         }
 
-        let replacement = expand_replacement(&overlay, type_names)?;
+        let replacement = overlay
+            .replacement_type_list
+            .as_deref()
+            .map(|list| expand_replacement(&overlay, list, type_names))
+            .transpose()?;
         let method = &mut methods[method_index];
         validate_version_bounds(method, &overlay)?;
         let parameters =
@@ -136,7 +143,21 @@ fn apply_parameter_overrides(
                 overlay.parameter_index
             ))
         })?;
-        parameter_object.insert("param_type".to_owned(), Value::String(replacement.join(", ")));
+        if let Some(replacement) = replacement {
+            parameter_object.insert("param_type".to_owned(), Value::String(replacement.join(", ")));
+        }
+        // The literal is the single medium; the snapshot decoder parses it into `MethodParam`.
+        if let Some(passing) = overlay.passing {
+            let literal = match passing {
+                ParamPassing::ByVal => "by_value",
+                ParamPassing::ByRef => "by_ref",
+            };
+            parameter_object.insert("passing".to_owned(), Value::String(literal.to_owned()));
+        }
+        if let Some(follows) = overlay.result_follows_argument_text {
+            parameter_object
+                .insert("result_follows_argument_text".to_owned(), Value::Bool(follows));
+        }
     }
 
     Ok(())
@@ -485,6 +506,62 @@ pub(crate) fn parse_resolved_member_surface_attestations(
         resolved.push(attestation);
     }
     Ok(resolved)
+}
+
+/// The attestations of `parameter_passing_attestations`, resolved to the corpus. Only the
+/// `global_context` scope is supported: any other scope is refused rather than guessed at,
+/// though the schema stays general for the type methods to come.
+///
+/// An `unverified_functions` entry is resolved by its Russian or English spelling and carried
+/// under the Russian one; an entry the corpus lacks is dropped. Unlike the member surface, where
+/// dropping makes the check more cautious, this moves the function to "by value": it is sound
+/// only because the exclusion has a subject solely where the function exists in the corpus.
+/// A typo in our own data is caught by the test over the bundled corpus, not by this loader.
+pub(crate) fn parse_resolved_parameter_passing_attestations(
+    data: &Value,
+    overlay_source: &str,
+) -> Result<Vec<ParameterPassingAttestationRecord>, OverlayError> {
+    let attestations = parse_parameter_passing_attestations(overlay_source)?;
+    let mut resolved = Vec::new();
+    for attestation in attestations {
+        if attestation.scope != "global_context" {
+            return Err(OverlayError(format!(
+                "parameter passing attestation scope {} is not supported yet: only global_context",
+                attestation.scope
+            )));
+        }
+        let mut unverified_functions = Vec::new();
+        for name in &attestation.unverified_functions {
+            let folded = name.fold_lower();
+            let russian_name = global_function_russian_name(data, &folded);
+            if let Some(russian_name) = russian_name {
+                unverified_functions.push(russian_name);
+            }
+        }
+        resolved.push(ParameterPassingAttestationRecord {
+            scope: attestation.scope,
+            verified_against_version: attestation.verified_against_version,
+            unverified_functions,
+        });
+    }
+    Ok(resolved)
+}
+
+/// The extract's Russian name of the global function spelled `folded` (lower-cased) in either
+/// language, `None` when the corpus has no such function.
+fn global_function_russian_name(data: &Value, folded: &str) -> Option<String> {
+    data.get("global_functions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .find_map(|function| {
+            let russian = function.get("name").and_then(Value::as_str)?;
+            let english = function.get("english_name").and_then(Value::as_str);
+            (russian.fold_lower() == folded
+                || english.is_some_and(|english| english.fold_lower() == folded))
+            .then(|| russian.to_owned())
+        })
 }
 
 enum ExistingProperty {

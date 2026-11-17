@@ -257,8 +257,6 @@ fn unproven_call_or_execute_suppresses() {
     };
     let input = with_call("НеизвестныйМетод(ПозднееЗначение);");
     check(&input, expect![[""]]);
-    let input = with_call("СтрДлина(ПозднееЗначение);");
-    check(&input, expect![[""]]);
     let input = with_call("Выполнить(\"ПозднееЗначение = 1\");");
     check(&input, expect![[""]]);
     check(
@@ -268,6 +266,28 @@ fn unproven_call_or_execute_suppresses() {
           message: Переменная 'ПозднееЗначение' может быть не инициализирована: на первой итерации цикла значение ей ещё не присвоено, присваивание в цикле действует только на следующих итерациях
           severity: Warning"#]],
     );
+}
+
+/// A local handed to a platform function counts as initialized by the call, whatever the corpus
+/// says of the parameter: the check judges a read only on the code's own `Знач`. `СтрДлина`
+/// and the second parameter of `ПоместитьФайл` are attested by value, the first one of
+/// `ПоместитьФайл` by reference; none of them reports (#889).
+#[test]
+fn platform_function_argument_suppresses_whatever_the_corpus_says() {
+    let with_call = |call: &str| {
+        ISSUE_EXAMPLE.replace(
+            "        Копия = ПозднееЗначение;",
+            &format!("        {call}\n        Копия = ПозднееЗначение;"),
+        )
+    };
+    for call in [
+        "СтрДлина(ПозднееЗначение);",
+        "ПоместитьФайл(ПозднееЗначение);",
+        "ПоместитьФайл(\"\", ПозднееЗначение);",
+        "Сообщить(ТипЗнч(ПозднееЗначение));",
+    ] {
+        check(&with_call(call), expect![[""]]);
+    }
 }
 
 #[test]
@@ -951,5 +971,64 @@ fn literal_loop_header_edges() {
             UninitializedLocalVariable @ 8:9..8:17
               message: Переменная 'Значение' может быть не инициализирована: на пути, где цикл не выполняется ни разу, значение ей не присваивается
               severity: Warning"#]],
+    );
+}
+
+/// A property of the extension the main attribute mixes into the form is the form's, read
+/// without a receiver, and not a local: `КлючТекущегоВарианта` belongs to the report form
+/// extension. The extension of another kind of form adds nothing, so in a document form the
+/// same name is a local of the method. `Заголовок` is the form's own in every kind. The local
+/// holds the type name's text on one path only, so the type-name rule stays silent there.
+#[test]
+fn form_extension_property_follows_the_kind_of_form() {
+    let form_xml = |main_type: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.10">
+    <Attributes>
+        <Attribute name="Объект" id="1">
+            <Type>
+                <v8:Type>{main_type}</v8:Type>
+            </Type>
+            <MainAttribute>true</MainAttribute>
+        </Attribute>
+    </Attributes>
+</Form>"#
+        )
+    };
+    let codes = |name: &str, main_type: &str| {
+        let source = format!(
+            "&НаКлиенте
+Процедура Проба(Значение)
+    Если Значение = 1 Тогда
+        {name} = Строка(ТипЗнч(Значение));
+    КонецЕсли;
+    Если {name} = \"Число\" Тогда
+        Сообщить(1);
+    КонецЕсли;
+КонецПроцедуры
+"
+        );
+        check_form_with_form_xml(&source, &form_xml(main_type))
+            .into_iter()
+            .map(|diag| diag.code)
+            .filter(|code| {
+                matches!(
+                    code,
+                    DiagnosticCode::UninitializedLocalVariable
+                        | DiagnosticCode::TypeNameComparedAsText
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let report = "cfg:ReportObject.Продажи";
+    let document = "cfg:DocumentObject.Заказ";
+    assert_eq!(codes("КлючТекущегоВарианта", report), []);
+    assert_eq!(codes("Заголовок", report), []);
+    assert_eq!(codes("Заголовок", document), []);
+    assert_eq!(
+        codes("КлючТекущегоВарианта", document),
+        [DiagnosticCode::UninitializedLocalVariable]
     );
 }

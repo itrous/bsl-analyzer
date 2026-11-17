@@ -8,8 +8,14 @@ pub enum CfgVertex {
     /// Evaluates the condition of `Если` or of one `ИначеЕсли`.
     Conditional(ConditionalVertex),
 
-    /// Loop headers: the computations a loop performs before every pass of its
-    /// body, and the place its continuation is tested.
+    /// Entry of `Для` or `Для Каждого`: evaluates the bounds or the collection
+    /// once, before the header is first reached. The loop's own back-edge and
+    /// `Продолжить` return to the header, not here.
+    LoopEntry(LoopEntryVertex),
+
+    /// Loop headers, reached before every pass of the body: `Пока` evaluates
+    /// its condition here, `Для` and `Для Каждого` bind the loop variable and
+    /// test whether another pass follows.
     WhileHeader(WhileHeaderVertex),
 
     ForHeader(ForHeaderVertex),
@@ -117,28 +123,44 @@ impl WhileHeaderVertex {
     }
 }
 
+/// The expressions a counted or collection loop evaluates once, on entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopEntryVertex {
+    /// `Для`: the lower bound, then the upper bound.
+    For([ExprId; 2]),
+    /// `Для Каждого`: the collection.
+    ForEach(ExprId),
+}
+
+impl LoopEntryVertex {
+    /// The roots in evaluation order.
+    pub fn roots(&self) -> &[ExprId] {
+        match self {
+            LoopEntryVertex::For(bounds) => bounds,
+            LoopEntryVertex::ForEach(collection) => std::slice::from_ref(collection),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForHeaderVertex {
     pub loop_var: BindingId,
-    pub from: ExprId,
-    pub to: ExprId,
 }
 
 impl ForHeaderVertex {
-    pub fn new(loop_var: BindingId, from: ExprId, to: ExprId) -> Self {
-        Self { loop_var, from, to }
+    pub fn new(loop_var: BindingId) -> Self {
+        Self { loop_var }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForEachHeaderVertex {
     pub loop_var: BindingId,
-    pub collection: ExprId,
 }
 
 impl ForEachHeaderVertex {
-    pub fn new(loop_var: BindingId, collection: ExprId) -> Self {
-        Self { loop_var, collection }
+    pub fn new(loop_var: BindingId) -> Self {
+        Self { loop_var }
     }
 }
 

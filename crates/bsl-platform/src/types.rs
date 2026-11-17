@@ -178,17 +178,34 @@ impl PlatformProperty {
     }
 }
 
+/// How a parameter is passed: `ByVal` copies the argument, `ByRef` can write back into the
+/// caller's variable. One notion for both the `Знач` of a user method in the source and the
+/// curated fact about a platform parameter, so the two sides cannot drift into two enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ParamPassing {
+    ByVal,
+    ByRef,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodParam {
     pub name: SmolStr,
     pub param_type: Option<SmolStr>,
     pub is_optional: bool,
     pub is_variadic: bool,
+    /// How the platform passes this parameter. `None` means unknown: the corpus states nothing
+    /// about it and no attestation covers it. That is not the same as `ByVal`.
+    pub passing: Option<ParamPassing>,
+    /// The call's result is the text of this argument, or text derived from it by a transformation
+    /// that preserves what the text says. Curated, additive: `false` means "not known to", never
+    /// "known not to", so a missing record cannot produce a finding that is not there.
+    pub result_follows_argument_text: bool,
 }
 
 impl MethodParam {
     /// Heap bytes owned by this parameter: its name/type `SmolStr`s (spilled
-    /// ones only). `is_optional`/`is_variadic` are `Copy` and own no heap.
+    /// ones only). `is_optional`/`is_variadic`/`passing` are `Copy` and own no heap.
     pub fn estimated_heap_size(&self) -> usize {
         stdx::heap::smol_str_bytes(self.name.len())
             + self.param_type.as_ref().map_or(0, |s| stdx::heap::smol_str_bytes(s.len()))
@@ -329,12 +346,16 @@ mod tests {
                     param_type: Some(SmolStr::new(long_type_name)),
                     is_optional: false,
                     is_variadic: false,
+                    passing: None,
+                    result_follows_argument_text: false,
                 },
                 MethodParam {
                     name: SmolStr::new("Второй"),
                     param_type: None,
                     is_optional: true,
                     is_variadic: false,
+                    passing: None,
+                    result_follows_argument_text: false,
                 },
             ],
             variants: vec![],

@@ -293,12 +293,7 @@ pub enum DescribedPart {
     Attributes,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ParamPassing {
-    ByVal,
-    ByRef,
-}
+pub use bsl_platform::ParamPassing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
