@@ -237,6 +237,55 @@ mod tests {
         );
     }
 
+    fn async_local_source(export: &str) -> String {
+        format!(
+            "Процедура ПередЗакрытием()
+	Оповещение = Новый ОписаниеОповещения(\"ОбработчикЗавершения\", ЭтотОбъект);
+КонецПроцедуры
+
+Асинх Процедура ОбработчикЗавершения(Результат, Параметры){export}
+КонецПроцедуры
+"
+        )
+    }
+
+    #[test]
+    fn an_async_exported_local_handler_is_silent() {
+        let diagnostics = run_local(&async_local_source(" Экспорт"));
+        assert!(diagnostics.is_empty(), "an async exported handler must pass: {diagnostics:#?}");
+    }
+
+    /// Control for the case above: only `Экспорт` is removed.
+    #[test]
+    fn an_async_local_handler_without_export_is_still_reported() {
+        let diagnostics = run_local(&async_local_source(""));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.starts_with("Добавьте \"Экспорт\""), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn an_async_exported_handler_of_a_common_module_is_silent() {
+        let diagnostics = with_module(
+            module_source(),
+            "Асинх Процедура Готово(Результат, Параметры) Экспорт
+КонецПроцедуры
+",
+        );
+        assert!(diagnostics.is_empty(), "an async exported handler must pass: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn an_async_handler_of_a_common_module_without_export_is_still_reported() {
+        let diagnostics = with_module(
+            module_source(),
+            "Асинх Процедура Готово(Результат, Параметры)
+КонецПроцедуры
+",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.starts_with("Добавьте \"Экспорт\""), "{diagnostics:#?}");
+    }
+
     #[test]
     fn an_unknown_receiver_module_proves_nothing() {
         let diagnostics = run_local(module_source());
