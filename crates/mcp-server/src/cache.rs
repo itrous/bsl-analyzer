@@ -18,6 +18,9 @@ const SWEEP_ENTRY_LIMIT: usize = 10_000;
 /// hex digest, so no live one starts with a dot.
 const SWEPT_DIR_PREFIX: &str = ".swept-";
 
+/// Lease record file name, next to the caches it governs. The lease writes it through
+/// `lease_path` and the sweep reads it in sibling directories, so both take the name from here.
+pub(crate) const LEASE_FILE: &str = "writer.lease";
 pub(crate) const LEASE_LOCK_FILE: &str = "writer.lease.lock";
 pub(crate) const STALL_REPORT_FILE: &str = "bsl-graph-stall-report.txt";
 /// Records which workspace a cache directory was derived for; see `write_workspace_marker`.
@@ -396,7 +399,7 @@ impl WorkspaceCacheLayout {
         self.root.join("bsl-search.db")
     }
     pub fn lease_path(&self) -> PathBuf {
-        self.root.join("writer.lease")
+        self.root.join(LEASE_FILE)
     }
     pub fn lease_lock_path(&self) -> PathBuf {
         self.root.join(LEASE_LOCK_FILE)
@@ -1567,7 +1570,7 @@ mod tests {
             if let Some(tree) = tree {
                 record["workspace"] = tree.to_string_lossy().into_owned().into();
             }
-            std::fs::write(dir.join("writer.lease"), record.to_string()).unwrap();
+            std::fs::write(dir.join(LEASE_FILE), record.to_string()).unwrap();
             dir
         }
 
@@ -1845,7 +1848,7 @@ mod tests {
             let family = new_family(CacheOrigin::Default);
             // The root would match both removal rules were it not skipped by identity.
             std::fs::write(
-                family.layout.root.join("writer.lease"),
+                family.layout.root.join(LEASE_FILE),
                 serde_json::json!({
                     "generation": 1, "token": 1, "pid": 1, "heartbeat_secs": 1,
                     "workspace": gone_tree(&family).to_string_lossy(),
