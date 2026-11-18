@@ -1,9 +1,9 @@
 //! Nesting deeper than the parser descends is a syntax error, not a crash.
 //!
 //! Every input here is far deeper than any stack holds when each level is a
-//! recursive call, and each is parsed on a thread with a small stack: the
-//! parse has to come back with the whole text in the tree and the depth
-//! reported where it was exceeded.
+//! recursive call or a node of the tree, and each is parsed on a thread with
+//! the 1 MiB stack of a Windows main thread: the parse has to come back with
+//! the whole text in the tree and the depth reported where it was exceeded.
 
 const DEPTH: usize = 100_000;
 const TOO_DEEP: &str = "Слишком глубокая вложенность";
@@ -11,7 +11,7 @@ const TOO_DEEP: &str = "Слишком глубокая вложенность";
 fn on_small_stack<T: Send + 'static>(label: &str, parse: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
         .name(format!("deep-nesting-{label}"))
-        .stack_size(256 * 1024)
+        .stack_size(1024 * 1024)
         .spawn(parse)
         .expect("spawn small-stack parser thread")
         .join()
@@ -94,6 +94,37 @@ fn deep_sdbl_nesting_is_reported_not_overflowed() {
     for (label, input) in cases {
         assert_reported(label, input, parser::parse_sdbl);
     }
+}
+
+#[test]
+fn long_bsl_chains_are_reported_not_overflowed() {
+    let cases = [
+        ("fields", in_method(format!("А = а{};", ".б".repeat(DEPTH)))),
+        ("calls", in_method(format!("А = ф{};", "()".repeat(DEPTH)))),
+        ("indexes", in_method(format!("А = а{};", "[1]".repeat(DEPTH)))),
+        ("sum", in_method(format!("А = 1{};", " + 1".repeat(DEPTH)))),
+        ("product", in_method(format!("А = 1{};", " * 1".repeat(DEPTH)))),
+        ("comparison", in_method(format!("А = 1{};", " = 1".repeat(DEPTH)))),
+        ("and", in_method(format!("А = 1{};", " И 1".repeat(DEPTH)))),
+        ("or", in_method(format!("А = 1{};", " ИЛИ 1".repeat(DEPTH)))),
+        // Chains under every level of nesting add up in one tree.
+        (
+            "nested-chains",
+            in_method(format!("А = {};", nested("(", "а", &format!("){}", ".б".repeat(100)), 120))),
+        ),
+    ];
+    for (label, input) in cases {
+        assert_reported(label, input, parser::parse);
+    }
+}
+
+#[test]
+fn chains_real_code_builds_are_not_reported() {
+    let concatenation =
+        in_method(format!("Текст = \"\"{};", " + Символы.ПС + \"строка\"".repeat(1_000)));
+    let reports =
+        on_small_stack("concatenation", move || too_deep_reports(&parser::parse(&concatenation)));
+    assert_eq!(reports, 0);
 }
 
 #[test]

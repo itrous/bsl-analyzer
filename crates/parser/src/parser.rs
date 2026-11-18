@@ -23,6 +23,17 @@ const POSITION_HISTORY_SIZE: usize = 100;
 /// a default thread stack in an unoptimized build.
 pub(crate) const MAX_NESTING_DEPTH: u32 = 128;
 
+/// How deep a tree a chain may build.
+///
+/// `а.б.в`, `ф()()` and `1 + 2 + 3` are read by loops, not by recursion, but
+/// each link wraps everything before it in one more node — a binary link in
+/// two — so the tree is as deep as the chain is long. The tree's own code
+/// walks it recursively, hashing in the node cache and dropping, and on a
+/// 1 MiB stack that overflows between four and eight thousand levels. Real
+/// code concatenates strings over a couple of thousand links, which this
+/// bound still admits.
+const MAX_CHAIN_DEPTH: u32 = 5_000;
+
 const TOO_DEEP_MESSAGE: &str = "слишком глубокая вложенность";
 
 pub struct Parser<'a> {
@@ -32,6 +43,9 @@ pub struct Parser<'a> {
     events: Vec<Event>,
     iteration_count: usize,
     nesting_depth: u32,
+    /// For each open marker, innermost last: its event and the depth of the
+    /// deepest node completed inside it so far.
+    open_nodes: Vec<(usize, u32)>,
     recent_positions: Vec<usize>,
     paren_depth: u32,
     brace_depth: u32,
@@ -57,6 +71,7 @@ impl<'a> Parser<'a> {
             events: Vec::new(),
             iteration_count: 0,
             nesting_depth: 0,
+            open_nodes: Vec::new(),
             recent_positions: Vec::with_capacity(POSITION_HISTORY_SIZE),
             paren_depth: 0,
             brace_depth: 0,
@@ -674,6 +689,7 @@ impl<'a> Parser<'a> {
         // пропущенном токене на конце входа ставит маркер именно там.
         let start_token_pos = self.input.raw_at(self.pos);
         self.events.push(Event::Placeholder);
+        self.open_nodes.push((pos, 0));
         Marker { pos, start_token_pos }
     }
 
@@ -922,6 +938,34 @@ impl<'a> Parser<'a> {
         self.error_custom_at_marker(m, TOO_DEEP_MESSAGE);
     }
 
+    /// Whether the chain read by the loop at the cursor must stop growing.
+    ///
+    /// Asked before each link: the node about to be wrapped is the deepest
+    /// completed in the innermost open marker. Past [`MAX_CHAIN_DEPTH`] the
+    /// rest of the chain is reported and taken as [`Parser::nested`] takes a
+    /// construct it will not descend into.
+    pub fn chain_is_too_deep(&mut self) -> bool {
+        let depth = self.open_nodes.last().map_or(0, |&(_, depth)| depth);
+        if depth < MAX_CHAIN_DEPTH {
+            return false;
+        }
+        self.skip_too_deep();
+        true
+    }
+
+    /// Closes the innermost open marker and returns the depth of the node it
+    /// becomes, or of the deepest node inside it when it is abandoned and its
+    /// content hangs from the enclosing node instead.
+    fn close_node(&mut self, pos: usize, becomes_node: bool) -> u32 {
+        let (open, inner) = self.open_nodes.pop().expect("a marker is open");
+        debug_assert_eq!(open, pos, "markers are closed innermost first");
+        let depth = inner + u32::from(becomes_node);
+        if let Some((_, outer)) = self.open_nodes.last_mut() {
+            *outer = (*outer).max(depth);
+        }
+        depth
+    }
+
     pub fn at_declaration_start(&self) -> bool {
         matches!(self.current(), Some(T![KwFunction] | T![KwProcedure]))
             && self.nth(1) == Some(T![Ident])
@@ -985,10 +1029,12 @@ impl Marker {
         let event = &mut p.events[self.pos];
         *event = Event::Start { kind, forward_parent: None };
         p.events.push(Event::Finish);
-        CompletedMarker::at_event_pos(self.pos, self.start_token_pos)
+        let depth = p.close_node(self.pos, true);
+        CompletedMarker::at_event_pos(self.pos, self.start_token_pos, depth)
     }
 
     pub fn abandon(self, p: &mut Parser) {
+        p.close_node(self.pos, false);
         if self.pos == p.events.len() - 1 {
             if let Some(Event::Placeholder) = p.events.last() {
                 p.events.pop();
@@ -1000,11 +1046,12 @@ impl Marker {
 pub struct CompletedMarker {
     pos: usize,
     start_token_pos: usize,
+    depth: u32,
 }
 
 impl CompletedMarker {
-    fn at_event_pos(pos: usize, start_token_pos: usize) -> Self {
-        Self { pos, start_token_pos }
+    fn at_event_pos(pos: usize, start_token_pos: usize, depth: u32) -> Self {
+        Self { pos, start_token_pos, depth }
     }
 
     pub fn precede(self, p: &mut Parser) -> Marker {
@@ -1014,6 +1061,7 @@ impl CompletedMarker {
         if let Event::Start { forward_parent, .. } = &mut p.events[self.pos] {
             *forward_parent = Some(new_pos - self.pos);
         }
+        p.open_nodes.push((new_pos, self.depth));
 
         Marker::at_event_pos(new_pos, self.start_token_pos)
     }
