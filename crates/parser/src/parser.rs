@@ -27,9 +27,12 @@ pub(crate) const MAX_NESTING_DEPTH: u32 = 128;
 ///
 /// `а.б.в`, `ф()()` and `1 + 2 + 3` are read by loops, not by recursion, but
 /// each link wraps everything before it in one more node — a binary link in
-/// two — so the tree is as deep as the chain is long. The tree's own code
-/// walks it recursively, hashing in the node cache and dropping, and on a
-/// 1 MiB stack that overflows between four and eight thousand levels. Real
+/// two — so the tree grows as deep as the chain is long, or twice as deep.
+/// The tree's own code walks it recursively, hashing in the node cache and
+/// dropping, and on a 1 MiB stack an unoptimized build on Linux overflows
+/// between twelve and fourteen thousand levels, over twice this bound; the
+/// depth tests build trees at the bound on a 1 MiB stack, the size of a
+/// Windows main thread, so the margin is checked wherever they run. Real
 /// code concatenates strings over a couple of thousand links, which this
 /// bound still admits.
 const MAX_CHAIN_DEPTH: u32 = 5_000;
