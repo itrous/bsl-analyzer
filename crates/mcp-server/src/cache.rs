@@ -647,6 +647,8 @@ fn is_temp_family(base: &Path) -> bool {
 /// The temp family can be built on: absent, or a real directory that is private to this user.
 /// Anything else (another user's directory, a symlink planted in the shared temp dir) means the
 /// throwaway base is not ours, and the OS cache directory serves instead of failing startup.
+/// This is decided once, when the layout is resolved: a family that turns unusable after that is
+/// refused by `ensure`, which never builds under a base it cannot prove private.
 #[cfg(unix)]
 fn temp_family_is_usable(path: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
