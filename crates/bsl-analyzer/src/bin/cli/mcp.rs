@@ -313,7 +313,15 @@ impl McpCommand {
             // truncate a dotted name like `daemon.custom.log`).
             let mut rotated = log_path.file_name().unwrap_or_default().to_os_string();
             rotated.push(".prev");
-            let _ = std::fs::rename(&log_path, log_path.with_file_name(rotated));
+            let rotated = log_path.with_file_name(rotated);
+            if std::fs::rename(&log_path, &rotated).is_ok() && is_cache_log {
+                // A rename keeps the last write's mtime, and the stale-trail sweep reads the age
+                // from it: date the trail from its rotation so the next startup keeps it.
+                let _ = std::fs::File::options()
+                    .write(true)
+                    .open(&rotated)
+                    .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+            }
         }
         Some(log_path)
     }
@@ -3267,6 +3275,22 @@ mod tests {
             .daemon_log_file_for(Some(custom.to_str().unwrap()))
             .unwrap();
         assert!(custom_prev.exists(), "a caller-selected log's directory is never swept");
+    }
+
+    #[test]
+    fn a_trail_rotated_from_an_old_log_survives_the_next_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = || {
+            serve_command(McpServeMode::Daemon, dir.path()).daemon_log_file_for(Some("1")).unwrap()
+        };
+        let log = start();
+        std::fs::File::create(&log).unwrap().set_len(51 * 1024 * 1024).unwrap();
+        age_file(&log, 48 * HOUR);
+        start();
+        let prev = log.with_file_name("bsl-analyzer-daemon.log.prev");
+        assert!(prev.exists(), "the first startup rotates the oversized log");
+        start();
+        assert!(prev.exists(), "a trail is aged from its rotation, not from its last write");
     }
 
     #[test]
