@@ -2,9 +2,22 @@
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use crate::workspace_lease::{inspect_lease_dir, LeaseSnapshot};
+
+/// Rotated daemon log; a directory holding only this has no index and no lease to identify it.
+const DAEMON_LOG_PREV_FILE: &str = "bsl-analyzer-daemon.log.prev";
+/// A lone rotated log younger than this may belong to a daemon that is still starting up.
+const LONE_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Bound on the work of one sweep: the family can hold thousands of directories.
+const SWEEP_ENTRY_LIMIT: usize = 10_000;
 
 pub(crate) const LEASE_LOCK_FILE: &str = "writer.lease.lock";
 pub(crate) const STALL_REPORT_FILE: &str = "bsl-graph-stall-report.txt";
+/// Records which workspace a cache directory was derived for; see `write_workspace_marker`.
+pub(crate) const WORKSPACE_MARKER_FILE: &str = "workspace.path";
 pub const WORKSPACE_CACHE_SCOPE_ENV: &str = "BSL_MCP_CACHE_SCOPE";
 pub const WORKSPACE_CACHE_BASE_ENV: &str = "BSL_CACHE_DIR";
 const SCOPE_DOMAIN: &[u8] = b"bsl-analyzer/workspace-derived-cache/v1";
@@ -92,11 +105,7 @@ impl WorkspaceCacheLayout {
         let base_declared = match selected {
             Some(path) if path.is_absolute() => path,
             Some(path) => current_dir()?.join(path),
-            None => dirs::cache_dir()
-                .ok_or_else(|| {
-                    invalid("OS cache directory is unavailable; set --cache-dir or BSL_CACHE_DIR")
-                })?
-                .join("bsl-analyzer"),
+            None => default_base(&std::env::temp_dir(), &project.root)?,
         };
         let base = canonicalize_nearest(&base_declared)?;
         let scope = project_scope(project)?;
@@ -275,7 +284,73 @@ impl WorkspaceCacheLayout {
         if self.root.canonicalize()? != self.root {
             return Err(invalid("workspace cache path changed during startup"));
         }
+        self.write_workspace_marker();
+        self.sweep_abandoned_siblings();
         Ok(())
+    }
+
+    /// Record the workspace this directory was derived for, so it stays identifiable without a
+    /// lease.
+    ///
+    /// Identity used to come only from `writer.lease`, which only a process that becomes the
+    /// cache writer ever writes. Measured on one machine: of 1080 cache directories (16 GB) just
+    /// 5 held a lease, and none of those named a missing tree, so the sweep could prove almost
+    /// nothing abandoned. Short CLI runs, tests and degraded runs create the directory here and
+    /// never write a lease, which made them unidentifiable rather than abandoned.
+    ///
+    /// Best effort: a read-only or full disk must not stop a startup. The path is written as
+    /// the OS string's encoded bytes, so nothing is lost on a non-UTF-8 name; the reader treats
+    /// anything it cannot decode as no evidence at all.
+    fn write_workspace_marker(&self) {
+        let Some(workspace) = self.workspace.as_deref() else { return };
+        let marker = self.root.join(WORKSPACE_MARKER_FILE);
+        let content = workspace.as_os_str().as_encoded_bytes();
+        if std::fs::read(&marker).is_ok_and(|existing| existing == content) {
+            return;
+        }
+        let _ = std::fs::write(&marker, content);
+    }
+
+    /// `ensure` can run more than once per process and a scan of thousands of entries is not
+    /// free, so only the first call sweeps.
+    fn sweep_abandoned_siblings(&self) {
+        static SWEPT: AtomicBool = AtomicBool::new(false);
+        if self.origin == CacheOrigin::Default && !SWEPT.swap(true, Ordering::Relaxed) {
+            self.sweep_family();
+        }
+    }
+
+    /// Remove sibling cache directories whose owner is provably gone.
+    ///
+    /// Nothing evicted these before, and every temporary workspace (test fixtures above all)
+    /// leaves one behind. Only the default base is swept: an explicit `--cache-dir` may be
+    /// shared or user-owned, and we do not delete inside it.
+    ///
+    /// Never returns an error and ignores every filesystem failure: a sibling may belong to a
+    /// live foreign daemon (a removal can fail, or race with its writes), and a failed sweep
+    /// must not stop a startup.
+    ///
+    /// Liveness is the lease heartbeat, never the recorded pid: the pid is reused by unrelated
+    /// processes (measured: every "live" pid in 400 lease files belonged to node, cmd or
+    /// python). A stale heartbeat alone is not enough either - an idle cache of a tree that
+    /// still exists is wanted, and two digests of one existing tree prove nothing about which
+    /// is current - so a directory goes only when the tree it served is gone too.
+    fn sweep_family(&self) {
+        if self.origin != CacheOrigin::Default {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.family) else { return };
+        for entry in entries.take(SWEEP_ENTRY_LIMIT).flatten() {
+            let path = entry.path();
+            // `file_type` does not follow symlinks, so a link is never descended into.
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if !is_dir || path == self.root {
+                continue;
+            }
+            if is_abandoned(&path) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
     }
 
     pub fn graph_db_path(&self) -> PathBuf {
@@ -343,6 +418,67 @@ impl WorkspaceCacheLayout {
         }
         Ok(())
     }
+}
+
+/// Liveness comes from the lease (a fresh one always wins); identity comes from the lease's
+/// workspace and, failing that, from the marker `ensure` leaves in every directory.
+fn is_abandoned(dir: &Path) -> bool {
+    match inspect_lease_dir(dir) {
+        LeaseSnapshot::Fresh => false,
+        LeaseSnapshot::Stale { workspace: Some(tree) } => tree_is_gone(&tree),
+        // A record of an older program names no tree: fall back to the marker.
+        LeaseSnapshot::Stale { workspace: None } => marked_tree_is_gone(dir),
+        LeaseSnapshot::Unreadable => marked_tree_is_gone(dir) || is_lone_stale_log(dir),
+    }
+}
+
+/// The tree recorded in `dir`'s marker is provably gone. No marker, an empty or undecodable
+/// one, or a relative path proves nothing.
+fn marked_tree_is_gone(dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(dir.join(WORKSPACE_MARKER_FILE)) else { return false };
+    let Ok(text) = String::from_utf8(bytes) else { return false };
+    !text.is_empty() && tree_is_gone(Path::new(&text))
+}
+
+/// The single proof of absence shared by the lease and marker paths, so they cannot drift.
+/// An unanswerable existence check (e.g. access denied) is not evidence of absence. Neither is
+/// an unreachable volume: on Windows an absent one (detached USB disk, unmapped network
+/// drive, unattached VHD) answers `Ok(false)` for EVERY path on it, so without the volume
+/// check a detached drive would delete the indexes of all its projects.
+fn tree_is_gone(tree: &Path) -> bool {
+    volume_root(tree).is_some_and(|volume| matches!(volume.try_exists(), Ok(true)))
+        && matches!(tree.try_exists(), Ok(false))
+}
+
+/// Root of the volume `path` lives on: `C:\x\y` -> `C:\`, `\\server\share\x` ->
+/// `\\server\share\`; `None` for a path that names no volume (a relative path, or a rooted
+/// one on Windows without a drive). On unix there is no prefix and the root is `/`.
+fn volume_root(path: &Path) -> Option<PathBuf> {
+    match path.components().next()? {
+        Component::Prefix(prefix) => {
+            let mut root = prefix.as_os_str().to_os_string();
+            root.push(std::path::MAIN_SEPARATOR_STR);
+            Some(PathBuf::from(root))
+        }
+        Component::RootDir if cfg!(unix) => Some(PathBuf::from("/")),
+        _ => None,
+    }
+}
+
+/// A rotated daemon log can outlive everything else in its directory (21 of 21 such
+/// directories measured held only a 51 MB `.prev`). Anything else inside, even beside the log,
+/// makes the directory unidentifiable, so it stays.
+fn is_lone_stale_log(dir: &Path) -> bool {
+    let Ok(mut entries) = std::fs::read_dir(dir) else { return false };
+    let (Some(Ok(only)), None) = (entries.next(), entries.next()) else { return false };
+    if only.file_name() != DAEMON_LOG_PREV_FILE {
+        return false;
+    }
+    only.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > LONE_LOG_RETENTION)
 }
 
 pub fn validate_scope_stamp(stamp: &str) -> std::io::Result<()> {
@@ -452,6 +588,40 @@ fn canonicalize_nearest(path: &Path) -> std::io::Result<PathBuf> {
         resolved.push(component);
     }
     Ok(lexical_normalize(&resolved))
+}
+
+/// Name of the throwaway cache family used for workspaces that are themselves throwaway.
+const TEMP_WORKSPACE_CACHE_DIR: &str = "bsl-analyzer-cache";
+
+/// Pick the default cache base for a workspace nobody named a cache directory for.
+///
+/// A workspace under the OS temp dir dies with the run that made it, so its derived cache is
+/// put under the temp dir too: in the user's real cache it would leave one entry per run that
+/// only the sweep ever removes. Anything else keeps the OS cache directory.
+fn default_base(temp_dir: &Path, workspace_root: &Path) -> std::io::Result<PathBuf> {
+    let os_cache = || {
+        dirs::cache_dir()
+            .ok_or_else(|| {
+                invalid("OS cache directory is unavailable; set --cache-dir or BSL_CACHE_DIR")
+            })
+            .map(|dir| dir.join("bsl-analyzer"))
+    };
+    let (Ok(temp), Ok(workspace)) =
+        (canonicalize_nearest(temp_dir), canonicalize_nearest(workspace_root))
+    else {
+        return os_cache();
+    };
+    // Equality, not just containment: a workspace that IS the temp dir would hold its own
+    // cache, which the placement checks rightly refuse for a default base.
+    if !workspace.starts_with(&temp) || workspace == temp {
+        return os_cache();
+    }
+    let candidate = temp.join(TEMP_WORKSPACE_CACHE_DIR);
+    // A workspace rooted inside the throwaway family itself would again contain its own cache.
+    if workspace.starts_with(&candidate) {
+        return os_cache();
+    }
+    Ok(candidate)
 }
 
 fn validate_base_ancestor(declared: &Path, resolved: &Path) -> std::io::Result<()> {
@@ -1159,5 +1329,333 @@ mod tests {
         assert!(accepted
             .root()
             .starts_with(workspace.path().canonicalize().unwrap().join("explicit-cache")));
+    }
+
+    #[test]
+    fn workspace_cache_default_base_for_temp_workspace_stays_in_temp() {
+        let workspace = tempfile::tempdir().unwrap();
+        let project = project(workspace.path());
+        let layout =
+            WorkspaceCacheLayout::for_project(&project, None, workspace.path(), None).unwrap();
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert!(layout.base().starts_with(&temp), "{:?} not under {:?}", layout.base(), temp);
+        if let Some(os_cache) = dirs::cache_dir() {
+            assert!(!layout.base().starts_with(os_cache));
+        }
+        layout.ensure().unwrap();
+        assert!(layout.root().is_dir());
+    }
+
+    #[test]
+    fn workspace_cache_default_base_control_non_temp_workspace_uses_os_cache() {
+        let claimed_temp = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let base = default_base(claimed_temp.path(), workspace.path()).unwrap();
+        assert_eq!(base, dirs::cache_dir().unwrap().join("bsl-analyzer"));
+    }
+
+    #[test]
+    fn workspace_cache_default_base_declines_when_workspace_is_the_temp_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = default_base(dir.path(), dir.path()).unwrap();
+        assert_eq!(base, dirs::cache_dir().unwrap().join("bsl-analyzer"));
+    }
+
+    #[test]
+    fn workspace_cache_default_base_declines_a_workspace_inside_the_cache_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let inside = temp.path().join("bsl-analyzer-cache/ws");
+        std::fs::create_dir_all(&inside).unwrap();
+        let base = default_base(temp.path(), &inside).unwrap();
+        assert_eq!(base, dirs::cache_dir().unwrap().join("bsl-analyzer"));
+    }
+
+    mod sweep {
+        use super::*;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        /// A family directory with the layout's own `current` root inside it.
+        struct Family {
+            dir: tempfile::TempDir,
+            layout: WorkspaceCacheLayout,
+        }
+
+        fn new_family(origin: CacheOrigin) -> Family {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("current");
+            std::fs::create_dir(&root).unwrap();
+            let layout = WorkspaceCacheLayout {
+                declared: root.clone(),
+                family: dir.path().to_path_buf(),
+                family_declared: dir.path().to_path_buf(),
+                base: dir.path().to_path_buf(),
+                base_declared: dir.path().to_path_buf(),
+                root,
+                workspace: None,
+                scope: [1; 32],
+                origin,
+            };
+            Family { dir, layout }
+        }
+
+        fn now() -> u64 {
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        }
+
+        /// A sibling directory with a lease stamped at `heartbeat_secs`, serving `tree`.
+        fn sibling(
+            family: &Family,
+            name: &str,
+            heartbeat_secs: u64,
+            tree: Option<&Path>,
+        ) -> PathBuf {
+            let dir = family.dir.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            let mut record = serde_json::json!({
+                "generation": 1, "token": 1, "pid": 1, "heartbeat_secs": heartbeat_secs,
+            });
+            if let Some(tree) = tree {
+                record["workspace"] = tree.to_string_lossy().into_owned().into();
+            }
+            std::fs::write(dir.join("writer.lease"), record.to_string()).unwrap();
+            dir
+        }
+
+        fn gone_tree(family: &Family) -> PathBuf {
+            family.dir.path().join("no-such-tree")
+        }
+
+        fn lone_log(family: &Family, name: &str, age: Duration) -> PathBuf {
+            let dir = family.dir.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            write_log(&dir, age);
+            dir
+        }
+
+        fn write_log(dir: &Path, age: Duration) {
+            let file = std::fs::File::create(dir.join(DAEMON_LOG_PREV_FILE)).unwrap();
+            file.set_modified(SystemTime::now() - age).unwrap();
+        }
+
+        const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+        #[test]
+        fn stale_lease_of_a_missing_tree_is_removed() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = sibling(&family, "a", 1, Some(&gone_tree(&family)));
+            family.layout.sweep_family();
+            assert!(!dir.exists());
+        }
+
+        /// A sibling with NO lease, optionally carrying a marker with the given content.
+        fn leaseless(family: &Family, name: &str, marker: Option<&str>) -> PathBuf {
+            let dir = family.dir.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            if let Some(content) = marker {
+                std::fs::write(dir.join(WORKSPACE_MARKER_FILE), content).unwrap();
+            }
+            dir
+        }
+
+        fn gone_str(family: &Family) -> String {
+            gone_tree(family).to_string_lossy().into_owned()
+        }
+
+        #[test]
+        fn ensure_writes_the_workspace_marker() {
+            let workspace = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let project = project(workspace.path());
+            let layout = WorkspaceCacheLayout::for_project(
+                &project,
+                Some(&cache.path().join("c")),
+                workspace.path(),
+                None,
+            )
+            .unwrap();
+            layout.ensure().unwrap();
+            let marker = layout.root().join(WORKSPACE_MARKER_FILE);
+            let expected = layout.workspace().unwrap().as_os_str().as_encoded_bytes();
+            assert_eq!(std::fs::read(&marker).unwrap(), expected);
+            // A second startup leaves it intact.
+            layout.ensure().unwrap();
+            assert_eq!(std::fs::read(&marker).unwrap(), expected);
+        }
+
+        #[test]
+        fn leaseless_sibling_whose_marker_names_a_missing_tree_is_removed() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = leaseless(&family, "a", Some(&gone_str(&family)));
+            family.layout.sweep_family();
+            assert!(!dir.exists());
+        }
+
+        #[test]
+        fn stale_lease_without_a_tree_defers_to_the_marker() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = sibling(&family, "a", 1, None);
+            std::fs::write(dir.join(WORKSPACE_MARKER_FILE), gone_str(&family)).unwrap();
+            family.layout.sweep_family();
+            assert!(!dir.exists());
+        }
+
+        #[test]
+        fn leaseless_sibling_whose_marker_names_an_existing_tree_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let tree = tempfile::tempdir().unwrap();
+            let dir = leaseless(&family, "a", Some(&tree.path().to_string_lossy()));
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn leaseless_sibling_without_a_marker_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = leaseless(&family, "a", None);
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn fresh_lease_wins_over_a_marker_naming_a_missing_tree() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = sibling(&family, "a", now(), None);
+            std::fs::write(dir.join(WORKSPACE_MARKER_FILE), gone_str(&family)).unwrap();
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn marker_that_is_empty_or_relative_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let empty = leaseless(&family, "a", Some(""));
+            let relative = leaseless(&family, "b", Some("no-such-relative-tree/x"));
+            family.layout.sweep_family();
+            assert!(empty.exists(), "an empty marker proves nothing");
+            assert!(relative.exists(), "a relative path names no volume");
+        }
+
+        #[test]
+        fn volume_root_is_parsed_from_the_path_prefix() {
+            assert_eq!(volume_root(Path::new("relative/x")), None);
+            #[cfg(windows)]
+            {
+                assert_eq!(volume_root(Path::new(r"C:\x\y")), Some(PathBuf::from(r"C:\")));
+                assert_eq!(volume_root(Path::new(r"\\?\D:\x")), Some(PathBuf::from(r"\\?\D:\")));
+                assert_eq!(
+                    volume_root(Path::new(r"\\server\share\x\y")),
+                    Some(PathBuf::from(r"\\server\share\"))
+                );
+                assert_eq!(volume_root(Path::new(r"\x")), None);
+            }
+            #[cfg(unix)]
+            assert_eq!(volume_root(Path::new("/a/b")), Some(PathBuf::from("/")));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn stale_lease_on_an_absent_volume_is_kept() {
+            let absent = ('D'..='Z')
+                .map(|letter| format!(r"{letter}:\"))
+                .find(|root| !matches!(Path::new(root).try_exists(), Ok(true)))
+                .expect("no absent drive letter was available for this test");
+            let family = new_family(CacheOrigin::Default);
+            let tree = PathBuf::from(format!(r"{absent}no-such-project"));
+            let dir = sibling(&family, "a", 1, Some(&tree));
+            family.layout.sweep_family();
+            assert!(dir.exists(), "an absent volume is no evidence that the tree is gone");
+        }
+
+        #[test]
+        fn fresh_lease_of_a_missing_tree_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = sibling(&family, "a", now(), Some(&gone_tree(&family)));
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn stale_lease_of_an_existing_tree_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let tree = tempfile::tempdir().unwrap();
+            let dir = sibling(&family, "a", 1, Some(tree.path()));
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn stale_lease_without_a_named_tree_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = sibling(&family, "a", 1, None);
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn directory_without_a_lease_but_with_a_database_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = family.dir.path().join("a");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("bsl-graph.db"), b"x").unwrap();
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn lone_old_rotated_log_is_removed() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = lone_log(&family, "a", 2 * DAY);
+            family.layout.sweep_family();
+            assert!(!dir.exists());
+        }
+
+        #[test]
+        fn lone_recent_rotated_log_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = lone_log(&family, "a", Duration::from_secs(60));
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn old_rotated_log_beside_a_database_is_kept() {
+            let family = new_family(CacheOrigin::Default);
+            let dir = lone_log(&family, "a", 2 * DAY);
+            std::fs::write(dir.join("bsl-search.db"), b"x").unwrap();
+            family.layout.sweep_family();
+            assert!(dir.exists());
+        }
+
+        #[test]
+        fn explicit_origin_removes_nothing() {
+            let family = new_family(CacheOrigin::Explicit);
+            let stale = sibling(&family, "a", 1, Some(&gone_tree(&family)));
+            let log = lone_log(&family, "b", 2 * DAY);
+            family.layout.sweep_family();
+            family.layout.sweep_abandoned_siblings();
+            assert!(stale.exists() && log.exists());
+        }
+
+        #[test]
+        fn own_root_is_never_removed() {
+            let family = new_family(CacheOrigin::Default);
+            // The root would match both removal rules were it not skipped by identity.
+            std::fs::write(
+                family.layout.root.join("writer.lease"),
+                serde_json::json!({
+                    "generation": 1, "token": 1, "pid": 1, "heartbeat_secs": 1,
+                    "workspace": gone_tree(&family).to_string_lossy(),
+                })
+                .to_string(),
+            )
+            .unwrap();
+            family.layout.sweep_family();
+            assert!(family.layout.root.exists());
+
+            let log_only = new_family(CacheOrigin::Default);
+            write_log(&log_only.layout.root, 2 * DAY);
+            log_only.layout.sweep_family();
+            assert!(log_only.layout.root.exists());
+        }
     }
 }

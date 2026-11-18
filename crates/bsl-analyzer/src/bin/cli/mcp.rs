@@ -289,17 +289,25 @@ impl McpCommand {
             expected_scope,
         )
         .ok()?;
-        let log_path = if let Some(path) = opt_in {
+        let (log_path, is_cache_log) = if let Some(path) = opt_in {
             // An unpreparable explicit path degrades to stderr like every other
             // opt-in logging failure, but only after the launch gate above.
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent).ok()?;
             }
-            path
+            (path, false)
         } else {
             layout.ensure().ok()?;
-            layout.daemon_log_path()
+            (layout.daemon_log_path(), true)
         };
+        // Only the cache log's `.prev` is ours to delete: a caller-selected path
+        // lives in a directory the caller owns, and a file there that happens to be
+        // named `<log>.prev` is theirs, however old. Swept BEFORE the rotation below,
+        // because a rename keeps the mtime, so a freshly rotated trail of a log last
+        // written days ago would look stale and be deleted the moment it was made.
+        if is_cache_log {
+            remove_stale_prev_log(&log_path, std::time::SystemTime::now());
+        }
         if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
             // Append `.prev` to the whole file name (`with_extension` would
             // truncate a dotted name like `daemon.custom.log`).
@@ -308,6 +316,26 @@ impl McpCommand {
             let _ = std::fs::rename(&log_path, log_path.with_file_name(rotated));
         }
         Some(log_path)
+    }
+}
+
+/// A `.prev` is a superseded copy of a log: past this age no live run can still be
+/// reading it, and nothing else ever deletes it (ceiling was ~100 MB per cache
+/// directory, for every digest that ever existed).
+const STALE_PREV_LOG_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Deletes `<log>.prev` when it is older than [`STALE_PREV_LOG_AGE`]. A younger one
+/// is kept: it is what one reads to diagnose a crash that just happened. Every
+/// filesystem failure is ignored, since a failed cleanup must not stop a startup.
+fn remove_stale_prev_log(log_path: &Path, now: std::time::SystemTime) {
+    // Append to the whole file name (`with_extension` would truncate a dotted name).
+    let mut name = log_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".prev");
+    let prev = log_path.with_file_name(name);
+    let Ok(modified) = std::fs::metadata(&prev).and_then(|m| m.modified()) else { return };
+    // A clock that went backwards gives `Err`: age unknown, so keep the file.
+    if now.duration_since(modified).is_ok_and(|age| age > STALE_PREV_LOG_AGE) {
+        let _ = std::fs::remove_file(&prev);
     }
 }
 
@@ -1735,7 +1763,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        daemon_command, decode_password, frozen_embedding_prefixes,
+        daemon_command, decode_password, frozen_embedding_prefixes, remove_stale_prev_log,
         resolve_embedding_prefix_values, resolve_onec_password, resolve_serve_mode_with_override,
         resolve_token_profile_values, validate_backend_pid, validate_onec_settings,
         validate_serve_args, warn_on_wildcard_allowlist, CheckExecutorConfig, HttpServeOptions,
@@ -1744,7 +1772,7 @@ mod tests {
     use clap::Parser;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn test_cache_layout(
         workspace: &std::path::Path,
@@ -3159,6 +3187,86 @@ mod tests {
             .is_none());
         assert_eq!(std::fs::metadata(&custom).unwrap().len(), 51 * 1024 * 1024);
         assert!(!logs.path().join("daemon.log.prev").exists());
+    }
+
+    fn age_file(path: &Path, age: std::time::Duration) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age).unwrap();
+    }
+
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    #[test]
+    fn stale_prev_log_old_is_removed_and_recent_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        let prev = dir.path().join("daemon.log.prev");
+        std::fs::write(&prev, "old trail").unwrap();
+
+        age_file(&prev, 25 * HOUR);
+        remove_stale_prev_log(&log, std::time::SystemTime::now());
+        assert!(!prev.exists(), "a `.prev` older than a day must go");
+
+        // Control: the distinction is real, not "delete every `.prev`".
+        std::fs::write(&prev, "fresh trail").unwrap();
+        age_file(&prev, 23 * HOUR);
+        remove_stale_prev_log(&log, std::time::SystemTime::now());
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), "fresh trail");
+    }
+
+    #[test]
+    fn stale_prev_log_missing_is_noop_and_leaves_the_log_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        std::fs::write(&log, "live").unwrap();
+        age_file(&log, 48 * HOUR);
+        remove_stale_prev_log(&log, std::time::SystemTime::now());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "live");
+    }
+
+    #[test]
+    fn stale_prev_log_unreadable_metadata_is_noop() {
+        // Parent directory missing, empty path, and a name the OS rejects: `metadata`
+        // fails in each case and nothing may panic or be created.
+        remove_stale_prev_log(Path::new("no-such-dir/daemon.log"), std::time::SystemTime::now());
+        remove_stale_prev_log(Path::new(""), std::time::SystemTime::now());
+        let dir = tempfile::tempdir().unwrap();
+        remove_stale_prev_log(&dir.path().join("da\0emon.log"), std::time::SystemTime::now());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn stale_prev_log_with_unknowable_age_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        let prev = dir.path().join("daemon.log.prev");
+        std::fs::write(&prev, "x").unwrap();
+        age_file(&prev, 48 * HOUR);
+        // `now` earlier than the mtime: the clock went backwards, keep.
+        remove_stale_prev_log(&log, std::time::SystemTime::now() - 100 * HOUR);
+        assert!(prev.exists());
+    }
+
+    #[test]
+    fn daemon_log_startup_sweeps_old_cache_prev_but_not_a_selected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            serve_command(McpServeMode::Daemon, dir.path()).daemon_log_file_for(Some("1")).unwrap();
+        let prev = path.with_file_name("bsl-analyzer-daemon.log.prev");
+        std::fs::write(&prev, "old").unwrap();
+        age_file(&prev, 25 * HOUR);
+        serve_command(McpServeMode::Daemon, dir.path()).daemon_log_file_for(Some("1")).unwrap();
+        assert!(!prev.exists(), "cache log: a stale `.prev` is swept at startup");
+
+        let logs = tempfile::tempdir().unwrap();
+        let custom = logs.path().join("daemon.custom.log");
+        let custom_prev = logs.path().join("daemon.custom.log.prev");
+        std::fs::write(&custom_prev, "theirs").unwrap();
+        age_file(&custom_prev, 25 * HOUR);
+        serve_command(McpServeMode::Daemon, dir.path())
+            .daemon_log_file_for(Some(custom.to_str().unwrap()))
+            .unwrap();
+        assert!(custom_prev.exists(), "a caller-selected log's directory is never swept");
     }
 
     #[test]
