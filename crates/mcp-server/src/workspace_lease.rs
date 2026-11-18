@@ -45,12 +45,10 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-/// Lease record file name, next to the caches it governs.
-#[cfg(test)]
-const LEASE_FILE: &str = "writer.lease";
-/// The file locked for the read-modify-write of a claim. Separate from the record so the
-/// record itself is only ever replaced by an atomic rename and readers need no lock.
-use crate::cache::LEASE_LOCK_FILE;
+/// The cache layout names the record and the file locked for the read-modify-write of a claim.
+/// The lock is separate from the record so the record itself is only ever replaced by an atomic
+/// rename and readers need no lock.
+use crate::cache::{LEASE_FILE, LEASE_LOCK_FILE};
 
 /// How often the owner restamps its record so the others can tell it is still alive.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -1497,6 +1495,29 @@ fn written_before_stale(path: &Path) -> bool {
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|age| age > STALE_AFTER)
+}
+
+/// What a cache directory's lease record says about its owner, as an outside observer (the
+/// abandoned-cache sweep) needs it: no claim is made and nothing is written.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LeaseSnapshot {
+    /// No record, or one that will not read or parse: the directory is unidentifiable.
+    Unreadable,
+    /// The owner restamped within the staleness window.
+    Fresh,
+    /// The owner stopped reporting; `workspace` is the tree the cache serves, when the
+    /// record names one (a record of an older program does not).
+    Stale { workspace: Option<PathBuf> },
+}
+
+/// Read the lease record in `dir` without taking the lock; a record is only ever replaced by an
+/// atomic rename, so a lock-free read cannot see a half-written file.
+pub(crate) fn inspect_lease_dir(dir: &Path) -> LeaseSnapshot {
+    match read_record(&dir.join(LEASE_FILE)) {
+        None => LeaseSnapshot::Unreadable,
+        Some(record) if !is_stale(&record) => LeaseSnapshot::Fresh,
+        Some(record) => LeaseSnapshot::Stale { workspace: record.workspace.map(PathBuf::from) },
+    }
 }
 
 fn is_stale(record: &LeaseRecord) -> bool {

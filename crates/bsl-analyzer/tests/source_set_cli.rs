@@ -145,24 +145,34 @@ const DEP: &str = "a/b/dep";
 #[cfg(unix)]
 const CACHE_ADOPTION_LOG: &str = "reused cached graph database (workspace unchanged)";
 const STDERR_TAIL_LIMIT: usize = 64 * 1024;
+/// Startup diagnostics come first, so the head is kept beside the tail: how much a child logs
+/// after them depends on path lengths and must not decide whether they are still visible.
+const STDERR_HEAD_LIMIT: usize = 16 * 1024;
 /// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
 /// latency measure.
 const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
-/// Drains child stderr continuously while retaining only a bounded tail. This
+/// Drains child stderr continuously while retaining only a bounded head and tail. This
 /// keeps native startup diagnostics available without allowing a verbose child
 /// to block on a full stderr pipe or grow the fixture's memory without bound.
 struct StderrCapture {
-    tail: Arc<Mutex<String>>,
+    text: Arc<Mutex<CapturedStderr>>,
     reader: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct CapturedStderr {
+    head: String,
+    tail: String,
+    trimmed: bool,
 }
 
 impl StderrCapture {
     fn attach(stderr: std::process::ChildStderr) -> Self {
         use std::io::Read as _;
 
-        let tail = Arc::new(Mutex::new(String::new()));
-        let reader_tail = Arc::clone(&tail);
+        let text = Arc::new(Mutex::new(CapturedStderr::default()));
+        let reader_text = Arc::clone(&text);
         let reader = std::thread::spawn(move || {
             let mut stderr = stderr;
             let mut buffer = [0_u8; 4096];
@@ -171,7 +181,13 @@ impl StderrCapture {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
                         let text = String::from_utf8_lossy(&buffer[..read]);
-                        let mut tail = reader_tail.lock().expect("stderr capture mutex");
+                        let mut captured = reader_text.lock().expect("stderr capture mutex");
+                        let mut room = STDERR_HEAD_LIMIT.saturating_sub(captured.head.len());
+                        while !text.is_char_boundary(room.min(text.len())) {
+                            room -= 1;
+                        }
+                        captured.head.push_str(&text[..room.min(text.len())]);
+                        let tail = &mut captured.tail;
                         tail.push_str(&text);
                         if tail.len() > STDERR_TAIL_LIMIT {
                             let mut trim = tail.len() - STDERR_TAIL_LIMIT;
@@ -179,16 +195,22 @@ impl StderrCapture {
                                 trim += 1;
                             }
                             tail.drain(..trim);
+                            captured.trimmed = true;
                         }
                     }
                 }
             }
         });
-        Self { tail, reader: Some(reader) }
+        Self { text, reader: Some(reader) }
     }
 
     fn snapshot(&self) -> String {
-        self.tail.lock().expect("stderr capture mutex").clone()
+        let captured = self.text.lock().expect("stderr capture mutex");
+        if captured.trimmed {
+            format!("{}\n[...]\n{}", captured.head, captured.tail)
+        } else {
+            captured.tail.clone()
+        }
     }
 
     #[cfg(unix)]
@@ -407,6 +429,13 @@ fn analyze(source_dir: &Path, flags: &[&str]) -> Run {
 
 fn workspace() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
+}
+
+/// A fixture workspace outside the OS temp dir. A workspace under the temp dir is throwaway and
+/// gets its default cache base there, so a test of the default base in the OS cache home needs
+/// its tree somewhere else.
+fn workspace_outside_temp() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
 }
 
 fn write_scoped_extensions(root: &Path, extensions: &[(&str, &str, &[&str])]) {
@@ -1931,7 +1960,7 @@ fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restart
 #[test]
 #[ignore = "необязательный тест: a real daemon's stdio and a separate CLI analyze with read-only sources and a restart; after a ready event the next request or shutdown may still never end, and EOF comes only from a process that exited, so a live silent server has no finite negative outcome; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_linux_default_stdio_and_read_only_cli_stay_outside_sources -- --ignored"]
 fn workspace_cache_scope_linux_default_stdio_and_read_only_cli_stay_outside_sources() {
-    let root = workspace();
+    let root = workspace_outside_temp();
     source_composition(root.path());
     let before = tree_snapshot(root.path());
     let legacy = tree_snapshot(&root.path().join(".build"));
@@ -2407,7 +2436,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
         }
     }
 
-    let root = workspace();
+    let root = workspace_outside_temp();
     source_composition(root.path());
     let before = tree_snapshot(root.path());
     let legacy = tree_snapshot(&root.path().join(".build"));
@@ -2883,7 +2912,7 @@ fn workspace_cache_scope_live_topology_drift_stops_stdio_and_http() {
 #[test]
 #[ignore = "необязательный тест: a live broker and the real idle TTL and orphan grace, including a detached process; telling a silent daemon apart needs a deadline, and stopping it by hand instead of the idle shutdown changes the subject; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf -- --ignored"]
 fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf() {
-    let root = workspace();
+    let root = workspace_outside_temp();
     source_composition(root.path());
     let before = tree_snapshot(root.path());
     let legacy = tree_snapshot(&root.path().join(".build"));
@@ -3416,7 +3445,7 @@ fn daemon_holding_its_lease(root: &Path, flags: &[&str], paths: &Path) -> OwnedD
 #[cfg(unix)]
 #[test]
 fn a_signalled_daemon_hands_the_workspace_lease_back() {
-    let root = workspace();
+    let root = workspace_outside_temp();
     source_composition(root.path());
     let flags_owned = composition_flags(root.path(), "EXT_A");
     let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
@@ -3445,7 +3474,7 @@ fn a_signalled_daemon_hands_the_workspace_lease_back() {
     ignore = "timing contract: the next server gets the graph only once the signalled daemon released its lease within the shutdown budget of SharedState::shutdown; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test -p bsl-analyzer --test source_set_cli"
 )]
 fn a_server_started_after_a_signalled_daemon_gets_the_graph() {
-    let root = workspace();
+    let root = workspace_outside_temp();
     source_composition(root.path());
     let flags_owned = composition_flags(root.path(), "EXT_A");
     let flags: Vec<_> = flags_owned.iter().map(String::as_str).collect();
@@ -3725,7 +3754,7 @@ fn s12_proxy_scope_mismatch_driver() {
 #[ignore = "необязательный тест: deletes NTFS sources while a real subprocess holds them open, then shuts it down gracefully; an in-process fixture cannot stand for another process's handles, and a silent child may never answer the shutdown; запуск: cargo test -p bsl-analyzer --test source_set_cli workspace_cache_scope_windows_source_delete_default_and_explicit -- --ignored"]
 fn workspace_cache_scope_windows_source_delete_default_and_explicit() {
     fn run_case(cache_base: Option<&Path>, default_base: &Path) {
-        let root = workspace();
+        let root = workspace_outside_temp();
         source_composition(root.path());
         let before = tree_snapshot(root.path());
         let legacy = tree_snapshot(&root.path().join(".build"));

@@ -84,11 +84,16 @@ pub fn private_directory(path: &Path) -> io::Result<()> {
             return Err(error);
         }
     }
-    let metadata = fs::symlink_metadata(path)?;
+    verify_private_directory(path, &fs::symlink_metadata(path)?)
+}
+
+/// The one privacy rule for an existing cache directory: a real directory, not a reparse point,
+/// whose ACL grants access to this user alone. `metadata` must come from `symlink_metadata`.
+pub fn verify_private_directory(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_dir() {
         return Err(invalid());
     }
-    reject_reparse(&metadata)?;
+    reject_reparse(metadata)?;
     verify_private(path)
 }
 
