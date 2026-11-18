@@ -276,7 +276,16 @@ impl WorkspaceCacheLayout {
         // into an undeclared tree; repeat after creation to cover replacement
         // during the operation itself.
         validate_base_ancestor(&self.base_declared, &self.base)?;
-        std::fs::create_dir_all(&self.base)?;
+        if self.origin == CacheOrigin::Default && is_temp_family(&self.base) {
+            // The temp dir is shared: a base another user created there could let them swap
+            // the private namespace underneath it, so only a private base of our own will do.
+            if let Some(parent) = self.base.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            ensure_private_dir(&self.base)?;
+        } else {
+            std::fs::create_dir_all(&self.base)?;
+        }
         validate_base_ancestor(&self.base_declared, &self.base)?;
         ensure_private_dir(&self.base.join("workspaces"))?;
         ensure_private_dir(&self.base.join("workspaces/v1"))?;
@@ -591,7 +600,45 @@ fn canonicalize_nearest(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// Name of the throwaway cache family used for workspaces that are themselves throwaway.
-const TEMP_WORKSPACE_CACHE_DIR: &str = "bsl-analyzer-cache";
+///
+/// On unix the temp dir is usually shared by every user, so the name carries the effective uid:
+/// one user's family must neither block nor serve another's.
+#[cfg(unix)]
+fn temp_workspace_cache_dir() -> String {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    format!("bsl-analyzer-cache-{}", unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+fn temp_workspace_cache_dir() -> String {
+    "bsl-analyzer-cache".to_owned()
+}
+
+fn is_temp_family(base: &Path) -> bool {
+    base.file_name().is_some_and(|name| *name == *temp_workspace_cache_dir())
+}
+
+/// The temp family can be built on: absent, or a real directory that is private to this user.
+/// Anything else (another user's directory, a symlink planted in the shared temp dir) means the
+/// throwaway base is not ours, and the OS cache directory serves instead of failing startup.
+#[cfg(unix)]
+fn temp_family_is_usable(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            meta.file_type().is_dir()
+                // SAFETY: `geteuid` has no preconditions and cannot fail.
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.permissions().mode() & 0o777 == 0o700
+        }
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+#[cfg(not(unix))]
+fn temp_family_is_usable(_path: &Path) -> bool {
+    true
+}
 
 /// Pick the default cache base for a workspace nobody named a cache directory for.
 ///
@@ -616,9 +663,9 @@ fn default_base(temp_dir: &Path, workspace_root: &Path) -> std::io::Result<PathB
     if !workspace.starts_with(&temp) || workspace == temp {
         return os_cache();
     }
-    let candidate = temp.join(TEMP_WORKSPACE_CACHE_DIR);
+    let candidate = temp.join(temp_workspace_cache_dir());
     // A workspace rooted inside the throwaway family itself would again contain its own cache.
-    if workspace.starts_with(&candidate) {
+    if workspace.starts_with(&candidate) || !temp_family_is_usable(&candidate) {
         return os_cache();
     }
     Ok(candidate)
@@ -1364,10 +1411,52 @@ mod tests {
     #[test]
     fn workspace_cache_default_base_declines_a_workspace_inside_the_cache_family() {
         let temp = tempfile::tempdir().unwrap();
-        let inside = temp.path().join("bsl-analyzer-cache/ws");
+        let inside = temp.path().join(temp_workspace_cache_dir()).join("ws");
         std::fs::create_dir_all(&inside).unwrap();
         let base = default_base(temp.path(), &inside).unwrap();
         assert_eq!(base, dirs::cache_dir().unwrap().join("bsl-analyzer"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_cache_default_base_declines_a_temp_family_that_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        let family = temp.path().join(temp_workspace_cache_dir());
+        std::fs::create_dir(&family).unwrap();
+        let os_cache = dirs::cache_dir().unwrap().join("bsl-analyzer");
+
+        std::fs::set_permissions(&family, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(default_base(temp.path(), &workspace).unwrap(), os_cache);
+
+        // Control: the same directory once private is used.
+        std::fs::set_permissions(&family, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(default_base(temp.path(), &workspace).unwrap(), family.canonicalize().unwrap());
+
+        std::fs::remove_dir(&family).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("elsewhere"), &family).unwrap();
+        std::fs::create_dir(temp.path().join("elsewhere")).unwrap();
+        assert_eq!(default_base(temp.path(), &workspace).unwrap(), os_cache);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_cache_temp_family_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().unwrap();
+        let layout = WorkspaceCacheLayout::for_project(
+            &project(workspace.path()),
+            None,
+            workspace.path(),
+            None,
+        )
+        .unwrap();
+        assert!(is_temp_family(layout.base()), "{:?}", layout.base());
+        layout.ensure().unwrap();
+        let mode = std::fs::metadata(layout.base()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     mod sweep {
