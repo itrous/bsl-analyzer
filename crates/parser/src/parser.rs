@@ -891,30 +891,37 @@ impl<'a> Parser<'a> {
     /// whatever its depth. Everything else is taken as [`Parser::error`] takes
     /// a token, which keeps the progress the rules around rely on: a group
     /// opener is always taken, even `#Если`, which an error otherwise leaves.
+    ///
+    /// An unclosed group ends where the parser ends it anyway: brackets at the
+    /// statement separator, as [`Parser::track_group`] closes them, and every
+    /// group at the end of the enclosing method, since methods do not nest.
+    /// Without that one stray opener would take the rest of the file.
     fn skip_too_deep(&mut self) {
         let m = self.start();
-        let mut open = 0usize;
+        let (mut brackets, mut blocks) = (0usize, 0usize);
         while let Some(kind) = self.current() {
-            let opens = matches!(
-                kind,
-                T![LParen]
-                    | T![LBracket]
-                    | T![KwIf]
-                    | T![KwWhile]
-                    | T![KwFor]
-                    | T![KwTry]
-                    | T![PreIf]
-            );
-            if open == 0 && !opens && self.at_statement_separator() {
+            if matches!(kind, T![KwEndProcedure] | T![KwEndFunction])
+                && self.at_enclosing_boundary()
+            {
                 break;
             }
-            if opens {
-                open += 1;
-            } else if matches!(
-                kind,
-                T![RParen] | T![RBracket] | T![KwEndIf] | T![KwEndDo] | T![KwEndTry] | T![PreEndIf]
-            ) {
-                open = open.saturating_sub(1);
+            let opens_bracket = matches!(kind, T![LParen] | T![LBracket]);
+            let opens_block =
+                matches!(kind, T![KwIf] | T![KwWhile] | T![KwFor] | T![KwTry] | T![PreIf]);
+            let inside = blocks > 0 || (brackets > 0 && kind != T![Semicolon]);
+            if !inside && !opens_bracket && !opens_block && self.at_statement_separator() {
+                break;
+            }
+            if opens_bracket {
+                brackets += 1;
+            } else if opens_block {
+                blocks += 1;
+            } else if matches!(kind, T![RParen] | T![RBracket]) {
+                brackets = brackets.saturating_sub(1);
+            } else if kind == T![Semicolon] {
+                brackets = 0;
+            } else if matches!(kind, T![KwEndIf] | T![KwEndDo] | T![KwEndTry] | T![PreEndIf]) {
+                blocks = blocks.saturating_sub(1);
             }
             self.check_iteration_limit();
             self.bump();

@@ -117,3 +117,48 @@ fn nesting_real_code_reaches_is_not_reported() {
     assert_eq!(too_deep_reports(&parser::parse(&bsl)), 0);
     assert_eq!(too_deep_reports(&parser::parse_sdbl(&sdbl)), 0);
 }
+
+#[test]
+fn unclosed_groups_past_the_bound_end_with_their_statement_or_method() {
+    use syntax::ast::{AstNode, ProcedureDef};
+
+    let next_method = "\nПроцедура Д()\nВ = ;\nКонецПроцедуры\n";
+    let cases = [
+        (
+            "parens",
+            format!(
+                "Процедура П()\nА = {};\nБ = 2;\nКонецПроцедуры{next_method}",
+                "(".repeat(DEPTH)
+            ),
+        ),
+        (
+            "index",
+            format!(
+                "Процедура П()\nА = {};\nБ = 2;\nКонецПроцедуры{next_method}",
+                "а[".repeat(DEPTH)
+            ),
+        ),
+        (
+            "if",
+            format!(
+                "Процедура П()\n{}\nКонецПроцедуры{next_method}",
+                "Если 1 Тогда ".repeat(DEPTH)
+            ),
+        ),
+    ];
+    for (label, input) in cases {
+        let (methods, reports, unexpected) = on_small_stack(label, move || {
+            let parse = parser::parse(&input);
+            let methods = parse.syntax_node().descendants().filter_map(ProcedureDef::cast).count();
+            let unexpected = parse
+                .errors()
+                .iter()
+                .filter(|error| error.message() == "Неожиданный токен ';'")
+                .count();
+            (methods, too_deep_reports(&parse), unexpected)
+        });
+        assert!(reports > 0, "{label}: the exceeded depth must be reported");
+        assert_eq!(methods, 2, "{label}: the method after the unclosed groups must be parsed");
+        assert_eq!(unexpected, 1, "{label}: the error in the next method must be reported");
+    }
+}
