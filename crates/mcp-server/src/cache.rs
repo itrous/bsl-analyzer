@@ -320,7 +320,12 @@ impl WorkspaceCacheLayout {
         if std::fs::read(&marker).is_ok_and(|existing| existing == content) {
             return;
         }
-        let _ = std::fs::write(&marker, content);
+        // Replaced by a rename, never rewritten in place: a sweep in another process reads the
+        // marker without a lock, and a torn read would name a shorter path that does not exist.
+        let staged = self.root.join(format!("{WORKSPACE_MARKER_FILE}.{}.tmp", std::process::id()));
+        if std::fs::write(&staged, content).is_err() || std::fs::rename(&staged, &marker).is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
     }
 
     /// `ensure` can run more than once per process and a scan of thousands of entries is not
@@ -1732,6 +1737,24 @@ mod tests {
             std::fs::write(claimed.join("bsl-graph.db"), b"x").unwrap();
             family.layout.sweep_family();
             assert!(!claimed.exists());
+        }
+
+        #[test]
+        fn rewriting_the_marker_leaves_no_staging_file() {
+            let workspace = tempfile::tempdir().unwrap();
+            let family = new_family(CacheOrigin::Default);
+            let layout = family.layout.clone().with_workspace(workspace.path().to_path_buf());
+            std::fs::write(layout.root.join(WORKSPACE_MARKER_FILE), b"/stale/path").unwrap();
+            layout.write_workspace_marker();
+            assert_eq!(
+                std::fs::read(layout.root.join(WORKSPACE_MARKER_FILE)).unwrap(),
+                workspace.path().as_os_str().as_encoded_bytes()
+            );
+            let names: Vec<_> = std::fs::read_dir(&layout.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [OsString::from(WORKSPACE_MARKER_FILE)]);
         }
 
         #[test]
