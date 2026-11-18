@@ -308,12 +308,9 @@ impl McpCommand {
         if is_cache_log {
             remove_stale_prev_log(&log_path, std::time::SystemTime::now());
         }
-        if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
-            // Append `.prev` to the whole file name (`with_extension` would
-            // truncate a dotted name like `daemon.custom.log`).
-            let mut rotated = log_path.file_name().unwrap_or_default().to_os_string();
-            rotated.push(".prev");
-            let rotated = log_path.with_file_name(rotated);
+        let rotated = mcp_server::rotated_log_path(&log_path)
+            .filter(|_| std::fs::metadata(&log_path).is_ok_and(|m| m.len() > ROTATE_BYTES));
+        if let Some(rotated) = rotated {
             if std::fs::rename(&log_path, &rotated).is_ok() && is_cache_log {
                 // A rename keeps the last write's mtime, and the stale-trail sweep reads the age
                 // from it: date the trail from its rotation so the next startup keeps it.
@@ -327,25 +324,16 @@ impl McpCommand {
     }
 }
 
-/// A `.prev` is a superseded copy of a log: past this age no live run can still be
-/// reading it, and nothing else ever deletes it (ceiling was ~100 MB per cache
-/// directory, for every digest that ever existed).
-const STALE_PREV_LOG_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
-/// Deletes `<log>.prev` when it is older than [`STALE_PREV_LOG_AGE`]. A younger one
-/// is kept: it is what one reads to diagnose a crash that just happened. Every
-/// filesystem failure is ignored, since a failed cleanup must not stop a startup.
+/// Deletes the rotated trail of `log_path` once it is older than
+/// [`mcp_server::ROTATED_LOG_RETENTION`]; a younger one is kept. Without this nothing ever
+/// deletes a trail of a live cache directory (ceiling was ~100 MB per cache directory, for
+/// every digest that ever existed). Every filesystem failure is ignored, since a failed cleanup
+/// must not stop a startup.
 fn remove_stale_prev_log(log_path: &Path, now: std::time::SystemTime) {
-    // A path that names no file has no trail; an empty name would make `.prev` a sibling of
-    // whatever directory the path ends in.
-    let Some(name) = log_path.file_name() else { return };
-    // Append to the whole file name (`with_extension` would truncate a dotted name).
-    let mut name = name.to_os_string();
-    name.push(".prev");
-    let prev = log_path.with_file_name(name);
+    let Some(prev) = mcp_server::rotated_log_path(log_path) else { return };
     let Ok(modified) = std::fs::metadata(&prev).and_then(|m| m.modified()) else { return };
     // A clock that went backwards gives `Err`: age unknown, so keep the file.
-    if now.duration_since(modified).is_ok_and(|age| age > STALE_PREV_LOG_AGE) {
+    if now.duration_since(modified).is_ok_and(|age| age > mcp_server::ROTATED_LOG_RETENTION) {
         let _ = std::fs::remove_file(&prev);
     }
 }

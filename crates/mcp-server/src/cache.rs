@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use crate::workspace_lease::{inspect_lease_dir, LeaseSnapshot};
 
-/// Rotated daemon log; a directory holding only this has no index and no lease to identify it.
-const DAEMON_LOG_PREV_FILE: &str = "bsl-analyzer-daemon.log.prev";
-/// A lone rotated log younger than this may belong to a daemon that is still starting up.
-const LONE_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const DAEMON_LOG_FILE: &str = "bsl-analyzer-daemon.log";
+/// How long the trail of a rotated daemon log (see [`rotated_log_path`]) is kept. A younger one
+/// is what one reads to diagnose a crash that just happened, and may belong to a daemon that is
+/// still starting up; past this age no live run can still be reading the superseded copy.
+pub const ROTATED_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// Bound on the work of one sweep: the family can hold thousands of directories.
 const SWEEP_ENTRY_LIMIT: usize = 10_000;
 /// Prefix of a family entry a sweep has claimed for removal. Cache directories are named by a
@@ -413,7 +414,7 @@ impl WorkspaceCacheLayout {
         self.root.join(STALL_REPORT_FILE)
     }
     pub fn daemon_log_path(&self) -> PathBuf {
-        self.root.join("bsl-analyzer-daemon.log")
+        daemon_log_in(&self.root)
     }
 
     fn validate_source_placement(&self, project: &project_model::Project) -> std::io::Result<()> {
@@ -480,6 +481,11 @@ fn marked_tree_is_gone(dir: &Path) -> bool {
 /// an unreachable volume: on Windows an absent one (detached USB disk, unmapped network
 /// drive, unattached VHD) answers `Ok(false)` for EVERY path on it, so without the volume
 /// check a detached drive would delete the indexes of all its projects.
+///
+/// The volume guard protects only on Windows. On unix every absolute path's volume root is
+/// `/`, which always exists, so a tree on an unmounted volume (`/mnt`, `/media`, `/Volumes`)
+/// reads as gone, and its cache directory goes once its lease is stale or it has none. Only the
+/// derived cache is lost: the next run on that tree rebuilds it.
 fn tree_is_gone(tree: &Path) -> bool {
     volume_root(tree).is_some_and(|volume| matches!(volume.try_exists(), Ok(true)))
         && matches!(tree.try_exists(), Ok(false))
@@ -487,7 +493,8 @@ fn tree_is_gone(tree: &Path) -> bool {
 
 /// Root of the volume `path` lives on: `C:\x\y` -> `C:\`, `\\server\share\x` ->
 /// `\\server\share\`; `None` for a path that names no volume (a relative path, or a rooted
-/// one on Windows without a drive). On unix there is no prefix and the root is `/`.
+/// one on Windows without a drive). On unix there is no prefix and the root is `/` whatever is
+/// mounted where, so the volume answers nothing there.
 fn volume_root(path: &Path) -> Option<PathBuf> {
     match path.components().next()? {
         Component::Prefix(prefix) => {
@@ -506,14 +513,28 @@ fn volume_root(path: &Path) -> Option<PathBuf> {
 fn is_lone_stale_log(dir: &Path) -> bool {
     let Ok(mut entries) = std::fs::read_dir(dir) else { return false };
     let (Some(Ok(only)), None) = (entries.next(), entries.next()) else { return false };
-    if only.file_name() != DAEMON_LOG_PREV_FILE {
+    if rotated_log_path(&daemon_log_in(dir)).is_none_or(|trail| only.path() != trail) {
         return false;
     }
     only.metadata()
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age > LONE_LOG_RETENTION)
+        .is_some_and(|age| age > ROTATED_LOG_RETENTION)
+}
+
+fn daemon_log_in(dir: &Path) -> PathBuf {
+    dir.join(DAEMON_LOG_FILE)
+}
+
+/// The trail a log leaves when it is rotated: `<log>.prev`, appended to the whole file name
+/// (`with_extension` would truncate a dotted name like `daemon.custom.log`). `None` for a path
+/// that names no file: an empty name would put the trail beside whatever directory the path
+/// ends in.
+pub fn rotated_log_path(log: &Path) -> Option<PathBuf> {
+    let mut name = log.file_name()?.to_os_string();
+    name.push(".prev");
+    Some(log.with_file_name(name))
 }
 
 pub fn validate_scope_stamp(stamp: &str) -> std::io::Result<()> {
@@ -651,14 +672,8 @@ fn is_temp_family(base: &Path) -> bool {
 /// refused by `ensure`, which never builds under a base it cannot prove private.
 #[cfg(unix)]
 fn temp_family_is_usable(path: &Path) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            meta.file_type().is_dir()
-                // SAFETY: `geteuid` has no preconditions and cannot fail.
-                && meta.uid() == unsafe { libc::geteuid() }
-                && meta.permissions().mode() & 0o777 == 0o700
-        }
+        Ok(meta) => is_private_dir(&meta),
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
@@ -666,11 +681,7 @@ fn temp_family_is_usable(path: &Path) -> bool {
 #[cfg(windows)]
 fn temp_family_is_usable(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            meta.is_dir()
-                && crate::cache_windows::reject_reparse(&meta).is_ok()
-                && crate::cache_windows::verify_private(path).is_ok()
-        }
+        Ok(meta) => crate::cache_windows::verify_private_directory(path, &meta).is_ok(),
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
@@ -735,14 +746,23 @@ fn invalid(message: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.to_string())
 }
 
+/// The one privacy rule for a cache directory on unix: a real directory (`symlink_metadata`
+/// never reports a link as one) owned by the effective user with mode 0700.
+#[cfg(unix)]
+fn is_private_dir(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    meta.file_type().is_dir()
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        && meta.uid() == unsafe { libc::geteuid() }
+        && meta.permissions().mode() & 0o777 == 0o700
+}
+
 #[cfg(unix)]
 fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_dir() => {
-            if meta.uid() != unsafe { libc::geteuid() }
-                || meta.permissions().mode() & 0o777 != 0o700
-            {
+            if !is_private_dir(&meta) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
@@ -1558,12 +1578,15 @@ mod tests {
         fn lone_log(family: &Family, name: &str, age: Duration) -> PathBuf {
             let dir = family.dir.path().join(name);
             std::fs::create_dir(&dir).unwrap();
-            write_log(&dir, age);
+            write_log(family, &dir, age);
             dir
         }
 
-        fn write_log(dir: &Path, age: Duration) {
-            let file = std::fs::File::create(dir.join(DAEMON_LOG_PREV_FILE)).unwrap();
+        /// The trail is named as the daemon would leave it, from the layout's log path, so the
+        /// sweep is checked against the name that is actually written.
+        fn write_log(family: &Family, dir: &Path, age: Duration) {
+            let trail = rotated_log_path(&family.layout.daemon_log_path()).unwrap();
+            let file = std::fs::File::create(dir.join(trail.file_name().unwrap())).unwrap();
             file.set_modified(SystemTime::now() - age).unwrap();
         }
 
@@ -1680,6 +1703,16 @@ mod tests {
             }
             #[cfg(unix)]
             assert_eq!(volume_root(Path::new("/a/b")), Some(PathBuf::from("/")));
+        }
+
+        #[test]
+        fn rotated_log_path_appends_to_the_whole_file_name() {
+            assert_eq!(
+                rotated_log_path(Path::new("logs/daemon.custom.log")),
+                Some(PathBuf::from("logs/daemon.custom.log.prev"))
+            );
+            assert_eq!(rotated_log_path(Path::new("logs/..")), None);
+            assert_eq!(rotated_log_path(Path::new("")), None);
         }
 
         #[cfg(windows)]
@@ -1824,7 +1857,7 @@ mod tests {
             assert!(family.layout.root.exists());
 
             let log_only = new_family(CacheOrigin::Default);
-            write_log(&log_only.layout.root, 2 * DAY);
+            write_log(&log_only, &log_only.layout.root, 2 * DAY);
             log_only.layout.sweep_family();
             assert!(log_only.layout.root.exists());
         }
