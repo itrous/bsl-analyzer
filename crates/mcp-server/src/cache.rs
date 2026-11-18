@@ -661,7 +661,20 @@ fn temp_family_is_usable(path: &Path) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn temp_family_is_usable(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            meta.is_dir()
+                && crate::cache_windows::reject_reparse(&meta).is_ok()
+                && crate::cache_windows::verify_private(path).is_ok()
+        }
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Elsewhere `ensure_private_dir` checks no ownership either, so there is nothing to decline on.
+#[cfg(not(any(unix, windows)))]
 fn temp_family_is_usable(_path: &Path) -> bool {
     true
 }
