@@ -129,7 +129,7 @@ fn random_edits(
     rng: &mut Rng,
     per_method: usize,
     stride: usize,
-    refusals: &mut [u64; 8],
+    refusals: &mut [u64; Refusal::ALL.len()],
     spliced: &mut u64,
 ) {
     for range in method_ranges(text).into_iter().step_by(stride) {
@@ -159,7 +159,7 @@ fn random_edits(
 #[test]
 fn reparse_matches_full_parse_on_random_edits() {
     let mut rng = Rng(0x1134_2026_0903);
-    let mut refusals = [0u64; 8];
+    let mut refusals = [0u64; Refusal::ALL.len()];
     let mut spliced = 0u64;
     for snippet in SNIPPETS {
         random_edits(snippet, &mut rng, 40, 1, &mut refusals, &mut spliced);
@@ -173,7 +173,7 @@ fn reparse_matches_full_parse_on_random_edits() {
 
 #[test]
 fn reparse_matches_full_parse_on_adversarial_insertions() {
-    let mut refusals = [0u64; 8];
+    let mut refusals = [0u64; Refusal::ALL.len()];
     let mut spliced = 0u64;
     for snippet in SNIPPETS {
         for range in method_ranges(snippet) {
@@ -214,6 +214,11 @@ fn reparse_matches_full_parse_on_adversarial_insertions() {
 /// гардов вход опасен.
 #[test]
 fn each_guard_refuses_an_input_that_would_otherwise_splice_wrong() {
+    let depth_old_text = format!(
+        "{}Процедура А()\n\tЕсли Х Тогда\n\t\tУ = 1;\n\tКонецЕсли;\nКонецПроцедуры\n{}",
+        "#Если Сервер Тогда\n".repeat(127),
+        "#КонецЕсли\n".repeat(127),
+    );
     // (гард, старый текст, якорь — вставка идёт перед ним, вставка)
     let cases: &[(Refusal, &str, &str, &str)] = &[
         (
@@ -255,6 +260,14 @@ fn each_guard_refuses_an_input_that_would_otherwise_splice_wrong() {
             Refusal::ContextError,
             "#Если Сервер Тогда\nПроцедура А()\n\tУ = 2;\nКонецПроцедуры",
             "\tУ = 2;",
+            "З = 3;",
+        ),
+        (
+            // Метод на уровень выше предела: его `Если` доходит до предела в
+            // полном разборе, а во фрагменте, разобранном с нуля, — нет.
+            Refusal::Depth,
+            &depth_old_text,
+            "\t\tУ = 1;",
             "З = 3;",
         ),
     ];
@@ -426,4 +439,28 @@ fn green_eq_agrees_with_structural_equality() {
         assert_ne!(a, c);
         assert!(syntax::green_eq(a.green(), &a.green().clone()));
     }
+}
+
+#[test]
+fn a_method_inside_constructs_keeps_the_nesting_bound_of_the_full_parse() {
+    // Метод на уровень выше предела: его `Если` доходит до предела в полном
+    // разборе, а фрагмент, разобранный с нулевой глубины, — нет.
+    let groups = 127;
+    let old_text = format!(
+        "{}Процедура А()\n\tЕсли Х Тогда\n\t\tУ = 1;\n\tКонецЕсли;\nКонецПроцедуры\n{}",
+        "#Если Сервер Тогда\n".repeat(groups),
+        "#КонецЕсли\n".repeat(groups),
+    );
+    let new_text = old_text.replacen("У = 1;", "У = 2;", 1);
+    assert!(
+        parser::parse(&new_text)
+            .errors()
+            .iter()
+            .any(|e| e.message() == "Слишком глубокая вложенность"),
+        "полный разбор доходит до предела внутри метода"
+    );
+    assert_eq!(
+        check(&old_text, &new_text, "method one level short of the bound"),
+        Err(Refusal::Depth)
+    );
 }

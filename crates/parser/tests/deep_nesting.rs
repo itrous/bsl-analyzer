@@ -1,9 +1,9 @@
 //! Nesting deeper than the parser descends is a syntax error, not a crash.
 //!
 //! Every input here is far deeper than any stack holds when each level is a
-//! recursive call, and each is parsed on a thread with a small stack: the
-//! parse has to come back with the whole text in the tree and the depth
-//! reported where it was exceeded.
+//! recursive call or a node of the tree, and each is parsed on a thread with
+//! the 1 MiB stack of a Windows main thread: the parse has to come back with
+//! the whole text in the tree and the depth reported where it was exceeded.
 
 const DEPTH: usize = 100_000;
 const TOO_DEEP: &str = "Слишком глубокая вложенность";
@@ -11,7 +11,7 @@ const TOO_DEEP: &str = "Слишком глубокая вложенность";
 fn on_small_stack<T: Send + 'static>(label: &str, parse: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
         .name(format!("deep-nesting-{label}"))
-        .stack_size(256 * 1024)
+        .stack_size(1024 * 1024)
         .spawn(parse)
         .expect("spawn small-stack parser thread")
         .join()
@@ -97,6 +97,37 @@ fn deep_sdbl_nesting_is_reported_not_overflowed() {
 }
 
 #[test]
+fn long_bsl_chains_are_reported_not_overflowed() {
+    let cases = [
+        ("fields", in_method(format!("А = а{};", ".б".repeat(DEPTH)))),
+        ("calls", in_method(format!("А = ф{};", "()".repeat(DEPTH)))),
+        ("indexes", in_method(format!("А = а{};", "[1]".repeat(DEPTH)))),
+        ("sum", in_method(format!("А = 1{};", " + 1".repeat(DEPTH)))),
+        ("product", in_method(format!("А = 1{};", " * 1".repeat(DEPTH)))),
+        ("comparison", in_method(format!("А = 1{};", " = 1".repeat(DEPTH)))),
+        ("and", in_method(format!("А = 1{};", " И 1".repeat(DEPTH)))),
+        ("or", in_method(format!("А = 1{};", " ИЛИ 1".repeat(DEPTH)))),
+        // Chains under every level of nesting add up in one tree.
+        (
+            "nested-chains",
+            in_method(format!("А = {};", nested("(", "а", &format!("){}", ".б".repeat(100)), 120))),
+        ),
+    ];
+    for (label, input) in cases {
+        assert_reported(label, input, parser::parse);
+    }
+}
+
+#[test]
+fn chains_real_code_builds_are_not_reported() {
+    let concatenation =
+        in_method(format!("Текст = \"\"{};", " + Символы.ПС + \"строка\"".repeat(1_000)));
+    let reports =
+        on_small_stack("concatenation", move || too_deep_reports(&parser::parse(&concatenation)));
+    assert_eq!(reports, 0);
+}
+
+#[test]
 fn nesting_real_code_reaches_is_not_reported() {
     const SHALLOW: usize = 30;
     let bsl = in_method(nested(
@@ -161,4 +192,71 @@ fn unclosed_groups_past_the_bound_end_with_their_statement_or_method() {
         assert_eq!(methods, 2, "{label}: the method after the unclosed groups must be parsed");
         assert_eq!(unexpected, 1, "{label}: the error in the next method must be reported");
     }
+}
+
+#[test]
+fn a_block_past_the_bound_ends_with_its_closer() {
+    use syntax::ast::{AstNode, ProcedureDef, ReturnStmt};
+
+    // As many `#Если` as the parser descends into, so the next one is past
+    // the bound; their conditions are plain symbols, which add no depth.
+    let outer = 128;
+    let deep_block = "#Если Клиент Тогда\nА = 1;\n#КонецЕсли\n";
+    let module = format!(
+        "{}{deep_block}#Если Клиент Тогда\n#КонецЕсли\nПроцедура П()\nКонецПроцедуры\n{}",
+        "#Если Сервер Тогда\n".repeat(outer),
+        "#КонецЕсли\n".repeat(outer),
+    );
+    let method = format!(
+        "Процедура П()\n{}{deep_block}Возврат;\n{}КонецПроцедуры\n",
+        "#Если Сервер Тогда\n".repeat(outer),
+        "#КонецЕсли\n".repeat(outer),
+    );
+    let (methods, module_reports) = on_small_stack("block-in-module", move || {
+        let parse = parser::parse(&module);
+        let methods = parse.syntax_node().descendants().filter_map(ProcedureDef::cast).count();
+        (methods, too_deep_reports(&parse))
+    });
+    assert_eq!(module_reports, 2, "each of the two blocks past the bound is reported on its own");
+    assert_eq!(methods, 1, "the method after the block past the bound must be parsed");
+
+    let (returns, method_reports) = on_small_stack("block-in-method", move || {
+        let parse = parser::parse(&method);
+        let returns = parse.syntax_node().descendants().filter_map(ReturnStmt::cast).count();
+        (returns, too_deep_reports(&parse))
+    });
+    assert_eq!(method_reports, 1, "only the block past the bound is reported");
+    assert_eq!(returns, 1, "the statement after the block past the bound must be parsed");
+}
+
+#[test]
+fn a_keyword_behind_a_dot_or_a_tilde_inside_a_skipped_construct_is_a_name() {
+    use syntax::ast::{AstNode, ProcedureDef, ReturnStmt};
+
+    let outer = 128;
+    let module = format!(
+        "{}#Если Клиент Тогда\nХ.Если = 1;\nПерейти ~Пока;\n#КонецЕсли\nПроцедура П()\nКонецПроцедуры\n{}",
+        "#Если Сервер Тогда\n".repeat(outer),
+        "#КонецЕсли\n".repeat(outer),
+    );
+    let method = format!(
+        "Процедура П()\nА = а{}.Если.Пока;\nВозврат;\nКонецПроцедуры\n",
+        ".б".repeat(DEPTH)
+    );
+
+    let (methods, module_reports) = on_small_stack("names-in-block", move || {
+        let parse = parser::parse(&module);
+        let methods = parse.syntax_node().descendants().filter_map(ProcedureDef::cast).count();
+        (methods, too_deep_reports(&parse))
+    });
+    assert_eq!(module_reports, 1, "only the block past the bound is reported");
+    assert_eq!(methods, 1, "the method after the block past the bound must be parsed");
+
+    let (returns, method_reports) = on_small_stack("names-in-chain", move || {
+        let parse = parser::parse(&method);
+        let returns = parse.syntax_node().descendants().filter_map(ReturnStmt::cast).count();
+        (returns, too_deep_reports(&parse))
+    });
+    assert_eq!(method_reports, 1, "only the chain past the bound is reported");
+    assert_eq!(returns, 1, "the statement after the chain past the bound must be parsed");
 }

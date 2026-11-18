@@ -15,6 +15,7 @@
 //! lines and the other branches as opaque parts. What decides which group is
 //! which, and which branch is read, is computed here once for the whole input.
 
+use crate::parser::block_words::{block_word, is_name_after, Block, BlockWord};
 use crate::parser::input::Sig;
 use crate::parser::MAX_NESTING_DEPTH;
 
@@ -220,15 +221,6 @@ impl<K: Fn(usize) -> Option<Sig>> Condition<'_, K> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Block {
-    If,
-    Loop,
-    Try,
-    Procedure,
-    Function,
-}
-
 /// Walks code from `range.0` to `range.1`, keeping the constructs it opens on
 /// `blocks`. Returns `false` when the code closes or continues a construct it
 /// did not open.
@@ -287,31 +279,8 @@ fn walk(
             at += 1;
             continue;
         }
-        // A keyword behind a dot is a member name and one behind a tilde a
-        // label (`~КонецЦикла:`), not the word of a construct.
-        let name = at > 0 && matches!(kind(at - 1), Some(T![Dot] | T![Tilde]));
-        if !name {
-            let opens = match k {
-                T![KwIf] => Some(Block::If),
-                T![KwWhile] | T![KwFor] => Some(Block::Loop),
-                T![KwTry] => Some(Block::Try),
-                T![KwProcedure] => Some(Block::Procedure),
-                T![KwFunction] => Some(Block::Function),
-                _ => None,
-            };
-            let closes = match k {
-                T![KwEndIf] => Some(Block::If),
-                T![KwEndDo] => Some(Block::Loop),
-                T![KwEndTry] => Some(Block::Try),
-                T![KwEndProcedure] => Some(Block::Procedure),
-                T![KwEndFunction] => Some(Block::Function),
-                _ => None,
-            };
-            let continues = match k {
-                T![KwElsIf] | T![KwElse] => Some(Block::If),
-                T![KwExcept] => Some(Block::Try),
-                _ => None,
-            };
+        let previous = at.checked_sub(1).and_then(kind);
+        if !is_name_after(previous) {
             if matches!(
                 k,
                 T![AnnAtClient]
@@ -329,18 +298,17 @@ fn walk(
             } else if matches!(k, T![KwProcedure] | T![KwFunction] | T![KwVar]) {
                 annotated = false;
             }
-            if let Some(block) = opens {
-                blocks.push(block);
-            } else if let Some(block) = closes {
-                if blocks.last() == Some(&block) {
-                    blocks.pop();
-                } else {
-                    whole = false;
+            match block_word(k, previous) {
+                Some(BlockWord::Opens(block)) => blocks.push(block),
+                Some(BlockWord::Closes(block)) => {
+                    if blocks.last() == Some(&block) {
+                        blocks.pop();
+                    } else {
+                        whole = false;
+                    }
                 }
-            } else if let Some(block) = continues {
-                if blocks.last() != Some(&block) {
-                    whole = false;
-                }
+                Some(BlockWord::Continues(block)) if blocks.last() != Some(&block) => whole = false,
+                Some(BlockWord::Continues(_)) | None => {}
             }
         }
         at += 1;
