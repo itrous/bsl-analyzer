@@ -336,8 +336,11 @@ const STALE_PREV_LOG_AGE: std::time::Duration = std::time::Duration::from_secs(2
 /// is kept: it is what one reads to diagnose a crash that just happened. Every
 /// filesystem failure is ignored, since a failed cleanup must not stop a startup.
 fn remove_stale_prev_log(log_path: &Path, now: std::time::SystemTime) {
+    // A path that names no file has no trail; an empty name would make `.prev` a sibling of
+    // whatever directory the path ends in.
+    let Some(name) = log_path.file_name() else { return };
     // Append to the whole file name (`with_extension` would truncate a dotted name).
-    let mut name = log_path.file_name().unwrap_or_default().to_os_string();
+    let mut name = name.to_os_string();
     name.push(".prev");
     let prev = log_path.with_file_name(name);
     let Ok(modified) = std::fs::metadata(&prev).and_then(|m| m.modified()) else { return };
@@ -3241,6 +3244,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         remove_stale_prev_log(&dir.path().join("da\0emon.log"), std::time::SystemTime::now());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn stale_prev_log_of_a_path_without_a_file_name_touches_nothing() {
+        // `<dir>/sub/..` names no file; appending `.prev` to it would name `<dir>/.prev`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let stray = dir.path().join(".prev");
+        std::fs::write(&stray, "not ours").unwrap();
+        age_file(&stray, 48 * HOUR);
+        remove_stale_prev_log(&dir.path().join("sub/.."), std::time::SystemTime::now());
+        assert!(stray.exists());
     }
 
     #[test]
