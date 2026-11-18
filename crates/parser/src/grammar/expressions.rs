@@ -25,7 +25,7 @@ const CROSS_LINE_PROPERTY_NAME_TOKENS: TokenSet = TokenSet::new(&[
 ]);
 
 pub fn expression(p: &mut Parser) {
-    or_expr(p);
+    p.nested(or_expr);
 }
 
 pub fn postfix_expression_for_assignment(p: &mut Parser) -> bool {
@@ -71,7 +71,7 @@ fn not_expr(p: &mut Parser) {
     if p.at(T![KwNot]) {
         let m = p.start();
         p.bump();
-        not_expr(p);
+        p.nested(not_expr);
         m.complete(p, NodeKind::UnaryExpr);
     } else {
         comparison_expr(p);
@@ -149,7 +149,7 @@ fn unary_expr(p: &mut Parser) {
     match p.current() {
         Some(T![Plus]) | Some(T![Minus]) => {
             p.bump();
-            unary_expr(p);
+            p.nested(unary_expr);
         }
         _ => postfix_expr(p),
     }
