@@ -166,6 +166,10 @@ pub fn select_query(p: &mut Parser) {
 }
 
 pub(super) fn subquery(p: &mut Parser) {
+    p.nested(union_of_queries);
+}
+
+fn union_of_queries(p: &mut Parser) {
     let m = p.start();
 
     query(p);
@@ -697,7 +701,7 @@ fn join_clause(p: &mut Parser) {
     }
     p.bump();
 
-    data_source(p);
+    p.nested(data_source);
 
     if !eat_sdbl_keyword(p, "ON", "ПО") {
         p.error_custom("ожидалось 'ПО' / 'ON' в соединении");

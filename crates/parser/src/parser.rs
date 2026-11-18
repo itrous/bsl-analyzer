@@ -14,12 +14,24 @@ const MAX_ITERATIONS: usize = 1_000_000;
 
 const POSITION_HISTORY_SIZE: usize = 100;
 
+/// How many recursive rules may be open at once.
+///
+/// Every level costs the parser several stack frames and the tree one node or
+/// more, so without a bound a short input such as `((((…1…))))` overflows the
+/// stack of whoever parses it and aborts the process. Real modules and queries
+/// stay far below this; the bound only has to keep the deepest construct within
+/// a default thread stack in an unoptimized build.
+pub(crate) const MAX_NESTING_DEPTH: u32 = 128;
+
+const TOO_DEEP_MESSAGE: &str = "слишком глубокая вложенность";
+
 pub struct Parser<'a> {
     input: Input<'a>,
     /// Позиция среди ЗНАЧИМЫХ токенов, а не среди лексем.
     pos: usize,
     events: Vec<Event>,
     iteration_count: usize,
+    nesting_depth: u32,
     recent_positions: Vec<usize>,
     paren_depth: u32,
     brace_depth: u32,
@@ -44,6 +56,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             events: Vec::new(),
             iteration_count: 0,
+            nesting_depth: 0,
             recent_positions: Vec::with_capacity(POSITION_HISTORY_SIZE),
             paren_depth: 0,
             brace_depth: 0,
@@ -854,6 +867,66 @@ impl<'a> Parser<'a> {
         let m = self.start();
         self.events.push(Event::Error(err));
         m.complete(self, NodeKind::Error);
+    }
+
+    /// Runs a rule that may lead back into itself, one nesting level deeper.
+    ///
+    /// Past [`MAX_NESTING_DEPTH`] the rule is not run: the construct it would
+    /// have read is reported and taken whole into one error node, so the parse
+    /// goes on after it with the stack and the tree no deeper than the bound.
+    pub fn nested(&mut self, rule: impl FnOnce(&mut Self)) {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            self.skip_too_deep();
+            return;
+        }
+        self.nesting_depth += 1;
+        rule(self);
+        self.nesting_depth -= 1;
+    }
+
+    /// Takes the construct under the cursor up to where the enclosing rule
+    /// resumes: a separator or a boundary outside every group opened here.
+    ///
+    /// The groups are counted, not parsed, so the text inside them stays flat
+    /// whatever its depth. Everything else is taken as [`Parser::error`] takes
+    /// a token, which keeps the progress the rules around rely on: a group
+    /// opener is always taken, even `#Если`, which an error otherwise leaves.
+    ///
+    /// An unclosed group ends where the parser ends it anyway: brackets at the
+    /// statement separator, as [`Parser::track_group`] closes them, and every
+    /// group at the end of the enclosing method, since methods do not nest.
+    /// Without that one stray opener would take the rest of the file.
+    fn skip_too_deep(&mut self) {
+        let m = self.start();
+        let (mut brackets, mut blocks) = (0usize, 0usize);
+        while let Some(kind) = self.current() {
+            if matches!(kind, T![KwEndProcedure] | T![KwEndFunction])
+                && self.at_enclosing_boundary()
+            {
+                break;
+            }
+            let opens_bracket = matches!(kind, T![LParen] | T![LBracket]);
+            let opens_block =
+                matches!(kind, T![KwIf] | T![KwWhile] | T![KwFor] | T![KwTry] | T![PreIf]);
+            let inside = blocks > 0 || (brackets > 0 && kind != T![Semicolon]);
+            if !inside && !opens_bracket && !opens_block && self.at_statement_separator() {
+                break;
+            }
+            if opens_bracket {
+                brackets += 1;
+            } else if opens_block {
+                blocks += 1;
+            } else if matches!(kind, T![RParen] | T![RBracket]) {
+                brackets = brackets.saturating_sub(1);
+            } else if kind == T![Semicolon] {
+                brackets = 0;
+            } else if matches!(kind, T![KwEndIf] | T![KwEndDo] | T![KwEndTry] | T![PreEndIf]) {
+                blocks = blocks.saturating_sub(1);
+            }
+            self.check_iteration_limit();
+            self.bump();
+        }
+        self.error_custom_at_marker(m, TOO_DEEP_MESSAGE);
     }
 
     pub fn at_declaration_start(&self) -> bool {
