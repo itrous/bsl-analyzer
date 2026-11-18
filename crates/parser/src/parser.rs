@@ -4,10 +4,12 @@ use smallvec::smallvec;
 
 #[macro_use]
 pub(crate) mod input;
+mod block_words;
 pub mod token_set;
 mod torn_if;
 
 use crate::event::{Event, NodeKind};
+use crate::parser::block_words::{block_word, Block, BlockWord};
 use crate::parser::input::{Input, Sig};
 
 const MAX_ITERATIONS: usize = 1_000_000;
@@ -953,7 +955,7 @@ impl<'a> Parser<'a> {
                 brackets = brackets.saturating_sub(1);
             } else if kind == T![Semicolon] {
                 brackets = 0;
-            } else if matches!(kind, T![KwEndIf] | T![KwEndDo] | T![KwEndTry] | T![PreEndIf]) {
+            } else if self.at_block_closer() {
                 blocks = blocks.saturating_sub(1);
             }
             self.check_iteration_limit();
@@ -965,8 +967,22 @@ impl<'a> Parser<'a> {
         self.error_custom_at_marker(m, TOO_DEEP_MESSAGE);
     }
 
+    /// A group [`Parser::skip_too_deep`] counts opens here: a statement block
+    /// or a `#Если`. Methods are not counted, since no group spans one.
     fn at_block_opener(&self) -> bool {
-        matches!(self.current(), Some(T![KwIf] | T![KwWhile] | T![KwFor] | T![KwTry] | T![PreIf]))
+        self.at(T![PreIf])
+            || matches!(
+                self.current().and_then(|word| block_word(word, self.prev_significant())),
+                Some(BlockWord::Opens(Block::If | Block::Loop | Block::Try))
+            )
+    }
+
+    fn at_block_closer(&self) -> bool {
+        self.at(T![PreEndIf])
+            || matches!(
+                self.current().and_then(|word| block_word(word, self.prev_significant())),
+                Some(BlockWord::Closes(Block::If | Block::Loop | Block::Try))
+            )
     }
 
     /// Whether the chain read by the loop at the cursor must stop growing.

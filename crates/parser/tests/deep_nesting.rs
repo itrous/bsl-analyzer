@@ -228,3 +228,35 @@ fn a_block_past_the_bound_ends_with_its_closer() {
     assert_eq!(method_reports, 1, "only the block past the bound is reported");
     assert_eq!(returns, 1, "the statement after the block past the bound must be parsed");
 }
+
+#[test]
+fn a_keyword_behind_a_dot_or_a_tilde_inside_a_skipped_construct_is_a_name() {
+    use syntax::ast::{AstNode, ProcedureDef, ReturnStmt};
+
+    let outer = 128;
+    let module = format!(
+        "{}#Если Клиент Тогда\nХ.Если = 1;\nПерейти ~Пока;\n#КонецЕсли\nПроцедура П()\nКонецПроцедуры\n{}",
+        "#Если Сервер Тогда\n".repeat(outer),
+        "#КонецЕсли\n".repeat(outer),
+    );
+    let method = format!(
+        "Процедура П()\nА = а{}.Если.Пока;\nВозврат;\nКонецПроцедуры\n",
+        ".б".repeat(DEPTH)
+    );
+
+    let (methods, module_reports) = on_small_stack("names-in-block", move || {
+        let parse = parser::parse(&module);
+        let methods = parse.syntax_node().descendants().filter_map(ProcedureDef::cast).count();
+        (methods, too_deep_reports(&parse))
+    });
+    assert_eq!(module_reports, 1, "only the block past the bound is reported");
+    assert_eq!(methods, 1, "the method after the block past the bound must be parsed");
+
+    let (returns, method_reports) = on_small_stack("names-in-chain", move || {
+        let parse = parser::parse(&method);
+        let returns = parse.syntax_node().descendants().filter_map(ReturnStmt::cast).count();
+        (returns, too_deep_reports(&parse))
+    });
+    assert_eq!(method_reports, 1, "only the chain past the bound is reported");
+    assert_eq!(returns, 1, "the statement after the chain past the bound must be parsed");
+}
