@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use cfg::{CfgEdgeType, CfgVertex, ControlFlowGraph};
 use fixedbitset::FixedBitSet;
-use hir_def::{body::Body, BindingId, ExprId, StmtId};
+use hir_def::{body::Body, BindingId, ExprId, IdConversion, Stmt, StmtId};
 use la_arena::RawIdx;
 use petgraph::graph::NodeIndex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{DataflowResult, DataflowSolver, Lattice, Transfer};
+use crate::{is_non_raising_assignment, DataflowResult, DataflowSolver, Lattice, Transfer};
 
 /// Where a read is evaluated: before a statement of a basic block, or inside a
 /// header root (`Если`/`ИначеЕсли`/`Пока` condition, `Для` bounds, `Для Каждого`
@@ -128,6 +128,51 @@ impl Transfer<DefiniteInit> for DefiniteInitTransfer {
             state.add(&[bit]);
         }
     }
+
+    /// An exception can only be raised by a statement that can raise. The protected statements
+    /// standing BEFORE the first such statement therefore always completed when the handler is
+    /// entered, so what they initialise is initialised there too. The walk is top level only:
+    /// a statement inside a branch or loop may be skipped, so it proves nothing.
+    ///
+    /// The statements before the first raising one are reachable whenever the `Попытка`
+    /// vertex is, so the walk does not consult liveness. A label in the protected body is
+    /// not: a `Перейти` from outside the prefix can land on it and skip the assignments.
+    fn transfer_exception_edge(&self, try_stmt: StmtId, state: &mut DefiniteInit, body: &Body) {
+        let Stmt::Try { body: protected, .. } = body.stmt(try_stmt) else { return };
+        if body_contains_label(protected, body) {
+            return;
+        }
+        for &idx in protected.iter() {
+            if !is_non_raising_assignment(body, idx) {
+                break;
+            }
+            if let Some(bits) = self.events.stmt.get(&StmtId::from_idx(idx)) {
+                state.add(bits);
+            }
+        }
+    }
+}
+
+fn body_contains_label(stmts: &[hir_def::hir::StmtIdx], body: &Body) -> bool {
+    stmts.iter().any(|&idx| match body.stmt_idx(idx) {
+        Stmt::Label(_) => true,
+        Stmt::If(if_stmt) => {
+            body_contains_label(&if_stmt.then_branch, body)
+                || if_stmt
+                    .elsif_branches
+                    .iter()
+                    .any(|(_, branch)| body_contains_label(branch, body))
+                || if_stmt
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|branch| body_contains_label(branch, body))
+        }
+        Stmt::For { body: nested, .. }
+        | Stmt::ForEach { body: nested, .. }
+        | Stmt::While { body: nested, .. }
+        | Stmt::Try { body: nested, .. } => body_contains_label(nested, body),
+        _ => false,
+    })
 }
 
 pub struct DefiniteInitResult {
@@ -324,6 +369,8 @@ mod tests {
         BasicBlockVertex, ConditionalVertex, ForEachHeaderVertex, ForHeaderVertex, LoopEntryVertex,
         WhileHeaderVertex,
     };
+
+    use hir_def::{hir::StmtIdx, Expr, Literal};
 
     use super::*;
     use crate::DEFAULT_MAX_ITERATIONS;
@@ -636,6 +683,140 @@ mod tests {
         let result = solve(cfg, events(1, &[]));
         assert!(!result.back_edges_initialize(header, 0));
     }
+    /// `Попытка <protected> Исключение <read> КонецПопытки`, with the protected statements
+    /// built by `build` (each paired with the bit it initialises); returns the state on entry
+    /// to the handler's read, as bit `0` and bit `1` see it.
+    fn handler_state(
+        build: impl FnOnce(&mut Body) -> Vec<(StmtIdx, Option<u32>)>,
+    ) -> (Option<bool>, Option<bool>) {
+        let mut body = Body::new();
+        let protected = build(&mut body);
+        let mut events = events(2, &[]);
+        for &(idx, bit) in &protected {
+            if let Some(bit) = bit {
+                events.stmt.entry(StmtId::from_idx(idx)).or_default().push(bit);
+            }
+        }
+        let read_expr = body.alloc_expr(Expr::Path(hir_def::Name::new("Значение"))).to_idx();
+        let read = body.alloc_stmt(Stmt::Expr(read_expr));
+        let try_stmt = body.alloc_stmt(Stmt::Try {
+            body: protected.iter().map(|&(idx, _)| idx).collect(),
+            except: Box::default(),
+        });
+
+        let mut cfg = ControlFlowGraph::new();
+        let start = cfg.add_vertex(block(&[]));
+        let try_vertex = cfg.add_vertex_with_origin(CfgVertex::Try, try_stmt);
+        let mut try_block = BasicBlockVertex::new();
+        for &(idx, _) in &protected {
+            try_block.add_statement(StmtId::from_idx(idx));
+        }
+        let try_block = cfg.add_vertex(CfgVertex::BasicBlock(try_block));
+        let mut handler = BasicBlockVertex::new();
+        handler.add_statement(read);
+        let handler = cfg.add_vertex(CfgVertex::BasicBlock(handler));
+        let exit = cfg.exit();
+        cfg.set_start(start);
+        cfg.add_edge(start, try_vertex, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, try_block, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, handler, CfgEdgeType::Exception);
+        cfg.add_edge(try_block, exit, CfgEdgeType::Unconditional);
+        cfg.add_edge(handler, exit, CfgEdgeType::Unconditional);
+
+        let result =
+            analyze_definite_init(Arc::new(cfg), body, Arc::new(events), DEFAULT_MAX_ITERATIONS)
+                .expect("converges");
+        let at_read = result.state_before(InitPoint::Stmt(read)).unwrap();
+        (at_read.is_initialized(0), at_read.is_initialized(1))
+    }
+
+    fn path(body: &mut Body, name: &str) -> hir_def::hir::ExprIdx {
+        body.alloc_expr(Expr::Path(hir_def::Name::new(name))).to_idx()
+    }
+
+    fn assign(body: &mut Body, target: &str, value: Expr) -> StmtIdx {
+        let target = path(body, target);
+        let value = body.alloc_expr(value).to_idx();
+        body.alloc_stmt(Stmt::Assign { target, value }).to_idx()
+    }
+
+    fn plain_copy(body: &mut Body, target: &str) -> StmtIdx {
+        assign(body, target, Expr::Path(hir_def::Name::new("Значение")))
+    }
+
+    #[test]
+    fn an_assignment_before_anything_that_can_raise_is_initialised_in_the_handler() {
+        let (first, _) = handler_state(|body| vec![(plain_copy(body, "Исх"), Some(0))]);
+        assert_eq!(first, Some(true));
+    }
+
+    #[test]
+    fn a_label_in_the_protected_body_keeps_the_prefix_unproven() {
+        let (first, _) = handler_state(|body| {
+            let label = body.alloc_stmt(Stmt::Label(hir_def::Name::new("М"))).to_idx();
+            vec![(plain_copy(body, "Исх"), Some(0)), (label, None)]
+        });
+        assert_eq!(first, Some(false));
+    }
+
+    #[test]
+    fn an_assignment_whose_value_is_a_call_is_not_initialised_in_the_handler() {
+        let (first, _) = handler_state(|body| {
+            let callee = path(body, "Прочитать");
+            let call = Expr::Call { callee, args: Box::default() };
+            vec![(assign(body, "Исх", call), Some(0))]
+        });
+        assert_eq!(first, Some(false));
+    }
+
+    #[test]
+    fn an_assignment_of_an_arithmetic_expression_is_not_initialised_in_the_handler() {
+        let (first, _) = handler_state(|body| {
+            let (lhs, rhs) = (path(body, "А"), path(body, "Б"));
+            let division = Expr::BinaryOp { lhs, rhs, op: hir_def::BinaryOp::Div };
+            vec![(assign(body, "Исх", division), Some(0))]
+        });
+        assert_eq!(first, Some(false));
+    }
+
+    #[test]
+    fn an_assignment_after_a_statement_that_can_raise_is_not_initialised_in_the_handler() {
+        let (first, _) = handler_state(|body| {
+            let callee = path(body, "Прочитать");
+            let call = body.alloc_expr(Expr::Call { callee, args: Box::default() }).to_idx();
+            let call_stmt = body.alloc_stmt(Stmt::Expr(call)).to_idx();
+            vec![(call_stmt, None), (plain_copy(body, "Исх"), Some(0))]
+        });
+        assert_eq!(first, Some(false));
+    }
+
+    #[test]
+    fn an_assignment_inside_a_condition_is_not_initialised_in_the_handler() {
+        let (first, _) = handler_state(|body| {
+            let inner = plain_copy(body, "Исх");
+            let condition = path(body, "Значение");
+            let branch = body
+                .alloc_stmt(Stmt::If(Box::new(hir_def::IfStmt {
+                    condition,
+                    then_branch: Box::new([inner]),
+                    elsif_branches: Box::default(),
+                    else_branch: None,
+                })))
+                .to_idx();
+            vec![(branch, None), (inner, Some(0))]
+        });
+        assert_eq!(first, Some(false));
+    }
+
+    #[test]
+    fn two_plain_assignments_before_anything_that_can_raise_are_both_initialised() {
+        let (first, second) = handler_state(|body| {
+            let literal = Expr::Literal(Literal::Bool(true));
+            vec![(plain_copy(body, "Исх"), Some(0)), (assign(body, "Флаг", literal), Some(1))]
+        });
+        assert_eq!((first, second), (Some(true), Some(true)));
+    }
+
     #[test]
     fn witness_avoids_unexecutable_edges() {
         // The shortest way into `merge` leaves the jump block `[s1]` along its dead

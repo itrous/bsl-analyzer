@@ -214,6 +214,45 @@ fn a_write_through_a_by_reference_call_in_dead_code_does_not_silence_the_finding
     assert_eq!(d.len(), 1, "{d:?}");
 }
 
+/// The handler is entered only when something protected raised. A plain assignment cannot
+/// raise, so after `Имя = "обычный текст"` nothing can send control to the handler, and the
+/// type name assigned before it never reaches the comparison there. A call after the assignment
+/// can raise while `Имя` still holds that name, but the assignment's own call can also raise
+/// before the write, and that path leaves the name unknown: the comparison is not a proven type
+/// name either way. The dataflow test pins that the write reaches only when something after it
+/// can raise.
+#[test]
+fn a_write_followed_only_by_plain_assignments_does_not_reach_the_handler() {
+    let safe_tail = "    Попытка\n        Имя = Строка(ТипЗнч(Объект));\n        Имя = \"обычный текст\";\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(safe_tail);
+    assert!(d.is_empty(), "{d:?}");
+
+    let raising_tail = "    Попытка\n        Имя = Строка(ТипЗнч(Объект));\n        Ф();\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(raising_tail);
+    assert!(d.is_empty(), "{d:?}");
+
+    // The type name was assigned before the region. A call can raise before the plain
+    // assignment, so the handler may compare that name; the plain assignment cannot raise
+    // and does not hide it.
+    let before = "    Имя = Строка(ТипЗнч(Объект));\n    Попытка\n        Ф();\n        Имя = \"обычный текст\";\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(before);
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
+/// A call that writes back through its argument, followed by a statement that can raise: the
+/// handler may be entered after the write, so the value it compares is not proven to be the
+/// type name. The control without the by-reference call keeps the finding.
+#[test]
+fn a_by_reference_write_before_a_raising_statement_reaches_the_handler() {
+    let written = "    Имя = Строка(ТипЗнч(Объект));\n    Попытка\n        ВвестиСтроку(Имя);\n        Ф();\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(written);
+    assert!(d.is_empty(), "{d:?}");
+
+    let not_written = "    Имя = Строка(ТипЗнч(Объект));\n    Попытка\n        Ф();\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(not_written);
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
 #[test]
 fn a_local_assigned_a_type_name_and_something_else_is_not_flagged() {
     let d = run("    Имя = Строка(ТипЗнч(Объект));\n    Имя = \"Документ\";\n    Если Имя = \"Документ\" Тогда\n    КонецЕсли;");
