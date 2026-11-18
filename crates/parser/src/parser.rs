@@ -14,12 +14,24 @@ const MAX_ITERATIONS: usize = 1_000_000;
 
 const POSITION_HISTORY_SIZE: usize = 100;
 
+/// How many recursive rules may be open at once.
+///
+/// Every level costs the parser several stack frames and the tree one node or
+/// more, so without a bound a short input such as `((((…1…))))` overflows the
+/// stack of whoever parses it and aborts the process. Real modules and queries
+/// stay far below this; the bound only has to keep the deepest construct within
+/// a default thread stack in an unoptimized build.
+pub(crate) const MAX_NESTING_DEPTH: u32 = 128;
+
+const TOO_DEEP_MESSAGE: &str = "слишком глубокая вложенность";
+
 pub struct Parser<'a> {
     input: Input<'a>,
     /// Позиция среди ЗНАЧИМЫХ токенов, а не среди лексем.
     pos: usize,
     events: Vec<Event>,
     iteration_count: usize,
+    nesting_depth: u32,
     recent_positions: Vec<usize>,
     paren_depth: u32,
     brace_depth: u32,
@@ -44,6 +56,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             events: Vec::new(),
             iteration_count: 0,
+            nesting_depth: 0,
             recent_positions: Vec::with_capacity(POSITION_HISTORY_SIZE),
             paren_depth: 0,
             brace_depth: 0,
@@ -854,6 +867,59 @@ impl<'a> Parser<'a> {
         let m = self.start();
         self.events.push(Event::Error(err));
         m.complete(self, NodeKind::Error);
+    }
+
+    /// Runs a rule that may lead back into itself, one nesting level deeper.
+    ///
+    /// Past [`MAX_NESTING_DEPTH`] the rule is not run: the construct it would
+    /// have read is reported and taken whole into one error node, so the parse
+    /// goes on after it with the stack and the tree no deeper than the bound.
+    pub fn nested(&mut self, rule: impl FnOnce(&mut Self)) {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            self.skip_too_deep();
+            return;
+        }
+        self.nesting_depth += 1;
+        rule(self);
+        self.nesting_depth -= 1;
+    }
+
+    /// Takes the construct under the cursor up to where the enclosing rule
+    /// resumes: a separator or a boundary outside every group opened here.
+    ///
+    /// The groups are counted, not parsed, so the text inside them stays flat
+    /// whatever its depth. Everything else is taken as [`Parser::error`] takes
+    /// a token, which keeps the progress the rules around rely on: a group
+    /// opener is always taken, even `#Если`, which an error otherwise leaves.
+    fn skip_too_deep(&mut self) {
+        let m = self.start();
+        let mut open = 0usize;
+        while let Some(kind) = self.current() {
+            let opens = matches!(
+                kind,
+                T![LParen]
+                    | T![LBracket]
+                    | T![KwIf]
+                    | T![KwWhile]
+                    | T![KwFor]
+                    | T![KwTry]
+                    | T![PreIf]
+            );
+            if open == 0 && !opens && self.at_statement_separator() {
+                break;
+            }
+            if opens {
+                open += 1;
+            } else if matches!(
+                kind,
+                T![RParen] | T![RBracket] | T![KwEndIf] | T![KwEndDo] | T![KwEndTry] | T![PreEndIf]
+            ) {
+                open = open.saturating_sub(1);
+            }
+            self.check_iteration_limit();
+            self.bump();
+        }
+        self.error_custom_at_marker(m, TOO_DEEP_MESSAGE);
     }
 
     pub fn at_declaration_start(&self) -> bool {

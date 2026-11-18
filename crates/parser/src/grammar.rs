@@ -115,7 +115,7 @@ pub fn source_file(p: &mut Parser) {
             Some(T![KwVar]) => items::var_declaration(p),
             Some(T![PreRegion]) => preprocessor_region(p),
             Some(T![PreEndRegion]) => preprocessor_end_region(p),
-            Some(T![PreIf]) => preprocessor_if(p),
+            Some(T![PreIf]) => p.nested(preprocessor_if),
             Some(T![PreDelete]) => preprocessor_delete(p),
             Some(T![PreInsert]) => preprocessor_insert(p),
             Some(T![AnnAtClient])
@@ -363,7 +363,7 @@ fn preproc_content(p: &mut Parser) {
             Some(T![KwVar]) => items::var_declaration(p),
             Some(T![PreRegion]) => preprocessor_region(p),
             Some(T![PreEndRegion]) => preprocessor_end_region(p),
-            Some(T![PreIf]) => preprocessor_if(p),
+            Some(T![PreIf]) => p.nested(preprocessor_if),
             Some(T![PreDelete]) => preprocessor_delete(p),
             Some(T![PreInsert]) => preprocessor_insert(p),
             Some(T![AnnAtClient])
@@ -427,16 +427,16 @@ fn preproc_logical_operand(p: &mut Parser) {
         p.within_boundary(at_closing_paren, |p| {
             if p.at(T![KwNot]) {
                 p.bump();
-                preproc_logical_operand(p);
+                p.nested(preproc_logical_operand);
             } else {
-                preproc_logical_expression(p);
+                p.nested(preproc_logical_expression);
             }
         });
 
         p.expect(T![RParen]);
     } else if p.at(T![KwNot]) {
         p.bump();
-        preproc_logical_operand(p);
+        p.nested(preproc_logical_operand);
     } else {
         preproc_symbol(p);
     }
