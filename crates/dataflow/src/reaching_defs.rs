@@ -913,11 +913,14 @@ struct ExecutableReachingDefsTransfer {
     hidden_on_exception: FxHashSet<StmtId>,
 }
 
-/// A raising statement whose own writes must not ride its exception edge: every
-/// statement after it in the same region is an assignment that cannot raise, and
-/// at least one such statement follows. Once the writes complete, nothing left can
-/// enter the handler. A statement with nothing after it is not here — its own
-/// failure may come after the write, which the exceptional exit already records.
+/// A raising statement whose ordinary writes must not ride its exception edge:
+/// every statement after it in the same region is an assignment that cannot raise,
+/// and at least one such statement follows. Once an ordinary write completes,
+/// nothing left can enter the handler. A possible write of the statement itself
+/// is not covered: the call may write its argument and then raise, and the
+/// assignments after it then do not run. A statement with nothing after it is not
+/// here — its own failure may come after the write, which the exceptional exit
+/// already records.
 fn writes_hidden_on_exception(body: &Body) -> FxHashSet<StmtId> {
     let mut hidden = FxHashSet::default();
     hide_writes_after_safe_tail(body.body_stmts_typed(), body, false, &mut hidden);
@@ -1049,9 +1052,11 @@ impl Transfer<ExecutableDefs> for ExecutableReachingDefsTransfer {
         let writes = Self::stmt_writes(stmt_id, body, def_index);
         let may = def_index.point_writes(EvalPoint::Stmt(stmt_id));
         // A plain assignment cannot raise, so its exception edge carries nothing.
-        // A raising statement followed only by such assignments has already completed
-        // by the time anything could still enter the handler, so that edge carries the
-        // state from before its own writes.
+        // A raising statement followed only by such assignments has completed its
+        // ordinary write only when the region can no longer raise, so that write is
+        // not on a path into the handler. A possible write of the statement itself
+        // may have happened before the statement raised, and the assignments after
+        // it then do not run, so that write still reaches the handler.
         if crate::is_non_raising_assignment(body, stmt_id.to_idx()) {
             let mut out = Self::evaluate(input, &[], &writes);
             out.exceptional = Reach::Unreached;
@@ -1059,7 +1064,11 @@ impl Transfer<ExecutableDefs> for ExecutableReachingDefsTransfer {
         }
         if self.hidden_on_exception.contains(&stmt_id) {
             let mut out = Self::evaluate(input, may, &writes);
-            out.exceptional = Reach::Reached(input.clone());
+            let mut exceptional = input.clone();
+            for &idx in may {
+                exceptional.bits.insert(idx as usize);
+            }
+            out.exceptional = Reach::Reached(exceptional);
             return out;
         }
         Self::evaluate(input, may, &writes)

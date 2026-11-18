@@ -1021,8 +1021,8 @@ fn dataflow_writes_i10_exceptional_sources() {
     );
     assert_eq!(
         f.read(&result, "м2", "x"),
-        strings(&["A"]),
-        "W is followed only by an assignment that cannot raise, so its write is not on a path into the handler"
+        strings(&["A", "W:W"]),
+        "W may write and then raise; the plain assignment after it does not run"
     );
     assert_eq!(f.read(&f.solve_with(f.mutant(Rule::TryVeto)), "м1", "x"), strings(&["A", "W:W"]));
     assert_eq!(f.read(&f.solve_with(f.mutant(Rule::OnlyTryEntry)), "м2", "x"), strings(&["A"]));
@@ -1254,8 +1254,8 @@ fn a_write_followed_only_by_non_raising_assignments_does_not_reach_the_handler()
     );
     assert_eq!(
         safe.read(&safe.solve(), "м1", "x"),
-        strings(&["Unknown"]),
-        "neither the call assignment nor the plain assignment after it can be what the handler sees"
+        strings(&["Unknown", "W:F"]),
+        "the ordinary assignment does not reach; the call may have written its argument and then raised"
     );
 
     let raising = fixture(
@@ -1267,4 +1267,15 @@ fn a_write_followed_only_by_non_raising_assignments_does_not_reach_the_handler()
         "Процедура Т()\n    x = \"A\";\n    Попытка\n        W(x);\n        Ф();\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\nКонецПроцедуры\n",
     );
     assert_eq!(written.read(&written.solve(), "м1", "x"), strings(&["A", "W:W"]));
+
+    // A call may write its argument and then raise. The plain assignment after it does not
+    // run on that path, so the handler still sees the possible write.
+    let raises_after_write = fixture(
+        "Процедура Т()\n    x = \"A\";\n    Попытка\n        W(x);\n        x = \"B\";\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\nКонецПроцедуры\n",
+    );
+    assert_eq!(
+        raises_after_write.read(&raises_after_write.solve(), "м1", "x"),
+        strings(&["A", "W:W"]),
+        "the plain assignment cannot raise, so it is not what the handler sees"
+    );
 }
