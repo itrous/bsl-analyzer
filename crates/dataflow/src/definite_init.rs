@@ -135,9 +135,13 @@ impl Transfer<DefiniteInit> for DefiniteInitTransfer {
     /// a statement inside a branch or loop may be skipped, so it proves nothing.
     ///
     /// The statements before the first raising one are reachable whenever the `Попытка`
-    /// vertex is, so the walk does not consult liveness.
+    /// vertex is, so the walk does not consult liveness. A label in the protected body is
+    /// not: a `Перейти` from outside the prefix can land on it and skip the assignments.
     fn transfer_exception_edge(&self, try_stmt: StmtId, state: &mut DefiniteInit, body: &Body) {
         let Stmt::Try { body: protected, .. } = body.stmt(try_stmt) else { return };
+        if body_contains_label(protected, body) {
+            return;
+        }
         for &idx in protected.iter() {
             if !is_non_raising_assignment(body, idx) {
                 break;
@@ -147,6 +151,38 @@ impl Transfer<DefiniteInit> for DefiniteInitTransfer {
             }
         }
     }
+}
+
+fn body_contains_label(stmts: &[hir_def::hir::StmtIdx], body: &Body) -> bool {
+    for &idx in stmts {
+        match body.stmt_idx(idx) {
+            Stmt::Label(_) => return true,
+            Stmt::If(if_stmt) => {
+                if body_contains_label(&if_stmt.then_branch, body)
+                    || if_stmt
+                        .elsif_branches
+                        .iter()
+                        .any(|(_, branch)| body_contains_label(branch, body))
+                    || if_stmt
+                        .else_branch
+                        .as_ref()
+                        .is_some_and(|branch| body_contains_label(branch, body))
+                {
+                    return true;
+                }
+            }
+            Stmt::For { body: nested, .. }
+            | Stmt::ForEach { body: nested, .. }
+            | Stmt::While { body: nested, .. }
+            | Stmt::Try { body: nested, .. } => {
+                if body_contains_label(nested, body) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 pub struct DefiniteInitResult {
@@ -722,6 +758,15 @@ mod tests {
     fn an_assignment_before_anything_that_can_raise_is_initialised_in_the_handler() {
         let (first, _) = handler_state(|body| vec![(plain_copy(body, "Исх"), Some(0))]);
         assert_eq!(first, Some(true));
+    }
+
+    #[test]
+    fn a_label_in_the_protected_body_keeps_the_prefix_unproven() {
+        let (first, _) = handler_state(|body| {
+            let label = body.alloc_stmt(Stmt::Label(hir_def::Name::new("М"))).to_idx();
+            vec![(plain_copy(body, "Исх"), Some(0)), (label, None)]
+        });
+        assert_eq!(first, Some(false));
     }
 
     #[test]

@@ -927,20 +927,22 @@ fn writes_hidden_on_exception(body: &Body) -> FxHashSet<StmtId> {
     hidden
 }
 
+/// `region_ends_safely` means that once `stmts` completes, nothing that can raise remains.
+/// A protected body's own list does not: its last statement may fail after its write.
+/// A branch does, when the statement that contains it is followed only by assignments
+/// that cannot raise — the last statement of that branch then has the same tail.
 fn hide_writes_after_safe_tail(
     stmts: &[StmtIdx],
     body: &Body,
-    tail: bool,
+    region_ends_safely: bool,
     hidden: &mut FxHashSet<StmtId>,
 ) {
-    let tail_from = stmts
-        .iter()
-        .rposition(|&stmt_id| !crate::is_non_raising_assignment(body, stmt_id))
-        .unwrap_or(0);
     for (position, &stmt_id) in stmts.iter().enumerate() {
-        let in_tail = tail && position >= tail_from;
-        if in_tail && position + 1 < stmts.len() && !crate::is_non_raising_assignment(body, stmt_id)
-        {
+        let later = &stmts[position + 1..];
+        let later_cannot_raise =
+            later.iter().all(|&later_id| crate::is_non_raising_assignment(body, later_id));
+        let ends_safely_after = later_cannot_raise && (!later.is_empty() || region_ends_safely);
+        if ends_safely_after && !crate::is_non_raising_assignment(body, stmt_id) {
             hidden.insert(StmtId::from_idx(stmt_id));
         }
         match body.stmt_idx(stmt_id) {
@@ -950,17 +952,17 @@ fn hide_writes_after_safe_tail(
                 hide_writes_after_safe_tail(nested, body, false, hidden);
             }
             Stmt::If(if_stmt) => {
-                hide_writes_after_safe_tail(&if_stmt.then_branch, body, in_tail, hidden);
+                hide_writes_after_safe_tail(&if_stmt.then_branch, body, ends_safely_after, hidden);
                 for (_, branch) in if_stmt.elsif_branches.iter() {
-                    hide_writes_after_safe_tail(branch, body, in_tail, hidden);
+                    hide_writes_after_safe_tail(branch, body, ends_safely_after, hidden);
                 }
                 if let Some(else_stmts) = &if_stmt.else_branch {
-                    hide_writes_after_safe_tail(else_stmts, body, in_tail, hidden);
+                    hide_writes_after_safe_tail(else_stmts, body, ends_safely_after, hidden);
                 }
             }
             Stmt::Try { body: protected, except, .. } => {
-                hide_writes_after_safe_tail(protected, body, true, hidden);
-                hide_writes_after_safe_tail(except, body, in_tail, hidden);
+                hide_writes_after_safe_tail(protected, body, false, hidden);
+                hide_writes_after_safe_tail(except, body, ends_safely_after, hidden);
             }
             _ => {}
         }

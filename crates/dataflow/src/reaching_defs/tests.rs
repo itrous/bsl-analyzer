@@ -1278,4 +1278,13 @@ fn a_write_followed_only_by_non_raising_assignments_does_not_reach_the_handler()
         strings(&["A", "W:W"]),
         "the plain assignment cannot raise, so it is not what the handler sees"
     );
+
+    // The assignment is the last statement of a branch, and the branch's statement is followed
+    // only by an assignment that cannot raise. Once the call returns, nothing left can enter
+    // the handler, so the ordinary write does not reach it. The call may still have written
+    // its argument and then raised.
+    let nested = fixture(
+        "Процедура Т(Усл)\n    Попытка\n        Если Усл Тогда\n            x = F(x);\n        КонецЕсли;\n        y = \"C\";\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\nКонецПроцедуры\n",
+    );
+    assert_eq!(nested.read(&nested.solve(), "м1", "x"), strings(&["Unknown", "W:F"]));
 }
