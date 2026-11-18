@@ -43,6 +43,9 @@ pub struct Parser<'a> {
     events: Vec<Event>,
     iteration_count: usize,
     nesting_depth: u32,
+    /// The deepest level at which a rule asked to descend, past the bound or
+    /// not.
+    deepest_nesting: u32,
     /// For each open marker, innermost last: its event and the depth of the
     /// deepest node completed inside it so far.
     open_nodes: Vec<(usize, u32)>,
@@ -71,6 +74,7 @@ impl<'a> Parser<'a> {
             events: Vec::new(),
             iteration_count: 0,
             nesting_depth: 0,
+            deepest_nesting: 0,
             open_nodes: Vec::new(),
             recent_positions: Vec::with_capacity(POSITION_HISTORY_SIZE),
             paren_depth: 0,
@@ -891,6 +895,7 @@ impl<'a> Parser<'a> {
     /// have read is reported and taken whole into one error node, so the parse
     /// goes on after it with the stack and the tree no deeper than the bound.
     pub fn nested(&mut self, rule: impl FnOnce(&mut Self)) {
+        self.deepest_nesting = self.deepest_nesting.max(self.nesting_depth);
         if self.nesting_depth >= MAX_NESTING_DEPTH {
             self.skip_too_deep();
             return;
@@ -898,6 +903,11 @@ impl<'a> Parser<'a> {
         self.nesting_depth += 1;
         rule(self);
         self.nesting_depth -= 1;
+    }
+
+    /// The deepest level at which [`Parser::nested`] was asked to descend.
+    pub(crate) fn deepest_nesting(&self) -> u32 {
+        self.deepest_nesting
     }
 
     /// Takes the construct under the cursor up to where the enclosing rule
