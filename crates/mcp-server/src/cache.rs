@@ -13,6 +13,9 @@ const DAEMON_LOG_PREV_FILE: &str = "bsl-analyzer-daemon.log.prev";
 const LONE_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// Bound on the work of one sweep: the family can hold thousands of directories.
 const SWEEP_ENTRY_LIMIT: usize = 10_000;
+/// Prefix of a family entry a sweep has claimed for removal. Cache directories are named by a
+/// hex digest, so no live one starts with a dot.
+const SWEPT_DIR_PREFIX: &str = ".swept-";
 
 pub(crate) const LEASE_LOCK_FILE: &str = "writer.lease.lock";
 pub(crate) const STALL_REPORT_FILE: &str = "bsl-graph-stall-report.txt";
@@ -322,10 +325,16 @@ impl WorkspaceCacheLayout {
 
     /// `ensure` can run more than once per process and a scan of thousands of entries is not
     /// free, so only the first call sweeps.
+    ///
+    /// The sweep runs off the startup path: it checks trees that belong to other caches, and a
+    /// `stat` of a tree on a hung network mount can block indefinitely.
     fn sweep_abandoned_siblings(&self) {
         static SWEPT: AtomicBool = AtomicBool::new(false);
         if self.origin == CacheOrigin::Default && !SWEPT.swap(true, Ordering::Relaxed) {
-            self.sweep_family();
+            let layout = self.clone();
+            let _ = std::thread::Builder::new()
+                .name("cache-sweep".into())
+                .spawn(move || layout.sweep_family());
         }
     }
 
@@ -356,8 +365,20 @@ impl WorkspaceCacheLayout {
             if !is_dir || path == self.root {
                 continue;
             }
-            if is_abandoned(&path) {
+            let name = entry.file_name();
+            if name.as_encoded_bytes().starts_with(SWEPT_DIR_PREFIX.as_bytes()) {
+                // An earlier sweep claimed it and was stopped mid-removal.
                 let _ = std::fs::remove_dir_all(&path);
+            } else if is_abandoned(&path) {
+                // Claimed by a rename first: a process can exit in the middle of a removal, and a
+                // half-removed directory may no longer hold what named its tree, so it would stay
+                // forever. A claimed name is finished by whichever sweep sees it next.
+                let mut claimed = OsString::from(SWEPT_DIR_PREFIX);
+                claimed.push(&name);
+                let claimed = self.family.join(claimed);
+                if std::fs::rename(&path, &claimed).is_ok() {
+                    let _ = std::fs::remove_dir_all(&claimed);
+                }
             }
         }
     }
@@ -1688,6 +1709,29 @@ mod tests {
             std::fs::write(dir.join("bsl-graph.db"), b"x").unwrap();
             family.layout.sweep_family();
             assert!(dir.exists());
+        }
+
+        #[test]
+        fn removal_leaves_no_claimed_directory_behind() {
+            let family = new_family(CacheOrigin::Default);
+            sibling(&family, "a", 1, Some(&gone_tree(&family)));
+            family.layout.sweep_family();
+            let left: Vec<_> = std::fs::read_dir(family.dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(left, [OsString::from("current")]);
+        }
+
+        #[test]
+        fn a_claimed_directory_left_by_an_interrupted_sweep_is_finished() {
+            let family = new_family(CacheOrigin::Default);
+            // Holds a database and no identity: on its own it would be kept.
+            let claimed = family.dir.path().join(format!("{SWEPT_DIR_PREFIX}a"));
+            std::fs::create_dir(&claimed).unwrap();
+            std::fs::write(claimed.join("bsl-graph.db"), b"x").unwrap();
+            family.layout.sweep_family();
+            assert!(!claimed.exists());
         }
 
         #[test]
