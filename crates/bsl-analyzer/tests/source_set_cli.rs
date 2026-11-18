@@ -145,24 +145,34 @@ const DEP: &str = "a/b/dep";
 #[cfg(unix)]
 const CACHE_ADOPTION_LOG: &str = "reused cached graph database (workspace unchanged)";
 const STDERR_TAIL_LIMIT: usize = 64 * 1024;
+/// Startup diagnostics come first, so the head is kept beside the tail: how much a child logs
+/// after them depends on path lengths and must not decide whether they are still visible.
+const STDERR_HEAD_LIMIT: usize = 16 * 1024;
 /// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
 /// latency measure.
 const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
-/// Drains child stderr continuously while retaining only a bounded tail. This
+/// Drains child stderr continuously while retaining only a bounded head and tail. This
 /// keeps native startup diagnostics available without allowing a verbose child
 /// to block on a full stderr pipe or grow the fixture's memory without bound.
 struct StderrCapture {
-    tail: Arc<Mutex<String>>,
+    text: Arc<Mutex<CapturedStderr>>,
     reader: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct CapturedStderr {
+    head: String,
+    tail: String,
+    trimmed: bool,
 }
 
 impl StderrCapture {
     fn attach(stderr: std::process::ChildStderr) -> Self {
         use std::io::Read as _;
 
-        let tail = Arc::new(Mutex::new(String::new()));
-        let reader_tail = Arc::clone(&tail);
+        let text = Arc::new(Mutex::new(CapturedStderr::default()));
+        let reader_text = Arc::clone(&text);
         let reader = std::thread::spawn(move || {
             let mut stderr = stderr;
             let mut buffer = [0_u8; 4096];
@@ -171,7 +181,13 @@ impl StderrCapture {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
                         let text = String::from_utf8_lossy(&buffer[..read]);
-                        let mut tail = reader_tail.lock().expect("stderr capture mutex");
+                        let mut captured = reader_text.lock().expect("stderr capture mutex");
+                        let mut room = STDERR_HEAD_LIMIT.saturating_sub(captured.head.len());
+                        while !text.is_char_boundary(room.min(text.len())) {
+                            room -= 1;
+                        }
+                        captured.head.push_str(&text[..room.min(text.len())]);
+                        let tail = &mut captured.tail;
                         tail.push_str(&text);
                         if tail.len() > STDERR_TAIL_LIMIT {
                             let mut trim = tail.len() - STDERR_TAIL_LIMIT;
@@ -179,16 +195,22 @@ impl StderrCapture {
                                 trim += 1;
                             }
                             tail.drain(..trim);
+                            captured.trimmed = true;
                         }
                     }
                 }
             }
         });
-        Self { tail, reader: Some(reader) }
+        Self { text, reader: Some(reader) }
     }
 
     fn snapshot(&self) -> String {
-        self.tail.lock().expect("stderr capture mutex").clone()
+        let captured = self.text.lock().expect("stderr capture mutex");
+        if captured.trimmed {
+            format!("{}\n[...]\n{}", captured.head, captured.tail)
+        } else {
+            captured.tail.clone()
+        }
     }
 
     #[cfg(unix)]
