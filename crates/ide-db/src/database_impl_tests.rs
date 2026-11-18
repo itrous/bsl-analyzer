@@ -9277,3 +9277,182 @@ fn re_publishing_an_unchanged_metadata_listing_writes_nothing() {
     let entries = db.metadata_listing("/cfg").unwrap().entries(&db);
     assert_eq!(entries[0].name, "Услуги");
 }
+
+fn uninitialized_reads<'a>(
+    diagnostics: impl IntoIterator<Item = &'a hir::InferenceDiagnostic>,
+) -> Vec<String> {
+    diagnostics
+        .into_iter()
+        .filter_map(|diagnostic| match diagnostic {
+            hir::InferenceDiagnostic::UninitializedRead { name, .. } => {
+                Some(name.as_str().to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// I14: one revision of a memoised body has one CFG and one set of events,
+/// which its inference, its reaching definitions and every later reader share;
+/// an edit of another method rebuilds neither. A body the memo does not hold
+/// gets a flow of its own, built once.
+#[test]
+fn dataflow_writes_i14_body_flow_identity() {
+    use hir::HirDatabase;
+
+    let mut db = RootDatabaseImpl::new_with_salsa_events();
+    let file_id = FileId(0);
+    let mut file_set = FileSet::new();
+    file_set.insert(file_id, VfsPath::new("/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    let text = |second: &str| {
+        format!(
+            "Перем Модульная;\n\
+             Процедура Первый(Знач Флаг)\n\tЕсли Флаг Тогда\n\t\tА = 1;\n\tКонецЕсли;\n\tБ = А;\nКонецПроцедуры\n\
+             Процедура Второй(Знач Флаг)\n\tЕсли Флаг Тогда\n\t\t{second}\n\tКонецЕсли;\n\tУ = Х;\nКонецПроцедуры\n\
+             Если Модульная = 1 Тогда\n\tВ = 2;\nКонецЕсли;\nГ = В;\n"
+        )
+    };
+    db.set_file_text(file_id, &text("Х = 1;"));
+    let module_id = ModuleId::new(file_id);
+    let method_id = |db: &RootDatabaseImpl, name: &str| {
+        db.symbol_tree(module_id).find_method(&hir::Name::new(name)).expect("method").id
+    };
+    let first_id = method_id(&db, "Первый");
+    let second_id = method_id(&db, "Второй");
+
+    assert!(db.salsa_events_reset(), "the database must count salsa events");
+    let first = hir::MethodIdInput::new(&db, first_id);
+    let second = hir::MethodIdInput::new(&db, second_id);
+    // Each inference runs the definite-initialization check over its flow.
+    assert_eq!(uninitialized_reads(&db.infer_method(first).diagnostics), ["А"]);
+    assert_eq!(uninitialized_reads(&db.infer_method(second).diagnostics), ["Х"]);
+    assert_eq!(db.salsa_family_churn("method_cfg_query").unwrap().0, 2, "one graph per body");
+    assert_eq!(db.salsa_family_churn("method_body_events_query").unwrap().0, 2);
+
+    let cfg = db.method_cfg(first);
+    let events = db.method_body_events(first);
+    assert!(Arc::ptr_eq(&cfg, &db.method_cfg(first)));
+    assert!(Arc::ptr_eq(&events, &db.method_body_events(first)));
+    let reaching = db.method_reaching_definitions(first).expect("converges");
+    assert!(Arc::ptr_eq(reaching.events(), &events), "RD reads the events memo");
+    let flow = hir::BodyFlow::for_method(&db, first, db.method_body_ref(first));
+    assert!(Arc::ptr_eq(&flow.cfg(&db), &cfg));
+    assert!(Arc::ptr_eq(&flow.events(&db), &events));
+    assert!(Arc::ptr_eq(&flow.reaching_defs(&db).expect("converges"), &reaching));
+    assert_eq!(db.salsa_family_churn("method_cfg_query").unwrap().0, 2, "no build per read");
+
+    // The module-level code reads its own memos the same way.
+    assert_eq!(uninitialized_reads(&db.infer_module_code(file_id).diagnostics), ["В"]);
+    let module_cfg = db.module_code_cfg(file_id);
+    let module_events = db.module_code_body_events(file_id).expect("module code");
+    let module_body =
+        db.module_bodies_ref(module_id).module_code_arc().expect("module code").clone();
+    let module_flow = hir::BodyFlow::for_module_code(&db, file_id, &module_body);
+    assert!(Arc::ptr_eq(&module_flow.cfg(&db), &module_cfg));
+    assert!(Arc::ptr_eq(&module_flow.events(&db), &module_events));
+    let module_reaching = db.module_code_reaching_definitions(file_id).expect("converges");
+    assert!(Arc::ptr_eq(module_reaching.events(), &module_events));
+    assert!(Arc::ptr_eq(&db.module_code_cfg(file_id), &module_cfg));
+
+    // Narrowing walks the same graphs rather than building its own.
+    let narrowed = db.narrow(file_id, hir::DefWithBodyId::Method(first_id.local_id));
+    assert!(std::ptr::eq(narrowed.expect("converges").cfg(), &*cfg));
+    let narrowed = db.narrow(file_id, hir::DefWithBodyId::ModuleCode);
+    assert!(std::ptr::eq(narrowed.expect("converges").cfg(), &*module_cfg));
+
+    // An equal body that is not the memo's own is not taken for it.
+    let copy = Arc::new((**db.method_body_ref(first)).clone());
+    let own = hir::BodyFlow::for_method(&db, first, &copy);
+    let own_cfg = own.cfg(&db);
+    assert!(!Arc::ptr_eq(&own_cfg, &cfg));
+    assert!(Arc::ptr_eq(&own_cfg, &own.cfg(&db)), "a flow of its own builds once");
+    assert!(Arc::ptr_eq(&own.events(&db), &own.events(&db)));
+    drop((flow, module_flow, own));
+
+    // An edit of the second method leaves the first one's graph and events.
+    db.set_file_text(file_id, &text("Х = 1;\n\t\tЖ = 2;"));
+    assert!(db.salsa_events_reset());
+    let first = hir::MethodIdInput::new(&db, first_id);
+    let second = hir::MethodIdInput::new(&db, second_id);
+    assert_eq!(uninitialized_reads(&db.infer_method(first).diagnostics), ["А"]);
+    assert_eq!(uninitialized_reads(&db.infer_method(second).diagnostics), ["Х"]);
+    assert!(Arc::ptr_eq(&db.method_cfg(first), &cfg));
+    assert!(Arc::ptr_eq(&db.method_body_events(first), &events));
+    assert_eq!(db.salsa_family_churn("method_cfg_query").unwrap().0, 1, "only the edited body");
+    assert_eq!(db.salsa_family_churn("method_body_events_query").unwrap().0, 1);
+    effective_body_has_its_own_flow();
+}
+
+/// The `&ИзменениеИКонтроль` splice of a method has ids of its own, so its
+/// inference judges it over its own flow, never over the memo of the base
+/// method it replaces.
+fn effective_body_has_its_own_flow() {
+    use hir::HirDatabase;
+
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("src/cf");
+    let ext_root = temp.path().join("src/cfe/X");
+    std::fs::create_dir_all(&main_root).unwrap();
+    std::fs::create_dir_all(&ext_root).unwrap();
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+    let main_file = FileId(0);
+    let ext_file = FileId(1);
+    let mut file_set = FileSet::new();
+    let main_path = main_root.join("CommonModules/М/Ext/Module.bsl");
+    let ext_path = ext_root.join("CommonModules/М/Ext/Module.bsl");
+    file_set.insert(main_file, VfsPath::new(main_path.to_string_lossy().as_ref()));
+    file_set.insert(ext_file, VfsPath::new(ext_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(main_file, SourceRootId(0));
+    db.set_file_source_root(ext_file, SourceRootId(0));
+    db.set_file_text(
+        main_file,
+        "Функция Сосед() Экспорт\n\tВозврат 1;\nКонецФункции\n\n\
+         Функция Цель() Экспорт\n\tВозврат 0;\nКонецФункции",
+    );
+    db.set_file_text(
+        ext_file,
+        "&ИзменениеИКонтроль(\"Цель\")\n\
+         Функция Расш1_Цель()\n\
+         #Вставка\n\
+         \tЕсли Сосед() = 1 Тогда\n\
+         \t\tЧ = 1;\n\
+         \tКонецЕсли;\n\
+         \tШ = Ч;\n\
+         #КонецВставки\n\
+         \tВозврат 0;\n\
+         КонецФункции",
+    );
+
+    let eid = hir::EffectiveModuleId::new(&db, main_file, ext_file);
+    let result = hir::infer_effective(&db, eid);
+    assert_eq!(
+        uninitialized_reads(result.diagnostics.iter().map(|(_, diagnostic)| diagnostic)),
+        ["Ч"],
+        "the inserted read is judged over the effective body's own flow"
+    );
+
+    let main = ModuleId::new(main_file);
+    let target = db.symbol_tree(main).find_method(&hir::Name::new("Цель")).expect("Цель").id;
+    let neighbour = db.symbol_tree(main).find_method(&hir::Name::new("Сосед")).expect("Сосед").id;
+    let effective = hir::module_bodies_effective(&db, eid);
+    for id in [target, neighbour] {
+        let base = hir::MethodIdInput::new(&db, id);
+        let body = Arc::new(effective.body(id.local_id).expect("effective body").clone());
+        let flow = hir::BodyFlow::for_method(&db, base, &body);
+        let cfg = flow.cfg(&db);
+        assert!(Arc::ptr_eq(&cfg, &flow.cfg(&db)), "built once for its owner");
+        assert!(!Arc::ptr_eq(&cfg, &db.method_cfg(base)), "not the base method's graph");
+        assert_eq!(flow.events(&db).stmts().len(), body.stmt_count(), "events of this body");
+    }
+    let changed = effective.body(target.local_id).expect("effective body").stmt_count();
+    let base_target = hir::MethodIdInput::new(&db, target);
+    assert_ne!(changed, db.method_body_events(base_target).stmts().len());
+}

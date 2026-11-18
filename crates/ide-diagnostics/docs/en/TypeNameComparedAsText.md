@@ -4,7 +4,7 @@
 
 The expression `String(TypeOf(Value))` turns a type name into text, and that text depends on the interface language: the same value renders differently in the Russian and the English interface. If a decision is taken on such text, then when the language changes the condition silently stops matching: there is no error, the intended branch just no longer runs.
 
-The platform does not catch it: the comparison runs without an error and gives the expected result in the developer's language. This is a code-standards finding, not a runtime error.
+The platform does not catch it: the comparison runs without an error and gives the expected result in the developer's language. This is a code-quality finding, not a runtime error.
 
 The correct way to compare types is `Type()`: `TypeOf(Value) = Type("CatalogRef.Products")`. Such a comparison does not depend on the interface language.
 
@@ -18,7 +18,7 @@ The finding sits on the call when the text is produced in place, and on the comp
 
 - The text of a type name is only printed, logged, put into an exception text, concatenated, returned or stored: nothing depends on the text there.
 - The other side of the comparison is not a literal but a parameter, a variable or any other expression: the comparison may well be type-to-type.
-- Between producing the text and the comparison the value may have been overwritten in a way the walk cannot see through: a call PROVEN to take the argument by reference, or `Execute`. A call the platform data attests as taking its argument by value does not suppress the finding.
+- Between producing the text and the comparison the value may have been overwritten in a way the walk cannot see through: a call PROVEN to take the argument by reference, a call whose passing direction for the argument is not established (for example, a procedure the walk could not resolve), or `Execute`. A call the platform data attests as taking its argument by value does not suppress the finding.
 - The value comes from a parameter, a module variable, a loop variable, or a call the walk could not resolve.
 
 ### What the diagnostic does NOT catch yet

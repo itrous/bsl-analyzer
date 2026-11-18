@@ -1,4 +1,4 @@
-use bsl_metadata::{AttributeType, Form, MdoType, PlatformValueType};
+use bsl_metadata::{AttributeType, Form, MdoType, ModuleType, PlatformValueType};
 use bsl_platform::PlatformDataInner;
 use hir_def::resolver::Resolver;
 use hir_def::Name;
@@ -36,13 +36,14 @@ const MANAGED_FORM_EXTENSION_TYPE_NAMES: &[&str] = &[
     "Расширение формы клиентского приложения для компоновщика настроек",
 ];
 
-/// The platform types whose methods a managed form module calls without a
-/// receiver: the form itself plus the extension its main attribute mixes in.
+/// The platform types whose methods and properties a managed form module
+/// reaches without a receiver: the form itself plus the extension its main
+/// attribute mixes in. The extension of another kind of form is not among them.
 ///
 /// A main attribute of a type that was not read (a defined type, a composite)
 /// cannot name its extension, so every extension is included: a bare name that
 /// misses even that union is absent on any reading of the attribute.
-pub(crate) fn managed_form_self_method_types(form: &Form) -> Vec<&'static str> {
+pub(crate) fn managed_form_self_types(form: &Form) -> Vec<&'static str> {
     let mut types = vec![FORM_TYPE_NAME];
     let Some(attribute) = form.main_attribute() else { return types };
     match managed_form_extension_type_name(&attribute.attr_type) {
@@ -115,16 +116,20 @@ fn managed_form_extension_type_name(attr_type: &AttributeType) -> Option<&'stati
     }
 }
 
+/// A property of the managed form the module belongs to, read without a receiver.
 pub(crate) fn resolve_form_self_property(
     db: &dyn HirDatabase,
     resolver: &Resolver,
     name: &Name,
 ) -> Option<PlatformPropertyResolution> {
-    let resolution = lookup_platform_property_by_type(db, FORM_TYPE_NAME, name)?;
-    if !crate::this_object::is_managed_form_module(db, resolver) {
+    let metadata = db.module_metadata(resolver.module_id()?);
+    if metadata.module_type != ModuleType::FormModule {
         return None;
     }
-    Some(resolution)
+    let form = metadata.form.as_deref().filter(|form| form.is_managed())?;
+    managed_form_self_types(form)
+        .into_iter()
+        .find_map(|type_name| lookup_platform_property_by_type(db, type_name, name))
 }
 
 pub fn is_form_self_property_name(name: &str) -> bool {
@@ -195,19 +200,19 @@ mod tests {
         let record = form_with_main_type(AttributeType::UnknownNamed(
             "cfg:InformationRegisterRecordManager.Курсы".to_string(),
         ));
-        let types = managed_form_self_method_types(&record);
+        let types = managed_form_self_types(&record);
         assert!(
             types.contains(&"Расширение формы клиентского приложения для записи регистра сведений")
         );
         assert_eq!(types.len(), 1 + MANAGED_FORM_EXTENSION_TYPE_NAMES.len());
 
         let scalar = form_with_main_type(AttributeType::String { length: None });
-        assert_eq!(managed_form_self_method_types(&scalar), [FORM_TYPE_NAME]);
+        assert_eq!(managed_form_self_types(&scalar), [FORM_TYPE_NAME]);
 
         let external =
             form_with_main_type(AttributeType::AnyObjectRef { mdo_type: MdoType::ExternalReport });
         assert_eq!(
-            managed_form_self_method_types(&external),
+            managed_form_self_types(&external),
             [FORM_TYPE_NAME, "Расширение формы клиентского приложения для отчета"]
         );
     }
@@ -218,7 +223,7 @@ mod tests {
             name: "Курсы".to_string(),
         });
         assert_eq!(
-            managed_form_self_method_types(&record),
+            managed_form_self_types(&record),
             [
                 FORM_TYPE_NAME,
                 "Расширение формы клиентского приложения для записи регистра сведений"
@@ -230,7 +235,7 @@ mod tests {
             name: "Курсы".to_string(),
         });
         assert_eq!(
-            managed_form_self_method_types(&record_set),
+            managed_form_self_types(&record_set),
             [FORM_TYPE_NAME, "Расширение формы клиентского приложения для набора записей"]
         );
     }

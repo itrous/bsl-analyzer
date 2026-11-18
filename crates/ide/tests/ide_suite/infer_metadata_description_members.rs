@@ -419,6 +419,25 @@ fn a_write_interrupted_in_a_try_body_reaches_the_handler() {
 }
 
 #[test]
+fn a_member_no_description_reaching_through_the_handler_has_is_reported() {
+    // Both the catalog and the register description reach the read, and neither has it.
+    let found = unresolved_fields(
+        r#"Процедура Тест()
+    Описание = Метаданные.РегистрыСведений.РегистрСведений1;
+    Попытка
+        Описание = Метаданные.Справочники.Справочник1;
+        Х = 1 / 0;
+        Описание = Метаданные.РегистрыСведений.РегистрСведений1;
+    Исключение
+    КонецПопытки;
+    Есть = Описание.НетТакогоЧлена;
+КонецПроцедуры
+"#,
+    );
+    assert_eq!(found, vec!["НетТакогоЧлена".to_string()]);
+}
+
+#[test]
 fn a_write_inside_a_try_body_is_checked_within_it() {
     let found = unresolved_fields(
         r#"Процедура Тест()

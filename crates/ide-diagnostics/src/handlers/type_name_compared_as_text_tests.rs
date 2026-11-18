@@ -1,4 +1,6 @@
-use crate::test_utils::{check_diagnostics_for, range_to_line_col};
+use crate::test_utils::{
+    check_diagnostics_for, check_diagnostics_for_with_config, range_to_line_col,
+};
 use crate::DiagnosticCode;
 
 const MESSAGE: &str = "Сравнение с текстом имени типа: текст зависит от языка интерфейса, сравнивать типы следует через Тип()";
@@ -19,6 +21,23 @@ fn anchored_text<'a>(text: &'a str, d: &crate::Diagnostic) -> &'a str {
     let start: usize = d.range.start().into();
     let end: usize = d.range.end().into();
     &text[start..end]
+}
+
+#[test]
+fn the_rule_reports_nothing_unless_enabled() {
+    let text =
+        text_of("    Если Строка(ТипЗнч(Элемент)) = \"Табличное поле\" Тогда\n    КонецЕсли;");
+    let d = check_diagnostics_for_with_config(
+        &text,
+        crate::DiagnosticsConfig::default(),
+        DiagnosticCode::TypeNameComparedAsText,
+    );
+    assert!(d.is_empty(), "{d:?}");
+    let mut enabled = crate::DiagnosticsConfig::default();
+    enabled.enabled.push(DiagnosticCode::TypeNameComparedAsText);
+    let d =
+        check_diagnostics_for_with_config(&text, enabled, DiagnosticCode::TypeNameComparedAsText);
+    assert_eq!(d.len(), 1, "{d:?}");
 }
 
 // ---- the flagged shape -------------------------------------------------------------------
@@ -153,17 +172,17 @@ fn a_write_through_a_call_proven_by_reference_is_not_flagged() {
 
 #[test]
 fn a_value_a_call_may_have_rewritten_without_attestation_is_not_flagged() {
-    // Measured over five real configurations: reporting this shape gives 11582 findings against
-    // 10 without it, and the extra ones are plain string comparisons (`Если ИмяЭлемента =
-    // "КодБанка"`), because the walk answers this reason before it looks at the value's origin.
+    // The call's passing direction is not attested, so it may have written something else into
+    // the local: the walk meets the assignment's type-name text with `RewriteDirectionUnknown`,
+    // and an unproven value is not reported.
     let body = "    Имя = Строка(ТипЗнч(Объект));\n    НеизвестнаяПроцедура(Имя);\n    Если Имя = \"Документ\" Тогда\n    КонецЕсли;";
     let d = run(body);
     assert!(d.is_empty(), "{d:?}");
 }
 
-/// Order, which the body-wide scan this replaced could not see: the write happens AFTER the
-/// comparison, so the value compared is the one the assignment gave, and the finding stands.
-/// The control is the same write one statement earlier, which does silence it.
+/// Order matters: the write happens AFTER the comparison, so the value compared is the one the
+/// assignment gave, and the finding stands. The control is the same write one statement
+/// earlier, which does silence it.
 #[test]
 fn a_write_through_a_by_reference_call_after_the_read_does_not_silence_the_finding() {
     let after = "    Имя = Строка(ТипЗнч(Объект));\n    Если Имя = \"Документ\" Тогда\n    КонецЕсли;\n    ВвестиСтроку(Имя);";
@@ -197,8 +216,11 @@ fn a_write_through_a_by_reference_call_in_dead_code_does_not_silence_the_finding
 
 /// The handler is entered only when something protected raised. A plain assignment cannot
 /// raise, so after `Имя = "обычный текст"` nothing can send control to the handler, and the
-/// type name assigned before it never reaches the comparison there. The control has a call
-/// after the plain assignment instead, which can raise while `Имя` still holds that name.
+/// type name assigned before it never reaches the comparison there. A call after the assignment
+/// can raise while `Имя` still holds that name, but the assignment's own call can also raise
+/// before the write, and that path leaves the name unknown: the comparison is not a proven type
+/// name either way. The dataflow test pins that the write reaches only when something after it
+/// can raise.
 #[test]
 fn a_write_followed_only_by_plain_assignments_does_not_reach_the_handler() {
     let safe_tail = "    Попытка\n        Имя = Строка(ТипЗнч(Объект));\n        Имя = \"обычный текст\";\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
@@ -207,6 +229,13 @@ fn a_write_followed_only_by_plain_assignments_does_not_reach_the_handler() {
 
     let raising_tail = "    Попытка\n        Имя = Строка(ТипЗнч(Объект));\n        Ф();\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
     let d = run(raising_tail);
+    assert!(d.is_empty(), "{d:?}");
+
+    // The type name was assigned before the region. A call can raise before the plain
+    // assignment, so the handler may compare that name; the plain assignment cannot raise
+    // and does not hide it.
+    let before = "    Имя = Строка(ТипЗнч(Объект));\n    Попытка\n        Ф();\n        Имя = \"обычный текст\";\n    Исключение\n        Если Имя = \"Документ\" Тогда\n        КонецЕсли;\n    КонецПопытки;";
+    let d = run(before);
     assert_eq!(d.len(), 1, "{d:?}");
 }
 
@@ -252,11 +281,12 @@ fn plain_string_comparison_without_a_type_name_is_not_flagged() {
     assert!(d.is_empty(), "{d:?}");
 }
 
-// ---- shapes of the earlier name-matching rule that are deliberately NOT caught yet -------
+// ---- shapes of a type-name text comparison that are deliberately NOT caught yet -----------
 //
 // Each needs a function identified by its NAME (or a literal that arrives indirectly), which
 // this rule may not do. Identifying them needs new curated platform data - a separate step.
-// The cases stay here, ignored, so that the knowledge of what is not caught is not lost.
+// The cases stay here, ignored, so that the knowledge of what is not caught is not lost; each
+// is unignored once its shape is a platform or value-origin fact (#888).
 
 #[test]
 #[ignore = "not caught yet: Найти(<имя типа>, \"литерал\") compared with a number needs the function identified by name; needs curated platform data, a separate step"]

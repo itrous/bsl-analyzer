@@ -347,11 +347,17 @@ fn select(
     path_prefix: Option<&str>,
 ) -> Result<Selection, McpError> {
     let roots = resident.workspace_roots();
+    // Accepted in either spelling, compared in the key spelling; the refusals below echo what the
+    // caller sent, so they can recognise their own input.
+    let sent_root_id = root_id;
+    let spelled_root_id = root_id.map(bsl_search::spell_as_key);
+    let root_id = spelled_root_id.as_deref();
     if let Some(root_id) = root_id {
+        let sent_root_id = sent_root_id.unwrap_or(root_id);
         if !roots.contains_id(root_id) {
             return Err(McpError::invalid_params(
                 format!(
-                    "no source root is registered under '{root_id}'; `search` reports the \
+                    "no source root is registered under '{sent_root_id}'; `search` reports the \
                      roots this workspace knows"
                 ),
                 None,
@@ -369,7 +375,7 @@ fn select(
         if !roots.registration_is_current(root_id) {
             return Err(McpError::invalid_params(
                 format!(
-                    "source root '{root_id}' can no longer be resolved to the directory it was \
+                    "source root '{sent_root_id}' can no longer be resolved to the directory it was \
                      registered with; the resident's view may be stale — reload the workspace"
                 ),
                 None,

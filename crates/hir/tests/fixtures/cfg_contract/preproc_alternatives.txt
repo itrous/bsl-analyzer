@@ -26,7 +26,7 @@ definitions (limit 10000):
   s1: Some([])
   s2: Some([])
   s3: None
-  s4: Some([])
+  s4: Some(["Definition { var_name: \"flag\", def_site: Assignment(0) }", "Definition { var_name: \"flag\", def_site: Assignment(1) }", "Definition { var_name: \"flag\", def_site: Assignment(2) }"])
 source states:
   s0: range=Some(LocalRange(62..81)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })
   s1: range=Some(LocalRange(128..143)); fallthrough=true; value=(true,None); security=Some(SecurityCounters { privilege: PrivilegeCounter { may: Exact(0), must: Exact(0) }, unsafe_frame: PrivilegeCounter { may: Exact(0), must: Exact(0) } })

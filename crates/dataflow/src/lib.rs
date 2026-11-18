@@ -34,50 +34,6 @@ pub(crate) fn map_table_bytes<K, V>(len: usize) -> usize {
     cap.saturating_mul(std::mem::size_of::<K>() + std::mem::size_of::<V>() + 1)
 }
 
-/// The statements the graph can execute: those of a vertex the start reaches over executable
-/// edges ([`CfgEdgeType::is_executable`]). Liveness is the GRAPH's knowledge - a [`Body`]
-/// statement carries no notion of it - so the solver computes this and hands it to
-/// [`Transfer::transfer_exception_edge`], whose addition must never carry a write that no
-/// execution performs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LiveStatements {
-    stmts: FxHashSet<hir_def::StmtId>,
-}
-
-impl LiveStatements {
-    /// Nothing executes. The solver's value for a graph without a `Попытка`, where
-    /// [`Transfer::transfer_exception_edge`] is never called.
-    pub fn none() -> Self {
-        Self::default()
-    }
-
-    pub fn of_graph(cfg: &ControlFlowGraph) -> Self {
-        use cfg::CfgVertex;
-
-        let mut stmts = FxHashSet::default();
-        let mut seen: FxHashSet<NodeIndex> = FxHashSet::default();
-        let mut stack: Vec<NodeIndex> = cfg.start().into_iter().collect();
-        while let Some(node) = stack.pop() {
-            if !seen.insert(node) {
-                continue;
-            }
-            match cfg.vertex(node) {
-                Some(CfgVertex::BasicBlock(block)) => stmts.extend(block.statements().iter()),
-                _ => stmts.extend(cfg.source_stmt_id(node)),
-            }
-            stack.extend(
-                cfg.outgoing_edges(node)
-                    .filter_map(|(target, kind)| kind.is_executable().then_some(target)),
-            );
-        }
-        Self { stmts }
-    }
-
-    pub fn contains(&self, stmt: hir_def::StmtId) -> bool {
-        self.stmts.contains(&stmt)
-    }
-}
-
 /// `Имя = Имя` or `Имя = <literal>`: the only assignments that provably cannot raise.
 /// Deliberately conservative - when in doubt the statement CAN raise. The target must be a
 /// bare variable (an index or property write can fail on the receiver). The value must be a
@@ -138,35 +94,30 @@ pub trait Transfer<L: Lattice> {
 
     fn transfer_loop_var_bind(&self, _loop_var: hir_def::BindingId, _state: &mut L, _body: &Body) {}
 
+    /// Whether states cross the `Exception` edges that only say a protected point
+    /// may fail ([`ControlFlowGraph::is_possible_failure`]). An analysis that does
+    /// not model such failures sees a handler entered from the entry of `Попытка`
+    /// and from `ВызватьИсключение` only.
+    fn follows_possible_failures(&self) -> bool {
+        false
+    }
+
     /// Transfer through the `Попытка` vertex. In a forward analysis the state
     /// computed here flows both into the protected statements and along the
     /// exception edge into the handler; a backward analysis receives the join
     /// of both successors instead and flows the result to the predecessor.
     fn transfer_try_entry(&self, _try_stmt: hir_def::StmtId, _state: &mut L, _body: &Body) {}
 
-    /// Transfer along the `Exception` edge that leaves the `Попытка` vertex of `try_stmt`,
-    /// applied after [`Transfer::transfer_edge`]. The vertex itself precedes every protected
-    /// statement, so its out-state knows nothing of what they do; an exception, however, can
-    /// interrupt the protected statements anywhere, so what any of them MAY have done by then
-    /// belongs on this edge. The hook exists apart from `transfer_edge` because the `Попытка`
-    /// vertex has ONE out-state shared by both its successors: what is added here must reach
-    /// the handler without reaching the protected body.
+    /// Transfer along the `Exception` edge that leaves the `Попытка` vertex, applied after
+    /// [`Transfer::transfer_edge`]. The vertex precedes every protected statement, so its
+    /// out-state knows nothing of what they do. What is added here reaches the handler and
+    /// not the protected body: the vertex has one out-state shared by both successors.
     ///
-    /// Only the edge leaving a `CfgVertex::Try` is offered - not the `Exception` edge of a
-    /// `ВызватьИсключение`, which leaves a basic block. A backward analysis receives the hook
-    /// on the same edge, as it receives `transfer_edge` there.
-    ///
-    /// `live` carries the statements the graph can execute. Raising an exception after a write
-    /// requires reaching that write, so a statement absent from `live` contributes nothing -
-    /// the implementor must honour this, since the `Body` it walks has no notion of dead code.
-    fn transfer_exception_edge(
-        &self,
-        _try_stmt: hir_def::StmtId,
-        _state: &mut L,
-        _body: &Body,
-        _live: &LiveStatements,
-    ) {
-    }
+    /// Only the edge leaving a `CfgVertex::Try` is offered, not the `Exception` edge of
+    /// `ВызватьИсключение`. Analyses that follow possible-failure edges already see each
+    /// protected point; this hook is for an analysis that does not, and still needs what the
+    /// protected prefix has certainly done by the time the handler runs.
+    fn transfer_exception_edge(&self, _try_stmt: hir_def::StmtId, _state: &mut L, _body: &Body) {}
 }
 
 pub struct DataflowSolver<L: Lattice, T: Transfer<L>> {
@@ -183,10 +134,6 @@ pub struct DataflowSolver<L: Lattice, T: Transfer<L>> {
     max_iterations: usize,
 
     direction: Direction,
-
-    /// Built once per [`DataflowSolver::solve`], and only for a graph that has a `Попытка`:
-    /// nothing else consults it.
-    live_stmts: LiveStatements,
 }
 
 impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
@@ -199,7 +146,6 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             block_out: FxHashMap::default(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
             direction: Direction::Forward,
-            live_stmts: LiveStatements::none(),
         }
     }
 
@@ -241,10 +187,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         }
     }
 
-    pub fn solve(mut self) -> Option<DataflowResult<L>> {
-        if self.cfg.vertices().any(|(_, vertex)| matches!(vertex, cfg::CfgVertex::Try)) {
-            self.live_stmts = LiveStatements::of_graph(&self.cfg);
-        }
+    pub fn solve(self) -> Option<DataflowResult<L>> {
         match self.direction {
             Direction::Forward => self.solve_forward(),
             Direction::Backward => self.solve_backward(),
@@ -292,6 +235,9 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             } else {
                 let mut state: Option<L> = None;
                 for (pred_idx, edge_kind) in self.cfg.incoming_edges(block_idx) {
+                    if !self.crosses(pred_idx, *edge_kind) {
+                        continue;
+                    }
                     if let Some(pred_out) = self.block_out.get(&pred_idx) {
                         let edge_state = self.transfer_edge_state(pred_idx, *edge_kind, pred_out);
                         match &mut state {
@@ -403,6 +349,9 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
             } else {
                 let mut state: Option<L> = None;
                 for (succ_idx, edge_kind) in self.cfg.outgoing_edges(block_idx) {
+                    if !self.crosses(block_idx, *edge_kind) {
+                        continue;
+                    }
                     if let Some(succ_in) = self.block_in.get(&succ_idx) {
                         let edge_state = self.transfer_edge_state(block_idx, *edge_kind, succ_in);
                         match &mut state {
@@ -471,20 +420,19 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
         })
     }
 
-    /// The state that crosses one edge of the graph: [`Transfer::transfer_edge`], plus
-    /// [`Transfer::transfer_exception_edge`] on the `Exception` edge of a `Попытка`.
+    fn crosses(&self, from: NodeIndex, kind: CfgEdgeType) -> bool {
+        self.transfer.follows_possible_failures() || !self.cfg.is_possible_failure(from, kind)
+    }
+
+    /// [`Transfer::transfer_edge`], plus [`Transfer::transfer_exception_edge`] on the
+    /// `Exception` edge of a `Попытка`.
     fn transfer_edge_state(&self, source: NodeIndex, edge_kind: CfgEdgeType, state: &L) -> L {
         let mut edge_state = self.transfer.transfer_edge(edge_kind, state);
         if matches!(edge_kind, CfgEdgeType::Exception)
             && matches!(self.cfg.vertex(source), Some(cfg::CfgVertex::Try))
         {
             if let Some(try_stmt) = self.cfg.source_stmt_id(source) {
-                self.transfer.transfer_exception_edge(
-                    try_stmt,
-                    &mut edge_state,
-                    &self.body,
-                    &self.live_stmts,
-                );
+                self.transfer.transfer_exception_edge(try_stmt, &mut edge_state, &self.body);
             }
         }
         edge_state
@@ -530,21 +478,22 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                 state
             }
 
+            CfgVertex::LoopEntry(entry) => {
+                let mut state = in_state.clone();
+                for &root in entry.roots() {
+                    self.transfer.transfer_expr_in_place(root, &mut state, &self.body);
+                }
+                state
+            }
+
             CfgVertex::ForHeader(for_vertex) => {
                 let mut state = in_state.clone();
-                self.transfer.transfer_expr_in_place(for_vertex.from, &mut state, &self.body);
-                self.transfer.transfer_expr_in_place(for_vertex.to, &mut state, &self.body);
                 self.transfer.transfer_loop_var_bind(for_vertex.loop_var, &mut state, &self.body);
                 state
             }
 
             CfgVertex::ForEachHeader(foreach_vertex) => {
                 let mut state = in_state.clone();
-                self.transfer.transfer_expr_in_place(
-                    foreach_vertex.collection,
-                    &mut state,
-                    &self.body,
-                );
                 self.transfer.transfer_loop_var_bind(
                     foreach_vertex.loop_var,
                     &mut state,
@@ -718,6 +667,66 @@ mod tests {
                 _ => state.clone(),
             }
         }
+    }
+
+    /// Adds the number of every statement it passes.
+    struct RecordingTransfer {
+        follows_possible_failures: bool,
+    }
+
+    impl Transfer<IntSetLattice> for RecordingTransfer {
+        fn transfer_stmt(&self, stmt: RawIdx, state: &IntSetLattice, _: &Body) -> IntSetLattice {
+            let mut values = state.values.clone();
+            values.push(u32::from(stmt) as i32);
+            IntSetLattice { values }
+        }
+
+        fn follows_possible_failures(&self) -> bool {
+            self.follows_possible_failures
+        }
+    }
+
+    /// `[s0]` → `Попытка` → `[s1]` → exit, with the protected `[s1]` and the entry of
+    /// `Попытка` both leaving for the handler: only an analysis following possible
+    /// failures sees in the handler what `[s1]` did.
+    #[test]
+    fn possible_failure_edges_are_crossed_only_on_request() {
+        use cfg::{BasicBlockVertex, CfgVertex, ControlFlowGraph};
+        use hir_def::StmtId;
+
+        let block = |stmt: u32| {
+            let mut block = BasicBlockVertex::new();
+            block.add_statement(StmtId::from_raw(RawIdx::from(stmt)));
+            CfgVertex::BasicBlock(block)
+        };
+        let mut cfg = ControlFlowGraph::new();
+        let start = cfg.add_vertex(block(0));
+        let try_vertex = cfg.add_vertex(CfgVertex::Try);
+        let point = cfg.add_vertex(block(1));
+        let handler = cfg.add_vertex(CfgVertex::BasicBlock(BasicBlockVertex::new()));
+        let exit = cfg.exit();
+        cfg.set_start(start);
+        cfg.add_edge(start, try_vertex, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, point, CfgEdgeType::Unconditional);
+        cfg.add_edge(try_vertex, handler, CfgEdgeType::Exception);
+        cfg.add_edge(point, exit, CfgEdgeType::Unconditional);
+        cfg.add_edge(point, handler, CfgEdgeType::Exception);
+        cfg.add_edge(handler, exit, CfgEdgeType::Unconditional);
+        assert!(cfg.is_possible_failure(point, CfgEdgeType::Exception));
+        assert!(!cfg.is_possible_failure(try_vertex, CfgEdgeType::Exception));
+        let cfg = Arc::new(cfg);
+
+        let handler_in = |follows_possible_failures| {
+            let transfer = RecordingTransfer { follows_possible_failures };
+            let mut solver = DataflowSolver::new(cfg.clone(), Body::default(), transfer);
+            solver.set_bottom_factory(|| IntSetLattice { values: vec![] });
+            solver.set_initial_state(IntSetLattice { values: vec![] });
+            let mut values = solver.solve().unwrap().block_in(handler).unwrap().values.clone();
+            values.sort_unstable();
+            values
+        };
+        assert_eq!(handler_in(false), vec![0]);
+        assert_eq!(handler_in(true), vec![0, 1]);
     }
 
     #[test]

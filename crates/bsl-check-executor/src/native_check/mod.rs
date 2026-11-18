@@ -103,5 +103,12 @@ pub(super) fn echoed_result(request: &CheckRequest, status: CheckStatus) -> Chec
     result
 }
 
+/// Whether reading a `/proc/<pid>` entry failed because the process is gone: its directory
+/// disappears once the process is reaped, and a file opened just before that reads `ESRCH`.
+#[cfg(target_os = "linux")]
+fn process_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 #[cfg(test)]
 mod tests;

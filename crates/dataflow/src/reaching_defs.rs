@@ -1,32 +1,24 @@
 use cfg_types::IdConversion;
 use fixedbitset::FixedBitSet;
 use hir_def::{
-    body::Body,
-    hir::{Expr, Stmt},
-    BindingId, Name,
+    body::{
+        events::{hir_suppressed, BodyEvents, EvalPoint},
+        Body,
+    },
+    hir::{Expr, Stmt, StmtIdx},
+    BindingId, ExprId, Name, StmtId,
 };
 use la_arena::RawIdx;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 use std::sync::Arc;
 use stdx::case::CaseExt;
 
-use crate::{Lattice, Transfer};
+use crate::{DataflowResult, DataflowSolver, Lattice, Transfer, DEFAULT_MAX_ITERATIONS};
 
-/// A writer of a local that the body does not spell out as an assignment: the analysis cannot
-/// read the value, only the fact that one may have been written here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ForeignWrite {
-    /// An argument the callee is PROVEN to take by reference.
-    ByRefArgument,
-    /// An argument whose passing direction is not attested: the callee may take it either way.
-    /// Kept apart from [`ForeignWrite::ByRefArgument`] because a reader is allowed to look past
-    /// an unattested direction and not past a proven one.
-    UnattestedArgument,
-    /// `Выполнить`, which may write any name of the body.
-    Execute,
-}
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DefSite {
@@ -40,15 +32,34 @@ pub enum DefSite {
 
     ForEachLoop(BindingId),
 
-    /// A write the body does not spell out, attributed to the statement that may perform it.
-    /// `site` is the enclosing statement for a write inside a header expression too: identity
-    /// of the place is all a consumer needs, and a header expression is not a statement.
-    ForeignWrite {
-        site: RawIdx,
-        kind: ForeignWrite,
-    },
-
+    /// No value the body gave: whatever the name held on entry.
     Unknown,
+
+    /// An event that may have rebound the name, or may have left it as it was.
+    MayWrite(WriteId),
+}
+
+/// The identity of one possible write: its row in the table of
+/// [`DefinitionIndex::write`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WriteId(u32);
+
+/// An event at `point` that may rebind `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteEvent {
+    pub point: EvalPoint,
+    /// The name the event may rebind, folded to lower case.
+    pub target: SmolStr,
+    pub kind: WriteEventKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteEventKind {
+    /// The name is passed bare to `call` as its argument `arg` at `position`.
+    /// Whether the callee writes the argument back is not known here.
+    Argument { call: ExprId, arg: ExprId, position: u32 },
+    /// `Выполнить` runs code that may assign any name of the body.
+    Execute,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -87,167 +98,6 @@ impl Definition {
     pub fn unknown(var_name: SmolStr) -> Self {
         Self::new(var_name, DefSite::Unknown)
     }
-
-    pub fn foreign_write(var_name: SmolStr, site: RawIdx, kind: ForeignWrite) -> Self {
-        Self::new(var_name, DefSite::ForeignWrite { site, kind })
-    }
-}
-
-/// One write a [`ForeignWriteEvents`] collector attributes to one place of the body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForeignWriteEvent {
-    /// The enclosing statement, which becomes `DefSite::ForeignWrite::site`.
-    pub site: hir_def::StmtId,
-    pub var_name: SmolStr,
-    pub kind: ForeignWrite,
-}
-
-/// Writes of the body that reaching definitions cannot read, described by a collector outside
-/// this crate: the engine knows nothing about calls, callees or passing directions.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ForeignWriteEvents {
-    /// Writes performed while a statement runs.
-    pub stmt: FxHashMap<hir_def::StmtId, Vec<ForeignWriteEvent>>,
-    /// Writes performed while a header expression is evaluated - an `Если` or `Пока` condition,
-    /// a `Для` bound, a `Для Каждого` collection. Such an expression belongs to no basic block,
-    /// so its writes cannot hang off a statement.
-    pub header: FxHashMap<hir_def::ExprId, Vec<ForeignWriteEvent>>,
-    /// Statements that may write EVERY name. The engine expands these over its own definition
-    /// index: only the engine knows which names the body has.
-    pub every_name: Vec<hir_def::StmtId>,
-}
-
-impl ForeignWriteEvents {
-    pub fn is_empty(&self) -> bool {
-        self.stmt.is_empty() && self.header.is_empty() && self.every_name.is_empty()
-    }
-
-    pub fn push_stmt(&mut self, site: hir_def::StmtId, var_name: SmolStr, kind: ForeignWrite) {
-        self.stmt.entry(site).or_default().push(ForeignWriteEvent { site, var_name, kind });
-    }
-
-    pub fn push_header(
-        &mut self,
-        header: hir_def::ExprId,
-        site: hir_def::StmtId,
-        var_name: SmolStr,
-        kind: ForeignWrite,
-    ) {
-        self.header.entry(header).or_default().push(ForeignWriteEvent { site, var_name, kind });
-    }
-
-    pub fn push_every_name(&mut self, site: hir_def::StmtId) {
-        self.every_name.push(site);
-    }
-}
-
-/// The foreign definitions of one body, ready to be generated: the events as the collector
-/// described them, plus the name universe the engine expanded `every_name` over.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ForeignWriteGen {
-    writes: Arc<ForeignWriteEvents>,
-    names: Arc<Vec<SmolStr>>,
-}
-
-impl ForeignWriteGen {
-    fn new(writes: Arc<ForeignWriteEvents>, index: &DefinitionIndex) -> Self {
-        let names: Vec<SmolStr> =
-            if writes.every_name.is_empty() { Vec::new() } else { index.var_names().collect() };
-        Self { writes, names: Arc::new(names) }
-    }
-
-    /// Every foreign definition this body can hold, to be added to the definition index: a
-    /// definition absent from the index cannot be set in any state.
-    fn definitions(&self) -> Vec<Definition> {
-        let from_event = |event: &ForeignWriteEvent| {
-            Definition::foreign_write(event.var_name.clone(), event.site.into_raw(), event.kind)
-        };
-        let mut defs: Vec<Definition> = self
-            .writes
-            .stmt
-            .values()
-            .chain(self.writes.header.values())
-            .flatten()
-            .map(from_event)
-            .collect();
-        for &site in &self.writes.every_name {
-            defs.extend(self.names.iter().map(|name| {
-                Definition::foreign_write(name.clone(), site.into_raw(), ForeignWrite::Execute)
-            }));
-        }
-        defs
-    }
-
-    /// Adds, without killing, the definitions a statement writes foreign. The earlier
-    /// definition still reaches the use: a by-reference argument or `Выполнить` MAY write, so a
-    /// consumer that sees a foreign definition beside an ordinary one knows only that the value
-    /// is not proven.
-    fn apply_stmt(&self, stmt_id: hir_def::StmtId, state: &mut ReachingDefs) {
-        if let Some(events) = self.writes.stmt.get(&stmt_id) {
-            for event in events {
-                state.insert(&Definition::foreign_write(
-                    event.var_name.clone(),
-                    event.site.into_raw(),
-                    event.kind,
-                ));
-            }
-        }
-        if self.writes.every_name.contains(&stmt_id) {
-            for name in self.names.iter() {
-                state.insert(&Definition::foreign_write(
-                    name.clone(),
-                    stmt_id.into_raw(),
-                    ForeignWrite::Execute,
-                ));
-            }
-        }
-    }
-
-    /// Approximate live heap bytes of the shared events and name universe, as
-    /// [`ReachingDefsResult::estimated_heap`] counts its own tables. Both are behind an `Arc`
-    /// shared with the transfer, which is dropped with the solve, so this result owns them.
-    fn estimated_heap(&self) -> usize {
-        let event_bytes =
-            |events: &Vec<ForeignWriteEvent>| crate::vec_bytes::<ForeignWriteEvent>(events.len());
-        let mut bytes = crate::map_table_bytes::<hir_def::StmtId, Vec<ForeignWriteEvent>>(
-            self.writes.stmt.len(),
-        ) + crate::map_table_bytes::<hir_def::ExprId, Vec<ForeignWriteEvent>>(
-            self.writes.header.len(),
-        ) + crate::vec_bytes::<hir_def::StmtId>(self.writes.every_name.len())
-            + crate::vec_bytes::<SmolStr>(self.names.len());
-        bytes += self.writes.stmt.values().map(event_bytes).sum::<usize>();
-        bytes += self.writes.header.values().map(event_bytes).sum::<usize>();
-        bytes
-    }
-
-    /// Adds, without killing, the foreign writes of one protected statement that the handler of
-    /// its `Попытка` may see. The statement's own writes follow the tail rule of
-    /// [`walk_interruptible`]; the writes of its header do not, because the header is evaluated
-    /// before the statement's own body, which can raise or run the header again.
-    fn apply_interrupted(&self, stmt_id: hir_def::StmtId, in_tail: bool, state: &mut ReachingDefs) {
-        if !in_tail {
-            self.apply_stmt(stmt_id, state);
-        }
-        for event in self.writes.header.values().flatten().filter(|event| event.site == stmt_id) {
-            state.insert(&Definition::foreign_write(
-                event.var_name.clone(),
-                event.site.into_raw(),
-                event.kind,
-            ));
-        }
-    }
-
-    fn apply_header(&self, header: hir_def::ExprId, state: &mut ReachingDefs) {
-        if let Some(events) = self.writes.header.get(&header) {
-            for event in events {
-                state.insert(&Definition::foreign_write(
-                    event.var_name.clone(),
-                    event.site.into_raw(),
-                    event.kind,
-                ));
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,55 +107,146 @@ pub struct DefinitionIndex {
     var_to_defs: FxHashMap<SmolStr, SmallVec<[u32; 4]>>,
 
     def_to_idx: FxHashMap<Definition, u32>,
+
+    writes: Vec<WriteEvent>,
+
+    /// The possible writes of each point, as definition indices.
+    point_writes: FxHashMap<EvalPoint, SmallVec<[u32; 4]>>,
+
+    /// The `Для` or `Для Каждого` definition of each loop variable.
+    loop_defs: FxHashMap<BindingId, u32>,
+}
+
+#[derive(Default)]
+struct IndexBuilder {
+    definitions: Vec<Definition>,
+    var_to_defs: FxHashMap<SmolStr, SmallVec<[u32; 4]>>,
+    def_to_idx: FxHashMap<Definition, u32>,
+    writes: Vec<WriteEvent>,
+    point_writes: FxHashMap<EvalPoint, SmallVec<[u32; 4]>>,
+    loop_defs: FxHashMap<BindingId, u32>,
+}
+
+impl IndexBuilder {
+    fn add(&mut self, def: Definition) -> u32 {
+        if let Some(&idx) = self.def_to_idx.get(&def) {
+            return idx;
+        }
+        let idx = self.definitions.len() as u32;
+        self.var_to_defs.entry(def.var_name.clone()).or_default().push(idx);
+        self.def_to_idx.insert(def.clone(), idx);
+        self.definitions.push(def);
+        idx
+    }
+
+    fn add_write(&mut self, point: EvalPoint, target: &str, kind: WriteEventKind) {
+        let id = WriteId(self.writes.len() as u32);
+        let def = Definition::new(SmolStr::new(target), DefSite::MayWrite(id));
+        self.writes.push(WriteEvent { point, target: def.var_name.clone(), kind });
+        let idx = self.add(def);
+        self.point_writes.entry(point).or_default().push(idx);
+    }
+
+    fn finish(self) -> Arc<DefinitionIndex> {
+        Arc::new(DefinitionIndex {
+            definitions: self.definitions,
+            var_to_defs: self.var_to_defs,
+            def_to_idx: self.def_to_idx,
+            writes: self.writes,
+            point_writes: self.point_writes,
+            loop_defs: self.loop_defs,
+        })
+    }
 }
 
 impl DefinitionIndex {
-    pub fn from_body(body: &Body) -> Arc<Self> {
-        let mut definitions = Vec::new();
-        let mut var_to_defs: FxHashMap<SmolStr, SmallVec<[u32; 4]>> = FxHashMap::default();
-        let mut def_to_idx: FxHashMap<Definition, u32> = FxHashMap::default();
-
-        let mut add_def = |def: Definition| {
-            if def_to_idx.contains_key(&def) {
-                return;
-            }
-            let idx = definitions.len() as u32;
-            var_to_defs.entry(def.var_name.clone()).or_default().push(idx);
-            def_to_idx.insert(def.clone(), idx);
-            definitions.push(def);
-        };
-
-        collect_stmt_defs(body.body_stmts_typed(), body, &mut add_def);
-
-        Arc::new(Self { definitions, var_to_defs, def_to_idx })
+    pub fn from_body(body: &Body, events: &BodyEvents) -> Arc<Self> {
+        Self::from_body_with_params(body, events, [])
     }
 
+    /// Every definition the body can make, from its syntactic events: the
+    /// parameters given, declarations, writes and loop variables of every
+    /// statement, an entry `Unknown` for every name of the body, and a
+    /// possible write for every bare-name argument and for every name at each
+    /// `Выполнить`, names mentioned only after it included.
     pub fn from_body_with_params(
         body: &Body,
+        events: &BodyEvents,
         params: impl IntoIterator<Item = (Name, BindingId)>,
     ) -> Arc<Self> {
-        let mut definitions = Vec::new();
-        let mut var_to_defs: FxHashMap<SmolStr, SmallVec<[u32; 4]>> = FxHashMap::default();
-        let mut def_to_idx: FxHashMap<Definition, u32> = FxHashMap::default();
-
-        let mut add_def = |def: Definition| {
-            if def_to_idx.contains_key(&def) {
-                return;
-            }
-            let idx = definitions.len() as u32;
-            var_to_defs.entry(def.var_name.clone()).or_default().push(idx);
-            def_to_idx.insert(def.clone(), idx);
-            definitions.push(def);
-        };
-
+        let mut index = IndexBuilder::default();
         for (name, binding_id) in params {
-            let def = Definition::parameter(&name, binding_id);
-            add_def(def);
+            index.add(Definition::parameter(&name, binding_id));
         }
 
-        collect_stmt_defs(body.body_stmts_typed(), body, &mut add_def);
+        for stmt in events.stmts() {
+            if let Some(var_name) =
+                stmt.write.and_then(|write| extract_var_name_from_expr(write.target, body))
+            {
+                index.add(Definition::assignment(var_name, stmt.stmt.into_raw()));
+            }
+            match body.stmt(stmt.stmt) {
+                Stmt::VarDecl { bindings } => {
+                    for &binding_id in bindings.iter() {
+                        let binding = body.binding_idx(binding_id);
+                        index.add(Definition::var_decl(
+                            &binding.name,
+                            BindingId::from_idx(binding_id),
+                        ));
+                    }
+                }
+                Stmt::For { var, .. } => {
+                    let var = BindingId::from_idx(*var);
+                    let idx = index.add(Definition::for_loop(&body.binding(var).name, var));
+                    index.loop_defs.insert(var, idx);
+                }
+                Stmt::ForEach { var, .. } => {
+                    let var = BindingId::from_idx(*var);
+                    let idx = index.add(Definition::for_each_loop(&body.binding(var).name, var));
+                    index.loop_defs.insert(var, idx);
+                }
+                _ => {}
+            }
+        }
 
-        Arc::new(Self { definitions, var_to_defs, def_to_idx })
+        for name in events.names() {
+            index.add(Definition::unknown(SmolStr::new(name)));
+        }
+
+        for stmt in events.stmts() {
+            for root in stmt.roots.iter() {
+                for call in root.calls.iter() {
+                    for arg in call.path_args.iter() {
+                        let Expr::Path(name) = body.expr(arg.expr) else { continue };
+                        index.add_write(
+                            root.point,
+                            &name.as_str().fold_lower(),
+                            WriteEventKind::Argument {
+                                call: call.call,
+                                arg: arg.expr,
+                                position: arg.position,
+                            },
+                        );
+                    }
+                }
+            }
+            if stmt.execute {
+                for name in events.names() {
+                    index.add_write(EvalPoint::Stmt(stmt.stmt), name, WriteEventKind::Execute);
+                }
+            }
+        }
+
+        index.finish()
+    }
+
+    /// The possible-write event `id` stands for.
+    pub fn write(&self, id: WriteId) -> &WriteEvent {
+        &self.writes[id.0 as usize]
+    }
+
+    fn point_writes(&self, point: EvalPoint) -> &[u32] {
+        self.point_writes.get(&point).map_or(&[], |writes| writes.as_slice())
     }
 
     #[inline]
@@ -332,192 +273,6 @@ impl DefinitionIndex {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.definitions.is_empty()
-    }
-
-    /// Every name the index holds a definition for, `fold_lower`ed as [`Definition::new`] folds
-    /// them. The name universe a `Выполнить` write expands over.
-    fn var_names(&self) -> impl Iterator<Item = SmolStr> + '_ {
-        self.var_to_defs.keys().cloned()
-    }
-
-    /// This index with `extra` appended. The definitions already present keep their positions,
-    /// so a state built against either index means the same bits.
-    fn extended(&self, extra: impl IntoIterator<Item = Definition>) -> Arc<Self> {
-        let mut definitions = self.definitions.clone();
-        let mut var_to_defs = self.var_to_defs.clone();
-        let mut def_to_idx = self.def_to_idx.clone();
-        for def in extra {
-            if def_to_idx.contains_key(&def) {
-                continue;
-            }
-            let idx = definitions.len() as u32;
-            var_to_defs.entry(def.var_name.clone()).or_default().push(idx);
-            def_to_idx.insert(def.clone(), idx);
-            definitions.push(def);
-        }
-        Arc::new(Self { definitions, var_to_defs, def_to_idx })
-    }
-}
-
-/// Every definition the statements of one region generate, nested statements included: the
-/// gen set of a whole subtree of the body, which both the definition index and the
-/// `Exception` edge of a `Попытка` need.
-fn collect_stmt_defs<F: FnMut(Definition)>(
-    stmts: &[hir_def::hir::StmtIdx],
-    body: &Body,
-    add_def: &mut F,
-) {
-    for &stmt_id in stmts {
-        let opaque_id = hir_def::StmtId::from_idx(stmt_id);
-        match body.stmt(opaque_id) {
-            Stmt::Assign { target, .. } => {
-                if let Some(var_name) =
-                    extract_var_name_from_expr(hir_def::ExprId::from_idx(*target), body)
-                {
-                    let def = Definition::assignment(var_name, stmt_id.into_raw());
-                    add_def(def);
-                }
-            }
-            Stmt::VarDecl { bindings } => {
-                for &binding_id in bindings.iter() {
-                    let binding = body.binding_idx(binding_id);
-                    let def = Definition::var_decl(&binding.name, BindingId::from_idx(binding_id));
-                    add_def(def);
-                }
-            }
-            Stmt::For { var, body: loop_body, .. } => {
-                let binding = body.binding_idx(*var);
-                let def = Definition::for_loop(&binding.name, BindingId::from_idx(*var));
-                add_def(def);
-                collect_stmt_defs(loop_body, body, add_def);
-            }
-            Stmt::ForEach { var, body: loop_body, .. } => {
-                let binding = body.binding_idx(*var);
-                let def = Definition::for_each_loop(&binding.name, BindingId::from_idx(*var));
-                add_def(def);
-                collect_stmt_defs(loop_body, body, add_def);
-            }
-            Stmt::If(if_stmt) => {
-                collect_stmt_defs(&if_stmt.then_branch, body, add_def);
-                for (_cond, stmts) in if_stmt.elsif_branches.iter() {
-                    collect_stmt_defs(stmts, body, add_def);
-                }
-                if let Some(ref else_stmts) = if_stmt.else_branch {
-                    collect_stmt_defs(else_stmts, body, add_def);
-                }
-            }
-            Stmt::While { body: loop_body, .. } => {
-                collect_stmt_defs(loop_body, body, add_def);
-            }
-            Stmt::Try { body: try_body, except, .. } => {
-                collect_stmt_defs(try_body, body, add_def);
-                collect_stmt_defs(except, body, add_def);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// The definitions the protected statements of a `Попытка` may have produced when its handler
-/// starts: the union, over those statements, of what holds immediately BEFORE each of them.
-/// [`walk_interruptible`] decides which statements contribute and which are in tail position.
-fn collect_interruptible_defs<F: FnMut(Definition)>(
-    stmts: &[hir_def::hir::StmtIdx],
-    body: &Body,
-    live: &crate::LiveStatements,
-    add_def: &mut F,
-) {
-    walk_interruptible(stmts, body, live, true, &mut |stmt_id, in_tail| {
-        match body.stmt_idx(stmt_id) {
-            Stmt::Assign { target, .. } if !in_tail => {
-                if let Some(var_name) =
-                    extract_var_name_from_expr(hir_def::ExprId::from_idx(*target), body)
-                {
-                    add_def(Definition::assignment(var_name, stmt_id.into_raw()));
-                }
-            }
-            Stmt::VarDecl { bindings } if !in_tail => {
-                for &binding_id in bindings.iter() {
-                    let binding = body.binding_idx(binding_id);
-                    add_def(Definition::var_decl(&binding.name, BindingId::from_idx(binding_id)));
-                }
-            }
-            // The loop variable is written before the body and the next condition run, both of
-            // which can raise, so it contributes even in tail position.
-            Stmt::For { var, .. } => {
-                let binding = body.binding_idx(*var);
-                add_def(Definition::for_loop(&binding.name, BindingId::from_idx(*var)));
-            }
-            Stmt::ForEach { var, .. } => {
-                let binding = body.binding_idx(*var);
-                add_def(Definition::for_each_loop(&binding.name, BindingId::from_idx(*var)));
-            }
-            _ => {}
-        }
-    });
-}
-
-/// Visits every live protected statement of a `Попытка`, nested ones included, with whether it
-/// stands in TAIL position: once it completes, nothing that can raise runs before the region
-/// ends.
-///
-/// The handler is entered only if something inside the region raised, so what it sees is the
-/// state at a point where an exception can STILL be raised. A statement therefore contributes
-/// its own writes only when something that can raise runs after it while the region is still
-/// open; a statement in tail position contributes nothing, because once it completes the region
-/// ends normally and the handler is not entered at all. The statements after it may still run,
-/// but when each of them is an assignment that cannot raise
-/// ([`crate::is_non_raising_assignment`]) none of them can send control to the handler either.
-///
-/// `tail` says that the region ends, with nothing left that could raise, once `stmts` completes.
-/// It carries into the places where that remains true - a trailing `Если` branch, the body and
-/// the handler of a trailing nested `Попытка`, whose own handler ends the inner region and
-/// returns control to the outer one - and is dropped where it does not: after the last statement
-/// of a LOOP body the loop's own condition is evaluated, which can raise, and the loop may run
-/// again.
-///
-/// `live` drops a statement no execution reaches. The tail rule does not subsume it: a dead
-/// statement standing LAST in the protected body of a nested `Попытка` that is itself followed
-/// by more region statements that can raise is not in tail position, and only liveness keeps its
-/// write out of the outer handler.
-fn walk_interruptible(
-    stmts: &[hir_def::hir::StmtIdx],
-    body: &Body,
-    live: &crate::LiveStatements,
-    tail: bool,
-    visit: &mut impl FnMut(hir_def::hir::StmtIdx, bool),
-) {
-    let tail_from = stmts
-        .iter()
-        .rposition(|&stmt_id| !crate::is_non_raising_assignment(body, stmt_id))
-        .unwrap_or(0);
-    for (position, &stmt_id) in stmts.iter().enumerate() {
-        if !live.contains(hir_def::StmtId::from_idx(stmt_id)) {
-            continue;
-        }
-        let in_tail = tail && position >= tail_from;
-        visit(stmt_id, in_tail);
-        match body.stmt_idx(stmt_id) {
-            Stmt::For { body: loop_body, .. }
-            | Stmt::ForEach { body: loop_body, .. }
-            | Stmt::While { body: loop_body, .. } => {
-                walk_interruptible(loop_body, body, live, false, visit);
-            }
-            Stmt::If(if_stmt) => {
-                walk_interruptible(&if_stmt.then_branch, body, live, in_tail, visit);
-                for (_cond, branch) in if_stmt.elsif_branches.iter() {
-                    walk_interruptible(branch, body, live, in_tail, visit);
-                }
-                if let Some(ref else_stmts) = if_stmt.else_branch {
-                    walk_interruptible(else_stmts, body, live, in_tail, visit);
-                }
-            }
-            Stmt::Try { body: try_body, except, .. } => {
-                walk_interruptible(try_body, body, live, in_tail, visit);
-                walk_interruptible(except, body, live, in_tail, visit);
-            }
-            _ => {}
-        }
     }
 }
 
@@ -676,102 +431,138 @@ impl ReachingDefsTransfer {
 }
 
 /// Reaching definitions over one body. Parameters seed the entry state only
-/// for methods; module-level code has none.
+/// for methods; module-level code has none. `events` are the body's own
+/// syntactic events, kept with the result for its readers.
 pub fn solve_reaching_definitions(
     cfg: Arc<cfg::ControlFlowGraph>,
     body_arc: &Arc<Body>,
-    seed_params: bool,
-) -> Option<Arc<ReachingDefsResult>> {
-    solve_with(ReachingDefsTransfer, cfg, body_arc, seed_params)
-}
-
-/// [`solve_reaching_definitions`] where nothing crosses an unexecutable edge: a write followed by
-/// `Возврат`, `Прервать` or `ВызватьИсключение` does not reach the text after the jump, and a
-/// write in dead code reaches nothing.
-pub fn solve_executable_reaching_definitions(
-    cfg: Arc<cfg::ControlFlowGraph>,
-    body_arc: &Arc<Body>,
-    seed_params: bool,
-) -> Option<Arc<ReachingDefsResult>> {
-    solve_with(ExecutableReachingDefsTransfer, cfg, body_arc, seed_params)
-}
-
-/// [`solve_executable_reaching_definitions`] told about the writes it cannot read: a call that
-/// may write the local it is given, `Выполнить`. Such a write GENERATES its definition beside
-/// whatever reached the place already, and kills nothing, so a consumer reading the definitions
-/// of a use sees both the value it could follow and the fact that something else may have
-/// written since.
-///
-/// Empty events give the plain executable solve, down to the bits.
-pub fn solve_executable_reaching_definitions_with_writes(
-    cfg: Arc<cfg::ControlFlowGraph>,
-    body_arc: &Arc<Body>,
-    seed_params: bool,
-    writes: Arc<ForeignWriteEvents>,
-) -> Option<Arc<ReachingDefsResult>> {
-    if writes.is_empty() {
-        return solve_executable_reaching_definitions(cfg, body_arc, seed_params);
-    }
-    let body: &Body = body_arc;
-    let base = definition_index_of(body, seed_params);
-    let foreign = ForeignWriteGen::new(writes, &base);
-    let def_index = base.extended(foreign.definitions());
-    solve_prepared(
-        WritesAwareTransfer { foreign: foreign.clone() },
-        def_index,
-        Some(foreign),
-        cfg,
-        body_arc,
-        seed_params,
-    )
-}
-
-fn definition_index_of(body: &Body, seed_params: bool) -> Arc<DefinitionIndex> {
-    let params: Vec<_> = if seed_params {
-        body.params().map(|param_id| (body.binding(param_id).name.clone(), param_id)).collect()
-    } else {
-        Vec::new()
-    };
-    DefinitionIndex::from_body_with_params(body, params)
-}
-
-fn solve_with<T: Transfer<ReachingDefs>>(
-    transfer: T,
-    cfg: Arc<cfg::ControlFlowGraph>,
-    body_arc: &Arc<Body>,
-    seed_params: bool,
-) -> Option<Arc<ReachingDefsResult>> {
-    let def_index = definition_index_of(body_arc, seed_params);
-    solve_prepared(transfer, def_index, None, cfg, body_arc, seed_params)
-}
-
-fn solve_prepared<T: Transfer<ReachingDefs>>(
-    transfer: T,
-    def_index: Arc<DefinitionIndex>,
-    foreign: Option<ForeignWriteGen>,
-    cfg: Arc<cfg::ControlFlowGraph>,
-    body_arc: &Arc<Body>,
+    events: Arc<BodyEvents>,
     seed_params: bool,
 ) -> Option<Arc<ReachingDefsResult>> {
     let body: &Body = body_arc;
+    let params = params_of(body, seed_params);
+    let def_index = DefinitionIndex::from_body_with_params(body, &events, params.iter().cloned());
 
     let mut initial_defs = ReachingDefs::new(def_index.clone());
-    if seed_params {
-        for param_id in body.params() {
-            let binding = body.binding(param_id);
-            initial_defs.insert(&Definition::parameter(&binding.name, param_id));
-        }
+    for (name, binding_id) in &params {
+        initial_defs.insert(&Definition::parameter(name, *binding_id));
     }
 
-    let mut solver = crate::DataflowSolver::new(cfg, body.clone(), transfer);
-    solver.set_max_iterations(crate::DEFAULT_MAX_ITERATIONS);
+    let mut solver = DataflowSolver::new(cfg, body.clone(), ReachingDefsTransfer);
+    solver.set_max_iterations(DEFAULT_MAX_ITERATIONS);
     solver.set_bottom_factory(|| ReachingDefs::new(def_index.clone()));
     solver.set_initial_state(initial_defs);
 
     solver.solve().map(|dataflow_result| {
-        let mut result = ReachingDefsResult::new(dataflow_result, Arc::clone(body_arc));
-        result.foreign = foreign;
-        Arc::new(result)
+        Arc::new(ReachingDefsResult::new(dataflow_result, Arc::clone(body_arc), events))
+    })
+}
+
+/// Reaching definitions along executable paths only, with the body's possible
+/// writes: a bare-name argument of a call and every name at `Выполнить` add a
+/// [`DefSite::MayWrite`] beside the definitions already reaching, and an
+/// ordinary write replaces them all. A point no executable path reaches —
+/// text after `Возврат`, `Прервать` or `ВызватьИсключение`, a block entered
+/// only from there — makes no definition, and the result holds no state for
+/// it. On entry a parameter holds its `Parameter` definition and every other
+/// name of the body `Unknown`.
+///
+/// `None` when the solver stopped before converging, and for a body whose
+/// lowering may have dropped statements or a jump target ([`hir_suppressed`])
+/// unless `recovered` asks to solve it anyway.
+pub fn solve_executable_reaching_definitions(
+    cfg: Arc<cfg::ControlFlowGraph>,
+    body_arc: &Arc<Body>,
+    events: Arc<BodyEvents>,
+    seed_params: bool,
+    recovered: RecoveredBody,
+) -> Option<Arc<ReachingDefsResult>> {
+    let body: &Body = body_arc;
+    if recovered == RecoveredBody::Refuse && hir_suppressed(body) {
+        return None;
+    }
+    let params = params_of(body, seed_params);
+    let def_index = DefinitionIndex::from_body_with_params(body, &events, params.iter().cloned());
+    let entry = entry_definitions(&def_index, &events, &params);
+    let budget = visit_budget(&cfg);
+    let solved =
+        solve_executable(ExecutableReachingDefsTransfer::new(body), cfg, body, entry, budget)?;
+    publish_executable(&solved, body_arc, events)
+}
+
+/// Block visits a body's solution may take before it is given up as not converging.
+///
+/// Every state only grows, so the visits a body needs grow with its blocks: a long method
+/// with many nested loops needs tens of thousands of them and does converge, while one bound
+/// for every body would cut it off and leave it without any proof. The bound keeps a guard
+/// against a transfer that never settles.
+fn visit_budget(cfg: &cfg::ControlFlowGraph) -> usize {
+    const VISITS_PER_BLOCK: usize = 64;
+    DEFAULT_MAX_ITERATIONS.max(cfg.vertex_count().saturating_mul(VISITS_PER_BLOCK))
+}
+
+/// What [`solve_executable_reaching_definitions`] does with a body whose
+/// lowering may have dropped statements or a jump target ([`hir_suppressed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveredBody {
+    /// No result: a write the lowering lost may reach any read, so what the
+    /// kept statements give is no proof of a value.
+    Refuse,
+    /// Solve the statements the lowering kept, for a reader that accepts an
+    /// answer blind to what a syntax error swallowed.
+    Solve,
+}
+
+fn params_of(body: &Body, seed_params: bool) -> Vec<(Name, BindingId)> {
+    if !seed_params {
+        return Vec::new();
+    }
+    body.params().map(|param_id| (body.binding(param_id).name.clone(), param_id)).collect()
+}
+
+/// A parameter holds its own definition on entry; any other name of the body
+/// holds nothing the body gave it.
+fn entry_definitions(
+    def_index: &Arc<DefinitionIndex>,
+    events: &BodyEvents,
+    params: &[(Name, BindingId)],
+) -> ReachingDefs {
+    let mut entry = ReachingDefs::new(def_index.clone());
+    let mut param_names = FxHashSet::default();
+    for (name, binding_id) in params {
+        entry.insert(&Definition::parameter(name, *binding_id));
+        param_names.insert(name.as_str().fold_lower());
+    }
+    for name in events.names() {
+        if !param_names.contains(name) {
+            entry.insert(&Definition::unknown(SmolStr::new(name)));
+        }
+    }
+    entry
+}
+
+fn solve_executable<T: Transfer<ExecutableDefs>>(
+    transfer: T,
+    cfg: Arc<cfg::ControlFlowGraph>,
+    body: &Body,
+    entry: ReachingDefs,
+    max_iterations: usize,
+) -> Option<DataflowResult<ExecutableDefs>> {
+    let mut solver = DataflowSolver::new(cfg, body.clone(), transfer);
+    solver.set_max_iterations(max_iterations);
+    solver.set_bottom_factory(ExecutableDefs::unreached);
+    solver.set_initial_state(ExecutableDefs::entering(Reach::Reached(entry)));
+    solver.solve()
+}
+
+/// A partial solution proves nothing, so none is published.
+fn publish_executable(
+    solved: &DataflowResult<ExecutableDefs>,
+    body_arc: &Arc<Body>,
+    events: Arc<BodyEvents>,
+) -> Option<Arc<ReachingDefsResult>> {
+    solved.converged().then(|| {
+        Arc::new(ReachingDefsResult::from_executable(solved, Arc::clone(body_arc), events))
     })
 }
 
@@ -785,55 +576,78 @@ pub struct ReachingDefsResult {
 
     block_stmts: rustc_hash::FxHashMap<petgraph::graph::NodeIndex, Vec<la_arena::RawIdx>>,
 
-    /// The vertex of each condition a pass evaluates anew, by that condition: such a statement
-    /// belongs to no basic block, and what enters the vertex is what the condition reads.
-    condition_blocks: rustc_hash::FxHashMap<hir_def::ExprId, petgraph::graph::NodeIndex>,
+    /// The vertex evaluating each root no statement holds, by that root: an `Если`,
+    /// `ИначеЕсли` or `Пока` condition, a `Для` bound, a `Для Каждого` collection. What
+    /// enters the vertex is what the root reads; a loop's entry is not on its back-edge.
+    root_blocks: rustc_hash::FxHashMap<hir_def::ExprId, petgraph::graph::NodeIndex>,
 
-    /// The block entering each `Для` and `Для Каждого`, by the first expression of the header.
-    /// Those run once, on entry: what the loop's own back-edge brings to the header never
-    /// reaches them, so they read what leaves this block.
-    loop_entry_blocks: rustc_hash::FxHashMap<hir_def::ExprId, petgraph::graph::NodeIndex>,
+    /// The roots a vertex evaluates before each of its later roots, in order: a `Для` upper
+    /// bound is read after the lower bound has run.
+    earlier_roots: rustc_hash::FxHashMap<hir_def::ExprId, Box<[hir_def::ExprId]>>,
 
     /// Shared with the lowering memo: a retained result must not carry its
     /// own copy of the body.
     body: Arc<Body>,
 
-    /// Present when the solve was told about writes it cannot read. The replay inside a basic
-    /// block ([`ReachingDefsResult::defs_up_to_stmt`]) must generate the same definitions as
-    /// the solve did, or a read would see the block's entry state only.
-    foreign: Option<ForeignWriteGen>,
-}
+    /// Shared with the events memo of the same body, like `body`.
+    events: Arc<BodyEvents>,
 
-/// The expression naming the CFG header a read in `stmt` happens at, when `stmt` is a header
-/// (`defs_for_var_at_header` takes it). Nothing writes between an `Если` condition and an
-/// `ИначеЕсли` one, so the first condition answers for all of them, and likewise a `Для` lower
-/// bound for the upper. `None` for a statement that is not a header: ask `defs_for_var_at_stmt`.
-pub fn header_read_expr(body: &Body, stmt: hir_def::StmtId) -> Option<hir_def::ExprId> {
-    let header = match body.stmt(stmt) {
-        Stmt::If(if_stmt) => if_stmt.condition,
-        Stmt::While { condition, .. } => *condition,
-        Stmt::For { from, .. } => *from,
-        Stmt::ForEach { collection, .. } => *collection,
-        _ => return None,
-    };
-    Some(hir_def::ExprId::from_idx(header))
+    /// Whether the states come from the executable solver, whose transfer
+    /// replays the statements of a block for a statement query.
+    executable: bool,
 }
 
 impl ReachingDefsResult {
-    pub fn new(dataflow: crate::DataflowResult<ReachingDefs>, body: Arc<Body>) -> Self {
+    pub fn new(
+        dataflow: crate::DataflowResult<ReachingDefs>,
+        body: Arc<Body>,
+        events: Arc<BodyEvents>,
+    ) -> Self {
+        let mut block_in = rustc_hash::FxHashMap::default();
+        let mut block_out = rustc_hash::FxHashMap::default();
+        for (block_idx, in_state, out_state) in dataflow.blocks() {
+            block_in.insert(block_idx, in_state.clone());
+            block_out.insert(block_idx, out_state.clone());
+        }
+        Self::with_states(dataflow.cfg(), block_in, block_out, body, events, false)
+    }
+
+    /// The normal exit states of an executable solution; a block no executable
+    /// path enters has no state at all.
+    fn from_executable(
+        dataflow: &crate::DataflowResult<ExecutableDefs>,
+        body: Arc<Body>,
+        events: Arc<BodyEvents>,
+    ) -> Self {
+        let mut block_in = rustc_hash::FxHashMap::default();
+        let mut block_out = rustc_hash::FxHashMap::default();
+        for (block_idx, in_state, out_state) in dataflow.blocks() {
+            if let Reach::Reached(defs) = &in_state.normal {
+                block_in.insert(block_idx, defs.clone());
+            }
+            if let Reach::Reached(defs) = &out_state.normal {
+                block_out.insert(block_idx, defs.clone());
+            }
+        }
+        Self::with_states(dataflow.cfg(), block_in, block_out, body, events, true)
+    }
+
+    fn with_states(
+        cfg: &cfg::ControlFlowGraph,
+        block_in: rustc_hash::FxHashMap<petgraph::graph::NodeIndex, ReachingDefs>,
+        block_out: rustc_hash::FxHashMap<petgraph::graph::NodeIndex, ReachingDefs>,
+        body: Arc<Body>,
+        events: Arc<BodyEvents>,
+        executable: bool,
+    ) -> Self {
         use cfg::CfgVertex;
 
         let mut stmt_to_block = rustc_hash::FxHashMap::default();
         let mut block_stmts = rustc_hash::FxHashMap::default();
-        let mut condition_blocks = rustc_hash::FxHashMap::default();
-        let mut loop_entry_blocks = rustc_hash::FxHashMap::default();
-        // The builder creates a loop header before its body, so among the header's predecessors
-        // only the block entering the loop precedes it.
-        let entry_of = |header: petgraph::graph::NodeIndex| {
-            dataflow.cfg().incoming_edges(header).map(|(source, _)| source).find(|s| *s < header)
-        };
+        let mut root_blocks = rustc_hash::FxHashMap::default();
+        let mut earlier_roots = rustc_hash::FxHashMap::default();
 
-        for (block_idx, vertex) in dataflow.cfg().vertices() {
+        for (block_idx, vertex) in cfg.vertices() {
             match vertex {
                 CfgVertex::BasicBlock(basic_block) => {
                     let stmts: Vec<la_arena::RawIdx> =
@@ -846,28 +660,24 @@ impl ReachingDefsResult {
                     }
                 }
                 CfgVertex::Conditional(header) => {
-                    condition_blocks.insert(header.condition, block_idx);
+                    root_blocks.insert(header.condition, block_idx);
                 }
                 CfgVertex::WhileHeader(header) => {
-                    condition_blocks.insert(header.condition, block_idx);
+                    root_blocks.insert(header.condition, block_idx);
                 }
-                CfgVertex::ForHeader(header) => {
-                    loop_entry_blocks.extend(entry_of(block_idx).map(|entry| (header.from, entry)));
-                }
-                CfgVertex::ForEachHeader(header) => {
-                    loop_entry_blocks
-                        .extend(entry_of(block_idx).map(|entry| (header.collection, entry)));
+                CfgVertex::LoopEntry(entry) => {
+                    let roots = entry.roots();
+                    root_blocks.extend(roots.iter().map(|&root| (root, block_idx)));
+                    earlier_roots.extend(
+                        roots
+                            .iter()
+                            .enumerate()
+                            .skip(1)
+                            .map(|(at, &root)| (root, roots[..at].into())),
+                    );
                 }
                 _ => {}
             }
-        }
-
-        let mut block_in = rustc_hash::FxHashMap::default();
-        let mut block_out = rustc_hash::FxHashMap::default();
-
-        for (block_idx, in_state, out_state) in dataflow.blocks() {
-            block_in.insert(block_idx, in_state.clone());
-            block_out.insert(block_idx, out_state.clone());
         }
 
         Self {
@@ -875,11 +685,17 @@ impl ReachingDefsResult {
             block_out,
             stmt_to_block,
             block_stmts,
-            condition_blocks,
-            loop_entry_blocks,
+            root_blocks,
+            earlier_roots,
             body,
-            foreign: None,
+            events,
+            executable,
         }
+    }
+
+    /// The syntactic events of the body the result was solved over.
+    pub fn events(&self) -> &Arc<BodyEvents> {
+        &self.events
     }
 
     pub fn defs_before_stmt(&self, stmt_id: hir_def::StmtId) -> Option<&ReachingDefs> {
@@ -905,11 +721,21 @@ impl ReachingDefsResult {
                 break;
             }
 
-            let transfer = ReachingDefsTransfer;
-            state = transfer.transfer_stmt(hir_stmt_raw, &state, &self.body);
-            if let Some(foreign) = &self.foreign {
-                foreign.apply_stmt(hir_stmt_id, &mut state);
-            }
+            state = if self.executable {
+                match ExecutableReachingDefsTransfer::replay()
+                    .transfer_stmt(
+                        hir_stmt_raw,
+                        &ExecutableDefs::entering(Reach::Reached(state)),
+                        &self.body,
+                    )
+                    .normal
+                {
+                    Reach::Reached(defs) => defs,
+                    Reach::Unreached => unreachable!("a reached statement exits reached"),
+                }
+            } else {
+                ReachingDefsTransfer.transfer_stmt(hir_stmt_raw, &state, &self.body)
+            };
         }
 
         Some(state)
@@ -924,18 +750,54 @@ impl ReachingDefsResult {
         Some(reaching.defs_for_var(var_name).cloned().collect())
     }
 
-    /// The definitions of `var_name` a header reads, by the expression it evaluates first: an
-    /// `Если`, `ИначеЕсли` or `Пока` condition, a `Для` lower bound, a `Для Каждого` collection.
+    /// The definitions of `var_name` a header root reads: an `Если`, `ИначеЕсли` or `Пока`
+    /// condition, a `Для` bound, a `Для Каждого` collection. A root evaluated after others of
+    /// its vertex reads what they left.
     pub fn defs_for_var_at_header(
         &self,
         var_name: &str,
         header_expr: hir_def::ExprId,
     ) -> Option<Vec<Definition>> {
-        let state = match self.condition_blocks.get(&header_expr) {
-            Some(block) => self.block_in.get(block)?,
-            None => self.block_out.get(self.loop_entry_blocks.get(&header_expr)?)?,
-        };
+        let mut state = self.block_in.get(self.root_blocks.get(&header_expr)?)?.clone();
+        if self.executable {
+            for &root in self.earlier_roots.get(&header_expr).into_iter().flatten() {
+                state = match ExecutableReachingDefsTransfer::replay()
+                    .transfer_expr(
+                        root,
+                        &ExecutableDefs::entering(Reach::Reached(state)),
+                        &self.body,
+                    )
+                    .normal
+                {
+                    Reach::Reached(defs) => defs,
+                    Reach::Unreached => unreachable!("a reached root exits reached"),
+                };
+            }
+        }
         Some(state.defs_for_var(var_name).cloned().collect())
+    }
+
+    /// The possible-write event `id` stands for.
+    pub fn write(&self, id: WriteId) -> Option<&WriteEvent> {
+        Some(self.def_index()?.write(id))
+    }
+
+    /// The possible writes of `var_name` that the evaluation at `point` makes itself.
+    pub fn possible_writes_at(&self, point: EvalPoint, var_name: &str) -> Vec<Definition> {
+        let Some(index) = self.def_index() else { return Vec::new() };
+        let var_name = var_name.fold_lower();
+        index
+            .point_writes(point)
+            .iter()
+            .map(|&idx| index.get_definition(idx))
+            .filter(|def| def.var_name == var_name)
+            .cloned()
+            .collect()
+    }
+
+    /// The index every state numbers its definitions by; absent when no point was reached.
+    fn def_index(&self) -> Option<&Arc<DefinitionIndex>> {
+        self.block_in.values().next().map(ReachingDefs::def_index)
     }
 
     pub fn var_is_defined_at_stmt(&self, var_name: &str, stmt_id: hir_def::StmtId) -> bool {
@@ -952,7 +814,7 @@ impl ReachingDefsResult {
         self.block_in.get(&block_idx)
     }
 
-    /// Approximate live heap bytes for Salsa's `memory_usage` report: the six
+    /// Approximate live heap bytes for Salsa's `memory_usage` report: the five
     /// per-block hashbrown tables (including each `ReachingDefs` bitset and the
     /// `block_stmts` index vectors). The shared [`Body`] and the shared
     /// `Arc<DefinitionIndex>` payloads behind each `ReachingDefs` are counted
@@ -969,88 +831,288 @@ impl ReachingDefsResult {
             bytes += v.estimated_heap();
         }
         bytes += crate::map_table_bytes::<hir_def::StmtId, NodeIndex>(self.stmt_to_block.len());
-        bytes += crate::map_table_bytes::<hir_def::ExprId, NodeIndex>(self.condition_blocks.len());
-        bytes += crate::map_table_bytes::<hir_def::ExprId, NodeIndex>(self.loop_entry_blocks.len());
+        bytes += crate::map_table_bytes::<hir_def::ExprId, NodeIndex>(self.root_blocks.len());
+        bytes += crate::map_table_bytes::<hir_def::ExprId, Box<[hir_def::ExprId]>>(
+            self.earlier_roots.len(),
+        );
+        for roots in self.earlier_roots.values() {
+            bytes += crate::vec_bytes::<hir_def::ExprId>(roots.len());
+        }
         bytes += crate::map_table_bytes::<NodeIndex, Vec<la_arena::RawIdx>>(self.block_stmts.len());
         for stmts in self.block_stmts.values() {
             bytes += crate::vec_bytes::<la_arena::RawIdx>(stmts.len());
         }
         // The body is the lowering memo's `Arc`, counted there; only the pointer
         // is this result's own.
-        if let Some(foreign) = &self.foreign {
-            bytes += foreign.estimated_heap();
-        }
         bytes
     }
 }
 
-/// [`ExecutableReachingDefsTransfer`] that also generates the foreign definitions of a place
-/// AFTER its ordinary transfer: a write performed while the statement or header expression runs
-/// is seen by the next read, not by the reads of the place itself.
-struct WritesAwareTransfer {
-    foreign: ForeignWriteGen,
+/// Definitions reaching a point along executable paths, or `Unreached` when no
+/// executable path gets there. `Unreached` is the neutral element of the join
+/// and makes no definitions; an entry reached with nothing is `Reached` with an
+/// empty set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reach {
+    Unreached,
+    Reached(ReachingDefs),
 }
 
-impl Transfer<ReachingDefs> for WritesAwareTransfer {
-    fn transfer_stmt(&self, stmt_id: RawIdx, state: &ReachingDefs, body: &Body) -> ReachingDefs {
-        let mut new_state = ReachingDefsTransfer.transfer_stmt(stmt_id, state, body);
-        self.foreign.apply_stmt(hir_def::StmtId::from_raw(stmt_id), &mut new_state);
-        new_state
+impl Reach {
+    fn join_in_place(&mut self, other: &Reach) {
+        let Reach::Reached(other) = other else { return };
+        match self {
+            Reach::Unreached => *self = Reach::Reached(other.clone()),
+            Reach::Reached(defs) => defs.join_in_place(other),
+        }
+    }
+}
+
+/// The state of the executable solver: what leaves a point when it completes,
+/// and what leaves it when it fails part way, to a handler. A state entering a
+/// point has both parts equal: each point builds its exceptional part from its
+/// own input again, so a failure carries the effects of the failing point, not
+/// those of every point before it.
+///
+/// `skipped` is what leaves a `Для Каждого` header when the collection has no
+/// further element: the loop then binds nothing, so the variable keeps what it
+/// held. Every other point leaves it `Unreached`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutableDefs {
+    normal: Reach,
+    exceptional: Reach,
+    skipped: Reach,
+}
+
+impl ExecutableDefs {
+    fn unreached() -> Self {
+        Self::entering(Reach::Unreached)
+    }
+
+    fn entering(reach: Reach) -> Self {
+        Self { normal: reach.clone(), exceptional: reach, skipped: Reach::Unreached }
+    }
+}
+
+impl Lattice for ExecutableDefs {
+    fn join(&self, other: &Self) -> Self {
+        let mut joined = self.clone();
+        joined.join_in_place(other);
+        joined
+    }
+
+    fn join_in_place(&mut self, other: &Self) {
+        self.normal.join_in_place(&other.normal);
+        self.exceptional.join_in_place(&other.exceptional);
+        self.skipped.join_in_place(&other.skipped);
+    }
+}
+
+struct ExecutableReachingDefsTransfer {
+    /// See [`writes_hidden_on_exception`].
+    hidden_on_exception: FxHashSet<StmtId>,
+}
+
+/// A raising statement whose own writes must not ride its exception edge: every
+/// statement after it in the same region is an assignment that cannot raise, and
+/// at least one such statement follows. Once the writes complete, nothing left can
+/// enter the handler. A statement with nothing after it is not here — its own
+/// failure may come after the write, which the exceptional exit already records.
+fn writes_hidden_on_exception(body: &Body) -> FxHashSet<StmtId> {
+    let mut hidden = FxHashSet::default();
+    hide_writes_after_safe_tail(body.body_stmts_typed(), body, false, &mut hidden);
+    hidden
+}
+
+fn hide_writes_after_safe_tail(
+    stmts: &[StmtIdx],
+    body: &Body,
+    tail: bool,
+    hidden: &mut FxHashSet<StmtId>,
+) {
+    let tail_from = stmts
+        .iter()
+        .rposition(|&stmt_id| !crate::is_non_raising_assignment(body, stmt_id))
+        .unwrap_or(0);
+    for (position, &stmt_id) in stmts.iter().enumerate() {
+        let in_tail = tail && position >= tail_from;
+        if in_tail && position + 1 < stmts.len() && !crate::is_non_raising_assignment(body, stmt_id)
+        {
+            hidden.insert(StmtId::from_idx(stmt_id));
+        }
+        match body.stmt_idx(stmt_id) {
+            Stmt::For { body: nested, .. }
+            | Stmt::ForEach { body: nested, .. }
+            | Stmt::While { body: nested, .. } => {
+                hide_writes_after_safe_tail(nested, body, false, hidden);
+            }
+            Stmt::If(if_stmt) => {
+                hide_writes_after_safe_tail(&if_stmt.then_branch, body, in_tail, hidden);
+                for (_, branch) in if_stmt.elsif_branches.iter() {
+                    hide_writes_after_safe_tail(branch, body, in_tail, hidden);
+                }
+                if let Some(else_stmts) = &if_stmt.else_branch {
+                    hide_writes_after_safe_tail(else_stmts, body, in_tail, hidden);
+                }
+            }
+            Stmt::Try { body: protected, except, .. } => {
+                hide_writes_after_safe_tail(protected, body, true, hidden);
+                hide_writes_after_safe_tail(except, body, in_tail, hidden);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ExecutableReachingDefsTransfer {
+    fn new(body: &Body) -> Self {
+        Self { hidden_on_exception: writes_hidden_on_exception(body) }
+    }
+
+    /// Replaying a block's normal exits does not consult [`Self::hidden_on_exception`]:
+    /// that set changes only the exceptional exit.
+    fn replay() -> Self {
+        Self { hidden_on_exception: FxHashSet::default() }
+    }
+
+    /// A point evaluated over the definitions `input`: its possible writes add
+    /// to them, and its ordinary writes then replace the definitions of their
+    /// names. A failure may come after any possible write and after the
+    /// ordinary write itself, so the exceptional exit keeps the input together
+    /// with every effect of the point.
+    fn evaluate(
+        input: &ReachingDefs,
+        may_writes: &[u32],
+        writes: &[(SmolStr, u32)],
+    ) -> ExecutableDefs {
+        let mut normal = input.clone();
+        for &idx in may_writes {
+            normal.bits.insert(idx as usize);
+        }
+        let mut exceptional = normal.clone();
+        for (var_name, idx) in writes {
+            normal.kill(var_name);
+            normal.bits.insert(*idx as usize);
+            exceptional.bits.insert(*idx as usize);
+        }
+        ExecutableDefs {
+            normal: Reach::Reached(normal),
+            exceptional: Reach::Reached(exceptional),
+            skipped: Reach::Unreached,
+        }
+    }
+
+    /// The ordinary writes of a statement: an assignment rebinds its target,
+    /// and a declaration gives each declared name its declaration in place of
+    /// the entry `Unknown`.
+    fn stmt_writes(
+        stmt_id: StmtId,
+        body: &Body,
+        def_index: &DefinitionIndex,
+    ) -> SmallVec<[(SmolStr, u32); 1]> {
+        let mut writes = SmallVec::new();
+        match body.stmt(stmt_id) {
+            Stmt::Assign { target, .. } => {
+                if let Some(var_name) = extract_var_name_from_expr(ExprId::from_idx(*target), body)
+                {
+                    let def = Definition::assignment(var_name, stmt_id.into_raw());
+                    if let Some(idx) = def_index.get_index(&def) {
+                        writes.push((def.var_name, idx));
+                    }
+                }
+            }
+            Stmt::VarDecl { bindings } => {
+                for &binding_id in bindings.iter() {
+                    let binding = body.binding_idx(binding_id);
+                    let def = Definition::var_decl(&binding.name, BindingId::from_idx(binding_id));
+                    if let Some(idx) = def_index.get_index(&def) {
+                        writes.push((def.var_name, idx));
+                    }
+                }
+            }
+            _ => {}
+        }
+        writes
+    }
+}
+
+impl Transfer<ExecutableDefs> for ExecutableReachingDefsTransfer {
+    fn transfer_stmt(
+        &self,
+        stmt_id: RawIdx,
+        state: &ExecutableDefs,
+        body: &Body,
+    ) -> ExecutableDefs {
+        let Reach::Reached(input) = &state.normal else { return ExecutableDefs::unreached() };
+        let stmt_id = StmtId::from_raw(stmt_id);
+        let def_index = input.def_index();
+        let writes = Self::stmt_writes(stmt_id, body, def_index);
+        let may = def_index.point_writes(EvalPoint::Stmt(stmt_id));
+        // A plain assignment cannot raise, so its exception edge carries nothing.
+        // A raising statement followed only by such assignments has already completed
+        // by the time anything could still enter the handler, so that edge carries the
+        // state from before its own writes.
+        if crate::is_non_raising_assignment(body, stmt_id.to_idx()) {
+            let mut out = Self::evaluate(input, &[], &writes);
+            out.exceptional = Reach::Unreached;
+            return out;
+        }
+        if self.hidden_on_exception.contains(&stmt_id) {
+            let mut out = Self::evaluate(input, may, &writes);
+            out.exceptional = Reach::Reached(input.clone());
+            return out;
+        }
+        Self::evaluate(input, may, &writes)
     }
 
     fn transfer_expr(
         &self,
-        expr_id: hir_def::ExprId,
-        state: &ReachingDefs,
+        expr_id: ExprId,
+        state: &ExecutableDefs,
         _body: &Body,
-    ) -> ReachingDefs {
-        let mut new_state = state.clone();
-        self.foreign.apply_header(expr_id, &mut new_state);
-        new_state
+    ) -> ExecutableDefs {
+        let Reach::Reached(input) = &state.normal else { return ExecutableDefs::unreached() };
+        Self::evaluate(input, input.def_index().point_writes(EvalPoint::Header(expr_id)), &[])
     }
 
-    fn transfer_edge(&self, edge_kind: cfg::CfgEdgeType, state: &ReachingDefs) -> ReachingDefs {
-        ExecutableReachingDefsTransfer.transfer_edge(edge_kind, state)
-    }
-
-    fn transfer_exception_edge(
-        &self,
-        try_stmt: hir_def::StmtId,
-        state: &mut ReachingDefs,
-        body: &Body,
-        live: &crate::LiveStatements,
-    ) {
-        ExecutableReachingDefsTransfer.transfer_exception_edge(try_stmt, state, body, live);
-        if let Stmt::Try { body: protected, .. } = body.stmt(try_stmt) {
-            walk_interruptible(protected, body, live, true, &mut |stmt_id, in_tail| {
-                self.foreign.apply_interrupted(hir_def::StmtId::from_idx(stmt_id), in_tail, state);
-            });
+    fn transfer_loop_var_bind(&self, loop_var: BindingId, state: &mut ExecutableDefs, body: &Body) {
+        let Reach::Reached(input) = &state.normal else {
+            *state = ExecutableDefs::unreached();
+            return;
+        };
+        let def_index = input.def_index();
+        let loop_def = def_index.loop_defs.get(&loop_var).copied();
+        let writes: SmallVec<[(SmolStr, u32); 1]> = loop_def
+            .map(|idx| (SmolStr::new(body.binding(loop_var).name.as_str().fold_lower()), idx))
+            .into_iter()
+            .collect();
+        let mut out = Self::evaluate(input, &[], &writes);
+        let for_each = loop_def.is_some_and(|idx| {
+            matches!(def_index.get_definition(idx).def_site, DefSite::ForEachLoop(_))
+        });
+        if for_each {
+            out.skipped = Reach::Reached(input.clone());
         }
-    }
-}
-
-struct ExecutableReachingDefsTransfer;
-
-impl Transfer<ReachingDefs> for ExecutableReachingDefsTransfer {
-    fn transfer_stmt(&self, stmt_id: RawIdx, state: &ReachingDefs, body: &Body) -> ReachingDefs {
-        ReachingDefsTransfer.transfer_stmt(stmt_id, state, body)
+        *state = out;
     }
 
-    fn transfer_edge(&self, edge_kind: cfg::CfgEdgeType, state: &ReachingDefs) -> ReachingDefs {
+    /// An exception edge carries the exceptional exit of its source, the exit
+    /// of a `Для Каждого` header without a further element its state before
+    /// the binding, any other executable edge the normal exit; an unexecutable
+    /// edge carries nothing.
+    fn transfer_edge(&self, edge_kind: cfg::CfgEdgeType, state: &ExecutableDefs) -> ExecutableDefs {
         match edge_kind {
-            cfg::CfgEdgeType::Unexecutable => ReachingDefs::new(state.def_index.clone()),
-            _ => state.clone(),
+            cfg::CfgEdgeType::Unexecutable => ExecutableDefs::unreached(),
+            cfg::CfgEdgeType::Exception => ExecutableDefs::entering(state.exceptional.clone()),
+            cfg::CfgEdgeType::FalseBranch if state.skipped != Reach::Unreached => {
+                ExecutableDefs::entering(state.skipped.clone())
+            }
+            _ => ExecutableDefs::entering(state.normal.clone()),
         }
     }
 
-    fn transfer_exception_edge(
-        &self,
-        try_stmt: hir_def::StmtId,
-        state: &mut ReachingDefs,
-        body: &Body,
-        live: &crate::LiveStatements,
-    ) {
-        ReachingDefsTransfer.transfer_exception_edge(try_stmt, state, body, live);
+    fn follows_possible_failures(&self) -> bool {
+        true
     }
 }
 
@@ -1096,859 +1158,5 @@ impl Transfer<ReachingDefs> for ReachingDefsTransfer {
         }
 
         new_state
-    }
-
-    /// Adds, without killing, the definitions the protected statements may have produced when
-    /// the handler starts - [`collect_interruptible_defs`] decides which. Nothing is killed
-    /// because the exception may equally have come BEFORE such a write, so what reached the
-    /// `Попытка` still reaches the handler beside it.
-    ///
-    /// Both restrictions the collector applies are facts about the edge, not policies this
-    /// transfer is free to relax: propagating state ACROSS an unexecutable edge is what the
-    /// plain transfer does, inventing a write that no execution performs, or one after which
-    /// the region can no longer raise, is not. So they hold here as well as in
-    /// [`ExecutableReachingDefsTransfer`].
-    fn transfer_exception_edge(
-        &self,
-        try_stmt: hir_def::StmtId,
-        state: &mut ReachingDefs,
-        body: &Body,
-        live: &crate::LiveStatements,
-    ) {
-        if let Stmt::Try { body: protected, .. } = body.stmt(try_stmt) {
-            collect_interruptible_defs(protected, body, live, &mut |def| state.insert(&def));
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn create_def_index(defs: &[Definition]) -> Arc<DefinitionIndex> {
-        let mut definitions = Vec::new();
-        let mut var_to_defs: FxHashMap<SmolStr, SmallVec<[u32; 4]>> = FxHashMap::default();
-        let mut def_to_idx: FxHashMap<Definition, u32> = FxHashMap::default();
-
-        for def in defs {
-            if def_to_idx.contains_key(def) {
-                continue;
-            }
-            let idx = definitions.len() as u32;
-            var_to_defs.entry(def.var_name.clone()).or_default().push(idx);
-            def_to_idx.insert(def.clone(), idx);
-            definitions.push(def.clone());
-        }
-
-        Arc::new(DefinitionIndex { definitions, var_to_defs, def_to_idx })
-    }
-
-    #[test]
-    fn test_definition_creation() {
-        let name = Name::new("Переменная");
-        let binding_id = BindingId::from_raw(la_arena::RawIdx::from_u32(0));
-
-        let param_def = Definition::parameter(&name, binding_id);
-        assert_eq!(param_def.var_name, "переменная");
-        assert!(matches!(param_def.def_site, DefSite::Parameter(_)));
-
-        let var_def = Definition::var_decl(&name, binding_id);
-        assert!(matches!(var_def.def_site, DefSite::VarDecl(_)));
-    }
-
-    #[test]
-    fn test_reaching_defs_empty() {
-        let def_index = create_def_index(&[]);
-        let empty = ReachingDefs::new(def_index);
-        assert!(empty.is_empty());
-    }
-
-    #[test]
-    fn test_reaching_defs_lattice_join() {
-        let name = Name::new("x");
-        let binding_id = BindingId::from_raw(la_arena::RawIdx::from_u32(0));
-
-        let def1 = Definition::parameter(&name, binding_id);
-        let def2 = Definition::var_decl(&name, binding_id);
-
-        let def_index = create_def_index(&[def1.clone(), def2.clone()]);
-
-        let set1 = ReachingDefs::singleton(def_index.clone(), &def1);
-        let set2 = ReachingDefs::singleton(def_index.clone(), &def2);
-
-        let joined = set1.join(&set2);
-        assert_eq!(joined.len(), 2);
-        assert!(joined.iter().any(|d| d == &def1));
-        assert!(joined.iter().any(|d| d == &def2));
-    }
-
-    #[test]
-    fn test_reaching_defs_lattice_join_idempotent() {
-        let name = Name::new("x");
-        let binding_id = BindingId::from_raw(la_arena::RawIdx::from_u32(0));
-        let def = Definition::parameter(&name, binding_id);
-
-        let def_index = create_def_index(std::slice::from_ref(&def));
-        let set = ReachingDefs::singleton(def_index, &def);
-        let joined = set.join(&set);
-        assert_eq!(joined, set);
-    }
-
-    #[test]
-    fn test_reaching_defs_lattice_join_commutative() {
-        let name = Name::new("x");
-        let binding_id = BindingId::from_raw(la_arena::RawIdx::from_u32(0));
-
-        let def1 = Definition::parameter(&name, binding_id);
-        let def2 = Definition::var_decl(&name, binding_id);
-
-        let def_index = create_def_index(&[def1.clone(), def2.clone()]);
-
-        let set1 = ReachingDefs::singleton(def_index.clone(), &def1);
-        let set2 = ReachingDefs::singleton(def_index.clone(), &def2);
-
-        assert_eq!(set1.join(&set2), set2.join(&set1));
-    }
-
-    #[test]
-    fn test_reaching_defs_lattice_bottom_identity() {
-        let name = Name::new("x");
-        let binding_id = BindingId::from_raw(la_arena::RawIdx::from_u32(0));
-        let def = Definition::parameter(&name, binding_id);
-
-        let def_index = create_def_index(std::slice::from_ref(&def));
-        let set = ReachingDefs::singleton(def_index.clone(), &def);
-        let bottom = ReachingDefs::new(def_index);
-
-        assert_eq!(set.join(&bottom), set);
-        assert_eq!(bottom.join(&set), set);
-    }
-
-    #[test]
-    fn test_gen_kill() {
-        let name = Name::new("x");
-        let binding_id1 = BindingId::from_raw(la_arena::RawIdx::from_u32(0));
-        let binding_id2 = BindingId::from_raw(la_arena::RawIdx::from_u32(1));
-
-        let def1 = Definition::parameter(&name, binding_id1);
-        let def2 = Definition::var_decl(&name, binding_id2);
-
-        let def_index = create_def_index(&[def1.clone(), def2.clone()]);
-        let mut state = ReachingDefs::singleton(def_index, &def1);
-        assert_eq!(state.len(), 1);
-
-        state.gen_kill("x", &def2);
-        assert_eq!(state.len(), 1);
-        assert!(!state.iter().any(|d| d == &def1));
-        assert!(state.iter().any(|d| d == &def2));
-    }
-
-    #[test]
-    fn test_case_insensitive() {
-        let name_upper = Name::new("ПЕРЕМЕННАЯ");
-        let name_lower = Name::new("переменная");
-        let binding_id = BindingId::from_raw(la_arena::RawIdx::from_u32(0));
-
-        let def1 = Definition::parameter(&name_upper, binding_id);
-        let def2 = Definition::var_decl(&name_lower, binding_id);
-
-        assert_eq!(def1.var_name, def2.var_name);
-
-        let def_index = create_def_index(&[def1.clone(), def2.clone()]);
-        let mut state = ReachingDefs::singleton(def_index, &def1);
-        state.gen_kill("ПЕРЕМЕННАЯ", &def2);
-
-        assert_eq!(state.len(), 1);
-        assert!(state.iter().any(|d| d == &def2));
-    }
-
-    #[test]
-    fn test_defs_for_var() {
-        let name_x = Name::new("x");
-        let name_y = Name::new("y");
-        let binding_id = BindingId::from_raw(la_arena::RawIdx::from_u32(0));
-
-        let def_x = Definition::parameter(&name_x, binding_id);
-        let def_y = Definition::parameter(&name_y, binding_id);
-
-        let def_index = create_def_index(&[def_x.clone(), def_y.clone()]);
-        let state = ReachingDefs::from_definitions(def_index, [def_x.clone(), def_y.clone()]);
-
-        let x_defs: Vec<_> = state.defs_for_var("x").collect();
-        assert_eq!(x_defs.len(), 1);
-        assert_eq!(x_defs[0], &def_x);
-
-        assert!(state.has_def_for_var("x"));
-        assert!(state.has_def_for_var("y"));
-        assert!(!state.has_def_for_var("z"));
-    }
-
-    /// Builds one body by hand. The verdicts under test are about ORDER, so the fixture needs
-    /// real statements - the ordinary transfer reads the body - and a real CFG built from them,
-    /// not a hand-drawn graph whose edges could be drawn to suit the expectation.
-    struct Fixture {
-        body: Body,
-    }
-
-    impl Fixture {
-        fn new() -> Self {
-            Self { body: Body::new() }
-        }
-
-        fn path(&mut self, text: &str) -> hir_def::hir::ExprIdx {
-            self.body.alloc_expr(Expr::Path(Name::new(text))).to_idx()
-        }
-
-        /// `<target> = Истина`: these tests read which writes arrive, never a value.
-        fn assign(&mut self, target: &str) -> hir_def::StmtId {
-            let target = self.path(target);
-            let value =
-                self.body.alloc_expr(Expr::Literal(hir_def::hir::Literal::Bool(true))).to_idx();
-            self.body.alloc_stmt(Stmt::Assign { target, value })
-        }
-
-        /// `<callee>(<arg>)` as a statement: the place a foreign write is attributed to.
-        fn call(&mut self, callee: &str, arg: &str) -> hir_def::StmtId {
-            let callee = self.path(callee);
-            let arg = self.path(arg);
-            let call = self.body.alloc_expr(Expr::Call { callee, args: Box::new([arg]) }).to_idx();
-            self.body.alloc_stmt(Stmt::Expr(call))
-        }
-
-        fn execute(&mut self, text: &str) -> hir_def::StmtId {
-            let expr = self
-                .body
-                .alloc_expr(Expr::Literal(hir_def::hir::Literal::String(text.into())))
-                .to_idx();
-            self.body.alloc_stmt(Stmt::Execute { expr })
-        }
-
-        fn ret(&mut self) -> hir_def::StmtId {
-            self.body.alloc_stmt(Stmt::Return { value: None })
-        }
-
-        /// `Пока <cond> Цикл <body> КонецЦикла`, returning the statement and its condition.
-        fn while_loop(
-            &mut self,
-            cond: &str,
-            stmts: &[hir_def::StmtId],
-        ) -> (hir_def::StmtId, hir_def::ExprId) {
-            let condition = self.path(cond);
-            let body: Vec<_> = stmts.iter().map(|s| s.to_idx()).collect();
-            let stmt =
-                self.body.alloc_stmt(Stmt::While { condition, body: body.into_boxed_slice() });
-            (stmt, hir_def::ExprId::from_idx(condition))
-        }
-
-        fn if_then(&mut self, cond: &str, stmts: &[hir_def::StmtId]) -> hir_def::StmtId {
-            let condition = self.path(cond);
-            let then_branch: Vec<_> = stmts.iter().map(|s| s.to_idx()).collect();
-            self.body.alloc_stmt(Stmt::If(Box::new(hir_def::hir::IfStmt {
-                condition,
-                then_branch: then_branch.into_boxed_slice(),
-                elsif_branches: Box::new([]),
-                else_branch: None,
-            })))
-        }
-
-        fn try_except(
-            &mut self,
-            protected: &[hir_def::StmtId],
-            handler: &[hir_def::StmtId],
-        ) -> hir_def::StmtId {
-            let body: Vec<_> = protected.iter().map(|s| s.to_idx()).collect();
-            let except: Vec<_> = handler.iter().map(|s| s.to_idx()).collect();
-            self.body.alloc_stmt(Stmt::Try {
-                body: body.into_boxed_slice(),
-                except: except.into_boxed_slice(),
-            })
-        }
-
-        fn finish(mut self, top_level: &[hir_def::StmtId]) -> Arc<Body> {
-            let stmts: Vec<_> = top_level.iter().map(|s| s.to_idx()).collect();
-            self.body.set_body_stmts(stmts.into_boxed_slice());
-            Arc::new(self.body)
-        }
-    }
-
-    fn solve_foreign(body: &Arc<Body>, writes: ForeignWriteEvents) -> Arc<ReachingDefsResult> {
-        let cfg = cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), body);
-        solve_executable_reaching_definitions_with_writes(
-            Arc::new(cfg),
-            body,
-            false,
-            Arc::new(writes),
-        )
-        .expect("the solve converges")
-    }
-
-    fn foreign_kinds(defs: &[Definition]) -> Vec<ForeignWrite> {
-        defs.iter()
-            .filter_map(|def| match def.def_site {
-                DefSite::ForeignWrite { kind, .. } => Some(kind),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn assignment_sites(defs: &[Definition]) -> Vec<RawIdx> {
-        defs.iter()
-            .filter_map(|def| match def.def_site {
-                DefSite::Assignment(site) => Some(site),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn foreign_write_at_a_statement_is_seen_after_it_and_not_before() {
-        // х = 1; Ф(х); у = х;
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let site = fixture.call("ф", "х");
-        let read = fixture.assign("у");
-        let body = fixture.finish(&[assign, site, read]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_stmt(site, SmolStr::new("х"), ForeignWrite::ByRefArgument);
-        let result = solve_foreign(&body, writes);
-
-        let before = result.defs_for_var_at_stmt("х", site).expect("state before the call");
-        assert_eq!(foreign_kinds(&before), Vec::new(), "the call's own write is not read by it");
-
-        let after = result.defs_for_var_at_stmt("х", read).expect("state before the read");
-        assert_eq!(foreign_kinds(&after), vec![ForeignWrite::ByRefArgument]);
-        assert_eq!(
-            assignment_sites(&after),
-            vec![assign.into_raw()],
-            "a write that MAY happen kills nothing"
-        );
-    }
-
-    #[test]
-    fn foreign_write_round_a_loop_is_seen_inside_it_and_not_before() {
-        // х = 1; в = х; Пока у Цикл г = х; Ф(х); КонецЦикла;
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let before_loop = fixture.assign("в");
-        let in_loop = fixture.assign("г");
-        let site = fixture.call("ф", "х");
-        let (loop_stmt, _) = fixture.while_loop("у", &[in_loop, site]);
-        let body = fixture.finish(&[assign, before_loop, loop_stmt]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_stmt(site, SmolStr::new("х"), ForeignWrite::ByRefArgument);
-        let result = solve_foreign(&body, writes);
-
-        let outside = result.defs_for_var_at_stmt("х", before_loop).expect("state before the loop");
-        assert_eq!(foreign_kinds(&outside), Vec::new());
-
-        let inside = result.defs_for_var_at_stmt("х", in_loop).expect("state inside the loop");
-        assert_eq!(
-            foreign_kinds(&inside),
-            vec![ForeignWrite::ByRefArgument],
-            "the back edge carries the write to a read that precedes it in the text"
-        );
-    }
-
-    /// The control for [`foreign_write_in_dead_code_reaches_nothing`]: one statement apart, the
-    /// same write does reach the read.
-    #[test]
-    fn foreign_write_in_a_live_branch_reaches_the_read_after_it() {
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let site = fixture.call("ф", "х");
-        let branch = fixture.if_then("у", &[site]);
-        let read = fixture.assign("з");
-        let body = fixture.finish(&[assign, branch, read]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_stmt(site, SmolStr::new("х"), ForeignWrite::ByRefArgument);
-        let result = solve_foreign(&body, writes);
-
-        let defs = result.defs_for_var_at_stmt("х", read).expect("state before the read");
-        assert_eq!(foreign_kinds(&defs), vec![ForeignWrite::ByRefArgument]);
-    }
-
-    #[test]
-    fn foreign_write_in_dead_code_reaches_nothing() {
-        // х = 1; Если у Тогда Возврат; Ф(х); КонецЕсли; з = 2;
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let ret = fixture.ret();
-        let site = fixture.call("ф", "х");
-        let branch = fixture.if_then("у", &[ret, site]);
-        let read = fixture.assign("з");
-        let body = fixture.finish(&[assign, branch, read]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_stmt(site, SmolStr::new("х"), ForeignWrite::ByRefArgument);
-        let result = solve_foreign(&body, writes);
-
-        let defs = result.defs_for_var_at_stmt("х", read).expect("state before the read");
-        assert_eq!(
-            foreign_kinds(&defs),
-            Vec::new(),
-            "nothing executes the call, so nothing can be written there"
-        );
-        assert_eq!(assignment_sites(&defs), vec![assign.into_raw()]);
-    }
-
-    #[test]
-    fn execute_adds_a_foreign_definition_beside_the_assignment() {
-        // х = 1; Выполнить("…"); у = 2;
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let site = fixture.execute("х = 2");
-        let read = fixture.assign("у");
-        let body = fixture.finish(&[assign, site, read]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_every_name(site);
-        let result = solve_foreign(&body, writes);
-
-        let defs = result.defs_for_var_at_stmt("х", read).expect("state before the read");
-        assert_eq!(foreign_kinds(&defs), vec![ForeignWrite::Execute]);
-        assert_eq!(assignment_sites(&defs), vec![assign.into_raw()]);
-    }
-
-    /// The handler is reached from the `Попытка` vertex, BEFORE the protected statements, so the
-    /// definition that reached the statement still reaches the handler - the earlier value is
-    /// what the handler may see - and the write among the protected statements does not.
-    #[test]
-    fn a_foreign_write_among_protected_statements_leaves_the_handlers_read_its_earlier_definition()
-    {
-        // х = 1; Попытка Ф(х); Исключение у = 2; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let site = fixture.call("ф", "х");
-        let handler_read = fixture.assign("у");
-        let try_stmt = fixture.try_except(&[site], &[handler_read]);
-        let body = fixture.finish(&[assign, try_stmt]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_stmt(site, SmolStr::new("х"), ForeignWrite::ByRefArgument);
-        let result = solve_foreign(&body, writes);
-
-        let defs = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
-        assert_eq!(
-            assignment_sites(&defs),
-            vec![assign.into_raw()],
-            "the earlier definition is not lost"
-        );
-        assert_eq!(
-            foreign_kinds(&defs),
-            Vec::new(),
-            "an error can interrupt before the call, so its write is not on the handler's path"
-        );
-    }
-
-    /// The control for the test above: a statement that can raise follows the call, so the
-    /// handler may be entered after the call wrote back through its argument, and that write
-    /// reaches the handler beside the earlier definition.
-    #[test]
-    fn a_foreign_write_before_a_statement_that_can_raise_reaches_the_handler() {
-        // х = 1; Попытка Ф(х); Г(з); Исключение у = 2; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let site = fixture.call("ф", "х");
-        let raising = fixture.call("г", "з");
-        let handler_read = fixture.assign("у");
-        let try_stmt = fixture.try_except(&[site, raising], &[handler_read]);
-        let body = fixture.finish(&[assign, try_stmt]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_stmt(site, SmolStr::new("х"), ForeignWrite::ByRefArgument);
-        let result = solve_foreign(&body, writes);
-
-        let defs = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
-        assert_eq!(assignment_sites(&defs), vec![assign.into_raw()]);
-        assert_eq!(foreign_kinds(&defs), vec![ForeignWrite::ByRefArgument]);
-    }
-
-    /// A header is evaluated before the statement's own body, so its write is on the handler's
-    /// path even when the statement stands last in the region: the branch after it can raise.
-    #[test]
-    fn a_foreign_write_in_the_condition_of_a_trailing_branch_reaches_the_handler() {
-        // Попытка Если Ф(х) Тогда Г(з); КонецЕсли; Исключение у = 2; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let in_branch = fixture.call("г", "з");
-        let callee = fixture.path("ф");
-        let arg = fixture.path("х");
-        let call = fixture.body.alloc_expr(Expr::Call { callee, args: Box::new([arg]) });
-        let branch = fixture.body.alloc_stmt(Stmt::If(Box::new(hir_def::hir::IfStmt {
-            condition: call.to_idx(),
-            then_branch: Box::new([in_branch.to_idx()]),
-            elsif_branches: Box::new([]),
-            else_branch: None,
-        })));
-        let handler_read = fixture.assign("у");
-        let try_stmt = fixture.try_except(&[branch], &[handler_read]);
-        let body = fixture.finish(&[try_stmt]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_header(call, branch, SmolStr::new("х"), ForeignWrite::ByRefArgument);
-        let result = solve_foreign(&body, writes);
-
-        let defs = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
-        assert_eq!(foreign_kinds(&defs), vec![ForeignWrite::ByRefArgument]);
-    }
-
-    #[test]
-    fn a_write_in_an_if_condition_is_seen_after_the_branch_and_not_by_the_condition() {
-        // х = Истина; Если Ф(х) Тогда г = Истина; КонецЕсли; з = Истина;
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let in_branch = fixture.assign("г");
-        let callee = fixture.path("ф");
-        let arg = fixture.path("х");
-        let call = fixture.body.alloc_expr(Expr::Call { callee, args: Box::new([arg]) });
-        let branch = fixture.body.alloc_stmt(Stmt::If(Box::new(hir_def::hir::IfStmt {
-            condition: call.to_idx(),
-            then_branch: Box::new([in_branch.to_idx()]),
-            elsif_branches: Box::new([]),
-            else_branch: None,
-        })));
-        let read = fixture.assign("з");
-        let body = fixture.finish(&[assign, branch, read]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_header(call, branch, SmolStr::new("х"), ForeignWrite::UnattestedArgument);
-        let result = solve_foreign(&body, writes);
-
-        let at_header = result.defs_for_var_at_header("х", call).expect("state at the header");
-        assert_eq!(foreign_kinds(&at_header), Vec::new(), "the condition reads before it writes");
-
-        let after = result.defs_for_var_at_stmt("х", read).expect("state after the branch");
-        assert_eq!(foreign_kinds(&after), vec![ForeignWrite::UnattestedArgument]);
-    }
-
-    /// The control for the test above, one statement apart: a LOOP condition is evaluated again
-    /// after its own write, so the write of the previous pass is among the definitions the
-    /// condition reads. That is the answer the body-wide scan this replaced could not give at
-    /// all - it had no notion of a second pass.
-    #[test]
-    fn a_write_in_a_loop_condition_is_seen_by_the_condition_on_a_later_pass() {
-        // х = Истина; Пока Ф(х) Цикл г = Истина; КонецЦикла;
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let in_loop = fixture.assign("г");
-        let callee = fixture.path("ф");
-        let arg = fixture.path("х");
-        let call = fixture.body.alloc_expr(Expr::Call { callee, args: Box::new([arg]) });
-        let loop_stmt = fixture.body.alloc_stmt(Stmt::While {
-            condition: call.to_idx(),
-            body: Box::new([in_loop.to_idx()]),
-        });
-        let body = fixture.finish(&[assign, loop_stmt]);
-
-        let mut writes = ForeignWriteEvents::default();
-        writes.push_header(call, loop_stmt, SmolStr::new("х"), ForeignWrite::UnattestedArgument);
-        let result = solve_foreign(&body, writes);
-
-        let at_header = result.defs_for_var_at_header("х", call).expect("state at the header");
-        assert_eq!(foreign_kinds(&at_header), vec![ForeignWrite::UnattestedArgument]);
-
-        let in_body = result.defs_for_var_at_stmt("х", in_loop).expect("state inside the loop");
-        assert_eq!(foreign_kinds(&in_body), vec![ForeignWrite::UnattestedArgument]);
-    }
-
-    #[test]
-    fn empty_events_give_the_plain_executable_solve() {
-        let mut fixture = Fixture::new();
-        let assign = fixture.assign("х");
-        let read = fixture.assign("у");
-        let body = fixture.finish(&[assign, read]);
-
-        let cfg =
-            Arc::new(cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), &body));
-        let plain = solve_executable_reaching_definitions(cfg.clone(), &body, false)
-            .expect("the solve converges");
-        let with_none = solve_executable_reaching_definitions_with_writes(
-            cfg,
-            &body,
-            false,
-            Arc::new(ForeignWriteEvents::default()),
-        )
-        .expect("the solve converges");
-
-        assert_eq!(plain, with_none);
-    }
-
-    /// The case the liveness filter still catches once the tail rule is in place: a dead write
-    /// standing LAST in the protected body of a nested `Попытка` that is itself followed by more
-    /// region statements. It is not in tail position of the outer region - the call after
-    /// `КонецПопытки` can raise - so only liveness keeps it out of the outer handler. The live
-    /// write of the same inner body does reach it.
-    #[test]
-    fn a_dead_write_last_in_an_inner_protected_body_does_not_reach_the_outer_handler() {
-        // Попытка Попытка х = Истина; Возврат; д = Истина; Исключение г = Истина; КонецПопытки;
-        // Ф(е); Исключение у = Истина; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let live_write = fixture.assign("х");
-        let ret = fixture.ret();
-        let dead_write = fixture.assign("д");
-        let inner_handler = fixture.assign("г");
-        let inner_try = fixture.try_except(&[live_write, ret, dead_write], &[inner_handler]);
-        let after_inner = fixture.call("ф", "е");
-        let outer_handler_read = fixture.assign("у");
-        let outer_try = fixture.try_except(&[inner_try, after_inner], &[outer_handler_read]);
-        let body = fixture.finish(&[outer_try]);
-
-        let result = solve_plain(&body);
-
-        let live = result
-            .defs_for_var_at_stmt("х", outer_handler_read)
-            .expect("state in the outer handler");
-        assert_eq!(
-            assignment_sites(&live),
-            vec![live_write.into_raw()],
-            "the live write of the inner body may have happened before the outer handler"
-        );
-
-        let dead = result
-            .defs_for_var_at_stmt("д", outer_handler_read)
-            .expect("state in the outer handler");
-        assert_eq!(
-            assignment_sites(&dead),
-            Vec::new(),
-            "nothing executes a write after Возврат, whatever its position in the region"
-        );
-    }
-
-    /// The handler is entered only when the region raised, so a write after which the region
-    /// can no longer raise is not on any path into it: once the LAST protected statement
-    /// completes, the region ends normally and the handler is skipped. The write before it is
-    /// on such a path, because the call between them can raise.
-    #[test]
-    fn a_write_in_tail_position_does_not_reach_the_handler_but_one_before_it_does() {
-        // Попытка х = Истина; Ф(з); г = Истина; Исключение у = Истина; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let before_tail = fixture.assign("х");
-        let raising = fixture.call("ф", "з");
-        let tail_write = fixture.assign("г");
-        let handler_read = fixture.assign("у");
-        let try_stmt = fixture.try_except(&[before_tail, raising, tail_write], &[handler_read]);
-        let body = fixture.finish(&[try_stmt]);
-
-        let result = solve_plain(&body);
-
-        let before = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
-        assert_eq!(
-            assignment_sites(&before),
-            vec![before_tail.into_raw()],
-            "the call after it can raise, so the write before it may have happened"
-        );
-
-        let tail = result.defs_for_var_at_stmt("г", handler_read).expect("state in the handler");
-        assert_eq!(
-            assignment_sites(&tail),
-            Vec::new(),
-            "once the last protected statement completes, the region ends and the handler is              not entered"
-        );
-    }
-
-    /// An assignment of a literal cannot raise, so a region that ends in such assignments ends
-    /// normally once the write before them completes: neither write is on a path into the
-    /// handler. The test above is the control - a call in between can raise, and the first write
-    /// then does reach.
-    #[test]
-    fn writes_followed_only_by_assignments_that_cannot_raise_do_not_reach_the_handler() {
-        // Попытка х = Истина; г = Истина; Исключение у = Истина; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let first = fixture.assign("х");
-        let second = fixture.assign("г");
-        let handler_read = fixture.assign("у");
-        let try_stmt = fixture.try_except(&[first, second], &[handler_read]);
-        let body = fixture.finish(&[try_stmt]);
-
-        let result = solve_plain(&body);
-
-        for name in ["х", "г"] {
-            let defs =
-                result.defs_for_var_at_stmt(name, handler_read).expect("state in the handler");
-            assert_eq!(assignment_sites(&defs), Vec::new(), "{name}: nothing after it can raise");
-        }
-    }
-
-    /// A trailing LOOP is not a tail: after the last statement of its body the loop's own
-    /// condition is evaluated, which can raise, and the loop may run again.
-    #[test]
-    fn a_write_in_the_body_of_a_trailing_loop_reaches_the_handler() {
-        // Попытка Пока у Цикл х = Истина; КонецЦикла; Исключение з = Истина; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let in_loop = fixture.assign("х");
-        let (loop_stmt, _) = fixture.while_loop("у", &[in_loop]);
-        let handler_read = fixture.assign("з");
-        let try_stmt = fixture.try_except(&[loop_stmt], &[handler_read]);
-        let body = fixture.finish(&[try_stmt]);
-
-        let result = solve_plain(&body);
-        let defs = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
-
-        assert_eq!(
-            assignment_sites(&defs),
-            vec![in_loop.into_raw()],
-            "the condition after the loop body can raise, so the write may have happened"
-        );
-    }
-
-    /// The PLAIN solve, which propagates state across an unexecutable edge instead of dropping
-    /// it: the strictest setting for the liveness filter of the `Exception` edge, since nothing
-    /// else here removes a dead statement's contribution.
-    fn solve_plain(body: &Arc<Body>) -> Arc<ReachingDefsResult> {
-        let cfg = cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), body);
-        solve_reaching_definitions(Arc::new(cfg), body, false).expect("the solve converges")
-    }
-
-    /// Raising an exception after a write requires reaching that write. The live write of the
-    /// protected body is therefore on the handler's path and the write after `Возврат` is not,
-    /// though both stand in the same protected body and write the same local.
-    #[test]
-    fn a_dead_write_in_the_protected_body_does_not_reach_the_handler_but_a_live_one_does() {
-        // Попытка х = Истина; Возврат; х = Истина; Исключение у = Истина; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let live_write = fixture.assign("х");
-        let ret = fixture.ret();
-        let dead_write = fixture.assign("х");
-        let handler_read = fixture.assign("у");
-        let try_stmt = fixture.try_except(&[live_write, ret, dead_write], &[handler_read]);
-        let body = fixture.finish(&[try_stmt]);
-
-        let result = solve_plain(&body);
-        let defs = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
-        let sites = assignment_sites(&defs);
-
-        assert!(
-            sites.contains(&live_write.into_raw()),
-            "an exception can interrupt the protected body after the live write: {sites:?}"
-        );
-        assert!(
-            !sites.contains(&dead_write.into_raw()),
-            "nothing executes the write after Возврат, so no handler can see it: {sites:?}"
-        );
-    }
-
-    fn solve_executable(body: &Arc<Body>) -> Arc<ReachingDefsResult> {
-        let cfg = cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), body);
-        solve_executable_reaching_definitions(Arc::new(cfg), body, false)
-            .expect("the solve converges")
-    }
-
-    /// The handler is entered from the `Попытка` vertex, before any protected statement runs, so
-    /// the graph alone would say the handler sees only what reached the `Попытка`. An exception
-    /// can interrupt the protected statements anywhere, so a write among them may have happened
-    /// by then - and may equally not have happened, which is why BOTH definitions reach.
-    #[test]
-    fn a_write_among_protected_statements_reaches_the_handler_beside_the_earlier_definition() {
-        // х = Истина; Попытка х = Истина; Ф(г); Исключение у = Истина; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let before_try = fixture.assign("х");
-        let inside_try = fixture.assign("х");
-        let after_write = fixture.call("ф", "г");
-        let handler_read = fixture.assign("у");
-        let try_stmt = fixture.try_except(&[inside_try, after_write], &[handler_read]);
-        let body = fixture.finish(&[before_try, try_stmt]);
-
-        let result = solve_executable(&body);
-        let defs = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
-        let sites = assignment_sites(&defs);
-
-        assert_eq!(
-            sites.len(),
-            2,
-            "both the interrupted write and the earlier one reach: {sites:?}"
-        );
-        assert!(
-            sites.contains(&inside_try.into_raw()),
-            "the write among the protected statements may have happened"
-        );
-        assert!(
-            sites.contains(&before_try.into_raw()),
-            "the exception may have come before that write"
-        );
-    }
-
-    /// The code after `КонецПопытки` is fed by the end of the protected body and by the end of
-    /// the handler. A write the protected body OVERWRITES later leaves the first path, so it can
-    /// only arrive through the handler - which is the regression this carries: without the write
-    /// on the exception edge, a value written and overwritten inside a `Попытка` reaches nothing.
-    #[test]
-    fn a_write_overwritten_later_in_the_protected_body_reaches_the_code_after_it() {
-        // х = Истина; Попытка х = Истина; Ф(з); х = Истина; Исключение г = Истина; КонецПопытки;
-        // у = Истина;
-        let mut fixture = Fixture::new();
-        let before_try = fixture.assign("х");
-        let interrupted = fixture.assign("х");
-        let raising = fixture.call("ф", "з");
-        let overwrite = fixture.assign("х");
-        let handler_stmt = fixture.assign("г");
-        let try_stmt = fixture.try_except(&[interrupted, raising, overwrite], &[handler_stmt]);
-        let read_after = fixture.assign("у");
-        let body = fixture.finish(&[before_try, try_stmt, read_after]);
-
-        let result = solve_executable(&body);
-        let defs = result.defs_for_var_at_stmt("х", read_after).expect("state after the Попытка");
-        let sites = assignment_sites(&defs);
-
-        assert!(
-            sites.contains(&interrupted.into_raw()),
-            "the overwritten write survives through the handler: {sites:?}"
-        );
-        assert!(sites.contains(&overwrite.into_raw()), "the uninterrupted path reaches too");
-    }
-
-    /// The control for the two above: the union is of the PROTECTED statements, not of the body.
-    /// A write placed after `КонецПопытки` cannot have run when the handler starts.
-    #[test]
-    fn a_write_after_the_popytka_is_not_seen_inside_the_handler() {
-        // Попытка г = Истина; Исключение у = Истина; КонецПопытки; х = Истина;
-        let mut fixture = Fixture::new();
-        let inside_try = fixture.assign("г");
-        let handler_read = fixture.assign("у");
-        let try_stmt = fixture.try_except(&[inside_try], &[handler_read]);
-        let after_try = fixture.assign("х");
-        let body = fixture.finish(&[try_stmt, after_try]);
-
-        let result = solve_executable(&body);
-        let defs = result.defs_for_var_at_stmt("х", handler_read).expect("state in the handler");
-
-        assert_eq!(
-            assignment_sites(&defs),
-            Vec::new(),
-            "the handler runs before the text that follows the Попытка"
-        );
-    }
-
-    /// The statements of a nested `Попытка` are protected by the outer handler as well: an
-    /// exception raised there and not caught inside propagates outwards. The inner write needs
-    /// something after it that can still raise - here the call following the inner
-    /// `КонецПопытки` - or it would stand in tail position of the outer region and
-    /// contribute nothing, which is what the single-statement region of `security_balanced`
-    /// records.
-    #[test]
-    fn a_write_in_an_inner_protected_body_reaches_the_outer_handler() {
-        // х = Истина; Попытка Попытка х = Истина; Исключение г = Истина; КонецПопытки;
-        // Ф(д); Исключение у = Истина; КонецПопытки;
-        let mut fixture = Fixture::new();
-        let before_try = fixture.assign("х");
-        let inner_write = fixture.assign("х");
-        let inner_handler = fixture.assign("г");
-        let inner_try = fixture.try_except(&[inner_write], &[inner_handler]);
-        let after_inner = fixture.call("ф", "д");
-        let outer_handler_read = fixture.assign("у");
-        let outer_try = fixture.try_except(&[inner_try, after_inner], &[outer_handler_read]);
-        let body = fixture.finish(&[before_try, outer_try]);
-
-        let result = solve_executable(&body);
-        let defs =
-            result.defs_for_var_at_stmt("х", outer_handler_read).expect("state in the handler");
-        let sites = assignment_sites(&defs);
-
-        assert!(
-            sites.contains(&inner_write.into_raw()),
-            "the inner write may have happened before the outer handler: {sites:?}"
-        );
-        assert!(sites.contains(&before_try.into_raw()), "the earlier definition is not lost");
     }
 }

@@ -326,10 +326,10 @@ pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParam
         }
     }
 
-    // Dependency discovery walks the (still cold and incomplete) database
-    // synchronously on the event-loop thread, so during the initial load it
-    // both stalls VFS batch draining and warms caches the next revision bump
-    // throws away. The vfs_done finalize preloads open documents instead.
+    // During the initial load dependency discovery walks a cold, incomplete
+    // database and warms caches the next revision bump throws away, while the
+    // pool is busy with the load itself. The vfs_done finalize preloads open
+    // documents instead.
     let preload_start = Instant::now();
     if vfs_done {
         preload_dependencies(state, file_id);
@@ -363,38 +363,19 @@ pub(crate) fn preload_dependencies(state: &mut GlobalState, file_id: vfs::FileId
         return;
     }
 
-    let discover_start = Instant::now();
+    // Discovery belongs in the job, not here: asking the database what this file
+    // depends on is itself a query, and on the event loop it holds up every other
+    // notification for as long as it takes. The job carries the exclusion test with
+    // it, so a dependency the exclusions now cover keeps its id, tombstoned, and is
+    // still not warmed. One consequence is worth having: the discovery is now
+    // cancellable, because the token covers the whole job and not just the warming.
     let analysis = state.analysis_host.analysis();
-    // A dependency the exclusions now cover keeps its id, tombstoned; it is not warmed.
-    let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
-    let deps: Vec<_> = analysis
-        .file_dependencies(file_id)
-        .iter()
-        .copied()
-        .filter(|&dep| !state.is_file_id_excluded(dep, &mut resolved))
-        .collect();
-    let discover_ms = discover_start.elapsed().as_millis() as u64;
-
-    if deps.is_empty() {
-        tracing::debug!(file_id = file_id.0, discover_ms, "preload: no dependencies found",);
-        return;
-    }
-
-    let dep_count = deps.len();
-    let dep_ids: Vec<u32> = deps.iter().map(|f| f.0).collect();
-    tracing::info!(
-        file_id = file_id.0,
-        dep_count,
-        discover_ms,
-        ?dep_ids,
-        "preload: dispatching warm-cache task",
-    );
+    let filter = state.exclusion_filter();
+    let task = analysis.warm_dependencies_task(file_id, move |deps| filter.retain_included(deps));
 
     if let Some(prev) = state.preload_tokens.remove(&file_id) {
         prev.cancel();
     }
-
-    let task = analysis.warm_caches_task(&deps);
     state.preload_tokens.insert(file_id, task.cancellation_token());
     let queued_at = Instant::now();
 
@@ -404,22 +385,23 @@ pub(crate) fn preload_dependencies(state: &mut GlobalState, file_id: vfs::FileId
         let started_at = Instant::now();
         let queue_wait_ms = started_at.duration_since(queued_at).as_millis() as u64;
         let count = match salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| task.run())) {
-            Ok(count) => {
+            Ok(warmed) => {
                 tracing::info!(
                     file_id = file_id.0,
-                    dep_count = count,
+                    dep_count = warmed.warmed,
+                    discover_ms = warmed.discover_ms,
                     queue_wait_ms,
                     run_ms = started_at.elapsed().as_millis() as u64,
-                    "preload: warm-cache complete",
+                    "preload: dependencies discovered and warmed",
                 );
-                count
+                warmed.warmed
             }
             Err(_) => {
                 tracing::debug!(
                     file_id = file_id.0,
                     queue_wait_ms,
                     run_ms = started_at.elapsed().as_millis() as u64,
-                    "preload: warm-cache cancelled",
+                    "preload: cancelled",
                 );
                 0
             }
@@ -1099,6 +1081,52 @@ mod tests {
         assert!(!state.scope_dirty_docs.contains(&uri));
         assert!(state.diagnostics_tokens.is_empty());
         assert!(state.vfs.read().file_id(&vfs::VfsPath::new(hidden)).is_none());
+    }
+
+    #[test]
+    fn the_exclusion_filter_keeps_only_what_may_be_warmed() {
+        let (mut state, _receiver) = create_test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let hidden_dir = dir.path().join(".tmp");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        let excluded = hidden_dir.join("Hidden.bsl");
+        let included = dir.path().join("Visible.bsl");
+        std::fs::write(&excluded, "Процедура Скрытая() КонецПроцедуры").unwrap();
+        std::fs::write(&included, "Процедура Видимая() КонецПроцедуры").unwrap();
+        state.source_exclusions =
+            std::sync::Arc::new(project_model::ExcludedPaths::new([hidden_dir]));
+        let (excluded_id, included_id) = {
+            let mut vfs = state.vfs.write();
+            (
+                vfs.alloc_file_id(vfs::VfsPath::new(excluded)),
+                vfs.alloc_file_id(vfs::VfsPath::new(included)),
+            )
+        };
+        let never_allocated = vfs::FileId(u32::MAX - 1);
+
+        let filter = state.exclusion_filter();
+        assert_eq!(
+            filter.retain_included(vec![excluded_id, included_id, never_allocated]),
+            vec![included_id],
+            "only a file the project still covers may be warmed"
+        );
+    }
+
+    #[test]
+    fn preload_queues_discovery_as_a_cancellable_job() {
+        let (mut state, _receiver) = create_test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Ordinary.bsl");
+        std::fs::write(&path, "Процедура Обычная() КонецПроцедуры").unwrap();
+        let file_id = state.vfs.write().alloc_file_id(vfs::VfsPath::new(path));
+
+        preload_dependencies(&mut state, file_id);
+
+        assert!(
+            state.preload_tokens.contains_key(&file_id),
+            "the token must cover discovery too, so a job queued for a file the editor \
+             has already moved on from can be cancelled"
+        );
     }
 
     #[cfg(unix)]

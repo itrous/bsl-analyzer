@@ -324,7 +324,7 @@ fn record_used_names_in_expr(
     if let Expr::Path(name) = body.expr_idx(expr) {
         used.insert(name.as_str().fold_lower());
     }
-    crate::narrow::for_each_expr_child(body, expr, &mut |child| {
+    hir_def::body::events::for_each_expr_child(body, expr, &mut |child| {
         record_used_names_in_expr(body, child, used);
     });
 }
@@ -673,7 +673,7 @@ fn invalidate_expression_escapes(
                 invalidate_expression_escapes(body, shapes, arg, forwarder, true);
             }
         }
-        _ => crate::narrow::for_each_expr_child(body, expr, &mut |child| {
+        _ => hir_def::body::events::for_each_expr_child(body, expr, &mut |child| {
             invalidate_expression_escapes(body, shapes, child, forwarder, escapes);
         }),
     }

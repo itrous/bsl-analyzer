@@ -2059,6 +2059,22 @@ fn a_record_carrying_only_result_follows_argument_text_decodes_and_reaches_the_p
     assert_eq!(parameters[0].passing, None, "the two facts are independent");
 }
 
+/// `false` is "not known to follow", the reading of a parameter nobody recorded: a record whose
+/// only fact it is states nothing and is refused like an empty one.
+#[test]
+fn a_record_whose_only_fact_is_result_follows_argument_text_false_is_refused() {
+    let mut record = follows_text_record();
+    record["result_follows_argument_text"] = json!(false);
+    let mut data = passing_data();
+    let error =
+        apply_global_function_parameter_overlays(&mut data, &global_function_overlay(record))
+            .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "overlay entry 0 changes nothing: it needs replacement_type_list, passing or result_follows_argument_text"
+    );
+}
+
 #[test]
 fn a_record_stating_none_of_the_three_facts_is_refused_and_each_one_alone_is_accepted() {
     let mut bare = follows_text_record();

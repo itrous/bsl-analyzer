@@ -15,21 +15,20 @@
 
 use std::sync::Arc;
 
-use dataflow::reaching_defs::{header_read_expr, DefSite, ForeignWrite, ReachingDefsResult};
+use dataflow::reaching_defs::{DefSite, ReachingDefsResult};
 use hir_def::body::Body;
 use hir_def::hir::{Expr, Stmt};
-use hir_def::{
-    BindingId, DefWithBodyId, ExprId, IdConversion, MethodId, MethodIdInput, ModuleId, StmtId,
-};
+use hir_def::{DefWithBodyId, ExprId, IdConversion, MethodId, MethodIdInput, ModuleId, StmtId};
 use rustc_hash::FxHashMap;
 use stdx::case::CaseExt;
 use vfs::FileId;
 
 use bsl_types::kind::{TypeId, TypeKind};
 
-use crate::call_resolution::CallSelection;
+use crate::body_flow::BodyFlow;
 use crate::db::HirDatabase;
 use crate::infer::{CallArgBinding, ImplicitLocalInfo};
+use crate::possible_writes::Rebinding;
 
 /// What the walk proved about the values of an expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,43 +89,29 @@ const DEPTH_CAP: u32 = 16;
 /// requested only when a local is met.
 pub struct ValueOriginWalk<'a> {
     db: &'a dyn HirDatabase,
-    file_id: FileId,
-    owner: DefWithBodyId,
+    flow: &'a BodyFlow,
     body: &'a Body,
     bindings: &'a [CallArgBinding],
     expr_types: &'a FxHashMap<ExprId, TypeId>,
-    // Kept for parity with the other walks over one inference result; a parameter has no
-    // assigned value to follow, so the walk reads no binding type.
-    #[allow(dead_code)]
-    binding_types: &'a FxHashMap<BindingId, TypeId>,
     implicit_locals: &'a FxHashMap<String, ImplicitLocalInfo>,
     reaching: Option<Option<Arc<ReachingDefsResult>>>,
     memo: FxHashMap<ExprId, ValueOrigin>,
 }
 
 impl<'a> ValueOriginWalk<'a> {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the fields of one inference result, passed as they are held"
-    )]
     pub fn new(
         db: &'a dyn HirDatabase,
-        file_id: FileId,
-        owner: DefWithBodyId,
-        body: &'a Body,
+        flow: &'a BodyFlow,
         bindings: &'a [CallArgBinding],
         expr_types: &'a FxHashMap<ExprId, TypeId>,
-        binding_types: &'a FxHashMap<BindingId, TypeId>,
         implicit_locals: &'a FxHashMap<String, ImplicitLocalInfo>,
     ) -> Self {
         Self {
             db,
-            file_id,
-            owner,
-            body,
+            flow,
+            body: flow.body(),
             bindings,
             expr_types,
-            binding_types,
             implicit_locals,
             reaching: None,
             memo: FxHashMap::default(),
@@ -162,11 +147,9 @@ impl<'a> ValueOriginWalk<'a> {
         let Some(binding) = self.bindings.iter().find(|binding| binding.call_expr == callee) else {
             return opaque;
         };
-        // The same test `argument_passing_of` applies: one candidate, or the call proves nothing.
-        let candidate = match &binding.candidate.resolution.selection {
-            CallSelection::Unique { candidate } => *candidate,
-            CallSelection::Ambiguous { candidates } if candidates.len() == 1 => candidates[0],
-            _ => return opaque,
+        // One candidate, or the call proves nothing - the test `argument_passing_of` applies too.
+        let Some(candidate) = binding.candidate.resolution.selection.sole_candidate() else {
+            return opaque;
         };
         let Some(signature) = binding
             .candidate
@@ -235,14 +218,12 @@ impl<'a> ValueOriginWalk<'a> {
             return ValueOrigin::Unproven(Unproven::OpaqueDefinition);
         };
 
-        // A read inside an `Если` / `Пока` condition or a `Для` bound happens at the header, which
-        // is not a statement of any block: its definitions are asked by the expression the header
-        // evaluates first, as inference does.
-        let header = header_read_expr(self.body, stmt);
-        let Some(defs) = self.reaching().and_then(|reaching| match header {
-            Some(header) => reaching.defs_for_var_at_header(name, header),
-            None => reaching.defs_for_var_at_stmt(name, stmt),
-        }) else {
+        let Some(reaching) = self.reaching() else {
+            return ValueOrigin::Unproven(Unproven::OpaqueDefinition);
+        };
+        let Some(defs) =
+            crate::possible_writes::defs_reaching_read(self.body, &reaching, &key, expr, stmt)
+        else {
             return ValueOrigin::Unproven(Unproven::OpaqueDefinition);
         };
         if defs.is_empty() {
@@ -263,13 +244,23 @@ impl<'a> ValueOriginWalk<'a> {
                 | DefSite::ForLoop(_)
                 | DefSite::ForEachLoop(_) => ValueOrigin::Other,
                 // A writer the walk cannot see through. `Выполнить` and a PROVEN by-reference
-                // argument certainly can write, so they are not a matter of an unknown
-                // direction and do not fall under the policy knob. The meet below settles what
-                // happens when such a write reaches a read beside an ordinary definition.
-                DefSite::ForeignWrite { kind, .. } => ValueOrigin::Unproven(match kind {
-                    ForeignWrite::ByRefArgument | ForeignWrite::Execute => Unproven::Rewritten,
-                    ForeignWrite::UnattestedArgument => Unproven::RewriteDirectionUnknown,
-                }),
+                // argument certainly can write: `Rewritten`. A call whose direction is not
+                // attested may write or not: `RewriteDirectionUnknown`. One proven to take the
+                // argument by value writes nothing and gives no definition. The meet below
+                // settles what happens when such a write reaches a read beside an ordinary one.
+                DefSite::MayWrite(_) => match crate::possible_writes::rebinding(
+                    self.db,
+                    self.body,
+                    self.bindings,
+                    &reaching,
+                    def,
+                ) {
+                    Some(Rebinding::Cannot) => continue,
+                    Some(Rebinding::Certain) => ValueOrigin::Unproven(Unproven::Rewritten),
+                    Some(Rebinding::Unattested) | None => {
+                        ValueOrigin::Unproven(Unproven::RewriteDirectionUnknown)
+                    }
+                },
                 DefSite::Unknown => ValueOrigin::Unproven(Unproven::OpaqueDefinition),
             };
             let merged = met.map_or(origin, |earlier| earlier.meet(origin));
@@ -281,21 +272,15 @@ impl<'a> ValueOriginWalk<'a> {
         met.unwrap_or(ValueOrigin::Unproven(Unproven::OpaqueDefinition))
     }
 
-    /// The writes-aware executable definitions: a write the walk cannot read is one of them, and
-    /// a value that only dead code wrote is not.
+    /// The executable definitions: a write the walk cannot read is one of them, and a value that
+    /// only dead code wrote is not. A body whose lowering may have lost a write proves nothing.
     fn reaching(&mut self) -> Option<Arc<ReachingDefsResult>> {
         self.reaching
-            .get_or_insert_with(|| match self.owner {
-                DefWithBodyId::Method(local_id) => {
-                    let module = ModuleId::new(self.file_id);
-                    self.db.method_foreign_write_reaching_definitions(MethodIdInput::new(
-                        self.db,
-                        MethodId { module, local_id },
-                    ))
+            .get_or_insert_with(|| {
+                if hir_def::body::events::hir_suppressed(self.body) {
+                    return None;
                 }
-                DefWithBodyId::ModuleCode => {
-                    self.db.module_code_foreign_write_reaching_definitions(self.file_id)
-                }
+                self.flow.executable_reaching_defs(self.db)
             })
             .clone()
     }
@@ -314,16 +299,13 @@ pub fn value_origin_of(
         DefWithBodyId::Method(local_id) => {
             let method = MethodId { module: ModuleId::new(file_id), local_id };
             let input = MethodIdInput::new(db, method);
-            let body = db.method_body_ref(input);
+            let flow = BodyFlow::for_method(db, input, db.method_body_ref(input));
             let infer = db.infer_method_ref(input);
             ValueOriginWalk::new(
                 db,
-                file_id,
-                owner,
-                body,
+                &flow,
                 &infer.call_arg_bindings,
                 &infer.expr_types,
-                &infer.binding_types,
                 &infer.implicit_locals,
             )
             .value_origin_on_every_path(expr)
@@ -333,15 +315,13 @@ pub fn value_origin_of(
             let Some(body) = module_bodies.module_code_arc() else {
                 return ValueOrigin::Unproven(Unproven::OpaqueDefinition);
             };
+            let flow = BodyFlow::for_module_code(db, file_id, body);
             let infer = db.infer_module_code_ref(file_id);
             ValueOriginWalk::new(
                 db,
-                file_id,
-                owner,
-                body,
+                &flow,
                 &infer.call_arg_bindings,
                 &infer.expr_types,
-                &infer.binding_types,
                 &infer.implicit_locals,
             )
             .value_origin_on_every_path(expr)

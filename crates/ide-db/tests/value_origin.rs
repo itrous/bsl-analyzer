@@ -9,7 +9,7 @@ use hir::{
     DefDatabase, DefWithBodyId, Expr, ExprId, HirDatabase, IdConversion, MethodId, MethodIdInput,
     ModuleId, Name, Stmt,
 };
-use hir_ty::value_origin::{Unproven, ValueOrigin, ValueOriginWalk};
+use hir_ty::value_origin::{Unproven, ValueOrigin};
 use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
 use test_fixture::Fixture;
@@ -46,7 +46,6 @@ fn origin(source: &str) -> ValueOrigin {
     let (db, file_id) = setup(source);
     let mid = method(&db, file_id, "П");
     let input = MethodIdInput::new(&db, mid);
-    let infer = db.infer_method_ref(input);
     let body = db.method_body_ref(input);
     let value = body
         .stmts_iter()
@@ -60,17 +59,7 @@ fn origin(source: &str) -> ValueOrigin {
         })
         .next_back()
         .expect("an assignment to Итог");
-    let mut walk = ValueOriginWalk::new(
-        &db,
-        file_id,
-        DefWithBodyId::Method(mid.local_id),
-        body,
-        &infer.call_arg_bindings,
-        &infer.expr_types,
-        &infer.binding_types,
-        &infer.implicit_locals,
-    );
-    walk.value_origin_on_every_path(value)
+    hir_ty::value_origin::value_origin_of(&db, file_id, DefWithBodyId::Method(mid.local_id), value)
 }
 
 /// The origin of the local `Имя` as read inside the condition of the first `Если` / `Пока` of
@@ -79,7 +68,6 @@ fn origin_in_condition(source: &str) -> ValueOrigin {
     let (db, file_id) = setup(source);
     let mid = method(&db, file_id, "П");
     let input = MethodIdInput::new(&db, mid);
-    let infer = db.infer_method_ref(input);
     let body = db.method_body_ref(input);
     let is_header = |id| {
         body.enclosing_stmt(id)
@@ -91,17 +79,7 @@ fn origin_in_condition(source: &str) -> ValueOrigin {
         .map(|(id, _)| id)
         .next()
         .expect("a read of Имя in an Если or Пока condition");
-    let mut walk = ValueOriginWalk::new(
-        &db,
-        file_id,
-        DefWithBodyId::Method(mid.local_id),
-        body,
-        &infer.call_arg_bindings,
-        &infer.expr_types,
-        &infer.binding_types,
-        &infer.implicit_locals,
-    );
-    walk.value_origin_on_every_path(read)
+    hir_ty::value_origin::value_origin_of(&db, file_id, DefWithBodyId::Method(mid.local_id), read)
 }
 
 const TEXT: ValueOrigin = ValueOrigin::TypeNameText;

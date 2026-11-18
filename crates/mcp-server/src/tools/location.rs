@@ -187,8 +187,10 @@ impl Location {
     /// address its source knows and we do not.
     pub fn from_key(root_id: &str, rel_path: &str) -> Self {
         Self {
-            root_id: root_id.to_string(),
-            path: normalize_separators(rel_path),
+            // A caller may hold the pair in the host spelling (a request echoed back, a baseline
+            // row written before keys were `/`-spelled); the contract publishes the store's.
+            root_id: bsl_search::spell_as_key(root_id),
+            path: bsl_search::spell_as_key(rel_path),
             range: None,
             enclosing_range: None,
             module: None,
@@ -242,18 +244,6 @@ impl Location {
             map.insert("module".into(), json!({ "kind": module.kind, "name": module.name }));
         }
         body
-    }
-}
-
-/// Windows spells a stored relative path with `\`, and the contract publishes `/`. On
-/// UNIX a backslash is an ordinary character in a file name, so rewriting it there would
-/// mint an address that looks right and points elsewhere — the exact failure this contract
-/// exists to prevent.
-fn normalize_separators(path: &str) -> String {
-    if cfg!(windows) {
-        path.replace('\\', "/")
-    } else {
-        path.to_owned()
     }
 }
 
@@ -650,6 +640,19 @@ mod tests {
         // address a different file, and `resolve` would hand back the wrong one.
         let location = Location::from_key("", "CommonModules/A\\B/Ext/Module.bsl");
         assert_eq!(location.path, "CommonModules/A\\B/Ext/Module.bsl");
+    }
+
+    /// Both halves of a pair held in the host spelling come out in the key spelling, so the
+    /// pair a consumer feeds back matches the store. Assembled with `Path::join`: a literal
+    /// `"extensions/provider-a"` would pass on Windows by luck and hide the defect.
+    #[test]
+    fn a_host_spelled_pair_is_answered_in_the_key_spelling() {
+        let root_id = Path::new("extensions").join("provider-a");
+        let path = Path::new("CommonModules").join("M").join("Module.bsl");
+        let value =
+            Location::from_key(&root_id.to_string_lossy(), &path.to_string_lossy()).to_value();
+        assert_eq!(value["root_id"], "extensions/provider-a");
+        assert_eq!(value["path"], "CommonModules/M/Module.bsl");
     }
 
     #[test]

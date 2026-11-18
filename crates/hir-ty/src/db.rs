@@ -1,4 +1,5 @@
 use bsl_types::kind::TypeId;
+use hir_def::body::events::BodyEvents;
 use hir_def::{ConfigsDatabase, DefWithBodyId, ExprId, MethodIdInput};
 use std::sync::Arc;
 use vfs::FileId;
@@ -86,18 +87,18 @@ pub trait HirDatabase: ConfigsDatabase + bsl_types::intern::TypeKernelDb {
         method: MethodIdInput<'_>,
     ) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>>;
 
-    /// Reaching definitions of the module-level code told about the writes they cannot read: a
-    /// call that may write the local it is given, `Выполнить`. Depends on the inference result,
-    /// so inference must not read it.
-    fn module_code_foreign_write_reaching_definitions(
-        &self,
-        file_id: FileId,
-    ) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>>;
+    /// The control-flow graph of one method's memoised body, built once per
+    /// revision of that body.
+    fn method_cfg(&self, method: MethodIdInput<'_>) -> Arc<cfg::ControlFlowGraph>;
 
-    /// [`module_code_foreign_write_reaching_definitions`](Self::module_code_foreign_write_reaching_definitions)
-    /// of one method.
-    fn method_foreign_write_reaching_definitions(
-        &self,
-        method: MethodIdInput<'_>,
-    ) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>>;
+    /// The control-flow graph of the module-level code; empty when the module
+    /// has none.
+    fn module_code_cfg(&self, file_id: FileId) -> Arc<cfg::ControlFlowGraph>;
+
+    /// The syntactic evaluation events of one method's memoised body.
+    fn method_body_events(&self, method: MethodIdInput<'_>) -> Arc<BodyEvents>;
+
+    /// The syntactic evaluation events of the module-level code; `None` when
+    /// the module has none.
+    fn module_code_body_events(&self, file_id: FileId) -> Option<Arc<BodyEvents>>;
 }

@@ -46,6 +46,7 @@ pub const METHOD_KEYED_QUERY_FAMILIES: &[&str] = &[
     "doc_see_signature_query",
     "structure_param_keys_query",
     "method_cfg_query",
+    "method_body_events_query",
     "reaching_definitions_query",
     "method_path_terminates_query",
     "method_security_state_query",
@@ -525,6 +526,7 @@ impl RootDatabaseImpl {
             "infer_module_code_query",
             "module_bodies_query",
             "module_code_reaching_definitions_query",
+            "module_code_body_events_query",
             "module_code_security_state_query",
             "module_code_arg_diagnostics_query",
         ];
@@ -3770,19 +3772,20 @@ impl hir::HirDatabase for RootDatabaseImpl {
         queries::reaching_definitions_query(self, method)
     }
 
-    fn module_code_foreign_write_reaching_definitions(
-        &self,
-        file_id: FileId,
-    ) -> Option<Arc<hir::dataflow::reaching_defs::ReachingDefsResult>> {
-        let file_id_input = FileIdInput::new(self, file_id);
-        queries::module_code_foreign_write_reaching_definitions_query(self, file_id_input)
+    fn method_cfg(&self, method: hir::MethodIdInput<'_>) -> Arc<hir::cfg::ControlFlowGraph> {
+        method_cfg_query(self, method)
     }
 
-    fn method_foreign_write_reaching_definitions(
-        &self,
-        method: hir::MethodIdInput<'_>,
-    ) -> Option<Arc<hir::dataflow::reaching_defs::ReachingDefsResult>> {
-        queries::foreign_write_reaching_definitions_query(self, method)
+    fn module_code_cfg(&self, file_id: FileId) -> Arc<hir::cfg::ControlFlowGraph> {
+        queries::module_level_cfg_query(self, FileIdInput::new(self, file_id))
+    }
+
+    fn method_body_events(&self, method: hir::MethodIdInput<'_>) -> Arc<hir::BodyEvents> {
+        queries::method_body_events_query(self, method)
+    }
+
+    fn module_code_body_events(&self, file_id: FileId) -> Option<Arc<hir::BodyEvents>> {
+        queries::module_code_body_events_query(self, FileIdInput::new(self, file_id))
     }
 }
 
@@ -3956,14 +3959,8 @@ impl RootDatabase for RootDatabaseImpl {
         crate::effects::module_code_security_state_query(self, file_id_input)
     }
 
-    fn method_cfg(&self, method_id: hir::MethodId) -> Arc<hir::cfg::ControlFlowGraph> {
-        let method_id_input = hir::MethodIdInput::new(self, method_id);
-        method_cfg_query(self, method_id_input)
-    }
-
     fn module_level_cfg(&self, module_id: hir::ModuleId) -> Arc<hir::cfg::ControlFlowGraph> {
-        let file_id_input = base_db::FileIdInput::new(self, module_id.file_id);
-        queries::module_level_cfg_query(self, file_id_input)
+        hir::HirDatabase::module_code_cfg(self, module_id.file_id)
     }
 
     fn line_index(&self, file_id_input: base_db::FileIdInput) -> Arc<line_index::LineIndex> {

@@ -832,22 +832,7 @@ pub(crate) fn has_module_syntax(code: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
-
-    /// Writes an executable through a child process. A file some process still holds open for
-    /// writing cannot be executed (`ETXTBSY`), and a child that another test thread forks while
-    /// this one writes holds the descriptor until it execs: a program written here and spawned
-    /// at once would start or not depending on what the other threads were doing.
-    fn write_executable(path: &std::path::Path, text: &str) {
-        let staged = path.with_extension("staged");
-        std::fs::write(&staged, text).unwrap();
-        let installed = std::process::Command::new("install")
-            .args(["-m", "700"])
-            .arg(&staged)
-            .arg(path)
-            .status()
-            .unwrap();
-        assert!(installed.success(), "install {}", path.display());
-    }
+    use test_utils::write_executable;
 
     #[test]
     fn reaper_stops_when_the_child_was_collected_elsewhere() {
