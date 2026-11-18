@@ -154,35 +154,25 @@ impl Transfer<DefiniteInit> for DefiniteInitTransfer {
 }
 
 fn body_contains_label(stmts: &[hir_def::hir::StmtIdx], body: &Body) -> bool {
-    for &idx in stmts {
-        match body.stmt_idx(idx) {
-            Stmt::Label(_) => return true,
-            Stmt::If(if_stmt) => {
-                if body_contains_label(&if_stmt.then_branch, body)
-                    || if_stmt
-                        .elsif_branches
-                        .iter()
-                        .any(|(_, branch)| body_contains_label(branch, body))
-                    || if_stmt
-                        .else_branch
-                        .as_ref()
-                        .is_some_and(|branch| body_contains_label(branch, body))
-                {
-                    return true;
-                }
-            }
-            Stmt::For { body: nested, .. }
-            | Stmt::ForEach { body: nested, .. }
-            | Stmt::While { body: nested, .. }
-            | Stmt::Try { body: nested, .. } => {
-                if body_contains_label(nested, body) {
-                    return true;
-                }
-            }
-            _ => {}
+    stmts.iter().any(|&idx| match body.stmt_idx(idx) {
+        Stmt::Label(_) => true,
+        Stmt::If(if_stmt) => {
+            body_contains_label(&if_stmt.then_branch, body)
+                || if_stmt
+                    .elsif_branches
+                    .iter()
+                    .any(|(_, branch)| body_contains_label(branch, body))
+                || if_stmt
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|branch| body_contains_label(branch, body))
         }
-    }
-    false
+        Stmt::For { body: nested, .. }
+        | Stmt::ForEach { body: nested, .. }
+        | Stmt::While { body: nested, .. }
+        | Stmt::Try { body: nested, .. } => body_contains_label(nested, body),
+        _ => false,
+    })
 }
 
 pub struct DefiniteInitResult {
