@@ -192,7 +192,7 @@ impl Fixture {
     }
 
     fn solve(&self) -> ReachingDefsResult {
-        self.solve_with(ExecutableReachingDefsTransfer)
+        self.solve_with(ExecutableReachingDefsTransfer::new(&self.body))
     }
 
     fn solve_with<T: Transfer<ExecutableDefs>>(&self, transfer: T) -> ReachingDefsResult {
@@ -212,7 +212,11 @@ impl Fixture {
     }
 
     fn mutant(&self, rule: Rule) -> Mutant {
-        Mutant { rule, index: self.index.clone() }
+        Mutant {
+            rule,
+            index: self.index.clone(),
+            real: ExecutableReachingDefsTransfer::new(&self.body),
+        }
     }
 
     /// The header root holding the string literal `marker`.
@@ -395,6 +399,7 @@ enum Rule {
 struct Mutant {
     rule: Rule,
     index: Arc<DefinitionIndex>,
+    real: ExecutableReachingDefsTransfer,
 }
 
 impl Mutant {
@@ -405,10 +410,15 @@ impl Mutant {
         state: &ExecutableDefs,
         out: ExecutableDefs,
     ) -> ExecutableDefs {
-        let (Reach::Reached(input), Reach::Reached(mut normal), Reach::Reached(mut exceptional)) =
-            (&state.normal, out.normal.clone(), out.exceptional.clone())
-        else {
-            return out;
+        let Reach::Reached(input) = &state.normal else { return out };
+        let Reach::Reached(mut normal) = out.normal.clone() else { return out };
+        // A plain assignment cannot raise, so its exceptional exit is unreached. Rules that
+        // change the normal exit still apply; the unreached exit stays unreached unless the
+        // rule itself writes the exceptional part.
+        let exceptional_unreached = matches!(out.exceptional, Reach::Unreached);
+        let mut exceptional = match out.exceptional.clone() {
+            Reach::Reached(defs) => defs,
+            Reach::Unreached => ReachingDefs::new(self.index.clone()),
         };
         let may = self.index.point_writes(point);
         match self.rule {
@@ -466,9 +476,17 @@ impl Mutant {
             }
             _ => {}
         }
+        let touches_exceptional = matches!(
+            self.rule,
+            Rule::NoMayWrite | Rule::ExecuteOnlyEarlierNames | Rule::AccumulatedExceptional
+        );
         ExecutableDefs {
             normal: Reach::Reached(normal),
-            exceptional: Reach::Reached(exceptional),
+            exceptional: if exceptional_unreached && !touches_exceptional {
+                Reach::Unreached
+            } else {
+                Reach::Reached(exceptional)
+            },
             skipped: out.skipped,
         }
     }
@@ -487,7 +505,7 @@ impl Transfer<ExecutableDefs> for Mutant {
         state: &ExecutableDefs,
         body: &Body,
     ) -> ExecutableDefs {
-        let out = ExecutableReachingDefsTransfer.transfer_stmt(stmt_id, state, body);
+        let out = self.real.transfer_stmt(stmt_id, state, body);
         self.adjust(EvalPoint::Stmt(StmtId::from_raw(stmt_id)), body, state, out)
     }
 
@@ -500,16 +518,16 @@ impl Transfer<ExecutableDefs> for Mutant {
         if self.rule == Rule::SkipHeaderRoots {
             return ExecutableDefs::entering(state.normal.clone());
         }
-        let out = ExecutableReachingDefsTransfer.transfer_expr(expr_id, state, body);
+        let out = self.real.transfer_expr(expr_id, state, body);
         self.adjust(EvalPoint::Header(expr_id), body, state, out)
     }
 
     fn transfer_loop_var_bind(&self, loop_var: BindingId, state: &mut ExecutableDefs, body: &Body) {
-        ExecutableReachingDefsTransfer.transfer_loop_var_bind(loop_var, state, body);
+        self.real.transfer_loop_var_bind(loop_var, state, body);
     }
 
     fn transfer_edge(&self, edge_kind: CfgEdgeType, state: &ExecutableDefs) -> ExecutableDefs {
-        let real = ExecutableReachingDefsTransfer.transfer_edge(edge_kind, state);
+        let real = self.real.transfer_edge(edge_kind, state);
         match (self.rule, edge_kind) {
             (Rule::UnexecutableAsEmpty, CfgEdgeType::Unexecutable) => {
                 ExecutableDefs::entering(Reach::Reached(ReachingDefs::new(self.index.clone())))
@@ -570,7 +588,11 @@ fn dataflow_writes_i01_strong_write() {
         params_only.insert(&Definition::parameter(&name, binding_id));
     }
     assert_eq!(
-        f.read(&f.solve_from(ExecutableReachingDefsTransfer, params_only), "м1", "x"),
+        f.read(
+            &f.solve_from(ExecutableReachingDefsTransfer::new(&f.body), params_only),
+            "м1",
+            "x",
+        ),
         strings(&["A"]),
         "without the entry Unknown the one write passes for every path",
     );
@@ -813,7 +835,7 @@ fn dataflow_writes_i07_unreached_does_not_generate() {
     let f = fixture_with_cfg(body, Arc::new(cfg));
     let empty = || ReachingDefs::new(f.index.clone());
 
-    let result = f.solve_from(ExecutableReachingDefsTransfer, empty());
+    let result = f.solve_from(ExecutableReachingDefsTransfer::new(&f.body), empty());
     assert_eq!(f.read(&result, "м1", "x"), strings(&[]), "the live entry is reached, though empty");
     assert!(!result.block_in.contains_key(&dead), "the dead block is unreached");
     assert_eq!(
@@ -997,7 +1019,11 @@ fn dataflow_writes_i10_exceptional_sources() {
         strings(&["A"]),
         "an early read does not see a later write"
     );
-    assert_eq!(f.read(&result, "м2", "x"), strings(&["A", "W:W"]));
+    assert_eq!(
+        f.read(&result, "м2", "x"),
+        strings(&["A", "W:W"]),
+        "W may write and then raise; the plain assignment after it does not run"
+    );
     assert_eq!(f.read(&f.solve_with(f.mutant(Rule::TryVeto)), "м1", "x"), strings(&["A", "W:W"]));
     assert_eq!(f.read(&f.solve_with(f.mutant(Rule::OnlyTryEntry)), "м2", "x"), strings(&["A"]));
 
@@ -1026,12 +1052,13 @@ fn dataflow_writes_i10_exceptional_sources() {
     );
     assert_eq!(
         f.read(&f.solve(), "м1", "x"),
-        strings(&["A", "B"]),
-        "the Try entry keeps its input"
+        strings(&["A"]),
+        "a literal assignment cannot raise, so it does not reach the handler; the Try entry keeps its input"
     );
     assert_eq!(
         f.read(&f.solve_with(f.mutant(Rule::AccumulatedExceptional)), "м1", "x"),
-        strings(&["A", "B", "Unknown", "W:W"])
+        strings(&["A", "Unknown", "W:W"]),
+        "accumulation drags earlier exceptional bits along the normal edge, but not the assignment itself"
     );
 }
 
@@ -1072,9 +1099,14 @@ fn dataflow_writes_i05_i11_argument_events_and_names() {
 fn dataflow_writes_i12_unavailable_is_not_proof() {
     let source = "Процедура Т(Усл)\n    x = \"A\";\n    Пока Усл Цикл\n        Если x = \"м1\" Тогда КонецЕсли;\n        W(x);\n    КонецЦикла;\n    Возврат;\n    Если x = \"м2\" Тогда КонецЕсли;\nКонецПроцедуры\n";
     let f = fixture(source);
-    let capped =
-        solve_executable(ExecutableReachingDefsTransfer, f.cfg.clone(), &f.body, f.entry(), 2)
-            .expect("solves");
+    let capped = solve_executable(
+        ExecutableReachingDefsTransfer::new(&f.body),
+        f.cfg.clone(),
+        &f.body,
+        f.entry(),
+        2,
+    )
+    .expect("solves");
     assert!(!capped.converged());
     assert!(publish_executable(&capped, &f.body, f.events.clone()).is_none());
     let partial = ReachingDefsResult::from_executable(&capped, f.body.clone(), f.events.clone());
@@ -1147,7 +1179,7 @@ fn dataflow_writes_i12_unavailable_is_not_proof() {
         );
         assert!(
             solve_executable(
-                ExecutableReachingDefsTransfer,
+                ExecutableReachingDefsTransfer::new(&f.body),
                 f.cfg.clone(),
                 &f.body,
                 f.entry(),
@@ -1180,7 +1212,7 @@ fn nested_loops(depth: usize, width: usize) -> String {
 fn dataflow_writes_i12_long_method_converges() {
     let f = fixture(&nested_loops(10, 60));
     let fixed_bound = solve_executable(
-        ExecutableReachingDefsTransfer,
+        ExecutableReachingDefsTransfer::new(&f.body),
         f.cfg.clone(),
         &f.body,
         f.entry(),
@@ -1199,7 +1231,7 @@ fn dataflow_writes_i12_long_method_converges() {
     let published = published.expect("a long method that converges is solved");
     // The budget decides only whether the fixed point is reached, not which one it is.
     let unbounded = solve_executable(
-        ExecutableReachingDefsTransfer,
+        ExecutableReachingDefsTransfer::new(&f.body),
         f.cfg.clone(),
         &f.body,
         f.entry(),
@@ -1211,4 +1243,48 @@ fn dataflow_writes_i12_long_method_converges() {
         *published,
         ReachingDefsResult::from_executable(&unbounded, f.body.clone(), f.events.clone())
     );
+}
+
+/// A write followed only by assignments that cannot raise is not on any path into the handler.
+/// A by-reference write followed by a call is: the call can still raise after the write.
+#[test]
+fn a_write_followed_only_by_non_raising_assignments_does_not_reach_the_handler() {
+    let safe = fixture(
+        "Процедура Т()\n    Попытка\n        x = F(x);\n        x = \"B\";\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\nКонецПроцедуры\n",
+    );
+    assert_eq!(
+        safe.read(&safe.solve(), "м1", "x"),
+        strings(&["Unknown", "W:F"]),
+        "the ordinary assignment does not reach; the call may have written its argument and then raised"
+    );
+
+    let raising = fixture(
+        "Процедура Т()\n    Попытка\n        x = F(x);\n        Ф();\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\nКонецПроцедуры\n",
+    );
+    assert_eq!(raising.read(&raising.solve(), "м1", "x"), strings(&["=F", "Unknown", "W:F"]));
+
+    let written = fixture(
+        "Процедура Т()\n    x = \"A\";\n    Попытка\n        W(x);\n        Ф();\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\nКонецПроцедуры\n",
+    );
+    assert_eq!(written.read(&written.solve(), "м1", "x"), strings(&["A", "W:W"]));
+
+    // A call may write its argument and then raise. The plain assignment after it does not
+    // run on that path, so the handler still sees the possible write.
+    let raises_after_write = fixture(
+        "Процедура Т()\n    x = \"A\";\n    Попытка\n        W(x);\n        x = \"B\";\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\nКонецПроцедуры\n",
+    );
+    assert_eq!(
+        raises_after_write.read(&raises_after_write.solve(), "м1", "x"),
+        strings(&["A", "W:W"]),
+        "the plain assignment cannot raise, so it is not what the handler sees"
+    );
+
+    // The assignment is the last statement of a branch, and the branch's statement is followed
+    // only by an assignment that cannot raise. Once the call returns, nothing left can enter
+    // the handler, so the ordinary write does not reach it. The call may still have written
+    // its argument and then raised.
+    let nested = fixture(
+        "Процедура Т(Усл)\n    Попытка\n        Если Усл Тогда\n            x = F(x);\n        КонецЕсли;\n        y = \"C\";\n    Исключение\n        Если x = \"м1\" Тогда КонецЕсли;\n    КонецПопытки;\nКонецПроцедуры\n",
+    );
+    assert_eq!(nested.read(&nested.solve(), "м1", "x"), strings(&["Unknown", "W:F"]));
 }

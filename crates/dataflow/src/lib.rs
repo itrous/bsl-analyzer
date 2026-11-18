@@ -8,7 +8,7 @@ pub mod temp_resource;
 pub mod value_state;
 
 use cfg::{CfgEdgeType, ControlFlowGraph};
-use hir_def::body::Body;
+use hir_def::{body::Body, hir::StmtIdx, Expr, Literal, Stmt, UnaryOp};
 use la_arena::RawIdx;
 use petgraph::graph::NodeIndex;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -32,6 +32,27 @@ pub(crate) fn map_table_bytes<K, V>(len: usize) -> usize {
     }
     let cap = (len * 8 / 7 + 1).checked_next_power_of_two().unwrap_or(len);
     cap.saturating_mul(std::mem::size_of::<K>() + std::mem::size_of::<V>() + 1)
+}
+
+/// `Имя = Имя` or `Имя = <literal>`: the only assignments that provably cannot raise.
+/// Deliberately conservative - when in doubt the statement CAN raise. The target must be a
+/// bare variable (an index or property write can fail on the receiver). The value must be a
+/// bare name read, a literal, or a minus on a number literal; a call, `Новый`, a ternary, a
+/// property access or an index can raise, and so can arithmetic: `A + B` raises on a type
+/// mismatch and `A / B` on a zero divisor, so it is NOT safe. A minus on a name is not safe
+/// either - it raises when the name holds a string.
+pub(crate) fn is_non_raising_assignment(body: &Body, stmt: StmtIdx) -> bool {
+    let Stmt::Assign { target, value } = body.stmt_idx(stmt) else { return false };
+    if !matches!(body.expr_idx(*target), Expr::Path(_)) {
+        return false;
+    }
+    match body.expr_idx(*value) {
+        Expr::Path(_) | Expr::Literal(_) => true,
+        Expr::UnaryOp { expr, op: UnaryOp::Neg } => {
+            matches!(body.expr_idx(*expr), Expr::Literal(Literal::Number(_)))
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +107,17 @@ pub trait Transfer<L: Lattice> {
     /// exception edge into the handler; a backward analysis receives the join
     /// of both successors instead and flows the result to the predecessor.
     fn transfer_try_entry(&self, _try_stmt: hir_def::StmtId, _state: &mut L, _body: &Body) {}
+
+    /// Transfer along the `Exception` edge that leaves the `Попытка` vertex, applied after
+    /// [`Transfer::transfer_edge`]. The vertex precedes every protected statement, so its
+    /// out-state knows nothing of what they do. What is added here reaches the handler and
+    /// not the protected body: the vertex has one out-state shared by both successors.
+    ///
+    /// Only the edge leaving a `CfgVertex::Try` is offered, not the `Exception` edge of
+    /// `ВызватьИсключение`. Analyses that follow possible-failure edges already see each
+    /// protected point; this hook is for an analysis that does not, and still needs what the
+    /// protected prefix has certainly done by the time the handler runs.
+    fn transfer_exception_edge(&self, _try_stmt: hir_def::StmtId, _state: &mut L, _body: &Body) {}
 }
 
 pub struct DataflowSolver<L: Lattice, T: Transfer<L>> {
@@ -207,7 +239,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                         continue;
                     }
                     if let Some(pred_out) = self.block_out.get(&pred_idx) {
-                        let edge_state = self.transfer.transfer_edge(*edge_kind, pred_out);
+                        let edge_state = self.transfer_edge_state(pred_idx, *edge_kind, pred_out);
                         match &mut state {
                             None => {
                                 state = Some(edge_state);
@@ -321,7 +353,7 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                         continue;
                     }
                     if let Some(succ_in) = self.block_in.get(&succ_idx) {
-                        let edge_state = self.transfer.transfer_edge(*edge_kind, succ_in);
+                        let edge_state = self.transfer_edge_state(block_idx, *edge_kind, succ_in);
                         match &mut state {
                             None => {
                                 state = Some(edge_state);
@@ -390,6 +422,20 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
 
     fn crosses(&self, from: NodeIndex, kind: CfgEdgeType) -> bool {
         self.transfer.follows_possible_failures() || !self.cfg.is_possible_failure(from, kind)
+    }
+
+    /// [`Transfer::transfer_edge`], plus [`Transfer::transfer_exception_edge`] on the
+    /// `Exception` edge of a `Попытка`.
+    fn transfer_edge_state(&self, source: NodeIndex, edge_kind: CfgEdgeType, state: &L) -> L {
+        let mut edge_state = self.transfer.transfer_edge(edge_kind, state);
+        if matches!(edge_kind, CfgEdgeType::Exception)
+            && matches!(self.cfg.vertex(source), Some(cfg::CfgVertex::Try))
+        {
+            if let Some(try_stmt) = self.cfg.source_stmt_id(source) {
+                self.transfer.transfer_exception_edge(try_stmt, &mut edge_state, &self.body);
+            }
+        }
+        edge_state
     }
 
     fn transfer_block(&self, block_idx: NodeIndex, in_state: &L) -> L {
