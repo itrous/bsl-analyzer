@@ -269,11 +269,11 @@ pub(super) fn parse_delimited_list<F>(
 }
 
 pub fn logical_expression(p: &mut Parser) {
-    logical_or_expr(p);
+    p.nested(logical_or_expr);
 }
 
 pub fn expression(p: &mut Parser) {
-    logical_or_expr(p);
+    p.nested(logical_or_expr);
 }
 
 fn logical_or_expr(p: &mut Parser) {
@@ -316,7 +316,7 @@ fn not_expr(p: &mut Parser) {
     if p.at(T![KwNot]) && !at_a_keyword_qualifier(p) {
         let m = p.start();
         p.bump();
-        not_expr(p);
+        p.nested(not_expr);
         m.complete(p, NodeKind::SdblNotExpr);
     } else {
         comparison_expr(p);
@@ -363,7 +363,7 @@ fn unary_expr(p: &mut Parser) {
     {
         let m = p.start();
         p.bump();
-        unary_expr(p);
+        p.nested(unary_expr);
         m.complete(p, NodeKind::SdblUnaryExpr);
     } else {
         primary_expr(p);

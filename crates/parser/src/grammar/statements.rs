@@ -22,10 +22,10 @@ pub fn statement(p: &mut Parser) -> bool {
             m.complete(p, NodeKind::EmptyStmt);
         }
         Some(T![KwReturn]) => return_stmt(p),
-        Some(T![KwIf]) => if_stmt(p),
-        Some(T![KwWhile]) => while_stmt(p),
-        Some(T![KwFor]) => for_stmt(p),
-        Some(T![KwTry]) => try_stmt(p),
+        Some(T![KwIf]) => p.nested(if_stmt),
+        Some(T![KwWhile]) => p.nested(while_stmt),
+        Some(T![KwFor]) => p.nested(for_stmt),
+        Some(T![KwTry]) => p.nested(try_stmt),
         Some(T![KwRaise]) => raise_stmt(p),
         Some(T![KwBreak]) => {
             let m = p.start();
@@ -47,7 +47,7 @@ pub fn statement(p: &mut Parser) -> bool {
         Some(T![KwVar]) => super::items::var_declaration(p),
         Some(T![PreRegion]) => super::preprocessor_region(p),
         Some(T![PreEndRegion]) => super::preprocessor_end_region(p),
-        Some(T![PreIf]) => super::preprocessor_if(p),
+        Some(T![PreIf]) => p.nested(super::preprocessor_if),
         // The end of the branch read of a torn conditional group, where the
         // statements of that branch end. It is matched by position, so it comes
         // before the crossed block, whose directives share its nesting depth.

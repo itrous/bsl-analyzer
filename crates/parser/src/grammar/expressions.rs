@@ -25,7 +25,7 @@ const CROSS_LINE_PROPERTY_NAME_TOKENS: TokenSet = TokenSet::new(&[
 ]);
 
 pub fn expression(p: &mut Parser) {
-    or_expr(p);
+    p.nested(or_expr);
 }
 
 pub fn postfix_expression_for_assignment(p: &mut Parser) -> bool {
@@ -38,6 +38,9 @@ fn or_expr(p: &mut Parser) {
 
     while p.at(T![KwOr]) {
         p.check_iteration_limit();
+        if p.chain_is_too_deep() {
+            break;
+        }
         let m = lhs.complete(p, NodeKind::Expr).precede(p);
         p.bump();
         let rhs = p.start();
@@ -55,6 +58,9 @@ fn and_expr(p: &mut Parser) {
 
     while p.at(T![KwAnd]) {
         p.check_iteration_limit();
+        if p.chain_is_too_deep() {
+            break;
+        }
         let m = lhs.complete(p, NodeKind::Expr).precede(p);
         p.bump();
         let rhs = p.start();
@@ -71,7 +77,7 @@ fn not_expr(p: &mut Parser) {
     if p.at(T![KwNot]) {
         let m = p.start();
         p.bump();
-        not_expr(p);
+        p.nested(not_expr);
         m.complete(p, NodeKind::UnaryExpr);
     } else {
         comparison_expr(p);
@@ -84,6 +90,10 @@ fn comparison_expr(p: &mut Parser) {
     let mut saw_comparison = false;
 
     while matches!(p.current(), Some(T![Eq] | T![Neq] | T![Lt] | T![Le] | T![Gt] | T![Ge])) {
+        p.check_iteration_limit();
+        if p.chain_is_too_deep() {
+            break;
+        }
         saw_comparison = true;
         let m = lhs.complete(p, NodeKind::Expr).precede(p);
         p.bump();
@@ -106,6 +116,9 @@ fn additive_expr(p: &mut Parser) {
 
     while matches!(p.current(), Some(T![Plus]) | Some(T![Minus])) {
         p.check_iteration_limit();
+        if p.chain_is_too_deep() {
+            break;
+        }
         let m = lhs.complete(p, NodeKind::Expr).precede(p);
         p.bump();
         let rhs = p.start();
@@ -123,6 +136,9 @@ fn multiplicative_expr(p: &mut Parser) {
 
     while matches!(p.current(), Some(T![Star]) | Some(T![Slash]) | Some(T![Percent])) {
         p.check_iteration_limit();
+        if p.chain_is_too_deep() {
+            break;
+        }
         let m = lhs.complete(p, NodeKind::Expr).precede(p);
         p.bump();
         let rhs = p.start();
@@ -149,7 +165,7 @@ fn unary_expr(p: &mut Parser) {
     match p.current() {
         Some(T![Plus]) | Some(T![Minus]) => {
             p.bump();
-            unary_expr(p);
+            p.nested(unary_expr);
         }
         _ => postfix_expr(p),
     }
@@ -178,6 +194,10 @@ fn postfix_expr_with_call_info(p: &mut Parser) -> bool {
 
     loop {
         p.check_iteration_limit();
+        if matches!(p.current(), Some(T![Dot] | T![LBracket] | T![LParen])) && p.chain_is_too_deep()
+        {
+            break;
+        }
         match p.current() {
             Some(T![Dot]) => {
                 let m = lhs.precede(p);
