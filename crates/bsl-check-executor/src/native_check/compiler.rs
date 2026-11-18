@@ -727,7 +727,7 @@ fn write_active_process(cwd: &Path, pid: u32) -> io::Result<std::path::PathBuf> 
         }
         writeln!(file, "{pid}:{start}")?;
         file.sync_all()?;
-        return Ok(path);
+        Ok(path)
     }
     #[cfg(not(windows))]
     {
@@ -909,16 +909,18 @@ impl ProcessGroupGuard {
             if snapshot.is_null() || snapshot as isize == -1 {
                 return Err(ProcessFailure::Spawn);
             }
-            let mut entry = THREADENTRY32::default();
-            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
             let mut thread_id = None;
             let mut found = Thread32First(snapshot, &mut entry) != 0;
             while found {
-                if entry.th32OwnerProcessID == pid {
-                    if thread_id.replace(entry.th32ThreadID).is_some() {
-                        windows_sys::Win32::Foundation::CloseHandle(snapshot);
-                        return Err(ProcessFailure::Spawn);
-                    }
+                if entry.th32OwnerProcessID == pid
+                    && thread_id.replace(entry.th32ThreadID).is_some()
+                {
+                    windows_sys::Win32::Foundation::CloseHandle(snapshot);
+                    return Err(ProcessFailure::Spawn);
                 }
                 found = Thread32Next(snapshot, &mut entry) != 0;
             }
@@ -1949,8 +1951,7 @@ mod windows_tests {
             .await
             .expect("cmd.exe should start");
         assert!(output.status.success());
-        let units =
-            output.stdout.chunks_exact(2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+        let units = output.stdout.as_chunks::<2>().0.iter().map(|bytes| u16::from_le_bytes(*bytes));
         let mut text = String::from_utf16_lossy(&units.collect::<Vec<_>>());
         text = text.trim_start_matches('\u{feff}').trim_end_matches(['\r', '\n']).to_owned();
         text

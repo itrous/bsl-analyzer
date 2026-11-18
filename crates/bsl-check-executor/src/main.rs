@@ -244,59 +244,6 @@ fn install_stop_handler(cancel: CancellationToken) -> Option<StopHandler> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn request_frame_is_read_through_eof_and_rejects_one_byte_over_limit() {
-        let exact = read_request_frame(&b"{}"[..], 2).await.unwrap();
-        assert_eq!(exact, b"{}");
-        assert_eq!(read_request_frame(&b"{} "[..], 2).await.unwrap_err(), 2);
-    }
-
-    #[test]
-    fn a_response_over_the_requested_limit_is_refused_instead_of_written() {
-        let limits = check_contract::WireLimits {
-            timeout_ms: 120_000,
-            max_code_bytes: 1024,
-            max_response_bytes: 16 * 1024,
-            max_stderr_bytes: 4096,
-            stop_grace_ms: 2_000,
-        };
-        let mut request: check_contract::CheckRequest = serde_json::from_value(serde_json::json!({
-            "schema_version": check_contract::SCHEMA_VERSION,
-            "request_id": "r1",
-            "connection": "test",
-            "code": "x = 1;",
-            "limits": limits,
-        }))
-        .unwrap();
-        let fits = error_response(&request, "profile_not_found", "missing");
-        assert!(encode_response(&fits, limits.max_response_bytes).is_ok());
-
-        request.connection = "a".repeat(20_000);
-        let echoed = error_response(&request, "profile_connection_mismatch", "mismatch");
-        assert_eq!(encode_response(&echoed, limits.max_response_bytes), Err(2));
-    }
-
-    #[test]
-    fn native_limits_reject_unsupported_stop_grace_before_profile_startup() {
-        let mut limits = check_contract::WireLimits {
-            timeout_ms: 120_000,
-            max_code_bytes: 2 * 1024 * 1024,
-            max_response_bytes: 256 * 1024,
-            max_stderr_bytes: 64 * 1024,
-            stop_grace_ms: 500,
-        };
-        assert!(supported_limits(&limits));
-        limits.stop_grace_ms = 499;
-        assert!(!supported_limits(&limits));
-        limits.stop_grace_ms = 900_001;
-        assert!(!supported_limits(&limits));
-    }
-}
-
 #[cfg(windows)]
 async fn wait_stop_event(name: &str, cancel: CancellationToken) -> bool {
     use std::os::windows::ffi::OsStrExt;
@@ -347,5 +294,58 @@ fn validate_stop_event(name: &str) -> bool {
         }
         windows_sys::Win32::Foundation::CloseHandle(handle);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_frame_is_read_through_eof_and_rejects_one_byte_over_limit() {
+        let exact = read_request_frame(&b"{}"[..], 2).await.unwrap();
+        assert_eq!(exact, b"{}");
+        assert_eq!(read_request_frame(&b"{} "[..], 2).await.unwrap_err(), 2);
+    }
+
+    #[test]
+    fn a_response_over_the_requested_limit_is_refused_instead_of_written() {
+        let limits = check_contract::WireLimits {
+            timeout_ms: 120_000,
+            max_code_bytes: 1024,
+            max_response_bytes: 16 * 1024,
+            max_stderr_bytes: 4096,
+            stop_grace_ms: 2_000,
+        };
+        let mut request: check_contract::CheckRequest = serde_json::from_value(serde_json::json!({
+            "schema_version": check_contract::SCHEMA_VERSION,
+            "request_id": "r1",
+            "connection": "test",
+            "code": "x = 1;",
+            "limits": limits,
+        }))
+        .unwrap();
+        let fits = error_response(&request, "profile_not_found", "missing");
+        assert!(encode_response(&fits, limits.max_response_bytes).is_ok());
+
+        request.connection = "a".repeat(20_000);
+        let echoed = error_response(&request, "profile_connection_mismatch", "mismatch");
+        assert_eq!(encode_response(&echoed, limits.max_response_bytes), Err(2));
+    }
+
+    #[test]
+    fn native_limits_reject_unsupported_stop_grace_before_profile_startup() {
+        let mut limits = check_contract::WireLimits {
+            timeout_ms: 120_000,
+            max_code_bytes: 2 * 1024 * 1024,
+            max_response_bytes: 256 * 1024,
+            max_stderr_bytes: 64 * 1024,
+            stop_grace_ms: 500,
+        };
+        assert!(supported_limits(&limits));
+        limits.stop_grace_ms = 499;
+        assert!(!supported_limits(&limits));
+        limits.stop_grace_ms = 900_001;
+        assert!(!supported_limits(&limits));
     }
 }

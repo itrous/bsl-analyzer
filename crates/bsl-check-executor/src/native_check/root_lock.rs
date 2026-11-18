@@ -187,7 +187,7 @@ fn create_private_lock_file(path: &Path) -> io::Result<File> {
     };
 
     let descriptor = super::windows_acl::descriptor()?;
-    let mut security = SECURITY_ATTRIBUTES {
+    let security = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: 0,
@@ -207,7 +207,7 @@ fn create_private_lock_file(path: &Path) -> io::Result<File> {
             wide.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            &mut security,
+            &security,
             OPEN_ALWAYS,
             FILE_FLAG_OPEN_REPARSE_POINT,
             std::ptr::null_mut(),

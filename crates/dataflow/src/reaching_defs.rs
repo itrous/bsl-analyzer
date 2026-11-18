@@ -5,7 +5,7 @@ use hir_def::{
         events::{hir_suppressed, BodyEvents, EvalPoint},
         Body,
     },
-    hir::{Expr, Stmt},
+    hir::{Expr, Stmt, StmtIdx},
     BindingId, ExprId, Name, StmtId,
 };
 use la_arena::RawIdx;
@@ -485,7 +485,8 @@ pub fn solve_executable_reaching_definitions(
     let def_index = DefinitionIndex::from_body_with_params(body, &events, params.iter().cloned());
     let entry = entry_definitions(&def_index, &events, &params);
     let budget = visit_budget(&cfg);
-    let solved = solve_executable(ExecutableReachingDefsTransfer, cfg, body, entry, budget)?;
+    let solved =
+        solve_executable(ExecutableReachingDefsTransfer::new(body), cfg, body, entry, budget)?;
     publish_executable(&solved, body_arc, events)
 }
 
@@ -721,7 +722,7 @@ impl ReachingDefsResult {
             }
 
             state = if self.executable {
-                match ExecutableReachingDefsTransfer
+                match ExecutableReachingDefsTransfer::replay()
                     .transfer_stmt(
                         hir_stmt_raw,
                         &ExecutableDefs::entering(Reach::Reached(state)),
@@ -760,7 +761,7 @@ impl ReachingDefsResult {
         let mut state = self.block_in.get(self.root_blocks.get(&header_expr)?)?.clone();
         if self.executable {
             for &root in self.earlier_roots.get(&header_expr).into_iter().flatten() {
-                state = match ExecutableReachingDefsTransfer
+                state = match ExecutableReachingDefsTransfer::replay()
                     .transfer_expr(
                         root,
                         &ExecutableDefs::entering(Reach::Reached(state)),
@@ -907,9 +908,78 @@ impl Lattice for ExecutableDefs {
     }
 }
 
-struct ExecutableReachingDefsTransfer;
+struct ExecutableReachingDefsTransfer {
+    /// See [`writes_hidden_on_exception`].
+    hidden_on_exception: FxHashSet<StmtId>,
+}
+
+/// A raising statement whose ordinary writes must not ride its exception edge:
+/// every statement after it in the same region is an assignment that cannot raise,
+/// and at least one such statement follows. Once an ordinary write completes,
+/// nothing left can enter the handler. A possible write of the statement itself
+/// is not covered: the call may write its argument and then raise, and the
+/// assignments after it then do not run. A statement with nothing after it is not
+/// here — its own failure may come after the write, which the exceptional exit
+/// already records.
+fn writes_hidden_on_exception(body: &Body) -> FxHashSet<StmtId> {
+    let mut hidden = FxHashSet::default();
+    hide_writes_after_safe_tail(body.body_stmts_typed(), body, false, &mut hidden);
+    hidden
+}
+
+/// `region_ends_safely` means that once `stmts` completes, nothing that can raise remains.
+/// A protected body's own list does not: its last statement may fail after its write.
+/// A branch does, when the statement that contains it is followed only by assignments
+/// that cannot raise — the last statement of that branch then has the same tail.
+fn hide_writes_after_safe_tail(
+    stmts: &[StmtIdx],
+    body: &Body,
+    region_ends_safely: bool,
+    hidden: &mut FxHashSet<StmtId>,
+) {
+    for (position, &stmt_id) in stmts.iter().enumerate() {
+        let later = &stmts[position + 1..];
+        let later_cannot_raise =
+            later.iter().all(|&later_id| crate::is_non_raising_assignment(body, later_id));
+        let ends_safely_after = later_cannot_raise && (!later.is_empty() || region_ends_safely);
+        if ends_safely_after && !crate::is_non_raising_assignment(body, stmt_id) {
+            hidden.insert(StmtId::from_idx(stmt_id));
+        }
+        match body.stmt_idx(stmt_id) {
+            Stmt::For { body: nested, .. }
+            | Stmt::ForEach { body: nested, .. }
+            | Stmt::While { body: nested, .. } => {
+                hide_writes_after_safe_tail(nested, body, false, hidden);
+            }
+            Stmt::If(if_stmt) => {
+                hide_writes_after_safe_tail(&if_stmt.then_branch, body, ends_safely_after, hidden);
+                for (_, branch) in if_stmt.elsif_branches.iter() {
+                    hide_writes_after_safe_tail(branch, body, ends_safely_after, hidden);
+                }
+                if let Some(else_stmts) = &if_stmt.else_branch {
+                    hide_writes_after_safe_tail(else_stmts, body, ends_safely_after, hidden);
+                }
+            }
+            Stmt::Try { body: protected, except, .. } => {
+                hide_writes_after_safe_tail(protected, body, false, hidden);
+                hide_writes_after_safe_tail(except, body, ends_safely_after, hidden);
+            }
+            _ => {}
+        }
+    }
+}
 
 impl ExecutableReachingDefsTransfer {
+    fn new(body: &Body) -> Self {
+        Self { hidden_on_exception: writes_hidden_on_exception(body) }
+    }
+
+    /// Replaying a block's normal exits does not consult [`Self::hidden_on_exception`]:
+    /// that set changes only the exceptional exit.
+    fn replay() -> Self {
+        Self { hidden_on_exception: FxHashSet::default() }
+    }
+
     /// A point evaluated over the definitions `input`: its possible writes add
     /// to them, and its ordinary writes then replace the definitions of their
     /// names. A failure may come after any possible write and after the
@@ -982,7 +1052,28 @@ impl Transfer<ExecutableDefs> for ExecutableReachingDefsTransfer {
         let stmt_id = StmtId::from_raw(stmt_id);
         let def_index = input.def_index();
         let writes = Self::stmt_writes(stmt_id, body, def_index);
-        Self::evaluate(input, def_index.point_writes(EvalPoint::Stmt(stmt_id)), &writes)
+        let may = def_index.point_writes(EvalPoint::Stmt(stmt_id));
+        // A plain assignment cannot raise, so its exception edge carries nothing.
+        // A raising statement followed only by such assignments has completed its
+        // ordinary write only when the region can no longer raise, so that write is
+        // not on a path into the handler. A possible write of the statement itself
+        // may have happened before the statement raised, and the assignments after
+        // it then do not run, so that write still reaches the handler.
+        if crate::is_non_raising_assignment(body, stmt_id.to_idx()) {
+            let mut out = Self::evaluate(input, &[], &writes);
+            out.exceptional = Reach::Unreached;
+            return out;
+        }
+        if self.hidden_on_exception.contains(&stmt_id) {
+            let mut out = Self::evaluate(input, may, &writes);
+            let mut exceptional = input.clone();
+            for &idx in may {
+                exceptional.bits.insert(idx as usize);
+            }
+            out.exceptional = Reach::Reached(exceptional);
+            return out;
+        }
+        Self::evaluate(input, may, &writes)
     }
 
     fn transfer_expr(
