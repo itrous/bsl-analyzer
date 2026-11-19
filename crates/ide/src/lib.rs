@@ -16,6 +16,8 @@ pub mod graph;
 mod hover;
 mod inlay_hints;
 pub mod jsonl;
+pub mod metadata_rename;
+pub mod metadata_rename_plan;
 mod name_lookup;
 pub mod partitioned_diagnostics_baseline;
 mod reference_kind;
@@ -162,6 +164,31 @@ impl Analysis {
     pub fn find_references(&self, file_id: FileId, offset: u32) -> Vec<Location> {
         let offset = TextSize::from(offset);
         references::find_references(&self.db, file_id, offset)
+    }
+
+    pub fn find_references_rich(
+        &self,
+        file_id: FileId,
+        offset: u32,
+        include_declaration: bool,
+        max_files: usize,
+    ) -> ReferencesResult {
+        references::find_references_at_rich(
+            &self.db,
+            file_id,
+            TextSize::from(offset),
+            include_declaration,
+            max_files,
+        )
+    }
+
+    /// Resolve one metadata declaration from a BSL, SDBL or supported XML name span.
+    pub fn metadata_target_at(
+        &self,
+        file_id: FileId,
+        offset: u32,
+    ) -> Result<hir::metadata_symbol::MetadataUse, metadata_rename::MetadataPreviewError> {
+        metadata_rename::metadata_target_at(&self.db, file_id, TextSize::from(offset))
     }
 
     pub fn type_definition(&self, file_id: FileId, offset: u32) -> Option<NavigationTarget> {
@@ -411,8 +438,20 @@ impl Analysis {
         config: DiagnosticsConfigInput,
         pool: &rayon::ThreadPool,
     ) -> Vec<(FileId, Arc<Vec<Diagnostic>>)> {
+        self.workspace_diagnostics_parallel_with_cancellation(file_ids, config, pool, |_| {})
+    }
+
+    /// Register each parallel database handle before it can read disk-backed inputs.
+    pub fn workspace_diagnostics_parallel_with_cancellation(
+        &self,
+        file_ids: &[FileId],
+        config: DiagnosticsConfigInput,
+        pool: &rayon::ThreadPool,
+        register: impl Fn(salsa::CancellationToken) + Send + Sync,
+    ) -> Vec<(FileId, Arc<Vec<Diagnostic>>)> {
         use ide_db::base_db::{DiagnosticsConfigId, FileIdInput};
         use rayon::prelude::*;
+        use salsa::Database as _;
 
         if !file_ids.is_empty() {
             self.warm_configuration_inventory();
@@ -421,10 +460,12 @@ impl Analysis {
         // Move an owned db clone into the pool (Salsa handles are `Send` but `&Analysis`
         // is not, so `install` cannot borrow `self`); each worker gets its own clone from it.
         let seed = self.db.clone();
+        register(seed.cancellation_token());
         pool.install(move || {
             file_ids
                 .par_iter()
                 .map_with(seed, |db, &file_id| {
+                    register(db.cancellation_token());
                     // Belt-and-suspenders: if a diagnostic still reaches an internally
                     // parallel query despite the warm-up, this makes it run serially rather
                     // than steal a sibling job onto this pool and attach a second database.
@@ -831,6 +872,51 @@ mod workspace_diagnostics_drift_tests {
             "a file changed under the parallel sweep aborts it instead of being skipped: {:?}",
             swept.map(|files| files.len())
         );
+    }
+
+    #[test]
+    fn workspace_diagnostics_parallel_registered_derivative_can_be_cancelled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let analysis = two_file_analysis(dir.path(), BODY);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let registered = AtomicUsize::new(0);
+        let result = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+            analysis.workspace_diagnostics_parallel_with_cancellation(
+                &[FileId(0), FileId(1)],
+                DiagnosticsConfig::all_enabled().to_input(),
+                &pool,
+                |token| {
+                    if registered.fetch_add(1, Ordering::SeqCst) > 0 {
+                        token.cancel();
+                    }
+                },
+            )
+        }));
+        assert!(registered.load(Ordering::SeqCst) >= 2);
+        assert!(matches!(result, Err(salsa::Cancelled::Local | salsa::Cancelled::PropagatedPanic)));
+    }
+
+    #[test]
+    fn workspace_diagnostics_parallel_registration_preserves_serial_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let analysis = two_file_analysis(dir.path(), BODY);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let files = [FileId(0), FileId(1)];
+        let config = DiagnosticsConfig::all_enabled().to_input();
+        let serial = analysis.workspace_diagnostics(&files, config.clone());
+        let registered = AtomicUsize::new(0);
+        let parallel = analysis.workspace_diagnostics_parallel_with_cancellation(
+            &files,
+            config,
+            &pool,
+            |_| {
+                registered.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(parallel, serial);
+        assert!(registered.load(Ordering::SeqCst) >= 3);
     }
 
     /// The same stand with `FileId(0)` recorded right and then deleted from disk.

@@ -76,7 +76,7 @@ crates/ide/src/graph.rs	form	2	вне-класса: вид узла графа
 crates/ide/src/symbol_info/form/card.rs	form	1	вне-класса: вид символа
 crates/mcp-server/src/contract.rs	form	1	вне-класса: вид узла графа
 crates/mcp-server/src/graph_query.rs	form	5	вне-класса: вид узла графа
-crates/mcp-server/src/lib.rs	form	2	вне-класса: вид узла графа
+crates/mcp-server/src/lib.rs	form	5	вне-класса: имя source metadata action и его параметров
 crates/mcp-server/src/tools/graph.rs	form	2	вне-класса: вид узла графа
 crates/mcp-server/src/tools/diagnostics/snippet.rs	form	1	вне-класса: вид модуля-хоста в ответе snippet
 crates/mcp-server/src/tools/metadata.rs	commonmodule	1	вне-класса: двуязычное имя вида MDO
@@ -92,3 +92,24 @@ crates/mcp-server/src/tools/location.rs	module	1	вне-класса: вид у�
 crates/mcp-server/src/tools/diagnostics/snippet.rs	module	3	вне-класса: значение параметра code_kind и ключ вида модуля-хоста в ответе snippet
 crates/mcp-server/src/tools/symbol_info.rs	module	2	вне-класса: вид символа
 crates/platform-help/src/installed.rs	bin	1	вне-класса: подкаталог установки платформы с архивами справки
+crates/bsl-metadata/src/rename_xml.rs	Form	1	вне-класса: XML QName корневого элемента управляемой формы
+crates/bsl-metadata/src/rename_xml/properties.rs	CommonModule	2	вне-класса: вид XML декларации метаданных в контракте свойств, не имя файла
+crates/bsl-metadata/src/rename_xml/properties.rs	Form	10	вне-класса: вид декларации метаданных и цель XML reference contract
+crates/epf-carrier/src/lib.rs	AdmittedModule	1	вне-класса: имя Rust-типа в debug_struct, не имя файла
+crates/ide-db/src/metadata_symbol/form_bindings.rs	Form	1	вне-класса: вид XML descriptor, не путь контейнера формы
+crates/ide/src/metadata_rename_plan/build/xml_paths.rs	ExternalConnectionModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
+crates/ide/src/metadata_rename_plan/build/xml_paths.rs	Form	3	вне-класса: вид XML декларации и имя внутренней записи ConfigDumpInfo
+crates/ide/src/metadata_rename_plan/build/xml_paths.rs	ManagedApplicationModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
+crates/ide/src/metadata_rename_plan/build/xml_paths.rs	ManagerModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
+crates/ide/src/metadata_rename_plan/build/xml_paths.rs	Module	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
+crates/ide/src/metadata_rename_plan/build/xml_paths.rs	ObjectModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
+crates/ide/src/metadata_rename_plan/build/xml_paths.rs	OrdinaryApplicationModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
+crates/ide/src/metadata_rename_plan/build/xml_paths.rs	SessionModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
+crates/mcp-server/src/tools/metadata/inspection_cards.rs	Form	1	вне-класса: вид XML descriptor, не путь контейнера формы
+crates/mcp-server/src/tools/metadata/inspection_cards.rs	form	2	вне-класса: поле JSON результата source-карточки
+crates/mcp-server/src/tools/metadata/inspection_cards.rs	forms	1	вне-класса: поле JSON результата списка source-форм
+crates/onec-client/src/epf_module.rs	ObjectModule	1	вне-класса: английский сегмент штатного кадра ошибки 1С, не имя файла
+crates/bsl-metadata/src/form.rs	SHA-256 сайдкара не подтверждён содержимым Ext/Form.bin	1	вне-класса: текст диагностической причины несовпадения fingerprint, не построение пути
+crates/bsl-metadata/src/xml_parser/form_inspection.rs	Commands	2	вне-класса: XML QName секции команд управляемой формы
+crates/bsl-metadata/src/xml_parser/form_inspection.rs	Form	1	вне-класса: XML QName корня управляемой формы
+crates/bsl-metadata/src/xml_parser/form_inspection.rs	form	3	вне-класса: поле JSON ordinary sidecar и семантический владелец form bindings

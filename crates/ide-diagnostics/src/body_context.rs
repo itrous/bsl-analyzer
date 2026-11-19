@@ -7,6 +7,7 @@
 //! Ranges are relative to the body's own root (`LocalRange`): the detached
 //! method node for a method, the file root for module-level code.
 
+use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
 
 use hir::{
@@ -25,6 +26,9 @@ pub struct BodyContext<'a> {
     lower: &'a LowerResult,
     decl: OnceLock<Option<Arc<MethodDecl>>>,
     line_index: OnceLock<Arc<line_index::LineIndex>>,
+    platform_global_calls: OnceLock<rustc_hash::FxHashSet<hir::ExprId>>,
+    replacement_applicabilities:
+        RefCell<rustc_hash::FxHashMap<String, hir::ReplacementApplicability>>,
 }
 
 impl<'a> std::ops::Deref for BodyContext<'a> {
@@ -45,7 +49,16 @@ impl<'a> BodyContext<'a> {
         root: SyntaxNode,
         lower: &'a LowerResult,
     ) -> Self {
-        Self { analysis, owner, root, lower, decl: OnceLock::new(), line_index: OnceLock::new() }
+        Self {
+            analysis,
+            owner,
+            root,
+            lower,
+            decl: OnceLock::new(),
+            line_index: OnceLock::new(),
+            platform_global_calls: OnceLock::new(),
+            replacement_applicabilities: RefCell::new(Default::default()),
+        }
     }
 
     pub fn owner(&self) -> DefWithBodyId {
@@ -181,6 +194,24 @@ impl<'a> BodyContext<'a> {
 
     pub fn infer(&self) -> InferOwnerResult {
         self.analysis.infer_owner(self.owner)
+    }
+
+    /// Bare callee IDs with proved platform ownership, shared by body checks.
+    pub fn unshadowed_platform_global_calls(&self) -> &rustc_hash::FxHashSet<hir::ExprId> {
+        self.platform_global_calls.get_or_init(|| {
+            self.analysis.provider().unshadowed_platform_global_calls(self.file_id, self.owner)
+        })
+    }
+
+    /// One semantic verdict feeds a replacement's message and fix.
+    pub fn replacement_applicability(&self, target: &str) -> hir::ReplacementApplicability {
+        if let Some(result) = self.replacement_applicabilities.borrow().get(target).copied() {
+            return result;
+        }
+        let result =
+            self.analysis.provider().replacement_applicability(self.file_id, self.owner, target);
+        self.replacement_applicabilities.borrow_mut().insert(target.to_owned(), result);
+        result
     }
 
     pub fn arg_diagnostics(&self) -> Arc<Vec<hir::InferenceDiagnostic>> {

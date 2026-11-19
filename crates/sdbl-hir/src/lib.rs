@@ -3,6 +3,7 @@ mod diagnostics;
 mod hir;
 mod literal;
 mod lower;
+pub mod metadata_reference;
 mod position_detector;
 mod scope;
 mod source_map;

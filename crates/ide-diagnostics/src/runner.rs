@@ -28,6 +28,8 @@ const SYNTAX_DIAGNOSTICS: &[DiagnosticCode] = &[
 ];
 
 const ITEM_TREE_DIAGNOSTICS: &[DiagnosticCode] = &[
+    DiagnosticCode::DuplicateInterception,
+    DiagnosticCode::DuplicateMethodDeclaration,
     DiagnosticCode::OrderOfParams,
     DiagnosticCode::ReservedParameterNames,
     DiagnosticCode::SeveralCompilerDirectives,
@@ -187,6 +189,16 @@ pub fn collect_item_tree_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic
 
     let mut diagnostics = Vec::new();
 
+    diagnostics.extend(run_diagnostic(
+        "DuplicateInterception",
+        ctx,
+        handlers::duplicate_interception::check,
+    ));
+    diagnostics.extend(run_diagnostic(
+        "DuplicateMethodDeclaration",
+        ctx,
+        handlers::duplicate_method_declaration::check,
+    ));
     diagnostics.extend(run_diagnostic("OrderOfParams", ctx, handlers::order_of_params::check));
     diagnostics.extend(run_diagnostic(
         "ReservedParameterNames",
@@ -405,7 +417,7 @@ pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispat
 ];
 
 fn collect_sdbl_hir_single_pass(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
-    use crate::sdbl_utils::{build_line_index_shared, SdblPositionMapper};
+    use crate::sdbl_utils::{build_line_index_shared, sdbl_query_pairs, SdblPositionMapper};
 
     let enabled: Vec<_> =
         SDBL_DISPATCH.iter().filter(|(code, _)| !ctx.is_disabled_with_metadata(*code)).collect();
@@ -431,7 +443,7 @@ fn collect_sdbl_hir_single_pass(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let mut diagnostics = Vec::new();
 
-    for ((_, sdbl_package), (_, query_info)) in sdbl_hirs.iter().zip(sdbl_queries.iter()) {
+    for (sdbl_package, query_info) in sdbl_query_pairs(&sdbl_hirs, &sdbl_queries) {
         let mapper = SdblPositionMapper::from_query_info(query_info, &bsl_source, &line_starts);
 
         for hir_diag in sdbl_package.all_diagnostics() {

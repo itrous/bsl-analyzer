@@ -269,6 +269,7 @@ enum Commands {
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
+    let daemon = matches!(&cli.command, Some(Commands::Mcp { command }) if command.is_daemon());
 
     let (log_file, append_log) = match env::var("BSL_LOG_FILE")
         .ok()
@@ -288,6 +289,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let _journal_guard = match setup_logging(
         log_file.clone(),
         append_log,
+        daemon,
         profile_filter.clone(),
         json_profile_filter.clone(),
     ) {
@@ -295,7 +297,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Err(e) => {
             eprintln!("Failed to setup logging: {}", e);
             if append_log {
-                setup_logging(None, false, profile_filter, json_profile_filter)?
+                setup_logging(None, false, false, profile_filter, json_profile_filter)?
             } else {
                 if let Some(ref path) = log_file {
                     let _ = fs::write(path, format!("ERROR: Failed to setup logging: {}\n", e));
@@ -316,6 +318,9 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // per-request panic log in `handlers::dispatch` is complementary, not replaced.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if daemon {
+            tracing::error!(panic = %info, "broker daemon panicked");
+        }
         if let Some(backtrace) = salsa::Backtrace::capture() {
             tracing::error!(query_backtrace = %backtrace, "panic inside salsa query");
         }
@@ -344,7 +349,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // serves the contract cannot forget to.
     mcp_server::contract::register_cli_surface(cli_surface(&Cli::command()));
 
-    match cli.command {
+    let result = match cli.command {
         Some(Commands::Analyze {
             source_dir,
             workspace_dir,
@@ -432,7 +437,11 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some(Commands::Bench { command }) => run_bench(command),
         Some(Commands::Lsp(args)) => run_lsp_server(args),
         None => run_lsp_server(cli::lsp::LspArgs::default()),
+    };
+    if let (true, Err(error)) = (daemon, &result) {
+        tracing::error!(error = %error, "broker daemon stopped with an error");
     }
+    result
 }
 
 #[cfg(test)]

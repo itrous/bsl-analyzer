@@ -1,0 +1,10 @@
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dataSource><name>Local</name><dataSourceType>Local</dataSourceType></dataSource>
+  <dataSet xsi:type="DataSetQuery"><name>Main</name><dataSource>Local</dataSource>
+    <query>SELECT P.Ref AS SelectedPartner, C.Ref AS SelectedCustomer FROM Catalog.Partners AS P, Catalog.Customers AS C</query>
+    <field xsi:type="DataSetFieldField"><dataPath>Partner</dataPath><field>SelectedPartner</field><title>Caption</title></field>
+    <field xsi:type="DataSetFieldField"><dataPath>Customer</dataPath><field>SelectedCustomer</field></field>
+  </dataSet>
+  <calculatedField><dataPath>Caption</dataPath><expression>Partner.Cap&#116;ion</expression><title>Caption</title></calculatedField>
+  <calculatedField><dataPath>OtherCaption</dataPath><expression>Customer.Caption</expression></calculatedField>
+</DataCompositionSchema>

@@ -202,7 +202,25 @@ pub fn handle_find_references(
             }
         };
 
-    let locations = ctx.analysis.find_references(file_id, offset.into());
+    let result = ctx.analysis.find_references_rich(
+        file_id,
+        offset.into(),
+        params.context.include_declaration,
+        10_000,
+    );
+    if let ide::ReferencesOutcome::Partial { reasons } = result.outcome {
+        let known = result.hits.len();
+        let count = reasons.len();
+        let sample = reasons.iter().take(8).map(|reason| &reason.kind).collect::<Vec<_>>();
+        anyhow::bail!(
+            "Metadata references are incomplete: {known} known occurrences; {count} issues; {sample:?}"
+        );
+    }
+    let locations = result
+        .hits
+        .into_iter()
+        .map(|hit| ide::Location { file_id: hit.file_id, range: hit.range })
+        .collect::<Vec<_>>();
 
     if locations.is_empty() {
         return Ok(None);
@@ -2632,6 +2650,7 @@ mod tests {
 
     fn latency_ctx(state: &GlobalState) -> LatencyRequestContext {
         LatencyRequestContext {
+            disk_read: state.try_disk_read().unwrap(),
             analysis: state.analysis_host.analysis(),
             workspace_root: state.workspace_root.clone(),
             project: state.project.clone(),
@@ -2660,9 +2679,12 @@ mod tests {
     ) -> (LatencyRequestContext, salsa::CancellationToken) {
         use salsa::Database as _;
 
+        let disk_read = state.try_disk_read().unwrap();
         let db = state.analysis_host.raw_database().clone();
         let token = db.cancellation_token();
+        disk_read.register_cancel(token.clone());
         let ctx = LatencyRequestContext {
+            disk_read,
             analysis: ide::Analysis::from_database(db),
             workspace_root: state.workspace_root.clone(),
             project: state.project.clone(),

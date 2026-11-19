@@ -36,6 +36,8 @@ None = Area.CurrentArea; // <-- a cell area has no such member
 
 A value table built by `New ValueTable` on every path counts as the attested type `ValueTable`; its columns belong to its rows, not to the table.
 
+For example, `DOMNodeType.УзелЭлемента` reports a missing value, while `DOMNodeType.Element` is valid. This check requires the complete attested value set and a known supported source version. A truncated set or a source of unknown version cannot prove absence. A local variable with the same name does not inherit the system enumeration's members.
+
 ## Examples
 
 Incorrect:

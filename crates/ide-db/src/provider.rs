@@ -323,6 +323,14 @@ pub trait AnalysisProvider {
         None
     }
 
+    /// Selected per-file context. `Some(Unknown)` must not fall back to project facts.
+    fn file_compilation_context(
+        &self,
+        _file_id: FileId,
+    ) -> Option<Arc<hir::FileCompilationContext>> {
+        None
+    }
+
     /// The vendor support map when `file_id` belongs to the main configuration;
     /// `None` (the default for providers without project settings) when it does
     /// not, or no map is loaded.
@@ -338,6 +346,14 @@ pub trait AnalysisProvider {
     /// project settings does not invent a stricter availability gate.
     fn env_options(&self) -> hir::execution_env::EnvOptions {
         hir::execution_env::EnvOptions::default()
+    }
+
+    /// Conflicts in one physical source file, without effective-module routing.
+    fn method_declaration_conflicts(
+        &self,
+        _file_id: FileId,
+    ) -> Arc<hir::MethodDeclarationConflicts> {
+        Arc::new(hir::MethodDeclarationConflicts::default())
     }
 
     fn parse(&self, file_id: FileId) -> Parse<SyntaxNode>;
@@ -387,6 +403,25 @@ pub trait AnalysisProvider {
     /// The method's syntax detached from the file (offsets start at zero).
     fn method_syntax(&self, _method_id: MethodId) -> Option<SyntaxNode> {
         None
+    }
+
+    /// Bare call callee IDs whose platform ownership is proved in the active body.
+    fn unshadowed_platform_global_calls(
+        &self,
+        _file_id: FileId,
+        _owner: DefWithBodyId,
+    ) -> rustc_hash::FxHashSet<hir::ExprId> {
+        Default::default()
+    }
+
+    /// Availability of an intended replacement in the active body.
+    fn replacement_applicability(
+        &self,
+        _file_id: FileId,
+        _owner: DefWithBodyId,
+        _target: &str,
+    ) -> hir::ReplacementApplicability {
+        hir::ReplacementApplicability::Unknown
     }
 
     fn infer_owner(&self, _file_id: FileId, owner: DefWithBodyId) -> hir::InferOwnerResult {

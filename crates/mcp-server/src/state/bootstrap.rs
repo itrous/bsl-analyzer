@@ -788,9 +788,10 @@ impl SharedState {
         // check over scan roots only would let a cache covering the workspace root
         // swallow every config edit in silence — the same failure the check exists to
         // refuse, one target over.
-        let scan_roots = project.source_roots();
+        let mut watch_roots = project.source_roots();
+        watch_roots.extend(project.semantic_dependency_roots());
         let watched: Vec<PathBuf> =
-            crate::change_hub::watch_targets_for(&project.root, &scan_roots)
+            crate::change_hub::watch_targets_for(&project.root, &watch_roots)
                 .into_iter()
                 .map(|target| target.path)
                 .collect();
@@ -826,7 +827,6 @@ impl SharedState {
         crate::project::warn_about_rejected_roots(
             &crate::project::workspace_roots(&project, &source_exclusions).1,
         );
-        let search_engine: SharedSearchEngine = super::shared_engine(None);
         let workspace_search_initializing = Arc::new(AtomicBool::new(true));
         let index_progress = IndexProgress::new();
         let semantic_runtime =
@@ -882,9 +882,12 @@ impl SharedState {
         // The user's `[source].exclude` is kept apart from that list: it follows the
         // project on every re-declaration, and nothing declared inside it is carved out.
         let change_hub = WorkspaceChangeHub::start_targets_scoped(
-            crate::change_hub::watch_targets_for(&project.root, &scan_roots),
+            crate::change_hub::watch_targets_for(&project.root, &watch_roots),
             source_exclusions.clone(),
             project.source_exclusions().clone(),
+        );
+        let search_engine: SharedSearchEngine = Arc::new(
+            crate::tools::search::AdmittedEngine::new(None).with_disk_gate(change_hub.disk_gate()),
         );
 
         // Subscribed here, synchronously, before the thread that reads disk even exists —
@@ -1165,6 +1168,15 @@ impl SharedState {
                     if thread_owners.is_stopped() {
                         break;
                     }
+                    let disk_read = match hub.disk_gate().try_read() {
+                        Ok(read) => read,
+                        Err(_) => {
+                            if thread_owners.sleep(std::time::Duration::from_millis(25)) {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
                     // Sample before draining: a delivery before this sample is
                     // included in the batch, and one after it makes the wait
                     // return. Sampling after drain would lose the window between
@@ -1209,6 +1221,7 @@ impl SharedState {
                     if let Some(diagnostics) = &disk_updates {
                         diagnostics.poll_pending_drift();
                     }
+                    drop(disk_read);
                     hub.wait_for_change_or(
                         generation,
                         std::time::Duration::from_secs(24 * 60 * 60),
@@ -1301,6 +1314,9 @@ impl SharedState {
                         baseline.external()
                     }
                     WorkspaceSearchMode::SqliteLocal => None,
+                };
+                let Some(_disk_read) = search_engine.disk_gate.read_until_cancelled(&|| owners.is_stopped()) else {
+                    return;
                 };
                 let mut sink_lease = sink_lease;
                 let init = Self::init_workspace_search_engine(

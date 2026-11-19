@@ -201,6 +201,14 @@ impl CommonModuleBodies {
 
 #[salsa::db]
 pub trait ConfigsDatabase: DefDatabase {
+    /// Owner-published per-file compilation context. `None` preserves legacy single-file settings.
+    fn file_compilation_context(
+        &self,
+        _file_id: FileId,
+    ) -> Option<Arc<crate::compilation_context::FileCompilationContext>> {
+        None
+    }
+
     /// The configurations VISIBLE to `file_id` as separate entries (no merge):
     /// base first, then the file's dependency chain in order (own extension
     /// last). Never includes an unrelated sibling extension.

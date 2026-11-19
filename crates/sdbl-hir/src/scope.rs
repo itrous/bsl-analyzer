@@ -1,3 +1,4 @@
+mod metadata_references;
 use std::sync::Arc;
 use stdx::case::CaseExt;
 
@@ -110,7 +111,7 @@ impl<'a> Scope<'a> {
     #[must_use = "a colliding alias silently evicts the source already registered under it"]
     pub fn add_table(&mut self, table: TableRef) -> Option<String> {
         let frame = self.frames.last_mut()?;
-        let name = table.effective_name().to_string();
+        let name = table.binding_name().to_string();
         let key = name.fold_lower();
         frame.tables.insert(key, table).map(|_| name)
     }
@@ -269,30 +270,10 @@ impl<'a> Scope<'a> {
     /// Mirrors [`Self::resolve_column_type`]: naming a table from an enclosing query would
     /// point the reader at a source the reference could not have meant.
     pub fn find_tables_with_column(&self, column_name: &str) -> Vec<String> {
-        for frame in self.frames.iter().rev() {
-            if frame.outputs && Self::output_named(frame, column_name).is_some() {
-                return Vec::new();
-            }
-            let mut result = Vec::new();
-            for table in frame.tables.values() {
-                let Some(resolved) = table.metadata.as_ref() else { continue };
-                // Same rule as the ambiguity decision itself: a provisional field is not an
-                // occurrence, so naming its table as a candidate would mislead the reader.
-                let offered = resolved.fields().iter().any(|f| f.matches_name(column_name));
-                if offered && !resolved.column_is_provisional(column_name) {
-                    result.push(table.effective_name().to_string());
-                }
-            }
-            if !result.is_empty() {
-                result.sort();
-                return result;
-            }
-            if frame.opaque {
-                break;
-            }
-        }
-
-        Vec::new()
+        self.column_source_tables(column_name)
+            .into_iter()
+            .map(|table| table.effective_name().to_string())
+            .collect()
     }
 
     /// The sources that also offer `head` as a field, when `head` is an alias at their level.

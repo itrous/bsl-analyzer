@@ -190,6 +190,7 @@ pub(super) enum HoleOrigin {
 /// path to the Salsa input it set. Held behind the [`std::sync::Mutex`]; reads borrow it,
 /// a reload mutates `db` in place.
 pub(crate) struct DiagnosticsResident {
+    pub(super) dependency_fingerprint: Option<[u8; 32]>,
     pub(super) db: ide_host_core::WorkspaceBackend,
     /// Trims [`Self::trim_after_read`] has run, for a test that every read trims.
     #[cfg(test)]

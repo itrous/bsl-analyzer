@@ -103,7 +103,14 @@ impl SessionAnalysisHost {
                     false
                 }
             }
-            CatchUp::Reseed(_) => false,
+            CatchUp::Reseed(snapshot) => {
+                if let Some(view) = self.view_mut() {
+                    view.catch_up(*snapshot, &[]);
+                } else {
+                    self.ensure_view(*snapshot);
+                }
+                true
+            }
         }
     }
 

@@ -50,6 +50,7 @@ struct AdvisoryOwner(Option<AdvisorySlot>);
 
 impl AdvisoryOwner {
     fn refresh(&self, graph: &GraphState, stop: &OwnerStop) {
+        let Ok(_disk_read) = graph.disk_gate.try_read() else { return };
         let Some((root, slot)) = self.0.as_ref() else { return };
         let project = match crate::project::at(root) {
             Ok(project) => project,
@@ -99,8 +100,14 @@ pub(crate) fn start(
         return false;
     };
     graph.set_watch(WatchPhase::Starting, Some(cursor));
-    let initial_roots = project_roots(graph);
-    let initial_hashes = initial_descriptor_hashes(&initial_roots);
+    let (initial_roots, initial_hashes) = match graph.disk_gate.try_read() {
+        Ok(_disk_read) => {
+            let roots = project_roots(graph);
+            let hashes = initial_descriptor_hashes(&roots);
+            (roots, hashes)
+        }
+        Err(_) => Default::default(),
+    };
     let watcher = Watcher {
         graph: graph.clone(),
         hub: hub.clone(),
@@ -324,6 +331,10 @@ impl Watcher {
     /// the workspace for the graph and the search index together instead of two. What the
     /// watcher does decide, it decides in [`Self::ring_alarms`], which cannot take that build.
     fn drain(&mut self) {
+        let Some(_disk_read) = self.graph.disk_gate.read_until_cancelled(&|| self.must_leave())
+        else {
+            return;
+        };
         let batch = self.hub.materialize(self.cursor);
         let fact = batch.fact_seq();
         if batch.rescan_required {
@@ -346,7 +357,19 @@ impl Watcher {
     }
 
     fn apply(&self, entries: &[ChangeEntry], fact: u64) {
-        let project = entries.iter().any(|entry| self.is_project_input(entry));
+        let dependencies = self
+            .graph
+            .workspace_root
+            .as_deref()
+            .and_then(|root| crate::project::at(root).ok())
+            .map(|project| project.semantic_dependency_roots())
+            .unwrap_or_default();
+        let project = entries.iter().any(|entry| {
+            self.is_project_input(entry)
+                || dependencies
+                    .iter()
+                    .any(|root| entry.raw.starts_with(root) || entry.canonical.starts_with(root))
+        });
         let universe = entries.iter().any(super::snapshot::entry_touches_scan_universe);
         if universe {
             self.graph.record_change_quietly(fact);
@@ -441,7 +464,11 @@ fn initial_descriptor_hashes(roots: &[PathBuf]) -> std::collections::HashMap<Pat
 fn project_roots(graph: &GraphState) -> Vec<PathBuf> {
     let Some(root) = graph.workspace_root.as_deref() else { return Vec::new() };
     let mut roots: Vec<PathBuf> = crate::project::at(root)
-        .map(|project| project.source_roots())
+        .map(|project| {
+            let mut roots = project.source_roots();
+            roots.extend(project.semantic_dependency_roots());
+            roots
+        })
         .unwrap_or_default()
         .into_iter()
         .map(|path| std::fs::canonicalize(&path).unwrap_or(path))

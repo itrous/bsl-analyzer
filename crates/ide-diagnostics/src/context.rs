@@ -1,5 +1,5 @@
 use crate::DiagnosticsConfig;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use vfs::FileId;
 
 /// What a check may know about the file without reading its positions: the
@@ -13,6 +13,7 @@ pub struct AnalysisContext<'a> {
     pub config: &'a DiagnosticsConfig,
     pub file_id: FileId,
     provider: &'a dyn ide_db::AnalysisProvider,
+    compilation_context: OnceLock<Option<Arc<hir::FileCompilationContext>>>,
 }
 
 /// The whole-file view: [`AnalysisContext`] plus the file's positional
@@ -20,6 +21,7 @@ pub struct AnalysisContext<'a> {
 /// Only file-level checks and the assembly of a file's diagnostics see it.
 pub struct DiagnosticsContext<'a> {
     analysis: AnalysisContext<'a>,
+    method_declaration_conflicts: OnceLock<Arc<hir::MethodDeclarationConflicts>>,
 }
 
 impl<'a> std::ops::Deref for DiagnosticsContext<'a> {
@@ -36,7 +38,10 @@ impl<'a> DiagnosticsContext<'a> {
         file_id: FileId,
         provider: &'a dyn ide_db::AnalysisProvider,
     ) -> Self {
-        Self { analysis: AnalysisContext::new(config, file_id, provider) }
+        Self {
+            analysis: AnalysisContext::new(config, file_id, provider),
+            method_declaration_conflicts: OnceLock::new(),
+        }
     }
 
     pub fn analysis(&self) -> &AnalysisContext<'a> {
@@ -66,6 +71,12 @@ impl<'a> DiagnosticsContext<'a> {
 
     pub fn call_summary(&self, module_id: hir::ModuleId) -> Arc<hir::ModuleCallSummary> {
         self.query(|p| p.call_summary(module_id))
+    }
+
+    /// Declaration conflicts retain ranges of the physical file.
+    pub fn method_declaration_conflicts(&self) -> &hir::MethodDeclarationConflicts {
+        self.method_declaration_conflicts
+            .get_or_init(|| self.analysis.provider.method_declaration_conflicts(self.file_id))
     }
 
     pub fn item_tree(&self) -> Arc<hir::ItemTree> {
@@ -108,7 +119,7 @@ impl<'a> AnalysisContext<'a> {
         file_id: FileId,
         provider: &'a dyn ide_db::AnalysisProvider,
     ) -> Self {
-        Self { config, file_id, provider }
+        Self { config, file_id, provider, compilation_context: OnceLock::new() }
     }
 
     pub(crate) fn provider(&self) -> &'a dyn ide_db::AnalysisProvider {
@@ -205,7 +216,11 @@ impl<'a> AnalysisContext<'a> {
     /// The compatibility mode the code compiles under; `None` when it hides
     /// nothing (unknown, `DontUse`, or not a mode).
     pub fn compatibility_mode(&self) -> Option<bsl_platform::PlatformVersion> {
-        hir::compat_mode::effective_mode(self.provider.compatibility_mode().as_deref())
+        let raw = self.file_compilation_context().map_or_else(
+            || self.provider.compatibility_mode(),
+            |context| context.compatibility_mode.clone(),
+        );
+        hir::compat_mode::effective_mode(raw.as_deref())
     }
 
     /// The vendor support map, when this file belongs to the main configuration
@@ -214,9 +229,17 @@ impl<'a> AnalysisContext<'a> {
         self.provider.vendor_support_for_file(self.file_id)
     }
 
-    /// Project settings for which environments a call is compiled into.
+    /// The file's selected compilation context, including an explicit unknown owner.
+    pub fn file_compilation_context(&self) -> Option<&hir::FileCompilationContext> {
+        self.compilation_context
+            .get_or_init(|| self.provider.file_compilation_context(self.file_id))
+            .as_deref()
+    }
+
+    /// The selected configuration's runtime facts and the analysis environment mask.
     pub fn env_options(&self) -> hir::execution_env::EnvOptions {
-        self.provider.env_options()
+        self.file_compilation_context()
+            .map_or_else(|| self.provider.env_options(), |context| context.environment)
     }
 
     pub fn main_configuration(&self) -> Option<Arc<bsl_metadata::Configuration>> {

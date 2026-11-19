@@ -4,7 +4,7 @@ use crate::{BodyContext, Diagnostic, DiagnosticCode};
 use hir::catch_class::{classify_catch_body, CatchBodyClass};
 use hir::BodySourceMap;
 use hir::LocalRange;
-use hir::{IdConversion, Stmt, StmtId};
+use hir::{Stmt, StmtId};
 use syntax::{NodeOrToken, SyntaxKind};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
@@ -34,139 +34,38 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
         .get_bool(DiagnosticCode::MissingCodeTryCatchEx, "commentAsCode")
         .unwrap_or(false);
 
-    check_body_for_empty_except(ctx.body(), ctx.source_map(), comment_as_code, code, ctx, acc);
-}
-
-fn check_body_for_empty_except(
-    body: &hir::Body,
-    source_map: &BodySourceMap,
-    comment_as_code: bool,
-    code: DiagnosticCode,
-    ctx: &BodyContext,
-    diagnostics: &mut Vec<Diagnostic<LocalRange>>,
-) {
-    for stmt_id in body.body_stmts() {
-        check_stmt_recursive(stmt_id, body, source_map, comment_as_code, code, ctx, diagnostics);
-    }
-}
-
-fn check_stmt_recursive(
-    stmt_id: StmtId,
-    body: &hir::Body,
-    source_map: &BodySourceMap,
-    comment_as_code: bool,
-    code: DiagnosticCode,
-    ctx: &BodyContext,
-    diagnostics: &mut Vec<Diagnostic<LocalRange>>,
-) {
-    let stmt = body.stmt(stmt_id);
-
-    if let Stmt::Try { body: try_body, except } = stmt {
-        let class = classify_catch_body(body, except);
+    let body = ctx.body();
+    let source_map = ctx.source_map();
+    let mut catches: Vec<_> = body
+        .stmts_iter()
+        .filter_map(|(id, stmt)| match stmt {
+            Stmt::Try { except, .. } => Some((id, classify_catch_body(body, except))),
+            _ => None,
+        })
+        .collect();
+    catches.sort_by_key(|(id, _)| source_map.stmt_range(*id).map(|range| range.in_root().start()));
+    let observable = if catches
+        .iter()
+        .any(|(_, class)| matches!(class, CatchBodyClass::Silent | CatchBodyClass::RollbackOnly))
+    {
+        hir::dataflow::catch_outcome::observable_catch_results(
+            body,
+            ctx.cfg(),
+            ctx.unshadowed_platform_global_calls().clone(),
+        )
+    } else {
+        Default::default()
+    };
+    for (stmt_id, class) in catches {
         let should_emit = match class {
             CatchBodyClass::Empty => {
                 !(comment_as_code && except_clause_has_comments(stmt_id, source_map, ctx))
             }
-            CatchBodyClass::Silent => true,
-            CatchBodyClass::RollbackOnly => true,
+            CatchBodyClass::Silent | CatchBodyClass::RollbackOnly => !observable.contains(&stmt_id),
             CatchBodyClass::RaisesOnly | CatchBodyClass::LogsOnly | CatchBodyClass::Mixed => false,
         };
-
         if should_emit {
-            emit_at_except_keyword(stmt_id, source_map, code, ctx, diagnostics, class);
-        }
-
-        for &nested_stmt_idx in try_body.iter() {
-            check_stmt_recursive(
-                StmtId::from_idx(nested_stmt_idx),
-                body,
-                source_map,
-                comment_as_code,
-                code,
-                ctx,
-                diagnostics,
-            );
-        }
-
-        for &nested_stmt_idx in except.iter() {
-            check_stmt_recursive(
-                StmtId::from_idx(nested_stmt_idx),
-                body,
-                source_map,
-                comment_as_code,
-                code,
-                ctx,
-                diagnostics,
-            );
-        }
-    } else {
-        match stmt {
-            Stmt::If(if_stmt) => {
-                for &nested_idx in if_stmt.then_branch.iter() {
-                    check_stmt_recursive(
-                        StmtId::from_idx(nested_idx),
-                        body,
-                        source_map,
-                        comment_as_code,
-                        code,
-                        ctx,
-                        diagnostics,
-                    );
-                }
-                for (_, branch) in if_stmt.elsif_branches.iter() {
-                    for &nested_idx in branch.iter() {
-                        check_stmt_recursive(
-                            StmtId::from_idx(nested_idx),
-                            body,
-                            source_map,
-                            comment_as_code,
-                            code,
-                            ctx,
-                            diagnostics,
-                        );
-                    }
-                }
-                if let Some(ref branch) = if_stmt.else_branch {
-                    for &nested_idx in branch.iter() {
-                        check_stmt_recursive(
-                            StmtId::from_idx(nested_idx),
-                            body,
-                            source_map,
-                            comment_as_code,
-                            code,
-                            ctx,
-                            diagnostics,
-                        );
-                    }
-                }
-            }
-            Stmt::While { body: while_body, .. } => {
-                for &nested_idx in while_body.iter() {
-                    check_stmt_recursive(
-                        StmtId::from_idx(nested_idx),
-                        body,
-                        source_map,
-                        comment_as_code,
-                        code,
-                        ctx,
-                        diagnostics,
-                    );
-                }
-            }
-            Stmt::For { body: for_body, .. } | Stmt::ForEach { body: for_body, .. } => {
-                for &nested_idx in for_body.iter() {
-                    check_stmt_recursive(
-                        StmtId::from_idx(nested_idx),
-                        body,
-                        source_map,
-                        comment_as_code,
-                        code,
-                        ctx,
-                        diagnostics,
-                    );
-                }
-            }
-            _ => {}
+            emit_at_except_keyword(stmt_id, source_map, code, ctx, acc, class);
         }
     }
 }
@@ -258,6 +157,47 @@ mod tests {
 
     fn check(code: &str, expected: expect_test::Expect) {
         check_diagnostics_snapshot_for(code, DiagnosticCode::MissingCodeTryCatchEx, expected);
+    }
+
+    fn configured_diagnostics(code: &str) -> Vec<crate::Diagnostic> {
+        crate::test_utils::check_with_cfe(code, test_fixture::CfeFixtureBuilder::new("").build())
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::MissingCodeTryCatchEx)
+            .collect()
+    }
+
+    #[test]
+    fn observable_exception_results_do_not_emit() {
+        let code = include_str!("fixtures/observable_catch_results.bsl");
+        let diagnostics = configured_diagnostics(code);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn unindexed_platform_calls_do_not_prove_exception_observation() {
+        let code = include_str!("fixtures/observable_catch_results.bsl");
+        let diagnostics = check_body_diagnostic(code, check_body);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn unobserved_exception_results_still_emit() {
+        let code = include_str!("fixtures/unobserved_catch_results.bsl");
+        assert_eq!(configured_diagnostics(code).len(), 3);
+    }
+
+    #[test]
+    fn discarded_exception_results_still_emit() {
+        let code = include_str!("fixtures/discarded_catch_results.bsl");
+        let diagnostics = configured_diagnostics(code);
+        assert_eq!(diagnostics.len(), 10, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn shadowed_formatters_do_not_prove_exception_observation() {
+        let code = include_str!("fixtures/shadowed_catch_formatters.bsl");
+        let diagnostics = configured_diagnostics(code);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
     }
 
     #[test]

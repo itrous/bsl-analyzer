@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,54 +9,40 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 static TEST_ENV: Mutex<()> = Mutex::new(());
+const CLEANUP_HANG_GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(30));
+const _: () = assert!(CLEANUP_HANG_GUARD.as_nanos() <= test_utils::wait::HANG_GUARD.as_nanos());
 
-struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-impl EnvGuard {
-    fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    fn set(&mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-        if !self.0.iter().any(|(saved, _)| *saved == key) {
-            self.0.push((key, std::env::var_os(key)));
-        }
-        std::env::set_var(key, value);
-    }
-
-    fn remove(&mut self, key: &'static str) {
-        if !self.0.iter().any(|(saved, _)| *saved == key) {
-            self.0.push((key, std::env::var_os(key)));
-        }
-        std::env::remove_var(key);
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.0.drain(..) {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
+fn set_isolated_env(command: &mut Command, cache: &Path, runtime: &Path) {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("PG")
+            || name.starts_with("EMBEDDING_")
+            || name.starts_with("BSL_SEARCH_")
+            || name.starts_with("BSL_MCP_EFFECTIVE_EMBEDDING_")
+            || name.starts_with("BSL_PLATFORM_HELP_")
+            || name.starts_with("BSL_ONEC_")
+            || matches!(
+                name.as_str(),
+                "DATABASE_URL" | "ONEC_CONFIGURATIONS_ROOT" | "BSL_TEST_EMBEDDING"
+            )
+        {
+            command.env_remove(key);
         }
     }
-}
-
-fn set_isolated_env(env: &mut EnvGuard, cache: &Path, runtime: &Path) {
-    env.set("BSL_CACHE_DIR", cache);
-    env.set("BSL_SHARED_BACKEND_MARKERS", "1");
-    env.set("BSL_LOG", "info");
-    env.set("BSL_MCP_IDLE_TTL_SECS", "1");
-    env.set("BSL_MCP_ORPHAN_GRACE_SECS", "1");
-    env.set("BSL_MCP_DAEMON_LOG", runtime.join("shared-daemon.log"));
-    env.set("XDG_RUNTIME_DIR", runtime);
-    env.set("TMP", runtime);
-    env.set("TEMP", runtime);
-    env.set("TMPDIR", runtime);
+    command.env("BSL_CACHE_DIR", cache);
+    command.env("BSL_SHARED_BACKEND_MARKERS", "1");
+    command.env("BSL_LOG", "info");
+    command.env("BSL_MCP_IDLE_TTL_SECS", "1");
+    command.env("BSL_MCP_ORPHAN_GRACE_SECS", "1");
+    command.env("BSL_MCP_DAEMON_LOG", runtime.join("shared-daemon.log"));
+    command.env("XDG_RUNTIME_DIR", runtime);
+    command.env("TMP", runtime);
+    command.env("TEMP", runtime);
+    command.env("TMPDIR", runtime);
+    command.env("SYSTEMTEMP", runtime);
     for key in [
         "BSL_ONEC_PASSWORD",
         "BSL_ONEC_CONNECTIONS_FILE",
@@ -69,7 +57,7 @@ fn set_isolated_env(env: &mut EnvGuard, cache: &Path, runtime: &Path) {
         "BSL_TEST_SHARED_EDITOR_SEED_GATE",
         "BSL_TEST_SHARED_LSP_EVENT_GATE",
     ] {
-        env.remove(key);
+        command.env_remove(key);
     }
 }
 
@@ -89,6 +77,10 @@ fn copy_fixture() -> tempfile::TempDir {
             std::fs::copy(entry.path(), target).expect("fixture file");
         }
     }
+    let config = root.path().join("bsl-analyzer.toml");
+    let content = std::fs::read_to_string(&config).expect("fixture config");
+    std::fs::write(config, format!("{content}\n[search.baseline]\nbackend = \"sqlite\"\n"))
+        .expect("local fixture baseline");
     root
 }
 
@@ -116,7 +108,7 @@ impl Gate {
     fn wait_until_held(&self, label: &str, lsp: &ProcessLsp) {
         wait_for_file(
             &self.0.join("entered"),
-            test_utils::wait::ceiling(Duration::from_secs(30)),
+            test_utils::wait::hang_guard(Duration::from_secs(30)),
             label,
             &lsp.stderr_tail(),
         );
@@ -167,80 +159,291 @@ fn events(markers: &[String], event: &str) -> usize {
     markers.iter().filter(|line| line.contains(event)).count()
 }
 
-struct OwnedDaemonCleanup(PathBuf);
+struct OwnedDaemonCleanup {
+    root: tempfile::TempDir,
+    runtime: tempfile::TempDir,
+    cache: tempfile::TempDir,
+    executable: tempfile::TempDir,
+    image: PathBuf,
+}
 
 impl OwnedDaemonCleanup {
-    fn new(runtime: &Path) -> Self {
-        Self(runtime.to_owned())
+    fn new(root: tempfile::TempDir) -> Self {
+        let app = common::qualified_app();
+        let runtime = tempfile::tempdir().expect("disposable runtime outside source root");
+        let cache = tempfile::tempdir().expect("disposable cache outside source root");
+        let executable = tempfile::Builder::new()
+            .prefix("bp-")
+            .rand_bytes(6)
+            .tempdir()
+            .expect("private server executable directory");
+        // A unique short name also identifies Linux comm without its fifteen-byte truncation.
+        let name = executable.path().file_name().expect("private executable name");
+        let mut image = executable.path().join(name);
+        if cfg!(windows) {
+            image.set_extension("exe");
+        }
+        std::fs::copy(app, &image).expect("copy the qualified server executable");
+        let image = image.canonicalize().expect("resolve private executable");
+        Self { root, runtime, cache, executable, image }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.image);
+        set_isolated_env(&mut command, self.cache.path(), self.runtime.path());
+        command
+    }
+
+    fn wait_for_idle_exit(&self) -> std::io::Result<()> {
+        let deadline = Instant::now() + CLEANUP_HANG_GUARD;
+        while private_image_running(&self.image, deadline)? {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "private server image did not idle out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
     }
 }
 
 impl Drop for OwnedDaemonCleanup {
     fn drop(&mut self) {
+        let result = self.wait_for_idle_exit();
+        if result.is_err() {
+            self.root.disable_cleanup(true);
+            self.runtime.disable_cleanup(true);
+            self.cache.disable_cleanup(true);
+            self.executable.disable_cleanup(true);
+        }
         if std::thread::panicking() {
             let artifacts = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../.artifacts/issue420-implementation")
                 .join(format!(
                     "backpressure-failure-{}-{}",
                     std::process::id(),
-                    self.0.file_name().unwrap_or_default().to_string_lossy()
+                    self.runtime.path().file_name().unwrap_or_default().to_string_lossy()
                 ));
             if std::fs::create_dir_all(&artifacts).is_ok() {
-                let logs = shared_markers(&self.0);
+                let logs = shared_markers(self.runtime.path());
                 let tail = logs[logs.len().saturating_sub(160)..].join("\n");
                 let _ = std::fs::write(artifacts.join("backend.log"), tail);
                 eprintln!("preserved backend failure phases at {}", artifacts.display());
             }
         }
-        let Some(pid) = shared_markers(&self.0)
-            .iter()
-            .find(|line| line.contains("owner_init_start"))
-            .and_then(|line| {
-                line.split_whitespace().find_map(|field| field.strip_prefix("daemon_pid="))
-            })
-            .and_then(|pid| pid.parse::<u32>().ok())
-        else {
-            return;
-        };
-        if !is_test_daemon_executable(pid) {
-            return;
+        if let Err(error) = result {
+            let message = format!(
+                "graceful cleanup failed: {error}; preserved source={}, runtime={}, cache={}, executable={}",
+                self.root.path().display(), self.runtime.path().display(),
+                self.cache.path().display(), self.executable.path().display()
+            );
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
         }
-        let pid = pid.to_string();
-        #[cfg(unix)]
-        let _ = Command::new("kill").args(["-KILL", pid.as_str()]).status();
-        #[cfg(windows)]
-        let _ = Command::new("taskkill").args(["/PID", pid.as_str(), "/F"]).status();
     }
 }
 
-fn is_test_daemon_executable(pid: u32) -> bool {
-    let expected = std::fs::canonicalize(env!("CARGO_BIN_EXE_bsl-analyzer-app")).ok();
-    #[cfg(target_os = "linux")]
-    let actual = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
-    #[cfg(windows)]
-    let actual = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("(Get-Process -Id {pid} -ErrorAction Stop).Path"),
-        ])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|path| std::fs::canonicalize(path.trim()).ok());
-    #[cfg(not(any(target_os = "linux", windows)))]
-    let actual: Option<PathBuf> = None;
-    let (Some(expected), Some(actual)) = (expected, actual) else { return false };
-    #[cfg(windows)]
-    {
-        expected.to_string_lossy().eq_ignore_ascii_case(&actual.to_string_lossy())
+fn private_image_running(image: &Path, deadline: Instant) -> std::io::Result<bool> {
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "private executable observation timed out",
+        ));
     }
+    observe_private_image(image, deadline)
+}
+
+#[test]
+fn private_image_observation_refuses_a_past_deadline_before_probing() {
+    let error = private_image_running(
+        Path::new("no-process-probe-may-run"),
+        Instant::now() - Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+struct ObserverControlChild(Child);
+
+impl Drop for ObserverControlChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            if let Err(error) = stop_owned_observer(&mut self.0) {
+                if std::thread::panicking() {
+                    eprintln!("own observer-control child cleanup failed: {error}");
+                } else {
+                    panic!("own observer-control child cleanup failed: {error}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn private_image_observation_sees_a_live_stdio_child_then_its_exit() {
+    let _serial = TEST_ENV.lock().unwrap_or_else(|poison| poison.into_inner());
+    let cleanup = OwnedDaemonCleanup::new(copy_fixture());
+    let mut child = ObserverControlChild(
+        cleanup
+            .command()
+            .args(["lsp", "--mode", "stdio"])
+            .current_dir(cleanup.root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start own stdio observer-control child"),
+    );
+    assert!(
+        private_image_running(&cleanup.image, Instant::now() + CLEANUP_HANG_GUARD).unwrap(),
+        "the private executable must be observed while its stdin is held"
+    );
+    drop(child.0.stdin.take());
+    let deadline = Instant::now() + CLEANUP_HANG_GUARD;
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "own stdio observer-control child did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!private_image_running(&cleanup.image, Instant::now() + CLEANUP_HANG_GUARD).unwrap());
+}
+
+fn private_process_snapshot(
+    processes: ProcessesToUpdate<'_>,
+    deadline: Instant,
+) -> std::io::Result<System> {
+    let observer = Pid::from_u32(std::process::id());
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "private executable observation timed out",
+        ));
+    }
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        processes,
+        true,
+        ProcessRefreshKind::nothing().without_tasks().with_exe(UpdateKind::Always),
+    );
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "private executable observation timed out",
+        ));
+    }
+    if system.process(observer).is_none() {
+        return Err(std::io::Error::other("process snapshot does not contain its observer"));
+    }
+    Ok(system)
+}
+
+fn observe_private_image(image: &Path, deadline: Instant) -> std::io::Result<bool> {
+    let observer = Pid::from_u32(std::process::id());
+    let system = private_process_snapshot(ProcessesToUpdate::All, deadline)?;
+    for process in system.processes().values() {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "private executable observation timed out",
+            ));
+        }
+        let matched =
+            private_process_image_matches(process.name(), process.exe(), process.status(), image);
+        // Status and image are separate OS reads; confirm absence if exit raced the image read.
+        let matched =
+            if matched.is_err() && process.exe().is_none_or(|path| path.as_os_str().is_empty()) {
+                let pids = [process.pid(), observer];
+                let current = private_process_snapshot(ProcessesToUpdate::Some(&pids), deadline)?;
+                match current.process(process.pid()) {
+                    None => false,
+                    Some(current) => private_process_image_matches(
+                        current.name(),
+                        current.exe(),
+                        current.status(),
+                        image,
+                    )?,
+                }
+            } else {
+                matched?
+            };
+        if matched {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn private_process_image_matches(
+    name: &std::ffi::OsStr,
+    executable: Option<&Path>,
+    status: ProcessStatus,
+    image: &Path,
+) -> std::io::Result<bool> {
+    let expected = image.file_name().expect("private executable name");
+    #[cfg(windows)]
+    let candidate = name.to_string_lossy().eq_ignore_ascii_case(&expected.to_string_lossy());
     #[cfg(not(windows))]
-    {
-        expected == actual
+    let candidate = name == expected;
+    if !candidate {
+        return Ok(false);
     }
+    // A zombie has already terminated; only its unreaped process-table entry remains.
+    if status == ProcessStatus::Zombie {
+        return Ok(false);
+    }
+    let executable = executable.filter(|path| !path.as_os_str().is_empty()).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "private executable candidate has no image; status={status:?}"
+        ))
+    })?;
+    let actual = executable.canonicalize()?;
+    #[cfg(windows)]
+    return Ok(actual.to_string_lossy().eq_ignore_ascii_case(&image.to_string_lossy()));
+    #[cfg(not(windows))]
+    Ok(actual == image)
+}
+
+#[test]
+fn private_image_observation_refuses_unknown_own_image_and_ignores_other_names() {
+    let root = tempfile::tempdir().unwrap();
+    let image = root.path().join("bp-private");
+    std::fs::write(&image, "private executable identity").unwrap();
+    let image = image.canonicalize().unwrap();
+    let own = image.file_name().unwrap();
+    assert!(!private_process_image_matches(
+        std::ffi::OsStr::new("unrelated"),
+        None,
+        ProcessStatus::Run,
+        &image
+    )
+    .unwrap());
+    assert!(private_process_image_matches(own, None, ProcessStatus::Run, &image).is_err());
+    assert!(!private_process_image_matches(own, None, ProcessStatus::Zombie, &image).unwrap());
+    assert!(private_process_image_matches(own, Some(Path::new("")), ProcessStatus::Run, &image)
+        .is_err());
+    assert!(private_process_image_matches(own, Some(&image), ProcessStatus::Run, &image).unwrap());
+    let other = root.path().join("another-image");
+    std::fs::write(&other, "different executable identity").unwrap();
+    assert!(!private_process_image_matches(own, Some(&other), ProcessStatus::Run, &image).unwrap());
+}
+
+fn stop_owned_observer(child: &mut Child) -> std::io::Result<()> {
+    child.kill()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "private executable observer did not stop",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 fn read_lsp_frame(reader: &mut impl BufRead) -> std::io::Result<Value> {
@@ -283,8 +486,8 @@ struct ProcessLsp {
 }
 
 impl ProcessLsp {
-    fn start(root: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+    fn start(root: &Path, mut command: Command) -> Self {
+        let mut child = command
             .arg("lsp")
             .current_dir(root)
             .stdin(Stdio::piped())
@@ -537,17 +740,15 @@ fn assert_document_symbols(response: &Value, expected: &[(String, usize)]) {
 #[test]
 fn held_metadata_bootstrap_keeps_cold_lsp_live_and_rejected_project_bounded() {
     let _serial = TEST_ENV.lock().unwrap_or_else(|poison| poison.into_inner());
-    let root = copy_fixture();
+    let cleanup = OwnedDaemonCleanup::new(copy_fixture());
+    let root = &cleanup.root;
+    let runtime = &cleanup.runtime;
     let source = root.path().join("CommonModules/ОбщийМодуль/Ext/Module.bsl");
-    let runtime = tempfile::tempdir().expect("disposable runtime outside source root");
-    let cache = tempfile::tempdir().expect("disposable cache outside source root");
-    let mut env = EnvGuard::new();
-    set_isolated_env(&mut env, cache.path(), runtime.path());
     let gate = Gate(metadata_gate(runtime.path()));
-    env.set("BSL_TEST_SHARED_METADATA_BOOTSTRAP_GATE", &gate.0);
+    let mut command = cleanup.command();
+    command.env("BSL_TEST_SHARED_METADATA_BOOTSTRAP_GATE", &gate.0);
 
-    let _daemon_cleanup = OwnedDaemonCleanup::new(runtime.path());
-    let mut lsp = ProcessLsp::start(root.path());
+    let mut lsp = ProcessLsp::start(root.path(), command);
     gate.wait_until_held("owner source bootstrap before metadata bootstrap", &lsp);
     let markers = wait_for_event(runtime.path(), "resident_bootstrap_start", &lsp);
     assert_eq!(events(&markers, "owner_init_start"), 1, "one shared owner initializer");
@@ -589,18 +790,14 @@ fn held_metadata_bootstrap_keeps_cold_lsp_live_and_rejected_project_bounded() {
     wait_for_event(runtime.path(), "resident_bootstrap_complete", &lsp);
     lsp.shutdown();
     drop(lsp);
-    env.remove("BSL_TEST_SHARED_METADATA_BOOTSTRAP_GATE");
 
     let rejected = tempfile::tempdir().expect("rejected project fixture");
     std::fs::write(rejected.path().join("bsl-analyzer.toml"), "[source\n").unwrap();
     let rejected_source = rejected.path().join("src/Rejected.bsl");
     std::fs::create_dir_all(rejected_source.parent().unwrap()).unwrap();
     std::fs::write(&rejected_source, "Процедура Отклонено()\nКонецПроцедуры\n").unwrap();
-    let rejected_runtime = tempfile::tempdir().expect("rejected-project runtime");
-    let rejected_cache = tempfile::tempdir().expect("rejected-project cache");
-    set_isolated_env(&mut env, rejected_cache.path(), rejected_runtime.path());
-    let _rejected_daemon_cleanup = OwnedDaemonCleanup::new(rejected_runtime.path());
-    let mut lsp = ProcessLsp::start(rejected.path());
+    let rejected_cleanup = OwnedDaemonCleanup::new(rejected);
+    let mut lsp = ProcessLsp::start(rejected_cleanup.root.path(), rejected_cleanup.command());
     let rejected_uri = uri(&rejected_source);
     lsp.send(json!({
         "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
@@ -629,19 +826,17 @@ fn held_metadata_bootstrap_keeps_cold_lsp_live_and_rejected_project_bounded() {
 #[test]
 fn large_ordered_public_changes_backpressure_while_editor_seed_is_held() {
     let _serial = TEST_ENV.lock().unwrap_or_else(|poison| poison.into_inner());
-    let root = copy_fixture();
+    let cleanup = OwnedDaemonCleanup::new(copy_fixture());
+    let root = &cleanup.root;
+    let runtime = &cleanup.runtime;
     let source = root.path().join("CommonModules/ОбщийМодуль/Ext/Module.bsl");
-    let runtime = tempfile::tempdir().expect("disposable runtime outside source root");
-    let cache = tempfile::tempdir().expect("disposable cache outside source root");
     let seed_gate = Gate(runtime.path().join("editor-seed-gate"));
     let event_gate = Gate(runtime.path().join("event-loop-gate"));
-    let mut env = EnvGuard::new();
-    set_isolated_env(&mut env, cache.path(), runtime.path());
-    env.set("BSL_TEST_SHARED_EDITOR_SEED_GATE", &seed_gate.0);
-    env.set("BSL_TEST_SHARED_LSP_EVENT_GATE", &event_gate.0);
+    let mut command = cleanup.command();
+    command.env("BSL_TEST_SHARED_EDITOR_SEED_GATE", &seed_gate.0);
+    command.env("BSL_TEST_SHARED_LSP_EVENT_GATE", &event_gate.0);
 
-    let _daemon_cleanup = OwnedDaemonCleanup::new(runtime.path());
-    let mut lsp = ProcessLsp::start(root.path());
+    let mut lsp = ProcessLsp::start(root.path(), command);
     wait_for_event(runtime.path(), "resident_bootstrap_complete", &lsp);
     let document_uri = uri(&source);
     let padding = "x".repeat(1_500_000);

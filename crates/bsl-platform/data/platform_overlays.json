@@ -157,6 +157,15 @@
   ],
   "global_function_parameter_overrides": [
     {
+      "russian_name": "XMLСтрока",
+      "english_name": "XMLString",
+      "min_version": "8.0",
+      "parameter_index": 0,
+      "replacement_type_list": ["Неопределено", "Null", "Булево", "Число", "Строка", "Дата"],
+      "evidence_source": "The pinned platform_data.json identified in PROVENANCE.md (SHA-256 3c759994cbd82a1522b1c497d9f2ef68c77b776d5c6723ba5a72623b570cacce), global function id 417: documentation.param_descriptions explicitly includes Дата and the example serializes a date with XMLСтрока, while parameters[0].param_type stops after Строка. Server runtime on 8.3.27.2130, compatibility НеИспользовать: date, string, number and boolean serialize; a value table is rejected.",
+      "rationale": "Restore only the documented date alternative lost from the extracted parameter list; keep the method's environment, minimum version and all other signature facts. No wider object family is inferred from the truncated description."
+    },
+    {
       "russian_name": "ПравоДоступа",
       "english_name": "AccessRight",
       "min_version": "8.0",
@@ -333,6 +342,30 @@
       "verified_against_version": "8.3.27",
       "evidence_source": "The pinned 8.3.27 corpus documents РежимДиалогаВопрос / QuestionDialogMode as a system enumeration with exactly 6 values (ids 3107-3112: ПрерватьПовторитьПропустить, ОК, ОКОтмена, ПовторитьОтмена, ДаНет, ДаНетОтмена) and no method; platform_facts.json holds exactly these records. The type is not among the corpus types without members, its name is unique, and no docs-gap overlay of crates/bsl-platform/src/db.rs covers it. A live run on 8.3.17.1549 and 8.3.27.2214 answers `РежимДиалогаВопрос.НетТакогоЗначения` with «Поле объекта не обнаружено (НетТакогоЗначения)», while each of the listed values works.",
       "rationale": "A system enumeration has no members beyond its values, so the extracted list is the platform's own value set and a miss on it fails at run time. Attesting it lets the absent-field check judge the enumeration read by its global name, where before the receiver was open."
+    },
+    {
+      "type": "DOMNodeType",
+      "verified_against_version": "8.3.27",
+      "members": {
+        "methods": [],
+        "properties": [
+          "Attribute",
+          "CDATASection",
+          "Comment",
+          "Document",
+          "DocumentFragment",
+          "DocumentType",
+          "Element",
+          "Entity",
+          "EntityReference",
+          "Notation",
+          "ProcessingInstruction",
+          "Text",
+          "XPathNamespace"
+        ]
+      },
+      "evidence_source": "The pinned 8.3.27 platform_data.json identified in PROVENANCE.md (SHA-256 3c759994cbd82a1522b1c497d9f2ef68c77b776d5c6723ba5a72623b570cacce) lists DOMNodeType / ТипУзлаDOM as one type with no methods and exactly 13 properties, ids 2468-2480. The corpus-contract test checks every id and both member names against that corpus; the served snapshot must carry exactly this member set. The type has no docs-gap synthesized members and is not extended by configuration metadata.",
+      "rationale": "The enumeration has a fixed value surface. Its documented Element / Элемент exists, while УзелЭлемента does not. Exact member-set matching refuses truncated or changed extracts before the existing version and unique-owner gates can attest a missing member."
     }
   ]
 }

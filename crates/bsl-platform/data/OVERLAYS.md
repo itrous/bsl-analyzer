@@ -217,6 +217,17 @@ whose version the analyzer cannot determine, keeps the receiver open. A homonym
 is never attested: its two namesakes share a name but not a surface, so the
 lookup cannot tell which one a receiver denotes.
 
+An optional `members` object binds an attestation to the served member set. It
+contains both `methods` and `properties` arrays, written with canonical English
+member names. The existing member resolver accepts aliases and ignores case;
+each name must resolve uniquely, and the resolved set must equal the entire
+served set in both sections. Missing, added, replaced or ambiguous members drop
+only that attestation, leaving the corpus and other attestations usable. Omitting
+`members` preserves the version-based contract of earlier attestations; explicit
+empty arrays attest an empty set, rather than disabling the constraint. The
+`DOMNodeType` attestation uses this constraint, with its membership checked
+against the SHA-pinned corpus by the corpus-contract test.
+
 One type is attested once, and attestations are deduplicated after their type
 names are resolved: two entries naming one type through different spellings
 (`SpreadsheetDocumentRange` and `ОбластьЯчеекТабличногоДокумента`) are refused

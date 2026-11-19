@@ -18,6 +18,13 @@ const OWNER_MARKER: &str = ".native-check-owner";
 const OWNER_MARKER_PREFIX: &str = "bsl-analyzer-native-check-v1:";
 static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
 
+#[path = "file_source.rs"]
+mod file_source;
+
+#[cfg(test)]
+#[path = "file_source_tests.rs"]
+mod file_source_tests;
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
@@ -227,9 +234,9 @@ impl NativeProfile {
             }
             SourceKind::File => {
                 let path = std::path::Path::new(&source);
-                if super::source::canonical_file_source(path).is_none() {
+                if file_source::validate_locations(path, &self.work_root).is_err() {
                     return Err(NativeProfileError::Invalid(
-                        "file source must name an existing canonical infobase directory",
+                        "file source must name a canonical infobase separate from work_root",
                     ));
                 }
             }
@@ -326,6 +333,17 @@ impl NativeProfile {
         deadline: std::time::Instant,
     ) -> super::types::CheckResult {
         let mut result = super::echoed_result(request, super::types::CheckStatus::Error);
+        if self.source_kind == SourceKind::File
+            && runtime_env(&self.source_connection_env).is_ok_and(|source| {
+                file_source::validate_locations(Path::new(&source), &self.work_root).is_err()
+            })
+        {
+            apply_native_check_error(
+                &mut result,
+                check_error("source_unavailable", "The configured file source is unavailable"),
+            );
+            return result;
+        }
         let _root_lock =
             match super::root_lock::RootLock::acquire(&self.work_root, deadline, &cancel).await {
                 Ok(lock) => lock,
@@ -491,7 +509,7 @@ impl NativeProfile {
             runtime_passport.as_ref(),
         )
         .await;
-        if checked.as_ref().is_err_and(|error| error.code == "source_snapshot_stale") {
+        if retry_source_snapshot(self.source_kind, &checked) {
             if self.source_kind == SourceKind::Server {
                 let Some(configured_source) = source.to_str() else {
                     result.status = super::types::CheckStatus::Error;
@@ -571,6 +589,14 @@ fn apply_native_check_error(result: &mut super::types::CheckResult, error: Nativ
     });
 }
 
+fn retry_source_snapshot(
+    source_kind: SourceKind,
+    checked: &Result<super::types::CheckResult, NativeCheckError>,
+) -> bool {
+    source_kind == SourceKind::Server
+        && checked.as_ref().is_err_and(|error| error.code == "source_snapshot_stale")
+}
+
 fn process_error(
     error: super::compiler::ProcessFailure,
     code: &'static str,
@@ -621,6 +647,9 @@ async fn run_native_check(
         })?,
         SourceKind::Server => source_path.to_path_buf(),
     };
+    if profile.source_kind == SourceKind::File {
+        file_source::validate_locations(&source, workspace)?;
+    }
     let user =
         profile.user_env.as_deref().map(runtime_env).transpose().map_err(|_| {
             check_error("source_unavailable", "The configured source is unavailable")
@@ -680,10 +709,24 @@ async fn run_native_check(
             }
         };
     let attempt = workspace.join(format!("attempt-{attempt_index}"));
-    fs::create_dir(&attempt).map_err(|_| {
+    #[cfg(windows)]
+    let create_attempt = if profile.source_kind == SourceKind::File {
+        super::windows_acl::new_private_directory(&attempt)
+    } else {
+        fs::create_dir(&attempt)
+    };
+    #[cfg(not(windows))]
+    let create_attempt = fs::create_dir(&attempt);
+    create_attempt.map_err(|_| {
         check_error("workspace_unavailable", "The private native-check workspace is unavailable")
     })?;
     set_private_dir(&attempt)?;
+    let file_source = if profile.source_kind == SourceKind::File {
+        Some(file_source::FileSourceSnapshot::create(&source, &attempt, deadline, cancel).await?)
+    } else {
+        None
+    };
+    let source = file_source.as_ref().map_or(source, |snapshot| snapshot.path().to_path_buf());
     let source_extensions_data = attempt.join("ibcmd-source-data");
     let copy_extensions_data = attempt.join("ibcmd-copy-data");
     let file_extension_state = if profile.source_kind == SourceKind::File {
@@ -1122,7 +1165,7 @@ async fn run_native_check(
         }
     }
 
-    // Re-read the source after compilation; an outdated snapshot is never reported as valid.
+    // Recheck the platform-facing state; the original FILE bytes are verified separately.
     let verify = attempt.join("source-verify.cf");
     let source_args = source_dump_args(
         profile.source_kind,
@@ -1193,6 +1236,9 @@ async fn run_native_check(
         cancel,
     )
     .await?;
+    if let Some(snapshot) = &file_source {
+        snapshot.verify_original(deadline, cancel).await?;
+    }
     if result.issues.is_empty() {
         result.status = CheckStatus::Valid;
         result.valid = Some(true);
@@ -1441,7 +1487,7 @@ async fn inspect_file_extensions(
     deadline: std::time::Instant,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<FileExtensionProbe, NativeCheckError> {
-    use super::compiler::{read_bounded_log, run_designer, Termination};
+    use super::compiler::{read_bounded_log, run_designer};
 
     if source.to_str().is_none_or(|value| value.chars().any(char::is_control)) {
         return Err(check_error("source_unavailable", "The configured file source is unavailable"));
@@ -1458,14 +1504,24 @@ async fn inspect_file_extensions(
     let log_path = workspace.join(log_name);
     let output =
         run_designer(profile, &args, workspace, &log_path, deadline, cancel, profile.max_log_bytes)
-            .await
-            .map_err(|error| {
-                process_error(
-                    error,
-                    "extension_snapshot_unavailable",
-                    "The extension list cannot be verified",
-                )
-            })?;
+            .await;
+    inspect_file_extension_output(output, || read_bounded_log(&log_path, profile.max_log_bytes))
+}
+
+fn inspect_file_extension_output<E>(
+    output: Result<super::compiler::ProcessOutput, super::compiler::ProcessFailure>,
+    read_log: impl FnOnce() -> Result<(Vec<u8>, bool), E>,
+) -> Result<FileExtensionProbe, NativeCheckError> {
+    use super::compiler::Termination;
+
+    let output = output.map_err(|error| {
+        warn_file_extension_probe("process_error", Some(error), None, None);
+        process_error(
+            error,
+            "extension_snapshot_unavailable",
+            "The extension list cannot be verified",
+        )
+    })?;
     let exit_code = match output.termination {
         Termination::Completed(Some(code @ (0 | 1))) => code,
         Termination::Cancelled => {
@@ -1478,6 +1534,7 @@ async fn inspect_file_extensions(
             ));
         }
         _ => {
+            warn_file_extension_probe("unexpected_termination", None, Some(&output), None);
             return Err(check_error(
                 "extension_snapshot_unavailable",
                 "The extension list cannot be verified",
@@ -1485,21 +1542,67 @@ async fn inspect_file_extensions(
         }
     };
     if output.truncated || !output.stdout.is_empty() || !output.stderr.is_empty() {
+        warn_file_extension_probe("streams", None, Some(&output), None);
         return Err(check_error(
             "extension_snapshot_unavailable",
             "The extension list cannot be verified",
         ));
     }
-    let (log, truncated) = read_bounded_log(&log_path, profile.max_log_bytes).map_err(|_| {
+    let (log, truncated) = read_log().map_err(|_| {
+        warn_file_extension_probe("log_read", None, Some(&output), None);
         check_error("extension_snapshot_unavailable", "The extension list cannot be verified")
     })?;
     if truncated {
+        warn_file_extension_probe("log_truncated", None, Some(&output), Some((&log, truncated)));
         return Err(check_error(
             "extension_snapshot_unavailable",
             "The extension list cannot be verified",
         ));
     }
-    classify_file_extension_list(exit_code, &log)
+    classify_file_extension_list(exit_code, &log).inspect_err(|_| {
+        warn_file_extension_probe("classification", None, Some(&output), Some((&log, false)));
+    })
+}
+
+fn warn_file_extension_probe(
+    failure: &'static str,
+    error: Option<super::compiler::ProcessFailure>,
+    output: Option<&super::compiler::ProcessOutput>,
+    log: Option<(&[u8], bool)>,
+) {
+    use super::compiler::{ProcessFailure, Termination};
+
+    let termination = match output.map(|value| value.termination) {
+        None => "unavailable",
+        Some(Termination::Completed(_)) => "completed",
+        Some(Termination::Cancelled) => "cancelled",
+        Some(Termination::Deadline) => "deadline",
+        Some(Termination::OutputLimit) => "output_limit",
+    };
+    let exit_code = output.and_then(|value| match value.termination {
+        Termination::Completed(code) => code,
+        _ => None,
+    });
+    let process_error = error.map(|value| match value {
+        ProcessFailure::Spawn => "spawn",
+        ProcessFailure::Wait => "wait",
+        ProcessFailure::OutputRead => "output_read",
+        ProcessFailure::Cleanup => "cleanup",
+    });
+    tracing::warn!(
+        target: "native_check::file_extensions",
+        stage = "inspect_file_extensions",
+        failure,
+        termination,
+        exit_code,
+        process_error,
+        stdout_bytes = output.map(|value| value.stdout.len() as u64),
+        stderr_bytes = output.map(|value| value.stderr.len() as u64),
+        streams_truncated = output.map(|value| value.truncated),
+        log_bytes = log.map(|(bytes, _)| bytes.len() as u64),
+        log_truncated = log.map(|(_, truncated)| truncated),
+        "File extension probe failed"
+    );
 }
 
 fn classify_file_extension_list(
@@ -3180,11 +3283,17 @@ fn current_process_start() -> Option<u64> {
 
 #[cfg(windows)]
 fn windows_process_start(pid: u32) -> Result<Option<u64>, NativeProfileError> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, FILETIME},
-        System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        Foundation::{FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{
+            GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE,
+        },
     };
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    // SAFETY: the returned process handle is checked and immediately given an owning wrapper.
+    let handle =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid) };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error()
@@ -3194,15 +3303,33 @@ fn windows_process_start(pid: u32) -> Result<Option<u64>, NativeProfileError> {
         }
         return Err(NativeProfileError::CleanupFailed);
     }
+    // SAFETY: OpenProcess returned a valid, uniquely owned handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let is_live = || {
+        // SAFETY: the owning wrapper retains a process handle with SYNCHRONIZE access.
+        match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => Ok(false),
+            WAIT_TIMEOUT => Ok(true),
+            _ => Err(NativeProfileError::CleanupFailed),
+        }
+    };
+    if !is_live()? {
+        return Ok(None);
+    }
     let mut creation = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
     let mut exit = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
     let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
     let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-    let success =
-        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-    unsafe { CloseHandle(handle) };
+    // SAFETY: the process handle remains owned and all four output pointers are valid.
+    let success = unsafe {
+        GetProcessTimes(handle.as_raw_handle(), &mut creation, &mut exit, &mut kernel, &mut user)
+    };
     if success == 0 {
         return Err(NativeProfileError::CleanupFailed);
+    }
+    // A retained process object still exposes creation time after exit; it is not a live owner.
+    if !is_live()? {
+        return Ok(None);
     }
     Ok(Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64))
 }
@@ -3658,6 +3785,356 @@ fn valid_job_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod file_extension_traces {
+        use super::*;
+        use crate::native_check::compiler::{ProcessFailure, ProcessOutput, Termination};
+        use serde_json::{json, Map, Value};
+        use std::sync::Mutex;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Debug)]
+        struct Captured {
+            level: tracing::Level,
+            target: String,
+            fields: Map<String, Value>,
+        }
+
+        struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor(Map<String, Value>);
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn fmt::Debug,
+                    ) {
+                        self.0.insert(field.name().to_owned(), Value::String(format!("{value:?}")));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_owned(), Value::String(value.to_owned()));
+                    }
+                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                        self.0.insert(field.name().to_owned(), value.into());
+                    }
+                    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                        self.0.insert(field.name().to_owned(), value.into());
+                    }
+                    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                        self.0.insert(field.name().to_owned(), value.into());
+                    }
+                }
+                let mut fields = Visitor(Map::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(Captured {
+                    level: *event.metadata().level(),
+                    target: event.metadata().target().to_owned(),
+                    fields: fields.0,
+                });
+            }
+        }
+
+        fn output(
+            termination: Termination,
+            stdout: &[u8],
+            stderr: &[u8],
+            truncated: bool,
+        ) -> ProcessOutput {
+            ProcessOutput {
+                termination,
+                stdout: stdout.to_vec(),
+                stderr: stderr.to_vec(),
+                truncated,
+                #[cfg(target_os = "linux")]
+                x11_conflict: false,
+            }
+        }
+
+        fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Captured>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let result = test_utils::with_subscriber(
+                tracing_subscriber::registry().with(Capture(events.clone())),
+                f,
+            );
+            let captured = events.lock().unwrap().clone();
+            (result, captured)
+        }
+
+        #[test]
+        fn failures_emit_one_warn_with_exact_safe_stage_exit_and_counts() {
+            struct Case {
+                process: Result<ProcessOutput, ProcessFailure>,
+                log: Result<(Vec<u8>, bool), std::io::Error>,
+                reads_log: bool,
+                want: Value,
+            }
+            let cases = [
+                Case {
+                    process: Err(ProcessFailure::Spawn),
+                    log: Ok((Vec::new(), false)),
+                    reads_log: false,
+                    want: json!({"failure":"process_error","termination":"unavailable","process_error":"spawn"}),
+                },
+                Case {
+                    process: Ok(output(
+                        Termination::Completed(Some(23)),
+                        b"secret-stdout",
+                        &[],
+                        false,
+                    )),
+                    log: Ok((Vec::new(), false)),
+                    reads_log: false,
+                    want: json!({"failure":"unexpected_termination","termination":"completed","exit_code":23,"stdout_bytes":13,"stderr_bytes":0,"streams_truncated":false}),
+                },
+                Case {
+                    process: Ok(output(Termination::Completed(None), &[], &[], false)),
+                    log: Ok((Vec::new(), false)),
+                    reads_log: false,
+                    want: json!({"failure":"unexpected_termination","termination":"completed","stdout_bytes":0,"stderr_bytes":0,"streams_truncated":false}),
+                },
+                Case {
+                    process: Ok(output(Termination::OutputLimit, &[], &[], true)),
+                    log: Ok((Vec::new(), false)),
+                    reads_log: false,
+                    want: json!({"failure":"unexpected_termination","termination":"output_limit","stdout_bytes":0,"stderr_bytes":0,"streams_truncated":true}),
+                },
+                Case {
+                    process: Ok(output(
+                        Termination::Completed(Some(0)),
+                        b"secret-stdout",
+                        b"secret-stderr",
+                        false,
+                    )),
+                    log: Ok((Vec::new(), false)),
+                    reads_log: false,
+                    want: json!({"failure":"streams","termination":"completed","exit_code":0,"stdout_bytes":13,"stderr_bytes":13,"streams_truncated":false}),
+                },
+                Case {
+                    process: Ok(output(Termination::Completed(Some(0)), &[], &[], true)),
+                    log: Ok((Vec::new(), false)),
+                    reads_log: false,
+                    want: json!({"failure":"streams","termination":"completed","exit_code":0,"stdout_bytes":0,"stderr_bytes":0,"streams_truncated":true}),
+                },
+                Case {
+                    process: Ok(output(Termination::Completed(Some(0)), &[], &[], false)),
+                    log: Err(std::io::Error::other("secret-error")),
+                    reads_log: true,
+                    want: json!({"failure":"log_read","termination":"completed","exit_code":0,"stdout_bytes":0,"stderr_bytes":0,"streams_truncated":false}),
+                },
+                Case {
+                    process: Ok(output(Termination::Completed(Some(0)), &[], &[], false)),
+                    log: Ok((b"secret-log".to_vec(), true)),
+                    reads_log: true,
+                    want: json!({"failure":"log_truncated","termination":"completed","exit_code":0,"stdout_bytes":0,"stderr_bytes":0,"streams_truncated":false,"log_bytes":10,"log_truncated":true}),
+                },
+                Case {
+                    process: Ok(output(Termination::Completed(Some(1)), &[], &[], false)),
+                    log: Ok((b"secret-log\n".to_vec(), false)),
+                    reads_log: true,
+                    want: json!({"failure":"classification","termination":"completed","exit_code":1,"stdout_bytes":0,"stderr_bytes":0,"streams_truncated":false,"log_bytes":11,"log_truncated":false}),
+                },
+            ];
+            for case in cases {
+                let read = std::cell::Cell::new(false);
+                let (result, events) = capture(|| {
+                    inspect_file_extension_output(case.process, || {
+                        read.set(true);
+                        case.log
+                    })
+                });
+                let error = result.expect_err("the rejected probe remains an error");
+                assert_eq!(error.code, "extension_snapshot_unavailable");
+                assert_eq!(error.message, "The extension list cannot be verified");
+                assert_eq!(read.get(), case.reads_log);
+                assert_eq!(events.len(), 1);
+                let event = &events[0];
+                assert_eq!(event.level, tracing::Level::WARN);
+                assert_eq!(event.target, "native_check::file_extensions");
+                let mut fields = event.fields.clone();
+                assert_eq!(fields.remove("stage"), Some(json!("inspect_file_extensions")));
+                assert_eq!(fields.remove("message"), Some(json!("File extension probe failed")));
+                assert_eq!(Value::Object(fields), case.want);
+                let captured = format!("{events:?}");
+                for secret in ["secret-stdout", "secret-stderr", "secret-log", "secret-error"] {
+                    assert!(!captured.contains(secret));
+                }
+            }
+        }
+
+        #[test]
+        fn success_cancellation_and_deadline_preserve_their_gates_without_warns() {
+            for (termination, log, expected) in [
+                (Termination::Completed(Some(0)), Vec::new(), None),
+                (Termination::Completed(Some(1)), b"The database structure does not support extensions. Turn the compatibility mode off.\n".to_vec(), None),
+                (Termination::Cancelled, Vec::new(), Some("cancelled")),
+                (Termination::Deadline, Vec::new(), Some("deadline_exceeded")),
+            ] {
+                let (result, events) = capture(|| inspect_file_extension_output(
+                    Ok(output(termination, &[], &[], false)), || {
+                        assert!(matches!(termination, Termination::Completed(_)));
+                        Ok::<_, std::io::Error>((log, false))
+                    },
+                ));
+                assert!(events.is_empty());
+                if let Some(code) = expected {
+                    assert_eq!(result.expect_err("stop remains an error").code, code);
+                } else {
+                    assert!(result.is_ok());
+                }
+            }
+        }
+
+        #[test]
+        fn process_cleanup_error_stays_cleanup_failed_without_formatting_errors() {
+            struct PrivateError;
+            let (result, events) = capture(|| {
+                inspect_file_extension_output(Err(ProcessFailure::Cleanup), || {
+                    Err::<(Vec<u8>, bool), _>(PrivateError)
+                })
+            });
+            assert_eq!(result.expect_err("cleanup error").code, "cleanup_failed");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].fields.get("process_error"), Some(&json!("cleanup")));
+        }
+    }
+
+    #[cfg(windows)]
+    mod windows_liveness {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Duration;
+        use windows_sys::Win32::{
+            Foundation::{FILETIME, WAIT_OBJECT_0},
+            System::Threading::{GetProcessTimes, WaitForSingleObject},
+        };
+
+        const CHILD_ROLE: &str = "BSL_NATIVE_LIVENESS_TEST_CHILD";
+
+        #[test]
+        #[ignore = "subprocess entrypoint for owned process liveness tests"]
+        fn child() {
+            match std::env::var(CHILD_ROLE).unwrap().as_str() {
+                "exit0" => std::process::exit(0),
+                "exit259" => std::process::exit(259),
+                "live" => {
+                    let _ = std::io::stdin().read_exact(&mut [0]);
+                }
+                _ => panic!("unknown child role"),
+            }
+        }
+
+        fn spawn(role: &str) -> Child {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "native_check::profile::tests::windows_liveness::child",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ROLE, role)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        }
+
+        fn creation_time(child: &Child) -> u64 {
+            let mut times = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+            let [created, exited, kernel, user] = &mut times;
+            // SAFETY: the directly owned child retains this handle and all four outputs are valid.
+            assert_ne!(
+                unsafe { GetProcessTimes(child.as_raw_handle(), created, exited, kernel, user) },
+                0
+            );
+            ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64
+        }
+
+        fn wait_retaining_handle(child: &mut Child, expected: i32) {
+            // SAFETY: the directly owned child remains borrowed throughout the bounded wait.
+            assert_eq!(unsafe { WaitForSingleObject(child.as_raw_handle(), 5_000) }, WAIT_OBJECT_0);
+            assert_eq!(child.wait().unwrap().code(), Some(expected));
+        }
+
+        fn exited_creator_is_not_live(role: &str, exit: i32) {
+            let mut child = spawn(role);
+            let created = creation_time(&child);
+            wait_retaining_handle(&mut child, exit);
+            let id = format!("{}-123-0", child.id());
+            assert!(
+                !job_creator_may_be_live(&id, created).unwrap(),
+                "an exited creator is not live while its handle is retained"
+            );
+        }
+
+        fn exited_designer_marker_is_recovered(role: &str, exit: i32) {
+            let mut child = spawn(role);
+            let created = creation_time(&child);
+            wait_retaining_handle(&mut child, exit);
+            let job = super::super::super::tests::canonical_tempdir();
+            let marker = job.path().join(".native-check-active-pid");
+            fs::write(&marker, format!("{}:{created}\n", child.id())).unwrap();
+            cleanup_owned_processes(
+                job.path(),
+                Instant::now() + Duration::from_secs(5),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(!marker.exists());
+        }
+
+        #[test]
+        fn retained_exit_zero_creator_is_not_live() {
+            exited_creator_is_not_live("exit0", 0);
+        }
+
+        #[test]
+        fn retained_exit_259_creator_is_not_live() {
+            exited_creator_is_not_live("exit259", 259);
+        }
+
+        #[test]
+        fn retained_exit_zero_designer_marker_is_recovered() {
+            exited_designer_marker_is_recovered("exit0", 0);
+        }
+
+        #[test]
+        fn retained_exit_259_designer_marker_is_recovered() {
+            exited_designer_marker_is_recovered("exit259", 259);
+        }
+
+        #[test]
+        fn live_creator_and_mismatched_live_marker_stay_protected() {
+            let mut child = spawn("live");
+            let created = creation_time(&child);
+            let id = format!("{}-123-0", child.id());
+            assert!(job_creator_may_be_live(&id, created).unwrap());
+            assert!(!job_creator_may_be_live(&id, created + 1).unwrap());
+            for marker_start in [created, created + 1] {
+                let job = super::super::super::tests::canonical_tempdir();
+                let marker = job.path().join(".native-check-active-pid");
+                fs::write(&marker, format!("{}:{marker_start}\n", child.id())).unwrap();
+                assert!(cleanup_owned_processes(
+                    job.path(),
+                    Instant::now() + Duration::from_secs(5),
+                    &AtomicBool::new(false)
+                )
+                .is_err());
+                assert!(marker.exists());
+                assert!(child.try_wait().unwrap().is_none());
+            }
+            child.stdin.take().unwrap().write_all(&[1]).unwrap();
+            wait_retaining_handle(&mut child, 0);
+        }
+    }
 
     #[cfg(any(unix, windows))]
     fn profile_with_designer_path(designer_path: PathBuf) -> NativeProfile {

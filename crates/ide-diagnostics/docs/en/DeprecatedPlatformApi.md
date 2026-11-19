@@ -4,7 +4,23 @@
 
 Reports calls and references to 1C:Enterprise platform APIs that are marked as deprecated by the platform documentation.
 
-The diagnostic covers deprecated global functions, global methods, platform types, and platform attributes that have a known replacement. Message text names the specific deprecated API and keeps the replacement suggested by the platform fact registry.
+The diagnostic covers deprecated global functions, global methods, platform types, and platform attributes that have a known replacement. Message text names the specific deprecated API.
+
+For global calls, both the replacement recommendation and the fix use the file's
+selected configuration, its compatibility mode, the minimum platform version and
+the method's execution environments. An external data processor or report with
+`configuration_root` uses that configuration's context. For example,
+`Version8_2_16` keeps the warning about deprecated `Find`, but withholds the
+unavailable `StrFind` replacement. An unknown owner does not inherit the main
+project configuration's settings.
+An unknown compatibility mode is different from an explicit `DontUse` /
+`НеИспользовать`: a replacement that depends on the mode is withheld.
+
+The `Message` replacement `CommonUse.MessageToUser` requires a visible exported
+method available in the caller's environments, including compilation guards and
+`ServerCall`. A configuration's name alone does not establish that BSP is present.
+When replacement availability cannot be established, the deprecated-call warning
+remains without a recommendation or fix.
 
 `DeprecatedMethodCall` is a separate diagnostic for project source methods deprecated by documentation comments. `GetFormMethod` is also separate and can be reported together with this diagnostic for `GetForm()` / `ПолучитьФорму()`.
 

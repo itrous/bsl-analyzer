@@ -4,6 +4,7 @@ pub mod command;
 pub mod common_attribute;
 pub mod common_module;
 pub mod configuration;
+pub mod declaration_identity;
 pub mod defined_type;
 pub mod dimension;
 pub mod enums;
@@ -12,15 +13,20 @@ pub mod event_subscription;
 pub mod external_object;
 pub mod form;
 pub mod http_service;
+pub mod inspection_sources;
 pub mod integration_service;
 pub mod loader;
 pub mod metadata_object;
 pub mod metadata_resolver;
 pub mod module_path;
+pub mod read_object;
+pub mod read_properties;
 pub mod register;
+pub mod rename_xml;
 pub mod role;
 pub mod scheduled_job;
 pub mod scoped_fs;
+pub mod source_content;
 pub mod subsystem;
 pub mod tabular_section;
 pub mod traits;
@@ -64,8 +70,8 @@ pub use loader::{
     discover_http_service_structure, discover_integration_service_structure,
     discover_metadata_structure, discover_register_structure, discover_role_structure,
     discover_scheduled_job_structure, discover_subsystem_structure, discover_web_service_structure,
-    load_from_directory, load_from_directory_scoped, parse_common_attribute_from_text,
-    parse_common_module_from_text, parse_defined_type_from_text,
+    load_from_directory, load_from_directory_scoped, load_from_directory_scoped_with_origins,
+    parse_common_attribute_from_text, parse_common_module_from_text, parse_defined_type_from_text,
     parse_event_subscription_from_text, parse_http_service_from_text,
     parse_integration_service_from_text, parse_metadata_object_from_texts,
     parse_register_from_text, parse_role_from_texts, parse_scheduled_job_from_text,

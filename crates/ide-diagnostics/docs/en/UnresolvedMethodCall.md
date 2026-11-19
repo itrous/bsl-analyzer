@@ -14,6 +14,8 @@ This usually means one of the following:
 
 The current implementation is conservative and focuses on qualified calls such as `CommonModule.Method()`, where the resolver has enough information to produce a useful error.
 
+`GetPredefinedItemName` (`ПолучитьИмяПредопределенного`) is supported by catalog, chart of characteristic types, chart of accounts and chart of calculation types managers. A separately attested fact fills the help extraction gap while preserving the reference parameter and manager availability. It neither adds the method to document managers nor accepts incompatible arguments.
+
 ## Platform types
 
 A method call on a value of a platform type is checked only where the completeness of that type's member surface is attested (`type_member_surface_attestations` in `crates/bsl-platform/data/platform_overlays.json`). Such a type counts as closed: the platform data is known to list every method it has, so calling a method it does not have is a defect of the code rather than a gap in the data.

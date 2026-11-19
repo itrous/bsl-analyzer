@@ -131,6 +131,7 @@ impl FrozenFilePaths {
 
 pub struct LatencyRequestContext {
     pub analysis: Analysis,
+    pub disk_read: ide_host_core::WorkspaceDiskRead,
     pub workspace_root: Option<PathBuf>,
     pub project: Option<Project>,
     pub diagnostics_baseline: Arc<ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot>,

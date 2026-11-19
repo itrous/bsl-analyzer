@@ -38,6 +38,9 @@ use crate::tools::response::{structured, trim_items_to_budget};
 
 pub(crate) mod snippet;
 
+#[cfg(test)]
+mod occurrence_identity_tests;
+
 /// Server-side cap on returned findings, honouring Anthropic's tool-response budget.
 /// `counts` still reports the full severity histogram, so a capped response is honest.
 pub(crate) const DEFAULT_MAX_FINDINGS: usize = 200;

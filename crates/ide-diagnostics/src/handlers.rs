@@ -45,6 +45,8 @@ pub mod deprecated_type_managed_form;
 pub mod disable_safe_mode;
 pub mod double_negatives;
 pub mod duplicate_alias_in_query;
+pub mod duplicate_interception;
+pub mod duplicate_method_declaration;
 pub mod duplicate_region;
 pub mod duplicate_string_literal;
 pub mod duplicated_insertion_into_collection;
@@ -278,6 +280,8 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::UselessTernaryOperator => Some(&useless_ternary_operator::METADATA),
         DiagnosticCode::DuplicateStringLiteral => Some(&duplicate_string_literal::METADATA),
         DiagnosticCode::DuplicateRegion => Some(&duplicate_region::METADATA),
+        DiagnosticCode::DuplicateInterception => Some(&duplicate_interception::METADATA),
+        DiagnosticCode::DuplicateMethodDeclaration => Some(&duplicate_method_declaration::METADATA),
         DiagnosticCode::NonStandardRegion => Some(&non_standard_region::METADATA),
         DiagnosticCode::DuplicatedInsertionIntoCollection => {
             Some(&duplicated_insertion_into_collection::METADATA)

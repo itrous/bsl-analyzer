@@ -75,6 +75,11 @@ impl Deref for DeferredCallHierarchyIndexState {
 
 #[derive(Debug)]
 pub enum Task {
+    DiskReadCompleted {
+        epoch: u64,
+        task: Box<Task>,
+        cancelled: Box<Task>,
+    },
     DependenciesPreloaded {
         file_id: vfs::FileId,
         count: usize,
@@ -331,6 +336,7 @@ pub struct WorkspaceBatchItem {
 /// against `batch_reported` to clear only files that left scope.
 pub struct WorkspaceBatchPlan {
     pub generation: u64,
+    pub disk_epoch: u64,
     pub file_ids: Arc<Vec<vfs::FileId>>,
     pub file_paths: crate::frozen_context::FrozenFilePaths,
     pub config: DiagnosticsConfigInput,
@@ -394,6 +400,7 @@ impl Drop for AnalysisGuard {
 }
 
 pub struct GlobalState {
+    pub(crate) metadata_rename: crate::metadata_rename::runtime::State,
     pub sender: Sender<Message>,
     pub req_queue: ReqQueue<(), ()>,
     pub analysis_host: SessionAnalysisHost,
@@ -719,6 +726,7 @@ impl GlobalState {
         loader_receiver: Receiver<loader::Message>,
     ) -> Self {
         Self {
+            metadata_rename: Default::default(),
             sender,
             req_queue: ReqQueue::default(),
             analysis_host: SessionAnalysisHost::default(),
@@ -1173,7 +1181,43 @@ impl GlobalState {
         }
     }
 
-    pub fn snapshot(&self) -> GlobalStateSnapshot {
+    pub(crate) fn workspace_disk_gate(&self) -> ide_host_core::WorkspaceDiskGate {
+        self.analysis_host
+            .owner()
+            .map(|owner| owner.disk_gate())
+            .unwrap_or_else(|| self.metadata_rename.gate.clone())
+    }
+
+    pub(crate) fn try_disk_read(&self) -> anyhow::Result<ide_host_core::WorkspaceDiskRead> {
+        Ok(self.workspace_disk_gate().try_read()?)
+    }
+
+    pub(crate) fn prepare_disk_read(&mut self) -> anyhow::Result<ide_host_core::WorkspaceDiskRead> {
+        let read = self.try_disk_read()?;
+        if self.shared_view_seeded && self.analysis_host.catch_up() {
+            self.mark_shared_view_changed();
+            if self.vfs_done {
+                for uri in self.opened_document_uris() {
+                    self.enqueue_pending_diagnostics(uri);
+                }
+                self.request_semantic_tokens_refresh();
+                self.request_workspace_diagnostic_refresh();
+            }
+        }
+        if self.metadata_rename.buffers_deferred {
+            crate::handlers::notification::replay_open_documents_after_disk_transaction(self)?;
+        }
+        Ok(read)
+    }
+
+    pub fn snapshot(&self) -> anyhow::Result<GlobalStateSnapshot> {
+        use salsa::Database as _;
+        let disk_read = self.try_disk_read()?;
+        let analysis = self
+            .analysis_host
+            .serving_analysis()
+            .ok_or_else(|| anyhow::anyhow!("workspace analysis is not ready"))?;
+        disk_read.register_cancel(analysis.database().cancellation_token());
         let workspace_catalog = self.analysis_host.owner().map(|owner| owner.catalog());
         let open_file_uri_ids = self
             .open_file_uri_ids
@@ -1181,8 +1225,9 @@ impl GlobalState {
             .filter(|(_, file_id)| self.open_files.contains(file_id))
             .map(|(uri, file_id)| (uri.clone(), *file_id))
             .collect();
-        GlobalStateSnapshot {
-            analysis: self.analysis_host.analysis(),
+        Ok(GlobalStateSnapshot {
+            analysis,
+            disk_read,
             vfs: Arc::clone(&self.vfs),
             mem_docs: self.mem_docs.clone(),
             workspace_root: self.workspace_root.clone(),
@@ -1196,7 +1241,7 @@ impl GlobalState {
             scope_dirty_docs: self.scope_dirty_docs.clone(),
             workspace_catalog,
             open_file_uri_ids,
-        }
+        })
     }
 
     /// Give a shared session its editor storage, empty until a seed fills it from the
@@ -1240,6 +1285,7 @@ impl GlobalState {
     }
 
     pub(crate) fn start_shared_metadata_warmup(&mut self) {
+        use salsa::Database as _;
         if !self.shared_metadata_warm_pending
             || self.shared_metadata_warm_in_flight
             || !self.shared_view_seeded
@@ -1247,16 +1293,23 @@ impl GlobalState {
         {
             return;
         }
+        let Ok(disk_read) = self.prepare_disk_read() else { return };
         if self.shared_metadata_warm_parked() {
             return;
         }
         self.shared_metadata_warm_parked_at = None;
         let analysis = self.analysis_host.analysis();
+        disk_read.register_cancel(analysis.database().cancellation_token());
         let started = DispatchStamp::of(analysis.database());
         let analysis_guard = self.note_analysis_spawned();
         let spawned = self.task_pool.pool.try_spawn(move || {
             let _analysis_guard = analysis_guard;
-            shared_metadata_warmup(|| analysis.warm_configuration_inventory())
+            let task = shared_metadata_warmup(|| analysis.warm_configuration_inventory());
+            Task::DiskReadCompleted {
+                epoch: disk_read.epoch(),
+                task: Box::new(task),
+                cancelled: Box::new(Task::SharedMetadataWarmed { cancelled: true, local: true }),
+            }
         });
         if spawned.is_ok() {
             self.shared_metadata_warm_started = Some(started);
@@ -1291,11 +1344,17 @@ impl GlobalState {
     }
 
     pub(crate) fn start_foreign_handler_bindings_priming(&mut self) {
+        use salsa::Database as _;
         let priming = &self.foreign_bindings_priming;
         if !priming.pending || priming.in_flight || !self.task_pool.pool.has_capacity() {
             return;
         }
-        if priming.parked_at.is_some_and(|at| at == self.analysis_host.request_revision()) {
+        let Ok(disk_read) = self.prepare_disk_read() else { return };
+        if self
+            .foreign_bindings_priming
+            .parked_at
+            .is_some_and(|at| at == self.analysis_host.request_revision())
+        {
             return;
         }
         if !self.foreign_bindings_readers_enabled() {
@@ -1305,13 +1364,21 @@ impl GlobalState {
         }
 
         let db = self.analysis_host.raw_database().clone();
+        disk_read.register_cancel(db.cancellation_token());
         let started = DispatchStamp::of(&db);
         let analysis_guard = self.note_analysis_spawned();
         let spawned = self.task_pool.pool.try_spawn(move || {
             let _analysis_guard = analysis_guard;
-            foreign_handler_bindings_priming(move || {
+            let task = foreign_handler_bindings_priming(move || {
                 db.prime_foreign_handler_bindings(base_db::BSL_SOURCE_ROOT)
-            })
+            });
+            Task::DiskReadCompleted {
+                epoch: disk_read.epoch(),
+                task: Box::new(task),
+                cancelled: Box::new(Task::ForeignHandlerBindingsPrimed {
+                    cut: Some(salsa::Cancelled::Local),
+                }),
+            }
         });
         if spawned.is_ok() {
             let priming = &mut self.foreign_bindings_priming;
@@ -1340,6 +1407,7 @@ impl GlobalState {
             return;
         }
         let Some(owner) = self.analysis_host.owner().cloned() else { return };
+        let Ok(disk_read) = self.prepare_disk_read() else { return };
         let epoch = self.shared_view_epoch;
         let slot = Arc::clone(&self.shared_seed_snapshot);
         let sender = self.task_pool.pool.sender.clone();
@@ -1353,7 +1421,10 @@ impl GlobalState {
                         match owner.snapshot() {
                             mcp_server::WorkspaceRead::Ready(snapshot) => {
                                 EditorView::prepare(snapshot, || {
-                                    stop.as_ref().is_some_and(|stop| stop.load(Ordering::Acquire))
+                                    !disk_read.is_current()
+                                        || stop
+                                            .as_ref()
+                                            .is_some_and(|stop| stop.load(Ordering::Acquire))
                                 })
                             }
                             _ => None,
@@ -1363,7 +1434,11 @@ impl GlobalState {
                     .flatten();
                 *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
                     prepared.map(|view| (epoch, view));
-                let _ = sender.send(Task::SharedWorkspaceSeedReady { epoch });
+                let _ = sender.send(Task::DiskReadCompleted {
+                    epoch: disk_read.epoch(),
+                    task: Box::new(Task::SharedWorkspaceSeedReady { epoch }),
+                    cancelled: Box::new(Task::SharedWorkspaceSeedReady { epoch }),
+                });
             })
         {
             self.shared_seed_running = false;
@@ -1478,6 +1553,7 @@ impl loader::Handle for NoopLoader {
 
 pub struct GlobalStateSnapshot {
     pub analysis: Analysis,
+    pub disk_read: ide_host_core::WorkspaceDiskRead,
     pub vfs: Arc<RwLock<Vfs>>,
     pub mem_docs: MemDocs,
     pub workspace_root: Option<PathBuf>,
@@ -1859,7 +1935,7 @@ mod vfs_race_tests {
             "the event-loop lookup readmitted an excluded editor URI"
         );
         assert!(
-            state.snapshot().file_id_for_url(&open_uri).is_err(),
+            state.snapshot().unwrap().file_id_for_url(&open_uri).is_err(),
             "an async request snapshot admitted an excluded editor URI"
         );
 

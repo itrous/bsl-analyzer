@@ -5,7 +5,7 @@ pub(crate) use overlay_schema::OverlayError;
 use overlay_schema::{
     parse_global_function_overrides, parse_member_surface_attestations,
     parse_method_return_type_corrections, parse_overrides, parse_property_additions,
-    parse_property_corrections, validate_version_bounds, MethodParameterOverride,
+    parse_property_corrections, validate_version_bounds, MemberSurface, MethodParameterOverride,
     TypeMemberSurfaceAttestation, TypePropertyAddition,
 };
 use serde_json::{Map, Value};
@@ -39,7 +39,7 @@ pub(crate) fn apply_global_function_parameter_overlays(
     data: &mut Value,
     overlay_source: &str,
 ) -> Result<(), OverlayError> {
-    let overrides = parse_global_function_overrides(overlay_source)?;
+    let mut overrides = parse_global_function_overrides(overlay_source)?;
     if overrides.is_empty() {
         return Ok(());
     }
@@ -48,6 +48,12 @@ pub(crate) fn apply_global_function_parameter_overlays(
         data.get_mut("global_functions").and_then(Value::as_array_mut).ok_or_else(|| {
             OverlayError("base platform data has no global_functions array".to_owned())
         })?;
+    // A partial help extract can omit a function entirely; a present alias
+    // still has to identify one consistent record before it can be corrected.
+    overrides.retain(|overlay| {
+        !method_matches(functions, None, "name", &overlay.russian_name).is_empty()
+            || !method_matches(functions, None, "english_name", &overlay.english_name).is_empty()
+    });
     apply_parameter_overrides(functions, overrides, &type_names)
 }
 
@@ -481,10 +487,42 @@ pub(crate) fn parse_resolved_member_surface_attestations(
                 attestation.type_name
             )));
         }
+        if attestation
+            .members
+            .as_ref()
+            .is_some_and(|members| !member_surface_matches(data, &canonical_name, members))
+        {
+            continue;
+        }
         attestation.type_name = canonical_name;
         resolved.push(attestation);
     }
     Ok(resolved)
+}
+
+fn member_surface_matches(data: &Value, canonical_type: &str, members: &MemberSurface) -> bool {
+    let section_matches =
+        |section: &str, names: &[String], resolve: fn(&Value, &str, &str) -> Option<usize>| {
+            let actual: HashSet<usize> = data
+                .get(section)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter(|(_, member)| {
+                    stdx::case::eq_ignore_case(
+                        member.get("type_name").and_then(Value::as_str).unwrap_or(""),
+                        canonical_type,
+                    )
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let expected: Option<HashSet<usize>> =
+                names.iter().map(|name| resolve(data, canonical_type, name)).collect();
+            expected.is_some_and(|expected| expected.len() == names.len() && expected == actual)
+        };
+    section_matches("methods", &members.methods, unique_method_index)
+        && section_matches("properties", &members.properties, unique_property_index)
 }
 
 enum ExistingProperty {

@@ -228,6 +228,7 @@ pub enum OrdinaryDialogRejection {
     Unreadable,
     Malformed,
     InvalidSchema,
+    Fingerprint,
 }
 
 impl OrdinaryDialogRejection {
@@ -238,6 +239,7 @@ impl OrdinaryDialogRejection {
             Self::Unreadable => "сайдкар Ext/Form/Form.json не читается",
             Self::Malformed => "сайдкар Ext/Form/Form.json не разбирается",
             Self::InvalidSchema => "версия схемы сайдкара Ext/Form/Form.json не поддерживается",
+            Self::Fingerprint => "SHA-256 сайдкара не подтверждён содержимым Ext/Form.bin",
         }
     }
 }
@@ -259,6 +261,8 @@ pub struct Form {
     /// `form.handlers` still uses default names for the form's own events.
     /// Always `false` for a managed form, whose dialog is `Ext/Form.xml`.
     pub ordinary_dialog_known: bool,
+    /// Whether the sidecar confirms the complete map of event and command bindings.
+    pub ordinary_bindings_known: bool,
     /// Why an existing sidecar was rejected. `None` both when the dialog was read and
     /// when there is no sidecar at all: the sidecar is optional, so its absence is a
     /// normal state and is not reported.
@@ -277,6 +281,7 @@ impl Form {
             attributes: Vec::new(),
             has_base_form: false,
             ordinary_dialog_known: false,
+            ordinary_bindings_known: false,
             ordinary_dialog_rejection: None,
         }
     }
@@ -297,6 +302,7 @@ impl Form {
             attributes: Vec::new(),
             has_base_form: false,
             ordinary_dialog_known: false,
+            ordinary_bindings_known: false,
             ordinary_dialog_rejection: None,
         }
     }
@@ -319,6 +325,7 @@ impl Form {
             attributes: Vec::new(),
             has_base_form: false,
             ordinary_dialog_known: false,
+            ordinary_bindings_known: false,
             ordinary_dialog_rejection: None,
         }
     }
@@ -382,6 +389,10 @@ impl Form {
 
     pub fn ordinary_dialog_known(&self) -> bool {
         self.ordinary_dialog_known
+    }
+
+    pub fn ordinary_bindings_known(&self) -> bool {
+        self.ordinary_dialog_known && self.ordinary_bindings_known
     }
 
     pub fn ordinary_dialog_rejection(&self) -> Option<OrdinaryDialogRejection> {

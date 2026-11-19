@@ -391,6 +391,7 @@ dependencies = [
  "serde_json",
  "stdx",
  "syntax",
+ "sysinfo",
  "tempfile",
  "test-utils",
  "thiserror 1.0.69",
@@ -432,6 +433,8 @@ dependencies = [
  "test-utils",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "win-security-identifier",
  "windows-sys 0.61.2",
 ]
@@ -502,6 +505,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "stdx",
  "tempfile",
  "thiserror 2.0.18",
@@ -1601,6 +1605,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
+name = "epf-carrier"
+version = "0.4.3"
+dependencies = [
+ "bsl-platform",
+ "check-contract",
+ "flate2",
+ "line-index",
+ "parser",
+ "stdx",
+ "syntax",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2066,6 +2083,7 @@ dependencies = [
  "ide-db",
  "parser",
  "rustc-hash 2.1.2",
+ "sdbl-hir",
  "stdx",
  "syntax",
  "tracing",
@@ -3178,6 +3196,7 @@ dependencies = [
  "check-contract",
  "chrono",
  "dirs",
+ "epf-carrier",
  "expect-test",
  "ide",
  "ide-host-core",
@@ -3559,11 +3578,15 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "onec-client"
 version = "0.4.3"
 dependencies = [
+ "base64 0.22.1",
+ "check-contract",
+ "epf-carrier",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -5586,6 +5609,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

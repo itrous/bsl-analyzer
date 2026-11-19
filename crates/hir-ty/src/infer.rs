@@ -27,6 +27,10 @@ use crate::definite_init;
 use crate::lower::TyLoweringContext;
 use crate::method_resolution;
 
+#[path = "infer_replacement.rs"]
+mod replacement;
+pub use replacement::{replacement_applicability, ReplacementApplicability};
+
 static DEPRECATED_PLATFORM_MEMBER_OWNERS: Lazy<FxHashSet<String>> = Lazy::new(|| {
     let mut owners = FxHashSet::default();
     for entry in deprecation::registry().entries() {
@@ -417,6 +421,13 @@ pub enum InferenceDiagnostic {
         from_doc_comment: bool,
     },
 
+    /// A known writable platform property rejects part of the assigned value's type.
+    PropertyAssignmentTypeMismatch {
+        expr: ExprId,
+        expected: TypeId,
+        actual: TypeId,
+    },
+
     UnresolvedField {
         expr: ExprId,
         receiver_ty: TypeId,
@@ -652,10 +663,9 @@ pub struct InferenceContext<'db> {
     db: &'db dyn HirDatabase,
 
     /// File whose configuration/metadata/cross-module context governs resolution.
-    /// For an ordinary module this is the module's own file; for an effective
-    /// `&ИзменениеИКонтроль` module it stays the BASE file (the effective module *is*
-    /// the base module with the extension's edits applied). Same-module method/variable
-    /// lookups are NOT keyed on this — they go through `local_symbols`.
+    /// Changed effective bodies compile as the extension; copied base bodies and
+    /// top-level code keep the base context. Same-module declarations retain their
+    /// original identities through `local_symbols`.
     context_file_id: FileId,
 
     /// Effective module's symbol tree, present only when inferring a spliced
@@ -663,6 +673,10 @@ pub struct InferenceContext<'db> {
     /// same-module lookups go to the declarations of `ModuleId{context_file_id}` by
     /// name, one memo per declaration.
     local_symbols: Option<Arc<ModuleInterface>>,
+
+    /// The spliced body's IDs belong to neither physical file's memoized CFG.
+    effective_definitions:
+        std::sync::OnceLock<Option<Arc<dataflow::reaching_defs::ReachingDefsResult>>>,
 
     /// The extension module an effective `&ИзменениеИКонтроль` module was spliced from,
     /// present for the bodies the extension compiles — the `&ИзменениеИКонтроль` methods,
@@ -1038,6 +1052,79 @@ pub fn infer_owner(
     }
 }
 
+/// Callee identities whose bare calls resolve to the platform's global callable surface.
+/// Variables keep BSL's separate value namespace; callable shadows and unread global
+/// surfaces prevent a proof. The optional routes select the same bodies as inference.
+pub fn unshadowed_platform_global_calls<'db>(
+    db: &'db dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    effective: Option<EffectiveModuleId<'db>>,
+    weaving: Option<hir_def::weaving::WeavingModuleId<'db>>,
+) -> FxHashSet<ExprId> {
+    routed_inference_context(db, file_id, owner, effective, weaving)
+        .map(|mut context| context.proven_platform_global_calls())
+        .unwrap_or_default()
+}
+
+fn routed_inference_context<'db>(
+    db: &'db dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    effective: Option<EffectiveModuleId<'db>>,
+    weaving: Option<hir_def::weaving::WeavingModuleId<'db>>,
+) -> Option<InferenceContext<'db>> {
+    if effective.is_some_and(|route| route.ext_file(db) != file_id)
+        || weaving.is_some_and(|route| route.ext_file(db) != file_id)
+    {
+        return None;
+    }
+    let bodies = match effective {
+        Some(eid) => hir_def::effective_module::module_bodies_effective(db, eid),
+        None => db.module_bodies(hir_def::ModuleId::new(file_id)),
+    };
+    let body = match owner {
+        DefWithBodyId::Method(key) => bodies
+            .iter_body_arcs()
+            .find_map(|(method, body)| (method == key).then(|| Arc::clone(body))),
+        DefWithBodyId::ModuleCode => bodies.module_code_arc().cloned(),
+    };
+    let body = body?;
+    let context = if let Some(eid) = effective {
+        let changed = matches!(owner, DefWithBodyId::Method(key)
+            if hir_def::effective_module::changed_method_keys(db, eid).contains(&key));
+        InferenceContext::new_effective(
+            db,
+            eid.base_file(db),
+            changed.then_some(eid.ext_file(db)),
+            hir_def::effective_module::module_interface_effective(db, eid),
+            owner,
+            &body,
+        )
+    } else if let Some(wid) = weaving {
+        InferenceContext::new_weaving(
+            db,
+            file_id,
+            hir_def::ModuleId::new(wid.base_file(db)),
+            owner,
+            &body,
+        )
+    } else {
+        InferenceContext::new_impl(db, file_id, owner, &body, false)
+    };
+    Some(context)
+}
+
+fn platform_global_is_callable(name: &Name) -> bool {
+    builtin::builtin_functions().get(name.as_str()).is_some()
+        || bsl_platform::PlatformGlobalCatalog::instance().lookup(name.as_str()).is_some_and(
+            |symbol| {
+                symbol.kind == bsl_platform::PlatformGlobalKind::Function
+                    && symbol.capabilities.callable == Some(true)
+            },
+        )
+}
+
 impl<'db> InferenceContext<'db> {
     pub fn new(
         db: &'db dyn HirDatabase,
@@ -1055,7 +1142,7 @@ impl<'db> InferenceContext<'db> {
         body: &Arc<Body>,
         with_body_env: bool,
     ) -> Self {
-        let opts = db.env_options();
+        let opts = db.env_options_for_file(file_id);
         let assignment_target_names = body
             .stmts_iter()
             .filter_map(|(_, stmt)| {
@@ -1075,8 +1162,11 @@ impl<'db> InferenceContext<'db> {
                 ),
                 DefWithBodyId::ModuleCode => {
                     let metadata = db.module_metadata(hir_def::ModuleId { file_id });
-                    Some(hir_def::execution_env::module_code_env(&metadata, &opts))
-                        .filter(|env| !env.is_empty())
+                    Some(db.file_compilation_context(file_id).map_or_else(
+                        || hir_def::execution_env::module_code_env(&metadata, &opts),
+                        |context| context.module_environment(&metadata),
+                    ))
+                    .filter(|env| !env.is_empty())
                 }
             }
         };
@@ -1091,7 +1181,10 @@ impl<'db> InferenceContext<'db> {
                 ),
                 DefWithBodyId::ModuleCode => {
                     let metadata = db.module_metadata(hir_def::ModuleId { file_id });
-                    hir_def::execution_env::module_code_env(&metadata, &opts)
+                    db.file_compilation_context(file_id).map_or_else(
+                        || hir_def::execution_env::module_code_env(&metadata, &opts),
+                        |context| context.module_environment(&metadata),
+                    )
                 }
             }
         };
@@ -1099,6 +1192,7 @@ impl<'db> InferenceContext<'db> {
             db,
             context_file_id: file_id,
             local_symbols: None,
+            effective_definitions: std::sync::OnceLock::new(),
             effective_extension: None,
             local_effective_returns: None,
             weaving_base: None,
@@ -1133,7 +1227,9 @@ impl<'db> InferenceContext<'db> {
             min_platform: db
                 .min_platform_version()
                 .and_then(|value| bsl_platform::PlatformVersion::parse_release(&value)),
-            compat_mode: crate::compat_mode::effective_mode(db.compatibility_mode().as_deref()),
+            compat_mode: crate::compat_mode::effective_mode(
+                db.compatibility_mode_for_file(file_id).as_deref(),
+            ),
             global_exports: None,
             global_read_exports: None,
             global_surface_partly_unknown: false,
@@ -1156,11 +1252,10 @@ impl<'db> InferenceContext<'db> {
     }
 
     /// Inference over an effective `&ИзменениеИКонтроль` module: local bodies/symbols come
-    /// from the spliced effective text (`local_symbols`), while configuration / metadata /
-    /// cross-module resolution keeps `context_file_id = base_file`. Identical to [`Self::new`]
-    /// apart from same-module method/variable lookups, which route to `local_symbols` and,
-    /// on a miss, to the declarations of the extension file `ext_file_id`. Pass `None` for a
-    /// body the extension does not compile: the base module's own top-level code.
+    /// from the spliced effective text (`local_symbols`), while metadata and cross-module
+    /// resolution use the compiling extension's context. Same-module declarations keep
+    /// their original identities, with an extension fallback for its own helpers. Pass
+    /// `None` for a body the extension does not compile.
     pub fn new_effective(
         db: &'db dyn HirDatabase,
         base_file_id: FileId,
@@ -1174,6 +1269,7 @@ impl<'db> InferenceContext<'db> {
         // method rather than the one being inferred — disable availability
         // checks rather than misattribute them.
         let mut ctx = Self::new_impl(db, base_file_id, owner, body, false);
+        ctx.context_file_id = ext_file_id.unwrap_or(base_file_id);
         ctx.local_symbols = Some(local_symbols);
         ctx.effective_extension = ext_file_id.map(hir_def::ModuleId::new);
         ctx
@@ -1253,22 +1349,22 @@ impl<'db> InferenceContext<'db> {
 
     /// In effective inference, prefer a LOCAL method's CHANGED-body return over the value
     /// materialised by the base-keyed `resolve_*` paths (which re-derive the base body).
-    /// A no-op for cross-module resolutions (the file guard fails) and for ordinary modules
-    /// (`local_effective_returns == None`), so it is safe to apply at every local-capable
-    /// `MethodResolution` return site.
-    fn effective_local_return(&self, method_id: hir_def::MethodId, resolved: TypeId) -> TypeId {
-        if method_id.module.file_id == self.context_file_id {
-            if let Some(ret) = self
-                .local_effective_returns
-                .as_ref()
-                .and_then(|m| m.get(&method_id.local_id).copied())
-            {
-                if !self.is_unknown(ret) {
-                    return ret;
-                }
-            }
+    /// The declaration's identity, rather than its compilation context, owns that return.
+    fn effective_local_return(&self, method_id: hir_def::MethodId) -> Option<TypeId> {
+        let local = self
+            .local_symbols
+            .as_ref()
+            .map_or(method_id.module.file_id == self.context_file_id, |symbols| {
+                symbols.find_method_by_id(method_id).is_some()
+            });
+        if !local {
+            return None;
         }
-        resolved
+        self.local_effective_returns
+            .as_ref()?
+            .get(&method_id.local_id)
+            .copied()
+            .filter(|ret| !self.is_unknown(*ret))
     }
 
     /// Lazily build both usage projections of the complete user global surface.
@@ -1351,7 +1447,10 @@ impl<'db> InferenceContext<'db> {
         kind: hir_def::ApplicationModuleKind,
     ) -> hir_def::execution_env::EnvFlags {
         let metadata = hir_def::ModuleMetadata::unknown(kind.module_type());
-        hir_def::execution_env::module_base_env(&metadata, &self.db.env_options())
+        hir_def::execution_env::module_base_env(
+            &metadata,
+            &self.db.env_options_for_file(self.context_file_id),
+        )
     }
 
     /// Whether `name` is a method of the current module (or, under weaving, its paired
@@ -1436,17 +1535,16 @@ impl<'db> InferenceContext<'db> {
             let returns = signatures
                 .iter()
                 .map(|(method, signature)| {
-                    self.effective_local_return(
-                        *method,
-                        self.documented_return(*method, signature.ret),
-                    )
+                    self.effective_local_return(*method)
+                        .unwrap_or_else(|| self.documented_return(*method, signature.ret))
                 })
                 .collect();
             return Some(self.db.union(returns));
         }
 
         let return_ty = self
-            .effective_local_return(*method_id, self.documented_return(*method_id, signature.ret));
+            .effective_local_return(*method_id)
+            .unwrap_or_else(|| self.documented_return(*method_id, signature.ret));
         let candidates =
             crate::user_call_candidates::for_resolved_method(self.db, *method_id, return_ty)
                 .ok()?;
@@ -1460,7 +1558,8 @@ impl<'db> InferenceContext<'db> {
             InferenceDiagnostic::UnresolvedMethodCall { expr, .. } => *expr,
             InferenceDiagnostic::UnresolvedBareCall { expr, .. } => *expr,
             InferenceDiagnostic::MismatchedArgCount { call_expr, .. } => *call_expr,
-            InferenceDiagnostic::TypeMismatch { expr, .. } => *expr,
+            InferenceDiagnostic::TypeMismatch { expr, .. }
+            | InferenceDiagnostic::PropertyAssignmentTypeMismatch { expr, .. } => *expr,
             InferenceDiagnostic::UnresolvedField { expr, .. } => *expr,
             InferenceDiagnostic::UnresolvedMetadataPath { expr, .. } => *expr,
             InferenceDiagnostic::ReadOnlyPropertyAssignment { lhs, .. } => *lhs,
@@ -1913,6 +2012,36 @@ impl<'db> InferenceContext<'db> {
         crate::form_attr::resolve_form_attribute_value(self.db, &resolver, attribute)
     }
 
+    fn proven_platform_global_calls(&mut self) -> FxHashSet<ExprId> {
+        self.global_export_map();
+        if !self.db.workspace_load_complete()
+            || self.global_surface_incomplete
+            || matches!(self.implicit_self_surface(), ImplicitSelfSurface::Unreadable)
+        {
+            return FxHashSet::default();
+        }
+        let calls: Vec<_> = self
+            .body
+            .exprs_iter()
+            .filter_map(|(call, expression)| {
+                let Expr::Call { callee, args } = expression else { return None };
+                let callee = ExprId::from_idx(*callee);
+                let Expr::Path(name) = self.body.expr(callee) else { return None };
+                (!self.body.is_recovered(call) && !self.body.is_recovered(callee))
+                    .then(|| (callee, name.clone(), args.len()))
+            })
+            .collect();
+        calls
+            .into_iter()
+            .filter_map(|(callee, name, argument_count)| {
+                (platform_global_is_callable(&name)
+                    && !self.is_call_name_shadowed(&name)
+                    && self.bare_receiver_global_method(&name, argument_count).is_none())
+                .then_some(callee)
+            })
+            .collect()
+    }
+
     fn is_call_name_shadowed(&mut self, name: &Name) -> bool {
         // Variables are NOT asked: BSL keeps names of variables and of methods
         // apart, so `Имя(...)` is looked up among methods even where a local
@@ -1978,7 +2107,7 @@ impl<'db> InferenceContext<'db> {
         let cached = match self.callee_module_env.get(&callee_module.file_id) {
             Some(v) => *v,
             None => {
-                let opts = self.db.env_options();
+                let opts = self.db.env_options_for_file(callee_module.file_id);
                 let metadata = self.db.module_metadata(callee_module);
                 let v = metadata
                     .common_module
@@ -2021,7 +2150,7 @@ impl<'db> InferenceContext<'db> {
         // before reporting, re-judge against the flags visible TO THE CALLER.
         // The physical flags stand when the provider has no configuration
         // scoping.
-        let opts = self.db.env_options();
+        let opts = self.db.env_options_for_file(self.context_file_id);
         let caller_scoped = self.db.resolve_common_module(self.context_file_id, name.as_str());
         let cm = caller_scoped.as_deref().unwrap_or(physical);
         let missing =
@@ -2056,7 +2185,7 @@ impl<'db> InferenceContext<'db> {
         let callee_env = match self.local_callee_env.get(&callee_local_id) {
             Some(&env) => env,
             None => {
-                let opts = self.db.env_options();
+                let opts = self.db.env_options_for_file(self.context_file_id);
                 let env = crate::method_environment::effective_method_env(
                     self.db,
                     hir_def::MethodId {
@@ -2083,6 +2212,33 @@ impl<'db> InferenceContext<'db> {
         if hir_def::execution_env::local_server_call_is_remote(module_type) {
             missing = missing & EnvFlags::SERVER_SIDE;
         }
+        if missing.is_empty() {
+            return;
+        }
+        self.push_inference_diagnostic(InferenceDiagnostic::ModuleAccessibility {
+            expr,
+            name: name.clone(),
+            callee_kind: EnvCalleeKind::LocalMethod,
+            missing,
+        });
+    }
+
+    fn check_external_object_callee_env(
+        &mut self,
+        expr: ExprId,
+        name: &Name,
+        method: hir_def::MethodId,
+    ) {
+        if self.body_env.is_empty() {
+            return;
+        }
+        let options = self.db.env_options_for_file(method.module.file_id);
+        let Some(environment) =
+            crate::method_environment::possible_method_env(self.db, method, &options)
+        else {
+            return;
+        };
+        let missing = self.body_env.without(environment) & self.checked_env;
         if missing.is_empty() {
             return;
         }
@@ -2153,7 +2309,10 @@ impl<'db> InferenceContext<'db> {
     fn query_facts(&self) -> crate::query_in_loop::BodyQueryFacts {
         let bindings: FxHashMap<ExprId, &CallArgBinding> =
             self.call_arg_bindings.iter().map(|binding| (binding.call_expr, binding)).collect();
-        let module = hir_def::ModuleId::new(self.context_file_id);
+        let module = self
+            .local_symbols
+            .as_ref()
+            .map_or(hir_def::ModuleId::new(self.context_file_id), |symbols| symbols.module_id());
         let mut facts = crate::query_in_loop::BodyQueryFacts::default();
         let mut own_defs = None;
         for &(call, in_loop_body) in &self.query_call_sites {
@@ -3179,12 +3338,26 @@ impl<'db> InferenceContext<'db> {
         var_key: &str,
     ) -> Option<Vec<ReachingDef>> {
         let module = hir_def::ModuleId::new(self.context_file_id);
-        let body_defs = match self.owner {
-            DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
-                MethodIdInput::new(self.db, hir_def::MethodId { module, local_id }),
-            )?,
-            DefWithBodyId::ModuleCode => {
-                self.db.module_code_reaching_definitions(self.context_file_id)?
+        let body_defs = if self.local_symbols.is_some() {
+            self.effective_definitions
+                .get_or_init(|| {
+                    let cfg = cfg::CfgBuilder::new()
+                        .build_graph_from_hir(self.body.body_stmts_typed(), &self.body);
+                    dataflow::reaching_defs::solve_reaching_definitions(
+                        Arc::new(cfg),
+                        &self.body,
+                        matches!(self.owner, DefWithBodyId::Method(_)),
+                    )
+                })
+                .clone()?
+        } else {
+            match self.owner {
+                DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
+                    MethodIdInput::new(self.db, hir_def::MethodId { module, local_id }),
+                )?,
+                DefWithBodyId::ModuleCode => {
+                    self.db.module_code_reaching_definitions(self.context_file_id)?
+                }
             }
         };
         let defs = body_defs.defs_for_var_at_stmt(var_key, stmt_id)?;
@@ -3346,6 +3519,24 @@ impl<'db> InferenceContext<'db> {
         );
     }
 
+    fn check_platform_property_assignment(
+        &mut self,
+        value: ExprId,
+        expected: TypeId,
+        actual: TypeId,
+    ) {
+        if self.in_uncompiled_branch || self.in_dead_branch {
+            return;
+        }
+        if !crate::subtype::is_assignable(self.db, actual, expected) {
+            self.push_inference_diagnostic(InferenceDiagnostic::PropertyAssignmentTypeMismatch {
+                expr: value,
+                expected,
+                actual,
+            });
+        }
+    }
+
     fn infer_stmts(&mut self, stmts: &[StmtIdx]) {
         for &stmt_idx in stmts {
             self.infer_stmt(stmt_idx);
@@ -3403,6 +3594,12 @@ impl<'db> InferenceContext<'db> {
                                             receiver_ty: form_ty,
                                             field_name: name.clone(),
                                         },
+                                    );
+                                } else {
+                                    self.check_platform_property_assignment(
+                                        ExprId::from_idx(*value),
+                                        prop.return_ty,
+                                        value_ty,
                                     );
                                 }
                             }
@@ -3478,6 +3675,18 @@ impl<'db> InferenceContext<'db> {
                                     },
                                 );
                             }
+                            if !info.is_readonly
+                                && matches!(
+                                    info.origin,
+                                    crate::field_enum::FieldOrigin::PlatformProperty { .. }
+                                )
+                            {
+                                self.check_platform_property_assignment(
+                                    ExprId::from_idx(*value),
+                                    info.ty,
+                                    value_ty,
+                                );
+                            }
                             self.expr_types.insert(target_id, info.ty);
                             infer_target = false;
                         } else if let Some(info) = crate::field_lookup::lookup_field(
@@ -3510,6 +3719,18 @@ impl<'db> InferenceContext<'db> {
                                         receiver_ty: base_ty,
                                         field_name: field.clone(),
                                     },
+                                );
+                            }
+                            if !info.is_readonly
+                                && matches!(
+                                    info.origin,
+                                    crate::field_enum::FieldOrigin::PlatformProperty { .. }
+                                )
+                            {
+                                self.check_platform_property_assignment(
+                                    ExprId::from_idx(*value),
+                                    info.ty,
+                                    value_ty,
                                 );
                             }
                             self.expr_types.insert(target_id, info.ty);
@@ -3776,7 +3997,13 @@ impl<'db> InferenceContext<'db> {
                 let resolver = self.get_resolver();
                 let obj_resolver =
                     crate::object_resolver::DbObjectResolver::new(self.db, self.context_file_id);
-                if let Some(info) =
+                let form_attribute =
+                    self.form_self_receiver_name(ExprId::from_idx(*base)).and_then(|_| {
+                        crate::form_attr::resolve_form_attribute(self.db, &resolver, field)
+                    });
+                if let Some(ty) = form_attribute {
+                    ty
+                } else if let Some(info) =
                     crate::form_items::lookup_form_item_field(self.db, &resolver, base_ty, field)
                 {
                     info.ty
@@ -3859,16 +4086,17 @@ impl<'db> InferenceContext<'db> {
                         }
                         _ => true,
                     };
-                    let closed_receiver = (matches!(
-                        base_kind,
-                        TypeKind::MetadataRef(_)
-                            | TypeKind::ThisObject { .. }
-                            | TypeKind::ManagerCollection(_)
-                    ) && !crate::field_enum::metadata_fields_open(
-                        self.db,
-                        &obj_resolver,
-                        base_ty,
-                    ) && closed_metadata_object)
+                    let metadata_receiver =
+                        matches!(base_kind, TypeKind::MetadataRef(_) | TypeKind::ThisObject { .. })
+                            || (matches!(base_kind, TypeKind::ManagerCollection(_))
+                                && self.db.file_has_visible_config(self.context_file_id));
+                    let closed_receiver = (metadata_receiver
+                        && !crate::field_enum::metadata_fields_open(
+                            self.db,
+                            &obj_resolver,
+                            base_ty,
+                        )
+                        && closed_metadata_object)
                         || matches!(base_kind, TypeKind::Structure(facet) if facet.closed)
                         || crate::manager_lookup::manager_members_closed(
                             self.db,
@@ -4056,6 +4284,28 @@ impl<'db> InferenceContext<'db> {
             Expr::Await { expr } => self.infer_expr(ExprId::from_idx(*expr)),
         };
 
+        if let Some((receiver, output, key)) =
+            crate::structure_keys::property_out_arg(&self.body, expr_id.to_idx())
+        {
+            let output = output.clone();
+            let receiver_ty =
+                self.expr_types.get(&receiver).copied().unwrap_or_else(|| self.db.unknown());
+            let receiver_kind = self.db.lookup_type(receiver_ty);
+            let value = match &receiver_kind {
+                TypeKind::Structure(facet) if facet.closed => key
+                    .and_then(|key| crate::structure_keys::structure_projection_field(facet, key)),
+                _ => None,
+            };
+            if matches!(receiver_kind, TypeKind::Structure(_) | TypeKind::Unknown | TypeKind::Any)
+                && (self.body_declares_binding(&output) || !self.owned_outside_body(&output))
+            {
+                let output = NormName::intern(output.as_str());
+                match value.filter(|value| !self.is_unknown(*value)) {
+                    Some(value) => self.record_local_type(output, value),
+                    None => self.reset_local_type(output),
+                }
+            }
+        }
         self.expr_types.insert(expr_id, ty);
         ty
     }
@@ -4781,11 +5031,22 @@ impl<'db> InferenceContext<'db> {
                             kind: UnresolvedMethodKind::MethodNotExport,
                         });
                     }
+                    if matches!(
+                        workspace_receiver_kind,
+                        TypeKind::MetadataRef(ref facet)
+                            if matches!(facet.kind, hir_def::ty::MetadataKind::ExternalDataProcessorObject | hir_def::ty::MetadataKind::ExternalReportObject)
+                    ) {
+                        self.check_external_object_callee_env(
+                            callee,
+                            &method_name,
+                            resolution.method_id,
+                        );
+                    }
                     self.expr_types.insert(callee, self.db.unknown());
-                    let return_ty = self.effective_local_return(
-                        resolution.method_id,
-                        self.documented_return(resolution.method_id, resolution.return_type),
-                    );
+                    let return_ty =
+                        self.effective_local_return(resolution.method_id).unwrap_or_else(|| {
+                            self.documented_return(resolution.method_id, resolution.return_type)
+                        });
                     let Ok(candidates) = crate::user_call_candidates::for_resolved_method(
                         self.db,
                         resolution.method_id,
@@ -5321,20 +5582,31 @@ impl<'db> InferenceContext<'db> {
         args: &[ExprId],
         callee: ExprId,
     ) -> Option<TypeId> {
+        let info = self.bare_receiver_global_method(name, args.len())?;
+        for arg in args {
+            self.infer_expr(*arg);
+        }
+        // No availability verdict here: the platform compiles a thick-client-only
+        // receiver method (`ПолучитьФорму` of an ordinary-application object) in the
+        // server context of the same module without complaint, so the method's
+        // availability says nothing about whether this module compiles.
+        let return_ty = self.record_candidate_call_arg_binding(callee, args, info.candidates);
+        self.expr_types.insert(callee, self.db.unknown());
+        Some(return_ty)
+    }
+
+    fn bare_receiver_global_method(
+        &self,
+        name: &Name,
+        argument_count: usize,
+    ) -> Option<crate::method_lookup::MethodInfo> {
         if name.is_missing() || self.bare_module_method_exists(name) {
             return None;
         }
-        let is_platform_global = builtin::builtin_functions().get(name.as_str()).is_some()
-            || bsl_platform::PlatformGlobalCatalog::instance().lookup(name.as_str()).is_some_and(
-                |symbol| {
-                    symbol.kind == bsl_platform::PlatformGlobalKind::Function
-                        && symbol.capabilities.callable == Some(true)
-                },
-            );
-        if !is_platform_global {
+        if !platform_global_is_callable(name) {
             return None;
         }
-        if args.len() == 2
+        if argument_count == 2
             && crate::method_lookup::is_platform_name_str(
                 name.as_str(),
                 "ПолучитьДанныеВыбора",
@@ -5346,18 +5618,7 @@ impl<'db> InferenceContext<'db> {
         let ImplicitSelfSurface::Receiver(receiver_ty) = self.implicit_self_surface() else {
             return None;
         };
-        let info =
-            crate::method_lookup::lookup_method_with_refinement(self.db, receiver_ty, name, None)?;
-        for arg in args {
-            self.infer_expr(*arg);
-        }
-        // No availability verdict here: the platform compiles a thick-client-only
-        // receiver method (`ПолучитьФорму` of an ordinary-application object) in the
-        // server context of the same module without complaint, so the method's
-        // availability says nothing about whether this module compiles.
-        let return_ty = self.record_candidate_call_arg_binding(callee, args, info.candidates);
-        self.expr_types.insert(callee, self.db.unknown());
-        Some(return_ty)
+        crate::method_lookup::lookup_method_with_refinement(self.db, receiver_ty, name, None)
     }
 
     /// Whether a variable answers `name` as a value: a parameter or `Перем` of the
@@ -5602,12 +5863,7 @@ impl<'db> InferenceContext<'db> {
         // In effective (`&ИзменениеИКонтроль`) inference, prefer the CHANGED
         // body's return over the base-keyed query, so inserted code that consumes
         // a changed sibling's result types correctly.
-        let effective_ret = self
-            .local_effective_returns
-            .as_ref()
-            .filter(|_| method.id.module.file_id == self.context_file_id)
-            .and_then(|m| m.get(&method.id.local_id).copied())
-            .filter(|ret| !self.is_unknown(*ret));
+        let effective_ret = self.effective_local_return(method.id);
         let sig =
             crate::method_resolution::materialise_signature_enriched(self.db, method.id, &method);
         let return_ty = effective_ret.unwrap_or_else(|| self.documented_return(method.id, sig.ret));
@@ -5702,7 +5958,9 @@ impl<'db> InferenceContext<'db> {
         if self.self_name_is_shadowed(&name, &resolver) {
             return None;
         }
-        crate::this_object::is_managed_form_module(self.db, &resolver).then_some(name)
+        let metadata = self.db.module_metadata(resolver.module_id()?);
+        (metadata.module_type == bsl_metadata::ModuleType::FormModule && metadata.form.is_some())
+            .then_some(name)
     }
 
     /// `static_receiver` — the call names the module directly
@@ -6393,7 +6651,7 @@ pub fn infer_query<'db>(
 /// pair. Mirrors [`infer_query`] but runs every body inline through
 /// [`InferenceContext::new_effective`] — same-module method/variable lookups resolve
 /// against the effective symbol tree (so `#Вставка` code sees base siblings), while
-/// metadata / cross-module context stays the base file. It deliberately does NOT
+/// metadata / cross-module context belongs to the compiling extension. It deliberately does NOT
 /// reuse `infer_method` / `infer_module_code`: those key on `ModuleId{base_file}` and
 /// would collide with the base module's own cached inference.
 #[salsa::tracked(lru = 256, heap_size = heap_estimate::inference_result_heap, returns(clone))]
@@ -6416,26 +6674,7 @@ pub fn infer_effective<'db>(
     // facts to the changed methods is therefore output-identical. The query facts are the one
     // exception: a loop in `#Вставка` reaches a query through a copied body too, in the same
     // logical module.
-    let changed_ids: rustc_hash::FxHashSet<hir_def::MethodKey> = {
-        let ext_parse = db.parse(ext_file);
-        let changed_targets: rustc_hash::FxHashSet<String> = ext_parse
-            .syntax_node()
-            .children()
-            .filter(|n| {
-                matches!(
-                    n.kind(),
-                    syntax::SyntaxKind::PROCEDURE_DEF | syntax::SyntaxKind::FUNCTION_DEF
-                )
-            })
-            .filter_map(|m| hir_def::extension_merge::extract_change_and_validate(&m))
-            .map(|cc| cc.target.fold_lower())
-            .collect();
-        interface
-            .methods()
-            .filter(|m| changed_targets.contains(&m.name.as_str().fold_lower()))
-            .map(|m| m.id.local_id)
-            .collect()
-    };
+    let changed_ids = hir_def::effective_module::changed_method_keys(db, eid);
 
     // Pass 1: infer each CHANGED method body once to capture its EFFECTIVE return type. A bare
     // same-module call to a `&ИзменениеИКонтроль` target must see its changed body's

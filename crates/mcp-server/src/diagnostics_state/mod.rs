@@ -41,6 +41,9 @@ pub(crate) mod test_support;
 mod types;
 mod workspace_sweep;
 
+pub(crate) const DISK_RECOVERY_REQUIRED: &str =
+    "workspace filesystem transaction requires recovery";
+
 pub(crate) use lifecycle::{lock_recover, DiagnosticsState};
 pub(crate) use resident::{diagnostic_survives_authors, DiagnosticsResident};
 pub(crate) use session::{resident_call, CallOutcome, ResidentSession};

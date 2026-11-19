@@ -1113,6 +1113,36 @@ fn applies_global_function_override_by_name_alone() {
 }
 
 #[test]
+fn xml_string_override_adds_only_date_and_preserves_availability() {
+    let mut data: Value =
+        serde_json::from_str(include_str!("../data/platform_facts.json")).unwrap();
+    let before = data["global_functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["english_name"] == "XMLString")
+        .unwrap()
+        .clone();
+    let mut overlay = curated_overlay();
+    overlay["global_function_parameter_overrides"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["english_name"] == "XMLString");
+    apply_global_function_parameter_overlays(&mut data, &overlay.to_string()).unwrap();
+    let after = data["global_functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["english_name"] == "XMLString")
+        .unwrap();
+    let mut expected = before;
+    expected["parameters"][0]["param_type"] =
+        json!("Неопределено, Null, Булево, Число, Строка, Дата");
+    assert_eq!(after, &expected);
+    assert_eq!(after["context"]["web_client"], false);
+}
+
+#[test]
 fn global_function_override_leaves_method_overrides_alone() {
     let mut data = global_function_data();
 
@@ -1134,11 +1164,23 @@ fn absent_global_function_section_is_a_no_op() {
 }
 
 #[test]
-fn rejects_missing_global_function_target() {
+fn absent_global_function_target_leaves_a_partial_extract_unchanged() {
+    let mut data = global_function_data();
+    let before = data.clone();
+    let mut entry = access_right_override();
+    entry["english_name"] = Value::String("XMLString".to_owned());
+    entry["russian_name"] = Value::String("XMLСтрока".to_owned());
+
+    apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry)).unwrap();
+
+    assert_eq!(data, before);
+}
+
+#[test]
+fn a_present_global_function_alias_requires_its_matching_alias() {
     let mut data = global_function_data();
     let mut entry = access_right_override();
     entry["english_name"] = Value::String("NoSuchFunction".to_owned());
-    entry["russian_name"] = Value::String("НетТакойФункции".to_owned());
 
     let error =
         apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry))
@@ -1423,4 +1465,81 @@ fn corrects_the_curated_xdto_factory_create() {
         data["methods"][0]["return_type"], "ОбъектXDTO, ЗначениеXDTO",
         "the curated overlay must correct ФабрикаXDTO.Создать"
     );
+}
+
+fn range_attestation_with_members(methods: Value, properties: Value) -> Value {
+    let mut entry = range_attestation();
+    entry["members"] = json!({"methods": methods, "properties": properties});
+    entry
+}
+
+#[test]
+fn member_sets_distinguish_an_absent_constraint_from_an_empty_surface() {
+    let data = range_data();
+    let absent = parse_resolved_member_surface_attestations(
+        &data,
+        &attestation_overlay(json!([range_attestation()])),
+    )
+    .unwrap();
+    assert_eq!(absent.len(), 1);
+    let empty = parse_resolved_member_surface_attestations(
+        &data,
+        &attestation_overlay(json!([range_attestation_with_members(json!([]), json!([]))])),
+    )
+    .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn member_sets_resolve_names_through_the_existing_member_aliases() {
+    let mut data = range_data();
+    data["methods"] = json!([{"id": 1, "type_name": "SpreadsheetDocumentRange", "name": "Прочитать", "english_name": "Read"}]);
+    for (methods, properties) in
+        [(json!(["Read"]), json!(["Value"])), (json!(["пРоЧиТаТь"]), json!(["vAlUe"]))]
+    {
+        let resolved = parse_resolved_member_surface_attestations(
+            &data,
+            &attestation_overlay(json!([range_attestation_with_members(methods, properties)])),
+        )
+        .unwrap();
+        assert_eq!(resolved.len(), 1);
+    }
+    let missing_method = parse_resolved_member_surface_attestations(
+        &data,
+        &attestation_overlay(json!([range_attestation_with_members(json!([]), json!(["Value"]))])),
+    )
+    .unwrap();
+    assert!(missing_method.is_empty());
+}
+
+#[test]
+fn member_sets_do_not_count_two_aliases_as_two_members() {
+    let data = range_data();
+    let resolved = parse_resolved_member_surface_attestations(
+        &data,
+        &attestation_overlay(json!([range_attestation_with_members(
+            json!([]),
+            json!(["Value", "Значение"])
+        )])),
+    )
+    .unwrap();
+    assert!(resolved.is_empty());
+}
+
+#[test]
+fn member_sets_reject_malformed_and_duplicate_names() {
+    for members in [
+        json!({"methods": []}),
+        json!({"methods": [], "properties": [false]}),
+        json!({"methods": [], "properties": ["Value", "value"]}),
+    ] {
+        let mut entry = range_attestation();
+        entry["members"] = members;
+        let error = parse_resolved_member_surface_attestations(
+            &range_data(),
+            &attestation_overlay(json!([entry])),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("members"), "{error}");
+    }
 }

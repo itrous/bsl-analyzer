@@ -112,7 +112,13 @@ where
     // Flush/persist resident state on the way out (success or failure), mirroring
     // the stdio path, before the process exits.
     let result = serve(server, listener, parked, orphan_grace, idle_ttl).await;
+    #[cfg(test)]
+    tracing::debug!(target: "broker_lifetime_probe", phase = "serve-returned");
+    #[cfg(test)]
+    tracing::debug!(target: "broker_lifetime_probe", phase = "state-shutdown-started");
     guard.shutdown();
+    #[cfg(test)]
+    tracing::debug!(target: "broker_lifetime_probe", phase = "state-shutdown-finished");
     result
 }
 
@@ -227,6 +233,7 @@ where
                     continue;
                 };
                 let active_guard = ActiveGuard::new(Arc::clone(&active));
+                idle_since = None;
                 let callback = Arc::clone(&on_session);
                 let key = key.clone();
                 let shutdown = shutdown.clone();
@@ -370,7 +377,7 @@ async fn serve(
     let poll =
         (orphan_grace.min(idle_ttl) / 4).clamp(Duration::from_millis(100), Duration::from_secs(15));
     let scope_shutdown = server.scope_transport_stop();
-    let mut idle_since = Some(Instant::now());
+    let mut idle_since = (active.load(Ordering::SeqCst) == 0).then(Instant::now);
     let mut superseded = false;
     let mut ticker = interval(poll);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -399,6 +406,7 @@ async fn serve(
                     continue;
                 }
                 sessions.push(spawn_session(&server, &active, &warmed, conn, session_shutdown.clone()));
+                idle_since = None;
             }
             _ = ticker.tick() => {
                 sessions.retain(|h| !h.is_finished());
@@ -418,6 +426,12 @@ async fn serve(
                 // Reset the idle clock while any session is connected; otherwise count down
                 // against the grace that fits the backend's history — the long `idle_ttl`
                 // once it has served real traffic, the short `orphan_grace` before then.
+                #[cfg(test)]
+                tracing::debug!(target: "broker_lifetime_probe", phase = "idle-tick",
+                    active = active.load(Ordering::SeqCst),
+                    background = server.background_work_active(),
+                    warmed = warmed.load(Ordering::SeqCst),
+                    index_active = server.state.index_progress().is_active());
                 if active.load(Ordering::SeqCst) != 0 || server.background_work_active() {
                     idle_since = None;
                 } else {
@@ -841,6 +855,77 @@ mod shared_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_idle_lifecycle_probe_records_session_and_shutdown_boundaries() {
+        use rmcp::ServiceExt;
+        use tracing_subscriber::prelude::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("lifecycle.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
+            .with_ansi(false)
+            .with_target(false)
+            .finish()
+            .with(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.target() == "broker_lifetime_probe"
+            }));
+        let trace_guard = tracing::subscriber::set_default(subscriber);
+        let key = BackendKey::new(
+            directory.path(),
+            directory.path().join("cache"),
+            crate::McpProfile::Reference,
+            0,
+            0,
+            Default::default(),
+        );
+        let daemon = run(
+            || Ok(McpServer::new(crate::McpProfile::Reference, crate::SharedState::shared())),
+            key.clone(),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+        let client = async {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let stream = loop {
+                match connect_endpoint(backend_name(&key).unwrap(), Duration::from_millis(100))
+                    .await
+                {
+                    Ok(stream) => break stream,
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(error) => panic!("own broker did not become ready: {error}"),
+                }
+            };
+            let client = ().serve(stream).await.unwrap();
+            client.cancel().await.unwrap();
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(daemon, client) })
+                .await
+                .expect("own broker must complete its idle lifecycle");
+        result.unwrap();
+        drop(trace_guard);
+        let text = std::fs::read_to_string(log).unwrap();
+        for phase in [
+            "session-initialized",
+            "session-waiting-returned",
+            "idle-tick",
+            "serve-returned",
+            "state-shutdown-started",
+            "state-shutdown-finished",
+        ] {
+            assert!(text.contains(phase), "missing {phase}: {text}");
+        }
+        for field in ["active=0", "background=false", "warmed=true", "index_active=false"] {
+            assert!(text.contains(field), "missing {field}: {text}");
+        }
+        assert!(text.len() < 32 * 1024);
+    }
+
     #[tokio::test]
     async fn incomplete_shared_handshakes_and_private_probe_do_not_warm_or_start_adapter() {
         let source = tempfile::tempdir().unwrap();
@@ -1121,7 +1206,7 @@ mod shared_tests {
 
         let mut stream = crate::broker::proxy::connect_or_launch_stream(
             key.clone(),
-            std::process::Command::new("unused-daemon-command"),
+            crate::broker::proxy::BrokerCommand::new("unused-daemon-command"),
         )
         .await
         .expect("new shared client connects to the existing endpoint without launching a daemon");
@@ -1604,3 +1689,6 @@ mod shared_tests {
             .unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+mod initialization_tests;

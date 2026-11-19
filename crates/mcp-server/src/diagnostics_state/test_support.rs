@@ -65,11 +65,11 @@ pub(crate) fn write_common_module(root: &Path, name: &str, server: bool, body: &
     write(root, &format!("CommonModules/{name}/Ext/Module.bsl"), body);
 }
 
-pub(super) fn sample_workspace(root: &Path) {
+pub(crate) fn sample_workspace(root: &Path) {
     write_common_module(root, "Сервер", true, "&НаСервере\nФункция Считать() Экспорт КонецФункции");
 }
 
-pub(super) fn module_path(root: &Path, name: &str) -> PathBuf {
+pub(crate) fn module_path(root: &Path, name: &str) -> PathBuf {
     root.join(format!("CommonModules/{name}/Ext/Module.bsl"))
 }
 

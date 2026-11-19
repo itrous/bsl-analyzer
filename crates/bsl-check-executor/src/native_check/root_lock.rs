@@ -11,7 +11,7 @@ pub(crate) struct RootLock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileIdentity {
+pub(super) struct FileIdentity {
     first: u64,
     second: u64,
 }
@@ -258,7 +258,7 @@ fn validate_lock_file(path: &Path, file: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn file_identity(file: &File) -> io::Result<FileIdentity> {
+pub(super) fn file_identity(file: &File) -> io::Result<FileIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

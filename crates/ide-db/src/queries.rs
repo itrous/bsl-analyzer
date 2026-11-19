@@ -338,11 +338,15 @@ fn borrowed_form_with_base_attributes(
     // only this read makes a base-root revision re-run the extension's form.
     let base_metadata = module_metadata_query(db, FileIdInput::new(db, base_file));
     let base_file_path = crate::vfs_helpers::get_file_path(db, base_file)?;
-    if !form_dialog_exists(file_path) || !form_dialog_exists(&base_file_path) {
+    let base_form = base_metadata.form.as_deref()?;
+    if base_form.form_type() != overlay.form_type()
+        || !form_dialog_exists(file_path, overlay)
+        || !form_dialog_exists(&base_file_path, base_form)
+    {
         return None;
     }
 
-    let mut merged = bsl_metadata::Form::clone(base_metadata.form.as_deref()?);
+    let mut merged = bsl_metadata::Form::clone(base_form);
     merged.apply_extension_overlay(overlay);
     Some(Arc::new(merged))
 }
@@ -387,11 +391,11 @@ fn resolve_borrowed_form_candidate(
     })
 }
 
-/// Whether the form module's dialog is a readable `Ext/Form.xml`, under the
-/// service-name policy of `parse_form_from_bsl_path`. An ordinary form keeps
-/// its dialog in the binary `Ext/Form.bin`; its attributes are unknown, so it
-/// takes part in no attribute merge on either side.
-fn form_dialog_exists(module_path: &std::path::Path) -> bool {
+/// Whether the parsed form has a readable dialog under its own source format.
+fn form_dialog_exists(module_path: &std::path::Path, form: &bsl_metadata::Form) -> bool {
+    if form.is_ordinary() {
+        return form.ordinary_dialog_known();
+    }
     module_path.parent().and_then(std::path::Path::parent).is_some_and(|ext| {
         bsl_conventions::find_child_ci(ext, bsl_conventions::ConventionalName::FormXml.canonical())
             .is_some()

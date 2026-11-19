@@ -33,9 +33,11 @@ mod doc_see_query;
 mod document_highlight_paired_keywords;
 mod double_inference_dedup;
 mod extension_metadata_inheritance;
+mod extension_owner_boundaries;
 mod external_object_inventory;
 mod folding_method_after_annotation;
 mod form_items_add_type_arg;
+mod form_property_assignment;
 mod global_common_module;
 mod highlight_directives_and_declarations;
 mod hover_baseline;
@@ -126,3 +128,5 @@ mod unload_iteration_projection;
 mod value_manager_calls;
 mod value_manager_module;
 mod workspace_symbol_parity;
+
+mod reported_platform_type_contracts;

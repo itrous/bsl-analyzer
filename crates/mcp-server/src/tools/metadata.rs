@@ -6,6 +6,15 @@ use rmcp::ErrorData as McpError;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
+mod inspection_cards;
+mod source_cards;
+pub use inspection_cards::{form_from_db, role_from_db, template_from_db};
+pub use source_cards::bound_source_response;
+pub use source_cards::select_predefined_account;
+use source_cards::{
+    append_read_properties, source_metadata_object_response, source_register_response,
+};
+
 pub async fn get_live_metadata_tree(
     state: &crate::SharedState,
     connection: Option<&str>,
@@ -35,6 +44,7 @@ pub async fn get_live_metadata_object(
     connection: Option<&str>,
     meta_type: &str,
     name: &str,
+    predefined_code: Option<&str>,
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     let selected =
@@ -49,7 +59,12 @@ pub async fn get_live_metadata_object(
         })
         .await
         .map_err(live_metadata_error)?;
-    live_metadata_object_response(connection, value, max_output_tokens)
+    if let Some(code) = predefined_code {
+        let result = live_metadata_object_response(connection, value, usize::MAX)?;
+        bound_source_response(select_predefined_account(result, code)?, max_output_tokens)
+    } else {
+        live_metadata_object_response(connection, value, max_output_tokens)
+    }
 }
 
 fn live_metadata_error(error: onec_client::Error) -> McpError {
@@ -68,6 +83,14 @@ fn live_metadata_object_response(
     let mut object = serde_json::to_value(object).map_err(|error| {
         McpError::internal_error(format!("Ошибка сериализации метаданных 1С: {error}"), None)
     })?;
+    if let Some(properties) = object.get("read_properties").filter(|value| !value.is_null()) {
+        if let Ok(properties) = serde_json::from_value::<
+            bsl_metadata::read_properties::ObjectReadProperties,
+        >(properties.clone())
+        {
+            object["read_properties"] = serde_json::json!(properties);
+        }
+    }
     let mut truncated = false;
     let ceiling = max_output_tokens.saturating_mul(4);
 
@@ -76,6 +99,7 @@ fn live_metadata_object_response(
         let result = crate::tools::response::structured(serde_json::json!({
             "schema_version": "2",
             "source": "infobase",
+            "query_schema_readiness": "not_checked",
             "connection": connection,
             "object": object.clone(),
             "completeness": completeness,
@@ -86,8 +110,14 @@ fn live_metadata_object_response(
         }
 
         let mut removed = false;
-        for field in ["Ресурсы", "Измерения", "ТабличныеЧасти", "Реквизиты", "СтандартныеРеквизиты"]
-        {
+        for field in [
+            "Ресурсы",
+            "Измерения",
+            "ТабличныеЧасти",
+            "Реквизиты",
+            "СтандартныеРеквизиты",
+            "enum_values",
+        ] {
             if object
                 .get_mut(field)
                 .and_then(serde_json::Value::as_array_mut)
@@ -96,6 +126,24 @@ fn live_metadata_object_response(
                 removed = true;
                 truncated = true;
                 break;
+            }
+        }
+        if !removed {
+            for path in [
+                "/predefined_accounts",
+                "/read_properties/members",
+                "/read_properties/predefined_accounts",
+                "/read_properties/exchange_plan_content",
+            ] {
+                if object
+                    .pointer_mut(path)
+                    .and_then(serde_json::Value::as_array_mut)
+                    .is_some_and(|items| items.pop().is_some())
+                {
+                    removed = true;
+                    truncated = true;
+                    break;
+                }
             }
         }
         if !removed {
@@ -123,6 +171,7 @@ fn live_metadata_tree_response(
         let response = crate::tools::response::structured(serde_json::json!({
             "schema_version": "2",
             "source": "infobase",
+            "query_schema_readiness": "not_checked",
             "connection": connection,
             "items": items.clone(),
             "returned": items.len(),
@@ -159,6 +208,83 @@ fn metadata_budget_error(minimum_bytes: usize) -> McpError {
 
 fn live_object_completeness(object: &serde_json::Value, truncated: bool) -> serde_json::Value {
     let mut reasons = Vec::new();
+    if object.get("read_properties").is_none_or(serde_json::Value::is_null) {
+        reasons
+            .push(serde_json::json!({"code":"legacy_read_properties","path":"/read_properties"}));
+    }
+    let kind = object
+        .get("full_name")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|full| full.split('.').next())
+        .and_then(|kind| kind.parse::<MdoType>().ok().or_else(|| MdoType::from_plural(kind)));
+    if let Some(properties) = object.get("read_properties").filter(|value| !value.is_null()) {
+        match serde_json::from_value::<bsl_metadata::read_properties::ObjectReadProperties>(
+            properties.clone(),
+        ) {
+            Ok(properties) => {
+                for (index, member) in properties.members.iter().enumerate() {
+                    if let Some(value) = &member.fill_value {
+                        let path = format!("/read_properties/members/{index}/fill_value");
+                        if value.runtime_predefined_identity.is_some()
+                            && !value.runtime_predefined_identity_matches_xml()
+                        {
+                            reasons.push(serde_json::json!({"code":"invalid_runtime_predefined_identity","path":format!("{path}/runtime_predefined_identity")}));
+                        } else if value.runtime_predefined_identity.is_none()
+                            && value.is_nonempty_runtime_catalog_reference()
+                        {
+                            reasons.push(serde_json::json!({"code":"runtime_predefined_identity_unavailable","path":path}));
+                        }
+                    }
+                }
+                if let Some(kind) = kind {
+                    for mut reason in source_cards::properties_reasons(&properties, kind) {
+                        // Configured Item IDs and runtime reference IDs have separate cards.
+                        if kind == MdoType::ChartOfAccounts
+                            && reason.get("path").and_then(serde_json::Value::as_str).is_some_and(
+                                |path| {
+                                    path.starts_with("/object/read_properties/predefined_accounts")
+                                },
+                            )
+                        {
+                            continue;
+                        }
+                        if let Some(path) = reason.get("path").and_then(serde_json::Value::as_str) {
+                            reason["path"] =
+                                serde_json::json!(path.strip_prefix("/object").unwrap_or(path));
+                        }
+                        reasons.push(reason);
+                    }
+                }
+            }
+            Err(_) => reasons.push(
+                serde_json::json!({"code":"invalid_read_properties","path":"/read_properties"}),
+            ),
+        }
+    }
+    if kind == Some(MdoType::ChartOfAccounts) {
+        match object.get("predefined_accounts").and_then(serde_json::Value::as_array) {
+            None => reasons.push(
+                serde_json::json!({"code":"property_unavailable","path":"/predefined_accounts"}),
+            ),
+            Some(accounts) => {
+                for (index, account) in accounts.iter().enumerate() {
+                    reasons.extend(source_cards::predefined_account_reasons(
+                        account,
+                        &format!("/predefined_accounts/{index}"),
+                        true,
+                    ));
+                }
+            }
+        }
+        if object.get("predefined_unread") == Some(&serde_json::Value::Bool(true)) {
+            reasons.push(serde_json::json!({"code":"predefined_set_incomplete","path":"/predefined_accounts"}));
+        }
+    }
+    if kind == Some(MdoType::Enum)
+        && object.get("enum_values").is_none_or(serde_json::Value::is_null)
+    {
+        reasons.push(serde_json::json!({"code":"legacy_enum_values","path":"/enum_values"}));
+    }
     for field in ["СтандартныеРеквизиты", "Реквизиты", "Измерения", "Ресурсы"]
     {
         if let Some(items) = object.get(field).and_then(serde_json::Value::as_array) {
@@ -235,6 +361,13 @@ enum ServiceKind {
     Integration,
 }
 
+pub(crate) fn parse_source_mdo_type(raw: &str) -> Result<MdoType, String> {
+    match raw.to_lowercase().as_str() {
+        "subsystems" | "подсистемы" => Ok(MdoType::Subsystem),
+        _ => raw.parse(),
+    }
+}
+
 fn parse_service_kind(raw: &str) -> Option<ServiceKind> {
     match raw.to_lowercase().as_str() {
         "httpservice" | "httpservices" | "httpсервис" | "httpсервисы" => {
@@ -289,6 +422,40 @@ pub fn get_metadata_tree(
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     if let Some(ref category) = filter {
+        let normalized = normalize_filter_category(category);
+        let scoped = matches!(
+            normalized.to_lowercase().as_str(),
+            "subsystem" | "subsystems" | "подсистема" | "подсистемы"
+        ) || matches!(
+            bsl_metadata::read_object::ReadObjectKind::parse(&normalized),
+            Some(
+                bsl_metadata::read_object::ReadObjectKind::CommonCommand
+                    | bsl_metadata::read_object::ReadObjectKind::CommonPicture
+            )
+        );
+        if scoped && !extensions.is_empty() {
+            let mut out = String::new();
+            for (label, source) in std::iter::once((None, config))
+                .chain(extensions.iter().map(|(name, config)| (Some(name.as_str()), config)))
+            {
+                if let Ok(result) = format_filtered_tree(db, source, category, max_output_tokens) {
+                    let scope = label.map_or_else(
+                        || format!("Базовая конфигурация {}", source.name()),
+                        |name| format!("Расширение {name}"),
+                    );
+                    let _ = writeln!(out, "## {scope}\n");
+                    out.push_str(&result.content[0].as_text().expect("text").text);
+                }
+            }
+            if !out.is_empty() {
+                crate::tools::response::truncate_text_to_budget(
+                    &mut out,
+                    max_output_tokens,
+                    "\n-- список усечён под max_output_tokens; запросите объект действием `object` --\n",
+                );
+                return Ok(CallToolResult::success(vec![ContentBlock::text(out)]));
+            }
+        }
         format_filtered_tree(db, config, category, max_output_tokens)
     } else {
         let mut result = format_summary_tree(db, config)?;
@@ -341,6 +508,15 @@ fn format_summary_tree(
     let scheduled_jobs = config.scheduled_jobs().len();
     if scheduled_jobs > 0 {
         categories.insert("РегламентноеЗадание", scheduled_jobs);
+    }
+    if !config.subsystems().is_empty() {
+        categories.insert("Подсистема", config.subsystems().len());
+    }
+    for kind in bsl_metadata::read_object::ReadObjectKind::ALL {
+        let count = config.read_objects().iter().filter(|object| object.kind == kind).count();
+        if count > 0 {
+            categories.insert(kind.russian_name(), count);
+        }
     }
 
     let roles = config.roles().len();
@@ -457,9 +633,60 @@ fn format_filtered_tree(
             found = format_service_listing(db, config, kind, &mut out);
         }
     }
+    if !found {
+        if let Some(kind) = bsl_metadata::read_object::ReadObjectKind::parse(category) {
+            for object in
+                checkpointed(db, config.read_objects()).filter(|object| object.kind == kind)
+            {
+                found = true;
+                let _ =
+                    writeln!(out, "- {}.{}", kind.russian_name(), escape_markdown(&object.name));
+                if matches!(
+                    kind,
+                    bsl_metadata::read_object::ReadObjectKind::CommonCommand
+                        | bsl_metadata::read_object::ReadObjectKind::CommonPicture
+                ) {
+                    let _ = writeln!(
+                        out,
+                        "  ObjectBelonging={:?}; UUID={}; ExtendedConfigurationObject={}",
+                        object.object_belonging,
+                        object.uuid,
+                        object
+                            .extended_configuration_object
+                            .map(|id| id.to_string())
+                            .as_deref()
+                            .unwrap_or("unknown")
+                    );
+                }
+            }
+        }
+    }
 
     if !found {
         match category.to_lowercase().as_str() {
+            "scheduledjob" | "scheduledjobs" | "регламентноезадание" | "регламентныезадания" => {
+                for job in checkpointed(db, config.scheduled_jobs()) {
+                    found = true;
+                    let _ = writeln!(out, "- {}", escape_markdown(job.name()));
+                }
+            }
+            "subsystem" | "subsystems" | "подсистема" | "подсистемы" => {
+                for subsystem in checkpointed(db, config.subsystems()) {
+                    found = true;
+                    let _ = writeln!(out, "- {}", escape_markdown(subsystem.address()));
+                    let _ = writeln!(
+                        out,
+                        "  ObjectBelonging={:?}; UUID={}; ExtendedConfigurationObject={}",
+                        subsystem.object_belonging,
+                        subsystem.uuid.map(|id| id.to_string()).as_deref().unwrap_or("unknown"),
+                        subsystem
+                            .extended_configuration_object
+                            .map(|id| id.to_string())
+                            .as_deref()
+                            .unwrap_or("unknown")
+                    );
+                }
+            }
             "общиемодули" | "общиймодуль" | "commonmodule" | "commonmodules" =>
             {
                 let modules = config.common_modules();
@@ -601,12 +828,44 @@ pub fn get_object_structure(
     object_type: &str,
     object_name: &str,
 ) -> Result<CallToolResult, McpError> {
+    if source_cards::is_scheduled_job(object_type) {
+        return config
+            .find_scheduled_job(object_name)
+            .map(source_cards::scheduled_job_response)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("РегламентноеЗадание.{object_name} не найдено"),
+                    None,
+                )
+            });
+    }
+    if let Some(kind) = bsl_metadata::read_object::ReadObjectKind::parse(object_type) {
+        return config
+            .find_read_object(kind, object_name)
+            .map(|object| source_cards::read_object_response(object, &[]))
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("{}.{object_name} не найден", kind.russian_name()),
+                    None,
+                )
+            });
+    }
     if let Some(kind) = parse_service_kind(object_type) {
         return get_service_structure(config, kind, object_name);
     }
 
-    let mdo_type: MdoType =
-        object_type.parse().map_err(|e: String| McpError::invalid_params(e, None))?;
+    let mdo_type: MdoType = parse_source_mdo_type(object_type)
+        .map_err(|e: String| McpError::invalid_params(e, None))?;
+    if mdo_type == MdoType::Subsystem {
+        return config
+            .subsystems()
+            .iter()
+            .find(|object| object.address().to_lowercase() == object_name.to_lowercase())
+            .map(source_cards::subsystem_response)
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("Подсистема.{object_name} не найдена"), None)
+            });
+    }
 
     // An event subscription is not a data-bearing object: it lives in its own catalog,
     // so it is looked up by name rather than via `find_metadata_object`/`find_register`.
@@ -623,15 +882,17 @@ pub fn get_object_structure(
     }
 
     if let Some(obj) = config.find_metadata_object(mdo_type, object_name) {
-        return Ok(CallToolResult::success(vec![ContentBlock::text(
-            format_metadata_object_structure(obj, mdo_type),
-        )]));
+        if mdo_type == MdoType::ChartOfCharacteristicTypes {
+            return source_cards::characteristic_type_response(obj, config, None);
+        }
+        return source_metadata_object_response(obj);
     }
 
     if let Some(reg) = config.find_register_by_type_and_name(mdo_type, object_name) {
-        return Ok(CallToolResult::success(vec![ContentBlock::text(format_register_structure(
-            reg,
-        ))]));
+        let mut register = reg.clone();
+        register
+            .resolve_recorder_type(|| config.recorders_for_register(mdo_type, reg.name()).to_vec());
+        return source_register_response(&register);
     }
 
     Err(McpError::invalid_params(
@@ -781,6 +1042,7 @@ fn format_metadata_object_structure(
 ) -> String {
     let mut out = format!("# {}.{}\n\n", mdo_type.russian_name(), escape_markdown(&obj.name));
     let unresolved = metadata_object_type_reasons(obj);
+    append_read_properties(&mut out, &obj.read_properties, mdo_type);
 
     if let Some(ref name_en) = obj.name_en {
         let _ = writeln!(out, "Английское имя: {}\n", escape_markdown(name_en));
@@ -937,6 +1199,7 @@ fn format_source_type(ty: &bsl_metadata::AttributeType) -> String {
 fn format_register_structure(reg: &bsl_metadata::Register) -> String {
     let mut out =
         format!("# {}.{}\n\n", reg.mdo_type().russian_name(), escape_markdown(reg.name()));
+    append_read_properties(&mut out, reg.read_properties(), reg.mdo_type());
     let mut reasons = Vec::new();
     for dim in reg.dimensions() {
         collect_type_reasons(
@@ -1030,7 +1293,9 @@ pub fn get_configuration_info(
         + config.roles().len()
         + config.http_services().len()
         + config.web_services().len()
-        + config.integration_services().len();
+        + config.integration_services().len()
+        + config.subsystems().len()
+        + config.read_objects().len();
 
     let mut out = format!("# Конфигурация: {}\n\n", config.name());
     let _ = writeln!(out, "- UUID: {}", config.uuid());
@@ -1042,6 +1307,15 @@ pub fn get_configuration_info(
     let _ = writeln!(out, "- Определяемые типы: {}", config.defined_types().len());
     let _ = writeln!(out, "- Регламентные задания: {}", config.scheduled_jobs().len());
     let _ = writeln!(out, "- Роли: {}", config.roles().len());
+    let _ = writeln!(out, "- Подсистемы: {}", config.subsystems().len());
+    for kind in bsl_metadata::read_object::ReadObjectKind::ALL {
+        let _ = writeln!(
+            out,
+            "- {}: {}",
+            kind.russian_name(),
+            config.read_objects().iter().filter(|object| object.kind == kind).count()
+        );
+    }
     let _ = writeln!(out, "- HTTP-сервисы: {}", config.http_services().len());
     let _ = writeln!(out, "- Web-сервисы: {}", config.web_services().len());
     let _ = writeln!(out, "- Сервисы интеграции: {}", config.integration_services().len());
@@ -1056,7 +1330,29 @@ pub fn get_configuration_info(
         }
     }
 
-    Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    let compatibility = config.compatibility_mode();
+    let modality = config.modality_use_mode();
+    let _ = writeln!(
+        out,
+        "\nCompatibilityMode: {}\nModalityUseMode: {}\nИсточник: source",
+        compatibility.unwrap_or("unknown"),
+        modality.unwrap_or("unknown")
+    );
+    let mut reasons = Vec::new();
+    if compatibility.is_none() {
+        reasons.push(serde_json::json!({"code":"property_unavailable","path":"/configuration/compatibility_mode"}));
+    }
+    if modality.is_none() {
+        reasons.push(serde_json::json!({"code":"property_unavailable","path":"/configuration/modality_use_mode"}));
+    }
+    Ok(crate::tools::response::structured_with_text(
+        out,
+        serde_json::json!({
+            "schema_version":"2", "source":"source", "configuration": {
+                "name":config.name(),"compatibility_mode":compatibility,"modality_use_mode":modality
+            }, "completeness":{"status":if reasons.is_empty() {"complete"} else {"partial"},"reasons":reasons},"truncated":false
+        }),
+    ))
 }
 
 /// Read forms from disk. `source_root` MUST be the configuration root (the
@@ -1065,7 +1361,8 @@ pub fn get_configuration_info(
 ///
 /// `object_name` is required for an object's forms (`<TypeDir>/<object>/Forms/…`) but ignored
 /// for `CommonForm`, which is a top-level form with no parent object (`CommonForms/<Form>/…`).
-pub fn get_form_structure(
+#[cfg(test)]
+pub(crate) fn get_form_structure(
     source_root: Option<&std::path::Path>,
     object_type: &str,
     object_name: Option<&str>,
@@ -1108,6 +1405,7 @@ pub fn get_form_structure(
 /// Read a single form (when `form_name` is given) or list every form directory inside
 /// `container` (`.../Forms` for an object, `CommonForms` for a common form). `title` labels
 /// the listing header and the empty-set error.
+#[cfg(test)]
 fn forms_in_container(
     container: &std::path::Path,
     form_name: Option<&str>,
@@ -1177,6 +1475,7 @@ fn forms_in_container(
 /// UUID — those live in the parent object's metadata — so the parsed name is usually empty and
 /// the UUID nil. Fall back to the requested name for the heading, and label a nil UUID as
 /// unavailable instead of printing a misleading all-zero one.
+#[cfg(test)]
 fn format_form(form: &bsl_metadata::Form, requested_name: Option<&str>) -> String {
     let title = match (form.name(), requested_name) {
         (name, _) if !name.is_empty() => name,
@@ -1253,6 +1552,20 @@ fn format_extension_summary(
         categories.insert("ОбщийМодуль", common_modules);
     }
 
+    for (category, count) in [
+        ("РегламентноеЗадание", config.scheduled_jobs().len()),
+        ("Подсистема", config.subsystems().len()),
+    ] {
+        if count > 0 {
+            categories.insert(category, count);
+        }
+    }
+    for kind in bsl_metadata::read_object::ReadObjectKind::ALL {
+        let count = config.read_objects().iter().filter(|object| object.kind == kind).count();
+        if count > 0 {
+            categories.insert(kind.russian_name(), count);
+        }
+    }
     let total: usize = categories.values().sum();
     let _ = writeln!(out, "Всего объектов: {total}\n");
     let _ = writeln!(out, "| Категория | Количество |");
@@ -1270,7 +1583,10 @@ fn format_extension_summary(
 /// would never retry a just-added HTTP/Web/Integration service (they'd stay "not found"
 /// until the next periodic drift poll, unlike catalogs/registers/subscriptions).
 pub(crate) fn is_resolvable_object_type(object_type: &str) -> bool {
-    parse_service_kind(object_type).is_some() || object_type.parse::<MdoType>().is_ok()
+    parse_service_kind(object_type).is_some()
+        || parse_source_mdo_type(object_type).is_ok()
+        || source_cards::is_scheduled_job(object_type)
+        || bsl_metadata::read_object::ReadObjectKind::parse(object_type).is_some()
 }
 
 /// The `metadata object` action reading the resident host: resolve the object across the
@@ -1283,12 +1599,42 @@ pub fn object_from_db(
     object_type: &str,
     object_name: &str,
 ) -> Result<CallToolResult, McpError> {
+    if source_cards::is_scheduled_job(object_type) {
+        return db
+            .resolve_scheduled_job_across_roots(object_name)
+            .map(|job| source_cards::scheduled_job_response(&job))
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("РегламентноеЗадание.{object_name} не найдено"),
+                    None,
+                )
+            });
+    }
+    if let Some(kind) = bsl_metadata::read_object::ReadObjectKind::parse(object_type) {
+        return db
+            .resolve_read_object_across_roots(kind, object_name)
+            .map(|(object, roots)| source_cards::read_object_response(&object, &roots))
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("{}.{object_name} не найден", kind.russian_name()),
+                    None,
+                )
+            });
+    }
     if let Some(kind) = parse_service_kind(object_type) {
         return service_from_db(db, kind, object_name);
     }
 
-    let mdo_type: MdoType =
-        object_type.parse().map_err(|e: String| McpError::invalid_params(e, None))?;
+    let mdo_type: MdoType = parse_source_mdo_type(object_type)
+        .map_err(|e: String| McpError::invalid_params(e, None))?;
+    if mdo_type == MdoType::Subsystem {
+        return db
+            .resolve_subsystem_across_roots(object_name)
+            .map(|object| source_cards::subsystem_response(&object))
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("Подсистема.{object_name} не найдена"), None)
+            });
+    }
 
     if mdo_type == MdoType::EventSubscription {
         return match db.resolve_event_subscription_across_roots(object_name) {
@@ -1303,21 +1649,41 @@ pub fn object_from_db(
     }
 
     if let Some(obj) = db.resolve_metadata_object_across_roots(mdo_type, object_name) {
-        return Ok(CallToolResult::success(vec![ContentBlock::text(
-            format_metadata_object_structure(&obj, mdo_type),
-        )]));
+        if mdo_type == MdoType::ChartOfCharacteristicTypes {
+            let roots = db
+                .designer_config_paths()
+                .into_iter()
+                .map(|(_, path)| path.to_string_lossy().into_owned())
+                .collect();
+            return source_cards::characteristic_type_response(
+                &obj,
+                &ide::AcrossRootsQueryResolver::new(db),
+                Some(roots),
+            );
+        }
+        return source_metadata_object_response(&obj);
     }
 
     if let Some(reg) = db.resolve_register_across_roots(mdo_type, object_name) {
-        return Ok(CallToolResult::success(vec![ContentBlock::text(format_register_structure(
-            &reg,
-        ))]));
+        return source_register_response(&reg);
     }
 
     Err(McpError::invalid_params(
         format!("Объект {}.{} не найден в конфигурации", mdo_type.russian_name(), object_name),
         None,
     ))
+}
+
+pub(crate) fn chart_of_accounts_from_db(
+    db: &ide::RootDatabaseImpl,
+    root_id: &str,
+    name: &str,
+) -> Result<CallToolResult, McpError> {
+    let object = db
+        .resolve_metadata_object_for_inspection_root(root_id, MdoType::ChartOfAccounts, name)
+        .map_err(|error| McpError::invalid_params(error, None))?
+        .ok_or_else(|| McpError::invalid_params(format!("ПланСчетов.{name} не найден"), None))?;
+    source_metadata_object_response(&object)
 }
 
 fn service_from_db(
@@ -1630,6 +1996,35 @@ mod tests {
         assert!(register_text.contains("| Количество | Строка(20) |"), "{register_text}");
     }
 
+    #[test]
+    fn source_register_recorder_reports_known_document_or_partial() {
+        let mut config = Configuration::new("Base");
+        let register = bsl_metadata::xml_parser::parse_information_register_xml(
+            r#"<MetaDataObject><InformationRegister uuid="00000000-0000-0000-0000-000000000001"><Properties><Name>Prices</Name><WriteMode>RecorderSubordinate</WriteMode><InformationRegisterPeriodicity>Day</InformationRegisterPeriodicity></Properties></InformationRegister></MetaDataObject>"#,
+        )
+        .unwrap();
+        config.add_register(register);
+        let response = get_object_structure(&config, "InformationRegister", "Prices").unwrap();
+        let body = response.structured_content.unwrap();
+        let attributes = body["object"]["attributes"].as_array().unwrap();
+        let index = attributes.iter().position(|field| field["name"] == "Регистратор").unwrap();
+        assert!(body["completeness"]["reasons"].as_array().unwrap().iter().any(|reason| {
+            reason["path"] == format!("/object/attributes/{index}/type")
+                && reason["code"] == "unknown_technical_name"
+        }));
+
+        let mut writer = bsl_metadata::MetadataObject::new(MdoType::Document, "Writer");
+        writer.set_register_records(vec![(MdoType::InformationRegister, "Prices".into())]);
+        config.add_metadata_object(writer);
+        let response = get_object_structure(&config, "InformationRegister", "Prices").unwrap();
+        let body = response.structured_content.as_ref().unwrap();
+        assert_eq!(
+            body["object"]["attributes"][index]["type"],
+            serde_json::json!({"Ref":{"mdo_type":"Document","name":"Writer"}}),
+        );
+        assert!(extract_text(&response).contains("Writer"));
+    }
+
     /// Every listing a cancelled `metadata` call can enter stops at its first item
     /// instead of enumerating the configuration for a response nobody will read.
     ///
@@ -1717,6 +2112,322 @@ mod tests {
             } else {
                 std::fs::copy(entry.path(), target).expect("copy");
             }
+        }
+    }
+
+    #[test]
+    fn live_predefined_accounts_keep_runtime_identity_and_code_selection() {
+        let object = serde_json::from_str(include_str!(
+            "../../../onec-client/tests/fixtures/live_predefined_accounts.json"
+        ))
+        .unwrap();
+        let card = live_metadata_object_response(Some("test"), object, 6_000).unwrap();
+        let body = card.structured_content.as_ref().unwrap();
+        let accounts = body["object"]["predefined_accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts[0].get("uuid").is_none());
+        assert_eq!(accounts[0]["runtime_reference"]["parent_known_empty"], true);
+        assert_eq!(
+            accounts[1]["runtime_reference"]["parent_uuid"],
+            accounts[0]["runtime_reference"]["uuid"]
+        );
+        let selected = select_predefined_account(card.clone(), "10").unwrap();
+        assert_eq!(
+            selected.structured_content.as_ref().unwrap()["query_schema_readiness"],
+            "not_checked"
+        );
+        let account = &selected.structured_content.as_ref().unwrap()["object"];
+        assert_eq!(account["name"], "Assets");
+        assert_eq!(account["off_balance"], false);
+        assert_eq!(account["accounting_flags"][0]["enabled"], false);
+        assert_eq!(
+            account["ext_dimension_types"][0]["predefined_name"],
+            "ChartOfCharacteristicTypes.OwnKinds.Second"
+        );
+        assert_eq!(account["ext_dimension_types"][1]["turnover"], true);
+        assert_eq!(
+            selected.structured_content.as_ref().unwrap()["completeness"]["status"],
+            "complete"
+        );
+        assert!(selected
+            .content
+            .iter()
+            .filter_map(|item| item.as_text())
+            .any(|text| text.text.contains("runtime_reference")));
+        assert!(select_predefined_account(card.clone(), "Assets").is_err());
+        let mut duplicate = card;
+        duplicate.structured_content.as_mut().unwrap()["object"]["predefined_accounts"][1]
+            ["code"] = serde_json::json!("10");
+        let error = select_predefined_account(duplicate, "10").unwrap_err();
+        assert_eq!(error.data.unwrap()["reason"], "ambiguous_account_code");
+    }
+
+    #[test]
+    fn live_predefined_accounts_keep_legacy_empty_and_unknown_states_distinct() {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../onec-client/tests/fixtures/live_predefined_accounts.json"
+        ))
+        .unwrap();
+        let card = |value| {
+            live_metadata_object_response(None, serde_json::from_value(value).unwrap(), 6_000)
+                .unwrap()
+        };
+        let mut legacy = fixture.clone();
+        legacy.as_object_mut().unwrap().remove("predefined_accounts");
+        let legacy = card(legacy);
+        let error = select_predefined_account(legacy, "10").unwrap_err();
+        assert_eq!(error.data.unwrap()["reason"], "metadata_property_unavailable");
+        let mut empty = fixture.clone();
+        empty["predefined_accounts"] = serde_json::json!([]);
+        let empty = card(empty);
+        assert_eq!(
+            empty.structured_content.as_ref().unwrap()["object"]["predefined_accounts"],
+            serde_json::json!([])
+        );
+        let reasons = empty.structured_content.as_ref().unwrap()["completeness"]["reasons"]
+            .as_array()
+            .unwrap();
+        assert!(!reasons.iter().any(|reason| reason["path"] == "/predefined_accounts"));
+        let error = select_predefined_account(empty, "10").unwrap_err();
+        assert!(error.data.is_none());
+
+        fixture["predefined_accounts"][0]["runtime_reference"] = serde_json::json!({});
+        fixture["predefined_accounts"][0]["off_balance"] = serde_json::Value::Null;
+        fixture["predefined_accounts"][0]["accounting_flags"][0]["enabled"] =
+            serde_json::Value::Null;
+        fixture["predefined_accounts"][0]["ext_dimension_types"][0]["turnover"] =
+            serde_json::Value::Null;
+        fixture["predefined_accounts"][1]["code"] = serde_json::Value::Null;
+        let unknown = card(fixture);
+        let selected = select_predefined_account(unknown.clone(), "10").unwrap();
+        let body = selected.structured_content.as_ref().unwrap();
+        assert!(body["object"]["runtime_reference"]["parent_known_empty"].is_null());
+        assert!(body["object"]["off_balance"].is_null());
+        assert_eq!(body["completeness"]["status"], "partial");
+        let reasons = body["completeness"]["reasons"].as_array().unwrap();
+        for path in [
+            "/object/runtime_reference/uuid",
+            "/object/runtime_reference/parent_known_empty",
+            "/object/off_balance",
+            "/object/accounting_flags/0/enabled",
+            "/object/ext_dimension_types/0/turnover",
+        ] {
+            assert!(reasons.iter().any(|reason| reason["path"] == path), "missing {path}");
+        }
+        let error = select_predefined_account(unknown, "not-known").unwrap_err();
+        assert_eq!(error.data.unwrap()["reason"], "incomplete_predefined_set");
+    }
+
+    #[test]
+    fn live_predefined_accounts_mark_invalid_runtime_identity_without_rewriting_it() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../onec-client/tests/fixtures/live_predefined_accounts.json"
+        ))
+        .unwrap();
+        for (field, bad_value) in [
+            ("/runtime_reference/uuid", ""),
+            ("/runtime_reference/uuid", "not-a-uuid"),
+            ("/runtime_reference/uuid", "00000000-0000-0000-0000-000000000000"),
+            ("/runtime_reference/parent_uuid", "22222222-2222-4222-8222-222222222222"),
+            ("/runtime_reference/parent_uuid", "wrong-parent-uuid"),
+            ("/ext_dimension_types/0/runtime_ref_uuid", ""),
+            ("/ext_dimension_types/0/runtime_ref_uuid", "wrong-dimension-uuid"),
+            ("/ext_dimension_types/0/runtime_ref_uuid", "00000000-0000-0000-0000-000000000000"),
+        ] {
+            let mut raw = fixture.clone();
+            *raw["predefined_accounts"][0].pointer_mut(field).unwrap() =
+                serde_json::json!(bad_value);
+            let card =
+                live_metadata_object_response(None, serde_json::from_value(raw).unwrap(), 6_000)
+                    .unwrap();
+            let card_body = card.structured_content.as_ref().unwrap();
+            let card_path = format!("/predefined_accounts/0{field}");
+            assert!(
+                card_body["completeness"]["reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason["code"] == "invalid_runtime_identity"
+                        && reason["path"] == card_path),
+                "missing card reason for {field}={bad_value:?}"
+            );
+            let selected = select_predefined_account(card, "10").unwrap();
+            let body = selected.structured_content.as_ref().unwrap();
+            assert_eq!(body["object"].pointer(field), Some(&serde_json::json!(bad_value)));
+            assert_eq!(body["completeness"]["status"], "partial");
+            assert!(body["completeness"]["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason["code"] == "invalid_runtime_identity"
+                    && reason["path"] == format!("/object{field}")));
+            assert!(selected.content[0].as_text().unwrap().text.contains(bad_value));
+        }
+        let mut valid = fixture;
+        valid["predefined_accounts"][0]["runtime_reference"]["uuid"] =
+            serde_json::json!("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA");
+        let card =
+            live_metadata_object_response(None, serde_json::from_value(valid).unwrap(), 6_000)
+                .unwrap();
+        let selected = select_predefined_account(card, "10").unwrap();
+        assert_eq!(
+            selected.structured_content.as_ref().unwrap()["completeness"]["status"],
+            "complete"
+        );
+        assert_eq!(
+            selected.structured_content.as_ref().unwrap()["object"]["runtime_reference"]["uuid"],
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+        );
+    }
+
+    #[test]
+    fn live_predefined_accounts_preserve_successful_empty_native_names() {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../onec-client/tests/fixtures/live_predefined_accounts.json"
+        ))
+        .unwrap();
+        fixture["predefined_accounts"][0]["ext_dimension_types"][0]["predefined_name"] =
+            serde_json::json!("");
+        let card =
+            live_metadata_object_response(None, serde_json::from_value(fixture).unwrap(), 6_000)
+                .unwrap();
+        let selected = select_predefined_account(card, "10").unwrap();
+        let body = selected.structured_content.as_ref().unwrap();
+        assert_eq!(body["object"]["ext_dimension_types"][0]["predefined_name"], "");
+        assert_eq!(body["completeness"]["status"], "complete");
+        assert!(selected.content[0].as_text().unwrap().text.contains("\"predefined_name\": \"\""));
+    }
+
+    #[test]
+    fn live_predefined_accounts_respect_the_public_payload_budget() {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../onec-client/tests/fixtures/live_predefined_accounts.json"
+        ))
+        .unwrap();
+        let account = fixture["predefined_accounts"][0].clone();
+        fixture["predefined_accounts"] = serde_json::Value::Array(
+            (0..40)
+                .map(|index| {
+                    let mut account = account.clone();
+                    account["name"] = serde_json::json!(format!("Own{index}"));
+                    account["code"] = serde_json::json!(index.to_string());
+                    account
+                })
+                .collect(),
+        );
+        let card =
+            live_metadata_object_response(None, serde_json::from_value(fixture).unwrap(), 700)
+                .unwrap();
+        assert!(live_result_payload_bytes(&card) <= 2_800);
+        assert_eq!(card.structured_content.as_ref().unwrap()["truncated"], true);
+        let error = select_predefined_account(card, "not-known").unwrap_err();
+        assert_eq!(error.data.unwrap()["reason"], "incomplete_predefined_set");
+    }
+
+    fn live_fill_value_fixture() -> serde_json::Value {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bsl-analyzer/tests/fixtures/live_metadata_read_properties.json"
+        ))
+        .unwrap();
+        let mut raw = fixture["catalog"].clone();
+        let proof = serde_json::json!({"metadata_type":"Catalog", "metadata_name":"OwnCountries",
+            "predefined_name":"OwnCountry", "runtime_ref_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"});
+        let value = serde_json::json!({"type_name":"{}CatalogRef.OwnCountries",
+            "value":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","nil":false,"fields":[],
+            "runtime_predefined_identity":proof});
+        raw["read_properties"]["members"][0]["fill_value"] = value.clone();
+        raw
+    }
+
+    #[test]
+    fn live_fill_value_preserves_verified_runtime_predefined_identity() {
+        let raw = live_fill_value_fixture();
+        let value = raw["read_properties"]["members"][0]["fill_value"].clone();
+        let response =
+            live_metadata_object_response(None, serde_json::from_value(raw).unwrap(), 6_000)
+                .unwrap();
+        let body = response.structured_content.as_ref().unwrap();
+        assert_eq!(body["object"]["read_properties"]["members"][0]["fill_value"], value);
+        let text_body: serde_json::Value =
+            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(text_body, *body);
+    }
+
+    #[test]
+    fn live_fill_value_marks_inconsistent_native_identity_without_rewriting_raw_facts() {
+        for (field, bad) in [
+            ("/runtime_predefined_identity/metadata_type", serde_json::json!("Document")),
+            ("/runtime_predefined_identity/metadata_name", serde_json::json!("OtherCountries")),
+            ("/runtime_predefined_identity/predefined_name", serde_json::json!("")),
+            ("/runtime_predefined_identity/predefined_name", serde_json::json!("bad.name")),
+            ("/runtime_predefined_identity/runtime_ref_uuid", serde_json::json!("not-a-uuid")),
+            (
+                "/runtime_predefined_identity/runtime_ref_uuid",
+                serde_json::json!("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            ),
+            ("/type_name", serde_json::json!("{urn:unsupported}CatalogRef.OwnCountries")),
+            ("/value", serde_json::json!("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
+            ("/nil", serde_json::json!(true)),
+            (
+                "/fields",
+                serde_json::json!([["Nested", {"type_name":null,"value":"x","nil":false,"fields":[]}]]),
+            ),
+        ] {
+            let mut raw = live_fill_value_fixture();
+            let value = &mut raw["read_properties"]["members"][0]["fill_value"];
+            *value.pointer_mut(field).unwrap() = bad;
+            let expected = value.clone();
+            let response =
+                live_metadata_object_response(None, serde_json::from_value(raw).unwrap(), 6_000)
+                    .unwrap();
+            let body = response.structured_content.as_ref().unwrap();
+            assert_eq!(body["object"]["read_properties"]["members"][0]["fill_value"], expected);
+            assert_eq!(body["completeness"]["status"], "partial");
+            assert!(
+                body["completeness"]["reasons"].as_array().unwrap().iter().any(|reason| reason
+                    ["code"]
+                    == "invalid_runtime_predefined_identity"
+                    && reason["path"]
+                        == "/read_properties/members/0/fill_value/runtime_predefined_identity"),
+                "no native proof refusal for {field}"
+            );
+            let text: serde_json::Value =
+                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(text, *body);
+        }
+    }
+
+    #[test]
+    fn live_fill_value_distinguishes_unavailable_catalog_binding_from_inapplicable_proofs() {
+        for (ty, value, unavailable) in [
+            ("{}CatalogRef.OwnCountries", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", true),
+            ("{}CatalogRef.OwnCountries", "00000000-0000-0000-0000-000000000000", false),
+            ("{http://www.w3.org/2001/XMLSchema}string", "", false),
+            ("{}EnumRef.OwnEnum", "First", false),
+            (
+                "{http://v8.1c.ru/8.3/xcf/readable}DesignTimeRef",
+                "Catalog.OwnCountries.OwnCountry",
+                false,
+            ),
+        ] {
+            let mut raw = live_fill_value_fixture();
+            let value = serde_json::json!({"type_name":ty,"value":value,"nil":false,"fields":[]});
+            raw["read_properties"]["members"][0]["fill_value"] = value.clone();
+            let response =
+                live_metadata_object_response(None, serde_json::from_value(raw).unwrap(), 6_000)
+                    .unwrap();
+            let body = response.structured_content.as_ref().unwrap();
+            assert_eq!(body["object"]["read_properties"]["members"][0]["fill_value"], value);
+            assert_eq!(
+                body["completeness"]["reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason["code"] == "runtime_predefined_identity_unavailable"
+                        && reason["path"] == "/read_properties/members/0/fill_value"),
+                unavailable,
+                "{ty}"
+            );
         }
     }
 
@@ -1843,6 +2554,75 @@ mod tests {
     }
 
     #[test]
+    fn live_synonym_current_locale_stays_partial_after_typed_normalization() {
+        let mut object = object_from_fixture();
+        object.read_properties = Some(
+            serde_json::json!({"synonym":{"ru":""},"synonym_complete":false,"members":[{"path":["Attribute","Code"],"synonym":{"ru":"Код"},"synonym_complete":false}]}),
+        );
+        let response = live_metadata_object_response(Some("test"), object, 6000).unwrap();
+        let body = response.structured_content.unwrap();
+        assert_eq!(body["object"]["read_properties"]["synonym"]["ru"], "");
+        assert_eq!(body["object"]["read_properties"]["synonym_complete"], false);
+        let reasons = body["completeness"]["reasons"].as_array().unwrap();
+        assert!(reasons.iter().any(|reason| reason["path"] == "/read_properties/synonym_complete"));
+        assert!(reasons
+            .iter()
+            .any(|reason| reason["path"] == "/read_properties/members/0/synonym_complete"));
+        assert_eq!(body["completeness"]["status"], "partial");
+    }
+
+    #[test]
+    fn live_read_properties_fixture_preserves_empty_fill_values_and_enum_values() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bsl-analyzer/tests/fixtures/live_metadata_read_properties.json"
+        ))
+        .unwrap();
+        let mut bodies = serde_json::Map::new();
+        for kind in ["catalog", "independent_register", "enum", "legacy"] {
+            let object: onec_client::MetadataStructureResult =
+                serde_json::from_value(fixture[kind].clone()).unwrap();
+            let result = live_metadata_object_response(Some("test"), object, 6000).unwrap();
+            let body = result.structured_content.unwrap();
+            assert_eq!(body["completeness"]["status"], "partial", "{kind}");
+            bodies.insert(kind.into(), body);
+        }
+        let catalog = &bodies["catalog"]["object"]["read_properties"];
+        assert_eq!(catalog["code_allowed_length"], "Fixed");
+        assert_eq!(catalog["members"][0]["use_mode"], "ForFolderAndItem");
+        assert_eq!(catalog["members"][0]["synonym"]["ru"], "");
+        assert_eq!(catalog["members"][0]["fill_value"]["nil"], false);
+        assert_eq!(catalog["members"][0]["fill_value"]["value"], "");
+        let register = &bodies["independent_register"]["object"];
+        assert_eq!(register["СтандартныеРеквизиты"], serde_json::json!([]));
+        assert_eq!(register["read_properties"]["write_mode"], "Independent");
+        assert_eq!(register["read_properties"]["periodicity"], "Nonperiodical");
+        assert_eq!(register["read_properties"]["members"][1]["fill_value"]["nil"], true);
+        assert_eq!(bodies["enum"]["object"]["enum_values"].as_array().unwrap().len(), 2);
+        assert_eq!(bodies["enum"]["object"]["enum_values"][1]["synonym"], "");
+        assert_eq!(bodies["legacy"]["object"]["read_properties"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn live_metadata_does_not_attest_query_schema_readiness() {
+        let object =
+            live_metadata_object_response(Some("test"), object_from_fixture(), 6_000).unwrap();
+        let tree = live_metadata_tree_response(
+            Some("test"),
+            onec_client::MetadataListResult { items: Vec::new(), returned: 0, truncated: false },
+            6_000,
+        )
+        .unwrap();
+        for response in [object, tree] {
+            let body = response.structured_content.as_ref().unwrap();
+            assert_eq!(body["source"], "infobase");
+            assert_eq!(body["query_schema_readiness"], "not_checked");
+            let text: serde_json::Value =
+                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(text, *body);
+        }
+    }
+
+    #[test]
     fn live_tree_budget_keeps_whole_items_and_recounts_service_truncation() {
         let result = onec_client::MetadataListResult {
             items: (0..100)
@@ -1859,6 +2639,7 @@ mod tests {
         assert!(live_result_payload_bytes(&fitted) <= 700 * 4);
         let body = fitted.structured_content.as_ref().unwrap();
         assert_eq!(body["schema_version"], "2");
+        assert_eq!(body["query_schema_readiness"], "not_checked");
         assert_eq!(body["returned"], body["items"].as_array().unwrap().len());
         assert_eq!(body["truncated"], true);
         let error = live_metadata_tree_response(
@@ -1942,11 +2723,34 @@ mod tests {
         let section_body = fitted_section.structured_content.as_ref().unwrap();
         assert!(section_body["object"]["ТабличныеЧасти"].as_array().unwrap().is_empty());
         assert!(section_body["truncated"].as_bool().unwrap());
-        assert!(section_body["completeness"]["reasons"]
-            .as_array()
-            .unwrap()
+        let reasons = section_body["completeness"]["reasons"].as_array().unwrap();
+        assert!(reasons
             .iter()
-            .all(|reason| reason["code"] == "output_budget" && reason["path"] == ""));
+            .any(|reason| reason["code"] == "output_budget" && reason["path"] == ""));
+        assert!(reasons.iter().any(|reason| reason["code"] == "legacy_read_properties"
+            && reason["path"] == "/read_properties"));
+        assert!(reasons.iter().all(|reason| reason["code"] == "output_budget"
+            || reason["code"] == "legacy_read_properties"));
+    }
+
+    #[test]
+    fn live_read_properties_budget_removes_whole_members_and_keeps_locale_coverage() {
+        let mut object = object_from_fixture();
+        object.attributes.clear();
+        object.dimensions.clear();
+        object.resources.clear();
+        object.standard_attributes.clear();
+        object.tabular_sections.clear();
+        object.read_properties = Some(
+            serde_json::json!({"synonym":{"ru":"Товары"},"synonym_complete":false,"members":(0..50).map(|index|serde_json::json!({"path":["Attribute",format!("Field{index}")],"synonym":{"ru":"Длинный перевод".repeat(50)},"synonym_complete":false})).collect::<Vec<_>>()}),
+        );
+        let response = live_metadata_object_response(Some("test"), object, 900).unwrap();
+        assert!(live_result_payload_bytes(&response) <= 3600);
+        let body = response.structured_content.unwrap();
+        assert_eq!(body["truncated"], true);
+        assert_eq!(body["object"]["read_properties"]["synonym_complete"], false);
+        assert!(body["object"]["read_properties"]["members"].as_array().unwrap().len() < 50);
+        assert_eq!(body["completeness"]["status"], "partial");
     }
 
     #[test]
@@ -2173,6 +2977,63 @@ mod tests {
     }
 
     #[test]
+    fn source_read_categories_roundtrip_tree_filter_and_object_in_both_languages() {
+        let mut config = Configuration::new("ReadSurface");
+        let job = bsl_metadata::xml_parser::parse_scheduled_job_xml(r#"<MetaDataObject><ScheduledJob uuid="00000000-0000-0000-0000-000000000001"><Properties><Name>Job</Name><MethodName>CommonModule.Jobs.Run</MethodName><Use>false</Use><Schedule><RepeatPeriod>60</RepeatPeriod></Schedule></Properties></ScheduledJob></MetaDataObject>"#).unwrap();
+        config.add_scheduled_job(job);
+        let subsystem = bsl_metadata::xml_parser::parse_subsystem_xml(r#"<MetaDataObject><Subsystem><Properties><Name>Group</Name><Content/><Picture>CommonPicture.Icon</Picture></Properties></Subsystem></MetaDataObject>"#).unwrap();
+        config.add_subsystem(subsystem);
+        for kind in bsl_metadata::read_object::ReadObjectKind::ALL {
+            let element = kind.english_name();
+            config.add_read_object(bsl_metadata::read_object::ReadObject::from_xml(&format!("<MetaDataObject><{element}><Properties><Name>Sample</Name><Synonym/><Location/><PrivilegedGetMode>false</PrivilegedGetMode><Content/></Properties></{element}></MetaDataObject>"),kind).unwrap());
+        }
+        let db = ide::RootDatabaseImpl::new();
+        for (types, name) in [
+            (["ScheduledJobs", "РегламентныеЗадания"], "Job"),
+            (["Subsystems", "Подсистемы"], "Group"),
+            (["FunctionalOptions", "ФункциональныеОпции"], "Sample"),
+            (["CommonCommands", "ОбщиеКоманды"], "Sample"),
+            (["CommonPictures", "ОбщиеКартинки"], "Sample"),
+        ] {
+            for kind in types {
+                let listing =
+                    get_metadata_tree(&db, &config, &[], Some(kind.into()), 6000).unwrap();
+                assert!(extract_text(&listing).contains(name), "{kind}");
+                let card = get_object_structure(&config, kind, name).unwrap();
+                assert_eq!(
+                    card.structured_content.as_ref().unwrap()["object"]["name"],
+                    name,
+                    "{kind}"
+                );
+                assert!(is_resolvable_object_type(kind), "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_nested_subsystems_keep_qualified_addresses_and_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        for parent in ["Operations", "Other"] {
+            let children = directory.path().join("Subsystems").join(parent).join("Subsystems");
+            std::fs::create_dir_all(&children).unwrap();
+            std::fs::write(directory.path().join("Subsystems").join(format!("{parent}.xml")),format!("<MetaDataObject><Subsystem><Properties><Name>{parent}</Name><Content/><Picture/></Properties><ChildObjects><Subsystem>Rules</Subsystem></ChildObjects></Subsystem></MetaDataObject>")).unwrap();
+            std::fs::write(children.join("Rules.xml"),format!("<MetaDataObject><Subsystem><Properties><Name>Rules</Name><Content/><Picture>CommonPicture.{parent}</Picture></Properties></Subsystem></MetaDataObject>")).unwrap();
+        }
+        let config = bsl_metadata::load_from_directory(directory.path()).unwrap();
+        let db = ide::RootDatabaseImpl::new();
+        let tree = get_metadata_tree(&db, &config, &[], Some("Subsystems".into()), 6000).unwrap();
+        assert!(extract_text(&tree).contains("Operations.Subsystem.Rules"));
+        for parent in ["Operations", "Other"] {
+            let name = format!("{parent}.Subsystem.Rules");
+            let response = get_object_structure(&config, "Subsystem", &name).unwrap();
+            let body = response.structured_content.unwrap();
+            assert_eq!(body["object"]["parent"], parent);
+            assert_eq!(body["object"]["picture"], format!("CommonPicture.{parent}"));
+        }
+        assert!(get_object_structure(&config, "Subsystem", "Rules").is_err());
+    }
+
+    #[test]
     fn test_object_structure_event_subscription_not_found_is_graceful() {
         let config = fixture_config();
         // A missing subscription is an in-band invalid-params error, not a parse crash.
@@ -2193,6 +3054,176 @@ mod tests {
         let result = get_object_structure(&config, "InvalidType", "Test");
 
         assert!(result.is_err(), "should return error for invalid type");
+    }
+
+    #[test]
+    fn source_read_contract_configuration_settings() {
+        for (compatibility, modality) in [
+            (Some("Version8_2_16"), Some("Use")),
+            (Some("Version8_3_27"), Some("DontUse")),
+            (Some("FutureCompatibility"), Some("FutureModality")),
+            (None, None),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let property = |name: &str, value: Option<&str>| {
+                value.map(|value| format!("<{name}>{value}</{name}>")).unwrap_or_default()
+            };
+            let xml = format!(
+                "<MetaDataObject><Configuration><Properties><Name>Selected</Name>{}{}</Properties></Configuration></MetaDataObject>",
+                property("CompatibilityMode", compatibility),
+                property("ModalityUseMode", modality)
+            );
+            std::fs::write(directory.path().join("Configuration.xml"), xml).unwrap();
+            let config = bsl_metadata::load_from_directory(directory.path()).unwrap();
+            let response = get_configuration_info(&config, &[]).unwrap();
+            let text = extract_text(&response);
+            assert!(text
+                .contains(&format!("CompatibilityMode: {}", compatibility.unwrap_or("unknown"))));
+            assert!(text.contains(&format!("ModalityUseMode: {}", modality.unwrap_or("unknown"))));
+            let body = response.structured_content.as_ref().unwrap();
+            assert_eq!(body["source"], "source");
+            assert_eq!(body["configuration"]["name"], "Selected");
+            assert_eq!(
+                body["configuration"]["compatibility_mode"],
+                serde_json::json!(compatibility)
+            );
+            assert_eq!(body["configuration"]["modality_use_mode"], serde_json::json!(modality));
+            assert_eq!(
+                body["completeness"]["status"],
+                if compatibility.is_some() { "complete" } else { "partial" }
+            );
+            if compatibility.is_none() {
+                let reasons = body["completeness"]["reasons"].as_array().unwrap();
+                assert_eq!(reasons.len(), 2);
+                for path in
+                    ["/configuration/compatibility_mode", "/configuration/modality_use_mode"]
+                {
+                    assert!(reasons
+                        .iter()
+                        .any(|reason| reason["code"] == "property_unavailable"
+                            && reason["path"] == path));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_read_contract_exchange_plan() {
+        for (content, expected) in [
+            (Some("<ExchangePlanContent><Item><Metadata>Catalog.Products</Metadata><AutoRecord>Allow</AutoRecord></Item><Item><Metadata>Document.Sale</Metadata><AutoRecord>Deny</AutoRecord></Item></ExchangePlanContent>"), serde_json::json!([
+                {"metadata":"Catalog.Products","auto_record":"Allow"},
+                {"metadata":"Document.Sale","auto_record":"Deny"}
+            ])),
+            (Some("<ExchangePlanContent/>"), serde_json::json!([])),
+            (None, serde_json::Value::Null),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(directory.path().join("ExchangePlans/Sync/Ext")).unwrap();
+            std::fs::write(directory.path().join("ExchangePlans/Sync.xml"), "<MetaDataObject><ExchangePlan><Properties><Name>Sync</Name></Properties></ExchangePlan></MetaDataObject>").unwrap();
+            if let Some(content) = content {
+                std::fs::write(directory.path().join("ExchangePlans/Sync/Ext/Content.xml"), content).unwrap();
+            }
+            let config = bsl_metadata::load_from_directory(directory.path()).unwrap();
+            for kind in ["ExchangePlan", "ПланОбмена"] {
+                let response = get_object_structure(&config, kind, "Sync").unwrap();
+                let text = extract_text(&response);
+                let body = response.structured_content.as_ref().unwrap();
+                assert_eq!(body["object"]["read_properties"]["exchange_plan_content"], expected);
+                if expected.is_null() {
+                    assert!(text.contains("Состав плана обмена: unknown"));
+                    assert!(body["completeness"]["reasons"].as_array().unwrap().iter().any(|reason| reason["path"] == "/object/read_properties/exchange_plan_content"));
+                } else {
+                    let items = expected.as_array().unwrap();
+                    assert!(text.contains(&format!("Состав плана обмена ({}):", items.len())));
+                    for item in items {
+                        assert!(text.contains(&format!("{}: AutoRecord={}", item["metadata"].as_str().unwrap(), item["auto_record"].as_str().unwrap())));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_read_contract_scheduled_job() {
+        for known in [true, false] {
+            let mut config = Configuration::new("Jobs");
+            let properties = if known {
+                "<MethodName>CommonModule.Jobs.Run</MethodName><Use>false</Use><Schedule><RepeatPeriod>60</RepeatPeriod></Schedule>"
+            } else {
+                ""
+            };
+            config.add_scheduled_job(bsl_metadata::xml_parser::parse_scheduled_job_xml(&format!("<MetaDataObject><ScheduledJob uuid=\"00000000-0000-0000-0000-000000000001\"><Properties><Name>Job</Name>{properties}</Properties></ScheduledJob></MetaDataObject>")).unwrap());
+            for kind in ["ScheduledJobs", "РегламентныеЗадания"] {
+                let response = get_object_structure(&config, kind, "Job").unwrap();
+                let text = extract_text(&response);
+                let body = response.structured_content.as_ref().unwrap();
+                if known {
+                    assert_eq!(body["object"]["handler"], "CommonModule.Jobs.Run");
+                    assert_eq!(body["object"]["use"], false);
+                    assert!(body["object"]["schedule"].to_string().contains("60"));
+                    assert!(text.contains("CommonModule.Jobs.Run"));
+                    assert!(text.contains("Use: false"));
+                    assert_eq!(body["completeness"]["status"], "complete");
+                } else {
+                    for field in ["handler", "schedule", "use"] {
+                        assert!(body["object"][field].is_null());
+                        assert!(body["completeness"]["reasons"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|reason| reason["path"] == format!("/object/{field}")));
+                    }
+                    assert!(text.contains("Обработчик: unknown"));
+                    assert_eq!(body["completeness"]["status"], "partial");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_functional_option_contract_uses_resident_values_and_explicit_unknowns() {
+        use base_db::{SourceDatabase, SourceRoot, METADATA_SOURCE_ROOT};
+        use vfs::{file_set::FileSet, FileId, VfsPath};
+
+        for (properties, location, content) in [
+            ("<Location>Constant.Feature</Location><PrivilegedGetMode>false</PrivilegedGetMode><Content><xr:Object>CommonCommand.Run</xr:Object><xr:Object>Catalog.Products</xr:Object></Content>", Some("Constant.Feature"), serde_json::json!(["CommonCommand.Run", "Catalog.Products"])),
+            ("<Location/><PrivilegedGetMode>false</PrivilegedGetMode><Content/>", Some(""), serde_json::json!([])),
+            ("", None, serde_json::Value::Null),
+        ] {
+            let mut db = ide::RootDatabaseImpl::new();
+            db.set_all_config_paths(vec![(None, "/functional-option/base".into())], None);
+            let file = FileId::from_raw(100);
+            let mut files = FileSet::new();
+            files.insert(file, VfsPath::new("/functional-option/base/FunctionalOptions/UseFeature.xml"));
+            db.set_file_source_root(file, METADATA_SOURCE_ROOT);
+            db.set_file_text(file, &format!(r#"<MetaDataObject xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"><FunctionalOption uuid="00000000-0000-0000-0000-000000000001"><Properties><Name>UseFeature</Name><Synonym/>{properties}</Properties></FunctionalOption></MetaDataObject>"#));
+            db.set_source_root(METADATA_SOURCE_ROOT, SourceRoot::new_metadata(files));
+            for kind in ["FunctionalOption", "ФункциональнаяОпция"] {
+                let response = source_cards::bound_source_response(object_from_db(&db, kind, "UseFeature").unwrap(), 512).unwrap();
+                assert!(live_result_payload_bytes(&response) <= 2048);
+                let text = extract_text(&response);
+                let body = response.structured_content.as_ref().unwrap();
+                assert_eq!(body["source"], "source");
+                assert_eq!(body["source_roots"], serde_json::json!(["/functional-option/base"]));
+                assert_eq!(body["object"]["location"], serde_json::json!(location));
+                assert_eq!(body["object"]["content"], content);
+                assert!(text.contains(&format!("Хранение: {}", location.unwrap_or("unknown"))));
+                if location.is_some() {
+                    assert_eq!(body["object"]["privileged_get_mode"], false);
+                    assert_eq!(body["completeness"]["status"], "complete");
+                    assert!(text.contains("Привилегированное получение: false"));
+                    for item in content.as_array().unwrap() {
+                        assert!(text.contains(item.as_str().unwrap()));
+                    }
+                } else {
+                    assert!(body["object"]["privileged_get_mode"].is_null());
+                    assert_eq!(body["completeness"]["status"], "partial");
+                    for field in ["location", "privileged_get_mode", "content"] {
+                        assert!(body["completeness"]["reasons"].as_array().unwrap().iter().any(|reason| reason["path"] == format!("/object/{field}")));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

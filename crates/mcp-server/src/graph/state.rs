@@ -283,6 +283,7 @@ struct ComparisonProof {
 /// on the first `graph` tool call.
 #[derive(Clone)]
 pub(crate) struct GraphState {
+    pub(super) disk_gate: ide_host_core::WorkspaceDiskGate,
     pub(super) inner: Arc<Mutex<Inner>>,
     pub(super) scan: Arc<Mutex<Option<ScanCache>>>,
     pub(super) workspace_root: Option<PathBuf>,
@@ -583,6 +584,7 @@ impl GraphState {
 
     fn with_status(status: GraphStatus, workspace_root: Option<PathBuf>) -> Self {
         Self {
+            disk_gate: Default::default(),
             inner: Arc::new(Mutex::new(Inner {
                 status,
                 published: None,
@@ -1086,6 +1088,7 @@ impl GraphState {
     }
 
     fn drive_as(&self, executor: Executor) {
+        let Ok(_disk_read) = self.disk_gate.try_read() else { return };
         if self.workspace_root.is_none() {
             return;
         }
@@ -1676,6 +1679,7 @@ impl GraphState {
 
     /// Revalidate the immutable namespace before an on-disk graph preparation or publication.
     pub(crate) fn validate_workspace_scope(&self) -> bool {
+        let Ok(_disk_read) = self.disk_gate.try_read() else { return true };
         let (Some(root), Some(cache)) = (self.workspace_root.as_deref(), self.cache.as_ref())
         else {
             return true;
@@ -1757,6 +1761,7 @@ impl GraphState {
     /// Basename-only detection is unsafe: nested projects may carry the same config name but
     /// cannot change this daemon's source-root table.
     pub(crate) fn is_workspace_config_path(&self, path: &Path) -> bool {
+        let Ok(_disk_read) = self.disk_gate.try_read() else { return true };
         let Some(root) = self.workspace_root.as_deref() else { return false };
         if !path
             .file_name()
@@ -1778,6 +1783,7 @@ impl GraphState {
     /// Attach the daemon's change hub so a freshness check invalidates the throttled
     /// fingerprint cache as soon as a change is delivered, without waiting out the throttle.
     pub(crate) fn with_change_hub(mut self, hub: WorkspaceChangeHub) -> Self {
+        self.disk_gate = hub.disk_gate();
         self.change_hub = Some(hub);
         self
     }

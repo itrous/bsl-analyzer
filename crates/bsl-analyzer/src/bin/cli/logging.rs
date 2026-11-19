@@ -1,5 +1,10 @@
-use std::{env, fs, io, path::PathBuf, sync::Arc};
+use std::{
+    env, fs, io,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
+mod bounded;
 mod journal;
 pub use journal::JournalGuard;
 
@@ -30,6 +35,7 @@ pub fn expand_log_file_path(path: PathBuf, pid: u32) -> PathBuf {
 pub fn setup_logging(
     log_file: Option<PathBuf>,
     append_file: bool,
+    bounded_file: bool,
     profile_filter: Option<String>,
     json_profile_filter: Option<String>,
 ) -> anyhow::Result<JournalGuard> {
@@ -40,6 +46,9 @@ pub fn setup_logging(
     // live file. An explicit `BSL_LOG_FILE` keeps the historical truncate-on-start
     // behaviour.
     let writer: BoxMakeWriter = match log_file {
+        Some(file) if bounded_file => {
+            BoxMakeWriter::new(Mutex::new(bounded::BoundedLog::open(&file, append_file)?))
+        }
         Some(file) if append_file => BoxMakeWriter::new(Arc::new(
             fs::OpenOptions::new().create(true).append(true).open(&file)?,
         )),
@@ -66,6 +75,34 @@ pub fn setup_logging(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn an_active_mcp_session_survives_repeated_log_rotation() {
+        use mcp_server::{McpProfile, McpServer, SharedState};
+        use rmcp::ServiceExt;
+        use std::{io::Write, time::Duration};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.log");
+        let mut writer = bounded::BoundedLog::open(&path, true).unwrap();
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server = McpServer::new(McpProfile::Reference, SharedState::reference(None));
+        let task = tokio::spawn(mcp_server::serve_stream(server, server_io));
+        let budget = test_utils::wait::ceiling(Duration::from_secs(20));
+        let client = tokio::time::timeout(budget, ().serve(client_io)).await.unwrap().unwrap();
+        let payload = vec![b'x'; bounded::LOG_BYTES as usize];
+        for _ in 0..6 {
+            writer.write_all(&payload).unwrap();
+            let tools =
+                tokio::time::timeout(budget, client.list_all_tools()).await.unwrap().unwrap();
+            assert!(!tools.is_empty());
+            assert!(path.metadata().unwrap().len() <= bounded::LOG_BYTES);
+            let previous = directory.path().join("daemon.log.prev");
+            assert!(previous.metadata().map(|m| m.len()).unwrap_or(0) <= bounded::LOG_BYTES);
+        }
+        tokio::time::timeout(budget, client.cancel()).await.unwrap().unwrap();
+        task.abort();
+    }
+
     #[test]
     fn pid_placeholder_is_replaced_with_the_process_id() {
         assert_eq!(
@@ -89,3 +126,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod broker_rotation_tests;

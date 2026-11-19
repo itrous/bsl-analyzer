@@ -2970,9 +2970,21 @@ pub fn rank_resolve_candidates(
     let q_lower = query.fold_lower();
     let mut ranked: Vec<(u8, ResolveCandidate)> = nodes
         .filter_map(|(id, kind)| {
-            let (rank, match_kind) = if id == query {
+            let symbol = if query.contains('.') {
+                match classify_graph_id(&id) {
+                    Ok(GraphIdKind::Method { scope, name }) => {
+                        Some(crate::name_lookup::method_symbol(&scope, &name))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let (rank, match_kind) = if id == query || symbol.as_deref() == Some(query) {
                 (0, "exact")
-            } else if id.fold_lower() == q_lower {
+            } else if id.fold_lower() == q_lower
+                || symbol.is_some_and(|symbol| symbol.fold_lower() == q_lower)
+            {
                 (1, "case_insensitive")
             } else if resolve_name_segment(&id).fold_lower() == q_lower {
                 (2, "name")
@@ -4135,14 +4147,11 @@ mod tests {
     /// for the already-relative form the search overlay stores.
     #[test]
     fn method_graph_id_matches_encoder_and_round_trips_for_path_fallback() {
-        use std::path::Path;
-
-        let a = workspace(&[(
-            "/ws/proj/scripts/loose.bsl",
-            "Процедура Свободный() Экспорт КонецПроцедуры",
-        )]);
-        let root = Path::new("/ws/proj");
-        let strip_root = StripRoot::resolve(root);
+        let root = std::path::absolute("/ws/proj").unwrap();
+        let file = root.join("scripts/loose.bsl");
+        let a =
+            workspace(&[(file.to_str().unwrap(), "Процедура Свободный() Экспорт КонецПроцедуры")]);
+        let strip_root = StripRoot::resolve(&root);
 
         // The durable id the encoder stores for the loose method.
         let db = a.database();
@@ -4157,8 +4166,7 @@ mod tests {
 
         // Absolute path → stripped by the root to the encoder's rel.
         assert_eq!(
-            method_graph_id("/ws/proj/scripts/loose.bsl", "Свободный", Some(&strip_root))
-                .as_deref(),
+            method_graph_id(file.to_str().unwrap(), "Свободный", Some(&strip_root)).as_deref(),
             Some(encoder_id.as_str()),
         );
         // Already-relative path (search-overlay form) → used directly; root unused.
@@ -4195,20 +4203,21 @@ mod tests {
     #[test]
     fn method_graph_id_file_fallback_normalization() {
         use std::path::Path;
-        let root = Path::new("/ws/proj");
+        let root = std::path::absolute("/ws/proj").unwrap();
+        let file = root.join("a/b/Module.bsl");
+        let strip_root = StripRoot::resolve(&root);
 
         // Absolute path under the root → rel form.
         assert_eq!(
-            method_graph_id("/ws/proj/a/b/Module.bsl", "M", Some(&StripRoot::resolve(root)))
-                .as_deref(),
+            method_graph_id(file.to_str().unwrap(), "M", Some(&strip_root)).as_deref(),
             Some("method/file/a/b/Module.bsl::M"),
         );
         // Trailing slash on the root is tolerated (matches the encoder's rel).
         assert_eq!(
             method_graph_id(
-                "/ws/proj/a/b/Module.bsl",
+                file.to_str().unwrap(),
                 "M",
-                Some(&StripRoot::resolve(Path::new("/ws/proj/"))),
+                Some(&StripRoot::resolve(Path::new(&format!("{}/", root.display())))),
             )
             .as_deref(),
             Some("method/file/a/b/Module.bsl::M"),
@@ -4220,16 +4229,24 @@ mod tests {
         );
         // Absolute path NOT under the root → None (never emit a non-resolving id).
         assert_eq!(
-            method_graph_id("/elsewhere/Module.bsl", "M", Some(&StripRoot::resolve(root))),
+            method_graph_id(
+                std::path::absolute("/elsewhere/Module.bsl").unwrap().to_str().unwrap(),
+                "M",
+                Some(&strip_root)
+            ),
             None
         );
         // A longer-named sibling that merely shares the prefix string is NOT under the root.
         assert_eq!(
-            method_graph_id("/ws/project/a/Module.bsl", "M", Some(&StripRoot::resolve(root))),
+            method_graph_id(
+                std::path::absolute("/ws/project/a/Module.bsl").unwrap().to_str().unwrap(),
+                "M",
+                Some(&strip_root)
+            ),
             None
         );
         // Absolute path with no root → None.
-        assert_eq!(method_graph_id("/ws/proj/a/Module.bsl", "M", None), None);
+        assert_eq!(method_graph_id(file.to_str().unwrap(), "M", None), None);
     }
 
     #[test]
@@ -4362,6 +4379,52 @@ mod tests {
         assert_eq!(module_id_of_method("method/file/::M"), None);
         // A `file/<rel>` with no `::` member separator is malformed, not a module bucket.
         assert_eq!(module_id_of_method("method/file/src/Module.bsl"), None);
+    }
+
+    #[test]
+    fn rank_resolve_accepts_qualified_method_symbols() {
+        let nodes = || {
+            [
+                ("method/common/УчетЗарплаты/ДанныеФизическихЛиц".to_owned(), "method"),
+                ("method/common/ДругойМодуль/ДанныеФизическихЛиц".to_owned(), "method"),
+                ("method/file/first/Module.bsl::ДанныеФизическихЛиц".to_owned(), "method"),
+                ("method/file/second/Module.bsl::ДанныеФизическихЛиц".to_owned(), "method"),
+            ]
+            .into_iter()
+        };
+        let id = "method/common/УчетЗарплаты/ДанныеФизическихЛиц";
+        for query in ["УчетЗарплаты.ДанныеФизическихЛиц", "учетзарплаты.данныефизическихлиц", id]
+        {
+            let (found, total) = rank_resolve_candidates(nodes(), query, 10);
+            assert_eq!(total, 1, "{query}");
+            assert_eq!(found[0].id, id);
+        }
+        let (bare, total) = rank_resolve_candidates(nodes(), "ДанныеФизическихЛиц", 10);
+        assert_eq!(total, 4);
+        assert_eq!(bare.len(), 4);
+    }
+
+    #[test]
+    fn rank_resolve_retains_ambiguous_metadata_module_scopes() {
+        let nodes = || {
+            [
+                ("method/manager/Catalog/Товары/Прочитать".to_owned(), "method"),
+                ("method/object/Catalog/Товары/Прочитать".to_owned(), "method"),
+                ("method/manager/Document/Товары/Прочитать".to_owned(), "method"),
+            ]
+            .into_iter()
+        };
+        let (found, total) = rank_resolve_candidates(nodes(), "Справочник.Товары.Прочитать", 10);
+        assert_eq!(total, 2);
+        assert_eq!(
+            found.iter().map(|node| node.id.as_str()).collect::<Vec<_>>(),
+            ["method/manager/Catalog/Товары/Прочитать", "method/object/Catalog/Товары/Прочитать"]
+        );
+        let (limited, total) = rank_resolve_candidates(nodes(), "Справочник.Товары.Прочитать", 1);
+        assert!(ResolveResult::new("Справочник.Товары.Прочитать", limited, total).truncated);
+        let (other, total) = rank_resolve_candidates(nodes(), "Документ.Товары.Прочитать", 10);
+        assert_eq!(total, 1);
+        assert_eq!(other[0].id, "method/manager/Document/Товары/Прочитать");
     }
 
     #[test]

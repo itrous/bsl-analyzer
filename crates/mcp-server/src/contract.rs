@@ -36,7 +36,7 @@ use crate::{McpProfile, McpServer};
 /// Consumers should require an exact major and a minimum minor. Bump this by hand in the
 /// same commit that changes the surface; the snapshot test over [`document`] puts the
 /// version field next to the change in the diff.
-pub const CONTRACT_VERSION: &str = "3.5";
+pub const CONTRACT_VERSION: &str = "3.6";
 
 /// URI of the MCP resource carrying [`document`].
 pub const CONTRACT_URI: &str = "bsl-analyzer://contract";
@@ -85,6 +85,7 @@ const METADATA_ACTIONS: &[ActionDecl] = &[
     },
     action("object", &["object_type", "object_name"]),
     action("form", &["object_type"]),
+    action("template", &["object_type"]),
     action("status", &[]),
 ];
 
@@ -185,7 +186,7 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
             "one of `symbol` or `path` with `line` and/or `line_content` is required; \
              opt-in — a launch has to name it with `--enable-tool references`",
         ),
-        output_schema_version: Some("1"),
+        output_schema_version: Some("2"),
         // Opt-in: the full occurrence list of a popular name is a large answer, and a
         // profile that served it unasked would spend an agent's budget on a question it
         // did not ask.
@@ -542,7 +543,7 @@ mod tests {
     #[test]
     fn indexing_discovery_contract() {
         use crate::indexing::{Indexing, Kind, State, Target};
-        assert_eq!(CONTRACT_VERSION, "3.5");
+        assert_eq!(CONTRACT_VERSION, "3.6");
         let indexing = serde_json::to_value(Indexing::single(Target::new(
             Kind::Reference,
             State::Ready,
@@ -963,7 +964,7 @@ mod tests {
         doc.insert("mcp".into(), mcp_surface());
         expect![[r#"
             {
-              "contract_version": "3.5",
+              "contract_version": "3.6",
               "mcp": {
                 "profiles": {
                   "reference": {
@@ -1087,8 +1088,8 @@ mod tests {
                         "actions": [],
                         "name": "references",
                         "note": "one of `symbol` or `path` with `line` and/or `line_content` is required; opt-in — a launch has to name it with `--enable-tool references`",
-                        "output_schema_fingerprint": "blake3:2ee4fa6ea2bec6f9acd52f43f1aa20ed950fc9db1c30a48f45de299dbf772a4a",
-                        "output_schema_version": "1",
+                        "output_schema_fingerprint": "blake3:44d1563ca0d26a2f92386a2a7e1e1e864ea7195ee1b74022cd941db6fb3378fa",
+                        "output_schema_version": "2",
                         "params": [
                           {
                             "name": "anchor_root_id",
@@ -1208,6 +1209,12 @@ mod tests {
                             ]
                           },
                           {
+                            "name": "template",
+                            "required": [
+                              "object_type"
+                            ]
+                          },
+                          {
                             "name": "status",
                             "required": []
                           }
@@ -1275,6 +1282,24 @@ mod tests {
                           },
                           {
                             "name": "object_type",
+                            "nullable": true,
+                            "required": false,
+                            "type": "string"
+                          },
+                          {
+                            "name": "predefined_code",
+                            "nullable": true,
+                            "required": false,
+                            "type": "string"
+                          },
+                          {
+                            "name": "root_id",
+                            "nullable": true,
+                            "required": false,
+                            "type": "string"
+                          },
+                          {
+                            "name": "template_name",
                             "nullable": true,
                             "required": false,
                             "type": "string"

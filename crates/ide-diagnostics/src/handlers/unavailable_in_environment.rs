@@ -56,6 +56,31 @@ mod tests {
     }
 
     #[test]
+    fn xml_string_aliases_preserve_source_environment_availability() {
+        let calls = "RU = XMLСтрока('20260102');\nEN = XMLString('20260102');";
+        for directive in ["&НаСервере", "&AtServer"] {
+            let fixture = format!("//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl\n{directive}\nProcedure Test()\n{calls}\nEndProcedure");
+            assert!(env_diags(&fixture).is_empty(), "{directive}");
+        }
+        for directive in ["&НаКлиенте", "&AtClient"] {
+            let fixture = format!("//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl\n{directive}\nProcedure Test()\n{calls}\nEndProcedure");
+            let reported = env_diags(&fixture);
+            assert_eq!(reported.len(), 2, "{directive}: {reported:?}");
+            for name in ["XMLСтрока", "XMLString"] {
+                assert!(
+                    reported.iter().any(|(message, _)| message.contains(&format!("'{name}'"))
+                        && message.ends_with("[Веб-клиент]")),
+                    "{reported:?}"
+                );
+            }
+            for condition in ["НЕ ВебКлиент", "NOT WebClient"] {
+                let fixture = format!("//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl\n{directive}\nProcedure Test()\n#If {condition} Then\n{calls}\n#EndIf\nEndProcedure");
+                assert!(env_diags(&fixture).is_empty(), "{directive}/{condition}");
+            }
+        }
+    }
+
+    #[test]
     #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
     fn server_only_type_method_flagged_in_client_form_method() {
         // ЧтениеТекста is unavailable in the web client; a form method behind

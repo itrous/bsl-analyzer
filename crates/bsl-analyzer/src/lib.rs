@@ -23,6 +23,7 @@ pub mod lsp;
 pub mod mcp_install;
 pub mod mem_docs;
 pub mod mem_report;
+mod metadata_rename;
 pub mod panic_watch;
 pub mod reporters;
 pub mod server;

@@ -35,7 +35,7 @@ use crate::tools::response::{structured, trim_items_to_budget, DEFAULT_OUTPUT_BU
 
 /// Version of THIS tool's response shape. Separate from the location block's
 /// own version: the block travels across tools and cannot be versioned by one.
-pub(crate) const SCHEMA_VERSION: &str = "1";
+pub(crate) const SCHEMA_VERSION: &str = "2";
 
 pub(crate) const DEFAULT_LIMIT: usize = 50;
 pub(crate) const MAX_LIMIT: usize = 500;
@@ -430,9 +430,30 @@ fn parse_kinds(kinds: &[String]) -> Result<Option<Vec<ReferenceKind>>, McpError>
 
 pub(crate) const KIND_VOCABULARY: &str = "declaration | call | write | read";
 
+fn metadata_reason_code(kind: &ide::metadata_rename::MetadataPreviewIssueKind) -> &'static str {
+    use ide::metadata_rename::MetadataPreviewIssueKind;
+    match kind {
+        MetadataPreviewIssueKind::XmlCoverageRequired => "xml_coverage_incomplete",
+        MetadataPreviewIssueKind::SnapshotBindingRequired => "snapshot_binding_required",
+        MetadataPreviewIssueKind::FileLimit => "file_limit",
+        MetadataPreviewIssueKind::UnreadFile => "unread_file",
+        MetadataPreviewIssueKind::ParseErrors => "parse_errors",
+        MetadataPreviewIssueKind::DynamicReference => "dynamic_reference",
+        MetadataPreviewIssueKind::IncompleteQuery => "incomplete_query",
+        MetadataPreviewIssueKind::UnresolvedReference(_) => "unresolved_metadata_identity",
+        MetadataPreviewIssueKind::UnattestedQuerySource => "unattested_query_source",
+        MetadataPreviewIssueKind::MissingQueryIndex => "missing_query_index",
+        MetadataPreviewIssueKind::InvalidQuery => "invalid_query",
+        MetadataPreviewIssueKind::QueryReference(_) => "unresolved_query_reference",
+        MetadataPreviewIssueKind::UnmappableQueryRange => "unmappable_query_range",
+        MetadataPreviewIssueKind::QueryOutputContract => "query_output_contract",
+    }
+}
+
 fn outcome_str(outcome: &ReferencesOutcome) -> &'static str {
     match outcome {
         ReferencesOutcome::Resolved => "resolved",
+        ReferencesOutcome::Partial { .. } => "partial",
         ReferencesOutcome::Ambiguous => "ambiguous",
         ReferencesOutcome::NotFound => "not_found",
         ReferencesOutcome::UnsupportedSymbol { .. } => "unsupported_symbol",
@@ -504,8 +525,22 @@ fn render(
     let total = result.hits.len();
     let mut completeness = loc::Completeness::complete();
 
+    let metadata_partial = matches!(result.outcome, ReferencesOutcome::Partial { .. });
+    if let ReferencesOutcome::Partial { reasons } = &result.outcome {
+        let mut codes =
+            reasons.iter().map(|issue| metadata_reason_code(&issue.kind)).collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        body.insert("metadata_incomplete_reasons".into(), json!(codes));
+        body.insert("metadata_issues_total".into(), json!(reasons.len()));
+        completeness = completeness.when(
+            true,
+            loc::ReasonCode::ModalityDegraded,
+            "metadata references are a lower bound: unresolved or unsupported consumers remain",
+        );
+    }
     match &result.outcome {
-        ReferencesOutcome::Resolved => {
+        ReferencesOutcome::Resolved | ReferencesOutcome::Partial { .. } => {
             let shown: Vec<&ReferenceHit> = result.hits.iter().take(limit).collect();
             // Resolved once and kept: the preview needs the very line and column the
             // location publishes, and resolving a second time would be a second reading of
@@ -526,11 +561,17 @@ fn render(
 
             body.insert("references".into(), Value::Array(items));
             body.insert("total".into(), json!(total));
-            body.insert("total_is_lower_bound".into(), json!(result.files_capped));
+            body.insert(
+                "total_is_lower_bound".into(),
+                json!(result.files_capped || metadata_partial),
+            );
             // Two answers taken with a truncated walk count different candidate
             // sets, so the narrowing strategy that replaces a cursor does not
             // apply to them — said in a field rather than left to be inferred.
-            body.insert("narrowing_comparable".into(), json!(!result.files_capped));
+            body.insert(
+                "narrowing_comparable".into(),
+                json!(!result.files_capped && !metadata_partial),
+            );
             body.insert("files_scanned".into(), json!(result.files_scanned));
 
             let used_tokens = items_tokens(&body);
@@ -1314,9 +1355,9 @@ pub(crate) fn loading(report: &crate::diagnostics_state::StatusReport) -> CallTo
               `Value` so the location contract stays the only serializer of a place"
 )]
 pub(crate) struct ReferencesResponse {
-    /// Version of this response shape. Always `"1"`.
+    /// Version of this response shape. Always `"2"`.
     schema_version: String,
-    /// What happened, from the closed vocabulary `resolved` | `ambiguous` | `not_found` |
+    /// What happened, from the closed vocabulary `resolved` | `partial` | `ambiguous` | `not_found` |
     /// `unsupported_symbol` | `anchor_stale`.
     outcome: String,
     /// The `symbol` the request anchored on, echoed back.
@@ -1344,27 +1385,27 @@ pub(crate) struct ReferencesResponse {
     anchor_sites: Option<Vec<Value>>,
     /// The area filter as it was applied, with how many files it selected.
     area: Option<Value>,
-    /// `resolved` only: the occurrences, each with a `location` (or
+    /// `resolved`/`partial` only: the occurrences, each with a `location` (or
     /// `location_unavailable`) and a `kind`. With `include_preview`, each also carries
     /// `snippet` and the `snippet_start_character` it begins at, plus `snippet_truncated`
     /// when the line was windowed and `snippet_redacted` when a literal was masked — after
     /// which the columns no longer index the snippet byte for byte.
     references: Option<Vec<ReferenceEntry>>,
-    /// `resolved` only: how many occurrences passed the area and kind filters,
+    /// `resolved`/`partial` only: how many occurrences passed the area and kind filters,
     /// counted before `limit`.
     total: Option<usize>,
-    /// `resolved` only: the walk stopped at `max_files`, so `total` counts only
+    /// `resolved`/`partial` only: the walk stopped at `max_files`, so `total` counts only
     /// what was walked.
     total_is_lower_bound: Option<bool>,
-    /// `resolved` only: whether this answer may be compared with a narrower one.
+    /// `resolved`/`partial` only: whether this answer may be compared with a narrower one.
     /// False once the walk was truncated: the two counted different candidate sets.
     narrowing_comparable: Option<bool>,
-    /// `resolved` only: how many candidate files were walked.
+    /// `resolved`/`partial` only: how many candidate files were walked.
     files_scanned: Option<usize>,
-    /// `resolved` only: per-file counts over the whole `total`, most-populated
+    /// `resolved`/`partial` only: per-file counts over the whole `total`, most-populated
     /// first — what a caller walks instead of a cursor.
     files: Option<Vec<Value>>,
-    /// `resolved` only: the histogram itself was cut by the output budget, so
+    /// `resolved`/`partial` only: the histogram itself was cut by the output budget, so
     /// whole files are missing from it.
     histogram_truncated: Option<bool>,
     /// `include_preview` only: how many references went without a preview because the budget
@@ -1388,6 +1429,9 @@ pub(crate) struct ReferencesResponse {
     /// be anchored on here, and its state travels in `providers` rather than being
     /// reported as never consulted.
     lookup: Option<Value>,
+    /// Metadata consumers that prevent a complete reference answer.
+    metadata_incomplete_reasons: Option<Vec<String>>,
+    metadata_issues_total: Option<usize>,
     /// Who answered, at which revision and topology, and whether the answer is whole.
     freshness: Value,
 }
@@ -1395,6 +1439,70 @@ pub(crate) struct ReferencesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_partial_answer_keeps_known_hits_and_bounded_reason_codes() {
+        use base_db::{SourceDatabase, SourceRoot, BSL_SOURCE_ROOT};
+        use vfs::{FileId, FileSet, VfsPath};
+        let mut db = ide::RootDatabaseImpl::new();
+        let file = FileId(0);
+        let mut files = FileSet::default();
+        files.insert(file, VfsPath::new("/ws/src/cf/CommonModules/Test/Ext/Module.bsl"));
+        db.set_source_root(BSL_SOURCE_ROOT, SourceRoot::new_local(files));
+        db.set_file_source_root(file, BSL_SOURCE_ROOT);
+        db.set_file_text(file, "Caption");
+        let (roots, _) = WorkspaceRoots::build(Path::new("/ws"), Path::new("/ws/src/cf"), &[]);
+        let issue = ide::metadata_rename::MetadataPreviewIssue {
+            file_id: Some(file),
+            range: None,
+            kind: ide::metadata_rename::MetadataPreviewIssueKind::XmlCoverageRequired,
+        };
+        let result = ReferencesResult {
+            outcome: ReferencesOutcome::Partial { reasons: vec![issue; 1000] },
+            body_source: BodySource::Resident,
+            hits: vec![ReferenceHit {
+                file_id: file,
+                range: syntax::TextRange::new(0.into(), 7.into()),
+                enclosing_range: None,
+                kind: ReferenceKind::Read,
+            }],
+            per_file: vec![(file, 1)],
+            declarations: Vec::new(),
+            candidates: None,
+            files_scanned: 1,
+            files_capped: false,
+            anchor_candidates_capped: false,
+            anchor_line: None,
+            anchor_sites: Vec::new(),
+        };
+        let params = Params {
+            symbol: Some("Catalog.Partners.Caption"),
+            anchor_root_id: None,
+            root_id: None,
+            path: None,
+            line: None,
+            column: None,
+            line_content: None,
+            area_root_id: None,
+            area_path_prefix: None,
+            kinds: &[],
+            include_declaration: None,
+            limit: None,
+            max_files: None,
+            include_preview: None,
+        };
+        let anchor = ReferenceAnchor::Name("Catalog.Partners.Caption".into());
+        let answer =
+            render(&db, &roots, &result, &params, &anchor, None, DEFAULT_LIMIT, DEFAULT_BUDGET, 0);
+        assert_eq!(answer.body["outcome"], "partial");
+        assert_eq!(answer.body["total"], 1);
+        assert_eq!(answer.body["total_is_lower_bound"], true);
+        assert_eq!(answer.body["narrowing_comparable"], false);
+        assert_eq!(answer.body["references"].as_array().unwrap().len(), 1);
+        assert_eq!(answer.body["metadata_incomplete_reasons"], json!(["xml_coverage_incomplete"]));
+        assert_eq!(answer.body["metadata_issues_total"], 1000);
+        assert!(!answer.completeness.is_complete());
+    }
 
     fn building_report() -> crate::diagnostics_state::StatusReport {
         crate::diagnostics_state::StatusReport {
@@ -1437,7 +1545,7 @@ mod tests {
         // The rejected shortcut, spelled out: the same envelope with the answer's required
         // keys bolted on. It must NOT read as an envelope any more.
         let mut disguised = body.clone();
-        disguised["schema_version"] = json!("1");
+        disguised["schema_version"] = json!(SCHEMA_VERSION);
         disguised["outcome"] = json!("not_found");
         disguised["freshness"] = json!({
             "source": "resident",
@@ -1784,6 +1892,7 @@ mod tests {
 
         let outcomes: Vec<String> = [
             ReferencesOutcome::Resolved,
+            ReferencesOutcome::Partial { reasons: Vec::new() },
             ReferencesOutcome::Ambiguous,
             ReferencesOutcome::NotFound,
             ReferencesOutcome::UnsupportedSymbol {
@@ -1940,7 +2049,7 @@ mod tests {
             "a positional miss says only that no name stands at those coordinates, and a \
              second look at the same coordinates says it again",
         );
-        for settled in ["resolved", "ambiguous", "unsupported_symbol"] {
+        for settled in ["resolved", "partial", "ambiguous", "unsupported_symbol"] {
             assert!(
                 !warrants_rescan(&answer(settled, Some("Продажи.Расчёт"))),
                 "`{settled}` is an answer, not a miss",

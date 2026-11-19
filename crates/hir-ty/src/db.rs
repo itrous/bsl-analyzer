@@ -36,6 +36,20 @@ pub trait HirDatabase: ConfigsDatabase + bsl_types::intern::TypeKernelDb {
     /// checks (which client environments the configuration targets).
     fn env_options(&self) -> hir_def::execution_env::EnvOptions;
 
+    /// The environment options of the file's selected compilation configuration.
+    fn env_options_for_file(&self, file_id: FileId) -> hir_def::execution_env::EnvOptions {
+        self.file_compilation_context(file_id)
+            .map_or_else(|| self.env_options(), |context| context.environment)
+    }
+
+    /// Compatibility of the selected configuration; an unknown owner never falls back to another root.
+    fn compatibility_mode_for_file(&self, file_id: FileId) -> Option<Arc<str>> {
+        match self.file_compilation_context(file_id) {
+            Some(context) => context.compatibility_mode.clone(),
+            None => self.compatibility_mode(),
+        }
+    }
+
     /// Configured 1C runtime target; `None` selects the bundled catalog release.
     fn target_platform_version(&self) -> Option<Arc<str>>;
 

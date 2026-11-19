@@ -452,6 +452,8 @@ pub struct MetadataObject {
     #[serde(default)]
     pub name_en: Option<String>,
     #[serde(default)]
+    pub read_properties: crate::read_properties::ObjectReadProperties,
+    #[serde(default)]
     pub attributes: Vec<Attribute>,
     #[serde(default)]
     pub tabular_sections: Vec<crate::tabular_section::TabularSection>,
@@ -840,6 +842,7 @@ impl MetadataObject {
             mdo_type,
             name: name.into(),
             name_en: None,
+            read_properties: Default::default(),
             attributes: Vec::new(),
             tabular_sections: Vec::new(),
             children: Vec::new(),
@@ -870,6 +873,7 @@ impl MetadataObject {
             mdo_type,
             name: name.into(),
             name_en,
+            read_properties: Default::default(),
             attributes,
             tabular_sections: Vec::new(),
             children: Vec::new(),
@@ -909,6 +913,7 @@ impl MetadataObject {
     /// ([`crate::Configuration::merge_extension_overlay`]) and per-object
     /// resolution.
     pub fn apply_extension_overlay(&mut self, overlay: &MetadataObject) {
+        self.predefined_unread |= self.read_properties.apply_overlay(&overlay.read_properties);
         if overlay.name_en.is_some() {
             self.name_en = overlay.name_en.clone();
         }
@@ -962,8 +967,13 @@ impl MetadataObject {
             self.predefined_items.push(predefined_item.clone());
         }
 
-        if !overlay.register_records().is_empty() {
-            self.set_register_records(overlay.register_records().to_vec());
+        // Adopted documents list the movements supplied by the extension.
+        for (kind, name) in overlay.register_records() {
+            if !self.register_records.iter().any(|(existing_kind, existing_name)| {
+                existing_kind == kind && stdx::case::eq_ignore_case(existing_name, name)
+            }) {
+                self.register_records.push((*kind, name.clone()));
+            }
         }
         if overlay.max_ext_dimension_count.is_some() {
             self.max_ext_dimension_count = overlay.max_ext_dimension_count;
@@ -1092,12 +1102,24 @@ impl MetadataObject {
         })
     }
 
+    pub fn find_predefined_account_by_code(
+        &self,
+        code: &str,
+    ) -> Option<&crate::source_content::PredefinedAccount> {
+        self.read_properties
+            .predefined_accounts
+            .as_ref()?
+            .iter()
+            .find(|account| account.code.as_deref() == Some(code))
+    }
+
     /// Heap bytes owned by this object, memoised by `ide-db`'s `parse_mdo_query`
     /// for Salsa's `heap_size` hook: its own name strings plus every owned
     /// collection, recursing into nested attributes, tabular sections, and
     /// children. New heap-owning fields must be added here too.
     pub fn estimated_heap_size(&self) -> usize {
         let mut bytes = self.name.capacity();
+        bytes += self.read_properties.estimated_heap_size();
         bytes += self.name_en.as_ref().map_or(0, String::capacity);
         bytes += stdx::heap::vec_bytes::<Attribute>(self.attributes.len())
             + self.attributes.iter().map(Attribute::estimated_heap_size).sum::<usize>();

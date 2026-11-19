@@ -1,17 +1,17 @@
-use crate::AnalysisContext;
+use crate::BodyContext;
 use crate::{Diagnostic, DiagnosticCode};
-use bsl_platform::deprecation::{DeprecationEntry, LifecycleGroup};
+use bsl_platform::deprecation::LifecycleGroup;
 use hir::LocalRange;
 
 use super::deprecated_platform_api;
 use super::deprecated_platform_facts::{
-    canonical_name_for, global_function_fact, is_russian_alias, replacement_for_name,
+    applicable_replacement, global_function_fact, global_function_message,
 };
 
 pub fn from_hir(
     name: &str,
     range: LocalRange,
-    ctx: &AnalysisContext,
+    ctx: &BodyContext,
 ) -> Option<Diagnostic<LocalRange>> {
     let code = DiagnosticCode::DeprecatedPlatformApi;
 
@@ -23,7 +23,8 @@ pub fn from_hir(
     }
 
     let fact = global_function_fact(name, LifecycleGroup::UserNotification)?;
-    let message = get_message(name, fact)?;
+    let replacement = applicable_replacement(fact, name, ctx);
+    let message = global_function_message(name, fact, replacement)?;
 
     Some(Diagnostic {
         code,
@@ -33,16 +34,6 @@ pub fn from_hir(
         tags: ctx.tags(code),
         fixes: vec![],
     })
-}
-
-fn get_message(method_name: &str, fact: &DeprecationEntry) -> Option<String> {
-    let replacement = replacement_for_name(fact, method_name)?;
-    let deprecated = canonical_name_for(fact, method_name)?;
-    if is_russian_alias(fact, method_name) {
-        Some(format!("Используйте \"{}\" вместо устаревшего \"{}\"", replacement, deprecated))
-    } else {
-        Some(format!("Use \"{}\" instead of deprecated \"{}\"", replacement, deprecated))
-    }
 }
 
 #[cfg(test)]
@@ -66,10 +57,11 @@ mod tests {
 
         expect![[r#"
             DeprecatedPlatformApi @ 3:5..3:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
-              severity: Warning"#]].assert_eq(&format_diags(code, &deprecated_diags));
+              message: Устаревший API "Сообщить"
+              severity: Warning"#]]
+        .assert_eq(&format_diags(code, &deprecated_diags));
         assert_eq!(deprecated_diags[0].severity, Severity::Warning);
-        assert!(deprecated_diags[0].message.contains("СообщитьПользователю"));
+        assert!(!deprecated_diags[0].message.contains("СообщитьПользователю"));
     }
 
     #[test]
@@ -87,10 +79,10 @@ EndProcedure
 
         expect![[r#"
             DeprecatedPlatformApi @ 3:5..3:12
-              message: Use "CommonUse.MessageToUser" instead of deprecated "Message"
+              message: Deprecated API "Message"
               severity: Warning"#]]
         .assert_eq(&format_diags(code, &deprecated_diags));
-        assert!(deprecated_diags[0].message.contains("MessageToUser"));
+        assert!(!deprecated_diags[0].message.contains("MessageToUser"));
     }
 
     #[test]
@@ -127,17 +119,18 @@ EndProcedure
 
         expect![[r#"
             DeprecatedPlatformApi @ 3:5..3:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
+              message: Устаревший API "Сообщить"
               severity: Warning
             DeprecatedPlatformApi @ 4:5..4:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
+              message: Устаревший API "Сообщить"
               severity: Warning
             DeprecatedPlatformApi @ 5:5..5:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
+              message: Устаревший API "Сообщить"
               severity: Warning
             DeprecatedPlatformApi @ 6:5..6:13
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
-              severity: Warning"#]].assert_eq(&format_diags(code, &deprecated_diags));
+              message: Устаревший API "Сообщить"
+              severity: Warning"#]]
+        .assert_eq(&format_diags(code, &deprecated_diags));
     }
 
     #[test]
@@ -157,10 +150,10 @@ EndProcedure
             .collect();
         expect![[r#"
             DeprecatedPlatformApi @ 4:9..4:16
-              message: Use "CommonUse.MessageToUser" instead of deprecated "Message"
+              message: Deprecated API "Message"
               severity: Warning"#]]
         .assert_eq(&format_diags(code, &diags));
-        assert!(diags[0].message.contains("MessageToUser"));
+        assert!(!diags[0].message.contains("MessageToUser"));
     }
 
     #[test]
@@ -177,8 +170,9 @@ EndProcedure
             .collect();
         expect![[r#"
             DeprecatedPlatformApi @ 2:1..2:9
-              message: Используйте "ОбщегоНазначения.СообщитьПользователю" вместо устаревшего "Сообщить"
-              severity: Warning"#]].assert_eq(&format_diags(code, &diags));
-        assert!(diags[0].message.contains("СообщитьПользователю"));
+              message: Устаревший API "Сообщить"
+              severity: Warning"#]]
+        .assert_eq(&format_diags(code, &diags));
+        assert!(!diags[0].message.contains("СообщитьПользователю"));
     }
 }

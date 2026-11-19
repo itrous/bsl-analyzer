@@ -69,13 +69,25 @@ pub fn from_hir(
     range: LocalRange,
     ctx: &AnalysisContext,
 ) -> Option<Diagnostic<LocalRange>> {
+    if ctx.kernel_types_overlap(expected, actual) {
+        return None;
+    }
+    from_property_assignment_hir(expected, actual, range, ctx)
+}
+
+/// Render an incompatibility already established for a writable property in HIR.
+/// Shared optional members do not admit other incompatible assigned values.
+pub fn from_property_assignment_hir(
+    expected: TypeId,
+    actual: TypeId,
+    range: LocalRange,
+    ctx: &AnalysisContext,
+) -> Option<Diagnostic<LocalRange>> {
     let locale = ctx.locale();
     let expected_label = ctx.kernel_type_display(expected, locale);
     let actual_label = ctx.kernel_type_display(actual, locale);
-    // An overlapping set means some value of this expression is acceptable, so the analyzer
-    // cannot state a mismatch; only a disjoint set can. Two sides rendering identically in
-    // the message language make it self-contradictory whatever their members are.
-    if expected_label == actual_label || ctx.kernel_types_overlap(expected, actual) {
+    // Identical labels would make the message contradict itself.
+    if expected_label == actual_label {
         return None;
     }
     let (expected_label, actual_label) =

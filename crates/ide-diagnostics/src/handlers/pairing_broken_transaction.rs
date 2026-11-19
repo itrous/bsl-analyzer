@@ -56,7 +56,16 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
         .unwrap_or(32) as i32;
 
     let cfg = ctx.cfg();
-    let issues = check_transaction_pairing_cfg(ctx.body(), ctx.source_map(), &cfg, max_level);
+    let body = ctx.body();
+    let no_platform_calls = FxHashSet::default();
+    let platform_calls =
+        if body.exprs_iter().any(|(id, _)| active_condition_call(body, id).is_some()) {
+            ctx.unshadowed_platform_global_calls()
+        } else {
+            &no_platform_calls
+        };
+    let issues =
+        check_transaction_pairing_cfg(body, ctx.source_map(), &cfg, max_level, platform_calls);
     for issue in issues {
         acc.push(create_diagnostic(issue, code, ctx));
     }
@@ -98,6 +107,22 @@ fn condition_guard_var(body: &Body, condition: ExprId) -> Option<(String, bool)>
             Expr::Path(name) => Some((name.as_str().fold_lower(), false)),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn active_condition_call(body: &Body, condition: ExprId) -> Option<(ExprId, bool)> {
+    match body.expr(condition) {
+        Expr::Call { callee, args } if args.is_empty() => {
+            let callee = ExprId::from_idx(*callee);
+            let Expr::Path(name) = body.expr(callee) else { return None };
+            matches!(name.as_str().fold_lower().as_str(), "транзакцияактивна" | "transactionactive")
+                .then_some((callee, true))
+        }
+        Expr::UnaryOp { expr, op: UnaryOp::Not } => {
+            active_condition_call(body, ExprId::from_idx(*expr))
+                .map(|(callee, value)| (callee, !value))
+        }
         _ => None,
     }
 }
@@ -200,6 +225,7 @@ fn check_transaction_pairing_cfg(
     source_map: &BodySourceMap,
     cfg: &ControlFlowGraph,
     max_level: i32,
+    platform_calls: &FxHashSet<ExprId>,
 ) -> Vec<TransactionIssue> {
     let entry = match cfg.start() {
         Some(e) => e,
@@ -218,6 +244,7 @@ fn check_transaction_pairing_cfg(
         node_assigned_vars: &node_assigned_vars,
         assign_counts: &assign_counts,
         begin_guard_flags: &begin_guard_flags,
+        platform_calls,
         max_level,
     };
 
@@ -301,6 +328,7 @@ struct DfsContext<'a> {
     node_assigned_vars: &'a FxHashMap<NodeIndex, Vec<(String, Option<bool>)>>,
     assign_counts: &'a FxHashMap<String, u32>,
     begin_guard_flags: &'a FxHashSet<String>,
+    platform_calls: &'a FxHashSet<ExprId>,
     max_level: i32,
 }
 
@@ -418,6 +446,13 @@ fn dfs_check_paths(
             }
         }
     } else if let Some(CfgVertex::Conditional(cond)) = ctx.cfg.vertex(node) {
+        // An exception does not cancel a transaction begun by this method.
+        // At level zero the caller may own a transaction, so absence proves nothing.
+        let active_condition = (state.level > 0)
+            .then(|| active_condition_call(ctx.body, cond.condition))
+            .flatten()
+            .filter(|(callee, _)| ctx.platform_calls.contains(callee))
+            .map(|(_, value)| value);
         let guard = condition_guard_var(ctx.body, cond.condition)
             .filter(|(name, _)| ctx.begin_guard_flags.contains(name))
             .filter(|(name, _)| ctx.assign_counts.get(name).copied().unwrap_or(0) <= 1);
@@ -429,6 +464,12 @@ fn dfs_check_paths(
             .collect();
 
         for (succ, edge_type) in edges {
+            if matches!(
+                (edge_type, active_condition),
+                (CfgEdgeType::TrueBranch, Some(false)) | (CfgEdgeType::FalseBranch, Some(true))
+            ) {
+                continue;
+            }
             let mut next = state.clone();
 
             if let Some((var, true_val)) = &guard {
@@ -545,6 +586,50 @@ mod tests {
     use crate::test_utils::check_diagnostics_snapshot_for;
     use crate::DiagnosticCode;
     use expect_test::expect;
+
+    fn configured_diagnostics(code: &str) -> Vec<crate::Diagnostic> {
+        crate::test_utils::check_with_cfe(code, test_fixture::CfeFixtureBuilder::new("").build())
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::PairingBrokenTransaction)
+            .collect()
+    }
+
+    #[test]
+    fn platform_active_guards_preserve_method_namespace_and_loop_exits() {
+        let code = include_str!("fixtures/transaction_active_guards.bsl");
+        let diagnostics = configured_diagnostics(code);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn shadowed_or_qualified_active_checks_do_not_prove_a_rollback() {
+        let code = include_str!("fixtures/shadowed_transaction_active.bsl");
+        let diagnostics = configured_diagnostics(code);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn full_reported_transaction_methods_do_not_emit() {
+        let code = include_str!("fixtures/reported_transaction_methods.bsl");
+        let diagnostics = configured_diagnostics(code);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn unindexed_active_checks_do_not_prove_a_rollback() {
+        let code = include_str!("fixtures/reported_transaction_methods.bsl");
+        let diagnostics = crate::test_utils::check_diagnostics_for(
+            code,
+            DiagnosticCode::PairingBrokenTransaction,
+        );
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn real_unpaired_paths_still_emit() {
+        let code = include_str!("fixtures/unpaired_transaction_paths.bsl");
+        assert_eq!(configured_diagnostics(code).len(), 4);
+    }
     #[test]
     fn test_valid_pairing_with_commit() {
         let code = r#"

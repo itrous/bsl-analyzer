@@ -230,13 +230,20 @@ fn entry(hunks: &FileHunks) -> ScopeEntry<'_> {
     }
 }
 
-/// Whether `haystack` ends with `needle` on a `/` boundary (or equals it).
+/// Whether `haystack` ends with `needle` on a path boundary (or equals it).
 fn suffix_matches(haystack: &str, needle: &str) -> bool {
-    if !haystack.ends_with(needle) {
-        return false;
+    #[cfg(windows)]
+    {
+        Path::new(haystack).ends_with(Path::new(needle))
     }
-    let prefix_len = haystack.len() - needle.len();
-    prefix_len == 0 || haystack.as_bytes()[prefix_len - 1] == b'/'
+    #[cfg(not(windows))]
+    {
+        if !haystack.ends_with(needle) {
+            return false;
+        }
+        let prefix_len = haystack.len() - needle.len();
+        prefix_len == 0 || haystack.as_bytes()[prefix_len - 1] == b'/'
+    }
 }
 
 fn convert_hunks(hunks: Option<Vec<[u32; 2]>>) -> FileHunks {
@@ -244,8 +251,11 @@ fn convert_hunks(hunks: Option<Vec<[u32; 2]>>) -> FileHunks {
 }
 
 fn normalize_path(path: &str) -> PathBuf {
+    #[cfg(not(windows))]
     let normalized = path.replace('\\', "/");
-    let trimmed = normalized.strip_prefix("./").unwrap_or(&normalized);
+    #[cfg(not(windows))]
+    let path = normalized.as_str();
+    let trimmed = path.strip_prefix("./").or_else(|| path.strip_prefix(".\\")).unwrap_or(path);
     PathBuf::from(trimmed)
 }
 
@@ -406,11 +416,46 @@ mod tests {
 
     #[test]
     fn windows_and_dot_prefixed_keys_normalize() {
-        let scope = AnalysisScope::from_relative_report(
+        for key in ["src/Module.bsl", "./src/Module.bsl", "src\\Module.bsl", ".\\src\\Module.bsl"] {
+            let scope = AnalysisScope::from_relative_report("vendor", [(key.to_string(), None)]);
+            assert!(scope.is_file_in_scope(Path::new("/repo/src/Module.bsl")), "{key}");
+            #[cfg(windows)]
+            assert!(scope.is_file_in_scope(Path::new(r"C:\repo\src\Module.bsl")), "{key}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_report_matches_canonical_windows_files_without_a_suffix_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/Own.bsl"), "Перем А;\nПерем Наша;\n").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = root.join("src/Own.bsl").canonicalize().unwrap();
+        let scope = AnalysisScope::from_report(
             "vendor",
-            [(".\\src\\Module.bsl".to_string(), None)],
+            &root,
+            [("src/Own.bsl".to_string(), Some(vec![[2, 2]]))],
         );
-        assert!(scope.is_file_in_scope(Path::new("/repo/src/Module.bsl")));
+
+        assert_eq!(normalize_path(&file.to_string_lossy()), file);
+        assert!(scope.is_file_in_scope(&file));
+        assert!(scope.lines_in_scope(&file, 1, 1));
+        assert!(!scope.lines_in_scope(&file, 0, 0));
+        assert!(!scope.is_file_in_scope(&root.join("other/src/Own.bsl")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_unc_prefix_is_preserved_without_reinterpreting_its_components() {
+        let raw = r"\\?\UNC\server\share\src\Own.bsl";
+        let normalized = normalize_path(raw);
+        assert_eq!(normalized.as_os_str(), std::ffi::OsStr::new(raw));
+        assert!(
+            matches!(normalized.components().next(), Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::VerbatimUNC(server, share)
+                if server == "server" && share == "share"))
+        );
     }
 
     #[test]
