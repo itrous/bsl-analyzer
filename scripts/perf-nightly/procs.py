@@ -27,15 +27,19 @@ CLK_TCK = os.sysconf("SC_CLK_TCK")
 SAMPLE_INTERVAL_S = 1.0
 TRACE_SCHEMA = 1
 TRACE_NAME = "resources.jsonl"
+# Every variable family of the caller that a measured process must not see.
+ANALYZER_ENV_PREFIXES = ("BSL_", "EMBEDDING_")
 
 
 def child_env(run_id: str, xdg_root: dict | None = None, extra: dict | None = None,
               base: dict | None = None) -> dict:
     """Environment of a measured process: no `BSL_*` variable survives (they
-    change cache roots, broker use, help lookup, logging and thread counts),
-    the run marker is set, and the XDG roots point at the run's own dirs."""
+    change cache roots, broker use, help lookup, logging and thread counts)
+    and no `EMBEDDING_*` one (they switch on the background embedding pass,
+    which talks to a network service), the run marker is set, and the XDG
+    roots point at the run's own dirs."""
     env = {k: v for k, v in (os.environ if base is None else base).items()
-           if not k.startswith("BSL_")}
+           if not k.startswith(ANALYZER_ENV_PREFIXES)}
     env[MARKER] = run_id
     for name, path in (xdg_root or {}).items():
         env[name] = path

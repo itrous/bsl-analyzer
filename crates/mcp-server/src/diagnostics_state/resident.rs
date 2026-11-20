@@ -621,10 +621,15 @@ impl DiagnosticsResident {
         self.clear_pool_node_caches();
     }
 
-    /// The sweep's final trim: the swept files are batch working set nothing will read
-    /// again, so the heavy per-file chains go down to the small sweep caps instead of
-    /// pinning a full interactive window of them until the next request.
-    fn trim_after_sweep(&mut self) {
+    /// The diagnostics sweep's trim, after each of its chunks and at its end: the swept
+    /// files are batch working set nothing will read again, so the heavy per-file
+    /// chains go down to the small sweep caps instead of pinning a full interactive
+    /// window of them, and the freed pages go back to the system. Left to the
+    /// allocator between chunks, that window stays resident under the next chunk's
+    /// working set and sets the peak of the whole sweep.
+    fn trim_swept(&mut self) {
+        #[cfg(test)]
+        sweep_probe::record_deep_trim();
         ide::sweep_lru_deep(&mut self.db);
         self.clear_pool_node_caches();
         profile::purge_allocator();
@@ -926,6 +931,47 @@ impl DiagnosticsResident {
             },
             SWEEP_CHUNK,
         );
+        // Form modules check method use against the handler names other modules bind by
+        // string — a fold over every file of the source root. Asked first from inside a
+        // chunk, the fold scans those files on one worker while the chunk's form modules
+        // wait for it; built here, its per-file work spreads over the pool (the CLI
+        // `analyze` discipline). The trees of the files it lowers fit the interactive
+        // parse window, so only the deep trim drops them before the first chunk grows
+        // its own working set. Only a form module reads the fold: a selection without
+        // one would pay for the whole build and ask for none of it.
+        let reads_the_fold = |file_id: &FileId| {
+            path_of.get(file_id).is_some_and(|path| {
+                ide::get_module_type_from_uri(path) == Some(bsl_metadata::ModuleType::FormModule)
+            })
+        };
+        if !cancel.is_cancelled()
+            && config.any_enabled(ide::FOREIGN_HANDLER_BINDINGS_READERS)
+            && swept.iter().any(reads_the_fold)
+        {
+            #[cfg(test)]
+            sweep_probe::record_fold_warm();
+            #[cfg(test)]
+            let origin = std::thread::current().id();
+            let db = self.db.database().clone();
+            cancel.register(salsa::Database::cancellation_token(&db));
+            // The per-file work runs on handles of its own, which the token registered
+            // above does not reach: the request's flag, asked before each file, is what
+            // stops it.
+            let keep_going = || {
+                #[cfg(test)]
+                sweep_probe::fold_file_asked(origin);
+                !cancel.is_cancelled()
+            };
+            // A build that does not finish is not the sweep's failure: the form module
+            // that asks for the fold in its chunk meets the same cancellation or panic
+            // at its own boundary, as it would without the warm-up.
+            let _ = self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
+                std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    db.prime_foreign_handler_bindings_while(base_db::BSL_SOURCE_ROOT, keep_going)
+                }))
+            });
+            self.trim_swept();
+        }
         for &chunk in &chunks {
             if cancel.is_cancelled() {
                 prepared.extend(chunk.iter().map(|_| None));
@@ -978,7 +1024,7 @@ impl DiagnosticsResident {
                                 diagnostics
                                     .into_iter()
                                     .map(|d| {
-                                        let output = d.to_output(&text);
+                                        let output = d.to_output_with_index(&text, &line_index);
                                         let visible = late_scope.is_none_or(|scope| {
                                             ide::diagnostic_in_scope(
                                                 Some(scope),
@@ -1025,7 +1071,7 @@ impl DiagnosticsResident {
                         .collect()
                 });
             prepared.extend(chunk_results);
-            self.trim_between_chunks();
+            self.trim_swept();
         }
 
         let cancelled = cancel.is_cancelled();
@@ -1263,7 +1309,7 @@ impl DiagnosticsResident {
         });
         // The author pass above ran on clones of its own, so the deep trim here sees
         // the whole sweep's working set and no live handle.
-        self.trim_after_sweep();
+        self.trim_swept();
 
         WorkspaceSweep {
             aggregates,
@@ -1329,6 +1375,17 @@ pub(super) mod sweep_probe {
         /// the warm-up loads EVERY config root: a sweep with nothing to sweep, or one
         /// whose request is already cancelled, must not pay for it.
         warms: usize,
+        /// One entry per build of the handler-binding fold ahead of the chunks: how many
+        /// fan-out jobs the sweep had recorded by then. Zero is "before the first chunk",
+        /// which is the only place where the build spreads over the pool.
+        fold_warms: Vec<usize>,
+        /// One entry per deep trim of the sweep: how many fan-out jobs it had recorded by
+        /// then. An entry strictly inside the run is a trim between two chunks.
+        deep_trims: Vec<usize>,
+        /// Run once, when the build of the fold asks about its first file: the only
+        /// point at which a test can act between the start of the build and its
+        /// per-file work.
+        at_fold_file: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     }
 
     fn observed() -> &'static Mutex<HashMap<ThreadId, Observed>> {
@@ -1355,6 +1412,26 @@ pub(super) mod sweep_probe {
         with_entry(std::thread::current().id(), |entry| entry.warms += 1);
     }
 
+    /// Called where the sweep builds the handler-binding fold — on the thread that
+    /// started it.
+    pub(super) fn record_fold_warm() {
+        with_entry(std::thread::current().id(), |entry| entry.fold_warms.push(entry.jobs.len()));
+    }
+
+    /// Called where the build of the fold asks whether to go on to its next file — on a
+    /// pool worker, which has to be told which sweep it belongs to.
+    pub(super) fn fold_file_asked(origin: ThreadId) {
+        let action = with_entry(origin, |entry| entry.at_fold_file.take());
+        if let Some(action) = action {
+            action();
+        }
+    }
+
+    /// Called where the sweep trims deep — on the thread that started it.
+    pub(super) fn record_deep_trim() {
+        with_entry(std::thread::current().id(), |entry| entry.deep_trims.push(entry.jobs.len()));
+    }
+
     /// Watch the sweeps started by THIS thread, from an empty slate.
     pub(crate) fn watch() -> Watch {
         let origin = std::thread::current().id();
@@ -1373,6 +1450,18 @@ pub(super) mod sweep_probe {
 
         pub(crate) fn warms(&self) -> usize {
             with_entry(self.origin, |entry| entry.warms)
+        }
+
+        pub(crate) fn fold_warms(&self) -> Vec<usize> {
+            with_entry(self.origin, |entry| entry.fold_warms.clone())
+        }
+
+        pub(crate) fn deep_trims(&self) -> Vec<usize> {
+            with_entry(self.origin, |entry| entry.deep_trims.clone())
+        }
+
+        pub(crate) fn at_fold_file(&self, action: impl Fn() + Send + Sync + 'static) {
+            with_entry(self.origin, |entry| entry.at_fold_file = Some(std::sync::Arc::new(action)));
         }
     }
 
@@ -1728,7 +1817,7 @@ pub(super) fn apply_resident_changes(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{module_path, sample_workspace, wait_ready, write};
+    use super::super::test_support::{join_load, module_path, sample_workspace, wait_ready, write};
     use super::super::{DiagnosticsState, ResidentOutcome};
     use super::*;
     use crate::tools::file_request::RootedPathError;
@@ -1872,6 +1961,379 @@ mod tests {
         assert!(
             matches!(pooled, ResidentOutcome::Ready(true, _)),
             "the control has to raise the pool, or the two refusals above prove nothing",
+        );
+    }
+
+    /// The fold of handler bindings is built once, ahead of the first chunk, and only
+    /// for a sweep that will read it.
+    ///
+    /// A form module asks for the fold from inside its chunk, and the fold scans every
+    /// file of the source root on that one worker while the chunk's other form modules
+    /// wait for it. Built ahead of the chunks its per-file work spreads over the pool;
+    /// built after the first chunk it is already too late, which is why the probe counts
+    /// the fan-out jobs recorded by then rather than only the builds.
+    #[test]
+    fn the_sweep_builds_the_handler_binding_fold_ahead_of_its_first_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        super::super::test_support::write_common_module(
+            root,
+            "Подключение",
+            true,
+            "Процедура Подключить(Форма) Экспорт\n    \
+             Форма.ПодключитьОбработчикОжидания(\"ОбработчикОжидания1\", 0.1, Истина);\n\
+             КонецПроцедуры",
+        );
+        write(
+            root,
+            "Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl",
+            "Процедура ОбработчикОжидания1()\n    Сообщить(1);\nКонецПроцедуры\n\n\
+             Процедура Подготовить() Экспорт\n    Подключение.Подключить(ЭтотОбъект);\n\
+             КонецПроцедуры",
+        );
+
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        join_load(&state);
+
+        let watch = super::sweep_probe::watch();
+        let sweep = |config: Option<DiagnosticsConfig>, max_files: usize, cancel: RequestCancel| {
+            let mut opts = sweep_opts();
+            opts.max_files = max_files;
+            let out = state.read_mut(|resident, _| {
+                let config = config.unwrap_or_else(|| resident.config().clone());
+                resident.workspace_aggregates(&config, &opts, &cancel);
+                config.any_enabled(ide::FOREIGN_HANDLER_BINDINGS_READERS)
+            });
+            match out {
+                ResidentOutcome::Ready(readers_enabled, _) => readers_enabled,
+                _ => panic!("expected Ready"),
+            }
+        };
+
+        // The live sweep goes first: the probe counts the jobs since the watch began.
+        assert!(
+            sweep(None, 1000, RequestCancel::default()),
+            "the resident's own configuration has to keep a reader of the fold on",
+        );
+        assert_eq!(
+            watch.fold_warms(),
+            [0],
+            "one build, and no fan-out job recorded before it: the fold goes ahead of the chunks",
+        );
+        assert!(
+            !watch.jobs().is_empty(),
+            "the sweep has to have run its chunks, or the zero above says nothing about order",
+        );
+        assert_eq!(
+            watch.deep_trims().first(),
+            Some(&0),
+            "the build is followed by a deep trim before the first chunk grows its working set",
+        );
+
+        let no_readers = DiagnosticsConfig {
+            only_enabled: Some(vec![ide::DiagnosticCode::LineLength]),
+            ..DiagnosticsConfig::default()
+        };
+        assert!(
+            !sweep(Some(no_readers), 1000, RequestCancel::default()),
+            "the stand has to switch every reader of the fold off",
+        );
+        assert_eq!(watch.fold_warms().len(), 1, "no rule would read the fold");
+
+        sweep(None, 0, RequestCancel::default());
+        assert_eq!(watch.fold_warms().len(), 1, "a zero-file sweep builds no fold");
+
+        let cancelled = RequestCancel::default();
+        cancelled.cancel_all();
+        sweep(None, 1000, cancelled);
+        assert_eq!(watch.fold_warms().len(), 1, "an already-cancelled sweep builds no fold");
+    }
+
+    /// A sweep that selects no form module builds no fold.
+    ///
+    /// Only a form module reads the fold, so for any other selection the build would go
+    /// through every file of the source root, under the resident lock, for nothing.
+    #[test]
+    fn a_sweep_without_a_form_module_builds_no_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_workspace(dir.path());
+        let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        join_load(&state);
+
+        let watch = super::sweep_probe::watch();
+        let readers_enabled = match state.read_mut(|resident, _| {
+            let config = resident.config().clone();
+            resident.workspace_aggregates(&config, &sweep_opts(), &RequestCancel::default());
+            config.any_enabled(ide::FOREIGN_HANDLER_BINDINGS_READERS)
+        }) {
+            ResidentOutcome::Ready(readers_enabled, _) => readers_enabled,
+            _ => panic!("expected Ready"),
+        };
+        assert!(readers_enabled, "the control: a reader of the fold is on");
+        assert!(!watch.jobs().is_empty(), "the control: the sweep ran its chunk");
+        assert!(watch.fold_warms().is_empty(), "the common module alone reads no fold");
+    }
+
+    /// A request cancelled while the fold is being built stops the build's per-file work.
+    ///
+    /// That work runs on database handles of its own, so the cancellation token of the
+    /// handle the sweep registered does not reach it: left alone, the build goes through
+    /// every file of the source root under the resident lock for a caller that has
+    /// already gone. The probe cancels the request when the build asks about its first
+    /// file - after the build has started, before any file is read.
+    #[test]
+    fn a_sweep_cancelled_during_the_fold_build_reads_no_file() {
+        // The memo of one file's share of the fold, kept for the files that bind a handler.
+        const FILE_BINDINGS: &str = "[hir_def::call_graph::ForeignHandlerBinding]";
+        let file_shares = |state: &DiagnosticsState| {
+            let shares = state.read(|resident, _| {
+                resident
+                    .db()
+                    .memory_report()
+                    .into_iter()
+                    .filter(|(name, ..)| name.contains(FILE_BINDINGS))
+                    .map(|(_, count, ..)| count)
+                    .sum::<usize>()
+            });
+            match shares {
+                ResidentOutcome::Ready(shares, _) => shares,
+                _ => panic!("expected Ready"),
+            }
+        };
+        let workspace = || {
+            let dir = tempfile::tempdir().unwrap();
+            sample_workspace(dir.path());
+            super::super::test_support::write_common_module(
+                dir.path(),
+                "Подключение",
+                true,
+                "Процедура Подключить(Форма) Экспорт\n    \
+                 Форма.ПодключитьОбработчикОжидания(\"ОбработчикОжидания1\", 0.1, Истина);\n\
+                 КонецПроцедуры",
+            );
+            // The reader: without a form module in the selection the fold is not built.
+            write(
+                dir.path(),
+                "Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl",
+                "Процедура Подготовить() Экспорт\n    Подключение.Подключить(ЭтотОбъект);\n\
+                 КонецПроцедуры",
+            );
+            let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+            join_load(&state);
+            (dir, state)
+        };
+        let sweep = |state: &DiagnosticsState, cancel: &RequestCancel| {
+            let _ = state.read_mut(|resident, _| {
+                resident.workspace_aggregates(&resident.config().clone(), &sweep_opts(), cancel);
+            });
+        };
+
+        // The control: a sweep nobody cancels keeps the share of the binding module, so
+        // the zero below is not a stand whose fold reads nothing.
+        let (_dir, state) = workspace();
+        sweep(&state, &RequestCancel::default());
+        assert_eq!(file_shares(&state), 1, "the control: the build reads the binding module");
+
+        let (_dir, state) = workspace();
+        let watch = super::sweep_probe::watch();
+        let cancel = std::sync::Arc::new(RequestCancel::default());
+        watch.at_fold_file({
+            let cancel = std::sync::Arc::clone(&cancel);
+            move || cancel.cancel_all()
+        });
+        sweep(&state, &cancel);
+        assert!(cancel.is_cancelled(), "the control: the build asked about a file");
+        assert_eq!(file_shares(&state), 0, "the cancelled build went on through the files");
+    }
+
+    /// A build of the fold that panics is not the sweep's failure.
+    ///
+    /// The form module that asks for the fold in its chunk builds it there, and meets
+    /// whatever broke the build at its own boundary, so the sweep answers what it answers
+    /// when the build finishes. The probe raises the panic where the build asks about
+    /// its first file: inside the build, on a worker of the pool.
+    #[test]
+    fn a_fold_build_that_panics_leaves_the_sweep_its_answer() {
+        let answer = |disturb: &dyn Fn(&super::sweep_probe::Watch)| {
+            let dir = tempfile::tempdir().unwrap();
+            sample_workspace(dir.path());
+            super::super::test_support::write_common_module(
+                dir.path(),
+                "Подключение",
+                true,
+                "Процедура Подключить(Форма) Экспорт\n    \
+                 Форма.ПодключитьОбработчикОжидания(\"ОбработчикОжидания1\", 0.1, Истина);\n\
+                 КонецПроцедуры",
+            );
+            // The reader of the fold: one method bound by the module above, one bound by
+            // nobody.
+            write(
+                dir.path(),
+                "Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl",
+                "Процедура ОбработчикОжидания1()\n    Сообщить(1);\nКонецПроцедуры\n\n\
+                 Процедура НикемНеПривязана()\n    Сообщить(2);\nКонецПроцедуры\n\n\
+                 Процедура Подготовить() Экспорт\n    Подключение.Подключить(ЭтотОбъект);\n\
+                 КонецПроцедуры",
+            );
+            let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+            join_load(&state);
+
+            let watch = super::sweep_probe::watch();
+            disturb(&watch);
+            let swept = state.read_mut(|resident, _| {
+                let sweep = resident.workspace_aggregates(
+                    &resident.config().clone(),
+                    &sweep_opts(),
+                    &RequestCancel::default(),
+                );
+                let tallies: Vec<_> = sweep
+                    .aggregates
+                    .into_iter()
+                    .map(|a| (a.code, a.count, a.files_affected))
+                    .collect();
+                (sweep.files_swept, tallies)
+            });
+            match swept {
+                ResidentOutcome::Ready(swept, _) => (swept, watch.fold_warms()),
+                _ => panic!("expected Ready"),
+            }
+        };
+
+        let (undisturbed, warms) = answer(&|_| {});
+        assert_eq!(warms, [0], "the control: the sweep builds the fold ahead of its chunks");
+        assert!(!undisturbed.1.is_empty(), "the control: the stand has findings to answer with");
+
+        let raised = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (disturbed, _) = answer(&|watch| {
+            let raised = std::sync::Arc::clone(&raised);
+            watch.at_fold_file(move || {
+                raised.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Not `panic!`: the hook of the test harness would print it as a failure
+                // of a test that expects it.
+                std::panic::resume_unwind(Box::new("the build of the fold broke"));
+            });
+        });
+        assert!(
+            raised.load(std::sync::atomic::Ordering::SeqCst),
+            "the control: the build was broken"
+        );
+        assert_eq!(disturbed, undisturbed);
+    }
+
+    /// The sweep trims deep after each of its chunks, not only at its end.
+    ///
+    /// Trimmed to the interactive caps, a chunk leaves a full window of its files'
+    /// parse trees, lowered bodies and inference resident under the next chunk's
+    /// working set, and that sum is the peak of the whole sweep. The final trim always
+    /// runs, so the probe tells the trims apart by the fan-out jobs recorded by then:
+    /// one that falls on the end of a chunk inside the run stands between two chunks.
+    /// Three chunks give two such ends: a trim after the first chunk alone, or before
+    /// the last one alone, misses one of them.
+    #[test]
+    fn the_sweep_trims_deep_between_its_chunks() {
+        let chunk = super::SWEEP_CHUNK.max_files;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // One file over the cap of two chunks: the sweep has to split in three.
+        for n in 0..=2 * chunk {
+            super::super::test_support::write_common_module(
+                root,
+                &format!("Модуль{n}"),
+                true,
+                "Процедура Выполнить() Экспорт\nКонецПроцедуры",
+            );
+        }
+
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        join_load(&state);
+
+        let watch = super::sweep_probe::watch();
+        let mut opts = sweep_opts();
+        opts.max_files = usize::MAX;
+        let swept = match state.read_mut(|resident, _| {
+            resident
+                .workspace_aggregates(&resident.config().clone(), &opts, &RequestCancel::default())
+                .files_swept
+        }) {
+            ResidentOutcome::Ready(swept, _) => swept,
+            _ => panic!("expected Ready"),
+        };
+        assert!(swept > 2 * chunk, "the control: {swept} files do not make a third chunk");
+        let trims = watch.deep_trims();
+        for chunk_end in [chunk, 2 * chunk] {
+            assert!(
+                trims.contains(&chunk_end),
+                "no deep trim after the chunk that ends at file {chunk_end} of {swept}: \
+                 trims after {trims:?} jobs",
+            );
+        }
+    }
+
+    /// The sweep builds one line table per file, however many diagnostics the file has.
+    ///
+    /// Turning a diagnostic into its output needs the line table of the file's text, and
+    /// the sweep already holds one for the file's snippets. A table built again for each
+    /// diagnostic costs a pass over the whole text per finding, and a file of thousands of
+    /// findings is the one the sweep is slowest on. The output is the same either way, so
+    /// only the number of tables built tells the two apart: the watch counts, on every
+    /// thread of the pool, the blocks of the size of a table of this file's line count -
+    /// a count no other table in the process has. The same lines with a few findings
+    /// against hundreds give the cost of what is not per-diagnostic, and the difference
+    /// between the two is what each finding added.
+    #[test]
+    fn the_sweep_builds_one_line_table_per_file_not_one_per_diagnostic() {
+        // A prime, so that no other table, vector or slice of 4-byte items in the process
+        // happens to have this length.
+        const LINES: usize = 7919;
+        const FEW: usize = 1;
+        const MANY: usize = 300;
+        let tables_built = |locals: usize| -> (usize, usize) {
+            let mut body = String::from("Процедура Выполнить() Экспорт\n");
+            for n in 0..locals {
+                body.push_str(&format!("    Перем Пер{n};\n"));
+            }
+            body.push_str("КонецПроцедуры");
+            while body.matches('\n').count() < LINES {
+                body.push('\n');
+            }
+            let dir = tempfile::tempdir().unwrap();
+            super::super::test_support::write_common_module(dir.path(), "Модуль", true, &body);
+            let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+            join_load(&state);
+
+            // After the load: what the workspace builds on its own is not the sweep's.
+            let watch = crate::measured_alloc::watch_blocks(LINES * std::mem::size_of::<u32>(), 4);
+            let sweep = match state.read_mut(|resident, _| {
+                resident.workspace_aggregates(
+                    &resident.config().clone(),
+                    &sweep_opts(),
+                    &RequestCancel::default(),
+                )
+            }) {
+                ResidentOutcome::Ready(sweep, _) => sweep,
+                _ => panic!("expected Ready"),
+            };
+            let findings = sweep
+                .aggregates
+                .iter()
+                .find(|aggregate| aggregate.code == "UnusedLocalVariable")
+                .map_or(0, |aggregate| aggregate.count);
+            (watch.blocks(), findings)
+        };
+
+        let (few, few_findings) = tables_built(FEW);
+        let (many, many_findings) = tables_built(MANY);
+        assert_eq!(
+            (few_findings, many_findings),
+            (FEW, MANY),
+            "the control: the files hold the findings the stand counts on",
+        );
+        assert!(few >= 1, "the control: the watch sees the tables of a sweep ({few} blocks)");
+        assert!(
+            many < few + MANY / 4,
+            "{MANY} findings built {many} line tables against {few} for {FEW}: \
+             one per finding instead of one per file",
         );
     }
 
@@ -3545,7 +4007,7 @@ mod trim_tests {
         let state = joined_state(dir.path());
         let (inference_swept, inference_again) = ready(state.read_mut(|resident, _| {
             infer_all(resident);
-            resident.trim_after_sweep();
+            resident.trim_swept();
             let inference_swept = heap_bytes(resident.db(), INFERENCE);
 
             infer_all(resident);
@@ -3562,6 +4024,66 @@ mod trim_tests {
             inference_again, inference_all,
             "after the sweep the interactive cap keeps every method again"
         );
+    }
+
+    /// A sweep's trim clears the parser's node cache on the thread that runs it and on
+    /// every worker of its pool.
+    ///
+    /// The cache keeps a strong reference to every token and small node it has handed
+    /// out and never evicts, so a thread that parsed a chunk's files pins their green
+    /// storage until the cache is cleared; the workers parse the chunk, the calling
+    /// thread parses the rest, and the trim is where the sweep lets go of both. The probe
+    /// parses one text and keeps hold of the first token it got: while the cache stands a
+    /// second parse of the text hands out that very token, and once the cache is cleared
+    /// it builds a new one. The control is the same two parses with no trim between them.
+    #[test]
+    fn a_sweeps_trim_clears_the_node_caches_of_its_thread_and_of_its_pool() {
+        const TEXT: &str = "Процедура Проба() КонецПроцедуры";
+        let first_token = || {
+            parser::parse_with_shared_cache(TEXT)
+                .syntax_node()
+                .first_token()
+                .expect("the text has a token")
+                .green()
+                .to_owned()
+        };
+        fn same<T: std::ops::Deref>(a: &T, b: &T) -> bool {
+            std::ptr::eq(&**a, &**b)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_common_module(
+            dir.path(),
+            "Модуль",
+            true,
+            "Процедура Выполнить() Экспорт\nКонецПроцедуры",
+        );
+        let state = joined_state(dir.path());
+        ready(state.read_mut(|resident, _| {
+            let pool = resident.sweep_pool.get_or_init(super::build_sweep_pool);
+            let thread_held = first_token();
+            let pool_held = pool.broadcast(|_| first_token());
+            let thread_again = first_token();
+            let pool_again = pool.broadcast(|_| first_token());
+            assert!(same(&thread_held, &thread_again), "the control: the thread's cache stands");
+            assert!(
+                pool_held.iter().zip(&pool_again).all(|(held, again)| same(held, again)),
+                "the control: the cache of every worker stands",
+            );
+
+            resident.trim_swept();
+
+            let pool = resident.sweep_pool.get().expect("the pool was raised above");
+            assert!(
+                !same(&thread_held, &first_token()),
+                "the trim left the node cache of the thread that ran it",
+            );
+            let pool_after = pool.broadcast(|_| first_token());
+            assert_eq!(pool_after.len(), pool_held.len());
+            let kept =
+                pool_held.iter().zip(&pool_after).filter(|(held, after)| same(*held, *after));
+            assert_eq!(kept.count(), 0, "the trim left the node cache of a worker of the pool",);
+        }));
     }
 
     /// A `references` call whose cancellation was requested before it started unwinds

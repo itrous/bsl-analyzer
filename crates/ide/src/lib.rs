@@ -61,7 +61,9 @@ pub use hir::ModuleId;
 pub use hir::{call_hierarchy_method_digest, MethodCallDigest};
 pub use ide_assists::{Assist, AssistId, SourceChange};
 pub use ide_db::base_db::Locale;
-pub use ide_db::metadata::{RootKind as WorkspaceRootKind, WorkspaceConfigsSnapshot};
+pub use ide_db::metadata::{
+    get_module_type_from_uri, RootKind as WorkspaceRootKind, WorkspaceConfigsSnapshot,
+};
 pub use ide_db::query_resolver::AcrossRootsQueryResolver;
 pub use ide_db::FairMutex;
 pub use ide_db::{
