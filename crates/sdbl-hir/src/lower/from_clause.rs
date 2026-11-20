@@ -1042,7 +1042,7 @@ impl LoweringContext<'_> {
 
     /// Returns `true` only when the produced field set is exhaustive for the
     /// table's schema (so an unknown-field diagnostic is false-positive safe).
-    fn add_metadata_fields(
+    pub(in crate::lower) fn add_metadata_fields(
         &self,
         mdo_type: MdoType,
         object_name: &str,
@@ -1156,7 +1156,7 @@ impl LoweringContext<'_> {
 
     /// Returns `true` only when both the parent object and the named tabular
     /// section resolved (the field set is then exhaustive).
-    fn add_tabular_section_fields(
+    pub(in crate::lower) fn add_tabular_section_fields(
         &self,
         mdo_type: MdoType,
         object_name: &str,
