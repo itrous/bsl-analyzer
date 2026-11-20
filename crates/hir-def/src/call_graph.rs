@@ -1044,7 +1044,10 @@ fn is_notify_description(name: &Name) -> bool {
 
 fn is_notify_description_str(name: &str) -> bool {
     let lower = name.fold_lower();
-    lower == "описаниеоповещения" || lower == "notifydescription"
+    // `CallbackDescription` is the platform's own English name of the type (`platform_facts`:
+    // `english_name`); `NotifyDescription` reaches the
+    // constructor too (live probe, 8.3.27.2214), so both stay accepted.
+    lower == "описаниеоповещения" || lower == "notifydescription" || lower == "callbackdescription"
 }
 
 fn is_this_object(name_lower: &str) -> bool {
@@ -1151,6 +1154,11 @@ fn extract_notify_reg_at(
 ) -> Option<NotifyReg> {
     let callback_name = extract_string_literal(body, *args.get(method_idx)?)?;
     let target = match args.get(target_idx).map(|&idx| body.expr_idx(idx)) {
+        // A parameter, a declared variable or an assigned local with the receiver's name
+        // IS the receiver: `Процедура Тест(ЭтаФорма)` does not name the form, and a local
+        // `МойМодуль` is not the common module of that name. Nothing can be said about
+        // where its handler lives.
+        Some(Expr::Path(name)) if is_body_local(body, name) => NotifyTarget::Unsupported,
         Some(Expr::Path(name)) if is_this_receiver(&name.as_str().fold_lower()) => {
             NotifyTarget::ThisObject
         }
@@ -1545,6 +1553,9 @@ mod tests {
     fn test_is_notify_description() {
         assert!(is_notify_description(&Name::new("ОписаниеОповещения")));
         assert!(is_notify_description(&Name::new("NotifyDescription")));
+        assert!(is_notify_description(&Name::new("CallbackDescription")));
+        assert!(is_notify_description(&Name::new("callbackdescription")));
+        assert!(!is_notify_description(&Name::new("CallbackDescriptionXX")));
         assert!(is_notify_description(&Name::new("описаниеоповещения")));
         assert!(!is_notify_description(&Name::new("ОписаниеОшибки")));
     }
@@ -1979,6 +1990,69 @@ EndProcedure
         assert_eq!(summary.notify_regs[0].caller, CallerId::Method(MethodKey::first("Test")));
         assert_eq!(summary.notify_regs[0].callback_name, Name::new("HandleResult"));
         assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
+    }
+
+    #[test]
+    fn test_notify_description_callback_description_spelling() {
+        let code = r#"
+Procedure Test()
+    Notification = New CallbackDescription("HandleResult", ThisObject);
+    Other = New("CallbackDescription", "AnotherHandler", CommonModule);
+EndProcedure
+"#;
+        let summary = parse_and_extract(code);
+
+        assert_eq!(summary.notify_regs.len(), 2);
+        assert_eq!(summary.notify_regs[0].callback_name, Name::new("HandleResult"));
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
+        assert_eq!(summary.notify_regs[1].callback_name, Name::new("AnotherHandler"));
+        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Module(Name::new("CommonModule")));
+    }
+
+    #[test]
+    fn test_notify_description_receiver_shadowed_by_parameter_is_unsupported() {
+        let code = r#"
+Процедура Тест(ЭтаФорма, МойОбщийМодуль)
+    А = Новый ОписаниеОповещения("Первый", ЭтаФорма);
+    Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs.len(), 2);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
+        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Unsupported);
+    }
+
+    #[test]
+    fn test_notify_description_receiver_shadowed_by_local_is_unsupported() {
+        let code = r#"
+Процедура Тест()
+    Перем МойОбщийМодуль;
+    ЭтотОбъект = Новый Структура;
+    А = Новый ОписаниеОповещения("Первый", ЭтотОбъект);
+    Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs.len(), 2);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
+        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Unsupported);
+    }
+
+    #[test]
+    fn test_notify_description_unshadowed_receivers_keep_their_target() {
+        let code = r#"
+Процедура Тест(Другой)
+    А = Новый ОписаниеОповещения("Первый", ЭтаФорма);
+    Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
+        assert_eq!(
+            summary.notify_regs[1].target,
+            NotifyTarget::Module(Name::new("МойОбщийМодуль"))
+        );
     }
 
     #[test]

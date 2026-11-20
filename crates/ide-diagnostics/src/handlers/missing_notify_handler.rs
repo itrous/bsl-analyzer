@@ -39,12 +39,18 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
+    // A form borrowed by an extension also exposes the base form's module, which is not
+    // in this file's symbol tree: absence here proves nothing about a local handler.
+    // Same stance as `missing_form_event_handler`.
+    let local_unprovable = ctx.module_metadata().form.as_deref().is_some_and(|f| f.has_base_form());
+
     let mut diagnostics = Vec::new();
     for reg in &summary.notify_regs {
         if reg.callback_name.as_str().is_empty() {
             continue;
         }
         let verdict = match &reg.target {
+            NotifyTarget::ThisObject if local_unprovable => None,
             NotifyTarget::ThisObject => {
                 local_verdict(ctx, &reg.callback_name).map(|v| (v, reg.callback_name.to_string()))
             }
@@ -293,5 +299,157 @@ mod tests {
             diagnostics.is_empty(),
             "absence in a module the analysis cannot see is not provable: {diagnostics:#?}"
         );
+    }
+
+    #[test]
+    fn a_handler_registered_through_callback_description_is_reported_like_the_old_name() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый CallbackDescription(\"НетТакогоОбработчика\", ЭтотОбъект);
+КонецПроцедуры
+";
+        let diagnostics = run_local(source);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "Создайте экспортную процедуру \"НетТакогоОбработчика\" или исправьте имя обработчика оповещения"
+        );
+    }
+
+    /// Control for the case above: the same registration with an exported handler.
+    #[test]
+    fn an_exported_handler_registered_through_callback_description_is_silent() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый CallbackDescription(\"Готово\", ЭтотОбъект);
+КонецПроцедуры
+
+Процедура Готово(Результат, Параметры) Экспорт
+КонецПроцедуры
+";
+        let diagnostics = run_local(source);
+        assert!(diagnostics.is_empty(), "an exported handler must pass: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_parameter_named_like_this_form_is_not_the_form() {
+        let source = "Процедура Тест(ЭтаФорма)
+	Оповещение = Новый ОписаниеОповещения(\"НетТакогоОбработчика\", ЭтаФорма);
+КонецПроцедуры
+";
+        let diagnostics = run_local(source);
+        assert!(diagnostics.is_empty(), "the receiver is a parameter: {diagnostics:#?}");
+    }
+
+    /// Control for the case above: without the parameter `ЭтаФорма` is the form.
+    #[test]
+    fn this_form_without_a_shadowing_parameter_is_still_checked() {
+        let source = "Процедура Тест()
+	Оповещение = Новый ОписаниеОповещения(\"НетТакогоОбработчика\", ЭтаФорма);
+КонецПроцедуры
+";
+        let diagnostics = run_local(source);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_local_variable_named_like_a_common_module_is_not_the_module() {
+        let source = "Процедура ПередЗакрытием()
+	МойМодульКлиент = Новый Структура;
+	Оповещение = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);
+КонецПроцедуры
+";
+        let diagnostics = with_module(
+            source,
+            "Процедура Другая(Результат, Параметры) Экспорт
+КонецПроцедуры
+",
+        );
+        assert!(diagnostics.is_empty(), "the receiver is a local: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_parameter_named_like_a_common_module_is_not_the_module() {
+        let source = "Процедура Тест(МойМодульКлиент)
+	Оповещение = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);
+КонецПроцедуры
+";
+        let diagnostics = with_module(
+            source,
+            "Процедура Другая(Результат, Параметры) Экспорт
+КонецПроцедуры
+",
+        );
+        assert!(diagnostics.is_empty(), "the receiver is a parameter: {diagnostics:#?}");
+    }
+
+    const BASE_FORM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20">
+    <Events/>
+    <BaseForm version="2.17">
+        <Events/>
+    </BaseForm>
+</Form>"#;
+
+    const PLAIN_FORM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20">
+    <Events/>
+</Form>"#;
+
+    fn run_with_form_xml(
+        source: &str,
+        form_xml: &str,
+        fixture: test_fixture::CfeFixture,
+    ) -> Vec<Diagnostic> {
+        crate::test_utils::check_cfe_at_with_unreadable_config_and_setup(
+            CALLER,
+            source,
+            fixture,
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                let path = fixture.root().join("CommonForms/Форма1/Ext/Form.xml");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, form_xml).unwrap();
+            },
+            check,
+        )
+    }
+
+    /// A handler exported in the BASE form's module is not in this file's tree.
+    #[test]
+    fn a_local_handler_of_a_form_with_a_base_form_is_not_judged() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый ОписаниеОповещения(\"ЕстьВБазовойФорме\", ЭтотОбъект);
+КонецПроцедуры
+";
+        let diagnostics =
+            run_with_form_xml(source, BASE_FORM_XML, CfeFixtureBuilder::new("").build());
+        assert!(diagnostics.is_empty(), "the base form's module is unseen: {diagnostics:#?}");
+    }
+
+    /// Control for the case above: the same form without `<BaseForm>`.
+    #[test]
+    fn a_local_handler_of_a_form_without_a_base_form_is_still_judged() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый ОписаниеОповещения(\"ЕстьВБазовойФорме\", ЭтотОбъект);
+КонецПроцедуры
+";
+        let diagnostics =
+            run_with_form_xml(source, PLAIN_FORM_XML, CfeFixtureBuilder::new("").build());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    }
+
+    /// The common-module verdict does not depend on this file's tree.
+    #[test]
+    fn a_common_module_handler_is_still_judged_in_a_form_with_a_base_form() {
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_base_module(
+            "МойМодульКлиент",
+            "Процедура Готово(Результат, Параметры)
+КонецПроцедуры
+",
+        );
+        let diagnostics = run_with_form_xml(module_source(), BASE_FORM_XML, builder.build());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.starts_with("Добавьте \"Экспорт\""), "{diagnostics:#?}");
     }
 }

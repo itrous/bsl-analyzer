@@ -824,11 +824,17 @@ EndProcedure"#,
     ),
     (
         DiagnosticCode::MissingNotifyHandler,
+        // Two registrations on each side: the English side spells the type both ways the
+        // platform accepts (`NotifyDescription`, `CallbackDescription`), so a missed spelling
+        // shows as one finding against two. The handler name is the same Latin string on both
+        // sides because the message quotes it.
         r#"Процедура Тест()
-    Оповещение = Новый ОписаниеОповещения("Обработчик", ЭтотОбъект);
+    Оповещение = Новый ОписаниеОповещения("Handler", ЭтотОбъект);
+    Второе = Новый ОписаниеОповещения("Handler", ЭтотОбъект);
 КонецПроцедуры"#,
         r#"Procedure Test()
     Notification = New NotifyDescription("Handler", ThisObject);
+    Second = New CallbackDescription("Handler", ThisObject);
 EndProcedure"#,
     ),
 ];
