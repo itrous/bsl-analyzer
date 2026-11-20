@@ -107,7 +107,7 @@ fn module_verdict(ctx: &DiagnosticsContext, module_name: &Name, name: &Name) -> 
     ctx.resolve_common_module(module_name.as_str())?;
 
     let bodies = ctx.common_module_bodies(module_name.as_str());
-    if bodies.is_empty() {
+    if bodies.is_empty() || bodies.has_missing_expected_body() {
         return None;
     }
 
@@ -293,5 +293,57 @@ mod tests {
             diagnostics.is_empty(),
             "absence in a module the analysis cannot see is not provable: {diagnostics:#?}"
         );
+    }
+
+    #[test]
+    fn an_unmapped_module_body_prevents_a_verdict() {
+        use crate::test_utils::check_cfe_at_with_db;
+
+        fn run_with_body(base_body: &str, missing_extension_body: bool) -> Vec<Diagnostic> {
+            let mut builder = CfeFixtureBuilder::new("");
+            builder.add_base_module("МойМодульКлиент", base_body).add_extension("Расш", "");
+            check_cfe_at_with_db(
+                CALLER,
+                module_source(),
+                builder.build(),
+                &[],
+                crate::DiagnosticsConfig::all_enabled(),
+                |fixture| {
+                    if missing_extension_body {
+                        let ext_modules = fixture.extensions()[0].root().join("CommonModules");
+                        std::fs::create_dir_all(&ext_modules).unwrap();
+                        std::fs::copy(
+                            fixture.root().join("CommonModules/МойМодульКлиент.xml"),
+                            ext_modules.join("МойМодульКлиент.xml"),
+                        )
+                        .unwrap();
+                        let body_dir = ext_modules.join("МойМодульКлиент/Ext");
+                        std::fs::create_dir_all(&body_dir).unwrap();
+                        std::fs::write(
+                            body_dir.join("Module.bsl"),
+                            "Процедура Готово() Экспорт\nКонецПроцедуры\n",
+                        )
+                        .unwrap();
+                    }
+                },
+                |_, ctx| {
+                    let bodies = ctx.common_module_bodies("МойМодульКлиент");
+                    assert!(!bodies.is_empty());
+                    assert_eq!(bodies.has_missing_expected_body(), missing_extension_body);
+                    check(ctx)
+                },
+            )
+        }
+
+        for body in
+            ["Процедура Другая() Экспорт\nКонецПроцедуры\n", "Процедура Готово()\nКонецПроцедуры\n"]
+        {
+            assert_eq!(run_with_body(body, false).len(), 1);
+            let diagnostics = run_with_body(body, true);
+            assert!(
+                diagnostics.is_empty(),
+                "an unmapped body may define the handler: {diagnostics:#?}"
+            );
+        }
     }
 }
