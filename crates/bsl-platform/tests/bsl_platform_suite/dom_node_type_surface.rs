@@ -1,6 +1,6 @@
 use bsl_platform::{
-    PlatformData, PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
-    PlatformSnapshot,
+    MemberSurface, PlatformData, PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest,
+    PlatformHelpSourceKind, PlatformSnapshot,
 };
 use serde_json::Value;
 
@@ -31,14 +31,15 @@ fn served(version: Option<&str>, edit: impl FnOnce(&mut Value)) -> PlatformData 
 fn dom_surface_requires_the_attested_release_and_complete_value_set() {
     let data = served(Some("8.3.27"), |_| {});
     for name in ["DOMNodeType", "ТипУзлаDOM", "domnodetype"] {
-        assert!(data.platform_type_member_surface_verified(name), "{name}");
+        assert!(data.platform_type_member_surface_verified(name, MemberSurface::Fields), "{name}");
     }
     assert_eq!(data.get_type_properties("DOMNodeType").len(), 13);
     assert!(data.get_type_methods("DOMNodeType").is_empty());
     assert!(data.get_property("DOMNodeType", "Element").is_some());
     assert!(data.get_property("DOMNodeType", "УзелЭлемента").is_none());
     for version in [None, Some("8.3.26"), Some("unknown")] {
-        assert!(!served(version, |_| {}).platform_type_member_surface_verified("DOMNodeType"));
+        assert!(!served(version, |_| {})
+            .platform_type_member_surface_verified("DOMNodeType", MemberSurface::Fields));
     }
 }
 
@@ -48,8 +49,8 @@ fn a_truncated_dom_surface_cannot_prove_a_missing_value() {
         corpus["properties"].as_array_mut().unwrap().retain(|property| property["id"] != 2474);
     });
     assert_eq!(data.get_type_properties("DOMNodeType").len(), 12);
-    assert!(!data.platform_type_member_surface_verified("DOMNodeType"));
-    assert!(data.platform_type_member_surface_verified("QuestionDialogMode"));
+    assert!(!data.platform_type_member_surface_verified("DOMNodeType", MemberSurface::Fields));
+    assert!(data.platform_type_member_surface_verified("QuestionDialogMode", MemberSurface::Fields));
 }
 
 #[test]
@@ -65,7 +66,7 @@ fn replacing_a_dom_value_is_not_the_attested_surface_even_at_the_same_size() {
         value["english_name"] = Value::String("OtherElement".to_owned());
     });
     assert_eq!(data.get_type_properties("DOMNodeType").len(), 13);
-    assert!(!data.platform_type_member_surface_verified("DOMNodeType"));
+    assert!(!data.platform_type_member_surface_verified("DOMNodeType", MemberSurface::Fields));
 }
 
 #[test]
@@ -77,9 +78,9 @@ fn a_namesake_does_not_borrow_the_dom_surface() {
             .push(serde_json::json!({"name":"ТипУзлаDOM","english_name":"OtherOwner"}));
     });
     assert!(data.is_ambiguous_type_name("ТипУзлаDOM"));
-    assert!(!data.platform_type_member_surface_verified("ТипУзлаDOM"));
-    assert!(!data.platform_type_member_surface_verified("OtherOwner"));
-    assert!(data.platform_type_member_surface_verified("DOMNodeType"));
+    assert!(!data.platform_type_member_surface_verified("ТипУзлаDOM", MemberSurface::Fields));
+    assert!(!data.platform_type_member_surface_verified("OtherOwner", MemberSurface::Fields));
+    assert!(data.platform_type_member_surface_verified("DOMNodeType", MemberSurface::Fields));
 }
 
 #[test]
@@ -128,5 +129,5 @@ fn the_attested_dom_members_are_the_pinned_corpus_surface() {
             (2480, "ПространствоИменXPath", "XPathNamespace"),
         ]
     );
-    assert!(data.platform_type_member_surface_verified("DOMNodeType"));
+    assert!(data.platform_type_member_surface_verified("DOMNodeType", MemberSurface::Fields));
 }

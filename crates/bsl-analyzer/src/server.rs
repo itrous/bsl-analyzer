@@ -6180,6 +6180,18 @@ mod tests {
             "subdirectory exclusion must not rely on a root-list change"
         );
         assert!(!request_origin_matches(&state, &excluded_origin));
+        // Every entry point must explain an excluded document with the same text and name both
+        // configuration keys.
+        let synchronous = state.vfs_file_for_url(&excluded_uri).expect_err("an excluded document");
+        assert_eq!(
+            synchronous.to_string(),
+            crate::excluded_document::excluded_from_project(&excluded_uri).to_string(),
+            "a synchronous request must give the shared excluded-document wording"
+        );
+        assert!(
+            synchronous.to_string().contains("[source].exclude or [source].exclude_globs"),
+            "{synchronous}"
+        );
         let excluded_id = lsp_server::RequestId::from(606);
         let excluded_key = crate::global_state::RequestAttemptKey {
             id: excluded_id.clone(),
@@ -6650,7 +6662,8 @@ mod tests {
         let hidden_xml = hidden_dir.join("Hidden.xml");
         let allowed_bsl = dir.path().join("Allowed.bsl");
         let allowed_xml = dir.path().join("Allowed.xml");
-        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+        state.source_exclusions =
+            std::sync::Arc::new(project_model::ExcludedPaths::new([hidden_dir]));
         let abs = |path: std::path::PathBuf| paths::AbsPathBuf::assert_utf8(path);
 
         handle_loader_msg(
@@ -6713,7 +6726,8 @@ mod tests {
             .expect("positive control: an allowed file starts cache warming");
         allowed_token.cancel();
 
-        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+        state.source_exclusions =
+            std::sync::Arc::new(project_model::ExcludedPaths::new([hidden_dir]));
         handle_task(&mut state, Task::PreloadExternalFiles { files: vec![hidden_id] }).unwrap();
 
         assert!(
@@ -8702,9 +8716,9 @@ mod tests {
         );
     }
 
-    /// Only `UnusedLocalMethod` and `UnusedParameters` read the fold. The inputs switch them
-    /// off through each setting that can, and keep one of them on through each, so a gate
-    /// that always primes and one that never does both fail.
+    /// Only `UnusedLocalMethod`, `UnusedParameters` and `UnboundFormEventHandler` read the
+    /// fold. The inputs switch them off through each setting that can, and keep one of them
+    /// on through each, so a gate that always primes and one that never does both fail.
     #[test]
     fn priming_runs_while_a_rule_that_reads_the_fold_can_run() {
         let strings = |codes: &[&str]| codes.iter().map(|c| c.to_string()).collect::<Vec<_>>();
@@ -8712,9 +8726,16 @@ mod tests {
         let cases: &[Case] = &[
             ("by default", &[], None, true),
             ("one disabled", &["UnusedLocalMethod"], None, true),
-            ("the other disabled", &["UnusedParameters"], None, true),
-            ("both disabled", &["UnusedLocalMethod", "UnusedParameters"], None, false),
+            ("another disabled", &["UnusedParameters"], None, true),
+            ("only the form rule on", &["UnusedLocalMethod", "UnusedParameters"], None, true),
+            (
+                "all disabled",
+                &["UnusedLocalMethod", "UnusedParameters", "UnboundFormEventHandler"],
+                None,
+                false,
+            ),
             ("restricted to a reader", &[], Some(&["UnusedParameters"]), true),
+            ("restricted to the form rule", &[], Some(&["UnboundFormEventHandler"]), true),
             ("restricted to another rule", &[], Some(&["LineLength"]), false),
         ];
         for &(name, disabled, only, primes) in cases {
@@ -8731,14 +8752,17 @@ mod tests {
         }
     }
 
-    /// The load's end skips the priming while both readers are off, so the reload that
+    /// The load's end skips the priming while every reader is off, so the reload that
     /// switches one on is what asks for it. A reload that leaves the readers as they were,
     /// and one during the load, whose end primes anyway, do not.
     #[test]
     fn a_reload_that_switches_a_reader_on_primes_the_fold() {
         let readers_off = |state: &mut crate::global_state::GlobalState| {
-            state.diagnostics_config.disabled =
-                vec!["UnusedLocalMethod".to_owned(), "UnusedParameters".to_owned()];
+            state.diagnostics_config.disabled = vec![
+                "UnusedLocalMethod".to_owned(),
+                "UnusedParameters".to_owned(),
+                "UnboundFormEventHandler".to_owned(),
+            ];
         };
 
         let mut state = state_with_a_source_root();

@@ -206,6 +206,24 @@ impl<'a> AnalysisContext<'a> {
         self.provider.kernel_type_includes_undefined(id)
     }
 
+    pub fn kernel_type_is_structure(&self, id: hir::TypeId) -> bool {
+        self.provider.kernel_type_is_structure(id)
+    }
+
+    pub fn kernel_type_is_fixed_structure(&self, id: hir::TypeId) -> bool {
+        self.provider.kernel_type_is_fixed_structure(id)
+    }
+    pub fn kernel_type_is_form_data_structure(&self, id: hir::TypeId) -> bool {
+        self.provider.kernel_type_is_form_data_structure(id)
+    }
+    pub fn kernel_type_is_boolean(&self, id: hir::TypeId) -> bool {
+        self.provider.kernel_type_is_boolean(id)
+    }
+
+    pub fn kernel_type_is_metadata_reference(&self, id: hir::TypeId) -> bool {
+        self.provider.kernel_type_is_metadata_reference(id)
+    }
+
     /// The project's minimum platform release, parsed; `None` when unset or not a
     /// version.
     pub fn min_platform_version(&self) -> Option<bsl_platform::PlatformVersion> {
@@ -384,7 +402,8 @@ impl<'a> AnalysisContext<'a> {
 
     /// Handler names some module of this file's source root binds by string to
     /// another module's object - `Форма.ПодключитьОбработчикОжидания("Имя", …)` in a
-    /// helper handed the form.
+    /// helper handed the form. Only the rules of [`FOREIGN_HANDLER_BINDINGS_READERS`]
+    /// read it.
     pub fn workspace_foreign_handler_bindings(&self) -> Arc<hir::ForeignHandlerBindings> {
         let source_root_id = self.source_root_id();
         self.query(|p| p.workspace_foreign_handler_bindings(source_root_id))
@@ -558,3 +577,12 @@ impl<'a> AnalysisContext<'a> {
         self.config.is_disabled(code)
     }
 }
+
+/// Rules that read [`DiagnosticsContext::workspace_foreign_handler_bindings`]. The fold scans
+/// every file of the source root, so a host builds it ahead of the first form module
+/// whenever one of these rules can run; a rule that reads the fold belongs here.
+pub const FOREIGN_HANDLER_BINDINGS_READERS: &[crate::DiagnosticCode] = &[
+    crate::DiagnosticCode::UnusedLocalMethod,
+    crate::DiagnosticCode::UnusedParameters,
+    crate::DiagnosticCode::UnboundFormEventHandler,
+];

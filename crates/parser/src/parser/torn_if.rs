@@ -15,7 +15,9 @@
 //! lines and the other branches as opaque parts. What decides which group is
 //! which, and which branch is read, is computed here once for the whole input.
 
+use crate::parser::block_words::{block_word, is_name_after, Block, BlockWord};
 use crate::parser::input::Sig;
+use crate::parser::MAX_NESTING_DEPTH;
 
 /// A closed group, by positions among significant tokens.
 #[derive(Debug, Clone, Copy)]
@@ -86,7 +88,7 @@ pub(crate) fn conditionals(kind: impl Fn(usize) -> Option<Sig>) -> Vec<Condition
         let active = branches.iter().find(|branch| branch.holds).map(|branch| branch.body);
         let balanced = branches.iter().all(|branch| {
             let mut blocks = Vec::new();
-            let whole = walk(&kind, branch.body, &mut blocks, &decided, &by_open);
+            let whole = walk(&kind, branch.body, &mut blocks, &decided, &by_open, 0);
             whole && blocks.is_empty()
         });
         by_open.insert(start, decided.len());
@@ -109,7 +111,7 @@ pub(crate) fn whole(kind: impl Fn(usize) -> Option<Sig>, groups: &[Conditional])
         end += 1;
     }
     let mut blocks = Vec::new();
-    walk(&kind, (0, end), &mut blocks, groups, &by_open) && blocks.is_empty()
+    walk(&kind, (0, end), &mut blocks, groups, &by_open, 0) && blocks.is_empty()
 }
 
 /// The branches of a group, or `None` when a header has no `Тогда`.
@@ -128,7 +130,7 @@ fn branches(
             continue;
         }
         let then = (directive + 1..end).find(|&at| kind(at) == Some(T![KwThen]))?;
-        let holds = Condition { kind, at: directive + 1, end: then }.holds();
+        let holds = Condition { kind, at: directive + 1, end: then, depth: 0 }.holds();
         branches.push(Branch { body: (then + 1, end), holds });
     }
     Some(branches)
@@ -141,10 +143,15 @@ fn branches(
 /// groups with one condition is put together from halves that belong
 /// together. Taking every symbol as defined is the assignment that needs no
 /// list of symbols.
+///
+/// A condition nested deeper than the parser descends is taken as holding
+/// whatever follows: the parser reports it, and the choice only has to be
+/// the same every time.
 struct Condition<'k, K> {
     kind: &'k K,
     at: usize,
     end: usize,
+    depth: u32,
 }
 
 impl<K: Fn(usize) -> Option<Sig>> Condition<'_, K> {
@@ -181,6 +188,17 @@ impl<K: Fn(usize) -> Option<Sig>> Condition<'_, K> {
     }
 
     fn operand(&mut self) -> bool {
+        if self.depth >= MAX_NESTING_DEPTH {
+            self.at = self.end;
+            return true;
+        }
+        self.depth += 1;
+        let value = self.nested_operand();
+        self.depth -= 1;
+        value
+    }
+
+    fn nested_operand(&mut self) -> bool {
         match self.peek() {
             Some(T![KwNot]) => {
                 self.at += 1;
@@ -203,15 +221,6 @@ impl<K: Fn(usize) -> Option<Sig>> Condition<'_, K> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Block {
-    If,
-    Loop,
-    Try,
-    Procedure,
-    Function,
-}
-
 /// Walks code from `range.0` to `range.1`, keeping the constructs it opens on
 /// `blocks`. Returns `false` when the code closes or continues a construct it
 /// did not open.
@@ -224,13 +233,20 @@ enum Block {
 ///
 /// An annotation counts as opening the declaration it belongs to: a range
 /// that ends between the two gives one declaration a header per branch.
+///
+/// Torn groups nested deeper than the parser descends are not followed and
+/// count as tearing: the parser reports the depth there anyway.
 fn walk(
     kind: &impl Fn(usize) -> Option<Sig>,
     range: (usize, usize),
     blocks: &mut Vec<Block>,
     decided: &[Conditional],
     by_open: &std::collections::HashMap<usize, usize>,
+    depth: u32,
 ) -> bool {
+    if depth >= MAX_NESTING_DEPTH {
+        return false;
+    }
     let mut whole = true;
     let mut annotated = false;
     let mut brackets: i32 = 0;
@@ -241,7 +257,7 @@ fn walk(
             if let Some(group) = by_open.get(&at).map(|&index| decided[index]) {
                 if !group.balanced {
                     if let Some(branch) = group.active {
-                        whole &= walk(kind, branch, blocks, decided, by_open);
+                        whole &= walk(kind, branch, blocks, decided, by_open, depth + 1);
                     }
                 }
                 at = group.close + 1;
@@ -263,31 +279,8 @@ fn walk(
             at += 1;
             continue;
         }
-        // A keyword behind a dot is a member name and one behind a tilde a
-        // label (`~КонецЦикла:`), not the word of a construct.
-        let name = at > 0 && matches!(kind(at - 1), Some(T![Dot] | T![Tilde]));
-        if !name {
-            let opens = match k {
-                T![KwIf] => Some(Block::If),
-                T![KwWhile] | T![KwFor] => Some(Block::Loop),
-                T![KwTry] => Some(Block::Try),
-                T![KwProcedure] => Some(Block::Procedure),
-                T![KwFunction] => Some(Block::Function),
-                _ => None,
-            };
-            let closes = match k {
-                T![KwEndIf] => Some(Block::If),
-                T![KwEndDo] => Some(Block::Loop),
-                T![KwEndTry] => Some(Block::Try),
-                T![KwEndProcedure] => Some(Block::Procedure),
-                T![KwEndFunction] => Some(Block::Function),
-                _ => None,
-            };
-            let continues = match k {
-                T![KwElsIf] | T![KwElse] => Some(Block::If),
-                T![KwExcept] => Some(Block::Try),
-                _ => None,
-            };
+        let previous = at.checked_sub(1).and_then(kind);
+        if !is_name_after(previous) {
             if matches!(
                 k,
                 T![AnnAtClient]
@@ -305,18 +298,17 @@ fn walk(
             } else if matches!(k, T![KwProcedure] | T![KwFunction] | T![KwVar]) {
                 annotated = false;
             }
-            if let Some(block) = opens {
-                blocks.push(block);
-            } else if let Some(block) = closes {
-                if blocks.last() == Some(&block) {
-                    blocks.pop();
-                } else {
-                    whole = false;
+            match block_word(k, previous) {
+                Some(BlockWord::Opens(block)) => blocks.push(block),
+                Some(BlockWord::Closes(block)) => {
+                    if blocks.last() == Some(&block) {
+                        blocks.pop();
+                    } else {
+                        whole = false;
+                    }
                 }
-            } else if let Some(block) = continues {
-                if blocks.last() != Some(&block) {
-                    whole = false;
-                }
+                Some(BlockWord::Continues(block)) if blocks.last() != Some(&block) => whole = false,
+                Some(BlockWord::Continues(_)) | None => {}
             }
         }
         at += 1;

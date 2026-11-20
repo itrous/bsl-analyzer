@@ -289,6 +289,56 @@ mod tests {
         assert_ne!(renumbered.as_array().unwrap()[0]["fingerprint"], third);
     }
 
+    /// Code Quality reads the occurrence the classification gave a survivor. In the
+    /// counterexample c keeps occurrence 2 after a scope dropped a and the baseline hid b,
+    /// and after one more retain of the survivors it still pairs with its own snippet; its
+    /// fingerprint is the one the full input gives the third finding. Numbering the
+    /// survivors from zero after the retain would hand c the fingerprint of a.
+    #[test]
+    fn finality_existing_baseline_and_reporter_identity() {
+        let snippet = "А = А;";
+        let render = |analysis: FileAnalysis| {
+            let results = AnalysisResults {
+                files_analyzed: 1,
+                files_with_issues: 1,
+                total_diagnostics: analysis.diagnostics.len(),
+                elapsed_secs: 0.0,
+                diagnostics: vec![analysis],
+                source_dir: PathBuf::from("."),
+                workspace_dir: PathBuf::from("."),
+                baseline: ide::diagnostics_baseline::DiagnosticsBaselineSummary::disabled(),
+            };
+            serde_json::to_value(CodeQualitySeq { results: &results }).unwrap()
+        };
+        let file = |lines: &[usize], occurrences: Vec<u32>| FileAnalysis {
+            path: PathBuf::from("module.bsl"),
+            relative_path: PathBuf::from("module.bsl"),
+            diagnostics: lines.iter().map(|line| diag_at("SelfAssign", "Warning", *line)).collect(),
+            line_snippets: lines.iter().map(|_| snippet.to_owned()).collect(),
+            occurrences,
+        };
+
+        let full = render(file(&[1, 2, 3], vec![0, 1, 2]));
+        let c = full.as_array().unwrap()[2]["fingerprint"].clone();
+        let a = full.as_array().unwrap()[0]["fingerprint"].clone();
+
+        // b and c survived the scope and the baseline with their classified numbers; a
+        // later retain drops b.
+        let mut survivors = file(&[2, 3], vec![1, 2]);
+        survivors.retain_findings(|index| index == 1);
+        assert_eq!(survivors.diagnostics[0].start_line, 3);
+        assert_eq!((survivors.line_snippets.len(), survivors.occurrences.clone()), (1, vec![2]));
+        let shown = render(survivors);
+        assert_eq!(shown.as_array().unwrap()[0]["fingerprint"], c, "c keeps its fingerprint");
+
+        let renumbered = render(file(&[3], vec![0]));
+        assert_eq!(
+            renumbered.as_array().unwrap()[0]["fingerprint"],
+            a,
+            "control: numbering from zero after the retain gives c the fingerprint of a"
+        );
+    }
+
     #[test]
     fn emits_codeclimate_entries_with_expected_shape() {
         let temp = TempDir::new().unwrap();

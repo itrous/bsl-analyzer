@@ -1,6 +1,9 @@
 use crate::graph::ControlFlowGraph;
 use petgraph::visit::EdgeRef;
 
+/// Counts the decisions of the text: an edge saying only that a protected
+/// point may fail adds no path of its own, and a loop's entry adds a vertex
+/// and its single edge, which cancel.
 pub fn cyclomatic_complexity(cfg: &ControlFlowGraph) -> u32 {
     let Some(start) = cfg.start() else {
         return 1;
@@ -30,6 +33,9 @@ pub fn cyclomatic_complexity(cfg: &ControlFlowGraph) -> u32 {
                 continue;
             }
             if !reachable.contains(&edge.target()) {
+                continue;
+            }
+            if cfg.is_possible_failure(node, *edge.weight()) {
                 continue;
             }
             edge_count += 1;

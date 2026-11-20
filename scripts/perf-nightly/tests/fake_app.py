@@ -32,6 +32,9 @@ Every LSP didOpen and didClose is appended as `{"method", "uri"}` to FAKE_LOG/do
        sweep_other_count   the same codes, one of them counted 8 times instead of 7
        refs_tool           `references` is listed only when the server got `--enable-tool references`
        cand_crash          the server exits right after it answered `initialize`
+       daemon_log          the server writes the graph build marks (`done`, `validation`, `published`) of a
+                           finished build into the log that `BSL_MCP_DAEMON_LOG` names
+       daemon_log_no_validation  the same without the `validation` mark
 Every MCP tool call is appended as `{"name", "arguments"}` to FAKE_LOG/tools.jsonl.
 """
 
@@ -348,8 +351,26 @@ def silence_once() -> bool:
         return False
 
 
+DAEMON_LOG = (
+    "2026-11-08T10:25:46.246818537+03:00  INFO log session started pid=1\n"
+    "2026-11-08T10:27:20.000000001+03:00  INFO graph build: index batch 2/71 (first: /x/Module.bsl)\n"
+    "2026-11-08T10:27:21.345590215+03:00  INFO graph build: done elapsed_ms=90717\n"
+    "2026-11-08T10:28:08.815278827+03:00  INFO graph build: validation elapsed_ms=138186\n"
+    "2026-11-08T10:28:13.403670511+03:00  INFO graph build: published elapsed_ms=142775\n")
+
+
+def write_daemon_log() -> None:
+    marks = DAEMON_LOG.splitlines(keepends=True)
+    if "daemon_log_no_validation" in MODE:
+        marks = [line for line in marks if "validation" not in line]
+    with open(os.environ["BSL_MCP_DAEMON_LOG"], "a", encoding="utf-8") as fh:
+        fh.writelines(marks)
+
+
 def mcp(argv) -> int:
     out = sys.stdout
+    if MODE & {"daemon_log", "daemon_log_no_validation"}:
+        write_daemon_log()
     references = "--enable-tool" in argv and argv[argv.index("--enable-tool") + 1] == "references"
     calls = 0
     if "help_warn_mcp" in MODE:

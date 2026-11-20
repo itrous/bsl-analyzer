@@ -29,16 +29,17 @@ fn try_except_fallthrough_merges_try_and_except_exits() {
               ENTRY:EMPTY:0
               EXIT:EMPTY:3
               NORMAL:CALL_STMT:2:#1f799033
+              NORMAL:CALL_STMT:2:#3fdcb577
               NORMAL:CALL_STMT:2:#750007e2
-              NORMAL:CALL_STMT:2:#b9d7f32e
               NORMAL:TRY_STMT:1
             edges:
               ENTRY:EMPTY:0 -> NORMAL:TRY_STMT:1 [Unconditional]
               NORMAL:CALL_STMT:2:#1f799033 -> EXIT:EMPTY:3 [Unconditional]
+              NORMAL:CALL_STMT:2:#3fdcb577 -> NORMAL:CALL_STMT:2:#1f799033 [Unconditional]
               NORMAL:CALL_STMT:2:#750007e2 -> NORMAL:CALL_STMT:2:#1f799033 [Unconditional]
-              NORMAL:CALL_STMT:2:#b9d7f32e -> NORMAL:CALL_STMT:2:#1f799033 [Unconditional]
+              NORMAL:CALL_STMT:2:#750007e2 -> NORMAL:CALL_STMT:2:#3fdcb577 [Exception]
+              NORMAL:TRY_STMT:1 -> NORMAL:CALL_STMT:2:#3fdcb577 [Exception]
               NORMAL:TRY_STMT:1 -> NORMAL:CALL_STMT:2:#750007e2 [Unconditional]
-              NORMAL:TRY_STMT:1 -> NORMAL:CALL_STMT:2:#b9d7f32e [Exception]
         "#]],
     );
 }
@@ -81,6 +82,7 @@ fn nested_try_routes_raise_to_nearest_except() {
             edges:
               ENTRY:EMPTY:0 -> NORMAL:TRY_STMT:1 [Unconditional]
               NORMAL:CALL_STMT:2 -> NORMAL:EMPTY:2:#abe4a1ce [Unconditional]
+              NORMAL:CALL_STMT:4 -> NORMAL:CALL_STMT:2 [Exception]
               NORMAL:CALL_STMT:4 -> NORMAL:RAISE_STMT:4:#dfa84cce [Unconditional]
               NORMAL:CALL_STMT:5 -> NORMAL:RAISE_STMT:4:#dfa84cce [Unexecutable]
               NORMAL:EMPTY:2:#750007e2 -> NORMAL:TRY_STMT:3 [Unconditional]

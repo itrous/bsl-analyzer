@@ -149,14 +149,15 @@ async fn rooted_symbol_info(
 }
 
 async fn wait_mcp_target(client: &Client, source_path: &Path) -> Value {
-    let provider_a_root_id = Path::new("extensions").join("provider-a");
+    // The answer carries the root id as stored, `/`-spelled on every host.
+    let provider_a_root_id = "extensions/provider-a";
     let card = symbol_info(client, source_path, "ДатьСтроку").await;
     assert_eq!(card["status"], "ok", "provider A symbol resolves: {card}");
     assert_eq!(card["return_type"], "Строка", "provider A semantic type: {card}");
     let definitions = card["definitions"].as_array().expect("definition list");
     assert!(
         definitions.iter().any(|definition| {
-            definition["location"]["root_id"] == provider_a_root_id.to_string_lossy().as_ref()
+            definition["location"]["root_id"] == provider_a_root_id
                 && definition["location"]["path"] == "CommonModules/Общий/Ext/Module.bsl"
         }),
         "provider A resolves through the expected source root and path: {card}"
@@ -565,10 +566,12 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
         "&НаСервере\nФункция ДатьСтроку() Экспорт\n    Возврат \"excluded base\";\nКонецФункции\n",
     )
     .expect("create an excluded base copy with the provider's relative path");
-    let excluded_config = CONFIG.replace(
-        "[source]\nroot = \"base\"\n",
-        "[source]\nroot = \"base\"\nexclude = [\"base/CommonModules/Общий\"]\n",
-    );
+    // The needle must not span a line: CONFIG is the fixture's bytes as checked out, and on a
+    // checkout with core.autocrlf=true its newlines are CRLF, so an "\n" inside the needle
+    // matches nothing and the edit silently becomes no edit. The sibling test s6 writes the same
+    // exclusion with a single-line needle for the same reason.
+    let excluded_config = CONFIG
+        .replace("root = \"base\"", "root = \"base\"\nexclude = [\"base/CommonModules/Общий\"]");
     assert_ne!(excluded_config, CONFIG, "the exclusion was added to the project config");
     std::fs::write(&config_path, &excluded_config).expect("write explicit source exclusion");
 
@@ -617,8 +620,8 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
     assert!(
         excluded_definition["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("File not in frozen VFS snapshot")),
-        "excluded didOpen is retained only in the editor buffer, not the analyzed VFS: {excluded_definition}"
+            .is_some_and(|message| message.contains("excluded from the project")),
+        "excluded didOpen is retained only in the editor buffer, not the analyzed VFS, and the error says which of the two it is: {excluded_definition}"
     );
     assert_eq!(
         excluded_definition["error"]["code"],
@@ -672,7 +675,10 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
     let (client, task, state) = mcp_session(root.path(), cache).await;
 
     let provider_a_relative = Path::new("CommonModules/Общий/Ext/Module.bsl");
+    // Sent with the host separator on purpose: the server accepts either spelling and answers
+    // with the one the store uses.
     let provider_a_root_id = Path::new("extensions").join("provider-a");
+    let provider_a_stored_root_id = "extensions/provider-a";
     let active_provider = rooted_symbol_info(
         &client,
         provider_a_root_id.to_str().expect("UTF-8 fixture root id"),
@@ -686,7 +692,7 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
     assert!(
         active_provider["definitions"].as_array().is_some_and(|definitions| {
             definitions.iter().any(|definition| {
-                definition["location"]["root_id"] == provider_a_root_id.to_string_lossy().as_ref()
+                definition["location"]["root_id"] == provider_a_stored_root_id
                     && definition["location"]["path"] == provider_a_relative.to_string_lossy().as_ref()
             })
         }),

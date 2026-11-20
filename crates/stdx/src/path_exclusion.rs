@@ -574,10 +574,14 @@ fn push_unique(spellings: &mut Vec<PathBuf>, spelling: PathBuf) {
     }
 }
 
-/// `canonicalize` on Windows answers with a verbatim `\\?\C:\...` path, which no
-/// watcher event or walk entry is spelled with.
+/// `path` with a verbatim disk prefix rewritten as the ordinary spelling: `\\?\C:\x`
+/// becomes `C:\x`. `canonicalize` answers with the verbatim form on Windows, and no
+/// walk entry, watcher event or diff report is spelled that way, so the two sides of
+/// a comparison name the same file differently. Any other prefix is returned
+/// untouched — a UNC share among them, whose verbatim form names different
+/// components. Purely lexical: nothing is read from the file system.
 #[cfg(windows)]
-fn simplify_verbatim(path: PathBuf) -> PathBuf {
+pub fn simplify_verbatim(path: PathBuf) -> PathBuf {
     use std::path::Prefix;
     let mut components = path.components();
     match components.next() {
@@ -597,8 +601,9 @@ fn simplify_verbatim(path: PathBuf) -> PathBuf {
     }
 }
 
+/// Nothing to simplify off Windows: the verbatim prefix is a Windows spelling.
 #[cfg(not(windows))]
-fn simplify_verbatim(path: PathBuf) -> PathBuf {
+pub fn simplify_verbatim(path: PathBuf) -> PathBuf {
     path
 }
 

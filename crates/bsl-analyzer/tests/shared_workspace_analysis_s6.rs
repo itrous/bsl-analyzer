@@ -102,7 +102,6 @@ async fn wait_mcp_target(
     let (expected_root_id, expected_path_suffix) = expected_target
         .split_once("/CommonModules/")
         .expect("expected target includes source root and module path");
-    let expected_root_id = expected_root_id.split('/').collect::<PathBuf>();
     let expected_path = format!("CommonModules/{expected_path_suffix}");
     let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     loop {
@@ -119,8 +118,7 @@ async fn wait_mcp_target(
                 let definitions = card["definitions"].as_array().expect("definition list");
                 assert!(
                     definitions.iter().any(|definition| {
-                        definition["location"]["root_id"]
-                            == expected_root_id.to_string_lossy().as_ref()
+                        definition["location"]["root_id"] == expected_root_id
                             && definition["location"]["path"] == expected_path
                     }),
                     "active composition resolves {needle} into {expected_target}: {card}"

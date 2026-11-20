@@ -1,4 +1,5 @@
 pub mod arg_diagnostics;
+pub mod body_flow;
 pub mod builtin;
 mod call_binding;
 pub mod call_resolution;
@@ -15,6 +16,7 @@ pub mod infer;
 pub mod iteration_lookup;
 pub mod lower;
 pub mod manager_lookup;
+mod map_keys;
 pub mod metadata_path;
 pub mod metadata_symbol;
 pub mod method_declarations;
@@ -31,6 +33,7 @@ pub mod platform_manager_lookup;
 pub mod platform_property_lookup;
 pub mod platform_resolution;
 pub mod platform_type_name;
+mod possible_writes;
 pub mod proc_signature;
 pub mod proc_signature_lookup;
 pub mod query_in_loop;
@@ -44,7 +47,9 @@ pub mod this_object;
 pub mod this_object_attr;
 mod type_literal;
 mod user_call_candidates;
+pub mod value_origin;
 
+pub use body_flow::BodyFlow;
 pub use bsl_config::VisibleConfig;
 pub use call_resolution::{
     ArityFallback, BuiltinCallableId, CallCandidateSet, CallParam, CallParamMode, CallRejection,
@@ -70,10 +75,11 @@ pub use infer::{
     BodyInferenceResult, CallArgBinding, CandidateCallBinding, EnvCalleeKind, EnvMemberKind,
     ImplicitDatabaseReadKind, ImplicitLocalAssignment, ImplicitLocalInfo, InferOwnerResult,
     InferenceContext, InferenceDiagnostic, InferenceResult, ModuleCodeInferenceResult,
-    UninitializedPath, UnresolvedMethodKind,
+    RefPresentationCause, UninitializedPath, UnresolvedMethodKind,
 };
 pub use lower::TyLoweringContext;
 pub use manager_lookup::{lookup_manager_field, ManagerMemberInfo};
+pub use method_environment::owner_body_env;
 pub use method_lookup::{lookup_method, MethodInfo};
 pub use method_resolution::{resolve_qualified_call, MethodResolution};
 pub use module_implicit::module_implicit_fields;
@@ -82,7 +88,7 @@ pub use object_resolver::{
 };
 pub use platform_global_lookup::{
     bare_global_name_claim, manager_collection_env, resolve_platform_global_property_type,
-    BareGlobalClaim, BodyShadowScope,
+    unassignable_global_property, BareGlobalClaim, BodyShadowScope,
 };
 pub use platform_manager_lookup::{
     platform_methods_for_manager, platform_methods_for_metadata_kind,

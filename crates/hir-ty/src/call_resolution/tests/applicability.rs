@@ -13,6 +13,16 @@ fn applicability() {
     let array = db.array(None);
     let unknown = db.unknown();
     let any = db.any();
+    let description_name = "ОбъектМетаданных: Справочник".to_string();
+    let description = db.platform_object(description_name.clone());
+    let goods_description = db.described_platform_object(
+        description_name,
+        bsl_types::facet::DescribedObject::new(
+            bsl_metadata::MdoType::Catalog,
+            "Товары".to_string(),
+            bsl_types::facet::DescribedPart::Description,
+        ),
+    );
     let cases = [
         (
             "exact",
@@ -21,6 +31,16 @@ fn applicability() {
                 maximum: Some(1),
             }),
             vec![number],
+            vec![ArgumentApplicability::Exact],
+            ArityUsage { actual: 1, defaults_used: 0, variadic_arguments: 0 },
+        ),
+        (
+            "exact through the described object",
+            signature(&db, vec![positional("value", description, false)], AritySpec {
+                required: 1,
+                maximum: Some(1),
+            }),
+            vec![goods_description],
             vec![ArgumentApplicability::Exact],
             ArityUsage { actual: 1, defaults_used: 0, variadic_arguments: 0 },
         ),

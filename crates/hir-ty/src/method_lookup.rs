@@ -616,7 +616,7 @@ pub(crate) fn to_method_info(db: &dyn TypeKernelDb, method: &PlatformMethod) -> 
         .map(|ret| lower_return_type_string_typeid(db, ret))
         .unwrap_or_else(|| db.undefined());
 
-    let candidates = CallCandidateSet::from_platform_method(db, method, return_ty);
+    let candidates = CallCandidateSet::from_platform_method(db, method, return_ty, None);
     MethodInfo {
         return_ty,
         candidates,
@@ -644,7 +644,7 @@ pub(crate) fn build_tabular_section_method_info(
         })
         .unwrap_or_else(|| db.undefined());
 
-    let mut candidates = CallCandidateSet::from_platform_method(db, method, return_ty);
+    let mut candidates = CallCandidateSet::from_platform_method(db, method, return_ty, None);
     for candidate in candidates.signatures_mut() {
         candidate.return_ty = return_ty;
     }
@@ -835,6 +835,8 @@ mod tests {
                 param_type: param_type.map(Into::into),
                 is_optional: false,
                 is_variadic: false,
+                passing: None,
+                result_follows_argument_text: false,
             }],
             variants: Vec::new(),
             min_version: None,

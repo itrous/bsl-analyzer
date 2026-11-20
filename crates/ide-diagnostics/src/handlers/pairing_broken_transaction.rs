@@ -438,8 +438,9 @@ fn dfs_check_paths(
         }
 
         if let Some(except_n) = except_node {
-            let has_raise_edges =
-                ctx.cfg.incoming_edges(except_n).any(|(source, _)| source != node);
+            let has_raise_edges = ctx.cfg.incoming_edges(except_n).any(|(source, kind)| {
+                source != node && !ctx.cfg.is_possible_failure(source, *kind)
+            });
 
             if !has_raise_edges {
                 dfs_check_paths(except_n, state.clone(), visited_states, issues, ctx);
@@ -460,7 +461,7 @@ fn dfs_check_paths(
         let edges: Vec<_> = ctx
             .cfg
             .outgoing_edges(node)
-            .filter(|(_, edge_type)| !matches!(edge_type, CfgEdgeType::Unexecutable))
+            .filter(|(_, edge_type)| is_followed(ctx.cfg, node, **edge_type))
             .collect();
 
         for (succ, edge_type) in edges {
@@ -497,13 +498,19 @@ fn dfs_check_paths(
         let successors: Vec<_> = ctx
             .cfg
             .outgoing_edges(node)
-            .filter(|(_, edge_type)| !matches!(edge_type, CfgEdgeType::Unexecutable))
+            .filter(|(_, edge_type)| is_followed(ctx.cfg, node, **edge_type))
             .map(|(idx, _)| idx)
             .collect();
         for succ in successors {
             dfs_check_paths(succ, state.clone(), visited_states, issues, ctx);
         }
     }
+}
+
+/// The walk enters a handler from the entry of `Попытка` or from
+/// `ВызватьИсключение`, not from every protected point that may fail.
+fn is_followed(cfg: &ControlFlowGraph, node: NodeIndex, kind: CfgEdgeType) -> bool {
+    kind != CfgEdgeType::Unexecutable && !cfg.is_possible_failure(node, kind)
 }
 
 fn check_transaction_call(

@@ -155,11 +155,7 @@ fn is_guarded_dfs(
         }
     }
 
-    if !any_predecessor {
-        return false;
-    }
-
-    true
+    any_predecessor
 }
 
 fn condition_matches_guard(body: &Body, condition: ExprId, registry: &GuardRegistry) -> bool {

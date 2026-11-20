@@ -6,11 +6,53 @@ use crate::standard_fields::{
 };
 use crate::SdblType;
 use bsl_metadata::{is_standard_attribute_name, MdoType};
-use stdx::case::CaseExt;
+use rustc_hash::FxHashSet;
+use stdx::case::{eq_ignore_case, CaseExt};
 use syntax::ast::AstNode;
 use text_size::TextRange;
 
 use super::context::LoweringContext;
+
+/// The explicit aliases a query gives its sources in FROM and JOIN, folded to lower case. Nested
+/// queries declare their own and are not entered.
+pub(super) fn declared_source_aliases(
+    from_clause: Option<syntax::ast::SdblFromClause>,
+) -> FxHashSet<String> {
+    fn collect(ds: &syntax::ast::SdblDataSource, out: &mut FxHashSet<String>) {
+        if let Some(name) = ds.alias().and_then(|alias| alias.name()) {
+            out.insert(name.fold_lower());
+        }
+        for join in ds.join_clauses() {
+            if let Some(joined) = join.data_source() {
+                collect(&joined, out);
+            }
+        }
+    }
+
+    let mut aliases = FxHashSet::default();
+    for ds in from_clause.iter().flat_map(|from| from.data_sources()) {
+        collect(&ds, &mut aliases);
+    }
+    aliases
+}
+
+const POINT_IN_TIME: &str = "МоментВремени";
+
+/// Query-only fields of a reference table that `StandardAttributeKind` does not list: present
+/// on every reference table (ITS ch.18 / §8.3), and `МоментВремени` (date + ref) on documents
+/// only, with no BSL object-model counterpart.
+const DOCUMENT_VIRTUAL_QUERY_FIELDS: [(&str, &str); 3] = [
+    ("Представление", "Presentation"),
+    ("ВерсияДанных", "DataVersion"),
+    (POINT_IN_TIME, "PointInTime"),
+];
+
+/// Whether `name` is one of the query-only virtual fields of a reference table, in either language.
+pub(super) fn is_document_virtual_query_field(name: &str) -> bool {
+    DOCUMENT_VIRTUAL_QUERY_FIELDS.iter().any(|(ru, en)| {
+        stdx::case::eq_ignore_case(ru, name) || stdx::case::eq_ignore_case(en, name)
+    })
+}
 
 impl LoweringContext<'_> {
     pub(super) fn lower_from_clause(
@@ -85,7 +127,7 @@ impl LoweringContext<'_> {
             let has_union_siblings = queries.len() > 1;
 
             for (query_index, query) in queries.into_iter().enumerate() {
-                self.scope.push_frame();
+                self.scope.push_derived_table_frame();
 
                 let nested_hir = self.lower_query(&query, has_union_siblings, query_index == 0);
 
@@ -1089,29 +1131,14 @@ impl LoweringContext<'_> {
                         ));
                     }
 
-                    // Virtual query fields present on every reference table but
-                    // absent from StandardAttributeKind (ITS ch.18 / §8.3).
-                    fields.push(FieldDef::standard(
-                        "Представление",
-                        "Presentation",
-                        SdblType::string(),
-                    ));
-                    fields.push(FieldDef::standard(
-                        "ВерсияДанных",
-                        "DataVersion",
-                        SdblType::string(),
-                    ));
-
-                    // МоментВремени is a query-only virtual field of document
-                    // tables (date + ref); it has no BSL object-model
-                    // counterpart, so it lives here rather than in the
-                    // standard-attribute synthesiser.
-                    if mdo_type == MdoType::Document {
-                        fields.push(FieldDef::standard(
-                            "МоментВремени",
-                            "PointInTime",
-                            SdblType::DateTime,
-                        ));
+                    for (name, name_en) in DOCUMENT_VIRTUAL_QUERY_FIELDS {
+                        let is_point_in_time = name == POINT_IN_TIME;
+                        if is_point_in_time && mdo_type != MdoType::Document {
+                            continue;
+                        }
+                        let ty =
+                            if is_point_in_time { SdblType::DateTime } else { SdblType::string() };
+                        fields.push(FieldDef::standard(name, name_en, ty));
                     }
 
                     for common in &obj.common_attributes {
@@ -1504,6 +1531,202 @@ impl LoweringContext<'_> {
                     range: argument.text_range(),
                 });
             }
+        }
+
+        self.check_condition_index_coverage(table_name, mdo_type, vt_type, slots, &arguments);
+    }
+}
+
+impl LoweringContext<'_> {
+    /// #std652: the totals tables of an accumulation register carry a main index over the
+    /// dimensions in configuration order, and every dimension marked as indexed adds an index that
+    /// starts with that dimension and continues with the others in configuration order. A condition
+    /// is served when its dimensions are exactly the leading fields of one of those indexes.
+    ///
+    /// Judged only for a pure conjunction of equalities on register dimensions: any other shape
+    /// (`ИЛИ`, `В`, a range, a function of the field) has no verdict from the text alone.
+    fn check_condition_index_coverage(
+        &mut self,
+        table_name: &str,
+        mdo_type: MdoType,
+        vt_type: VirtualTableType,
+        slots: &[ParameterSlot],
+        arguments: &[Option<syntax::SyntaxNode>],
+    ) {
+        if mdo_type != MdoType::AccumulationRegister
+            || !matches!(
+                vt_type,
+                VirtualTableType::Balance
+                    | VirtualTableType::Turnovers
+                    | VirtualTableType::BalanceAndTurnovers
+            )
+        {
+            return;
+        }
+        let Some(condition) =
+            slots.iter().zip(arguments).find_map(|(slot, argument)| match (slot, argument) {
+                (ParameterSlot::Condition(_), Some(node)) => Some(node),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let Some(register_name) = table_name.split('.').nth(1) else {
+            return;
+        };
+        let Some(register) =
+            self.resolver.and_then(|resolver| resolver.resolve_register(mdo_type, register_name))
+        else {
+            return;
+        };
+        let dimensions = register.dimensions();
+
+        let mut names = Vec::new();
+        let is_equality_conjunction =
+            collect_equality_fields(condition, &mut names, &|qualifier| {
+                dimensions.iter().any(|dimension| eq_ignore_case(dimension.name(), qualifier))
+                    || register
+                        .resources()
+                        .iter()
+                        .any(|resource| eq_ignore_case(resource.name(), qualifier))
+            });
+        if !is_equality_conjunction || names.is_empty() {
+            return;
+        }
+
+        let mut matched = Vec::new();
+        for name in &names {
+            let Some(position) =
+                dimensions.iter().position(|dimension| eq_ignore_case(dimension.name(), name))
+            else {
+                return;
+            };
+            matched.push(position);
+        }
+        matched.sort_unstable();
+        matched.dedup();
+
+        // Candidate indexes: the dimensions in configuration order, and per indexed dimension
+        // that dimension first followed by the others in configuration order. The condition is
+        // served when its dimensions are exactly the first `n` fields of some candidate.
+        let n = matched.len();
+        let main_index = (0..dimensions.len()).collect::<Vec<_>>();
+        let indexed_candidates = (0..dimensions.len())
+            .filter(|&position| {
+                matches!(dimensions[position].indexing(), "Index" | "IndexWithAdditionalOrder")
+            })
+            .map(|first| {
+                std::iter::once(first)
+                    .chain((0..dimensions.len()).filter(move |&other| other != first))
+                    .collect::<Vec<_>>()
+            });
+        let covered = std::iter::once(main_index).chain(indexed_candidates).any(|candidate| {
+            let mut head = candidate[..n].to_vec();
+            head.sort_unstable();
+            head == matched
+        });
+        if covered {
+            return;
+        }
+        let Some(missing) = (0..dimensions.len()).find(|position| !matched.contains(position))
+        else {
+            return;
+        };
+
+        self.diagnostics.push(SdblDiagnostic::QueryConditionWithoutIndex {
+            missing_dimension: dimensions[missing].name().to_string(),
+            range: condition.text_range(),
+        });
+    }
+}
+
+/// Collects the field names of a condition that is a conjunction (`И` / `AND`) of equalities
+/// `<field> = <anything>`; `false` for every other shape.
+///
+/// The tree wraps each operand in one node per precedence level and parentheses are a wrapper too,
+/// so the wrappers that carry a single child and no operator are looked through first. The field is
+/// the left side of the comparison, bare or qualified by the source alias; `is_field_name` tells a
+/// qualifier that is itself a field (`Склад.Имя`, a dereference) from a source alias.
+fn collect_equality_fields(
+    node: &syntax::SyntaxNode,
+    names: &mut Vec<String>,
+    is_field_name: &dyn Fn(&str) -> bool,
+) -> bool {
+    use syntax::SyntaxKind;
+
+    let node = look_through_wrappers(node);
+    let operators: Vec<SyntaxKind> = node
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .map(|token| token.kind())
+        .filter(|kind| !kind.is_trivia())
+        .collect();
+    match node.kind() {
+        SyntaxKind::SDBL_LOGICAL_AND_EXPR => {
+            operators.iter().all(|kind| *kind == SyntaxKind::KW_AND)
+                && node
+                    .children()
+                    .all(|operand| collect_equality_fields(&operand, names, is_field_name))
+        }
+        SyntaxKind::SDBL_COMPARISON_EXPR => {
+            let mut operands = node.children();
+            let (Some(left), Some(_), None) = (operands.next(), operands.next(), operands.next())
+            else {
+                return false;
+            };
+            if operators != [SyntaxKind::EQ] {
+                return false;
+            }
+            let left = look_through_wrappers(&left);
+            if left.kind() != SyntaxKind::SDBL_COLUMN_REF {
+                return false;
+            }
+            let mut path = Vec::new();
+            for token in left.children_with_tokens().filter_map(|element| element.into_token()) {
+                match token.kind() {
+                    kind if kind.is_trivia() || kind == SyntaxKind::DOT => {}
+                    kind if kind.is_name_token() => path.push(token.text().to_string()),
+                    _ => return false,
+                }
+            }
+            match path.as_slice() {
+                [field] => names.push(field.clone()),
+                [qualifier, field] if !is_field_name(qualifier) => names.push(field.clone()),
+                _ => return false,
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Descends through the nodes that only wrap their single operand: one node per precedence level
+/// and parentheses.
+fn look_through_wrappers(node: &syntax::SyntaxNode) -> syntax::SyntaxNode {
+    use syntax::SyntaxKind;
+
+    let mut node = node.clone();
+    loop {
+        let wrapper = matches!(
+            node.kind(),
+            SyntaxKind::SDBL_EXPR
+                | SyntaxKind::SDBL_LOGICAL_OR_EXPR
+                | SyntaxKind::SDBL_LOGICAL_AND_EXPR
+                | SyntaxKind::SDBL_ADDITIVE_EXPR
+                | SyntaxKind::SDBL_MULTIPLICATIVE_EXPR
+                | SyntaxKind::SDBL_PAREN_EXPR
+        );
+        let is_parens = node.kind() == SyntaxKind::SDBL_PAREN_EXPR;
+        let has_operator =
+            node.children_with_tokens().filter_map(|element| element.into_token()).any(|token| {
+                !token.kind().is_trivia()
+                    && !(is_parens
+                        && matches!(token.kind(), SyntaxKind::L_PAREN | SyntaxKind::R_PAREN))
+            });
+        let mut children = node.children();
+        match (wrapper && !has_operator, children.next(), children.next()) {
+            (true, Some(only), None) => node = only,
+            _ => return node,
         }
     }
 }

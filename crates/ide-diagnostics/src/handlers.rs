@@ -1,6 +1,7 @@
 pub mod all_function_path_must_have_return;
 pub mod ambiguous_field_in_query;
 pub mod assign_alias_fields_in_query;
+pub mod at_client_at_server_form_method;
 pub mod bad_words;
 pub mod begin_transaction_before_try_catch;
 pub mod builtin_function_name_as_declaration;
@@ -62,7 +63,9 @@ pub mod extra_commas;
 pub mod fields_from_joins_without_is_null;
 pub mod file_system_access;
 pub mod forbidden_metadata_name;
+pub mod form_data_has_no_metadata_method;
 pub mod form_data_to_value;
+pub mod form_event_handler_directive;
 pub mod full_outer_join_query;
 pub mod function_name_starts_with_get;
 pub mod function_out_parameter;
@@ -124,6 +127,7 @@ pub mod non_standard_region;
 pub mod number_of_optional_params;
 pub mod number_of_params;
 pub mod number_of_values_in_structure_constructor;
+pub mod object_modified_in_on_write;
 pub mod one_statement_per_line;
 pub mod order_of_params;
 pub mod ordinary_app_support;
@@ -135,11 +139,14 @@ pub mod platform_member_hidden_by_compatibility_mode;
 pub mod platform_member_newer_than_min_version;
 pub mod possibly_undefined_value;
 pub mod postfix_access_on_expression;
+pub mod posting_while_data_exchange_loading;
 pub mod privileged_module_method_call;
 pub mod procedure_returns_value;
 pub mod protected_module;
 pub mod public_methods_description;
+pub mod query_condition_without_index;
 pub mod query_nested_fields_by_dot;
+pub mod query_order_by_document_date;
 pub mod query_parameter_source_without_into;
 pub mod query_parse_error;
 pub mod query_to_missing_metadata;
@@ -147,6 +154,7 @@ pub mod query_totals_in_value_table_into;
 pub mod read_only_property;
 pub mod redundant_access_to_object;
 pub mod ref_overuse;
+pub mod register_recorder_field_in_query;
 pub mod reserved_parameter_names;
 pub mod reserved_word_as_method_name;
 pub mod rewrite_method_parameter;
@@ -162,6 +170,7 @@ pub mod set_permissions_for_new_objects;
 pub mod set_privileged_mode;
 pub mod several_compiler_directives;
 pub mod space_at_start_comment;
+pub mod structure_key_is_not_identifier;
 pub mod style_element_constructors;
 pub mod temp_files_dir;
 pub mod ternary_operator_usage;
@@ -172,9 +181,12 @@ pub mod transferring_parameters_between_client_and_server;
 pub mod try_number;
 pub mod type_mismatch;
 pub mod type_mismatch_by_doc_comment;
+pub mod type_name_compared_as_text;
 pub mod typo;
 pub mod unary_plus_in_concatenation;
+pub mod unavailable_alias_in_query;
 pub mod unavailable_in_environment;
+pub mod unbound_form_event_handler;
 pub mod uninitialized_local_variable;
 pub mod union_all;
 pub mod unknown_field_in_query;
@@ -210,6 +222,7 @@ pub mod using_object_not_available_unix;
 pub mod using_service_tag;
 pub mod using_synchronous_calls;
 pub mod using_this_form;
+pub mod value_is_filled_of_boolean;
 pub mod virtual_table_call_without_parameters;
 pub mod weaving_annotation_not_applicable;
 pub mod weaving_signature_mismatch;
@@ -294,6 +307,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::MultilingualStringHasAllDeclaredLanguages => {
             Some(&multilingual_string_has_all_declared_languages::METADATA)
         }
+        DiagnosticCode::MultilingualStringHasEmptyTranslation => {
+            Some(&multilingual_string_has_all_declared_languages::EMPTY_TRANSLATION_METADATA)
+        }
         DiagnosticCode::MultilingualStringUsingWithTemplate => {
             Some(&multilingual_string_using_with_template::METADATA)
         }
@@ -349,6 +365,18 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
             Some(&missing_temporary_file_deletion::METADATA)
         }
         DiagnosticCode::MisplacedLoopControl => Some(&misplaced_loop_control::METADATA),
+        DiagnosticCode::ObjectModifiedInOnWrite => Some(&object_modified_in_on_write::METADATA),
+        DiagnosticCode::PostingWhileDataExchangeLoading => {
+            Some(&posting_while_data_exchange_loading::METADATA)
+        }
+        DiagnosticCode::StructureKeyIsNotIdentifier => {
+            Some(&structure_key_is_not_identifier::METADATA)
+        }
+        DiagnosticCode::TypeNameComparedAsText => Some(&type_name_compared_as_text::METADATA),
+        DiagnosticCode::FormDataHasNoMetadataMethod => {
+            Some(&form_data_has_no_metadata_method::METADATA)
+        }
+        DiagnosticCode::ValueIsFilledOfBoolean => Some(&value_is_filled_of_boolean::METADATA),
         DiagnosticCode::UseLessForEach => Some(&useless_for_each::METADATA),
         DiagnosticCode::IteratorCollidesCollection => Some(&iterator_collides_collection::METADATA),
         DiagnosticCode::UsingGoto => Some(&using_goto::METADATA),
@@ -372,6 +400,10 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::DeletingCollectionItem => Some(&deleting_collection_item::METADATA),
         DiagnosticCode::SelfInsertion => Some(&self_insertion::METADATA),
         DiagnosticCode::SeveralCompilerDirectives => Some(&several_compiler_directives::METADATA),
+        DiagnosticCode::AtClientAtServerFormMethod => {
+            Some(&at_client_at_server_form_method::METADATA)
+        }
+        DiagnosticCode::FormEventHandlerDirective => Some(&form_event_handler_directive::METADATA),
         DiagnosticCode::StyleElementConstructors => Some(&style_element_constructors::METADATA),
         DiagnosticCode::DeprecatedPlatformApi => Some(&deprecated_platform_api::METADATA),
         DiagnosticCode::DeprecatedMethodCall => Some(&deprecated_method_call::METADATA),
@@ -441,7 +473,11 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::ProtectedModule => Some(&protected_module::METADATA),
         DiagnosticCode::PublicMethodsDescription => Some(&public_methods_description::METADATA),
+        DiagnosticCode::QueryConditionWithoutIndex => {
+            Some(&query_condition_without_index::METADATA)
+        }
         DiagnosticCode::QueryNestedFieldsByDot => Some(&query_nested_fields_by_dot::METADATA),
+        DiagnosticCode::QueryOrderByDocumentDate => Some(&query_order_by_document_date::METADATA),
         DiagnosticCode::QueryParseError => Some(&query_parse_error::METADATA),
         DiagnosticCode::QueryToMissingMetadata => Some(&query_to_missing_metadata::METADATA),
         DiagnosticCode::QueryParameterSourceWithoutInto => {
@@ -452,6 +488,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         }
         DiagnosticCode::AmbiguousFieldInQuery => Some(&ambiguous_field_in_query::METADATA),
         DiagnosticCode::DuplicateAliasInQuery => Some(&duplicate_alias_in_query::METADATA),
+        DiagnosticCode::UnavailableAliasInQuery => Some(&unavailable_alias_in_query::METADATA),
         DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder => {
             Some(&calculation_register_virtual_table_without_recorder::METADATA)
         }
@@ -464,6 +501,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
             Some(&unlimited_length_string_usage_in_query::METADATA)
         }
         DiagnosticCode::RefOveruse => Some(&ref_overuse::METADATA),
+        DiagnosticCode::RegisterRecorderFieldInQuery => {
+            Some(&register_recorder_field_in_query::METADATA)
+        }
         DiagnosticCode::SelectTopWithoutOrderBy => Some(&select_top_without_order_by::METADATA),
         DiagnosticCode::UnionAll => Some(&union_all::METADATA),
         DiagnosticCode::UsingLikeInQuery => Some(&using_like_in_query::METADATA),
@@ -475,6 +515,7 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::ServerSideExportFormMethod => {
             Some(&server_side_export_form_method::METADATA)
         }
+        DiagnosticCode::UnboundFormEventHandler => Some(&unbound_form_event_handler::METADATA),
         DiagnosticCode::SetPermissionsForNewObjects => {
             Some(&set_permissions_for_new_objects::METADATA)
         }
@@ -571,6 +612,10 @@ mod implicit_database_read_in_cycle_tests;
 #[cfg(test)]
 #[path = "handlers/uninitialized_local_variable_tests.rs"]
 mod uninitialized_local_variable_tests;
+
+#[cfg(test)]
+#[path = "handlers/type_name_compared_as_text_tests.rs"]
+mod type_name_compared_as_text_tests;
 
 #[cfg(test)]
 mod metadata_tests {

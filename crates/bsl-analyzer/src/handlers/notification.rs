@@ -130,7 +130,13 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
     if config.scope.is_some() && state.scope_dirty_docs.contains(uri) {
         config.scope = None;
     }
-    let baseline_applies = crate::diagnostics_baseline::applies_under_scope(config.scope.is_some());
+    // A file without a path cannot be placed in the scope after the fact, so it keeps
+    // the ordinary gate.
+    let late_scope = config.scope.clone().filter(|_| {
+        path.is_some()
+            && crate::diagnostics_baseline::defers_scope_line_gate(&diagnostics_baseline, true)
+    });
+    config.defer_scope_line_gate = late_scope.is_some();
     let position_encoding = state.position_encoding;
     let code_descriptions = crate::lsp::to_proto::CodeDescriptions::from_client_support(
         state.supports_code_description,
@@ -151,17 +157,14 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
             let file_id_input = FileIdInput::new(&db, file_id);
             let config_id = base_db::DiagnosticsConfigId::new(&db, config);
             let ide_diagnostics = file_diagnostics_query(&db, file_id_input, config_id);
-            let ide_diagnostics =
-                match (workspace_root.as_deref().filter(|_| baseline_applies), path.as_deref()) {
-                    (Some(root), Some(path)) => crate::diagnostics_baseline::active_for_file(
-                        &diagnostics_baseline,
-                        root,
-                        path,
-                        &text,
-                        ide_diagnostics.iter().cloned().collect(),
-                    ),
-                    _ => ide_diagnostics.iter().cloned().collect(),
-                };
+            let ide_diagnostics = crate::diagnostics_baseline::active_for_publication(
+                &diagnostics_baseline,
+                workspace_root.as_deref(),
+                path.as_deref(),
+                &text,
+                ide_diagnostics.iter().cloned().collect(),
+                late_scope.as_deref(),
+            );
             let line_index = LineIndex::new(&text);
             crate::lsp::diagnostics_with_encoding(
                 &line_index,
@@ -423,10 +426,10 @@ pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParam
         }
     }
 
-    // Dependency discovery walks the (still cold and incomplete) database
-    // synchronously on the event-loop thread, so during the initial load it
-    // both stalls VFS batch draining and warms caches the next revision bump
-    // throws away. The vfs_done finalize preloads open documents instead.
+    // During the initial load dependency discovery walks a cold, incomplete
+    // database and warms caches the next revision bump throws away, while the
+    // pool is busy with the load itself. The vfs_done finalize preloads open
+    // documents instead.
     let preload_start = Instant::now();
     if vfs_done {
         preload_dependencies(state, file_id);
@@ -462,44 +465,19 @@ pub(crate) fn preload_dependencies(state: &mut GlobalState, file_id: vfs::FileId
 
     let Ok(disk_read) = state.prepare_disk_read() else { return };
 
-    let discover_start = Instant::now();
+    // Discovery belongs in the job, not here: asking the database what this file
+    // depends on is itself a query, and on the event loop it holds up every other
+    // notification for as long as it takes. The job carries the exclusion test with
+    // it, so a dependency the exclusions now cover keeps its id, tombstoned, and is
+    // still not warmed. One consequence is worth having: the discovery is now
+    // cancellable, because the token covers the whole job and not just the warming.
     let analysis = state.analysis_host.analysis();
-    disk_read.register_cancel(analysis.database().cancellation_token());
-    // A dependency the exclusions now cover keeps its id, tombstoned; it is not warmed.
-    let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
-    let deps: Vec<_> = match salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
-        analysis
-            .file_dependencies(file_id)
-            .iter()
-            .copied()
-            .filter(|&dep| !state.is_file_id_excluded(dep, &mut resolved))
-            .collect()
-    })) {
-        Ok(deps) => deps,
-        Err(_) => return,
-    };
-    let discover_ms = discover_start.elapsed().as_millis() as u64;
-
-    if deps.is_empty() {
-        tracing::debug!(file_id = file_id.0, discover_ms, "preload: no dependencies found",);
-        return;
-    }
-
-    let dep_count = deps.len();
-    let dep_ids: Vec<u32> = deps.iter().map(|f| f.0).collect();
-    tracing::info!(
-        file_id = file_id.0,
-        dep_count,
-        discover_ms,
-        ?dep_ids,
-        "preload: dispatching warm-cache task",
-    );
+    let filter = state.exclusion_filter();
+    let task = analysis.warm_dependencies_task(file_id, move |deps| filter.retain_included(deps));
 
     if let Some(prev) = state.preload_tokens.remove(&file_id) {
         prev.cancel();
     }
-
-    let task = analysis.warm_caches_task(&deps);
     disk_read.register_cancel(task.cancellation_token());
     state.preload_tokens.insert(file_id, task.cancellation_token());
     let queued_at = Instant::now();
@@ -511,22 +489,23 @@ pub(crate) fn preload_dependencies(state: &mut GlobalState, file_id: vfs::FileId
         let started_at = Instant::now();
         let queue_wait_ms = started_at.duration_since(queued_at).as_millis() as u64;
         let count = match salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| task.run())) {
-            Ok(count) => {
+            Ok(warmed) => {
                 tracing::info!(
                     file_id = file_id.0,
-                    dep_count = count,
+                    dep_count = warmed.warmed,
+                    discover_ms = warmed.discover_ms,
                     queue_wait_ms,
                     run_ms = started_at.elapsed().as_millis() as u64,
-                    "preload: warm-cache complete",
+                    "preload: dependencies discovered and warmed",
                 );
-                count
+                warmed.warmed
             }
             Err(_) => {
                 tracing::debug!(
                     file_id = file_id.0,
                     queue_wait_ms,
                     run_ms = started_at.elapsed().as_millis() as u64,
-                    "preload: warm-cache cancelled",
+                    "preload: cancelled",
                 );
                 0
             }
@@ -1378,7 +1357,8 @@ mod tests {
         let hidden = hidden_dir.join("Hidden.bsl");
         std::fs::write(&hidden, "Процедура Скрытая() КонецПроцедуры").unwrap();
         let uri = lsp_types::Url::from_file_path(&hidden).unwrap();
-        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+        state.source_exclusions =
+            std::sync::Arc::new(project_model::ExcludedPaths::new([hidden_dir]));
 
         handle_did_open(
             &mut state,
@@ -1431,6 +1411,52 @@ mod tests {
         assert!(state.vfs.read().file_id(&vfs::VfsPath::new(hidden)).is_none());
     }
 
+    #[test]
+    fn the_exclusion_filter_keeps_only_what_may_be_warmed() {
+        let (mut state, _receiver) = create_test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let hidden_dir = dir.path().join(".tmp");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        let excluded = hidden_dir.join("Hidden.bsl");
+        let included = dir.path().join("Visible.bsl");
+        std::fs::write(&excluded, "Процедура Скрытая() КонецПроцедуры").unwrap();
+        std::fs::write(&included, "Процедура Видимая() КонецПроцедуры").unwrap();
+        state.source_exclusions =
+            std::sync::Arc::new(project_model::ExcludedPaths::new([hidden_dir]));
+        let (excluded_id, included_id) = {
+            let mut vfs = state.vfs.write();
+            (
+                vfs.alloc_file_id(vfs::VfsPath::new(excluded)),
+                vfs.alloc_file_id(vfs::VfsPath::new(included)),
+            )
+        };
+        let never_allocated = vfs::FileId(u32::MAX - 1);
+
+        let filter = state.exclusion_filter();
+        assert_eq!(
+            filter.retain_included(vec![excluded_id, included_id, never_allocated]),
+            vec![included_id],
+            "only a file the project still covers may be warmed"
+        );
+    }
+
+    #[test]
+    fn preload_queues_discovery_as_a_cancellable_job() {
+        let (mut state, _receiver) = create_test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Ordinary.bsl");
+        std::fs::write(&path, "Процедура Обычная() КонецПроцедуры").unwrap();
+        let file_id = state.vfs.write().alloc_file_id(vfs::VfsPath::new(path));
+
+        preload_dependencies(&mut state, file_id);
+
+        assert!(
+            state.preload_tokens.contains_key(&file_id),
+            "the token must cover discovery too, so a job queued for a file the editor \
+             has already moved on from can be cancelled"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn did_open_cannot_create_an_unsaved_vfs_file_through_an_excluded_symlink_alias() {
@@ -1444,7 +1470,8 @@ mod tests {
         let unsaved = alias.join(".tmp/New.bsl");
         assert!(!unsaved.exists(), "the counterexample requires an unsaved new document");
         let uri = lsp_types::Url::from_file_path(&unsaved).unwrap();
-        state.source_exclusions = project_model::ExcludedPaths::new([hidden_dir]);
+        state.source_exclusions =
+            std::sync::Arc::new(project_model::ExcludedPaths::new([hidden_dir]));
 
         handle_did_open(
             &mut state,
@@ -2077,5 +2104,93 @@ mod tests {
             !state.interactive_analysis_quiescent(),
             "a cancelled-but-running request must still defer trims"
         );
+    }
+
+    /// Schedules the push for the fixture module and waits for its published report.
+    fn pushed_self_assign_lines(state: &mut GlobalState, uri: &Url) -> Vec<u32> {
+        use crate::diagnostics_baseline::finality_fixture::published_self_assign_lines;
+
+        schedule_diagnostics(state, uri);
+        assert!(state.diagnostics_tokens.contains_key(uri), "the push must be scheduled");
+        let bound = test_utils::wait::ceiling(std::time::Duration::from_secs(60));
+        loop {
+            let task = match state.task_pool.receiver.recv_timeout(bound).expect("the push reports")
+            {
+                crate::global_state::Task::DiskReadCompleted { epoch, task, cancelled } => {
+                    if state.workspace_disk_gate().is_current(epoch) {
+                        *task
+                    } else {
+                        *cancelled
+                    }
+                }
+                task => task,
+            };
+            match task {
+                crate::global_state::Task::DiagnosticsReady { uri: ready, diagnostics, .. }
+                    if &ready == uri =>
+                {
+                    return published_self_assign_lines(&diagnostics);
+                }
+                crate::global_state::Task::DiagnosticsCancelled {
+                    uri: cancelled, kind, ..
+                } if &cancelled == uri => {
+                    panic!("the push was cancelled: {kind:?}")
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// The counterexample on the push: recorded a and b stay hidden and c is published,
+    /// for the v1 baseline and both partition policies (`Unsuppressed` shows b and c).
+    /// Without recorded entries b and c both show.
+    #[test]
+    fn finality_scoped_baseline() {
+        use crate::diagnostics_baseline::finality_fixture::{Form, Workspace};
+
+        for form in [Form::V1, Form::Set, Form::Unsuppressed] {
+            let workspace = Workspace::new(form);
+            let uri = workspace.uri();
+            let scope = Some(workspace.scope(Some(vec![[3, 4]])));
+            let mut state = workspace.state(workspace.snapshot(2), scope.clone(), true);
+            let expected = if form == Form::Unsuppressed { vec![3, 4] } else { vec![4] };
+            assert_eq!(pushed_self_assign_lines(&mut state, &uri), expected, "{form:?}");
+
+            let mut unrecorded = workspace.state(workspace.snapshot(0), scope, true);
+            assert_eq!(pushed_self_assign_lines(&mut unrecorded, &uri), vec![3, 4], "{form:?}");
+        }
+    }
+
+    /// A clean buffer is pushed cut to the disk-derived hunks, a dirty one whole, both under
+    /// the baseline: with a recorded and line 4 in the scope, c against b and c.
+    #[test]
+    fn finality_file_and_overlay_scope() {
+        use crate::diagnostics_baseline::finality_fixture::{Form, Workspace};
+
+        let workspace = Workspace::new(Form::V1);
+        let uri = workspace.uri();
+        let mut state =
+            workspace.state(workspace.snapshot(1), Some(workspace.scope(Some(vec![[4, 4]]))), true);
+        assert_eq!(pushed_self_assign_lines(&mut state, &uri), vec![4], "clean buffer");
+        state.scope_dirty_docs.insert(uri.clone());
+        assert_eq!(pushed_self_assign_lines(&mut state, &uri), vec![3, 4], "dirty buffer");
+    }
+
+    /// Without a project root the push applies no baseline, yet still cuts the whole-file
+    /// computation to the scope: b and c, never a; without a scope all three.
+    #[test]
+    fn finality_missing_root_still_projects_scope() {
+        use crate::diagnostics_baseline::finality_fixture::{Form, Workspace};
+
+        let workspace = Workspace::new(Form::V1);
+        let uri = workspace.uri();
+        let mut state =
+            workspace.state(workspace.snapshot(2), Some(workspace.scope(Some(vec![[3, 4]]))), true);
+        state.workspace_root = None;
+        assert_eq!(pushed_self_assign_lines(&mut state, &uri), vec![3, 4]);
+
+        let mut unscoped = workspace.state(workspace.snapshot(2), None, true);
+        unscoped.workspace_root = None;
+        assert_eq!(pushed_self_assign_lines(&mut unscoped, &uri), vec![2, 3, 4], "control");
     }
 }

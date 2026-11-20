@@ -233,3 +233,21 @@ async fn public_check_reports_dirty_owned_root_as_error_without_starting_a_platf
     assert_eq!(result.failure.unwrap().code, "cleanup_failed");
     assert_eq!(result.cleanup_status, CleanupStatus::Pending);
 }
+
+/// Opening `/proc/<pid>/stat` does not keep the process: once it is reaped, the open file reads
+/// `ESRCH` rather than `NotFound`, which a scan of every process meets whenever one exits.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_proc_entry_of_a_process_reaped_after_it_was_opened_reads_as_gone() {
+    use std::io::Read;
+
+    let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let mut stat = std::fs::File::open(format!("/proc/{}/stat", child.id())).unwrap();
+    child.kill().unwrap();
+    wait_child(child, "killed /proc probe child").unwrap();
+    let error = stat.read_to_string(&mut String::new()).unwrap_err();
+
+    assert!(process_gone(&error), "{error:?}");
+    assert!(process_gone(&std::io::Error::from(std::io::ErrorKind::NotFound)));
+    assert!(!process_gone(&std::io::Error::from_raw_os_error(libc::EACCES)));
+}

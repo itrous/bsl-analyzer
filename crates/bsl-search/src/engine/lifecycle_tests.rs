@@ -1140,6 +1140,29 @@ fn payload_overlay_offlock_preserves_paid_cache_and_checks_between_requests() {
 }
 
 #[test]
+fn payload_overlay_offlock_drops_a_response_that_arrives_after_ownership_is_lost() {
+    use crate::embedder::payload_tests::{success, PayloadServer};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("overlay.db")).unwrap();
+    let missing: HashMap<_, _> = [("key0".to_owned(), "Текст запроса".to_owned())].into();
+    let server = PayloadServer::new(success);
+    let embedder = Embedder::new(server.config(4096));
+    let result = SearchEngine::embed_missing_overlay_chunks(
+        &store,
+        &embedder,
+        &missing,
+        32,
+        &|| server.requests().is_empty(),
+        &mut |op| FenceOutcome::Applied(op()),
+        &mut || false,
+    )
+    .unwrap();
+    assert!(matches!(result, FenceOutcome::Released));
+    assert_eq!(server.requests().len(), 1);
+    assert!(store.load_overlay_embedding_cache("fixture", 3).unwrap().is_empty());
+}
+
+#[test]
 fn vector_lifecycle_startup_snapshot_precedes_fence_with_root_mode_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("search.db");

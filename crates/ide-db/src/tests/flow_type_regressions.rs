@@ -131,8 +131,10 @@ fn xml_reader_compound_comparison_is_boolean() {
     assert_eq!(mismatches(&db, file).len(), 1, "{:?}", mismatch_types(&db, file));
 }
 
+// The compiler accepts any argument of `XMLСтрока`; an unconvertible object fails only
+// at run time ("Ошибка преобразования данных XML"), so no argument is a static mismatch.
 #[test]
-fn xml_string_accepts_date_and_primitives_but_rejects_value_table() {
+fn xml_string_accepts_any_argument_and_returns_a_string() {
     let (db, file) = setup(
         r#"Процедура Тест()
     А = XMLСтрока('20261107');
@@ -143,21 +145,23 @@ fn xml_string_accepts_date_and_primitives_but_rejects_value_table() {
     ЧислоEN = XMLString(42);
     БулевоRU = XMLСтрока(Истина);
     БулевоEN = XMLString(True);
-    ОшибкаRU = XMLСтрока(Новый ТаблицаЗначений);
-    ОшибкаEN = XMLString(New ValueTable);
+    ТаблицаRU = XMLСтрока(Новый ТаблицаЗначений);
+    ТаблицаEN = XMLString(New ValueTable);
 КонецПроцедуры"#,
     );
-    assert_eq!(mismatches(&db, file).len(), 2, "{:?}", mismatches(&db, file));
-    for diagnostic in mismatches(&db, file) {
-        let InferenceDiagnostic::TypeMismatch { actual, .. } = diagnostic else { unreachable!() };
-        assert!(
-            matches!(db.lookup_type(actual), TypeKind::ValueTable(_)),
-            "{:?}",
-            db.lookup_type(actual)
-        );
-    }
-    for name in ["а", "датаen", "текстru", "текстen", "числоru", "числоen", "булевоru", "булевоen"]
-    {
+    assert!(mismatches(&db, file).is_empty(), "{:?}", mismatches(&db, file));
+    for name in [
+        "а",
+        "датаen",
+        "текстru",
+        "текстen",
+        "числоru",
+        "числоen",
+        "булевоru",
+        "булевоen",
+        "таблицаru",
+        "таблицаen",
+    ] {
         assert_eq!(local(&db, file, name), db.string(None, false), "{name}");
     }
 }

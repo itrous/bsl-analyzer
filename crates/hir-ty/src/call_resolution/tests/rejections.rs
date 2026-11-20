@@ -6,20 +6,20 @@ fn rejects_wrong_variadic_element() {
     };
     use support::{positional, signature, variadic, AritySpec};
 
-    // Given a number followed by a boolean variadic tail.
+    // Given a number followed by a structure variadic tail.
     let db = InMemoryDb::new();
     let number = db.number(None, None);
-    let boolean = db.boolean();
+    let structure = db.structure(None);
     let candidate = signature(&db, vec![
         positional("first", number, false),
-        variadic("rest", boolean),
+        variadic("rest", structure),
     ], AritySpec {
         required: 1,
         maximum: None,
     });
 
-    // When a concrete number reaches the variadic boolean element position.
-    let evaluation = evaluate_applicability(&db, &candidate, &[number, boolean, number]);
+    // When a concrete number reaches the variadic structure element position.
+    let evaluation = evaluate_applicability(&db, &candidate, &[number, structure, number]);
 
     // Then the candidate is incompatible at that tail argument.
     let CandidateEvaluation::ArityCompatible {
@@ -37,11 +37,10 @@ fn rejects_cross_product_signature() {
     use super::{evaluate_applicability, CandidateApplicability, CandidateEvaluation};
     use support::{positional, signature, AritySpec};
 
-    // Given the independent signatures (Number, Date) and (Boolean, Structure).
+    // Given the independent signatures (Number, Date) and (Date, Structure).
     let db = InMemoryDb::new();
     let number = db.number(None, None);
     let date = db.date(bsl_types::facet::DateComponent::DateTime);
-    let boolean = db.boolean();
     let structure = db.structure(None);
     let first = signature(&db, vec![
         positional("left", number, false),
@@ -51,7 +50,7 @@ fn rejects_cross_product_signature() {
         maximum: Some(2),
     });
     let second = signature(&db, vec![
-        positional("left", boolean, false),
+        positional("left", date, false),
         positional("right", structure, false),
     ], AritySpec {
         required: 2,
@@ -83,14 +82,14 @@ fn rejects_unknown_plus_concrete_incompatibility() {
     };
     use support::{positional, signature, AritySpec};
 
-    // Given one unknown comparison followed by a concrete boolean parameter.
+    // Given one unknown comparison followed by a concrete date parameter.
     let db = InMemoryDb::new();
     let unknown = db.unknown();
     let number = db.number(None, None);
-    let boolean = db.boolean();
+    let date = db.date(bsl_types::facet::DateComponent::DateTime);
     let candidate = signature(&db, vec![
         positional("uncertain", unknown, false),
-        positional("concrete", boolean, false),
+        positional("concrete", date, false),
     ], AritySpec {
         required: 2,
         maximum: Some(2),

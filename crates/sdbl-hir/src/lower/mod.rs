@@ -274,6 +274,7 @@ impl LoweringContext<'_> {
             crate::source_map::TokenCategory::ClauseKeyword,
         );
 
+        self.scope.set_declared_aliases(from_clause::declared_source_aliases(query.from_clause()));
         let from = self.lower_from_clause(query.from_clause());
 
         for table in &from {
@@ -348,7 +349,11 @@ impl LoweringContext<'_> {
 
         self.check_nested_fields_by_dot(&hir);
 
+        self.check_register_recorder_fields(&hir);
+
         self.check_ref_overuse(&hir);
+
+        self.check_order_by_document_date(&hir);
 
         self.check_unlimited_string_usage(&hir);
 

@@ -620,6 +620,7 @@ mod tests {
                                     ),
                                     parameters: [],
                                     is_hyperlink: false,
+                                    map_entries: [],
                                 },
                             ],
                         },
@@ -632,6 +633,7 @@ mod tests {
                             ),
                             parameters: [],
                             is_hyperlink: false,
+                            map_entries: [],
                         },
                     ],
                     examples: [

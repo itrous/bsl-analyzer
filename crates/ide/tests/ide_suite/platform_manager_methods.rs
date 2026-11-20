@@ -1080,8 +1080,13 @@ fn platform_member_misses_follow_the_completeness_attestation() {
         // missing.
         let data = bsl_platform::PlatformData::instance();
         assert!(
-            !data.platform_type_member_surface_verified("ОбластьЯчеекТабличногоДокумента")
-                && !data.platform_type_member_surface_verified("JSONWriter"),
+            !data.platform_type_member_surface_verified(
+                "ОбластьЯчеекТабличногоДокумента",
+                bsl_platform::MemberSurface::Fields
+            ) && !data.platform_type_member_surface_verified(
+                "JSONWriter",
+                bsl_platform::MemberSurface::Methods
+            ),
             "a corpus without a version must leave the gate shut"
         );
         assert!(
@@ -1120,8 +1125,13 @@ fn a_versionless_corpus_keeps_the_platform_misses_silent() {
         "the members the positive test misses must still be absent from the corpus"
     );
     assert!(
-        !data.platform_type_member_surface_verified("ОбластьЯчеекТабличногоДокумента")
-            && !data.platform_type_member_surface_verified("JSONWriter"),
+        !data.platform_type_member_surface_verified(
+            "ОбластьЯчеекТабличногоДокумента",
+            bsl_platform::MemberSurface::Fields
+        ) && !data.platform_type_member_surface_verified(
+            "JSONWriter",
+            bsl_platform::MemberSurface::Methods
+        ),
         "a corpus without a version must leave the gate shut"
     );
 

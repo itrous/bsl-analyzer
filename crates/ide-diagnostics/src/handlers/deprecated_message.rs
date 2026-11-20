@@ -1,11 +1,12 @@
 use crate::BodyContext;
 use crate::{Diagnostic, DiagnosticCode};
-use bsl_platform::deprecation::LifecycleGroup;
+use bsl_platform::deprecation::{DeprecationEntry, LifecycleGroup};
 use hir::LocalRange;
 
 use super::deprecated_platform_api;
 use super::deprecated_platform_facts::{
-    applicable_replacement, global_function_fact, global_function_message,
+    applicable_replacement, canonical_name_for, global_function_fact, global_function_message,
+    is_russian_alias, replacement_absent_from_configuration, replacement_for_name,
 };
 
 pub fn from_hir(
@@ -23,8 +24,7 @@ pub fn from_hir(
     }
 
     let fact = global_function_fact(name, LifecycleGroup::UserNotification)?;
-    let replacement = applicable_replacement(fact, name, ctx);
-    let message = global_function_message(name, fact, replacement)?;
+    let message = get_message(name, fact, ctx)?;
 
     Some(Diagnostic {
         code,
@@ -34,6 +34,33 @@ pub fn from_hir(
         tags: ctx.tags(code),
         fixes: vec![],
     })
+}
+
+/// The replacement is named only where it applies here. Where it does not, a
+/// `Module.Method` replacement this configuration provably lacks is still named, as
+/// absent, since that tells the reader why no fix is offered; any other replacement
+/// that cannot be proven applicable is withheld.
+fn get_message(method_name: &str, fact: &DeprecationEntry, ctx: &BodyContext) -> Option<String> {
+    let replacement = applicable_replacement(fact, method_name, ctx);
+    if replacement.is_none() {
+        if let Some(absent) = replacement_for_name(fact, method_name)
+            .filter(|replacement| replacement_absent_from_configuration(replacement, ctx))
+        {
+            let deprecated = canonical_name_for(fact, method_name)?;
+            return Some(if is_russian_alias(fact, method_name) {
+                format!(
+                    "Устаревшее \"{}\": рекомендуемой замены \"{}\" в этой конфигурации нет",
+                    deprecated, absent
+                )
+            } else {
+                format!(
+                    "Deprecated \"{}\": the recommended replacement \"{}\" is absent from this configuration",
+                    deprecated, absent
+                )
+            });
+        }
+    }
+    global_function_message(method_name, fact, replacement)
 }
 
 #[cfg(test)]
@@ -154,6 +181,122 @@ EndProcedure
               severity: Warning"#]]
         .assert_eq(&format_diags(code, &diags));
         assert!(!diags[0].message.contains("MessageToUser"));
+    }
+
+    const CLIENT_SERVER_MODULE_XML: &str = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000104">
+        <Properties>
+            <Name>ОбщегоНазначения</Name>
+            <Server>true</Server>
+            <ClientManagedApplication>true</ClientManagedApplication>
+            <ServerCall>false</ServerCall>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#;
+
+    const OTHER_EXPORT: &str = "Процедура ДругойМетод() Экспорт\nКонецПроцедуры\n";
+    const REPLACEMENT_EXPORT: &str = "Процедура СообщитьПользователю() Экспорт\nКонецПроцедуры\n";
+    const CALL_SITE: &str = "&НаКлиенте\nПроцедура Тест()\n    Сообщить(\"х\");\nКонецПроцедуры\n";
+
+    const ABSENT_MESSAGE: &str = "Устаревшее \"Сообщить\": рекомендуемой замены \"ОбщегоНазначения.СообщитьПользователю\" в этой конфигурации нет";
+    const NAMED_MESSAGE: &str =
+        "Используйте \"ОбщегоНазначения.СообщитьПользователю\" вместо устаревшего \"Сообщить\"";
+    const WITHHELD_MESSAGE: &str = "Устаревший API \"Сообщить\"";
+
+    fn deprecated_messages(modules: &[(&str, &str, &str)]) -> Vec<String> {
+        check_form_with_common_modules(CALL_SITE, modules)
+            .into_iter()
+            .filter(|d| d.code == DiagnosticCode::DeprecatedPlatformApi)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn replacement_absent_from_the_configuration_is_not_named() {
+        let messages =
+            deprecated_messages(&[("ОбщегоНазначения", OTHER_EXPORT, CLIENT_SERVER_MODULE_XML)]);
+        assert_eq!(messages, vec![ABSENT_MESSAGE.to_string()]);
+        assert!(!messages[0].contains("Используйте"));
+    }
+
+    #[test]
+    fn replacement_present_in_the_configuration_is_still_named() {
+        let messages = deprecated_messages(&[(
+            "ОбщегоНазначения",
+            REPLACEMENT_EXPORT,
+            CLIENT_SERVER_MODULE_XML,
+        )]);
+        assert_eq!(messages, vec![NAMED_MESSAGE.to_string()]);
+    }
+
+    // A receiver that is not a common module of the configuration proves neither
+    // absence nor applicability: the replacement is neither called absent nor advised.
+    #[test]
+    fn a_receiver_that_is_not_a_common_module_withholds_the_replacement() {
+        let messages = deprecated_messages(&[]);
+        assert_eq!(messages, vec![WITHHELD_MESSAGE.to_string()]);
+    }
+
+    // `Module.Method` reaches only an exported method, so a non-exported one of that
+    // name is as good as absent.
+    #[test]
+    fn a_non_exported_replacement_is_not_named() {
+        let messages = deprecated_messages(&[(
+            "ОбщегоНазначения",
+            "Процедура СообщитьПользователю()\nКонецПроцедуры\n",
+            CLIENT_SERVER_MODULE_XML,
+        )]);
+        assert_eq!(messages, vec![ABSENT_MESSAGE.to_string()]);
+    }
+
+    fn deprecated_messages_in_configuration(unreadable: &[&str]) -> Vec<String> {
+        const CONFIGURATION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>Тест</Name></Properties>
+        <ChildObjects>
+            <CommonModule>ОбщегоНазначения</CommonModule>
+            <CommonModule>Проба</CommonModule>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+        const CALLER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000003">
+        <Properties><Name>Проба</Name><Server>true</Server></Properties>
+    </CommonModule>
+</MetaDataObject>"#;
+        const CALLER_PATH: &str = "CommonModules/Проба/Ext/Module.bsl";
+
+        check_config_files_with_unreadable(
+            &[
+                ("Configuration.xml", CONFIGURATION_XML),
+                ("CommonModules/ОбщегоНазначения.xml", CLIENT_SERVER_MODULE_XML),
+                ("CommonModules/Проба.xml", CALLER_XML),
+                ("CommonModules/ОбщегоНазначения/Ext/Module.bsl", OTHER_EXPORT),
+                (CALLER_PATH, "Процедура Тест() Экспорт\n    Сообщить(\"х\");\nКонецПроцедуры\n"),
+            ],
+            CALLER_PATH,
+            unreadable,
+        )
+        .into_iter()
+        .filter(|d| d.code == DiagnosticCode::DeprecatedPlatformApi)
+        .map(|d| d.message)
+        .collect()
+    }
+
+    // The module body could not be read, so the method may well be declared there:
+    // the replacement is not called absent, and as it is not proven either it is
+    // withheld. Only the unreadable flag differs from the control.
+    #[test]
+    fn an_unread_module_body_withholds_the_replacement() {
+        let control = deprecated_messages_in_configuration(&[]);
+        assert_eq!(control, vec![ABSENT_MESSAGE.to_string()]);
+
+        let unread = deprecated_messages_in_configuration(&[
+            "CommonModules/ОбщегоНазначения/Ext/Module.bsl",
+        ]);
+        assert_eq!(unread, vec![WITHHELD_MESSAGE.to_string()]);
     }
 
     #[test]

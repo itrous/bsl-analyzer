@@ -453,7 +453,7 @@ class IssueOfTheNight(RecordPublish, CriteriaCase):
         self.assertIn("Δ = +48.21%; предел по бару 5 %, шум отсутствует: 4900681.8; абсолютный потолок: 7340032", body)
         self.assertNotIn("ν = ", body, "no noise is invented for the memory")
         self.assertNotIn("R·(1+ν)", body)
-        self.assertIn(publish.OWNER_TARGET_TEXT, body)
+        self.assertIn(publish.owner_target_text("hwm_kb", TARGET_KB), body)
 
     def test_a_memory_with_a_noise_tells_the_noise_as_before(self):
         self.memory_record(0.01)

@@ -30,7 +30,7 @@ pub mod test_utils;
 pub use body_context::BodyContext;
 pub use code::DiagnosticCode;
 pub use config::{DiagnosticsConfig, EffectiveMetadata, MetadataOverride};
-pub use context::{AnalysisContext, DiagnosticsContext};
+pub use context::{AnalysisContext, DiagnosticsContext, FOREIGN_HANDLER_BINDINGS_READERS};
 pub use handlers::get_metadata;
 pub use metadata::{
     CleanCodeAttribute, DiagnosticCompatibilityMode, DiagnosticMetadata, DiagnosticScope,
@@ -40,6 +40,7 @@ pub use query::{
     file_diagnostics_query, method_diagnostics_query, method_line_diagnostics_query,
     module_code_diagnostics_query, set_diagnostics_lru_sweep_mode,
 };
+pub use scope_gate::diagnostic_in_scope;
 pub use slab::slab_verify_mismatches;
 pub use standalone_query::{sdbl_query_codes, validate_query_text, METADATA_DEPENDENT_CODES};
 pub use standards::{message_with_standards, standard_url, standards};
@@ -134,6 +135,18 @@ pub fn diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 pub(crate) fn module_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let mut result = Vec::new();
 
+    // The fold is shared by several rules, and whichever asks first pays for all of it,
+    // so the slow-collector log would blame that rule. Build it here, only where a reader
+    // would have asked anyway: a reader is enabled and this is a form module.
+    if ctx.config.any_enabled(FOREIGN_HANDLER_BINDINGS_READERS) {
+        safe_collect("foreign_handler_bindings", || {
+            if ctx.module_metadata().module_type == bsl_metadata::ModuleType::FormModule {
+                let _ = ctx.workspace_foreign_handler_bindings();
+            }
+            Vec::new()
+        });
+    }
+
     result.extend(safe_collect("line", || collect_line_diagnostics(ctx)));
 
     result.extend(safe_collect("syntax", || collect_syntax_diagnostics(ctx)));
@@ -168,6 +181,10 @@ pub(crate) fn module_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 ///
 /// For every ordinary module — and every extension file without a usable change — this is
 /// byte-identical to the standalone `diagnostics` pass (`effective_target` returns `None`).
+///
+/// With `config.defer_scope_line_gate` the answer is the file's complete finalized set: the
+/// scope's file gate still applies, its line gate is left to the caller (see
+/// [`apply_extension_merge`]).
 pub fn file_diagnostics(
     db: &dyn ide_db::RootDatabase,
     file_id: vfs::FileId,
@@ -191,6 +208,13 @@ pub fn file_diagnostics(
 /// keeping its own standalone provider construction — pass the same `config_path_input` and
 /// `file_set` the standalone pass used so the effective pass resolves metadata/cross-module
 /// context identically.
+///
+/// Both exits end in the one finalization, so what this returns is final: nothing after it
+/// adds, supersedes, suppresses or deduplicates a finding. With
+/// `config.defer_scope_line_gate` it is the file's complete set, findings on lines outside
+/// the scope included — the input a baseline classifier must see whole, since it numbers the
+/// file's repeated findings. The caller then keeps only the findings
+/// [`diagnostic_in_scope`] admits, after the numbers are fixed.
 pub fn apply_extension_merge<'db>(
     db: &'db dyn ide_db::RootDatabase,
     file_id: vfs::FileId,
@@ -320,7 +344,10 @@ pub fn apply_extension_merge<'db>(
 /// 2. [`scope_gate::apply`] — the source-scope policy: findings on unchanged lines do
 ///    not survive. It only removes, so for source diagnostics it commutes with the step
 ///    below; its position here is decided by what that step *adds*, not by what it
-///    removes.
+///    removes. Skipped under `config.defer_scope_line_gate`, and only this step: the
+///    caller classifies the complete set against its baseline and applies the same rule
+///    ([`diagnostic_in_scope`]) afterwards, which spares the metas of step 3 explicitly.
+///    The file gate above it is never deferred.
 /// 3. [`suppression::apply`] — the inline-directive policy and the suppression module's
 ///    own meta-diagnostics. The metas report a broken directive, not a code line, and
 ///    are protected from directives and from the baseline; the gate must not cut them
@@ -346,7 +373,9 @@ fn finalize_diagnostics(
         return;
     }
     supersede_dominated(diagnostics);
-    scope_gate::apply(db, file_set, file_id, config, diagnostics);
+    if !config.defer_scope_line_gate {
+        scope_gate::apply(db, file_set, file_id, config, diagnostics);
+    }
     suppression::apply(db, file_id, config, diagnostics);
     normalize_diagnostics(diagnostics);
     if !config.quick_fixes {

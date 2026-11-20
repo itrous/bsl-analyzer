@@ -102,10 +102,17 @@ fn export_keyword(root: &SyntaxNode, source_range: TextRange) -> Option<SyntaxTo
     })
 }
 
-/// A method reachable on the client is not a forbidden server-only export. Besides
-/// `&НаКлиенте`, the context-free `&НаКлиентеНаСервереБезКонтекста` (and the
-/// `&НаКлиентеНаСервере` pair) compile for the client too, so an export of that kind
-/// is a legitimate client-callable form method, not a server export.
+/// A method reachable on the client is not a forbidden server-only export: `&НаКлиенте`
+/// and the context-free `&НаКлиентеНаСервереБезКонтекста` compile for the client, so an
+/// export of either kind is a legitimate client-callable form method.
+///
+/// `&НаКлиентеНаСервере` is listed here for a different reason. In a FORM module such a
+/// method compiles for neither side — a call from `&НаСервере` fails with "Ошибка
+/// инициализации модуля: ... Процедура или функция с указанным именем не определена"
+/// (measured on 8.3.27.2214) — so it is not client-callable at all. It is excluded from
+/// this check because `AtClientAtServerFormMethod` reports the declaration itself, and
+/// reporting the same declaration twice, as an unreachable method and as a server-side
+/// export, would say two different things about one defect.
 fn has_client_annotation(annotations: &[hir::Annotation]) -> bool {
     annotations.iter().any(|a| {
         matches!(

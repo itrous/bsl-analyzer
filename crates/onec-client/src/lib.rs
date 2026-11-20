@@ -7,6 +7,7 @@ pub use epf_module::{
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -61,23 +62,66 @@ pub fn validate_execute_timeout_ms(timeout_ms: u64) -> Result<Duration, Error> {
     Ok(timeout)
 }
 
+/// Process-wide HTTP client: building one makes the TLS verifier read the system root
+/// certificates and warn about every unreadable file, so all [`Client`]s share a single instance.
+static SHARED_HTTP: Mutex<Option<reqwest::Client>> = Mutex::new(None);
+
+#[cfg(test)]
+static HTTP_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn build_http() -> Result<reqwest::Client, reqwest::Error> {
+    #[cfg(test)]
+    HTTP_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let mut headers = header::HeaderMap::new();
+    headers.insert(header::CONNECTION, header::HeaderValue::from_static("close"));
+
+    reqwest::Client::builder().timeout(Duration::from_secs(30)).default_headers(headers).build()
+}
+
+/// Process-wide client for `/execute`, shared for the same reason as [`SHARED_HTTP`].
+static SHARED_EXECUTE_HTTP: Mutex<Option<reqwest::Client>> = Mutex::new(None);
+
+/// An execute request runs arbitrary code on the server, so a transport failure must never
+/// replay it and a redirect must never carry its body and credentials elsewhere.
+fn build_execute_http() -> Result<reqwest::Client, reqwest::Error> {
+    let mut headers = header::HeaderMap::new();
+    headers.insert(header::CONNECTION, header::HeaderValue::from_static("close"));
+
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(headers)
+        .build()
+}
+
+/// Returns the client held in `slot`, building it on first use. A failed build leaves the slot
+/// empty, so the next call builds again and reports its own error.
+fn shared_or_build<T: Clone, E>(
+    slot: &Mutex<Option<T>>,
+    build: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(value) = slot.as_ref() {
+        return Ok(value.clone());
+    }
+    let value = build()?;
+    *slot = Some(value.clone());
+    Ok(value)
+}
+
 impl Client {
+    /// All clients of a process share one HTTP client, so the system root certificates are read
+    /// once per process: changes to the system trust store become visible after a restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the HTTP client cannot be built; the failure is not cached, so a later call
+    /// builds it again.
     pub fn new(base_url: &str, user: &str, password: &str) -> Self {
-        let mut headers = header::HeaderMap::new();
-        headers.insert(header::CONNECTION, header::HeaderValue::from_static("close"));
-
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .default_headers(headers.clone())
-            .build()
-            .expect("failed to build HTTP client");
-
-        let execute_http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .retry(reqwest::retry::never())
-            .redirect(reqwest::redirect::Policy::none())
-            .default_headers(headers)
-            .build()
+        let http = shared_or_build(&SHARED_HTTP, build_http).expect("failed to build HTTP client");
+        let execute_http = shared_or_build(&SHARED_EXECUTE_HTTP, build_execute_http)
             .expect("failed to build HTTP client");
 
         let (user, password) = if user.is_empty() {
@@ -584,6 +628,37 @@ fn known_producer_type_id(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn clients_of_a_process_build_the_http_client_once() {
+        let first = Client::new("http://localhost:1", "", "");
+        let second = Client::new("http://localhost:2", "user", "secret");
+
+        assert_eq!(HTTP_BUILDS.load(Ordering::SeqCst), 1);
+        assert_eq!(first.base_url, "http://localhost:1");
+        assert_eq!(second.base_url, "http://localhost:2");
+        assert_eq!(second.user.as_deref(), Some("user"));
+        assert_eq!(first.user, None);
+    }
+
+    #[test]
+    fn failed_build_is_not_cached() {
+        let slot = Mutex::new(None);
+        let mut attempts = 0;
+
+        for _ in 0..2 {
+            let result: Result<u32, &str> = shared_or_build(&slot, || {
+                attempts += 1;
+                Err("boom")
+            });
+            assert_eq!(result, Err("boom"));
+        }
+        assert_eq!(attempts, 2);
+
+        assert_eq!(shared_or_build(&slot, || Ok::<_, &str>(7)), Ok(7));
+        assert_eq!(shared_or_build(&slot, || Err("must not rebuild")), Ok(7));
+    }
 
     fn http_response(
         status: &str,

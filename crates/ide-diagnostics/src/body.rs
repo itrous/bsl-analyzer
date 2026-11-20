@@ -31,6 +31,12 @@ pub(crate) const BODY_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::PairingBrokenTransaction,
     DiagnosticCode::UnreachableCode,
     DiagnosticCode::MissingTemporaryFileDeletion,
+    DiagnosticCode::ObjectModifiedInOnWrite,
+    DiagnosticCode::PostingWhileDataExchangeLoading,
+    DiagnosticCode::StructureKeyIsNotIdentifier,
+    DiagnosticCode::TypeNameComparedAsText,
+    DiagnosticCode::FormDataHasNoMetadataMethod,
+    DiagnosticCode::ValueIsFilledOfBoolean,
     DiagnosticCode::MissingTempStorageDeletion,
     DiagnosticCode::SetPrivilegedMode,
     DiagnosticCode::DisableSafeMode,
@@ -42,6 +48,7 @@ pub(crate) const BODY_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::NumberOfParams,
     DiagnosticCode::NumberOfOptionalParams,
     DiagnosticCode::MultilingualStringHasAllDeclaredLanguages,
+    DiagnosticCode::MultilingualStringHasEmptyTranslation,
     DiagnosticCode::MultilingualStringUsingWithTemplate,
     DiagnosticCode::ExcessiveAutoTestCheck,
     DiagnosticCode::LatinAndCyrillicSymbolInWord,
@@ -77,6 +84,12 @@ pub fn body_diagnostics(ctx: &BodyContext) -> Vec<Diagnostic<LocalRange>> {
         handlers::pairing_broken_transaction::check_body(ctx, &mut acc);
         handlers::unreachable_code::check_body(ctx, &mut acc);
         handlers::missing_temporary_file_deletion::check_body(ctx, &mut acc);
+        handlers::object_modified_in_on_write::check_body(ctx, &mut acc);
+        handlers::posting_while_data_exchange_loading::check_body(ctx, &mut acc);
+        handlers::structure_key_is_not_identifier::check_body(ctx, &mut acc);
+        handlers::type_name_compared_as_text::check_body(ctx, &mut acc);
+        handlers::form_data_has_no_metadata_method::check_body(ctx, &mut acc);
+        handlers::value_is_filled_of_boolean::check_body(ctx, &mut acc);
         handlers::missing_temp_storage_deletion::check_body(ctx, &mut acc);
         handlers::set_privileged_mode::check_body(ctx, &mut acc);
         handlers::disable_safe_mode::check_body(ctx, &mut acc);

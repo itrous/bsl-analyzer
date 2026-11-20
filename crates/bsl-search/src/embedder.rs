@@ -142,10 +142,14 @@ impl Embedder {
     /// the engine mutex, so one slow embed cannot stall every concurrent `search_code`.
     const INTERACTIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
+    /// Global timeout of the resilient agent: the batch indexing pass and the unattended
+    /// overlay warmup ([`Self::embed_batch_background`]).
+    const BACKGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     pub fn new(config: EmbedderConfig) -> Self {
         let storage_identity = storage_identity(&config);
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(120)))
+            .timeout_global(Some(Self::BACKGROUND_TIMEOUT))
             .build()
             .new_agent();
         let interactive_agent = ureq::Agent::config_builder()
@@ -453,6 +457,19 @@ impl Embedder {
         }
         self.send_request(&self.interactive_agent, &body, texts.len(), false)
             .map_err(BatchFailure::into_error)
+    }
+
+    /// Embed a batch on the long-timeout agent, ONE attempt, for the unattended overlay warmup.
+    /// It runs off the engine mutex, so nobody waits on it and the 12 s interactive budget would
+    /// only abort a slow but healthy provider mid-response. Unlike [`Self::embed_batch`] there is
+    /// no retry schedule: a refusal (503 included) is returned as is, and the caller's next
+    /// refresh re-attempts the chunks that stayed un-embedded.
+    pub fn embed_batch_background(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, SearchError> {
+        let body = self.prepare_request(texts)?;
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.send_request(&self.agent, &body, texts.len(), false).map_err(BatchFailure::into_error)
     }
 
     pub fn health_check(&self) -> Result<(), SearchError> {

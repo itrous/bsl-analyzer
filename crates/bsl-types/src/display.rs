@@ -160,7 +160,7 @@ fn render(kind: &TypeKind, ctx: &dyn DisplayCtx, db: &dyn TypeKernelDb, buf: &mu
             Locale::Ru => "Тип",
             Locale::En => "Type",
         }),
-        TypeKind::PlatformObject(PlatformObjectFacet { name }) => {
+        TypeKind::PlatformObject(PlatformObjectFacet { name, .. }) => {
             buf.push_str(platform_object_label(name, ctx.locale()));
         }
         TypeKind::MetadataRef(facet) => render_meta_ref(facet, ctx, buf),
@@ -942,5 +942,27 @@ mod tests {
             control,
             &en(),
         ));
+    }
+
+    #[test]
+    fn a_keyed_map_is_shown_as_the_plain_map_without_its_keys() {
+        use crate::kind::{Projection, ProjectionField};
+        let db = InMemoryDb::new();
+        let field = ProjectionField::new(
+            "сумма".to_string(),
+            db.number(None, None),
+            ProjectionFieldSource::DocComment,
+        );
+        let keyed = db.map_keyed(Arc::new(Projection::new(
+            vec![field].into(),
+            ProjectionOrigin::DocComment,
+            None,
+        )));
+        let plain = db.map(None, None);
+
+        assert_eq!(show(&db, keyed, &ru()), "Соответствие");
+        assert_eq!(show(&db, keyed, &en()), "Map");
+        assert_eq!(show(&db, keyed, &ru()), show(&db, plain, &ru()));
+        assert_eq!(show(&db, keyed, &en()), show(&db, plain, &en()));
     }
 }

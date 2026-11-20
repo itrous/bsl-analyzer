@@ -74,12 +74,14 @@ GATE_INCOMPLETE = ("no_noise", "noisy", "confirm", "incomplete")
 # The second base of the gate, `baseline.json`: metric -> (unit, aggregate of the
 # candidate). Its limit is the noise of the record, with no bar on top of it; the
 # growth of a work metric over that limit may still be repaid by the wall (`gate.py`).
+# Memory is the peak of series A, which runs no references: the peak of series B
+# answers to `GATE_HWM_LIMIT_KB` alone.
 GATE_RECORD = {
     "graph_ready_s": ("s", "median_A"),
     "graph_ready_cpu_s": ("s", "median_A"),
     "graph_resolve_s": ("s", "median_A"),
     "diagnostics_workspace_s": ("s", "median_A"),
-    "hwm_kb": ("KB", "max_AB"),
+    "hwm_kb": ("KB", "max_A"),
     "references_1_s": ("s", "median_B"),
     "references_2_same_s": ("s", "median_B"),
     "references_3_other_s": ("s", "median_B"),

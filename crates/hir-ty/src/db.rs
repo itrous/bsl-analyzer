@@ -1,4 +1,5 @@
 use bsl_types::kind::TypeId;
+use hir_def::body::events::BodyEvents;
 use hir_def::{ConfigsDatabase, DefWithBodyId, ExprId, MethodIdInput};
 use std::sync::Arc;
 use vfs::FileId;
@@ -31,6 +32,9 @@ pub trait HirDatabase: ConfigsDatabase + bsl_types::intern::TypeKernelDb {
     fn arg_diagnostics(&self, file_id: FileId) -> Arc<Vec<(DefWithBodyId, InferenceDiagnostic)>>;
 
     fn type_narrowing_enabled(&self) -> bool;
+
+    /// The `mapKeyTypes` profile: typed `Соответствие.Получить("key")` results.
+    fn map_key_types_enabled(&self) -> bool;
 
     /// Project-level execution-environment settings for API-availability
     /// checks (which client environments the configuration targets).
@@ -96,4 +100,19 @@ pub trait HirDatabase: ConfigsDatabase + bsl_types::intern::TypeKernelDb {
         &self,
         method: MethodIdInput<'_>,
     ) -> Option<Arc<dataflow::reaching_defs::ReachingDefsResult>>;
+
+    /// The control-flow graph of one method's memoised body, built once per
+    /// revision of that body.
+    fn method_cfg(&self, method: MethodIdInput<'_>) -> Arc<cfg::ControlFlowGraph>;
+
+    /// The control-flow graph of the module-level code; empty when the module
+    /// has none.
+    fn module_code_cfg(&self, file_id: FileId) -> Arc<cfg::ControlFlowGraph>;
+
+    /// The syntactic evaluation events of one method's memoised body.
+    fn method_body_events(&self, method: MethodIdInput<'_>) -> Arc<BodyEvents>;
+
+    /// The syntactic evaluation events of the module-level code; `None` when
+    /// the module has none.
+    fn module_code_body_events(&self, file_id: FileId) -> Option<Arc<BodyEvents>>;
 }

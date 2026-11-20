@@ -90,6 +90,13 @@ pub enum SdblDiagnostic {
         range: TextRange,
     },
 
+    /// An alias of an enclosing query named inside a derived table, where the platform does not
+    /// see it. The range is the alias token alone.
+    UnavailableAlias {
+        alias: String,
+        range: TextRange,
+    },
+
     FullOuterJoin {
         range: TextRange,
     },
@@ -132,6 +139,29 @@ pub enum SdblDiagnostic {
     QueryNestedFieldsByDot {
         range: TextRange,
         parts_count: Option<u32>,
+    },
+
+    /// A path through a register's `Регистратор` that reads something other than a standard
+    /// field of the document: a declared attribute, a common attribute or a tabular section.
+    RegisterRecorderFieldInQuery {
+        attribute: String,
+        range: TextRange,
+    },
+
+    /// An `ORDER BY` key that orders by the `Дата` of a document reference field. Documents of
+    /// one date come in arbitrary order, so the chronological key is `МоментВремени`.
+    QueryOrderByDocumentDate {
+        reference_field: String,
+        range: TextRange,
+    },
+
+    /// A condition in the parameters of an accumulation register virtual table whose fields are not
+    /// the leading dimensions of the register: no index of the totals table serves it (#std652).
+    /// `missing_dimension` is the first dimension, in configuration order, that is absent from the
+    /// condition while a later one is present.
+    QueryConditionWithoutIndex {
+        missing_dimension: String,
+        range: TextRange,
     },
 
     RefOveruse {
@@ -201,6 +231,14 @@ pub enum VirtualTableParameterProblem {
 /// not from a join.
 pub const SCHEDULE_DATA_NULL_MESSAGE: &str = "Поле данных графика может быть NULL, если график за период не заполнен: добавьте проверку через ЕСТЬ NULL или функцию ЕСТЬNULL";
 
+/// The one wording of the `ORDER BY` document-date finding, shared by the enum rendering and
+/// the `ide-diagnostics` handler.
+pub fn query_order_by_document_date_message(reference_field: &str) -> String {
+    format!(
+        "Упорядочивание по «{reference_field}.Дата» не задаёт однозначного порядка: у документов с одной датой порядок произвольный. Упорядочивайте по «{reference_field}.МоментВремени»"
+    )
+}
+
 /// The one wording of a parameter-list error, shared by the enum rendering and the
 /// `ide-diagnostics` handler.
 pub fn invalid_virtual_table_parameters_message(
@@ -220,6 +258,14 @@ pub fn invalid_virtual_table_parameters_message(
              параметры читаются строго по порядку"
         ),
     }
+}
+
+/// The one wording of an unindexed virtual-table condition, shared by the enum rendering and the
+/// `ide-diagnostics` handler.
+pub fn query_condition_without_index_message(missing_dimension: &str) -> String {
+    format!(
+        "Условие в параметрах виртуальной таблицы не опирается на индекс: поля условия должны быть начальными и идти подряд в порядке измерений регистра. Пропущено измерение «{missing_dimension}»"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +356,12 @@ impl SdblDiagnostic {
                     alias
                 )
             }
+            Self::UnavailableAlias { alias, .. } => {
+                format!(
+                    "Псевдоним \"{}\" внешнего запроса недоступен внутри производной таблицы",
+                    alias
+                )
+            }
             Self::FullOuterJoin { .. } => {
                 "Использование FULL OUTER JOIN значительно снижает производительность запроса. \
                  Рассмотрите возможность переписать с использованием UNION и LEFT JOIN"
@@ -356,6 +408,19 @@ impl SdblDiagnostic {
                 "Поле, полученное через точку от ссылочного поля, добавляет в запрос неявное \
                  соединение с таблицей, на которую указывает ссылка"
                     .to_string()
+            }
+            Self::RegisterRecorderFieldInQuery { attribute, .. } => {
+                format!(
+                    "В запросе к регистру читается реквизит «{attribute}» документа-регистратора. \
+                     Регистр должен быть самодостаточен: нужные данные хранятся его измерениями \
+                     и реквизитами (#std477)"
+                )
+            }
+            Self::QueryOrderByDocumentDate { reference_field, .. } => {
+                query_order_by_document_date_message(reference_field)
+            }
+            Self::QueryConditionWithoutIndex { missing_dimension, .. } => {
+                query_condition_without_index_message(missing_dimension)
             }
             Self::RefOveruse { .. } => {
                 "Поле «Ссылка», полученное через точку от ссылочного поля, совпадает с самим \
@@ -409,6 +474,7 @@ impl SdblDiagnostic {
             Self::InvalidArgumentCount { range, .. } => *range,
             Self::AliasRequired { range, .. } => *range,
             Self::DuplicateAlias { range, .. } => *range,
+            Self::UnavailableAlias { range, .. } => *range,
             Self::FullOuterJoin { range, .. } => *range,
             Self::JoinWithSubQuery { range, .. } => *range,
             Self::AliasWithoutAsKeyword { range, .. } => *range,
@@ -418,6 +484,9 @@ impl SdblDiagnostic {
             Self::ScheduleDataFieldWithoutNullCheck { range, .. } => *range,
             Self::MultilineString { range } => *range,
             Self::QueryNestedFieldsByDot { range, .. } => *range,
+            Self::RegisterRecorderFieldInQuery { range, .. } => *range,
+            Self::QueryOrderByDocumentDate { range, .. } => *range,
+            Self::QueryConditionWithoutIndex { range, .. } => *range,
             Self::RefOveruse { range } => *range,
             Self::UnionWithoutAll { range } => *range,
             Self::LikeUsage { range, .. } => *range,
@@ -442,6 +511,7 @@ impl SdblDiagnostic {
             Self::CalculationRegisterVirtualTableWithoutRecorder { .. } => false,
             Self::AliasRequired { .. } => false,
             Self::DuplicateAlias { .. } => true,
+            Self::UnavailableAlias { .. } => true,
             Self::FullOuterJoin { .. } => false,
             Self::JoinWithSubQuery { .. } => false,
             Self::AliasWithoutAsKeyword { .. } => false,
@@ -451,6 +521,9 @@ impl SdblDiagnostic {
             Self::ScheduleDataFieldWithoutNullCheck { .. } => false,
             Self::MultilineString { .. } => false,
             Self::QueryNestedFieldsByDot { .. } => false,
+            Self::RegisterRecorderFieldInQuery { .. } => false,
+            Self::QueryOrderByDocumentDate { .. } => false,
+            Self::QueryConditionWithoutIndex { .. } => false,
             Self::RefOveruse { .. } => false,
             Self::UnionWithoutAll { .. } => false,
             Self::LikeUsage { kind: LikeUsageKind::Allowed, .. } => false,
@@ -524,5 +597,19 @@ mod tests {
         };
         assert!(diag.message().contains("НесуществующееПоле"));
         assert!(diag.message().contains("Справочник.Валюты"));
+    }
+
+    #[test]
+    fn register_recorder_message_has_single_spaces() {
+        let diag = SdblDiagnostic::RegisterRecorderFieldInQuery {
+            attribute: "Контрагент".to_string(),
+            range: syntax::MODULE_RANGE,
+        };
+        assert_eq!(
+            diag.message(),
+            "В запросе к регистру читается реквизит «Контрагент» документа-регистратора. \
+             Регистр должен быть самодостаточен: нужные данные хранятся его измерениями и \
+             реквизитами (#std477)"
+        );
     }
 }

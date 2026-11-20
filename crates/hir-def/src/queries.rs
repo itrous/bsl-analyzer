@@ -329,6 +329,7 @@ pub fn workspace_foreign_handler_bindings_query(
     source_root_input: base_db::SourceRootInput,
 ) -> Arc<crate::call_graph::ForeignHandlerBindings> {
     let _span = tracing::info_span!("workspace_foreign_handler_bindings").entered();
+    let started = std::time::Instant::now();
     let source_root = source_root_input.root(db);
     let file_set = source_root.file_set();
     // A text scan, not the source root's name-usage index: that index parses every
@@ -365,7 +366,12 @@ pub fn workspace_foreign_handler_bindings_query(
             }
         }
     }
-    tracing::info!(candidates = candidates, names = names.len(), "ForeignHandlerBindings built");
+    tracing::info!(
+        candidates = candidates,
+        names = names.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "ForeignHandlerBindings built"
+    );
     Arc::new(crate::call_graph::ForeignHandlerBindings::new(names))
 }
 

@@ -10,10 +10,12 @@ command lines, which would also hit the shell running the check.
 
 from __future__ import annotations
 
+import json
 import os
 import select
 import signal
 import threading
+import time
 
 from clock import RealClock
 
@@ -22,6 +24,9 @@ TERM_GRACE_S = 10.0
 # SIGKILL cannot be ignored; this bound only guards against a stuck kernel.
 KILL_WAIT_S = 30.0
 CLK_TCK = os.sysconf("SC_CLK_TCK")
+SAMPLE_INTERVAL_S = 1.0
+TRACE_SCHEMA = 1
+TRACE_NAME = "resources.jsonl"
 
 
 def child_env(run_id: str, xdg_root: dict | None = None, extra: dict | None = None,
@@ -118,6 +123,22 @@ def _cpu_s(pid: int, proc_root: str) -> float | None:
     return (int(fields[11]) + int(fields[12])) / CLK_TCK
 
 
+def _io_bytes(pid: int, proc_root: str) -> dict:
+    """`read_bytes` and `write_bytes` of `/proc/<pid>/io`; a field that cannot
+    be read is None (the file is readable only by the owner, and gone with the
+    process)."""
+    found = {"read_bytes": None, "write_bytes": None}
+    text = _read(os.path.join(proc_root, str(pid), "io"))
+    for line in (text or b"").decode("ascii", "replace").splitlines():
+        name, _, value = line.partition(":")
+        if name in found:
+            try:
+                found[name] = int(value)
+            except ValueError:
+                pass
+    return found
+
+
 def snapshot(run_id: str, proc_root: str = "/proc") -> dict:
     """One pass over /proc: the tracked set, its summed VmRSS and CPU."""
     pids = tracked(run_id, proc_root)
@@ -202,15 +223,109 @@ def stop(run_id: str, clock=None, proc_root: str = "/proc", grace: float = TERM_
     return report
 
 
+class ResourceTrace:
+    """The opt-in time series of one run: a JSON object per line (`header`,
+    `sample`, `event`, `phase`, `footer`), written as it comes and never held in
+    memory. The sampler and the run's calls share it, so a whole line is written
+    under one lock. Losing the trace never fails the run: a write that fails
+    closes the file and only the trace ends, with the loss in `errors`."""
+
+    def __init__(self, path: str, header: dict, clock, wall=None):
+        """`clock` gives the monotonic `t_s`, `wall` the Unix UTC `wall_s`."""
+        self.path = path
+        self.clock = clock
+        self.wall = wall or time.time
+        self.errors: list[str] = []
+        self._seen: set[str] = set()
+        self._lock = threading.Lock()
+        self._t0 = clock.now()
+        try:
+            self._fh = open(path, "w", encoding="utf-8")
+        except OSError as exc:
+            self._fh = None
+            self.errors.append(f"open: {exc}")
+        self._write("header", **header, interval_s=SAMPLE_INTERVAL_S)
+
+    def t_s(self) -> float:
+        """Monotonic seconds since the trace began, on the run's clock."""
+        return self.clock.now() - self._t0
+
+    def loss(self, text: str) -> None:
+        """Record a gap of the trace once, however often it repeats."""
+        with self._lock:
+            if text not in self._seen:
+                self._seen.add(text)
+                self.errors.append(text)
+
+    def sample(self, processes: list[dict]) -> None:
+        for proc in processes:
+            for name, value in proc.items():
+                if value is None:
+                    self.loss(f"pid {proc['pid']}: {name} unreadable")
+        self._write("sample", t_s=self.t_s(), processes=processes)
+
+    def event(self, name: str, at: float | None = None, **fields) -> None:
+        """An event at clock time `at` (now when omitted)."""
+        t_s = self.t_s() if at is None else at - self._t0
+        self._write("event", name=name, t_s=t_s, **fields)
+
+    def phase(self, name: str, elapsed_ms: int, wall_s: float | None) -> None:
+        self._write("phase", name=name, elapsed_ms=elapsed_ms, source="daemon.log", wall_s=wall_s)
+
+    def finish(self) -> dict:
+        """Write the footer, close the file, and say what the run record keeps
+        of the trace — also when the footer itself could not be written.
+        The series is closed before the footer, so a failed close is one of the
+        footer's errors; a trace already ended by a failure gets no footer."""
+        with self._lock:
+            if self._fh is not None:
+                self._close()
+                try:
+                    self._fh = open(self.path, "a", encoding="utf-8")
+                except OSError as exc:
+                    self.errors.append(f"open: {exc}")
+            errors = list(self.errors)
+        self._write("footer", status="partial" if errors else "complete", errors=errors)
+        with self._lock:
+            self._close()
+            errors = list(self.errors)
+        return {"path": os.path.basename(self.path), "status": "partial" if errors else "complete",
+                "errors": errors}
+
+    def _write(self, kind: str, **fields) -> None:
+        line = {"schema": TRACE_SCHEMA, "kind": kind, "wall_s": self.wall(), **fields}
+        with self._lock:
+            if self._fh is None:
+                return
+            try:
+                self._fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+                self._fh.flush()
+            except (OSError, ValueError) as exc:
+                self.errors.append(f"write: {exc}")
+                self._close()
+
+    def _close(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            self._fh.close()
+        except OSError as exc:
+            self.errors.append(f"close: {exc}")
+        self._fh = None
+
+
 class Sampler:
     """1 Hz sampler of the tracked set: peak of summed RSS, the last CPU and
     the peak `VmHWM` seen per PID (so processes that exit before the end still
-    count)."""
+    count). With a `sink` (a `ResourceTrace`) every sample also goes there per
+    PID, with the PID's I/O bytes; without one `/proc/<pid>/io` is never read."""
 
-    def __init__(self, run_id: str, interval: float = 1.0, proc_root: str = "/proc"):
+    def __init__(self, run_id: str, interval: float = SAMPLE_INTERVAL_S, proc_root: str = "/proc",
+                 sink: ResourceTrace | None = None):
         self.run_id = run_id
         self.interval = interval
         self.proc_root = proc_root
+        self.sink = sink
         self.peak_rss_kb = 0
         self._cpu: dict[str, float] = {}
         self._hwm: dict[str, int] = {}
@@ -229,6 +344,10 @@ class Sampler:
             for pid, kb in hwm.items():
                 if kb is not None:
                     self._hwm[pid] = max(kb, self._hwm.get(pid, 0))
+        if self.sink is not None:
+            self.sink.sample([{"pid": pid, "cpu_s": snap["cpu_by_pid"].get(str(pid)),
+                               "rss_kb": snap["rss_by_pid"].get(str(pid)), "hwm_kb": hwm[str(pid)],
+                               **_io_bytes(pid, self.proc_root)} for pid in snap["pids"]])
         return snap
 
     def cpu_s(self, exclude=()) -> float:

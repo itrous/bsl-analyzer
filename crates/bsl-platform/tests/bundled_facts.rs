@@ -5,8 +5,8 @@
 //! than entering the binary.
 
 use bsl_platform::{
-    PlatformData, PlatformHelp, PlatformHelpRequest, PlatformHelpSourceKind, PlatformHelpStatus,
-    BUNDLED_PLATFORM_VERSION,
+    MemberSurface, PlatformData, PlatformHelp, PlatformHelpRequest, PlatformHelpSourceKind,
+    PlatformHelpStatus, BUNDLED_PLATFORM_VERSION,
 };
 use serde_json::Value;
 
@@ -15,6 +15,19 @@ const FACTS: &str = include_str!("../data/platform_facts.json");
 /// The type the curated property correction and the first attestation name.
 const RANGE_TYPE: &str = "ОбластьЯчеекТабличногоДокумента";
 const RANGE_EN: &str = "SpreadsheetDocumentRange";
+
+/// What the gate answers for the methods and for the fields of `name`, each
+/// asked on its own.
+fn surfaces_of(data: &PlatformData, name: &str) -> (bool, bool) {
+    (
+        data.platform_type_member_surface_verified(name, MemberSurface::Methods),
+        data.platform_type_member_surface_verified(name, MemberSurface::Fields),
+    )
+}
+
+const BOTH: (bool, bool) = (true, true);
+const NEITHER: (bool, bool) = (false, false);
+const METHODS_ONLY: (bool, bool) = (true, false);
 
 const RECORD_KEYS: &[(&str, &[&str])] = &[
     (
@@ -254,17 +267,39 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     // The attested surfaces, under both spellings of their names.
     for name in [RANGE_TYPE, RANGE_EN] {
         assert!(
-            data.platform_type_member_surface_verified(name),
+            surfaces_of(&data, name) == BOTH,
             "{name} is attested and the built-in facts are of the attested release"
         );
     }
-    for name in ["ЗаписьJSON", "JSONWriter", "ТаблицаЗначений", "ValueTable"] {
-        assert!(data.platform_type_member_surface_verified(name), "{name} is attested");
+    for name in ["ОбъектМетаданных: Реквизит", "MetadataObject: Attribute"]
+    {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
     }
+    for name in ["ЗаписьJSON", "JSONWriter", "ТаблицаЗначений", "ValueTable"] {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} is attested");
+    }
+    // The collections that address their elements by name are attested for the
+    // methods alone: an element name is answered as a property, so the property
+    // surface stays open.
+    for name in [
+        "SpreadsheetDocumentDrawingCollection",
+        "КоллекцияРисунковТабличногоДокумента",
+        "StandardAttributeDescriptions",
+        "ОписанияСтандартныхРеквизитов",
+    ] {
+        assert!(
+            surfaces_of(&data, name) == METHODS_ONLY,
+            "{name} is attested for its methods and not for its properties"
+        );
+    }
+    assert_eq!(data.get_type_methods("SpreadsheetDocumentDrawingCollection").len(), 6);
+    assert!(data.get_type_properties("SpreadsheetDocumentDrawingCollection").is_empty());
+    assert_eq!(data.get_type_methods("StandardAttributeDescriptions").len(), 1);
+    assert!(data.get_type_properties("StandardAttributeDescriptions").is_empty());
     // ...and the types nobody attested stay open, however complete they look.
-    assert!(!data.platform_type_member_surface_verified("ТабличныйДокумент"));
-    assert!(!data.platform_type_member_surface_verified("Запрос"));
-    assert!(!data.platform_type_member_surface_verified("ЗаписьJSONНеТакой"));
+    assert!(surfaces_of(&data, "ТабличныйДокумент") == NEITHER);
+    assert!(surfaces_of(&data, "Запрос") == NEITHER);
+    assert!(surfaces_of(&data, "ЗаписьJSONНеТакой") == NEITHER);
 
     // The members the attestation covers are the ones the positive tests call
     // absent: were the corpus to gain them, those tests would have to change.
@@ -304,8 +339,11 @@ fn the_curated_return_type_correction_reaches_the_built_in_facts() {
 }
 
 /// The curating rule of an attestation, held by a test rather than by prose in
-/// `OVERLAYS.md`: a type whose extract had to be patched has no surface the
-/// extract may call complete, and neither has a type a configuration extends.
+/// `OVERLAYS.md`, and it is a rule about surfaces. A type whose extract had to
+/// be patched has no surface the extract may call complete, so it is not
+/// attested at all. A type a configuration extends and a type that addresses its
+/// elements by name keep their properties open, while their methods are still the
+/// platform's own, so such a type may be attested for `["methods"]` only.
 ///
 /// The form half is a name check with a stated limit: a managed form gains
 /// properties from its per-MDO extensions (`form_extension_property_names` in
@@ -316,10 +354,17 @@ fn the_curated_return_type_correction_reaches_the_built_in_facts() {
 /// would still slip through (the corpus names are not a classification), which is
 /// why the check is written down here as the rule's ceiling rather than as a
 /// proof of it.
+///
+/// The second list is the same kind of ceiling for the name-addressed collections:
+/// the corpus does not say that `КоллекцияРисунковТабличногоДокумента` answers
+/// `Рисунки.<имя рисунка>` as a property, a live run does, so the names are kept here by
+/// hand, as the markers are. Each entry carries the type's English canonical name.
 #[test]
 fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
     const EXTENDED_TYPE_MARKERS: &[&str] =
         &["form", "форма", "extension", "расширение", "datacomposition", "компоновкаданных"];
+    const ELEMENTS_ADDRESSED_BY_NAME: &[&str] =
+        &["SpreadsheetDocumentDrawingCollection", "StandardAttributeDescriptions"];
 
     fn normalized(name: &str) -> String {
         name.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
@@ -340,6 +385,12 @@ fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
 
     let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
     let data = PlatformData::from_help(help);
+    for name in ELEMENTS_ADDRESSED_BY_NAME {
+        assert!(
+            data.get_type(name).is_some(),
+            "{name} of the name-addressed list must exist in the built-in facts"
+        );
+    }
     for entry in entries {
         let name = entry["type"].as_str().expect("an attested type is named");
         let ty = data
@@ -348,13 +399,27 @@ fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
         assert!(
             !synthesized.iter().any(|patched| *patched == ty.english_name.as_str()),
             "{name} is a type whose member list the docs-gap overlays synthesize: \
-             its extract is patched, so it has no attested-complete surface"
+             its extract is patched, so it has no attested surface of either kind"
         );
-        for alias in [ty.name.as_str(), ty.english_name.as_str()] {
+        let surfaces: Option<Vec<&str>> = entry.get("verified_surface").map(|value| {
+            value
+                .as_array()
+                .expect("verified_surface is a list")
+                .iter()
+                .map(|surface| surface.as_str().expect("a surface is named by a string"))
+                .collect()
+        });
+        let extended = [ty.name.as_str(), ty.english_name.as_str()].iter().any(|alias| {
             let folded = normalized(alias);
-            assert!(
-                !EXTENDED_TYPE_MARKERS.iter().any(|marker| folded.contains(marker)),
-                "{alias} is extended by a configuration, so the extract cannot list its members"
+            EXTENDED_TYPE_MARKERS.iter().any(|marker| folded.contains(marker))
+        });
+        let addressed_by_name = ELEMENTS_ADDRESSED_BY_NAME.contains(&ty.english_name.as_str());
+        if extended || addressed_by_name {
+            assert_eq!(
+                surfaces.as_deref(),
+                Some(&["methods"][..]),
+                "{name} is extended by a configuration or addresses its elements by name, so \
+                 its properties are open: it may be attested for [\"methods\"] only"
             );
         }
     }
@@ -464,4 +529,86 @@ fn every_readonly_correction_changes_a_built_in_property() {
             assert_eq!(served.is_readonly, corrected, "{canonical_type}.{name}");
         }
     }
+}
+
+/// The folded names of the functions the shipped passing attestation leaves out.
+fn shipped_unverified_functions() -> std::collections::BTreeSet<String> {
+    use stdx::case::CaseExt;
+    let document: Value =
+        serde_json::from_str(include_str!("../data/platform_overlays.json")).expect("overlay JSON");
+    let attestations = document["parameter_passing_attestations"]
+        .as_array()
+        .expect("the curated document carries the passing attestation");
+    assert_eq!(attestations.len(), 1, "the guards below are written for one global attestation");
+    attestations[0]["unverified_functions"]
+        .as_array()
+        .expect("the attestation lists its unverified functions")
+        .iter()
+        .map(|name| name.as_str().expect("a function is named").fold_lower())
+        .collect()
+}
+
+/// The exclusion list must be exactly the functions that carry call variants. The extract
+/// flattens a function's variants into one parameter list and leaves the merged ones
+/// undescribed, so a function that gains variants later must be added to the list, or the
+/// attestation would start claiming "by value" for parameters nothing ever verified.
+#[test]
+fn the_unverified_functions_are_exactly_the_global_functions_with_call_variants() {
+    use stdx::case::CaseExt;
+    let facts: Value = serde_json::from_str(FACTS).expect("the built-in corpus is JSON");
+    let with_variants: std::collections::BTreeSet<String> = facts["global_functions"]
+        .as_array()
+        .expect("global functions are an array")
+        .iter()
+        .filter(|function| {
+            function["variants"].as_array().is_some_and(|variants| !variants.is_empty())
+        })
+        .map(|function| function["name"].as_str().expect("a function is named").fold_lower())
+        .collect();
+    let listed = shipped_unverified_functions();
+    assert!(!listed.is_empty(), "the guard would be vacuous without listed functions");
+
+    let missing: Vec<_> = with_variants.difference(&listed).collect();
+    let superfluous: Vec<_> = listed.difference(&with_variants).collect();
+    assert!(
+        missing.is_empty() && superfluous.is_empty(),
+        "the extract flattens a function's call variants into one parameter list and leaves the \
+         merged ones undescribed, so every global function with variants must be listed in \
+         unverified_functions, or the attestation would claim \"by value\" for parameters \
+         nothing ever verified. With variants but not listed: {missing:?}; listed but without \
+         variants: {superfluous:?}"
+    );
+}
+
+/// The attestation's effect on the shipped corpus, computed from the data: outside the list
+/// every parameter has a verdict, inside it none has.
+#[test]
+fn the_passing_attestation_covers_every_parameter_outside_its_exclusion_list() {
+    use stdx::case::CaseExt;
+    let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+    let data = PlatformData::from_help(help);
+    let listed = shipped_unverified_functions();
+
+    let mut attested = 0;
+    for function in data.all_global_functions() {
+        let excluded = listed.contains(&function.name.fold_lower());
+        for parameter in &function.parameters {
+            if excluded {
+                assert_eq!(
+                    parameter.passing, None,
+                    "{}: parameter {} of an unverified function must stay unknown",
+                    function.name, parameter.name
+                );
+            } else {
+                attested += 1;
+                assert!(
+                    parameter.passing.is_some(),
+                    "{}: parameter {} has no passing verdict although the function is attested",
+                    function.name,
+                    parameter.name
+                );
+            }
+        }
+    }
+    assert!(attested > 0, "the guard would be vacuous without attested parameters");
 }

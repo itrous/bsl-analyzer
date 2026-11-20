@@ -13,3 +13,18 @@ crates/bsl-analyzer/tests/fixtures/foreign_handler_bindings/** -text
 # (core.autocrlf=true) would fail them without any change in the code.
 crates/ide-diagnostics/src/handlers/fixtures/** -text
 crates/lexer/tests/fixtures/sdbl_golden_corpus.txt -text
+# Read by tests that look for an LF-spelled needle (`"\n## "`, `"\n      - name:"`), so a CRLF
+# checkout fails four tests with no change in the code. Spelled `eol=lf` rather than `-text`
+# because, unlike the fixtures above, these are documents people edit: the checkout stays LF and
+# an edit made on Windows cannot commit CRLF back into them.
+docs/mcp/LOCATION_CONTRACT.md eol=lf
+docs/mcp/TOOLS_AND_EXTENSION.md eol=lf
+.github/workflows/ci.yml eol=lf
+# The tests pin line and column of a finding inside a multi-line query string and compare the
+# query text byte for byte with the module that holds it; a CRLF checkout would shift both.
+crates/ide-diagnostics/tests/fixtures/derived_table_outer_alias/** -text
+# The CFG contract compares an expect dump that pins byte offsets of these sources, and every
+# parser fixture is compared byte for byte: the licence header of the module corpus, the CST
+# dump and the recorded trivia ranges. A CRLF checkout shifts every offset by one per line.
+crates/hir/tests/fixtures/cfg_contract/** -text
+crates/parser/tests/fixtures/** -text

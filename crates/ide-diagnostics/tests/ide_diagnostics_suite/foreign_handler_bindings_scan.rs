@@ -48,9 +48,14 @@ fn filler(index: usize) -> String {
 /// The form module, the helper that binds one of its procedures, and [`FILLERS`]
 /// common modules, in one source root of a database that counts salsa executions.
 fn stand() -> (RootDatabaseImpl, usize) {
+    stand_with_main_module(FORM_MODULE)
+}
+
+/// [`stand`] with the module under analysis (file 0) placed at `main_path`.
+fn stand_with_main_module(main_path: &str) -> (RootDatabaseImpl, usize) {
     let mut db = RootDatabaseImpl::new_with_salsa_events();
     let mut sources = vec![
-        (FORM_MODULE.to_string(), FORM.to_string()),
+        (main_path.to_string(), FORM.to_string()),
         ("/test/CommonModules/ОбщийМодуль1/Ext/Module.bsl".to_string(), HELPER.to_string()),
     ];
     sources.extend(
@@ -135,4 +140,44 @@ fn primed_bindings_give_the_same_findings() {
         !cold_findings.iter().any(|f| f.contains("\"ОбработчикОжидания1\"")),
         "{cold_findings:#?}"
     );
+}
+
+/// The collector chain asks for the fold once, up front, so the first rule to need it
+/// is not billed for the whole workspace scan - and the prime is not a second build.
+#[test]
+fn the_fold_is_built_once_for_a_form_module() {
+    let (db, _) = stand();
+    assert!(db.salsa_events_reset());
+
+    ide_diagnostics::file_diagnostics(&db, FileId(0), &DiagnosticsConfig::all_enabled());
+
+    assert_eq!(executions(&db, "workspace_foreign_handler_bindings_query"), 1);
+}
+
+/// Guard against a prime without the module-kind gate: it would build a workspace-wide
+/// fold for a module no reader consults it for.
+#[test]
+fn the_fold_is_not_built_for_a_module_that_is_not_a_form() {
+    let (db, _) = stand_with_main_module("/test/CommonModules/Другой/Ext/Module.bsl");
+    assert!(db.salsa_events_reset());
+
+    ide_diagnostics::file_diagnostics(&db, FileId(0), &DiagnosticsConfig::all_enabled());
+
+    assert_eq!(executions(&db, "workspace_foreign_handler_bindings_query"), 0);
+}
+
+/// Guard against a prime without the configuration gate: with every reader switched off
+/// nothing would have asked for the fold.
+#[test]
+fn the_fold_is_not_built_for_a_form_module_when_no_reader_is_enabled() {
+    let (db, _) = stand();
+    assert!(db.salsa_events_reset());
+    let config = DiagnosticsConfig {
+        disabled: ide_diagnostics::FOREIGN_HANDLER_BINDINGS_READERS.to_vec(),
+        ..DiagnosticsConfig::all_enabled()
+    };
+
+    ide_diagnostics::file_diagnostics(&db, FileId(0), &config);
+
+    assert_eq!(executions(&db, "workspace_foreign_handler_bindings_query"), 0);
 }

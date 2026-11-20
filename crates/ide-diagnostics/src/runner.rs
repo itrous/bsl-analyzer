@@ -33,6 +33,8 @@ const ITEM_TREE_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::OrderOfParams,
     DiagnosticCode::ReservedParameterNames,
     DiagnosticCode::SeveralCompilerDirectives,
+    DiagnosticCode::AtClientAtServerFormMethod,
+    DiagnosticCode::FormEventHandlerDirective,
     DiagnosticCode::NonExportMethodsInApiRegion,
     DiagnosticCode::CachedPublic,
     DiagnosticCode::CompilationDirectiveLost,
@@ -55,6 +57,7 @@ const MODULE_BODIES_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::DataExchangeLoading,
     DiagnosticCode::TransferringParametersBetweenClientAndServer,
     DiagnosticCode::UnusedLocalMethod,
+    DiagnosticCode::UnboundFormEventHandler,
 ];
 
 const CONFIGURATION_DIAGNOSTICS: &[DiagnosticCode] = &[
@@ -69,6 +72,7 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::AssignAliasFieldsInQuery,
     DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
     DiagnosticCode::DuplicateAliasInQuery,
+    DiagnosticCode::UnavailableAliasInQuery,
     DiagnosticCode::FieldsFromJoinsWithoutIsNull,
     DiagnosticCode::FullOuterJoinQuery,
     DiagnosticCode::IncorrectUseLikeInQuery,
@@ -78,7 +82,9 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::LogicalOrInJoinQuerySection,
     DiagnosticCode::LogicalOrInTheWhereSectionOfQuery,
     DiagnosticCode::MultilineStringInQuery,
+    DiagnosticCode::QueryConditionWithoutIndex,
     DiagnosticCode::QueryNestedFieldsByDot,
+    DiagnosticCode::QueryOrderByDocumentDate,
     DiagnosticCode::QueryToMissingMetadata,
     DiagnosticCode::QueryParameterSourceWithoutInto,
     DiagnosticCode::QueryTotalsInValueTableInto,
@@ -86,6 +92,7 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::UnknownQueryFunction,
     DiagnosticCode::UnlimitedLengthStringUsageInQuery,
     DiagnosticCode::RefOveruse,
+    DiagnosticCode::RegisterRecorderFieldInQuery,
     DiagnosticCode::SelectTopWithoutOrderBy,
     DiagnosticCode::UnionAll,
     DiagnosticCode::UsingLikeInQuery,
@@ -213,6 +220,18 @@ pub fn collect_item_tree_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic
     ));
 
     diagnostics.extend(run_diagnostic(
+        "AtClientAtServerFormMethod",
+        ctx,
+        handlers::at_client_at_server_form_method::check,
+    ));
+
+    diagnostics.extend(run_diagnostic(
+        "FormEventHandlerDirective",
+        ctx,
+        handlers::form_event_handler_directive::check,
+    ));
+
+    diagnostics.extend(run_diagnostic(
         "NonExportMethodsInApiRegion",
         ctx,
         handlers::non_export_methods_in_api_region::check,
@@ -314,6 +333,11 @@ pub fn collect_module_bodies_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagno
         handlers::unused_local_method::check,
     ));
     diagnostics.extend(run_diagnostic(
+        "UnboundFormEventHandler",
+        ctx,
+        handlers::unbound_form_event_handler::check,
+    ));
+    diagnostics.extend(run_diagnostic(
         "ServerCallsInFormEvents",
         ctx,
         handlers::server_calls_in_form_events::check,
@@ -372,6 +396,7 @@ pub fn collect_sdbl_hir_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic>
 pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispatchFn)] = &[
     (DiagnosticCode::AmbiguousFieldInQuery, handlers::ambiguous_field_in_query::dispatch),
     (DiagnosticCode::DuplicateAliasInQuery, handlers::duplicate_alias_in_query::dispatch),
+    (DiagnosticCode::UnavailableAliasInQuery, handlers::unavailable_alias_in_query::dispatch),
     (DiagnosticCode::AssignAliasFieldsInQuery, handlers::assign_alias_fields_in_query::dispatch),
     (
         DiagnosticCode::CalculationRegisterVirtualTableWithoutRecorder,
@@ -398,7 +423,9 @@ pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispat
         handlers::logical_or_in_the_where_section_of_query::dispatch,
     ),
     (DiagnosticCode::MultilineStringInQuery, handlers::multiline_string_in_query::dispatch),
+    (DiagnosticCode::QueryConditionWithoutIndex, handlers::query_condition_without_index::dispatch),
     (DiagnosticCode::QueryNestedFieldsByDot, handlers::query_nested_fields_by_dot::dispatch),
+    (DiagnosticCode::QueryOrderByDocumentDate, handlers::query_order_by_document_date::dispatch),
     (DiagnosticCode::QueryToMissingMetadata, handlers::query_to_missing_metadata::dispatch),
     (DiagnosticCode::UnknownFieldInQuery, handlers::unknown_field_in_query::dispatch),
     (DiagnosticCode::UnknownQueryFunction, handlers::unknown_query_function::dispatch),
@@ -407,6 +434,10 @@ pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispat
         handlers::unlimited_length_string_usage_in_query::dispatch,
     ),
     (DiagnosticCode::RefOveruse, handlers::ref_overuse::dispatch),
+    (
+        DiagnosticCode::RegisterRecorderFieldInQuery,
+        handlers::register_recorder_field_in_query::dispatch,
+    ),
     (DiagnosticCode::SelectTopWithoutOrderBy, handlers::select_top_without_order_by::dispatch),
     (DiagnosticCode::UnionAll, handlers::union_all::dispatch),
     (DiagnosticCode::UsingLikeInQuery, handlers::using_like_in_query::dispatch),

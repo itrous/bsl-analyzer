@@ -59,7 +59,7 @@ const BSLLS_MARKER: &str = "bslls";
 
 /// The two diagnostics this module itself emits, which must never be suppressed by a directive
 /// (a typo in a directive must still surface) — the retain step below skips them.
-fn is_meta_code(code: DiagnosticCode) -> bool {
+pub(crate) fn is_meta_code(code: DiagnosticCode) -> bool {
     matches!(code, DiagnosticCode::UnknownSuppressionCode | DiagnosticCode::SuppressionWithoutCode)
 }
 
@@ -70,7 +70,9 @@ fn is_meta_code(code: DiagnosticCode) -> bool {
 /// Runs after the scope gate by design: the metas below point at the directive, not at a code
 /// line, and must survive the line gate the same way they survive directives and the baseline
 /// (github#61). The gate removes only, so for source diagnostics the two steps commute; the
-/// order is chosen for the metas this step *adds*.
+/// order is chosen for the metas this step *adds*. When the caller defers the line gate the
+/// metas do meet it, after this step, and it spares them by their code rather than by this
+/// order ([`crate::diagnostic_in_scope`]).
 pub(crate) fn apply(
     db: &dyn ide_db::RootDatabase,
     file_id: vfs::FileId,

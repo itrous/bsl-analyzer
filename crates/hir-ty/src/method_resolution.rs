@@ -361,9 +361,12 @@ pub fn resolve_user_call(
     }
 }
 
+/// `map_keys` is the `mapKeyTypes` profile: when off, documented map keys are read as the plain
+/// `Соответствие` the slot names.
 pub(crate) fn materialise_signature(
     db: &dyn TypeKernelDb,
     method_symbol: &MethodDecl,
+    map_keys: bool,
 ) -> FunctionSignature {
     let ctx = TyLoweringContext::new();
     // Absent documentation is the common case, and then nothing below changes a single type.
@@ -379,7 +382,8 @@ pub(crate) fn materialise_signature(
             let documented = docs
                 .and_then(|docs| find_param_doc(docs, &p.name))
                 .map(|param_doc| param_doc.types.as_slice());
-            let (ty, sees_target) = enrich_with_documented_structure(db, base, documented);
+            let (ty, sees_target) =
+                enrich_with_documented_structure(db, base, documented, map_keys);
             param_sees.push(sees_target);
             ty
         })
@@ -391,8 +395,12 @@ pub(crate) fn materialise_signature(
         .as_ref()
         .map(|t| ctx.lower_type_ref_id(db, t))
         .unwrap_or_else(|| if method_symbol.is_function { db.unknown() } else { db.undefined() });
-    let (ret, ret_sees_target) =
-        enrich_with_documented_structure(db, ret, docs.map(|docs| docs.returned_value.as_slice()));
+    let (ret, ret_sees_target) = enrich_with_documented_structure(
+        db,
+        ret,
+        docs.map(|docs| docs.returned_value.as_slice()),
+        map_keys,
+    );
 
     let max_args = Some(params.len() as u32);
     let doc_see = DocSeeSlots { ret: ret_sees_target, params: param_sees.into() };
@@ -413,6 +421,7 @@ fn enrich_with_documented_structure(
     db: &dyn TypeKernelDb,
     base: TypeId,
     documented: Option<&[hir_def::docs::TypeDoc]>,
+    map_keys: bool,
 ) -> (TypeId, bool) {
     let Some(documented) = documented else {
         return (base, false);
@@ -423,6 +432,7 @@ fn enrich_with_documented_structure(
         let Some(expr) = hir_def::docs::parse_type_expr(type_doc) else {
             continue;
         };
+        let expr = if map_keys { expr } else { expr.without_map_keys() };
         sees_target |= expr.names_documentation_target();
         if let Some(documented) = crate::lower::doc_structure::doc_structure_ty(
             db,
@@ -450,7 +460,8 @@ pub(crate) fn materialise_signature_enriched(
     method_id: hir_def::MethodId,
     method_symbol: &MethodDecl,
 ) -> FunctionSignature {
-    let mut sig: FunctionSignature = materialise_signature(db, method_symbol);
+    let mut sig: FunctionSignature =
+        materialise_signature(db, method_symbol, db.map_key_types_enabled());
     // A slot documented as a bare `Структура` says nothing the body does not already say, and the
     // keys the body proves are the only thing anyone can use. Reading the body for it keeps the
     // rule that documentation adds and never removes.
@@ -709,7 +720,7 @@ mod tests {
             &[("Ссылка", any.clone()), ("Любой", any.clone()), ("Проза", any)],
         );
 
-        let signature = materialise_signature(&db, &symbol);
+        let signature = materialise_signature(&db, &symbol, true);
 
         assert!(signature.doc_see.ret, "трёхсегментная ссылка на возврате");
         assert!(signature.doc_see.param(0), "ссылка в параметре");
@@ -744,7 +755,7 @@ mod tests {
             )],
         );
 
-        let signature = materialise_signature(&db, &symbol);
+        let signature = materialise_signature(&db, &symbol, true);
 
         assert!(
             signature.doc_see.param(0),
@@ -774,7 +785,7 @@ mod tests {
             )],
         );
 
-        let signature = materialise_signature(&db, &symbol);
+        let signature = materialise_signature(&db, &symbol, true);
 
         assert!(signature.doc_see.is_empty(), "ни один слот не называет цель");
         // Positive control: the documented structure still carries its field, so the assertion
@@ -815,7 +826,7 @@ mod tests {
             )],
         );
 
-        let signature = materialise_signature(&db, &symbol);
+        let signature = materialise_signature(&db, &symbol, true);
 
         let bsl_types::kind::TypeKind::Structure(facet) = db.lookup_type(signature.params[0])
         else {
@@ -879,5 +890,79 @@ mod tests {
         assert_eq!(record_set_kind_to_mdo(MetadataKind::AccumulationRegisterRef), None);
         assert_eq!(record_set_kind_to_mdo(MetadataKind::AccountingRegisterRef), None);
         assert_eq!(record_set_kind_to_mdo(MetadataKind::CalculationRegisterRef), None);
+    }
+
+    // ---- documented map keys follow the profile ---------------------------------------------
+
+    fn keyed_slot() -> hir_def::docs::TypeDoc {
+        hir_def::docs::TypeDoc {
+            name: "Соответствие".to_string(),
+            description: None,
+            parameters: Vec::new(),
+            is_hyperlink: false,
+            map_entries: vec![hir_def::docs::MapEntryDoc {
+                key: "сумма".to_string(),
+                types: vec![slot("Число")],
+            }],
+        }
+    }
+
+    fn keyed_method(slot_doc: hir_def::docs::TypeDoc) -> MethodDecl {
+        let mut docs = hir_def::docs::MethodDocs::empty();
+        docs.parameters =
+            vec![hir_def::docs::ParameterDoc::new("Данные".into(), vec![slot_doc.clone()])];
+        docs.returned_value = vec![slot_doc];
+        // The declared hints are what the interface builds from the documentation's type names.
+        let mut method = method_with_docs(docs, &[("Данные", Some(hir_def::TypeRef::Map(None)))]);
+        method.return_type_ref = Some(hir_def::TypeRef::Map(None));
+        method
+    }
+
+    fn entry_names(db: &InMemoryDb, ty: bsl_types::kind::TypeId) -> Option<Vec<String>> {
+        let bsl_types::kind::TypeKind::Map(facet) = db.lookup_type(ty) else {
+            panic!("a map expected, got {:?}", db.lookup_type(ty));
+        };
+        facet
+            .entries
+            .as_ref()
+            .map(|entries| entries.fields.iter().map(|field| field.name.to_string()).collect())
+    }
+
+    #[test]
+    fn the_profile_on_keeps_documented_keys_on_the_parameter_and_the_return() {
+        let db = InMemoryDb::new();
+        let signature = materialise_signature(&db, &keyed_method(keyed_slot()), true);
+
+        assert_eq!(entry_names(&db, signature.params[0]), Some(vec!["сумма".to_owned()]));
+        assert_eq!(entry_names(&db, signature.ret), Some(vec!["сумма".to_owned()]));
+    }
+
+    #[test]
+    fn the_profile_off_reads_both_slots_as_the_plain_map_they_name() {
+        let db = InMemoryDb::new();
+        let signature = materialise_signature(&db, &keyed_method(keyed_slot()), false);
+
+        assert_eq!(signature.params[0], db.map(None, None));
+        assert_eq!(signature.ret, db.map(None, None));
+
+        // The prior reading: the same documentation without the key items.
+        let mut plain_slot = keyed_slot();
+        plain_slot.map_entries.clear();
+        let prior = materialise_signature(&db, &keyed_method(plain_slot), true);
+        assert_eq!(signature.params[0], prior.params[0]);
+        assert_eq!(signature.ret, prior.ret);
+        assert_eq!(entry_names(&db, signature.params[0]), None);
+    }
+
+    #[test]
+    fn the_profile_flag_is_not_a_default_of_the_signature() {
+        // Both values reach the signature: neither a constant `true` nor a constant `false`
+        // gives these two answers.
+        let db = InMemoryDb::new();
+        let method = keyed_method(keyed_slot());
+        assert_ne!(
+            materialise_signature(&db, &method, true).ret,
+            materialise_signature(&db, &method, false).ret
+        );
     }
 }

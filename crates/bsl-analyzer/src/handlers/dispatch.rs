@@ -479,6 +479,7 @@ impl RequestDispatcher<'_> {
         } else {
             FrozenFilePaths::freeze(&state.vfs.read())
         };
+        let file_paths = file_paths.with_source_exclusions(Arc::clone(&state.source_exclusions));
         let ctx = LatencyRequestContext {
             analysis,
             disk_read,

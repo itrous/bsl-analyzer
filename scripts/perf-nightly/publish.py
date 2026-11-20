@@ -37,10 +37,23 @@ INCOMPARABLE = ("baseline_missing", "baseline_invalid", "record_no_noise", "reco
                 "record_protocol_mismatch")
 # Older issues of the release job name the failed metric only in their title.
 RELEASE_TITLE_RE = re.compile(r"Ночной релиз .+: гейт (?:\w+ )?провален по (.+)")
-OWNER_TARGET_TEXT = ("Цель 4 667 316 KB задана для общего пика; исходное число — серия A v0.4.2. Общий пик кандидата "
-                     "включает references B. Следующий релиз заблокирован до возврата с допуском ν; исправление "
-                     "памяти — отдельная задача.")
+# The record of the sweep before the owner moved it to the level of develop.
+SWEEP_RECORD_V041_S = 21.9344880010176
 
+
+def owner_target_text(metric: str, value) -> str | None:
+    """What a record the owner set says of itself, built on its own value so the text and
+    `R` above it never name two numbers; `None` for a metric the owner never set."""
+    if metric == "hwm_kb":
+        target = f"{int(value):,}".replace(",", " ")
+        return (f"Цель {target} KB задана владельцем для пика серии A, без references. Пик серии B с "
+                "references держит абсолютный потолок 7 340 032 KB. Следующий релиз заблокирован до возврата с "
+                "допуском ν; исправление памяти — отдельная задача.")
+    if metric == "diagnostics_workspace_s":
+        slower = (value / SWEEP_RECORD_V041_S - 1) * 100
+        return (f"Рекорд {value:.2f} с задан владельцем на уровне develop: замедление на {slower:.2f} % против "
+                f"v0.4.1 ({SWEEP_RECORD_V041_S:.2f} с) узаконено. Вернуть метрику вниз — отдельная задача.")
+    return None
 
 def run_gh(args: list[str], stdin: str | None = None) -> tuple[int, str, str]:
     try:
@@ -359,7 +372,8 @@ def _candidates_text(record_sha: str, sha: str, ancestor) -> list[str]:
 
 
 def _run_table(saved: dict, row: dict) -> list[str]:
-    series = {"median_A": ("A",), "median_B": ("B",), "max_AB": ("A", "B")}[row["aggregate"]]
+    # `max_AB` is the memory of summaries written before the record of memory held A alone.
+    series = {"median_A": ("A",), "median_B": ("B",), "max_A": ("A",), "max_AB": ("A", "B")}[row["aggregate"]]
     lines = ["| запуск | серия | удержан | значение |", "|---|---|---|---|"]
     return lines + [f"| {r['run']} | {r['series']} | {str(r['held']).lower()} | {_exact(r['metrics'].get(row['metric']))} |"
                     for r in saved.get("run_values") or [] if r["series"] in series]
@@ -398,8 +412,9 @@ def ratchet_facts(group: dict, saved: dict, ancestor) -> list[str]:
     if row.get("basis") == "growth_not_repaid":
         wall = "недоступна" if row["wall_delta"] is None else f"{row['wall_delta'] * 100:+.2f}%"
         lines.append(f"Размен не выполнен: Δ стены против рекорда {wall} в том же раунде не окупает Δ метрики.")
-    if (record.get("evidence") or {}).get("kind") == "owner_target":
-        lines.append(OWNER_TARGET_TEXT)
+    owner = owner_target_text(row["metric"], record["value"])
+    if (record.get("evidence") or {}).get("kind") == "owner_target" and owner is not None:
+        lines.append(owner)
     return lines + _candidates_text(record["sha"], sha, ancestor) + _profile_lines(saved) + \
         _artifacts(saved) + ["", *_run_table(saved, row)]
 

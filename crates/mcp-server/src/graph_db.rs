@@ -2066,6 +2066,11 @@ pub(crate) enum PatchError {
 
 /// How long applying a patch's SQL may take, and how long the write lock is waited for.
 pub(crate) const PATCH_SQL_BUDGET: Duration = Duration::from_secs(5);
+/// [`PATCH_SQL_BUDGET`] for a test that is not about the budget: on a loaded machine the durable
+/// writes alone can outlast the production bound, and an overrun sends the patch down another path.
+#[cfg(test)]
+pub(crate) const PATCH_SQL_BUDGET_NOT_UNDER_TEST: Duration =
+    test_utils::wait::hang_guard(PATCH_SQL_BUDGET);
 const PATCH_LOCK_WAIT: Duration = Duration::from_millis(250);
 
 /// A patch written to the graph database and not yet committed. Dropping it rolls the
@@ -2174,7 +2179,9 @@ pub(crate) fn begin_body_patch(
 }
 
 /// A patch applied to a COPY of `src_path` written to `out_path`: the shape the equivalence
-/// tests compare against a full rebuild.
+/// tests compare against a full rebuild. The SQL is not held to [`PATCH_SQL_BUDGET`]: which
+/// rows a patch writes does not depend on how fast the machine writes them, and the budget
+/// is tested through [`begin_body_patch`] itself.
 #[cfg(test)]
 pub(crate) fn update_graph_database_bodies(
     project: &crate::graph::ProjectSnapshot,
@@ -2188,7 +2195,7 @@ pub(crate) fn update_graph_database_bodies(
     let patch = compute_body_patch(project, universe, src_path, changed_paths, budget)?;
     std::fs::copy(src_path, out_path)?;
     let transaction =
-        begin_body_patch(out_path, project, universe, &patch, meta, false, PATCH_SQL_BUDGET)
+        begin_body_patch(out_path, project, universe, &patch, meta, false, Duration::MAX)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     Ok(transaction.commit()?)
 }
@@ -3512,7 +3519,7 @@ mod tests {
     /// shape, and the shape is the whole point — the dictionary resolves this
     /// against the scanned universe.
     fn expected_file(_root: &Path, relative: &str) -> (String, String) {
-        (String::new(), relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+        (String::new(), relative.to_owned())
     }
 
     /// Every batch database goes to the drop thread, so a build of several batches
@@ -3754,8 +3761,7 @@ mod tests {
         .unwrap();
     }
 
-    /// What `update_graph_database_bodies` does, without the 5 s the patch is held to
-    /// there: which row a store keeps does not depend on how fast the machine writes it.
+    /// What `update_graph_database_bodies` does, over a one-file batch and the test meta.
     fn patched_copy(
         project: &crate::graph::ProjectSnapshot,
         universe: &crate::graph::universe::ScannedUniverse,

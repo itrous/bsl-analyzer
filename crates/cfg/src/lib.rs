@@ -11,7 +11,7 @@ pub use edge::CfgEdgeType;
 pub use graph::ControlFlowGraph;
 pub use vertex::{
     BasicBlockVertex, CfgVertex, ConditionalVertex, ForEachHeaderVertex, ForHeaderVertex,
-    PreprocConditionVertex, WhileHeaderVertex,
+    LoopEntryVertex, PreprocConditionVertex, WhileHeaderVertex,
 };
 
 pub use petgraph::graph::NodeIndex;

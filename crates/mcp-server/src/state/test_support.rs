@@ -67,7 +67,10 @@ impl Drop for EnvVarGuard {
 }
 
 pub(super) use fixtures::{mock_embedding_env, write_common_module, write_common_module_tree};
-pub(crate) use fixtures::{mock_semantic_config, spawn_mock_embedding_server};
+pub(crate) use fixtures::{
+    mock_semantic_config, spawn_mock_embedding_server, spawn_recording_embedding_server,
+    EmbeddingRequests,
+};
 
 /// Explicit local fixtures for the handler acceptance tests: no environment changes,
 /// cache discovery, resident graph or filesystem watcher is needed by these search routes.
@@ -139,6 +142,44 @@ mod fixtures {
     /// fixed vector per input, so the real `Embedder` produces deterministic vectors without
     /// a live service. Returns the base URL; the detached server thread stops on process exit.
     pub(crate) fn spawn_mock_embedding_server(vector: Vec<f32>) -> String {
+        serve_embeddings(move |_, inputs| vec![vector.clone(); inputs.len().max(1)])
+    }
+
+    /// What a recording endpoint was asked: every text sent for embedding, in arrival order,
+    /// and the requests that carried no input (health and model probes).
+    #[derive(Default)]
+    pub(crate) struct EmbeddingRequests {
+        pub(crate) inputs: Vec<String>,
+        pub(crate) probes: usize,
+    }
+
+    /// [`spawn_mock_embedding_server`] that records the texts it embeds. Every input gets a
+    /// vector of its own, numbered in arrival order, so a vector that survives a restart is
+    /// told apart from one paid for again.
+    pub(crate) fn spawn_recording_embedding_server(
+    ) -> (String, std::sync::Arc<std::sync::Mutex<EmbeddingRequests>>) {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(EmbeddingRequests::default()));
+        let recorder = requests.clone();
+        let url = serve_embeddings(move |request_line, inputs| {
+            let mut requests = recorder.lock().unwrap();
+            if !request_line.starts_with("POST ") || inputs.is_empty() {
+                requests.probes += 1;
+                return vec![vec![1.0, 0.0, 0.0]];
+            }
+            inputs
+                .iter()
+                .map(|input| {
+                    requests.inputs.push(input.clone());
+                    vec![1.0, requests.inputs.len() as f32, 0.5]
+                })
+                .collect()
+        });
+        (url, requests)
+    }
+
+    fn serve_embeddings(
+        respond: impl Fn(&str, &[String]) -> Vec<Vec<f32>> + Send + 'static,
+    ) -> String {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -172,13 +213,25 @@ mod fixtures {
                         break;
                     }
                 }
+                let request_line =
+                    String::from_utf8_lossy(&buf).lines().next().unwrap_or_default().to_owned();
                 let body = header_end.map(|he| &buf[he..]).unwrap_or(&[]);
-                let n_inputs = serde_json::from_slice::<serde_json::Value>(body)
+                let inputs: Vec<String> = serde_json::from_slice::<serde_json::Value>(body)
                     .ok()
-                    .and_then(|v| v.get("input").and_then(|i| i.as_array().map(|a| a.len())))
-                    .unwrap_or(1);
-                let data: Vec<serde_json::Value> = (0..n_inputs)
-                    .map(|i| serde_json::json!({ "index": i, "embedding": vector }))
+                    .and_then(|v| {
+                        v.get("input").and_then(|i| {
+                            i.as_array().map(|a| {
+                                a.iter()
+                                    .map(|t| t.as_str().unwrap_or_default().to_owned())
+                                    .collect()
+                            })
+                        })
+                    })
+                    .unwrap_or_default();
+                let data: Vec<serde_json::Value> = respond(&request_line, &inputs)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, embedding)| serde_json::json!({ "index": i, "embedding": embedding }))
                     .collect();
                 let resp_body = serde_json::json!({ "data": data }).to_string();
                 let resp = format!(

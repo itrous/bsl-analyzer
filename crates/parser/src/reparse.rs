@@ -101,10 +101,14 @@ pub enum Refusal {
     /// последний токен узла либо пересекает узел частично; или ошибка
     /// фрагмента задевает его первый или последний токен.
     ContextError,
+    /// Фрагмент разобран с нулевой глубины вложенности, а метод в файле стоит
+    /// внутри конструкций: вместе с ними глубина фрагмента могла дойти до
+    /// предела, за которым полный разбор сообщает ошибку, а фрагмент — нет.
+    Depth,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 8] = [
+    pub const ALL: [Refusal; 9] = [
         Refusal::OutsideMethod,
         Refusal::OldUnclosed,
         Refusal::TokenBoundary,
@@ -113,6 +117,7 @@ impl Refusal {
         Refusal::Kind,
         Refusal::NewUnclosed,
         Refusal::ContextError,
+        Refusal::Depth,
     ];
 
     pub fn index(self) -> usize {
@@ -193,6 +198,7 @@ pub fn reparse_method_guarded(
 
     let mut p = Parser::new(&tokens);
     grammar::source_file(&mut p);
+    let deepest = p.deepest_nesting();
     let events = p.finish();
     let fragment_parse = syntax::with_shared_node_cache(|cache| {
         let sink = sink::Sink::with_cache(&tokens, cache);
@@ -216,10 +222,21 @@ pub fn reparse_method_guarded(
 
     let strict = guards.has(Refusal::ContextError);
     let errors = merge_errors(old, &node, &fragment_parse, &new_node, start, delta, strict)?;
+    if guards.has(Refusal::Depth) && may_reach_nesting_bound(&node, deepest) {
+        return Err(Refusal::Depth);
+    }
 
     let heap_bytes = old.heap_bytes() - subtree_heap_bytes(&node) + subtree_heap_bytes(&new_node);
     let green = node.replace_with(new_node.green().into_owned());
     Ok(Parse::from_parts(green, errors, heap_bytes))
+}
+
+/// Могла ли глубина вложенности внутри метода дойти до предела в полном
+/// разборе. Каждое правило, вложившее метод на уровень глубже, — его предок в
+/// дереве, поэтому число предков ограничивает глубину метода сверху.
+fn may_reach_nesting_bound(node: &SyntaxNode, fragment_depth: u32) -> bool {
+    let around = u32::try_from(node.ancestors().count()).unwrap_or(u32::MAX);
+    around.saturating_add(fragment_depth) >= crate::parser::MAX_NESTING_DEPTH
 }
 
 /// Внешний узел метода, накрывающий диапазон. Внешний, а не ближайший: метод

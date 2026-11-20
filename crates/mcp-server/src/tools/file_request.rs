@@ -120,16 +120,25 @@ pub(crate) fn resolve_rooted_path(
             Err(RootedPathError::AbsolutePathWithRootId(root_id.to_owned()))
         };
     }
+    // Stored ids and paths are `/`-spelled on every host, but a client that learned the pair on
+    // Windows may still send it with the host separator; both spellings are accepted on input.
+    // The ERROR TEXT below keeps `root_id` as the caller sent it, so the caller recognises their
+    // own input in the refusal; only the lookups use the key spelling.
+    let sent_root_id = root_id;
+    let spelled_root_id = bsl_search::spell_as_key(sent_root_id);
+    let root_id = spelled_root_id.as_str();
+    let spelled_path = bsl_search::spell_as_key(&path.to_string_lossy());
+    let path = Path::new(&spelled_path);
     if !roots.contains_id(root_id) {
         // Asked FIRST, so a caller with two wrong halves is told about the one that will
         // still be wrong after fixing the other.
-        return Err(RootedPathError::RootNotRegistered(root_id.to_owned()));
+        return Err(RootedPathError::RootNotRegistered(sent_root_id.to_owned()));
     }
     // A registered id is not yet a CURRENT one: the id survives a root's retarget, so a table from
     // an earlier generation answers this pair about a directory it can no longer resolve the id to.
     // Checked before the pair is joined, because every answer below is a file of that directory.
     if !roots.registration_is_current(root_id) {
-        return Err(RootedPathError::RegistrationStale(root_id.to_owned()));
+        return Err(RootedPathError::RegistrationStale(sent_root_id.to_owned()));
     }
     // One rule, and it is about the SPELLING: every component must be a plain name.
     //
@@ -150,13 +159,13 @@ pub(crate) fn resolve_rooted_path(
     // of `(root_id, path)` emits any of these, and the same file is always reachable by
     // its plain spelling.
     if path.components().any(|component| !matches!(component, std::path::Component::Normal(_))) {
-        return Err(RootedPathError::PathIsNotPlainRelative(root_id.to_owned()));
+        return Err(RootedPathError::PathIsNotPlainRelative(sent_root_id.to_owned()));
     }
     // What follows from stopping here: a link sitting inside a root is a file OF that root,
     // and reading it yields its target, exactly as it would for anything else opening that
     // path. The pair names one file; it does not promise the bytes live in this tree.
     let key = bsl_search::FileKey::new(root_id, path.to_string_lossy());
-    roots.resolve(&key).ok_or_else(|| RootedPathError::RootNotRegistered(root_id.to_owned()))
+    roots.resolve(&key).ok_or_else(|| RootedPathError::RootNotRegistered(sent_root_id.to_owned()))
 }
 
 /// The pair the ANSWER carries, given how the request spelled the file.
@@ -175,6 +184,8 @@ pub(crate) fn answer_location(
     let rooted_spelling =
         root_id.zip(path_as_given.to_str().filter(|spelling| !Path::new(spelling).is_absolute()));
     match rooted_spelling {
+        // `from_key` answers in the store's `/` spelling however the request was spelled: the
+        // pair is fed back by consumers and has to match the store.
         Some((root_id, relative)) => Ok(loc::Location::from_key(root_id, relative)),
         None => loc::Location::from_path(roots, abs),
     }
@@ -304,6 +315,53 @@ mod tests {
         assert!(
             refusal.contains(&ext_id) && refusal.contains("can no longer be resolved"),
             "the refusal must name both the root and what was observed: {refusal}",
+        );
+    }
+
+    /// A client that learned a pair on Windows may send it with the host separator; the server
+    /// accepts either spelling, resolves the same file, and answers with the key spelling.
+    ///
+    /// The host-spelled request is assembled with `Path::join` (a literal would hide the defect
+    /// on Windows), and the control proves an unregistered root is still refused, with the
+    /// refusal echoing the spelling the caller sent.
+    #[test]
+    fn a_host_spelled_rooted_request_resolves_like_the_slash_spelled_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let configuration = workspace.join("cf");
+        let ext_rel = Path::new("extensions").join("provider-a");
+        let module_rel = Path::new("CommonModules").join("M").join("Module.bsl");
+        let module_dir = workspace.join(&ext_rel).join("CommonModules").join("M");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(module_dir.join("Module.bsl"), "x").unwrap();
+        std::fs::create_dir_all(&configuration).unwrap();
+        let (roots, rejected) =
+            WorkspaceRoots::build(workspace, &configuration, &[workspace.join(&ext_rel)]);
+        assert!(rejected.is_empty(), "the extension root is registered");
+        assert!(roots.contains_id("extensions/provider-a"), "ids are stored `/`-spelled");
+
+        let host_root = ext_rel.to_string_lossy().into_owned();
+        let slash = resolve_rooted_path(
+            &roots,
+            Some("extensions/provider-a"),
+            Path::new("CommonModules/M/Module.bsl"),
+        )
+        .expect("the key spelling resolves");
+        let host = resolve_rooted_path(&roots, Some(&host_root), &module_rel)
+            .expect("the host spelling resolves too");
+        assert_eq!(host, slash, "both spellings name the same file");
+
+        let answer = answer_location(&roots, Some(&host_root), &module_rel, &host).unwrap();
+        assert_eq!(answer.root_id, "extensions/provider-a");
+        assert_eq!(answer.path, "CommonModules/M/Module.bsl");
+
+        let unregistered = Path::new("extensions").join("nobody");
+        let sent = unregistered.to_string_lossy().into_owned();
+        let refusal = resolve_rooted_path(&roots, Some(&sent), &module_rel);
+        assert_eq!(
+            refusal,
+            Err(RootedPathError::RootNotRegistered(sent)),
+            "control: an unregistered root is refused, echoing the caller's own spelling",
         );
     }
 }

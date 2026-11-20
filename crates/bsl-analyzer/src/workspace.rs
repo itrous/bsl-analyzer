@@ -88,7 +88,7 @@ impl GlobalState {
         let diff_base_changed = previous_diff_base != project.config.analysis.diff_base.as_ref();
 
         self.source_exclusions =
-            project.source_exclusions().respelled_under(&project.source_roots());
+            Arc::new(project.source_exclusions().respelled_under(&project.source_roots()));
         self.workspace_root = Some(root);
         self.project = Some(project);
         self.project_rejected = false;
@@ -167,7 +167,7 @@ impl GlobalState {
         let diagnostics_baseline =
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project);
         self.source_exclusions =
-            project.source_exclusions().respelled_under(&project.source_roots());
+            Arc::new(project.source_exclusions().respelled_under(&project.source_roots()));
         self.workspace_root = Some(root.clone());
         self.project = Some(project);
         self.install_diagnostics_baseline(diagnostics_baseline);
@@ -239,7 +239,7 @@ impl GlobalState {
                 paths::AbsPathBuf::assert_utf8(root.join("build")),
                 paths::AbsPathBuf::assert_utf8(root.join(".vscode")),
             ],
-            hard_exclude: self.source_exclusions.clone(),
+            hard_exclude: stdx::path_exclusion::ExcludedPaths::clone(&self.source_exclusions),
             rules: vec![loader::FileRule {
                 extensions: project_model::METADATA_WATCHED_EXTENSIONS
                     .iter()
@@ -255,7 +255,7 @@ impl GlobalState {
                 extensions: Vec::new(),
                 include: dependencies.into_iter().map(paths::AbsPathBuf::assert_utf8).collect(),
                 exclude: Vec::new(),
-                hard_exclude: self.source_exclusions.clone(),
+                hard_exclude: stdx::path_exclusion::ExcludedPaths::clone(&self.source_exclusions),
                 rules: vec![loader::FileRule {
                     extensions: project_model::SOURCE_EXTENSIONS
                         .iter()
@@ -816,14 +816,19 @@ impl GlobalState {
         file_id: FileId,
         resolved: &mut stdx::path_exclusion::ResolvedDirs,
     ) -> bool {
-        let path = {
-            let vfs = self.vfs.read();
-            if file_id.0 >= vfs.num_file_ids() {
-                return true;
-            }
-            vfs.file_path(file_id).clone()
-        };
-        self.is_source_excluded(path.as_path(), resolved)
+        is_file_id_excluded_in(&self.vfs, &self.source_exclusions, file_id, resolved)
+    }
+
+    /// The exclusion test as a value a background job can own, so work queued against a
+    /// `FileId` can apply it where it runs instead of on the event loop. It shares the
+    /// VFS, so paths are read as they are when it runs; the exclusions are the ones in
+    /// force when it was made: a reload installs new ones rather than editing these, and
+    /// the revision it bumps for the sources it takes out cancels a job still running.
+    pub fn exclusion_filter(&self) -> ExclusionFilter {
+        ExclusionFilter {
+            vfs: Arc::clone(&self.vfs),
+            source_exclusions: Arc::clone(&self.source_exclusions),
+        }
     }
 
     /// [`Self::is_source_excluded`] that also resolves `path` through the file system:
@@ -1262,7 +1267,7 @@ impl GlobalState {
             return Err(anyhow!("File is not BSL, LSP unsupported: {}", url));
         }
         if self.is_source_excluded_resolved(&path) {
-            return Err(anyhow!("File is excluded by [source].exclude: {}", url));
+            return Err(crate::excluded_document::excluded_from_project(url));
         }
 
         if self.analysis_host.owner().is_some() && self.mem_docs.contains(url) {
@@ -1363,6 +1368,46 @@ fn path_in_workspace(
         return true;
     }
     open_paths.contains(path)
+}
+
+/// The one body that decides whether a `FileId` is excluded, shared by [`GlobalState`]
+/// and by [`ExclusionFilter`] so the two can never drift apart.
+fn is_file_id_excluded_in(
+    vfs: &parking_lot::RwLock<vfs::Vfs>,
+    source_exclusions: &stdx::path_exclusion::ExcludedPaths,
+    file_id: FileId,
+    resolved: &mut stdx::path_exclusion::ResolvedDirs,
+) -> bool {
+    let path = {
+        let vfs = vfs.read();
+        if file_id.0 >= vfs.num_file_ids() {
+            return true;
+        }
+        vfs.file_path(file_id).clone()
+    };
+    source_exclusions.is_excluded_resolving(path.as_path(), resolved)
+}
+
+/// [`GlobalState`]'s exclusion test, detached from the state so a pooled job can carry
+/// it. Cheap to make: both fields are handles, not copies.
+#[derive(Clone)]
+pub struct ExclusionFilter {
+    vfs: Arc<parking_lot::RwLock<vfs::Vfs>>,
+    source_exclusions: Arc<stdx::path_exclusion::ExcludedPaths>,
+}
+
+impl ExclusionFilter {
+    /// Those of `file_ids` the project still covers, in the order given. One
+    /// `ResolvedDirs` serves the whole batch, so each parent directory resolves once.
+    pub fn retain_included(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
+        file_ids
+            .into_iter()
+            .filter(|&file_id| {
+                !is_file_id_excluded_in(&self.vfs, &self.source_exclusions, file_id, &mut resolved)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

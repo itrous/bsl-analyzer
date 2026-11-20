@@ -100,7 +100,9 @@ pub fn from_property_assignment_hir(
 #[cfg(test)]
 mod tests {
     use super::shorten_union_members;
-    use crate::test_utils::check_diagnostics_snapshot_for;
+    use crate::test_utils::{
+        built_in_facts_are_served, check_config_files, check_diagnostics_snapshot_for, format_diags,
+    };
     use crate::DiagnosticCode;
     use expect_test::expect;
 
@@ -382,6 +384,271 @@ mod tests {
             expect![[r#"
                 TypeMismatchByDocComment @ 18:13..18:21
                   message: Несоответствие типов: ожидалось 'Булево | Число | Строка | ТаблицаЗначений', получено 'Булево | Число | Строка | Неопределено' (тип параметра из описания)
+                  severity: Error"#]],
+        );
+    }
+
+    const BOOLEAN_SLOT_MODULE: &str = "CommonModules/Проба/Ext/Module.bsl";
+
+    const BOOLEAN_SLOT_CONFIGURATION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>Тест</Name></Properties>
+        <ChildObjects>
+            <Catalog>Товары</Catalog>
+            <CommonModule>Проба</CommonModule>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+
+    const BOOLEAN_SLOT_CATALOG_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Catalog uuid="00000000-0000-0000-0000-000000000002">
+        <Properties>
+            <Name>Товары</Name>
+            <Hierarchical>true</Hierarchical>
+            <CodeLength>9</CodeLength>
+            <DescriptionLength>100</DescriptionLength>
+        </Properties>
+    </Catalog>
+</MetaDataObject>"#;
+
+    const BOOLEAN_SLOT_MODULE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000008">
+        <Properties>
+            <Name>Проба</Name>
+            <Server>true</Server>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#;
+
+    fn boolean_slot_mismatches(body: &str) -> (String, Vec<crate::Diagnostic>) {
+        let source = format!("Процедура Тест()\n{body}КонецПроцедуры\n");
+        let files = [
+            ("Configuration.xml", BOOLEAN_SLOT_CONFIGURATION_XML),
+            ("Catalogs/Товары.xml", BOOLEAN_SLOT_CATALOG_XML),
+            ("CommonModules/Проба.xml", BOOLEAN_SLOT_MODULE_XML),
+            (BOOLEAN_SLOT_MODULE, source.as_str()),
+        ];
+        let found = check_config_files(&files, BOOLEAN_SLOT_MODULE)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::TypeMismatch)
+            .collect();
+        (source, found)
+    }
+
+    #[test]
+    fn a_number_in_a_boolean_platform_parameter_of_a_manager_method_is_silent() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = boolean_slot_mismatches(
+            "    Первый = Справочники.Товары.НайтиПоКоду(\"001\", 5);\n    \
+             Второй = Справочники.Товары.НайтиПоКоду(\"001\", 0);\n",
+        );
+        expect![[""]].assert_eq(&format_diags(&source, &found));
+    }
+
+    #[test]
+    fn a_number_in_a_boolean_parameter_of_a_global_function_is_silent() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = boolean_slot_mismatches(
+            "    Первый = СтрРазделить(\"a,b\", \",\", 5);\n    \
+             Второй = СтрРазделить(\"a,b\", \",\", 0);\n",
+        );
+        expect![[""]].assert_eq(&format_diags(&source, &found));
+    }
+
+    #[test]
+    fn a_date_and_an_array_in_a_boolean_platform_parameter_are_still_reported() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = boolean_slot_mismatches(
+            "    Первый = Справочники.Товары.НайтиПоКоду(\"001\", ТекущаяДата());\n    \
+             Второй = Справочники.Товары.НайтиПоКоду(\"001\", Новый Массив);\n",
+        );
+        expect![[r#"
+            TypeMismatch @ 2:52..2:65
+              message: Несоответствие типов: ожидалось 'Булево', получено 'ДатаВремя'
+              severity: Major
+            TypeMismatch @ 3:52..3:64
+              message: Несоответствие типов: ожидалось 'Булево', получено 'Массив'
+              severity: Major"#]]
+        .assert_eq(&format_diags(&source, &found));
+    }
+
+    const REFERENCE_SLOT_CONFIGURATION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>Тест</Name></Properties>
+        <ChildObjects>
+            <Catalog>Товары</Catalog>
+            <Catalog>Контрагенты</Catalog>
+            <CommonModule>Проба</CommonModule>
+        </ChildObjects>
+    </Configuration>
+</MetaDataObject>"#;
+
+    const REFERENCE_SLOT_PARTNERS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <Catalog uuid="00000000-0000-0000-0000-000000000003">
+        <Properties>
+            <Name>Контрагенты</Name>
+            <CodeLength>9</CodeLength>
+            <DescriptionLength>100</DescriptionLength>
+        </Properties>
+    </Catalog>
+</MetaDataObject>"#;
+
+    // The 3rd parameter of `НайтиПоКоду` is `Родитель`, declared as the bare kind
+    // name `СправочникСсылка`.
+    fn reference_slot_mismatches(argument: &str) -> (String, Vec<crate::Diagnostic>) {
+        reference_call_mismatches(&format!("\"001\", Истина, {argument}"))
+    }
+
+    fn reference_call_mismatches(arguments: &str) -> (String, Vec<crate::Diagnostic>) {
+        let source = format!(
+            "Процедура Тест()
+    Значение = Справочники.Товары.НайтиПоКоду({arguments});
+КонецПроцедуры
+"
+        );
+        let files = [
+            ("Configuration.xml", REFERENCE_SLOT_CONFIGURATION_XML),
+            ("Catalogs/Товары.xml", BOOLEAN_SLOT_CATALOG_XML),
+            ("Catalogs/Контрагенты.xml", REFERENCE_SLOT_PARTNERS_XML),
+            ("CommonModules/Проба.xml", BOOLEAN_SLOT_MODULE_XML),
+            (BOOLEAN_SLOT_MODULE, source.as_str()),
+        ];
+        let found = check_config_files(&files, BOOLEAN_SLOT_MODULE)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::TypeMismatch)
+            .collect();
+        (source, found)
+    }
+
+    #[test]
+    fn a_reference_of_the_receivers_own_catalog_in_a_manager_reference_slot_is_silent() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = reference_slot_mismatches("Справочники.Товары.ПустаяСсылка()");
+        expect![[""]].assert_eq(&format_diags(&source, &found));
+    }
+
+    #[test]
+    fn undefined_in_a_manager_reference_slot_is_silent() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = reference_slot_mismatches("Неопределено");
+        expect![[""]].assert_eq(&format_diags(&source, &found));
+    }
+
+    #[test]
+    fn a_number_in_a_manager_reference_slot_is_reported() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = reference_slot_mismatches("5");
+        expect![[r#"
+            TypeMismatch @ 2:62..2:63
+              message: Несоответствие типов: ожидалось 'СправочникСсылка.Товары | Неопределено', получено 'Число'
+              severity: Major"#]].assert_eq(&format_diags(&source, &found));
+    }
+
+    #[test]
+    fn a_reference_of_another_catalog_in_a_manager_reference_slot_is_reported() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = reference_slot_mismatches("Справочники.Контрагенты.ПустаяСсылка()");
+        expect![[r#"
+            TypeMismatch @ 2:62..2:100
+              message: Несоответствие типов: ожидалось 'СправочникСсылка.Товары | Неопределено', получено 'СправочникСсылка.Контрагенты'
+              severity: Major"#]].assert_eq(&format_diags(&source, &found));
+    }
+
+    // Regression: the owner is a reference to a DIFFERENT catalog (one of the
+    // catalog's `Владельцы`), so it must not be narrowed to the receiver's own
+    // reference. Measured: 239 correct calls in the corpus.
+    #[test]
+    fn a_reference_of_another_catalog_in_the_owner_slot_is_not_reported() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) =
+            reference_call_mismatches("\"001\", , , Справочники.Контрагенты.ПустаяСсылка()");
+        expect![[""]].assert_eq(&format_diags(&source, &found));
+    }
+
+    // The owner slot is not narrowed to the receiver, yet it still takes only a catalog
+    // reference: a number there is reported. Which catalog is checked against
+    // `Владельцы` is a separate question.
+    #[test]
+    fn a_number_in_the_owner_slot_is_reported() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let (source, found) = reference_call_mismatches("\"001\", , , 5");
+        expect![[r#"
+            TypeMismatch @ 2:58..2:59
+              message: Несоответствие типов: ожидалось 'СправочникСсылка', получено 'Число'
+              severity: Major"#]]
+        .assert_eq(&format_diags(&source, &found));
+    }
+
+    #[test]
+    fn a_manager_without_a_concrete_object_keeps_its_reference_slot_permissive() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        let source = "Процедура Тест(ИмяСправочника)
+                 Значение = Справочники[ИмяСправочника].НайтиПоКоду(\"001\", Истина, 5);
+             КонецПроцедуры
+";
+        let files = [
+            ("Configuration.xml", REFERENCE_SLOT_CONFIGURATION_XML),
+            ("Catalogs/Товары.xml", BOOLEAN_SLOT_CATALOG_XML),
+            ("Catalogs/Контрагенты.xml", REFERENCE_SLOT_PARTNERS_XML),
+            ("CommonModules/Проба.xml", BOOLEAN_SLOT_MODULE_XML),
+            (BOOLEAN_SLOT_MODULE, source),
+        ];
+        let found: Vec<_> = check_config_files(&files, BOOLEAN_SLOT_MODULE)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::TypeMismatch)
+            .collect();
+        expect![[""]].assert_eq(&format_diags(source, &found));
+    }
+
+    #[test]
+    fn a_number_in_a_boolean_documented_parameter_is_silent_and_a_date_is_still_reported() {
+        // The language itself turns a number into a Boolean where one is expected (a
+        // condition, a logical operator, a Boolean attribute), so a configuration
+        // procedure documented as taking Булево accepts it as a platform method does.
+        let code = r#"
+// Параметры:
+//   Флаг - Булево - флаг.
+//   Признак - Булево, Неопределено - признак.
+Процедура Принять(Флаг, Признак = Неопределено) Экспорт
+КонецПроцедуры
+
+Процедура Тест()
+    Принять(5);
+    Принять(0, 1);
+    Принять(ТекущаяДата());
+КонецПроцедуры
+"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::TypeMismatchByDocComment,
+            expect![[r#"
+                TypeMismatchByDocComment @ 11:13..11:26
+                  message: Несоответствие типов: ожидалось 'Булево', получено 'ДатаВремя' (тип параметра из описания)
                   severity: Error"#]],
         );
     }

@@ -2,10 +2,12 @@
 //! target: each file a module, so the crate links one test binary instead of one per file.
 
 mod ambiguous_field_in_query;
+mod at_client_at_server_form_method;
 mod bilingual_parity;
 mod builtin_function_name_as_declaration;
 mod common_attributes_in_query;
 mod data_exchange_and_unused_method_fixes;
+mod derived_table_outer_alias;
 mod diagnostic_quick_fixes;
 mod fields_from_joins_issue_773;
 mod foreign_handler_bindings_scan;
@@ -21,6 +23,7 @@ mod preproc_symbol_docs;
 mod query_keyword_alias;
 mod query_nested_fields_routes;
 mod query_nested_in_select_list;
+mod register_recorder_field_in_query;
 mod register_records_element_member_checks;
 mod standalone_query_parity;
 mod unresolved_metadata_path;

@@ -493,6 +493,34 @@ pub(crate) fn build_author_filter(
     }
 }
 
+/// The scope whose line gate a computation under `snapshot` defers, or `None` when it keeps
+/// the ordinary one.
+///
+/// A baseline numbers repeated findings over the whole file, so a snapshot that can change
+/// the set is handed every finding and the scope's lines are cut after its classification.
+/// `Disabled` and `Error` cannot change it, and keep the ordinary scoped computation.
+pub(crate) fn deferred_scope<'a>(
+    config: &'a ide::DiagnosticsConfig,
+    snapshot: &ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot,
+) -> Option<&'a base_db::AnalysisScope> {
+    config.scope.as_deref().filter(|_| snapshot.affects_diagnostics())
+}
+
+/// The configuration a computation under `late_scope` runs with: the line gate deferred
+/// exactly when there is a scope to apply afterwards.
+pub(crate) fn computation_config<'a>(
+    config: &'a ide::DiagnosticsConfig,
+    late_scope: Option<&base_db::AnalysisScope>,
+) -> std::borrow::Cow<'a, ide::DiagnosticsConfig> {
+    match late_scope {
+        Some(_) => std::borrow::Cow::Owned(ide::DiagnosticsConfig {
+            defer_scope_line_gate: true,
+            ..config.clone()
+        }),
+        None => std::borrow::Cow::Borrowed(config),
+    }
+}
+
 /// Whether a diagnostic on `range` survives the author filter: any covered
 /// line kept → survives. Uses the scope-gate line mapping (half-open range →
 /// last line from `end - 1`, empty range anchors at `start`).
@@ -865,8 +893,13 @@ impl DiagnosticsResident {
         // Compute the unfiltered candidates in parallel. Baseline classification happens
         // before severity/code/author shaping, so those presentation filters cannot hide
         // a new finding or manufacture a resolved entry.
+        // The last member is whether the deferred scope admits the finding. It travels with
+        // the candidate instead of filtering it: the classifier numbers the whole file.
         type Candidate =
-            ide::diagnostics_baseline::BaselineDiagnosticCandidate<(FileId, ide::Diagnostic)>;
+            ide::diagnostics_baseline::BaselineDiagnosticCandidate<(FileId, ide::Diagnostic, bool)>;
+        let late_scope = deferred_scope(config, &self.diagnostics_baseline);
+        let computation_config = computation_config(config, late_scope);
+        let computation_config = computation_config.as_ref();
         // The pool takes an owned db clone: `&self` is not `Sync` (the resident holds a
         // `RefCell` VFS), and each worker clones its own handle from this seed anyway.
         // Borrow what the jobs read, so `move` takes the references and leaves the values
@@ -931,7 +964,8 @@ impl DiagnosticsResident {
                                 return None;
                             }
                             let caught = salsa::Cancelled::catch(AssertUnwindSafe(|| {
-                                let diagnostics = worker.analysis.diagnostics(file_id, config);
+                                let diagnostics =
+                                    worker.analysis.diagnostics(file_id, computation_config);
                                 let text = worker.analysis.file_text(file_id);
                                 let path =
                                     path_of.get(&file_id).expect("swept file has a resident path");
@@ -946,8 +980,16 @@ impl DiagnosticsResident {
                                     .into_iter()
                                     .map(|d| {
                                         let output = d.to_output(&text);
+                                        let visible = late_scope.is_none_or(|scope| {
+                                            ide::diagnostic_in_scope(
+                                                Some(scope),
+                                                Some(Path::new(path)),
+                                                &line_index,
+                                                &d,
+                                            )
+                                        });
                                         ide::diagnostics_baseline::BaselineDiagnosticCandidate {
-                                        diagnostic: (file_id, d),
+                                        diagnostic: (file_id, d, visible),
                                         path: relative.clone(),
                                         code: output.code,
                                         snippet: Some(
@@ -1112,9 +1154,12 @@ impl DiagnosticsResident {
                 ide::diagnostics_baseline::DiagnosticsBaselineSummary::disabled(),
             )
         };
+        // The classification is done, so the scope's cut cannot renumber anything now.
         let mut active_by_file: HashMap<FileId, Vec<ide::Diagnostic>> = HashMap::new();
-        for (file_id, diagnostic) in active {
-            active_by_file.entry(file_id).or_default().push(diagnostic);
+        for (file_id, diagnostic, visible) in active {
+            if visible {
+                active_by_file.entry(file_id).or_default().push(diagnostic);
+            }
         }
 
         // The author pass queries Salsa through its own db clones, so it observes
@@ -2902,9 +2947,11 @@ mod tests {
 mod trim_tests {
     use std::path::Path;
 
-    use super::super::test_support::{join_load, module_path, wait_ready, write_common_module};
+    use super::super::test_support::{
+        join_load, module_path, staged_designer_fixture, wait_ready, write, write_common_module,
+    };
     use super::super::{DiagnosticsState, ResidentOutcome, SweepOptions};
-    use super::DiagnosticsResident;
+    use super::{Analysis, DiagnosticsResident, FileId};
     use crate::cancel::RequestCancel;
 
     /// More modules than the sweep window of syntax trees (`parse_query`'s sweep cap is
@@ -3270,15 +3317,20 @@ mod trim_tests {
         });
         let (per_file, samples): (Vec<_>, Vec<T>) = walked.into_iter().unzip();
         let result = resident.with_request_handle(cancel, |_, analysis| {
-            ide::finish_references(analysis.database(), walk, per_file.concat())
+            ide::finish_references(
+                analysis.database(),
+                walk,
+                per_file.into_iter().flatten().collect(),
+            )
         });
         (result, samples)
     }
 
     /// Inside the chunked walk, never more than the interactive window plus one chunk of
-    /// syntax trees is held. Sampled INSIDE the walk, after every file: the walk trims
-    /// after its last chunk too, and a reading taken after it could not tell a trim
-    /// between chunks from one trim at the end — or from one chunk.
+    /// syntax trees is held, and the trim comes once per chunk, not oftener. Sampled
+    /// INSIDE the walk, after every file: the walk trims after its last chunk too, and a
+    /// reading taken after it could not tell a trim between chunks from one trim at the
+    /// end — or from one chunk.
     #[test]
     #[cfg_attr(
         windows,
@@ -3326,6 +3378,17 @@ mod trim_tests {
             "the walk keeps at most the window plus one chunk of syntax trees: \
              {parse_peak} of {parse_all} bytes"
         );
+        // And not less: a trim after fewer files than a sweep chunk, or one that goes
+        // down to the sweep caps, drops the memos a repeated request answers from, and
+        // the request pays for them again. The peak alone cannot tell them apart — it
+        // stands at the end of the first chunk, before any trim — but the end of the
+        // second chunk holds the window the first trim kept plus that whole chunk.
+        let after_two_chunks = samples[2 * CHUNK - 1];
+        assert!(
+            after_two_chunks >= parse_all * (PARSE_WINDOW + CHUNK - CHUNK / 10) / CANDIDATES,
+            "the walk trims once per sweep chunk, on the interactive caps: \
+             {after_two_chunks} of {parse_all} bytes at the end of the second chunk"
+        );
     }
 
     /// The chunked walk answers what the serial walk answers, field by field, on a stand
@@ -3358,6 +3421,148 @@ mod trim_tests {
         assert_eq!(chunked.files_capped, serial.files_capped);
         assert_eq!(chunked.declarations, serial.declarations);
         assert_eq!(chunked.outcome, serial.outcome);
+    }
+
+    /// The chunked walk answers what the serial walk answers for a method reached through
+    /// a typed receiver: each caller's hit rests on inferring `Объект`, half of them from
+    /// the catalog manager and half from the return type of a function in another module,
+    /// which the walk does not enter. The callers span three chunks, so a hit lost to a
+    /// trim between chunks changes the length.
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "waits on file-change events without a bound of its own, and a run under load on Windows outlasted any limit"
+    )]
+    fn references_walk_through_typed_receivers_answers_the_same_as_the_serial_walk() {
+        const TYPED_CALLERS: usize = CALLERS;
+        let _serialised = crate::walk_probe::WALK_GATE.blocking_lock();
+        let dir = staged_designer_fixture();
+        write(
+            dir.path(),
+            "Catalogs/Справочник1/Ext/ObjectModule.bsl",
+            "Процедура ПодготовитьОбъект() Экспорт\nКонецПроцедуры\n",
+        );
+        write_common_module(
+            dir.path(),
+            "Фабрика",
+            true,
+            "&НаСервере\nФункция Создать() Экспорт\n    \
+             Возврат Справочники.Справочник1.СоздатьЭлемент();\nКонецФункции\n",
+        );
+        for i in 0..TYPED_CALLERS {
+            let receiver = if i % 2 == 0 {
+                "Справочники.Справочник1.СоздатьЭлемент()"
+            } else {
+                "Фабрика.Создать()"
+            };
+            write_common_module(
+                dir.path(),
+                &format!("Типизированный{i:04}"),
+                true,
+                &format!(
+                    "&НаСервере\nПроцедура Тело() Экспорт\n    Объект = {receiver};\n    \
+                     Объект.ПодготовитьОбъект();\nКонецПроцедуры\n"
+                ),
+            );
+        }
+        let request = ide::ReferencesRequest {
+            anchor: ide::ReferenceAnchor::Name(
+                "Справочник.Справочник1.ПодготовитьОбъект".to_owned(),
+            ),
+            ..callers_request()
+        };
+        let state = joined_state(dir.path());
+
+        let serial = serial_walk(&state, &request);
+        assert_eq!(serial.outcome, ide::ReferencesOutcome::Resolved);
+        assert_eq!(
+            serial.hits.len(),
+            TYPED_CALLERS + 1,
+            "the control: every typed call, both routes, and the declaration"
+        );
+        assert!(serial.files_scanned > 2 * CHUNK, "the control: the walk spans three chunks");
+
+        let cancel = RequestCancel::default();
+        let (chunked, _) =
+            ready(state.read_mut(|resident, _| chunked_walk(resident, &cancel, &request, |_| ())));
+        assert_eq!(chunked.hits, serial.hits);
+        assert_eq!(chunked.per_file, serial.per_file);
+        assert_eq!(chunked.files_scanned, serial.files_scanned);
+        assert_eq!(chunked.files_capped, serial.files_capped);
+        assert_eq!(chunked.declarations, serial.declarations);
+        assert_eq!(chunked.outcome, serial.outcome);
+    }
+
+    /// A sweep's final trim holds per-method inference to its sweep cap, and the
+    /// interactive cap is back for what comes next. The stand infers more methods than
+    /// the sweep cap and than half the interactive one, and fewer than the interactive
+    /// one, so the control — the same inference trimmed on the interactive caps — keeps
+    /// every method, and a final trim that kept the interactive window, a cap left shrunk
+    /// after it, or a smaller interactive cap all show.
+    #[test]
+    fn a_sweeps_final_trim_holds_inference_to_the_sweep_cap_and_restores_the_interactive_one() {
+        const FILES: usize = 1100;
+        const METHODS_PER_FILE: usize = 4;
+        const METHODS: usize = FILES * METHODS_PER_FILE;
+        const INFER_SWEEP: usize = 2048;
+        const INFER_INTERACTIVE: usize = 8192;
+        const _: () = assert!(INFER_SWEEP < METHODS && METHODS < INFER_INTERACTIVE);
+        const _: () = assert!(METHODS > INFER_INTERACTIVE / 2);
+        const INFERENCE: &str = "BodyInferenceResult";
+
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..METHODS_PER_FILE)
+            .map(|i| {
+                format!(
+                    "Функция Метод{i}(Параметр) Экспорт\n    Значение = Параметр + 1;\n    \
+                     Возврат Значение;\nКонецФункции\n"
+                )
+            })
+            .collect();
+        for i in 0..FILES {
+            write_common_module(dir.path(), &format!("Модуль{i:04}"), true, &body);
+        }
+        let infer_all = |resident: &DiagnosticsResident| {
+            let mut files: Vec<FileId> = resident.by_path.values().copied().collect();
+            files.sort_by_key(|id| id.0);
+            let analysis: Analysis = resident.analysis();
+            files.iter().map(|&id| analysis.database().prime_module_inference(id, 0)).sum::<usize>()
+        };
+
+        let state = joined_state(dir.path());
+        let (inferred, inference_all, inference_kept) = ready(state.read_mut(|resident, _| {
+            let inferred = infer_all(resident);
+            let inference_all = heap_bytes(resident.db(), INFERENCE);
+            resident.trim_between_chunks();
+            (inferred, inference_all, heap_bytes(resident.db(), INFERENCE))
+        }));
+        assert_eq!(inferred, METHODS, "the control: every method of the stand is inferred");
+        assert!(inference_all > 0, "the control: the inference holds heap");
+        assert_eq!(
+            inference_kept, inference_all,
+            "the control: the interactive cap keeps every method of the stand"
+        );
+
+        let state = joined_state(dir.path());
+        let (inference_swept, inference_again) = ready(state.read_mut(|resident, _| {
+            infer_all(resident);
+            resident.trim_after_sweep();
+            let inference_swept = heap_bytes(resident.db(), INFERENCE);
+
+            infer_all(resident);
+            resident.trim_between_chunks();
+            (inference_swept, heap_bytes(resident.db(), INFERENCE))
+        }));
+        // The methods are alike, so their inference weighs alike — within one of slack.
+        assert!(
+            inference_swept <= inference_all * (INFER_SWEEP + 1) / METHODS,
+            "the sweep's final trim leaves at most the sweep cap of inference: \
+             {inference_swept} of {inference_all} bytes"
+        );
+        assert_eq!(
+            inference_again, inference_all,
+            "after the sweep the interactive cap keeps every method again"
+        );
     }
 
     /// A `references` call whose cancellation was requested before it started unwinds
@@ -3456,6 +3661,10 @@ mod trim_tests {
             "a cancel raised inside a job unwinds the walk with the request's cancellation"
         );
         assert_eq!(entered, 1, "the walk entered no file after the one that cancelled it");
+
+        let (repeated, entered, total) = walk(false);
+        assert!(repeated.is_ok(), "the same resident walks again after the cancel");
+        assert_eq!(entered, total, "the repeated walk enters every file");
     }
 
     /// A request cancelled before it takes its handle runs nothing on it: the closure
@@ -3546,5 +3755,73 @@ mod trim_tests {
                 panic!("the empty sweep did not return: its final trim waits on a live db handle")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod finality_tests {
+    use super::super::test_support::{
+        finality_add_phantom, finality_ready_state, finality_unscope, finality_workspace,
+        FinalityForm,
+    };
+    use super::super::{ResidentOutcome, SweepOptions, WorkspaceSweep};
+
+    fn sweep(root: &std::path::Path) -> WorkspaceSweep {
+        let state = finality_ready_state(root);
+        let outcome = state.read_mut(|resident, _| {
+            resident.workspace_aggregates(
+                &resident.config().clone(),
+                &SweepOptions {
+                    min_severity: ide::SeverityBucket::Hint,
+                    codes: Vec::new(),
+                    max_files: 100,
+                },
+                &crate::cancel::RequestCancel::default(),
+            )
+        });
+        state.shutdown();
+        match outcome {
+            ResidentOutcome::Ready(sweep, _) => sweep,
+            _ => panic!("expected a ready sweep"),
+        }
+    }
+
+    fn self_assigns(sweep: &WorkspaceSweep) -> usize {
+        sweep.aggregates.iter().find(|a| a.code == "SelfAssign").map_or(0, |a| a.count)
+    }
+
+    /// The counterexample on the workspace sweep and its statistics: with a and b recorded
+    /// and the diff scope on b and c, the aggregate counts c alone; an `Unsuppressed`
+    /// partition and a project without a baseline count b and c.
+    #[test]
+    fn finality_scoped_baseline() {
+        let count =
+            |form, recorded| self_assigns(&sweep(finality_workspace(form, recorded).path()));
+        assert_eq!(count(FinalityForm::Off, 0), 2, "control: b and c are in the scope");
+        assert_eq!(count(FinalityForm::V1, 0), 2, "control: nothing recorded");
+        assert_eq!(count(FinalityForm::V1, 2), 1, "v1");
+        assert_eq!(count(FinalityForm::Set, 2), 1, "partition set");
+        assert_eq!(count(FinalityForm::Unsuppressed, 2), 2, "Unsuppressed");
+    }
+
+    /// The sweep's summary counts the whole classified set of the swept files — a and b
+    /// known, c new — under a scope that shows c alone, and resolves nothing; unscoped,
+    /// the same workspace is fully covered and resolves the recorded occurrence the text
+    /// no longer produces.
+    #[test]
+    fn finality_scoped_coverage() {
+        let dir = finality_workspace(FinalityForm::V1, 2);
+        finality_add_phantom(dir.path());
+        let scoped = sweep(dir.path());
+        assert_eq!(self_assigns(&scoped), 1);
+        assert_eq!(scoped.baseline.known, Some(2), "{:?}", scoped.baseline);
+        assert!(!scoped.baseline.complete);
+        assert_eq!(scoped.baseline.resolved, Some(0));
+
+        finality_unscope(dir.path());
+        let whole = sweep(dir.path());
+        assert!(whole.baseline.complete, "control: {:?}", whole.baseline);
+        assert_eq!(whole.baseline.resolved, Some(1), "control: {:?}", whole.baseline);
+        assert_eq!(scoped.baseline.new, whole.baseline.new, "the summary counts the whole set");
     }
 }

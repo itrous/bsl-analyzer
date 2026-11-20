@@ -47,7 +47,6 @@ mod cli;
 use std::{
     env,
     error::Error,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -62,7 +61,7 @@ use cli::{
     diagnostics_baseline::{self, DiagnosticsCommand},
     extension::{self, ExtensionCommands},
     format::run_format,
-    logging::{expand_log_file_path, setup_logging},
+    logging::{expand_log_file_path, non_empty_env, start_logging},
     lsp::run_lsp_server,
     mcp::{self, McpCommand},
     platform_help::{self as platform_help_cli, PlatformHelpCommand},
@@ -267,12 +266,37 @@ enum Commands {
     },
 }
 
+/// Analysis is recursive: lowering and inference walk an expression tree whose depth
+/// follows the shape of the source, so a single statement with a long chain of calls or
+/// a long chain of `+` costs stack in proportion to its length. The main thread gets
+/// 1 MiB on Windows, and 600 chained calls overflow it — the process aborts, the whole
+/// run is lost, and no file is named. Measured on this tree: 1 MiB aborts at 600 links,
+/// 8 MiB carries them, 64 MiB carries 2000. The reservation is virtual and is committed
+/// only as it is used, so the cost of the headroom is address space, not memory.
+/// `analyze` gives the same stack to the rayon workers it analyses files on.
+///
+/// This is headroom, not a bound: a deep enough expression still overflows. A depth
+/// limit in the recursive walks is the real answer and is tracked separately.
+const ANALYSIS_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let worker = std::thread::Builder::new()
+        .name("bsl-analyzer-main".to_string())
+        .stack_size(ANALYSIS_STACK_BYTES)
+        .spawn(run)?;
+    match worker.join() {
+        Ok(result) => result,
+        // The thread already printed the panic through the hook `run` installs; resuming
+        // the unwind here keeps the process's exit behaviour exactly as it was.
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
     let daemon = matches!(&cli.command, Some(Commands::Mcp { command }) if command.is_daemon());
 
-    let (log_file, append_log) = match env::var("BSL_LOG_FILE")
-        .ok()
+    let (log_file, default_log) = match non_empty_env("BSL_LOG_FILE")
         .map(|value| expand_log_file_path(PathBuf::from(value), std::process::id()))
     {
         Some(file) => (Some(file), false),
@@ -282,30 +306,17 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         },
     };
 
-    let profile_filter = cli.profile.clone().or_else(|| env::var("BSL_PROFILE").ok());
+    let profile_filter = cli.profile.clone().or_else(|| non_empty_env("BSL_PROFILE"));
     let json_profile_filter =
-        cli.profile_json.clone().or_else(|| env::var("BSL_PROFILE_JSON").ok());
+        cli.profile_json.clone().or_else(|| non_empty_env("BSL_PROFILE_JSON"));
 
-    let _journal_guard = match setup_logging(
+    let _journal_guard = start_logging(
         log_file.clone(),
-        append_log,
+        default_log,
         daemon,
         profile_filter.clone(),
         json_profile_filter.clone(),
-    ) {
-        Ok(guard) => guard,
-        Err(e) => {
-            eprintln!("Failed to setup logging: {}", e);
-            if append_log {
-                setup_logging(None, false, false, profile_filter, json_profile_filter)?
-            } else {
-                if let Some(ref path) = log_file {
-                    let _ = fs::write(path, format!("ERROR: Failed to setup logging: {}\n", e));
-                }
-                return Err(e.into());
-            }
-        }
-    };
+    )?;
 
     // A panic inside a Salsa query leaves no useful trace of *which* query blew
     // up once `catch_unwind` has unwound past the query stack: Salsa attaches the
@@ -327,8 +338,8 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         prev_hook(info);
     }));
 
-    if append_log && log_file.is_some() {
-        // Appended daemon logs concatenate runs; the separator must survive the
+    if log_file.is_some() {
+        // Appended file logs concatenate runs; the separator must survive the
         // default filter (`warn` + the `bsl_graph` diagnosis trail), so it rides
         // the `bsl_graph` target rather than plain info.
         tracing::info!(target: "bsl_graph", pid = std::process::id(), "log session started");

@@ -2,7 +2,7 @@ use bsl_metadata::MdoType;
 use bsl_platform::{MethodParam, PlatformMethod};
 use bsl_types::builders::Builders;
 use bsl_types::intern::TypeKernelDb;
-use bsl_types::kind::TypeId;
+use bsl_types::kind::{ConfigId, TypeId};
 use hir_def::ty::FunctionSignature;
 use hir_def::Name;
 
@@ -10,7 +10,7 @@ use super::{
     map_generic_metadata_return_type, map_generic_metadata_return_type_typeid,
     PlatformMethodRecordResolution,
 };
-use crate::call_resolution::{CallCandidateSet, CandidateId, PlatformSignatureSlot};
+use crate::call_resolution::{CallCandidateSet, CandidateId, ParamReceiver, PlatformSignatureSlot};
 use crate::lower::type_string::{lower_param_type_string_typeid, lower_platform_type_name_typeid};
 
 pub(super) fn build_method_record_resolution(
@@ -54,7 +54,13 @@ pub(super) fn build_method_record_resolution(
         return_ty,
         overloads: metadata_overloads(db, method, mdo_type),
         env: hir_def::execution_env::EnvFlags::from_platform_context(method.context.as_ref()),
-        candidates: metadata_candidates(db, method, return_ty, mdo_type),
+        candidates: metadata_candidates(
+            db,
+            method,
+            return_ty,
+            mdo_type,
+            Some(ParamReceiver { mdo_type, name: mdo_name, config_id: &ConfigId::Root }),
+        ),
     }
 }
 
@@ -99,7 +105,7 @@ pub(super) fn build_any_metadata_ref_method_record(
         return_ty,
         overloads: metadata_overloads(db, method, parent_mdo),
         env: hir_def::execution_env::EnvFlags::from_platform_context(method.context.as_ref()),
-        candidates: metadata_candidates(db, method, return_ty, parent_mdo),
+        candidates: metadata_candidates(db, method, return_ty, parent_mdo, None),
     }
 }
 
@@ -144,8 +150,9 @@ fn metadata_candidates(
     method: &PlatformMethod,
     return_ty: TypeId,
     mdo_type: MdoType,
+    receiver: Option<ParamReceiver<'_>>,
 ) -> CallCandidateSet {
-    let mut candidates = CallCandidateSet::from_platform_method(db, method, return_ty);
+    let mut candidates = CallCandidateSet::from_platform_method(db, method, return_ty, receiver);
     for candidate in candidates.signatures_mut() {
         let parameters = match candidate.id {
             CandidateId::Platform { signature: PlatformSignatureSlot::Base, .. } => {
@@ -156,10 +163,18 @@ fn metadata_candidates(
             }
             _ => continue,
         };
-        for (parameter, ty) in
-            candidate.params.iter_mut().zip(metadata_parameters(db, parameters, mdo_type))
+        for (parameter, (declared, ty)) in candidate
+            .params
+            .iter_mut()
+            .zip(parameters.iter().zip(metadata_parameters(db, parameters, mdo_type)))
         {
-            parameter.ty = ty;
+            // A slot the receiver already narrowed to its own reference is stricter
+            // than the generic kind and stays as the candidate builder made it.
+            let plain =
+                declared.param_type.as_deref().map(|raw| lower_param_type_string_typeid(db, raw));
+            if plain.is_none_or(|plain| parameter.ty == plain) {
+                parameter.ty = ty;
+            }
         }
     }
     candidates
@@ -174,11 +189,15 @@ mod tests {
     #[test]
     fn generic_reference_parameter_keeps_all_signature_projections_typed() {
         let db = InMemoryDb::new();
+        // Not a parameter name the receiver narrows, so only the generic
+        // metadata lowering decides the slot.
         let parameter = |name: &str| MethodParam {
-            name: "Ссылка".into(),
+            name: "Основание".into(),
             param_type: Some(name.into()),
             is_optional: false,
             is_variadic: false,
+            passing: None,
+            result_follows_argument_text: false,
         };
         let method = PlatformMethod {
             id: 1,

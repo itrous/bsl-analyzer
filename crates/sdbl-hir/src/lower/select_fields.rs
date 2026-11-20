@@ -89,17 +89,30 @@ impl LoweringContext<'_> {
         let field_range = field.syntax().text_range();
 
         if field.is_asterisk() {
-            let asterisk_qualifier =
-                field.syntax().children().find_map(syntax::ast::SdblAsteriskField::cast).and_then(
-                    |node| {
-                        let parts = node.qualifier_parts();
-                        if parts.is_empty() {
-                            None
-                        } else {
-                            Some(parts.join("."))
-                        }
-                    },
-                );
+            let asterisk_node =
+                field.syntax().children().find_map(syntax::ast::SdblAsteriskField::cast);
+            let head_token = asterisk_node.as_ref().and_then(|node| {
+                node.syntax()
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .find(|t| t.kind() == syntax::SyntaxKind::IDENT)
+            });
+            if let Some(head) = head_token {
+                if self.scope.is_inaccessible_alias(head.text()) {
+                    self.diagnostics.push(crate::diagnostics::SdblDiagnostic::UnavailableAlias {
+                        alias: head.text().to_string(),
+                        range: head.text_range(),
+                    });
+                }
+            }
+            let asterisk_qualifier = asterisk_node.and_then(|node| {
+                let parts = node.qualifier_parts();
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join("."))
+                }
+            });
             return FieldHir {
                 expr: ExprHir::Missing { range: field_range },
                 alias: None,

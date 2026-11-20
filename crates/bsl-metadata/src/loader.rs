@@ -1976,6 +1976,19 @@ mod tests {
     use super::*;
     use crate::traits::Module;
 
+    /// A checkout under the developer's home directory, resolved at RUNTIME. `env!` would
+    /// resolve it when the crate is COMPILED, and `HOME` does not exist on Windows - which
+    /// stopped this crate from compiling its tests there at all. The tests using this are
+    /// `#[ignore]`d and skip themselves when the directory is absent, so a home variable that
+    /// is unset or empty is not an error either: it only means "not this machine".
+    fn home_checkout(relative: &str) -> Option<std::path::PathBuf> {
+        let home = ["HOME", "USERPROFILE"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .find(|home| !home.is_empty())?;
+        Some(std::path::PathBuf::from(home).join(relative))
+    }
+
     /// Both polarities on purpose: a hop that never happens leaves the deadlock
     /// in place, and one that always happens pays a thread per load on every
     /// ordinary path.
@@ -3554,10 +3567,10 @@ mod tests {
     #[test]
     #[ignore]
     fn test_load_enum_values_from_doc3() {
-        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        let Some(doc3_path) = home_checkout("src/doc3/src/cf") else {
+            eprintln!("Skipping test: neither HOME nor USERPROFILE is set");
             return;
         };
-        let doc3_path = PathBuf::from(home).join("src/doc3/src/cf");
 
         if !doc3_path.exists() {
             eprintln!("Skipping test: doc3 project not found at {}", doc3_path.display());
@@ -3625,10 +3638,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_niagara_field_resolution() {
-        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
-            return;
-        };
-        let path = PathBuf::from(home).join("src/niagara_ut/src/cf");
+        let Some(path) = home_checkout("src/niagara_ut/src/cf") else { return };
         if !path.exists() {
             return;
         }
@@ -3692,10 +3702,10 @@ mod tests {
     #[test]
     #[ignore]
     fn test_load_from_doc3_project() {
-        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        let Some(doc3_path) = home_checkout("src/doc3/src/cf") else {
+            eprintln!("Skipping test: neither HOME nor USERPROFILE is set");
             return;
         };
-        let doc3_path = PathBuf::from(home).join("src/doc3/src/cf");
 
         if !doc3_path.exists() {
             eprintln!("Skipping test: doc3 project not found at {}", doc3_path.display());
@@ -3769,10 +3779,10 @@ mod tests {
     #[test]
     #[ignore]
     fn test_catalog_xml_only_without_directory() {
-        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        let Some(doc3_path) = home_checkout("src/doc3/src/cf") else {
+            eprintln!("Skipping test: neither HOME nor USERPROFILE is set");
             return;
         };
-        let doc3_path = PathBuf::from(home).join("src/doc3/src/cf");
 
         if !doc3_path.exists() {
             eprintln!("Skipping test: doc3 project not found at {}", doc3_path.display());
@@ -3783,8 +3793,8 @@ mod tests {
 
         let catalog_name = "ПоставляемыеДополнительныеОтчетыИОбработки";
 
-        let xml_path = doc3_path.join(format!("Catalogs/{catalog_name}.xml"));
-        let dir_path = doc3_path.join(format!("Catalogs/{catalog_name}"));
+        let xml_path = doc3_path.join("Catalogs").join(format!("{catalog_name}.xml"));
+        let dir_path = doc3_path.join("Catalogs").join(catalog_name);
         assert!(xml_path.exists(), "XML file should exist");
         assert!(!dir_path.exists(), "Directory should NOT exist (this is the test case)");
 

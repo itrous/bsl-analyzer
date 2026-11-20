@@ -46,6 +46,7 @@ pub const METHOD_KEYED_QUERY_FAMILIES: &[&str] = &[
     "doc_see_signature_query",
     "structure_param_keys_query",
     "method_cfg_query",
+    "method_body_events_query",
     "reaching_definitions_query",
     "method_path_terminates_query",
     "method_security_state_query",
@@ -285,6 +286,7 @@ impl RootDatabaseImpl {
         let defaults = project_model::FeaturesConfig::default();
         let _ = FeaturesInput::builder(
             defaults.type_narrowing,
+            defaults.map_key_types,
             hir::execution_env::EnvOptions::default(),
             None,
             None,
@@ -334,7 +336,7 @@ impl RootDatabaseImpl {
     }
 
     /// Run one deep LRU trim: evict with the heaviest per-file caps (parse trees,
-    /// lowered bodies) shrunk to a small sweep profile, then restore the interactive
+    /// lowered bodies, inference) shrunk to a small sweep profile, then restore the interactive
     /// caps — restoring evicts nothing, the wide window simply repopulates on
     /// demand. For a whole-workspace sweep's final cleanup, where the swept files'
     /// memos are working set nothing will read again: a plain [`Self::enforce_lru`]
@@ -355,6 +357,7 @@ impl RootDatabaseImpl {
     fn set_sweep_lru(&mut self, sweep: bool) {
         base_db::set_parse_lru_sweep_mode(self, sweep);
         hir::set_lowering_lru_sweep_mode(self, sweep);
+        hir::set_infer_method_lru_sweep_mode(self, sweep);
         queries::set_dataflow_lru_sweep_mode(self, sweep);
     }
 
@@ -523,6 +526,7 @@ impl RootDatabaseImpl {
             "infer_module_code_query",
             "module_bodies_query",
             "module_code_reaching_definitions_query",
+            "module_code_body_events_query",
             "module_code_security_state_query",
             "module_code_arg_diagnostics_query",
         ];
@@ -2948,6 +2952,16 @@ impl RootDatabaseImpl {
         input.set_type_narrowing(self).to(enabled);
     }
 
+    pub fn map_key_types_enabled(&self) -> bool {
+        self.features().map_key_types(self)
+    }
+
+    pub fn set_map_key_types_enabled(&mut self, enabled: bool) {
+        use salsa::Setter;
+        let input = self.features();
+        input.set_map_key_types(self).to(enabled);
+    }
+
     pub fn env_options(&self) -> hir::execution_env::EnvOptions {
         self.features().env_options(self)
     }
@@ -3883,6 +3897,10 @@ impl hir::HirDatabase for RootDatabaseImpl {
         RootDatabaseImpl::type_narrowing_enabled(self)
     }
 
+    fn map_key_types_enabled(&self) -> bool {
+        RootDatabaseImpl::map_key_types_enabled(self)
+    }
+
     fn env_options(&self) -> hir::execution_env::EnvOptions {
         RootDatabaseImpl::env_options(self)
     }
@@ -3943,6 +3961,22 @@ impl hir::HirDatabase for RootDatabaseImpl {
         method: hir::MethodIdInput<'_>,
     ) -> Option<Arc<hir::dataflow::reaching_defs::ReachingDefsResult>> {
         queries::reaching_definitions_query(self, method)
+    }
+
+    fn method_cfg(&self, method: hir::MethodIdInput<'_>) -> Arc<hir::cfg::ControlFlowGraph> {
+        method_cfg_query(self, method)
+    }
+
+    fn module_code_cfg(&self, file_id: FileId) -> Arc<hir::cfg::ControlFlowGraph> {
+        queries::module_level_cfg_query(self, FileIdInput::new(self, file_id))
+    }
+
+    fn method_body_events(&self, method: hir::MethodIdInput<'_>) -> Arc<hir::BodyEvents> {
+        queries::method_body_events_query(self, method)
+    }
+
+    fn module_code_body_events(&self, file_id: FileId) -> Option<Arc<hir::BodyEvents>> {
+        queries::module_code_body_events_query(self, FileIdInput::new(self, file_id))
     }
 }
 
@@ -4116,14 +4150,8 @@ impl RootDatabase for RootDatabaseImpl {
         crate::effects::module_code_security_state_query(self, file_id_input)
     }
 
-    fn method_cfg(&self, method_id: hir::MethodId) -> Arc<hir::cfg::ControlFlowGraph> {
-        let method_id_input = hir::MethodIdInput::new(self, method_id);
-        method_cfg_query(self, method_id_input)
-    }
-
     fn module_level_cfg(&self, module_id: hir::ModuleId) -> Arc<hir::cfg::ControlFlowGraph> {
-        let file_id_input = base_db::FileIdInput::new(self, module_id.file_id);
-        queries::module_level_cfg_query(self, file_id_input)
+        hir::HirDatabase::module_code_cfg(self, module_id.file_id)
     }
 
     fn line_index(&self, file_id_input: base_db::FileIdInput) -> Arc<line_index::LineIndex> {

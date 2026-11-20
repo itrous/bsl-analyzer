@@ -311,6 +311,21 @@ pub trait AnalysisProvider {
     /// Whether the type is `Undefined` or a union containing it.
     fn kernel_type_includes_undefined(&self, id: bsl_types::kind::TypeId) -> bool;
 
+    /// Whether the type is a plain structure; a union is not.
+    fn kernel_type_is_structure(&self, id: bsl_types::kind::TypeId) -> bool;
+
+    /// Whether the type is a `ФиксированнаяСтруктура`; a union is not.
+    fn kernel_type_is_fixed_structure(&self, id: bsl_types::kind::TypeId) -> bool;
+    /// Whether the type is the data of a form's object attribute (`ДанныеФормыСтруктура`);
+    /// a union is not.
+    fn kernel_type_is_form_data_structure(&self, id: bsl_types::kind::TypeId) -> bool;
+
+    /// Whether the type is exactly `Boolean`; a union is not.
+    fn kernel_type_is_boolean(&self, id: bsl_types::kind::TypeId) -> bool;
+
+    /// Whether the type is a reference to a metadata object; a union is not.
+    fn kernel_type_is_metadata_reference(&self, id: bsl_types::kind::TypeId) -> bool;
+
     /// The project's `min_platform_version`; `None` (the default for providers
     /// without project settings) keeps the min-platform check silent.
     fn min_platform_version(&self) -> Option<Arc<str>> {
@@ -433,6 +448,17 @@ pub trait AnalysisProvider {
                 hir::ModuleCodeInferenceResult::default(),
             )),
         }
+    }
+
+    /// Where the value of `expr` came from, proven on every path reaching it. A provider that
+    /// knows nothing proves nothing.
+    fn value_origin(
+        &self,
+        _file_id: FileId,
+        _owner: DefWithBodyId,
+        _expr: hir::ExprId,
+    ) -> hir::ValueOrigin {
+        hir::ValueOrigin::Unproven(hir::Unproven::OpaqueDefinition)
     }
 
     /// The query literals executed as a whole `Запрос` text in the method.

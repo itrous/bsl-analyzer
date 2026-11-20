@@ -170,7 +170,10 @@ fn dom_node_type_missing_value_has_a_precise_range_and_other_owners_stay_separat
     #[cfg(corpus_contract)]
     {
         assert!(platform.help_origin().unwrap().platform_version.is_none());
-        assert!(!platform.platform_type_member_surface_verified("DOMNodeType"));
+        assert!(!platform.platform_type_member_surface_verified(
+            "DOMNodeType",
+            bsl_platform::MemberSurface::Fields
+        ));
         assert!(
             diagnostics.is_empty(),
             "an unknown corpus version cannot prove a miss: {diagnostics:?}"
@@ -178,7 +181,10 @@ fn dom_node_type_missing_value_has_a_precise_range_and_other_owners_stay_separat
     }
     #[cfg(not(corpus_contract))]
     {
-        assert!(platform.platform_type_member_surface_verified("DOMNodeType"));
+        assert!(platform.platform_type_member_surface_verified(
+            "DOMNodeType",
+            bsl_platform::MemberSurface::Fields
+        ));
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             &source[usize::from(diagnostics[0].range.start())

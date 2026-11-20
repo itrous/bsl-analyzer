@@ -141,7 +141,7 @@ fn parse_outcome_of(edit: impl FnOnce(&SyntheticModule) -> String) -> ParseStats
     let text = edit(&stand.module);
     stand.edit_and_diagnose(&text);
     let after = stand.parse_stats();
-    let mut refused = [0u64; 8];
+    let mut refused = [0u64; parser::reparse::Refusal::ALL.len()];
     for (slot, (a, b)) in refused.iter_mut().zip(after.refused.iter().zip(&before.refused)) {
         *slot = a - b;
     }

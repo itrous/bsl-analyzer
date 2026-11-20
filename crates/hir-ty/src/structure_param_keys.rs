@@ -112,7 +112,8 @@ fn compute_summary(
     // interleaves correctly in the collector's source-ordered pass.
     let resolver = Resolver::with_builtins_and_workspace(mid.module);
     let summarize = |callee: MethodId| Arc::new(compute_summary(db, callee, visited, depth + 1));
-    let forwarder = Forwarder::new(db, &resolver, mid.module, body, &summarize);
+    let body_env = crate::method_environment::effective_method_env(db, mid, &db.env_options());
+    let forwarder = Forwarder::new(db, &resolver, mid.module, body, body_env, &summarize);
     let shapes = collect_structure_shapes(body, SeedRoots::ParamNames(&byref), Some(&forwarder));
 
     let mut per_param: FxHashMap<u32, Arc<Projection>> = FxHashMap::default();
@@ -139,6 +140,7 @@ pub(crate) struct Forwarder<'a> {
     db: &'a dyn HirDatabase,
     resolver: &'a Resolver,
     module: ModuleId,
+    body_env: hir_def::execution_env::EnvFlags,
     /// Names (lowercased) that are body bindings or assignment targets — a same-named method is
     /// shadowed and must not be resolved as a callee (mirrors the inference dispatch guard).
     shadowing_locals: FxHashSet<String>,
@@ -160,6 +162,7 @@ impl<'a> Forwarder<'a> {
         resolver: &'a Resolver,
         module: ModuleId,
         body: &Body,
+        body_env: hir_def::execution_env::EnvFlags,
         summarize: &'a dyn Fn(MethodId) -> Arc<StructureParamSummary>,
     ) -> Self {
         let mut declared_bindings = FxHashSet::default();
@@ -178,6 +181,7 @@ impl<'a> Forwarder<'a> {
             db,
             resolver,
             module,
+            body_env,
             shadowing_locals,
             declared_bindings,
             global_methods: OnceCell::new(),
@@ -243,6 +247,9 @@ impl<'a> Forwarder<'a> {
     /// Whether this syntactic call resolves to a user method whose corresponding parameter is
     /// explicitly passed by value. Only that case proves that the caller's structure cannot be
     /// mutated through the argument.
+    ///
+    /// Not answerable from `argument_passing_of`: this pass runs inside `infer_all` before
+    /// `infer_stmts`, which is what builds `call_arg_bindings`, so no bindings exist yet.
     pub(crate) fn argument_is_by_value(&self, body: &Body, call: &Expr, arg_index: usize) -> bool {
         let Expr::Call { callee, .. } = call else { return false };
         let Some(mid) = self.resolve_callee(body, body.expr_idx(*callee)) else { return false };
@@ -301,6 +308,7 @@ impl<'a> Forwarder<'a> {
                         self.resolver,
                         None,
                         plural,
+                        self.body_env,
                     )
                     .is_some()
                     {

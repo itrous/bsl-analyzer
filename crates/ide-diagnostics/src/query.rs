@@ -178,6 +178,11 @@ pub fn method_line_diagnostics_query<'db>(
 // Sized for a whole workspace of answers: a file's list is small next to the chains
 // it was computed from, and a sweep that trims those chains away keeps its answers,
 // so a repeated sweep over the same files is a lookup, not a recomputation.
+/// A file's final diagnostics, memoised per configuration: the same answer
+/// [`crate::file_diagnostics`] gives, assembled from the per-method memos.
+///
+/// `defer_scope_line_gate` is part of the key, so the complete set a baseline classifier
+/// asks for and the scoped set every other caller gets are separate answers.
 #[salsa::tracked(lru = 32768, heap_size = diagnostics_heap, returns(clone))]
 pub fn file_diagnostics_query<'db>(
     db: &'db dyn RootDatabase,
@@ -196,6 +201,14 @@ pub fn file_diagnostics_query<'db>(
     let config_path_input = ide_db::configuration_path_for_file(db, file_id);
     let provider = ide_db::SalsaProvider::new(db, config_path_input);
     let ctx = DiagnosticsContext::new(&config, file_id, &provider);
+    // The parts below never apply the line gate, so their answers do not depend on
+    // where it runs: both modes share their memos, and a code action computed without
+    // the deferral does not redo every method of a file a publication just analysed.
+    let config_id = if config.defer_scope_line_gate {
+        DiagnosticsConfigId::new(db, config_id.config(db).clone().with_defer_scope_line_gate(false))
+    } else {
+        config_id
+    };
 
     // The per-body and per-slab memos, lifted by the positional half of the
     // file: the only place the method offsets are read.

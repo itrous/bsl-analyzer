@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.4.6"
 edition = "2021"
 license = "MIT"
 authors = ["BSL Analyzer Contributors"]
@@ -51,6 +51,7 @@ vfs = { path = "crates/vfs" }
 project-model = { path = "crates/project-model" }
 intern = { path = "crates/intern" }
 stdx = { path = "crates/stdx" }
+build-info = { path = "crates/build-info" }
 profile = { path = "crates/profile" }
 test-fixture = { path = "crates/test-fixture" }
 test-utils = { path = "crates/test-utils" }

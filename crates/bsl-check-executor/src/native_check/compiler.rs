@@ -53,6 +53,14 @@ pub(crate) fn current_stop_clock() -> StopClock {
     STOP_CLOCK.try_with(Clone::clone).unwrap_or_else(|_| StopClock::new(DEFAULT_STOP_GRACE_MS))
 }
 
+/// Stop clock for a cleanup that tests something other than its deadline: the production grace
+/// is short enough that a loaded machine turns slow scheduling into a spurious cleanup failure,
+/// so only a hang ends the cleanup early.
+#[cfg(all(test, unix))]
+pub(super) fn stop_clock_not_under_test() -> StopClock {
+    StopClock::new(u64::try_from(super::tests::HANG_GUARD.as_millis()).unwrap())
+}
+
 struct StopWatch {
     task: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
@@ -719,7 +727,7 @@ fn write_active_process(cwd: &Path, pid: u32) -> io::Result<std::path::PathBuf> 
         }
         writeln!(file, "{pid}:{start}")?;
         file.sync_all()?;
-        return Ok(path);
+        Ok(path)
     }
     #[cfg(not(windows))]
     {
@@ -901,16 +909,18 @@ impl ProcessGroupGuard {
             if snapshot.is_null() || snapshot as isize == -1 {
                 return Err(ProcessFailure::Spawn);
             }
-            let mut entry = THREADENTRY32::default();
-            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
             let mut thread_id = None;
             let mut found = Thread32First(snapshot, &mut entry) != 0;
             while found {
-                if entry.th32OwnerProcessID == pid {
-                    if thread_id.replace(entry.th32ThreadID).is_some() {
-                        windows_sys::Win32::Foundation::CloseHandle(snapshot);
-                        return Err(ProcessFailure::Spawn);
-                    }
+                if entry.th32OwnerProcessID == pid
+                    && thread_id.replace(entry.th32ThreadID).is_some()
+                {
+                    windows_sys::Win32::Foundation::CloseHandle(snapshot);
+                    return Err(ProcessFailure::Spawn);
                 }
                 found = Thread32Next(snapshot, &mut entry) != 0;
             }
@@ -1188,7 +1198,6 @@ fn schedule_process_group_cleanup(pid: u32, deadline: Instant) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     #[test]
@@ -1250,16 +1259,14 @@ mod tests {
 
     fn script(directory: &Path, body: &str) -> std::path::PathBuf {
         let path = directory.join("designer-stub");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        test_utils::write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
 
     #[cfg(target_os = "linux")]
     fn python_script(directory: &Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = directory.join(name);
-        std::fs::write(&path, format!("#!/usr/bin/python3\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        test_utils::write_executable(&path, &format!("#!/usr/bin/python3\n{body}\n"));
         path
     }
 
@@ -1944,8 +1951,7 @@ mod windows_tests {
             .await
             .expect("cmd.exe should start");
         assert!(output.status.success());
-        let units =
-            output.stdout.chunks_exact(2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+        let units = output.stdout.as_chunks::<2>().0.iter().map(|bytes| u16::from_le_bytes(*bytes));
         let mut text = String::from_utf16_lossy(&units.collect::<Vec<_>>());
         text = text.trim_start_matches('\u{feff}').trim_end_matches(['\r', '\n']).to_owned();
         text

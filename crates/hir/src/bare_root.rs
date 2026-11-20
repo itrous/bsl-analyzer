@@ -53,7 +53,8 @@ pub fn claim_at<DB: HirDatabase>(
         read_offset,
     });
     let resolver = Resolver::with_builtins_and_workspace(module_id);
-    (bare_global_name_claim(db, &resolver, scope.as_ref(), name), owner)
+    let body_env = hir_ty::owner_body_env(db, file_id, owner);
+    (bare_global_name_claim(db, &resolver, scope.as_ref(), name, body_env), owner)
 }
 
 /// Same, keyed off a receiver node: the read position is the node's own start.

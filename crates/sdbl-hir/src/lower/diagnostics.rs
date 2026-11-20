@@ -1,4 +1,5 @@
 use super::context::LoweringContext;
+use super::from_clause::is_document_virtual_query_field;
 use super::missing_row::{AliasMatch, MissingRowConditions, QueryFacts};
 use crate::diagnostics::{SdblDiagnostic, UnprotectedFieldRef};
 use crate::hir::{
@@ -10,7 +11,7 @@ use crate::standard_fields::{
 };
 use crate::types::{MdoRef, SdblType};
 use bsl_metadata::MdoType;
-use stdx::case::CaseExt;
+use stdx::case::{eq_ignore_case, CaseExt};
 use syntax::ast::AstNode;
 
 impl LoweringContext<'_> {
@@ -148,6 +149,133 @@ impl LoweringContext<'_> {
                 self.report_dotted_paths(&item.expr, PathStart::SourceAlias);
             }
         }
+    }
+
+    /// Reports a path that reads a non-standard member through a register's `Регистратор`.
+    ///
+    /// #std477: a register carries what its logic needs in its own dimensions and resources.
+    /// The standard fields of the document identify and present the recorder and stay allowed;
+    /// any other name after it is a declared attribute, a common attribute or a tabular
+    /// section. The registrar's concrete documents are not known to the query layer, so a name
+    /// no document declares is reported too — the unknown-field rule covers the typo.
+    pub(super) fn check_register_recorder_fields(&mut self, hir: &SdblHir) {
+        let mut found = Vec::new();
+        let mut visit = |this: &Self, expr: &ExprHir, table: Option<&TableRef>| {
+            this.collect_recorder_reads(expr, table, &mut found);
+        };
+        for field in &hir.select.fields {
+            visit(self, &field.expr, None);
+        }
+        for table in hir.from.iter().chain(hir.joins.iter().map(|join| &join.table)) {
+            for param in &table.virtual_table_params {
+                visit(self, param, Some(table));
+            }
+        }
+        for join in &hir.joins {
+            if let Some(condition) = &join.condition {
+                visit(self, condition, None);
+            }
+        }
+        if let Some(where_expr) = &hir.where_clause {
+            visit(self, where_expr, None);
+        }
+        if let Some(group_by) = &hir.group_by {
+            for expr in &group_by.exprs {
+                visit(self, expr, None);
+            }
+        }
+        if let Some(having) = &hir.having {
+            visit(self, having, None);
+        }
+        if let Some(order_by) = &hir.order_by {
+            for item in &order_by.items {
+                visit(self, &item.expr, None);
+            }
+        }
+        for (attribute, range) in found {
+            self.diagnostics
+                .push(SdblDiagnostic::RegisterRecorderFieldInQuery { attribute, range });
+        }
+    }
+
+    /// `table` is set for a virtual-table parameter, where the path starts from a field.
+    fn collect_recorder_reads(
+        &self,
+        expr: &ExprHir,
+        table: Option<&TableRef>,
+        found: &mut Vec<(String, text_size::TextRange)>,
+    ) {
+        if let ExprHir::ColumnRef { parts, range, .. } = expr {
+            let attribute = self.members_after_recorder(parts, table).and_then(<[Name]>::first);
+            if let Some(attribute) = attribute.and_then(recorder_data_member) {
+                found.push((attribute, *range));
+            }
+            return;
+        }
+        // `ВЫРАЗИТЬ(Источник.Регистратор КАК Документ.Х).Реквизит` reads the document through
+        // the recorder just as a dotted path does.
+        if let ExprHir::FunctionCall {
+            function: FunctionKind::Cast,
+            args,
+            member_access,
+            range,
+            ..
+        } = expr
+        {
+            let casts_recorder = matches!(
+                args.first(),
+                Some(ExprHir::ColumnRef { parts, .. })
+                    if self.members_after_recorder(parts, table).is_some_and(<[Name]>::is_empty)
+            );
+            if let Some(attribute) =
+                member_access.first().filter(|_| casts_recorder).and_then(recorder_data_member)
+            {
+                found.push((attribute, *range));
+            }
+        }
+        for child in direct_operands(expr) {
+            self.collect_recorder_reads(child, table, found);
+        }
+    }
+
+    /// The members that follow a register's `Регистратор` in `parts`, or `None` when the path
+    /// does not go through that field.
+    fn members_after_recorder<'a>(
+        &self,
+        parts: &'a [Name],
+        table: Option<&TableRef>,
+    ) -> Option<&'a [Name]> {
+        let (table, rest) = match table {
+            Some(table) => (table, parts),
+            None => {
+                if parts.len() < 2 || crate::is_mdo_type(parts[0].as_str()) {
+                    return None;
+                }
+                (self.scope.find_table(parts[0].as_str())?, &parts[1..])
+            }
+        };
+        let (recorder, members) = rest.split_first()?;
+        let metadata = table.metadata.as_ref()?;
+        let crate::hir::ResolvedTable::Register { mdo_type, name, .. } = metadata else {
+            return None;
+        };
+        let field = metadata.find_field(recorder.as_str())?;
+        if !field.is_standard || !field.matches_name("Регистратор") {
+            return None;
+        }
+        if field.provisional {
+            // The parser reads the write mode, so for a subordinate information register the
+            // recorder field is unconditional and the provisional mark does not apply.
+            let subordinate = *mdo_type == bsl_metadata::MdoType::InformationRegister
+                && self
+                    .resolver
+                    .and_then(|resolver| resolver.resolve_register(*mdo_type, name))
+                    .is_some_and(|register| register.is_recorder_subordinate());
+            if !subordinate {
+                return None;
+            }
+        }
+        Some(members)
     }
 
     fn report_dotted_paths_in_source(&mut self, table: &TableRef) {
@@ -305,6 +433,80 @@ impl LoweringContext<'_> {
                 (std::borrow::Cow::Owned(expanded(&resolved).clone()), false)
             }
             ty => (std::borrow::Cow::Borrowed(ty), may_resolve),
+        }
+    }
+
+    /// Reports an `ORDER BY` key `<источник>.<поле>.Дата` where `<поле>` is a document
+    /// reference (#std412).
+    ///
+    /// Documents of the same date come in arbitrary order, so the date is not a definite
+    /// chronological key; `МоментВремени` is. The rule judges only a three-part key whose
+    /// first part names a resolved source of this query, whose second part is a field of
+    /// that source typed as a document reference (a single document reference, "any
+    /// document reference", or a composite made of nothing else), and whose last part is
+    /// `Дата`/`Date`. A key accompanied by `<источник>.<поле>.МоментВремени` in the same
+    /// `ORDER BY` is silent. Two-part keys, longer paths and expressions are not judged; the
+    /// other query sections are not looked at.
+    pub(super) fn check_order_by_document_date(&mut self, hir: &SdblHir) {
+        let Some(order_by) = &hir.order_by else { return };
+        fn path_of(expr: &ExprHir) -> Option<&[Name]> {
+            match expr {
+                ExprHir::ColumnRef { parts, .. } if parts.len() == 3 => Some(parts),
+                _ => None,
+            }
+        }
+        for item in &order_by.items {
+            let Some(parts) = path_of(&item.expr) else { continue };
+            if !is_name_of(&parts[2], "Дата", "Date") {
+                continue;
+            }
+            let has_point_in_time =
+                order_by.items.iter().filter_map(|key| path_of(&key.expr)).any(|other| {
+                    eq_ignore_case(&other[0], &parts[0])
+                        && eq_ignore_case(&other[1], &parts[1])
+                        && is_name_of(&other[2], "МоментВремени", "PointInTime")
+                });
+            if has_point_in_time {
+                continue;
+            }
+            let Some(table) = hir
+                .from
+                .iter()
+                .chain(hir.joins.iter().map(|join| &join.table))
+                .find(|table| eq_ignore_case(table.effective_name(), &parts[0]))
+            else {
+                continue;
+            };
+            let Some(field) = table.metadata.as_ref().and_then(|meta| meta.find_field(&parts[1]))
+            else {
+                continue;
+            };
+            if !self.is_document_reference(&field.ty) {
+                continue;
+            }
+            self.diagnostics.push(SdblDiagnostic::QueryOrderByDocumentDate {
+                reference_field: parts[1].to_string(),
+                range: item.expr.range(),
+            });
+        }
+    }
+
+    /// Whether `ty` is a document reference: a single one, "any document reference", or a
+    /// composite in which every arm is one of those. An arm may be a defined type that
+    /// expands to a composite of its own, so arms are judged the same way.
+    fn is_document_reference(&self, ty: &SdblType) -> bool {
+        self.is_document_arm(ty, true)
+    }
+
+    fn is_document_arm(&self, ty: &SdblType, may_resolve: bool) -> bool {
+        let (ty, may_resolve) = self.expanded_resolving(ty, may_resolve);
+        match ty.as_ref() {
+            SdblType::Ref(MdoRef { mdo_type: MdoType::Document, .. })
+            | SdblType::AnyObjectRef { mdo_type: MdoType::Document } => true,
+            SdblType::Composite { types } => {
+                !types.is_empty() && types.iter().all(|arm| self.is_document_arm(arm, may_resolve))
+            }
+            _ => false,
         }
     }
 
@@ -679,6 +881,11 @@ enum PathStart<'t> {
     SourceAlias,
     /// A parameter of this virtual table: the path's head is one of its fields.
     VirtualTableField(&'t TableRef),
+}
+
+/// Whether `name` is the Russian or the English spelling of a query word, ignoring case.
+fn is_name_of(name: &str, russian: &str, english: &str) -> bool {
+    eq_ignore_case(name, russian) || eq_ignore_case(name, english)
 }
 
 /// `ty` without the wrappers that do not change what it may hold: a defined type whose
@@ -1223,4 +1430,13 @@ impl<'a> NullableUses<'a> {
                 .into_iter()
                 .any(|operand| self.tests_presence_anywhere(operand))
     }
+}
+
+/// The member read through the recorder when it is data rather than a standard field of the
+/// document.
+fn recorder_data_member(member: &Name) -> Option<String> {
+    let name = member.as_str();
+    (!bsl_metadata::is_document_standard_attribute_name(name)
+        && !is_document_virtual_query_field(name))
+    .then(|| name.to_string())
 }

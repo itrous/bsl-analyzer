@@ -10,8 +10,11 @@ fn deprecated(host: &AnalysisHost, file: FileId) -> Vec<ide::Diagnostic> {
 
 fn assert_replacements(diagnostics: &[ide::Diagnostic], names: &[&str], applicable: bool) {
     assert_eq!(diagnostics.len(), names.len(), "{diagnostics:?}");
+    // The message for a replacement proven absent names it only to say it is missing.
     for (diagnostic, name) in diagnostics.iter().zip(names) {
-        assert_eq!(diagnostic.message.contains(name), applicable, "{diagnostic:?}");
+        let recommends = diagnostic.message.contains(name)
+            && !diagnostic.message.contains("в этой конфигурации нет");
+        assert_eq!(recommends, applicable, "{diagnostic:?}");
     }
 }
 

@@ -298,6 +298,7 @@ pub fn partitioned_coverage(
     Ok(result)
 }
 
+/// [`classify_partitioned_diagnostics_with`] that also computes `resolved`.
 pub fn classify_partitioned_diagnostics<T>(
     snapshot: &DiagnosticsBaselineSetSnapshot,
     plan: &DiagnosticsBaselinePartitionPlan,
@@ -315,6 +316,14 @@ pub fn classify_partitioned_diagnostics<T>(
     )
 }
 
+/// The partitioned form of
+/// [`classify_diagnostics_with`](crate::diagnostics_baseline::classify_diagnostics_with),
+/// under the same contract: `current` holds every finalized finding of each file it
+/// mentions, identity is fixed here in each [`ClassifiedDiagnostic::entry`], and callers
+/// only shape the result afterwards — they may drop entries of `new`, `known` or
+/// `unsuppressed` without renumbering them, never classify a reduced set again. A
+/// finding of an `Unsuppressed` partition is numbered like any other; the policy only
+/// decides that it stays active.
 pub fn classify_partitioned_diagnostics_with<T>(
     snapshot: &DiagnosticsBaselineSetSnapshot,
     plan: &DiagnosticsBaselinePartitionPlan,
@@ -1585,6 +1594,127 @@ mod tests {
             .write_all(&diagnostics_manifest_json(&manifest).unwrap())
             .unwrap();
         manifest
+    }
+
+    /// The counterexample in the partitioned form: a, b, c identical findings of one main
+    /// file, the main partition holding occurrences 0 and 1. Under the `Baseline` policy c
+    /// is new with occurrence 2 through any permutation and projection; under
+    /// `Unsuppressed` the policy shows b and c, numbered the same way.
+    #[test]
+    fn finality_projection_keeps_occurrence() {
+        let path = "src/cf/CommonModules/A/Ext/Module.bsl";
+        let snippet = "А = А;";
+        let recorded = |occurrence: u32, line: u32| DiagnosticsBaselineEntry {
+            fingerprint: diagnostic_fingerprint(path, "SelfAssign", snippet, occurrence),
+            path: path.to_owned(),
+            code: "SelfAssign".to_owned(),
+            snippet: snippet.to_owned(),
+            occurrence,
+            message: "message".to_owned(),
+            severity: "Warning".to_owned(),
+            range: DiagnosticsBaselineRange {
+                start_line: line,
+                start_column: 0,
+                end_line: line,
+                end_column: 1,
+            },
+        };
+        let finding = |line: u32, name: &'static str| PartitionedBaselineDiagnosticCandidate {
+            partition_id: "main".to_owned(),
+            candidate: BaselineDiagnosticCandidate {
+                diagnostic: name,
+                path: path.to_owned(),
+                code: "SelfAssign".to_owned(),
+                snippet: Some(snippet.to_owned()),
+                message: "message".to_owned(),
+                severity: "Warning".to_owned(),
+                range: DiagnosticsBaselineRange {
+                    start_line: line,
+                    start_column: 0,
+                    end_line: line,
+                    end_column: 1,
+                },
+            },
+        };
+        let full = || vec![finding(1, "a"), finding(2, "b"), finding(3, "c")];
+
+        let root = tempdir().unwrap();
+        let directory = ManagedBaselineDirectory::open(root.path(), "baselines", true).unwrap();
+        let plan = plan();
+        let mut files = Vec::new();
+        for partition in &plan.partitions {
+            let entries =
+                if partition.id == "main" { vec![recorded(0, 1), recorded(1, 2)] } else { vec![] };
+            let bytes = diagnostics_partition_json(partition.identity.clone(), entries).unwrap();
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            let file = partition_object_path(&partition.id, &partition.key, &hash).unwrap();
+            directory.create_file_new(&file).unwrap().write_all(&bytes).unwrap();
+            files.push(DiagnosticsBaselineManifestEntry {
+                partition_id: partition.id.clone(),
+                file,
+                blake3: hash,
+            });
+        }
+        let manifest = diagnostics_manifest(plan.project_scope_fingerprint.clone(), files);
+        directory
+            .create_file_new("manifest.json")
+            .unwrap()
+            .write_all(&diagnostics_manifest_json(&manifest).unwrap())
+            .unwrap();
+        let snapshot = load_diagnostics_baseline_set(&directory, &plan).unwrap();
+        let unproven = BTreeMap::new();
+        let classify =
+            |plan: &DiagnosticsBaselinePartitionPlan,
+             current: Vec<PartitionedBaselineDiagnosticCandidate<&'static str>>| {
+                classify_partitioned_diagnostics(
+                    &snapshot,
+                    plan,
+                    "b".to_owned(),
+                    current,
+                    &unproven,
+                )
+                .unwrap()
+            };
+
+        let classified = classify(&plan, full());
+        let known: Vec<_> =
+            classified.known.iter().map(|item| (item.diagnostic, item.entry.occurrence)).collect();
+        assert_eq!(known, vec![("a", 0), ("b", 1)]);
+        assert_eq!(classified.new.len(), 1);
+        let c = &classified.new[0];
+        assert_eq!((c.diagnostic, c.entry.occurrence), ("c", 2));
+        assert_eq!(c.entry.fingerprint, diagnostic_fingerprint(path, "SelfAssign", snippet, 2));
+        assert_eq!(c.entry.range.start_line, 3);
+
+        let mut reversed = full();
+        reversed.reverse();
+        let permuted = classify(&plan, reversed);
+        assert_eq!(permuted.new, classified.new, "the input order must not matter");
+        assert_eq!(permuted.known, classified.known);
+
+        let visible: Vec<_> =
+            classified.new.iter().filter(|item| item.entry.range.start_line >= 2).collect();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].entry, c.entry, "a projection must not touch the identity");
+
+        let scoped_first: Vec<_> =
+            full().into_iter().filter(|item| item.candidate.range.start_line >= 2).collect();
+        let renumbered = classify(&plan, scoped_first);
+        assert!(
+            renumbered.new.iter().all(|item| item.diagnostic != "c"),
+            "control: classifying the scoped set must lose c"
+        );
+
+        let unsuppressed_plan = selective_plan(&["extension:Ext"]);
+        let shown = classify(&unsuppressed_plan, full());
+        assert!(shown.known.is_empty() && shown.new.is_empty());
+        let visible: Vec<_> = shown
+            .unsuppressed
+            .iter()
+            .filter(|item| item.entry.range.start_line >= 2)
+            .map(|item| (item.diagnostic, item.entry.occurrence))
+            .collect();
+        assert_eq!(visible, vec![("b", 1), ("c", 2)], "Unsuppressed shows b and c");
     }
 
     fn replace_extension_object_identity(

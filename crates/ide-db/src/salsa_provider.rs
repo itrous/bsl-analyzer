@@ -276,6 +276,24 @@ impl AnalysisProvider for SalsaProvider<'_> {
         hir::kernel_type_includes_undefined(self.db, id)
     }
 
+    fn kernel_type_is_structure(&self, id: bsl_types::kind::TypeId) -> bool {
+        hir::kernel_type_is_structure(self.db, id)
+    }
+
+    fn kernel_type_is_fixed_structure(&self, id: bsl_types::kind::TypeId) -> bool {
+        hir::kernel_type_is_fixed_structure(self.db, id)
+    }
+    fn kernel_type_is_form_data_structure(&self, id: bsl_types::kind::TypeId) -> bool {
+        hir::kernel_type_is_form_data_structure(self.db, id)
+    }
+    fn kernel_type_is_boolean(&self, id: bsl_types::kind::TypeId) -> bool {
+        hir::kernel_type_is_boolean(self.db, id)
+    }
+
+    fn kernel_type_is_metadata_reference(&self, id: bsl_types::kind::TypeId) -> bool {
+        hir::kernel_type_is_metadata_reference(self.db, id)
+    }
+
     fn min_platform_version(&self) -> Option<Arc<str>> {
         HirDatabase::min_platform_version(self.db)
     }
@@ -441,6 +459,15 @@ impl AnalysisProvider for SalsaProvider<'_> {
         hir::infer_owner(self.db, file_id, owner)
     }
 
+    fn value_origin(
+        &self,
+        file_id: FileId,
+        owner: DefWithBodyId,
+        expr: hir::ExprId,
+    ) -> hir::ValueOrigin {
+        hir::value_origin_of(self.db, file_id, owner, expr)
+    }
+
     fn executed_query_texts(&self, method_id: MethodId) -> Arc<[hir::ExecutedQueryText]> {
         hir::executed_query_texts(self.db, method_id).into()
     }
@@ -502,7 +529,7 @@ impl AnalysisProvider for SalsaProvider<'_> {
     }
 
     fn method_cfg(&self, method_id: hir::MethodId) -> Arc<hir::cfg::ControlFlowGraph> {
-        self.db.method_cfg(method_id)
+        self.db.method_cfg(hir::MethodIdInput::new(self.db, method_id))
     }
 
     fn method_path_terminates(

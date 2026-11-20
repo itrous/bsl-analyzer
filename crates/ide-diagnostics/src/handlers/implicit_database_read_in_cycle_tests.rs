@@ -1152,3 +1152,213 @@ fn implicit_database_read_in_cycle_every_object_reference_kind_is_a_candidate() 
         "any-reference (Эл9) is not an object reference"
     );
 }
+
+fn presentation_reads(source: &str) -> Vec<Diagnostic> {
+    diagnostics_for(source, DiagnosticCode::ImplicitDatabaseReadInCycle)
+}
+
+const CONCAT_MESSAGE: &str = "Возможное чтение из базы в цикле: ссылка в строковом выражении получает представление. Получите представление в запросе (ПРЕДСТАВЛЕНИЕ) до цикла";
+
+#[test]
+fn presentation_in_concatenation_with_string_literal_is_reported() {
+    let source = r#"Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Номенклатура ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Пока Выборка.Следующий() Цикл
+        Текст = "Не хватает товара " + Выборка.Номенклатура;
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    let found = presentation_reads(source);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(range_text(source, &found[0]), "Выборка.Номенклатура");
+    assert_eq!(found[0].message, CONCAT_MESSAGE);
+}
+
+#[test]
+fn presentation_in_concatenation_chain_reports_each_reference_once() {
+    let source = r#"Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Номенклатура, Т.Ссылка КАК Склад ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Пока Выборка.Следующий() Цикл
+        Текст = "Товар " + Выборка.Номенклатура + " на складе " + Выборка.Склад;
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    let found = presentation_reads(source);
+    let texts: Vec<_> = found.iter().map(|diag| range_text(source, diag)).collect();
+    assert_eq!(texts, ["Выборка.Номенклатура", "Выборка.Склад"], "{found:#?}");
+}
+
+#[test]
+fn presentation_passed_to_message_is_reported() {
+    let source = r#"Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Номенклатура ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Пока Выборка.Следующий() Цикл
+        Сообщить(Выборка.Номенклатура);
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    let found = presentation_reads(source);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(range_text(source, &found[0]), "Выборка.Номенклатура");
+    assert!(found[0].message.starts_with("Возможное чтение из базы в цикле: Сообщить() от ссылки"));
+}
+
+#[test]
+fn presentation_passed_to_str_template_is_reported_except_the_template() {
+    let source = r#"Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Номенклатура ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Пока Выборка.Следующий() Цикл
+        Текст = СтрШаблон("%1", Выборка.Номенклатура);
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    let found = presentation_reads(source);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(range_text(source, &found[0]), "Выборка.Номенклатура");
+    assert!(found[0].message.contains("СтрШаблон() от ссылки"));
+}
+
+#[test]
+fn presentation_in_english_module_body_is_reported() {
+    let source = r#"Procedure Test()
+    For Each Ref In Refs() Do
+        Message("Short of " + Ref);
+        Text = StrTemplate("%1", Ref);
+    EndDo;
+EndProcedure
+
+// Returns:
+//   Array of CatalogRef.Товары
+Function Refs() Export
+    Return New Array;
+EndFunction
+"#;
+    let found = presentation_reads(source);
+    let texts: Vec<_> = found.iter().map(|diag| range_text(source, diag)).collect();
+    assert_eq!(texts, ["Ref", "Ref"], "{found:#?}");
+}
+#[test]
+fn presentation_in_nested_loop_inside_condition_is_reported() {
+    let source = r#"Процедура Тест(Список)
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Номенклатура ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Для Каждого Элемент Из Список Цикл
+        Если Элемент <> Неопределено Тогда
+            Для Каждого Вложенный Из Элемент Цикл
+                Текст = "Товар " + Выборка.Номенклатура;
+            КонецЦикла;
+        КонецЕсли;
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    assert_eq!(presentation_reads(source).len(), 1);
+}
+
+#[test]
+fn presentation_outside_loop_is_silent() {
+    let source = r#"Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Номенклатура ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Если Выборка.Следующий() Тогда
+        Текст = "Товар " + Выборка.Номенклатура;
+        Сообщить(Выборка.Номенклатура);
+    КонецЕсли;
+КонецПроцедуры
+"#;
+    assert_count(source, DiagnosticCode::ImplicitDatabaseReadInCycle, 0);
+}
+
+#[test]
+fn presentation_concatenation_with_number_or_date_is_silent() {
+    let source = r#"Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Номенклатура ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Пока Выборка.Следующий() Цикл
+        Первое = Выборка.Номенклатура + 5;
+        Второе = Выборка.Номенклатура + ТекущаяДата();
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    assert_count(source, DiagnosticCode::ImplicitDatabaseReadInCycle, 0);
+}
+
+#[test]
+fn presentation_taken_in_the_query_is_silent() {
+    let source = r#"Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ ПРЕДСТАВЛЕНИЕ(Т.Ссылка) КАК Номенклатура, Т.Артикул КАК Артикул ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Пока Выборка.Следующий() Цикл
+        Текст = "Товар " + Выборка.Номенклатура + " " + Выборка.Артикул;
+        Сообщить(Выборка.Номенклатура);
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    assert_count(source, DiagnosticCode::ImplicitDatabaseReadInCycle, 0);
+}
+
+#[test]
+fn presentation_of_enum_reference_is_silent() {
+    let source = r#"Процедура Тест()
+    Статус = Перечисления.Статусы.Активный;
+    Для Индекс = 1 По 3 Цикл
+        Текст = "Статус " + Статус;
+        Сообщить(Статус);
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    assert_count(source, DiagnosticCode::ImplicitDatabaseReadInCycle, 0);
+}
+
+#[test]
+fn presentation_in_locally_defined_message_is_silent() {
+    let source = r#"Процедура Сообщить(Значение)
+КонецПроцедуры
+
+Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Номенклатура ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Пока Выборка.Следующий() Цикл
+        Сообщить(Выборка.Номенклатура);
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    assert_count(source, DiagnosticCode::ImplicitDatabaseReadInCycle, 0);
+}
+
+#[test]
+fn str_template_without_reference_is_silent() {
+    let source = r#"Процедура Тест(Шаблон)
+    Для Индекс = 1 По 3 Цикл
+        Текст = СтрШаблон(Шаблон, "строка");
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    assert_count(source, DiagnosticCode::ImplicitDatabaseReadInCycle, 0);
+}
+
+#[test]
+fn str_template_reference_in_template_position_is_silent() {
+    let source = r#"Процедура Тест()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Т.Ссылка КАК Номенклатура ИЗ Справочник.Товары КАК Т";
+    Выборка = Запрос.Выполнить().Выбрать();
+    Пока Выборка.Следующий() Цикл
+        Текст = СтрШаблон(Выборка.Номенклатура, "строка");
+    КонецЦикла;
+КонецПроцедуры
+"#;
+    assert_count(source, DiagnosticCode::ImplicitDatabaseReadInCycle, 0);
+}

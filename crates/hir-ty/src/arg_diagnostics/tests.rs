@@ -33,6 +33,8 @@ fn candidates(db: &InMemoryDb, parameter_sets: &[&[TypeId]]) -> CallCandidateSet
                             ty,
                             has_default: false,
                             mode: CallParamMode::Positional,
+                            passing: None,
+                            result_follows_argument_text: false,
                         })
                         .collect(),
                     required_args: parameter_types.len(),
@@ -86,11 +88,11 @@ fn t12_type_rejection_uses_best_candidate_and_first_incompatible_argument() {
     let db = InMemoryDb::new();
     let number = db.number(None, None);
     let string = db.string(None, false);
-    let boolean = db.boolean();
+    let structure = db.structure(None);
     let date = db.date(bsl_types::facet::DateComponent::DateTime);
     let binding = binding(
         &db,
-        &[&[boolean, boolean], &[number, date], &[number, boolean]],
+        &[&[structure, structure], &[number, date], &[number, structure]],
         &[number, string],
     );
 

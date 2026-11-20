@@ -349,3 +349,266 @@ fn prose_and_plain_types_name_no_target() {
         assert!(!names_target(&docs, param), "{param} не называет цель");
     }
 }
+
+// ---- documented map keys --------------------------------------------------------------------
+
+use super::DocMapEntry;
+use crate::type_ref::BuiltinTypeRef;
+use crate::TypeRef;
+
+fn returned_keys(lines: &[&str]) -> Vec<(String, Vec<DocTypeExpr>)> {
+    let docs = parse_docs(lines);
+    let Some(DocTypeExpr::Map { entries }) = parse_type_expr(&docs.returned_value[0]) else {
+        panic!("expected a documented map for {lines:?}");
+    };
+    entries.into_iter().map(|DocMapEntry { key, types }| (key, types)).collect()
+}
+
+fn number() -> DocTypeExpr {
+    DocTypeExpr::TypeRef(TypeRef::from_bare_name("Число").expect("Число is a platform type"))
+}
+
+/// Whether the slot parses as a keyed map at all.
+fn parses_as_keyed_map(slot: &TypeDoc) -> bool {
+    matches!(parse_type_expr(slot), Some(DocTypeExpr::Map { .. }))
+}
+
+#[test]
+fn quoted_items_give_the_keys_with_dashes_spaces_separators_and_doubled_quotes() {
+    let docs = parse_docs(&[
+        "Возвращаемое значение:",
+        "  Соответствие:",
+        "    * \"а-б\" - Число",
+        "    * \"а б\" - Строка",
+        "    * \"а - б\" - Булево - описание",
+        "    * \"а\"\"б\" - Дата",
+    ]);
+    let Some(DocTypeExpr::Map { entries }) = parse_type_expr(&docs.returned_value[0]) else {
+        panic!("expected a documented map");
+    };
+    let keys: Vec<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
+    assert_eq!(keys, ["а-б", "а б", "а - б", "а\"б"]);
+    let names: Vec<String> = entries
+        .iter()
+        .map(|entry| match entry.types.as_slice() {
+            [DocTypeExpr::TypeRef(TypeRef::Builtin(BuiltinTypeRef::Number))] => "Число".to_owned(),
+            [DocTypeExpr::TypeRef(TypeRef::Builtin(BuiltinTypeRef::String))] => "Строка".to_owned(),
+            [DocTypeExpr::TypeRef(TypeRef::Builtin(BuiltinTypeRef::Boolean))] => {
+                "Булево".to_owned()
+            }
+            [DocTypeExpr::TypeRef(TypeRef::Builtin(BuiltinTypeRef::Date))] => "Дата".to_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["Число", "Строка", "Булево", "Дата"]);
+    assert!(docs.returned_value[0].parameters.is_empty(), "no ordinary fields appear");
+}
+
+#[test]
+fn a_parameter_slot_takes_the_same_items_in_either_language_and_case() {
+    for head in ["Соответствие:", "Map:", "СоОтВеТсТвИе:", "соответствие", "MAP"]
+    {
+        let docs =
+            parse_docs(&["Параметры:", &format!("  Данные - {head}"), "    * \"сумма\" - Число"]);
+        let slot = &docs.parameters[0].types[0];
+        let Some(DocTypeExpr::Map { entries }) = parse_type_expr(slot) else {
+            panic!("`{head}` must be a documented map: {slot:?}");
+        };
+        assert_eq!(entries.len(), 1, "{head}");
+        assert_eq!(entries[0].key, "сумма");
+        assert_eq!(entries[0].types, [number()]);
+    }
+}
+
+#[test]
+fn items_that_are_not_a_quoted_key_with_a_separator_give_no_key() {
+    // Each of these keeps the old reading: the slot is not a keyed map, and `TypeDoc.parameters`
+    // is what it was before keys existed.
+    let unquoted =
+        parse_docs(&["Возвращаемое значение:", "  Соответствие:", "    * сумма - Число"]);
+    assert!(!parses_as_keyed_map(&unquoted.returned_value[0]));
+    assert_eq!(unquoted.returned_value[0].parameters.len(), 1, "an unquoted name stays a field");
+    assert_eq!(unquoted.returned_value[0].parameters[0].name, "сумма");
+
+    for item in ["* \"а - Число", "* \"а\"-Число", "* \"а\" Число", "* \"а\" -", "* \"\""]
+    {
+        let docs =
+            parse_docs(&["Возвращаемое значение:", "  Соответствие:", &format!("    {item}")]);
+        let slot = &docs.returned_value[0];
+        assert!(slot.map_entries.is_empty(), "`{item}` must give no key: {slot:?}");
+        assert!(slot.parameters.is_empty(), "`{item}` must not become a field: {slot:?}");
+        assert!(!parses_as_keyed_map(slot), "`{item}`");
+    }
+}
+
+#[test]
+fn the_separator_needs_a_space_after_the_dash_and_the_key_keeps_its_tabs() {
+    let docs = parse_docs(&[
+        "Возвращаемое значение:",
+        "  Соответствие:",
+        "    * \"а\" - Число",
+        "    * \"б\" -Число",
+        "    * \"в\tг\" -\tСтрока",
+    ]);
+    let slot = &docs.returned_value[0];
+    let keys: Vec<&str> = slot.map_entries.iter().map(|entry| entry.key.as_str()).collect();
+    assert_eq!(keys, ["а", "в\tг"], "`-Число` is no separator, a tab after the dash is one");
+}
+
+#[test]
+fn a_general_map_declaration_takes_no_keys() {
+    // `Соответствие из КлючИЗначение:` documents key and value types with `* Ключ` / `* Значение`;
+    // those items are not keys, and neither is a quoted item beside them.
+    for lines in [
+        vec![
+            "Возвращаемое значение:",
+            "  Соответствие из КлючИЗначение:",
+            "    * Ключ - Строка",
+            "    * Значение - Число",
+        ],
+        vec!["Возвращаемое значение:", "  Соответствие из КлючИЗначение:", "    * \"а\" - Число"],
+        vec!["Возвращаемое значение:", "  Map of KeyAndValue:", "    * \"а\" - Число"],
+        vec!["Возвращаемое значение:", "  Соответствие - из КлючИЗначение:", "    * \"а\" - Число"],
+    ] {
+        let docs = parse_docs(&lines);
+        let slot = &docs.returned_value[0];
+        assert!(!parses_as_keyed_map(slot), "{lines:?} -> {slot:?}");
+    }
+    let general = parse_docs(&[
+        "Параметры:",
+        "  Данные - Соответствие из КлючИЗначение:",
+        "    * Ключ - Строка",
+        "    * Значение - Число",
+    ]);
+    assert!(!parses_as_keyed_map(&general.parameters[0].types[0]));
+    let tail_in_description = parse_docs(&[
+        "Параметры:",
+        "  Данные - Соответствие - из КлючИЗначение:",
+        "    * \"а\" - Число",
+    ]);
+    assert!(!parses_as_keyed_map(&tail_in_description.parameters[0].types[0]));
+}
+
+#[test]
+fn nested_items_and_continuations_under_a_key_are_not_attached() {
+    let docs = parse_docs(&[
+        "Возвращаемое значение:",
+        "  Соответствие:",
+        "    * \"а\" - Соответствие:",
+        "      ** \"б\" - Число",
+        "    * \"в\" - Число - описание",
+        "      продолжение описания",
+    ]);
+    let Some(DocTypeExpr::Map { entries }) = parse_type_expr(&docs.returned_value[0]) else {
+        panic!("expected a documented map");
+    };
+    let keys: Vec<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
+    assert_eq!(keys, ["а", "в"], "a nested item is not a key of the outer map");
+    assert_eq!(
+        entries[0].types,
+        [DocTypeExpr::TypeRef(TypeRef::Map(None))],
+        "the nested map has no keys of its own"
+    );
+    let value = &docs.returned_value[0].map_entries[1];
+    assert_eq!(value.types[0].description.as_deref(), Some("описание"), "{value:?}");
+}
+
+#[test]
+fn an_unreadable_alternative_stays_in_the_key_as_an_unknown_type() {
+    let entries =
+        returned_keys(&["Возвращаемое значение:", "  Соответствие:", "    * \"а\" - Число, см. "]);
+    let [(key, types)] = entries.as_slice() else { panic!("one key expected: {entries:?}") };
+    assert_eq!(key, "а");
+    assert_eq!(
+        types,
+        &[number(), DocTypeExpr::TypeRef(TypeRef::Unknown)],
+        "the alternative is kept as an unknown type, not dropped"
+    );
+}
+
+#[test]
+fn keys_under_an_array_stay_with_the_collection_and_not_its_element() {
+    let docs = parse_docs(&[
+        "Возвращаемое значение:",
+        "  Массив из Соответствие:",
+        "    * \"сумма\" - Число",
+    ]);
+    let Some(DocTypeExpr::Array(element)) = parse_type_expr(&docs.returned_value[0]) else {
+        panic!("expected an array");
+    };
+    assert_eq!(*element, DocTypeExpr::TypeRef(TypeRef::Map(None)));
+}
+
+#[test]
+fn a_field_of_a_structure_never_carries_keys() {
+    let docs = parse_docs(&[
+        "Возвращаемое значение:",
+        "  Структура:",
+        "    * Поле - Соответствие:",
+        "      ** \"сумма\" - Число",
+    ]);
+    let Some(DocTypeExpr::Structure { fields }) = parse_type_expr(&docs.returned_value[0]) else {
+        panic!("expected a documented structure");
+    };
+    assert_eq!(fields[0].types, [DocTypeExpr::TypeRef(TypeRef::Map(None))]);
+}
+
+#[test]
+fn without_map_keys_reads_a_map_as_plain_at_every_depth() {
+    let plain = DocTypeExpr::TypeRef(TypeRef::Map(None));
+    let keyed = || DocTypeExpr::Map {
+        entries: vec![DocMapEntry { key: "а".to_owned(), types: vec![number()] }],
+    };
+    assert_eq!(keyed().without_map_keys(), plain);
+    assert_eq!(
+        DocTypeExpr::Array(Box::new(keyed())).without_map_keys(),
+        DocTypeExpr::Array(Box::new(plain.clone())),
+        "under an array"
+    );
+    let in_field = DocTypeExpr::Structure {
+        fields: vec![super::DocField { name: "П".to_owned(), types: vec![keyed()] }],
+    };
+    assert_eq!(
+        in_field.without_map_keys(),
+        DocTypeExpr::Structure {
+            fields: vec![super::DocField { name: "П".to_owned(), types: vec![plain.clone()] }]
+        },
+        "in a field of a structure"
+    );
+    assert_eq!(number().without_map_keys(), number(), "everything else is untouched");
+}
+
+#[test]
+fn a_documented_map_without_items_is_the_plain_map_it_always_was() {
+    let docs = parse_docs(&["Параметры:", "  Данные - Соответствие - значение."]);
+    assert_eq!(
+        parse_type_expr(&docs.parameters[0].types[0]),
+        Some(DocTypeExpr::TypeRef(TypeRef::Map(None)))
+    );
+}
+
+#[test]
+fn a_nested_item_is_attached_only_to_an_ordinary_field() {
+    // Under an ordinary field the nested key items belong to the field's type; under a key item
+    // there is no field to hold them and they are dropped.
+    let docs = parse_docs(&[
+        "Возвращаемое значение:",
+        "  Структура:",
+        "    * Поле - Соответствие:",
+        "      ** \"сумма\" - Число",
+    ]);
+    let field = &docs.returned_value[0].parameters[0];
+    let [field_type] = field.types.as_slice() else { panic!("one type expected: {field:?}") };
+    let keys: Vec<&str> = field_type.map_entries.iter().map(|entry| entry.key.as_str()).collect();
+    assert_eq!(keys, ["сумма"]);
+
+    let under_key = parse_docs(&[
+        "Возвращаемое значение:",
+        "  Соответствие:",
+        "    * \"а\" - Соответствие:",
+        "      ** \"б\" - Число",
+    ]);
+    let outer = &under_key.returned_value[0].map_entries;
+    assert_eq!(outer.len(), 1);
+    assert!(outer[0].types[0].map_entries.is_empty(), "nothing is attached under a key item");
+}

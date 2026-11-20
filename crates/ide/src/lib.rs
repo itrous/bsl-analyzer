@@ -70,12 +70,13 @@ pub use ide_db::{
     CommonModuleBodies, GraphConfigCache, RootDatabase, RootDatabaseImpl, SymbolKind, TextRange,
 };
 pub use ide_diagnostics::{
-    all_diagnostic_codes, apply_extension_merge, diagnostics as compute_diagnostics, docs,
-    file_diagnostics, file_diagnostics_query, get_metadata, load_vendor_support,
-    message_with_standards, slab_verify_mismatches, standard_url, standards, validate_query_text,
-    CleanCodeAttribute, Diagnostic, DiagnosticCode, DiagnosticOutput, DiagnosticSeverityLevel,
-    DiagnosticTag, DiagnosticType, DiagnosticsConfig, DiagnosticsContext, Fix, ImpactSeverity,
-    MetadataTag, Severity, SoftwareQuality, TextEdit, METADATA_DEPENDENT_CODES,
+    all_diagnostic_codes, apply_extension_merge, diagnostic_in_scope,
+    diagnostics as compute_diagnostics, docs, file_diagnostics, file_diagnostics_query,
+    get_metadata, load_vendor_support, message_with_standards, slab_verify_mismatches,
+    standard_url, standards, validate_query_text, CleanCodeAttribute, Diagnostic, DiagnosticCode,
+    DiagnosticOutput, DiagnosticSeverityLevel, DiagnosticTag, DiagnosticType, DiagnosticsConfig,
+    DiagnosticsContext, Fix, ImpactSeverity, MetadataTag, Severity, SoftwareQuality, TextEdit,
+    FOREIGN_HANDLER_BINDINGS_READERS, METADATA_DEPENDENT_CODES,
 };
 pub use inlay_hints::{InlayHint, InlayHintKind};
 pub use name_lookup::{
@@ -152,6 +153,9 @@ impl Analysis {
         salsa::attach(&self.db, || f(self))
     }
 
+    /// A file's final diagnostics under `config`. With `config.defer_scope_line_gate` the
+    /// answer keeps the findings on lines outside the scope, for a caller that classifies
+    /// the complete set against a baseline and then applies [`diagnostic_in_scope`].
     pub fn diagnostics(&self, file_id: FileId, config: &DiagnosticsConfig) -> Vec<Diagnostic> {
         ide_diagnostics::file_diagnostics(&self.db, file_id, config)
     }
@@ -498,6 +502,18 @@ impl Analysis {
         WarmCachesTask { db: self.db.clone(), file_ids: file_ids.to_vec() }
     }
 
+    /// Dependency discovery and cache warming as one job: the discovery query runs
+    /// wherever the warming runs, not on the caller's thread. `retain` drops the
+    /// dependencies the caller no longer wants warmed — an exclusion added since the id
+    /// was issued — and is handed the whole batch, because resolving one directory
+    /// serves every path under it.
+    pub fn warm_dependencies_task<F>(&self, file_id: FileId, retain: F) -> WarmDependenciesTask<F>
+    where
+        F: FnOnce(Vec<FileId>) -> Vec<FileId>,
+    {
+        WarmDependenciesTask { db: self.db.clone(), file_id, retain }
+    }
+
     pub fn highlight(&self, file_id: FileId) -> HighlightResult {
         syntax_highlighting::highlight(&self.db, file_id)
     }
@@ -557,16 +573,65 @@ impl WarmCachesTask {
         salsa::Database::cancellation_token(&self.db)
     }
 
+    /// Runs as one attach scope, so a cancel of the token that lands inside one query
+    /// stops the warming at the next instead of being wiped on that query's way out
+    /// (see [`Analysis::attached`]).
     pub fn run(self) -> usize {
+        salsa::attach(&self.db, || warm_files(&self.db, &self.file_ids));
+        self.file_ids.len()
+    }
+}
+
+fn warm_files(db: &RootDatabaseImpl, file_ids: &[FileId]) {
+    use hir::{DefDatabase, ModuleId};
+
+    for file_id in file_ids {
+        let module_id = ModuleId::new(*file_id);
+        let _ = db.symbol_tree(module_id);
+        let _ = db.module_bodies(module_id);
+    }
+}
+
+/// What a [`WarmDependenciesTask`] did. Discovery is timed apart from warming because
+/// the point of the task is that the caller stops paying the discovery cost itself: a
+/// caller that cannot see where the time went cannot tell whether it moved.
+pub struct WarmedDependencies {
+    pub discover_ms: u64,
+    pub warmed: usize,
+}
+
+/// Discovery and warming of one file's dependencies, to run off the caller's thread.
+pub struct WarmDependenciesTask<F> {
+    db: RootDatabaseImpl,
+    file_id: FileId,
+    retain: F,
+}
+
+impl<F> WarmDependenciesTask<F>
+where
+    F: FnOnce(Vec<FileId>) -> Vec<FileId>,
+{
+    pub fn cancellation_token(&self) -> salsa::CancellationToken {
+        salsa::Database::cancellation_token(&self.db)
+    }
+
+    /// Runs as one attach scope from discovery to the last warmed file, so a cancel of
+    /// the token that lands inside one query stops the job at the next instead of being
+    /// wiped on that query's way out (see [`Analysis::attached`]).
+    pub fn run(self) -> WarmedDependencies {
         use hir::{DefDatabase, ModuleId};
 
-        for file_id in &self.file_ids {
-            let module_id = ModuleId::new(*file_id);
-            let _ = self.db.symbol_tree(module_id);
-            let _ = self.db.module_bodies(module_id);
-        }
+        let Self { db, file_id, retain } = self;
+        salsa::attach(&db, || {
+            let discover_start = std::time::Instant::now();
+            let discovered = db.file_dependencies(ModuleId::new(file_id));
+            let deps = retain(discovered.as_ref().clone());
+            let discover_ms = discover_start.elapsed().as_millis() as u64;
 
-        self.file_ids.len()
+            warm_files(&db, &deps);
+
+            WarmedDependencies { discover_ms, warmed: deps.len() }
+        })
     }
 }
 
@@ -728,6 +793,43 @@ mod attached_scope_tests {
         assert!(
             matches!(outcome, Err(salsa::Cancelled::Local)),
             "the cancel was wiped before the checkpoint: {outcome:?}"
+        );
+    }
+
+    /// A dependency-warming job is one attach scope from discovery to the last warmed
+    /// file. Input: `retain` lands a cancel inside a nested scope on the job's own
+    /// handle, the way a cancel lands inside a query body, and hands back a file whose
+    /// warming is the next checkpoint. Outside one scope there is no handle attached to
+    /// land it on, and the job would warm on.
+    #[test]
+    fn a_cancel_landing_inside_the_dependency_job_stops_it() {
+        use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+        use ide_db::vfs::{file_set::FileSet, VfsPath};
+        use std::{cell::OnceCell, rc::Rc};
+
+        let mut db = ide_db::RootDatabaseImpl::new();
+        let file_id = super::FileId(0);
+        let mut file_set = FileSet::new();
+        file_set.insert(file_id, VfsPath::new("/test.bsl"));
+        db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+        db.set_file_source_root(file_id, SourceRootId(0));
+        db.set_file_text(file_id, "Процедура Тест()\nКонецПроцедуры\n");
+        let analysis = Analysis::from_database(db);
+
+        let token = Rc::new(OnceCell::<salsa::CancellationToken>::new());
+        let job_token = Rc::clone(&token);
+        let task = analysis.warm_dependencies_task(file_id, move |_| {
+            salsa::with_attached_database(|db| {
+                salsa::attach(db, || job_token.get().expect("token set before run").cancel())
+            });
+            vec![file_id]
+        });
+        assert!(token.set(task.cancellation_token()).is_ok(), "token set once");
+
+        let outcome = salsa::Cancelled::catch(AssertUnwindSafe(|| task.run().warmed));
+        assert!(
+            matches!(outcome, Err(salsa::Cancelled::Local)),
+            "the job warmed past a cancel that landed inside it: {outcome:?}"
         );
     }
 

@@ -23,6 +23,7 @@ pub use hir_ty::min_platform;
 pub use hir_ty::subtype::type_sets_overlap;
 pub use hir_ty::this_object::coerce_to_metadata_ref_id;
 pub use hir_ty::unshadowed_platform_global_calls;
+pub use hir_ty::BodyFlow;
 pub use hir_ty::TyLoweringContext;
 pub use hir_ty::{
     bare_global_name_claim, manager_collection_env, resolve_platform_global_property_type,
@@ -36,7 +37,9 @@ pub use semantic_symbol::{
     SymbolDeclaration,
 };
 pub use type_facade::{
-    execution_environment_at, form_element_type, kernel_type_includes_undefined, kernel_type_label,
+    execution_environment_at, form_element_type, kernel_type_includes_undefined,
+    kernel_type_is_boolean, kernel_type_is_fixed_structure, kernel_type_is_form_data_structure,
+    kernel_type_is_metadata_reference, kernel_type_is_structure, kernel_type_label,
     kernel_union_member_labels, module_implicit_field_names, module_implicit_fields,
     platform_name_entries, root_metadata_object_type, root_metadata_ref_type,
     root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry, PlatformNameKind, Type,
@@ -56,6 +59,7 @@ pub use hir_def::{
 pub use hir_def::{ExecutionContext, QualifiedName};
 pub use hir_def::{RedundantAccessKind, SdblExprId};
 
+pub use hir_def::body::events::BodyEvents;
 pub use hir_def::body::SourceMapAt;
 pub use hir_def::body::{
     DeprecatedKind8312, ExistingBindingKind, ExternalRef, MagicNumberContext, ManagerType,
@@ -111,8 +115,8 @@ pub use hir_def::metrics;
 pub mod cfg {
     pub use ::cfg::{
         cyclomatic_complexity, BasicBlockVertex, CfgBuilder, CfgEdgeType, CfgVertex,
-        ConditionalVertex, ControlFlowGraph, ForEachHeaderVertex, ForHeaderVertex, NodeIndex,
-        PreprocConditionVertex, WhileHeaderVertex,
+        ConditionalVertex, ControlFlowGraph, ForEachHeaderVertex, ForHeaderVertex, LoopEntryVertex,
+        NodeIndex, PreprocConditionVertex, WhileHeaderVertex,
     };
 }
 
@@ -229,7 +233,9 @@ pub use hir_ty::infer::{
     infer_effective, infer_module_code_query, infer_owner, infer_query, infer_weaving,
     type_of_expr_query,
 };
-pub use hir_ty::method_graph::{infer_method_query, method_return_type_query};
+pub use hir_ty::method_graph::{
+    infer_method_query, method_return_type_query, set_infer_method_lru_sweep_mode,
+};
 pub use hir_ty::method_resolution::{resolve_qualified_call, MethodResolution};
 pub use hir_ty::narrow::{
     narrow_or_base, narrow_or_base_indexed, narrow_query, narrowed_type_at, NarrowExprIndex,
@@ -241,13 +247,14 @@ pub use hir_ty::query_in_loop::{
     QueryExecutionSite, QueryInLoopCandidate,
 };
 pub use hir_ty::query_text_dataflow::{executed_query_texts, ExecutedQueryText};
+pub use hir_ty::value_origin::{value_origin_of, Unproven, ValueOrigin};
 pub use hir_ty::{
     form_control_platform_type_chain, form_control_platform_type_name, form_element_kind_label,
     form_element_kind_sort_band, BareNameGap, BareNameOrigin, BareNameResolution, BareNameUse,
     BodyInferenceResult, CallArgBinding, EnvCalleeKind, EnvMemberKind, FormElementKind,
     ImplicitDatabaseReadKind, InferOwnerResult, InferenceContext, InferenceDiagnostic,
-    InferenceResult, MetadataKind, ModuleCodeInferenceResult, UninitializedPath,
-    UnresolvedMethodKind,
+    InferenceResult, MetadataKind, ModuleCodeInferenceResult, RefPresentationCause,
+    UninitializedPath, UnresolvedMethodKind,
 };
 
 pub use bsl_types::builders::Builders;

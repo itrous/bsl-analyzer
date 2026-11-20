@@ -3,8 +3,9 @@
 ## Description
 
 This diagnostic marks static candidates for database reads inside a loop body: accessing an
-attribute through a reference, obtaining a reference's presentation with `String()`, and searching
-through a manager's `FindBy*` method. Fetch the required values with one query before the loop.
+attribute through a reference, converting a reference to a string (`String()`, concatenation with a
+string, `Message`, `StrTemplate`), and searching through a manager's `FindBy*` method. Fetch the
+required values with one query before the loop.
 
 ### Reference attribute access
 
@@ -37,16 +38,20 @@ While Selection.Next() Do
 EndDo;
 ```
 
-### Reference presentation with `String()`
+### Converting a reference to a string
 
-`String(Ref)` obtains the reference's presentation. If it is needed in the loop, select it in a query
-before the loop with `PRESENTATION`.
+The platform fetches a reference's presentation with a separate database read. That happens not only
+in `String(Ref)` but in any string expression: concatenation with a string, and passing the
+reference to `Message` or `StrTemplate`. If the presentation is needed in the loop, select it in a
+query before the loop with `PRESENTATION`.
 
 Incorrect:
 
 ```bsl
 For Each Ref In Refs() Do
     View = String(Ref);
+    Message("Short of " + Ref);
+    Text = StrTemplate("Short of %1", Ref);
 EndDo;
 ```
 

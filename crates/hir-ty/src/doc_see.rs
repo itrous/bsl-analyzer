@@ -143,6 +143,9 @@ struct State {
 struct Driver<'a> {
     targets: &'a dyn SeeTargets,
     state: RefCell<State>,
+    /// The `mapKeyTypes` profile, so a slot reached through a reference reads its key items the
+    /// same way the signature does.
+    map_keys: bool,
 }
 
 impl Driver<'_> {
@@ -236,7 +239,7 @@ impl Driver<'_> {
         // A fresh closure per module: a reference inside the target's documentation resolves from
         // the target's module, not from wherever the walk started.
         let resolve = |name: &QualifiedName| self.resolve(db, module, name);
-        lower_alternatives(db, alternatives, &SeePolicy::Resolve(&resolve))
+        lower_alternatives(db, alternatives, &SeePolicy::Resolve(&resolve), self.map_keys)
     }
 }
 
@@ -273,6 +276,7 @@ fn lower_alternatives(
     db: &dyn TypeKernelDb,
     docs: &[TypeDoc],
     policy: &SeePolicy<'_>,
+    map_keys: bool,
 ) -> Option<TypeId> {
     // An alternative this parser cannot read becomes the top type, never nothing. Dropping it
     // would narrow the slot to whatever else happened to parse — the kernel discards `Unknown`
@@ -281,6 +285,7 @@ fn lower_alternatives(
     let exprs: Vec<DocTypeExpr> = docs
         .iter()
         .map(|doc| parse_type_expr(doc).unwrap_or(DocTypeExpr::TypeRef(hir_def::TypeRef::Any)))
+        .map(|expr| if map_keys { expr } else { expr.without_map_keys() })
         .collect();
     (!exprs.is_empty()).then(|| doc_structure::field_ty(db, &exprs, policy))
 }
@@ -305,7 +310,8 @@ pub fn doc_see_signature_query<'db>(
         return Arc::new(DocSeeSignature::default());
     };
 
-    let signature = crate::method_resolution::materialise_signature(db, &symbol);
+    let map_keys = db.map_key_types_enabled();
+    let signature = crate::method_resolution::materialise_signature(db, &symbol, map_keys);
     // Nothing in this method's documentation names a target, so there is nothing to resolve. This
     // is the answer for the overwhelming majority of methods, and it costs one bit to reach.
     if signature.doc_see.is_empty() {
@@ -313,7 +319,7 @@ pub fn doc_see_signature_query<'db>(
     }
 
     let targets = WorkspaceTargets { db };
-    let driver = Driver { targets: &targets, state: RefCell::new(State::default()) };
+    let driver = Driver { targets: &targets, state: RefCell::new(State::default()), map_keys };
 
     let mut resolved = DocSeeSignature::default();
     if signature.doc_see.ret {
@@ -362,7 +368,7 @@ fn resolve_own_slot(
     lowered_by_the_signature: TypeId,
 ) -> Option<TypeId> {
     let alternatives = slot_alternatives(symbol, slot)?;
-    let rebuilt = lower_alternatives(db, alternatives, &SeePolicy::Permissive)?;
+    let rebuilt = lower_alternatives(db, alternatives, &SeePolicy::Permissive, driver.map_keys)?;
     if rebuilt != lowered_by_the_signature
         && !(rebuilt == db.any() && is_only_placeholder_structures(db, lowered_by_the_signature))
     {

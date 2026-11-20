@@ -33,6 +33,12 @@ pub(crate) fn status(
     if let Some(owns) = owns_caches {
         body["owns_caches"] = json!(owns);
     }
+    // Which commit this binary came from, so an observation can be dated to the code that
+    // produced it: the version number is the same across a day of builds. Absent when the
+    // build could not determine it.
+    if let Some(build) = build_body(build_info::commit(), build_info::committed()) {
+        body["build"] = build;
+    }
     // The project is analyzed without its main configuration — the workspace is
     // an extension, or it declares external objects and no base. Calls into that
     // configuration cannot resolve, so the findings this backend is about to
@@ -75,6 +81,17 @@ pub(crate) fn status(
         });
     }
     structured(body)
+}
+
+/// The `build` object for a status body: which commit this binary came from. Pure, so
+/// the shape is testable without a second build — `status` passes what the binary knows.
+fn build_body(commit: Option<&str>, committed: Option<&str>) -> Option<Value> {
+    let commit = commit?;
+    let mut build = json!({ "commit": commit });
+    if let Some(committed) = committed {
+        build["committed"] = json!(committed);
+    }
+    Some(build)
 }
 
 /// What a not-ready envelope's `status` field says.
@@ -242,6 +259,36 @@ mod tests {
             unknown.get("owns_caches").is_none(),
             "a verdict nobody has established is published as one: {unknown}",
         );
+    }
+
+    #[test]
+    fn a_build_without_a_commit_reports_no_build_object() {
+        assert!(
+            build_body(None, Some("2026-11-14T00:00:00+00:00")).is_none(),
+            "a date alone identifies nothing, so it must not be published as a build",
+        );
+    }
+
+    #[test]
+    fn a_stamped_build_reports_commit_and_date() {
+        let build = build_body(Some("0123456789ab"), Some("2026-11-14T03:25:06+03:00"))
+            .expect("a stamped build has a build object");
+
+        assert_eq!(build["commit"], "0123456789ab");
+        assert_eq!(build["committed"], "2026-11-14T03:25:06+03:00");
+    }
+
+    #[test]
+    fn the_status_body_carries_the_build_when_the_binary_knows_it() {
+        let body =
+            status(&ready_report(), None, None).structured_content.expect("structuredContent");
+
+        // Conditional on purpose: the stamp is a compile-time property of the running test
+        // binary, so one binary cannot exercise both branches.
+        match build_info::commit() {
+            Some(commit) => assert_eq!(body["build"]["commit"], commit),
+            None => assert!(body["build"].is_null(), "no stamp, no build object: {body}"),
+        }
     }
 
     /// A failed build is not a slow one: the envelope's `status` says `failed` (the flat

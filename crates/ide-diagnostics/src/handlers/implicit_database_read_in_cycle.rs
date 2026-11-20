@@ -2,7 +2,7 @@ use crate::define_metadata;
 use crate::metadata::*;
 use crate::AnalysisContext;
 use crate::{Diagnostic, DiagnosticCode};
-use hir::{ImplicitDatabaseReadKind, LocalRange};
+use hir::{ImplicitDatabaseReadKind, LocalRange, RefPresentationCause};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::CodeSmell,
@@ -29,8 +29,17 @@ pub fn from_hir(
             "Возможное чтение из базы в цикле: обращение к реквизиту «{}» через точку от ссылки загружает объект. Получите реквизит в запросе до цикла",
             field.as_str()
         ),
-        ImplicitDatabaseReadKind::RefPresentation => {
+        ImplicitDatabaseReadKind::RefPresentation { cause: RefPresentationCause::Cast } => {
             "Возможное чтение из базы в цикле: Строка() от ссылки получает её представление. Получите представление в запросе (ПРЕДСТАВЛЕНИЕ) до цикла".to_string()
+        }
+        ImplicitDatabaseReadKind::RefPresentation { cause: RefPresentationCause::Concat } => {
+            "Возможное чтение из базы в цикле: ссылка в строковом выражении получает представление. Получите представление в запросе (ПРЕДСТАВЛЕНИЕ) до цикла".to_string()
+        }
+        ImplicitDatabaseReadKind::RefPresentation { cause: RefPresentationCause::Call { name } } => {
+            format!(
+                "Возможное чтение из базы в цикле: {}() от ссылки получает её представление. Получите представление в запросе (ПРЕДСТАВЛЕНИЕ) до цикла",
+                name.as_str()
+            )
         }
         ImplicitDatabaseReadKind::ManagerFind { method } => format!(
             "Возможное чтение из базы в цикле: {}() менеджера выполняет поиск в базе. Найдите значения одним запросом до цикла",

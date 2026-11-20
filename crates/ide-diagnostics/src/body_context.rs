@@ -214,6 +214,11 @@ impl<'a> BodyContext<'a> {
         result
     }
 
+    /// Where the value of `expr` came from, proven on every path that reaches it in this body.
+    pub fn value_origin(&self, expr: hir::ExprId) -> hir::ValueOrigin {
+        self.analysis.provider().value_origin(self.file_id, self.owner(), expr)
+    }
+
     pub fn arg_diagnostics(&self) -> Arc<Vec<hir::InferenceDiagnostic>> {
         self.analysis.arg_diagnostics_of(self.owner)
     }

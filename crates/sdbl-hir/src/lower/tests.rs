@@ -3882,3 +3882,736 @@ fn an_owner_join_that_the_syntax_cannot_confirm_is_not_exempt() {
     hir.joins[0].range = text_size::TextRange::empty(0.into());
     assert_eq!(check(&hir), 1);
 }
+
+fn recorder_reads(config: bsl_metadata::Configuration, code: &str) -> usize {
+    let ast = parser::parse_sdbl(code);
+    let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+    package
+        .all_diagnostics()
+        .filter(|d| {
+            matches!(d, crate::diagnostics::SdblDiagnostic::RegisterRecorderFieldInQuery { .. })
+        })
+        .count()
+}
+
+fn config_with_stock_register() -> bsl_metadata::Configuration {
+    let xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+<AccumulationRegister uuid="11111111-1111-1111-1111-111111111111">
+<Properties><Name>ТоварыНаСкладах</Name></Properties>
+<ChildObjects>
+<Dimension uuid="22222222-2222-2222-2222-222222222222"><Properties><Name>Склад</Name></Properties></Dimension>
+</ChildObjects>
+</AccumulationRegister></MetaDataObject>"#;
+    let register = bsl_metadata::xml_parser::parse_accumulation_register_xml(xml)
+        .expect("accumulation register fixture must parse");
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_register(register);
+    config.add_metadata_object(bsl_metadata::MetadataObject::new(
+        bsl_metadata::MdoType::Catalog,
+        "Контрагенты",
+    ));
+    config
+}
+
+const STOCK: &str = "РегистрНакопления.ТоварыНаСкладах КАК Движения";
+
+#[test]
+fn recorder_attribute_in_select_list_is_reported() {
+    let code = format!("ВЫБРАТЬ Движения.Регистратор.Контрагент ИЗ {STOCK}");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn recorder_attribute_in_where_is_reported() {
+    let code =
+        format!("ВЫБРАТЬ Движения.Склад ИЗ {STOCK} ГДЕ Движения.Регистратор.Контрагент = &К");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn recorder_attribute_in_order_by_is_reported() {
+    let code =
+        format!("ВЫБРАТЬ Движения.Склад ИЗ {STOCK} УПОРЯДОЧИТЬ ПО Движения.Регистратор.Контрагент");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn english_recorder_attribute_is_reported() {
+    let code =
+        "SELECT Records.Recorder.Counterparty FROM AccumulationRegister.ТоварыНаСкладах AS Records";
+    assert_eq!(recorder_reads(config_with_stock_register(), code), 1);
+}
+
+#[test]
+fn deeper_path_through_recorder_is_reported_once() {
+    let code = format!("ВЫБРАТЬ Движения.Регистратор.Контрагент.ИНН ИЗ {STOCK}");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn recorder_attribute_in_virtual_table_source_is_reported() {
+    let code = "ВЫБРАТЬ Т.Склад ИЗ РегистрНакопления.ТоварыНаСкладах.Обороты(,,, Регистратор.Контрагент = &К) КАК Т";
+    assert_eq!(recorder_reads(config_with_stock_register(), code), 1);
+}
+
+#[test]
+fn standard_fields_of_recorder_are_not_reported() {
+    for field in [
+        "Ссылка",
+        "Дата",
+        "Номер",
+        "Проведен",
+        "ПометкаУдаления",
+        "Представление",
+        "МоментВремени",
+        "ВерсияДанных",
+    ] {
+        let code = format!("ВЫБРАТЬ Движения.Регистратор.{field} ИЗ {STOCK}");
+        assert_eq!(recorder_reads(config_with_stock_register(), &code), 0, "{field}");
+    }
+}
+
+#[test]
+fn standard_attributes_that_documents_lack_are_reported_after_recorder() {
+    for field in ["Код", "Наименование", "Владелец", "Родитель", "Период", "Code", "Description"]
+    {
+        let code = format!("ВЫБРАТЬ Движения.Регистратор.{field} ИЗ {STOCK}");
+        assert_eq!(recorder_reads(config_with_stock_register(), &code), 1, "{field}");
+    }
+}
+
+#[test]
+fn english_standard_fields_of_recorder_are_not_reported() {
+    for field in ["Ref", "Date", "Number", "Posted", "DeletionMark", "PointInTime"] {
+        let code = format!("ВЫБРАТЬ Движения.Регистратор.{field} ИЗ {STOCK}");
+        assert_eq!(recorder_reads(config_with_stock_register(), &code), 0, "{field}");
+    }
+}
+
+#[test]
+fn recorder_attribute_read_through_cast_is_reported() {
+    let code = format!(
+        "ВЫБРАТЬ ВЫРАЗИТЬ(Движения.Регистратор КАК Документ.Реализация).Контрагент ИЗ {STOCK}"
+    );
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 1);
+}
+
+#[test]
+fn recorder_standard_field_read_through_cast_is_not_reported() {
+    for field in ["Дата", "Ссылка"] {
+        let code = format!(
+            "ВЫБРАТЬ ВЫРАЗИТЬ(Движения.Регистратор КАК Документ.Реализация).{field} ИЗ {STOCK}"
+        );
+        assert_eq!(recorder_reads(config_with_stock_register(), &code), 0, "{field}");
+    }
+}
+
+#[test]
+fn recorder_attribute_read_through_cast_in_virtual_table_source_is_reported() {
+    let code = "ВЫБРАТЬ Т.Склад ИЗ РегистрНакопления.ТоварыНаСкладах.Обороты(,,, \
+                ВЫРАЗИТЬ(Регистратор КАК Документ.Реализация).Контрагент = &К) КАК Т";
+    assert_eq!(recorder_reads(config_with_stock_register(), code), 1);
+}
+
+#[test]
+fn recorder_read_as_last_part_is_not_reported() {
+    let code = format!("ВЫБРАТЬ Движения.Регистратор ИЗ {STOCK}");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 0);
+}
+
+#[test]
+fn own_dimension_of_register_is_not_reported() {
+    let code = format!("ВЫБРАТЬ Движения.Склад ИЗ {STOCK} ГДЕ Движения.Склад.Наименование = &Н");
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 0);
+}
+
+#[test]
+fn recorder_attribute_of_temp_table_is_not_reported() {
+    let code = format!(
+        "ВЫБРАТЬ Движения.Склад КАК Регистратор ПОМЕСТИТЬ Врем ИЗ {STOCK}; \
+         ВЫБРАТЬ Т.Регистратор.Контрагент ИЗ Врем КАК Т"
+    );
+    assert_eq!(recorder_reads(config_with_stock_register(), &code), 0);
+}
+
+#[test]
+fn recorder_attribute_over_catalog_is_not_reported() {
+    let code = "ВЫБРАТЬ К.Регистратор.Контрагент ИЗ Справочник.Контрагенты КАК К";
+    assert_eq!(recorder_reads(config_with_stock_register(), code), 0);
+}
+
+fn config_with_information_register_write_mode(write_mode: &str) -> bsl_metadata::Configuration {
+    let xml = format!(
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+<InformationRegister uuid="59f8d329-f39c-4999-b470-ae9fc74511ac">
+<Properties><Name>Курсы</Name><WriteMode>{write_mode}</WriteMode></Properties>
+<ChildObjects>
+<Dimension uuid="532f2a7f-4c1e-4a49-8281-3c21232da2d7"><Properties><Name>Валюта</Name></Properties></Dimension>
+</ChildObjects>
+</InformationRegister></MetaDataObject>"#
+    );
+    let register = bsl_metadata::xml_parser::parse_information_register_xml(&xml)
+        .expect("information register fixture must parse");
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_register(register);
+    config
+}
+
+#[test]
+fn recorder_attribute_of_subordinate_information_register_is_reported() {
+    let code = "ВЫБРАТЬ Т.Регистратор.Контрагент ИЗ РегистрСведений.Курсы КАК Т";
+    let config = config_with_information_register_write_mode("RecorderSubordinate");
+    assert_eq!(recorder_reads(config, code), 1);
+}
+
+#[test]
+fn recorder_attribute_of_independent_information_register_is_not_reported() {
+    let code = "ВЫБРАТЬ Т.Регистратор.Контрагент ИЗ РегистрСведений.Курсы КАК Т";
+    let config = config_with_information_register_write_mode("Independent");
+    assert_eq!(recorder_reads(config, code), 0);
+}
+mod order_by_document_date {
+    use std::sync::Arc;
+
+    use bsl_metadata::xml_parser::{
+        parse_accumulation_register_xml, parse_catalog_xml, parse_document_xml,
+    };
+    use bsl_metadata::Configuration;
+
+    use crate::diagnostics::SdblDiagnostic;
+    use crate::lower::lower_sdbl_to_hir;
+
+    const HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" version="2.10">"#;
+
+    fn configuration() -> Arc<Configuration> {
+        let mut config = Configuration::new("Тест");
+        config.add_metadata_object(
+            parse_catalog_xml(&format!(
+                r#"{HEADER}
+    <Catalog uuid="00000000-0000-0000-0000-000000000010">
+        <Properties><Name>Номенклатура</Name></Properties>
+    </Catalog>
+</MetaDataObject>"#
+            ))
+            .unwrap(),
+        );
+        config.add_metadata_object(
+            parse_document_xml(&format!(
+                r#"{HEADER}
+    <Document uuid="00000000-0000-0000-0000-000000000020">
+        <Properties><Name>Поступление</Name></Properties>
+    </Document>
+</MetaDataObject>"#
+            ))
+            .unwrap(),
+        );
+        config.add_metadata_object(
+            parse_document_xml(&format!(
+                r#"{HEADER}
+    <Document uuid="00000000-0000-0000-0000-000000000021">
+        <Properties><Name>Возврат</Name></Properties>
+    </Document>
+</MetaDataObject>"#
+            ))
+            .unwrap(),
+        );
+        config.add_register(
+            parse_accumulation_register_xml(&format!(
+                r#"{HEADER}
+    <AccumulationRegister uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>ПартииТоваров</Name><RegisterType>Balance</RegisterType></Properties>
+        <ChildObjects>
+            <Dimension uuid="00000000-0000-0000-0000-000000000101">
+                <Properties><Name>Номенклатура</Name><Type><v8:Type>cfg:CatalogRef.Номенклатура</v8:Type></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000102">
+                <Properties><Name>Партия</Name><Type><v8:Type>cfg:DocumentRef.Поступление</v8:Type></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000103">
+                <Properties><Name>ОснованиеДокумент</Name><Type><v8:Type>cfg:DocumentRef.Поступление</v8:Type><v8:Type>cfg:DocumentRef.Возврат</v8:Type></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000104">
+                <Properties><Name>ОснованиеСмешанное</Name><Type><v8:Type>cfg:DocumentRef.Поступление</v8:Type><v8:Type>cfg:CatalogRef.Номенклатура</v8:Type></Type></Properties>
+            </Dimension>
+            <Resource uuid="00000000-0000-0000-0000-000000000200">
+                <Properties><Name>Количество</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties>
+            </Resource>
+        </ChildObjects>
+    </AccumulationRegister>
+</MetaDataObject>"#
+            ))
+            .unwrap(),
+        );
+        Arc::new(config)
+    }
+
+    fn findings(query: &str) -> Vec<(String, text_size::TextRange)> {
+        let ast = parser::parse_sdbl(query);
+        lower_sdbl_to_hir(&ast, Some(configuration()))
+            .all_diagnostics()
+            .filter_map(|diag| match diag {
+                SdblDiagnostic::QueryOrderByDocumentDate { reference_field, range } => {
+                    Some((reference_field.clone(), *range))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reports(query: &str) -> Vec<String> {
+        findings(query).into_iter().map(|(field, _)| field).collect()
+    }
+
+    fn balance(order_by: &str) -> Vec<String> {
+        reports(&format!(
+            "ВЫБРАТЬ Партии.Партия КАК Партия ИЗ РегистрНакопления.ПартииТоваров.Остатки(&Момент, Номенклатура = &Номенклатура) КАК Партии УПОРЯДОЧИТЬ ПО {order_by}"
+        ))
+    }
+
+    #[test]
+    fn ordering_by_the_date_of_a_document_reference_is_reported() {
+        assert_eq!(balance("Партии.Партия.Дата"), ["Партия"]);
+    }
+
+    #[test]
+    fn the_descending_direction_is_reported_too() {
+        assert_eq!(balance("Партии.Партия.Дата УБЫВ"), ["Партия"]);
+    }
+
+    #[test]
+    fn english_keywords_are_judged_the_same() {
+        assert_eq!(
+            reports(
+                "SELECT Партии.Партия AS Партия FROM AccumulationRegister.ПартииТоваров.Balance(&Момент) AS Партии ORDER BY Партии.Партия.Date"
+            ),
+            ["Партия"]
+        );
+    }
+
+    #[test]
+    fn a_document_reference_of_the_main_table_of_a_register_is_reported() {
+        assert_eq!(
+            reports(
+                "ВЫБРАТЬ Партии.Партия КАК Партия ИЗ РегистрНакопления.ПартииТоваров КАК Партии УПОРЯДОЧИТЬ ПО Партии.Партия.Дата"
+            ),
+            ["Партия"]
+        );
+    }
+
+    #[test]
+    fn the_reported_range_covers_exactly_the_order_by_key() {
+        let query = "ВЫБРАТЬ Партии.Партия КАК Партия ИЗ РегистрНакопления.ПартииТоваров КАК Партии УПОРЯДОЧИТЬ ПО Партии.Партия.Дата УБЫВ";
+        let found = findings(query);
+        assert_eq!(found.len(), 1);
+        let range = found[0].1;
+        assert_eq!(
+            &query[usize::from(range.start())..usize::from(range.end())],
+            "Партии.Партия.Дата"
+        );
+    }
+
+    #[test]
+    fn a_composite_of_two_documents_is_reported() {
+        assert_eq!(balance("Партии.ОснованиеДокумент.Дата"), ["ОснованиеДокумент"]);
+    }
+
+    #[test]
+    fn a_composite_of_a_document_and_a_catalog_is_silent() {
+        assert!(balance("Партии.ОснованиеСмешанное.Дата").is_empty());
+    }
+
+    #[test]
+    fn ordering_by_the_point_in_time_is_silent() {
+        assert!(balance("Партии.Партия.МоментВремени").is_empty());
+    }
+
+    #[test]
+    fn both_keys_over_the_same_reference_are_silent() {
+        assert!(balance("Партии.Партия.Дата, Партии.Партия.МоментВремени").is_empty());
+    }
+
+    #[test]
+    fn the_english_point_in_time_is_silent() {
+        assert!(balance("Партии.Партия.PointInTime").is_empty());
+    }
+
+    #[test]
+    fn ordering_by_the_date_of_a_catalog_reference_is_silent() {
+        assert!(balance("Партии.Номенклатура.Дата").is_empty());
+    }
+
+    #[test]
+    fn a_two_part_key_over_a_document_source_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ Док.Ссылка КАК Ссылка ИЗ Документ.Поступление КАК Док УПОРЯДОЧИТЬ ПО Док.Дата"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_unresolved_source_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ Т.Поле КАК Поле ИЗ НетТакойТаблицы КАК Т УПОРЯДОЧИТЬ ПО Т.Поле.Дата"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_four_part_key_is_silent() {
+        assert!(balance("Партии.Партия.Владелец.Дата").is_empty());
+    }
+
+    #[test]
+    fn a_condition_on_the_date_of_a_document_reference_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ Партии.Партия КАК Партия ИЗ РегистрНакопления.ПартииТоваров КАК Партии ГДЕ Партии.Партия.Дата = &Дата"
+        )
+        .is_empty());
+    }
+
+    /// The `Ключ` ordering of a register whose `Значение` is a composite of a defined type
+    /// with the arms `nested` and a `Возврат` document reference.
+    fn nested_defined_type(nested: Vec<bsl_metadata::AttributeType>) -> Vec<String> {
+        use bsl_metadata::{AttributeType, MdoType};
+        let document =
+            |name: &str| AttributeType::Ref { mdo_type: MdoType::Document, name: name.into() };
+        let config = super::register_config(
+            AttributeType::Composite {
+                types: vec![
+                    AttributeType::DefinedType { name: "Основание".into() },
+                    document("Возврат"),
+                ],
+            },
+            &[("Основание", AttributeType::Composite { types: nested })],
+        );
+        let ast = parser::parse_sdbl(
+            "ВЫБРАТЬ Т.Ключ КАК Ключ ИЗ РегистрСведений.Курсы КАК Т УПОРЯДОЧИТЬ ПО Т.Значение.Дата",
+        );
+        lower_sdbl_to_hir(&ast, Some(config))
+            .all_diagnostics()
+            .filter_map(|diag| match diag {
+                SdblDiagnostic::QueryOrderByDocumentDate { reference_field, .. } => {
+                    Some(reference_field.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_composite_arm_expanding_to_documents_only_is_reported() {
+        use bsl_metadata::{AttributeType, MdoType};
+        let document =
+            |name: &str| AttributeType::Ref { mdo_type: MdoType::Document, name: name.into() };
+        assert_eq!(
+            nested_defined_type(vec![document("Поступление"), document("Возврат")]),
+            ["Значение"]
+        );
+    }
+
+    #[test]
+    fn a_composite_arm_expanding_to_a_catalog_too_is_silent() {
+        use bsl_metadata::{AttributeType, MdoType};
+        assert!(nested_defined_type(vec![
+            AttributeType::Ref {
+                mdo_type: MdoType::Document, name: "Поступление".into()
+            },
+            AttributeType::Ref {
+                mdo_type: MdoType::Catalog, name: "Номенклатура".into()
+            },
+        ])
+        .is_empty());
+    }
+}
+
+mod condition_index_coverage {
+    use std::sync::Arc;
+
+    use bsl_metadata::xml_parser::{
+        parse_accounting_register_xml, parse_accumulation_register_xml,
+        parse_information_register_xml,
+    };
+    use bsl_metadata::Configuration;
+
+    use crate::diagnostics::SdblDiagnostic;
+    use crate::lower::lower_sdbl_to_hir;
+
+    fn dimensions(indexed: Option<&str>) -> String {
+        ["Склад", "Номенклатура", "Качество"]
+            .iter()
+            .enumerate()
+            .map(|(position, name)| {
+                let indexing = if indexed == Some(*name) { "Index" } else { "DontIndex" };
+                format!(
+                    r#"<Dimension uuid="00000000-0000-0000-0000-00000000010{position}">
+                <Properties><Name>{name}</Name><Type><v8:Type>xs:string</v8:Type></Type><Indexing>{indexing}</Indexing></Properties>
+            </Dimension>"#
+                )
+            })
+            .collect()
+    }
+
+    fn register_xml(kind: &str, name: &str, body: &str, indexed: Option<&str>) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
+    <{kind} uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>{name}</Name>{body}</Properties>
+        <ChildObjects>
+            {dimensions}
+            <Resource uuid="00000000-0000-0000-0000-000000000200">
+                <Properties><Name>Количество</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties>
+            </Resource>
+        </ChildObjects>
+    </{kind}>
+</MetaDataObject>"#,
+            dimensions = dimensions(indexed)
+        )
+    }
+
+    fn configuration() -> Arc<Configuration> {
+        let mut config = Configuration::new("Тест");
+        let balance = "<RegisterType>Balance</RegisterType>";
+        config.add_register(
+            parse_accumulation_register_xml(&register_xml(
+                "AccumulationRegister",
+                "ТоварыНаСкладах",
+                balance,
+                None,
+            ))
+            .unwrap(),
+        );
+        config.add_register(
+            parse_accumulation_register_xml(&register_xml(
+                "AccumulationRegister",
+                "ТоварыИндексированные",
+                balance,
+                Some("Номенклатура"),
+            ))
+            .unwrap(),
+        );
+        config.add_register(
+            parse_information_register_xml(&register_xml(
+                "InformationRegister",
+                "СведенияОТоварах",
+                "<InformationRegisterPeriodicity>Day</InformationRegisterPeriodicity>",
+                None,
+            ))
+            .unwrap(),
+        );
+        config.add_register(
+            parse_accounting_register_xml(&register_xml(
+                "AccountingRegister",
+                "Бухгалтерский",
+                "<Correspondence>false</Correspondence>",
+                None,
+            ))
+            .unwrap(),
+        );
+        Arc::new(config)
+    }
+
+    /// The reported missing dimensions of one query: empty when the rule stays silent.
+    fn reports(query: &str) -> Vec<String> {
+        let ast = parser::parse_sdbl(query);
+        lower_sdbl_to_hir(&ast, Some(configuration()))
+            .all_diagnostics()
+            .filter_map(|diag| match diag {
+                SdblDiagnostic::QueryConditionWithoutIndex { missing_dimension, .. } => {
+                    Some(missing_dimension.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn balance(condition: &str) -> Vec<String> {
+        reports(&format!(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, {condition}) КАК Остатки"
+        ))
+    }
+
+    #[test]
+    fn a_condition_on_the_second_dimension_only_is_reported() {
+        assert_eq!(balance("Номенклатура = &Номенклатура"), ["Склад"]);
+    }
+
+    #[test]
+    fn a_gap_between_the_first_and_the_third_dimension_is_reported() {
+        assert_eq!(balance("Склад = &Склад И Качество = &Качество"), ["Номенклатура"]);
+    }
+
+    #[test]
+    fn english_keywords_are_judged_the_same() {
+        assert_eq!(
+            reports(
+                "SELECT 1 FROM AccumulationRegister.ТоварыНаСкладах.Balance(, Склад = &Склад AND Качество = &Качество) AS Balance"
+            ),
+            ["Номенклатура"]
+        );
+    }
+
+    #[test]
+    fn the_condition_of_turnovers_is_judged() {
+        assert_eq!(
+            reports(
+                "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Обороты(, , , Качество = &Качество) КАК Обороты"
+            ),
+            ["Склад"]
+        );
+    }
+
+    #[test]
+    fn the_condition_of_balance_and_turnovers_is_judged() {
+        assert_eq!(
+            reports(
+                "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.ОстаткиИОбороты(, , , , Номенклатура = &Номенклатура) КАК Данные"
+            ),
+            ["Склад"]
+        );
+    }
+
+    #[test]
+    fn a_field_qualified_by_the_source_alias_is_read_as_the_field() {
+        assert_eq!(balance("Остатки.Качество = &Качество"), ["Склад"]);
+    }
+
+    #[test]
+    fn the_leading_dimension_alone_is_silent() {
+        assert!(balance("Склад = &Склад").is_empty());
+    }
+
+    #[test]
+    fn the_first_two_dimensions_are_silent() {
+        assert!(balance("Склад = &Склад И Номенклатура = &Номенклатура").is_empty());
+    }
+
+    #[test]
+    fn all_dimensions_are_silent() {
+        assert!(balance("Склад = &Склад И Номенклатура = &Номенклатура И Качество = &Качество")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_single_indexed_dimension_that_is_not_the_first_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыИндексированные.Остатки(, Номенклатура = &Номенклатура) КАК Остатки"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_indexed_dimension_does_not_excuse_a_gap_in_a_longer_condition() {
+        assert_eq!(
+            reports(
+                "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыИндексированные.Остатки(, Номенклатура = &Номенклатура И Качество = &Качество) КАК Остатки"
+            ),
+            ["Склад"]
+        );
+    }
+
+    fn indexed_balance(condition: &str) -> Vec<String> {
+        reports(&format!(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыИндексированные.Остатки(, {condition}) КАК Остатки"
+        ))
+    }
+
+    #[test]
+    fn an_indexed_dimension_with_the_leading_one_of_the_rest_is_silent() {
+        assert!(indexed_balance("Номенклатура = &Номенклатура И Склад = &Склад").is_empty());
+    }
+
+    #[test]
+    fn an_indexed_dimension_with_a_non_leading_one_is_reported() {
+        assert_eq!(
+            indexed_balance("Номенклатура = &Номенклатура И Качество = &Качество"),
+            ["Склад"]
+        );
+    }
+
+    #[test]
+    fn all_dimensions_of_the_indexed_register_are_silent() {
+        assert!(indexed_balance(
+            "Номенклатура = &Номенклатура И Склад = &Склад И Качество = &Качество"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_condition_with_or_is_silent() {
+        assert!(balance("Номенклатура = &Номенклатура ИЛИ Качество = &Качество").is_empty());
+    }
+
+    #[test]
+    fn a_condition_with_a_comparison_other_than_equality_is_silent() {
+        assert!(balance("Номенклатура > &Номенклатура").is_empty());
+        assert!(balance("Склад = &Склад И Качество <> &Качество").is_empty());
+    }
+
+    #[test]
+    fn a_condition_with_in_not_or_between_is_silent() {
+        assert!(balance("Номенклатура В (&Список)").is_empty());
+        assert!(balance("НЕ Номенклатура = &Номенклатура").is_empty());
+        assert!(balance("Номенклатура МЕЖДУ &А И &Б").is_empty());
+    }
+
+    #[test]
+    fn a_condition_naming_a_resource_or_an_unknown_field_is_silent() {
+        assert!(balance("Количество = &Количество").is_empty());
+        assert!(balance("Номенклатура = &Номенклатура И Количество = &Количество").is_empty());
+        assert!(balance("Номенклатура = &Номенклатура И НетТакогоПоля = 1").is_empty());
+    }
+
+    #[test]
+    fn an_empty_condition_slot_is_silent() {
+        assert!(reports("ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, ) КАК Остатки")
+            .is_empty());
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(&Период) КАК Остатки"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_information_register_slice_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрСведений.СведенияОТоварах.СрезПоследних(, Качество = &Качество) КАК Срез"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_accounting_register_balance_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрБухгалтерии.Бухгалтерский.Остатки(, , , Качество = &Качество) КАК Остатки"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_condition_in_where_is_silent() {
+        assert!(reports(
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки() КАК Остатки ГДЕ Остатки.Качество = &Качество"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_finding_covers_the_condition_argument() {
+        let query =
+            "ВЫБРАТЬ 1 ИЗ РегистрНакопления.ТоварыНаСкладах.Остатки(, Номенклатура = &Номенклатура) КАК Остатки";
+        let ast = parser::parse_sdbl(query);
+        let package = lower_sdbl_to_hir(&ast, Some(configuration()));
+        let range = package
+            .all_diagnostics()
+            .find_map(|diag| match diag {
+                SdblDiagnostic::QueryConditionWithoutIndex { range, .. } => Some(*range),
+                _ => None,
+            })
+            .expect("a finding");
+        let start = usize::from(range.start());
+        let end = usize::from(range.end());
+        assert_eq!(&query[start..end], "Номенклатура = &Номенклатура");
+    }
+}

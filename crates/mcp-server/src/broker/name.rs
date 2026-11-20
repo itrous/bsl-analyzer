@@ -743,13 +743,20 @@ pub fn backend_name(key: &BackendKey) -> io::Result<interprocess::local_socket::
     }
     #[cfg(windows)]
     {
-        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+        use interprocess::local_socket::{GenericFilePath, ToFsName};
         // Windows rendezvous does not use a filesystem socket, but the detached child
         // still writes its runtime log there. Validate that automatic output before the
         // directory is created, just as the Unix socket path does.
         let _ = key.runtime_log_path()?;
-        format!("bsl-mcp-{}.sock", key.digest()).to_ns_name::<GenericNamespaced>()
+        backend_pipe_path(key).to_fs_name::<GenericFilePath>()
     }
+}
+
+/// Full named-pipe path of a backend's rendezvous; the listener binds it and the owner
+/// connects to it to reserve its free instance before an idle exit.
+#[cfg(windows)]
+pub(crate) fn backend_pipe_path(key: &BackendKey) -> String {
+    format!(r"\\.\pipe\bsl-mcp-{}.sock", key.digest())
 }
 
 /// Cross-platform rendezvous name for the mixed-protocol backend.
@@ -763,10 +770,16 @@ pub fn shared_backend_name(
     }
     #[cfg(windows)]
     {
-        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+        use interprocess::local_socket::{GenericFilePath, ToFsName};
         let _ = key.runtime_log_path()?;
-        format!("bsl-shared-{}.sock", key.digest()).to_ns_name::<GenericNamespaced>()
+        shared_backend_pipe_path(key).to_fs_name::<GenericFilePath>()
     }
+}
+
+/// Full named-pipe path of a mixed-protocol backend's rendezvous.
+#[cfg(windows)]
+pub(crate) fn shared_backend_pipe_path(key: &SharedBackendKey) -> String {
+    format!(r"\\.\pipe\bsl-shared-{}.sock", key.digest())
 }
 
 #[cfg(test)]

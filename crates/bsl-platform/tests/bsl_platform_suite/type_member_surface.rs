@@ -5,13 +5,25 @@
 //! the name must denote a single type.
 
 use bsl_platform::{
-    PlatformData, PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
-    PlatformSnapshot,
+    MemberSurface, PlatformData, PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest,
+    PlatformHelpSourceKind, PlatformSnapshot,
 };
 use serde_json::{json, Value};
 
 const RANGE_TYPE: &str = "ОбластьЯчеекТабличногоДокумента";
 const RANGE_EN: &str = "SpreadsheetDocumentRange";
+
+/// What the gate answers for the methods and for the fields of `name`, each
+/// asked on its own.
+fn surfaces_of(data: &PlatformData, name: &str) -> (bool, bool) {
+    (
+        data.platform_type_member_surface_verified(name, MemberSurface::Methods),
+        data.platform_type_member_surface_verified(name, MemberSurface::Fields),
+    )
+}
+
+const BOTH: (bool, bool) = (true, true);
+const NEITHER: (bool, bool) = (false, false);
 
 /// A corpus with one unambiguous attested type, one homonym pair sharing a
 /// Russian name, and one type nobody attests.
@@ -86,35 +98,32 @@ fn served(version: Option<&str>) -> PlatformData {
 #[test]
 fn an_attested_type_is_verified_at_or_after_the_attested_release() {
     let data = served(Some("8.3.27"));
-    assert!(data.platform_type_member_surface_verified(RANGE_TYPE));
+    assert!(surfaces_of(&data, RANGE_TYPE) == BOTH);
     assert!(
-        data.platform_type_member_surface_verified(RANGE_EN),
+        surfaces_of(&data, RANGE_EN) == BOTH,
         "both spellings of the type name denote the attested surface"
     );
 
     let newer = served(Some("8.3.28.1"));
-    assert!(
-        newer.platform_type_member_surface_verified(RANGE_TYPE),
-        "a newer corpus keeps the surface"
-    );
-    assert!(newer.platform_type_member_surface_verified(RANGE_EN));
+    assert!(surfaces_of(&newer, RANGE_TYPE) == BOTH, "a newer corpus keeps the surface");
+    assert!(surfaces_of(&newer, RANGE_EN) == BOTH);
 
     // The attested release is 8.3.27 and the corpus is a deeper version of it:
     // `8.3.27.2214` must not read as older than `8.3.27`.
     let patch = served(Some("8.3.27.2214"));
-    assert!(patch.platform_type_member_surface_verified(RANGE_TYPE));
+    assert!(surfaces_of(&patch, RANGE_TYPE) == BOTH);
 }
 
 #[test]
 fn an_older_or_unknown_corpus_is_not_verified() {
     let older = served(Some("8.3.26.3"));
     assert!(
-        !older.platform_type_member_surface_verified(RANGE_TYPE),
+        surfaces_of(&older, RANGE_TYPE) == NEITHER,
         "a corpus older than the attestation may have lost the member it never covered"
     );
     let unknown = served(None);
     assert!(
-        !unknown.platform_type_member_surface_verified(RANGE_TYPE),
+        surfaces_of(&unknown, RANGE_TYPE) == NEITHER,
         "without a version the corpus says nothing about completeness"
     );
 }
@@ -123,11 +132,11 @@ fn an_older_or_unknown_corpus_is_not_verified() {
 fn an_ambiguous_name_is_never_verified() {
     let data = served(Some("8.3.27"));
     assert!(
-        data.platform_type_member_surface_verified("NamesakeA"),
+        surfaces_of(&data, "NamesakeA") == BOTH,
         "the namesake is attested under the spelling only it has"
     );
     assert!(
-        !data.platform_type_member_surface_verified("Тёзка"),
+        surfaces_of(&data, "Тёзка") == NEITHER,
         "the name both namesakes share denotes no single surface"
     );
     assert!(data.is_ambiguous_type_name("Тёзка"), "the fixture really is ambiguous");
@@ -140,11 +149,11 @@ fn an_ambiguous_name_is_never_verified() {
 fn an_attestation_for_an_absent_type_does_not_reject_the_corpus() {
     let data = served(Some("8.3.27"));
     assert!(
-        !data.platform_type_member_surface_verified("ЗаведомоНесуществующийТип"),
+        surfaces_of(&data, "ЗаведомоНесуществующийТип") == NEITHER,
         "the entry names no type of this corpus"
     );
-    assert!(!data.platform_type_member_surface_verified("ОбычныйТип"));
-    assert!(!data.platform_type_member_surface_verified(""));
+    assert!(surfaces_of(&data, "ОбычныйТип") == NEITHER);
+    assert!(surfaces_of(&data, "") == NEITHER);
 }
 
 /// The corpus has four pairs of records sharing one English name (form and
@@ -195,7 +204,7 @@ fn a_shared_english_name_leaves_the_gate_shut_for_both_records() {
     assert!(data.is_ambiguous_type_name("Dup"), "the fixture really shares the name");
     for name in ["ПервыйТип", "ВторойТип", "Dup"] {
         assert!(
-            !data.platform_type_member_surface_verified(name),
+            surfaces_of(&data, name) == NEITHER,
             "{name} must not be verified: the shared name denotes two records"
         );
     }
@@ -257,7 +266,7 @@ fn the_curated_correction_reaches_a_corpus_that_carries_the_target() {
         "the curated attestation of this corpus's type is kept; JSONWriter is not in it"
     );
     assert!(
-        served_with_curated_sections().platform_type_member_surface_verified(RANGE_TYPE),
+        surfaces_of(&served_with_curated_sections(), RANGE_TYPE) == BOTH,
         "the curated attestation opens the gate on a corpus of the attested release"
     );
 }
@@ -276,4 +285,83 @@ fn a_corpus_without_any_target_loads_unchanged() {
         PlatformSnapshot::from_corpus_json_with_overlays(&bytes, &curated_new_sections()).unwrap();
     assert!(snapshot.member_surface_attestations.is_empty());
     assert!(snapshot.properties.is_empty());
+}
+
+/// A corpus with a collection that addresses its elements by name: the entry
+/// covers its methods only, and the same collection attested without
+/// `verified_surface` covers both.
+fn surface_corpus() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "types": [
+            {"name": "ИменованнаяКоллекция", "english_name": "NamedCollection"},
+            {"name": "ПолнаяКоллекция", "english_name": "FullCollection"}
+        ],
+        "methods": [
+            {"id": 1, "type_name": "NamedCollection", "name": "Количество", "english_name": "Count"},
+            {"id": 2, "type_name": "FullCollection", "name": "Количество", "english_name": "Count"}
+        ],
+        "properties": []
+    }))
+    .unwrap()
+}
+
+fn served_with_surfaces(surface: Option<Value>) -> PlatformData {
+    let mut named = json!({
+        "type": "NamedCollection",
+        "verified_against_version": "8.3.27",
+        "evidence_source": "test fixture",
+        "rationale": "the elements are addressed by name, so only the methods are complete"
+    });
+    if let Some(surface) = surface {
+        named["verified_surface"] = surface;
+    }
+    let overlays = json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "type_member_surface_attestations": [named, {
+            "type": "FullCollection",
+            "verified_against_version": "8.3.27",
+            "evidence_source": "test fixture",
+            "rationale": "no verified_surface: both surfaces are attested"
+        }]
+    })
+    .to_string();
+    let snapshot =
+        PlatformSnapshot::from_corpus_json_with_overlays(&surface_corpus(), &overlays).unwrap();
+    PlatformData::from_help(PlatformHelp::loaded(
+        PlatformHelpRequest::ExternalPath("surfaces.json".into()),
+        snapshot,
+        PlatformHelpOrigin {
+            source: PlatformHelpSourceKind::External,
+            location: Some("surfaces.json".to_owned()),
+            platform_version: Some("8.3.27".to_owned()),
+            digest: None,
+        },
+    ))
+}
+
+#[test]
+fn an_entry_without_verified_surface_attests_both_surfaces() {
+    let data = served_with_surfaces(None);
+    for name in ["NamedCollection", "ИменованнаяКоллекция", "FullCollection", "ПолнаяКоллекция"]
+    {
+        assert!(surfaces_of(&data, name) == BOTH, "{name} carries no verified_surface");
+    }
+}
+
+#[test]
+fn a_methods_only_entry_attests_the_methods_and_not_the_fields() {
+    let data = served_with_surfaces(Some(json!(["methods"])));
+    for name in ["NamedCollection", "ИменованнаяКоллекция"] {
+        assert!(
+            surfaces_of(&data, name) == (true, false),
+            "{name} is attested for its methods only"
+        );
+    }
+    // Control: the other entry of the same document, without the field, is
+    // attested for both, so the narrowing above is the field and nothing else.
+    assert!(surfaces_of(&data, "FullCollection") == BOTH);
+
+    let fields_only = served_with_surfaces(Some(json!(["fields"])));
+    assert!(surfaces_of(&fields_only, "NamedCollection") == (false, true));
 }

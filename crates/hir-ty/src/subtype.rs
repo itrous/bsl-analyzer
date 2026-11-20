@@ -88,6 +88,18 @@ pub fn is_assignable(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool {
         return true;
     }
 
+    // Documented keys describe values, not a different kind of map: a keyed and a plain map are
+    // compared by their key and value types alone.
+    if let (TypeKind::Map(from_map), TypeKind::Map(to_map)) = (from_kind, to_kind) {
+        if from_map.entries.is_some() || to_map.entries.is_some() {
+            return is_assignable(
+                db,
+                db.map(from_map.key, from_map.value),
+                db.map(to_map.key, to_map.value),
+            );
+        }
+    }
+
     if matches!(from_kind, TypeKind::Null) && is_ref_kind(to_kind) {
         return true;
     }
@@ -381,6 +393,14 @@ pub fn is_coercible_to(db: &dyn TypeKernelDb, from: TypeId, to: TypeId) -> bool 
     if matches!(db.lookup_type(to), TypeKind::String(_)) {
         return true;
     }
+    // A number in a Boolean slot is converted by the platform: measured on 8.3.27.2214
+    // against two platform methods (a manager's FindByCode, СтрРазделить), both accept
+    // 0 and 5. Argument-position policy only, NOT subtype truth: a number is not a
+    // Boolean in the lattice, so is_assignable keeps them apart. Number only: how
+    // strictly a Boolean slot treats other types differs from method to method.
+    if matches!(db.lookup_type(from), TypeKind::Number(_)) && slot_admits_boolean(db, to) {
+        return true;
+    }
     // СообщитьПользователю and friends document the parameter as ЛюбаяСсылка
     // yet are canonically called with ЭтотОбъект — БСП resolves the object to
     // its ref internally. Argument-position policy only: in the lattice an
@@ -518,6 +538,15 @@ fn to_admits_bare_value_table(db: &dyn TypeKernelDb, to: TypeId) -> bool {
     match db.lookup_type(to) {
         TypeKind::ValueTable(facet) => facet.projection.is_none(),
         TypeKind::Union(parts) => parts.iter().any(|p| to_admits_bare_value_table(db, *p)),
+        _ => false,
+    }
+}
+
+/// The slot itself, or one member of a union (`Булево, Неопределено`), is Boolean.
+fn slot_admits_boolean(db: &dyn TypeKernelDb, to: TypeId) -> bool {
+    match db.lookup_type(to) {
+        TypeKind::Boolean => true,
+        TypeKind::Union(parts) => parts.iter().any(|p| slot_admits_boolean(db, *p)),
         _ => false,
     }
 }
@@ -824,6 +853,19 @@ mod tests {
             db.date(bsl_types::facet::DateComponent::DateTime)
         ));
         assert!(!is_coercible_to(&db, db.string(None, false), db.boolean()));
+    }
+
+    #[test]
+    fn a_number_fits_a_boolean_slot_alone_or_as_a_union_member() {
+        let db = InMemoryDb::new();
+        let number = db.number(None, None);
+        let date = db.date(bsl_types::facet::DateComponent::DateTime);
+        let optional_boolean = db.union(vec![db.boolean(), db.undefined()]);
+        assert!(is_coercible_to(&db, number, db.boolean()));
+        assert!(is_coercible_to(&db, number, optional_boolean));
+        assert!(!is_coercible_to(&db, date, optional_boolean));
+        assert!(!is_coercible_to(&db, number, db.union(vec![date, db.undefined()])));
+        assert!(!is_assignable(&db, number, db.boolean()));
     }
 
     #[test]
@@ -1517,5 +1559,120 @@ mod tests {
             ),
             "the colon prefix must match the generic exactly, not merely share a stem"
         );
+    }
+
+    // ---- keyed maps -----------------------------------------------------------------------
+
+    fn keyed_map(db: &dyn TypeKernelDb) -> TypeId {
+        use bsl_types::kind::{
+            Projection, ProjectionField, ProjectionFieldSource, ProjectionOrigin,
+        };
+        let field = ProjectionField::new(
+            "сумма".to_string(),
+            db.number(None, None),
+            ProjectionFieldSource::DocComment,
+        );
+        db.map_keyed(Arc::new(Projection::new(
+            vec![field].into(),
+            ProjectionOrigin::DocComment,
+            None,
+        )))
+    }
+
+    #[test]
+    fn a_keyed_map_and_a_plain_map_fit_each_other() {
+        let db = InMemoryDb::new();
+        let keyed = keyed_map(&db);
+        let plain = db.map(None, None);
+        assert!(is_assignable(&db, keyed, plain), "keyed into plain");
+        assert!(is_assignable(&db, plain, keyed), "plain into keyed");
+        assert!(is_assignable(&db, keyed, keyed));
+    }
+
+    #[test]
+    fn keyed_maps_are_compared_by_their_key_and_value_types_exactly_as_plain_ones() {
+        // The comparison erases the entries and nothing else: a keyed map has no key or value
+        // type, so it answers what an untyped plain map answers — "yes" to an untyped map and
+        // "no" to a typed one, and the same from the other side. Both answers occur, so a rule
+        // that says "yes" whenever entries are present cannot pass.
+        let db = InMemoryDb::new();
+        let string = db.string(None, false);
+        let number = db.number(None, None);
+        let by_text = db.map(Some(string), Some(number));
+        let by_number = db.map(Some(number), Some(string));
+        let untyped = db.map(None, None);
+        let keyed = keyed_map(&db);
+
+        assert!(is_assignable(&db, untyped, untyped));
+        assert!(!is_assignable(&db, untyped, by_text));
+        assert!(!is_assignable(&db, by_text, untyped));
+
+        assert!(is_assignable(&db, keyed, untyped), "keyed -> untyped, like untyped -> untyped");
+        assert!(is_assignable(&db, untyped, keyed), "untyped -> keyed");
+        for typed in [by_text, by_number] {
+            assert!(!is_assignable(&db, keyed, typed), "keyed -> typed, like untyped -> typed");
+            assert!(!is_assignable(&db, typed, keyed), "typed -> keyed, like typed -> untyped");
+        }
+    }
+
+    #[test]
+    fn a_keyed_map_does_not_fit_what_a_plain_map_does_not_fit() {
+        let db = InMemoryDb::new();
+        let keyed = keyed_map(&db);
+        let string = db.string(None, false);
+        let typed = db.map(Some(string), Some(db.number(None, None)));
+        let number = db.number(None, None);
+        assert_eq!(
+            is_assignable(&db, keyed, number),
+            is_assignable(&db, db.map(None, None), number)
+        );
+        assert!(!is_assignable(&db, keyed, number));
+        assert!(!is_assignable(&db, number, keyed));
+        assert_eq!(is_assignable(&db, typed, keyed), is_assignable(&db, typed, db.map(None, None)),);
+    }
+
+    #[test]
+    fn a_keyed_map_does_not_fit_a_structure_and_a_structure_does_not_fit_it() {
+        let db = InMemoryDb::new();
+        let keyed = keyed_map(&db);
+        let structure = db.structure(None);
+        assert_eq!(
+            is_assignable(&db, keyed, structure),
+            is_assignable(&db, db.map(None, None), structure)
+        );
+        assert_eq!(
+            is_assignable(&db, structure, keyed),
+            is_assignable(&db, structure, db.map(None, None))
+        );
+    }
+
+    #[test]
+    fn a_description_remembering_its_object_is_the_platform_description() {
+        // The remembered object refines the value, not the platform type: it is assignable
+        // to and from the bare description, and a description of another object still
+        // differs from it only by what it remembers.
+        use bsl_metadata::MdoType;
+        use bsl_types::facet::{DescribedObject, DescribedPart};
+
+        let db = InMemoryDb::new();
+        let name = "ОбъектМетаданных: Справочник".to_string();
+        let bare = db.platform_object(name.clone());
+        let described = |object: &str| {
+            db.described_platform_object(
+                name.clone(),
+                DescribedObject::new(
+                    MdoType::Catalog,
+                    object.to_string(),
+                    DescribedPart::Description,
+                ),
+            )
+        };
+        let goods = described("Товары");
+        let partners = described("Контрагенты");
+        assert_ne!(goods, bare);
+        assert_ne!(goods, partners);
+        assert!(is_assignable(&db, goods, bare));
+        assert!(is_assignable(&db, bare, goods));
+        assert!(is_assignable(&db, goods, partners));
     }
 }

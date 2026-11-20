@@ -1,4 +1,4 @@
-use super::{ParameterDoc, TypeDoc};
+use super::{MapEntryDoc, ParameterDoc, TypeDoc};
 use crate::{Name, QualifiedName, TypeRef};
 use stdx::case::CaseExt;
 
@@ -16,6 +16,20 @@ pub enum DocTypeExpr {
     },
     /// An array with a documented element expression.
     Array(Box<DocTypeExpr>),
+    /// A `Соответствие` whose string keys are documented by quoted items.
+    Map {
+        /// The key items declared directly under the slot.
+        entries: Vec<DocMapEntry>,
+    },
+}
+
+/// A quoted key item of a documented map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocMapEntry {
+    /// The unquoted key as written.
+    pub key: String,
+    /// The alternatives documented for the key's value.
+    pub types: Vec<DocTypeExpr>,
 }
 
 /// A direct field declared in a documented structure.
@@ -45,7 +59,29 @@ impl DocTypeExpr {
             Self::Structure { fields } => {
                 fields.iter().any(|field| field.types.iter().any(Self::names_documentation_target))
             }
+            Self::Map { entries } => {
+                entries.iter().any(|entry| entry.types.iter().any(Self::names_documentation_target))
+            }
             Self::TypeRef(_) => false,
+        }
+    }
+
+    /// The same expression with every documented map, at any depth, read as the plain
+    /// `Соответствие` the slot names without its key items.
+    pub fn without_map_keys(self) -> Self {
+        match self {
+            Self::Map { .. } => Self::TypeRef(TypeRef::Map(None)),
+            Self::Array(element) => Self::Array(Box::new(element.without_map_keys())),
+            Self::Structure { fields } => Self::Structure {
+                fields: fields
+                    .into_iter()
+                    .map(|field| DocField {
+                        name: field.name,
+                        types: field.types.into_iter().map(Self::without_map_keys).collect(),
+                    })
+                    .collect(),
+            },
+            other @ (Self::TypeRef(_) | Self::See(_)) => other,
         }
     }
 }
@@ -71,20 +107,27 @@ pub fn parse_type_expr(type_doc: &TypeDoc) -> Option<DocTypeExpr> {
         }
     }
 
-    parse_non_hyperlink_type(&type_doc.name, type_doc.description.as_deref(), &type_doc.parameters)
+    parse_non_hyperlink_type(
+        &type_doc.name,
+        type_doc.description.as_deref(),
+        &type_doc.parameters,
+        &type_doc.map_entries,
+    )
 }
 
 fn parse_non_hyperlink_type(
     name: &str,
     description: Option<&str>,
     fields: &[ParameterDoc],
+    entries: &[MapEntryDoc],
 ) -> Option<DocTypeExpr> {
     if is_see_candidate(name) {
         return parse_see_reference(name).map(DocTypeExpr::See);
     }
 
     if let Some(element) = collection_element(name, description) {
-        return parse_non_hyperlink_type(element, None, fields)
+        // Key items describe the slot itself, never an element of a collection.
+        return parse_non_hyperlink_type(element, None, fields, &[])
             .map(Box::new)
             .map(DocTypeExpr::Array);
     }
@@ -102,6 +145,14 @@ fn parse_non_hyperlink_type(
     // place for that value type, so the tail is dropped and the slot stays the structure its
     // bullets describe — the return path already arrives here with the tail moved into the
     // description, and a parameter keeps it in the name.
+    // Only the bare head takes key items: `Соответствие из КлючИЗначение` is the general form,
+    // whose `* Ключ` / `* Значение` items are not keys, and its tail may stand in the description.
+    if is_map_name(name)
+        && !entries.is_empty()
+        && !description.is_some_and(|text| collection_tail_starts(text.trim_start()))
+    {
+        return Some(DocTypeExpr::Map { entries: parse_map_entries(entries) });
+    }
     if is_structure_name(name) || collection_head(name).is_some_and(is_structure_name) {
         return Some(DocTypeExpr::Structure { fields: parse_fields(fields) });
     }
@@ -113,12 +164,34 @@ fn parse_non_hyperlink_type(
         .map(DocTypeExpr::TypeRef)
 }
 
+/// A structure field never carries map keys: only the slot itself may document them.
 fn parse_fields(fields: &[ParameterDoc]) -> Vec<DocField> {
     fields
         .iter()
         .map(|field| DocField {
             name: field.name.clone(),
-            types: field.types.iter().filter_map(parse_type_expr).collect(),
+            types: field
+                .types
+                .iter()
+                .filter_map(parse_type_expr)
+                .map(DocTypeExpr::without_map_keys)
+                .collect(),
+        })
+        .collect()
+}
+
+/// An alternative this parser cannot read stays as an unknown type rather than being dropped:
+/// dropping it would narrow the key's value to whatever else was documented beside it.
+fn parse_map_entries(entries: &[MapEntryDoc]) -> Vec<DocMapEntry> {
+    entries
+        .iter()
+        .map(|entry| DocMapEntry {
+            key: entry.key.clone(),
+            types: entry
+                .types
+                .iter()
+                .map(|ty| parse_type_expr(ty).unwrap_or(DocTypeExpr::TypeRef(TypeRef::Unknown)))
+                .collect(),
         })
         .collect()
 }
@@ -141,6 +214,13 @@ fn collection_element_from_name(name: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Whether the text starts with the `из` / `of` tail of a collection declaration.
+fn collection_tail_starts(text: &str) -> bool {
+    ["из ", "of "]
+        .iter()
+        .any(|prefix| stdx::case::find_ignore_case(text, prefix).is_some_and(|at| at.start == 0))
 }
 
 fn collection_element_from_description(description: &str) -> Option<&str> {
@@ -169,6 +249,10 @@ fn collection_head(name: &str) -> Option<&str> {
 
 fn is_array_name(name: &str) -> bool {
     matches!(name.trim().fold_lower().as_str(), "массив" | "array")
+}
+
+fn is_map_name(name: &str) -> bool {
+    matches!(name.fold_lower().as_str(), "соответствие" | "map")
 }
 
 fn is_structure_name(name: &str) -> bool {

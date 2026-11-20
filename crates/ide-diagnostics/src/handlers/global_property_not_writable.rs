@@ -161,4 +161,67 @@ mod tests {
 "#;
         assert_eq!(writes(code).len(), 2, "each illegal write is its own defect");
     }
+
+    /// Fixture write in a managed-form method behind the given compilation directive.
+    fn form_writes(directive: &str, statement: &str) -> Vec<crate::Diagnostic> {
+        let fixture = format!(
+            "//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+             {directive}
+Процедура Тест()
+    {statement}
+КонецПроцедуры
+"
+        );
+        check_hir_diagnostic_with_fixtures(&fixture)
+            .into_iter()
+            .filter(|d| d.code == DiagnosticCode::GlobalPropertyNotWritable)
+            .collect()
+    }
+
+    #[test]
+    fn a_collection_name_is_an_ordinary_local_in_client_code() {
+        // The thin client does not define the name at all, so the platform declares a local.
+        let found = form_writes("&НаКлиенте", "Справочники = Новый Структура;");
+        assert!(found.is_empty(), "client code declares a local: {found:#?}");
+    }
+
+    #[test]
+    fn a_collection_name_is_still_refused_in_server_code() {
+        let found = form_writes("&НаСервере", "Справочники = Новый Структура;");
+        assert_eq!(found.len(), 1, "{found:#?}");
+    }
+
+    #[test]
+    fn a_non_collection_global_property_is_refused_in_server_code() {
+        let found = form_writes("&НаСервере", "Метаданные = Новый Структура;");
+        assert_eq!(found.len(), 1, "{found:#?}");
+    }
+
+    #[test]
+    fn an_assignable_global_property_is_never_reported() {
+        for directive in ["&НаСервере", "&НаКлиенте"] {
+            let found = form_writes(directive, "РабочаяДата = Дата(2026, 1, 1);");
+            assert!(found.is_empty(), "РабочаяДата accepts the write ({directive}): {found:#?}");
+        }
+    }
+
+    #[test]
+    fn a_client_global_property_is_refused_in_client_code() {
+        let found = form_writes("&НаКлиенте", "ПараметрЗапуска = \"x\";");
+        assert_eq!(found.len(), 1, "{found:#?}");
+    }
+
+    #[test]
+    fn a_collection_name_is_still_refused_where_the_module_type_is_unknown() {
+        let code = "Процедура Тест()
+    Справочники = Новый Структура;
+КонецПроцедуры
+";
+        assert_eq!(writes(code).len(), 1, "an unknown environment keeps the old verdict");
+        let code = "Процедура Тест()
+    Метаданные = Новый Структура;
+КонецПроцедуры
+";
+        assert!(writes(code).is_empty(), "the wider rule needs a known environment");
+    }
 }

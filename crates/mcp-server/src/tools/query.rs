@@ -52,6 +52,9 @@ pub async fn validate_query(
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     let selected = validate_parameters(state, query, root_id, connection)?;
+    // Echoed in the store's spelling, like every pair an answer carries.
+    let root_id = root_id.map(bsl_search::spell_as_key);
+    let root_id = root_id.as_deref();
 
     let local = local_block(state, query, ct).await;
 
@@ -80,11 +83,14 @@ fn validate_parameters(
     }
 
     if let Some(root_id) = root_id {
+        // Compared in the key spelling, so an id learned on Windows in the host spelling still
+        // names its root; the refusals below echo what the caller sent.
+        let key_root_id = bsl_search::spell_as_key(root_id);
         let roots = state
             .workspace_root()
             .and_then(|root| crate::project::at(root).ok())
             .map(|project| crate::project::workspace_roots(&project, &[]).0);
-        if !roots.as_ref().is_some_and(|roots| roots.contains_id(root_id)) {
+        if !roots.as_ref().is_some_and(|roots| roots.contains_id(&key_root_id)) {
             return Err(McpError::invalid_params(format!("Неизвестный root_id: {root_id}"), None));
         }
         // The id must also still be CURRENT in the table it is matched against. The table here is
@@ -94,7 +100,7 @@ fn validate_parameters(
         // ones that hold a table built earlier (the diagnostics resident) CAN be stale
         // (`WorkspaceRoots::registration_is_current`). An id survives a root's retarget, so an
         // `unknown_root_id` refusal no longer covers that case by itself.
-        if roots.as_ref().is_some_and(|roots| !roots.registration_is_current(root_id)) {
+        if roots.as_ref().is_some_and(|roots| !roots.registration_is_current(&key_root_id)) {
             return Err(McpError::invalid_params(
                 format!(
                     "root_id '{root_id}' больше не разрешается в каталог, с которым он был \
@@ -976,6 +982,42 @@ mod tests {
             ));
             assert!(result.is_err(), "[{label}] must fail the call, not degrade the answer");
         }
+    }
+
+    /// A root id learned on Windows in the host spelling still names its root, and the
+    /// refusal of an unknown one echoes what the caller sent. Assembled with `Path::join`: a
+    /// literal `"extensions/provider-a"` would pass on Windows by luck and hide the defect.
+    #[test]
+    fn a_host_spelled_root_id_passes_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext_rel = std::path::Path::new("extensions").join("provider-a");
+        for (root, name) in [(dir.path().join("cf"), "Конфа"), (dir.path().join(&ext_rel), "Расш")]
+        {
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("Configuration.xml"),
+                format!("<Configuration><Name>{name}</Name></Configuration>"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \"cf\"\nextensions = [{ name = \"A\", path = \"extensions/provider-a\", \
+             scope = \"InfoBase\" }]\n",
+        )
+        .unwrap();
+        let mut state = test_shared_state();
+        state.set_workspace_root(dir.path().to_path_buf());
+
+        let sent = ext_rel.to_string_lossy().into_owned();
+        let result = validate_parameters(&state, "ВЫБРАТЬ 1", Some(&sent), None);
+        assert!(result.is_ok(), "{sent:?} names the registered root: {result:?}");
+
+        let unknown = std::path::Path::new("extensions").join("nobody");
+        let unknown = unknown.to_string_lossy();
+        let refusal = validate_parameters(&state, "ВЫБРАТЬ 1", Some(&unknown), None)
+            .expect_err("control: an unregistered root is refused");
+        assert!(refusal.message.contains(unknown.as_ref()), "{}", refusal.message);
     }
 
     /// The other half of the gate, and the half a test is likely to forget: a request that

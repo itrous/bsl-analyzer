@@ -287,6 +287,59 @@ fn install_stop_handler(cancel: CancellationToken) -> Option<StopHandler> {
     }
 }
 
+#[cfg(windows)]
+async fn wait_stop_event(name: &str, cancel: CancellationToken) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    let name: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().chain(Some(0)).collect();
+    use windows_sys::Win32::System::Threading::{
+        OpenEventW, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE,
+    };
+    let handle = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
+    if handle.is_null() {
+        return false;
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    loop {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        match unsafe { WaitForSingleObject(handle.as_raw_handle().cast(), 0) } {
+            windows_sys::Win32::Foundation::WAIT_OBJECT_0 => return true,
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT => {}
+            _ => return false,
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_stop_event(_name: &str) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn validate_stop_event(name: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let name: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().chain(Some(0)).collect();
+    if name.len() <= 1 || name.len() > 260 {
+        return false;
+    }
+    unsafe {
+        use windows_sys::Win32::System::Threading::{OpenEventW, SYNCHRONIZATION_SYNCHRONIZE};
+        let handle = OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
+        if handle.is_null() {
+            return false;
+        }
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,58 +445,5 @@ mod tests {
         assert!(!supported_limits(&limits));
         limits.stop_grace_ms = 900_001;
         assert!(!supported_limits(&limits));
-    }
-}
-
-#[cfg(windows)]
-async fn wait_stop_event(name: &str, cancel: CancellationToken) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    let name: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().chain(Some(0)).collect();
-    use windows_sys::Win32::System::Threading::{
-        OpenEventW, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE,
-    };
-    let handle = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
-    if handle.is_null() {
-        return false;
-    }
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-    loop {
-        if cancel.is_cancelled() {
-            return false;
-        }
-        match unsafe { WaitForSingleObject(handle.as_raw_handle().cast(), 0) } {
-            windows_sys::Win32::Foundation::WAIT_OBJECT_0 => return true,
-            windows_sys::Win32::Foundation::WAIT_TIMEOUT => {}
-            _ => return false,
-        }
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return false,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn validate_stop_event(_name: &str) -> bool {
-    false
-}
-
-#[cfg(windows)]
-fn validate_stop_event(name: &str) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    let name: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().chain(Some(0)).collect();
-    if name.len() <= 1 || name.len() > 260 {
-        return false;
-    }
-    unsafe {
-        use windows_sys::Win32::System::Threading::{OpenEventW, SYNCHRONIZATION_SYNCHRONIZE};
-        let handle = OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
-        if handle.is_null() {
-            return false;
-        }
-        windows_sys::Win32::Foundation::CloseHandle(handle);
-        true
     }
 }

@@ -52,8 +52,14 @@ pub struct FileKey {
 }
 
 impl FileKey {
+    /// Both halves are spelled with `/` on Windows ([`spell_as_key`]).
+    ///
+    /// A key is persisted and compared against keys built elsewhere, so its text cannot depend
+    /// on the host that minted it. Both halves are minted from paths relative to a root, which
+    /// is why the rewrite is safe for the root id too. Only Windows rewrites: a backslash is an
+    /// ordinary character in a Unix file name.
     pub fn new(root_id: impl Into<String>, path: impl Into<String>) -> Self {
-        Self { root_id: root_id.into(), path: path.into() }
+        Self { root_id: spell_as_key(&root_id.into()), path: spell_as_key(&path.into()) }
     }
 
     /// A file of the configuration root.
@@ -381,7 +387,7 @@ impl WorkspaceRoots {
     pub fn resolve(&self, key: &FileKey) -> Option<PathBuf> {
         let root = self.roots.iter().find(|root| root.id == key.root_id)?;
         validate_relative_key_path(&key.path)?;
-        Some(root.declared.join(&key.path))
+        Some(join_key_path(&root.declared, &key.path))
     }
 
     /// The file a stored key points at, spelled as the WALK reached it.
@@ -395,7 +401,7 @@ impl WorkspaceRoots {
     pub fn resolve_walked(&self, key: &FileKey) -> Option<PathBuf> {
         let root = self.roots.iter().find(|root| root.id == key.root_id)?;
         validate_relative_key_path(&key.path)?;
-        Some(root.canonical.join(&key.path))
+        Some(join_key_path(&root.canonical, &key.path))
     }
 
     pub fn workspace(&self) -> &Path {
@@ -703,7 +709,8 @@ fn validate_relative_key_path(path: &str) -> Option<()> {
     if path.is_empty() || path.contains('\0') {
         return None;
     }
-    // Durable keys use slashes, but older keys may have been persisted with Windows separators. Do
+    // Durable keys are emitted with `/`, but a store written before that carries
+    // the Windows separator and may be inspected on another platform.  Do
     // the security check for both separator conventions before asking `Path` to
     // validate the native spelling; otherwise Linux treats `..\\outside` as one
     // ordinary filename and Windows can later escape the declared root with it.
@@ -731,7 +738,30 @@ fn validate_relative_key_path(path: &str) -> Option<()> {
 
 /// The store key of a path relative to its root.
 fn key_of(rel: &Path) -> String {
-    rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+    spell_as_key(&rel.to_string_lossy())
+}
+
+/// A text spelled the way store keys are spelled: `/` between components on every platform.
+///
+/// Keys are persisted and compared against keys built from configuration paths, so a key's text
+/// cannot depend on the host separator. Only Windows rewrites: a backslash is an ordinary
+/// character in a Unix file name. This is the single place that knows the rule; a caller that
+/// accepts a root id or a relative path from outside applies it before comparing with keys.
+pub fn spell_as_key(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// A host path rebuilt from a key's `/`-spelled relative part.
+///
+/// Joined segment by segment: handing the whole string to `join` would leave the embedded `/`
+/// as given on Windows, a mixed spelling no walked path matches. Unconditional on purpose, so
+/// a literal backslash in a Unix file name stays inside its segment.
+fn join_key_path(root: &Path, key_path: &str) -> PathBuf {
+    key_path.split('/').fold(root.to_path_buf(), |path, segment| path.join(segment))
 }
 
 fn canonicalize(path: &Path) -> PathBuf {
@@ -984,6 +1014,63 @@ mod tests {
                 "the same relative path under {root:?} must key to its own root"
             );
         }
+    }
+
+    /// The key is spelled with `/` however the host joins path components.
+    ///
+    /// The fixture assembles every path component by component with `Path::join`, which
+    /// yields the HOST separator: a literal `"cfe/one"` would hide the defect, because
+    /// Windows accepts a forward slash in input and the key would come out right by luck.
+    #[test]
+    fn a_key_is_spelled_with_slashes_whatever_the_host_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let configuration = workspace.join("cf");
+        let one = Path::new("cfe").join("one");
+        let two = Path::new("cfe").join("two");
+        for rel in [&one, &two] {
+            std::fs::create_dir_all(workspace.join(rel)).unwrap();
+        }
+        std::fs::create_dir_all(&configuration).unwrap();
+        let (roots, rejected) = WorkspaceRoots::build(
+            workspace,
+            &configuration,
+            &[workspace.join(&one), workspace.join(&two)],
+        );
+        assert!(rejected.is_empty(), "both extensions are registered");
+
+        let file =
+            workspace.join(&one).join("CommonModules").join("М").join("Ext").join("Module.bsl");
+        let key = owner(&roots, &file).expect("the file lies under a registered root");
+        assert_eq!(key, FileKey::new("cfe/one", "CommonModules/М/Ext/Module.bsl".to_owned()));
+
+        let other = owner(&roots, &workspace.join(&two).join("CommonModules"))
+            .expect("the sibling root owns its own files");
+        assert_eq!(other.root_id, "cfe/two", "control: distinct roots stay distinct ids");
+        assert_ne!(key.root_id, other.root_id);
+    }
+
+    /// A key built through `FileKey::new` is `/`-spelled whatever separator the caller used.
+    ///
+    /// Assembled component by component with `Path::join`, which yields the HOST separator: a
+    /// literal `"a/b"` would pass on Windows by luck and hide the defect.
+    #[test]
+    fn a_key_built_from_a_host_joined_path_is_slash_spelled() {
+        let root = Path::new("extensions").join("provider-a");
+        let rel = Path::new("CommonModules").join("М").join("Ext").join("Module.bsl");
+        let key = FileKey::new(root.to_string_lossy(), rel.to_string_lossy());
+        assert_eq!(key.root_id, "extensions/provider-a");
+        assert_eq!(key.path, "CommonModules/М/Ext/Module.bsl");
+        assert_eq!(key, FileKey::new("extensions/provider-a", "CommonModules/М/Ext/Module.bsl"));
+    }
+
+    /// Control: a backslash inside a Unix file name is a character, not a separator.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_backslash_in_a_unix_file_name_is_not_rewritten() {
+        let key = FileKey::new("ext\\one", "dir\\file.bsl");
+        assert_eq!(key.root_id, "ext\\one");
+        assert_eq!(key.path, "dir\\file.bsl");
     }
 
     #[test]

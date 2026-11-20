@@ -1,18 +1,20 @@
 //! Field continuations belong to the documented container, not its return-type union.
 
 use super::{
-    mark_role, parse_parameter_line, parse_return_type_union, parse_type_line,
-    split_type_description, DescriptionUse, LineRole, ParameterDoc, TypeDoc,
+    mark_role, parse_parameter_line, parse_parameter_types, parse_return_type_union,
+    parse_type_line, split_type_description, DescriptionUse, LineRole, MapEntryDoc, ParameterDoc,
+    TypeDoc,
 };
 
 /// Consumes a field block while retaining the boundary with the next top-level declaration.
+/// Returns the ordinary fields and the quoted map key items of the block.
 pub(super) fn parse_fields(
     lines: &[String],
     cursor: &mut usize,
     roles: Option<&mut [LineRole]>,
-) -> Vec<ParameterDoc> {
+) -> (Vec<ParameterDoc>, Vec<MapEntryDoc>) {
     let Some(level) = lines.get(*cursor).and_then(|line| marker_depth(line.trim())) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     parse_fields_at_level(lines, cursor, level, roles)
 }
@@ -23,8 +25,9 @@ fn parse_fields_at_level(
     cursor: &mut usize,
     level: usize,
     mut roles: Option<&mut [LineRole]>,
-) -> Vec<ParameterDoc> {
+) -> (Vec<ParameterDoc>, Vec<MapEntryDoc>) {
     let mut fields = Vec::<ParameterDoc>::new();
+    let mut entries = Vec::<MapEntryDoc>::new();
     let mut current: Option<usize> = None;
     let mut field_indent = indentation(&lines[*cursor]);
     let mut open_union = false;
@@ -40,21 +43,30 @@ fn parse_fields_at_level(
                 break;
             }
             if marker_level > level {
-                let nested =
+                let (nested, nested_entries) =
                     parse_fields_at_level(lines, cursor, marker_level, roles.as_deref_mut());
                 if let Some(field) = current.map(|index| &mut fields[index]) {
                     if let Some(last_type) = field.types.last_mut() {
                         last_type.parameters.extend(nested);
+                        last_type.map_entries.extend(nested_entries);
                     }
                 }
                 continue;
             }
 
             mark_role(&mut roles, *cursor, LineRole::FieldMarker(level));
-            current = parse_field(trimmed, level).map(|field| {
-                fields.push(field);
-                fields.len() - 1
-            });
+            let item = trimmed.get(level..).map(str::trim).unwrap_or_default();
+            current = if item.starts_with('"') {
+                // A key item is one line: what follows it is neither its continuation nor nested
+                // under it.
+                entries.extend(parse_map_entry(item));
+                None
+            } else {
+                parse_field(trimmed, level).map(|field| {
+                    fields.push(field);
+                    fields.len() - 1
+                })
+            };
             field_indent = indentation(line);
             open_union = field_union_is_open(trimmed);
         } else if indentation(line) > field_indent {
@@ -86,7 +98,7 @@ fn parse_fields_at_level(
         }
         *cursor += 1;
     }
-    fields
+    (fields, entries)
 }
 
 /// The same field marker must be recognized by hover and semantic highlighting.
@@ -99,6 +111,31 @@ pub(super) fn marker_depth(line: &str) -> Option<usize> {
 fn parse_field(line: &str, level: usize) -> Option<ParameterDoc> {
     let (name, types) = parse_parameter_line(line.get(level..)?.trim())?;
     Some(ParameterDoc { name, types })
+}
+
+/// `"ключ" - Тип - описание`: a BSL string literal as the key, then the ordinary type grammar.
+///
+/// The key ends at the first single closing quote (`""` inside is an escaped quote), so dashes,
+/// spaces and ` - ` inside the quotes belong to the key and never to the separator.
+fn parse_map_entry(item: &str) -> Option<MapEntryDoc> {
+    let mut chars = item.char_indices().skip(1).peekable();
+    let close = loop {
+        let (index, character) = chars.next()?;
+        if character != '"' {
+            continue;
+        }
+        if chars.peek().is_some_and(|(_, next)| *next == '"') {
+            chars.next();
+            continue;
+        }
+        break index;
+    };
+    let key = crate::extension_merge::unquote_bsl_string(&item[..=close]);
+    let after_dash = item[close + 1..].trim_start().strip_prefix('-')?;
+    if !after_dash.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(MapEntryDoc { key, types: parse_parameter_types(after_dash.trim_start()) })
 }
 
 /// Tabs align documentation columns; comparing their visual indentation keeps fields grouped.

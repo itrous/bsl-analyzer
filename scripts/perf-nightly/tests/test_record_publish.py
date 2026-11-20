@@ -117,11 +117,71 @@ class OneIssuePerMetric(RecordPublish):
         self.publish(self.summary())
         memory = next(i for i in self.issues() if "hwm_kb" in i["title"])
         work = next(i for i in self.issues() if "graph_resolve_s" in i["title"])
-        self.assertIn(publish.OWNER_TARGET_TEXT, memory["body"])
-        self.assertIn("Цель 4 667 316 KB задана для общего пика", memory["body"])
+        self.assertIn(publish.owner_target_text("hwm_kb", 1000), memory["body"])
+        self.assertIn("Рекорд R = 1000;", memory["body"])
+        self.assertIn("Цель 1 000 KB задана владельцем для пика серии A, без references", memory["body"],
+                      "the target told is the record's own value")
+        self.assertNotIn("4 787 080", memory["body"], "no number of the shipped file stands beside another record")
+        self.assertIn("Пик серии B с references держит абсолютный потолок 7 340 032 KB", memory["body"])
+        self.assertNotIn("общего пика", memory["body"])
         self.assertIn("исправление памяти — отдельная задача", memory["body"])
-        self.assertNotIn("4 667 316", work["body"])
+        self.assertNotIn("владельцем", work["body"], "the record of the work was not set by the owner")
         self.assertIn("абсолютный потолок: 7340032", memory["body"])
+
+    def test_each_record_the_owner_set_tells_its_own_decision(self):
+        self.set_record("hwm_kb", 1000, 0.01)
+        self.set_record("diagnostics_workspace_s", 20.0, 0.01)   # the candidate's 22.1 is over it
+        self.edit_baseline(lambda doc: [doc["metrics"][metric]["evidence"].update(kind="owner_target")
+                                        for metric in ("hwm_kb", "diagnostics_workspace_s")])
+        self.publish(self.summary())
+        memory = next(i for i in self.issues() if "hwm_kb" in i["title"])
+        sweep = next(i for i in self.issues() if "diagnostics_workspace_s" in i["title"])
+        work = next(i for i in self.issues() if "graph_resolve_s" in i["title"])
+        self.assertIn(publish.owner_target_text("diagnostics_workspace_s", 20.0), sweep["body"])
+        self.assertIn("Рекорд 20.00 с задан владельцем на уровне develop", sweep["body"],
+                      "the level told is the record's own value")
+        self.assertIn("против v0.4.1 (21.93 с) узаконено", sweep["body"])
+        self.assertNotIn("Цель 1 000 KB", sweep["body"], "the sweep does not tell the target of the memory")
+        self.assertNotIn("узаконено", memory["body"])
+        self.assertNotIn("владельцем", work["body"], "a record nobody set by decision tells no decision")
+
+    def test_a_record_that_is_no_longer_the_owners_tells_no_decision_of_the_owner(self):
+        self.set_record("hwm_kb", 1000, 0.01)
+        self.set_record("diagnostics_workspace_s", 20.0, 0.01)
+        self.edit_baseline(lambda doc: [doc["metrics"][metric]["evidence"].update(kind="historical_import")
+                                        for metric in ("hwm_kb", "diagnostics_workspace_s")])
+        self.publish(self.summary())
+        for metric in ("hwm_kb", "diagnostics_workspace_s"):
+            body = next(i for i in self.issues() if metric in i["title"])["body"]
+            self.assertIn(f"Рекорд R = {'1000' if metric == 'hwm_kb' else '20.0'};", body, "the control: it is over the record")
+            self.assertNotIn("владельцем", body, metric)
+
+    def test_the_slowdown_the_owner_legalised_is_told_in_percent_of_the_record_it_replaced(self):
+        slowed = publish.owner_target_text("diagnostics_workspace_s", 22.560848722991068)
+        self.assertIn("Рекорд 22.56 с задан владельцем на уровне develop: замедление на 2.86 % против v0.4.1 "
+                      "(21.93 с) узаконено", slowed)
+        self.assertIn("Цель 4 787 080 KB задана владельцем", publish.owner_target_text("hwm_kb", 4787080))
+        self.assertIsNone(publish.owner_target_text("graph_resolve_s", 17.4), "the owner set no other record")
+
+    def memory_runs(self, saved) -> list[str]:
+        """The runs the table of the memory issue lists, in its order."""
+        self.publish(saved)
+        memory = next(i for i in self.issues() if "hwm_kb" in i["title"])
+        return [line.split("|")[1].strip() for line in self.lines(memory["body"])
+                if line.startswith(("| A-", "| B-"))]
+
+    def test_the_runs_listed_for_the_memory_are_the_runs_of_the_series_a_alone(self):
+        self.set_record("hwm_kb", 1000, 0.01)
+        saved = self.summary()
+        self.assertEqual({r["series"] for r in saved["run_values"]}, {"A", "B"}, "the control: both series ran")
+        self.assertEqual(self.memory_runs(saved), ["A-c1", "A-c2", "A-c3"])
+
+    def test_a_summary_of_the_memory_held_by_both_series_lists_the_runs_of_both(self):
+        self.set_record("hwm_kb", 1000, 0.01)
+        saved = self.summary()
+        [row] = [r for r in saved["record"]["rows"] if r["metric"] == "hwm_kb"]
+        row["aggregate"] = "max_AB"
+        self.assertEqual(self.memory_runs(saved), ["A-c1", "A-c2", "A-c3", "B-c1", "B-c2", "B-c3"])
 
     def test_a_record_that_is_not_an_ancestor_says_so_and_promises_no_linear_range(self):
         self.publish(self.summary(), ancestor=lambda sha, of: False)

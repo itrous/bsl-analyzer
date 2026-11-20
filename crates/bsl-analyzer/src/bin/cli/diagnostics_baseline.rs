@@ -997,6 +997,8 @@ fn partitioned_candidates<'a, T: Clone + 'a>(
     plan: &project_model::DiagnosticsBaselinePartitionPlan,
     files: impl IntoIterator<Item = (T, &'a FileAnalysis)>,
 ) -> Result<Vec<IndexedPartitionedCandidate<T>>, Box<dyn Error + Send + Sync>> {
+    #[cfg(test)]
+    CANDIDATE_PREPARATIONS.with(|count| count.set(count.get() + 1));
     let root = project.root.canonicalize()?;
     let mut result = Vec::new();
     for (file_id, file) in files {
@@ -1193,6 +1195,8 @@ fn candidates<'a, T: Clone + 'a>(
     project: &project_model::Project,
     files: impl IntoIterator<Item = (T, &'a FileAnalysis)>,
 ) -> Result<Vec<Candidate<T>>, Box<dyn Error + Send + Sync>> {
+    #[cfg(test)]
+    CANDIDATE_PREPARATIONS.with(|count| count.set(count.get() + 1));
     let root = project.root.canonicalize()?;
     let mut candidates = Vec::new();
     for (file_id, file) in files {
@@ -1239,15 +1243,25 @@ pub fn classify_files(
                 .map(|path| path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
         })
         .collect::<Result<_, _>>()?;
-    classify_files_with_loaded(project, files, coverage, Some(&all_project_files), &loaded)
+    classify_files_with_loaded(project, files, coverage, Some(&all_project_files), &loaded, None)
 }
 
+/// Classifies every finding of `files` against the loaded baseline and keeps the active
+/// ones, giving each survivor the occurrence the classification gave it.
+///
+/// `files` hold each analysed file's whole finalized set. Under a scope whose line gate the
+/// analysis deferred, `scope_masks` (index-aligned with `files`, and within a file with its
+/// diagnostics) says which findings the scope admits; they are dropped only after the
+/// classification, together with the known ones, so a finding cut by the scope still takes
+/// its place in the numbering. The summary therefore counts the whole classified set, which
+/// can exceed what the report shows.
 pub fn classify_files_with_loaded(
     project: &project_model::Project,
     files: &mut [Option<FileAnalysis>],
     coverage: DiagnosticsBaselineCoverage,
     all_project_files: Option<&std::collections::BTreeSet<String>>,
     loaded: &ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot,
+    scope_masks: Option<&[Option<Vec<bool>>]>,
 ) -> Result<DiagnosticsBaselineSummary, Box<dyn Error + Send + Sync>> {
     use ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot;
     let (baseline, project_path) = match loaded {
@@ -1282,7 +1296,14 @@ pub fn classify_files_with_loaded(
                 .iter()
                 .map(|item| (item.diagnostic.0, item.diagnostic.1))
                 .collect();
-            suppress_known_files(files, &known);
+            let occurrences = classified
+                .new
+                .iter()
+                .chain(&classified.known)
+                .chain(&classified.unsuppressed)
+                .map(|item| ((item.diagnostic.0, item.diagnostic.1), item.entry.occurrence))
+                .collect();
+            keep_active_files(files, &occurrences, &known, scope_masks);
             return Ok(classified.summary);
         }
         DiagnosticsBaselineSnapshot::Error { detail, .. } => return Err(detail.clone().into()),
@@ -1297,21 +1318,50 @@ pub fn classify_files_with_loaded(
     let classified = classify_diagnostics(baseline, project_path.clone(), current, &coverage)?;
     let known: std::collections::HashSet<_> =
         classified.known.iter().map(|item| item.diagnostic).collect();
-    suppress_known_files(files, &known);
+    let occurrences = classified
+        .new
+        .iter()
+        .chain(&classified.known)
+        .map(|item| (item.diagnostic, item.entry.occurrence))
+        .collect();
+    keep_active_files(files, &occurrences, &known, scope_masks);
     Ok(classified.summary)
 }
 
-fn suppress_known_files(
+/// Writes the classification's occurrences into `files`, then drops the known findings and
+/// those the scope mask refuses in one pass. Both steps address findings by their index in
+/// the whole set the classifier saw, which is why neither may run after a removal.
+fn keep_active_files(
     files: &mut [Option<FileAnalysis>],
+    occurrences: &std::collections::HashMap<(usize, usize), u32>,
     known: &std::collections::HashSet<(usize, usize)>,
+    scope_masks: Option<&[Option<Vec<bool>>]>,
 ) {
     for (file_index, file) in files.iter_mut().enumerate() {
         let Some(analysis) = file else { continue };
-        analysis.retain_findings(|index| !known.contains(&(file_index, index)));
+        let classified: Option<Vec<u32>> = (0..analysis.diagnostics.len())
+            .map(|index| occurrences.get(&(file_index, index)).copied())
+            .collect();
+        if let Some(classified) = classified {
+            analysis.occurrences = classified;
+        }
+        let mask = scope_masks.and_then(|masks| masks.get(file_index)).and_then(Option::as_ref);
+        analysis.retain_findings(|index| {
+            !known.contains(&(file_index, index))
+                && mask.is_none_or(|mask| mask.get(index).copied().unwrap_or(true))
+        });
         if analysis.diagnostics.is_empty() {
             *file = None;
         }
     }
+}
+
+// Counts the classifications that went past the early `Disabled` return and prepared
+// candidates, so a test tells the fast path from the work by the count, not the clock.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CANDIDATE_PREPARATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn read_baseline(
@@ -1646,5 +1696,267 @@ mod tests {
         .unwrap();
         assert_eq!(summary.state, ide::diagnostics_baseline::DiagnosticsBaselineState::Partial);
         assert_eq!(summary.resolved, Some(1));
+    }
+
+    fn partitioned_project(root: &Path) -> Project {
+        let mut config = ProjectConfig::default();
+        config.diagnostics.baseline = Some(DiagnosticsBaselineConfig {
+            directory: Some("baselines".to_owned()),
+            ..Default::default()
+        });
+        Project::with_config(root, config).unwrap()
+    }
+
+    /// The counterexample as the analysis hands it over: the first `count` of three
+    /// identical self-assignments a, b, c on 0-based lines 1, 2 and 3 of one module.
+    fn counterexample(root: &Path, count: usize) -> FileAnalysis {
+        let path = root.join("module.bsl");
+        std::fs::write(
+            &path,
+            "Процедура Т()\n    А = А;\n    А = А;\n    А = А;\nКонецПроцедуры\n",
+        )
+        .unwrap();
+        let path = path.canonicalize().unwrap();
+        FileAnalysis {
+            path,
+            relative_path: PathBuf::from("module.bsl"),
+            diagnostics: (1..=count)
+                .map(|line| DiagnosticOutput {
+                    code: "SelfAssign".to_owned(),
+                    message: "self".to_owned(),
+                    severity: "Warning".to_owned(),
+                    start_line: line,
+                    start_column: 4,
+                    end_line: line,
+                    end_column: 9,
+                    tags: Vec::new(),
+                })
+                .collect(),
+            line_snippets: vec!["А = А;".to_owned(); count],
+            occurrences: (0..count as u32).collect(),
+        }
+    }
+
+    fn unanalysed(root: &Path) -> FileAnalysis {
+        let mut other = file(root);
+        let path = root.join("other.bsl");
+        std::fs::write(&path, "x = 1;\n").unwrap();
+        other.path = path.canonicalize().unwrap();
+        other.relative_path = PathBuf::from("other.bsl");
+        other
+    }
+
+    fn lines_of(files: &[Option<FileAnalysis>]) -> Vec<(usize, u32)> {
+        files
+            .iter()
+            .flatten()
+            .flat_map(|file| {
+                file.diagnostics.iter().zip(&file.occurrences).map(|(d, o)| (d.start_line, *o))
+            })
+            .collect()
+    }
+
+    /// Under a scope the summary counts the whole classified set of the analysed files —
+    /// a and b known, c new — while only c is shown; the run is partial, so the entry of
+    /// a file nobody analysed is not resolved. The unscoped full run beside it does
+    /// resolve that entry, so the zero is the coverage at work, not an empty fixture.
+    #[test]
+    fn finality_scoped_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = project(&root, true);
+        let proof =
+            super::super::analyze::CoverageProof { total: 2, analyzed: 2, ..Default::default() };
+        apply(
+            &project,
+            &[counterexample(&root, 2), unanalysed(&root)],
+            &proof,
+            DiagnosticsBaselineCommand::Create(create_args()),
+        )
+        .unwrap();
+        let loaded =
+            ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project);
+
+        let mut files = vec![Some(counterexample(&root, 3))];
+        let masks = vec![Some(vec![false, true, true])];
+        let summary = classify_files_with_loaded(
+            &project,
+            &mut files,
+            DiagnosticsBaselineCoverage::Partial { completed_files: Default::default() },
+            None,
+            &loaded,
+            Some(&masks),
+        )
+        .unwrap();
+        assert_eq!((summary.known, summary.new, summary.resolved), (Some(2), Some(1), Some(0)));
+        assert!(!summary.complete);
+        assert_eq!(lines_of(&files), vec![(3, 2)], "only c is shown, with occurrence 2");
+
+        // A scope of a and b cuts the one new finding: nothing is shown, and the summary
+        // still counts c.
+        let mut files = vec![Some(counterexample(&root, 3))];
+        let masks = vec![Some(vec![true, true, false])];
+        let summary = classify_files_with_loaded(
+            &project,
+            &mut files,
+            DiagnosticsBaselineCoverage::Partial { completed_files: Default::default() },
+            None,
+            &loaded,
+            Some(&masks),
+        )
+        .unwrap();
+        assert_eq!((summary.known, summary.new), (Some(2), Some(1)));
+        assert!(lines_of(&files).is_empty(), "c is outside the scope: {:?}", lines_of(&files));
+
+        let mut files = vec![Some(counterexample(&root, 3))];
+        let full = classify_files_with_loaded(
+            &project,
+            &mut files,
+            DiagnosticsBaselineCoverage::Full,
+            None,
+            &loaded,
+            None,
+        )
+        .unwrap();
+        assert_eq!(full.resolved, Some(1), "control: a full run resolves the unanalysed entry");
+    }
+
+    /// `Disabled` returns before preparing candidates — counted, not timed — and leaves the
+    /// already scoped input as it is; a snapshot that cannot change the set never defers
+    /// the gate. A malformed baseline still fails the run. `Ready` prepares for real.
+    #[test]
+    fn finality_disabled_keeps_fast_path() {
+        use ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let prepared = || CANDIDATE_PREPARATIONS.with(std::cell::Cell::get);
+
+        let disabled_project = project(&root, false);
+        let disabled = DiagnosticsBaselineSnapshot::load(&disabled_project);
+        assert!(!disabled.affects_diagnostics(), "Disabled must not defer the gate");
+        let mut files = vec![Some(counterexample(&root, 2))];
+        let before = prepared();
+        let summary = classify_files_with_loaded(
+            &disabled_project,
+            &mut files,
+            DiagnosticsBaselineCoverage::Full,
+            None,
+            &disabled,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.state, ide::diagnostics_baseline::DiagnosticsBaselineState::Disabled);
+        assert_eq!(prepared(), before, "Disabled must not prepare candidates");
+        assert_eq!(lines_of(&files), vec![(1, 0), (2, 1)], "the input stays as it was");
+
+        let project = project(&root, true);
+        apply(
+            &project,
+            &[counterexample(&root, 2)],
+            &full(),
+            DiagnosticsBaselineCommand::Create(create_args()),
+        )
+        .unwrap();
+        let ready = DiagnosticsBaselineSnapshot::load(&project);
+        let before = prepared();
+        classify_files_with_loaded(
+            &project,
+            &mut [Some(counterexample(&root, 3))],
+            DiagnosticsBaselineCoverage::Full,
+            None,
+            &ready,
+            None,
+        )
+        .unwrap();
+        assert_eq!(prepared(), before + 1, "control: Ready prepares candidates");
+
+        std::fs::write(root.join("baseline.json"), b"not json").unwrap();
+        let broken = DiagnosticsBaselineSnapshot::load(&project);
+        assert!(
+            classify_files_with_loaded(
+                &project,
+                &mut [Some(counterexample(&root, 3))],
+                DiagnosticsBaselineCoverage::Full,
+                None,
+                &broken,
+                None,
+            )
+            .is_err(),
+            "a malformed baseline keeps failing the run"
+        );
+    }
+
+    /// The baseline files are read, never rewritten, and the identity the classification
+    /// gives a survivor is the one of the full input: c keeps occurrence 2 in both forms,
+    /// and after a further author-style retain every survivor still pairs its own snippet
+    /// and occurrence with its diagnostic.
+    #[test]
+    fn finality_existing_baseline_and_reporter_identity() {
+        for partitioned in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let project =
+                if partitioned { partitioned_project(&root) } else { project(&root, true) };
+            apply(
+                &project,
+                &[counterexample(&root, 1)],
+                &full(),
+                DiagnosticsBaselineCommand::Create(create_args()),
+            )
+            .unwrap();
+            let stored = |root: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+                let mut stored: Vec<_> = walkdir::WalkDir::new(root)
+                    .into_iter()
+                    .flatten()
+                    .filter(|entry| entry.file_type().is_file())
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                    .map(|entry| (entry.path().to_owned(), std::fs::read(entry.path()).unwrap()))
+                    .collect();
+                stored.sort();
+                stored
+            };
+            let before = stored(&root);
+            assert!(!before.is_empty(), "partitioned={partitioned}: the baseline must exist");
+            let loaded =
+                ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project);
+
+            // Without the producer's numbers, so the occurrences shown can only be the
+            // classification's.
+            let unnumbered = || {
+                let mut file = counterexample(&root, 3);
+                file.occurrences.clear();
+                Some(file)
+            };
+            let mut full_run = vec![unnumbered()];
+            classify_files_with_loaded(
+                &project,
+                &mut full_run,
+                DiagnosticsBaselineCoverage::Full,
+                None,
+                &loaded,
+                None,
+            )
+            .unwrap();
+            assert_eq!(lines_of(&full_run), vec![(2, 1), (3, 2)], "partitioned={partitioned}");
+
+            let mut scoped = vec![unnumbered()];
+            let masks = vec![Some(vec![true, true, true])];
+            classify_files_with_loaded(
+                &project,
+                &mut scoped,
+                DiagnosticsBaselineCoverage::Partial { completed_files: Default::default() },
+                None,
+                &loaded,
+                Some(&masks),
+            )
+            .unwrap();
+            let survivor = scoped[0].as_mut().unwrap();
+            survivor.retain_findings(|index| index == 1);
+            assert_eq!(lines_of(&scoped), vec![(3, 2)], "partitioned={partitioned}: c keeps 2");
+            let survivor = scoped[0].as_ref().unwrap();
+            assert_eq!(survivor.line_snippets, vec!["А = А;".to_owned()]);
+            assert_eq!(stored(&root), before, "partitioned={partitioned}: no baseline write");
+        }
     }
 }

@@ -58,20 +58,22 @@ class Proposals(RecordCase):
         row = self.record_row(summary, "graph_resolve_s")
         self.assertEqual([c["candidate"]["value"] for c in row["rounds"]], [98.0, 98.5])
 
-    def test_memory_is_proposed_at_the_worse_peak_of_a_and_b_together(self):
+    def test_memory_is_proposed_at_the_worse_peak_of_a(self):
         self.set_record("hwm_kb", 100, 0.01, base_a_noise=1000.0)
 
         def hwm(run):
-            return 90 if run.series == "A" else (95, 96, 97, 96, 98, 95)[run.n - 1]
+            if run.series == "B":
+                return 120
+            return (95, 96, 97, 96, 98, 95)[run.n - 1] if run.role == "c" else 90
 
         self.script.values["hwm_kb"] = hwm
         _, summary, _ = self.gate()
         [proposal] = summary["record_proposals"]
         self.assertEqual((proposal["metric"], proposal["value"], proposal["rounds"]), ("hwm_kb", 98.0, [97.0, 98.0]),
-                         "the peak of A+B of each round, not of A alone")
-        self.assertEqual((proposal["aggregate"], proposal["evidence"]["series"]), ("max_AB", "A+B"))
-        self.assertEqual(proposal["evidence"]["runs"], ["A-c1", "A-c2", "A-c3", "B-c1", "B-c2", "B-c3"])
-        self.assertEqual(proposal["evidence"]["confirmation"], ["A-c4", "A-c5", "A-c6", "B-c4", "B-c5", "B-c6"])
+                         "the peak of A of each round; B, over the record, is not part of it")
+        self.assertEqual((proposal["aggregate"], proposal["evidence"]["series"]), ("max_A", "A"))
+        self.assertEqual(proposal["evidence"]["runs"], ["A-c1", "A-c2", "A-c3"])
+        self.assertEqual(proposal["evidence"]["confirmation"], ["A-c4", "A-c5", "A-c6"])
 
     def test_a_reference_is_proposed_by_the_median_of_b_of_each_round(self):
         self.set_record("references_1_s", 60.0, 0.01)

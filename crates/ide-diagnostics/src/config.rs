@@ -64,6 +64,13 @@ pub struct DiagnosticsConfig {
     /// prepare facts of the whole module for it. Set programmatically by the driving
     /// surface, never from the `[diagnostics]` project config.
     pub quick_fixes: bool,
+    /// Keep the findings on lines outside `scope` in the computed set, leaving the line
+    /// filter to the caller. A baseline fingerprint numbers repeated findings within the
+    /// file, so a caller that classifies against a baseline needs the file's whole set:
+    /// classifying only the scoped lines would let a new finding inherit the number of a
+    /// recorded one. The file gate still applies. Set programmatically by the driving
+    /// surface for one computation, never from the `[diagnostics]` project config.
+    pub defer_scope_line_gate: bool,
 }
 
 /// `serde_json::Value` is only `PartialEq` (floats); a configuration is still
@@ -84,6 +91,7 @@ impl Default for DiagnosticsConfig {
             bslls_suppression_compat: true,
             scope: None,
             quick_fixes: true,
+            defer_scope_line_gate: false,
         }
     }
 }
@@ -208,6 +216,7 @@ impl DiagnosticsConfig {
             DiagnosticCode::TernaryOperatorUsage,
             DiagnosticCode::TooManyReturns,
             DiagnosticCode::TypeMismatchByDocComment,
+            DiagnosticCode::TypeNameComparedAsText,
             DiagnosticCode::UnresolvedName,
             DiagnosticCode::UseSystemInformation,
             DiagnosticCode::UsingLikeInQuery,
@@ -231,6 +240,7 @@ impl DiagnosticsConfig {
             bslls_suppression_compat: true,
             scope: None,
             quick_fixes: true,
+            defer_scope_line_gate: false,
         }
     }
 
@@ -730,6 +740,7 @@ impl<'de> serde::Deserialize<'de> for DiagnosticsConfig {
                     bslls_suppression_compat,
                     scope: None,
                     quick_fixes: true,
+                    defer_scope_line_gate: false,
                 })
             }
         }
@@ -837,6 +848,7 @@ impl DiagnosticsConfig {
             bslls_suppression_compat: input.bslls_suppression_compat,
             scope: input.scope.clone(),
             quick_fixes: input.quick_fixes,
+            defer_scope_line_gate: input.defer_scope_line_gate,
         }
     }
 
@@ -862,18 +874,34 @@ impl DiagnosticsConfig {
         )
         .with_scope(self.scope.clone())
         .with_quick_fixes(self.quick_fixes)
+        .with_defer_scope_line_gate(self.defer_scope_line_gate)
     }
 
-    pub fn apply_cli_filters(&mut self, only_diagnostic: &[String], disable_diagnostic: &[String]) {
-        warn_unknown_cli_codes(only_diagnostic, "--only-diagnostic");
-        warn_unknown_cli_codes(disable_diagnostic, "--disable-diagnostic");
+    /// Fails without touching `self` when any name is not a diagnostic code: a
+    /// silently ignored `--only-diagnostic` name would widen the run to every code.
+    pub fn apply_cli_filters(
+        &mut self,
+        only_diagnostic: &[String],
+        disable_diagnostic: &[String],
+    ) -> Result<(), String> {
+        let mut problems = Vec::new();
+        for (flag, names) in
+            [("--only-diagnostic", only_diagnostic), ("--disable-diagnostic", disable_diagnostic)]
+        {
+            for name in names.iter().filter(|name| name.parse::<DiagnosticCode>().is_err()) {
+                problems.push(format!(
+                    "unknown diagnostic code `{name}` in {flag}: {}",
+                    unknown_code_hint(name)
+                ));
+            }
+        }
+        if !problems.is_empty() {
+            return Err(problems.join("\n"));
+        }
 
         if !only_diagnostic.is_empty() {
-            let codes: Vec<DiagnosticCode> =
-                only_diagnostic.iter().filter_map(|s| s.parse().ok()).collect();
-            if !codes.is_empty() {
-                self.only_enabled = Some(codes);
-            }
+            self.only_enabled =
+                Some(only_diagnostic.iter().filter_map(|s| s.parse().ok()).collect());
         }
 
         for code_str in disable_diagnostic {
@@ -883,16 +911,7 @@ impl DiagnosticsConfig {
                 }
             }
         }
-    }
-}
-
-fn warn_unknown_cli_codes(names: &[String], flag: &str) {
-    for name in names.iter().filter(|name| name.parse::<DiagnosticCode>().is_err()) {
-        tracing::warn!(
-            key = name.as_str(),
-            "unknown diagnostic code `{name}` in {flag}: the name is ignored; {}",
-            unknown_code_hint(name)
-        );
+        Ok(())
     }
 }
 
@@ -1178,16 +1197,40 @@ mod tests {
     #[test]
     fn an_unknown_code_on_the_command_line_is_reported() {
         let mut config = DiagnosticsConfig::default();
-        let warnings = warnings_of(|| {
-            config.apply_cli_filters(&["DeprecatedCurrentDate".to_owned()], &["Nope".to_owned()]);
-        });
-        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        let err = config
+            .apply_cli_filters(&["DeprecatedCurrentDate".to_owned()], &["Nope".to_owned()])
+            .unwrap_err();
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 2, "{err}");
         assert!(
-            warnings[0].contains("`DeprecatedCurrentDate`")
-                && warnings[0].contains("--only-diagnostic")
+            lines[0].contains("`DeprecatedCurrentDate`") && lines[0].contains("--only-diagnostic")
         );
-        assert!(warnings[1].contains("`Nope`") && warnings[1].contains("--disable-diagnostic"));
+        assert!(lines[1].contains("`Nope`") && lines[1].contains("--disable-diagnostic"));
         assert!(config.only_enabled.is_none(), "an unknown name selects nothing");
+    }
+
+    #[test]
+    fn a_failed_command_line_filter_leaves_the_config_untouched() {
+        let mut config = DiagnosticsConfig::default();
+        config
+            .apply_cli_filters(&["Nope".to_owned(), "LineLength,Other".to_owned()], &[])
+            .unwrap_err();
+        assert!(config.only_enabled.is_none());
+        assert!(config.disabled.is_empty());
+
+        let mut config = DiagnosticsConfig::default();
+        config.apply_cli_filters(&["LineLength".to_owned()], &[]).unwrap();
+        let before = config.only_enabled.clone();
+        assert_eq!(before.as_ref().map(Vec::len), Some(1));
+        // A valid name next to an unknown one must not be applied either.
+        config
+            .apply_cli_filters(
+                &["DeprecatedCurrentDate".to_owned()],
+                &["LineLength".to_owned(), "Nope".to_owned()],
+            )
+            .unwrap_err();
+        assert_eq!(config.only_enabled, before);
+        assert!(config.disabled.is_empty(), "{:?}", config.disabled);
     }
 
     /// `[diagnostics.parameters.DeprecatedPlatformApi]` with this `exclude` value.
@@ -1378,16 +1421,17 @@ mod tests {
 
         // The same hint reaches the command-line filters.
         let mut cli = DiagnosticsConfig::default();
-        let warnings = warnings_of(|| {
-            cli.apply_cli_filters(
+        let err = cli
+            .apply_cli_filters(
                 &["DeprecatedCurrentDate".to_owned()],
                 &["DeprecatedErrorProcessing".to_owned(), "Nope".to_owned()],
-            );
-        });
-        assert_eq!(warnings.len(), 3, "{warnings:#?}");
-        assert!(warnings[0].contains(&entry(r#""ТекущаяДата""#)), "{}", warnings[0]);
-        assert!(warnings[1].contains(&entry(&error_processing.join(", "))), "{}", warnings[1]);
-        assert!(!warnings[2].contains("exclude"), "{}", warnings[2]);
+            )
+            .unwrap_err();
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 3, "{err}");
+        assert!(lines[0].contains(&entry(r#""ТекущаяДата""#)), "{}", lines[0]);
+        assert!(lines[1].contains(&entry(&error_processing.join(", "))), "{}", lines[1]);
+        assert!(!lines[2].contains("exclude"), "{}", lines[2]);
     }
 
     fn parse_with_warning_count(
@@ -1461,6 +1505,7 @@ mod tests {
         assert_eq!(config.severity(DiagnosticCode::UnavailableInEnvironment), Severity::Warning);
         assert_eq!(config.severity(DiagnosticCode::ModuleAccessibility), Severity::Warning);
         assert_eq!(config.severity(DiagnosticCode::ServerSideExportFormMethod), Severity::Warning);
+        assert_eq!(config.severity(DiagnosticCode::AtClientAtServerFormMethod), Severity::Warning);
         // Control: metadata without a static override keeps its computed grade.
         assert_eq!(config.severity(DiagnosticCode::DeletingCollectionItem), Severity::Major);
     }

@@ -25,13 +25,17 @@ const IDENTIFIER_AWARE_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::NestedConstructorsInStructureDeclaration,
     DiagnosticCode::NumberOfValuesInStructureConstructor,
     DiagnosticCode::OSUsersMethod,
+    DiagnosticCode::PostingWhileDataExchangeLoading,
     DiagnosticCode::SetPrivilegedMode,
+    DiagnosticCode::StructureKeyIsNotIdentifier,
     DiagnosticCode::TryNumber,
+    DiagnosticCode::TypeNameComparedAsText,
     DiagnosticCode::UnsafeSafeModeMethodCall,
     DiagnosticCode::UseSystemInformation,
     DiagnosticCode::UsingExternalCodeTools,
     DiagnosticCode::UsingFindElementByString,
     DiagnosticCode::UsingHardcodeSecretInformation,
+    DiagnosticCode::ValueIsFilledOfBoolean,
     DiagnosticCode::WrongUseFunctionProceedWithCall,
     DiagnosticCode::WrongUseOfRollbackTransactionMethod,
 ];
@@ -64,6 +68,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "line-layout check on preprocessor instructions; no identifier lookup",
     ),
     (DiagnosticCode::LineLength, "formatting-only diagnostic"),
+    (
+        DiagnosticCode::FormDataHasNoMetadataMethod,
+        "judged by the inferred type of a form attribute, which needs a form module and form metadata on disk; this fixture harness has neither, so no fixture can emit it - the English spelling is covered by a handler test with form metadata",
+    ),
     (
         DiagnosticCode::GlobalContextMethodConflict,
         "form declaration checked against the platform global catalog; does not inspect a bilingual use-site",
@@ -125,6 +133,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     (
         DiagnosticCode::MultilingualStringHasAllDeclaredLanguages,
         "localized string literal diagnostic",
+    ),
+    (
+        DiagnosticCode::MultilingualStringHasEmptyTranslation,
+        "localized string literal diagnostic; matches the fixed NStr/НСтр spelling, no platform identifier lookup",
     ),
     (DiagnosticCode::MultilingualStringUsingWithTemplate, "localized string/template diagnostic"),
     (DiagnosticCode::NestedFunctionInParameters, "call-shape diagnostic with configurable names"),
@@ -236,6 +248,22 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         DiagnosticCode::WrongWebServiceHandler,
         "metadata handler-name resolution; requires service metadata fixture",
     ),
+    (
+        DiagnosticCode::ObjectModifiedInOnWrite,
+        "identifier-aware (handler name, ЭтотОбъект/ThisObject, attribute name_en) but needs object metadata, which the plain-source fixture cannot supply; the English path is covered by the handler unit tests",
+    ),
+    (
+        DiagnosticCode::RegisterRecorderFieldInQuery,
+        "needs register metadata with a recorder field; a bare query text resolves no register",
+    ),
+    (
+        DiagnosticCode::QueryOrderByDocumentDate,
+        "needs register metadata whose dimension is a document reference; a bare query text resolves no source",
+    ),
+    (
+        DiagnosticCode::QueryConditionWithoutIndex,
+        "needs accumulation register metadata with dimensions; a bare query text resolves no register",
+    ),
     (DiagnosticCode::WrongDataPathForFormElements, "form metadata path diagnostic"),
     (DiagnosticCode::PublicMethodsDescription, "documentation/region diagnostic"),
     (DiagnosticCode::CachedPublic, "metadata return-value-reuse policy"),
@@ -278,6 +306,18 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     (DiagnosticCode::ScheduledJobHandler, "metadata scheduled-job handler diagnostic"),
     (DiagnosticCode::ServerCallsInFormEvents, "metadata form event/cross-module diagnostic"),
     (DiagnosticCode::ServerSideExportFormMethod, "form module export policy"),
+    (
+        DiagnosticCode::AtClientAtServerFormMethod,
+        "checks a method's compilation directive in a form module; no BSL identifier lookup",
+    ),
+    (
+        DiagnosticCode::UnboundFormEventHandler,
+        "checks a form procedure name against the form event bindings; no BSL identifier lookup",
+    ),
+    (
+        DiagnosticCode::FormEventHandlerDirective,
+        "checks a handler's compilation directive against the form events; no BSL identifier lookup",
+    ),
     (DiagnosticCode::SetPermissionsForNewObjects, "metadata managed-application policy"),
     (
         DiagnosticCode::TransferringParametersBetweenClientAndServer,
@@ -343,6 +383,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "SDBL alias policy; query-language parity needs dedicated metadata/query harness",
     ),
     (DiagnosticCode::DuplicateAliasInQuery, "SDBL source-alias policy; not BSL identifier parity"),
+    (
+        DiagnosticCode::UnavailableAliasInQuery,
+        "SDBL source-alias visibility; not BSL identifier parity",
+    ),
     (
         DiagnosticCode::FieldsFromJoinsWithoutIsNull,
         "SDBL join-field policy; not BSL identifier parity",
@@ -619,12 +663,32 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        DiagnosticCode::StructureKeyIsNotIdentifier,
+        r#"Процедура Тест()
+    Результат = Новый Структура("а.б");
+КонецПроцедуры"#,
+        r#"Procedure Test()
+    Result = New Structure("a.b");
+EndProcedure"#,
+    ),
+    (
         DiagnosticCode::OSUsersMethod,
         r#"Процедура Тест()
     ПользователиОС();
 КонецПроцедуры"#,
         r#"Procedure Test()
     OSUsers();
+EndProcedure"#,
+    ),
+    (
+        DiagnosticCode::PostingWhileDataExchangeLoading,
+        r#"Процедура Тест(Документ)
+    Документ.ОбменДанными.Загрузка = Истина;
+    Документ.Записать(РежимЗаписиДокумента.Проведение);
+КонецПроцедуры"#,
+        r#"Procedure Test(Document)
+    Document.DataExchange.Load = True;
+    Document.Write(DocumentWriteMode.Posting);
 EndProcedure"#,
     ),
     (
@@ -649,6 +713,17 @@ EndProcedure"#,
         Value = Number("1");
     Except
     EndTry;
+EndProcedure"#,
+    ),
+    (
+        DiagnosticCode::TypeNameComparedAsText,
+        r#"Процедура Тест(Значение)
+    Если Строка(ТипЗнч(Значение)) = "Табличное поле" Тогда
+    КонецЕсли;
+КонецПроцедуры"#,
+        r#"Procedure Test(Value)
+    If String(TypeOf(Value)) = "Table field" Then
+    EndIf;
 EndProcedure"#,
     ),
     (
@@ -716,6 +791,21 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        DiagnosticCode::ValueIsFilledOfBoolean,
+        r#"Процедура Тест()
+    Флаг = Истина;
+    Если ЗначениеЗаполнено(Флаг) Тогда
+        Значение = 1;
+    КонецЕсли;
+КонецПроцедуры"#,
+        r#"Procedure Test()
+    Flag = True;
+    If ValueIsFilled(Flag) Then
+        Value = 1;
+    EndIf;
+EndProcedure"#,
+    ),
+    (
         DiagnosticCode::WrongUseFunctionProceedWithCall,
         r#"Процедура Тест()
     ПродолжитьВызов();
@@ -738,7 +828,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 216, "update the bilingual inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 230, "update the bilingual inventory when DiagnosticCode changes");
 }
 
 #[test]

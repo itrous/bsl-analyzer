@@ -847,6 +847,43 @@ impl Store {
         Ok(ControlFlow::Continue(()))
     }
 
+    /// Whether any root-keyed table holds a key spelled with a backslash.
+    ///
+    /// Keys are `/`-spelled on every platform; a store written before that held the host
+    /// separator on Windows, and those rows are unreachable by any lookup yet still served,
+    /// so the cache cannot be reconciled and is rebuilt. The table shape did not change, hence
+    /// no `SCHEMA_VERSION` bump (which would also re-index Linux needlessly).
+    ///
+    /// Asked on Windows only, and that is not a half-measure. The stale spelling arose only
+    /// there: on any other host a pre-fix key was already `/`-spelled, so there is nothing to
+    /// migrate, and a backslash in a Unix file name is an ordinary character that must be left
+    /// alone (probing there would wipe such a store at every open, for ever). On Windows a
+    /// backslash cannot occur inside a file name, so after the reset the rebuilt rows are
+    /// `/`-spelled and the probe never fires again: idempotent where it applies, inapplicable
+    /// elsewhere. One `LIMIT 1` per table and no counting, since this runs at every open.
+    fn holds_host_separator_key(conn: &Connection) -> Result<bool, SearchError> {
+        if !cfg!(windows) {
+            return Ok(false);
+        }
+        for table in ROOT_KEYED_TABLES {
+            let columns = Self::column_names(conn, table.name);
+            let tests: Vec<String> = ["root_id", "path"]
+                .into_iter()
+                .filter(|key| columns.iter().any(|column| column == key))
+                .map(|key| format!("instr({key}, char(92)) > 0"))
+                .collect();
+            if tests.is_empty() {
+                continue;
+            }
+            let sql =
+                format!("SELECT 1 FROM \"{}\" WHERE {} LIMIT 1", table.name, tests.join(" OR "));
+            if conn.query_row(&sql, [], |_| Ok(())).optional()?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Reconcile the structural schema in a single transaction: wipe a stale cache,
     /// (re)create the current tables, and stamp the version atomically. Under WAL a
     /// crash mid-reconcile rolls back to the prior consistent state, so the next open
@@ -865,14 +902,27 @@ impl Store {
         observation.record.from_version = stored;
         observation.record.to_version = Some(SCHEMA_VERSION);
         if let Some(stored) = stored {
-            if stored != SCHEMA_VERSION {
-                observation.record.reason = Reason::SchemaReset;
+            let schema_changed = stored != SCHEMA_VERSION;
+            // Only asked when the version matches: a mismatch wipes anyway, and the log line
+            // must name the reason that actually fired.
+            let spelled_with_host_separator =
+                !schema_changed && Self::holds_host_separator_key(&tx)?;
+            if schema_changed || spelled_with_host_separator {
+                observation.record.reason =
+                    if schema_changed { Reason::SchemaReset } else { Reason::KeySpelling };
                 observation.record.emit(crate::lifecycle::Context::current().is_some());
-                tracing::info!(
-                    from = stored,
-                    to = SCHEMA_VERSION,
-                    "search index schema changed; wiping derived cache to rebuild"
-                );
+                if schema_changed {
+                    tracing::warn!(
+                        from = stored,
+                        to = SCHEMA_VERSION,
+                        "search index schema changed; wiping derived cache to rebuild"
+                    );
+                } else {
+                    tracing::warn!(
+                        reason = "key_spelling",
+                        "search index keys are spelled with a host separator; wiping derived cache to rebuild"
+                    );
+                }
                 for (table, target) in [
                     ("chunks", &mut counts.sqlite_vectors_removed),
                     ("overlay_chunks", &mut counts.overlay_vectors_removed),
@@ -9460,6 +9510,379 @@ mod tests {
             let records = capture(|| store.migrate_structural_schema().unwrap());
             assert_count(committed(&records), "overlay_cache_entries_removed", 1);
             assert_count(committed(&records), "sqlite_vectors_removed", 0);
+        }
+    }
+
+    /// What a reopen owes a store the restart finds: its rows and vectors when the structural
+    /// schema is current, a visible and atomic reset when it is not, and a vector only for the
+    /// payload and profile it was paid for.
+    mod cache_reuse_tests {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        const MODEL: &str = "reuse-profile";
+        const VECTOR: [f32; 3] = [0.5, 0.25, 0.75];
+
+        /// A store file holding one paid chunk, closed.
+        fn paid_store(path: &std::path::Path) {
+            let mut store = Store::open(path).unwrap();
+            store
+                .reindex_file_with_identity(
+                    CONFIGURATION_ROOT_ID,
+                    "Module.bsl",
+                    b"hash",
+                    &[sample_chunk("Method")],
+                    Some(&[VECTOR.to_vec()]),
+                    None,
+                    MODEL,
+                    3,
+                )
+                .unwrap();
+        }
+
+        fn stamp_schema(path: &std::path::Path, version: i64) {
+            Connection::open(path)
+                .unwrap()
+                .execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
+                    params![version.to_string()],
+                )
+                .unwrap();
+        }
+
+        /// Run `f` and keep what it logged at warn or above, the levels a default run shows,
+        /// each as `LEVEL message field=value ...`.
+        fn visible_at_default_logging(f: impl FnOnce()) -> Vec<String> {
+            use tracing_subscriber::prelude::*;
+
+            struct Capture(Arc<Mutex<Vec<String>>>);
+            impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+                fn on_event(
+                    &self,
+                    event: &tracing::Event<'_>,
+                    _: tracing_subscriber::layer::Context<'_, S>,
+                ) {
+                    struct Line {
+                        message: String,
+                        fields: String,
+                    }
+                    impl tracing::field::Visit for Line {
+                        fn record_debug(
+                            &mut self,
+                            field: &tracing::field::Field,
+                            value: &dyn std::fmt::Debug,
+                        ) {
+                            if field.name() == "message" {
+                                self.message = format!("{value:?}");
+                            } else {
+                                self.fields.push_str(&format!(" {}={value:?}", field.name()));
+                            }
+                        }
+                    }
+                    let level = *event.metadata().level();
+                    if level > tracing::Level::WARN {
+                        return;
+                    }
+                    let mut line = Line { message: String::new(), fields: String::new() };
+                    event.record(&mut line);
+                    self.0.lock().unwrap().push(format!("{level} {}{}", line.message, line.fields));
+                }
+            }
+
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            crate::lifecycle::test_with_subscriber(
+                tracing_subscriber::registry().with(Capture(lines.clone())),
+                f,
+            );
+            // tracing-core briefly upgrades every registered dispatcher while another test thread
+            // registers a callsite, so the subscriber may still be shared here; take the lines.
+            let taken = std::mem::take(&mut *lines.lock().unwrap());
+            taken
+        }
+
+        fn resets(lines: &[String]) -> Vec<&String> {
+            lines.iter().filter(|line| line.contains("wiping derived cache")).collect()
+        }
+
+        #[test]
+        fn a_schema_mismatch_reset_is_visible_by_default_with_the_found_and_expected_version() {
+            for found in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("search.db");
+                paid_store(&path);
+                stamp_schema(&path, found);
+
+                let lines = visible_at_default_logging(|| {
+                    let store = Store::open(&path).unwrap();
+                    assert_eq!(store.file_count().unwrap(), 0, "the incompatible rows were kept");
+                    assert_eq!(
+                        Store::stored_schema_version(&store.conn).unwrap(),
+                        Some(SCHEMA_VERSION)
+                    );
+                });
+
+                let resets = resets(&lines);
+                assert_eq!(resets.len(), 1, "expected one reset message in {lines:#?}");
+                assert!(resets[0].starts_with("WARN "), "{}", resets[0]);
+                assert!(
+                    resets[0].ends_with(&format!(" from={found} to={SCHEMA_VERSION}")),
+                    "{}",
+                    resets[0]
+                );
+            }
+        }
+
+        #[test]
+        fn a_compatible_reopen_keeps_rows_and_vectors_and_resets_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("search.db");
+            paid_store(&path);
+
+            for reopen in 0..2 {
+                let lines = visible_at_default_logging(|| {
+                    let store = Store::open(&path).unwrap();
+                    assert_eq!(store.file_count().unwrap(), 1, "reopen {reopen} dropped the file");
+                    assert_eq!(store.chunk_count().unwrap(), 1);
+                    let vectors = store.load_all_embeddings(3).unwrap();
+                    assert_eq!(vectors.len(), 1, "reopen {reopen} dropped the vector");
+                    assert_eq!(vectors[0].1, VECTOR.to_vec());
+                });
+                assert!(resets(&lines).is_empty(), "a current store was reset: {lines:#?}");
+            }
+        }
+
+        /// A store written when Windows keys carried the host separator is rebuilt, though its
+        /// schema version is current: the rows are unreachable by any `/`-spelled lookup and
+        /// still served, so nothing else would ever retire them. The log names this reason, not
+        /// a schema change that did not happen.
+        ///
+        /// Windows only: the probe is inapplicable elsewhere, where a backslash is just a
+        /// character in a file name (see `a_backslash_key_is_reset_at_most_once_on_any_host`).
+        #[cfg(windows)]
+        #[test]
+        fn a_backslash_spelled_key_resets_the_store_on_the_next_open() {
+            for (root_id, key_path) in
+                [(r"cfe\one", "Module.bsl"), ("cfe/one", r"Common\Module.bsl")]
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("search.db");
+                paid_store(&path);
+                Connection::open(&path)
+                    .unwrap()
+                    .execute("UPDATE files SET root_id = ?1, path = ?2", params![root_id, key_path])
+                    .unwrap();
+
+                let lines = visible_at_default_logging(|| {
+                    let store = Store::open(&path).unwrap();
+                    assert_eq!(store.file_count().unwrap(), 0, "{root_id:?} {key_path:?} was kept");
+                    assert_eq!(store.file_hash(root_id, key_path).unwrap(), None);
+                    assert_eq!(
+                        Store::stored_schema_version(&store.conn).unwrap(),
+                        Some(SCHEMA_VERSION)
+                    );
+                });
+                let fired = resets(&lines);
+                assert_eq!(fired.len(), 1, "expected one reset message in {lines:#?}");
+                assert!(fired[0].contains("key_spelling"), "{}", fired[0]);
+                assert!(!fired[0].contains("schema changed"), "{}", fired[0]);
+
+                let again = visible_at_default_logging(|| {
+                    Store::open(&path).unwrap();
+                });
+                assert!(resets(&again).is_empty(), "the rebuilt store reset again");
+            }
+        }
+
+        /// Idempotence, the property a probe that fires on a surviving row would break: a store
+        /// is reset by a backslash key at most once, and every open after the first leaves it
+        /// alone. On Windows the first open resets (and the rebuilt store is clean); elsewhere
+        /// the backslash is an ordinary file-name character and the row is never touched.
+        #[test]
+        fn a_backslash_key_is_reset_at_most_once_on_any_host() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("search.db");
+            paid_store(&path);
+            Connection::open(&path)
+                .unwrap()
+                .execute("UPDATE files SET root_id = ?1", params![r"cfe\one"])
+                .unwrap();
+
+            let first = visible_at_default_logging(|| {
+                let store = Store::open(&path).unwrap();
+                let kept = if cfg!(windows) { 0 } else { 1 };
+                assert_eq!(store.file_count().unwrap(), kept);
+            });
+            assert_eq!(resets(&first).len(), usize::from(cfg!(windows)), "{first:#?}");
+
+            for reopen in 0..3 {
+                let again = visible_at_default_logging(|| {
+                    Store::open(&path).unwrap();
+                });
+                assert!(resets(&again).is_empty(), "reopen {reopen} reset again: {again:#?}");
+            }
+        }
+
+        /// The control: a current store whose keys are all `/`-spelled is left alone. Without it
+        /// a probe that resets unconditionally would pass the test above.
+        #[test]
+        fn slash_spelled_keys_at_the_current_version_are_not_reset() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("search.db");
+            {
+                let mut store = Store::open(&path).unwrap();
+                store
+                    .reindex_file_with_identity(
+                        "cfe/one",
+                        "CommonModules/М/Ext/Module.bsl",
+                        b"hash",
+                        &[sample_chunk("Method")],
+                        Some(&[VECTOR.to_vec()]),
+                        None,
+                        MODEL,
+                        3,
+                    )
+                    .unwrap();
+            }
+
+            let lines = visible_at_default_logging(|| {
+                let store = Store::open(&path).unwrap();
+                assert_eq!(store.file_count().unwrap(), 1, "the file was dropped");
+                assert_eq!(
+                    store.file_hash("cfe/one", "CommonModules/М/Ext/Module.bsl").unwrap(),
+                    Some(b"hash".to_vec()),
+                    "the file hash did not survive"
+                );
+            });
+            assert!(resets(&lines).is_empty(), "a /-spelled store was reset: {lines:#?}");
+        }
+
+        /// The preserving migration stamps the current schema inside its own transaction, so
+        /// the structural check that follows finds nothing to wipe: the vectors written
+        /// before root ids existed come through as bytes, and nothing reports a reset.
+        #[test]
+        fn a_root_migration_keeps_the_stored_vectors_and_reports_no_reset() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("search.db");
+            write_pre_root_id_store(&path);
+
+            let lines = visible_at_default_logging(|| {
+                Store::open(&path).unwrap();
+            });
+
+            assert!(resets(&lines).is_empty(), "the migration was reported as a reset: {lines:#?}");
+            let raw = Connection::open(&path).unwrap();
+            let vectors: Vec<(i64, Vec<u8>)> = raw
+                .prepare("SELECT id, embedding FROM chunks ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(vectors, vec![(21, vec![0xca, 0xfe]), (23, vec![0xbe, 0xef])]);
+            assert_eq!(Store::stored_schema_version(&raw).unwrap(), Some(SCHEMA_VERSION));
+        }
+
+        /// A reset that dies after dropping its tables, before it commits, leaves the store as
+        /// the earlier version wrote it: still stamped with that version and still holding its
+        /// rows and vectors, so no later open takes an emptied store for a finished one.
+        #[test]
+        fn a_reset_that_fails_midway_leaves_the_previous_store_as_it_was() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("search.db");
+            paid_store(&path);
+            let found = SCHEMA_VERSION - 1;
+            stamp_schema(&path, found);
+            // The last step of a reset removes the vector sidecar beside the database; one that
+            // is a directory cannot be removed, which fails the reset inside its transaction.
+            let sidecar = dir.path().join("search.db.usearch.json");
+            std::fs::create_dir(&sidecar).unwrap();
+            std::fs::write(sidecar.join("held"), b"x").unwrap();
+
+            assert!(Store::open(&path).is_err(), "the reset went through over a held sidecar");
+
+            let raw = Connection::open(&path).unwrap();
+            let stamped: String = raw
+                .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(stamped, found.to_string(), "the failed reset changed the version");
+            let rows: (i64, i64, i64) = raw
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM files), (SELECT COUNT(*) FROM chunks),
+                            (SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(rows, (1, 1, 1), "the failed reset kept part of its wipe");
+            drop(raw);
+
+            std::fs::remove_dir_all(&sidecar).unwrap();
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.file_count().unwrap(), 0, "the retried reset did not finish");
+            assert_eq!(Store::stored_schema_version(&store.conn).unwrap(), Some(SCHEMA_VERSION));
+        }
+
+        #[test]
+        fn reuse_lookup_rejects_every_payload_drift_and_takes_the_exact_payload() {
+            use crate::IndexedDocument;
+
+            let chunk = sample_chunk("Method");
+            let paid = IndexedDocument {
+                collection: "code".to_owned(),
+                root_id: CONFIGURATION_ROOT_ID.to_owned(),
+                path: "Module.bsl".to_owned(),
+                symbol_name: chunk.name.clone(),
+                kind: "procedure".to_owned(),
+                line_start: chunk.line_start,
+                line_end: chunk.line_end,
+                text: chunk.text.clone(),
+                content_hash: "fixture".to_owned(),
+                graph_context: None,
+                source_span: None,
+            };
+            let mut store = Store::in_memory().unwrap();
+            store
+                .reindex_file_with_identity(
+                    CONFIGURATION_ROOT_ID,
+                    "Module.bsl",
+                    b"old",
+                    std::slice::from_ref(&chunk),
+                    Some(&[VECTOR.to_vec()]),
+                    None,
+                    MODEL,
+                    3,
+                )
+                .unwrap();
+            let reusable = |document: &IndexedDocument| {
+                store
+                    .reusable_embeddings_for_documents(
+                        CONFIGURATION_ROOT_ID,
+                        "Module.bsl",
+                        "code",
+                        std::slice::from_ref(document),
+                        MODEL,
+                        3,
+                        None,
+                    )
+                    .unwrap()[0]
+                    .is_some()
+            };
+
+            assert!(reusable(&paid), "the payload it was paid for is reusable");
+            type Drift = fn(&mut IndexedDocument);
+            let drifts: [(&str, Drift); 4] = [
+                ("text", |d| d.text.push_str("\n// edited")),
+                ("graph_context", |d| d.graph_context = Some("Calls: Иная\n".to_owned())),
+                ("kind", |d| d.kind = "function".to_owned()),
+                ("symbol_name", |d| d.symbol_name.push('2')),
+            ];
+            for (field, drift) in drifts {
+                let mut document = paid.clone();
+                drift(&mut document);
+                assert!(!reusable(&document), "a vector paid for another {field} was reused");
+            }
         }
     }
 }

@@ -45,7 +45,9 @@ pub(crate) const DISK_RECOVERY_REQUIRED: &str =
     "workspace filesystem transaction requires recovery";
 
 pub(crate) use lifecycle::{lock_recover, DiagnosticsState};
-pub(crate) use resident::{diagnostic_survives_authors, DiagnosticsResident};
+pub(crate) use resident::{
+    computation_config, deferred_scope, diagnostic_survives_authors, DiagnosticsResident,
+};
 pub(crate) use session::{resident_call, CallOutcome, ResidentSession};
 pub(crate) use snapshot::ResidentModuleSnapshotSource;
 #[allow(

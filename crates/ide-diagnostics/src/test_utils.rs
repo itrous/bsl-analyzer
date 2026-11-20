@@ -612,6 +612,24 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         hir::kernel_type_includes_undefined(&self.db, id)
     }
 
+    fn kernel_type_is_structure(&self, id: hir::TypeId) -> bool {
+        hir::kernel_type_is_structure(&self.db, id)
+    }
+
+    fn kernel_type_is_fixed_structure(&self, id: hir::TypeId) -> bool {
+        hir::kernel_type_is_fixed_structure(&self.db, id)
+    }
+    fn kernel_type_is_form_data_structure(&self, id: hir::TypeId) -> bool {
+        hir::kernel_type_is_form_data_structure(&self.db, id)
+    }
+    fn kernel_type_is_boolean(&self, id: hir::TypeId) -> bool {
+        hir::kernel_type_is_boolean(&self.db, id)
+    }
+
+    fn kernel_type_is_metadata_reference(&self, id: hir::TypeId) -> bool {
+        hir::kernel_type_is_metadata_reference(&self.db, id)
+    }
+
     fn parse(&self, file_id: vfs::FileId) -> syntax::Parse<syntax::SyntaxNode> {
         use ide_db::base_db::RootQueryDb;
         self.db.parse(file_id)
@@ -741,6 +759,15 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         hir::infer_owner(&self.db, file_id, owner)
     }
 
+    fn value_origin(
+        &self,
+        file_id: vfs::FileId,
+        owner: hir::DefWithBodyId,
+        expr: hir::ExprId,
+    ) -> hir::ValueOrigin {
+        hir::value_origin_of(&self.db, file_id, owner, expr)
+    }
+
     fn executed_query_texts(
         &self,
         method_id: hir::MethodId,
@@ -786,8 +813,8 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
     }
 
     fn method_cfg(&self, method_id: hir::MethodId) -> std::sync::Arc<hir::cfg::ControlFlowGraph> {
-        use ide_db::RootDatabase;
-        self.db.method_cfg(method_id)
+        use hir::HirDatabase;
+        self.db.method_cfg(hir::MethodIdInput::new(&self.db, method_id))
     }
 
     fn method_path_terminates(

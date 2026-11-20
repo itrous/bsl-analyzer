@@ -137,6 +137,24 @@ for block in blocks("list_tests"):
     assert list_tests("list_tests absent --workspace --lib") != 0
     assert list_tests("list_tests fixture --workspace --lib", "echo 'error: build failed'; return 101") == 101
 
+# Where a test executable sits is the toolchain's business: under `deps` on one, under
+# `build/<package>/<hash>/out` on another. Both listings name their binary the same way,
+# and a gate that reads only one of the two layouts names no test at all.
+out_layout_stub = (
+    'case " $* " in *" --list "*) ;; *) return 99 ;; esac; '
+    "echo '     Running unittests src/lib.rs (target/debug/build/fixture-pkg/0123abcd/out/fixture-0123abcd)'; "
+    "echo 'fixture::muted: test'; "
+    'case " $* " in *" --ignored "*) return 0 ;; esac; '
+    "echo 'fixture::kept: test'"
+)
+for block in blocks("list_tests"):
+    assert call(block, out_layout_stub,
+                "list_tests --exact fixture --workspace --lib -- fixture::kept").returncode == 0
+    assert call(block, out_layout_stub,
+                "list_tests --exact fixture --workspace --lib -- fixture::muted").returncode == 0
+    assert call(block, out_layout_stub,
+                "list_tests --exact fixture --workspace --lib -- fixture::gone").returncode != 0
+
 shared_step = re.findall(
     r"^      - name: Shared LSP and MCP owner and editor lifecycle\n.*?(?=^      - |^  \S|\Z)",
     text,

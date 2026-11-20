@@ -19,6 +19,7 @@ code-chunk.workspace = true
 project-model.workspace = true
 rayon.workspace = true
 stdx.workspace = true
+build-info.workspace = true
 syntax.workspace = true
 
 rusqlite = { workspace = true, features = ["functions"] }

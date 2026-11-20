@@ -370,6 +370,50 @@ class FeaturesAgainstThePreviousRelease(CriteriaCase):
                 self.assertIn("block: hwm_kb", summary["reasons"])
 
 
+class MemoryOfTheOwner(CriteriaCase):
+    """The owner's criterion of memory: the target holds the peak of series A with
+    its noise, the peak of series B answers to the absolute ceiling alone, and the
+    peak of both together is compared with nothing."""
+
+    NOISE = 0.02
+    CEILING = 7340032
+
+    def setUp(self):
+        super().setUp()
+        self.memory_record(self.NOISE)
+
+    def peaks(self, a, b):
+        self.peak(lambda run: b if run.series == "B" else (a if run.role == "c" else 4600000))
+
+    def test_a_peak_of_a_over_the_target_with_its_noise_blocks_by_the_record(self):
+        # 4 667 316 · 1.02 = 4 760 662.32; B at 7 000 000 is over the target in both cases.
+        for peak_a, expected in ((4760662, (0, "pass")), (4760663, (1, "block"))):
+            with self.subTest(peak_a=peak_a):
+                self.peaks(peak_a, 7000000)
+                code, summary, _ = self.gate(label=f"a-{peak_a}")
+                row = self.record_row(summary, "hwm_kb")
+                self.assertEqual((row["candidate"]["value"], row["noise"], row["limit_basis"]),
+                                 (float(peak_a), self.NOISE, "noise"))
+                self.assertEqual((code, summary["verdict"]), expected)
+                self.assertEqual("block: record:hwm_kb" in summary["reasons"], expected[1] == "block")
+                self.assertEqual(self.row(summary, "hwm_kb")["outcome"], "ok")
+
+    def test_a_peak_of_b_between_the_target_and_the_ceiling_passes(self):
+        self.peaks(4650000, self.CEILING)
+        code, summary, _ = self.gate(label="b-at-ceiling")
+        self.assertEqual((code, summary["verdict"], summary["reasons"]), (0, "pass", []))
+        self.assertEqual(self.record_row(summary, "hwm_kb")["candidate"]["value"], 4650000.0)
+        self.assertEqual(self.row(summary, "hwm_kb")["candidate"]["value"], float(self.CEILING))
+
+    def test_a_peak_of_b_over_the_ceiling_blocks_by_the_ceiling_and_not_by_the_record(self):
+        self.peaks(4650000, self.CEILING + 1)
+        code, summary, _ = self.gate(label="b-over-ceiling")
+        self.assertEqual((code, summary["verdict"]), (1, "block"))
+        self.assertIn("block: hwm_kb", summary["reasons"])
+        self.assertNotIn("block: record:hwm_kb", summary["reasons"])
+        self.assertEqual(self.record_row(summary, "hwm_kb")["outcome"], "ok")
+
+
 class ReadmeOfTheCriteria(unittest.TestCase):
     """The document the owner reads tells the rules of the code."""
 

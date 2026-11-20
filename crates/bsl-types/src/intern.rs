@@ -82,8 +82,11 @@ pub fn canonicalise(db: &dyn TypeKernelDb, kind: TypeKind) -> TypeKind {
 
         TypeKind::Union(members) => canonicalise_union(db, members),
 
-        TypeKind::PlatformObject(PlatformObjectFacet { name }) => {
-            TypeKind::PlatformObject(PlatformObjectFacet { name: canonical_platform_name(name) })
+        TypeKind::PlatformObject(PlatformObjectFacet { name, described }) => {
+            TypeKind::PlatformObject(PlatformObjectFacet {
+                name: canonical_platform_name(name),
+                described,
+            })
         }
 
         other => other,
@@ -207,6 +210,8 @@ fn canonicalise_union(db: &dyn TypeKernelDb, members: Arc<[TypeId]>) -> TypeKind
         flat.retain(|&m| !matches!(db.lookup_type(m), TypeKind::Unknown));
     }
 
+    join_divergent_descriptions(db, &mut flat);
+
     // Order members by a deterministic structural key, NOT the raw `TypeId`
     // (whose value follows interning order, which is scheduler-dependent under
     // parallel analysis). This keeps a union's canonical member order — and thus
@@ -224,6 +229,33 @@ fn canonicalise_union(db: &dyn TypeKernelDb, members: Arc<[TypeId]>) -> TypeKind
     }
 
     TypeKind::Union(flat.into())
+}
+
+/// Members that are one platform object and differ in the configuration object they
+/// remember become that bare platform object: the union holds one value type, and
+/// which object a given path describes is no longer known.
+fn join_divergent_descriptions(db: &dyn TypeKernelDb, flat: &mut [TypeId]) {
+    use crate::builders::Builders as _;
+
+    let platform_names: Vec<Option<&str>> = flat
+        .iter()
+        .map(|&id| match db.lookup_type(id) {
+            TypeKind::PlatformObject(PlatformObjectFacet { name, .. }) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    for i in 0..flat.len() {
+        let Some(name) = platform_names[i] else {
+            continue;
+        };
+        let diverges = flat
+            .iter()
+            .zip(&platform_names)
+            .any(|(&other, &other_name)| other != flat[i] && other_name == Some(name));
+        if diverges {
+            flat[i] = db.forget_described(flat[i]);
+        }
+    }
 }
 
 /// Deterministic structural ordering key for union members, independent of
@@ -260,6 +292,8 @@ fn write_type_order_key(db: &dyn TypeKernelDb, id: TypeId, depth: u8, out: &mut 
             opt(db, f.key, out);
             out.push(',');
             opt(db, f.value, out);
+            out.push(',');
+            write_projection_order_key(db, &f.entries, d, out);
             out.push('>');
         }
         TypeKind::ValueList(el) => {
@@ -502,5 +536,113 @@ mod tests {
             db.platform_object("ЭлементыФормы".to_string()),
             db.platform_object("элементыформы".to_string())
         );
+    }
+
+    // ---- keyed maps -----------------------------------------------------------------------
+
+    fn keyed(db: &InMemoryDb, key: &str, ty: crate::kind::TypeId) -> crate::kind::TypeId {
+        use crate::kind::{Projection, ProjectionField, ProjectionFieldSource, ProjectionOrigin};
+        let field = ProjectionField::new(key.to_string(), ty, ProjectionFieldSource::DocComment);
+        db.map_keyed(std::sync::Arc::new(Projection::new(
+            vec![field].into(),
+            ProjectionOrigin::DocComment,
+            None,
+        )))
+    }
+
+    fn first_key(db: &InMemoryDb, ty: crate::kind::TypeId) -> String {
+        let TypeKind::Map(facet) = db.lookup_type(ty).clone() else { panic!("a map expected") };
+        facet.entries.expect("entries").fields[0].name.to_string()
+    }
+
+    #[test]
+    fn maps_with_different_entries_are_different_types_and_equal_entries_intern_once() {
+        let db = InMemoryDb::new();
+        let number = db.number(None, None);
+        let string = db.string(None, false);
+
+        let a = keyed(&db, "сумма", number);
+        assert_eq!(a, keyed(&db, "сумма", number), "equal entries intern to one id");
+        assert_ne!(a, keyed(&db, "итог", number), "another key");
+        assert_ne!(a, keyed(&db, "сумма", string), "another value type");
+        assert_ne!(a, db.map(None, None), "a keyed map is not the plain map");
+        let TypeKind::Map(facet) = db.lookup_type(a).clone() else { panic!("a map expected") };
+        assert!(facet.key.is_none() && facet.value.is_none() && facet.entries.is_some());
+    }
+
+    #[test]
+    fn the_plain_map_builder_still_builds_a_map_without_entries() {
+        let db = InMemoryDb::new();
+        let TypeKind::Map(facet) = db.lookup_type(db.map(None, None)).clone() else {
+            panic!("a map expected")
+        };
+        assert!(facet.entries.is_none());
+    }
+
+    #[test]
+    fn a_union_of_keyed_maps_has_one_order_whatever_order_the_members_are_given_in() {
+        // The order key is structural. If the entries were left out of it, two keyed maps would
+        // tie and the union would keep the order its members were handed in, so the same two
+        // members given in opposite orders would build two different unions.
+        let members_in_union = |db: &InMemoryDb, given: [crate::kind::TypeId; 2]| -> Vec<String> {
+            let TypeKind::Union(members) = db.lookup_type(db.union(given.to_vec())).clone() else {
+                panic!("a union expected");
+            };
+            members.iter().map(|member| first_key(db, *member)).collect()
+        };
+        for created_a_first in [true, false] {
+            let db = InMemoryDb::new();
+            let (a, b) = if created_a_first {
+                let a = keyed(&db, "а", db.number(None, None));
+                let b = keyed(&db, "б", db.string(None, false));
+                (a, b)
+            } else {
+                let b = keyed(&db, "б", db.string(None, false));
+                let a = keyed(&db, "а", db.number(None, None));
+                (a, b)
+            };
+            let forward = members_in_union(&db, [a, b]);
+            let backward = members_in_union(&db, [b, a]);
+            assert_eq!(forward, backward, "created `а` first: {created_a_first}");
+            assert_eq!(forward.len(), 2);
+            assert_eq!(db.union(vec![a, b]), db.union(vec![b, a]));
+        }
+    }
+
+    #[test]
+    fn descriptions_of_different_objects_join_into_the_one_platform_description() {
+        // Before descriptions remembered their object, every catalog description was one
+        // type; a union of them must still be that one type, not a pair of equal labels.
+        use crate::facet::{DescribedObject, DescribedPart};
+        use bsl_metadata::MdoType;
+
+        let db = InMemoryDb::new();
+        let name = "ОбъектМетаданных: Справочник".to_string();
+        let bare = db.platform_object(name.clone());
+        let described = |object: &str| {
+            db.described_platform_object(
+                name.clone(),
+                DescribedObject::new(
+                    MdoType::Catalog,
+                    object.to_string(),
+                    DescribedPart::Description,
+                ),
+            )
+        };
+        let goods = described("Товары");
+        let partners = described("Контрагенты");
+
+        assert_eq!(db.union(vec![goods, partners]), bare);
+        assert_eq!(db.union(vec![goods, bare]), bare);
+        assert_eq!(db.union(vec![goods, goods]), goods, "one object keeps what it remembers");
+
+        let number = db.number(None, None);
+        let TypeKind::Union(members) =
+            db.lookup_type(db.union(vec![goods, number, partners])).clone()
+        else {
+            panic!("a union expected");
+        };
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&bare) && members.contains(&number), "{members:?}");
     }
 }
