@@ -223,6 +223,9 @@ mod tests {
             type_member("РежимРедактированияКолонки", "Непосредственно", true),
             Some(v("8.0"))
         );
+        // The control: the value that really is new keeps its own date, so correcting
+        // the type does not swallow a genuine finding.
+        assert_eq!(type_member("РежимРедактированияКолонки", "Авто", true), Some(v("8.5.1")));
     }
 
     #[test]
