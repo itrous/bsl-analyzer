@@ -109,6 +109,18 @@ pub trait AnalysisProvider {
         merged.map(Arc::new)
     }
 
+    /// Whether a bare name at this position denotes a common module rather than
+    /// a nearer symbol. A provider without positional resolution proves nothing.
+    fn common_module_receiver_at(
+        &self,
+        _file_id: FileId,
+        _owner: DefWithBodyId,
+        _offset: syntax::TextSize,
+        _name: &hir::Name,
+    ) -> Option<hir::CommonModuleRead> {
+        None
+    }
+
     /// The event subscription `name` visible to `file_id`. The default scans the
     /// provider's visible configurations; the salsa-backed provider overrides it
     /// with the per-event-subscription accessor.

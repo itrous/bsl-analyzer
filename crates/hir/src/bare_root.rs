@@ -38,14 +38,52 @@ pub fn claim_at<DB: HirDatabase>(
     name: &Name,
     read_offset: TextSize,
 ) -> (Option<BareGlobalClaim>, DefWithBodyId) {
-    let module_id = ModuleId::new(file_id);
     let item_tree = db.item_tree(file_id);
+    let owner = method_item_at(&item_tree, offset)
+        .map(|method| DefWithBodyId::Method(method.key()))
+        .unwrap_or(DefWithBodyId::ModuleCode);
+    with_scope(db, file_id, owner, read_offset, |resolver, scope| {
+        let body_env = hir_ty::owner_body_env(db, file_id, owner);
+        (bare_global_name_claim(db, resolver, scope, name, body_env), owner)
+    })
+}
+
+/// Whether the bare name at this position belongs to a common module rather than
+/// a nearer local, parameter, module declaration or implicit member.
+pub fn common_module_at(
+    db: &dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    offset: TextSize,
+    name: &Name,
+) -> Option<crate::CommonModuleRead> {
+    with_scope(db, file_id, owner, offset, |resolver, scope| {
+        let scope = scope?;
+        let body_env = hir_ty::owner_body_env(db, file_id, owner);
+        let has_form_context = hir_ty::owner_has_form_context(db, file_id, owner);
+        Some(hir_ty::platform_global_lookup::bare_name_common_module_read(
+            db,
+            resolver,
+            scope,
+            name,
+            body_env,
+            has_form_context,
+        ))
+    })
+}
+
+fn with_scope<R>(
+    db: &dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    read_offset: TextSize,
+    f: impl FnOnce(&Resolver, Option<&BodyShadowScope<'_>>) -> R,
+) -> R {
+    let module_id = ModuleId::new(file_id);
     let module_bodies = db.module_bodies_ref(module_id);
-    let (owner, lower_result) = match method_item_at(&item_tree, offset) {
-        Some(method) => {
-            (DefWithBodyId::Method(method.key()), module_bodies.lower_result(method.key()))
-        }
-        None => (DefWithBodyId::ModuleCode, module_bodies.module_code_result()),
+    let lower_result = match owner {
+        DefWithBodyId::Method(key) => module_bodies.lower_result(key),
+        DefWithBodyId::ModuleCode => module_bodies.module_code_result(),
     };
     let scope = lower_result.map(|r| BodyShadowScope {
         body: r.body(),
@@ -53,8 +91,7 @@ pub fn claim_at<DB: HirDatabase>(
         read_offset,
     });
     let resolver = Resolver::with_builtins_and_workspace(module_id);
-    let body_env = hir_ty::owner_body_env(db, file_id, owner);
-    (bare_global_name_claim(db, &resolver, scope.as_ref(), name, body_env), owner)
+    f(&resolver, scope.as_ref())
 }
 
 /// Same, keyed off a receiver node: the read position is the node's own start.

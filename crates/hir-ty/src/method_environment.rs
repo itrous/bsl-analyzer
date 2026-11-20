@@ -41,6 +41,25 @@ pub(crate) fn possible_method_env(
     Some(environment & (decl.preproc_env | decl.preproc_undecided))
 }
 
+/// Whether a body can access the implicit context of its form.
+pub fn owner_has_form_context(
+    db: &dyn HirDatabase,
+    file_id: vfs::FileId,
+    owner: hir_def::DefWithBodyId,
+) -> bool {
+    let hir_def::DefWithBodyId::Method(local_id) = owner else { return true };
+    let module = hir_def::ModuleId::new(file_id);
+    !db.interface_method(MethodId { module, local_id }).is_some_and(|method| {
+        method.directives.iter().any(|directive| {
+            matches!(
+                directive,
+                hir_def::item_tree::AnnotationKind::AtServerNoContext
+                    | hir_def::item_tree::AnnotationKind::AtClientAtServerNoContext
+            )
+        })
+    })
+}
+
 /// [`effective_method_env`] or the module-code environment, by body owner —
 /// the one answer position-based IDE queries share with inference.
 pub fn owner_body_env(

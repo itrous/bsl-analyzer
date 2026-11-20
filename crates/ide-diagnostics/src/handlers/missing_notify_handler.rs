@@ -1,7 +1,15 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
-use hir::{ModuleId, Name, NotifyTarget};
+use hir::{call_graph::CallerId, CommonModuleRead, DefWithBodyId, ModuleId, Name, NotifyTarget};
+use rustc_hash::FxHashMap;
+use syntax::TextSize;
+
+#[derive(Default)]
+struct ModuleCache {
+    receivers: FxHashMap<(DefWithBodyId, Name), (TextSize, CommonModuleRead)>,
+    handlers: FxHashMap<(Name, Name), Option<Verdict>>,
+}
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: crate::metadata::DiagnosticType::Error,
@@ -40,6 +48,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     }
 
     let mut diagnostics = Vec::new();
+    let mut module_cache = ModuleCache::default();
     for reg in &summary.notify_regs {
         if reg.callback_name.as_str().is_empty() {
             continue;
@@ -49,9 +58,19 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 local_verdict(ctx, &reg.callback_name).map(|v| (v, reg.callback_name.to_string()))
             }
             NotifyTarget::Module(module_name) => {
-                module_verdict(ctx, module_name, &reg.callback_name).map(|v| {
-                    (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
-                })
+                let owner = match reg.caller {
+                    CallerId::Method(key) => DefWithBodyId::Method(key),
+                    CallerId::ModuleCode => DefWithBodyId::ModuleCode,
+                };
+                module_verdict(
+                    ctx,
+                    module_name,
+                    &reg.callback_name,
+                    owner,
+                    reg.range.start(),
+                    &mut module_cache,
+                )
+                .map(|v| (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str())))
             }
             NotifyTarget::Unsupported => None,
         };
@@ -103,9 +122,40 @@ fn local_verdict(ctx: &DiagnosticsContext, name: &Name) -> Option<Verdict> {
 /// Handler named on a bare identifier. Only a receiver that is a known common module is
 /// judged: any other identifier (a local variable, a module the analysis cannot see) says
 /// nothing about where the handler lives, and neither does a body that could not be read.
-fn module_verdict(ctx: &DiagnosticsContext, module_name: &Name, name: &Name) -> Option<Verdict> {
-    ctx.resolve_common_module(module_name.as_str())?;
+fn module_verdict(
+    ctx: &DiagnosticsContext,
+    module_name: &Name,
+    name: &Name,
+    owner: DefWithBodyId,
+    offset: TextSize,
+    cache: &mut ModuleCache,
+) -> Option<Verdict> {
+    let verdict = *cache
+        .handlers
+        .entry((module_name.clone(), name.clone()))
+        .or_insert_with(|| module_body_verdict(ctx, module_name, name));
+    let verdict = verdict?;
+    let key = (owner, module_name.clone());
+    let cached = cache.receivers.get(&key).copied().filter(|(start, read)| {
+        *start <= offset && read.valid_before.is_none_or(|end| offset < end)
+    });
+    let read = match cached {
+        Some((_, read)) => read,
+        None => {
+            let read = ctx.common_module_receiver_at(owner, offset, module_name)?;
+            cache.receivers.insert(key, (offset, read));
+            read
+        }
+    };
+    read.is_common_module.then_some(verdict)
+}
 
+fn module_body_verdict(
+    ctx: &DiagnosticsContext,
+    module_name: &Name,
+    name: &Name,
+) -> Option<Verdict> {
+    ctx.resolve_common_module(module_name.as_str())?;
     let bodies = ctx.common_module_bodies(module_name.as_str());
     if bodies.is_empty() || bodies.has_missing_expected_body() {
         return None;
@@ -284,6 +334,79 @@ mod tests {
         );
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert!(diagnostics[0].message.starts_with("Добавьте \"Экспорт\""), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_parameter_named_like_a_common_module_is_not_that_module() {
+        let source = "Процедура Тест(МойМодульКлиент)\n\tОповещение = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\nКонецПроцедуры\n";
+        let diagnostics = with_module(source, "Процедура Другая() Экспорт\nКонецПроцедуры\n");
+        assert!(diagnostics.is_empty(), "the parameter is the receiver: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn local_bindings_named_like_a_common_module_are_not_that_module() {
+        let sources = [
+            "Процедура Тест()\n    Перем МойМодульКлиент;\n    О = Новый ОписаниеОповещения(\"Готово\", моймодульклиент);\nКонецПроцедуры\n",
+            "Процедура Тест()\n    МойМодульКлиент = Новый Структура;\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\nКонецПроцедуры\n",
+            "Процедура Тест()\n    Для Каждого МойМодульКлиент Из Массив Цикл\n        О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n    КонецЦикла;\nКонецПроцедуры\n",
+            "Перем МойМодульКлиент;\nПроцедура Тест()\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\nКонецПроцедуры\n",
+        ];
+        for source in sources {
+            let diagnostics = with_module(source, "Процедура Другая() Экспорт\nКонецПроцедуры\n");
+            assert!(diagnostics.is_empty(), "a nearer binding owns the receiver: {diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn a_parameter_in_another_method_does_not_shadow_the_common_module() {
+        let source = "Процедура Другая(МойМодульКлиент)\nКонецПроцедуры\nПроцедура Тест()\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\nКонецПроцедуры\n";
+        let diagnostics = with_module(source, "Процедура Другая() Экспорт\nКонецПроцедуры\n");
+        assert_eq!(diagnostics.len(), 1, "the common module remains visible: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn registrations_for_different_handlers_keep_their_own_verdicts() {
+        let source = "Процедура Тест()\n    А = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n    Б = Новый ОписаниеОповещения(\"Нет\", МойМодульКлиент);\n    В = Новый ОписаниеОповещения(\"БезЭкспорта\", МойМодульКлиент);\nКонецПроцедуры\n";
+        let module =
+            "Процедура Готово() Экспорт\nКонецПроцедуры\nПроцедура БезЭкспорта()\nКонецПроцедуры\n";
+        let diagnostics = with_module(source, module);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        assert!(diagnostics.iter().any(|d| d.message.starts_with("Создайте")));
+        assert!(diagnostics.iter().any(|d| d.message.starts_with("Добавьте")));
+    }
+
+    #[test]
+    fn a_local_assignment_between_registrations_changes_the_receiver() {
+        let source = "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n    МойМодульКлиент = Новый Структура;\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\nКонецПроцедуры\n";
+        let diagnostics = with_module(source, "Процедура Другая() Экспорт\nКонецПроцедуры\n");
+        assert_eq!(diagnostics.len(), 1, "only the first receiver is the module: {diagnostics:#?}");
+        assert!(
+            usize::from(diagnostics[0].range.start()) < source.find("МойМодульКлиент =").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_form_attribute_shadows_the_module_only_in_context() {
+        let module_xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+<CommonModule uuid="00000000-0000-0000-0000-000000000101"><Properties>
+<Name>Модуль</Name><Server>true</Server></Properties></CommonModule></MetaDataObject>"#;
+        let form_xml = r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
+<Attributes><Attribute name="Модуль" id="2"><Type><v8:Type>xs:decimal</v8:Type></Type></Attribute></Attributes></Form>"#;
+        let count = |directive: &str| {
+            let source = format!(
+                "{directive}\nПроцедура Тест()\n    О = Новый ОписаниеОповещения(\"Готово\", Модуль);\nКонецПроцедуры\n"
+            );
+            crate::test_utils::check_form_with_common_modules_and_form_xml(
+                &source,
+                &[("Модуль", "Процедура Другая() Экспорт\nКонецПроцедуры\n", module_xml)],
+                form_xml,
+            )
+            .into_iter()
+            .filter(|d| d.code == DiagnosticCode::MissingNotifyHandler)
+            .count()
+        };
+        assert_eq!(count("&НаСервере"), 0);
+        assert_eq!(count("&НаСервереБезКонтекста"), 1);
     }
 
     #[test]

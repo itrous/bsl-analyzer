@@ -158,6 +158,16 @@ impl AnalysisProvider for SalsaProvider<'_> {
         self.db.resolve_common_module(file_id, name)
     }
 
+    fn common_module_receiver_at(
+        &self,
+        file_id: FileId,
+        owner: DefWithBodyId,
+        offset: syntax::TextSize,
+        name: &Name,
+    ) -> Option<hir::CommonModuleRead> {
+        hir::bare_root::common_module_at(self.db, file_id, owner, offset, name)
+    }
+
     fn resolve_event_subscription(
         &self,
         file_id: FileId,

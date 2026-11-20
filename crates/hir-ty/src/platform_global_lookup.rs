@@ -154,6 +154,59 @@ pub fn bare_global_name_claim(
     name: &Name,
     body_env: EnvFlags,
 ) -> Option<BareGlobalClaim> {
+    bare_global_name_claim_with_owner(db, resolver, scope, name, body_env, true)
+        .map(|(claim, _, _)| claim)
+}
+
+/// The ownership of a bare common-module name, valid from the requested read
+/// until the next assignment to that name, if any.
+#[derive(Debug, Clone, Copy)]
+pub struct CommonModuleRead {
+    /// Whether the read is owned by the visible common module.
+    pub is_common_module: bool,
+    /// Exclusive upper bound for reusing this answer in the same body.
+    pub valid_before: Option<TextSize>,
+}
+
+/// Whether a bare value read belongs to the visible common module rather than a
+/// nearer binding or member with the same name.
+pub fn bare_name_common_module_read(
+    db: &dyn HirDatabase,
+    resolver: &Resolver,
+    scope: &BodyShadowScope<'_>,
+    name: &Name,
+    body_env: EnvFlags,
+    has_form_context: bool,
+) -> CommonModuleRead {
+    match bare_global_name_claim_with_owner(
+        db,
+        resolver,
+        Some(scope),
+        name,
+        body_env,
+        has_form_context,
+    ) {
+        Some((_, BareNameOwner::CommonModule, valid_before)) => {
+            CommonModuleRead { is_common_module: true, valid_before }
+        }
+        _ => CommonModuleRead { is_common_module: false, valid_before: None },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BareNameOwner {
+    Nearer,
+    CommonModule,
+}
+
+fn bare_global_name_claim_with_owner(
+    db: &dyn HirDatabase,
+    resolver: &Resolver,
+    scope: Option<&BodyShadowScope<'_>>,
+    name: &Name,
+    body_env: EnvFlags,
+    has_form_context: bool,
+) -> Option<(BareGlobalClaim, BareNameOwner, Option<TextSize>)> {
     // Data members own a write: assigning over a module variable or a form /
     // object member stores into that member — a value inference deliberately
     // does not flow-type, so no reaching write is reported for it. Resolution
@@ -164,8 +217,9 @@ pub fn bare_global_name_claim(
         Some(Resolution::Variable(_)) => true,
         Some(Resolution::Method(_)) => false,
         _ => {
-            crate::form_self::resolve_form_self_property(db, resolver, name).is_some()
-                || crate::form_attr::resolve_form_attribute(db, resolver, name).is_some()
+            (has_form_context
+                && (crate::form_self::resolve_form_self_property(db, resolver, name).is_some()
+                    || crate::form_attr::resolve_form_attribute(db, resolver, name).is_some()))
                 || crate::this_object_attr::resolve_this_object_member(db, resolver, name).is_some()
                 || crate::this_object_attr::resolve_this_record_set_member(db, resolver, name)
                     .is_some()
@@ -174,19 +228,28 @@ pub fn bare_global_name_claim(
     // Methods and common modules shadow a read but cannot be assigned to —
     // an assignment over them creates an implicit body local instead.
     let read_only_claim = || {
-        matches!(resolver.resolve_name(db, name), Some(Resolution::Method(_)))
-            || resolver.user_common_module_exists(db, name)
+        if matches!(resolver.resolve_name(db, name), Some(Resolution::Method(_))) {
+            Some(BareNameOwner::Nearer)
+        } else {
+            resolver.user_common_module_exists(db, name).then_some(BareNameOwner::CommonModule)
+        }
+    };
+    let claim = |reaching_value, owner, valid_before| {
+        (BareGlobalClaim { reaching_value }, owner, valid_before)
     };
     let Some(scope) = scope else {
-        return (write_owner_claim() || read_only_claim())
-            .then_some(BareGlobalClaim { reaching_value: None });
+        return if write_owner_claim() {
+            Some(claim(None, BareNameOwner::Nearer, None))
+        } else {
+            read_only_claim().map(|owner| claim(None, owner, None))
+        };
     };
 
     let key = NormName::intern(name.as_str());
     let body_declares =
         scope.body.bindings_iter().any(|(_, b)| NormName::intern(b.name.as_str()) == key);
     if !body_declares && write_owner_claim() {
-        return Some(BareGlobalClaim { reaching_value: None });
+        return Some(claim(None, BareNameOwner::Nearer, None));
     }
     // For a metadata-collection name an assignment alone claims nothing: the name
     // is a Global-context PROPERTY, and assigning to it does not declare a local —
@@ -196,10 +259,11 @@ pub fn bare_global_name_claim(
     // owner's value at the read. Other globals keep the older rule until the
     // platform's verdict on them is measured the same way.
     let names_a_collection = unassignable_global_property(name, body_env).is_some();
-    if names_a_collection && !body_declares && !read_only_claim() {
+    if names_a_collection && !body_declares && read_only_claim().is_none() {
         return None;
     }
     let mut reaching: Option<(TextSize, ExprId)> = None;
+    let mut next_write: Option<TextSize> = None;
     for (_, stmt) in scope.body.stmts_iter() {
         let Stmt::Assign { target, value } = stmt else { continue };
         let target_id = ExprId::from_idx(*target);
@@ -215,14 +279,22 @@ pub fn bare_global_name_claim(
             .or_else(|| scope.source_map.expr_range(target_id))
             .map(|range| range.end());
         let Some(end) = completed_at else { continue };
-        if end <= scope.read_offset && reaching.is_none_or(|(best, _)| end >= best) {
-            reaching = Some((end, value_id));
+        if end <= scope.read_offset {
+            if reaching.is_none_or(|(best, _)| end >= best) {
+                reaching = Some((end, value_id));
+            }
+        } else if next_write.is_none_or(|next| end < next) {
+            next_write = Some(end);
         }
     }
     if let Some((_, value_id)) = reaching {
-        return Some(BareGlobalClaim { reaching_value: Some(value_id) });
+        return Some(claim(Some(value_id), BareNameOwner::Nearer, None));
     }
-    (body_declares || read_only_claim()).then_some(BareGlobalClaim { reaching_value: None })
+    if body_declares {
+        Some(claim(None, BareNameOwner::Nearer, None))
+    } else {
+        read_only_claim().map(|owner| claim(None, owner, next_write))
+    }
 }
 
 /// Resolve a bare identifier that names a platform **system enumeration**

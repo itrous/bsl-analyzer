@@ -55,6 +55,15 @@ impl<'a> DiagnosticsContext<'a> {
         self.query(|p| p.module_bodies(module_id))
     }
 
+    pub(crate) fn common_module_receiver_at(
+        &self,
+        owner: hir::DefWithBodyId,
+        offset: syntax::TextSize,
+        name: &hir::Name,
+    ) -> Option<hir::CommonModuleRead> {
+        self.query(|p| p.common_module_receiver_at(self.file_id, owner, offset, name))
+    }
+
     pub fn infer(&self) -> Arc<hir::InferenceResult> {
         self.query(|p| p.infer(self.file_id))
     }
