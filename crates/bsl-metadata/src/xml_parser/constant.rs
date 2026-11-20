@@ -18,6 +18,7 @@ pub fn parse_constant_xml(xml: &str) -> Result<MetadataObject> {
 
     let name = child_text(props, "Name").unwrap_or("").to_string();
     let mut mdo_obj = MetadataObject::new(MdoType::Constant, name);
+    mdo_obj.read_properties = super::read_properties::parse_read_properties(mdo);
 
     if let Some(uuid_str) = mdo.attribute("uuid") {
         match parse_uuid(uuid_str, "Constant root") {

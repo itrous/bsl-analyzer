@@ -1,0 +1,4 @@
+<CommandInterface xmlns="http://v8.1c.ru/8.3/xcf/extrnprops">
+  <CommandsPlacement><Command name="Catalog.Partners.StandardCommand.OpenList"><CommandGroup>NavigationPanelOrdinary</CommandGroup><Placement>Auto</Placement></Command></CommandsPlacement>
+  <CommandsOrder><Command name='Catalog.Customers.StandardCommand.OpenList'><CommandGroup>NavigationPanelOrdinary</CommandGroup></Command></CommandsOrder>
+</CommandInterface>

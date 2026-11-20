@@ -1,0 +1,12 @@
+<MetaDataObject>
+  <Subsystem uuid="00000000-0000-0000-0000-000000000021">
+    <Properties>
+      <Name>Operations</Name>
+      <ObjectBelonging>Adopted</ObjectBelonging>
+      <ExtendedConfigurationObject>00000000-0000-0000-0000-000000000011</ExtendedConfigurationObject>
+      <Content><Item>Document.ExtensionSale</Item></Content>
+      <Picture>CommonPicture.ExtensionPicture</Picture>
+    </Properties>
+    <ChildObjects><Subsystem>ExtensionTools</Subsystem></ChildObjects>
+  </Subsystem>
+</MetaDataObject>

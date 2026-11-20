@@ -823,6 +823,35 @@ pub(crate) fn canonical_spelling(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_paths_mint_slash_separated_file_and_root_keys() {
+        let temporary = tempfile::tempdir().unwrap();
+        let configuration = temporary.path().join("cf");
+        let extension = temporary.path().join("cfe").join("one");
+        std::fs::create_dir_all(&configuration).unwrap();
+        std::fs::create_dir_all(&extension).unwrap();
+        let relative = PathBuf::from("nested").join("CommonModules").join("Module.bsl");
+        #[cfg(windows)]
+        assert!(relative.to_string_lossy().contains('\\'));
+        let (roots, rejected) = WorkspaceRoots::build(
+            temporary.path(),
+            &configuration,
+            std::slice::from_ref(&extension),
+        );
+        assert!(rejected.is_empty());
+        let key = roots.key_of_path(&extension.join(&relative)).unwrap();
+        assert_eq!(key, FileKey::new("cfe/one", "nested/CommonModules/Module.bsl"));
+        assert!(key.is_under(&FileKey::new("cfe/one", "nested")));
+        assert_eq!(roots.resolve(&key), Some(extension.join(&relative)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_path_rendering_preserves_a_literal_unix_backslash() {
+        let relative = PathBuf::from(r"literal\name").join("Module.bsl");
+        assert_eq!(key_of(&relative), r"literal\name/Module.bsl");
+    }
+
     /// Roots must exist on disk for the canonical spelling to mean anything, so
     /// every fixture builds real directories.
     fn dirs(root: &Path, rels: &[&str]) -> Vec<PathBuf> {

@@ -9,6 +9,7 @@ pub mod effective_exports;
 pub mod effects;
 pub mod features;
 pub mod metadata;
+mod metadata_symbol;
 pub mod provider;
 pub mod queries;
 pub mod query_resolver;
@@ -43,6 +44,14 @@ pub use queries::{
     reaching_definitions_query, weaving_target,
 };
 
+#[cfg(test)]
+#[path = "tests/flow_type_regressions.rs"]
+mod flow_type_regressions;
+
+#[cfg(test)]
+#[path = "tests/platform_call_proof.rs"]
+mod platform_call_proof;
+
 pub use effects::{
     method_effect_summary_query, method_security_state_query, module_code_security_state_query,
     module_effect_summaries_query, ModuleEffectSummaries,
@@ -54,3 +63,5 @@ pub use effective_exports::{
 };
 
 pub use metadata::build_module_metadata;
+
+mod external_context;

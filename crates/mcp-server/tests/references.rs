@@ -136,7 +136,7 @@ async fn a_qualified_name_is_answered_with_kinds_and_a_histogram() {
     let answer = references(&client, &[("symbol", Value::from(STAND_METHOD))]).await;
 
     assert_eq!(answer["outcome"], "resolved", "{answer}");
-    assert_eq!(answer["schema_version"], "1");
+    assert_eq!(answer["schema_version"], "2");
     assert_eq!(answer["total"], 6, "declaration + five calls: {answer}");
     assert_eq!(answer["total_is_lower_bound"], false);
     assert_eq!(answer["narrowing_comparable"], true);
@@ -225,21 +225,32 @@ async fn freshness_names_whoever_composed_the_body() {
     client.cancel().await.ok();
 }
 
-/// Gate O — a name that resolves to something with no reference walk is `unsupported_symbol`,
-/// which is not `not_found` and not an empty list. The third input is the control: an
-/// implementation answering `unsupported_symbol` for everything would pass the first two.
+/// Incomplete metadata coverage exposes confirmed hits as a lower bound; a whole module has no walk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_symbol_without_a_reference_walk_says_so() {
+async fn metadata_keeps_incomplete_source_hits_while_a_whole_module_stays_unsupported() {
     let ws = stage_workspace();
     let client = client_with_references(ws.path()).await;
 
     let object = references(&client, &[("symbol", Value::from("Справочник.Справочник1"))]).await;
-    assert_eq!(object["outcome"], "unsupported_symbol", "{object}");
-    assert!(object.get("references").is_none(), "no list at all, not an empty one: {object}");
-    assert!(!object["unsupported"]["category"].as_str().unwrap().is_empty(), "{object}");
+    assert_eq!(object["outcome"], "partial", "{object}");
+    assert_eq!(object["freshness"]["completeness"]["status"], "partial");
+    assert_eq!(object["total_is_lower_bound"], true);
+    assert_eq!(object["narrowing_comparable"], false);
+    assert!(object["metadata_issues_total"].as_u64().unwrap() > 0);
+    assert_eq!(
+        object["metadata_incomplete_reasons"],
+        json!(["unresolved_metadata_identity", "xml_coverage_incomplete"])
+    );
+    assert!(object["references"].as_array().unwrap().iter().any(|hit| {
+        hit["location"]["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("Catalogs/Справочник1.xml"))
+    }));
 
     let module = references(&client, &[("symbol", Value::from("ПервыйОбщийМодуль"))]).await;
     assert_eq!(module["outcome"], "unsupported_symbol", "a module as a whole: {module}");
+    assert!(module.get("references").is_none(), "no list for a whole module: {module}");
+    assert!(!module["unsupported"]["category"].as_str().unwrap().is_empty(), "{module}");
 
     // The control: an exported method nobody calls is `resolved` with an empty list —
     // a proven zero, and the answer says so with a different word.
@@ -609,7 +620,7 @@ async fn the_resolution_hint_names_an_axis_that_can_separate_these_declarations(
 /// consult is an identity without its evidence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
-async fn an_unsupported_answer_carries_the_sources_that_composed_it() {
+async fn reference_outcomes_carry_the_sources_that_composed_them() {
     let ws = stage_workspace();
     let client = client_with_references(ws.path()).await;
 
@@ -622,10 +633,10 @@ async fn an_unsupported_answer_carries_the_sources_that_composed_it() {
     });
     assert!(!providers.is_empty(), "{platform}");
 
-    // Composed by the resident: the category came from the resident's own resolution, and
-    // there is no dictionary answer to show.
+    // The resident source walk provides these confirmed metadata hits without a dictionary lookup.
     let object = references(&client, &[("symbol", Value::from("Справочник.Справочник1"))]).await;
-    assert_eq!(object["outcome"], "unsupported_symbol", "{object}");
+    assert_eq!(object["outcome"], "partial", "{object}");
+    assert_eq!(object["freshness"]["completeness"]["status"], "partial", "{object}");
     assert_eq!(object["freshness"]["source"], "resident", "{object}");
     assert!(object.get("lookup").is_none(), "nothing was asked of the dictionary: {object}");
 

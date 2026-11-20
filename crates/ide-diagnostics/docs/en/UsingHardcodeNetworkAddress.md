@@ -6,6 +6,10 @@ Hardcoded network addresses should not be stored directly in source code.
 
 This applies to both IPv4 and IPv6 literals. Such values are infrastructure settings and usually need to be changed independently from application code.
 
+An address must be separated from letters, digits, `_`, `-`, and `.`. Names such as `migration-1.0.0.1-applied` and `sha256:1.5:` are not addresses. Brackets and other punctuation remain supported; the diagnostic highlights the address itself, including in strings with doubled quotes.
+
+The existing exclusions for localhost, strings starting with HTTP/HTTPS/FTP URLs, and version contexts configured by the rule remain in effect.
+
 Recommended storage options:
 
 * constants

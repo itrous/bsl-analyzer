@@ -1,5 +1,6 @@
 pub mod bare_root;
 mod definition;
+pub mod metadata_symbol;
 pub mod name_classify;
 mod semantic_symbol;
 pub mod type_facade;
@@ -9,12 +10,19 @@ pub use bsl_types::kind::{MetadataReferenceKind, TypeId, TypeKind};
 pub use definition::{Definition, ReferenceScope};
 pub use hir_ty::builtin::builtin_functions;
 pub use hir_ty::compat_mode;
-pub use hir_ty::infer::CandidateCallBinding;
+pub use hir_ty::infer::{
+    replacement_applicability, CandidateCallBinding, ReplacementApplicability,
+};
 pub use hir_ty::metadata_path::MissingMetadata;
+pub use hir_ty::method_declarations::{
+    method_declaration_conflicts, InterceptionDeclarationConflict, MethodDeclarationConflict,
+    MethodDeclarationConflicts,
+};
 pub use hir_ty::method_lookup::platform_type_key_id;
 pub use hir_ty::min_platform;
 pub use hir_ty::subtype::type_sets_overlap;
 pub use hir_ty::this_object::coerce_to_metadata_ref_id;
+pub use hir_ty::unshadowed_platform_global_calls;
 pub use hir_ty::BodyFlow;
 pub use hir_ty::TyLoweringContext;
 pub use hir_ty::{
@@ -37,6 +45,8 @@ pub use type_facade::{
     root_object_manager_type, Field, HirFieldOrigin, PlatformNameEntry, PlatformNameKind, Type,
 };
 
+/// The owning configuration and execution model selected for a source file.
+pub use hir_def::compilation_context::{CompilationContextOrigin, FileCompilationContext};
 pub use hir_def::execution_env;
 pub use hir_def::sdbl_cache::DbSdblResolver;
 pub use hir_def::{all_sdbl_in_file_query, sdbl_hir_for_file_query, SdblHirEntries, SdblInFile};
@@ -113,6 +123,10 @@ pub mod cfg {
 pub mod dataflow {
     pub use ::dataflow::{DataflowResult, DataflowSolver, Direction, DEFAULT_MAX_ITERATIONS};
 
+    pub mod catch_outcome {
+        pub use ::dataflow::catch_outcome::observable_catch_results;
+    }
+
     pub mod path_terminates {
         pub use ::dataflow::path_terminates::{
             analyze_path_terminates, analyze_path_terminates_default, MayFallthrough,
@@ -186,9 +200,9 @@ pub use hir_def::{
 pub use bsl_config::VisibleConfig;
 pub use bsl_types::facet::{FormBindingFacet, FormBindingTargetFacet, MdoRefFacet};
 pub use hir_def::effective_module::{
-    effective_module_text, item_tree_effective, module_bodies_effective,
-    module_interface_effective, parse_effective, symbol_tree_effective, EffectiveModule,
-    EffectiveModuleId,
+    all_sdbl_in_effective_file, effective_module_text, item_tree_effective,
+    module_bodies_effective, module_interface_effective, parse_effective,
+    sdbl_hir_for_effective_file, symbol_tree_effective, EffectiveModule, EffectiveModuleId,
 };
 pub use hir_def::extension_merge::{
     extract_change_and_validate, pair_base_module_path, unquote_bsl_string, Origin, Segment,
@@ -1175,11 +1189,15 @@ mod tests {
     }
 
     #[test]
-    fn reference_scope_returns_unknown_for_non_source_definitions() {
+    fn reference_scope_distinguishes_metadata_from_platform_collections() {
         let (db, _file_id) = create_db_with_file("");
 
         let builtin = Definition::BuiltinFunction(Name::new("Сообщить"));
         let mdo = Definition::MdoCollectionType(bsl_metadata::MdoType::Catalog);
+        let object = Definition::MdoObject {
+            mdo_type: bsl_metadata::MdoType::Catalog,
+            object_name: Name::new("Товары"),
+        };
         let virt = Definition::VirtualTableField {
             table_name: Name::new("Документ"),
             field_name: Name::new("Поле"),
@@ -1187,7 +1205,8 @@ mod tests {
 
         assert_eq!(builtin.reference_scope(&db), ReferenceScope::Unknown);
         assert_eq!(mdo.reference_scope(&db), ReferenceScope::Unknown);
-        assert_eq!(virt.reference_scope(&db), ReferenceScope::Unknown);
+        assert_eq!(object.reference_scope(&db), ReferenceScope::Metadata);
+        assert_eq!(virt.reference_scope(&db), ReferenceScope::Metadata);
         assert_eq!(Definition::Unresolved.reference_scope(&db), ReferenceScope::Unknown);
     }
 

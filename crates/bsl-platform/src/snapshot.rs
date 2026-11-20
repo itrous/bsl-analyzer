@@ -141,8 +141,9 @@ impl PlatformSnapshot {
         Self::from_corpus_json_with_overlays(bytes, CURATED_OVERLAYS)
     }
 
-    /// [`Self::from_corpus_json`] with an explicit overlay document. A corpus the
-    /// overlay cannot apply to is rejected as a whole.
+    /// [`Self::from_corpus_json`] with an explicit overlay document. Global function
+    /// corrections skip absent pages in a partial corpus; ambiguous or malformed
+    /// present targets reject the corpus as a whole.
     pub fn from_corpus_json_with_overlays(
         bytes: &[u8],
         overlays: &str,

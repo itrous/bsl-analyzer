@@ -1,12 +1,11 @@
 use crate::BodyContext;
 use crate::{Diagnostic, DiagnosticCode, Fix, TextEdit};
-use bsl_platform::deprecation::{DeprecationEntry, LifecycleGroup};
+use bsl_platform::deprecation::LifecycleGroup;
 use hir::LocalRange;
 
 use super::deprecated_platform_api;
 use super::deprecated_platform_facts::{
-    canonical_name_for, global_function_fact, is_russian_alias, module_owns_bare_call,
-    replacement_compiles_here, replacement_for_name,
+    applicable_replacement, global_function_fact, global_function_message, module_owns_bare_call,
 };
 
 pub fn from_hir(
@@ -24,7 +23,8 @@ pub fn from_hir(
     }
 
     let fact = global_function_fact(name, LifecycleGroup::StringSearch)?;
-    let message = get_message(name, fact)?;
+    let replacement = applicable_replacement(fact, name, ctx);
+    let message = global_function_message(name, fact, replacement)?;
 
     Some(Diagnostic {
         code,
@@ -32,7 +32,10 @@ pub fn from_hir(
         severity: ctx.severity(code),
         range,
         tags: ctx.tags(code),
-        fixes: get_fix(name, fact, range, ctx).into_iter().collect(),
+        fixes: replacement
+            .and_then(|replacement| get_fix(name, replacement, range, ctx))
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -41,29 +44,15 @@ pub fn from_hir(
 /// not found, 1 for an empty substring). Renaming the call is therefore safe.
 fn get_fix(
     name: &str,
-    fact: &DeprecationEntry,
+    replacement: &str,
     range: LocalRange,
     ctx: &BodyContext,
 ) -> Option<Fix<LocalRange>> {
-    let replacement = replacement_for_name(fact, name)?;
-    if module_owns_bare_call(name, ctx) || module_owns_bare_call(replacement, ctx) {
-        return None;
-    }
-    if !replacement_compiles_here(replacement, ctx) {
+    if module_owns_bare_call(name, ctx) {
         return None;
     }
     let label = format!("Заменить на \"{}\"", replacement);
     Some(Fix::safe(label, vec![TextEdit { range, new_text: replacement.to_string() }]))
-}
-
-fn get_message(method_name: &str, fact: &DeprecationEntry) -> Option<String> {
-    let replacement = replacement_for_name(fact, method_name)?;
-    let deprecated = canonical_name_for(fact, method_name)?;
-    if is_russian_alias(fact, method_name) {
-        Some(format!("Используйте \"{}\" вместо устаревшего \"{}\"", replacement, deprecated))
-    } else {
-        Some(format!("Use \"{}\" instead of deprecated \"{}\"", replacement, deprecated))
-    }
 }
 
 #[cfg(test)]

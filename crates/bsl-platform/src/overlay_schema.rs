@@ -108,6 +108,15 @@ pub(crate) struct TypeMemberSurfaceAttestation {
     pub(crate) verified_against_version: String,
     /// The surfaces the attestation covers: `verified_surface`, both when absent.
     pub(crate) surfaces: crate::snapshot::AttestedSurfaces,
+    /// The exact served member set the attestation is bound to: `members`, no
+    /// binding when absent.
+    pub(crate) members: Option<AttestedMemberSet>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AttestedMemberSet {
+    pub(crate) methods: Vec<String>,
+    pub(crate) properties: Vec<String>,
 }
 
 /// Attests that a platform parameter of `scope` with no `passing` record is passed by value,
@@ -554,7 +563,14 @@ fn parse_member_surface_attestation(
         entry.as_object().ok_or_else(|| OverlayError(format!("{context} must be an object")))?;
     require_only_fields(
         object,
-        &["type", "verified_against_version", "verified_surface", "evidence_source", "rationale"],
+        &[
+            "type",
+            "verified_against_version",
+            "verified_surface",
+            "members",
+            "evidence_source",
+            "rationale",
+        ],
         &context,
     )?;
     let type_name = required_string(object, "type", index)?;
@@ -579,7 +595,38 @@ fn parse_member_surface_attestation(
     required_string(object, "evidence_source", index)?;
     required_string(object, "rationale", index)?;
 
-    Ok(TypeMemberSurfaceAttestation { type_name, verified_against_version, surfaces })
+    let members = match object.get("members") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(parse_member_surface(value, &context)?),
+    };
+    Ok(TypeMemberSurfaceAttestation { type_name, verified_against_version, surfaces, members })
+}
+
+fn parse_member_surface(value: &Value, context: &str) -> Result<AttestedMemberSet, OverlayError> {
+    let context = format!("{context} members");
+    let object =
+        value.as_object().ok_or_else(|| OverlayError(format!("{context} must be an object")))?;
+    require_only_fields(object, &["methods", "properties"], &context)?;
+    let names = |section: &str| -> Result<Vec<String>, OverlayError> {
+        let array = object
+            .get(section)
+            .and_then(Value::as_array)
+            .ok_or_else(|| OverlayError(format!("{context}.{section} must be an array")))?;
+        let names: Vec<String> = array
+            .iter()
+            .map(|value| {
+                value.as_str().filter(|name| !name.trim().is_empty()).map(str::to_owned).ok_or_else(
+                    || OverlayError(format!("{context}.{section} must contain non-empty strings")),
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        let unique: HashSet<String> = names.iter().map(|name| name.fold_lower()).collect();
+        if unique.len() != names.len() {
+            return Err(OverlayError(format!("{context}.{section} contains duplicate names")));
+        }
+        Ok(names)
+    };
+    Ok(AttestedMemberSet { methods: names("methods")?, properties: names("properties")? })
 }
 
 /// The optional `verified_surface`: a non-empty list of `"methods"` and

@@ -5,7 +5,10 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions};
 
-/// A diagnostics-baseline directory pinned below the canonical project root.
+mod rename;
+pub use rename::{ManagedDirectoryEntry, ManagedDirectoryEntryKind};
+
+/// A directory pinned below the canonical project root.
 /// All managed paths stay relative to opened directory handles.
 #[derive(Debug)]
 pub struct ManagedBaselineDirectory {
@@ -123,11 +126,14 @@ impl ManagedBaselineDirectory {
 
     #[cfg(not(windows))]
     pub fn sync_all(&self) -> io::Result<()> {
-        match self.dir.try_clone()?.into_std_file().sync_all() {
-            // Some Unix capability handles use O_PATH and cannot be fsynced.
-            Err(error) if error.raw_os_error() == Some(9) => Ok(()),
-            result => result,
-        }
+        // Capability directory handles may use O_PATH, which cannot be fsynced.
+        self.dir.open(".")?.into_std().sync_all()
+    }
+
+    /// Flushes the existing parent directory without following links or creating parents.
+    pub fn sync_parent(&self, path: &str) -> io::Result<()> {
+        let (dir, _) = self.open_parent(path, false)?;
+        Self { dir, project_path: PathBuf::new() }.sync_all()
     }
 
     /// Atomically replaces `to` with the regular file at `from`.
@@ -269,18 +275,30 @@ fn replace_regular_file(
     to_name: &Path,
     display: &Path,
 ) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
-
     use cap_fs_ext::OpenOptionsExt;
-    use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformation, NtSetInformationFile};
-    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO};
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES};
 
     let mut options = OpenOptions::new();
     options.access_mode(DELETE | FILE_READ_ATTRIBUTES).follow(FollowSymlinks::No);
     let source = open_regular_file(from_dir, from_name, options, display)?;
+    rename_windows_handle(&source, to_dir, to_name, true)
+}
+
+#[cfg(windows)]
+fn rename_windows_handle(
+    source: &File,
+    to_dir: &Dir,
+    to_name: &Path,
+    replace: bool,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformation, NtSetInformationFile};
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
     let mut name: Vec<u16> = to_name.as_os_str().encode_wide().collect();
     let name_byte_len = name.len() * std::mem::size_of::<u16>();
     name.push(0);
@@ -294,7 +312,7 @@ fn replace_regular_file(
     // both the header and that tail for the duration of the syscall.
     let status = unsafe {
         let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).Anonymous.ReplaceIfExists = replace;
         (*info).RootDirectory = to_dir.as_raw_handle().cast();
         (*info).FileNameLength = name_byte_len as u32;
         std::ptr::copy_nonoverlapping(
@@ -423,6 +441,52 @@ mod tests {
             Path::new("state/baselines/objects/key/value.json")
         );
         assert!(managed.validated_relative_path("../outside.json").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_sync_reopens_capability_handles_and_reports_filesystem_errors() {
+        let managed = ManagedBaselineDirectory::open_project_root(Path::new("/proc")).unwrap();
+        let capability = managed.dir.try_clone().unwrap().into_std_file();
+        assert_eq!(capability.sync_all().unwrap_err().raw_os_error(), Some(libc::EBADF));
+
+        // procfs rejects real fsync with EINVAL, distinguishing a flush from ignored O_PATH EBADF.
+        assert_eq!(managed.sync_all().unwrap_err().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_keeps_the_pinned_directory_after_its_path_is_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let managed = ManagedBaselineDirectory::open(root.path(), "baselines", true).unwrap();
+        std::fs::rename(root.path().join("baselines"), root.path().join("moved")).unwrap();
+        symlink(root.path().join("absent"), root.path().join("baselines")).unwrap();
+
+        managed.sync_all().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_parent_uses_existing_directories_without_following_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let managed = ManagedBaselineDirectory::open_project_root(root.path()).unwrap();
+        managed.create_file_new("objects/value.json").unwrap();
+        managed.sync_parent("objects/value.json").unwrap();
+        managed.sync_parent("root.json").unwrap();
+
+        assert_eq!(
+            managed.sync_parent("missing/value.json").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!root.path().join("missing").exists());
+        symlink(outside.path(), root.path().join("linked")).unwrap();
+        assert!(managed.sync_parent("linked/value.json").is_err());
+        assert!(managed.sync_parent("../value.json").is_err());
     }
 
     #[test]

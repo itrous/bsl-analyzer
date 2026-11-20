@@ -653,25 +653,19 @@ impl RootDatabaseImpl {
     /// agree). Reading the workspace config paths records a dependency, so a
     /// workspace reload invalidates every config-dependent query.
     fn longest_config_root_for_path(&self, path: &Path) -> Option<PathBuf> {
-        // Both spellings match, as in `visible_roots_for_file`: a file enumerated
-        // canonically under a root configured through a symlink still belongs to
-        // it. The CONFIGURED spelling is what comes back, so the revision key a
-        // reader interns is the one a bump on that root increments.
-        let snapshot = self.workspace_configs_snapshot();
-        snapshot
-            .paths
-            .iter()
-            .zip(&snapshot.canonical_paths)
-            .filter_map(|((_, configured), canonical)| {
-                [configured, canonical]
+        self.workspace_configs_snapshot()
+            .prepared_roots()
+            .into_iter()
+            .filter_map(|(_, configured, canonical)| {
+                [&configured, &canonical]
                     .into_iter()
                     .filter(|root| path.starts_with(root))
                     .map(|root| root.as_os_str().len())
                     .max()
                     .map(|len| (len, configured))
             })
-            .max_by_key(|&(len, _)| len)
-            .map(|(_, configured)| configured.clone())
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, root)| root)
     }
 
     /// The revision token to fold into a config's interned key for any reader
@@ -859,7 +853,7 @@ impl RootDatabaseImpl {
             snapshot.paths.len(),
             "workspace-configs snapshot: topological_order must not repeat paths"
         );
-        for (_, path) in &snapshot.paths {
+        for (_, path, _) in snapshot.prepared_roots() {
             self.ensure_config_revision_input(&path.to_string_lossy());
         }
         let input = self.workspace_configs();
@@ -898,37 +892,33 @@ impl RootDatabaseImpl {
         file_path: &std::path::Path,
     ) -> Option<(usize, Option<String>)> {
         let snapshot = self.workspace_configs_snapshot();
-        snapshot
-            .topological_order
-            .iter()
+        let prepared = snapshot.prepared_roots();
+        let order =
+            snapshot.topological_order.iter().copied().chain(snapshot.paths.len()..prepared.len());
+        order
             .enumerate()
-            .filter_map(|(rank, &idx)| {
-                let configured = &snapshot.paths[idx].1;
-                let canonical = &snapshot.canonical_paths[idx];
-                let matched_len = [configured, canonical]
+            .filter_map(|(rank, index)| {
+                let (_, configured, canonical) = &prepared[index];
+                let matched = [configured, canonical]
                     .into_iter()
                     .filter(|root| file_path.starts_with(root))
                     .map(|root| root.components().count())
                     .max()?;
-                Some((matched_len, rank, snapshot.paths[idx].0.clone()))
+                let label = snapshot.paths.get(index).and_then(|(label, _)| label.clone());
+                Some((matched, rank, label))
             })
-            .max_by_key(|(matched_len, _, _)| *matched_len)
+            .max_by_key(|(len, _, _)| *len)
             .map(|(_, rank, label)| (rank, label))
     }
 
     pub fn visible_config_root_ranks(&self, file_id: FileId) -> Option<Vec<usize>> {
         let roots = self.visible_roots_for_file(file_id)?;
-        let snapshot = self.workspace_configs_snapshot();
-        let visible_paths = roots.main.iter().chain(roots.chain.iter().map(|(_, path)| path));
-        let visible_paths: HashSet<&PathBuf> = visible_paths.collect();
         Some(
-            snapshot
-                .topological_order
+            roots
+                .main
                 .iter()
-                .enumerate()
-                .filter_map(|(rank, &idx)| {
-                    visible_paths.contains(&snapshot.paths[idx].1).then_some(rank)
-                })
+                .chain(roots.chain.iter().map(|(_, path)| path))
+                .filter_map(|path| self.config_root_rank_for_path(path).map(|(rank, _)| rank))
                 .collect(),
         )
     }
@@ -1075,33 +1065,40 @@ impl RootDatabaseImpl {
             return None;
         }
 
-        let main =
-            snapshot.paths.iter().find_map(|(label, path)| label.is_none().then(|| path.clone()));
-        // Longest-prefix match against BOTH the configured and the canonical
-        // root spelling: enumerated file paths may arrive canonicalized (MCP)
-        // while the configured root is symlinked, or vice versa. Ranking uses
-        // the length of the spelling that actually MATCHED — ranking by the
-        // configured spelling when only the canonical one matched could pick a
-        // less-specific root for nested symlinked extensions.
-        let own = snapshot
-            .paths
+        let prepared = snapshot.prepared_roots();
+        let matched = prepared
             .iter()
             .enumerate()
-            .filter_map(|(idx, (label, path))| {
-                label.as_ref()?;
-                let mut matched_len: Option<usize> = None;
-                if file_path.starts_with(path) {
-                    matched_len = Some(path.as_os_str().len());
-                }
-                let canonical = &snapshot.canonical_paths[idx];
-                if file_path.starts_with(canonical) {
-                    let len = canonical.as_os_str().len();
-                    matched_len = Some(matched_len.map_or(len, |best| best.max(len)));
-                }
-                matched_len.map(|len| (idx, len))
+            .filter_map(|(index, (_, configured, canonical))| {
+                [configured, canonical]
+                    .into_iter()
+                    .filter(|root| file_path.starts_with(root))
+                    .map(|root| root.as_os_str().len())
+                    .max()
+                    .map(|len| (len, index))
             })
-            .max_by_key(|&(_, len)| len)
-            .map(|(idx, _)| idx);
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, index)| index);
+        if let Some(index) = matched.filter(|index| *index >= snapshot.paths.len()) {
+            return Some(VisibleRoots { main: Some(prepared[index].1.clone()), chain: Vec::new() });
+        }
+        let own = matched.filter(|index| snapshot.paths[*index].0.is_some());
+        let main = own.and_then(|index| snapshot.external_owner(index)).map_or_else(
+            || {
+                snapshot
+                    .paths
+                    .iter()
+                    .find_map(|(label, path)| label.is_none().then(|| path.clone()))
+            },
+            |owner| {
+                owner.compilation_root().map(|root| {
+                    prepared
+                        .iter()
+                        .find(|(_, _, canonical)| canonical == &root.canonical_path)
+                        .map_or_else(|| root.path.clone(), |(_, path, _)| path.clone())
+                })
+            },
+        );
 
         let chain = own
             .map(|own_idx| {
@@ -2176,6 +2173,21 @@ impl RootDatabaseImpl {
         self.resolve_metadata_object_over(self.ordered_config_roots(), mdo_type, name)
     }
 
+    /// Resolve a metadata object in the selected root's designer visibility scope.
+    pub fn resolve_metadata_object_for_inspection_root(
+        &self,
+        root_id: &str,
+        mdo_type: bsl_metadata::MdoType,
+        name: &str,
+    ) -> Result<Option<Arc<bsl_metadata::MetadataObject>>, String> {
+        let roots = self
+            .inspection_roots(Some(root_id))?
+            .into_iter()
+            .map(|(_, path)| path.to_string_lossy().into_owned())
+            .collect();
+        Ok(self.resolve_metadata_object_over(roots, mdo_type, name))
+    }
+
     /// [`Self::resolve_metadata_object_across_roots`] over the designer's view alone —
     /// what a query resolver composes over, since SDBL names no external object.
     pub fn resolve_metadata_object_across_designer_roots(
@@ -2238,7 +2250,55 @@ impl RootDatabaseImpl {
         mdo_type: bsl_metadata::MdoType,
         name: &str,
     ) -> Option<Arc<bsl_metadata::Register>> {
-        self.resolve_register_over(self.ordered_config_roots(), mdo_type, name)
+        let mut register =
+            self.resolve_register_over(self.ordered_config_roots(), mdo_type, name)?;
+        Arc::make_mut(&mut register).resolve_recorder_type(|| {
+            self.document_recorders_across_designer_roots(mdo_type, name)
+        });
+        Some(register)
+    }
+
+    fn document_recorders_across_designer_roots(
+        &self,
+        kind: bsl_metadata::MdoType,
+        name: &str,
+    ) -> Vec<String> {
+        use bsl_metadata::{MdoType, MetadataObject};
+
+        let roots = self.designer_config_roots();
+        let writes_register = |document: &MetadataObject| {
+            document.register_records().iter().any(|(register_kind, register_name)| {
+                *register_kind == kind && stdx::case::eq_ignore_case(register_name, name)
+            })
+        };
+        // Scan document declarations only. Effective resolution checks whether a later
+        // root shadows a candidate, without loading other metadata families.
+        let mut candidates = std::collections::BTreeSet::new();
+        for root in &roots {
+            let Some(listing) = self.metadata_listing(root) else { continue };
+            for entry in
+                listing.entries(self).iter().filter(|entry| entry.kind == MdoType::Document)
+            {
+                if metadata::resolve_metadata_object(
+                    self,
+                    listing,
+                    MdoType::Document,
+                    entry.name.clone(),
+                )
+                .is_some_and(|document| writes_register(&document))
+                {
+                    candidates.insert(entry.name.fold_lower());
+                }
+            }
+        }
+        candidates
+            .into_iter()
+            .filter_map(|candidate| {
+                self.resolve_metadata_object_over(roots.clone(), MdoType::Document, &candidate)
+                    .filter(|document| writes_register(document))
+                    .map(|document| document.name.clone())
+            })
+            .collect()
     }
 
     /// [`Self::resolve_register_across_roots`] over the designer's view alone.
@@ -2350,6 +2410,76 @@ impl RootDatabaseImpl {
             let listing = self.metadata_listing(root)?;
             metadata::resolve_event_subscription(self, listing, name.to_string())
         })
+    }
+
+    /// Resolve a scheduled job at per-file granularity across designer roots.
+    pub fn resolve_scheduled_job_across_roots(
+        &self,
+        name: &str,
+    ) -> Option<Arc<bsl_metadata::ScheduledJob>> {
+        self.designer_config_roots().into_iter().find_map(|root| {
+            metadata::resolve_scheduled_job(self, self.metadata_listing(&root)?, name.to_string())
+        })
+    }
+
+    /// Compose a subsystem's known content across designer roots.
+    pub fn resolve_subsystem_across_roots(
+        &self,
+        name: &str,
+    ) -> Option<Arc<bsl_metadata::Subsystem>> {
+        let mut merged: Option<bsl_metadata::Subsystem> = None;
+        let mut origins = Vec::new();
+        for root in self.designer_config_roots() {
+            if let Some(value) = metadata::resolve_subsystem_in_root(self, &root, name) {
+                match &mut merged {
+                    Some(base) if value.adopts(base) => base.merge_from(&value),
+                    Some(base) => {
+                        *base = (*value).clone();
+                        base.resolution_incomplete = true;
+                    }
+                    None => {
+                        let mut value = (*value).clone();
+                        value.resolution_incomplete |=
+                            value.object_belonging == bsl_metadata::ObjectBelonging::Adopted;
+                        merged = Some(value);
+                    }
+                }
+                origins.push(root);
+            }
+        }
+        merged.map(|mut subsystem| {
+            subsystem.source_roots = origins;
+            Arc::new(subsystem)
+        })
+    }
+
+    /// Resolve declarations without manager types, preserving each actual source root.
+    pub fn resolve_read_object_across_roots(
+        &self,
+        kind: bsl_metadata::read_object::ReadObjectKind,
+        name: &str,
+    ) -> Option<(Arc<bsl_metadata::read_object::ReadObject>, Vec<String>)> {
+        let mut merged: Option<bsl_metadata::read_object::ReadObject> = None;
+        let mut origins = Vec::new();
+        for root in self.designer_config_roots() {
+            if let Some(object) = metadata::resolve_read_object_in_root(self, &root, kind, name) {
+                match &mut merged {
+                    Some(base) if object.adopts(base) => base.apply_overlay(&object),
+                    Some(base) => {
+                        *base = (*object).clone();
+                        base.resolution_incomplete = true;
+                    }
+                    None => {
+                        let mut object = (*object).clone();
+                        object.resolution_incomplete |=
+                            object.object_belonging == bsl_metadata::ObjectBelonging::Adopted;
+                        merged = Some(object);
+                    }
+                }
+                origins.push(root);
+            }
+        }
+        merged.map(|value| (Arc::new(value), origins))
     }
 
     /// Resolve an HTTP service by name across base + every extension (first match in
@@ -2580,6 +2710,47 @@ impl RootDatabaseImpl {
     ) -> Option<hir::CommonModuleBodies> {
         let visible_ranks = self.visible_config_root_ranks(file_id)?;
 
+        if let Some(kind) = bsl_metadata::ExternalObjectKind::of_mdo_type(mdo_type) {
+            let mut bodies = hir::CommonModuleBodies::default();
+            if role != hir::MdoModuleRole::Object {
+                return Some(bodies);
+            }
+            let path = vfs_helpers::get_file_path(self, file_id)?;
+            let snapshot = self.workspace_configs_snapshot();
+            let Some((configured, canonical, own_kind)) = snapshot.external_root_of_path(&path)
+            else {
+                return Some(bodies);
+            };
+            if own_kind != kind {
+                return Some(bodies);
+            }
+            let Some(object) = self.resolve_metadata_object_for_file(file_id, mdo_type, name)
+            else {
+                return Some(bodies);
+            };
+            let source_root = self.file_source_root_input(file_id).source_root_id(self);
+            let source_root = self.source_root_input(source_root);
+            use bsl_conventions::{ConventionalName as Conv, SegmentMatch as M};
+            for root in [configured, canonical] {
+                let candidate = root
+                    .join(&object.name)
+                    .join(Conv::Ext.canonical())
+                    .join(Conv::ObjectModule.canonical())
+                    .to_string_lossy()
+                    .into_owned();
+                if let Some(file) = base_db::resolve_vfs_path_ci_query(
+                    self,
+                    source_root,
+                    candidate,
+                    &[M::Exact, M::Ci, M::Ci],
+                ) {
+                    bodies.push(file, self.file_is_unread(file));
+                    break;
+                }
+            }
+            return Some(bodies);
+        }
+
         let source_root_id = self.file_source_root_input(file_id).source_root_id(self);
         let index = <Self as hir::DefDatabase>::module_index(self, source_root_id);
         let name = hir::Name::new(name);
@@ -2613,6 +2784,7 @@ impl RootDatabaseImpl {
             .filter_map(|file| match rank_of(file) {
                 Some(rank) if !visible_ranks.contains(&rank) => None,
                 Some(rank) => Some((file, rank)),
+                None if self.file_compilation_context(file_id).is_some() => None,
                 None => Some((file, usize::MAX)),
             })
             .collect();
@@ -2731,6 +2903,12 @@ impl RootDatabaseImpl {
         kind: hir::ApplicationModuleKind,
     ) -> Option<hir::CommonModuleBodies> {
         use base_db::SourceDatabase;
+        if self
+            .file_compilation_context(file_id)
+            .is_some_and(|context| context.origin == hir::CompilationContextOrigin::Unknown)
+        {
+            return None;
+        }
 
         let file_path = vfs_helpers::get_file_path(self, file_id)?;
         let roots = if RootDatabaseImpl::all_config_paths(self).is_empty() {
@@ -3309,6 +3487,13 @@ impl DefDatabase for RootDatabaseImpl {
 
 #[salsa::db]
 impl hir::ConfigsDatabase for RootDatabaseImpl {
+    fn file_compilation_context(
+        &self,
+        file_id: FileId,
+    ) -> Option<Arc<hir::FileCompilationContext>> {
+        RootDatabaseImpl::file_compilation_context(self, file_id)
+    }
+
     fn configurations(&self, file_id: FileId) -> Vec<hir::VisibleConfig> {
         RootDatabase::get_all_configurations(self, file_id)
             .into_iter()
@@ -3547,6 +3732,12 @@ impl hir::ConfigsDatabase for RootDatabaseImpl {
     }
 
     fn file_has_visible_config(&self, file_id: FileId) -> bool {
+        if self
+            .file_compilation_context(file_id)
+            .is_some_and(|context| context.origin == hir::CompilationContextOrigin::Unknown)
+        {
+            return false;
+        }
         let Some(file_path) = vfs_helpers::get_file_path(self, file_id) else {
             return false;
         };
