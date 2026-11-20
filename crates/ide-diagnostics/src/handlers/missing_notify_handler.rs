@@ -110,6 +110,11 @@ fn local_verdict(ctx: &DiagnosticsContext, name: &Name) -> Option<Verdict> {
 /// judged: any other identifier (a local variable, a module the analysis cannot see) says
 /// nothing about where the handler lives, and neither does a body that could not be read.
 fn module_verdict(ctx: &DiagnosticsContext, module_name: &Name, name: &Name) -> Option<Verdict> {
+    // A module-level `Перем` of that name is the receiver, exactly as a procedure local is
+    // (see `is_body_local` in `call_graph`); the summary does not carry module variables.
+    if ctx.symbol_tree().find_variable(module_name).is_some() {
+        return None;
+    }
     ctx.resolve_common_module(module_name.as_str())?;
 
     let bodies = ctx.common_module_bodies(module_name.as_str());
@@ -451,5 +456,38 @@ mod tests {
         let diagnostics = run_with_form_xml(module_source(), BASE_FORM_XML, builder.build());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert!(diagnostics[0].message.starts_with("Добавьте \"Экспорт\""), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_module_variable_named_like_a_common_module_is_not_the_module() {
+        let source = "Перем МойМодульКлиент;
+
+Процедура ПередЗакрытием()
+	Оповещение = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);
+КонецПроцедуры
+";
+        let diagnostics = with_module(
+            source,
+            "Процедура Другая(Результат, Параметры) Экспорт
+КонецПроцедуры
+",
+        );
+        assert!(diagnostics.is_empty(), "the receiver is a module variable: {diagnostics:#?}");
+    }
+
+    /// Control for the case above: the same registration without the `Перем`.
+    #[test]
+    fn the_same_registration_without_a_module_variable_is_still_checked() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);
+КонецПроцедуры
+";
+        let diagnostics = with_module(
+            source,
+            "Процедура Другая(Результат, Параметры) Экспорт
+КонецПроцедуры
+",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     }
 }

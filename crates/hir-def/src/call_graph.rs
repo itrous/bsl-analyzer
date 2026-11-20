@@ -1157,7 +1157,9 @@ fn extract_notify_reg_at(
         // A parameter, a declared variable or an assigned local with the receiver's name
         // IS the receiver: `Процедура Тест(ЭтаФорма)` does not name the form, and a local
         // `МойМодуль` is not the common module of that name. Nothing can be said about
-        // where its handler lives.
+        // where its handler lives. Order does not matter, on purpose: a name assigned or
+        // declared anywhere in a procedure is procedure-scoped, so even a use BEFORE the
+        // assignment denotes the local (reading `Неопределено`), never the module.
         Some(Expr::Path(name)) if is_body_local(body, name) => NotifyTarget::Unsupported,
         Some(Expr::Path(name)) if is_this_receiver(&name.as_str().fold_lower()) => {
             NotifyTarget::ThisObject
@@ -2028,8 +2030,8 @@ EndProcedure
         let code = r#"
 Процедура Тест()
     Перем МойОбщийМодуль;
-    ЭтотОбъект = Новый Структура;
-    А = Новый ОписаниеОповещения("Первый", ЭтотОбъект);
+    ДругойМодуль = Новый Структура;
+    А = Новый ОписаниеОповещения("Первый", ДругойМодуль);
     Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
 КонецПроцедуры
 "#;
@@ -2037,6 +2039,18 @@ EndProcedure
         assert_eq!(summary.notify_regs.len(), 2);
         assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
         assert_eq!(summary.notify_regs[1].target, NotifyTarget::Unsupported);
+    }
+
+    #[test]
+    fn test_notify_description_receiver_assigned_after_use_is_still_the_local() {
+        let code = r#"
+Процедура Тест()
+    А = Новый ОписаниеОповещения("Первый", МойОбщийМодуль);
+    МойОбщийМодуль = Новый Структура;
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
     }
 
     #[test]
