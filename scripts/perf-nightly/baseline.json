@@ -8,7 +8,7 @@
     "kernel": "7.2.11-arch1-1",
     "mem_total": "31 GiB",
     "nproc": 32,
-    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
     "source_commit": "9469321be80a4d3903b224d0ab7fab385d4ac655"
   },
   "protocol": {
@@ -33,12 +33,13 @@
       "record_sha": "09d5b2d117a9eeb02ca6892a6c3718e05fdba484",
       "measured_at": "2026-11-01T03:26:45+00:00",
       "evidence": {
-        "kind": "historical_import",
+        "kind": "owner_target",
         "summary": "data/gates/0.4.3-2026-11-01/summary.json",
         "role": "candidate",
         "series": "A",
         "runs": ["A-c1", "A-c2", "A-c3"],
-        "confirmation": null
+        "confirmation": null,
+        "note": "Значение и допуск ν перенесены как цель для rustc 1.100.0 решением владельца 2026-11-20 (https://github.com/itrous/bsl-analyzer/issues/897): на rustc 1.100.0 они не измерялись. Первоисточник — median_A стороны candidate на 09d5b2d117a9eeb02ca6892a6c3718e05fdba484, серия A, прогоны A-c1, A-c2, A-c3, снято 2026-11-01T03:26:45+00:00 на rustc 1.97.1 (8bab26f4f 2026-07-14), отчёт data/gates/0.4.3-2026-11-01/summary.json."
       },
       "noise": {
         "value": 0.045009872812704146,
@@ -55,12 +56,13 @@
       "record_sha": "698aafd6bb7394da35ca2bee1111841d2a914870",
       "measured_at": "2026-10-31T03:39:33+00:00",
       "evidence": {
-        "kind": "historical_import",
+        "kind": "owner_target",
         "summary": "data/gates/0.4.2-2026-10-31/summary.json",
         "role": "candidate",
         "series": "A",
         "runs": ["A-c1", "A-c2", "A-c3"],
-        "confirmation": null
+        "confirmation": null,
+        "note": "Значение и допуск ν перенесены как цель для rustc 1.100.0 решением владельца 2026-11-20 (https://github.com/itrous/bsl-analyzer/issues/897): на rustc 1.100.0 они не измерялись. Первоисточник — median_A стороны candidate на 698aafd6bb7394da35ca2bee1111841d2a914870, серия A, прогоны A-c1, A-c2, A-c3, снято 2026-10-31T03:39:33+00:00 на rustc 1.97.1 (8bab26f4f 2026-07-14), отчёт data/gates/0.4.2-2026-10-31/summary.json."
       },
       "noise": {
         "value": 0.012051462543783054,
@@ -77,12 +79,13 @@
       "record_sha": "698aafd6bb7394da35ca2bee1111841d2a914870",
       "measured_at": "2026-10-31T03:39:33+00:00",
       "evidence": {
-        "kind": "historical_import",
+        "kind": "owner_target",
         "summary": "data/gates/0.4.2-2026-10-31/summary.json",
         "role": "candidate",
         "series": "A",
         "runs": ["A-c1", "A-c2", "A-c3"],
-        "confirmation": null
+        "confirmation": null,
+        "note": "Значение и допуск ν перенесены как цель для rustc 1.100.0 решением владельца 2026-11-20 (https://github.com/itrous/bsl-analyzer/issues/897): на rustc 1.100.0 они не измерялись. Первоисточник — median_A стороны candidate на 698aafd6bb7394da35ca2bee1111841d2a914870, серия A, прогоны A-c1, A-c2, A-c3, снято 2026-10-31T03:39:33+00:00 на rustc 1.97.1 (8bab26f4f 2026-07-14), отчёт data/gates/0.4.2-2026-10-31/summary.json."
       },
       "noise": {
         "value": 0.012697172820715787,
@@ -105,7 +108,7 @@
         "series": "A",
         "runs": ["A-c1", "A-c2", "A-c3"],
         "confirmation": null,
-        "note": "Рекорд перенесён на уровень текущего develop решением владельца 2026-11-07 (https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6705349235). Число — медиана медиан A кандидата четырёх гейтов против v0.4.3 2026-11-07: perf-gate-044-fixed-2fbf243652cf 22.576484093006002, perf-gate-044-probe-interactive-5bdc42853286 22.758767238003202, perf-gate-044-probe-deep-c5bd868316f1 22.52428385100211, perf-gate-044-probe-sweepchunk-a2bfb4608dfd 22.545213352976134. Прежний рекорд 21.9344880010176 (v0.4.1, data/gates/0.4.2-2026-10-31) этим develop недостижим: узаконенное замедление на 2.86 %, вернуть метрику вниз — отдельная задача."
+        "note": "Рекорд перенесён на уровень текущего develop решением владельца 2026-11-07 (https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6705349235). Число — медиана медиан A кандидата четырёх гейтов против v0.4.3 2026-11-07: perf-gate-044-fixed-2fbf243652cf 22.576484093006002, perf-gate-044-probe-interactive-5bdc42853286 22.758767238003202, perf-gate-044-probe-deep-c5bd868316f1 22.52428385100211, perf-gate-044-probe-sweepchunk-a2bfb4608dfd 22.545213352976134. Прежний рекорд 21.9344880010176 (v0.4.1, data/gates/0.4.2-2026-10-31) этим develop недостижим: узаконенное замедление на 2.86 %, вернуть метрику вниз — отдельная задача. Значение и допуск ν перенесены как цель для rustc 1.100.0 решением владельца 2026-11-20 (https://github.com/itrous/bsl-analyzer/issues/897): на rustc 1.100.0 они не измерялись. Первоисточник — median_A стороны candidate на 2fbf243652cf89e69bd613298e9bbd7d2484ec6f, серия A, прогоны A-c1, A-c2, A-c3, снято 2026-11-07T05:27:04+00:00 на rustc 1.97.1 (8bab26f4f 2026-07-14), отчёт data/gates/perf-gate-044-fixed-2fbf243652cf/summary.json."
       },
       "noise": {
         "value": 0.009017533120752664,
@@ -128,7 +131,7 @@
         "series": "A",
         "runs": ["A-b1.3", "A-b2", "A-b3"],
         "confirmation": null,
-        "note": "Цель владельца для пика серии A, без references (решение владельца 2026-11-06, https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6693139982), перекалиброванная на уровень последнего релиза решением владельца 2026-11-07 (https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6705349235). Число — max(4371408,4787080,4762360) серии A базы v0.4.3, наибольший пик A v0.4.3 в его гейтах; прежняя цель 4667316 (серия A v0.4.2) с ν не проходила сама база. Пик серии B с references с целью не сравнивается: его держит абсолютный потолок 7340032 KB."
+        "note": "Цель владельца для пика серии A, без references (решение владельца 2026-11-06, https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6693139982), перекалиброванная на уровень последнего релиза решением владельца 2026-11-07 (https://github.com/itrous/bsl-analyzer/issues/785#issuecomment-6705349235). Число — max(4371408,4787080,4762360) серии A базы v0.4.3, наибольший пик A v0.4.3 в его гейтах; прежняя цель 4667316 (серия A v0.4.2) с ν не проходила сама база. Пик серии B с references с целью не сравнивается: его держит абсолютный потолок 7340032 KB. Значение и допуск ν перенесены как цель для rustc 1.100.0 решением владельца 2026-11-20 (https://github.com/itrous/bsl-analyzer/issues/897): на rustc 1.100.0 они не измерялись. Первоисточник — max_A стороны base на 72143dd78de5ff067f0836d2642763d1f52e9a64, серия A, прогоны A-b1.3, A-b2, A-b3, снято 2026-11-06T04:11:07+00:00 на rustc 1.97.1 (8bab26f4f 2026-07-14), отчёт data/gates/0.4.4-2026-11-03-own/summary.json."
       },
       "noise": {
         "value": 0.028,
@@ -154,12 +157,13 @@
       "record_sha": "698aafd6bb7394da35ca2bee1111841d2a914870",
       "measured_at": "2026-10-31T03:39:33+00:00",
       "evidence": {
-        "kind": "historical_import",
+        "kind": "owner_target",
         "summary": "data/gates/0.4.2-2026-10-31/summary.json",
         "role": "candidate",
         "series": "B",
         "runs": ["B-c1", "B-c2", "B-c3"],
-        "confirmation": null
+        "confirmation": null,
+        "note": "Значение и допуск ν перенесены как цель для rustc 1.100.0 решением владельца 2026-11-20 (https://github.com/itrous/bsl-analyzer/issues/897): на rustc 1.100.0 они не измерялись. Первоисточник — median_B стороны candidate на 698aafd6bb7394da35ca2bee1111841d2a914870, серия B, прогоны B-c1, B-c2, B-c3, снято 2026-10-31T03:39:33+00:00 на rustc 1.97.1 (8bab26f4f 2026-07-14), отчёт data/gates/0.4.2-2026-10-31/summary.json."
       },
       "noise": {
         "value": 0.036891099261083145,
@@ -176,12 +180,13 @@
       "record_sha": "09d5b2d117a9eeb02ca6892a6c3718e05fdba484",
       "measured_at": "2026-11-01T03:26:45+00:00",
       "evidence": {
-        "kind": "historical_import",
+        "kind": "owner_target",
         "summary": "data/gates/0.4.3-2026-11-01/summary.json",
         "role": "candidate",
         "series": "B",
         "runs": ["B-c1", "B-c2", "B-c3"],
-        "confirmation": null
+        "confirmation": null,
+        "note": "Значение и допуск ν перенесены как цель для rustc 1.100.0 решением владельца 2026-11-20 (https://github.com/itrous/bsl-analyzer/issues/897): на rustc 1.100.0 они не измерялись. Первоисточник — median_B стороны candidate на 09d5b2d117a9eeb02ca6892a6c3718e05fdba484, серия B, прогоны B-c1, B-c2, B-c3, снято 2026-11-01T03:26:45+00:00 на rustc 1.97.1 (8bab26f4f 2026-07-14), отчёт data/gates/0.4.3-2026-11-01/summary.json."
       },
       "noise": {
         "value": 0.03320290774888753,
@@ -198,12 +203,13 @@
       "record_sha": "698aafd6bb7394da35ca2bee1111841d2a914870",
       "measured_at": "2026-10-31T03:39:33+00:00",
       "evidence": {
-        "kind": "historical_import",
+        "kind": "owner_target",
         "summary": "data/gates/0.4.2-2026-10-31/summary.json",
         "role": "candidate",
         "series": "B",
         "runs": ["B-c1", "B-c2", "B-c3"],
-        "confirmation": null
+        "confirmation": null,
+        "note": "Значение и допуск ν перенесены как цель для rustc 1.100.0 решением владельца 2026-11-20 (https://github.com/itrous/bsl-analyzer/issues/897): на rustc 1.100.0 они не измерялись. Первоисточник — median_B стороны candidate на 698aafd6bb7394da35ca2bee1111841d2a914870, серия B, прогоны B-c1, B-c2, B-c3, снято 2026-10-31T03:39:33+00:00 на rustc 1.97.1 (8bab26f4f 2026-07-14), отчёт data/gates/0.4.2-2026-10-31/summary.json."
       },
       "noise": {
         "value": 0.04303570301900679,

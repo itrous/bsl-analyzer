@@ -185,6 +185,15 @@ class ShippedBaseline(unittest.TestCase):
             if evidence["kind"] != "confirmed":
                 self.assertIsNone(evidence["confirmation"], "an import is not a second round")
 
+    def test_the_record_is_carried_over_to_rustc_1_100_as_a_target_and_names_its_source(self):
+        self.assertEqual(self.doc["profile"]["rustc"], "rustc 1.100.0 (0ef1bc386 2026-11-09)")
+        for metric, entry in self.doc["metrics"].items():
+            evidence = entry["evidence"]
+            self.assertEqual(evidence["kind"], "owner_target", f"{metric} was not measured on this rustc")
+            for part in ("2026-11-20", "issues/897", "rustc 1.100.0", "rustc 1.97.1", entry["record_sha"],
+                         entry["measured_at"], evidence["summary"]):
+                self.assertIn(part, evidence.get("note") or "", metric)
+
     def test_the_memory_target_is_the_owners_and_is_not_dressed_up_as_a_measurement(self):
         entry = self.doc["metrics"]["hwm_kb"]
         if entry["evidence"]["kind"] != "owner_target":

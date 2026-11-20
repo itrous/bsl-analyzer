@@ -11,6 +11,7 @@ import hashlib
 import math
 import os
 import unittest
+from unittest import mock
 
 from gate_fixtures import BASE_TAG, CAND_LABEL
 from ok_criteria_fixtures import PEAK_OVER_TARGET_KB, TARGET_KB, TRADED, CriteriaCase, feature_signals, limit_of
@@ -514,6 +515,15 @@ class RecordFileStaysAsItIs(CriteriaCase):
         self.assertTrue(launches)
         self.assertEqual({launch["env"]["FAKE_LABEL"] for launch in launches}, {CAND_LABEL, BASE_TAG})
         self.assertTrue(all(launch["cwd"].startswith(self.tmp) for launch in launches))
+
+    def test_no_launch_sees_the_embedding_settings_of_the_caller(self):
+        with mock.patch.dict(os.environ, {"EMBEDDING_URL": "http://127.0.0.1:9", "EMBEDDING_MODEL": "m"}):
+            self.gate(label="embedding")
+            self.night()
+        launches = self.launches()
+        self.assertTrue(launches)
+        self.assertEqual(sorted({key for launch in launches for key in launch["env"]
+                                 if key.startswith("EMBEDDING_")}), [])
 
 
 if __name__ == "__main__":

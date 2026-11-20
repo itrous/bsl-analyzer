@@ -55,6 +55,15 @@ class FakeProcTree(unittest.TestCase):
             "BSL_CACHE_DIR": "/x", "BSL_MCP_BROKER": "0", "BSL_UNKNOWN_X": "1", "PATH": "/bin"})
         self.assertEqual(env, {"PATH": "/bin", procs.MARKER: "run-e", "XDG_CACHE_HOME": "/c"})
 
+    def test_child_env_drops_every_embedding_variable(self):
+        # `EMBED_KEEP` shares letters with the family and not its prefix; the `BSL_*` of
+        # `extra` is what the harness itself hands the run and has to survive the filter.
+        env = procs.child_env("run-e", extra={"BSL_CACHE_DIR": "/run/cache"}, base={
+            "BSL_X": "1", "EMBEDDING_URL": "http://127.0.0.1:9", "EMBEDDING_MODEL": "m",
+            "EMBEDDING_API_KEY": "k", "EMBEDDING_UNKNOWN_X": "1", "EMBED_KEEP": "1", "PATH": "/bin"})
+        self.assertEqual(env, {"EMBED_KEEP": "1", "PATH": "/bin", procs.MARKER: "run-e",
+                               "BSL_CACHE_DIR": "/run/cache"})
+
 
 def fake_run_proc(root, pid, run_id, hwm_kb, rss_kb=1000, cpu_ticks=(100, 50)):
     """A process of a run with a VmHWM (utime and stime in clock ticks); a second

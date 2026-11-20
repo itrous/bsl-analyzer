@@ -104,6 +104,28 @@ fn binding_scan_memoises_only_the_candidates_text() {
     );
 }
 
+/// A warm-up told to stop leaves the files it has not reached, and the fold itself, to
+/// whoever asks next: its per-file work runs on handles a cancellation of the caller's
+/// handle does not reach, so the question asked before each file is what ends it.
+#[test]
+fn a_warm_up_told_to_stop_primes_no_further_file() {
+    let (primed, files) = stand();
+    assert!(files > 2, "the control: the stand has files left after the first one");
+    assert!(primed.salsa_events_reset());
+
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    primed.prime_foreign_handler_bindings_while(SourceRootId(0), || {
+        asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+    });
+
+    assert_eq!(
+        executions(&primed, "file_mentions_handler_binding_query"),
+        1,
+        "only the file asked about before the stop is scanned"
+    );
+    assert_eq!(executions(&primed, "workspace_foreign_handler_bindings_query"), 0);
+}
+
 /// The batch warm-up computes the same fold the form module would ask for, so the
 /// module's findings do not depend on whether it ran.
 #[test]
