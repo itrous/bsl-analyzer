@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 
 ## [Unreleased]
 
+- diagnostics: `PlatformMemberNewerThanMinVersion` no longer reports the enumeration
+  `РежимРедактированияКолонки` (`ColumnEditMode`) or the property
+  `ТаблицаФормы.ПоложениеПанелиИерархии` (`FormTable.HierarchyPanelLocation`) as newer than the
+  minimum platform. The 8.5.1 help dates both 8.5.1, while the 8.3.27 help already dates them 8.0 and
+  8.3.27 (the 8.3.17 help dates the enumeration 8.0); they are the only two entries whose date moved
+  forward between the two corpora. Both read as undated now, so
+  `КолонкаФормы.РежимРедактирования = РежимРедактированияКолонки.Непосредственно` is no longer reported twice
+  on a project with minimum platform 8.3.17. The new value `Авто` keeps its own 8.5.1 date.
 - diagnostics: новое правило `PostingWhileDataExchangeLoading` (ошибка, критическая, включено по умолчанию) —
   запись объекта с режимом проведения (`РежимЗаписиДокумента.Проведение` или `ОтменаПроведения`) после
   `<Имя>.ОбменДанными.Загрузка = Истина` на той же локальной переменной. Платформа 8.3.27.2214 всегда
