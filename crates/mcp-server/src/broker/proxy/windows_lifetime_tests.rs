@@ -11,8 +11,9 @@ use windows_sys::Win32::{
     Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::{
         JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+            AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject, SetInformationJobObject,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
@@ -271,9 +272,9 @@ async fn cold_proxy_stdout_reaches_eof_while_another_session_keeps_broker_alive(
         .unwrap();
 }
 
-#[test]
-fn foreign_job_that_forbids_breakaway_is_not_modified_or_silently_inherited() {
-    for (role, expected_processes) in [("blocked-proxy", 2), ("nested-proxy", 3)] {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_job_that_forbids_breakaway_keeps_a_serving_broker_and_its_own_limits() {
+    for role in ["blocked-proxy", "nested-proxy"] {
         let root = tempfile::tempdir().unwrap();
         let mut proxy = worker_command(role, root.path()).spawn().unwrap();
         let process = OwnedProcess::open(proxy.id());
@@ -305,9 +306,20 @@ fn foreign_job_that_forbids_breakaway_is_not_modified_or_silently_inherited() {
         let launcher_job =
             (role == "nested-proxy").then(|| launcher_lifetime::adopt_child(&proxy).unwrap());
         proxy.stdin.as_mut().unwrap().write_all(b"1").unwrap();
-        assert!(marker(root.path(), "spawn-error").contains("breakaway"));
+        let broker_pid = marker(root.path(), "broker.pid").parse().unwrap();
+        let broker_process = OwnedProcess::open(broker_pid);
+        handshake(root.path(), broker_pid).await;
         process.wait();
         assert!(proxy.wait().unwrap().success());
+        assert!(!root.path().join("spawn-error").exists());
+        let mut in_job = 0;
+        assert_ne!(
+            unsafe {
+                IsProcessInJob(broker_process.handle(), job.as_raw_handle() as HANDLE, &mut in_job)
+            },
+            0
+        );
+        assert_ne!(in_job, 0, "a job that forbids breakaway keeps the broker inside");
         let mut after: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         assert_ne!(
             unsafe {
@@ -335,17 +347,11 @@ fn foreign_job_that_forbids_breakaway_is_not_modified_or_silently_inherited() {
             },
             0
         );
+        assert_eq!(accounting.TotalProcesses, 3, "the proxy, its ordinary child and one broker");
         assert_eq!(
-            accounting.TotalProcesses, expected_processes,
-            "exactly one broker spawn is attempted"
+            accounting.ActiveProcesses, 2,
+            "the ordinary child and the broker remain in the foreign job"
         );
-        assert_eq!(
-            accounting.ActiveProcesses, 1,
-            "only the ordinary child remains in the foreign job"
-        );
-        if role == "blocked-proxy" {
-            assert!(!root.path().join("broker-started").exists());
-        }
         drop(launcher_job);
     }
 }
@@ -378,16 +384,14 @@ fn worker() {
             let mut command = broker_command("broker", &root);
             match spawn_detached(&key(&root), &mut command) {
                 Ok(broker) => {
-                    assert_eq!(role, "proxy", "foreign restrictive job must refuse detachment");
                     write_marker(&root, "broker.pid", broker.id().to_string());
-                    std::io::stdin().read_exact(&mut gate).unwrap();
+                    if role == "proxy" {
+                        std::io::stdin().read_exact(&mut gate).unwrap();
+                    }
                 }
                 Err(error) => {
                     write_marker(&root, "spawn-error", format!("{error:#}"));
-                    assert!(
-                        matches!(role.as_str(), "blocked-proxy" | "nested-proxy"),
-                        "launcher-owned job must allow broker detachment"
-                    );
+                    panic!("broker launch failed: {error:#}");
                 }
             }
         }

@@ -18,9 +18,9 @@ use windows_sys::Win32::{
         Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW},
         JobObjects::IsProcessInJob,
         Threading::{
-            CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
-            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
-            DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+            CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB,
+            CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
+            PROCESS_INFORMATION, STARTUPINFOW,
         },
     },
 };
@@ -92,8 +92,10 @@ impl BrokerChild {
         self.poll(0)
     }
 
+    #[cfg(test)]
     pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.poll(INFINITE)?.ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+        self.poll(windows_sys::Win32::System::Threading::INFINITE)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
     }
 
     fn poll(&self, timeout: u32) -> io::Result<Option<ExitStatus>> {
@@ -112,13 +114,26 @@ impl BrokerChild {
     }
 }
 
+/// Launch the broker outside the launcher's Windows job, so it keeps serving after the
+/// editor that started it is gone. A containing job that forbids breakaway keeps the
+/// broker inside: it then ends with that job like any other child of it, the job itself
+/// is left as it is, and the editor still gets its shared backend.
 pub(super) fn spawn(cmd: &BrokerCommand) -> anyhow::Result<BrokerChild> {
-    let child = create(cmd)
-        .context("cannot launch detached broker: a containing Windows job may forbid breakaway")?;
-    verify_breakaway(child)
+    let child = match create(cmd, CREATE_BREAKAWAY_FROM_JOB) {
+        Ok(child) => child,
+        Err(breakaway) => create(cmd, 0).with_context(|| {
+            format!("cannot launch detached broker (outside its job: {breakaway})")
+        })?,
+    };
+    if remains_in_job(&child) {
+        tracing::warn!(
+            "a containing Windows job forbids breakaway: the broker ends together with that job"
+        );
+    }
+    Ok(child)
 }
 
-fn create(cmd: &BrokerCommand) -> io::Result<BrokerChild> {
+fn create(cmd: &BrokerCommand, job_flags: u32) -> io::Result<BrokerChild> {
     let program = cmd.0.get_program();
     if !Path::new(program).is_absolute() {
         return Err(io::Error::new(
@@ -158,10 +173,7 @@ fn create(cmd: &BrokerCommand) -> io::Result<BrokerChild> {
             null(),
             null(),
             0,
-            DETACHED_PROCESS
-                | CREATE_NEW_PROCESS_GROUP
-                | CREATE_BREAKAWAY_FROM_JOB
-                | CREATE_UNICODE_ENVIRONMENT,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT | job_flags,
             environment.as_ptr().cast(),
             cwd.as_ref().map_or(null(), |dir| dir.as_ptr()),
             &startup,
@@ -180,29 +192,11 @@ fn create(cmd: &BrokerCommand) -> io::Result<BrokerChild> {
     })
 }
 
-fn verify_breakaway(mut child: BrokerChild) -> anyhow::Result<BrokerChild> {
+fn remains_in_job(child: &BrokerChild) -> bool {
     let mut in_job = 0;
+    // SAFETY: The owned process handle stays valid for the query.
     let queried = unsafe { IsProcessInJob(child.handle(), null_mut(), &mut in_job) };
-    if queried != 0 && in_job == 0 {
-        return Ok(child);
-    }
-    let failure = if queried == 0 {
-        anyhow::anyhow!("cannot verify broker job breakaway: {}", io::Error::last_os_error())
-    } else {
-        anyhow::anyhow!(
-            "persistent broker is unsupported inside a Windows job that prevents full breakaway"
-        )
-    };
-    if unsafe { TerminateProcess(child.handle(), 1) } == 0 {
-        let error = io::Error::last_os_error();
-        if !matches!(child.try_wait(), Ok(Some(_))) {
-            return Err(error).with_context(|| {
-                format!("cannot stop own broker after refused job breakaway: {failure}")
-            });
-        }
-    }
-    child.wait().context("cannot reap own broker after refused job breakaway")?;
-    Err(failure)
+    queried != 0 && in_job != 0
 }
 
 fn wide(value: &OsStr) -> io::Result<Vec<u16>> {

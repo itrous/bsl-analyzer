@@ -149,10 +149,10 @@ Job Object с `KILL_ON_JOB_CLOSE`. Этот job разрешает явный `B
 только запуск постоянного broker использует `CREATE_BREAKAWAY_FROM_JOB` вместе
 с прежними detached/process-group флагами. Поэтому закрытие launcher/proxy
 сохраняет broker для следующего клиента, а обычные потомки app завершаются.
-После запуска проверяется, что новый broker не остался ни в одном Job Object.
-Если чужой job запрещает выход или проверка недоступна, завершается только
-созданный broker и возвращается явная причина; существующий переход в
-самостоятельный режим до начала сеанса сохраняется. Чужие jobs не меняются.
+Если чужой job запрещает выход (так работают, например, `cargo test` и
+CI-раннеры), broker запускается внутри этого job: клиенты получают общий
+backend, но broker завершается вместе с этим job и не переживает его закрытие.
+В журнал пишется предупреждение. Чужие jobs не меняются.
 
 Основания: [ограничения Job Object](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information),
 [флаги создания процесса](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags)

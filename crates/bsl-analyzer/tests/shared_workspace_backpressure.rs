@@ -9,6 +9,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use stdx::path_exclusion::resolve;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 static TEST_ENV: Mutex<()> = Mutex::new(());
@@ -184,7 +185,9 @@ impl OwnedDaemonCleanup {
             image.set_extension("exe");
         }
         std::fs::copy(app, &image).expect("copy the qualified server executable");
-        let image = image.canonicalize().expect("resolve private executable");
+        // The server trusts its shared backend only under the exact image path it was started
+        // from, and Windows reports a running image without the verbatim `\\?\` prefix.
+        let image = resolve(&image).expect("resolve private executable");
         Self { root, runtime, cache, executable, image }
     }
 
@@ -395,12 +398,17 @@ fn private_process_image_matches(
     if status == ProcessStatus::Zombie {
         return Ok(false);
     }
-    let executable = executable.filter(|path| !path.as_os_str().is_empty()).ok_or_else(|| {
-        std::io::Error::other(format!(
+    let Some(executable) = executable.filter(|path| !path.as_os_str().is_empty()) else {
+        // Windows withholds the image of a process that is being torn down; the random
+        // private name alone still identifies it, so it counts as running until it is gone.
+        #[cfg(windows)]
+        return Ok(true);
+        #[cfg(not(windows))]
+        return Err(std::io::Error::other(format!(
             "private executable candidate has no image; status={status:?}"
-        ))
-    })?;
-    let actual = executable.canonicalize()?;
+        )));
+    };
+    let actual = resolve(executable)?;
     #[cfg(windows)]
     return Ok(actual.to_string_lossy().eq_ignore_ascii_case(&image.to_string_lossy()));
     #[cfg(not(windows))]
@@ -412,7 +420,7 @@ fn private_image_observation_refuses_unknown_own_image_and_ignores_other_names()
     let root = tempfile::tempdir().unwrap();
     let image = root.path().join("bp-private");
     std::fs::write(&image, "private executable identity").unwrap();
-    let image = image.canonicalize().unwrap();
+    let image = resolve(&image).unwrap();
     let own = image.file_name().unwrap();
     assert!(!private_process_image_matches(
         std::ffi::OsStr::new("unrelated"),
@@ -421,10 +429,15 @@ fn private_image_observation_refuses_unknown_own_image_and_ignores_other_names()
         &image
     )
     .unwrap());
-    assert!(private_process_image_matches(own, None, ProcessStatus::Run, &image).is_err());
+    for missing in [None, Some(Path::new(""))] {
+        let observed = private_process_image_matches(own, missing, ProcessStatus::Run, &image);
+        if cfg!(windows) {
+            assert!(observed.unwrap(), "a private name without an image is still running");
+        } else {
+            assert!(observed.is_err());
+        }
+    }
     assert!(!private_process_image_matches(own, None, ProcessStatus::Zombie, &image).unwrap());
-    assert!(private_process_image_matches(own, Some(Path::new("")), ProcessStatus::Run, &image)
-        .is_err());
     assert!(private_process_image_matches(own, Some(&image), ProcessStatus::Run, &image).unwrap());
     let other = root.path().join("another-image");
     std::fs::write(&other, "different executable identity").unwrap();

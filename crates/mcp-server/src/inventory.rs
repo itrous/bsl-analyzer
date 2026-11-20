@@ -661,9 +661,6 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     // Private LSP control channels close with their transport; data EOF ends the writer select.
     ("broker/transport.rs", "new", ".recv(", Waiting::OwnProtocol),
     ("broker/transport.rs", "recv_control", ".recv(", Waiting::OwnProtocol),
-    // A refused job breakaway kills only the broker just spawned; the successful
-    // kill or an already-exited try_wait is followed by collecting that own child.
-    ("broker/proxy/windows_spawn.rs", "verify_breakaway", ".wait(", Waiting::OwnProtocol),
     // The external baseline service: its own `shutdown`, called before the owners stop.
     ("baseline.rs", "serve", ".recv(", Waiting::OwnProtocol),
     ("baseline.rs", "shutdown", ".recv_timeout(", Waiting::OwnProtocol),
