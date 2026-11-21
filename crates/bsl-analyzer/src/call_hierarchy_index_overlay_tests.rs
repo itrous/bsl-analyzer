@@ -38,6 +38,60 @@ fn call_hierarchy_index_overlay_prefers_frozen_open_buffer_text() {
 }
 
 #[test]
+fn call_hierarchy_index_batch_reads_cross_batch_targets_from_frozen_revisions() {
+    // Given: two disk-backed common modules, with a call crossing their batches.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let caller_path = directory.path().join("src/CommonModules/Первый/Ext/Module.bsl");
+    let target_path = directory.path().join("src/CommonModules/Второй/Ext/Module.bsl");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).expect("caller directory");
+    std::fs::create_dir_all(target_path.parent().unwrap()).expect("target directory");
+    let caller_text = "Процедура Начать()\nВторой.Продолжить();\nКонецПроцедуры";
+    let target_text = "Процедура Продолжить() Экспорт\nКонецПроцедуры";
+    std::fs::write(&caller_path, caller_text).expect("caller module");
+    std::fs::write(&target_path, target_text).expect("target module");
+
+    let source_root_id = SourceRootId(0);
+    let caller_file = FileId(0);
+    let target_file = FileId(1);
+    let mut file_set = FileSet::new();
+    file_set.insert(caller_file, VfsPath::new(caller_path));
+    file_set.insert(target_file, VfsPath::new(target_path));
+    let mut db = RootDatabaseImpl::default();
+    db.set_source_root(source_root_id, SourceRoot::new_local(file_set));
+    for (file_id, text) in [(caller_file, caller_text), (target_file, target_text)] {
+        db.set_file_source_root(file_id, source_root_id);
+        db.set_file_revision_from_disk(file_id, content_revision(text));
+    }
+    let snapshot = CallHierarchyIndexFrozenSnapshot::capture(
+        &db,
+        source_root_id,
+        &MemDocs::default().freeze(),
+        7,
+    )
+    .materialize();
+
+    // When: semantic resolution reads the target while only the caller is in the batch.
+    let read_target_text =
+        Analysis::from_database(snapshot.open_batch(&[ModuleId::new(caller_file)]))
+            .file_text(target_file);
+    assert_eq!(&*read_target_text, target_text);
+
+    let modules = snapshot.modules();
+    let mut open_batch = |batch: &[ModuleId]| snapshot.open_batch(batch);
+
+    // Then: the bounded builder can lower the caller in a database whose own batch
+    // does not contain the target module.
+    let built = ide::build_call_hierarchy_index(
+        ide::CallHierarchyIndexBuildRequest::new(&modules, 1).with_concurrency(1),
+        &mut open_batch,
+    )
+    .expect("bounded index build");
+
+    // Then: bounded indexing completes with both modules' methods available.
+    assert_eq!(built.method_count, 2);
+}
+
+#[test]
 fn call_hierarchy_index_overlay_uses_captured_disk_revision_after_buffer_closes() {
     // Given: a frozen open buffer backed by a registered disk revision.
     let directory = tempfile::tempdir().expect("temporary directory");

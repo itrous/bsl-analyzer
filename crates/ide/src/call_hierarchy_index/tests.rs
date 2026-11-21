@@ -81,17 +81,18 @@ fn fixture() -> [FixtureFile; 3] {
     ]
 }
 
-fn batch_database(files: &[FixtureFile], batch: &[ModuleId]) -> RootDatabaseImpl {
+fn batch_database(files: &[FixtureFile]) -> RootDatabaseImpl {
     let mut db = RootDatabaseImpl::new();
     let mut file_set = FileSet::new();
     for (index, file) in files.iter().enumerate() {
         file_set.insert(FileId(index as u32), VfsPath::new(file.path));
     }
     db.set_source_root(ROOT, SourceRoot::new_local(file_set));
-    for module in batch {
-        let file = files[module.file_id.0 as usize];
-        db.set_file_source_root(module.file_id, ROOT);
-        db.set_file_text(module.file_id, file.text);
+    // Inference can read a cross-module target before the index projects the call.
+    for (index, file) in files.iter().enumerate() {
+        let file_id = FileId(index as u32);
+        db.set_file_source_root(file_id, ROOT);
+        db.set_file_text(file_id, file.text);
     }
     db
 }
@@ -113,12 +114,12 @@ fn build_with_concurrency(
     let max_live = concurrency.max(1);
     let open_events = Rc::clone(&events);
     let open_live = Rc::clone(&live);
-    let mut open_batch = move |batch: &[ModuleId]| {
+    let mut open_batch = move |_batch: &[ModuleId]| {
         let live = open_live.get() + 1;
         assert!(live <= max_live, "at most {max_live} batch databases may be live, saw {live}");
         open_live.set(live);
         open_events.borrow_mut().push(ProbeEvent::Opened);
-        batch_database(&files, batch)
+        batch_database(&files)
     };
     let mut probe = Probe { events: Rc::clone(&events), live: Rc::clone(&live), cache_clears: 0 };
 

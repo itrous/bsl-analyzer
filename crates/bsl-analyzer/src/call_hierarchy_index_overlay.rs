@@ -104,12 +104,11 @@ impl CallHierarchyIndexFrozenSnapshot {
         db.set_graph_config_cache(Arc::clone(&self.config_cache));
         db.set_source_root(self.source_root_id, self.source_root.clone());
 
-        let mut batch_files = Vec::with_capacity(batch.len());
-        for module in batch {
-            let file_id = module.file_id;
-            let Some(path) = self.file_set.get(&file_id) else {
-                continue;
-            };
+        // Lowering a caller can resolve a cross-module call and read the target's
+        // item tree before the compact index handles that edge. Keep closed files
+        // disk-backed, but register every file from the frozen workspace so those
+        // reads use the captured revision instead of an absent Salsa input.
+        for &file_id in self.file_set.keys() {
             db.set_file_source_root(file_id, self.source_root_id);
             if let Some(text) = self.open_texts.get(&file_id) {
                 db.set_file_text(file_id, text.as_ref());
@@ -122,7 +121,13 @@ impl CallHierarchyIndexFrozenSnapshot {
                 // established.
                 db.set_file_text(file_id, "");
             }
-            batch_files.push((file_id, path.clone()));
+        }
+
+        let mut batch_files = Vec::with_capacity(batch.len());
+        for module in batch {
+            if let Some(path) = self.file_set.get(&module.file_id) {
+                batch_files.push((module.file_id, path.clone()));
+            }
         }
 
         db.set_workspace_configs_snapshot((*self.configs).clone());
