@@ -295,6 +295,47 @@ fn notify_registrations_use_live_branches_and_type_availability() {
 }
 
 #[test]
+fn server_only_notify_constructors_are_not_diagnosed() {
+    const CALLER: &str = "CommonForms/Форма1/Ext/Form/Module.bsl";
+    const SOURCE: &str = r#"
+&НаСервере
+Процедура Тест()
+    О = Новый ОписаниеОповещения("Статический", ЭтотОбъект);
+    О = Новый("CallbackDescription", "Динамический", ЭтотОбъект);
+КонецПроцедуры
+"#;
+    let fixture = CfeFixtureBuilder::new("").build();
+    crate::test_utils::check_cfe_at_with_db(
+        CALLER,
+        SOURCE,
+        fixture,
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        |_| {},
+        |db, ctx| {
+            let module = ModuleId::new(ctx.file_id);
+            let summary = db.module_call_summary(module);
+            assert_eq!(summary.notify_regs.len(), 2, "{:#?}", summary.notify_regs);
+            assert!(
+                summary
+                    .notify_regs
+                    .iter()
+                    .all(|reg| { matches!(reg.target, NotifyTarget::NotCompiled { .. }) }),
+                "{:#?}",
+                summary.notify_regs
+            );
+            assert!(db
+                .resolved_module_summary(module)
+                .edges
+                .iter()
+                .all(|edge| edge.kind != EdgeKind::NotifyRef));
+            assert!(missing_notify_handler::check(ctx).is_empty());
+            Vec::new()
+        },
+    );
+}
+
+#[test]
 fn unavailable_notify_registrations_do_not_keep_local_parameters_live() {
     const CALLER: &str = "CommonModules/Caller/Ext/Module.bsl";
     const SOURCE: &str = r#"

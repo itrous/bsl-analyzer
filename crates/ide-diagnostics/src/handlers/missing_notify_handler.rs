@@ -144,9 +144,9 @@ fn module_verdict(
         Ok(true) => None,
         Ok(false) => Some(Verdict::NotExported),
         Err(hir::QualifiedMethodError::NotFound) => Some(Verdict::NotFound),
-        Err(hir::QualifiedMethodError::BodyUnread | hir::QualifiedMethodError::NotVisibleInConfigs) => {
-            None
-        }
+        Err(
+            hir::QualifiedMethodError::BodyUnread | hir::QualifiedMethodError::NotVisibleInConfigs,
+        ) => None,
     }
 }
 
@@ -159,8 +159,30 @@ mod tests {
 
     const CALLER: &str = "CommonForms/Форма1/Ext/Form/Module.bsl";
 
+    fn client_context_source(source: &str) -> String {
+        let mut client_source = String::with_capacity(source.len() + 32);
+        let mut previous_nonempty_line = None;
+        let mut method_count = 0;
+        for line in source.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            if (trimmed.starts_with("Процедура ") || trimmed.starts_with("Асинх Процедура "))
+                && !previous_nonempty_line.is_some_and(|line: &str| line.starts_with('&'))
+            {
+                client_source.push_str("&НаКлиенте\n");
+                method_count += 1;
+            }
+            client_source.push_str(line);
+            if !trimmed.trim().is_empty() {
+                previous_nonempty_line = Some(trimmed.trim());
+            }
+        }
+        assert!(method_count > 0, "test source has no method declaration: {source}");
+        client_source
+    }
+
     fn run(source: &str, fixture: test_fixture::CfeFixture) -> Vec<Diagnostic> {
-        check_cfe_at_with_unreadable(CALLER, source, fixture, &[], check)
+        let source = client_context_source(source);
+        check_cfe_at_with_unreadable(CALLER, &source, fixture, &[], check)
     }
 
     fn run_local(source: &str) -> Vec<Diagnostic> {
@@ -184,10 +206,10 @@ mod tests {
         let source = local_source("");
         let diagnostics = run_local(&source);
         expect![[r#"
-            MissingNotifyHandler @ 2:15..2:75
+            MissingNotifyHandler @ 3:15..3:75
               message: Добавьте "Экспорт" процедуре "ОбработчикЗавершения" - обработчик оповещения вызывается платформой только как экспортный
               severity: Blocker"#]]
-        .assert_eq(&format_diags(&source, &diagnostics));
+        .assert_eq(&format_diags(&client_context_source(&source), &diagnostics));
     }
 
     /// Control for the case above: the fixture differs by the single word `Экспорт`.
@@ -203,10 +225,10 @@ mod tests {
         let source = "Процедура ПередЗакрытием()\n\tОповещение = Новый ОписаниеОповещения(\"НетТакогоОбработчика\", ЭтотОбъект);\nКонецПроцедуры\n";
         let diagnostics = run_local(source);
         expect![[r#"
-            MissingNotifyHandler @ 2:15..2:75
+            MissingNotifyHandler @ 3:15..3:75
               message: Создайте экспортную процедуру "НетТакогоОбработчика" или исправьте имя обработчика оповещения
               severity: Blocker"#]]
-        .assert_eq(&format_diags(source, &diagnostics));
+        .assert_eq(&format_diags(&client_context_source(source), &diagnostics));
     }
 
     #[test]
@@ -267,10 +289,10 @@ mod tests {
             "Процедура Готово(Результат, Параметры)\nКонецПроцедуры\n",
         );
         expect![[r#"
-            MissingNotifyHandler @ 2:15..2:66
+            MissingNotifyHandler @ 3:15..3:66
               message: Добавьте "Экспорт" процедуре "МойМодульКлиент.Готово" - обработчик оповещения вызывается платформой только как экспортный
               severity: Blocker"#]]
-        .assert_eq(&format_diags(module_source(), &diagnostics));
+        .assert_eq(&format_diags(&client_context_source(module_source()), &diagnostics));
     }
 
     #[test]
@@ -401,10 +423,10 @@ mod tests {
             .filter(|d| d.code == DiagnosticCode::MissingNotifyHandler)
             .count()
         };
-        assert_eq!(count("&НаСервере"), 0);
-        assert_eq!(count("&НаСервереБезКонтекста"), 1);
+        assert_eq!(count("&НаКлиентеНаСервере"), 0);
+        assert_eq!(count("&НаКлиентеНаСервереБезКонтекста"), 1);
 
-        let source = "&НаСервере\nПроцедура СКонтекстом()\n    О = Новый ОписаниеОповещения(\"Готово\", Модуль);\nКонецПроцедуры\n&НаСервереБезКонтекста\nПроцедура БезКонтекста()\n    О = Новый ОписаниеОповещения(\"Готово\", Модуль);\nКонецПроцедуры\n";
+        let source = "&НаКлиентеНаСервере\nПроцедура СКонтекстом()\n    О = Новый ОписаниеОповещения(\"Готово\", Модуль);\nКонецПроцедуры\n&НаКлиентеНаСервереБезКонтекста\nПроцедура БезКонтекста()\n    О = Новый ОписаниеОповещения(\"Готово\", Модуль);\nКонецПроцедуры\n";
         let diagnostics = crate::test_utils::check_form_with_common_modules_and_form_xml(
             source,
             &[("Модуль", "Процедура Другая() Экспорт\nКонецПроцедуры\n", module_xml)],
@@ -433,9 +455,10 @@ mod tests {
         fn run_with_body(base_body: &str, missing_extension_body: bool) -> Vec<Diagnostic> {
             let mut builder = CfeFixtureBuilder::new("");
             builder.add_base_module("МойМодульКлиент", base_body).add_extension("Расш", "");
+            let source = client_context_source(module_source());
             check_cfe_at_with_db(
                 CALLER,
-                module_source(),
+                &source,
                 builder.build(),
                 &[],
                 crate::DiagnosticsConfig::all_enabled(),
@@ -617,9 +640,10 @@ mod tests {
         form_xml: &str,
         fixture: test_fixture::CfeFixture,
     ) -> Vec<Diagnostic> {
+        let source = client_context_source(source);
         crate::test_utils::check_cfe_at_with_unreadable_config_and_setup(
             CALLER,
-            source,
+            &source,
             fixture,
             &[],
             crate::DiagnosticsConfig::all_enabled(),
