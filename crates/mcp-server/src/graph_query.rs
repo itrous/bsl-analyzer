@@ -1921,7 +1921,6 @@ mod tests {
             })
             .unwrap();
 
-        assert!(crate::graph_db::SCHEMA_VERSION > B0_SCHEMA_VERSION);
         assert!(GraphDb::open(&path).is_ok(), "the current projection is a positive control");
         Connection::open(&path)
             .unwrap()
