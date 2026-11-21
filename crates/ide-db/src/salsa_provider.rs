@@ -171,13 +171,20 @@ impl AnalysisProvider for SalsaProvider<'_> {
         )
     }
 
-    fn nonlocal_common_module_receiver(
+    fn notify_handler_availability_in_registration(
         &self,
         file_id: FileId,
         owner: DefWithBodyId,
-        name: &Name,
-    ) -> Option<bool> {
-        Some(hir::bare_root::nonlocal_common_module_receiver(self.db, file_id, owner, name))
+        registration_range: syntax::TextRange,
+        methods: &[MethodId],
+    ) -> hir::NotifyHandlerAvailability {
+        hir::notify_handler_availability_in_registration(
+            self.db,
+            file_id,
+            owner,
+            registration_range,
+            methods,
+        )
     }
 
     fn resolve_event_subscription(

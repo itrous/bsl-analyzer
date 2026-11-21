@@ -120,15 +120,16 @@ pub trait AnalysisProvider {
         None
     }
 
-    /// Whether the nonlocal owner of `name` in `owner` is a common module.
-    /// Providers without semantic name resolution cannot establish the answer.
-    fn nonlocal_common_module_receiver(
+    /// Whether same-named local methods provide an exported callback in each
+    /// proven execution environment of a registration.
+    fn notify_handler_availability_in_registration(
         &self,
         _file_id: FileId,
         _owner: DefWithBodyId,
-        _name: &Name,
-    ) -> Option<bool> {
-        None
+        _registration_range: syntax::TextRange,
+        _methods: &[MethodId],
+    ) -> hir::NotifyHandlerAvailability {
+        hir::NotifyHandlerAvailability::Unknown
     }
 
     /// The event subscription `name` visible to `file_id`. The default scans the

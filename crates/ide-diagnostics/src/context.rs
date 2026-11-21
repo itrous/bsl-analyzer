@@ -55,14 +55,6 @@ impl<'a> DiagnosticsContext<'a> {
         self.query(|p| p.module_bodies(module_id))
     }
 
-    pub(crate) fn nonlocal_common_module_receiver(
-        &self,
-        owner: hir::DefWithBodyId,
-        name: &hir::Name,
-    ) -> Option<bool> {
-        self.query(|p| p.nonlocal_common_module_receiver(self.file_id, owner, name))
-    }
-
     pub fn infer(&self) -> Arc<hir::InferenceResult> {
         self.query(|p| p.infer(self.file_id))
     }
@@ -368,6 +360,22 @@ impl<'a> AnalysisContext<'a> {
         method_name: &hir::Name,
     ) -> Option<Result<bool, hir::QualifiedMethodError>> {
         self.query(|p| p.qualified_method_export(self.file_id, module_name, method_name))
+    }
+
+    pub(crate) fn notify_handler_availability_in_registration(
+        &self,
+        owner: hir::DefWithBodyId,
+        registration_range: syntax::TextRange,
+        methods: &[hir::MethodId],
+    ) -> hir::NotifyHandlerAvailability {
+        self.query(|p| {
+            p.notify_handler_availability_in_registration(
+                self.file_id,
+                owner,
+                registration_range,
+                methods,
+            )
+        })
     }
 
     pub fn module_implicit_field_names(&self) -> Vec<String> {

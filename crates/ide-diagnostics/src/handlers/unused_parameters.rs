@@ -105,16 +105,12 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
     for reg in &summary.notify_regs {
-        // Excluded environments still need the same conservative signature protection
-        // as the syntactic self-name or non-bare receiver in the source.
+        // Keep the B0 exemption based on source syntax, not semantic receiver resolution:
+        // an unresolved bare name may be external, while self and non-bare receivers fix
+        // the callback signature.
         if matches!(
-            reg.target,
-            hir::NotifyTarget::ThisObject
-                | hir::NotifyTarget::Unsupported
-                | hir::NotifyTarget::NotCompiled {
-                    receiver_syntax: NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other,
-                    ..
-                }
+            reg.receiver_syntax,
+            NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other
         ) {
             fixed_signature_handlers.insert(reg.callback_name.as_str().fold_lower());
         }
@@ -1036,6 +1032,22 @@ EndProcedure
     }
 
     #[test]
+    fn test_notify_description_non_bare_receiver_no_diagnostic() {
+        let code = r#"&НаКлиенте
+Процедура Вызов()
+    Описание = Новый ОписаниеОповещения("Callback", ПолучитьОбъект());
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Callback(Результат, ДопПараметры) Экспорт
+    Вызов(Результат);
+КонецПроцедуры
+"#;
+
+        check_diagnostics_snapshot_for(code, DiagnosticCode::UnusedParameters, expect![[r#""#]]);
+    }
+
+    #[test]
     fn test_notify_description_callback_no_diagnostic() {
         let code = r#"&НаКлиенте
 Процедура СоздатьНаОснованииАктУПД()
@@ -1073,7 +1085,7 @@ EndProcedure
     }
 
     #[test]
-    fn test_notify_description_cross_module_still_flags() {
+    fn test_notify_description_client_common_module_still_flags() {
         use crate::test_utils::check_cfe_at_with_db;
         use hir::DefDatabase;
         use test_fixture::CfeFixtureBuilder;
@@ -1133,6 +1145,61 @@ EndProcedure
     }
 
     #[test]
+    fn test_notify_description_missing_module_still_flags() {
+        use crate::test_utils::check_cfe_at_with_db;
+        use hir::DefDatabase;
+        use test_fixture::CfeFixtureBuilder;
+
+        const CALLER: &str = "CommonModules/Caller/Ext/Module.bsl";
+        const CALLER_SOURCE: &str = r#"&НаКлиенте
+Процедура Вызов()
+    Описание = Новый ОписаниеОповещения("Callback", КлиентскийМодуль);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Callback(Результат, ДопПараметры) Экспорт
+    Вызов(Результат);
+КонецПроцедуры
+"#;
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_base_module("Caller", "");
+        let fixture = builder.build();
+        let diagnostics = check_cfe_at_with_db(
+            CALLER,
+            CALLER_SOURCE,
+            fixture,
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                for (_, root) in fixture.config_paths() {
+                    let path = root.join("CommonModules/Caller.xml");
+                    let xml = std::fs::read_to_string(&path).unwrap();
+                    let updated = xml.replace(
+                        "<ClientManagedApplication>false</ClientManagedApplication>",
+                        "<ClientManagedApplication>true</ClientManagedApplication>",
+                    );
+                    assert_ne!(updated, xml, "Caller starts client-disabled");
+                    std::fs::write(path, updated).unwrap();
+                }
+            },
+            |db, ctx| {
+                let summary = db.module_call_summary(hir::ModuleId::new(ctx.file_id));
+                assert!(matches!(
+                    &summary.notify_regs[0].target,
+                    hir::call_graph::NotifyTarget::Unsupported
+                ));
+                super::check(ctx)
+            },
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect::<Vec<_>>();
+        assert_eq!(unused.len(), 1, "{diagnostics:#?}");
+        assert!(unused[0].message.contains("ДопПараметры"), "{diagnostics:#?}");
+    }
+
+    #[test]
     fn test_notify_description_variable_arg_still_flags() {
         let code = r#"&НаКлиенте
 Процедура Вызов()
@@ -1157,10 +1224,11 @@ EndProcedure
     }
 
     #[test]
-    fn test_notify_description_dynamic_constructor() {
+    fn test_notify_description_unknown_parameter_array_does_not_protect_callback() {
         let code = r#"&НаКлиенте
 Процедура Вызов()
-    Описание = Новый("ОписаниеОповещения", "ПослеВыбора", ЭтотОбъект);
+    Параметры = ПолучитьПараметры();
+    Описание = Новый("ОписаниеОповещения", Параметры);
 КонецПроцедуры
 
 &НаКлиенте
@@ -1169,7 +1237,14 @@ EndProcedure
 КонецПроцедуры
 "#;
 
-        check_diagnostics_snapshot_for(code, DiagnosticCode::UnusedParameters, expect![[r#""#]]);
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnusedParameters,
+            expect![[r#"
+            UnusedParameters @ 7:34..7:46
+              message: Уберите неиспользуемый параметр "ДопПараметры"
+              severity: Warning"#]],
+        );
     }
 
     #[test]

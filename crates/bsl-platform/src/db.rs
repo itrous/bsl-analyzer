@@ -198,6 +198,24 @@ impl PlatformDataInner {
                 }
             }
         }
+        for (canonical_ru, legacy_en) in LEGACY_ENGLISH_TYPE_ALIASES {
+            let canonical_key: SmolStr = canonical_ru.fold_lower().into();
+            if ambiguous_type_names.contains(&canonical_key) {
+                continue;
+            }
+            let Some(&idx) = types_by_name.get(&canonical_key) else { continue };
+            let alias_key: SmolStr = legacy_en.fold_lower().into();
+            match types_by_name.get(&alias_key).copied() {
+                None => {
+                    types_by_name.insert(alias_key, idx);
+                }
+                Some(existing) if existing == idx => {}
+                Some(_) => {
+                    types_by_name.remove(&alias_key);
+                    ambiguous_type_names.insert(alias_key);
+                }
+            }
+        }
 
         let served_platform_version = origin
             .as_ref()
@@ -489,6 +507,18 @@ impl PlatformDataInner {
         self.types.get(idx)
     }
 
+    /// Whether `name` resolves to the platform's callback-description type.
+    /// Both canonical platform names and registered legacy aliases use the same
+    /// type record, so constructor context comes from one platform fact.
+    pub fn is_notify_description_type_name(&self, name: &str) -> bool {
+        if self.is_ambiguous_type_name(name) {
+            return false;
+        }
+        let Some(resolved) = self.get_type(name) else { return false };
+        let Some(canonical) = self.get_type("CallbackDescription") else { return false };
+        std::ptr::eq(resolved, canonical)
+    }
+
     pub fn all_types(&self) -> &[PlatformType] {
         &self.types
     }
@@ -555,7 +585,11 @@ impl PlatformDataInner {
 
     pub fn get_constructors(&self, type_name: &str) -> Vec<&PlatformConstructor> {
         let key: SmolStr = type_name.fold_lower().into();
-        match self.constructors_by_type.get(&key) {
+        let canonical_key = match self.types_by_name.get(&key) {
+            Some(&idx) => self.type_en_folded[idx].clone(),
+            None => key,
+        };
+        match self.constructors_by_type.get(&canonical_key) {
             Some(indices) => indices.iter().filter_map(|&i| self.constructors.get(i)).collect(),
             None => Vec::new(),
         }
@@ -671,6 +705,10 @@ pub const LEGACY_GLOBAL_FUNCTION_EN_ALIASES: &[(&str, &str)] = &[
     // (aligning with CopyFileAsync); FileCopy remains callable.
     ("КопироватьФайл", "FileCopy"),
 ];
+
+/// Historical English platform type names accepted by the runtime in addition
+/// to the current spelling in the help corpus.
+const LEGACY_ENGLISH_TYPE_ALIASES: &[(&str, &str)] = &[("ОписаниеОповещения", "NotifyDescription")];
 
 /// Since the 8.3.27 help archives, the `СписокЭлементовDOM` page lists only
 /// HTML element classes as collection elements, while the same collection is
@@ -1611,6 +1649,27 @@ mod tests {
             via_class.map(|t| t.english_name.as_str()),
             "XDTO alias must resolve to the same type as the class name"
         );
+    }
+
+    #[test]
+    fn callback_description_aliases_resolve_to_one_platform_type_and_context() {
+        let data = PlatformDataInner::instance();
+        if data.all_types().is_empty() {
+            return;
+        }
+
+        let canonical = data.get_type("ОписаниеОповещения").expect("platform type must exist");
+        let context = canonical.context.expect("callback description availability must be recorded");
+        assert!(!context.server, "callback descriptions are unavailable on the server");
+        let canonical_constructors = data.get_constructors("CallbackDescription");
+        assert!(!canonical_constructors.is_empty(), "callback constructor data must exist");
+        for alias in ["CallbackDescription", "NotifyDescription"] {
+            let resolved = data.get_type(alias).unwrap_or_else(|| panic!("{alias} must resolve"));
+            assert!(std::ptr::eq(resolved, canonical), "{alias} must share the platform record");
+            assert_eq!(resolved.context, Some(context), "{alias} must inherit platform availability");
+            assert_eq!(data.get_constructors(alias), canonical_constructors, "{alias} must resolve constructors");
+            assert!(data.is_notify_description_type_name(alias), "{alias} must identify the callback type");
+        }
     }
 
     #[test]

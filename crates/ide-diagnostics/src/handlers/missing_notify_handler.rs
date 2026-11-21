@@ -52,17 +52,18 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         let verdict = match &reg.target {
             NotifyTarget::ThisObject if local_unprovable => None,
             NotifyTarget::ThisObject => {
-                local_verdict(ctx, &reg.callback_name).map(|v| (v, reg.callback_name.to_string()))
-            }
-            NotifyTarget::Module(module_name) => {
                 let owner = match reg.caller {
                     CallerId::Method(key) => DefWithBodyId::Method(key),
                     CallerId::ModuleCode => DefWithBodyId::ModuleCode,
                 };
-                let key = (owner, module_name.clone(), reg.callback_name.clone());
+                local_verdict(ctx, &reg.callback_name, owner, reg.range)
+                    .map(|v| (v, reg.callback_name.to_string()))
+            }
+            NotifyTarget::Module(module_name) => {
+                let key = (module_name.clone(), reg.callback_name.clone());
                 let verdict = *module_verdicts
                     .entry(key)
-                    .or_insert_with(|| module_verdict(ctx, module_name, &reg.callback_name, owner));
+                    .or_insert_with(|| module_verdict(ctx, module_name, &reg.callback_name));
                 verdict.map(|v| {
                     (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
                 })
@@ -104,31 +105,32 @@ fn message(verdict: Verdict, detail: &str) -> String {
     }
 }
 
-/// Handler named on `ЭтотОбъект`: it must be declared in this very module.
-fn local_verdict(ctx: &DiagnosticsContext, name: &Name) -> Option<Verdict> {
-    let tree = ctx.symbol_tree();
-    let methods = tree.find_methods(name);
-    if methods.is_empty() {
-        Some(Verdict::NotFound)
-    } else if methods.iter().any(|m| m.is_export) {
-        None
-    } else {
-        Some(Verdict::NotExported)
+/// Handler named on `ЭтотОбъект`: only declarations available in the registration's
+/// execution environments can satisfy the string reference.
+fn local_verdict(
+    ctx: &DiagnosticsContext,
+    name: &Name,
+    owner: DefWithBodyId,
+    registration_range: syntax::TextRange,
+) -> Option<Verdict> {
+    let methods = ctx
+        .symbol_tree()
+        .find_methods(name)
+        .into_iter()
+        .map(|method| method.id)
+        .collect::<Vec<_>>();
+
+    match ctx.notify_handler_availability_in_registration(owner, registration_range, &methods) {
+        hir::NotifyHandlerAvailability::Exported | hir::NotifyHandlerAvailability::Unknown => None,
+        hir::NotifyHandlerAvailability::NotExported => Some(Verdict::NotExported),
+        hir::NotifyHandlerAvailability::NotFound => Some(Verdict::NotFound),
     }
 }
 
 /// Handler named on a bare identifier. Only a receiver that is a known common module is
 /// judged: any other identifier (a local variable, a module the analysis cannot see) says
 /// nothing about where the handler lives, and neither does a body that could not be read.
-fn module_verdict(
-    ctx: &DiagnosticsContext,
-    module_name: &Name,
-    name: &Name,
-    owner: DefWithBodyId,
-) -> Option<Verdict> {
-    if !ctx.nonlocal_common_module_receiver(owner, module_name)? {
-        return None;
-    }
+fn module_verdict(ctx: &DiagnosticsContext, module_name: &Name, name: &Name) -> Option<Verdict> {
     ctx.resolve_common_module(module_name.as_str())?;
     let bodies = ctx.common_module_bodies(module_name.as_str());
     if bodies.is_empty() || bodies.has_missing_expected_body() {
@@ -150,6 +152,8 @@ mod tests {
     use super::*;
     use crate::test_utils::format_diags;
     use expect_test::expect;
+    use hir::call_graph::{EdgeKind, EdgeProvenance, ResolvedTarget};
+    use hir::ConfigsDatabase;
     use test_fixture::CfeFixtureBuilder;
 
     const CALLER: &str = "CommonForms/Форма1/Ext/Form/Module.bsl";
@@ -183,6 +187,36 @@ mod tests {
         run(source, CfeFixtureBuilder::new("").build())
     }
 
+    fn run_local_with_string_resolved_notify_edges(
+        source: &str,
+        expected_edges: usize,
+    ) -> Vec<Diagnostic> {
+        let source = client_context_source(source);
+        crate::test_utils::check_cfe_at_with_db(
+            CALLER,
+            &source,
+            CfeFixtureBuilder::new("").build(),
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                let form = fixture.root().join("CommonForms/Форма1/Ext/Form.xml");
+                std::fs::create_dir_all(form.parent().unwrap()).unwrap();
+                std::fs::write(&form, PLAIN_FORM_XML).unwrap();
+            },
+            |db, ctx| {
+                let graph = db.resolved_module_summary(ModuleId::new(ctx.file_id));
+                let edges: Vec<_> =
+                    graph.edges.iter().filter(|edge| edge.kind == EdgeKind::NotifyRef).collect();
+                assert_eq!(edges.len(), expected_edges, "{edges:#?}");
+                assert!(edges.iter().all(|edge| {
+                    edge.provenance == EdgeProvenance::StringResolved
+                        && matches!(edge.target, ResolvedTarget::Method(_))
+                }), "the graph still resolves string callbacks independent of declaration availability: {edges:#?}");
+                check(ctx)
+            },
+        )
+    }
+
     fn with_module(source: &str, module_body: &str) -> Vec<Diagnostic> {
         let mut builder = CfeFixtureBuilder::new("");
         builder.add_base_module("МойМодульКлиент", module_body);
@@ -212,6 +246,68 @@ mod tests {
         let source = local_source(" Экспорт");
         let diagnostics = run_local(&source);
         assert!(diagnostics.is_empty(), "an exported handler must pass: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn an_export_in_an_impossible_preprocessor_branch_does_not_satisfy_a_live_client_registration()
+    {
+        let source = "&НаКлиенте\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\nКонецПроцедуры\n#Если Сервер И Не Сервер Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
+        let diagnostics = run_local_with_string_resolved_notify_edges(source, 1);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.starts_with("Создайте экспортную процедуру"));
+    }
+
+    #[test]
+    fn a_live_client_export_satisfies_a_client_registration() {
+        let source = "&НаКлиенте\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\nКонецПроцедуры\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n";
+        let diagnostics = run_local_with_string_resolved_notify_edges(source, 1);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn an_export_in_only_some_registration_environments_is_not_enough() {
+        let source = "&НаКлиентеНаСервере\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\nКонецПроцедуры\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n";
+        let diagnostics = run_local_with_string_resolved_notify_edges(source, 1);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.starts_with("Создайте экспортную процедуру"));
+    }
+
+    #[test]
+    fn complementary_exports_of_same_named_declarations_cover_the_registration_environments() {
+        let source = "&НаКлиентеНаСервере\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\nКонецПроцедуры\n#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n#Если Сервер Тогда\n&НаСервере\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
+        let diagnostics = run_local_with_string_resolved_notify_edges(source, 1);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn registrations_in_one_method_use_their_own_preprocessor_environments() {
+        let source = "&НаКлиентеНаСервере\nПроцедура ПередЗакрытием()\n#Если Клиент Тогда\n    А = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\n#КонецЕсли\n#Если Сервер Тогда\n    Б = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\n#КонецЕсли\nКонецПроцедуры\n#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
+        let diagnostics = run_local_with_string_resolved_notify_edges(source, 2);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.starts_with("Создайте экспортную процедуру"));
+        let server_registration = source.find("Б = Новый").unwrap();
+        assert!(
+            usize::from(diagnostics[0].range.start()) >= server_registration,
+            "the client registration is valid; the server registration is not: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn a_non_exported_declaration_outside_the_registration_environment_does_not_change_not_found() {
+        let source = "&НаКлиенте\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\nКонецПроцедуры\n#Если Сервер Тогда\n&НаСервере\nПроцедура Готово()\nКонецПроцедуры\n#КонецЕсли\n";
+        let diagnostics = run_local_with_string_resolved_notify_edges(source, 1);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.starts_with("Создайте экспортную процедуру"));
+    }
+
+    #[test]
+    fn an_undecidable_export_environment_does_not_produce_a_verdict() {
+        let source = "&НаКлиенте\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\nКонецПроцедуры\n#Если НеизвестныйСимвол Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
+        let diagnostics = run_local(&source);
+        assert!(
+            diagnostics.is_empty(),
+            "unknown preprocessor availability is not proof of absence: {diagnostics:#?}"
+        );
     }
 
     #[test]
@@ -656,7 +752,7 @@ mod tests {
 
     #[test]
     fn a_form_with_unreadable_type_is_not_judged() {
-        let source = "&НаКлиенте\nПроцедура Тест()\n    О = Новый ОписаниеОповещения(\"НетОбработчика\", ЭтотОбъект);\n    П = Новый ОписаниеОповещения(\"НетВМодуле\", МойМодульКлиент);\nКонецПроцедуры\n";
+        let source = "&НаКлиенте\nПроцедура Тест()\n    О = Новый ОписаниеОповещения(\"НетОбработчика\", ЭтотОбъект);\n    П = Новый ОписаниеОповещения(\"НетВМодуле\", МойМодульКлиент);\n    Л = Новый ОписаниеОповещения(\"ЛокальныйЭкспорт\", ЭтотОбъект);\nКонецПроцедуры\n&НаКлиенте\nПроцедура ЛокальныйЭкспорт() Экспорт\nКонецПроцедуры\n";
         for malformed in [false, true] {
             let mut builder = CfeFixtureBuilder::new("");
             builder

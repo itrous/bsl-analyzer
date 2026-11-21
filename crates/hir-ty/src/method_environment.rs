@@ -1,5 +1,5 @@
 use hir_def::execution_env::{self, EnvFlags, EnvOptions};
-use hir_def::MethodId;
+use hir_def::{DefWithBodyId, MethodId, ModuleId};
 
 use crate::db::HirDatabase;
 
@@ -39,6 +39,122 @@ pub(crate) fn possible_method_env(
         return None;
     }
     Some(environment & (decl.preproc_env | decl.preproc_undecided))
+}
+
+/// Outcome of checking whether same-named local declarations provide an exported handler
+/// in every proven environment of a particular registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyHandlerAvailability {
+    Exported,
+    NotExported,
+    NotFound,
+    Unknown,
+}
+
+/// Checks local callback declarations against the execution environments of one registration.
+///
+/// A possible but undecidable environment is never treated as proof that a callback is
+/// available or absent. Multiple declarations contribute to one union of environments, so
+/// complementary exported declarations can jointly cover a registration.
+pub fn notify_handler_availability_in_registration(
+    db: &dyn HirDatabase,
+    file_id: vfs::FileId,
+    owner: DefWithBodyId,
+    registration_range: syntax::TextRange,
+    methods: &[MethodId],
+) -> NotifyHandlerAvailability {
+    use NotifyHandlerAvailability as Availability;
+
+    if methods.is_empty() {
+        return Availability::NotFound;
+    }
+
+    let module = ModuleId::new(file_id);
+    let options = db.env_options();
+    let Some((owner_definite, owner_possible)) = owner_environments(db, module, owner, &options)
+    else {
+        return Availability::Unknown;
+    };
+    let (site_definite, site_undecided) =
+        execution_env::conditional_env_tracking(&db.conditional_tree(file_id), registration_range);
+    let registration_definite = owner_definite & site_definite;
+    if registration_definite.is_empty() {
+        return Availability::Unknown;
+    }
+
+    let registration_possible = owner_possible & (site_definite | site_undecided);
+    let mut exported_definite = EnvFlags::EMPTY;
+    let mut exported_possible = EnvFlags::EMPTY;
+    let mut other_definite = EnvFlags::EMPTY;
+    let mut other_possible = EnvFlags::EMPTY;
+
+    for &method in methods {
+        if method.module != module {
+            return Availability::Unknown;
+        }
+        let Some(declaration) = db.interface_method(method) else {
+            return Availability::Unknown;
+        };
+        let definite = effective_method_env(db, method, &options);
+        let Some(possible) = possible_method_env(db, method, &options) else {
+            return Availability::Unknown;
+        };
+        let (definite_env, possible_env) = if declaration.is_export {
+            (&mut exported_definite, &mut exported_possible)
+        } else {
+            (&mut other_definite, &mut other_possible)
+        };
+        *definite_env = *definite_env | definite;
+        *possible_env = *possible_env | possible;
+    }
+
+    let mut has_unexported_registration_env = false;
+    let mut has_missing_registration_env = false;
+    let mut has_undecided_registration_env = false;
+    for environment in registration_definite.iter() {
+        if exported_definite.contains(environment) {
+            continue;
+        }
+        if exported_possible.contains(environment) || other_possible.contains(environment) {
+            has_undecided_registration_env = true;
+        } else if other_definite.contains(environment) {
+            has_unexported_registration_env = true;
+        } else {
+            has_missing_registration_env = true;
+        }
+    }
+
+    if has_unexported_registration_env {
+        Availability::NotExported
+    } else if has_missing_registration_env {
+        Availability::NotFound
+    } else if has_undecided_registration_env
+        || !registration_possible.without(registration_definite).is_empty()
+    {
+        Availability::Unknown
+    } else {
+        Availability::Exported
+    }
+}
+
+fn owner_environments(
+    db: &dyn HirDatabase,
+    module: ModuleId,
+    owner: DefWithBodyId,
+    options: &EnvOptions,
+) -> Option<(EnvFlags, EnvFlags)> {
+    match owner {
+        DefWithBodyId::Method(local_id) => {
+            let method = MethodId { module, local_id };
+            let possible = possible_method_env(db, method, options)?;
+            Some((effective_method_env(db, method, options), possible))
+        }
+        DefWithBodyId::ModuleCode => {
+            let metadata = db.module_metadata(module);
+            let environment = execution_env::module_code_env(&metadata, options);
+            (!environment.is_empty()).then_some((environment, environment))
+        }
+    }
 }
 
 /// Whether a declared method can access the implicit context of its form.

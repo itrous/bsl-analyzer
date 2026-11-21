@@ -373,10 +373,10 @@ fn notify_receiver_assignments_shadow_only_overlapping_environments() {
             0,
         ),
         (
-            "English directives and CallbackDescription",
+            "English directives and dynamic CallbackDescription array",
             r#"#If ThinClient Then
-    hAnDlErS = Undefined;
-    О = Новый("CallbackDescription", "Один", Handlers);
+    Параметры = ПолучитьПараметры();
+    О = Новый("CallbackDescription", Параметры);
 #EndIf"#,
             0,
         ),
@@ -431,7 +431,7 @@ fn server_only_notify_constructors_are_not_diagnosed() {
 &НаСервере
 Процедура Тест()
     О = Новый ОписаниеОповещения("Статический", ЭтотОбъект);
-    О = Новый("CallbackDescription", "Динамический", ЭтотОбъект);
+    О = Новый NotifyDescription("LegacyEnglishAlias", ЭтотОбъект);
 КонецПроцедуры
 "#;
     let fixture = CfeFixtureBuilder::new("").build();
@@ -459,6 +459,47 @@ fn server_only_notify_constructors_are_not_diagnosed() {
                 .edges
                 .iter()
                 .all(|edge| edge.kind != EdgeKind::NotifyRef));
+            assert!(missing_notify_handler::check(ctx).is_empty());
+            Vec::new()
+        },
+    );
+}
+
+#[test]
+fn dynamic_notify_function_form_does_not_guess_array_elements() {
+    const CALLER: &str = "CommonForms/Форма1/Ext/Form/Module.bsl";
+    const SOURCE: &str = r#"
+&НаКлиенте
+Процедура Тест(Параметры)
+    О = Новый("CallbackDescription", Параметры);
+    Параметры.Добавить("Callback");
+    Параметры.Добавить(ЭтотОбъект);
+    Параметры = ПолучитьПараметры();
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Callback() Экспорт
+КонецПроцедуры
+"#;
+    crate::test_utils::check_cfe_at_with_db(
+        CALLER,
+        SOURCE,
+        CfeFixtureBuilder::new("").build(),
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        |fixture| {
+            let path = fixture.root().join("CommonForms/Форма1/Ext/Form.xml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20"><Events/></Form>"#,
+            )
+            .unwrap();
+        },
+        |db, ctx| {
+            let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+            assert!(summary.notify_regs.is_empty(), "{:#?}", summary.notify_regs);
             assert!(missing_notify_handler::check(ctx).is_empty());
             Vec::new()
         },

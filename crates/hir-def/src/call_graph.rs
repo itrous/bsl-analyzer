@@ -424,6 +424,8 @@ pub enum NotifyTarget {
 pub struct NotifyReg {
     pub caller: CallerId,
     pub callback_name: Name,
+    /// Source syntax retained independently of semantic receiver resolution.
+    pub receiver_syntax: NotifyReceiverSyntax,
     pub target: NotifyTarget,
     pub range: TextRange,
 }
@@ -1053,22 +1055,12 @@ fn extract_from_body(
                     _ => {}
                 }
             }
-            Expr::New { type_name, args } => {
-                // `Новый ОписаниеОповещения(ИмяПроцедуры, Модуль, ДополнительныеПараметры,
-                // ИмяПроцедурыОбработкиОшибки, МодульОбработкиОшибки)`. `base` is the index of
-                // the first constructor argument: 0 for the typed form, 1 for the string-first
-                // form `Новый("ОписаниеОповещения", …)` where arg 0 is the type name.
-                let base = match type_name {
-                    Some(tn) if is_notify_description(tn) => Some(0usize),
-                    None if !args.is_empty() => match body.expr_idx(args[0]) {
-                        Expr::Literal(Literal::String(tn)) if is_notify_description_str(tn) => {
-                            Some(1usize)
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                if let Some(base) = base {
+            Expr::New { type_name: Some(type_name), args } => {
+                // The typed form takes positional constructor parameters. The
+                // functional form `Новый(<Тип>, <МассивПараметров>)` does not, so
+                // only the typed syntax can produce registrations here.
+                if is_notify_description(type_name) {
+                    let base = 0usize;
                     let range =
                         source_map.expr_range(expr_id).unwrap_or(TextRange::empty(0.into()));
                     // The primary handler (ИмяПроцедуры, Модуль) and the error handler
@@ -1122,11 +1114,7 @@ fn is_notify_description(name: &Name) -> bool {
 }
 
 pub fn is_notify_description_type_name(name: &str) -> bool {
-    let lower = name.fold_lower();
-    // `CallbackDescription` is the platform's own English name of the type (`platform_facts`:
-    // `english_name`); `NotifyDescription` reaches the
-    // constructor too (live probe, 8.3.27.2214), so both stay accepted.
-    lower == "описаниеоповещения" || lower == "notifydescription" || lower == "callbackdescription"
+    bsl_platform::PlatformDataInner::instance().is_notify_description_type_name(name)
 }
 
 fn is_notify_description_str(name: &str) -> bool {
@@ -1250,7 +1238,17 @@ fn extract_notify_reg_at(
         },
         None => NotifyTarget::Unresolved { constructor, callback_expr },
     };
-    Some(NotifyReg { caller, callback_name: Name::new(&callback_name), target, range })
+    let receiver_syntax = match &target {
+        NotifyTarget::BareName { name, .. } => NotifyReceiverSyntax::for_bare_name(name),
+        _ => NotifyReceiverSyntax::Other,
+    };
+    Some(NotifyReg {
+        caller,
+        callback_name: Name::new(&callback_name),
+        receiver_syntax,
+        target,
+        range,
+    })
 }
 
 fn field_callee_to_edge(
@@ -1470,14 +1468,23 @@ mod tests {
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
                     callback_name: Name::new("Обработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::SelfName,
                     target: NotifyTarget::ThisObject,
                     range: range(70),
                 },
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
                     callback_name: Name::new("Обработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::BareName,
                     target: NotifyTarget::Unsupported,
                     range: range(80),
+                },
+                NotifyReg {
+                    caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_name: Name::new("ВнешнийОбработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::BareName,
+                    target: NotifyTarget::Module(Name::new("Handlers")),
+                    range: range(85),
                 },
             ],
             idle_handler_regs: vec![
@@ -1543,12 +1550,22 @@ mod tests {
         );
         assert_eq!(
             subset.notify_regs,
-            vec![NotifyReg {
-                caller: CallerId::Method(MethodKey::first("Главная")),
-                callback_name: Name::new("Обработчик"),
-                target: NotifyTarget::ThisObject,
-                range: zero,
-            }],
+            vec![
+                NotifyReg {
+                    caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_name: Name::new("Обработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::SelfName,
+                    target: NotifyTarget::ThisObject,
+                    range: zero,
+                },
+                NotifyReg {
+                    caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_name: Name::new("ВнешнийОбработчик"),
+                    receiver_syntax: NotifyReceiverSyntax::BareName,
+                    target: NotifyTarget::Module(Name::new("Handlers")),
+                    range: zero,
+                },
+            ],
         );
         assert_eq!(
             subset.idle_handler_regs,
@@ -2084,21 +2101,25 @@ EndProcedure
 Procedure Test()
     Notification = New NotifyDescription("HandleResult", ThisObject);
     Other = New CallbackDescription("AnotherHandler", CommonModule);
-    Dynamic = New("CallbackDescription", "DynamicHandler", DynamicModule);
+    Params = New Array;
+    Dynamic = New("CallbackDescription", Params);
 EndProcedure
 "#;
         let summary = parse_and_extract(code);
 
-        assert_eq!(summary.notify_regs.len(), 4);
+        assert_eq!(summary.notify_regs.len(), 3);
         let find = |callback: &str| {
             summary.notify_regs.iter().find(|reg| reg.callback_name.as_str() == callback).unwrap()
         };
         let module_code_reg = find("ОбработатьОповещение");
         assert_eq!(module_code_reg.caller, CallerId::ModuleCode);
         assert_bare_target(module_code_reg, "ЭтотОбъект");
+        assert_eq!(module_code_reg.receiver_syntax, NotifyReceiverSyntax::SelfName);
         assert_bare_target(find("HandleResult"), "ThisObject");
         assert_bare_target(find("AnotherHandler"), "CommonModule");
-        assert_bare_target(find("DynamicHandler"), "DynamicModule");
+        assert_eq!(find("HandleResult").receiver_syntax, NotifyReceiverSyntax::SelfName);
+        assert_eq!(find("AnotherHandler").receiver_syntax, NotifyReceiverSyntax::BareName);
+        assert!(summary.notify_regs.iter().all(|reg| reg.callback_name.as_str() != "DynamicHandler"));
     }
 
     #[test]
@@ -2131,6 +2152,7 @@ EndProcedure
         let summary = parse_and_extract(code);
         assert_eq!(summary.notify_regs.len(), 1);
         assert!(matches!(summary.notify_regs[0].target, NotifyTarget::Unresolved { .. }));
+        assert_eq!(summary.notify_regs[0].receiver_syntax, NotifyReceiverSyntax::Other);
     }
 
     #[test]
@@ -2145,8 +2167,10 @@ EndProcedure
         assert_eq!(summary.notify_regs.len(), 2);
         assert_eq!(summary.notify_regs[0].callback_name, Name::new("Готово"));
         assert_bare_target(&summary.notify_regs[0], "ЭтотОбъект");
+        assert_eq!(summary.notify_regs[0].receiver_syntax, NotifyReceiverSyntax::SelfName);
         assert_eq!(summary.notify_regs[1].callback_name, Name::new("ПриОшибке"));
         assert_bare_target(&summary.notify_regs[1], "МодульОшибок");
+        assert_eq!(summary.notify_regs[1].receiver_syntax, NotifyReceiverSyntax::BareName);
     }
 
     #[test]
@@ -2161,6 +2185,7 @@ EndProcedure
         assert_eq!(summary.notify_regs.len(), 1);
         assert_eq!(summary.notify_regs[0].callback_name, Name::new("Готово"));
         assert_bare_target(&summary.notify_regs[0], "ЭтотОбъект");
+        assert_eq!(summary.notify_regs[0].receiver_syntax, NotifyReceiverSyntax::SelfName);
     }
 
     #[test]

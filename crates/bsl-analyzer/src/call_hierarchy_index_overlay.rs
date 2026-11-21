@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use base_db::{SourceDatabase, SourceRoot, SourceRootId};
+use hir::{DefDatabase as _, ExternalRef, ModuleIndex};
 use ide::{GraphConfigCache, ModuleId, RootDatabaseImpl};
 use lsp_types::Url;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use vfs::FileId;
 
 use crate::mem_docs::FrozenMemDocs;
@@ -20,6 +21,7 @@ pub struct CallHierarchyIndexFrozenSnapshot {
     pub configs: Arc<ide::WorkspaceConfigsSnapshot>,
     pub creation_generation: u64,
     source_root: SourceRoot,
+    module_index: Arc<ModuleIndex>,
     config_cache: Arc<GraphConfigCache>,
 }
 
@@ -46,6 +48,13 @@ impl CallHierarchyIndexFrozenSnapshot {
             .keys()
             .map(|&file_id| (file_id, db.file_revision_input(file_id).revision(db)))
             .collect();
+        let module_paths: Vec<_> = file_set
+            .iter()
+            .filter_map(|(&file_id, path)| path.to_str().map(|path| (file_id, path.to_owned())))
+            .collect();
+        let module_index = ModuleIndex::build_from_paths(
+            module_paths.iter().map(|(file_id, path)| (*file_id, path.as_str())),
+        );
         Self {
             source_root_id,
             file_set: Arc::new(file_set),
@@ -54,6 +63,7 @@ impl CallHierarchyIndexFrozenSnapshot {
             configs: db.workspace_configs_snapshot(),
             creation_generation,
             source_root,
+            module_index: Arc::new(module_index),
             config_cache: Arc::new(GraphConfigCache::default()),
         }
     }
@@ -75,6 +85,7 @@ impl CallHierarchyIndexFrozenSnapshot {
             configs: Arc::clone(&self.configs),
             creation_generation: self.creation_generation,
             source_root: self.source_root.clone(),
+            module_index: Arc::clone(&self.module_index),
             config_cache: Arc::clone(&self.config_cache),
         }
     }
@@ -100,39 +111,79 @@ impl CallHierarchyIndexFrozenSnapshot {
     }
 
     pub fn open_batch(&self, batch: &[ModuleId]) -> RootDatabaseImpl {
+        self.open_batch_with_referenced_files(batch, true)
+    }
+
+    fn open_batch_with_referenced_files(
+        &self,
+        batch: &[ModuleId],
+        register_referenced_files: bool,
+    ) -> RootDatabaseImpl {
         let mut db = RootDatabaseImpl::default();
         db.set_graph_config_cache(Arc::clone(&self.config_cache));
         db.set_source_root(self.source_root_id, self.source_root.clone());
+        db.set_workspace_configs_snapshot((*self.configs).clone());
 
-        // Lowering a caller can resolve a cross-module call and read the target's
-        // item tree before the compact index handles that edge. Keep closed files
-        // disk-backed, but register every file from the frozen workspace so those
-        // reads use the captured revision instead of an absent Salsa input.
-        for &file_id in self.file_set.keys() {
+        let mut registered = FxHashSet::default();
+        let batch_files = self.register_files(&mut db, batch.iter().map(|module| module.file_id));
+        registered.extend(batch_files.iter().map(|(file_id, _)| *file_id));
+        ide::warm_batch_config_roots(&db, &batch_files);
+
+        if register_referenced_files {
+            let mut referenced = FxHashSet::default();
+            for module in batch {
+                for external_ref in db.file_external_refs(*module).iter() {
+                    match external_ref {
+                        ExternalRef::QualifiedCall { receiver, .. } => {
+                            referenced.extend(
+                                self.module_index
+                                    .common_module_candidates(receiver)
+                                    .iter()
+                                    .copied(),
+                            );
+                        }
+                        ExternalRef::ManagerAccess { manager_type, object_name, .. } => {
+                            referenced.extend(
+                                self.module_index
+                                    .manager_candidates(*manager_type, object_name)
+                                    .iter()
+                                    .copied(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            let mut referenced: Vec<_> =
+                referenced.into_iter().filter(|file_id| !registered.contains(file_id)).collect();
+            referenced.sort_unstable();
+            let referenced_files = self.register_files(&mut db, referenced);
+            ide::warm_batch_config_roots(&db, &referenced_files);
+        }
+        db
+    }
+
+    fn register_files(
+        &self,
+        db: &mut RootDatabaseImpl,
+        file_ids: impl IntoIterator<Item = FileId>,
+    ) -> Vec<(FileId, PathBuf)> {
+        let mut files = Vec::new();
+        for file_id in file_ids {
+            let Some(path) = self.file_set.get(&file_id) else { continue };
             db.set_file_source_root(file_id, self.source_root_id);
             if let Some(text) = self.open_texts.get(&file_id) {
                 db.set_file_text(file_id, text.as_ref());
             } else if let Some(revision) = self.disk_revisions.get(&file_id) {
                 db.set_file_revision_from_disk(file_id, *revision);
             } else {
-                // Not a read failure: the overlay simply holds neither an open buffer
-                // nor a disk revision for this file, so its content is unknown rather
-                // than unreadable. Marking it unread would assert a cause nobody
-                // established.
+                // The snapshot has neither an open buffer nor a disk revision for
+                // this file, so its content is unknown rather than unreadable.
                 db.set_file_text(file_id, "");
             }
+            files.push((file_id, path.clone()));
         }
-
-        let mut batch_files = Vec::with_capacity(batch.len());
-        for module in batch {
-            if let Some(path) = self.file_set.get(&module.file_id) {
-                batch_files.push((module.file_id, path.clone()));
-            }
-        }
-
-        db.set_workspace_configs_snapshot((*self.configs).clone());
-        ide::warm_batch_config_roots(&db, &batch_files);
-        db
+        files
     }
 
     pub fn freeze_config_inputs(&self) {
@@ -152,7 +203,7 @@ impl CallHierarchyIndexFrozenSnapshot {
         if representatives.is_empty() {
             return;
         }
-        drop(self.open_batch(&representatives));
+        drop(self.open_batch_with_referenced_files(&representatives, false));
     }
 }
 
