@@ -159,11 +159,10 @@ fn this_form_receiver_can_resolve_to_a_client_common_module() {
         "external ThisForm handler should satisfy the registration: {diagnostics:#?}"
     );
     assert!(
-        diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == crate::DiagnosticCode::UnusedParameters
-                && diagnostic.message.contains("НеИспользуется")
-        }),
-        "the local same-named method is not the registered handler: {diagnostics:#?}"
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != crate::DiagnosticCode::UnusedParameters),
+        "a self-form callback reference keeps the same-named local signature protected even when ThisForm resolves externally: {diagnostics:#?}"
     );
 }
 
