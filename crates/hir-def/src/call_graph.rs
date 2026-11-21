@@ -897,12 +897,18 @@ fn is_current_form_items(name_lower: &str) -> bool {
 
 /// Whether `name` is a parameter, a declared variable or an assigned local of `body` -
 /// a binding that shadows a context property of the same name.
+///
+/// Keys are `NormName`, the same match bucket the module classification uses, and NOT
+/// `fold_lower`: the latter falls back to `str::to_lowercase`, which applies contextual
+/// mappings (Greek final sigma), so two names equal for the classification would be
+/// different here - a shadowing binding would be missed and the receiver would be taken
+/// for a common module.
 fn is_body_local(body: &Body, name: &Name) -> bool {
-    let lower = name.as_str().fold_lower();
-    body.bindings_iter().any(|(_, binding)| binding.name.as_str().fold_lower() == lower)
+    let key = NormName::intern(name.as_str());
+    body.bindings_iter().any(|(_, binding)| NormName::intern(binding.name.as_str()) == key)
         || body.stmts_iter().any(|(_, stmt)| {
             matches!(stmt, Stmt::Assign { target, .. }
-                if matches!(body.expr_idx(*target), Expr::Path(target) if target.as_str().fold_lower() == lower))
+                if matches!(body.expr_idx(*target), Expr::Path(target) if NormName::intern(target.as_str()) == key))
         })
 }
 
@@ -2023,6 +2029,19 @@ EndProcedure
         assert_eq!(summary.notify_regs.len(), 2);
         assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
         assert_eq!(summary.notify_regs[1].target, NotifyTarget::Unsupported);
+    }
+
+    #[test]
+    fn test_notify_description_receiver_shadowed_by_a_final_sigma_parameter_is_unsupported() {
+        // The two spellings are the same identifier for the classification, so the parameter must still shadow it.
+        let code = r#"
+Процедура Тест(ΟΔΟΣ)
+    А = Новый ОписаниеОповещения("Обработчик", οδοσ);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs.len(), 1);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
     }
 
     #[test]
