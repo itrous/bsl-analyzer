@@ -4360,7 +4360,7 @@ impl<'db> InferenceContext<'db> {
                     (None, Some(&first)) => self.constructed_type_name(&body, first),
                     _ => None,
                 };
-                let notify_base = match (type_name, dynamic_name.as_deref()) {
+                let notify_base = match (type_name, dynamic_name) {
                     (Some(name), _)
                         if hir_def::call_graph::is_notify_description_type_name(name.as_str()) =>
                     {
