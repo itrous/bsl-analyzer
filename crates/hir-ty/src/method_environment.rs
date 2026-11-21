@@ -115,10 +115,12 @@ pub fn notify_handler_availability_in_registration(
         if exported_definite.contains(environment) {
             continue;
         }
-        if exported_possible.contains(environment) || other_possible.contains(environment) {
+        if exported_possible.contains(environment) {
             has_undecided_registration_env = true;
         } else if other_definite.contains(environment) {
             has_unexported_registration_env = true;
+        } else if other_possible.contains(environment) {
+            has_undecided_registration_env = true;
         } else {
             has_missing_registration_env = true;
         }

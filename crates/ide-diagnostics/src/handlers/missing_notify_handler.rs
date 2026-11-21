@@ -164,11 +164,12 @@ mod tests {
         let mut method_count = 0;
         for line in source.split_inclusive('\n') {
             let trimmed = line.trim_start();
-            if (trimmed.starts_with("Процедура ") || trimmed.starts_with("Асинх Процедура "))
-                && !previous_nonempty_line.is_some_and(|line: &str| line.starts_with('&'))
+            if trimmed.starts_with("Процедура ") || trimmed.starts_with("Асинх Процедура ")
             {
-                client_source.push_str("&НаКлиенте\n");
                 method_count += 1;
+                if !previous_nonempty_line.is_some_and(|line: &str| line.starts_with('&')) {
+                    client_source.push_str("&НаКлиенте\n");
+                }
             }
             client_source.push_str(line);
             if !trimmed.trim().is_empty() {
@@ -326,7 +327,7 @@ mod tests {
         let sources = [
             "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"\", ЭтотОбъект);\nКонецПроцедуры\n",
             "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект, Неопределено, \"\", ЭтотОбъект);\nКонецПроцедуры\nПроцедура Готово() Экспорт\nКонецПроцедуры\n",
-            "Процедура Тест()\n    О = Новый(\"CallbackDescription\", \"\", ThisForm);\nКонецПроцедуры\n",
+            "Процедура Тест()\n    О = Новый CallbackDescription(\"\", ThisForm);\nКонецПроцедуры\n",
         ];
         for source in sources {
             let diagnostics = run_local(source);
