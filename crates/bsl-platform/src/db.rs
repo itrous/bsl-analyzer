@@ -1659,16 +1659,28 @@ mod tests {
         }
 
         let canonical = data.get_type("ОписаниеОповещения").expect("platform type must exist");
-        let context = canonical.context.expect("callback description availability must be recorded");
+        let context =
+            canonical.context.expect("callback description availability must be recorded");
         assert!(!context.server, "callback descriptions are unavailable on the server");
         let canonical_constructors = data.get_constructors("CallbackDescription");
         assert!(!canonical_constructors.is_empty(), "callback constructor data must exist");
         for alias in ["CallbackDescription", "NotifyDescription"] {
             let resolved = data.get_type(alias).unwrap_or_else(|| panic!("{alias} must resolve"));
             assert!(std::ptr::eq(resolved, canonical), "{alias} must share the platform record");
-            assert_eq!(resolved.context, Some(context), "{alias} must inherit platform availability");
-            assert_eq!(data.get_constructors(alias), canonical_constructors, "{alias} must resolve constructors");
-            assert!(data.is_notify_description_type_name(alias), "{alias} must identify the callback type");
+            assert_eq!(
+                resolved.context,
+                Some(context),
+                "{alias} must inherit platform availability"
+            );
+            assert_eq!(
+                data.get_constructors(alias),
+                canonical_constructors,
+                "{alias} must resolve constructors"
+            );
+            assert!(
+                data.is_notify_description_type_name(alias),
+                "{alias} must identify the callback type"
+            );
         }
     }
 

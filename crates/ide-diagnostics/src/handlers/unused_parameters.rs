@@ -1,7 +1,7 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::utils::platform_event_handlers::{
-    ModuleOwner, is_platform_event_handler, is_report_object_module_event_handler,
+    is_platform_event_handler, is_report_object_module_event_handler, ModuleOwner,
 };
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 use bsl_metadata::traits::MdObject;
@@ -308,8 +308,8 @@ fn create_diagnostic(
 
 #[cfg(test)]
 mod tests {
-    use crate::DiagnosticCode;
     use crate::test_utils::check_diagnostics_snapshot_for;
+    use crate::DiagnosticCode;
     use expect_test::expect;
     #[test]
     fn test_unused_parameter() {
