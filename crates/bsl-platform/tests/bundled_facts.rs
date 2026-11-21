@@ -338,6 +338,77 @@ fn the_curated_return_type_correction_reaches_the_built_in_facts() {
     );
 }
 
+/// Lowercased alphanumeric words of a type name: `Form extension for a HTML document
+/// field` is five words, `ConfigurationExtension` is one.
+fn name_words(name: &str) -> Vec<String> {
+    name.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn normalized(name: &str) -> String {
+    name.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// An extension type: a type of the corpus that widens another type by a configuration
+/// (`Client application form extension for documents`, `Form field extension for a text box`,
+/// `Filter table box extension`). It is read off the corpus, not guessed: the word
+/// `extension` (`расширение`) stands on its own in the name of such a type, while the
+/// configuration-extension types (`ConfigurationExtension`, `ConfigurationExtensionsManager`)
+/// carry it inside a longer word and are not extensions of anything.
+fn is_extension_type(ty: &bsl_platform::PlatformType) -> bool {
+    name_words(&ty.english_name).iter().any(|word| word == "extension")
+        || name_words(&ty.name).iter().any(|word| word == "расширение")
+}
+
+/// The data-composition family is extended by a configuration in the same way, but it has
+/// 257 types and no extension type points at them one by one, so it is carried by name. The
+/// corpus spells it both with and without a space (`DataComposition…`, `…КомпоновкиДанных`),
+/// so the comparison drops whitespace on both sides.
+fn is_data_composition_type(ty: &bsl_platform::PlatformType) -> bool {
+    [ty.name.as_str(), ty.english_name.as_str()].iter().any(|alias| {
+        let folded = normalized(alias);
+        folded.contains("datacomposition") || folded.contains("компоновкаданных")
+    })
+}
+
+/// The base types the extension families of the corpus widen, each with the family that
+/// widens it, counted on the bundled 8.3.27 corpus by the extension types' English names
+/// (see [`is_extension_type`]). English canonical names. The list lives here, in the
+/// curating test, and not in the overlay document: it is a curating aid, not a fact the
+/// analyzer reads.
+const FORM_EXTENSION_TARGETS: &[(&str, &str)] = &[
+    // 13 `Client application form extension for ...` / `Managed form extension for ...` types.
+    ("ClientApplicationForm", "client application / managed form extensions"),
+    // 31 thick-client `<owner> form extension` types (`Catalog item form extension`, ...).
+    ("Form", "<owner> form extensions of the ordinary form"),
+    // 18 `Form field extension for a ...`, 11 `Tested form field extension for a ...`.
+    ("FormField", "form field extensions"),
+    // 7 `Form group extension for a ...`.
+    ("FormGroup", "form group extensions"),
+    // 8 `Form table extension for ...`.
+    ("FormTable", "form table extensions"),
+    // 2 `Form decoration extension for ...`.
+    ("FormDecoration", "form decoration extensions"),
+    // 3 `Form item addition extension for ...`.
+    ("FormItemAddition", "form item addition extensions"),
+    // `Form extension for a HTML document field` (12 properties) widens this field type.
+    // The PDF counterpart has no field type of its own in the corpus to list.
+    ("HTMLDocumentField", "form extension for a HTML document field"),
+];
+
+/// Whether the extract can call the property surface of `ty` complete: an extension type
+/// is a surface a configuration widens, the data-composition family is extended by a
+/// configuration, and a listed target is the type an extension family widens. None of those
+/// may be attested for properties.
+fn properties_stay_open(ty: &bsl_platform::PlatformType) -> bool {
+    is_extension_type(ty)
+        || is_data_composition_type(ty)
+        || FORM_EXTENSION_TARGETS.iter().any(|(target, _)| *target == ty.english_name.as_str())
+}
+
 /// The curating rule of an attestation, held by a test rather than by prose in
 /// `OVERLAYS.md`, and it is a rule about surfaces. A type whose extract had to
 /// be patched has no surface the extract may call complete, so it is not
@@ -345,30 +416,30 @@ fn the_curated_return_type_correction_reaches_the_built_in_facts() {
 /// elements by name keep their properties open, while their methods are still the
 /// platform's own, so such a type may be attested for `["methods"]` only.
 ///
-/// The form half is a name check with a stated limit: a managed form gains
-/// properties from its per-MDO extensions (`form_extension_property_names` in
-/// `crates/bsl-platform/src/db.rs`), and the extract knows nothing of them, so
-/// such a type must not be attested. The corpus spells those names both with and
-/// without a space (`DataComposition…`, `…КомпоновкиДанных`), so the comparison
-/// drops whitespace on both sides. A type whose name hides that it is extended
-/// would still slip through (the corpus names are not a classification), which is
-/// why the check is written down here as the rule's ceiling rather than as a
-/// proof of it.
+/// "A configuration extends" is three things, none of them a substring guess at a
+/// name. A type that IS an extension type (the corpus names it so, see
+/// [`is_extension_type`]) widens another type and has no complete surface of its own.
+/// A type an extension type WIDENS is listed in [`FORM_EXTENSION_TARGETS`]
+/// with the family that widens it: a managed form gains properties from its
+/// per-MDO extensions (`form_extension_property_names` in `crates/bsl-platform/src/db.rs`),
+/// and the extract knows nothing of them. The data-composition family is the third and is
+/// carried by name ([`is_data_composition_type`]). Neither a bare `form` in a name nor a
+/// type no extension family names is extended: a form button is a type of its own that no
+/// extension widens, so it may be attested for both surfaces.
+///
+/// The ceiling of this rule is the corpus: an extension no page describes would still slip
+/// through, which is why `FORM_EXTENSION_TARGETS` is a hand-kept list and not a
+/// proof, and why the corpus numbers behind it are pinned by
+/// [`the_form_extension_families_of_the_corpus_are_pinned`].
 ///
 /// The second list is the same kind of ceiling for the name-addressed collections:
 /// the corpus does not say that `КоллекцияРисунковТабличногоДокумента` answers
 /// `Рисунки.<имя рисунка>` as a property, a live run does, so the names are kept here by
-/// hand, as the markers are. Each entry carries the type's English canonical name.
+/// hand. Each entry carries the type's English canonical name.
 #[test]
 fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
-    const EXTENDED_TYPE_MARKERS: &[&str] =
-        &["form", "форма", "extension", "расширение", "datacomposition", "компоновкаданных"];
     const ELEMENTS_ADDRESSED_BY_NAME: &[&str] =
         &["SpreadsheetDocumentDrawingCollection", "StandardAttributeDescriptions"];
-
-    fn normalized(name: &str) -> String {
-        name.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
-    }
 
     let document: Value =
         serde_json::from_str(include_str!("../data/platform_overlays.json")).expect("overlay JSON");
@@ -409,12 +480,8 @@ fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
                 .map(|surface| surface.as_str().expect("a surface is named by a string"))
                 .collect()
         });
-        let extended = [ty.name.as_str(), ty.english_name.as_str()].iter().any(|alias| {
-            let folded = normalized(alias);
-            EXTENDED_TYPE_MARKERS.iter().any(|marker| folded.contains(marker))
-        });
         let addressed_by_name = ELEMENTS_ADDRESSED_BY_NAME.contains(&ty.english_name.as_str());
-        if extended || addressed_by_name {
+        if properties_stay_open(ty) || addressed_by_name {
             assert_eq!(
                 surfaces.as_deref(),
                 Some(&["methods"][..]),
@@ -425,58 +492,125 @@ fn curated_attestations_stay_off_types_the_extract_cannot_complete() {
     }
 }
 
-/// The marker check is only worth its name if it catches the corpus spellings: the
-/// data-composition family is the biggest extended one (251 types), and its names are
-/// written without a space. The check is exercised on the corpus's own names, not on
-/// invented ones.
+/// The extension rules are only worth their names if they catch the corpus spellings and
+/// leave the types they must not touch alone. They are exercised on the corpus's own names,
+/// not on invented ones, and the controls are types that are NOT extended.
 #[test]
-fn the_extended_type_marker_check_catches_the_corpus_spellings() {
-    fn normalized(name: &str) -> String {
-        name.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
-    }
-    const EXTENDED_TYPE_MARKERS: &[&str] =
-        &["form", "форма", "extension", "расширение", "datacomposition", "компоновкаданных"];
-
+fn the_extension_rules_catch_the_corpus_spellings() {
     let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
     let data = PlatformData::from_help(help);
-    let is_extended = |name: &str| {
-        data.get_type(name).is_some_and(|ty| {
-            [ty.name.as_str(), ty.english_name.as_str()]
-                .iter()
-                .any(|alias| EXTENDED_TYPE_MARKERS.iter().any(|m| normalized(alias).contains(m)))
-        })
-    };
 
-    let marked = data
-        .all_types()
-        .iter()
-        .filter(|ty| {
-            [ty.name.as_str(), ty.english_name.as_str()]
-                .iter()
-                .any(|alias| EXTENDED_TYPE_MARKERS.iter().any(|m| normalized(alias).contains(m)))
-        })
-        .count();
+    // The data-composition family is the biggest extended one, and its names are written
+    // without a space.
+    let composition = data.all_types().iter().filter(|ty| is_data_composition_type(ty)).count();
     assert!(
-        marked > 250,
-        "the corpus names a whole extended family with these markers, found {marked}"
+        composition > 250,
+        "the corpus names a whole data-composition family, found {composition}"
     );
 
-    // Real spellings of every marker, including the ones a spaced comparison missed:
-    // the data-composition family and the extension types are written both ways.
     for name in [
         "DataCompositionSettings",
         "НастройкиКомпоновкиДанных",
-        "ФормаКлиентскогоПриложения",
-        "ClientApplicationForm",
         "Расширение табличного поля отбора",
         "Filter table box extension",
+        "Client application form extension for documents",
+        "Form field extension for a text box",
+        "Form group extension for a command bar",
+        "Form extension for a HTML document field",
     ] {
+        let ty = data.get_type(name).unwrap_or_else(|| {
+            panic!("{name} must exist in the built-in facts for this check to mean anything")
+        });
         assert!(
-            data.get_type(name).is_some(),
-            "{name} must exist in the built-in facts for this check to mean anything"
+            properties_stay_open(ty),
+            "{name} must be recognized as a type a configuration extends"
         );
-        assert!(is_extended(name), "{name} must be recognized as a type a configuration extends");
     }
+
+    // Every listed target is a type of the corpus and is named by its English canonical
+    // spelling, so a Russian spelling or a typo cannot silently stop matching.
+    for (target, family) in FORM_EXTENSION_TARGETS {
+        let ty = data
+            .get_type(target)
+            .unwrap_or_else(|| panic!("target {target} must exist in the built-in facts"));
+        assert_eq!(ty.english_name.as_str(), *target, "{target} is not the canonical spelling");
+        assert!(properties_stay_open(ty), "{target} must stay open for properties");
+        assert!(!family.is_empty(), "{target} names the family that widens it");
+    }
+    let mut seen = std::collections::HashSet::new();
+    assert!(
+        FORM_EXTENSION_TARGETS.iter().all(|(target, _)| seen.insert(target.to_lowercase())),
+        "a target is listed once"
+    );
+
+    // The controls: a type that merely has `form` in its name, a type no extension family
+    // widens and a type that has `extension` only inside a longer word are not extended.
+    for name in
+        ["FormButton", "JSONWriter", "ConfigurationExtension", "ConfigurationExtensionsManager"]
+    {
+        let ty = data.get_type(name).unwrap_or_else(|| panic!("{name} must exist"));
+        assert!(
+            !properties_stay_open(ty),
+            "{name} is not extended by a configuration and must stay attestable"
+        );
+    }
+}
+
+/// The numbers the form-button attestation rests on, pinned so that a corpus that grows a
+/// button extension (or a field extension) breaks this test instead of silently widening
+/// what the attestation claims. `Form extension for a … field` is the family that widens a
+/// single element, so it is counted on its own.
+#[test]
+fn the_form_extension_families_of_the_corpus_are_pinned() {
+    let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+    let data = PlatformData::from_help(help);
+    let spaced = |ty: &bsl_platform::PlatformType| {
+        ty.english_name.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let has_properties = |ty: &bsl_platform::PlatformType| {
+        data.all_properties().iter().any(|prop| prop.type_name == ty.english_name)
+    };
+
+    let form_extensions: Vec<_> =
+        data.all_types().iter().filter(|ty| spaced(ty).contains("form extension")).collect();
+    assert_eq!(form_extensions.len(), 46, "`form extension` types of the corpus");
+    assert_eq!(
+        form_extensions.iter().filter(|ty| has_properties(ty)).count(),
+        36,
+        "`form extension` types that carry properties"
+    );
+    let field_family: Vec<_> = form_extensions
+        .iter()
+        .filter(|ty| {
+            spaced(ty).starts_with("form extension for a ") && spaced(ty).ends_with(" field")
+        })
+        .map(|ty| ty.english_name.as_str())
+        .collect();
+    assert_eq!(
+        field_family,
+        ["Form extension for a HTML document field", "Form extension for a PDF document field"],
+        "the `Form extension for a … field` family"
+    );
+
+    // No extension type of the corpus is a form button's: the only extension types that
+    // mention a button belong to a radio button field and to a button group.
+    let mut button_extensions: Vec<_> = data
+        .all_types()
+        .iter()
+        .filter(|ty| is_extension_type(ty))
+        .filter(|ty| name_words(&ty.english_name).iter().any(|word| word == "button"))
+        .map(|ty| ty.english_name.as_str())
+        .collect();
+    button_extensions.sort_unstable();
+    assert_eq!(
+        button_extensions,
+        [
+            "Form field extension for a radio button field",
+            "Form group extension for a button group",
+            "Tested form field extension for a radio button field",
+        ],
+        "an extension type that names a form button would widen the attested surface"
+    );
 }
 
 /// Every read-only correction must hit exactly one property of the built-in facts
