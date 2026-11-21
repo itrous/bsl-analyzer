@@ -482,6 +482,48 @@ mod tests {
     }
 
     #[test]
+    fn client_common_module_parameter_used_as_receiver_is_not_unused() {
+        use crate::test_utils::check_cfe_at_with_db;
+        use test_fixture::CfeFixtureBuilder;
+
+        const MODULE_PATH: &str = "CommonModules/КлиентскийМодуль/Ext/Module.bsl";
+        const SOURCE: &str = r#"&НаКлиенте
+Процедура ИспользоватьПриемник(Приемник, НеИспользуется)
+    Приемник.Выполнить();
+КонецПроцедуры
+"#;
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_base_module("КлиентскийМодуль", "");
+        let fixture = builder.build();
+        let diagnostics = check_cfe_at_with_db(
+            MODULE_PATH,
+            SOURCE,
+            fixture,
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                for (_, root) in fixture.config_paths() {
+                    let path = root.join("CommonModules/КлиентскийМодуль.xml");
+                    let xml = std::fs::read_to_string(&path).unwrap();
+                    let updated = xml.replace(
+                        "<ClientManagedApplication>false</ClientManagedApplication>",
+                        "<ClientManagedApplication>true</ClientManagedApplication>",
+                    );
+                    assert_ne!(updated, xml, "the module starts client-disabled");
+                    std::fs::write(path, updated).unwrap();
+                }
+            },
+            |_db, ctx| super::check(ctx),
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(unused, ["Уберите неиспользуемый параметр \"НеИспользуется\""]);
+    }
+
+    #[test]
     fn test_detects_unused_parameters_in_fixture() {
         let code = r#"Процедура ВсеПлохо(А1, Знач Б1 = Ложь) // Параметр Б
     ВызовМетода(А1);
