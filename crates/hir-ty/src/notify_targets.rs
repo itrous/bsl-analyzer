@@ -1,15 +1,25 @@
 use std::sync::Arc;
 
 use base_db::FileIdInput;
+use bsl_platform::PlatformDataInner;
 use bsl_types::kind::TypeKind;
+use cfg_types::IdConversion;
 use hir_def::body::Body;
-use hir_def::call_graph::{CallerId, ModuleCallSummary, NotifyReceiverSyntax, NotifyTarget};
-use hir_def::{DefWithBodyId, ExprId, ModuleId, StmtId};
+use hir_def::call_graph::{
+    CallerId, ModuleCallSummary, NotifyConstructorCandidate, NotifyReceiverSyntax, NotifyReg,
+    NotifyTarget,
+};
+use hir_def::hir::{Expr, ExprIdx, Literal};
+use hir_def::{DefWithBodyId, ExprId, MethodKey, ModuleId, Name, StmtId};
+use intern::NormName;
 use rustc_hash::{FxHashMap, FxHashSet};
 use vfs::FileId;
 
 use crate::db::HirDatabase;
 use crate::infer::{infer_owner, BareNameOrigin, InferOwnerResult};
+use crate::notify_array::{
+    accepts_argument_count, callback_slots, collect_notify_array_registrations,
+};
 
 #[salsa::tracked(
     lru = 256,
@@ -22,61 +32,76 @@ pub fn semantic_module_call_summary_query<'db>(
 ) -> Arc<ModuleCallSummary> {
     let file_id = file_id_input.file_id(db);
     let raw = hir_def::queries::module_call_summary_query(db, file_id_input);
-    if !raw.notify_regs.iter().any(|reg| is_syntactic_candidate(&reg.target)) {
-        return raw;
+    if raw.notify_candidates.is_empty() {
+        if raw.name_literal_ref_sites.is_empty() {
+            return raw;
+        }
+        let mut summary = (*raw).clone();
+        summary.name_literal_ref_sites.clear();
+        return Arc::new(summary);
     }
 
     let module_id = ModuleId::new(file_id);
     let mut summary = (*raw).clone();
-    let mut registrations_by_caller: FxHashMap<CallerId, Vec<usize>> = FxHashMap::default();
-    for (index, reg) in summary.notify_regs.iter().enumerate() {
-        if is_syntactic_candidate(&reg.target) {
-            registrations_by_caller.entry(reg.caller).or_default().push(index);
-        }
+    let candidates = summary.notify_candidates.clone();
+    let mut candidates_by_caller: FxHashMap<CallerId, Vec<usize>> = FxHashMap::default();
+    for (index, candidate) in candidates.iter().enumerate() {
+        candidates_by_caller.entry(candidate.caller).or_default().push(index);
     }
 
+    let platform = PlatformDataInner::instance();
     let bodies = db.module_bodies_ref(module_id);
     for (local_id, lower) in bodies.iter_lower_results() {
         let caller = CallerId::Method(local_id);
-        let Some(indices) = registrations_by_caller.remove(&caller) else { continue };
-        let owner = DefWithBodyId::Method(local_id);
-        normalize_owner_registrations(
+        let Some(indices) = candidates_by_caller.remove(&caller) else { continue };
+        normalize_owner_candidates(
             db,
             file_id,
-            owner,
+            DefWithBodyId::Method(local_id),
             lower.body(),
             &indices,
+            &candidates,
+            platform,
             &mut summary.notify_regs,
         );
     }
 
     if let Some(lower) = bodies.module_code_result() {
-        if let Some(indices) = registrations_by_caller.remove(&CallerId::ModuleCode) {
-            normalize_owner_registrations(
+        if let Some(indices) = candidates_by_caller.remove(&CallerId::ModuleCode) {
+            normalize_owner_candidates(
                 db,
                 file_id,
                 DefWithBodyId::ModuleCode,
                 lower.body(),
                 &indices,
+                &candidates,
+                platform,
                 &mut summary.notify_regs,
             );
         }
     }
 
-    // A recovered/missing body cannot establish a receiver's owner. Do not let
-    // its syntax-only candidate escape into graph or diagnostic consumers.
-    for reg in &mut summary.notify_regs {
-        if is_syntactic_candidate(&reg.target) {
-            reg.target = NotifyTarget::Unsupported;
-        }
-    }
+    // Candidates without a readable owner body cannot establish a registration.
+    summary.notify_candidates.clear();
+    retain_notify_name_literal_sites(&mut summary);
     filter_uncompiled_notify_name_literals(&mut summary);
 
     Arc::new(summary)
 }
 
-fn is_syntactic_candidate(target: &NotifyTarget) -> bool {
-    matches!(target, NotifyTarget::BareName { .. } | NotifyTarget::Unresolved { .. })
+fn retain_notify_name_literal_sites(summary: &mut ModuleCallSummary) {
+    let mut local_methods: FxHashMap<NormName, MethodKey> = FxHashMap::default();
+    for method in &summary.methods {
+        local_methods.entry(NormName::intern(method.name.as_str())).or_insert(method.local_id);
+    }
+    let notify_handlers: FxHashSet<_> = summary
+        .notify_regs
+        .iter()
+        .filter_map(|registration| {
+            local_methods.get(&NormName::intern(registration.callback_name.as_str())).copied()
+        })
+        .collect();
+    summary.name_literal_ref_sites.retain(|site| notify_handlers.contains(&site.local_id));
 }
 
 fn filter_uncompiled_notify_name_literals(summary: &mut ModuleCallSummary) {
@@ -111,43 +136,132 @@ fn module_call_summary_heap(summary: &Arc<ModuleCallSummary>) -> usize {
     hir_def::queries::module_call_summary_heap(summary)
 }
 
-fn normalize_owner_registrations(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The projection keeps database context and caller-specific inputs separate from its output."
+)]
+fn normalize_owner_candidates(
     db: &dyn HirDatabase,
     file_id: FileId,
     owner: DefWithBodyId,
     body: &Body,
-    registration_indices: &[usize],
-    registrations: &mut [hir_def::call_graph::NotifyReg],
+    candidate_indices: &[usize],
+    candidates: &[NotifyConstructorCandidate],
+    platform: &PlatformDataInner,
+    registrations: &mut Vec<NotifyReg>,
 ) {
     let inference = infer_owner(db, file_id, owner);
     let dead_stmts: FxHashSet<StmtId> = inference.dead_stmts().iter().copied().collect();
+    let array_registrations = collect_notify_array_registrations(body, platform);
 
-    for &index in registration_indices {
-        let (constructor, callback_expr, bare_name) = match &registrations[index].target {
-            NotifyTarget::BareName { name, constructor, callback_expr, .. } => {
-                (*constructor, *callback_expr, Some(name))
+    for &index in candidate_indices {
+        let candidate = candidates[index];
+        let Expr::New { type_name, args } = body.expr(candidate.constructor) else { continue };
+        let dynamic = type_name.is_none();
+        let platform_type_name = type_name
+            .as_ref()
+            .map(Name::as_str)
+            .or_else(|| args.first().and_then(|&arg| string_literal(body, arg)));
+        let Some(platform_type_name) = platform_type_name else { continue };
+        if !platform.is_notify_description_type_name(platform_type_name) {
+            continue;
+        }
+        let Some(slots) = callback_slots(platform, platform_type_name) else { continue };
+        let not_compiled =
+            constructor_is_not_compiled(body, &dead_stmts, &inference, candidate.constructor);
+
+        if dynamic {
+            let Some(array) = array_registrations
+                .iter()
+                .find(|registration| registration.constructor == candidate.constructor)
+            else {
+                continue;
+            };
+            for handler in &array.handlers {
+                append_notify_registration(
+                    db,
+                    candidate,
+                    handler.callback_name.as_str(),
+                    handler.callback_expr,
+                    handler.receiver,
+                    handler.receiver_syntax,
+                    not_compiled,
+                    &inference,
+                    registrations,
+                );
             }
-            NotifyTarget::Unresolved { constructor, callback_expr } => {
-                (*constructor, *callback_expr, None)
-            }
-            _ => continue,
-        };
-        if constructor_is_not_compiled(body, &dead_stmts, &inference, constructor) {
-            let receiver_syntax =
-                bare_name.map_or(NotifyReceiverSyntax::Other, NotifyReceiverSyntax::for_bare_name);
-            registrations[index].target =
-                NotifyTarget::NotCompiled { callback_expr, receiver_syntax };
             continue;
         }
 
-        let target = match &registrations[index].target {
-            NotifyTarget::BareName { receiver, .. } => {
-                normalize_receiver(db, &inference, *receiver)
-            }
-            NotifyTarget::Unresolved { .. } => NotifyTarget::Unsupported,
-            _ => continue,
-        };
-        registrations[index].target = target;
+        if !accepts_argument_count(slots, args.len()) {
+            continue;
+        }
+        for (handler_slot, receiver_slot) in
+            [(slots.handler, slots.receiver), (slots.error_handler, slots.error_receiver)]
+        {
+            let Some(&callback_idx) = args.get(handler_slot) else { continue };
+            let Some(callback_name) = string_literal(body, callback_idx) else { continue };
+            let callback_expr = ExprId::from_idx(callback_idx);
+            let receiver = args.get(receiver_slot).copied().map(ExprId::from_idx);
+            let receiver_syntax = receiver_syntax(body, receiver);
+            append_notify_registration(
+                db,
+                candidate,
+                callback_name,
+                callback_expr,
+                receiver,
+                receiver_syntax,
+                not_compiled,
+                &inference,
+                registrations,
+            );
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Source provenance and inferred receiver state are both needed to create each registration."
+)]
+fn append_notify_registration(
+    db: &dyn HirDatabase,
+    candidate: NotifyConstructorCandidate,
+    callback_name: &str,
+    callback_expr: ExprId,
+    receiver: Option<ExprId>,
+    receiver_syntax: NotifyReceiverSyntax,
+    not_compiled: bool,
+    inference: &InferOwnerResult,
+    registrations: &mut Vec<NotifyReg>,
+) {
+    let target = if not_compiled {
+        NotifyTarget::NotCompiled { callback_expr, receiver_syntax }
+    } else {
+        receiver.map_or(NotifyTarget::Unsupported, |receiver| {
+            normalize_receiver(db, inference, receiver)
+        })
+    };
+    let callback_name = Name::new(callback_name);
+    registrations.push(NotifyReg {
+        caller: candidate.caller,
+        callback_name,
+        receiver_syntax,
+        target,
+        range: candidate.range,
+    });
+}
+
+fn string_literal(body: &Body, expr: ExprIdx) -> Option<&str> {
+    match body.expr_idx(expr) {
+        Expr::Literal(Literal::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn receiver_syntax(body: &Body, receiver: Option<ExprId>) -> NotifyReceiverSyntax {
+    match receiver.map(|expr| body.expr(expr)) {
+        Some(Expr::Path(name)) => NotifyReceiverSyntax::for_bare_name(name),
+        _ => NotifyReceiverSyntax::Other,
     }
 }
 
@@ -170,9 +284,7 @@ fn normalize_receiver(
 ) -> NotifyTarget {
     match inference.notify_receiver_resolution(receiver) {
         Some((BareNameOrigin::CommonModule, ty)) => match db.lookup_type(ty) {
-            TypeKind::CommonModule(module) => {
-                NotifyTarget::Module(hir_def::Name::new(&module.name))
-            }
+            TypeKind::CommonModule(module) => NotifyTarget::Module(Name::new(&module.name)),
             _ => NotifyTarget::Unsupported,
         },
         Some((BareNameOrigin::SelfName, _)) => NotifyTarget::ThisObject,

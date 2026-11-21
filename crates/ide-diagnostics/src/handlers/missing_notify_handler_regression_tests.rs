@@ -465,16 +465,21 @@ fn server_only_notify_constructors_are_not_diagnosed() {
 }
 
 #[test]
-fn dynamic_notify_function_form_does_not_guess_array_elements() {
+fn dynamic_notify_function_form_uses_only_proven_local_array_state() {
     const CALLER: &str = "CommonForms/Форма1/Ext/Form/Module.bsl";
     const SOURCE: &str = r#"
 &НаКлиенте
 Процедура Тест(Параметры)
+    Перем ТочныеПараметры;
     О = Новый("CallbackDescription", Параметры);
     Параметры.Добавить("Callback");
     Параметры.Добавить(ЭтотОбъект);
     Параметры = ПолучитьПараметры();
     О = Новый("CallbackDescription", Параметры);
+    ТочныеПараметры = Новый Массив;
+    ТочныеПараметры.Добавить("Callback");
+    ТочныеПараметры.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", ТочныеПараметры);
 КонецПроцедуры
 
 &НаКлиенте
@@ -498,7 +503,9 @@ fn dynamic_notify_function_form_does_not_guess_array_elements() {
         },
         |db, ctx| {
             let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
-            assert!(summary.notify_regs.is_empty(), "{:#?}", summary.notify_regs);
+            assert_eq!(summary.notify_regs.len(), 1, "{:#?}", summary.notify_regs);
+            assert_eq!(summary.notify_regs[0].callback_name.as_str(), "Callback");
+            assert!(matches!(summary.notify_regs[0].target, NotifyTarget::ThisObject));
             assert!(missing_notify_handler::check(ctx).is_empty());
             Vec::new()
         },

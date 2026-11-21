@@ -77,8 +77,8 @@ mod heap_estimate {
 
     pub(super) fn module_call_summary_heap(v: &Arc<ModuleCallSummary>) -> usize {
         use crate::call_graph::{
-            CallEdge, FormEventEntry, IdleReg, MethodSummary, NameLiteralRefSite, NotifyReg,
-            NotifyTarget, SetActionReg,
+            CallEdge, FormEventEntry, IdleReg, MethodSummary, NameLiteralRefSite,
+            NotifyConstructorCandidate, NotifyReg, NotifyTarget, SetActionReg,
         };
 
         let s = &**v;
@@ -92,6 +92,7 @@ mod heap_estimate {
         for e in &s.call_edges {
             bytes += call_target_name_heap(&e.target);
         }
+        bytes += vec_bytes::<NotifyConstructorCandidate>(s.notify_candidates.len());
         bytes += vec_bytes::<NotifyReg>(s.notify_regs.len());
         for r in &s.notify_regs {
             bytes += name_bytes(&r.callback_name);

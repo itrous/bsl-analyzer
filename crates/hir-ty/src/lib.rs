@@ -26,6 +26,7 @@ pub mod min_platform;
 pub mod module_implicit;
 pub mod narrow;
 pub mod notify_targets;
+pub(crate) mod notify_array;
 pub mod object_resolver;
 pub mod platform_global_lookup;
 pub mod platform_manager_lookup;
