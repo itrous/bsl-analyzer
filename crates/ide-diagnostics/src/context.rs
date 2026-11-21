@@ -128,6 +128,10 @@ impl<'a> AnalysisContext<'a> {
         self.query(|p| p.interface_method(method_id))
     }
 
+    pub(crate) fn owner_has_form_context(&self, owner: hir::DefWithBodyId) -> bool {
+        self.query(|p| p.owner_has_form_context(self.file_id, owner))
+    }
+
     /// The first method of this file's module named `name`.
     pub fn interface_method_named(&self, name: &hir::Name) -> Option<Arc<hir::MethodDecl>> {
         let module_id = hir::ModuleId::new(self.file_id);
@@ -356,6 +360,18 @@ impl<'a> AnalysisContext<'a> {
     pub fn module_metadata(&self) -> Arc<hir::ModuleMetadata> {
         let module_id = hir::ModuleId::new(self.file_id);
         self.query(|p| p.module_metadata(module_id))
+    }
+
+    pub(crate) fn form_may_have_base(&self) -> Option<bool> {
+        self.query(|p| p.form_may_have_base(self.file_id))
+    }
+
+    pub(crate) fn qualified_method_export(
+        &self,
+        module_name: &hir::Name,
+        method_name: &hir::Name,
+    ) -> Option<Result<bool, hir::QualifiedMethodError>> {
+        self.query(|p| p.qualified_method_export(self.file_id, module_name, method_name))
     }
 
     pub fn module_implicit_field_names(&self) -> Vec<String> {

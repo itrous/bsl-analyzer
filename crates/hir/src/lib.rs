@@ -22,6 +22,7 @@ pub use hir_ty::{
     BareGlobalClaim, BodyShadowScope,
 };
 pub use hir_ty::{is_form_items_collection_ty, FORM_ITEMS_TYPE_EN, FORM_ITEMS_TYPE_RU};
+pub use hir_ty::{method_has_form_context, owner_has_form_context};
 pub use hir_ty::{PlatformMethodHandle, PlatformMethodOrigin};
 pub use name_classify::{classify_token, NameClass};
 pub use semantic_symbol::{
@@ -77,7 +78,7 @@ pub use hir_def::{
 
 pub use hir_def::resolver::{
     AssignmentResolution, GlobalExportCapabilities, GlobalExportDefinition, GlobalExportEntry,
-    GlobalExportHost, GlobalExports, GlobalSurfaceGap, Resolver,
+    GlobalExportHost, GlobalExports, GlobalSurfaceGap, QualifiedMethodError, Resolver,
 };
 pub use hir_def::scope::{ExprScopes, ScopeDef};
 pub use hir_def::DefDatabase;
@@ -227,6 +228,7 @@ pub use hir_ty::narrow::{
     narrow_or_base, narrow_or_base_indexed, narrow_query, narrowed_type_at, NarrowExprIndex,
     NarrowState,
 };
+pub use hir_ty::notify_targets::semantic_module_call_summary_query;
 pub use hir_ty::proc_signature;
 pub use hir_ty::query_in_loop::{
     query_in_loop_candidates, BodyQueryFacts, LocalQueryCall, QueryCallKey, QueryExecutionKind,

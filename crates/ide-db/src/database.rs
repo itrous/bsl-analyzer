@@ -3259,7 +3259,7 @@ impl DefDatabase for RootDatabaseImpl {
 
     fn module_call_summary(&self, module_id: ModuleId) -> Arc<hir::ModuleCallSummary> {
         let file_id_input = base_db::FileIdInput::new(self, module_id.file_id);
-        hir::module_call_summary_query(self, file_id_input)
+        hir::semantic_module_call_summary_query(self, file_id_input)
     }
 
     // Docs come off the method's own declaration, so a reader keyed by the

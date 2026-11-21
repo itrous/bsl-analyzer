@@ -106,15 +106,19 @@ pub fn resolve_this_record_set_owner(
     Some((mdo_type, name))
 }
 
+pub fn form_module_metadata_missing(db: &dyn DefDatabase, resolver: &Resolver) -> bool {
+    resolver.module_id().is_some_and(|module_id| {
+        let metadata = db.module_metadata(module_id);
+        metadata.module_type == ModuleType::FormModule && metadata.form.is_none()
+    })
+}
+
 pub fn is_managed_form_module(db: &dyn DefDatabase, resolver: &Resolver) -> bool {
     let Some(module_id) = resolver.module_id() else { return false };
     let metadata = db.module_metadata(module_id);
 
-    if metadata.module_type != ModuleType::FormModule {
-        return false;
-    }
-
-    metadata.form.as_ref().is_some_and(|f| f.is_managed())
+    metadata.module_type == ModuleType::FormModule
+        && metadata.form.as_ref().is_some_and(|form| form.is_managed())
 }
 
 #[cfg(test)]

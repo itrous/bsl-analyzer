@@ -137,6 +137,12 @@ pub(crate) mod heap_estimate {
                 r.call_arg_bindings.len(),
             )
             + vec_bytes::<ExprId>(r.return_expr_ids.len())
+            + map_table_bytes::<ExprId, NotifyConstructorEnvironment>(
+                r.notify_constructor_environments.len(),
+            )
+            + map_table_bytes::<ExprId, (BareNameOrigin, TypeId)>(
+                r.notify_receiver_resolutions.len(),
+            )
             + query_facts_heap(&r.query_facts)
     }
 
@@ -150,6 +156,12 @@ pub(crate) mod heap_estimate {
                 &r.expr_types,
                 r.diagnostics.len(),
                 r.call_arg_bindings.len(),
+            )
+            + map_table_bytes::<ExprId, NotifyConstructorEnvironment>(
+                r.notify_constructor_environments.len(),
+            )
+            + map_table_bytes::<ExprId, (BareNameOrigin, TypeId)>(
+                r.notify_receiver_resolutions.len(),
             )
             + query_facts_heap(&r.query_facts)
     }
@@ -255,6 +267,7 @@ impl InferenceResult {
 pub enum BareNameUse {
     ReadValue,
     AssignmentTarget,
+    NotifyReceiver,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -758,6 +771,9 @@ pub struct InferenceContext<'db> {
 
     expr_types: FxHashMap<ExprId, TypeId>,
 
+    /// Sparse environment facts for notify-description constructors.
+    notify_constructor_environments: FxHashMap<ExprId, NotifyConstructorEnvironment>,
+
     diagnostics: Vec<InferenceDiagnostic>,
 
     loop_depth: u32,
@@ -771,6 +787,10 @@ pub struct InferenceContext<'db> {
     /// dispatch consumes the same verdict so an absent root is not also reported
     /// as `UnresolvedMethodCall::ReceiverNotResolved`.
     bare_name_verdicts: FxHashMap<ExprId, BareNameVerdict>,
+
+    /// Receiver ownership is finalized after dead branches and body-wide assignments are known.
+    notify_body_local_names: FxHashSet<NormName>,
+    notify_receiver_exprs: FxHashSet<ExprId>,
 
     /// Bare reads the cascade resolved as a local of this body; only these are
     /// judged by the definite-initialization check.
@@ -869,6 +889,22 @@ pub struct InferenceContext<'db> {
     reading_bare_call_callee: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NotifyConstructorEnvironment {
+    definite: hir_def::execution_env::EnvFlags,
+    possible: hir_def::execution_env::EnvFlags,
+    available: hir_def::execution_env::EnvFlags,
+}
+
+impl NotifyConstructorEnvironment {
+    pub(crate) fn may_be_available(self) -> bool {
+        self.definite.intersects(self.available)
+            || self.possible.intersects(self.available)
+            // Empty means unknown unless inference separately marks the statement dead.
+            || self.definite.is_empty() && self.possible.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodyInferenceResult {
     pub owner: DefWithBodyId,
@@ -876,6 +912,8 @@ pub struct BodyInferenceResult {
     pub implicit_locals: FxHashMap<String, ImplicitLocalInfo>,
     pub binding_types: FxHashMap<BindingId, TypeId>,
     pub expr_types: FxHashMap<ExprId, TypeId>,
+    pub(crate) notify_constructor_environments: FxHashMap<ExprId, NotifyConstructorEnvironment>,
+    pub(crate) notify_receiver_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
     pub diagnostics: Vec<InferenceDiagnostic>,
     pub call_arg_bindings: Vec<CallArgBinding>,
     /// Statements walked inside a `#Если` branch nothing proves compiled (see
@@ -900,6 +938,8 @@ impl BodyInferenceResult {
             implicit_locals: FxHashMap::default(),
             binding_types: FxHashMap::default(),
             expr_types: FxHashMap::default(),
+            notify_constructor_environments: FxHashMap::default(),
+            notify_receiver_resolutions: FxHashMap::default(),
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
@@ -917,6 +957,8 @@ pub struct ModuleCodeInferenceResult {
     pub implicit_locals: FxHashMap<String, ImplicitLocalInfo>,
     pub binding_types: FxHashMap<BindingId, TypeId>,
     pub expr_types: FxHashMap<ExprId, TypeId>,
+    pub(crate) notify_constructor_environments: FxHashMap<ExprId, NotifyConstructorEnvironment>,
+    pub(crate) notify_receiver_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
     pub diagnostics: Vec<InferenceDiagnostic>,
     pub call_arg_bindings: Vec<CallArgBinding>,
     /// See [`BodyInferenceResult::uncompiled_stmts`].
@@ -934,6 +976,8 @@ impl Default for ModuleCodeInferenceResult {
             implicit_locals: FxHashMap::default(),
             binding_types: FxHashMap::default(),
             expr_types: FxHashMap::default(),
+            notify_constructor_environments: FxHashMap::default(),
+            notify_receiver_resolutions: FxHashMap::default(),
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
@@ -955,6 +999,8 @@ impl ModuleCodeInferenceResult {
             implicit_locals: body.implicit_locals,
             binding_types: body.binding_types,
             expr_types: body.expr_types,
+            notify_constructor_environments: body.notify_constructor_environments,
+            notify_receiver_resolutions: body.notify_receiver_resolutions,
             diagnostics: body.diagnostics,
             call_arg_bindings: body.call_arg_bindings,
             uncompiled_stmts: body.uncompiled_stmts,
@@ -982,6 +1028,28 @@ impl InferOwnerResult {
         match self {
             InferOwnerResult::Method(r) => r.expr_types.get(&expr).copied(),
             InferOwnerResult::ModuleCode(r) => r.expr_types.get(&expr).copied(),
+        }
+    }
+
+    pub(crate) fn notify_receiver_resolution(
+        &self,
+        expr: ExprId,
+    ) -> Option<(BareNameOrigin, TypeId)> {
+        match self {
+            InferOwnerResult::Method(r) => r.notify_receiver_resolutions.get(&expr).copied(),
+            InferOwnerResult::ModuleCode(r) => r.notify_receiver_resolutions.get(&expr).copied(),
+        }
+    }
+
+    pub(crate) fn notify_constructor_environment(
+        &self,
+        expr: ExprId,
+    ) -> Option<NotifyConstructorEnvironment> {
+        match self {
+            InferOwnerResult::Method(r) => r.notify_constructor_environments.get(&expr).copied(),
+            InferOwnerResult::ModuleCode(r) => {
+                r.notify_constructor_environments.get(&expr).copied()
+            }
         }
     }
 
@@ -1149,11 +1217,14 @@ impl<'db> InferenceContext<'db> {
             shadowed_root_names: FxHashMap::default(),
             binding_types: FxHashMap::default(),
             expr_types: FxHashMap::default(),
+            notify_constructor_environments: FxHashMap::default(),
             diagnostics: Vec::new(),
             loop_depth: 0,
             implicit_database_reads: rustc_hash::FxHashSet::default(),
             assignment_targets: rustc_hash::FxHashSet::default(),
             bare_name_verdicts: FxHashMap::default(),
+            notify_body_local_names: FxHashSet::default(),
+            notify_receiver_exprs: FxHashSet::default(),
             local_reads: FxHashSet::default(),
             calls_with_unread_target: rustc_hash::FxHashSet::default(),
             call_arg_bindings: Vec::new(),
@@ -2054,6 +2125,23 @@ impl<'db> InferenceContext<'db> {
         self.global_export_map().contains_key(&key)
     }
 
+    fn record_notify_constructor_environment(
+        &mut self,
+        expr: ExprId,
+        name: &str,
+        available: hir_def::execution_env::EnvFlags,
+    ) {
+        if hir_def::call_graph::is_notify_description_type_name(name) {
+            self.notify_constructor_environments.entry(expr).or_insert(
+                NotifyConstructorEnvironment {
+                    definite: self.body_env,
+                    possible: self.possible_env,
+                    available,
+                },
+            );
+        }
+    }
+
     /// The same type-availability check as the syntactic `Новый X`, for a name
     /// that arrived as a string value (`Новый("X")`, `Новый(Тип("X"))`). A
     /// qualified name denotes a configuration object rather than a platform
@@ -2071,6 +2159,7 @@ impl<'db> InferenceContext<'db> {
         }
         let environment =
             hir_def::execution_env::EnvFlags::from_platform_context(platform_type.context.as_ref());
+        self.record_notify_constructor_environment(expr, name, environment);
         let type_name = Name::new(name);
         self.check_member_env(expr, &type_name, environment, EnvMemberKind::Type);
         self.check_min_platform(expr, &type_name, || crate::min_platform::constructed_type(name));
@@ -2248,7 +2337,8 @@ impl<'db> InferenceContext<'db> {
         });
     }
 
-    pub fn finish(self) -> BodyInferenceResult {
+    pub fn finish(mut self) -> BodyInferenceResult {
+        let notify_receiver_resolutions = self.finish_notify_receiver_resolutions();
         let query_facts = self.query_facts();
         BodyInferenceResult {
             owner: self.owner,
@@ -2260,6 +2350,8 @@ impl<'db> InferenceContext<'db> {
             implicit_locals: self.implicit_locals,
             binding_types: self.binding_types,
             expr_types: self.expr_types,
+            notify_constructor_environments: self.notify_constructor_environments,
+            notify_receiver_resolutions,
             diagnostics: self.diagnostics,
             call_arg_bindings: self.call_arg_bindings,
             uncompiled_stmts: self.uncompiled_stmts,
@@ -2267,6 +2359,56 @@ impl<'db> InferenceContext<'db> {
             query_facts,
             return_expr_ids: self.return_expr_ids,
         }
+    }
+
+    fn finish_notify_receiver_resolutions(
+        &mut self,
+    ) -> FxHashMap<ExprId, (BareNameOrigin, TypeId)> {
+        if self.notify_receiver_exprs.is_empty() {
+            return FxHashMap::default();
+        }
+
+        let receiver_exprs: Vec<_> = self.notify_receiver_exprs.iter().copied().collect();
+        let receiver_names: FxHashSet<_> = receiver_exprs
+            .iter()
+            .filter_map(|expr| match self.body.expr(*expr) {
+                Expr::Path(name) => Some(NormName::intern(name.as_str())),
+                _ => None,
+            })
+            .collect();
+        let dead_stmts: FxHashSet<_> = self.dead_stmts.iter().copied().collect();
+        let mut checked_names = FxHashSet::default();
+        let assignment_names: Vec<Name> = self
+            .body
+            .stmts_iter()
+            .filter_map(|(stmt, statement)| {
+                if dead_stmts.contains(&stmt) {
+                    return None;
+                }
+                let Stmt::Assign { target, .. } = statement else { return None };
+                let Expr::Path(name) = self.body.expr_idx(*target) else { return None };
+                let key = NormName::intern(name.as_str());
+                (receiver_names.contains(&key) && checked_names.insert(key)).then(|| name.clone())
+            })
+            .collect();
+        self.notify_body_local_names.clear();
+        for name in assignment_names {
+            if self.assignment_can_declare_implicit_local(&name) {
+                self.notify_body_local_names.insert(NormName::intern(name.as_str()));
+            }
+        }
+
+        receiver_exprs
+            .into_iter()
+            .filter_map(|expr| {
+                let Expr::Path(name) = self.body.expr(expr) else { return None };
+                let name = name.clone();
+                match self.resolve_bare_name(&name, expr, BareNameUse::NotifyReceiver) {
+                    BareNameResolution::Resolved { ty, origin, .. } => Some((expr, (origin, ty))),
+                    BareNameResolution::Absent | BareNameResolution::Indeterminate { .. } => None,
+                }
+            })
+            .collect()
     }
 
     /// The query executions of the finished body. Judged only now: a local's type at a
@@ -4218,6 +4360,26 @@ impl<'db> InferenceContext<'db> {
                     (None, Some(&first)) => self.constructed_type_name(&body, first),
                     _ => None,
                 };
+                let notify_base = match (type_name, dynamic_name.as_deref()) {
+                    (Some(name), _)
+                        if hir_def::call_graph::is_notify_description_type_name(name.as_str()) =>
+                    {
+                        Some(0)
+                    }
+                    (None, Some(name))
+                        if hir_def::call_graph::is_notify_description_type_name(name) =>
+                    {
+                        Some(1)
+                    }
+                    _ => None,
+                };
+                if let Some(base) = notify_base {
+                    for receiver_idx in [base + 1, base + 4] {
+                        if let Some(&receiver) = args.get(receiver_idx) {
+                            self.notify_receiver_exprs.insert(ExprId::from_idx(receiver));
+                        }
+                    }
+                }
 
                 if let Some(name) = type_name {
                     if matches!(
@@ -4238,6 +4400,7 @@ impl<'db> InferenceContext<'db> {
                             )
                         },
                     );
+                    self.record_notify_constructor_environment(expr_id, name.as_str(), environment);
                     if !platform.is_ambiguous_type_name(name.as_str()) && platform_type.is_some() {
                         self.check_member_env(expr_id, name, environment, EnvMemberKind::Type);
                         self.check_min_platform(expr_id, name, || {
@@ -4392,15 +4555,23 @@ impl<'db> InferenceContext<'db> {
     ) -> BareNameResolution {
         use hir_def::resolver::Resolution;
 
-        debug_assert!(matches!(usage, BareNameUse::ReadValue | BareNameUse::AssignmentTarget));
+        debug_assert!(matches!(
+            usage,
+            BareNameUse::ReadValue | BareNameUse::AssignmentTarget | BareNameUse::NotifyReceiver
+        ));
+        let notify_receiver = usage == BareNameUse::NotifyReceiver;
         let resolver = self.get_resolver();
         let found =
             |ty, origin, availability| BareNameResolution::Resolved { ty, origin, availability };
         let all_env = hir_def::execution_env::EnvFlags::ALL;
 
         let name_lower = name.as_str().fold_lower();
-        let self_name_wins =
-            is_self_name(&name_lower) && !self.self_name_is_shadowed(name, &resolver);
+        let flow_key = NormName::intern(name.as_str());
+        if notify_receiver && self.notify_body_local_names.contains(&flow_key) {
+            return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
+        }
+        let self_name_wins = is_self_name(&name_lower)
+            && !self.self_name_is_shadowed(name, &resolver, notify_receiver);
         if self_name_wins && (name_lower == "этотобъект" || name_lower == "thisobject") {
             if let Some(owner) = crate::this_object::resolve_this_object_owner(self.db, &resolver) {
                 trace!("resolved {} as ThisObject {{ owner: {:?} }}", name, owner);
@@ -4456,43 +4627,50 @@ impl<'db> InferenceContext<'db> {
                 all_env,
             );
         }
+        if notify_receiver
+            && self_name_wins
+            && crate::this_object::form_module_metadata_missing(self.db, &resolver)
+        {
+            return found(self.db.unknown(), BareNameOrigin::SelfName, all_env);
+        }
 
         let resolved = resolver.resolve_name(self.db, name);
 
-        let flow_key = NormName::intern(name.as_str());
-        if self.reset_vars.contains(&flow_key) {
+        if !notify_receiver && self.reset_vars.contains(&flow_key) {
             trace!("resolved {} as a local reset by an untyped write", name);
             return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
         }
-        if let Some(ty) = self.var_types.get(&flow_key) {
-            trace!("resolved {} via var_types = {:?}", name, ty);
-            let ty_id = *ty;
-            // Structure-literal key enrichment: a local typed as a `Структура` gets its collected
-            // literal keys (and value types known up to this read) surfaced for completion/hover.
-            // Soft — never feeds a diagnostic.
-            if matches!(self.db.lookup_type(ty_id), TypeKind::Structure(_)) {
-                let key = name.as_str().fold_lower();
-                if let Some(rich) =
-                    crate::structure_keys::materialize(self.db, &self.structure_shapes, &key)
-                {
-                    return found(rich, BareNameOrigin::FlowLocal, all_env);
+        if !notify_receiver {
+            if let Some(ty) = self.var_types.get(&flow_key) {
+                trace!("resolved {} via var_types = {:?}", name, ty);
+                let ty_id = *ty;
+                // Structure-literal key enrichment: a local typed as a `Структура` gets its collected
+                // literal keys (and value types known up to this read) surfaced for completion/hover.
+                // Soft — never feeds a diagnostic.
+                if matches!(self.db.lookup_type(ty_id), TypeKind::Structure(_)) {
+                    let key = name.as_str().fold_lower();
+                    if let Some(rich) =
+                        crate::structure_keys::materialize(self.db, &self.structure_shapes, &key)
+                    {
+                        return found(rich, BareNameOrigin::FlowLocal, all_env);
+                    }
                 }
-            }
-            if crate::method_lookup::receiver_needs_refinement_id(self.db, ty_id) {
-                if let Some(projections) = crate::query_text_dataflow::refine_query_at_use_site(
-                    self.db,
-                    self.context_file_id,
-                    self.owner,
-                    expr_id,
-                    name,
-                    &self.body,
-                ) {
-                    let refined = self.db.query(projections.iter().cloned().collect());
-                    trace!("Phase F refined {} to {:?}", name, refined);
-                    return found(refined, BareNameOrigin::FlowLocal, all_env);
+                if crate::method_lookup::receiver_needs_refinement_id(self.db, ty_id) {
+                    if let Some(projections) = crate::query_text_dataflow::refine_query_at_use_site(
+                        self.db,
+                        self.context_file_id,
+                        self.owner,
+                        expr_id,
+                        name,
+                        &self.body,
+                    ) {
+                        let refined = self.db.query(projections.iter().cloned().collect());
+                        trace!("Phase F refined {} to {:?}", name, refined);
+                        return found(refined, BareNameOrigin::FlowLocal, all_env);
+                    }
                 }
+                return found(ty_id, BareNameOrigin::FlowLocal, all_env);
             }
-            return found(ty_id, BareNameOrigin::FlowLocal, all_env);
         }
 
         let user_shadows =
@@ -4508,7 +4686,7 @@ impl<'db> InferenceContext<'db> {
         let hir_sig = builtin::builtin_functions().get(name.as_str());
         // BSL procedures/functions are not first-class values: EDT accepts
         // `СтрДлина(...)` but reports `A = СтрДлина` as an undefined variable.
-        if usage != BareNameUse::ReadValue && (resolver_says_builtin || hir_sig.is_some()) {
+        if usage == BareNameUse::AssignmentTarget && (resolver_says_builtin || hir_sig.is_some()) {
             return found(self.db.unknown(), BareNameOrigin::Builtin, all_env);
         }
 
@@ -4535,6 +4713,11 @@ impl<'db> InferenceContext<'db> {
         }
 
         let workspace_owns_common_module = resolver.user_common_module_exists(self.db, name);
+        let assigned_in_body = if notify_receiver {
+            self.notify_body_local_names.contains(&flow_key)
+        } else {
+            self.assigned_var_names.contains(&flow_key)
+        };
 
         // Implicit `ЭтотОбъект` members (attributes, tabular sections, record-set fields) of the
         // current object/record-set module win over a same-named common module: in that module
@@ -4559,7 +4742,8 @@ impl<'db> InferenceContext<'db> {
             }
         }
 
-        if self.assignment_target_names.contains(&NormName::intern(name.as_str()))
+        if !notify_receiver
+            && self.assignment_target_names.contains(&NormName::intern(name.as_str()))
             && self.implicit_local_reaches(expr_id, name)
         {
             return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
@@ -4574,7 +4758,7 @@ impl<'db> InferenceContext<'db> {
         if workspace_owns_common_module
             && !user_shadows
             && !body_binding_shadows
-            && !self.assigned_var_names.contains(&NormName::intern(name.as_str()))
+            && !assigned_in_body
         {
             if let Some(canonical) = self.canonical_common_module_name(name) {
                 trace!("resolved {} as common module type", name);
@@ -4590,7 +4774,6 @@ impl<'db> InferenceContext<'db> {
         // object's name (`ТестовыйОтчёт.Метод()`). Name dispatch already treats
         // that spelling as this module's object manager; classify the root the
         // same way so it cannot simultaneously become `Absent`.
-        let assigned_in_body = self.assigned_var_names.contains(&NormName::intern(name.as_str()));
         if !assigned_in_body {
             if let Some((mdo_type, self_name)) =
                 crate::this_object::resolve_this_manager_owner(self.db, &resolver)
@@ -4607,6 +4790,10 @@ impl<'db> InferenceContext<'db> {
                     );
                 }
             }
+        }
+
+        if notify_receiver {
+            return BareNameResolution::Absent;
         }
 
         // Everything below denotes a PLATFORM global, so a user symbol holding the
@@ -6009,9 +6196,19 @@ impl<'db> InferenceContext<'db> {
     /// own object or form would invent members it does not have and lose every
     /// check that depends on its real type. Mirrors the `user_shadows` /
     /// `body_binding_shadows` rule the rest of the name cascade uses.
-    fn self_name_is_shadowed(&self, name: &hir_def::Name, resolver: &Resolver) -> bool {
+    fn self_name_is_shadowed(
+        &self,
+        name: &hir_def::Name,
+        resolver: &Resolver,
+        notify_receiver: bool,
+    ) -> bool {
+        let assignment_shadows = if notify_receiver {
+            self.notify_body_local_names.contains(&NormName::intern(name.as_str()))
+        } else {
+            self.assigned_var_names.contains(&NormName::intern(name.as_str()))
+        };
         self.body_declares_binding(name)
-            || self.assigned_var_names.contains(&NormName::intern(name.as_str()))
+            || assignment_shadows
             || matches!(
                 resolver.resolve_name(self.db, name),
                 Some(
@@ -6034,7 +6231,7 @@ impl<'db> InferenceContext<'db> {
             return None;
         }
         let resolver = self.get_resolver();
-        if self.self_name_is_shadowed(&name, &resolver) {
+        if self.self_name_is_shadowed(&name, &resolver, false) {
             return None;
         }
         crate::this_object::is_managed_form_module(self.db, &resolver).then_some(name)

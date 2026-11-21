@@ -77,7 +77,8 @@ mod heap_estimate {
 
     pub(super) fn module_call_summary_heap(v: &Arc<ModuleCallSummary>) -> usize {
         use crate::call_graph::{
-            CallEdge, FormEventEntry, IdleReg, MethodSummary, NotifyReg, NotifyTarget, SetActionReg,
+            CallEdge, FormEventEntry, IdleReg, MethodSummary, NameLiteralRefSite, NotifyReg,
+            NotifyTarget, SetActionReg,
         };
 
         let s = &**v;
@@ -94,8 +95,14 @@ mod heap_estimate {
         bytes += vec_bytes::<NotifyReg>(s.notify_regs.len());
         for r in &s.notify_regs {
             bytes += name_bytes(&r.callback_name);
-            if let NotifyTarget::Module(name) = &r.target {
-                bytes += name_bytes(name);
+            match &r.target {
+                NotifyTarget::Module(name) | NotifyTarget::BareName { name, .. } => {
+                    bytes += name_bytes(name);
+                }
+                NotifyTarget::ThisObject
+                | NotifyTarget::Unresolved { .. }
+                | NotifyTarget::NotCompiled { .. }
+                | NotifyTarget::Unsupported => {}
             }
         }
         bytes += vec_bytes::<IdleReg>(s.idle_handler_regs.len());
@@ -107,6 +114,7 @@ mod heap_estimate {
             bytes += name_bytes(&r.handler_name);
         }
         bytes += vec_bytes::<u32>(s.name_literal_refs.len());
+        bytes += vec_bytes::<NameLiteralRefSite>(s.name_literal_ref_sites.len());
         bytes += vec_bytes::<FormEventEntry>(s.form_entries.len());
         for f in &s.form_entries {
             bytes += f.event_type.capacity() + name_bytes(&f.handler_name);
@@ -148,6 +156,12 @@ mod heap_estimate {
     pub(super) fn file_dependencies_heap(v: &Arc<Vec<FileId>>) -> usize {
         vec_bytes::<FileId>(v.len())
     }
+}
+
+/// Approximate heap owned by a module call summary for Salsa caches in dependent crates.
+#[doc(hidden)]
+pub fn module_call_summary_heap(summary: &Arc<crate::call_graph::ModuleCallSummary>) -> usize {
+    heap_estimate::module_call_summary_heap(summary)
 }
 
 // Condensed per-module data (built from item_tree, no green-tree pin): on the
@@ -646,7 +660,11 @@ pub(crate) fn resolve_callback_edges(
                     QualifiedLookup::Absent => None,
                 }
             }
-            NotifyTarget::Unsupported => None,
+            // A syntactic candidate must be normalized before a semantic edge can be emitted.
+            NotifyTarget::BareName { .. }
+            | NotifyTarget::Unresolved { .. }
+            | NotifyTarget::NotCompiled { .. }
+            | NotifyTarget::Unsupported => None,
         };
         if let Some((target, provenance)) = resolved {
             out.push(ResolvedCallEdge {

@@ -41,15 +41,10 @@ pub(crate) fn possible_method_env(
     Some(environment & (decl.preproc_env | decl.preproc_undecided))
 }
 
-/// Whether a body can access the implicit context of its form.
-pub fn owner_has_form_context(
-    db: &dyn HirDatabase,
-    file_id: vfs::FileId,
-    owner: hir_def::DefWithBodyId,
-) -> bool {
-    let hir_def::DefWithBodyId::Method(local_id) = owner else { return true };
-    let module = hir_def::ModuleId::new(file_id);
-    !db.interface_method(MethodId { module, local_id }).is_some_and(|method| {
+/// Whether a declared method can access the implicit context of its form.
+/// An unavailable declaration is treated as potentially having context.
+pub fn method_has_form_context(method: Option<&hir_def::MethodDecl>) -> bool {
+    !method.is_some_and(|method| {
         method.directives.iter().any(|directive| {
             matches!(
                 directive,
@@ -58,6 +53,17 @@ pub fn owner_has_form_context(
             )
         })
     })
+}
+
+/// Whether a body can access the implicit context of its form.
+pub fn owner_has_form_context(
+    db: &dyn HirDatabase,
+    file_id: vfs::FileId,
+    owner: hir_def::DefWithBodyId,
+) -> bool {
+    let hir_def::DefWithBodyId::Method(local_id) = owner else { return true };
+    let module = hir_def::ModuleId::new(file_id);
+    method_has_form_context(db.interface_method(MethodId { module, local_id }).as_deref())
 }
 
 /// [`effective_method_env`] or the module-code environment, by body owner —
@@ -78,5 +84,53 @@ pub fn owner_body_env(
             let metadata = db.module_metadata(hir_def::ModuleId { file_id });
             execution_env::module_code_env(&metadata, &options)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::method_has_form_context;
+    use hir_def::{
+        execution_env::EnvFlags, item_tree::AnnotationKind, MethodDecl, MethodId, MethodKey,
+        ModuleId, Name,
+    };
+
+    fn method_with_directives(directives: &[AnnotationKind]) -> MethodDecl {
+        MethodDecl {
+            id: MethodId {
+                module: ModuleId::new(vfs::FileId(0)),
+                local_id: MethodKey::first("Тест"),
+            },
+            name: Name::new("Тест"),
+            is_function: false,
+            is_export: false,
+            params: Vec::new(),
+            directives: directives.to_vec().into_boxed_slice(),
+            preproc_env: EnvFlags::ALL,
+            preproc_undecided: EnvFlags::EMPTY,
+            docs: None,
+            return_type_ref: None,
+        }
+    }
+
+    #[test]
+    fn missing_method_declaration_may_have_form_context() {
+        assert!(method_has_form_context(None));
+    }
+
+    #[test]
+    fn no_context_directives_remove_form_context() {
+        for directive in
+            [AnnotationKind::AtServerNoContext, AnnotationKind::AtClientAtServerNoContext]
+        {
+            assert!(!method_has_form_context(Some(&method_with_directives(&[directive]))));
+        }
+    }
+
+    #[test]
+    fn contextual_method_has_form_context() {
+        assert!(method_has_form_context(Some(&method_with_directives(&[
+            AnnotationKind::AtServer,
+        ]))));
     }
 }

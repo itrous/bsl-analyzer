@@ -106,6 +106,8 @@ pub mod missing_common_module_method;
 pub mod missing_event_subscription_handler;
 pub mod missing_form_event_handler;
 pub mod missing_notify_handler;
+#[cfg(test)]
+mod missing_notify_handler_regression_tests;
 pub mod missing_parameter_description;
 pub mod missing_returned_value_description;
 pub mod missing_space;

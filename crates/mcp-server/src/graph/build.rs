@@ -12698,22 +12698,27 @@ mod cache_refusal_tests {
     }
 
     #[test]
-    fn an_older_schema_names_found_and_expected_and_is_rebuilt() {
+    fn a_b0_schema_cache_is_rebuilt_before_serving() {
+        const B0_SCHEMA_VERSION: u32 = 25;
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let db = seeded(root);
         let expected = crate::graph_db::SCHEMA_VERSION;
-        let found = expected - 1;
-        edit_meta(&db, &format!("UPDATE meta SET value = '{found}' WHERE key = 'schema_version'"));
+        assert!(expected > B0_SCHEMA_VERSION);
+        edit_meta(
+            &db,
+            &format!("UPDATE meta SET value = '{B0_SCHEMA_VERSION}' WHERE key = 'schema_version'"),
+        );
 
         let (graph, lines) = load(root);
 
         let refusal = refusal(&lines);
         assert!(
-            refusal.contains(&format!("schema_version {found} != expected {expected}")),
+            refusal.contains(&format!("schema_version {B0_SCHEMA_VERSION} != expected {expected}")),
             "{refusal}"
         );
-        assert_eq!(served_generation(&graph), Some(1), "the old format was not rebuilt");
+        assert_eq!(served_generation(&graph), Some(1), "the B0 cache was not rebuilt");
         assert_eq!(meta_string(&db, "schema_version"), expected.to_string());
     }
 

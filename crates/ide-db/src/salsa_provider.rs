@@ -158,6 +158,23 @@ impl AnalysisProvider for SalsaProvider<'_> {
         self.db.resolve_common_module(file_id, name)
     }
 
+    fn qualified_method_export(
+        &self,
+        file_id: FileId,
+        module_name: &Name,
+        method_name: &Name,
+    ) -> Option<Result<bool, hir::QualifiedMethodError>> {
+        Some(
+            Resolver::with_workspace_scope(ModuleId::new(file_id))
+                .resolve_qualified_method(self.db, module_name, method_name)
+                .map(|method| method.is_export),
+        )
+    }
+
+    fn form_may_have_base(&self, file_id: FileId) -> Option<bool> {
+        crate::queries::form_may_have_base(self.db, file_id)
+    }
+
     fn nonlocal_common_module_receiver(
         &self,
         file_id: FileId,
@@ -386,6 +403,20 @@ impl AnalysisProvider for SalsaProvider<'_> {
                 .find_method_by_id_shared(method_id)
                 .cloned(),
             None => self.db.interface_method(method_id),
+        }
+    }
+
+    fn owner_has_form_context(&self, file_id: FileId, owner: DefWithBodyId) -> bool {
+        if self.effective_for(file_id).is_some() {
+            match owner {
+                DefWithBodyId::Method(local_id) => hir::method_has_form_context(
+                    self.interface_method(MethodId { module: ModuleId::new(file_id), local_id })
+                        .as_deref(),
+                ),
+                DefWithBodyId::ModuleCode => true,
+            }
+        } else {
+            hir::owner_has_form_context(self.db, file_id, owner)
         }
     }
 

@@ -25,6 +25,7 @@ pub mod method_resolution;
 pub mod min_platform;
 pub mod module_implicit;
 pub mod narrow;
+pub mod notify_targets;
 pub mod object_resolver;
 pub mod platform_global_lookup;
 pub mod platform_manager_lookup;
@@ -77,7 +78,7 @@ pub use infer::{
 };
 pub use lower::TyLoweringContext;
 pub use manager_lookup::{lookup_manager_field, ManagerMemberInfo};
-pub use method_environment::{owner_body_env, owner_has_form_context};
+pub use method_environment::{method_has_form_context, owner_body_env, owner_has_form_context};
 pub use method_lookup::{lookup_method, MethodInfo};
 pub use method_resolution::{resolve_qualified_call, MethodResolution};
 pub use module_implicit::module_implicit_fields;

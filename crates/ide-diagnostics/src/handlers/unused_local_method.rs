@@ -180,6 +180,9 @@ pub(crate) fn collect_called_methods(
     // The platform invokes these by the registered string name:
     // ПодключитьОбработчикОжидания and Новый ОписаниеОповещения (both handler slots).
     for reg in &summary.notify_regs {
+        if matches!(&reg.target, hir::call_graph::NotifyTarget::NotCompiled { .. }) {
+            continue;
+        }
         called_methods.insert(reg.callback_name.as_str().fold_lower());
     }
     for reg in &summary.idle_handler_regs {
@@ -971,6 +974,48 @@ mod tests {
             names.iter().any(|m| m.contains("Обработчик")),
             "non-form SetAction must not exempt a local: {names:?}"
         );
+    }
+
+    #[test]
+    fn unavailable_notify_registration_does_not_keep_a_form_method_live() {
+        let code = r#"
+&НаКлиентеНаСервере
+Процедура Настроить() Экспорт
+#Если Сервер И Не Сервер Тогда
+    О = Новый ОписаниеОповещения("МёртвыйТолькоИзРегистрации", ЭтотОбъект);
+    О = Новый ОписаниеОповещения("МёртвыйНоЕстьСтрока", ЭтотОбъект);
+#КонецЕсли
+#Если Клиент Тогда
+    О = Новый ОписаниеОповещения("ЖивойОбработчик", ЭтотОбъект);
+#КонецЕсли
+    СтроковыеСсылки();
+КонецПроцедуры
+
+Процедура МёртвыйТолькоИзРегистрации()
+КонецПроцедуры
+
+Процедура МёртвыйНоЕстьСтрока()
+КонецПроцедуры
+
+Процедура ЖивойОбработчик()
+КонецПроцедуры
+
+Процедура ТолькоСтрока()
+КонецПроцедуры
+
+Процедура СтроковыеСсылки() Экспорт
+    Выполнить("МёртвыйНоЕстьСтрока");
+    Выполнить("ТолькоСтрока");
+КонецПроцедуры
+"#;
+        let diagnostics = crate::test_utils::check_form_with_common_modules(code, &[]);
+        let unused: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert_eq!(unused, vec!["Неиспользуемый локальный метод \"МёртвыйТолькоИзРегистрации\""]);
     }
 
     #[test]

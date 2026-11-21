@@ -208,6 +208,22 @@ pub fn weaving_target<'db>(
     Some(hir::WeavingModuleId::new(db, ext_file, base_file))
 }
 
+/// An extension form with unavailable metadata may still inherit a base module,
+/// even when that module is not present in the source root.
+pub fn form_may_have_base(db: &dyn RootDatabase, file_id: vfs::FileId) -> Option<bool> {
+    if weaving_target(db, file_id).is_some() {
+        return Some(true);
+    }
+    let path = crate::vfs_helpers::get_file_path(db, file_id)?;
+    if db.external_root_of_path(&path).is_some() {
+        return Some(false);
+    }
+    let (_, label) = db.config_root_rank_and_label(file_id)?;
+    Some(label.is_some_and(|label| {
+        db.designer_config_paths().iter().any(|(name, _)| name.as_deref() == Some(&label))
+    }))
+}
+
 #[salsa::tracked(lru = 128, heap_size = heap_estimate::module_metadata_heap, returns(clone))]
 pub fn module_metadata_query<'db>(
     db: &'db dyn RootDatabase,

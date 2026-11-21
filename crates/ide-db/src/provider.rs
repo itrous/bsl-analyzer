@@ -109,6 +109,23 @@ pub trait AnalysisProvider {
         merged.map(Arc::new)
     }
 
+    /// Export status of the method selected by the same qualified lookup as the call graph.
+    /// Providers without semantic resolution return `None` rather than guessing.
+    fn qualified_method_export(
+        &self,
+        _file_id: FileId,
+        _module_name: &Name,
+        _method_name: &Name,
+    ) -> Option<Result<bool, hir::QualifiedMethodError>> {
+        None
+    }
+
+    /// Whether a form whose metadata is unavailable might inherit a base form's module.
+    /// `None` means the provider cannot determine the owning configuration.
+    fn form_may_have_base(&self, _file_id: FileId) -> Option<bool> {
+        None
+    }
+
     /// Whether the nonlocal owner of `name` in `owner` is a common module.
     /// Providers without semantic name resolution cannot establish the answer.
     fn nonlocal_common_module_receiver(
@@ -385,6 +402,18 @@ pub trait AnalysisProvider {
     /// interface, so an edit of another declaration leaves its memo valid.
     fn interface_method(&self, method_id: MethodId) -> Option<Arc<hir::MethodDecl>> {
         self.module_interface(method_id.module).find_method_by_id_shared(method_id).cloned()
+    }
+
+    /// Whether this body can access its form's implicit context. A missing method
+    /// declaration stays conservative, matching the previous per-method lookup.
+    fn owner_has_form_context(&self, file_id: FileId, owner: DefWithBodyId) -> bool {
+        match owner {
+            DefWithBodyId::Method(local_id) => hir::method_has_form_context(
+                self.interface_method(MethodId { module: ModuleId::new(file_id), local_id })
+                    .as_deref(),
+            ),
+            DefWithBodyId::ModuleCode => true,
+        }
     }
 
     /// The first declaration of `name` in the module — what a bare call

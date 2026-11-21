@@ -1905,8 +1905,9 @@ mod tests {
     use rusqlite::{params, Connection};
 
     #[test]
-    fn rejects_graph_from_prior_projection_schema_version() {
-        // Given: a complete graph created by the current writer.
+    fn rejects_graph_from_b0_projection_schema_version() {
+        const B0_SCHEMA_VERSION: u32 = 25;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bsl-graph.db");
         GraphDbWriter::create(&path)
@@ -1919,16 +1920,25 @@ mod tests {
                 publication_id: "test-1".to_owned(),
             })
             .unwrap();
+
+        assert!(crate::graph_db::SCHEMA_VERSION > B0_SCHEMA_VERSION);
+        assert!(GraphDb::open(&path).is_ok(), "the current projection is a positive control");
         Connection::open(&path)
             .unwrap()
-            .execute("UPDATE meta SET value = '12' WHERE key = 'schema_version'", [])
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [B0_SCHEMA_VERSION.to_string()],
+            )
             .unwrap();
 
-        // When: the graph is opened through the serving path.
-        let result = GraphDb::open(&path);
-
-        // Then: a graph from the prior projection schema is rejected for rebuilding.
-        assert!(result.is_err(), "prior projection graphs must be rebuilt");
+        let error = GraphDb::open(&path).err().expect("B0 projection must be rejected");
+        assert!(
+            error.to_string().contains(&format!(
+                "schema_version {B0_SCHEMA_VERSION} != expected {}",
+                crate::graph_db::SCHEMA_VERSION
+            )),
+            "B0 projection must be refused: {error:#}"
+        );
     }
 
     #[test]

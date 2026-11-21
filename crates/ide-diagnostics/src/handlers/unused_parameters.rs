@@ -104,9 +104,9 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
     for reg in &summary.notify_regs {
-        // A callback handled in the current module (or whose receiver we cannot
-        // classify) keeps the platform-fixed signature, so its parameters are not
-        // "unused". A handler resolved to another module is checked there instead.
+        // A callback handled in the current module (or whose live receiver we cannot
+        // classify) keeps the platform-fixed signature. A registration excluded by
+        // control flow or constructor availability cannot keep a handler alive.
         if matches!(reg.target, hir::NotifyTarget::ThisObject | hir::NotifyTarget::Unsupported) {
             fixed_signature_handlers.insert(reg.callback_name.as_str().fold_lower());
         }
@@ -1056,7 +1056,12 @@ EndProcedure
 
     #[test]
     fn test_notify_description_cross_module_still_flags() {
-        let code = r#"&НаКлиенте
+        use crate::test_utils::check_cfe_at_with_db;
+        use hir::DefDatabase;
+        use test_fixture::CfeFixtureBuilder;
+
+        const CALLER: &str = "CommonModules/Caller/Ext/Module.bsl";
+        const CALLER_SOURCE: &str = r#"&НаКлиенте
 Процедура Вызов()
     Описание = Новый ОписаниеОповещения("Callback", КлиентскийМодуль);
 КонецПроцедуры
@@ -1066,15 +1071,47 @@ EndProcedure
     Вызов(Результат);
 КонецПроцедуры
 "#;
-
-        check_diagnostics_snapshot_for(
-            code,
-            DiagnosticCode::UnusedParameters,
-            expect![[r#"
-            UnusedParameters @ 7:31..7:43
-              message: Уберите неиспользуемый параметр "ДопПараметры"
-              severity: Warning"#]],
+        let mut builder = CfeFixtureBuilder::new("");
+        builder
+            .add_base_module("Caller", "")
+            .add_base_module("КлиентскийМодуль", "Процедура Callback() Экспорт\nКонецПроцедуры");
+        let fixture = builder.build();
+        let diagnostics = check_cfe_at_with_db(
+            CALLER,
+            CALLER_SOURCE,
+            fixture,
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                for (_, root) in fixture.config_paths() {
+                    for name in ["Caller", "КлиентскийМодуль"] {
+                        let path = root.join(format!("CommonModules/{name}.xml"));
+                        let xml = std::fs::read_to_string(&path).unwrap();
+                        let updated = xml.replace(
+                            "<ClientManagedApplication>false</ClientManagedApplication>",
+                            "<ClientManagedApplication>true</ClientManagedApplication>",
+                        );
+                        assert_ne!(updated, xml, "{name} starts client-disabled");
+                        std::fs::write(path, updated).unwrap();
+                    }
+                }
+            },
+            |db, ctx| {
+                let summary = db.module_call_summary(hir::ModuleId::new(ctx.file_id));
+                assert!(matches!(
+                    &summary.notify_regs[0].target,
+                    hir::call_graph::NotifyTarget::Module(name)
+                        if name.as_str() == "КлиентскийМодуль"
+                ));
+                super::check(ctx)
+            },
         );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect::<Vec<_>>();
+        assert_eq!(unused.len(), 1, "{diagnostics:#?}");
+        assert!(unused[0].message.contains("ДопПараметры"), "{diagnostics:#?}");
     }
 
     #[test]

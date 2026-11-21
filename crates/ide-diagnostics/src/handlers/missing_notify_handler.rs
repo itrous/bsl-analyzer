@@ -40,10 +40,16 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
-    // A form borrowed by an extension also exposes the base form's module, which is not
-    // in this file's symbol tree: absence here proves nothing about a local handler.
-    // Same stance as `missing_form_event_handler`.
-    let local_unprovable = ctx.module_metadata().form.as_deref().is_some_and(|f| f.has_base_form());
+    // A borrowed form exposes its base module, which is not in this file's symbol tree.
+    // Missing form metadata cannot disprove that the form is borrowed.
+    let metadata = ctx.module_metadata();
+    let local_unprovable = match metadata.form.as_deref() {
+        Some(form) => form.has_base_form(),
+        None if metadata.module_type == bsl_metadata::ModuleType::FormModule => {
+            ctx.form_may_have_base().unwrap_or(true)
+        }
+        None => false,
+    };
 
     let mut diagnostics = Vec::new();
     let mut module_verdicts = FxHashMap::default();
@@ -66,7 +72,10 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                     (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
                 })
             }
-            NotifyTarget::Unsupported => None,
+            NotifyTarget::Unsupported
+            | NotifyTarget::BareName { .. }
+            | NotifyTarget::Unresolved { .. }
+            | NotifyTarget::NotCompiled { .. } => None,
         };
         let Some((verdict, detail)) = verdict else { continue };
         diagnostics.push(Diagnostic {
@@ -131,22 +140,12 @@ fn module_verdict(
         return None;
     }
 
-    let mut saw_non_export = false;
-    match bodies.search_merged_surface(|module_file_id| {
-        let tree = ctx.symbol_tree_for(ModuleId::new(module_file_id));
-        let methods = tree.find_methods(name);
-        if methods.iter().any(|m| m.is_export) {
-            return Some(());
-        }
-        if !methods.is_empty() {
-            saw_non_export = true;
-        }
-        None
-    }) {
-        hir::BodySearch::Found(()) => None,
-        hir::BodySearch::Unread => None,
-        hir::BodySearch::Absent => {
-            Some(if saw_non_export { Verdict::NotExported } else { Verdict::NotFound })
+    match ctx.qualified_method_export(module_name, name)? {
+        Ok(true) => None,
+        Ok(false) => Some(Verdict::NotExported),
+        Err(hir::QualifiedMethodError::NotFound) => Some(Verdict::NotFound),
+        Err(hir::QualifiedMethodError::BodyUnread | hir::QualifiedMethodError::NotVisibleInConfigs) => {
+            None
         }
     }
 }

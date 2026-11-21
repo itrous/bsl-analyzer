@@ -1,4 +1,5 @@
 use bsl_metadata::MdoType;
+use cfg_types::IdConversion;
 use rustc_hash::{FxHashMap, FxHashSet};
 use stdx::case::CaseExt;
 use syntax::{TextRange, TextSize};
@@ -8,7 +9,7 @@ use crate::{
     hir::{Expr, ExprIdx, Literal, Stmt},
     item_tree::{AnnotationKind, ItemTree},
     name::Name,
-    MethodId, MethodKey, ModuleBodies, ModuleId,
+    ExprId, MethodId, MethodKey, ModuleBodies, ModuleId,
 };
 use intern::NormName;
 
@@ -28,6 +29,9 @@ pub struct ModuleCallSummary {
     /// cost of also matching string *data* that coincides with a method name.
     /// Sorted and deduplicated.
     pub name_literal_refs: Vec<MethodKey>,
+    /// Source sites for local notify-callback names, retained so semantic consumers can
+    /// exclude one unavailable registration without suppressing a separate string reference.
+    pub name_literal_ref_sites: Vec<NameLiteralRefSite>,
     pub form_entries: Vec<FormEventEntry>,
 }
 
@@ -116,7 +120,13 @@ impl ModuleCallSummary {
             .iter()
             .filter(|reg| {
                 matches!(reg.caller, CallerId::Method(_))
-                    && !matches!(reg.target, NotifyTarget::Unsupported)
+                    && !matches!(
+                        reg.target,
+                        NotifyTarget::BareName { .. }
+                            | NotifyTarget::Unresolved { .. }
+                            | NotifyTarget::Unsupported
+                            | NotifyTarget::NotCompiled { .. }
+                    )
             })
             .filter(|reg| {
                 seen_notify.insert((reg.caller, reg.callback_name.clone(), reg.target.clone()))
@@ -140,6 +150,7 @@ impl ModuleCallSummary {
             idle_handler_regs,
             set_action_regs: Vec::new(),
             name_literal_refs: Vec::new(),
+            name_literal_ref_sites: Vec::new(),
             form_entries: Vec::new(),
         }
     }
@@ -151,6 +162,13 @@ pub struct MethodSummary {
     pub name: Name,
     pub dispatch: MethodDispatch,
     pub is_export: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NameLiteralRefSite {
+    pub caller: CallerId,
+    pub local_id: MethodKey,
+    pub expr: ExprId,
 }
 
 /// Per-method facts derivable from the item tree alone — declaration name,
@@ -360,19 +378,23 @@ pub enum CallerId {
     ModuleCode,
 }
 
-/// Where a `Новый ОписаниеОповещения` callback's handler lives, decided purely
-/// syntactically from the second constructor argument. Kept distinct from a bare
-/// `Option` because "no module" and "receiver we can't classify" must not collapse:
-/// the graph resolves `ThisObject` to a current-module method but must NOT invent an
-/// edge for an `Unsupported` receiver.
+/// Where a `Новый ОписаниеОповещения` callback's handler lives. Bare names stay
+/// unresolved in the syntax query and are normalized by `hir-ty` using the same
+/// inference and name-resolution rules as other semantic consumers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NotifyTarget {
-    /// `ЭтотОбъект` / `ЭтаФорма` (or English forms) — handler is in the current module.
+    /// A syntactic bare-name candidate, not a resolved module. The semantic summary
+    /// replaces it before exposing registrations through `DefDatabase`.
+    BareName { name: Name, receiver: ExprId, constructor: ExprId, callback_expr: ExprId },
+    /// The receiver is not a bare name, so inference cannot resolve its owner.
+    Unresolved { constructor: ExprId, callback_expr: ExprId },
+    /// The registration lies only in an unavailable or unreachable compilation branch.
+    NotCompiled { callback_expr: ExprId },
+    /// The receiver resolves to the current object/form module.
     ThisObject,
-    /// A bare identifier receiver — treated as a (common) module name to resolve.
+    /// The receiver resolves to a common module.
     Module(Name),
-    /// Receiver is not a plain identifier (a call, index, `Неопределено`, …) or is
-    /// absent: the handler module cannot be decided syntactically.
+    /// The receiver cannot be resolved as a current object or common module.
     Unsupported,
 }
 
@@ -751,13 +773,12 @@ pub fn extract_call_summary(
         });
     }
 
-    let mut notify_scope = NotifyReceiverScope { item_tree, shadowed_self_receivers: None };
-
     let mut call_edges = Vec::new();
     let mut notify_regs = Vec::new();
     let mut idle_handler_regs = Vec::new();
     let mut set_action_regs = Vec::new();
     let mut name_literals: FxHashSet<MethodKey> = FxHashSet::default();
+    let mut name_literal_ref_sites = Vec::new();
 
     // Bodies come in item order, which is deterministic.
     for (local_id, lower_result) in module_bodies.iter_lower_results() {
@@ -766,12 +787,12 @@ pub fn extract_call_summary(
             lower_result.source_map(),
             CallerId::Method(local_id),
             &local_method_ids,
-            &mut notify_scope,
             &mut call_edges,
             &mut notify_regs,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
+            &mut name_literal_ref_sites,
         );
     }
 
@@ -781,17 +802,23 @@ pub fn extract_call_summary(
             module_code.source_map(),
             CallerId::ModuleCode,
             &local_method_ids,
-            &mut notify_scope,
             &mut call_edges,
             &mut notify_regs,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
+            &mut name_literal_ref_sites,
         );
     }
 
     let mut name_literal_refs: Vec<MethodKey> = name_literals.into_iter().collect();
     name_literal_refs.sort_unstable();
+    let notify_handler_ids: FxHashSet<_> = notify_regs
+        .iter()
+        .filter_map(|reg| local_method_ids.get(&NormName::intern(reg.callback_name.as_str())))
+        .copied()
+        .collect();
+    name_literal_ref_sites.retain(|site| notify_handler_ids.contains(&site.local_id));
 
     let form_entries = form_event_handlers
         .iter()
@@ -808,6 +835,7 @@ pub fn extract_call_summary(
         idle_handler_regs,
         set_action_regs,
         name_literal_refs,
+        name_literal_ref_sites,
         form_entries,
     }
 }
@@ -937,20 +965,24 @@ fn extract_from_body(
     source_map: crate::body::SourceMapAt<'_>,
     caller: CallerId,
     local_method_ids: &FxHashMap<NormName, MethodKey>,
-    notify_scope: &mut NotifyReceiverScope<'_>,
     call_edges: &mut Vec<CallEdge>,
     notify_regs: &mut Vec<NotifyReg>,
     idle_handler_regs: &mut Vec<IdleReg>,
     set_action_regs: &mut Vec<SetActionReg>,
     name_literals: &mut FxHashSet<MethodKey>,
+    name_literal_ref_sites: &mut Vec<NameLiteralRefSite>,
 ) {
     let common_bindings = crate::common_module_ref::common_module_var_bindings(body);
-    let mut notify_body_locals = None;
     for (expr_id, expr) in body.exprs_iter() {
         match expr {
             Expr::Literal(Literal::String(s)) if is_identifier_like(s) => {
                 if let Some(&local_id) = local_method_ids.get(&NormName::intern(s)) {
                     name_literals.insert(local_id);
+                    name_literal_ref_sites.push(NameLiteralRefSite {
+                        caller,
+                        local_id,
+                        expr: expr_id,
+                    });
                 }
             }
             Expr::Call { callee, args } => {
@@ -1029,8 +1061,7 @@ fn extract_from_body(
                             args,
                             (method_idx, target_idx),
                             range,
-                            notify_scope,
-                            &mut notify_body_locals,
+                            expr_id,
                         ) {
                             notify_regs.push(reg);
                         }
@@ -1068,12 +1099,16 @@ fn is_notify_description(name: &Name) -> bool {
     is_notify_description_str(name.as_str())
 }
 
-fn is_notify_description_str(name: &str) -> bool {
+pub fn is_notify_description_type_name(name: &str) -> bool {
     let lower = name.fold_lower();
     // `CallbackDescription` is the platform's own English name of the type (`platform_facts`:
     // `english_name`); `NotifyDescription` reaches the
     // constructor too (live probe, 8.3.27.2214), so both stay accepted.
     lower == "описаниеоповещения" || lower == "notifydescription" || lower == "callbackdescription"
+}
+
+fn is_notify_description_str(name: &str) -> bool {
+    is_notify_description_type_name(name)
 }
 
 fn is_this_object(name_lower: &str) -> bool {
@@ -1170,60 +1205,28 @@ fn extract_set_action_reg(
     Some(SetActionReg { caller, handler_name: Name::new(&handler_name), range })
 }
 
-struct NotifyReceiverScope<'a> {
-    item_tree: &'a ItemTree,
-    shadowed_self_receivers: Option<FxHashSet<String>>,
-}
-
-impl NotifyReceiverScope<'_> {
-    fn self_receiver_is_shadowed(&mut self, name: &str) -> bool {
-        self.shadowed_self_receivers
-            .get_or_insert_with(|| {
-                self.item_tree
-                    .variables()
-                    .filter_map(|(_, var)| {
-                        let name = var.name.as_str().fold_lower();
-                        is_this_receiver(&name).then_some(name)
-                    })
-                    .collect()
-            })
-            .contains(name)
-    }
-}
-
 fn extract_notify_reg_at(
     body: &Body,
     caller: CallerId,
     args: &[ExprIdx],
     (method_idx, target_idx): (usize, usize),
     range: TextRange,
-    notify_scope: &mut NotifyReceiverScope<'_>,
-    body_locals: &mut Option<FxHashSet<NormName>>,
+    constructor: ExprId,
 ) -> Option<NotifyReg> {
-    let callback_name = extract_string_literal(body, *args.get(method_idx)?)?;
-    let target = match args.get(target_idx).map(|&idx| body.expr_idx(idx)) {
-        Some(Expr::Path(name)) => {
-            let name_lower = name.as_str().fold_lower();
-            // A body binding or module variable can own a self-receiver's spelling.
-            // A body assignment anywhere also shadows the name before that assignment.
-            let is_local = body_locals
-                .get_or_insert_with(|| {
-                    body_local_names(body).map(|local| NormName::intern(local.as_str())).collect()
-                })
-                .contains(&NormName::intern(name.as_str()));
-            if is_local {
-                NotifyTarget::Unsupported
-            } else if is_this_receiver(&name_lower) {
-                if notify_scope.self_receiver_is_shadowed(&name_lower) {
-                    NotifyTarget::Unsupported
-                } else {
-                    NotifyTarget::ThisObject
-                }
-            } else {
-                NotifyTarget::Module(name.clone())
-            }
-        }
-        _ => NotifyTarget::Unsupported,
+    let callback_expr_idx = *args.get(method_idx)?;
+    let callback_expr = ExprId::from_idx(callback_expr_idx);
+    let callback_name = extract_string_literal(body, callback_expr_idx)?;
+    let target = match args.get(target_idx) {
+        Some(&receiver) => match body.expr_idx(receiver) {
+            Expr::Path(name) => NotifyTarget::BareName {
+                name: name.clone(),
+                receiver: ExprId::from_idx(receiver),
+                constructor,
+                callback_expr,
+            },
+            _ => NotifyTarget::Unresolved { constructor, callback_expr },
+        },
+        None => NotifyTarget::Unresolved { constructor, callback_expr },
     };
     Some(NotifyReg { caller, callback_name: Name::new(&callback_name), target, range })
 }
@@ -1476,6 +1479,7 @@ mod tests {
                 range: range(110),
             }],
             name_literal_refs: vec![MethodKey::first("М1")],
+            name_literal_ref_sites: Vec::new(),
             form_entries: Vec::new(),
         };
 
@@ -1536,6 +1540,7 @@ mod tests {
         assert!(subset.methods.is_empty());
         assert!(subset.set_action_regs.is_empty());
         assert!(subset.name_literal_refs.is_empty());
+        assert!(subset.name_literal_ref_sites.is_empty());
         assert!(subset.form_entries.is_empty());
     }
 
@@ -1791,6 +1796,13 @@ mod tests {
         parse_and_extract_with_handlers(code, &[])
     }
 
+    fn assert_bare_target(reg: &NotifyReg, expected: &str) {
+        match &reg.target {
+            NotifyTarget::BareName { name, .. } => assert_eq!(name.as_str(), expected),
+            target => panic!("expected unresolved bare-name candidate, got {target:?}"),
+        }
+    }
+
     fn parse_and_extract_with_handlers(
         code: &str,
         handlers: &[bsl_metadata::FormEventHandler],
@@ -2014,216 +2026,53 @@ EndProcedure
     }
 
     #[test]
-    fn test_notify_description_in_module_code() {
+    fn notify_registration_candidates_keep_bare_receiver_syntax() {
         let code = r#"
 Перем Оповещение;
 Оповещение = Новый ОписаниеОповещения("ОбработатьОповещение", ЭтотОбъект);
 
-Процедура ОбработатьОповещение(Результат, ДопПараметры) Экспорт
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].caller, CallerId::ModuleCode);
-        assert_eq!(summary.notify_regs[0].callback_name, Name::new("ОбработатьОповещение"));
-        assert_eq!(
-            summary.notify_regs[0].target,
-            NotifyTarget::ThisObject,
-            "ЭтотОбъект means current module"
-        );
-    }
-
-    #[test]
-    fn test_notify_description_english() {
-        let code = r#"
 Procedure Test()
     Notification = New NotifyDescription("HandleResult", ThisObject);
-EndProcedure
-
-Procedure HandleResult(Result, AdditionalParameters) Export
-EndProcedure
-"#;
-        let summary = parse_and_extract(code);
-
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].caller, CallerId::Method(MethodKey::first("Test")));
-        assert_eq!(summary.notify_regs[0].callback_name, Name::new("HandleResult"));
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
-    }
-
-    #[test]
-    fn test_notify_description_callback_description_spelling() {
-        let code = r#"
-Procedure Test()
-    Notification = New CallbackDescription("HandleResult", ThisObject);
-    Other = New("CallbackDescription", "AnotherHandler", CommonModule);
+    Other = New CallbackDescription("AnotherHandler", CommonModule);
+    Dynamic = New("CallbackDescription", "DynamicHandler", DynamicModule);
 EndProcedure
 "#;
         let summary = parse_and_extract(code);
 
-        assert_eq!(summary.notify_regs.len(), 2);
-        assert_eq!(summary.notify_regs[0].callback_name, Name::new("HandleResult"));
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
-        assert_eq!(summary.notify_regs[1].callback_name, Name::new("AnotherHandler"));
-        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Module(Name::new("CommonModule")));
+        assert_eq!(summary.notify_regs.len(), 4);
+        let find = |callback: &str| {
+            summary.notify_regs.iter().find(|reg| reg.callback_name.as_str() == callback).unwrap()
+        };
+        let module_code_reg = find("ОбработатьОповещение");
+        assert_eq!(module_code_reg.caller, CallerId::ModuleCode);
+        assert_bare_target(module_code_reg, "ЭтотОбъект");
+        assert_bare_target(find("HandleResult"), "ThisObject");
+        assert_bare_target(find("AnotherHandler"), "CommonModule");
+        assert_bare_target(find("DynamicHandler"), "DynamicModule");
     }
 
     #[test]
-    fn test_notify_description_receiver_shadowed_by_parameter_is_unsupported() {
+    fn notify_registration_candidates_defer_shadowing_to_semantics() {
         let code = r#"
+Перем ЭтотОбъект;
 Процедура Тест(ЭтаФорма, МойОбщийМодуль)
-    А = Новый ОписаниеОповещения("Первый", ЭтаФорма);
-    Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 2);
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
-        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Unsupported);
-    }
-
-    #[test]
-    fn test_notify_description_receiver_shadowed_by_a_final_sigma_parameter_is_unsupported() {
-        // The two spellings are the same identifier for the classification, so the parameter must still shadow it.
-        let code = r#"
-Процедура Тест(ΟΔΟΣ)
-    А = Новый ОписаниеОповещения("Обработчик", οδοσ);
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
-    }
-
-    #[test]
-    fn test_notify_description_receiver_shadowed_by_local_is_unsupported() {
-        let code = r#"
-Процедура Тест()
-    Перем МойОбщийМодуль;
-    ДругойМодуль = Новый Структура;
-    А = Новый ОписаниеОповещения("Первый", ДругойМодуль);
-    Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 2);
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
-        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Unsupported);
-    }
-
-    #[test]
-    fn test_notify_description_receiver_assigned_after_use_is_still_the_local() {
-        let code = r#"
-Процедура Тест()
-    А = Новый ОписаниеОповещения("Первый", МойОбщийМодуль);
+    Перем Местный;
+    А = Новый ОписаниеОповещения("Первый", этаформа);
+    Б = Новый ОписаниеОповещения("Второй", местный);
+    В = Новый ОписаниеОповещения("Третий", МойОбщийМодуль);
     МойОбщийМодуль = Новый Структура;
 КонецПроцедуры
 "#;
         let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
+
+        assert_eq!(summary.notify_regs.len(), 3);
+        assert_bare_target(&summary.notify_regs[0], "этаформа");
+        assert_bare_target(&summary.notify_regs[1], "местный");
+        assert_bare_target(&summary.notify_regs[2], "МойОбщийМодуль");
     }
 
     #[test]
-    fn test_notify_description_locals_and_unshadowed_receivers_in_one_body() {
-        let code = r#"
-Процедура Тест(ЭтаФорма)
-    Перем Местный;
-    А = Новый ОписаниеОповещения("Первый", этаформа);
-    Б = Новый ОписаниеОповещения("Второй", местный);
-    В = Новый ОписаниеОповещения("Третий", ДРУГОЙ);
-    Г = Новый ОписаниеОповещения("Четвертый", ОбщийМодуль);
-    Другой = Новый Структура;
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 4);
-        for reg in &summary.notify_regs[..3] {
-            assert_eq!(reg.target, NotifyTarget::Unsupported);
-        }
-        assert_eq!(summary.notify_regs[3].target, NotifyTarget::Module(Name::new("ОбщийМодуль")));
-    }
-
-    #[test]
-    fn test_notify_description_self_receivers_shadowed_by_module_variables() {
-        for (declaration, receiver, unshadowed) in [
-            ("ЭтотОбъект", "этотобъект", "ЭтаФорма"),
-            ("ЭтаФорма", "этаформа", "ЭтотОбъект"),
-            ("ThisObject", "thisobject", "ThisForm"),
-            ("ThisForm", "thisform", "ThisObject"),
-        ] {
-            let code = format!(
-                "Перем {declaration};\nО = Новый ОписаниеОповещения(\"Готово\", {receiver});\nПроцедура Тест()\n    А = Новый ОписаниеОповещения(\"Готово\", {receiver});\n    Б = Новый ОписаниеОповещения(\"Готово\", {unshadowed});\nКонецПроцедуры\n"
-            );
-            let summary = parse_and_extract(&code);
-            assert_eq!(
-                summary
-                    .notify_regs
-                    .iter()
-                    .filter(|reg| reg.target == NotifyTarget::Unsupported)
-                    .count(),
-                2,
-                "{code}\n{:#?}",
-                summary.notify_regs
-            );
-            assert_eq!(
-                summary
-                    .notify_regs
-                    .iter()
-                    .filter(|reg| reg.target == NotifyTarget::ThisObject)
-                    .count(),
-                1,
-                "{code}\n{:#?}",
-                summary.notify_regs
-            );
-        }
-    }
-
-    #[test]
-    fn test_notify_description_unshadowed_receivers_keep_their_target() {
-        let code = r#"
-Процедура Тест(Другой)
-    А = Новый ОписаниеОповещения("Первый", ЭтаФорма);
-    Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
-        assert_eq!(
-            summary.notify_regs[1].target,
-            NotifyTarget::Module(Name::new("МойОбщийМодуль"))
-        );
-    }
-
-    #[test]
-    fn test_notify_description_this_form_is_this_object() {
-        let code = r#"
-Процедура Тест()
-    Оповещение = Новый ОписаниеОповещения("ПослеЗакрытия", ЭтаФорма, Параметры);
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
-    }
-
-    #[test]
-    fn test_notify_description_common_module_target() {
-        let code = r#"
-Процедура Тест()
-    Оповещение = Новый ОписаниеОповещения("ОбработатьРезультат", МойОбщийМодуль);
-КонецПроцедуры
-"#;
-        let summary = parse_and_extract(code);
-        assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(
-            summary.notify_regs[0].target,
-            NotifyTarget::Module(Name::new("МойОбщийМодуль"))
-        );
-    }
-
-    #[test]
-    fn test_notify_description_unsupported_receiver() {
+    fn notify_registration_keeps_non_bare_receivers_for_semantic_filtering() {
         let code = r#"
 Процедура Тест()
     Оповещение = Новый ОписаниеОповещения("ОбработатьРезультат", Объекты[0]);
@@ -2231,38 +2080,37 @@ EndProcedure
 "#;
         let summary = parse_and_extract(code);
         assert_eq!(summary.notify_regs.len(), 1);
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
+        assert!(matches!(summary.notify_regs[0].target, NotifyTarget::Unresolved { .. }));
     }
 
     #[test]
-    fn test_notify_description_error_handler_is_second_reg() {
-        // `Новый ОписаниеОповещения(ИмяПроцедуры, Модуль, ДопПараметры,
-        // ИмяПроцедурыОбработкиОшибки, МодульОбработкиОшибки)` — both the success and the
-        // error handler are independent dispatch targets and must each yield a reg.
+    fn notify_error_handler_is_an_independent_candidate() {
         let code = r#"
 Процедура Тест()
     Оповещение = Новый ОписаниеОповещения("Готово", ЭтотОбъект, Параметры, "ПриОшибке", МодульОшибок);
 КонецПроцедуры
 "#;
         let summary = parse_and_extract(code);
+
         assert_eq!(summary.notify_regs.len(), 2);
         assert_eq!(summary.notify_regs[0].callback_name, Name::new("Готово"));
-        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
+        assert_bare_target(&summary.notify_regs[0], "ЭтотОбъект");
         assert_eq!(summary.notify_regs[1].callback_name, Name::new("ПриОшибке"));
-        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Module(Name::new("МодульОшибок")));
+        assert_bare_target(&summary.notify_regs[1], "МодульОшибок");
     }
 
     #[test]
-    fn test_notify_description_omitted_error_handler_yields_one_reg() {
-        // The error handler is optional: a 2-arg constructor must not invent a second reg.
+    fn notify_omitted_error_handler_yields_one_candidate() {
         let code = r#"
 Процедура Тест()
     Оповещение = Новый ОписаниеОповещения("Готово", ЭтотОбъект);
 КонецПроцедуры
 "#;
         let summary = parse_and_extract(code);
+
         assert_eq!(summary.notify_regs.len(), 1);
         assert_eq!(summary.notify_regs[0].callback_name, Name::new("Готово"));
+        assert_bare_target(&summary.notify_regs[0], "ЭтотОбъект");
     }
 
     #[test]

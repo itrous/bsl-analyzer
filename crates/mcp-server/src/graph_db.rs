@@ -88,7 +88,11 @@ use crate::graph::input::{build_source_root, db_for_files};
 // 25: the row encoder strips the workspace root whichever way Windows spells it, so a full build
 // there mints `method/file/<rel>::<name>` where version 24 minted `method/file/<basename>::<name>`
 // and an incremental patch minted the former: one database could hold both for one method.
-pub(crate) const SCHEMA_VERSION: u32 = 25;
+// 26: notification-reference extraction now recognizes `CallbackDescription` and rejects
+// receivers shadowed by body bindings, assignments, or module variables. Version-25 graphs can
+// therefore contain missing or spurious `notify_ref` edges even when the source fingerprint is
+// unchanged, so they must be rebuilt before serving.
+pub(crate) const SCHEMA_VERSION: u32 = 26;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
