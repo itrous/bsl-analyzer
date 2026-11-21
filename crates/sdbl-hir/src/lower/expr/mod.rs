@@ -415,17 +415,31 @@ impl LoweringContext<'_> {
             }
         };
 
-        let ty = if matches!(function, FunctionKind::Cast) {
-            self.resolve_cast_target(node)
-        } else {
-            self.infer_function_return_type(&function, &args)
+        let is_cast = matches!(function, FunctionKind::Cast);
+        let target_type = if is_cast { self.resolve_cast_target(node) } else { SdblType::Unknown };
+
+        // `cast_target` names the cast's own target whatever follows the closing paren,
+        // so it is taken from the target and not from the expression's type below.
+        let cast_target = match &target_type {
+            SdblType::Ref(target) if is_cast => Some(target.clone()),
+            _ => None,
         };
 
-        let cast_target = match &ty {
-            SdblType::Ref(target) if matches!(function, crate::hir::FunctionKind::Cast) => {
-                Some(target.clone())
+        let ty = if !is_cast {
+            self.infer_function_return_type(&function, &args)
+        } else if member_access.is_empty() {
+            target_type
+        } else {
+            // A field read after the cast has the field's type; one that cannot be
+            // established must not pass for the target type.
+            match &cast_target {
+                Some(target) => {
+                    let chain: Vec<String> =
+                        member_access.iter().map(|name| name.as_str().to_string()).collect();
+                    self.scope.resolve_field_chain_of_ref(target, &chain)
+                }
+                None => SdblType::Unknown,
             }
-            _ => None,
         };
 
         ExprHir::FunctionCall {
