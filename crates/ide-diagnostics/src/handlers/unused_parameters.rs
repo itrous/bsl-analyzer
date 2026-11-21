@@ -104,12 +104,9 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
     for reg in &summary.notify_regs {
-        // A callback handled in the current module (or whose live receiver we cannot
-        // classify) keeps the platform-fixed signature. A registration excluded by
-        // control flow or constructor availability cannot keep a handler alive.
-        if matches!(reg.target, hir::NotifyTarget::ThisObject | hir::NotifyTarget::Unsupported) {
-            fixed_signature_handlers.insert(reg.callback_name.as_str().fold_lower());
-        }
+        // The named handler can be invoked in an environment outside this analysis,
+        // so its signature must remain intact regardless of the resolved receiver.
+        fixed_signature_handlers.insert(reg.callback_name.as_str().fold_lower());
     }
     // A form-module procedure bound at runtime — `УстановитьДействие` directly, or by
     // name through a code-created command / a helper in another module — has a
@@ -1055,7 +1052,7 @@ EndProcedure
     }
 
     #[test]
-    fn test_notify_description_cross_module_still_flags() {
+    fn test_notify_description_cross_module_name_keeps_signature() {
         use crate::test_utils::check_cfe_at_with_db;
         use hir::DefDatabase;
         use test_fixture::CfeFixtureBuilder;
@@ -1110,8 +1107,7 @@ EndProcedure
             .iter()
             .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
             .collect::<Vec<_>>();
-        assert_eq!(unused.len(), 1, "{diagnostics:#?}");
-        assert!(unused[0].message.contains("ДопПараметры"), "{diagnostics:#?}");
+        assert!(unused.is_empty(), "{diagnostics:#?}");
     }
 
     #[test]

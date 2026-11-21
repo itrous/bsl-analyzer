@@ -157,11 +157,10 @@ fn this_form_receiver_can_resolve_to_a_client_common_module() {
         "external ThisForm handler should satisfy the registration: {diagnostics:#?}"
     );
     assert!(
-        diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == crate::DiagnosticCode::UnusedParameters
-                && diagnostic.message.contains("НеИспользуется")
-        }),
-        "the local same-named method is not the registered handler: {diagnostics:#?}"
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != crate::DiagnosticCode::UnusedParameters),
+        "the registration name conservatively protects the local signature: {diagnostics:#?}"
     );
 }
 
@@ -464,7 +463,7 @@ fn server_only_notify_constructors_are_not_diagnosed() {
 }
 
 #[test]
-fn unavailable_notify_registrations_do_not_keep_local_parameters_live() {
+fn notify_names_keep_local_parameters_regardless_of_environment() {
     const CALLER: &str = "CommonModules/Caller/Ext/Module.bsl";
     const SOURCE: &str = r#"
 &НаКлиентеНаСервере
@@ -474,6 +473,9 @@ fn unavailable_notify_registrations_do_not_keep_local_parameters_live() {
 #КонецЕсли
 #Если Клиент Тогда
     О = Новый ОписаниеОповещения("LiveHandler", ПолучитьОбъект());
+#КонецЕсли
+#Если МобильныйКлиент Тогда
+    О = Новый ОписаниеОповещения("mObIlEhAnDlEr", ЭтотОбъект);
 #КонецЕсли
 КонецПроцедуры
 
@@ -485,6 +487,16 @@ fn unavailable_notify_registrations_do_not_keep_local_parameters_live() {
 &НаКлиентеНаСервере
 Процедура LiveHandler(ЖивойПараметр)
     Сообщить("handler");
+КонецПроцедуры
+
+&НаКлиентеНаСервере
+Процедура MobileHandler(МобильныйПараметр)
+    Сообщить("handler");
+КонецПроцедуры
+
+&НаКлиентеНаСервере
+Процедура Unrelated(ОбычныйПараметр)
+    Сообщить("unrelated");
 КонецПроцедуры
 "#;
     let mut builder = CfeFixtureBuilder::new("");
@@ -509,6 +521,7 @@ fn unavailable_notify_registrations_do_not_keep_local_parameters_live() {
             };
             assert!(matches!(target_for("DeadHandler"), NotifyTarget::NotCompiled { .. }));
             assert_eq!(target_for("LiveHandler"), &NotifyTarget::Unsupported);
+            assert!(matches!(target_for("mObIlEhAnDlEr"), NotifyTarget::NotCompiled { .. }));
             super::unused_parameters::check(ctx)
         },
     );
@@ -517,7 +530,7 @@ fn unavailable_notify_registrations_do_not_keep_local_parameters_live() {
         .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedParameters)
         .collect();
     assert_eq!(unused_parameters.len(), 1, "{diagnostics:#?}");
-    assert!(unused_parameters[0].message.contains("МёртвыйПараметр"), "{diagnostics:#?}");
+    assert!(unused_parameters[0].message.contains("ОбычныйПараметр"), "{diagnostics:#?}");
 }
 
 fn form_with_unread_dialog(extension: bool, base_mapped: bool, malformed: bool) -> Vec<Diagnostic> {
