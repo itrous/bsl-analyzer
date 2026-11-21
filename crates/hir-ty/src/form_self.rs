@@ -73,33 +73,37 @@ fn main_attribute_type_is_opaque(attr_type: &AttributeType) -> bool {
 }
 
 fn managed_form_extension_type_name(attr_type: &AttributeType) -> Option<&'static str> {
+    let object_target = match attr_type {
+        AttributeType::AnyObjectRef { mdo_type } => Some(*mdo_type),
+        other => other.as_reference_target().map(|(mdo_type, _)| mdo_type),
+    };
+    if let Some(mdo_type) = object_target {
+        return Some(match mdo_type {
+            MdoType::Catalog => "Расширение формы клиентского приложения для справочника",
+            MdoType::Document => "Расширение формы клиентского приложения для документа",
+            MdoType::ChartOfCharacteristicTypes => {
+                "Расширение формы клиентского приложения для плана видов характеристик"
+            }
+            MdoType::BusinessProcess => {
+                "Расширение формы клиентского приложения для бизнес-процесса"
+            }
+            MdoType::Task => "Расширение формы клиентского приложения для задачи",
+            // An external data processor's or report's form is extended exactly as
+            // the configuration's own: the platform lists no separate extension.
+            MdoType::DataProcessor | MdoType::ExternalDataProcessor => {
+                "Расширение формы клиентского приложения для обработки"
+            }
+            MdoType::Report | MdoType::ExternalReport => {
+                "Расширение формы клиентского приложения для отчета"
+            }
+            MdoType::Constant => "Расширение формы клиентского приложения для констант",
+            mdo_type if mdo_type.is_register() => {
+                "Расширение формы клиентского приложения для набора записей"
+            }
+            _ => "Расширение формы клиентского приложения для объектов",
+        });
+    }
     match attr_type {
-        AttributeType::AnyObjectRef { mdo_type } | AttributeType::Ref { mdo_type, .. } => {
-            Some(match mdo_type {
-                MdoType::Catalog => "Расширение формы клиентского приложения для справочника",
-                MdoType::Document => "Расширение формы клиентского приложения для документа",
-                MdoType::ChartOfCharacteristicTypes => {
-                    "Расширение формы клиентского приложения для плана видов характеристик"
-                }
-                MdoType::BusinessProcess => {
-                    "Расширение формы клиентского приложения для бизнес-процесса"
-                }
-                MdoType::Task => "Расширение формы клиентского приложения для задачи",
-                // An external data processor's or report's form is extended exactly as
-                // the configuration's own: the platform lists no separate extension.
-                MdoType::DataProcessor | MdoType::ExternalDataProcessor => {
-                    "Расширение формы клиентского приложения для обработки"
-                }
-                MdoType::Report | MdoType::ExternalReport => {
-                    "Расширение формы клиентского приложения для отчета"
-                }
-                MdoType::Constant => "Расширение формы клиентского приложения для констант",
-                mdo_type if mdo_type.is_register() => {
-                    "Расширение формы клиентского приложения для набора записей"
-                }
-                _ => "Расширение формы клиентского приложения для объектов",
-            })
-        }
         AttributeType::InformationRegisterRecordManager { .. } => {
             Some("Расширение формы клиентского приложения для записи регистра сведений")
         }
@@ -289,5 +293,22 @@ mod tests {
                 prop.english_name
             );
         }
+    }
+
+    #[test]
+    fn a_characteristic_value_main_attribute_gets_the_chart_extension_like_a_chart_reference() {
+        let by_reference = form_with_main_type(AttributeType::Ref {
+            mdo_type: MdoType::ChartOfCharacteristicTypes,
+            name: "Виды".to_string(),
+        });
+        let by_value = form_with_main_type(AttributeType::CharacteristicValue {
+            name: "Виды".to_string(),
+        });
+        let expected = [
+            FORM_TYPE_NAME,
+            "Расширение формы клиентского приложения для плана видов характеристик",
+        ];
+        assert_eq!(managed_form_self_types(&by_reference), expected);
+        assert_eq!(managed_form_self_types(&by_value), expected);
     }
 }

@@ -796,6 +796,23 @@ impl AttributeType {
             | Self::Unknown => 0,
         }
     }
+
+    /// The metadata object a reference-shaped attribute type names, with the
+    /// characteristic value folded onto the chart it draws its kinds from.
+    ///
+    /// Call this where a consumer has not yet decided what a characteristic
+    /// value's own composition means: a bare `AttributeType::Ref` match silently
+    /// drops the value, because the parser stopped spelling it as a chart
+    /// reference.
+    pub fn as_reference_target(&self) -> Option<(MdoType, &str)> {
+        match self {
+            Self::Ref { mdo_type, name } => Some((*mdo_type, name.as_str())),
+            Self::CharacteristicValue { name } => {
+                Some((MdoType::ChartOfCharacteristicTypes, name.as_str()))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1421,6 +1438,17 @@ mod tests {
         assert_eq!(obj.name, "ПриходнаяНакладная");
         assert_eq!(obj.name_en, Some("GoodsReceipt".to_string()));
         assert_eq!(obj.attributes.len(), 2);
+    }
+
+    #[test]
+    fn a_characteristic_value_names_the_same_target_as_a_chart_reference() {
+        let chart = MdoType::ChartOfCharacteristicTypes;
+        let reference = AttributeType::Ref { mdo_type: chart, name: "Виды".to_string() };
+        let value = AttributeType::CharacteristicValue { name: "Виды".to_string() };
+        assert_eq!(reference.as_reference_target(), Some((chart, "Виды")));
+        assert_eq!(value.as_reference_target(), Some((chart, "Виды")));
+        // The control: a scalar names no metadata object.
+        assert_eq!(AttributeType::Boolean.as_reference_target(), None);
     }
 
     #[test]
