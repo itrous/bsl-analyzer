@@ -493,8 +493,13 @@ EndProcedure"#,
 EndProcedure"#,
     ),
     (
+        // The message of this rule embeds the local method's name, and `normalize_message`
+        // only folds whitespace, so parity is reachable only when both fixtures spell that
+        // name the same way. The RU fixture therefore names the method in Latin on purpose -
+        // do not "restore" `НайтиПоЗначению` here: it makes the pair differ by that name
+        // alone and the parity assertion red.
         DiagnosticCode::LocalCallWithQueryInCycle,
-        r#"Функция НайтиПоЗначению(Значение)
+        r#"Функция FindByValue(Значение)
 	Запрос = Новый Запрос("ВЫБРАТЬ 1 КАК Поле");
 	Запрос.УстановитьПараметр("Значение", Значение);
 	Выборка = Запрос.Выполнить().Выбрать();
@@ -504,7 +509,7 @@ EndProcedure"#,
 Процедура ЗаполнитьСтроки(Таблица, Чтение)
 	Пока Чтение.Прочитать() Цикл
 		НоваяСтрока = Таблица.Добавить();
-		НоваяСтрока.Поле = НайтиПоЗначению(Чтение.Значение);
+		НоваяСтрока.Поле = FindByValue(Чтение.Значение);
 	КонецЦикла;
 КонецПроцедуры"#,
         r#"Function FindByValue(Value)
