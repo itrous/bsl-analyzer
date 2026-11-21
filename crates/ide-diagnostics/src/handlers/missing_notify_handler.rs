@@ -537,6 +537,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn self_receivers_shadowed_by_module_variables_are_not_judged() {
+        for (declaration, receiver) in [
+            ("ЭтотОбъект", "этотобъект"),
+            ("ЭтаФорма", "этаформа"),
+            ("ThisObject", "thisobject"),
+            ("ThisForm", "thisform"),
+        ] {
+            for args in [
+                format!("\"Готово\", {receiver}"),
+                format!("\"НеВажно\", Неопределено, Неопределено, \"Готово\", {receiver}"),
+            ] {
+                let source = format!(
+                    "Перем {declaration};\n{declaration} = ОбщегоНазначения.ОбщийМодуль(\"Приемник\");\nПроцедура Тест()\n    О = Новый ОписаниеОповещения({args});\nКонецПроцедуры\n"
+                );
+                let diagnostics = run_local(&source);
+                assert!(diagnostics.is_empty(), "{source}\n{diagnostics:#?}");
+            }
+        }
+    }
+
     /// Control for the case above: without the parameter `ЭтаФорма` is the form.
     #[test]
     fn this_form_without_a_shadowing_parameter_is_still_checked() {

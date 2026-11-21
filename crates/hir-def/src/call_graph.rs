@@ -751,6 +751,8 @@ pub fn extract_call_summary(
         });
     }
 
+    let mut notify_scope = NotifyReceiverScope { item_tree, shadowed_self_receivers: None };
+
     let mut call_edges = Vec::new();
     let mut notify_regs = Vec::new();
     let mut idle_handler_regs = Vec::new();
@@ -764,6 +766,7 @@ pub fn extract_call_summary(
             lower_result.source_map(),
             CallerId::Method(local_id),
             &local_method_ids,
+            &mut notify_scope,
             &mut call_edges,
             &mut notify_regs,
             &mut idle_handler_regs,
@@ -778,6 +781,7 @@ pub fn extract_call_summary(
             module_code.source_map(),
             CallerId::ModuleCode,
             &local_method_ids,
+            &mut notify_scope,
             &mut call_edges,
             &mut notify_regs,
             &mut idle_handler_regs,
@@ -927,6 +931,7 @@ fn extract_from_body(
     source_map: crate::body::SourceMapAt<'_>,
     caller: CallerId,
     local_method_ids: &FxHashMap<NormName, MethodKey>,
+    notify_scope: &mut NotifyReceiverScope<'_>,
     call_edges: &mut Vec<CallEdge>,
     notify_regs: &mut Vec<NotifyReg>,
     idle_handler_regs: &mut Vec<IdleReg>,
@@ -1016,9 +1021,9 @@ fn extract_from_body(
                             body,
                             caller,
                             args,
-                            method_idx,
-                            target_idx,
+                            (method_idx, target_idx),
                             range,
+                            notify_scope,
                             &mut notify_body_locals,
                         ) {
                             notify_regs.push(reg);
@@ -1159,36 +1164,59 @@ fn extract_set_action_reg(
     Some(SetActionReg { caller, handler_name: Name::new(&handler_name), range })
 }
 
+struct NotifyReceiverScope<'a> {
+    item_tree: &'a ItemTree,
+    shadowed_self_receivers: Option<FxHashSet<String>>,
+}
+
+impl NotifyReceiverScope<'_> {
+    fn self_receiver_is_shadowed(&mut self, name: &str) -> bool {
+        self.shadowed_self_receivers
+            .get_or_insert_with(|| {
+                self.item_tree
+                    .variables()
+                    .filter_map(|(_, var)| {
+                        let name = var.name.as_str().fold_lower();
+                        is_this_receiver(&name).then_some(name)
+                    })
+                    .collect()
+            })
+            .contains(name)
+    }
+}
+
 fn extract_notify_reg_at(
     body: &Body,
     caller: CallerId,
     args: &[ExprIdx],
-    method_idx: usize,
-    target_idx: usize,
+    (method_idx, target_idx): (usize, usize),
     range: TextRange,
+    notify_scope: &mut NotifyReceiverScope<'_>,
     body_locals: &mut Option<FxHashSet<String>>,
 ) -> Option<NotifyReg> {
     let callback_name = extract_string_literal(body, *args.get(method_idx)?)?;
     let target = match args.get(target_idx).map(|&idx| body.expr_idx(idx)) {
-        // A parameter, a declared variable or an assigned local with the receiver's name
-        // IS the receiver: `Процедура Тест(ЭтаФорма)` does not name the form, and a local
-        // `МойМодуль` is not the common module of that name. Nothing can be said about
-        // where its handler lives. Order does not matter, on purpose: a name assigned or
-        // declared anywhere in a procedure is procedure-scoped, so even a use BEFORE the
-        // assignment denotes the local (reading `Неопределено`), never the module.
-        Some(Expr::Path(name))
-            if body_locals
+        Some(Expr::Path(name)) => {
+            let name_lower = name.as_str().fold_lower();
+            // A body binding or module variable can own a self-receiver's spelling.
+            // A body assignment anywhere also shadows the name before that assignment.
+            let is_local = body_locals
                 .get_or_insert_with(|| {
                     body_local_names(body).map(|local| local.as_str().fold_lower()).collect()
                 })
-                .contains(&name.as_str().fold_lower()) =>
-        {
-            NotifyTarget::Unsupported
+                .contains(&name_lower);
+            if is_local {
+                NotifyTarget::Unsupported
+            } else if is_this_receiver(&name_lower) {
+                if notify_scope.self_receiver_is_shadowed(&name_lower) {
+                    NotifyTarget::Unsupported
+                } else {
+                    NotifyTarget::ThisObject
+                }
+            } else {
+                NotifyTarget::Module(name.clone())
+            }
         }
-        Some(Expr::Path(name)) if is_this_receiver(&name.as_str().fold_lower()) => {
-            NotifyTarget::ThisObject
-        }
-        Some(Expr::Path(name)) => NotifyTarget::Module(name.clone()),
         _ => NotifyTarget::Unsupported,
     };
     Some(NotifyReg { caller, callback_name: Name::new(&callback_name), target, range })
@@ -2095,6 +2123,41 @@ EndProcedure
             assert_eq!(reg.target, NotifyTarget::Unsupported);
         }
         assert_eq!(summary.notify_regs[3].target, NotifyTarget::Module(Name::new("ОбщийМодуль")));
+    }
+
+    #[test]
+    fn test_notify_description_self_receivers_shadowed_by_module_variables() {
+        for (declaration, receiver, unshadowed) in [
+            ("ЭтотОбъект", "этотобъект", "ЭтаФорма"),
+            ("ЭтаФорма", "этаформа", "ЭтотОбъект"),
+            ("ThisObject", "thisobject", "ThisForm"),
+            ("ThisForm", "thisform", "ThisObject"),
+        ] {
+            let code = format!(
+                "Перем {declaration};\nО = Новый ОписаниеОповещения(\"Готово\", {receiver});\nПроцедура Тест()\n    А = Новый ОписаниеОповещения(\"Готово\", {receiver});\n    Б = Новый ОписаниеОповещения(\"Готово\", {unshadowed});\nКонецПроцедуры\n"
+            );
+            let summary = parse_and_extract(&code);
+            assert_eq!(
+                summary
+                    .notify_regs
+                    .iter()
+                    .filter(|reg| reg.target == NotifyTarget::Unsupported)
+                    .count(),
+                2,
+                "{code}\n{:#?}",
+                summary.notify_regs
+            );
+            assert_eq!(
+                summary
+                    .notify_regs
+                    .iter()
+                    .filter(|reg| reg.target == NotifyTarget::ThisObject)
+                    .count(),
+                1,
+                "{code}\n{:#?}",
+                summary.notify_regs
+            );
+        }
     }
 
     #[test]
