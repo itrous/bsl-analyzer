@@ -339,7 +339,15 @@ fn notify_description_with_computed_name(new_expr: &SyntaxNode) -> bool {
 }
 
 fn is_notify_description(name: &str) -> bool {
-    matches!(name.fold_lower().as_str(), "описаниеоповещения" | "notifydescription")
+    // `CallbackDescription` is the platform's own English name of the type
+    // (`bsl-platform/data/platform_facts.json`: `english_name` of `ОписаниеОповещения`,
+    // `min_version` 8.3.3); `NotifyDescription` is the earlier English spelling and still
+    // reaches the constructor, so both stay accepted. The facts carry only the current
+    // English name, which is why this list is spelled out here instead of read from them.
+    matches!(
+        name.fold_lower().as_str(),
+        "описаниеоповещения" | "notifydescription" | "callbackdescription"
+    )
 }
 
 /// The text of a position holding exactly one single-line string literal, unquoted.
@@ -629,5 +637,37 @@ mod tests {
             with_fixes.into_iter().map(strip).collect::<Vec<_>>(),
             "the findings do not depend on whether their fixes are built"
         );
+    }
+
+    /// A computed handler name must decline the fix whichever spelling of the type names it:
+    /// the platform calls the method the value names, with the arguments it passes, so no
+    /// parameter can be removed. `CallbackDescription` is the platform's current English name
+    /// and was missing from the list, so the fix was offered on such a module.
+    #[test]
+    fn a_computed_callback_is_bound_under_every_spelling_of_the_notify_description() {
+        let binds = |code: &str| super::binds_computed_callback(&parser::parse(code).syntax_node());
+
+        const SPELLINGS: [&str; 3] =
+            ["ОписаниеОповещения", "NotifyDescription", "CallbackDescription"];
+
+        for spelling in SPELLINGS {
+            let computed = format!(
+                "Процедура Связать(ИмяОбработчика)\n    Описание = Новый {spelling}(ИмяОбработчика, ЭтотОбъект);\nКонецПроцедуры\n"
+            );
+            assert!(
+                binds(&computed),
+                "{spelling} with a computed handler name must bind a computed callback"
+            );
+
+            // The control: a string literal names the method outright, so nothing is computed
+            // and the spelling alone must not decline the fix.
+            let literal = format!(
+                "Процедура Связать()\n    Описание = Новый {spelling}(\"Обработчик\", ЭтотОбъект);\nКонецПроцедуры\n"
+            );
+            assert!(
+                !binds(&literal),
+                "{spelling} with a literal handler name must not decline the fix"
+            );
+        }
     }
 }
