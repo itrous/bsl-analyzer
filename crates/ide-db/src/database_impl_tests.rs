@@ -4300,25 +4300,61 @@ fn workspace_call_graph_via_index_matches_salsa_fold() {
             && matches!(e.target, ResolvedTarget::Mdo { .. })),
         "platform find / absent manager method → Mdo + ManagerAccess"
     );
-    // String-dispatched callbacks: ЭтотОбъект handler + exported cross-module handler
-    // both resolve to a NotifyRef method edge with StringResolved provenance.
+    // String-dispatched callbacks: assert their exact destinations so a missing
+    // ЭтотОбъект pair cannot be hidden by another same-module callback.
+    let mut notify_targets: Vec<_> = caller
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            if edge.kind != EdgeKind::NotifyRef || edge.provenance != EdgeProvenance::StringResolved
+            {
+                return None;
+            }
+            let ResolvedTarget::Method(target) = &edge.target else {
+                return None;
+            };
+            let name = db
+                .symbol_tree(target.module)
+                .find_method_by_id(*target)
+                .expect("resolved callback target exists")
+                .name
+                .as_str()
+                .to_string();
+            Some((target.module, name))
+        })
+        .collect();
+    notify_targets.sort_unstable_by_key(|(_, name)| name.clone());
     assert_eq!(
-        caller
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::NotifyRef
-                && e.provenance == EdgeProvenance::StringResolved
-                && matches!(e.target, ResolvedTarget::Method(_)))
-            .count(),
-        2,
-        "ОписаниеОповещения(ЭтотОбъект) + ОписаниеОповещения(exported Сервер) → 2 NotifyRef methods"
+        notify_targets,
+        vec![
+            (ModuleId::new(FileId(0)), "ЛокальныйОбработчик".to_string()),
+            (ModuleId::new(FileId(1)), "Считать".to_string()),
+        ],
+        "ОписаниеОповещения must retain the local ЭтотОбъект pair and exported Сервер pair",
     );
-    assert!(
-        has(&|e| e.kind == EdgeKind::IdleHandler
-            && e.provenance == EdgeProvenance::StringResolved
-            && matches!(e.target, ResolvedTarget::Method(_))),
-        "ПодключитьОбработчикОжидания → IdleHandler method"
-    );
+    let idle_targets: Vec<_> = caller
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            if edge.kind != EdgeKind::IdleHandler
+                || edge.provenance != EdgeProvenance::StringResolved
+            {
+                return None;
+            }
+            let ResolvedTarget::Method(target) = &edge.target else {
+                return None;
+            };
+            Some(
+                db.symbol_tree(target.module)
+                    .find_method_by_id(*target)
+                    .expect("resolved idle target exists")
+                    .name
+                    .as_str()
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(idle_targets, vec!["ОбновитьЭкран"]);
     // The non-exported callback (Приватная) is surfaced VisibilityBlocked, never as an
     // edge; the unsupported receiver (Объекты[0]) yields nothing at all.
     assert!(
@@ -4454,10 +4490,29 @@ fn call_hierarchy_index_fixture_parity() {
     let salsa = db.workspace_call_graph(source_root_id);
     let folded = method_call_digest_from_fold(&salsa, &encoder);
 
-    // Then: every retained method edge agrees with the Salsa incoming graph.
+    // Then: every retained method edge agrees with the Salsa incoming graph, and
+    // all five expected destinations survive the form-specific ЭтотОбъект dispatch.
     assert_eq!(compact, folded);
-    assert_eq!(compact.len(), 5, "direct, qualified, manager, notify, and idle rows");
     let caller = ModuleId::new(FileId(0));
+    let main = hir::MethodId { module: caller, local_id: hir::MethodKey::first("Главная") };
+    let expected = hir::MethodCallDigest::from_rows(
+        [
+            (caller, "ЛокальнаяЦель"),
+            (ModuleId::new(FileId(1)), "Метод"),
+            (ModuleId::new(FileId(2)), "МетодМенеджера"),
+            (caller, "Оповещение"),
+            (caller, "Ожидание"),
+        ]
+        .into_iter()
+        .map(|(module, name)| {
+            let target = hir::MethodId { module, local_id: hir::MethodKey::first(name) };
+            (
+                encoder.encode(&GraphNode::Method(target)).0,
+                encoder.encode(&GraphNode::Method(main)).0,
+            )
+        }),
+    );
+    assert_eq!(compact, expected, "direct, qualified, manager, notify, and idle rows");
     assert!(salsa.edges().any(|edge| {
         edge.kind == EdgeKind::DirectLocal
             && matches!((&edge.from, &edge.to),
