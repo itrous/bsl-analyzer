@@ -108,6 +108,8 @@ pub mod missing_form_event_handler;
 pub mod missing_notify_handler;
 #[cfg(test)]
 mod missing_notify_handler_regression_tests;
+#[cfg(test)]
+mod missing_notify_owner_semantics_tests;
 pub mod missing_parameter_description;
 pub mod missing_returned_value_description;
 pub mod missing_space;
