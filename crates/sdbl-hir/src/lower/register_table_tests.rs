@@ -813,3 +813,279 @@ fn derived_accounting_fields_are_reads_of_their_resource() {
         assert_eq!(names, vec![expected], "{query}");
     }
 }
+
+mod nested_field_existence {
+    //! `Алиас.Ссылочное.Поле…`: a hop past the first is reported only when it is provably absent
+    //! from a field set that is known to be complete.
+
+    use std::sync::Arc;
+
+    use bsl_metadata::xml_parser::{
+        parse_catalog_xml, parse_chart_of_characteristic_types_xml, parse_document_xml,
+        parse_information_register_xml,
+    };
+    use bsl_metadata::Configuration;
+
+    use crate::diagnostics::SdblDiagnostic;
+    use crate::lower::lower_sdbl_to_hir;
+
+    const HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" version="2.10">"#;
+
+    const COUNTERPARTY: &str = r#"
+    <Catalog uuid="00000000-0000-0000-0000-000000000010">
+        <Properties><Name>Контрагенты</Name><CodeLength>9</CodeLength><DescriptionLength>100</DescriptionLength></Properties>
+        <ChildObjects>
+            <Attribute uuid="00000000-0000-0000-0000-000000000011">
+                <Properties><Name>ИНН</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties>
+            </Attribute>
+        </ChildObjects>
+    </Catalog>"#;
+
+    const ORDER: &str = r#"
+    <Document uuid="00000000-0000-0000-0000-000000000020">
+        <Properties><Name>Заказ</Name><NumberType>String</NumberType><NumberLength>11</NumberLength></Properties>
+        <ChildObjects>
+            <Attribute uuid="00000000-0000-0000-0000-000000000021">
+                <Properties><Name>Контрагент</Name><Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type></Properties>
+            </Attribute>
+            <Attribute uuid="00000000-0000-0000-0000-000000000022">
+                <Properties><Name>Основание</Name><Type><v8:Type>cfg:DocumentRef.Заказ</v8:Type></Type></Properties>
+            </Attribute>
+            <Attribute uuid="00000000-0000-0000-0000-000000000023">
+                <Properties><Name>Составной</Name><Type><v8:Type>cfg:DocumentRef.Заказ</v8:Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type></Properties>
+            </Attribute>
+            <TabularSection uuid="00000000-0000-0000-0000-000000000024">
+                <Properties><Name>Товары</Name></Properties>
+                <ChildObjects>
+                    <Attribute uuid="00000000-0000-0000-0000-000000000025">
+                        <Properties><Name>Количество</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties>
+                    </Attribute>
+                </ChildObjects>
+            </TabularSection>
+        </ChildObjects>
+    </Document>"#;
+
+    const QUEUE: &str = r#"
+    <InformationRegister uuid="00000000-0000-0000-0000-000000000030">
+        <Properties><Name>Очередь</Name><InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity></Properties>
+        <ChildObjects>
+            <Dimension uuid="00000000-0000-0000-0000-000000000031">
+                <Properties><Name>Заказ</Name><Type><v8:Type>cfg:DocumentRef.Заказ</v8:Type></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000032">
+                <Properties><Name>Составной</Name><Type><v8:Type>cfg:DocumentRef.Заказ</v8:Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000033">
+                <Properties><Name>Потерянный</Name><Type><v8:Type>cfg:DocumentRef.НеСуществует</v8:Type></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000035">
+                <Properties><Name>Значение</Name><Type><v8:TypeSet>cfg:Characteristic.Виды</v8:TypeSet></Type></Properties>
+            </Dimension>
+            <Dimension uuid="00000000-0000-0000-0000-000000000036">
+                <Properties><Name>ВидСсылка</Name><Type><v8:Type>cfg:ChartOfCharacteristicTypesRef.Виды</v8:Type></Type></Properties>
+            </Dimension>
+            <Resource uuid="00000000-0000-0000-0000-000000000034">
+                <Properties><Name>Ресурс1</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties>
+            </Resource>
+        </ChildObjects>
+    </InformationRegister>"#;
+
+    const KINDS: &str = r#"
+    <ChartOfCharacteristicTypes uuid="00000000-0000-0000-0000-000000000040">
+        <Properties><Name>Виды</Name><CodeLength>9</CodeLength><DescriptionLength>100</DescriptionLength></Properties>
+        <ChildObjects>
+            <Attribute uuid="00000000-0000-0000-0000-000000000041">
+                <Properties><Name>Описание</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties>
+            </Attribute>
+        </ChildObjects>
+    </ChartOfCharacteristicTypes>"#;
+
+    fn configuration(counterparty_open: bool) -> Arc<Configuration> {
+        let mut config = Configuration::new("Тест");
+        let mut counterparty =
+            parse_catalog_xml(&format!("{HEADER}{COUNTERPARTY}\n</MetaDataObject>")).unwrap();
+        counterparty.common_attributes_open = counterparty_open;
+        config.add_metadata_object(counterparty);
+        config.add_metadata_object(
+            parse_document_xml(&format!("{HEADER}{ORDER}\n</MetaDataObject>")).unwrap(),
+        );
+        config.add_metadata_object(
+            parse_chart_of_characteristic_types_xml(&format!("{HEADER}{KINDS}\n</MetaDataObject>"))
+                .unwrap(),
+        );
+        config.add_register(
+            parse_information_register_xml(&format!("{HEADER}{QUEUE}\n</MetaDataObject>")).unwrap(),
+        );
+        Arc::new(config)
+    }
+
+    /// `(table, field, text under the reported range)` of every `UnknownField`.
+    fn reports_in(config: Arc<Configuration>, expression: &str) -> Vec<(String, String, String)> {
+        let query = format!("ВЫБРАТЬ {expression} КАК П ИЗ РегистрСведений.Очередь КАК О");
+        let ast = parser::parse_sdbl(&query);
+        lower_sdbl_to_hir(&ast, Some(config))
+            .all_diagnostics()
+            .filter_map(|diag| match diag {
+                SdblDiagnostic::UnknownField { table_name, field_name, range } => Some((
+                    table_name.clone(),
+                    field_name.clone(),
+                    query[usize::from(range.start())..usize::from(range.end())].to_string(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reports(expression: &str) -> Vec<(String, String, String)> {
+        reports_in(configuration(false), expression)
+    }
+
+    fn triple(table: &str, field: &str) -> Vec<(String, String, String)> {
+        vec![(table.to_string(), field.to_string(), field.to_string())]
+    }
+
+    #[test]
+    fn a_missing_field_behind_a_reference_is_reported_once() {
+        assert_eq!(reports("О.Заказ.НетТакогоПоля"), triple("Документ.Заказ", "НетТакогоПоля"));
+    }
+
+    #[test]
+    fn an_existing_attribute_behind_a_reference_is_silent() {
+        assert!(reports("О.Заказ.Контрагент").is_empty());
+        assert!(reports("О.Заказ.Контрагент.ИНН").is_empty());
+    }
+
+    #[test]
+    fn standard_attributes_of_the_referenced_object_are_silent() {
+        for field in ["Ссылка", "Номер", "Дата", "ПометкаУдаления", "Проведен"]
+        {
+            assert!(reports(&format!("О.Заказ.{field}")).is_empty(), "{field}");
+        }
+        for field in ["Ссылка", "Код", "Наименование", "ПометкаУдаления"]
+        {
+            assert!(reports(&format!("О.Заказ.Контрагент.{field}")).is_empty(), "{field}");
+        }
+    }
+
+    #[test]
+    fn virtual_query_fields_of_the_referenced_object_are_silent() {
+        for field in ["Представление", "МоментВремени"] {
+            assert!(reports(&format!("О.Заказ.{field}")).is_empty(), "{field}");
+        }
+        assert!(reports("О.Заказ.Контрагент.Представление").is_empty());
+    }
+
+    #[test]
+    fn english_spelling_of_the_hop_is_accepted() {
+        assert!(reports("О.Заказ.Date").is_empty());
+        assert!(reports("О.Заказ.Ref").is_empty());
+    }
+
+    #[test]
+    fn a_composite_typed_hop_stops_the_walk() {
+        assert!(reports("О.Составной.ЧтоУгодно").is_empty());
+        assert!(reports("О.Заказ.Составной.ЧтоУгодно").is_empty());
+    }
+
+    #[test]
+    fn a_missing_field_in_a_tabular_section_is_reported() {
+        assert_eq!(
+            reports("О.Заказ.Товары.НетКолонки"),
+            triple("Документ.Заказ.Товары", "НетКолонки")
+        );
+    }
+
+    #[test]
+    fn existing_columns_of_a_tabular_section_are_silent() {
+        for column in ["Количество", "НомерСтроки", "Ссылка"] {
+            assert!(reports(&format!("О.Заказ.Товары.{column}")).is_empty(), "{column}");
+        }
+    }
+
+    #[test]
+    fn only_the_last_of_three_hops_is_reported() {
+        assert_eq!(reports("О.Заказ.Основание.Нету"), triple("Документ.Заказ", "Нету"));
+        assert_eq!(reports("О.Заказ.Основание.Основание.Нету"), triple("Документ.Заказ", "Нету"));
+        assert_eq!(reports("О.Заказ.Контрагент.Нету"), triple("Справочник.Контрагенты", "Нету"));
+    }
+
+    #[test]
+    fn the_first_miss_stops_the_walk() {
+        assert_eq!(reports("О.Заказ.Нету1.Нету2"), triple("Документ.Заказ", "Нету1"),);
+    }
+
+    #[test]
+    fn a_missing_first_hop_is_reported_once_not_twice() {
+        let found = reports("О.НетПервого.Ещё.Поле");
+        assert_eq!(found, triple("РегистрСведений.Очередь", "НетПервого"));
+    }
+
+    #[test]
+    fn an_object_with_open_common_attributes_is_not_judged() {
+        assert!(reports_in(configuration(true), "О.Заказ.Контрагент.Нету").is_empty());
+        assert_eq!(
+            reports_in(configuration(true), "О.Заказ.Нету"),
+            triple("Документ.Заказ", "Нету"),
+            "the document itself is still complete",
+        );
+    }
+
+    #[test]
+    fn a_reference_to_an_object_that_does_not_resolve_is_silent() {
+        assert!(reports("О.Потерянный.Нету").is_empty());
+    }
+    fn reports_query(query: &str) -> Vec<(String, String)> {
+        let ast = parser::parse_sdbl(query);
+        lower_sdbl_to_hir(&ast, Some(configuration(false)))
+            .all_diagnostics()
+            .filter_map(|diag| match diag {
+                SdblDiagnostic::UnknownField { table_name, field_name, .. } => {
+                    Some((table_name.clone(), field_name.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_characteristic_value_is_not_walked_into() {
+        // `cfg:Characteristic.Виды` is an open type: any reference the chart allows.
+        assert!(reports("О.Значение.Нету").is_empty());
+        assert!(reports("О.Значение.Описание").is_empty());
+        // The chart is modelled as a reference to itself, so a genuine reference is silent too.
+        assert!(reports("О.ВидСсылка.Нету").is_empty());
+    }
+
+    #[test]
+    fn a_column_of_a_temporary_table_is_not_walked_from() {
+        // `ВЫРАЗИТЬ(... КАК Т).Поле` is typed as `Т`, so a walk from it would look for `Код` on
+        // the document instead of the counterparty.
+        let query = "ВЫБРАТЬ ВЫРАЗИТЬ(О.Заказ КАК Документ.Заказ).Контрагент КАК Контр \
+                     ПОМЕСТИТЬ ВТ ИЗ РегистрСведений.Очередь КАК О; \
+                     ВЫБРАТЬ Вр.Контр.Код КАК П ИЗ ВТ КАК Вр";
+        assert_eq!(reports_query(query), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn an_inferred_column_of_a_temporary_table_is_not_walked_from() {
+        let query = "ВЫБРАТЬ О.Заказ КАК Заказ ПОМЕСТИТЬ ВТ ИЗ РегистрСведений.Очередь КАК О; \
+                     ВЫБРАТЬ Вр.Заказ.Нету КАК Н ИЗ ВТ КАК Вр";
+        assert_eq!(reports_query(query), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn a_column_of_a_nested_query_is_not_walked_from() {
+        let query = "ВЫБРАТЬ Вр.Заказ.Нету КАК Н ИЗ \
+                     (ВЫБРАТЬ О.Заказ КАК Заказ ИЗ РегистрСведений.Очередь КАК О) КАК Вр";
+        assert_eq!(reports_query(query), Vec::<(String, String)>::new());
+    }
+    #[test]
+    fn a_declared_attribute_is_still_walked_from() {
+        let query = "ВЫБРАТЬ О.Заказ.Контрагент.Нету КАК П ИЗ РегистрСведений.Очередь КАК О";
+        assert_eq!(
+            reports_query(query),
+            vec![("Справочник.Контрагенты".to_string(), "Нету".to_string())]
+        );
+    }
+}
