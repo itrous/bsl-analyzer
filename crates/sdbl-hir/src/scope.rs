@@ -446,13 +446,7 @@ impl<'a> Scope<'a> {
     }
 
     pub fn resolve_nested_field_type(&self, table_alias: &str, field_chain: &[String]) -> SdblType {
-        const MAX_DEPTH: usize = 10;
-
-        if field_chain.len() > MAX_DEPTH {
-            tracing::warn!(
-                depth = field_chain.len(),
-                "exceeded max nesting depth, possible circular reference"
-            );
+        if chain_exceeds_max_depth(field_chain) {
             return SdblType::Error;
         }
 
@@ -468,14 +462,39 @@ impl<'a> Scope<'a> {
             return SdblType::Unknown;
         };
 
-        let mut current_fields = metadata.fields().to_vec();
-        let mut current_type = SdblType::Unknown;
+        let fields = metadata.fields().to_vec();
 
         tracing::info!(
             alias = %table_alias,
-            initial_fields_count = current_fields.len(),
+            initial_fields_count = fields.len(),
             "starting field resolution"
         );
+
+        self.walk_field_chain(fields, field_chain)
+    }
+
+    /// Type of the last field of `field_chain` read from the object `target` names, for the
+    /// field access written after `ВЫРАЗИТЬ(... КАК <target>)`. `Unknown` when any hop is not
+    /// established, never `target` itself.
+    pub fn resolve_field_chain_of_ref(
+        &self,
+        target: &crate::types::MdoRef,
+        field_chain: &[String],
+    ) -> SdblType {
+        if chain_exceeds_max_depth(field_chain) {
+            return SdblType::Error;
+        }
+        match self.resolve_ref_fields(target) {
+            Some(fields) => self.walk_field_chain(fields, field_chain),
+            None => SdblType::Unknown,
+        }
+    }
+
+    /// The hop-by-hop walk shared by every starting point: `fields` are the fields the first
+    /// name of `field_chain` is looked up in.
+    fn walk_field_chain(&self, fields: Vec<FieldDef>, field_chain: &[String]) -> SdblType {
+        let mut current_fields = fields;
+        let mut current_type = SdblType::Unknown;
 
         for (i, field_name) in field_chain.iter().enumerate() {
             tracing::info!(
@@ -789,6 +808,19 @@ pub struct ColumnCompletion {
     pub table_name: Name,
     pub ty: SdblType,
     pub is_standard: bool,
+}
+
+const MAX_FIELD_CHAIN_DEPTH: usize = 10;
+
+fn chain_exceeds_max_depth(field_chain: &[String]) -> bool {
+    if field_chain.len() > MAX_FIELD_CHAIN_DEPTH {
+        tracing::warn!(
+            depth = field_chain.len(),
+            "exceeded max nesting depth, possible circular reference"
+        );
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
