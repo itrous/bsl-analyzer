@@ -901,9 +901,15 @@ fn is_current_form_items(name_lower: &str) -> bool {
 
 /// Whether `name` is a parameter, a declared variable or an assigned local of `body` -
 /// a binding that shadows a context property of the same name.
+///
+/// Keys are `NormName`, the same match bucket the module classification uses, and NOT
+/// `fold_lower`: the latter falls back to `str::to_lowercase`, which applies contextual
+/// mappings (Greek final sigma), so two names equal for the classification would be
+/// different here - a shadowing binding would be missed and the receiver would be taken
+/// for a common module.
 fn is_body_local(body: &Body, name: &Name) -> bool {
-    let lower = name.as_str().fold_lower();
-    body_local_names(body).any(|local| local.as_str().fold_lower() == lower)
+    let key = NormName::intern(name.as_str());
+    body_local_names(body).any(|local| NormName::intern(local.as_str()) == key)
 }
 
 fn body_local_names(body: &Body) -> impl Iterator<Item = &Name> {
@@ -1192,7 +1198,7 @@ fn extract_notify_reg_at(
     (method_idx, target_idx): (usize, usize),
     range: TextRange,
     notify_scope: &mut NotifyReceiverScope<'_>,
-    body_locals: &mut Option<FxHashSet<String>>,
+    body_locals: &mut Option<FxHashSet<NormName>>,
 ) -> Option<NotifyReg> {
     let callback_name = extract_string_literal(body, *args.get(method_idx)?)?;
     let target = match args.get(target_idx).map(|&idx| body.expr_idx(idx)) {
@@ -1202,9 +1208,9 @@ fn extract_notify_reg_at(
             // A body assignment anywhere also shadows the name before that assignment.
             let is_local = body_locals
                 .get_or_insert_with(|| {
-                    body_local_names(body).map(|local| local.as_str().fold_lower()).collect()
+                    body_local_names(body).map(|local| NormName::intern(local.as_str())).collect()
                 })
-                .contains(&name_lower);
+                .contains(&NormName::intern(name.as_str()));
             if is_local {
                 NotifyTarget::Unsupported
             } else if is_this_receiver(&name_lower) {
@@ -2075,6 +2081,19 @@ EndProcedure
         assert_eq!(summary.notify_regs.len(), 2);
         assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
         assert_eq!(summary.notify_regs[1].target, NotifyTarget::Unsupported);
+    }
+
+    #[test]
+    fn test_notify_description_receiver_shadowed_by_a_final_sigma_parameter_is_unsupported() {
+        // The two spellings are the same identifier for the classification, so the parameter must still shadow it.
+        let code = r#"
+Процедура Тест(ΟΔΟΣ)
+    А = Новый ОписаниеОповещения("Обработчик", οδοσ);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs.len(), 1);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
     }
 
     #[test]
