@@ -155,42 +155,31 @@ pub fn bare_global_name_claim(
     body_env: EnvFlags,
 ) -> Option<BareGlobalClaim> {
     bare_global_name_claim_with_owner(db, resolver, scope, name, body_env, true)
-        .map(|(claim, _, _)| claim)
+        .map(|(claim, _)| claim)
 }
 
-/// The ownership of a bare common-module name, valid from the requested read
-/// until the next assignment to that name, if any.
-#[derive(Debug, Clone, Copy)]
-pub struct CommonModuleRead {
-    /// Whether the read is owned by the visible common module.
-    pub is_common_module: bool,
-    /// Exclusive upper bound for reusing this answer in the same body.
-    pub valid_before: Option<TextSize>,
-}
-
-/// Whether a bare value read belongs to the visible common module rather than a
-/// nearer binding or member with the same name.
-pub fn bare_name_common_module_read(
+/// Whether a bare name's nonlocal owner is a visible common module.
+///
+/// This deliberately receives no body or source map: body-local shadowing is
+/// handled by the caller, while this shares the nonlocal precedence rules used
+/// by [`bare_global_name_claim`].
+pub fn nonlocal_common_module_receiver(
     db: &dyn HirDatabase,
     resolver: &Resolver,
-    scope: &BodyShadowScope<'_>,
     name: &Name,
-    body_env: EnvFlags,
     has_form_context: bool,
-) -> CommonModuleRead {
-    match bare_global_name_claim_with_owner(
-        db,
-        resolver,
-        Some(scope),
-        name,
-        body_env,
-        has_form_context,
-    ) {
-        Some((_, BareNameOwner::CommonModule, valid_before)) => {
-            CommonModuleRead { is_common_module: true, valid_before }
-        }
-        _ => CommonModuleRead { is_common_module: false, valid_before: None },
-    }
+) -> bool {
+    matches!(
+        bare_global_name_claim_with_owner(
+            db,
+            resolver,
+            None,
+            name,
+            EnvFlags::EMPTY,
+            has_form_context,
+        ),
+        Some((_, BareNameOwner::CommonModule))
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -206,7 +195,7 @@ fn bare_global_name_claim_with_owner(
     name: &Name,
     body_env: EnvFlags,
     has_form_context: bool,
-) -> Option<(BareGlobalClaim, BareNameOwner, Option<TextSize>)> {
+) -> Option<(BareGlobalClaim, BareNameOwner)> {
     // Data members own a write: assigning over a module variable or a form /
     // object member stores into that member — a value inference deliberately
     // does not flow-type, so no reaching write is reported for it. Resolution
@@ -234,14 +223,12 @@ fn bare_global_name_claim_with_owner(
             resolver.user_common_module_exists(db, name).then_some(BareNameOwner::CommonModule)
         }
     };
-    let claim = |reaching_value, owner, valid_before| {
-        (BareGlobalClaim { reaching_value }, owner, valid_before)
-    };
+    let claim = |reaching_value, owner| (BareGlobalClaim { reaching_value }, owner);
     let Some(scope) = scope else {
         return if write_owner_claim() {
-            Some(claim(None, BareNameOwner::Nearer, None))
+            Some(claim(None, BareNameOwner::Nearer))
         } else {
-            read_only_claim().map(|owner| claim(None, owner, None))
+            read_only_claim().map(|owner| claim(None, owner))
         };
     };
 
@@ -249,7 +236,7 @@ fn bare_global_name_claim_with_owner(
     let body_declares =
         scope.body.bindings_iter().any(|(_, b)| NormName::intern(b.name.as_str()) == key);
     if !body_declares && write_owner_claim() {
-        return Some(claim(None, BareNameOwner::Nearer, None));
+        return Some(claim(None, BareNameOwner::Nearer));
     }
     // For a metadata-collection name an assignment alone claims nothing: the name
     // is a Global-context PROPERTY, and assigning to it does not declare a local —
@@ -263,7 +250,6 @@ fn bare_global_name_claim_with_owner(
         return None;
     }
     let mut reaching: Option<(TextSize, ExprId)> = None;
-    let mut next_write: Option<TextSize> = None;
     for (_, stmt) in scope.body.stmts_iter() {
         let Stmt::Assign { target, value } = stmt else { continue };
         let target_id = ExprId::from_idx(*target);
@@ -279,21 +265,17 @@ fn bare_global_name_claim_with_owner(
             .or_else(|| scope.source_map.expr_range(target_id))
             .map(|range| range.end());
         let Some(end) = completed_at else { continue };
-        if end <= scope.read_offset {
-            if reaching.is_none_or(|(best, _)| end >= best) {
-                reaching = Some((end, value_id));
-            }
-        } else if next_write.is_none_or(|next| end < next) {
-            next_write = Some(end);
+        if end <= scope.read_offset && reaching.is_none_or(|(best, _)| end >= best) {
+            reaching = Some((end, value_id));
         }
     }
     if let Some((_, value_id)) = reaching {
-        return Some(claim(Some(value_id), BareNameOwner::Nearer, None));
+        return Some(claim(Some(value_id), BareNameOwner::Nearer));
     }
     if body_declares {
-        Some(claim(None, BareNameOwner::Nearer, None))
+        Some(claim(None, BareNameOwner::Nearer))
     } else {
-        read_only_claim().map(|owner| claim(None, owner, next_write))
+        read_only_claim().map(|owner| claim(None, owner))
     }
 }
 

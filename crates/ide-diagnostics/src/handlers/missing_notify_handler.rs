@@ -1,15 +1,8 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
-use hir::{call_graph::CallerId, CommonModuleRead, DefWithBodyId, ModuleId, Name, NotifyTarget};
+use hir::{call_graph::CallerId, DefWithBodyId, ModuleId, Name, NotifyTarget};
 use rustc_hash::FxHashMap;
-use syntax::TextSize;
-
-#[derive(Default)]
-struct ModuleCache {
-    receivers: FxHashMap<(DefWithBodyId, Name), (TextSize, CommonModuleRead)>,
-    handlers: FxHashMap<(Name, Name), Option<Verdict>>,
-}
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: crate::metadata::DiagnosticType::Error,
@@ -47,13 +40,19 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
+    // A form borrowed by an extension also exposes the base form's module, which is not
+    // in this file's symbol tree: absence here proves nothing about a local handler.
+    // Same stance as `missing_form_event_handler`.
+    let local_unprovable = ctx.module_metadata().form.as_deref().is_some_and(|f| f.has_base_form());
+
     let mut diagnostics = Vec::new();
-    let mut module_cache = ModuleCache::default();
+    let mut module_verdicts = FxHashMap::default();
     for reg in &summary.notify_regs {
         if reg.callback_name.as_str().is_empty() {
             continue;
         }
         let verdict = match &reg.target {
+            NotifyTarget::ThisObject if local_unprovable => None,
             NotifyTarget::ThisObject => {
                 local_verdict(ctx, &reg.callback_name).map(|v| (v, reg.callback_name.to_string()))
             }
@@ -62,15 +61,13 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                     CallerId::Method(key) => DefWithBodyId::Method(key),
                     CallerId::ModuleCode => DefWithBodyId::ModuleCode,
                 };
-                module_verdict(
-                    ctx,
-                    module_name,
-                    &reg.callback_name,
-                    owner,
-                    reg.range.start(),
-                    &mut module_cache,
-                )
-                .map(|v| (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str())))
+                let key = (owner, module_name.clone(), reg.callback_name.clone());
+                let verdict = *module_verdicts
+                    .entry(key)
+                    .or_insert_with(|| module_verdict(ctx, module_name, &reg.callback_name, owner));
+                verdict.map(|v| {
+                    (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
+                })
             }
             NotifyTarget::Unsupported => None,
         };
@@ -127,34 +124,10 @@ fn module_verdict(
     module_name: &Name,
     name: &Name,
     owner: DefWithBodyId,
-    offset: TextSize,
-    cache: &mut ModuleCache,
 ) -> Option<Verdict> {
-    let verdict = *cache
-        .handlers
-        .entry((module_name.clone(), name.clone()))
-        .or_insert_with(|| module_body_verdict(ctx, module_name, name));
-    let verdict = verdict?;
-    let key = (owner, module_name.clone());
-    let cached = cache.receivers.get(&key).copied().filter(|(start, read)| {
-        *start <= offset && read.valid_before.is_none_or(|end| offset < end)
-    });
-    let read = match cached {
-        Some((_, read)) => read,
-        None => {
-            let read = ctx.common_module_receiver_at(owner, offset, module_name)?;
-            cache.receivers.insert(key, (offset, read));
-            read
-        }
-    };
-    read.is_common_module.then_some(verdict)
-}
-
-fn module_body_verdict(
-    ctx: &DiagnosticsContext,
-    module_name: &Name,
-    name: &Name,
-) -> Option<Verdict> {
+    if !ctx.nonlocal_common_module_receiver(owner, module_name)? {
+        return None;
+    }
     ctx.resolve_common_module(module_name.as_str())?;
     let bodies = ctx.common_module_bodies(module_name.as_str());
     if bodies.is_empty() || bodies.has_missing_expected_body() {
@@ -376,13 +349,10 @@ mod tests {
     }
 
     #[test]
-    fn a_local_assignment_between_registrations_changes_the_receiver() {
+    fn a_local_assignment_shadows_both_earlier_and_later_registrations() {
         let source = "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n    МойМодульКлиент = Новый Структура;\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\nКонецПроцедуры\n";
         let diagnostics = with_module(source, "Процедура Другая() Экспорт\nКонецПроцедуры\n");
-        assert_eq!(diagnostics.len(), 1, "only the first receiver is the module: {diagnostics:#?}");
-        assert!(
-            usize::from(diagnostics[0].range.start()) < source.find("МойМодульКлиент =").unwrap()
-        );
+        assert!(diagnostics.is_empty(), "the receiver is a body-wide local: {diagnostics:#?}");
     }
 
     #[test]
@@ -407,6 +377,18 @@ mod tests {
         };
         assert_eq!(count("&НаСервере"), 0);
         assert_eq!(count("&НаСервереБезКонтекста"), 1);
+
+        let source = "&НаСервере\nПроцедура СКонтекстом()\n    О = Новый ОписаниеОповещения(\"Готово\", Модуль);\nКонецПроцедуры\n&НаСервереБезКонтекста\nПроцедура БезКонтекста()\n    О = Новый ОписаниеОповещения(\"Готово\", Модуль);\nКонецПроцедуры\n";
+        let diagnostics = crate::test_utils::check_form_with_common_modules_and_form_xml(
+            source,
+            &[("Модуль", "Процедура Другая() Экспорт\nКонецПроцедуры\n", module_xml)],
+            form_xml,
+        )
+        .into_iter()
+        .filter(|d| d.code == DiagnosticCode::MissingNotifyHandler)
+        .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(usize::from(diagnostics[0].range.start()) > source.find("БезКонтекста").unwrap());
     }
 
     #[test]
@@ -468,5 +450,210 @@ mod tests {
                 "an unmapped body may define the handler: {diagnostics:#?}"
             );
         }
+    }
+
+    #[test]
+    fn a_handler_registered_through_callback_description_is_reported_like_the_old_name() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый CallbackDescription(\"НетТакогоОбработчика\", ЭтотОбъект);
+КонецПроцедуры
+";
+        let diagnostics = run_local(source);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "Создайте экспортную процедуру \"НетТакогоОбработчика\" или исправьте имя обработчика оповещения"
+        );
+    }
+
+    /// Control for the case above: the same registration with an exported handler.
+    #[test]
+    fn an_exported_handler_registered_through_callback_description_is_silent() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый CallbackDescription(\"Готово\", ЭтотОбъект);
+КонецПроцедуры
+
+Процедура Готово(Результат, Параметры) Экспорт
+КонецПроцедуры
+";
+        let diagnostics = run_local(source);
+        assert!(diagnostics.is_empty(), "an exported handler must pass: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_parameter_named_like_this_form_is_not_the_form() {
+        let source = "Процедура Тест(ЭтаФорма)
+	Оповещение = Новый ОписаниеОповещения(\"НетТакогоОбработчика\", ЭтаФорма);
+КонецПроцедуры
+";
+        let diagnostics = run_local(source);
+        assert!(diagnostics.is_empty(), "the receiver is a parameter: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn self_receivers_shadowed_by_parameters_or_later_assignments_are_not_judged() {
+        for receiver in ["ЭтотОбъект", "ЭтаФорма", "ThisObject", "ThisForm"] {
+            let unshadowed = format!(
+                "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"Нет\", {receiver});\nКонецПроцедуры\n"
+            );
+            assert_eq!(run_local(&unshadowed).len(), 1, "{receiver}");
+            let parameter = format!(
+                "Процедура Тест({receiver})\n    О = Новый ОписаниеОповещения(\"Нет\", {receiver});\nКонецПроцедуры\n"
+            );
+            let assigned_later = format!(
+                "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"Нет\", {receiver});\n    {receiver} = Неопределено;\nКонецПроцедуры\n"
+            );
+            for source in [parameter, assigned_later] {
+                let diagnostics = run_local(&source);
+                assert!(diagnostics.is_empty(), "{receiver}: {source}\n{diagnostics:#?}");
+            }
+        }
+    }
+
+    /// Control for the case above: without the parameter `ЭтаФорма` is the form.
+    #[test]
+    fn this_form_without_a_shadowing_parameter_is_still_checked() {
+        let source = "Процедура Тест()
+	Оповещение = Новый ОписаниеОповещения(\"НетТакогоОбработчика\", ЭтаФорма);
+КонецПроцедуры
+";
+        let diagnostics = run_local(source);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_local_variable_named_like_a_common_module_is_not_the_module() {
+        let source = "Процедура ПередЗакрытием()
+	МойМодульКлиент = Новый Структура;
+	Оповещение = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);
+КонецПроцедуры
+";
+        let diagnostics = with_module(
+            source,
+            "Процедура Другая(Результат, Параметры) Экспорт
+КонецПроцедуры
+",
+        );
+        assert!(diagnostics.is_empty(), "the receiver is a local: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_parameter_named_like_a_common_module_is_not_the_module() {
+        let source = "Процедура Тест(МойМодульКлиент)
+	Оповещение = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);
+КонецПроцедуры
+";
+        let diagnostics = with_module(
+            source,
+            "Процедура Другая(Результат, Параметры) Экспорт
+КонецПроцедуры
+",
+        );
+        assert!(diagnostics.is_empty(), "the receiver is a parameter: {diagnostics:#?}");
+    }
+
+    const BASE_FORM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20">
+    <Events/>
+    <BaseForm version="2.17">
+        <Events/>
+    </BaseForm>
+</Form>"#;
+
+    const PLAIN_FORM_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20">
+    <Events/>
+</Form>"#;
+
+    fn run_with_form_xml(
+        source: &str,
+        form_xml: &str,
+        fixture: test_fixture::CfeFixture,
+    ) -> Vec<Diagnostic> {
+        crate::test_utils::check_cfe_at_with_unreadable_config_and_setup(
+            CALLER,
+            source,
+            fixture,
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                let path = fixture.root().join("CommonForms/Форма1/Ext/Form.xml");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, form_xml).unwrap();
+            },
+            check,
+        )
+    }
+
+    /// A handler exported in the BASE form's module is not in this file's tree.
+    #[test]
+    fn a_local_handler_of_a_form_with_a_base_form_is_not_judged() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый ОписаниеОповещения(\"ЕстьВБазовойФорме\", ЭтотОбъект);
+КонецПроцедуры
+";
+        let diagnostics =
+            run_with_form_xml(source, BASE_FORM_XML, CfeFixtureBuilder::new("").build());
+        assert!(diagnostics.is_empty(), "the base form's module is unseen: {diagnostics:#?}");
+    }
+
+    /// Control for the case above: the same form without `<BaseForm>`.
+    #[test]
+    fn a_local_handler_of_a_form_without_a_base_form_is_still_judged() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый ОписаниеОповещения(\"ЕстьВБазовойФорме\", ЭтотОбъект);
+КонецПроцедуры
+";
+        let diagnostics =
+            run_with_form_xml(source, PLAIN_FORM_XML, CfeFixtureBuilder::new("").build());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    }
+
+    /// The common-module verdict does not depend on this file's tree.
+    #[test]
+    fn a_common_module_handler_is_still_judged_in_a_form_with_a_base_form() {
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_base_module(
+            "МойМодульКлиент",
+            "Процедура Готово(Результат, Параметры)
+КонецПроцедуры
+",
+        );
+        let diagnostics = run_with_form_xml(module_source(), BASE_FORM_XML, builder.build());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(diagnostics[0].message.starts_with("Добавьте \"Экспорт\""), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_module_variable_named_like_a_common_module_is_not_the_module() {
+        let source = "Перем МойМодульКлиент;
+
+Процедура ПередЗакрытием()
+	Оповещение = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);
+КонецПроцедуры
+";
+        let diagnostics = with_module(
+            source,
+            "Процедура Другая(Результат, Параметры) Экспорт
+КонецПроцедуры
+",
+        );
+        assert!(diagnostics.is_empty(), "the receiver is a module variable: {diagnostics:#?}");
+    }
+
+    /// Control for the case above: the same registration without the `Перем`.
+    #[test]
+    fn the_same_registration_without_a_module_variable_is_still_checked() {
+        let source = "Процедура ПередЗакрытием()
+	Оповещение = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);
+КонецПроцедуры
+";
+        let diagnostics = with_module(
+            source,
+            "Процедура Другая(Результат, Параметры) Экспорт
+КонецПроцедуры
+",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     }
 }

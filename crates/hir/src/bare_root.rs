@@ -1,11 +1,8 @@
-//! Who owns a bare receiver name at a position.
+//! Who owns a bare receiver name at a position or outside the body.
 //!
 //! The decision itself is [`bare_global_name_claim`](crate::bare_global_name_claim) —
-//! this module only binds a position to the enclosing body so the predicate can
-//! be asked positionally. Every consumer that types a receiver from its
-//! identifier text must go through here; a consumer with its own guard set
-//! drifts from the diagnostic's verdict, which is how the shadowed-global
-//! suggestions kept coming back.
+//! this module binds body-sensitive lookups to the enclosing body and exposes
+//! nonlocal ownership without requiring a body scan.
 
 use hir_def::item_tree::{ItemTree, MethodItem};
 use hir_ty::db::HirDatabase;
@@ -38,52 +35,14 @@ pub fn claim_at<DB: HirDatabase>(
     name: &Name,
     read_offset: TextSize,
 ) -> (Option<BareGlobalClaim>, DefWithBodyId) {
-    let item_tree = db.item_tree(file_id);
-    let owner = method_item_at(&item_tree, offset)
-        .map(|method| DefWithBodyId::Method(method.key()))
-        .unwrap_or(DefWithBodyId::ModuleCode);
-    with_scope(db, file_id, owner, read_offset, |resolver, scope| {
-        let body_env = hir_ty::owner_body_env(db, file_id, owner);
-        (bare_global_name_claim(db, resolver, scope, name, body_env), owner)
-    })
-}
-
-/// Whether the bare name at this position belongs to a common module rather than
-/// a nearer local, parameter, module declaration or implicit member.
-pub fn common_module_at(
-    db: &dyn HirDatabase,
-    file_id: FileId,
-    owner: DefWithBodyId,
-    offset: TextSize,
-    name: &Name,
-) -> Option<crate::CommonModuleRead> {
-    with_scope(db, file_id, owner, offset, |resolver, scope| {
-        let scope = scope?;
-        let body_env = hir_ty::owner_body_env(db, file_id, owner);
-        let has_form_context = hir_ty::owner_has_form_context(db, file_id, owner);
-        Some(hir_ty::platform_global_lookup::bare_name_common_module_read(
-            db,
-            resolver,
-            scope,
-            name,
-            body_env,
-            has_form_context,
-        ))
-    })
-}
-
-fn with_scope<R>(
-    db: &dyn HirDatabase,
-    file_id: FileId,
-    owner: DefWithBodyId,
-    read_offset: TextSize,
-    f: impl FnOnce(&Resolver, Option<&BodyShadowScope<'_>>) -> R,
-) -> R {
     let module_id = ModuleId::new(file_id);
+    let item_tree = db.item_tree(file_id);
     let module_bodies = db.module_bodies_ref(module_id);
-    let lower_result = match owner {
-        DefWithBodyId::Method(key) => module_bodies.lower_result(key),
-        DefWithBodyId::ModuleCode => module_bodies.module_code_result(),
+    let (owner, lower_result) = match method_item_at(&item_tree, offset) {
+        Some(method) => {
+            (DefWithBodyId::Method(method.key()), module_bodies.lower_result(method.key()))
+        }
+        None => (DefWithBodyId::ModuleCode, module_bodies.module_code_result()),
     };
     let scope = lower_result.map(|r| BodyShadowScope {
         body: r.body(),
@@ -91,7 +50,24 @@ fn with_scope<R>(
         read_offset,
     });
     let resolver = Resolver::with_builtins_and_workspace(module_id);
-    f(&resolver, scope.as_ref())
+    let body_env = hir_ty::owner_body_env(db, file_id, owner);
+    (bare_global_name_claim(db, &resolver, scope.as_ref(), name, body_env), owner)
+}
+
+/// Whether the nonlocal owner of `name` is a visible common module.
+///
+/// The caller handles names declared in the body. This lookup intentionally
+/// does not load the owner's body or source map.
+pub fn nonlocal_common_module_receiver(
+    db: &dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    name: &Name,
+) -> bool {
+    let module_id = ModuleId::new(file_id);
+    let resolver = Resolver::with_builtins_and_workspace(module_id);
+    let has_form_context = hir_ty::owner_has_form_context(db, file_id, owner);
+    hir_ty::nonlocal_common_module_receiver(db, &resolver, name, has_form_context)
 }
 
 /// Same, keyed off a receiver node: the read position is the node's own start.

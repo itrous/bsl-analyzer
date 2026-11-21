@@ -19,7 +19,7 @@ pub use hir_ty::BodyFlow;
 pub use hir_ty::TyLoweringContext;
 pub use hir_ty::{
     bare_global_name_claim, manager_collection_env, resolve_platform_global_property_type,
-    BareGlobalClaim, BodyShadowScope, CommonModuleRead,
+    BareGlobalClaim, BodyShadowScope,
 };
 pub use hir_ty::{is_form_items_collection_ty, FORM_ITEMS_TYPE_EN, FORM_ITEMS_TYPE_RU};
 pub use hir_ty::{PlatformMethodHandle, PlatformMethodOrigin};

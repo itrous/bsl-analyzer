@@ -55,13 +55,12 @@ impl<'a> DiagnosticsContext<'a> {
         self.query(|p| p.module_bodies(module_id))
     }
 
-    pub(crate) fn common_module_receiver_at(
+    pub(crate) fn nonlocal_common_module_receiver(
         &self,
         owner: hir::DefWithBodyId,
-        offset: syntax::TextSize,
         name: &hir::Name,
-    ) -> Option<hir::CommonModuleRead> {
-        self.query(|p| p.common_module_receiver_at(self.file_id, owner, offset, name))
+    ) -> Option<bool> {
+        self.query(|p| p.nonlocal_common_module_receiver(self.file_id, owner, name))
     }
 
     pub fn infer(&self) -> Arc<hir::InferenceResult> {

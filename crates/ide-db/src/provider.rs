@@ -7,7 +7,7 @@ use bsl_metadata::Configuration;
 use hir::{
     dataflow::effect_summary::EffectSummary, AssignmentResolution, DefWithBodyId,
     InferenceDiagnostic, InferenceResult, ItemTree, MethodDocs, MethodId, ModuleBodies, ModuleId,
-    ModuleIndex, ModuleMetadata, SymbolTree, VariableDocs, VariableId,
+    ModuleIndex, ModuleMetadata, Name, SymbolTree, VariableDocs, VariableId,
 };
 use syntax::{Parse, SyntaxNode};
 use vfs::{FileId, VfsPath};
@@ -109,15 +109,14 @@ pub trait AnalysisProvider {
         merged.map(Arc::new)
     }
 
-    /// Whether a bare name at this position denotes a common module rather than
-    /// a nearer symbol. A provider without positional resolution proves nothing.
-    fn common_module_receiver_at(
+    /// Whether the nonlocal owner of `name` in `owner` is a common module.
+    /// Providers without semantic name resolution cannot establish the answer.
+    fn nonlocal_common_module_receiver(
         &self,
         _file_id: FileId,
         _owner: DefWithBodyId,
-        _offset: syntax::TextSize,
-        _name: &hir::Name,
-    ) -> Option<hir::CommonModuleRead> {
+        _name: &Name,
+    ) -> Option<bool> {
         None
     }
 

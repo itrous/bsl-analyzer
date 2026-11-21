@@ -899,11 +899,19 @@ fn is_current_form_items(name_lower: &str) -> bool {
 /// a binding that shadows a context property of the same name.
 fn is_body_local(body: &Body, name: &Name) -> bool {
     let lower = name.as_str().fold_lower();
-    body.bindings_iter().any(|(_, binding)| binding.name.as_str().fold_lower() == lower)
-        || body.stmts_iter().any(|(_, stmt)| {
-            matches!(stmt, Stmt::Assign { target, .. }
-                if matches!(body.expr_idx(*target), Expr::Path(target) if target.as_str().fold_lower() == lower))
-        })
+    body_local_names(body).any(|local| local.as_str().fold_lower() == lower)
+}
+
+fn body_local_names(body: &Body) -> impl Iterator<Item = &Name> {
+    body.bindings_iter().map(|(_, binding)| &binding.name).chain(body.stmts_iter().filter_map(
+        |(_, stmt)| match stmt {
+            Stmt::Assign { target, .. } => match body.expr_idx(*target) {
+                Expr::Path(name) => Some(name),
+                _ => None,
+            },
+            _ => None,
+        },
+    ))
 }
 
 fn is_attach_data_change_handler(name_lower: &str) -> bool {
@@ -926,6 +934,7 @@ fn extract_from_body(
     name_literals: &mut FxHashSet<MethodKey>,
 ) {
     let common_bindings = crate::common_module_ref::common_module_var_bindings(body);
+    let mut notify_body_locals = None;
     for (expr_id, expr) in body.exprs_iter() {
         match expr {
             Expr::Literal(Literal::String(s)) if is_identifier_like(s) => {
@@ -1003,9 +1012,15 @@ fn extract_from_body(
                     // fails. A constructor that omits the error handler simply yields no second
                     // reg (the args are absent), so this never invents an edge.
                     for (method_idx, target_idx) in [(base, base + 1), (base + 3, base + 4)] {
-                        if let Some(reg) =
-                            extract_notify_reg_at(body, caller, args, method_idx, target_idx, range)
-                        {
+                        if let Some(reg) = extract_notify_reg_at(
+                            body,
+                            caller,
+                            args,
+                            method_idx,
+                            target_idx,
+                            range,
+                            &mut notify_body_locals,
+                        ) {
                             notify_regs.push(reg);
                         }
                     }
@@ -1044,7 +1059,10 @@ fn is_notify_description(name: &Name) -> bool {
 
 fn is_notify_description_str(name: &str) -> bool {
     let lower = name.fold_lower();
-    lower == "описаниеоповещения" || lower == "notifydescription"
+    // `CallbackDescription` is the platform's own English name of the type (`platform_facts`:
+    // `english_name`); `NotifyDescription` reaches the
+    // constructor too (live probe, 8.3.27.2214), so both stay accepted.
+    lower == "описаниеоповещения" || lower == "notifydescription" || lower == "callbackdescription"
 }
 
 fn is_this_object(name_lower: &str) -> bool {
@@ -1148,9 +1166,25 @@ fn extract_notify_reg_at(
     method_idx: usize,
     target_idx: usize,
     range: TextRange,
+    body_locals: &mut Option<FxHashSet<String>>,
 ) -> Option<NotifyReg> {
     let callback_name = extract_string_literal(body, *args.get(method_idx)?)?;
     let target = match args.get(target_idx).map(|&idx| body.expr_idx(idx)) {
+        // A parameter, a declared variable or an assigned local with the receiver's name
+        // IS the receiver: `Процедура Тест(ЭтаФорма)` does not name the form, and a local
+        // `МойМодуль` is not the common module of that name. Nothing can be said about
+        // where its handler lives. Order does not matter, on purpose: a name assigned or
+        // declared anywhere in a procedure is procedure-scoped, so even a use BEFORE the
+        // assignment denotes the local (reading `Неопределено`), never the module.
+        Some(Expr::Path(name))
+            if body_locals
+                .get_or_insert_with(|| {
+                    body_local_names(body).map(|local| local.as_str().fold_lower()).collect()
+                })
+                .contains(&name.as_str().fold_lower()) =>
+        {
+            NotifyTarget::Unsupported
+        }
         Some(Expr::Path(name)) if is_this_receiver(&name.as_str().fold_lower()) => {
             NotifyTarget::ThisObject
         }
@@ -1545,6 +1579,9 @@ mod tests {
     fn test_is_notify_description() {
         assert!(is_notify_description(&Name::new("ОписаниеОповещения")));
         assert!(is_notify_description(&Name::new("NotifyDescription")));
+        assert!(is_notify_description(&Name::new("CallbackDescription")));
+        assert!(is_notify_description(&Name::new("callbackdescription")));
+        assert!(!is_notify_description(&Name::new("CallbackDescriptionXX")));
         assert!(is_notify_description(&Name::new("описаниеоповещения")));
         assert!(!is_notify_description(&Name::new("ОписаниеОшибки")));
     }
@@ -1979,6 +2016,101 @@ EndProcedure
         assert_eq!(summary.notify_regs[0].caller, CallerId::Method(MethodKey::first("Test")));
         assert_eq!(summary.notify_regs[0].callback_name, Name::new("HandleResult"));
         assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
+    }
+
+    #[test]
+    fn test_notify_description_callback_description_spelling() {
+        let code = r#"
+Procedure Test()
+    Notification = New CallbackDescription("HandleResult", ThisObject);
+    Other = New("CallbackDescription", "AnotherHandler", CommonModule);
+EndProcedure
+"#;
+        let summary = parse_and_extract(code);
+
+        assert_eq!(summary.notify_regs.len(), 2);
+        assert_eq!(summary.notify_regs[0].callback_name, Name::new("HandleResult"));
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
+        assert_eq!(summary.notify_regs[1].callback_name, Name::new("AnotherHandler"));
+        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Module(Name::new("CommonModule")));
+    }
+
+    #[test]
+    fn test_notify_description_receiver_shadowed_by_parameter_is_unsupported() {
+        let code = r#"
+Процедура Тест(ЭтаФорма, МойОбщийМодуль)
+    А = Новый ОписаниеОповещения("Первый", ЭтаФорма);
+    Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs.len(), 2);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
+        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Unsupported);
+    }
+
+    #[test]
+    fn test_notify_description_receiver_shadowed_by_local_is_unsupported() {
+        let code = r#"
+Процедура Тест()
+    Перем МойОбщийМодуль;
+    ДругойМодуль = Новый Структура;
+    А = Новый ОписаниеОповещения("Первый", ДругойМодуль);
+    Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs.len(), 2);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
+        assert_eq!(summary.notify_regs[1].target, NotifyTarget::Unsupported);
+    }
+
+    #[test]
+    fn test_notify_description_receiver_assigned_after_use_is_still_the_local() {
+        let code = r#"
+Процедура Тест()
+    А = Новый ОписаниеОповещения("Первый", МойОбщийМодуль);
+    МойОбщийМодуль = Новый Структура;
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::Unsupported);
+    }
+
+    #[test]
+    fn test_notify_description_locals_and_unshadowed_receivers_in_one_body() {
+        let code = r#"
+Процедура Тест(ЭтаФорма)
+    Перем Местный;
+    А = Новый ОписаниеОповещения("Первый", этаформа);
+    Б = Новый ОписаниеОповещения("Второй", местный);
+    В = Новый ОписаниеОповещения("Третий", ДРУГОЙ);
+    Г = Новый ОписаниеОповещения("Четвертый", ОбщийМодуль);
+    Другой = Новый Структура;
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs.len(), 4);
+        for reg in &summary.notify_regs[..3] {
+            assert_eq!(reg.target, NotifyTarget::Unsupported);
+        }
+        assert_eq!(summary.notify_regs[3].target, NotifyTarget::Module(Name::new("ОбщийМодуль")));
+    }
+
+    #[test]
+    fn test_notify_description_unshadowed_receivers_keep_their_target() {
+        let code = r#"
+Процедура Тест(Другой)
+    А = Новый ОписаниеОповещения("Первый", ЭтаФорма);
+    Б = Новый ОписаниеОповещения("Второй", МойОбщийМодуль);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_regs[0].target, NotifyTarget::ThisObject);
+        assert_eq!(
+            summary.notify_regs[1].target,
+            NotifyTarget::Module(Name::new("МойОбщийМодуль"))
+        );
     }
 
     #[test]

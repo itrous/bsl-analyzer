@@ -85,8 +85,9 @@ pub use object_resolver::{
     ConfigsObjectResolver, DbObjectResolver, MetadataResolution, ObjectResolver,
 };
 pub use platform_global_lookup::{
-    bare_global_name_claim, manager_collection_env, resolve_platform_global_property_type,
-    unassignable_global_property, BareGlobalClaim, BodyShadowScope, CommonModuleRead,
+    bare_global_name_claim, manager_collection_env, nonlocal_common_module_receiver,
+    resolve_platform_global_property_type, unassignable_global_property, BareGlobalClaim,
+    BodyShadowScope,
 };
 pub use platform_manager_lookup::{
     platform_methods_for_manager, platform_methods_for_metadata_kind,
