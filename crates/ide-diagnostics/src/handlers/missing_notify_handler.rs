@@ -48,9 +48,6 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut module_verdicts = FxHashMap::default();
     for reg in &summary.notify_regs {
-        if reg.callback_name.as_str().is_empty() {
-            continue;
-        }
         let verdict = match &reg.target {
             NotifyTarget::ThisObject if local_unprovable => None,
             NotifyTarget::ThisObject => {
@@ -211,6 +208,36 @@ mod tests {
               message: Создайте экспортную процедуру "НетТакогоОбработчика" или исправьте имя обработчика оповещения
               severity: Blocker"#]]
         .assert_eq(&format_diags(source, &diagnostics));
+    }
+
+    #[test]
+    fn empty_literal_handler_names_are_reported() {
+        let sources = [
+            "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"\", ЭтотОбъект);\nКонецПроцедуры\n",
+            "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект, Неопределено, \"\", ЭтотОбъект);\nКонецПроцедуры\nПроцедура Готово() Экспорт\nКонецПроцедуры\n",
+            "Процедура Тест()\n    О = Новый(\"CallbackDescription\", \"\", ThisForm);\nКонецПроцедуры\n",
+        ];
+        for source in sources {
+            let diagnostics = run_local(source);
+            assert_eq!(diagnostics.len(), 1, "{source}\n{diagnostics:#?}");
+            assert_eq!(
+                diagnostics[0].message,
+                "Создайте экспортную процедуру \"\" или исправьте имя обработчика оповещения"
+            );
+        }
+
+        let module = "Процедура Готово() Экспорт\nКонецПроцедуры\n";
+        for source in [
+            "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"\", МойМодульКлиент);\nКонецПроцедуры\n",
+            "Процедура Тест()\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент, Неопределено, \"\", МойМодульКлиент);\nКонецПроцедуры\n",
+        ] {
+            let diagnostics = with_module(source, module);
+            assert_eq!(diagnostics.len(), 1, "{source}\n{diagnostics:#?}");
+            assert_eq!(
+                diagnostics[0].message,
+                "Создайте экспортную процедуру \"МойМодульКлиент.\" или исправьте имя обработчика оповещения"
+            );
+        }
     }
 
     #[test]
