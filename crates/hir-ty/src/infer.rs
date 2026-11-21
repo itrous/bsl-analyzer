@@ -4902,26 +4902,27 @@ impl<'db> InferenceContext<'db> {
         let hir_sig = builtin::builtin_functions().get(name.as_str());
 
         let body_binding_shadows = self.body_binding_applies_at(name, expr_id);
-        let body_local_assignment_shadows =
-            !body_binding_shadows && self.body_local_assignment_applies_at(name, expr_id);
-        let assigned_in_body = body_binding_shadows || body_local_assignment_shadows;
-        if assigned_in_body {
-            let ty = self.flow_local_type_at(name, expr_id);
-            let ty = self.refine_flow_local_type(name, expr_id, ty);
-            let has_typed_binding = self.body.bindings_iter().any(|(binding, local)| {
-                NormName::intern(local.name.as_str()) == flow_key
-                    && self.binding_types.contains_key(&binding)
-            });
-            let origin = if body_local_assignment_shadows
-                || has_typed_binding
-                || self.body_assignment_overlaps_at(name, expr_id)
-            {
-                BareNameOrigin::FlowLocal
-            } else {
-                BareNameOrigin::UserBinding
-            };
-            return found(ty, origin, all_env);
+        let read_scope = self.compile_scope_at_expr(expr_id);
+        let scope_sensitive = self.body_assignment_stmts.get(&flow_key).is_some_and(|stmts| {
+            stmts.iter().any(|stmt| {
+                !self.body_stmt_scopes.get(stmt).is_some_and(|scope| scope.may_overlap(read_scope))
+            })
+        });
+        // A compatible local shadows self and same-named common modules throughout the body,
+        // while other names retain their existing sequential type and initialization behavior.
+        let local_assignment_applies = self.body_local_assignment_applies_at(name, expr_id);
+        let bodywide_local = local_assignment_applies
+            && (is_self_name(&name_lower) || resolver.user_common_module_exists(self.db, name));
+        let mut body_local_assignment_shadows = bodywide_local
+            || (self.assigned_var_names.contains(&flow_key) && local_assignment_applies);
+        if scope_sensitive
+            && usage == BareNameUse::ReadValue
+            && body_local_assignment_shadows
+            && !bodywide_local
+        {
+            body_local_assignment_shadows = self.implicit_local_reaches(expr_id, name);
         }
+        let assigned_in_body = body_binding_shadows || body_local_assignment_shadows;
 
         let self_name_wins = is_self_name(&name_lower)
             && !self.self_name_is_shadowed(name, &resolver, assigned_in_body);
@@ -4984,11 +4985,30 @@ impl<'db> InferenceContext<'db> {
             return found(self.db.unknown(), BareNameOrigin::SelfName, all_env);
         }
 
+        if bodywide_local && !body_binding_shadows && !self.assigned_var_names.contains(&flow_key) {
+            return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
+        }
+        if scope_sensitive {
+            if assigned_in_body {
+                let ty = self.flow_local_type_at(name, expr_id);
+                let ty = self.refine_flow_local_type(name, expr_id, ty);
+                return found(ty, BareNameOrigin::FlowLocal, all_env);
+            }
+        } else {
+            if self.reset_vars.contains(&flow_key) {
+                return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
+            }
+            if let Some(ty) = self.var_types.get(&flow_key).copied() {
+                let ty = self.refine_flow_local_type(name, expr_id, ty);
+                return found(ty, BareNameOrigin::FlowLocal, all_env);
+            }
+        }
+
         let user_shadows =
             matches!(resolved, Some(Resolution::Method(_)) | Some(Resolution::Variable(_)))
                 || resolver.resolve_module_variable(self.db, name).is_some();
 
-        if user_shadows {
+        if user_shadows || body_binding_shadows {
             return found(self.db.unknown(), BareNameOrigin::UserBinding, all_env);
         }
 
@@ -5045,8 +5065,7 @@ impl<'db> InferenceContext<'db> {
             }
         }
 
-        if usage == BareNameUse::ReadValue
-            && self.assignment_target_names.contains(&NormName::intern(name.as_str()))
+        if self.assignment_target_names.contains(&NormName::intern(name.as_str()))
             && self.implicit_local_reaches(expr_id, name)
         {
             return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
