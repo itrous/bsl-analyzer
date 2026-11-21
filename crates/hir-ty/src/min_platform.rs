@@ -29,10 +29,36 @@ pub const ASYNC_INTRODUCED: PlatformVersion =
 ///   `ПользователиСлужебный`) reads it on every 8.3.17 base.
 const MISDATED_MEMBERS: &[(&str, &str)] = &[("DataHashing", "ХешСумма")];
 
+/// Types whose own catalog date is contradicted by an older help, as the type's
+/// English name: treated as undated, so neither the type nor the members raised to
+/// its date are reported.
+/// - `РежимРедактированияКолонки` is dated 8.5.1 by the platform help of 8.5.1.1343,
+///   but 8.0 by the pinned 8.3.27.2214 extract and by the 8.3.17 help
+///   (`shcntx_ru.hbk:objects/catalog2/catalog277/ColumnEditMode.html`: «Доступен,
+///   начиная с версии 8.0.»). Probe 20.11.2026: on 8.3.17.1549, server context, the
+///   enumeration and its three old values exist and print
+///   `Непосредственно=Непосредственно; Вход=Вход; ВходПриВводе=Вход при вводе`, while
+///   `Авто` fails with «Поле объекта не обнаружено (Авто)». So the date 8.5.1 of the
+///   TYPE is contradicted by the running platform, and the value `Авто` (`Auto`) really
+///   is new in 8.5.1: this is why only the type is corrected, and `Авто` keeps its own
+///   8.5.1 date and is still reported. One enumeration gives the control pair, two of
+///   its values differing in exactly this way. The likely cause of the re-dating is
+///   that the new value made 1C re-date the whole page; the other three values keep
+///   8.0 in the 8.5.1 help.
+///
+/// Undated rather than "the older date": `None` means no data, and absence of data is
+/// never evidence that a member is new, so the check stays silent, which is right
+/// because the true date 8.0 is below any minimum platform in use.
+const MISDATED_TYPES: &[&str] = &["ColumnEditMode"];
+
 fn is_misdated(owner_en: &str, member_ru: &str) -> bool {
     MISDATED_MEMBERS.iter().any(|(owner, member)| {
         owner.eq_ignore_ascii_case(owner_en) && member.to_lowercase() == member_ru.to_lowercase()
     })
+}
+
+fn is_misdated_type(type_en: &str) -> bool {
+    MISDATED_TYPES.iter().any(|ty| ty.eq_ignore_ascii_case(type_en))
 }
 
 fn parse(value: Option<&str>) -> Option<PlatformVersion> {
@@ -56,7 +82,12 @@ fn type_version(data: &PlatformDataInner, type_name: &str) -> Option<PlatformVer
     if data.is_ambiguous_type_name(type_name) {
         return None;
     }
-    parse(data.get_type(type_name)?.min_version.as_deref())
+    let ty = data.get_type(type_name)?;
+    // `type_name` may be Russian or English: compare the resolved English name.
+    if is_misdated_type(&ty.english_name) {
+        return None;
+    }
+    parse(ty.min_version.as_deref())
 }
 
 /// A platform type named in code by itself (a system enumeration such as
@@ -176,6 +207,35 @@ mod tests {
         assert_eq!(type_member("ХешированиеДанных", "ХешСумма", true), None);
         assert_eq!(type_member("DataHashing", "HashSum", true), None);
         assert_eq!(type_member("ХешированиеДанных", "Добавить", false), Some(v("8.3.1")));
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn a_misdated_type_reads_as_undated_in_both_languages() {
+        assert_eq!(platform_type("РежимРедактированияКолонки"), None);
+        assert_eq!(platform_type("ColumnEditMode"), None);
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn a_value_of_a_misdated_type_keeps_its_own_date() {
+        assert_eq!(
+            type_member("РежимРедактированияКолонки", "Непосредственно", true),
+            Some(v("8.0"))
+        );
+        // The control: the value that really is new keeps its own date, so correcting
+        // the type does not swallow a genuine finding.
+        assert_eq!(type_member("РежимРедактированияКолонки", "Авто", true), Some(v("8.5.1")));
+    }
+
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn the_corrections_leave_neighbouring_entries_dated() {
+        assert_eq!(platform_type("ВидПоляФормы"), Some(v("8.2")));
+        assert_eq!(
+            type_member("ТаблицаФормы", "ПоведениеПриСжатииПоГоризонтали", true),
+            Some(v("8.3.12"))
+        );
     }
 
     #[test]
