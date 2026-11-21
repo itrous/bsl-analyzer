@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use stdx::case::CaseExt;
 
 use dashmap::DashMap;
@@ -105,6 +105,7 @@ pub struct RootDatabaseImpl {
     prepared_metadata_inputs: bool,
 
     files: Files,
+    frozen_file_content: Arc<OnceLock<Arc<base_db::FrozenFileContentSnapshot>>>,
 
     /// Per-config-root revision inputs, keyed by the canonical root path. Shared
     /// across cloned database handles (snapshots) so every handle reads and bumps
@@ -204,6 +205,7 @@ impl Clone for RootDatabaseImpl {
             panic_revision: Arc::clone(&self.panic_revision),
             prepared_metadata_inputs: self.prepared_metadata_inputs,
             files: self.files.clone(),
+            frozen_file_content: Arc::clone(&self.frozen_file_content),
             config_revisions: Arc::clone(&self.config_revisions),
             metadata_listings: Arc::clone(&self.metadata_listings),
             type_kernel: Arc::clone(&self.type_kernel),
@@ -237,6 +239,20 @@ impl RootDatabaseImpl {
         self.prepared_metadata_inputs = true;
     }
 
+    /// Attach immutable file revisions and overlays for lazy batch reads.
+    pub fn set_frozen_file_content(&mut self, snapshot: Arc<base_db::FrozenFileContentSnapshot>) {
+        assert!(
+            self.frozen_file_content.set(snapshot).is_ok(),
+            "frozen file content can only be set once per database",
+        );
+    }
+
+    /// Use one root input for files in the frozen source root that are read lazily.
+    pub fn set_file_source_root_fallback(&mut self, source_root_id: base_db::SourceRootId) {
+        let files = self.files.clone();
+        files.set_file_source_root_fallback(self, source_root_id);
+    }
+
     fn new_inner(events_enabled: bool) -> Self {
         // Install the event callback (if any) before any input is created so it
         // observes the whole database lifetime, including the singleton inputs below.
@@ -256,6 +272,7 @@ impl RootDatabaseImpl {
             panic_revision: Arc::new(Mutex::new(None)),
             prepared_metadata_inputs: false,
             files: Files::new(),
+            frozen_file_content: Arc::new(OnceLock::new()),
             config_revisions: Arc::new(DashMap::default()),
             metadata_listings: Arc::new(DashMap::default()),
             type_kernel: Arc::new(TypeKernelInner::new()),
@@ -3045,6 +3062,10 @@ impl SourceDatabase for RootDatabaseImpl {
 
     fn try_file_revision_input(&self, file_id: FileId) -> Option<base_db::FileRevisionInput> {
         self.files.try_file_revision(file_id)
+    }
+
+    fn frozen_file_content_snapshot(&self) -> Option<&base_db::FrozenFileContentSnapshot> {
+        self.frozen_file_content.get().map(Arc::as_ref)
     }
 
     fn file_text(&self, file_id: FileId) -> std::sync::Arc<str> {

@@ -1,9 +1,9 @@
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use vfs::{FileId, VfsPath};
 
 mod change;
@@ -25,6 +25,35 @@ pub use queries::{
 };
 pub use scope::AnalysisScope;
 
+/// Frozen file inputs used by immutable batch databases that lazily read files
+/// outside their current lowering batch.
+#[derive(Debug, Clone)]
+pub struct FrozenFileContentSnapshot {
+    revisions: Arc<FxHashMap<FileId, u64>>,
+    open_revisions: FxHashMap<FileId, u64>,
+    open_texts: Arc<FxHashMap<FileId, Arc<str>>>,
+}
+
+impl FrozenFileContentSnapshot {
+    /// Creates a file-content view captured before a batch database is opened.
+    pub fn new(
+        revisions: Arc<FxHashMap<FileId, u64>>,
+        open_texts: Arc<FxHashMap<FileId, Arc<str>>>,
+    ) -> Self {
+        let open_revisions =
+            open_texts.iter().map(|(&file_id, text)| (file_id, content_revision(text))).collect();
+        Self { revisions, open_revisions, open_texts }
+    }
+
+    fn revision(&self, file_id: FileId) -> Option<u64> {
+        self.open_revisions.get(&file_id).copied().or_else(|| self.revisions.get(&file_id).copied())
+    }
+
+    fn open_text(&self, file_id: FileId) -> Option<&str> {
+        self.open_texts.get(&file_id).map(AsRef::as_ref)
+    }
+}
+
 #[salsa::db]
 pub trait SourceDatabase: salsa::Database {
     fn file_text_input(&self, file_id: FileId) -> FileTextInput;
@@ -34,6 +63,12 @@ pub trait SourceDatabase: salsa::Database {
     fn file_revision_input(&self, file_id: FileId) -> FileRevisionInput;
 
     fn try_file_revision_input(&self, file_id: FileId) -> Option<FileRevisionInput>;
+
+    /// Immutable file revisions and open buffers available as a lazy fallback.
+    /// Implementations must keep this snapshot fixed while Salsa memos can read it.
+    fn frozen_file_content_snapshot(&self) -> Option<&FrozenFileContentSnapshot> {
+        None
+    }
 
     fn source_root_input(&self, source_root_id: SourceRootId) -> SourceRootInput;
 
@@ -164,6 +199,7 @@ pub struct Files {
     file_revisions: Arc<DashMap<FileId, FileRevisionInput, BuildHasherDefault<FxHasher>>>,
     source_roots: Arc<DashMap<SourceRootId, SourceRootInput, BuildHasherDefault<FxHasher>>>,
     file_source_roots: Arc<DashMap<FileId, FileSourceRootInput, BuildHasherDefault<FxHasher>>>,
+    file_source_root_fallback: Arc<OnceLock<FileSourceRootInput>>,
     parse_snapshots: Arc<DashMap<FileId, ParseSnapshot, BuildHasherDefault<FxHasher>>>,
     parse_counters: Arc<ParseCounters>,
     disk_drifts: Arc<AtomicU64>,
@@ -456,16 +492,47 @@ impl Files {
     }
 
     pub fn file_source_root(&self, file_id: FileId) -> FileSourceRootInput {
-        self.file_source_roots.get(&file_id).map(|entry| *entry.value()).unwrap_or_else(|| {
+        self.try_file_source_root(file_id).unwrap_or_else(|| {
             tracing::error!(?file_id, "file source root not set — this is a programming error");
             panic!("file source root not set for {:?}", file_id)
         })
     }
 
-    /// Whether an explicit file→root registration exists, without weakening the
-    /// strict [`Self::file_source_root`] accessor used by source and text queries.
+    /// The explicit mapping, or the single-source-root fallback configured for an
+    /// immutable batch database.
     pub fn try_file_source_root(&self, file_id: FileId) -> Option<FileSourceRootInput> {
-        self.file_source_roots.get(&file_id).map(|entry| *entry.value())
+        self.file_source_roots
+            .get(&file_id)
+            .map(|entry| *entry.value())
+            .or_else(|| self.file_source_root_fallback.get().copied())
+    }
+
+    /// Configure a fallback mapping for files in a single frozen source root.
+    /// Explicit per-file mappings still take precedence.
+    pub fn set_file_source_root_fallback(
+        &self,
+        db: &mut dyn SourceDatabase,
+        source_root_id: SourceRootId,
+    ) {
+        if let Some(existing) = self.file_source_root_fallback.get() {
+            assert_eq!(
+                existing.source_root_id(db),
+                source_root_id,
+                "a batch database cannot have fallbacks for multiple source roots",
+            );
+            return;
+        }
+
+        let durability = self
+            .source_roots
+            .get(&source_root_id)
+            .map(|input| input.root(db).durability())
+            .unwrap_or(salsa::Durability::LOW);
+        let input = FileSourceRootInput::builder(source_root_id).durability(durability).new(db);
+        assert!(
+            self.file_source_root_fallback.set(input).is_ok(),
+            "file source-root fallback was concurrently initialized",
+        );
     }
 
     /// The file→root mapping inherits the target root's durability (the root input
@@ -520,6 +587,7 @@ mod tests {
     struct TestDatabase {
         storage: salsa::Storage<Self>,
         files: Files,
+        frozen_file_content: Option<Arc<FrozenFileContentSnapshot>>,
         events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
@@ -532,6 +600,7 @@ mod tests {
                     move |event| events.lock().unwrap().push(format!("{:?}", event.kind))
                 }))),
                 files: Files::default(),
+                frozen_file_content: None,
                 events,
             }
         }
@@ -562,6 +631,10 @@ mod tests {
 
         fn try_file_revision_input(&self, file_id: FileId) -> Option<FileRevisionInput> {
             self.files.try_file_revision(file_id)
+        }
+
+        fn frozen_file_content_snapshot(&self) -> Option<&FrozenFileContentSnapshot> {
+            self.frozen_file_content.as_deref()
         }
 
         fn file_text(&self, file_id: FileId) -> Arc<str> {
@@ -1105,6 +1178,57 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn frozen_file_content_lazily_reads_overlay_and_revision_pinned_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let open_path = dir.path().join("open.bsl");
+        let closed_path = dir.path().join("closed.bsl");
+        let drift_path = dir.path().join("drift.bsl");
+        let open_disk = "Процедура НаДиске() КонецПроцедуры";
+        let open_buffer = "Процедура ВБуфере() КонецПроцедуры";
+        let closed_text = "Процедура Закрытая() КонецПроцедуры";
+        let drift_captured = "Процедура ДоИзменения() КонецПроцедуры";
+        std::fs::write(&open_path, open_disk).unwrap();
+        std::fs::write(&closed_path, closed_text).unwrap();
+        std::fs::write(&drift_path, drift_captured).unwrap();
+
+        let open_file = FileId(0);
+        let closed_file = FileId(1);
+        let drift_file = FileId(2);
+        let root_id = SourceRootId(0);
+        let mut file_set = FileSet::new();
+        file_set.insert(open_file, VfsPath::new(open_path.clone()));
+        file_set.insert(closed_file, VfsPath::new(closed_path.clone()));
+        file_set.insert(drift_file, VfsPath::new(drift_path.clone()));
+        let mut db = TestDatabase::default();
+        db.set_source_root(root_id, SourceRoot::new_local(file_set));
+        let files = db.files.clone();
+        files.set_file_source_root_fallback(&mut db, root_id);
+        db.frozen_file_content = Some(Arc::new(FrozenFileContentSnapshot::new(
+            Arc::new(FxHashMap::from_iter([
+                (open_file, content_revision(open_disk)),
+                (closed_file, content_revision(closed_text)),
+                (drift_file, content_revision(drift_captured)),
+            ])),
+            Arc::new(FxHashMap::from_iter([(open_file, Arc::<str>::from(open_buffer))])),
+        )));
+
+        std::fs::write(&open_path, "Процедура ПозжеНаДиске() КонецПроцедуры").unwrap();
+        std::fs::write(&drift_path, "Процедура ПослеСнимка() КонецПроцедуры").unwrap();
+
+        assert!(db.try_file_revision_input(open_file).is_none());
+        assert_eq!(&*db.file_text(open_file), open_buffer);
+        assert_eq!(&*db.file_text(closed_file), closed_text);
+        let drift = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.file_text(drift_file);
+        }))
+        .expect_err("a changed closed file must not escape the frozen revision");
+        assert!(matches!(
+            drift.downcast_ref::<salsa::Cancelled>(),
+            Some(salsa::Cancelled::PendingWrite)
+        ));
     }
 
     #[test]

@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use base_db::{SourceDatabase, SourceRoot, SourceRootId};
-use hir::{DefDatabase as _, ExternalRef, ModuleIndex};
+use base_db::{FrozenFileContentSnapshot, SourceDatabase, SourceRoot, SourceRootId};
 use ide::{GraphConfigCache, ModuleId, RootDatabaseImpl};
 use lsp_types::Url;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use vfs::FileId;
 
 use crate::mem_docs::FrozenMemDocs;
@@ -21,7 +20,7 @@ pub struct CallHierarchyIndexFrozenSnapshot {
     pub configs: Arc<ide::WorkspaceConfigsSnapshot>,
     pub creation_generation: u64,
     source_root: SourceRoot,
-    module_index: Arc<ModuleIndex>,
+    file_content: Arc<FrozenFileContentSnapshot>,
     config_cache: Arc<GraphConfigCache>,
 }
 
@@ -44,17 +43,14 @@ impl CallHierarchyIndexFrozenSnapshot {
             })
             .collect();
         let open_texts = Self::open_texts(&file_set, mem_docs);
-        let disk_revisions = file_set
+        let disk_revisions: FxHashMap<_, _> = file_set
             .keys()
             .map(|&file_id| (file_id, db.file_revision_input(file_id).revision(db)))
             .collect();
-        let module_paths: Vec<_> = file_set
-            .iter()
-            .filter_map(|(&file_id, path)| path.to_str().map(|path| (file_id, path.to_owned())))
-            .collect();
-        let module_index = ModuleIndex::build_from_paths(
-            module_paths.iter().map(|(file_id, path)| (*file_id, path.as_str())),
-        );
+        let file_content = Arc::new(FrozenFileContentSnapshot::new(
+            Arc::new(disk_revisions.clone()),
+            Arc::new(open_texts.clone()),
+        ));
         Self {
             source_root_id,
             file_set: Arc::new(file_set),
@@ -63,7 +59,7 @@ impl CallHierarchyIndexFrozenSnapshot {
             configs: db.workspace_configs_snapshot(),
             creation_generation,
             source_root,
-            module_index: Arc::new(module_index),
+            file_content,
             config_cache: Arc::new(GraphConfigCache::default()),
         }
     }
@@ -77,6 +73,10 @@ impl CallHierarchyIndexFrozenSnapshot {
     }
 
     fn materialize_with_open_texts(&self, open_texts: Arc<FxHashMap<FileId, Arc<str>>>) -> Self {
+        let file_content = Arc::new(FrozenFileContentSnapshot::new(
+            Arc::clone(&self.disk_revisions),
+            Arc::clone(&open_texts),
+        ));
         Self {
             source_root_id: self.source_root_id,
             file_set: Arc::clone(&self.file_set),
@@ -85,7 +85,7 @@ impl CallHierarchyIndexFrozenSnapshot {
             configs: Arc::clone(&self.configs),
             creation_generation: self.creation_generation,
             source_root: self.source_root.clone(),
-            module_index: Arc::clone(&self.module_index),
+            file_content,
             config_cache: Arc::clone(&self.config_cache),
         }
     }
@@ -111,55 +111,15 @@ impl CallHierarchyIndexFrozenSnapshot {
     }
 
     pub fn open_batch(&self, batch: &[ModuleId]) -> RootDatabaseImpl {
-        self.open_batch_with_referenced_files(batch, true)
-    }
-
-    fn open_batch_with_referenced_files(
-        &self,
-        batch: &[ModuleId],
-        register_referenced_files: bool,
-    ) -> RootDatabaseImpl {
         let mut db = RootDatabaseImpl::default();
         db.set_graph_config_cache(Arc::clone(&self.config_cache));
         db.set_source_root(self.source_root_id, self.source_root.clone());
+        db.set_file_source_root_fallback(self.source_root_id);
+        db.set_frozen_file_content(Arc::clone(&self.file_content));
         db.set_workspace_configs_snapshot((*self.configs).clone());
 
-        let mut registered = FxHashSet::default();
         let batch_files = self.register_files(&mut db, batch.iter().map(|module| module.file_id));
-        registered.extend(batch_files.iter().map(|(file_id, _)| *file_id));
         ide::warm_batch_config_roots(&db, &batch_files);
-
-        if register_referenced_files {
-            let mut referenced = FxHashSet::default();
-            for module in batch {
-                for external_ref in db.file_external_refs(*module).iter() {
-                    match external_ref {
-                        ExternalRef::QualifiedCall { receiver, .. } => {
-                            referenced.extend(
-                                self.module_index
-                                    .common_module_candidates(receiver)
-                                    .iter()
-                                    .copied(),
-                            );
-                        }
-                        ExternalRef::ManagerAccess { manager_type, object_name, .. } => {
-                            referenced.extend(
-                                self.module_index
-                                    .manager_candidates(*manager_type, object_name)
-                                    .iter()
-                                    .copied(),
-                            );
-                        }
-                    }
-                }
-            }
-
-            let mut referenced: Vec<_> =
-                referenced.into_iter().filter(|file_id| !registered.contains(file_id)).collect();
-            referenced.sort_unstable();
-            let referenced_files = self.register_files(&mut db, referenced);
-            ide::warm_batch_config_roots(&db, &referenced_files);
-        }
         db
     }
 
@@ -203,7 +163,7 @@ impl CallHierarchyIndexFrozenSnapshot {
         if representatives.is_empty() {
             return;
         }
-        drop(self.open_batch_with_referenced_files(&representatives, false));
+        drop(self.open_batch(&representatives));
     }
 }
 
