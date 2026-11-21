@@ -2,20 +2,20 @@
 
 ## Description
 
-`New CallbackDescription("HandlerName", Receiver)` names its handler by a string. `NotifyDescription` and `ОписаниеОповещения` are also recognized. The platform calls the handler only as an EXPORTED method of the receiver module. If the procedure is declared without `Export`, or does not exist at all (a typo in the string), the code still compiles and the module check passes; the failure shows at run time as the modal error `Не найден экспортируемый метод: <HandlerName>`, and in a form's `BeforeClose` flow the form can no longer be closed.
+The platform type `ОписаниеОповещения` is also known as `NotifyDescription` and `CallbackDescription`. In the usual form, `New CallbackDescription("HandlerName", Receiver)` gives the handler name as a string. The platform calls the handler only as an EXPORTED method of the receiver module. If the procedure is declared without `Export`, or does not exist (for example, because the string contains a typo), the code still compiles and the module check passes; the failure occurs at run time as the modal error `Не найден экспортируемый метод: <HandlerName>`. In a form's `BeforeClose` flow, the form can no longer be closed.
 
 This was measured on platform 8.3.17.1549 in a managed form module.
 
-The diagnostic reports the registration (the `New NotifyDescription` call, not the declaration) when:
+The diagnostic reports the registration (the constructor call, not the declaration) when the receiver module is known:
 
-- the receiver is `ThisObject` / `ThisForm` and the module declares no method with that name, or declares it without `Export`;
-- the receiver is a common module of the configuration and that module declares no method with that name, or declares it without `Export`.
+- for `ThisObject` / `ThisForm`, when the current module has no method with that name or declares it without `Export`;
+- for a known common module, when that module has no method with that name or declares it without `Export`.
 
-When provided, the optional error handler's name and receiver (the fourth and fifth arguments) are checked independently of the primary handler. Compilation conditions on the registration and declaration are taken into account; an unavailable registration is not reported.
+When provided, the optional error handler's name and receiver (the fourth and fifth arguments) are checked independently of the primary handler. In the functional form `New("Type", ParameterArray)`, handlers are checked only when the contents of a local array can be established from a tracked sequence of construction steps; unknown contents or changes outside that sequence are not guessed. Compilation conditions on registrations and declarations are taken into account; an unavailable registration is not reported.
 
-The diagnostic stays silent when the receiver is not recognized as the current object or a known common module (for example, a local variable, including one containing a command module, or a module the analysis cannot see), when a module body could not be read, when the receiver is not a plain identifier, and in ordinary form modules. A form with a base form does not have its local handler checked: the base form may supply it. The rule also stays silent if the form kind or metadata is unknown. Unknown contents of the parameter array in the functional `New(Type, ParameterArray)` form are not guessed. Registrations inside comments are ignored. `AttachIdleHandler` and `SetAction` handlers are not checked.
+The diagnostic stays silent when the receiver is not recognized as the current object or a known common module (for example, a local variable, including one containing a command module, or a module the analysis cannot see), when a module body could not be read, when the receiver is not a plain name, and in ordinary form modules. If form metadata identifies a base form, the local handler is not checked because the base form may provide it. This suppression applies to the local handler; a known common-module receiver is still checked. The rule also stays silent if the form kind or metadata is unknown. Registrations inside comments are ignored. `AttachIdleHandler` and `SetAction` handlers are not checked by this diagnostic.
 
-Currently an empty handler name is also reported as missing, with a suggestion to create an exported procedure or correct the name. The separate `CommandModuleExportMethods` rule reports exported methods in command modules; the recommendations are not automatically reconciled.
+An empty handler name is currently reported as missing, and the current message suggests creating an exported procedure or correcting the name. The separate `CommandModuleExportMethods` rule reports exported methods in command modules; the wording of the recommendations is not automatically reconciled.
 
 ## Examples
 
