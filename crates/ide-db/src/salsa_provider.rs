@@ -171,10 +171,6 @@ impl AnalysisProvider for SalsaProvider<'_> {
         )
     }
 
-    fn form_may_have_base(&self, file_id: FileId) -> Option<bool> {
-        crate::queries::form_may_have_base(self.db, file_id)
-    }
-
     fn nonlocal_common_module_receiver(
         &self,
         file_id: FileId,

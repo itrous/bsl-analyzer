@@ -362,10 +362,6 @@ impl<'a> AnalysisContext<'a> {
         self.query(|p| p.module_metadata(module_id))
     }
 
-    pub(crate) fn form_may_have_base(&self) -> Option<bool> {
-        self.query(|p| p.form_may_have_base(self.file_id))
-    }
-
     pub(crate) fn qualified_method_export(
         &self,
         module_name: &hir::Name,

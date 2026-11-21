@@ -34,22 +34,17 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
-    // Whether the thick client demands `Экспорт` for these handlers has not been
-    // measured (the rule is established on managed forms), so stay silent there.
-    if ctx.is_ordinary_form_module() {
+    let metadata = ctx.module_metadata();
+    // The rule is established for managed forms only; missing metadata cannot
+    // prove either the form kind or whether a base form supplies the handler.
+    if metadata.module_type == bsl_metadata::ModuleType::FormModule
+        && !metadata.form.as_deref().is_some_and(|form| form.is_managed())
+    {
         return Vec::new();
     }
 
     // A borrowed form exposes its base module, which is not in this file's symbol tree.
-    // Missing form metadata cannot disprove that the form is borrowed.
-    let metadata = ctx.module_metadata();
-    let local_unprovable = match metadata.form.as_deref() {
-        Some(form) => form.has_base_form(),
-        None if metadata.module_type == bsl_metadata::ModuleType::FormModule => {
-            ctx.form_may_have_base().unwrap_or(true)
-        }
-        None => false,
-    };
+    let local_unprovable = metadata.form.as_deref().is_some_and(|form| form.has_base_form());
 
     let mut diagnostics = Vec::new();
     let mut module_verdicts = FxHashMap::default();
@@ -153,7 +148,7 @@ fn module_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{check_cfe_at_with_unreadable, format_diags};
+    use crate::test_utils::format_diags;
     use expect_test::expect;
     use test_fixture::CfeFixtureBuilder;
 
@@ -181,8 +176,7 @@ mod tests {
     }
 
     fn run(source: &str, fixture: test_fixture::CfeFixture) -> Vec<Diagnostic> {
-        let source = client_context_source(source);
-        check_cfe_at_with_unreadable(CALLER, &source, fixture, &[], check)
+        run_with_form_xml(source, PLAIN_FORM_XML, fixture)
     }
 
     fn run_local(source: &str) -> Vec<Diagnostic> {
@@ -463,8 +457,12 @@ mod tests {
                 &[],
                 crate::DiagnosticsConfig::all_enabled(),
                 |fixture| {
+                    let extension = fixture.extensions()[0].root();
+                    let form = extension.join("CommonForms/Форма1/Ext/Form.xml");
+                    std::fs::create_dir_all(form.parent().unwrap()).unwrap();
+                    std::fs::write(form, PLAIN_FORM_XML).unwrap();
                     if missing_extension_body {
-                        let ext_modules = fixture.extensions()[0].root().join("CommonModules");
+                        let ext_modules = extension.join("CommonModules");
                         std::fs::create_dir_all(&ext_modules).unwrap();
                         std::fs::copy(
                             fixture.root().join("CommonModules/МойМодульКлиент.xml"),
@@ -654,6 +652,37 @@ mod tests {
             },
             check,
         )
+    }
+
+    #[test]
+    fn a_form_with_unreadable_type_is_not_judged() {
+        let source = "&НаКлиенте\nПроцедура Тест()\n    О = Новый ОписаниеОповещения(\"НетОбработчика\", ЭтотОбъект);\n    П = Новый ОписаниеОповещения(\"НетВМодуле\", МойМодульКлиент);\nКонецПроцедуры\n";
+        for malformed in [false, true] {
+            let mut builder = CfeFixtureBuilder::new("");
+            builder
+                .add_base_module("МойМодульКлиент", "Процедура Другая() Экспорт\nКонецПроцедуры\n");
+            let diagnostics = crate::test_utils::check_cfe_at_with_db(
+                CALLER,
+                source,
+                builder.build(),
+                &[],
+                crate::DiagnosticsConfig::all_enabled(),
+                |fixture| {
+                    let form_dir = fixture.root().join("CommonForms/Форма1/Ext");
+                    std::fs::create_dir_all(form_dir.join("Form")).unwrap();
+                    if malformed {
+                        std::fs::write(form_dir.join("Form.xml"), "<").unwrap();
+                    }
+                },
+                |_, ctx| {
+                    let metadata = ctx.module_metadata();
+                    assert_eq!(metadata.module_type, bsl_metadata::ModuleType::FormModule);
+                    assert!(metadata.form.is_none());
+                    check(ctx)
+                },
+            );
+            assert!(diagnostics.is_empty(), "malformed={malformed}: {diagnostics:#?}");
+        }
     }
 
     /// A handler exported in the BASE form's module is not in this file's tree.

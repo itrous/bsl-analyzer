@@ -120,12 +120,6 @@ pub trait AnalysisProvider {
         None
     }
 
-    /// Whether a form whose metadata is unavailable might inherit a base form's module.
-    /// `None` means the provider cannot determine the owning configuration.
-    fn form_may_have_base(&self, _file_id: FileId) -> Option<bool> {
-        None
-    }
-
     /// Whether the nonlocal owner of `name` in `owner` is a common module.
     /// Providers without semantic name resolution cannot establish the answer.
     fn nonlocal_common_module_receiver(

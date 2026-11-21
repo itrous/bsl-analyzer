@@ -26,6 +26,13 @@ fn common_module_handler_selection_matches_the_graph() {
             DiagnosticsConfig::all_enabled(),
             |fixture| {
                 for (_, root) in fixture.config_paths() {
+                    let form = root.join("CommonForms/Форма1/Ext/Form.xml");
+                    std::fs::create_dir_all(form.parent().unwrap()).unwrap();
+                    std::fs::write(
+                        form,
+                        r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20"><Events/></Form>"#,
+                    )
+                    .unwrap();
                     let path = root.join("CommonModules/Модуль.xml");
                     let xml = std::fs::read_to_string(&path).unwrap().replace(
                         "<ClientManagedApplication>false</ClientManagedApplication>",
@@ -564,13 +571,13 @@ fn form_with_unread_dialog(extension: bool, base_mapped: bool, malformed: bool) 
 }
 
 #[test]
-fn unread_extension_form_metadata_does_not_hide_the_paired_base_module() {
+fn unread_form_metadata_never_proves_the_form_is_managed() {
     for malformed in [false, true] {
         for base_mapped in [true, false] {
             let diagnostics = form_with_unread_dialog(true, base_mapped, malformed);
             assert!(diagnostics.is_empty(), "a base form can own the handler: {diagnostics:#?}");
         }
         let diagnostics = form_with_unread_dialog(false, false, malformed);
-        assert_eq!(diagnostics.len(), 1, "a base form has no paired module: {diagnostics:#?}");
+        assert!(diagnostics.is_empty(), "the base form kind is also unknown: {diagnostics:#?}");
     }
 }
