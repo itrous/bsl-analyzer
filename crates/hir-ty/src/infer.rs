@@ -2796,6 +2796,31 @@ impl<'db> InferenceContext<'db> {
         })
     }
 
+    /// Whether the receiver is an item of a managed form whose item set the form itself
+    /// fixes, so the walk needs no path analysis to vouch for its type.
+    ///
+    /// The every-path gate guards against a receiver that is a local holding another type on
+    /// another path. `Элементы.<Имя>` is no such thing: the items collection of a managed
+    /// form cannot be rebound, and which item the name picks out is decided by the form
+    /// description, not by the flow. The conditions are the ones
+    /// [`InferenceDiagnostic::UnresolvedField`] already applies to the item NAME one level
+    /// up: the module must not change the item set itself, the item must not be one the
+    /// platform generates, and an extension must not have added it.
+    fn form_control_fixed_by_the_form(&self, receiver_expr: ExprId) -> bool {
+        let Expr::Field { base, field: item } = self.body.expr(receiver_expr) else {
+            return false;
+        };
+        let items_ty = match self.expr_types.get(&ExprId::from_idx(*base)).copied() {
+            Some(ty) => ty,
+            None => return false,
+        };
+        let resolver = self.get_resolver();
+        crate::form_items::is_form_items_collection_ty(self.db, items_ty)
+            && crate::form_items::managed_form_items_closed(self.db, &resolver)
+            && !crate::form_items::may_be_generated_item_name(self.db, &resolver, item)
+            && !self.extension_form_lists_item(item)
+    }
+
     /// The method counterpart of [`Self::platform_field_miss_holds_on_every_path`]: a
     /// parameter written with a range on one path still holds the caller's value on the
     /// other, and that value may well have the method.
@@ -2960,6 +2985,10 @@ impl<'db> InferenceContext<'db> {
     fn closed_platform_type_candidate(&self, ty: TypeId) -> Option<String> {
         match self.db.lookup_type(ty) {
             TypeKind::PlatformObject(facet) => Some(facet.name.clone()),
+            TypeKind::FormControl { kind, .. } => {
+                let chain = hir_def::ty::form_control_platform_type_chain(*kind);
+                (chain.len() == 1).then(|| chain[0].to_string())
+            }
             TypeKind::ValueTable(_) => Some("ТаблицаЗначений".to_string()),
             _ => None,
         }
@@ -4116,7 +4145,8 @@ impl<'db> InferenceContext<'db> {
                     let base_id = ExprId::from_idx(*base);
                     let closed_platform_object = self
                         .is_closed_platform_object(base_ty, MemberSurface::Fields)
-                        && self.platform_field_miss_holds_on_every_path(base_id, field);
+                        && (self.platform_field_miss_holds_on_every_path(base_id, field)
+                            || self.form_control_fixed_by_the_form(base_id));
                     // A metadata object read through a local is typed by the local's textually
                     // latest write; after `Если … ИначеЕсли` another branch may have written an
                     // object of another kind that owns the field, so the miss must hold for
