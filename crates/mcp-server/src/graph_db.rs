@@ -29,8 +29,10 @@ use stdx::batch::BatchBudget;
 use vfs::FileId;
 
 #[cfg(test)]
+use crate::graph::input::build_source_root;
+#[cfg(test)]
 use crate::graph::input::enumerate_bsl_files;
-use crate::graph::input::{build_source_root, db_for_files};
+use crate::graph::input::{db_for_files, db_for_files_in_snapshot, GraphBatchSnapshot};
 
 /// Bumped whenever the table layout OR the persisted edge/node content changes so a
 /// stale on-disk cache from an older binary is rejected (via the `meta` row) and
@@ -1181,10 +1183,10 @@ pub(crate) fn build_graph_database_inner(
         ),
     );
 
-    // The whole-workspace source root, built once and shared (cheap `Arc` clone)
-    // into every per-batch database, so the 25k-path file set is assembled a single
-    // time for the build rather than re-cloned per batch.
-    let source_root = build_source_root(files);
+    // One immutable source root and file-revision view serve every batch. Capturing
+    // revisions here lets cross-batch resolution read lazily without registering the
+    // whole workspace in every temporary database.
+    let source_snapshot = GraphBatchSnapshot::capture(files);
 
     let mut writer = GraphDbWriter::create(out_path)?;
     writer.set_workspace_roots(project.search_roots.as_ref());
@@ -1229,8 +1231,12 @@ pub(crate) fn build_graph_database_inner(
         let mut open_batch = |batch: &[ModuleId]| -> RootDatabaseImpl {
             let batch_files: Vec<(FileId, PathBuf)> =
                 batch.iter().map(|m| (m.file_id, file_paths[&m.file_id].clone())).collect();
-            let loaded =
-                db_for_files(&source_root, &batch_files, &project.configs, Some(&config_cache));
+            let loaded = db_for_files_in_snapshot(
+                &source_snapshot,
+                &batch_files,
+                &project.configs,
+                Some(&config_cache),
+            );
             unread.extend(loaded.unread);
             loaded.db
         };
@@ -1258,8 +1264,16 @@ pub(crate) fn build_graph_database_inner(
     let (summary, mut writer) = match (built, writer.finish()) {
         (Ok(summary), Ok(writer)) => (summary, writer),
         (_, Err(writer_error)) => return Err(writer_error),
-        (Err(build_error), Ok(_)) => return Err(build_error),
+        (Err(build_error), Ok(_)) => {
+            if source_snapshot.has_drifted() {
+                anyhow::bail!("graph source changed after the frozen batch snapshot was captured");
+            }
+            return Err(build_error);
+        }
     };
+    if source_snapshot.has_drifted() {
+        anyhow::bail!("graph source changed after the frozen batch snapshot was captured");
+    }
 
     // Persist a per-file fingerprint for every graph-relevant file (`.bsl` + `.xml`),
     // from the SAME scanned universe the build lowered — not a fresh walk, which
@@ -1826,7 +1840,7 @@ pub(crate) fn compute_body_patch_with_metadata(
         });
     }
 
-    let source_root = build_source_root(files);
+    let source_snapshot = GraphBatchSnapshot::capture(files);
     let config_cache = std::sync::Arc::new(ide::GraphConfigCache::default());
     // The patch's own report covers the WHOLE universe, not just `changed`: the
     // index pass opens `all_modules` through this same closure.
@@ -1834,8 +1848,12 @@ pub(crate) fn compute_body_patch_with_metadata(
     let mut open_batch = |batch: &[ModuleId]| -> RootDatabaseImpl {
         let batch_files: Vec<(FileId, PathBuf)> =
             batch.iter().map(|m| (m.file_id, file_paths[&m.file_id].clone())).collect();
-        let loaded =
-            db_for_files(&source_root, &batch_files, &project.configs, Some(&config_cache));
+        let loaded = db_for_files_in_snapshot(
+            &source_snapshot,
+            &batch_files,
+            &project.configs,
+            Some(&config_cache),
+        );
         unread.extend(loaded.unread);
         loaded.db
     };
@@ -1877,7 +1895,13 @@ pub(crate) fn compute_body_patch_with_metadata(
             None,
             Some(&ticker),
         )
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        .map_err(|error| {
+            if source_snapshot.has_drifted() {
+                anyhow::anyhow!("graph source changed after the frozen batch snapshot was captured")
+            } else {
+                anyhow::anyhow!("{error}")
+            }
+        })?;
         ide::ReprojectedRows {
             nodes: projected_nodes,
             edges: projected_edges,
@@ -1904,7 +1928,13 @@ pub(crate) fn compute_body_patch_with_metadata(
             &mut open_batch,
             Some(&ticker),
         )
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .map_err(|error| {
+            if source_snapshot.has_drifted() {
+                anyhow::anyhow!("graph source changed after the frozen batch snapshot was captured")
+            } else {
+                anyhow::anyhow!("{error}")
+            }
+        })?
     };
 
     // A form-module BSL add/remove changes whether the cold graph projects that
@@ -1975,8 +2005,8 @@ pub(crate) fn compute_body_patch_with_metadata(
                 .iter()
                 .map(|module| (module.file_id, file_paths[&module.file_id].clone()))
                 .collect();
-            let loaded = db_for_files(
-                &source_root,
+            let loaded = db_for_files_in_snapshot(
+                &source_snapshot,
                 &projection_files,
                 &project.configs,
                 Some(&config_cache),
@@ -1998,6 +2028,10 @@ pub(crate) fn compute_body_patch_with_metadata(
             // matter which metadata owner changed. `clear_graph` below writes that
             // exact empty projection in the same transaction.
         }
+    }
+
+    if source_snapshot.has_drifted() {
+        anyhow::bail!("graph source changed after the frozen batch snapshot was captured");
     }
 
     let mut metadata_node_prefixes = Vec::new();

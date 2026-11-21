@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base_db::{SourceDatabase, SourceRoot, SourceRootId};
+use base_db::{FrozenFileContentSnapshot, SourceDatabase, SourceRoot, SourceRootId};
 use ide::RootDatabaseImpl;
 #[cfg(test)]
 use project_model::SourceSet;
+use rustc_hash::FxHashMap;
 use vfs::FileId;
 
 /// The whole workspace is loaded into a single source root.
@@ -227,6 +228,74 @@ pub(crate) fn enumerate_bsl_files(project: &ProjectSnapshot) -> Vec<(FileId, Pat
 
 pub(crate) use ide_host_core::build_source_root;
 
+/// One immutable source view shared by all batches of a graph build.
+///
+/// The source root makes every scanned file addressable; revisions are captured once
+/// so a batch can lazily read cross-batch files without registering every file in its
+/// temporary Salsa database.
+#[derive(Clone)]
+pub(crate) struct GraphBatchSnapshot {
+    source_root: SourceRoot,
+    file_content: Arc<FrozenFileContentSnapshot>,
+}
+
+impl GraphBatchSnapshot {
+    pub(crate) fn capture(files: &[(FileId, PathBuf)]) -> Self {
+        use rayon::prelude::*;
+
+        let captured: Vec<_> = files
+            .par_iter()
+            .map(|(file_id, path)| {
+                (
+                    *file_id,
+                    base_db::read_disk_text(path).map(|text| base_db::content_revision(&text)),
+                )
+            })
+            .collect();
+        let mut revisions = FxHashMap::with_capacity_and_hasher(captured.len(), Default::default());
+        let mut unreadable = Vec::new();
+        for (file_id, revision) in captured {
+            match revision {
+                Ok(revision) => {
+                    revisions.insert(file_id, revision);
+                }
+                Err(_) => unreadable.push(file_id),
+            }
+        }
+        let file_content = Arc::new(
+            FrozenFileContentSnapshot::new(
+                Arc::new(revisions),
+                Arc::new(FxHashMap::<FileId, Arc<str>>::default()),
+            )
+            .with_unreadable_files(unreadable),
+        );
+        Self { source_root: build_source_root(files), file_content }
+    }
+
+    fn install(&self, db: &mut RootDatabaseImpl) {
+        db.set_source_root(GRAPH_SOURCE_ROOT, self.source_root.clone());
+        db.set_file_source_root_fallback(GRAPH_SOURCE_ROOT);
+        db.set_frozen_file_content(Arc::clone(&self.file_content));
+    }
+
+    fn note_loaded_file(&self, file_id: FileId, text: &std::io::Result<String>) {
+        let matches_snapshot = match text {
+            Ok(text) => {
+                !self.file_content.is_unreadable(file_id)
+                    && self.file_content.revision(file_id) == Some(base_db::content_revision(text))
+            }
+            Err(_) => self.file_content.is_unreadable(file_id),
+        };
+        if !matches_snapshot {
+            self.file_content.note_drift();
+        }
+    }
+
+    pub(crate) fn has_drifted(&self) -> bool {
+        self.file_content.has_drifted()
+    }
+}
+
 /// A loaded batch database together with the paths whose bytes could not be read.
 ///
 /// The report exists because an unreadable file is registered with empty text and is
@@ -256,19 +325,46 @@ pub(crate) fn db_for_files(
     configs: &ide::WorkspaceConfigsSnapshot,
     config_cache: Option<&Arc<ide::GraphConfigCache>>,
 ) -> BatchLoad {
+    db_for_files_inner(source_root, batch_files, configs, config_cache, None)
+}
+
+/// Open one lowering batch against the build's shared immutable source snapshot.
+pub(crate) fn db_for_files_in_snapshot(
+    snapshot: &GraphBatchSnapshot,
+    batch_files: &[(FileId, PathBuf)],
+    configs: &ide::WorkspaceConfigsSnapshot,
+    config_cache: Option<&Arc<ide::GraphConfigCache>>,
+) -> BatchLoad {
+    db_for_files_inner(&snapshot.source_root, batch_files, configs, config_cache, Some(snapshot))
+}
+
+fn db_for_files_inner(
+    source_root: &SourceRoot,
+    batch_files: &[(FileId, PathBuf)],
+    configs: &ide::WorkspaceConfigsSnapshot,
+    config_cache: Option<&Arc<ide::GraphConfigCache>>,
+    snapshot: Option<&GraphBatchSnapshot>,
+) -> BatchLoad {
     let mut db = RootDatabaseImpl::default();
     if let Some(cache) = config_cache {
         db.set_graph_config_cache(Arc::clone(cache));
     }
-    db.set_source_root(GRAPH_SOURCE_ROOT, source_root.clone());
+    if let Some(snapshot) = snapshot {
+        snapshot.install(&mut db);
+    } else {
+        db.set_source_root(GRAPH_SOURCE_ROOT, source_root.clone());
+    }
     // The reads (and their UTF-8 checks) are independent, so they go to the pool;
     // the database inputs are then set in `batch_files` order as before.
     let texts: Vec<std::io::Result<String>> = {
         use rayon::prelude::*;
-        batch_files.par_iter().map(|(_, path)| std::fs::read_to_string(path)).collect()
+        batch_files.par_iter().map(|(_, path)| base_db::read_disk_text(path)).collect()
     };
     let mut unread = Vec::new();
     for ((file_id, path), text) in batch_files.iter().zip(texts) {
+        if let Some(snapshot) = snapshot {
+            snapshot.note_loaded_file(*file_id, &text);
+        }
         db.set_file_source_root(*file_id, GRAPH_SOURCE_ROOT);
         match text {
             Ok(text) => db.set_file_text(*file_id, &text),
@@ -336,8 +432,9 @@ pub(super) fn load_workspace_db(
 
 #[cfg(test)]
 mod tests {
-    use super::ProjectSnapshot;
+    use super::{db_for_files_in_snapshot, GraphBatchSnapshot, ProjectSnapshot, GRAPH_SOURCE_ROOT};
     use crate::graph::test_support::write_common_module;
+    use base_db::SourceDatabase;
     use std::fs;
     use std::path::Path;
 
@@ -550,6 +647,106 @@ mod tests {
                 .any(|(_, path)| path.ends_with("CommonModules/Сервер/Ext/Module.bsl")),
             "the allowed sibling disappeared"
         );
+    }
+
+    #[test]
+    fn graph_batches_share_revisions_without_registering_the_whole_source_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<_> = (0..128)
+            .map(|index| {
+                let file_id = vfs::FileId(index);
+                let path = dir.path().join(format!("{index:03}.bsl"));
+                fs::write(&path, format!("Процедура М{index}() КонецПроцедуры")).unwrap();
+                (file_id, path)
+            })
+            .collect();
+        let snapshot = GraphBatchSnapshot::capture(&files);
+        let loaded = db_for_files_in_snapshot(
+            &snapshot,
+            &files[..1],
+            &ide::WorkspaceConfigsSnapshot::default(),
+            None,
+        );
+        let db = loaded.db;
+
+        assert_eq!(
+            db.source_root_input(GRAPH_SOURCE_ROOT).root(&db).iter().count(),
+            files.len(),
+            "every scanned path stays resolvable from the shared root",
+        );
+        let registered = files
+            .iter()
+            .filter(|(file_id, _)| db.try_file_revision_input(*file_id).is_some())
+            .count();
+        assert_eq!(registered, 1, "only the current module is registered in this batch");
+
+        let (target, path) = files.last().unwrap();
+        let text = fs::read_to_string(path).unwrap();
+        assert_eq!(&*db.file_text(*target), text, "a cross-batch file reads lazily");
+        assert!(db.try_file_revision_input(*target).is_none());
+        assert_eq!(
+            files
+                .iter()
+                .filter(|(file_id, _)| db.try_file_revision_input(*file_id).is_some())
+                .count(),
+            1,
+            "lazy reads do not turn the snapshot into per-file Salsa registrations",
+        );
+    }
+
+    #[test]
+    fn graph_batch_snapshot_marks_unreadable_and_detects_drift_on_lazy_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller = (vfs::FileId(0), dir.path().join("caller.bsl"));
+        let unreadable = (vfs::FileId(1), dir.path().join("unreadable.bsl"));
+        let drifted = (vfs::FileId(2), dir.path().join("drifted.bsl"));
+        fs::write(&caller.1, "Процедура Вызов() КонецПроцедуры").unwrap();
+        fs::write(&unreadable.1, [0xff, 0xfe]).unwrap();
+        fs::write(&drifted.1, "Процедура ДоСнимка() КонецПроцедуры").unwrap();
+        let files = [caller.clone(), unreadable.clone(), drifted.clone()];
+        let snapshot = GraphBatchSnapshot::capture(&files);
+        let loaded = db_for_files_in_snapshot(
+            &snapshot,
+            std::slice::from_ref(&caller),
+            &ide::WorkspaceConfigsSnapshot::default(),
+            None,
+        );
+        let db = loaded.db;
+        assert!(db.file_is_unread(unreadable.0));
+        assert_eq!(&*db.file_text(unreadable.0), "", "unreadable cross-batch reads stay empty");
+        assert!(!snapshot.has_drifted(), "the captured unreadable state matches disk");
+
+        fs::write(&drifted.1, "Процедура ПослеСнимка() КонецПроцедуры").unwrap();
+        let drift = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.file_text(drifted.0);
+        }))
+        .expect_err("a cross-batch disk read cannot escape its frozen revision");
+        assert!(
+            matches!(
+                drift.downcast_ref::<salsa::Cancelled>(),
+                Some(salsa::Cancelled::PendingWrite)
+            ),
+            "drift unwinds as a pending write, not a mixed source result",
+        );
+        assert!(snapshot.has_drifted(), "all batches observe the shared drift mark");
+    }
+
+    #[test]
+    fn a_batch_load_detects_drift_from_its_frozen_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = (vfs::FileId(0), dir.path().join("module.bsl"));
+        fs::write(&file.1, "Процедура ДоСнимка() КонецПроцедуры").unwrap();
+        let snapshot = GraphBatchSnapshot::capture(std::slice::from_ref(&file));
+        fs::write(&file.1, "Процедура ПослеСнимка() КонецПроцедуры").unwrap();
+
+        let loaded = db_for_files_in_snapshot(
+            &snapshot,
+            std::slice::from_ref(&file),
+            &ide::WorkspaceConfigsSnapshot::default(),
+            None,
+        );
+        assert!(snapshot.has_drifted(), "the batch text differs from the captured revision");
+        assert!(loaded.unread.is_empty(), "content drift is not mislabeled as unreadable");
     }
 
     #[test]

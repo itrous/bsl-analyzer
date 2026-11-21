@@ -9588,6 +9588,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_cross_batch_callback_registration_resolves_its_external_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        write_common_module(
+            root,
+            "Обработчики",
+            false,
+            "&НаКлиенте\nПроцедура ПослеЗакрытия(Результат, Параметры) Экспорт\nКонецПроцедуры",
+        );
+        write_common_module(
+            root,
+            "Регистрация",
+            false,
+            "&НаКлиенте\nПроцедура Создать() Экспорт\n\
+             Описание = Новый ОписаниеОповещения(\"ПослеЗакрытия\", Обработчики);\n\
+             КонецПроцедуры",
+        );
+
+        let project = crate::graph::ProjectSnapshot::load(root);
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        assert_eq!(universe.files.len(), 2, "the stand has exactly two BSL modules");
+        let out = root.join(".build/cross-batch-callback.db");
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        crate::graph_db::build_graph_database(
+            &project,
+            &universe,
+            &out,
+            stdx::batch::BatchBudget::files(1),
+            &crate::graph_db::GraphMeta {
+                revision: 1,
+                fingerprint: crate::graph_db::GraphFp::default(),
+                files: 0,
+                built_at: "t".to_owned(),
+                publication_id: "cross-batch-callback".to_owned(),
+            },
+        )
+        .expect("the callback registration builds in a separate batch from its target");
+
+        let (_, edges, _, _) = dump_data(&out);
+        assert!(
+            edges.iter().any(|edge| {
+                edge.contains("method/common/Регистрация/Создать")
+                    && edge.contains("method/common/Обработчики/ПослеЗакрытия")
+                    && edge.contains("Text(\"notify_ref\")")
+            }),
+            "the actual callback registration resolves its cross-batch handler: {edges:?}",
+        );
+    }
+
     /// Every edge kind a body produces has a recorded span, so none of them may answer
     /// `no_call_site` — and none may answer `source_drifted` on a freshly built artefact.
     ///
@@ -11892,6 +11943,7 @@ mod form_twin_tests {
         .expect("existing catalog attribute edit is a local owner delta");
         let semantic_hash = crate::graph::scan::xml_semantic_hash_file(&metadata_path)
             .map(|hash| u64::from_le_bytes(hash[..8].try_into().expect("blake3 hash >= 8 bytes")));
+        // Separate the form modules from the representative to exercise frozen cross-batch reads.
         let patch = crate::graph_db::compute_body_patch_with_metadata(
             &project,
             &universe,
@@ -11901,7 +11953,7 @@ mod form_twin_tests {
             &owners,
             &forms,
             &[(metadata_path.clone(), semantic_hash)],
-            GRAPH_BUILD_BATCH,
+            stdx::batch::BatchBudget::files(1),
         )
         .unwrap();
         assert!(

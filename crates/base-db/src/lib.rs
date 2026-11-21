@@ -1,9 +1,9 @@
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use vfs::{FileId, VfsPath};
 
 mod change;
@@ -32,6 +32,8 @@ pub struct FrozenFileContentSnapshot {
     revisions: Arc<FxHashMap<FileId, u64>>,
     open_revisions: FxHashMap<FileId, u64>,
     open_texts: Arc<FxHashMap<FileId, Arc<str>>>,
+    unreadable: Arc<FxHashSet<FileId>>,
+    drifted: Arc<AtomicBool>,
 }
 
 impl FrozenFileContentSnapshot {
@@ -42,15 +44,50 @@ impl FrozenFileContentSnapshot {
     ) -> Self {
         let open_revisions =
             open_texts.iter().map(|(&file_id, text)| (file_id, content_revision(text))).collect();
-        Self { revisions, open_revisions, open_texts }
+        Self {
+            revisions,
+            open_revisions,
+            open_texts,
+            unreadable: Arc::default(),
+            drifted: Arc::new(AtomicBool::new(false)),
+        }
     }
 
-    fn revision(&self, file_id: FileId) -> Option<u64> {
-        self.open_revisions.get(&file_id).copied().or_else(|| self.revisions.get(&file_id).copied())
+    /// Marks files whose captured bytes could not be decoded as source text.
+    pub fn with_unreadable_files(mut self, file_ids: impl IntoIterator<Item = FileId>) -> Self {
+        self.unreadable = Arc::new(file_ids.into_iter().collect());
+        self
+    }
+
+    /// The revision captured for a file, including the empty input used for unreadable files.
+    pub fn revision(&self, file_id: FileId) -> Option<u64> {
+        self.open_revisions
+            .get(&file_id)
+            .copied()
+            .or_else(|| self.revisions.get(&file_id).copied())
+            .or_else(|| self.is_unreadable(file_id).then(|| content_revision("")))
+    }
+
+    /// Whether the captured source could not be read as UTF-8.
+    pub fn is_unreadable(&self, file_id: FileId) -> bool {
+        self.unreadable.contains(&file_id)
+    }
+
+    /// Record that a file no longer matches this immutable source view.
+    pub fn note_drift(&self) {
+        self.drifted.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether any consumer observed content that disagreed with this source view.
+    pub fn has_drifted(&self) -> bool {
+        self.drifted.load(Ordering::SeqCst)
     }
 
     fn open_text(&self, file_id: FileId) -> Option<&str> {
-        self.open_texts.get(&file_id).map(AsRef::as_ref)
+        self.open_texts
+            .get(&file_id)
+            .map(AsRef::as_ref)
+            .or_else(|| self.is_unreadable(file_id).then_some(""))
     }
 }
 
@@ -431,7 +468,13 @@ impl Files {
     /// a crash; `false` keeps the pre-existing behaviour for a file we know nothing
     /// about.
     pub fn file_is_unread(&self, db: &dyn SourceDatabase, file_id: FileId) -> bool {
-        self.file_revisions.get(&file_id).map(|e| e.value().unreadable(db)).unwrap_or(false)
+        self.file_revisions
+            .get(&file_id)
+            .map(|entry| entry.value().unreadable(db))
+            .or_else(|| {
+                db.frozen_file_content_snapshot().map(|snapshot| snapshot.is_unreadable(file_id))
+            })
+            .unwrap_or(false)
     }
 
     pub fn set_file_text_smart(&self, db: &mut dyn SourceDatabase, file_id: FileId, text: &str) {
@@ -1229,6 +1272,37 @@ mod tests {
             drift.downcast_ref::<salsa::Cancelled>(),
             Some(salsa::Cancelled::PendingWrite)
         ));
+        assert!(
+            db.frozen_file_content.as_ref().unwrap().has_drifted(),
+            "a lazy read records drift on the shared frozen snapshot",
+        );
+    }
+
+    #[test]
+    fn frozen_unreadable_files_stay_empty_and_are_marked_without_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unreadable.bsl");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        let file_id = FileId(5);
+        let mut file_set = FileSet::new();
+        file_set.insert(file_id, VfsPath::new(path));
+
+        let mut db = TestDatabase::default();
+        let root_id = SourceRootId(0);
+        db.set_source_root(root_id, SourceRoot::new_local(file_set));
+        let files = db.files.clone();
+        files.set_file_source_root_fallback(&mut db, root_id);
+        db.frozen_file_content = Some(Arc::new(
+            FrozenFileContentSnapshot::new(
+                Arc::new(FxHashMap::default()),
+                Arc::new(FxHashMap::default()),
+            )
+            .with_unreadable_files([file_id]),
+        ));
+
+        assert!(db.try_file_revision_input(file_id).is_none());
+        assert!(db.file_is_unread(file_id));
+        assert_eq!(&*db.file_text(file_id), "");
     }
 
     #[test]
