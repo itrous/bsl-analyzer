@@ -2418,7 +2418,9 @@ impl<'db> InferenceContext<'db> {
             .collect();
         let mut assignment_scopes = FxHashMap::default();
         for (key, (name, scopes)) in std::mem::take(&mut self.notify_body_assignments) {
-            if receiver_names.contains(&key) && self.assignment_can_declare_implicit_local(&name) {
+            if receiver_names.contains(&key)
+                && (is_self_name(key.as_str()) || self.assignment_can_declare_implicit_local(&name))
+            {
                 assignment_scopes.insert(key, scopes);
             }
         }
