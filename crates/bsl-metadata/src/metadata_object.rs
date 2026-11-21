@@ -746,6 +746,13 @@ pub enum AttributeType {
     DefinedType {
         name: String,
     },
+    /// `cfg:Characteristic.<Имя>` — a characteristic value constrained by the chart of
+    /// characteristic types `name`. Not a `Ref` to that chart: the actual type of the
+    /// value is decided by the data through the chart's `ТипЗначения`, so the field set
+    /// behind it is unknown, whereas a genuine chart reference has a complete one.
+    CharacteristicValue {
+        name: String,
+    },
     Composite {
         types: Vec<AttributeType>,
     },
@@ -769,6 +776,7 @@ impl AttributeType {
             Self::Ref { name, .. }
             | Self::InformationRegisterRecordManager { name }
             | Self::DefinedType { name }
+            | Self::CharacteristicValue { name }
             | Self::PlatformNamed(name) => name.capacity(),
             Self::Composite { types } => {
                 stdx::heap::vec_bytes::<AttributeType>(types.len())
@@ -1173,6 +1181,9 @@ impl std::fmt::Display for AttributeType {
             Self::ValueStorage => write!(f, "ХранилищеЗначения"),
             Self::DefinedType { name } => {
                 write!(f, "ОпределяемыйТип.{}", name)
+            }
+            Self::CharacteristicValue { name } => {
+                write!(f, "ПланВидовХарактеристик.{}", name)
             }
             Self::Composite { types } => {
                 if types.is_empty() {

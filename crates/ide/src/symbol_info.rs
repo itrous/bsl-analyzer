@@ -721,6 +721,10 @@ fn static_type_variants(
         AttributeType::Date | AttributeType::DateTime => Some("Дата".to_string()),
         AttributeType::Ref { mdo_type, name } => root_metadata_ref_type(db, *mdo_type, name)
             .map(|type_id| kernel_type_label(db, type_id, Locale::Ru, false)),
+        AttributeType::CharacteristicValue { name } => {
+            root_metadata_ref_type(db, MdoType::ChartOfCharacteristicTypes, name)
+                .map(|type_id| kernel_type_label(db, type_id, Locale::Ru, false))
+        }
         AttributeType::InformationRegisterRecordManager { .. } => Some(attr_type.to_string()),
         AttributeType::AnyRef => Some("ЛюбаяСсылка".to_string()),
         AttributeType::Uuid => Some("УникальныйИдентификатор".to_string()),

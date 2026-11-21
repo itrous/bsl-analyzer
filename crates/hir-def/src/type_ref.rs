@@ -83,6 +83,14 @@ impl TypeRef {
                 ])),
                 None => TypeRef::Unknown,
             },
+            // Same name the chart reference produced: BSL-side verdicts are unchanged until a
+            // consumer opts into treating a characteristic value's composition as unknown.
+            AttributeType::CharacteristicValue { name } => {
+                TypeRef::Name(QualifiedName::from_segments([
+                    Name::new("ChartOfCharacteristicTypesRef"),
+                    Name::new(name),
+                ]))
+            }
             AttributeType::InformationRegisterRecordManager { name } => {
                 TypeRef::Name(QualifiedName::from_segments([
                     Name::new("InformationRegisterRecordManager"),
