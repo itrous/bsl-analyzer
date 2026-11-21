@@ -295,6 +295,127 @@ fn notify_registrations_use_live_branches_and_type_availability() {
 }
 
 #[test]
+fn notify_receiver_assignments_shadow_only_overlapping_environments() {
+    const CALLER: &str = "CommonModules/Caller/Ext/Module.bsl";
+    let cases = [
+        (
+            "no assignment",
+            r#"#Если ТонкийКлиент Тогда
+    О = Новый ОписаниеОповещения("Один", Handlers);
+#КонецЕсли"#,
+            1,
+        ),
+        (
+            "server assignment and thin-client registration",
+            r#"#Если Сервер И Не ТолстыйКлиентУправляемоеПриложение Тогда
+    Handlers = Неопределено;
+#КонецЕсли
+#Если ТонкийКлиент Тогда
+    О = Новый ОписаниеОповещения("Один", Handlers);
+#КонецЕсли"#,
+            1,
+        ),
+        (
+            "overlapping assignment and registration",
+            r#"#Если ТонкийКлиент Тогда
+    Handlers = Неопределено;
+    О = Новый ОписаниеОповещения("Один", Handlers);
+#КонецЕсли"#,
+            0,
+        ),
+        (
+            "assignment in then branch does not shadow else registration",
+            r#"#Если ТонкийКлиент Тогда
+    Handlers = Неопределено;
+    О = Новый ОписаниеОповещения("ВТонком", Handlers);
+#Иначе
+    О = Новый ОписаниеОповещения("ВДругом", Handlers);
+#КонецЕсли"#,
+            1,
+        ),
+        (
+            "assignment in else branch does not shadow then registration",
+            r#"#Если ТонкийКлиент Тогда
+    О = Новый ОписаниеОповещения("ВТонком", Handlers);
+#Иначе
+    Handlers = Неопределено;
+    О = Новый ОписаниеОповещения("ВДругом", Handlers);
+#КонецЕсли"#,
+            1,
+        ),
+        (
+            "dead assignment does not shadow registration",
+            r#"#Если Сервер И Не Сервер Тогда
+    Handlers = Неопределено;
+#КонецЕсли
+#Если ТонкийКлиент Тогда
+    О = Новый ОписаниеОповещения("Один", Handlers);
+#КонецЕсли"#,
+            1,
+        ),
+        (
+            "unknown assignment environment conservatively shadows",
+            r#"#Если НеизвестнаяПлатформа Тогда
+    Handlers = Неопределено;
+#КонецЕсли
+#Если ТонкийКлиент Тогда
+    О = Новый ОписаниеОповещения("Один", Handlers);
+#КонецЕсли"#,
+            0,
+        ),
+        (
+            "English directives and CallbackDescription",
+            r#"#If ThinClient Then
+    hAnDlErS = Undefined;
+    О = Новый("CallbackDescription", "Один", Handlers);
+#EndIf"#,
+            0,
+        ),
+    ];
+
+    for (case, body, expected_module_targets) in cases {
+        let source = format!("&НаКлиентеНаСервере\nПроцедура Тест()\n{body}\nКонецПроцедуры\n");
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_base_module("Handlers", "Процедура Другая() Экспорт\nКонецПроцедуры\n");
+        let diagnostics = crate::test_utils::check_cfe_at_with_db(
+            CALLER,
+            &source,
+            builder.build(),
+            &[],
+            DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                enable_client_common_module(fixture, "Handlers");
+                write_client_common_module_metadata(fixture.root(), "Caller");
+            },
+            |db, ctx| {
+                let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+                let module_targets: Vec<_> = summary
+                    .notify_regs
+                    .iter()
+                    .filter_map(|reg| match &reg.target {
+                        NotifyTarget::Module(module) => Some(module),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    module_targets.len(),
+                    expected_module_targets,
+                    "{case}: {:#?}",
+                    summary.notify_regs
+                );
+                assert!(module_targets.iter().all(|module| module.as_str() == "Handlers"));
+                missing_notify_handler::check(ctx)
+            },
+        );
+        let missing: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+            .collect();
+        assert_eq!(missing.len(), expected_module_targets, "{case}: {diagnostics:#?}");
+    }
+}
+
+#[test]
 fn server_only_notify_constructors_are_not_diagnosed() {
     const CALLER: &str = "CommonForms/Форма1/Ext/Form/Module.bsl";
     const SOURCE: &str = r#"

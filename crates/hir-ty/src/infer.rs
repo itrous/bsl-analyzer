@@ -308,6 +308,22 @@ enum BareNameVerdict {
     Indeterminate,
 }
 
+#[derive(Clone, Copy)]
+struct NotifyEnvScope {
+    definite: hir_def::execution_env::EnvFlags,
+    possible: Option<hir_def::execution_env::EnvFlags>,
+}
+
+impl NotifyEnvScope {
+    fn may_overlap(self, other: Self) -> bool {
+        self.definite.intersects(other.definite)
+            || match (self.possible, other.possible) {
+                (Some(left), Some(right)) => left.intersects(right),
+                _ => true,
+            }
+    }
+}
+
 /// The receiver a bare name implicitly hangs off in the module being inferred.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ImplicitSelfSurface {
@@ -788,9 +804,11 @@ pub struct InferenceContext<'db> {
     /// as `UnresolvedMethodCall::ReceiverNotResolved`.
     bare_name_verdicts: FxHashMap<ExprId, BareNameVerdict>,
 
-    /// Receiver ownership is finalized after dead branches and body-wide assignments are known.
+    /// The active local-name set while each notification receiver is resolved.
     notify_body_local_names: FxHashSet<NormName>,
+    notify_body_assignments: FxHashMap<NormName, (Name, Vec<NotifyEnvScope>)>,
     notify_receiver_exprs: FxHashSet<ExprId>,
+    notify_receiver_envs: FxHashMap<ExprId, Option<NotifyEnvScope>>,
 
     /// Bare reads the cascade resolved as a local of this body; only these are
     /// judged by the definite-initialization check.
@@ -1224,7 +1242,9 @@ impl<'db> InferenceContext<'db> {
             assignment_targets: rustc_hash::FxHashSet::default(),
             bare_name_verdicts: FxHashMap::default(),
             notify_body_local_names: FxHashSet::default(),
+            notify_body_assignments: FxHashMap::default(),
             notify_receiver_exprs: FxHashSet::default(),
+            notify_receiver_envs: FxHashMap::default(),
             local_reads: FxHashSet::default(),
             calls_with_unread_target: rustc_hash::FxHashSet::default(),
             call_arg_bindings: Vec::new(),
@@ -2361,6 +2381,26 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
+    fn notify_env_scope(&self) -> Option<NotifyEnvScope> {
+        if self.in_dead_branch {
+            return None;
+        }
+        Some(NotifyEnvScope {
+            definite: self.body_env,
+            possible: (!self.possible_env.is_empty()).then_some(self.possible_env),
+        })
+    }
+
+    fn record_notify_assignment(&mut self, target: ExprIdx) {
+        let Some(scope) = self.notify_env_scope() else { return };
+        let Expr::Path(name) = self.body.expr_idx(target) else { return };
+        let key = NormName::intern(name.as_str());
+        self.notify_body_assignments
+            .entry(key)
+            .and_modify(|(_, scopes)| scopes.push(scope))
+            .or_insert_with(|| (name.clone(), vec![scope]));
+    }
+
     fn finish_notify_receiver_resolutions(
         &mut self,
     ) -> FxHashMap<ExprId, (BareNameOrigin, TypeId)> {
@@ -2376,33 +2416,27 @@ impl<'db> InferenceContext<'db> {
                 _ => None,
             })
             .collect();
-        let dead_stmts: FxHashSet<_> = self.dead_stmts.iter().copied().collect();
-        let mut checked_names = FxHashSet::default();
-        let assignment_names: Vec<Name> = self
-            .body
-            .stmts_iter()
-            .filter_map(|(stmt, statement)| {
-                if dead_stmts.contains(&stmt) {
-                    return None;
-                }
-                let Stmt::Assign { target, .. } = statement else { return None };
-                let Expr::Path(name) = self.body.expr_idx(*target) else { return None };
-                let key = NormName::intern(name.as_str());
-                (receiver_names.contains(&key) && checked_names.insert(key)).then(|| name.clone())
-            })
-            .collect();
-        self.notify_body_local_names.clear();
-        for name in assignment_names {
-            if self.assignment_can_declare_implicit_local(&name) {
-                self.notify_body_local_names.insert(NormName::intern(name.as_str()));
+        let mut assignment_scopes = FxHashMap::default();
+        for (key, (name, scopes)) in std::mem::take(&mut self.notify_body_assignments) {
+            if receiver_names.contains(&key) && self.assignment_can_declare_implicit_local(&name) {
+                assignment_scopes.insert(key, scopes);
             }
         }
 
+        self.notify_body_local_names.clear();
         receiver_exprs
             .into_iter()
             .filter_map(|expr| {
+                let scope = self.notify_receiver_envs.get(&expr).copied().flatten()?;
                 let Expr::Path(name) = self.body.expr(expr) else { return None };
                 let name = name.clone();
+                let key = NormName::intern(name.as_str());
+                self.notify_body_local_names.clear();
+                if assignment_scopes.get(&key).is_some_and(|scopes: &Vec<NotifyEnvScope>| {
+                    scopes.iter().any(|assignment| assignment.may_overlap(scope))
+                }) {
+                    self.notify_body_local_names.insert(key);
+                }
                 match self.resolve_bare_name(&name, expr, BareNameUse::NotifyReceiver) {
                     BareNameResolution::Resolved { ty, origin, .. } => Some((expr, (origin, ty))),
                     BareNameResolution::Absent | BareNameResolution::Indeterminate { .. } => None,
@@ -3745,6 +3779,7 @@ impl<'db> InferenceContext<'db> {
         let stmt = self.body.stmt_idx(stmt_idx).clone();
         match &stmt {
             Stmt::Assign { target, value } => {
+                self.record_notify_assignment(*target);
                 let value_ty = self.infer_expr(ExprId::from_idx(*value));
                 let target_id = ExprId::from_idx(*target);
                 let mut infer_target = true;
@@ -4376,7 +4411,10 @@ impl<'db> InferenceContext<'db> {
                 if let Some(base) = notify_base {
                     for receiver_idx in [base + 1, base + 4] {
                         if let Some(&receiver) = args.get(receiver_idx) {
-                            self.notify_receiver_exprs.insert(ExprId::from_idx(receiver));
+                            let receiver = ExprId::from_idx(receiver);
+                            let scope = self.notify_env_scope();
+                            self.notify_receiver_exprs.insert(receiver);
+                            self.notify_receiver_envs.entry(receiver).or_insert(scope);
                         }
                     }
                 }

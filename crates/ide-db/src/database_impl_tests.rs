@@ -3315,11 +3315,36 @@ fn test_workspace_call_graph_module_code_and_multiple_callers() {
     assert!(callers.iter().all(|e| !e.crosses_client_to_server));
 }
 
+fn managed_form_module_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("managed form fixture directory");
+    let forms_dir = dir.path().join("Catalogs/Товары/Forms");
+    let module_path = forms_dir.join("Форма/Ext/Form/Module.bsl");
+    let module_dir = module_path.parent().expect("form module directory");
+    std::fs::create_dir_all(module_dir).expect("create form module directory");
+    std::fs::write(&module_path, "").expect("write form module path anchor");
+    std::fs::write(
+        module_dir.parent().expect("form Ext directory").join("Form.xml"),
+        r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20"><Events /></Form>"#,
+    )
+    .expect("write managed form contents");
+    std::fs::write(
+        forms_dir.join("Форма.xml"),
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Form uuid="12345678-1234-1234-1234-123456789012">
+        <Properties><Name>Форма</Name><FormType>Managed</FormType></Properties>
+    </Form>
+</MetaDataObject>"#,
+    )
+    .expect("write managed form descriptor");
+    (dir, module_path)
+}
+
 #[test]
 fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods() {
     use hir::graph_index::{project_batch_method_call_pairs, GraphIndex};
 
-    const BASE_CALLER: &str = "Процедура Главная() Экспорт\n\
+    const BASE_CALLER: &str = "&НаКлиенте\n\
+         Процедура Главная() Экспорт\n\
          ЛокальнаяЦель();\n\
          Сервер.Считать();\n\
          Справочники.Контрагенты.НайтиПоИНН();\n\
@@ -3327,11 +3352,16 @@ fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods
          Оп2 = Новый ОписаниеОповещения(\"Считать\", Сервер);\n\
          ПодключитьОбработчикОжидания(\"ОбновитьЭкран\", 1);\n\
          КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ЛокальнаяЦель() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ЛокальныйОбработчик() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ОбновитьЭкран() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ОбработчикДействия() Экспорт КонецПроцедуры";
-    const IGNORED_CALLER: &str = "Процедура Главная() Экспорт\n\
+    const IGNORED_CALLER: &str = "&НаКлиенте\n\
+         Процедура Главная() Экспорт\n\
          ЛокальнаяЦель();\n\
          Сервер.Считать();\n\
          Справочники.Контрагенты.НайтиПоИНН();\n\
@@ -3342,13 +3372,19 @@ fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods
          Элементы.Кнопка.УстановитьДействие(\"Нажатие\", \"ОбработчикДействия\");\n\
          Запрос = Новый Запрос(\"ВЫБРАТЬ Ссылка ИЗ Справочник.Номенклатура\");\n\
          КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ЛокальнаяЦель() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ЛокальныйОбработчик() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ОбновитьЭкран() Экспорт КонецПроцедуры\n\
+         &НаКлиенте\n\
          Процедура ОбработчикДействия() Экспорт КонецПроцедуры\n\
          ЛокальнаяЦель();";
+    let (_form_fixture, caller_path) = managed_form_module_fixture();
+    let caller_path = caller_path.to_string_lossy().into_owned();
     let files = [
-        ("/src/CommonModules/Клиент/Ext/Module.bsl", BASE_CALLER),
+        (caller_path.as_str(), BASE_CALLER),
         ("/src/CommonModules/Сервер/Ext/Module.bsl", "Функция Считать() Экспорт КонецФункции"),
         (
             "/src/Catalogs/Контрагенты/Ext/ManagerModule.bsl",
@@ -3374,8 +3410,11 @@ fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods
         db
     };
 
-    // Given: direct, qualified, manager, and callback calls in one caller module.
+    // Given: direct, qualified, manager, and callback calls in a managed form module.
     let base = make_db(BASE_CALLER);
+    let caller_metadata = base.module_metadata(ModuleId::new(client));
+    assert_eq!(caller_metadata.module_type, bsl_metadata::ModuleType::FormModule);
+    assert!(caller_metadata.form.as_ref().is_some_and(|form| form.is_managed()));
     let index = GraphIndex::build(&base, &modules);
     let pool = rayon::ThreadPoolBuilder::new().build().expect("projection pool");
 
@@ -3446,6 +3485,98 @@ fn project_batch_method_pairs_include_resolved_callbacks_and_exclude_non_methods
         pairs,
         "module code, MDO, query, and SetAction additions must not alter the method-pair digest",
     );
+}
+
+#[test]
+fn client_common_module_named_thisobject_is_not_treated_as_form_self() {
+    use hir::call_graph::NotifyTarget;
+    use hir::graph_index::{project_batch_method_call_pairs, GraphIndex};
+    use hir::{MethodCallPair, MethodId};
+
+    let root = tempfile::tempdir().expect("common module fixture directory");
+    std::fs::write(
+        root.path().join("Configuration.xml"),
+        r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Configuration uuid="00000000-0000-0000-0000-000000000000">
+        <Properties><Name>Test</Name></Properties>
+    </Configuration>
+</MetaDataObject>"#,
+    )
+    .expect("write configuration descriptor");
+
+    let module_xml = |name: &str| {
+        format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000001">
+        <Properties>
+            <Name>{name}</Name><Server>false</Server><Global>false</Global>
+            <ClientManagedApplication>true</ClientManagedApplication>
+            <ClientOrdinaryApplication>true</ClientOrdinaryApplication>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#
+        )
+    };
+    let caller_source = "&НаКлиенте\n\
+         Процедура Главная() Экспорт\n\
+         Оп = Новый ОписаниеОповещения(\"Обработчик\", ЭтотОбъект);\n\
+         КонецПроцедуры\n\
+         &НаКлиенте\n\
+         Процедура Обработчик() Экспорт КонецПроцедуры";
+    let target_source = "&НаКлиенте\nПроцедура Обработчик() Экспорт КонецПроцедуры";
+    let caller = FileId(0);
+    let target = FileId(1);
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::new();
+    for (file_id, name, source) in
+        [(caller, "Клиент", caller_source), (target, "ЭтотОбъект", target_source)]
+    {
+        let module_dir = root.path().join("CommonModules").join(name);
+        std::fs::create_dir_all(module_dir.join("Ext")).expect("create common module directory");
+        let module_path = module_dir.join("Ext/Module.bsl");
+        std::fs::write(&module_path, source).expect("write common module body");
+        std::fs::write(
+            root.path().join("CommonModules").join(format!("{name}.xml")),
+            module_xml(name),
+        )
+        .expect("write common module descriptor");
+        file_set.insert(file_id, VfsPath::new(module_path.to_string_lossy().as_ref()));
+        db.set_file_source_root(file_id, SourceRootId(0));
+        db.set_file_text(file_id, source);
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_all_config_paths(vec![(None, root.path().to_path_buf())], None);
+
+    let caller_module = ModuleId::new(caller);
+    let target_module = ModuleId::new(target);
+    let caller_metadata = db.module_metadata(caller_module);
+    assert_eq!(caller_metadata.module_type, bsl_metadata::ModuleType::CommonModule);
+    assert!(caller_metadata
+        .common_module
+        .as_ref()
+        .is_some_and(|module| module.is_client_managed_application()));
+    let target_metadata = db.module_metadata(target_module);
+    assert!(target_metadata
+        .common_module
+        .as_ref()
+        .is_some_and(|module| module.is_client_managed_application()));
+
+    let summary = db.module_call_summary(caller_module);
+    assert!(summary.notify_regs.iter().any(|registration| {
+        matches!(&registration.target, NotifyTarget::Module(name) if name.as_str() == "ЭтотОбъект")
+    }));
+    let modules = [caller_module, target_module];
+    let index = GraphIndex::build(&db, &modules);
+    let pool = rayon::ThreadPoolBuilder::new().build().expect("projection pool");
+    let pairs = project_batch_method_call_pairs(&pool, &db, &index, &modules);
+    let caller_method =
+        MethodId { module: caller_module, local_id: hir::MethodKey::first("Главная") };
+    let module_handler =
+        MethodId { module: target_module, local_id: hir::MethodKey::first("Обработчик") };
+    let local_decoy =
+        MethodId { module: caller_module, local_id: hir::MethodKey::first("Обработчик") };
+    assert_eq!(pairs, vec![MethodCallPair::new(caller_method, module_handler)]);
+    assert!(!pairs.contains(&MethodCallPair::new(caller_method, local_decoy)));
 }
 
 #[test]
@@ -4059,9 +4190,11 @@ fn workspace_call_graph_via_index_matches_salsa_fold() {
     };
     use hir::ConfigsDatabase;
 
+    let (_form_fixture, caller_module_path) = managed_form_module_fixture();
+    let caller_module_path = caller_module_path.to_string_lossy().into_owned();
     let files: &[(&str, &str)] = &[
         (
-            "/src/CommonModules/Клиент/Ext/Module.bsl",
+            caller_module_path.as_str(),
             "&НаКлиенте\n\
              Процедура Главная() Экспорт\n\
              ЛокальнаяЦель();\n\
@@ -4112,6 +4245,10 @@ fn workspace_call_graph_via_index_matches_salsa_fold() {
         db.set_file_source_root(fid, SourceRootId(0));
         db.set_file_text(fid, text);
     }
+
+    let caller_metadata = db.module_metadata(ModuleId::new(FileId(0)));
+    assert_eq!(caller_metadata.module_type, bsl_metadata::ModuleType::FormModule);
+    assert!(caller_metadata.form.as_ref().is_some_and(|form| form.is_managed()));
 
     // Enumerate modules exactly as the fold does (same iteration order → same
     // edge insertion order, so the two graphs compare equal).
@@ -4253,11 +4390,14 @@ fn call_hierarchy_index_fixture_parity() {
     use rustc_hash::FxHashMap;
 
     // Given: all method-only call forms supported by the compact projection.
+    let (_form_fixture, caller_module_path) = managed_form_module_fixture();
+    let caller_module_path = caller_module_path.to_string_lossy().into_owned();
     let files: &[(FileId, &str, &str)] = &[
         (
             FileId(0),
-            "/src/CommonModules/Вызыватель/Ext/Module.bsl",
-            "Процедура Главная() Экспорт\n\
+            caller_module_path.as_str(),
+            "&НаКлиенте\n\
+             Процедура Главная() Экспорт\n\
              ЛокальнаяЦель();\n\
              Общий.Метод();\n\
              Справочники.Товары.МетодМенеджера();\n\
@@ -4265,9 +4405,13 @@ fn call_hierarchy_index_fixture_parity() {
              ПодключитьОбработчикОжидания(\"Ожидание\", 1);\n\
              УстановитьДействие(\"ПриНажатии\", \"Исключен\");\n\
              КонецПроцедуры\n\
+             &НаКлиенте\n\
              Процедура ЛокальнаяЦель() Экспорт КонецПроцедуры\n\
+             &НаКлиенте\n\
              Процедура Оповещение() Экспорт КонецПроцедуры\n\
+             &НаКлиенте\n\
              Процедура Ожидание() Экспорт КонецПроцедуры\n\
+             &НаКлиенте\n\
              Процедура Исключен() Экспорт КонецПроцедуры",
         ),
         (
@@ -4297,6 +4441,9 @@ fn call_hierarchy_index_fixture_parity() {
         db.set_file_source_root(file_id, source_root_id);
         db.set_file_text(file_id, text);
     }
+    let caller_metadata = db.module_metadata(ModuleId::new(FileId(0)));
+    assert_eq!(caller_metadata.module_type, bsl_metadata::ModuleType::FormModule);
+    assert!(caller_metadata.form.as_ref().is_some_and(|form| form.is_managed()));
     let modules: Vec<_> = files.iter().map(|(file_id, _, _)| ModuleId::new(*file_id)).collect();
 
     // When: the compact batch projection builds the reverse index.
