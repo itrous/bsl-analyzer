@@ -1,6 +1,8 @@
 use super::missing_notify_handler;
 use crate::{Diagnostic, DiagnosticsConfig, DiagnosticsContext};
-use hir::call_graph::{CallerId, EdgeKind, EdgeProvenance, NotifyTarget, ResolvedTarget};
+use hir::call_graph::{
+    CallerId, EdgeKind, EdgeProvenance, NotifyReceiverSyntax, NotifyTarget, ResolvedTarget,
+};
 use hir::{ConfigsDatabase, DefDatabase, ModuleId};
 use test_fixture::CfeFixtureBuilder;
 
@@ -157,10 +159,11 @@ fn this_form_receiver_can_resolve_to_a_client_common_module() {
         "external ThisForm handler should satisfy the registration: {diagnostics:#?}"
     );
     assert!(
-        diagnostics
-            .iter()
-            .all(|diagnostic| diagnostic.code != crate::DiagnosticCode::UnusedParameters),
-        "the registration name conservatively protects the local signature: {diagnostics:#?}"
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == crate::DiagnosticCode::UnusedParameters
+                && diagnostic.message.contains("НеИспользуется")
+        }),
+        "the local same-named method is not the registered handler: {diagnostics:#?}"
     );
 }
 
@@ -463,7 +466,7 @@ fn server_only_notify_constructors_are_not_diagnosed() {
 }
 
 #[test]
-fn notify_names_keep_local_parameters_regardless_of_environment() {
+fn unavailable_notify_regs_preserve_previous_signature_exemptions() {
     const CALLER: &str = "CommonModules/Caller/Ext/Module.bsl";
     const SOURCE: &str = r#"
 &НаКлиентеНаСервере
@@ -476,6 +479,9 @@ fn notify_names_keep_local_parameters_regardless_of_environment() {
 #КонецЕсли
 #Если МобильныйКлиент Тогда
     О = Новый ОписаниеОповещения("mObIlEhAnDlEr", ЭтотОбъект);
+    О = Новый ОписаниеОповещения("ForeignMobileHandler", ДругойМодуль);
+    О = Новый ОписаниеОповещения("OmittedReceiver");
+    О = Новый ОписаниеОповещения("PrimaryHandler", ЭтотОбъект,, "ForeignErrorHandler", ДругойМодуль);
 #КонецЕсли
 КонецПроцедуры
 
@@ -491,6 +497,26 @@ fn notify_names_keep_local_parameters_regardless_of_environment() {
 
 &НаКлиентеНаСервере
 Процедура MobileHandler(МобильныйПараметр)
+    Сообщить("handler");
+КонецПроцедуры
+
+&НаКлиентеНаСервере
+Процедура ForeignMobileHandler(ЧужойПараметр)
+    Сообщить("handler");
+КонецПроцедуры
+
+&НаКлиентеНаСервере
+Процедура OmittedReceiver(ПропущенныйПриёмник)
+    Сообщить("handler");
+КонецПроцедуры
+
+&НаКлиентеНаСервере
+Процедура PrimaryHandler(ОсновнойПараметр)
+    Сообщить("handler");
+КонецПроцедуры
+
+&НаКлиентеНаСервере
+Процедура ForeignErrorHandler(ЧужойПараметрОшибки)
     Сообщить("handler");
 КонецПроцедуры
 
@@ -519,9 +545,31 @@ fn notify_names_keep_local_parameters_regardless_of_environment() {
                     .map(|reg| &reg.target)
                     .unwrap_or_else(|| panic!("missing {name}: {:#?}", summary.notify_regs))
             };
-            assert!(matches!(target_for("DeadHandler"), NotifyTarget::NotCompiled { .. }));
+            assert!(matches!(
+                target_for("DeadHandler"),
+                NotifyTarget::NotCompiled { receiver_syntax: NotifyReceiverSyntax::Other, .. }
+            ));
             assert_eq!(target_for("LiveHandler"), &NotifyTarget::Unsupported);
-            assert!(matches!(target_for("mObIlEhAnDlEr"), NotifyTarget::NotCompiled { .. }));
+            assert!(matches!(
+                target_for("mObIlEhAnDlEr"),
+                NotifyTarget::NotCompiled { receiver_syntax: NotifyReceiverSyntax::SelfName, .. }
+            ));
+            assert!(matches!(
+                target_for("ForeignMobileHandler"),
+                NotifyTarget::NotCompiled { receiver_syntax: NotifyReceiverSyntax::BareName, .. }
+            ));
+            assert!(matches!(
+                target_for("OmittedReceiver"),
+                NotifyTarget::NotCompiled { receiver_syntax: NotifyReceiverSyntax::Other, .. }
+            ));
+            assert!(matches!(
+                target_for("PrimaryHandler"),
+                NotifyTarget::NotCompiled { receiver_syntax: NotifyReceiverSyntax::SelfName, .. }
+            ));
+            assert!(matches!(
+                target_for("ForeignErrorHandler"),
+                NotifyTarget::NotCompiled { receiver_syntax: NotifyReceiverSyntax::BareName, .. }
+            ));
             super::unused_parameters::check(ctx)
         },
     );
@@ -529,8 +577,70 @@ fn notify_names_keep_local_parameters_regardless_of_environment() {
         .iter()
         .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedParameters)
         .collect();
-    assert_eq!(unused_parameters.len(), 1, "{diagnostics:#?}");
-    assert!(unused_parameters[0].message.contains("ОбычныйПараметр"), "{diagnostics:#?}");
+    assert_eq!(unused_parameters.len(), 3, "{diagnostics:#?}");
+    for name in ["ЧужойПараметр", "ЧужойПараметрОшибки", "ОбычныйПараметр"]
+    {
+        assert!(
+            unused_parameters.iter().any(|d| d.message.contains(&format!("\"{name}\""))),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn unavailable_notify_name_preserves_form_string_reference() {
+    const CALLER: &str = "CommonForms/Форма1/Ext/Form/Module.bsl";
+    const SOURCE: &str = r#"
+&НаКлиенте
+Процедура Тест()
+#Если МобильныйКлиент Тогда
+    О = Новый ОписаниеОповещения("ForeignCallback", ДругойМодуль);
+#КонецЕсли
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ForeignCallback(ПараметрОповещения)
+    Сообщить("handler");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Unrelated(ОбычныйПараметр)
+    Сообщить("ordinary text");
+КонецПроцедуры
+"#;
+    let diagnostics = crate::test_utils::check_cfe_at_with_db(
+        CALLER,
+        SOURCE,
+        CfeFixtureBuilder::new("").build(),
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        |fixture| {
+            let path = fixture.root().join("CommonForms/Форма1/Ext/Form.xml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20"><Events/></Form>"#,
+            )
+            .unwrap();
+        },
+        |db, ctx| {
+            assert_eq!(ctx.module_metadata().module_type, bsl_metadata::ModuleType::FormModule);
+            let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+            assert!(matches!(
+                summary.notify_regs[0].target,
+                NotifyTarget::NotCompiled { receiver_syntax: NotifyReceiverSyntax::BareName, .. }
+            ));
+            assert!(summary.name_literal_refs.is_empty());
+            assert!(!summary.name_literal_ref_sites.is_empty());
+            super::unused_parameters::check(ctx)
+        },
+    );
+    let unused: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedParameters)
+        .collect();
+    assert_eq!(unused.len(), 1, "{diagnostics:#?}");
+    assert!(unused[0].message.contains("ОбычныйПараметр"), "{diagnostics:#?}");
 }
 
 fn form_with_unread_dialog(extension: bool, base_mapped: bool, malformed: bool) -> Vec<Diagnostic> {

@@ -5,6 +5,7 @@ use crate::utils::platform_event_handlers::{
 };
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 use bsl_metadata::traits::MdObject;
+use hir::call_graph::NotifyReceiverSyntax;
 use hir::{Expr, ModItem};
 use ide_db::TextRange;
 use rustc_hash::FxHashSet;
@@ -104,9 +105,19 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
     for reg in &summary.notify_regs {
-        // The named handler can be invoked in an environment outside this analysis,
-        // so its signature must remain intact regardless of the resolved receiver.
-        fixed_signature_handlers.insert(reg.callback_name.as_str().fold_lower());
+        // Excluded environments still need the same conservative signature protection
+        // as the syntactic self-name or non-bare receiver in the source.
+        if matches!(
+            reg.target,
+            hir::NotifyTarget::ThisObject
+                | hir::NotifyTarget::Unsupported
+                | hir::NotifyTarget::NotCompiled {
+                    receiver_syntax: NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other,
+                    ..
+                }
+        ) {
+            fixed_signature_handlers.insert(reg.callback_name.as_str().fold_lower());
+        }
     }
     // A form-module procedure bound at runtime — `УстановитьДействие` directly, or by
     // name through a code-created command / a helper in another module — has a
@@ -125,7 +136,17 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         for reg in &summary.set_action_regs {
             fixed_signature_handlers.insert(reg.handler_name.as_str().fold_lower());
         }
-        for local_id in &summary.name_literal_refs {
+        // A string excluded from the current environment can still name a form handler
+        // in another build, even though it no longer contributes a live call-graph reference.
+        let mut referenced = FxHashSet::default();
+        for local_id in summary
+            .name_literal_refs
+            .iter()
+            .chain(summary.name_literal_ref_sites.iter().map(|site| &site.local_id))
+        {
+            if !referenced.insert(*local_id) {
+                continue;
+            }
             if let Some(method) = summary.methods.iter().find(|m| m.local_id == *local_id) {
                 fixed_signature_handlers.insert(method.name.as_str().fold_lower());
             }
@@ -1052,7 +1073,7 @@ EndProcedure
     }
 
     #[test]
-    fn test_notify_description_cross_module_name_keeps_signature() {
+    fn test_notify_description_cross_module_still_flags() {
         use crate::test_utils::check_cfe_at_with_db;
         use hir::DefDatabase;
         use test_fixture::CfeFixtureBuilder;
@@ -1107,7 +1128,8 @@ EndProcedure
             .iter()
             .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
             .collect::<Vec<_>>();
-        assert!(unused.is_empty(), "{diagnostics:#?}");
+        assert_eq!(unused.len(), 1, "{diagnostics:#?}");
+        assert!(unused[0].message.contains("ДопПараметры"), "{diagnostics:#?}");
     }
 
     #[test]

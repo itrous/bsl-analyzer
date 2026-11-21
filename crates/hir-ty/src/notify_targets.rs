@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base_db::FileIdInput;
 use bsl_types::kind::TypeKind;
 use hir_def::body::Body;
-use hir_def::call_graph::{CallerId, ModuleCallSummary, NotifyTarget};
+use hir_def::call_graph::{CallerId, ModuleCallSummary, NotifyReceiverSyntax, NotifyTarget};
 use hir_def::{DefWithBodyId, ExprId, ModuleId, StmtId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use vfs::FileId;
@@ -84,7 +84,7 @@ fn filter_uncompiled_notify_name_literals(summary: &mut ModuleCallSummary) {
         .notify_regs
         .iter()
         .filter_map(|reg| match &reg.target {
-            NotifyTarget::NotCompiled { callback_expr } => Some((reg.caller, *callback_expr)),
+            NotifyTarget::NotCompiled { callback_expr, .. } => Some((reg.caller, *callback_expr)),
             _ => None,
         })
         .collect();
@@ -123,15 +123,20 @@ fn normalize_owner_registrations(
     let dead_stmts: FxHashSet<StmtId> = inference.dead_stmts().iter().copied().collect();
 
     for &index in registration_indices {
-        let (constructor, callback_expr) = match &registrations[index].target {
-            NotifyTarget::BareName { constructor, callback_expr, .. }
-            | NotifyTarget::Unresolved { constructor, callback_expr } => {
-                (*constructor, *callback_expr)
+        let (constructor, callback_expr, bare_name) = match &registrations[index].target {
+            NotifyTarget::BareName { name, constructor, callback_expr, .. } => {
+                (*constructor, *callback_expr, Some(name))
+            }
+            NotifyTarget::Unresolved { constructor, callback_expr } => {
+                (*constructor, *callback_expr, None)
             }
             _ => continue,
         };
         if constructor_is_not_compiled(body, &dead_stmts, &inference, constructor) {
-            registrations[index].target = NotifyTarget::NotCompiled { callback_expr };
+            let receiver_syntax =
+                bare_name.map_or(NotifyReceiverSyntax::Other, NotifyReceiverSyntax::for_bare_name);
+            registrations[index].target =
+                NotifyTarget::NotCompiled { callback_expr, receiver_syntax };
             continue;
         }
 

@@ -378,6 +378,28 @@ pub enum CallerId {
     ModuleCode,
 }
 
+/// Syntactic shape of a notification receiver, before semantic resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotifyReceiverSyntax {
+    /// An object or form self-name, in either language.
+    SelfName,
+    /// A bare name other than a self-name.
+    BareName,
+    /// A non-bare or omitted receiver.
+    Other,
+}
+
+impl NotifyReceiverSyntax {
+    /// Classify a bare receiver without assuming what the name resolves to.
+    pub fn for_bare_name(name: &Name) -> Self {
+        if is_this_receiver(&name.as_str().fold_lower()) {
+            Self::SelfName
+        } else {
+            Self::BareName
+        }
+    }
+}
+
 /// Where a `Новый ОписаниеОповещения` callback's handler lives. Bare names stay
 /// unresolved in the syntax query and are normalized by `hir-ty` using the same
 /// inference and name-resolution rules as other semantic consumers.
@@ -389,7 +411,7 @@ pub enum NotifyTarget {
     /// The receiver is not a bare name, so inference cannot resolve its owner.
     Unresolved { constructor: ExprId, callback_expr: ExprId },
     /// The registration lies only in an unavailable or unreachable compilation branch.
-    NotCompiled { callback_expr: ExprId },
+    NotCompiled { callback_expr: ExprId, receiver_syntax: NotifyReceiverSyntax },
     /// The receiver resolves to the current object/form module.
     ThisObject,
     /// The receiver resolves to a common module.
@@ -2023,6 +2045,34 @@ EndProcedure
                 if module_name.as_str() == "НесуществующийМодуль"
                     && method_name.as_str() == "НесуществующийМетод"
         ));
+    }
+
+    #[test]
+    fn notify_receiver_syntax_recognizes_self_names_case_insensitively() {
+        for name in [
+            "ЭтотОбъект",
+            "эТоТоБъЕкТ",
+            "ThisObject",
+            "THISOBJECT",
+            "ЭтаФорма",
+            "этаформа",
+            "ThisForm",
+            "thisform",
+        ] {
+            assert_eq!(
+                NotifyReceiverSyntax::for_bare_name(&Name::new(name)),
+                NotifyReceiverSyntax::SelfName,
+                "{name}"
+            );
+        }
+        for name in ["ДругойМодуль", "CommonModule", "ЭтотОбъектДругой"]
+        {
+            assert_eq!(
+                NotifyReceiverSyntax::for_bare_name(&Name::new(name)),
+                NotifyReceiverSyntax::BareName,
+                "{name}"
+            );
+        }
     }
 
     #[test]
