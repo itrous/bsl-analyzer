@@ -6,6 +6,195 @@ use hir::call_graph::{
 use hir::{ConfigsDatabase, DefDatabase, ModuleId};
 use test_fixture::CfeFixtureBuilder;
 
+const COMMAND_MODULE_CALLER: &str = "CommonCommands/ПроверкаОповещений/Ext/CommandModule.bsl";
+
+fn run_in_command_module(
+    source: &str,
+    run: impl FnOnce(&ide_db::RootDatabaseImpl, &DiagnosticsContext<'_>) -> Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
+    crate::test_utils::check_cfe_at_with_db(
+        COMMAND_MODULE_CALLER,
+        source,
+        CfeFixtureBuilder::new("").build(),
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        |fixture| {
+            let command_dir = fixture.root().join("CommonCommands/ПроверкаОповещений");
+            std::fs::create_dir_all(command_dir.join("Ext")).unwrap();
+            std::fs::write(command_dir.join("Ext/CommandModule.bsl"), source).unwrap();
+            std::fs::write(
+                fixture.root().join("CommonCommands/ПроверкаОповещений.xml"),
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonCommand uuid="5b9f7d02-c0da-4e02-b48a-1a5f2a6d7222">
+        <Properties><Name>ПроверкаОповещений</Name></Properties>
+    </CommonCommand>
+</MetaDataObject>"#,
+            )
+            .unwrap();
+        },
+        |db, ctx| {
+            assert_eq!(
+                ctx.module_metadata().module_type,
+                bsl_metadata::ModuleType::CommandModule,
+                "test must load real CommandModule metadata"
+            );
+            run(db, ctx)
+        },
+    )
+}
+
+#[test]
+fn command_module_this_object_is_a_callback_receiver_for_both_rules() {
+    const SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+    О = Новый ОписаниеОповещения("ЕстьЭкспорт", ЭтотОбъект);
+    О = Новый ОписаниеОповещения("НетОбработчика", ЭтотОбъект);
+    О = Новый ОписаниеОповещения("НеЭкспорт", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ЕстьЭкспорт() Экспорт
+КонецПроцедуры
+
+&НаКлиенте
+Процедура НеЭкспорт()
+КонецПроцедуры
+"#;
+
+    let diagnostics = run_in_command_module(SOURCE, |db, ctx| {
+        let module = ModuleId::new(ctx.file_id);
+        let summary = db.module_call_summary(module);
+        assert_eq!(summary.notify_regs.len(), 3, "{:#?}", summary.notify_regs);
+        assert!(
+            summary
+                .notify_regs
+                .iter()
+                .all(|registration| matches!(registration.target, NotifyTarget::ThisObject)),
+            "command-module receivers must normalize semantically: {:#?}",
+            summary.notify_regs
+        );
+
+        let mut diagnostics = missing_notify_handler::check(ctx);
+        diagnostics.extend(super::unused_local_method::check(ctx));
+        diagnostics
+    });
+
+    let missing = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+        .collect::<Vec<_>>();
+    assert_eq!(missing.len(), 2, "only missing and non-exported handlers: {missing:#?}");
+    assert!(missing.iter().any(|diagnostic| diagnostic.message.contains("НетОбработчика")));
+    assert!(missing.iter().any(|diagnostic| diagnostic.message.contains("НеЭкспорт")));
+    let unused = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedLocalMethod)
+        .collect::<Vec<_>>();
+    assert!(
+        unused.iter().all(|diagnostic| {
+            !diagnostic.message.contains("ЕстьЭкспорт") && !diagnostic.message.contains("НеЭкспорт")
+        }),
+        "a normalized ThisObject registration protects local handlers: {unused:#?}"
+    );
+}
+
+#[test]
+fn command_module_this_object_shadowed_by_parameter_or_local_is_not_a_receiver() {
+    const SOURCE: &str = r#"&НаКлиенте
+Процедура Параметр(ЭтотОбъект)
+    О = Новый ОписаниеОповещения("ПараметрОбработчик", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ЛокальнаяПеременная()
+    ЭтотОбъект = Новый Структура;
+    О = Новый ОписаниеОповещения("ЛокальныйОбработчик", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ПараметрОбработчик()
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ЛокальныйОбработчик()
+КонецПроцедуры
+"#;
+
+    let diagnostics = run_in_command_module(SOURCE, |db, ctx| {
+        let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+        assert_eq!(summary.notify_regs.len(), 2, "{:#?}", summary.notify_regs);
+        assert!(
+            summary
+                .notify_regs
+                .iter()
+                .all(|registration| !matches!(registration.target, NotifyTarget::ThisObject)),
+            "shadowed identifiers must not normalize as self: {:#?}",
+            summary.notify_regs
+        );
+        let mut diagnostics = missing_notify_handler::check(ctx);
+        diagnostics.extend(super::unused_local_method::check(ctx));
+        diagnostics
+    });
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != crate::DiagnosticCode::MissingNotifyHandler),
+        "unknown receivers are not judged as command-local handlers: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedLocalMethod && diagnostic.message.contains("ПараметрОбработчик")),
+        "the parameter-shadowed registration must not protect the same-named method: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedLocalMethod
+                && diagnostic.message.contains("ЛокальныйОбработчик")),
+        "the local-shadowed registration must not protect the same-named method: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn unavailable_command_module_registration_does_not_judge_or_protect_handler() {
+    const SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+#Если Сервер И Не Сервер Тогда
+    О = Новый ОписаниеОповещения("Недоступный", ЭтотОбъект);
+#КонецЕсли
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Недоступный()
+КонецПроцедуры
+"#;
+
+    let diagnostics = run_in_command_module(SOURCE, |db, ctx| {
+        let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+        assert_eq!(summary.notify_regs.len(), 1, "{:#?}", summary.notify_regs);
+        assert!(
+            matches!(summary.notify_regs[0].target, NotifyTarget::NotCompiled { .. }),
+            "registration in an impossible environment must remain unavailable: {:#?}",
+            summary.notify_regs
+        );
+        let mut diagnostics = missing_notify_handler::check(ctx);
+        diagnostics.extend(super::unused_local_method::check(ctx));
+        diagnostics
+    });
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != crate::DiagnosticCode::MissingNotifyHandler),
+        "an unavailable registration must not be checked: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == crate::DiagnosticCode::UnusedLocalMethod
+                && diagnostic.message.contains("Недоступный")
+        }),
+        "an unavailable registration must not protect its method: {diagnostics:#?}"
+    );
+}
+
 #[test]
 fn common_module_handler_selection_matches_the_graph() {
     const CALLER: &str = "CommonForms/Форма1/Ext/Form/Module.bsl";

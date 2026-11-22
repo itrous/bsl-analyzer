@@ -5016,6 +5016,17 @@ impl<'db> InferenceContext<'db> {
                 all_env,
             );
         }
+        if self_name_wins
+            && matches!(name_lower.as_str(), "этотобъект" | "thisobject")
+            && resolver.module_id().is_some_and(|module_id| {
+                self.db.module_metadata(module_id).module_type
+                    == bsl_metadata::ModuleType::CommandModule
+            })
+        {
+            // A command module's `ЭтотОбъект` is a valid notification callback receiver,
+            // but it does not expose the current module's methods as object members.
+            return found(self.db.unknown(), BareNameOrigin::SelfName, all_env);
+        }
         if self_name_wins && crate::this_object::form_module_metadata_missing(self.db, &resolver) {
             return found(self.db.unknown(), BareNameOrigin::SelfName, all_env);
         }
