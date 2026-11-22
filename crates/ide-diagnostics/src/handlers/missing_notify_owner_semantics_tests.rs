@@ -83,7 +83,10 @@ Observed = Handlers;
     ];
 
     for (case, body, expected_owner, expected_diagnostics) in cases {
-        let mut source = CALLBACKS.replace("BODY", body);
+        let mut source = CALLBACKS.replace("BODY", body).replace(
+            "Observed = Handlers;",
+            "Observed = Handlers;\nHandlers.MissingMethod();",
+        );
         if matches!(expected_owner, ExpectedOwner::Parameter) {
             source = source.replace("Процедура Test()", "Процедура Test(Handlers)");
         }
@@ -107,6 +110,19 @@ Observed = Handlers;
                 let body =
                     db.module_bodies_ref(module_id).body(local_id).expect("caller method body");
                 let inference = ctx.infer_owner(DefWithBodyId::Method(local_id));
+                let dispatched_to_common_module = inference.diagnostics().iter().any(|diagnostic| {
+                    matches!(
+                        diagnostic,
+                        hir::InferenceDiagnostic::MissedRequiredParameterCommonModule { module, callee, .. }
+                            if module.as_str() == "Handlers" && callee.as_str() == "MissingMethod"
+                    )
+                });
+                assert_eq!(
+                    dispatched_to_common_module,
+                    matches!(expected_owner, ExpectedOwner::CommonModule),
+                    "{case}: call dispatch disagrees with the read's owner: {:#?}",
+                    inference.diagnostics()
+                );
                 let ordinary_read = assigned_path_read(body, "Observed", "Handlers");
                 let ordinary_ty = inference
                     .type_id_of_expr(ordinary_read)
@@ -187,6 +203,64 @@ Observed = Handlers;
         );
         assert_eq!(diagnostics.len(), expected_diagnostics, "{case}: {diagnostics:#?}");
     }
+}
+
+#[test]
+fn bare_read_and_method_call_share_ownership_before_a_disjoint_late_assignment() {
+    let source = CALLBACKS.replace(
+        "BODY",
+        r#"#Если ТонкийКлиент Тогда
+    Observed = Ghost;
+    Ghost.Missing();
+#КонецЕсли
+#Если Сервер Тогда
+    Ghost = Новый Структура;
+#КонецЕсли
+О = Новый ОписаниеОповещения("Test", Ghost);"#,
+    );
+    let mut builder = CfeFixtureBuilder::new("");
+    builder.add_base_module("Handlers", "");
+    let fixture = builder.build();
+    let diagnostics = crate::test_utils::check_cfe_at_with_db(
+        CALLER,
+        &source,
+        fixture,
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        |fixture| configure_common_modules(fixture),
+        |db, ctx| {
+            let module_id = ModuleId::new(ctx.file_id);
+            let summary = db.module_call_summary(module_id);
+            let CallerId::Method(local_id) = summary
+                .notify_regs
+                .first()
+                .expect("registration provides its caller method")
+                .caller
+            else {
+                panic!("expected a method caller");
+            };
+            let inference = ctx.infer_owner(DefWithBodyId::Method(local_id));
+            assert!(
+                inference.diagnostics().iter().any(|diagnostic| matches!(
+                    diagnostic,
+                    hir::InferenceDiagnostic::UnresolvedName { .. }
+                )),
+                "the simple read in the thin-client environment must remain unresolved: {:#?}",
+                inference.diagnostics()
+            );
+            assert!(
+                inference.diagnostics().iter().any(|diagnostic| matches!(
+                    diagnostic,
+                    hir::InferenceDiagnostic::UnresolvedMethodCall { receiver_name, method_name, .. }
+                        if receiver_name.as_str() == "Ghost" && method_name.as_str() == "Missing"
+                )),
+                "the method call must use the same unowned-name verdict as the read: {:#?}",
+                inference.diagnostics()
+            );
+            Vec::new()
+        },
+    );
+    assert!(diagnostics.is_empty(), "diagnostics are checked in the inference result");
 }
 
 fn assigned_path_read(body: &hir::Body, target_name: &str, value_name: &str) -> ExprId {

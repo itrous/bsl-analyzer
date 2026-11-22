@@ -328,6 +328,14 @@ impl CompileEnvScope {
     }
 }
 
+#[derive(Clone, Copy)]
+struct BodyNameOwnership {
+    body_binding_shadows: bool,
+    scope_sensitive: bool,
+    assigned_in_body: bool,
+    bodywide_local: bool,
+}
+
 #[derive(Default)]
 struct BodyCompileScopes {
     assignments: FxHashMap<NormName, Vec<StmtId>>,
@@ -2860,6 +2868,48 @@ impl<'db> InferenceContext<'db> {
                 || self.assignment_can_declare_implicit_local_at(name, expr))
     }
 
+    /// Whether a body binding or assignment owns this bare name at this read.
+    /// Both value reads and method-call receivers use this verdict so a later
+    /// assignment in a disjoint compile environment cannot shadow a global only
+    /// for one inference path.
+    fn body_owns_bare_name_at(
+        &mut self,
+        name: &Name,
+        expr: ExprId,
+        usage: BareNameUse,
+    ) -> BodyNameOwnership {
+        let resolver = self.get_resolver();
+        let name_lower = name.as_str().fold_lower();
+        let flow_key = NormName::intern(name.as_str());
+        let body_binding_shadows = self.body_binding_applies_at(name, expr);
+        let read_scope = self.compile_scope_at_expr(expr);
+        let scope_sensitive = self.body_assignment_stmts.get(&flow_key).is_some_and(|stmts| {
+            stmts.iter().any(|stmt| {
+                !self.body_stmt_scopes.get(stmt).is_some_and(|scope| scope.may_overlap(read_scope))
+            })
+        });
+        let local_assignment_applies = self.body_local_assignment_applies_at(name, expr);
+        let bodywide_local = local_assignment_applies
+            && (is_self_name(&name_lower) || resolver.user_common_module_exists(self.db, name));
+        let mut body_local_assignment_shadows = bodywide_local
+            || (self.assigned_var_names.contains(&flow_key) && local_assignment_applies);
+        if scope_sensitive
+            && usage == BareNameUse::ReadValue
+            && body_local_assignment_shadows
+            && !bodywide_local
+        {
+            body_local_assignment_shadows = self.implicit_local_reaches(expr, name);
+        }
+        let assigned_in_body = body_binding_shadows || body_local_assignment_shadows;
+
+        BodyNameOwnership {
+            body_binding_shadows,
+            scope_sensitive,
+            assigned_in_body,
+            bodywide_local,
+        }
+    }
+
     /// Whether assignment syntax for `name` may introduce an implicit local.
     /// Mirrors the exclusions in assignment inference so reaching definitions
     /// cannot turn a rejected write to a module/global property into a local.
@@ -4901,28 +4951,13 @@ impl<'db> InferenceContext<'db> {
         let resolver_says_builtin = matches!(resolved, Some(Resolution::Builtin(_)));
         let hir_sig = builtin::builtin_functions().get(name.as_str());
 
-        let body_binding_shadows = self.body_binding_applies_at(name, expr_id);
-        let read_scope = self.compile_scope_at_expr(expr_id);
-        let scope_sensitive = self.body_assignment_stmts.get(&flow_key).is_some_and(|stmts| {
-            stmts.iter().any(|stmt| {
-                !self.body_stmt_scopes.get(stmt).is_some_and(|scope| scope.may_overlap(read_scope))
-            })
-        });
         // A compatible local shadows self and same-named common modules throughout the body,
         // while other names retain their existing sequential type and initialization behavior.
-        let local_assignment_applies = self.body_local_assignment_applies_at(name, expr_id);
-        let bodywide_local = local_assignment_applies
-            && (is_self_name(&name_lower) || resolver.user_common_module_exists(self.db, name));
-        let mut body_local_assignment_shadows = bodywide_local
-            || (self.assigned_var_names.contains(&flow_key) && local_assignment_applies);
-        if scope_sensitive
-            && usage == BareNameUse::ReadValue
-            && body_local_assignment_shadows
-            && !bodywide_local
-        {
-            body_local_assignment_shadows = self.implicit_local_reaches(expr_id, name);
-        }
-        let assigned_in_body = body_binding_shadows || body_local_assignment_shadows;
+        let ownership = self.body_owns_bare_name_at(name, expr_id, usage);
+        let body_binding_shadows = ownership.body_binding_shadows;
+        let scope_sensitive = ownership.scope_sensitive;
+        let assigned_in_body = ownership.assigned_in_body;
+        let bodywide_local = ownership.bodywide_local;
 
         let self_name_wins = is_self_name(&name_lower)
             && !self.self_name_is_shadowed(name, &resolver, assigned_in_body);
@@ -6735,10 +6770,10 @@ impl<'db> InferenceContext<'db> {
             Some(Resolution::Builtin(_)) | None => {}
         }
 
-        if self.body_declares_binding(module_name) {
-            return BareReceiverDispatch::Unhandled;
-        }
-        if self.assigned_var_names.contains(&NormName::intern(module_name.as_str())) {
+        if self
+            .body_owns_bare_name_at(module_name, root_expr, BareNameUse::ReadValue)
+            .assigned_in_body
+        {
             return BareReceiverDispatch::Unhandled;
         }
 
