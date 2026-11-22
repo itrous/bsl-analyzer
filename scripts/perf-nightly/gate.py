@@ -158,6 +158,207 @@ def foreign_cores(busy_s: float, own_cpu_s: float, wall_s: float) -> float:
     return math.inf if excess > 0 else 0.0
 
 
+def interval_cores(busy0, own0, busy1, own1, dt: float) -> float | None:
+    """Foreign cores of one span. A non-positive dt is not a rate and is not
+    proof of cleanliness; a missing counter is not a zero."""
+    if dt <= 0 or None in (busy0, own0, busy1, own1):
+        return None
+    return max(0.0, (busy1 - busy0) - (own1 - own0)) / dt
+
+
+def _over_limit(rate: float | None, limit: float) -> bool:
+    return rate is not None and rate > limit
+
+
+def measure_window(name: str, probes: list[dict], origin: float, limit: float,
+                   closed: bool) -> dict:
+    """One window over the probes that fall in it, origin included. Zero-dt
+    probes merge into the next positive span. An unmeasured rate stays None."""
+    start = probes[0]
+    end = probes[-1] if closed else None
+    error = next((p["error"] for p in probes if p.get("error")), None)
+    rates: list[float] = []
+    anchor = start
+    for probe in probes[1:]:
+        dt = probe["t"] - anchor["t"]
+        if dt < 0:
+            error = error or "clock went backwards"
+            anchor = probe
+            continue
+        if dt == 0:
+            continue
+        rate = interval_cores(anchor.get("busy_s"), anchor.get("own_cpu_s"), probe.get("busy_s"),
+                              probe.get("own_cpu_s"), dt)
+        if rate is not None:
+            rates.append(rate)
+        anchor = probe
+    mean = None
+    if closed and end is not None and not error:
+        mean = interval_cores(start.get("busy_s"), start.get("own_cpu_s"), end.get("busy_s"),
+                              end.get("own_cpu_s"), end["t"] - start["t"])
+    contaminated = _over_limit(mean, limit) or any(_over_limit(rate, limit) for rate in rates)
+    return {"name": name, "start_t": start["t"], "end_t": None if end is None else end["t"],
+            "samples": len(rates), "mean": mean, "max": max(rates) if rates else None,
+            "contaminated": contaminated, "error": error, "origin": origin}
+
+
+class LoadWatch:
+    """Windows of one attempt. Background probes only append; the controlling
+    thread judges at boundaries and after the final probe."""
+
+    def __init__(self, sampler, machine):
+        self.sampler = sampler
+        self.machine = machine
+        self.closed: list[dict] = []
+        self.open_name: str | None = None
+        self.open_probe: dict | None = None
+        self.origin: float | None = None
+        self.contaminated = False
+        self.measurement_error: str | None = None
+
+    def begin(self) -> None:
+        probe = self.sampler.probe()
+        self.origin = probe["t"]
+        self._open("graph_ready", probe)
+        self._phase("graph_ready")
+
+    def close_ready(self, probe: dict) -> None:
+        self._close(self.open_name, probe)
+        self._judge_new()
+
+    def open_next(self, name: str, probe: dict) -> None:
+        self._open(name, probe)
+        self._phase(name)
+
+    def enter_call(self, name: str) -> None:
+        probe = self.sampler.probe()
+        handoff = self._handoff(probe)
+        self._close(self.open_name, probe)
+        self._judge_new()
+        self.raise_if_bad()
+        self._open(name, handoff)
+        self._phase(name)
+
+    def leave_call(self, next_name: str) -> None:
+        probe = self.sampler.probe()
+        handoff = self._handoff(probe)
+        self._close(self.open_name, probe)
+        self._judge_new()
+        self._open(next_name, handoff)
+        self._phase(next_name)
+
+    def ensure_finish(self) -> None:
+        if self.origin is None or self.open_name == "finish":
+            return
+        try:
+            probe = self.sampler.probe()
+        except OSError as exc:
+            self.measurement_error = self.measurement_error or str(exc)
+            return
+        if self.open_name:
+            handoff = self._handoff(probe)
+            self._close(self.open_name, probe)
+            self._judge_new()
+        else:
+            handoff = probe
+        self._open("finish", handoff)
+        self._phase("finish")
+
+    def close_final(self) -> None:
+        self._note_errors()
+        probes = self.sampler._probes
+        if self.origin is None or not probes or self.open_name is None:
+            return
+        probe = probes[-1]
+        if probe is self.open_probe:
+            return
+        self._close(self.open_name, probe)
+        self._judge_new()
+
+    def raise_if_bad(self) -> None:
+        self._note_errors()
+        if self.measurement_error:
+            raise OSError(self.measurement_error)
+        if self.contaminated:
+            raise scenarios.NotHeld("foreign_load", self.detail())
+
+    def _note_errors(self) -> None:
+        if self.measurement_error:
+            return
+        for probe in self.sampler._probes:
+            if probe.get("error"):
+                self.measurement_error = probe["error"]
+                return
+
+    def detail(self) -> str:
+        bad = [w for w in self.closed if w["contaminated"]]
+        if not bad:
+            return "foreign load"
+        worst = max(bad, key=lambda w: w["max"] if w["max"] is not None else (w["mean"] or 0.0))
+        rate = worst["max"] if worst["max"] is not None else worst["mean"]
+        shown = f"{rate:.2f} " if rate is not None else ""
+        return f"{worst['name']}: {shown}cores of foreign load"
+
+    def export(self) -> list[dict]:
+        rows = [self._public(w) for w in self.closed]
+        if self.open_name and self.open_probe is not None and self.origin is not None:
+            probes = self._between(self.open_probe, self.sampler._probes[-1])
+            open_window = measure_window(self.open_name, probes, self.origin, verdict.GATE_FOREIGN_CORES,
+                                         closed=False)
+            rows.append(self._public(open_window))
+        return rows
+
+    def _handoff(self, probe: dict) -> dict:
+        """A boundary with no elapsed time is not its own interval: the next
+        window starts at the earlier probe, so the busy change merges forward."""
+        if self.open_probe is not None and probe["t"] == self.open_probe["t"]:
+            return self.open_probe
+        return probe
+
+    def _open(self, name: str, probe: dict) -> None:
+        self.open_name = name
+        self.open_probe = probe
+
+    def _close(self, name: str | None, probe: dict) -> None:
+        if name is None or self.open_probe is None or self.origin is None:
+            return
+        probes = self._between(self.open_probe, probe)
+        self.closed.append(measure_window(name, probes, self.origin, verdict.GATE_FOREIGN_CORES, closed=True))
+        self.open_name = None
+        self.open_probe = None
+
+    def _between(self, start: dict, end: dict) -> list[dict]:
+        probes = self.sampler._probes
+        try:
+            i = probes.index(start)
+            j = probes.index(end)
+        except ValueError:
+            return [start] if start is end else [start, end]
+        if j < i:
+            return [start, end]
+        return probes[i:j + 1]
+
+    def _judge_new(self) -> None:
+        for window in self.closed:
+            if window["contaminated"]:
+                self.contaminated = True
+            if window.get("error") and self.measurement_error is None:
+                self.measurement_error = window["error"]
+
+    def _phase(self, name: str | None) -> None:
+        # The scripted machine charges the upcoming interval to this window.
+        # A real machine never reads the attribute.
+        setattr(self.machine, "phase", name)
+
+    def _public(self, window: dict) -> dict:
+        origin = self.origin if self.origin is not None else window["start_t"]
+        end_t = window["end_t"]
+        return {"name": window["name"], "start_s": window["start_t"] - origin,
+                "end_s": None if end_t is None else end_t - origin, "samples": window["samples"],
+                "foreign_cores_mean": window["mean"], "foreign_cores_max": window["max"],
+                "contaminated": window["contaminated"]}
+
+
 # -- source and noise ----------------------------------------------------------------
 
 
@@ -282,8 +483,10 @@ class _Live:
         self.burners: list = []
         self.spinners: list = []
 
-    def reap_burners(self, clock) -> float:
-        """Wait for every burner to exit; their CPU from the kernel's own account."""
+    def reap_burners(self, clock, sampler=None) -> float:
+        """Wait for every burner to exit; their CPU from the kernel's own account.
+        The wait4 total replaces the sampled part of that PID, it is not added
+        on top of it."""
         fds = {}
         try:
             for proc in self.burners:
@@ -297,7 +500,10 @@ class _Live:
         for proc in self.burners:
             _, status, usage = os.wait4(proc.pid, 0)
             proc.returncode = os.waitstatus_to_exitcode(status)
-            total += usage.ru_utime + usage.ru_stime
+            accounted = usage.ru_utime + usage.ru_stime
+            total += accounted
+            if sampler is not None:
+                sampler.credit_reaped(proc.pid, accounted)
         self.burners = []
         return total
 
@@ -318,7 +524,7 @@ def _kill(processes: list) -> list:
 
 
 def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sampler, live: _Live,
-             trace: procs.ResourceTrace | None = None) -> None:
+             watch: LoadWatch, trace: procs.ResourceTrace | None = None) -> None:
     m = ctx.out["metrics"]
     run_dir = ctx.run_dir
     extra = ("--enable-tool", "references") if series == "B" else ()
@@ -337,6 +543,7 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
         env = {key: value for key, value in ctx.env.items() if key != procs.MARKER}
         live.spinners = [_spawn(SPIN_CODE, [], env) for _ in range(controls["control_foreign_burn"])]
         ctx.applied.add("control_foreign_burn")
+    watch.begin()
     run.start()
     if "graph" not in run.actions:
         raise scenarios.NotHeld("backend_failed", "the server has no graph tool")
@@ -352,14 +559,18 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
         burned = 0.0
         exclude = [proc.pid for proc in live.burners]
         if live.burners:
-            burned = live.reap_burners(ctx.clock)
-        sampler.sample()
-        m["graph_ready_cpu_s"] = round(sampler.cpu_s(exclude) + burned, 3)
-        m["foreign_cores"] = foreign_cores(machine.busy_s() - busy_from, m["graph_ready_cpu_s"],
+            burned = live.reap_burners(ctx.clock, sampler)
+        probe, own = sampler.ready_snapshot(exclude, burned)
+        m["graph_ready_cpu_s"] = round(own, 3)
+        m["foreign_cores"] = foreign_cores(probe["busy_s"] - busy_from, m["graph_ready_cpu_s"],
                                            m["graph_ready_s"])
         live.stop_spinners()
-        if m["foreign_cores"] > verdict.GATE_FOREIGN_CORES:
-            raise scenarios.NotHeld("foreign_load", f"{m['foreign_cores']:.2f} cores of foreign load")
+        watch.close_ready(probe)
+        if m["foreign_cores"] > verdict.GATE_FOREIGN_CORES or watch.contaminated:
+            detail = watch.detail() if watch.contaminated else f"{m['foreign_cores']:.2f} cores of foreign load"
+            raise scenarios.NotHeld("foreign_load", detail)
+        watch.raise_if_bad()
+        watch.open_next("finish" if ready_only else "between_calls", probe)
 
     m["ready_s"] = run.wait_ready(on_ready)
     if "graph_ready_s" not in m:
@@ -367,7 +578,9 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
     if ready_only:
         return
 
-    def call(name: str, tool: str, arguments: dict, answer: tuple | None = None, metric: str | None = None):
+    def call(name: str, tool: str, arguments: dict, answer: tuple | None = None, metric: str | None = None,
+             last: bool = False):
+        watch.enter_call(name)
         if trace is not None:
             trace.event("call_start", call_id=name)
         try:
@@ -376,6 +589,10 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
             # The server went away during the call: its end is when that was seen.
             if trace is not None:
                 trace.event("call_end", call_id=name, ok=False)
+            try:
+                watch.leave_call("between_calls")
+            except OSError:
+                pass
             raise
         ended = ctx.clock.now()
         if error is None:
@@ -386,6 +603,10 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
             error = f"no `{answer[1]}` list in the answer"
         if trace is not None:
             trace.event("call_end", ended, call_id=name, ok=error is None)
+        try:
+            watch.leave_call("finish" if last else "between_calls")
+        except OSError:
+            pass
         ctx.call({"id": name, "elapsed": elapsed, "ok": error is None, "error": error})
         if error is not None:
             raise scenarios.NotHeld("call_failed", f"{name}: {error}")
@@ -393,6 +614,7 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
             m[metric] = elapsed
         if answer is not None:
             _write_answer(run_dir, answer[0], value)
+        watch.raise_if_bad()
 
     ctx.clock.sleep(PAUSE_READY_S)
     call("symbol_info_1", "symbol_info", {"symbol": SYMBOL_1})
@@ -412,10 +634,10 @@ def _measure(ctx, series: str, ready_only: bool, controls: dict, machine, sample
         call("references_3_other", "references", {"symbol": SYMBOL_2}, metric="references_3_other_s")
     call("graph_resolve_2_same", "graph", {"action": "resolve", "query": SYMBOL_1})
     call("graph_resolve_3_other", "graph", {"action": "resolve", "query": SYMBOL_2},
-         ("d-graph-resolve-3", "candidates"))
+         ("d-graph-resolve-3", "candidates"), last=series == "B")
     if series == "A":
         call("diagnostics_workspace", "diagnostics", {"action": "workspace", "max_files": SWEEP_MAX_FILES},
-             (SWEEP_ANSWER, "aggregates"), "diagnostics_workspace_s")
+             (SWEEP_ANSWER, "aggregates"), "diagnostics_workspace_s", last=True)
         ctx.clock.sleep(PAUSE_SWEEP_S)
 
 
@@ -468,9 +690,11 @@ def run_pass(ctx, series: str, ready_only: bool, *, record: dict, controls: dict
             "run_id": ctx.run_id, "binary_sha": record["binary"]["sha"], "role": record["role"],
             "series": series, "attempt": record["attempt"]}, ctx.clock)
     sampler = procs.Sampler(ctx.run_id, sink=sink)
+    sampler.bind_load(ctx.clock, machine.busy_s)
+    watch = LoadWatch(sampler, machine)
     live = _Live()
     try:
-        _measure(ctx, series, ready_only, controls, machine, sampler, live, sink)
+        _measure(ctx, series, ready_only, controls, machine, sampler, live, watch, sink)
         out["held"], out["reason"] = True, None
     except scenarios.NotHeld as exc:
         out["held"], out["reason"] = False, exc.reason
@@ -480,12 +704,28 @@ def run_pass(ctx, series: str, ready_only: bool, *, record: dict, controls: dict
         out["held"], out["reason"] = False, "server_failed"
         ctx.error(f"harness: {type(exc).__name__}: {exc}")
     finally:
+        try:
+            watch.ensure_finish()
+        except OSError as exc:
+            watch.measurement_error = watch.measurement_error or str(exc)
         live.close()
         if live.server is not None:
             scenarios.stop_mcp(ctx, [live.server], sampler)
         sampled = sampler.stop()
+        watch.close_final()
         out["metrics"].update(hwm_kb=sampled["hwm_kb"], rss_peak_kb=sampled["rss_peak_kb"],
                               cpu_s=sampled["cpu_s"])
+    if watch.measurement_error and out.get("reason") is None:
+        out["held"], out["reason"] = False, "server_failed"
+        ctx.error(f"harness: OSError: {watch.measurement_error}")
+    elif watch.contaminated and out.get("reason") is None:
+        out["held"], out["reason"] = False, "foreign_load"
+        ctx.error(f"foreign_load: {watch.detail()}")
+    else:
+        if watch.contaminated and out.get("reason") != "foreign_load":
+            ctx.error(f"foreign_load: {watch.detail()}")
+        if watch.measurement_error and out.get("reason") != "server_failed":
+            ctx.error(f"load measurement failed: {watch.measurement_error}")
     try:
         final = procs.stop(ctx.run_id, ctx.clock)
     finally:
@@ -497,7 +737,8 @@ def run_pass(ctx, series: str, ready_only: bool, *, record: dict, controls: dict
              "held": out["held"], "reason": out["reason"], "exit_code": out.get("exit_code"),
              "controls": {name: controls[name] for name in sorted(ctx.applied)} or None,
              "load_before": load_before, "load_after": procs.machine_load(), "started_at": started_at,
-             "duration_s": ctx.clock.now() - began, "stop": {"first": out.get("stop"), "final": final}}
+             "duration_s": ctx.clock.now() - began, "stop": {"first": out.get("stop"), "final": final},
+             "load_windows": watch.export(), "load_contaminated": watch.contaminated}
     if sink is not None:
         found["resource_trace"] = traced
     if final["left"]:
@@ -568,7 +809,9 @@ class Runner:
                               trace=self.trace)
             self.launches.append({"run": os.path.basename(this_dir), "dir": this_dir, "role": role,
                                   "series": series, "k": k, "held": record["held"], "reason": record["reason"],
-                                  "foreign_cores": record["metrics"].get("foreign_cores")})
+                                  "foreign_cores": record["metrics"].get("foreign_cores"),
+                                  "load_windows": record.get("load_windows"),
+                                  "load_contaminated": record.get("load_contaminated")})
             if record["reason"] != "foreign_load":
                 if record_path is not None:
                     write_json(record_path, record)
@@ -1449,6 +1692,39 @@ def _record_lines(summary: dict) -> list[str]:
     return lines + [""]
 
 
+def _load_cell(run: dict) -> str:
+    if "load_contaminated" not in run and "load_windows" not in run:
+        return "контроль только до готовности"
+    value = run.get("load_contaminated")
+    if value is None:
+        return "missing"
+    return str(bool(value)).lower()
+
+
+def _window_num(value) -> str:
+    if value is None:
+        return "missing"
+    return verdict.fmt(value)
+
+
+def _window_rows(runs: list[dict]) -> list[str]:
+    rows = []
+    for run in runs:
+        if "load_windows" not in run:
+            rows.append(f"| {run['run']} | - | - | - | контроль только до готовности | - | - |")
+            continue
+        for window in run.get("load_windows") or []:
+            start, end = window.get("start_s"), window.get("end_s")
+            span = "missing" if start is None and end is None else f"{_window_num(start)}–{_window_num(end)}"
+            judged = window.get("foreign_cores_mean") is not None or window.get("foreign_cores_max") is not None \
+                or window.get("contaminated")
+            flag = str(bool(window.get("contaminated"))).lower() if judged else "missing"
+            rows.append(f"| {run['run']} | {window.get('name', '-')} | {span} | "
+                        f"{window.get('samples', 'missing')} | {_window_num(window.get('foreign_cores_mean'))} | "
+                        f"{_window_num(window.get('foreign_cores_max'))} | {flag} |")
+    return rows
+
+
 def write_report(out_dir: str, summary: dict) -> None:
     lines = [f"# Гейт {os.path.basename(out_dir)}", "",
              f"- вердикт: **{summary['verdict']}**",
@@ -1517,10 +1793,13 @@ def write_report(out_dir: str, summary: dict) -> None:
             lines.append("")
     runs = summary.get("runs") or []
     if runs:
-        lines += ["## Прогоны", "", "| прогон | сторона | серия | засчитан | причина | foreign_cores |",
-                  "|---|---|---|---|---|---|"]
+        lines += ["## Прогоны", "", "| прогон | сторона | серия | засчитан | причина | foreign_cores | загрязнено |",
+                  "|---|---|---|---|---|---|---|"]
         lines += [f"| {r['run']} | {r['role']} | {r['series']} | {str(r['held']).lower()} | {r['reason'] or '-'} | "
-                  f"{verdict.fmt(r['foreign_cores'])} |" for r in runs]
+                  f"{verdict.fmt(r['foreign_cores'])} | {_load_cell(r)} |" for r in runs]
+        lines += ["", "| прогон | окно | начало–конец, с | интервалы | среднее, ядра | максимум, ядра | загрязнено |",
+                  "|---|---|---|---|---|---|---|"]
+        lines += _window_rows(runs)
         lines.append("")
     with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")

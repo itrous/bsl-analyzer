@@ -431,5 +431,26 @@ class ReadmeOfTheCriteria(unittest.TestCase):
             self.assertTrue(part in self.flat, f"scripts/README.md does not say: {part}")
 
 
+class NumericRulesStay(unittest.TestCase):
+    """И9: the load check does not move the bar, the ceilings or the foreign-core limit."""
+
+    def test_a_clean_boundary_passes_and_the_old_limit_still_blocks(self):
+        self.assertEqual((verdict.GATE_BAR, verdict.GATE_FOREIGN_CORES, gate.RUNS), (0.05, 2.0, 3))
+        self.assertEqual(verdict.GATE_HWM_LIMIT_KB, 7168 * 1024)
+        self.assertEqual(verdict.GATE_REFS_LIMITS_S["references_1_s"], 67.7)
+
+        def runs(refs):
+            return [{"k": 1, "runs": 3, "held": True, "reason": None,
+                     "metrics": {"hwm_kb": 1, "references_1_s": refs, "references_2_same_s": 32.3,
+                                  "references_3_other_s": 59.5}, "calls": []} for _ in range(3)]
+
+        at_limit = {r["metric"]: r["outcome"] for r in gate.ceiling_rows(runs(1), runs(67.7))}
+        over = {r["metric"]: r["outcome"] for r in gate.ceiling_rows(runs(1), runs(67.8))}
+        self.assertEqual(at_limit["references_1_s"], "ok")
+        self.assertEqual(over["references_1_s"], "block")
+        self.assertFalse(gate._over_limit(verdict.GATE_FOREIGN_CORES, verdict.GATE_FOREIGN_CORES))
+        self.assertTrue(gate._over_limit(verdict.GATE_FOREIGN_CORES + 0.01, verdict.GATE_FOREIGN_CORES))
+
+
 if __name__ == "__main__":
     unittest.main()

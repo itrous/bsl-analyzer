@@ -333,26 +333,98 @@ class Sampler:
         self.peak_rss_kb = 0
         self._cpu: dict[str, float] = {}
         self._hwm: dict[str, int] = {}
-        self._lock = threading.Lock()
+        # Re-entrant: a ready snapshot calls `cpu_s` while it already holds the
+        # probe lock, so the scripted machine sees readiness before busy is read.
+        self._lock = threading.RLock()
         self._stop = threading.Event()
+        self._load_clock = None
+        self._busy = None
+        self._probes: list[dict] = []
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    def bind_load(self, clock, busy) -> None:
+        """Read machine busy together with this sampler's own CPU. `busy` is the
+        gate's `machine.busy_s`; there is no second poller beside this sampler."""
+        self._load_clock = clock
+        self._busy = busy
+
+    def credit_reaped(self, pid: int, accounted: float) -> None:
+        """Keep the kernel's wait4 CPU of a reaped own process. A later sample
+        cannot see it, and adding the whole wait4 on top of what was already
+        sampled would count that CPU twice."""
+        with self._lock:
+            key = str(pid)
+            self._cpu[key] = max(accounted, self._cpu.get(key, 0.0))
+
     def sample(self) -> dict:
+        with self._lock:
+            snap, hwm = self._read_unlocked()
+        self._emit(snap, hwm)
+        return snap
+
+    def probe(self, own: float | None = None) -> dict:
+        """One consistent `(monotonic, busy_s, own_cpu_s)`. The CPU update, the
+        busy read and the append share the lock, so a background probe cannot
+        pair this probe's busy with another probe's CPU."""
+        with self._lock:
+            snap, hwm = self._read_unlocked()
+            rec = self._note_unlocked(own)
+        self._emit(snap, hwm)
+        if rec["error"]:
+            raise OSError(rec["error"])
+        return rec
+
+    def ready_snapshot(self, exclude, burned: float) -> tuple[dict, float]:
+        """The readiness probe: one sample, then own CPU (`cpu_s(exclude) +
+        burned`) and busy, still under the same lock."""
+        with self._lock:
+            snap, hwm = self._read_unlocked()
+            own = self.cpu_s(exclude) + burned
+            rec = self._note_unlocked(own)
+        self._emit(snap, hwm)
+        if rec["error"]:
+            raise OSError(rec["error"])
+        return rec, own
+
+    def _read_unlocked(self) -> tuple[dict, dict]:
         snap = snapshot(self.run_id, self.proc_root)
         hwm = {str(pid): _status_kb(pid, "VmHWM", self.proc_root) for pid in snap["pids"]}
-        with self._lock:
-            self.peak_rss_kb = max(self.peak_rss_kb, snap["rss_kb"])
-            for pid, cpu in snap["cpu_by_pid"].items():
-                self._cpu[pid] = max(cpu, self._cpu.get(pid, 0.0))
-            for pid, kb in hwm.items():
-                if kb is not None:
-                    self._hwm[pid] = max(kb, self._hwm.get(pid, 0))
-        if self.sink is not None:
-            self.sink.sample([{"pid": pid, "cpu_s": snap["cpu_by_pid"].get(str(pid)),
-                               "rss_kb": snap["rss_by_pid"].get(str(pid)), "hwm_kb": hwm[str(pid)],
-                               **_io_bytes(pid, self.proc_root)} for pid in snap["pids"]])
-        return snap
+        self.peak_rss_kb = max(self.peak_rss_kb, snap["rss_kb"])
+        for pid, cpu in snap["cpu_by_pid"].items():
+            self._cpu[pid] = max(cpu, self._cpu.get(pid, 0.0))
+        for pid, kb in hwm.items():
+            if kb is not None:
+                self._hwm[pid] = max(kb, self._hwm.get(pid, 0))
+        return snap, hwm
+
+    def _note_unlocked(self, own: float | None) -> dict:
+        clock = self._load_clock
+        t = clock.now() if clock is not None else time.monotonic()
+        error = None
+        busy = None
+        if self._busy is None:
+            error = "no busy reader"
+        else:
+            try:
+                busy = self._busy()
+            except OSError as exc:
+                error = str(exc)
+        if own is None:
+            # Same account `cpu_s` reports, including a test double and the
+            # wait4 credit of a reaped burner. A raw `_cpu` sum would disagree
+            # with that account and look like foreign load.
+            own = self.cpu_s()
+        rec = {"t": t, "busy_s": busy, "own_cpu_s": own, "error": error}
+        self._probes.append(rec)
+        return rec
+
+    def _emit(self, snap: dict, hwm: dict) -> None:
+        if self.sink is None:
+            return
+        self.sink.sample([{"pid": pid, "cpu_s": snap["cpu_by_pid"].get(str(pid)),
+                           "rss_kb": snap["rss_by_pid"].get(str(pid)), "hwm_kb": hwm[str(pid)],
+                           **_io_bytes(pid, self.proc_root)} for pid in snap["pids"]])
 
     def cpu_s(self, exclude=()) -> float:
         """CPU of the set, without the PIDs in `exclude`."""
@@ -362,14 +434,28 @@ class Sampler:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            self.sample()
+            try:
+                if self._busy is not None:
+                    self.probe()
+                else:
+                    self.sample()
+            except OSError:
+                # The probe already recorded the read error; a background
+                # failure must not become a zero and must not kill the thread.
+                pass
             self._stop.wait(self.interval)
 
     def stop(self) -> dict:
         if not self._stop.is_set():
             self._stop.set()
             self._thread.join()
-            self.sample()
+            try:
+                if self._busy is not None:
+                    self.probe()
+                else:
+                    self.sample()
+            except OSError:
+                pass
         with self._lock:
             hwm_kb = max(self._hwm.values(), default=0)
         return {"rss_peak_kb": self.peak_rss_kb, "cpu_s": round(self.cpu_s(), 3), "hwm_kb": hwm_kb}

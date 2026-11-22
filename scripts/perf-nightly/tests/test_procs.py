@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 from helpers import FOREIGN_PREFIX, FakeClock, event_driven_process_waits
@@ -186,6 +187,115 @@ class RealProcesses(unittest.TestCase):
         finally:
             shell.communicate(b"\n")
         self.assertEqual(found, [{"pid": named.pid, "name": f"{FOREIGN_PREFIX}app"}])
+
+
+class LoadSnapshots(unittest.TestCase):
+    """Consistent CPU snapshots (И6): own CPU, a reaped burner, a raced probe, a read error."""
+
+    def setUp(self):
+        event_driven_process_waits(self)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def sampler(self, busy):
+        sampler = procs.Sampler("run-h", proc_root=self.root)
+        sampler.bind_load(FakeClock(), busy)
+        self.addCleanup(sampler.stop)
+        return sampler
+
+    def test_an_exited_pid_keeps_its_cpu_in_the_next_probe(self):
+        fake_run_proc(self.root, 300, "run-h", 1000, cpu_ticks=(200, 100))
+        sampler = self.sampler(lambda: 1.0)
+        first = sampler.probe()
+        shutil.rmtree(os.path.join(self.root, "300"))
+        second = sampler.probe()
+        self.assertGreater(first["own_cpu_s"], 0)
+        self.assertGreaterEqual(second["own_cpu_s"], first["own_cpu_s"])
+
+    def test_a_reaped_burner_is_credited_once(self):
+        fake_run_proc(self.root, 300, "run-h", 1000, cpu_ticks=(100, 0))
+        sampler = self.sampler(lambda: 1.0)
+        sampler.sample()
+        sampled = sampler.cpu_s()
+        sampler.credit_reaped(300, sampled + 5.0)
+        self.assertAlmostEqual(sampler.probe()["own_cpu_s"], sampled + 5.0)
+        sampler.credit_reaped(300, sampled + 5.0)
+        self.assertAlmostEqual(sampler.probe()["own_cpu_s"], sampled + 5.0)
+
+    def test_an_unmarked_process_is_not_own_cpu(self):
+        fake_run_proc(self.root, 300, "run-h", 1000, cpu_ticks=(200, 100))
+        fake_run_proc(self.root, 301, "run-other", 1000, cpu_ticks=(400, 100))
+        sampler = self.sampler(lambda: 10.0)
+        own = sampler.probe()["own_cpu_s"]
+        self.assertAlmostEqual(own, sampler.cpu_s())
+        self.assertLess(own, 8.0)
+
+    def test_a_read_error_is_not_a_zero_load(self):
+        fake_run_proc(self.root, 300, "run-h", 1000)
+
+        def busy():
+            raise OSError("stat unreadable")
+
+        sampler = self.sampler(busy)
+        with self.assertRaises(OSError):
+            sampler.probe()
+        probe = sampler._probes[-1]
+        self.assertIsNone(probe["busy_s"])
+        self.assertNotEqual(probe["busy_s"], 0)
+        self.assertIn("stat unreadable", probe["error"])
+
+    def test_a_boundary_probe_waits_for_the_background_probe(self):
+        fake_run_proc(self.root, 300, "run-h", 1000)
+        inside = 0
+        peak = 0
+        guard = threading.Lock()
+        busy_entered = threading.Event()
+        release_busy = threading.Event()
+        attempt_events = {f"probe-{i}": threading.Event() for i in range(4)}
+        lock = threading.RLock()
+
+        class ObservedRLock:
+            def acquire(self, *args, **kwargs):
+                event = attempt_events.get(threading.current_thread().name)
+                if event is not None:
+                    event.set()
+                return lock.acquire(*args, **kwargs)
+
+            def release(self):
+                lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.release()
+
+        def busy():
+            nonlocal inside, peak
+            with guard:
+                inside += 1
+                peak = max(peak, inside)
+                busy_entered.set()
+            release_busy.wait()
+            with guard:
+                inside -= 1
+            return 1.0
+
+        sampler = self.sampler(busy)
+        sampler._lock = ObservedRLock()
+        threads = [threading.Thread(target=sampler.probe, name=f"probe-{i}") for i in range(4)]
+        for thread in threads:
+            thread.start()
+        busy_entered.wait()
+        for event in attempt_events.values():
+            event.wait()
+        release_busy.set()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(peak, 1)
+        self.assertEqual(len(sampler._probes), 4)
 
 
 if __name__ == "__main__":
