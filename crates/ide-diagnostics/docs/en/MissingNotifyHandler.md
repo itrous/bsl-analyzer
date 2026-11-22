@@ -15,7 +15,9 @@ When provided, the optional error handler's name and receiver (the fourth and fi
 
 The diagnostic stays silent when the receiver is not recognized as the current object or a known common module (for example, a local variable, including one containing a command module, or a module the analysis cannot see), when a module body could not be read, when the receiver is not a plain name, and in ordinary form modules. If form metadata identifies a base form, the local handler is not checked because the base form may provide it. This suppression applies to the local handler; a known common-module receiver is still checked. The rule also stays silent if the form kind or metadata is unknown. Registrations inside comments are ignored. `AttachIdleHandler` and `SetAction` handlers are not checked by this diagnostic.
 
-An empty handler name is currently reported as missing, and the current message suggests creating an exported procedure or correcting the name. The separate `CommandModuleExportMethods` rule exempts an exported command-module method when it is recognized as a notification handler on the current object.
+With `platform_help = none`, semantic notification registrations are not available: this diagnostic does not report handlers, and `CommandModuleExportMethods` cannot apply its notification-handler exception. Otherwise, that rule exempts an exported command-module method only when a recognized registration targets the current object and the declaration is available in the registration's execution environment.
+
+An empty handler name is currently reported as missing, and the current message suggests creating an exported procedure or correcting the name.
 
 ## Examples
 
