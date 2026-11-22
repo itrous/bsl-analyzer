@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use vfs::FileId;
 
 use crate::db::HirDatabase;
-use crate::infer::{BareNameOrigin, InferOwnerResult, infer_owner};
+use crate::infer::{infer_owner, BareNameOrigin, InferOwnerResult};
 use crate::notify_array::{
     accepts_argument_count, callback_slots, collect_notify_array_registrations,
 };

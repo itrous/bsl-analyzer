@@ -1118,7 +1118,7 @@ EndProcedure
             code,
             DiagnosticCode::UnusedParameters,
             expect![[r#"
-                UnusedParameters @ 15:25..15:38
+                UnusedParameters @ 15:26..15:39
                   message: Уберите неиспользуемый параметр "ЧужойПараметр"
                   severity: Warning"#]],
         );

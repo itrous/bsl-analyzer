@@ -958,7 +958,14 @@ mod tests {
 КонецПроцедуры
 "#;
 
-        check_diagnostics_snapshot_for(code, DiagnosticCode::UnusedLocalMethod, expect![[r#""#]]);
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnusedLocalMethod,
+            expect![[r#"
+                UnusedLocalMethod @ 5:11..5:16
+                  message: Неиспользуемый локальный метод "Вызов"
+                  severity: Warning"#]],
+        );
     }
 
     #[test]

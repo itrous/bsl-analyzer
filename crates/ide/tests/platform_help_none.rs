@@ -11,6 +11,7 @@ use bsl_platform::{
 use common::*;
 use hir::DefDatabase;
 use ide::{Analysis, DiagnosticsConfig};
+use ide_db::base_db::SourceDatabase;
 
 fn install_none() {
     let help = PlatformHelp::without_io(&PlatformHelpRequest::None).unwrap();
