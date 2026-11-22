@@ -31,17 +31,24 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     }
 
     let item_tree = ctx.item_tree();
-    let summary = ctx.call_summary(hir::ModuleId::new(ctx.file_id));
+    let module = hir::ModuleId::new(ctx.file_id);
+    let summary = ctx.call_summary(module);
     let mut diagnostics = Vec::new();
 
     for (_, proc) in item_tree.procedures() {
-        if proc.is_export && !registered_on_this_object(&summary.notify_regs, &proc.name) {
+        let method = hir::MethodId { module, local_id: proc.key };
+        if proc.is_export
+            && !registered_on_this_object(ctx, &summary.notify_regs, &proc.name, method)
+        {
             diagnostics.push(make_diagnostic(proc.name_range, code, ctx));
         }
     }
 
     for (_, func) in item_tree.functions() {
-        if func.is_export && !registered_on_this_object(&summary.notify_regs, &func.name) {
+        let method = hir::MethodId { module, local_id: func.key };
+        if func.is_export
+            && !registered_on_this_object(ctx, &summary.notify_regs, &func.name, method)
+        {
             diagnostics.push(make_diagnostic(func.name_range, code, ctx));
         }
     }
@@ -52,12 +59,16 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 // Only a normalized ThisObject registration proves a local callback reference. Unsupported
 // and not-compiled receivers must not hide an export diagnostic by name alone.
 fn registered_on_this_object(
+    ctx: &DiagnosticsContext,
     registrations: &[hir::call_graph::NotifyReg],
     name: &hir::Name,
+    method: hir::MethodId,
 ) -> bool {
     registrations.iter().any(|registration| {
         matches!(&registration.target, hir::call_graph::NotifyTarget::ThisObject)
             && registration.callback_name.eq_ignore_case(name)
+            && ctx.notify_handler_availability_in_registration(registration, &[method])
+                == hir::NotifyHandlerAvailability::Exported
     })
 }
 
@@ -187,6 +198,28 @@ mod tests {
               message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint
             CommandModuleExportMethods @ 10:11..10:25
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn client_registration_does_not_exempt_server_only_handler() {
+        let code = r#"&НаКлиенте
+Процедура ОбработкаКоманды(Команда, Параметры) Экспорт
+    Оповещение = Новый ОписаниеОповещения("ПослеКоманды", ЭтотОбъект);
+КонецПроцедуры
+
+&НаСервере
+Процедура ПослеКоманды() Экспорт
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at(code);
+        expect![[r#"
+            CommandModuleExportMethods @ 2:11..2:27
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint
+            CommandModuleExportMethods @ 7:11..7:23
               message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint"#]]
         .assert_eq(&format_diags(code, &diagnostics));
