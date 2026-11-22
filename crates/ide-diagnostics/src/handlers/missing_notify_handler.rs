@@ -234,10 +234,35 @@ mod tests {
         )
     }
 
+    fn enable_managed_client_module(path: &std::path::Path) {
+        let xml = std::fs::read_to_string(path).unwrap();
+        let xml = xml.replace(
+            "<ClientManagedApplication>false</ClientManagedApplication>",
+            "<ClientManagedApplication>true</ClientManagedApplication>",
+        );
+        std::fs::write(path, xml).unwrap();
+    }
+
     fn with_module(source: &str, module_body: &str) -> Vec<Diagnostic> {
+        use crate::test_utils::check_cfe_at_with_db;
+
         let mut builder = CfeFixtureBuilder::new("");
         builder.add_base_module("МойМодульКлиент", module_body);
-        run(source, builder.build())
+        check_cfe_at_with_db(
+            CALLER,
+            &client_context_source(source),
+            builder.build(),
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                let module_xml = fixture.root().join("CommonModules/МойМодульКлиент.xml");
+                enable_managed_client_module(&module_xml);
+                let form = fixture.root().join("CommonForms/Форма1/Ext/Form.xml");
+                std::fs::create_dir_all(form.parent().unwrap()).unwrap();
+                std::fs::write(form, PLAIN_FORM_XML).unwrap();
+            },
+            |_, ctx| check(ctx),
+        )
     }
 
     fn local_source(export: &str) -> String {
@@ -426,7 +451,7 @@ mod tests {
             "client handler should satisfy a client registration: {diagnostics:#?}"
         );
 
-        let server_source = "&НаСервере\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\nКонецПроцедуры\n";
+        let server_source = "&НаКлиентеНаСервере\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\nКонецПроцедуры\n";
         let diagnostics = with_module(
             server_source,
             "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n",
@@ -462,11 +487,18 @@ mod tests {
 
     #[test]
     fn expected_common_module_bodies_are_combined_by_environment_and_priority() {
-        fn run_with_extension_body(source: &str, base_body: &str, extension_body: &str) -> Vec<Diagnostic> {
+        fn run_with_extension_body(
+            source: &str,
+            base_body: &str,
+            extension_body: &str,
+        ) -> Vec<Diagnostic> {
             use crate::test_utils::check_cfe_at_with_db;
 
             let mut builder = CfeFixtureBuilder::new("");
-            builder.add_base_module("МойМодульКлиент", base_body).add_extension("Расш", "");
+            builder
+                .add_base_module("МойМодульКлиент", base_body)
+                .add_extension("Расш", "")
+                .add_extension_module("Расш", "МойМодульКлиент", extension_body);
             let source = client_context_source(source);
             check_cfe_at_with_db(
                 CALLER,
@@ -476,6 +508,7 @@ mod tests {
                 crate::DiagnosticsConfig::all_enabled(),
                 |fixture| {
                     let base_module = fixture.root().join("CommonModules/МойМодульКлиент.xml");
+                    enable_managed_client_module(&base_module);
                     let extension = fixture.extensions()[0].root();
                     let ext_modules = extension.join("CommonModules");
                     std::fs::create_dir_all(&ext_modules).unwrap();
@@ -492,14 +525,16 @@ mod tests {
         }
 
         let source = module_source();
-        let client_only_base = "#Если Сервер Тогда\n&НаСервере\nПроцедура Готово()\nКонецПроцедуры\n#КонецЕсли\n";
+        let client_only_base =
+            "#Если Сервер Тогда\n&НаСервере\nПроцедура Готово()\nКонецПроцедуры\n#КонецЕсли\n";
         let client_export = "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
         assert!(
             run_with_extension_body(source, client_only_base, client_export).is_empty(),
             "the extension body supplies the client-only handler"
         );
 
-        let client_non_export = "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово()\nКонецПроцедуры\n#КонецЕсли\n";
+        let client_non_export =
+            "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово()\nКонецПроцедуры\n#КонецЕсли\n";
         let diagnostics = run_with_extension_body(source, client_non_export, client_export);
         assert_eq!(
             diagnostics.len(),
@@ -940,7 +975,23 @@ mod tests {
 КонецПроцедуры
 ",
         );
-        let diagnostics = run_with_form_xml(module_source(), BASE_FORM_XML, builder.build());
+        use crate::test_utils::check_cfe_at_with_db;
+
+        let diagnostics = check_cfe_at_with_db(
+            CALLER,
+            &client_context_source(module_source()),
+            builder.build(),
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                let module_xml = fixture.root().join("CommonModules/МойМодульКлиент.xml");
+                enable_managed_client_module(&module_xml);
+                let form = fixture.root().join("CommonForms/Форма1/Ext/Form.xml");
+                std::fs::create_dir_all(form.parent().unwrap()).unwrap();
+                std::fs::write(form, BASE_FORM_XML).unwrap();
+            },
+            |_, ctx| check(ctx),
+        );
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert!(diagnostics[0].message.starts_with("Добавьте \"Экспорт\""), "{diagnostics:#?}");
     }
