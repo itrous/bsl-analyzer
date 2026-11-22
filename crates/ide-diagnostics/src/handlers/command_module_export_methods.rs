@@ -31,21 +31,34 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     }
 
     let item_tree = ctx.item_tree();
+    let summary = ctx.call_summary(hir::ModuleId::new(ctx.file_id));
     let mut diagnostics = Vec::new();
 
     for (_, proc) in item_tree.procedures() {
-        if proc.is_export {
+        if proc.is_export && !registered_on_this_object(&summary.notify_regs, &proc.name) {
             diagnostics.push(make_diagnostic(proc.name_range, code, ctx));
         }
     }
 
     for (_, func) in item_tree.functions() {
-        if func.is_export {
+        if func.is_export && !registered_on_this_object(&summary.notify_regs, &func.name) {
             diagnostics.push(make_diagnostic(func.name_range, code, ctx));
         }
     }
 
     diagnostics
+}
+
+// Only a normalized ThisObject registration proves a local callback reference. Unsupported
+// and not-compiled receivers must not hide an export diagnostic by name alone.
+fn registered_on_this_object(
+    registrations: &[hir::call_graph::NotifyReg],
+    name: &hir::Name,
+) -> bool {
+    registrations.iter().any(|registration| {
+        matches!(&registration.target, hir::call_graph::NotifyTarget::ThisObject)
+            && registration.callback_name.eq_ignore_case(name)
+    })
 }
 
 fn make_diagnostic(range: TextRange, code: DiagnosticCode, ctx: &DiagnosticsContext) -> Diagnostic {
@@ -74,6 +87,38 @@ mod tests {
         "Documents/ПриходнаяНакладная/Commands/ПечатьЭтикеток/Ext/CommandModule.bsl";
     const COMMON_COMMAND: &str = "CommonCommands/ОбновитьОстатки/Ext/CommandModule.bsl";
     const REGULAR_MODULE: &str = "/СкладскойУчет.bsl";
+
+    fn check_command_at(code: &str) -> Vec<Diagnostic> {
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        crate::test_utils::check_cfe_at_with_db(
+            COMMON_COMMAND,
+            code,
+            fixture,
+            &[],
+            DiagnosticsConfig::default(),
+            |fixture| {
+                let command_dir = fixture.root().join("CommonCommands/ОбновитьОстатки");
+                std::fs::create_dir_all(command_dir.join("Ext")).unwrap();
+                std::fs::write(command_dir.join("Ext/CommandModule.bsl"), code).unwrap();
+                std::fs::write(
+                    fixture.root().join("CommonCommands/ОбновитьОстатки.xml"),
+                    r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <CommonCommand uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>ОбновитьОстатки</Name></Properties>
+    </CommonCommand>
+</MetaDataObject>"#,
+                )
+                .unwrap();
+            },
+            |_, ctx| {
+                assert_eq!(
+                    ctx.module_metadata().module_type,
+                    bsl_metadata::ModuleType::CommandModule
+                );
+                check(ctx)
+            },
+        )
+    }
 
     fn check_at(path: &str, code: &str) -> Vec<Diagnostic> {
         let mut db = RootDatabaseImpl::new();
@@ -120,6 +165,83 @@ mod tests {
               message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint"#]]
         .assert_eq(&format_diags(EXPORTED, &diagnostics));
+    }
+
+    #[test]
+    fn registered_this_object_handler_is_not_reported() {
+        let code = r#"&НаКлиенте
+Процедура ОбработкаКоманды(Команда, Параметры) Экспорт
+    Оповещение = Новый ОписаниеОповещения("послекоманды", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ПослеКоманды() Экспорт
+КонецПроцедуры
+
+Процедура ОбычныйЭкспорт() Экспорт
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at(code);
+        expect![[r#"
+            CommandModuleExportMethods @ 2:11..2:27
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint
+            CommandModuleExportMethods @ 10:11..10:25
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn external_receiver_does_not_hide_export_diagnostic() {
+        let code = r#"&НаКлиенте
+Процедура ОбработкаКоманды(Команда, Параметры) Экспорт
+    Оповещение = Новый ОписаниеОповещения("ПослеКоманды", ДругойОбъект);
+КонецПроцедуры
+
+Процедура ПослеКоманды() Экспорт
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at(code);
+        expect![[r#"
+            CommandModuleExportMethods @ 2:11..2:27
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint
+            CommandModuleExportMethods @ 6:11..6:23
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn unavailable_or_shadowed_registration_does_not_hide_export_diagnostic() {
+        let code = r#"&НаКлиенте
+Процедура ОбработкаКоманды(Команда, Параметры) Экспорт
+#Если Сервер И Не Сервер Тогда
+    Оповещение = Новый ОписаниеОповещения("ПослеНедоступнойКоманды", ЭтотОбъект);
+#КонецЕсли
+    ЭтотОбъект = Неопределено;
+    Оповещение = Новый ОписаниеОповещения("ПослеЗатенения", ЭтотОбъект);
+КонецПроцедуры
+
+Процедура ПослеНедоступнойКоманды() Экспорт
+КонецПроцедуры
+
+Процедура ПослеЗатенения() Экспорт
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at(code);
+        expect![[r#"
+            CommandModuleExportMethods @ 2:11..2:27
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint
+            CommandModuleExportMethods @ 10:11..10:34
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint
+            CommandModuleExportMethods @ 13:11..13:25
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
     }
 
     #[test]

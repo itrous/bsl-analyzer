@@ -9,7 +9,9 @@ functions is misleading: it suggests external reusability that the platform
 does not actually provide.
 
 This diagnostic reports exported procedures and functions in those module types
-so the declaration matches the real execution model.
+so the declaration matches the real execution model. It exempts a method registered
+as a notification handler on the current command module: the platform calls that
+handler by name and requires `Export`. The registration and receiver must be recognized.
 
 ## Example
 
