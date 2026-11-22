@@ -5528,12 +5528,14 @@ impl<'db> InferenceContext<'db> {
                 // A bare module name as receiver (not a variable that holds a module) keeps the
                 // self-qualified-access and missed-parameter diagnostics that the name dispatch
                 // emits — the handlers filter further (TwoLevel only fires when the called module
-                // is the current one). A variable is in `assigned_var_names`, so it is excluded.
+                // is the current one). A local receiver is excluded by the same ownership verdict
+                // used for its read, including the registration's compile environment.
                 let mut static_receiver = false;
                 if let Expr::Path(recv) = self.body.expr(base_id) {
                     let recv = recv.clone();
-                    if !self.assigned_var_names.contains(&NormName::intern(recv.as_str()))
-                        && !self.body_declares_binding(&recv)
+                    if !self
+                        .body_owns_bare_name_at(&recv, base_id, BareNameUse::ReadValue)
+                        .assigned_in_body
                     {
                         static_receiver = true;
                         let arg_presence: Vec<bool> = args

@@ -83,10 +83,9 @@ Observed = Handlers;
     ];
 
     for (case, body, expected_owner, expected_diagnostics) in cases {
-        let mut source = CALLBACKS.replace("BODY", body).replace(
-            "Observed = Handlers;",
-            "Observed = Handlers;\nHandlers.MissingMethod();",
-        );
+        let mut source = CALLBACKS
+            .replace("BODY", body)
+            .replace("Observed = Handlers;", "Observed = Handlers;\nHandlers.MissingMethod();");
         if matches!(expected_owner, ExpectedOwner::Parameter) {
             source = source.replace("Процедура Test()", "Процедура Test(Handlers)");
         }
