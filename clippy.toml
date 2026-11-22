@@ -1,2 +1,11 @@
 
 msrv = "1.95"
+
+# Test scratch must live under the per-run root (`stdx::test_temp`), never straight in the system
+# temp dir: a killed worker or a failing test leaves its directory behind, and the leftovers are
+# counted in the thousands. The ban is on the call, not on a list of name prefixes, because every
+# list of prefixes so far turned out shorter than reality. Production code that legitimately reads
+# the system temp dir allows the lint at the call with a reason.
+disallowed-methods = [
+    { path = "std::env::temp_dir", reason = "test scratch belongs under stdx::test_temp::root(); production reads allow this lint with a reason" },
+]

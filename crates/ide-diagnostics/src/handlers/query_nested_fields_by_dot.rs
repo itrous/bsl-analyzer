@@ -109,13 +109,7 @@ mod tests {
 
     impl FixtureConfig {
         fn materialize() -> Self {
-            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "bsl_query_nested_fields_fixture_{}_{}",
-                std::process::id(),
-                id
-            ));
+            let root = stdx::test_temp::unique_dir("bsl_query_nested_fields_fixture");
             let _ = std::fs::remove_dir_all(&root);
             let write = |path: &str, text: String| {
                 let path = root.join(path);

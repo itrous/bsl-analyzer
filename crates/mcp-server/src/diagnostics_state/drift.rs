@@ -3121,7 +3121,8 @@ mod tests {
     fn failed_build_clears_loading_since_and_is_visible() {
         let err = DiagnosticsState::catch_build(|| -> anyhow::Result<()> { panic!("boom") });
         // Simulate run_load's Err arm publishing the failure.
-        let state = DiagnosticsState::for_workspace(std::env::temp_dir());
+        let state =
+            DiagnosticsState::for_workspace(stdx::test_temp::unique_dir("diagnostics_state"));
         {
             let mut inner = lock_inner(&state.inner);
             inner.loading_since = Some(Instant::now());
@@ -3532,7 +3533,8 @@ mod tests {
     /// indistinguishable from one that armed.
     #[test]
     fn force_rescan_is_storm_guarded_by_the_floor() {
-        let state = DiagnosticsState::for_workspace(std::env::temp_dir());
+        let state =
+            DiagnosticsState::for_workspace(stdx::test_temp::unique_dir("diagnostics_state"));
 
         // A fresh scan (just now) must NOT be force-cleared — the storm guard.
         *lock_recover(&state.scan) = Some(ScanCache {

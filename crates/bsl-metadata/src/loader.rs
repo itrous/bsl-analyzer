@@ -2086,11 +2086,7 @@ mod tests {
 
     #[test]
     fn discover_subsystem_structure_is_deterministic_and_matches_directory_load_set() {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_subsystems_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_subsystems");
         let subsystems_dir = collection_dir(&bsl_conventions::RealFs, &root, "Subsystems");
         let parent_dir = subsystems_dir.join("Группа").join("Subsystems");
         std::fs::create_dir_all(&parent_dir).unwrap();
@@ -2156,11 +2152,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discover_subsystem_structure_ignores_symlink_directory_cycles() {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_subsystems_symlink_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_subsystems_symlink");
         let subsystems_dir = collection_dir(&bsl_conventions::RealFs, &root, "Subsystems");
         let child_dir = subsystems_dir.join("Группа").join("Subsystems");
         std::fs::create_dir_all(&child_dir).unwrap();
@@ -2219,11 +2211,7 @@ mod tests {
     fn discover_defined_type_structure_matches_directory_load() {
         use std::collections::BTreeSet;
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_dt_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_dt");
         let dt_dir = collection_dir(&bsl_conventions::RealFs, &root, "DefinedTypes");
         std::fs::create_dir_all(&dt_dir).unwrap();
         let xml = |name: &str| {
@@ -2261,11 +2249,7 @@ mod tests {
     fn discover_event_subscription_structure_finds_loose_xml_stably() {
         use std::collections::BTreeSet;
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_event_subscription_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_event_subscription");
         let dir = collection_dir(&bsl_conventions::RealFs, &root, "EventSubscriptions");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -2318,11 +2302,7 @@ mod tests {
     fn discover_scheduled_job_structure_finds_loose_xml_stably() {
         use std::collections::BTreeSet;
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_scheduled_job_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_scheduled_job");
         let dir = collection_dir(&bsl_conventions::RealFs, &root, "ScheduledJobs");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -2397,11 +2377,7 @@ mod tests {
     fn discover_role_structure_finds_main_and_optional_rights_stably() {
         use std::collections::BTreeSet;
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_role_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_role");
         let roles_dir = collection_dir(&bsl_conventions::RealFs, &root, "Roles");
         std::fs::create_dir_all(roles_dir.join("Alpha/Ext")).unwrap();
         std::fs::create_dir_all(roles_dir.join("Gamma/Ext")).unwrap();
@@ -2468,11 +2444,7 @@ mod tests {
     fn discover_role_structure_matches_directory_load() {
         use std::collections::BTreeSet;
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_role_load_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_role_load");
         let roles_dir = collection_dir(&bsl_conventions::RealFs, &root, "Roles");
         std::fs::create_dir_all(roles_dir.join("Alpha/Ext")).unwrap();
 
@@ -2684,11 +2656,7 @@ mod tests {
 
     #[test]
     fn discover_metadata_structure_attaches_predefined_sidecar() {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_predef_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_predef");
         let cat_dir = collection_dir(&bsl_conventions::RealFs, &root, "Catalogs").join("Товары");
         std::fs::create_dir_all(cat_dir.join("Ext")).unwrap();
         std::fs::write(root.join("Catalogs/Товары.xml"), "<MetaDataObject/>").unwrap();
@@ -2780,11 +2748,7 @@ mod tests {
 
     #[test]
     fn discover_http_service_structure_finds_dir_xml_and_module_stably() {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_http_service_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_http_service");
         let services_dir = collection_dir(&bsl_conventions::RealFs, &root, "HTTPServices");
         std::fs::create_dir_all(services_dir.join("Alpha/Ext")).unwrap();
         std::fs::create_dir_all(services_dir.join("Beta/Ext")).unwrap();
@@ -2846,11 +2810,7 @@ mod tests {
 
     #[test]
     fn discover_web_service_structure_finds_dir_xml_and_module_stably() {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_web_service_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_web_service");
         let services_dir = collection_dir(&bsl_conventions::RealFs, &root, "WebServices");
         std::fs::create_dir_all(services_dir.join("Alpha/Ext")).unwrap();
         std::fs::create_dir_all(services_dir.join("Beta/Ext")).unwrap();
@@ -2912,11 +2872,7 @@ mod tests {
 
     #[test]
     fn discover_integration_service_structure_finds_dir_xml_and_module_stably() {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_discover_integration_service_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_discover_integration_service");
         let services_dir = collection_dir(&bsl_conventions::RealFs, &root, "IntegrationServices");
         std::fs::create_dir_all(services_dir.join("Alpha/Ext")).unwrap();
         std::fs::create_dir_all(services_dir.join("Beta/Ext")).unwrap();
@@ -3485,11 +3441,7 @@ mod case_parity_tests {
     use crate::traits::MdObject;
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_case_parity_{tag}_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir(&format!("bsl_case_parity_{tag}"));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
@@ -3633,11 +3585,7 @@ mod tree_source_tests {
     use bsl_conventions::{PathSetTree, RealFs};
 
     fn temp_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_tree_source_{tag}_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir(&format!("bsl_tree_source_{tag}"));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root

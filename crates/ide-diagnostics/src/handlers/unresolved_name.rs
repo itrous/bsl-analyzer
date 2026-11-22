@@ -727,11 +727,7 @@ mod tests {
         use ide_db::RootDatabaseImpl;
         use vfs::{FileId, FileSet, VfsPath};
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_external_object_bare_{}_{}",
-            std::process::id(),
-            element
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_external_object_bare");
         let _ = std::fs::remove_dir_all(&root);
         let base = root.join("cf");
         let export = root.join("export");

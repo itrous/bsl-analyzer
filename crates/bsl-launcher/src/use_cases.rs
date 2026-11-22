@@ -646,7 +646,7 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::thread::sleep;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     const HANG_GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
@@ -679,21 +679,7 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            // A clock does not make a name unique: `SystemTime::now` is quantised to about
-            // a microsecond here, so two stands started at once read the same instant, take
-            // the same directory, and reap each other's files. The counter is what makes
-            // the name unique; the clock only keeps it clear of an earlier run's leftovers.
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let unique = format!(
-                "bsl-launcher-test-{}-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("system time before unix epoch")
-                    .as_nanos(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            );
-            let path = std::env::temp_dir().join(unique);
+            let path = stdx::test_temp::unique_dir("bsl-launcher-test");
             fs::create_dir_all(&path).expect("failed to create temp dir");
             Self { path }
         }

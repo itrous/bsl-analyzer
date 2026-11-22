@@ -47,11 +47,7 @@ mod tests {
     #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
     #[test]
     fn builds_client_when_system_trust_store_is_missing() {
-        let empty_store = std::env::temp_dir().join(format!(
-            "bsl-launcher-no-roots-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let empty_store = stdx::test_temp::unique_dir("bsl-launcher-no-roots");
         std::fs::create_dir_all(&empty_store).expect("failed to create the empty trust store");
         let absent_bundle = empty_store.join("ca-bundle.pem");
         assert!(!absent_bundle.exists(), "the bundle must stay absent inside our own directory");

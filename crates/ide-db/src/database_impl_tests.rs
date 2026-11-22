@@ -15,8 +15,7 @@ fn workspace_load_gate_stubs_whole_config_loading() {
 
     // An on-disk config root with one common module: the whole-config loader
     // parses it when, and only when, the load gate is open.
-    let root =
-        std::env::temp_dir().join(format!("bsl_load_gate_{}_{}", std::process::id(), line!()));
+    let root = stdx::test_temp::unique_dir("bsl_load_gate");
     let cm_dir = root.join("CommonModules");
     // The whole-config loader lists module DIRECTORIES and pairs each with its
     // sibling XML, so both must exist.
@@ -637,11 +636,7 @@ fn resolve_event_subscription_for_file_uses_bootstrapped_listing() {
         )
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_event_subscription_for_file_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_event_subscription_for_file");
     let subscription_path = root.join("EventSubscriptions/ПередЗаписью.xml");
     std::fs::create_dir_all(subscription_path.parent().unwrap()).unwrap();
 
@@ -723,11 +718,7 @@ fn main_event_subscription_names_fall_back_to_the_chain_for_an_extension_only_pr
         )
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_main_event_subscription_extension_only_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_main_event_subscription_extension_only");
     let subscription_path = root.join("EventSubscriptions/ПередЗаписью.xml");
     std::fs::create_dir_all(subscription_path.parent().unwrap()).unwrap();
 
@@ -808,11 +799,7 @@ fn main_event_subscription_names_stay_main_only_without_the_substrate() {
         )
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_main_event_subscription_main_unbootstrapped_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_main_event_subscription_main_unbootstrapped");
     let main_root = root.join("cf");
     let ext_root = root.join("cfe/X");
     std::fs::create_dir_all(main_root.join("EventSubscriptions")).unwrap();
@@ -998,11 +985,7 @@ fn resolve_scheduled_job_for_file_uses_bootstrapped_listing() {
         )
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_scheduled_job_for_file_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_scheduled_job_for_file");
     let job_path = root.join("ScheduledJobs/РегламентноеЗадание1.xml");
     std::fs::create_dir_all(job_path.parent().unwrap()).unwrap();
 
@@ -1246,8 +1229,7 @@ fn resolve_role_for_file_uses_bootstrapped_listing() {
 </Rights>"#
     }
 
-    let root =
-        std::env::temp_dir().join(format!("bsl_role_for_file_{}_{}", std::process::id(), line!()));
+    let root = stdx::test_temp::unique_dir("bsl_role_for_file");
     let role_path = root.join("Roles/ТестоваяРоль.xml");
     std::fs::create_dir_all(role_path.parent().unwrap()).unwrap();
 
@@ -1329,11 +1311,7 @@ fn a_chain_resolves_the_owning_extension_first_and_lists_each_name_once() {
         )
     }
 
-    let base = std::env::temp_dir().join(format!(
-        "bsl_chain_precedence_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let base = stdx::test_temp::unique_dir("bsl_chain_precedence");
     let dep_root = base.join("A");
     let own_root = base.join("B");
     std::fs::create_dir_all(dep_root.join("Roles")).unwrap();
@@ -1438,11 +1416,7 @@ fn per_file_lookups_serve_an_extension_only_project_from_its_chain() {
     // The label and its explicit Scope distinguish an extension from a base root;
     // both roots declare the same metadata.
     let resolve_with = |label: Option<String>| -> Option<String> {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_extension_only_lookup_{}_{:?}",
-            std::process::id(),
-            label
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_extension_only_lookup");
         let role_path = root.join("Roles/РольРасширения.xml");
         std::fs::create_dir_all(role_path.parent().unwrap()).unwrap();
 
@@ -1660,11 +1634,7 @@ fn role_names_for_file_uses_bootstrapped_listing() {
 </Rights>"#
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "bsl_role_names_for_file_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_role_names_for_file");
     let role_path = root.join("Roles/ТестоваяРоль.xml");
     std::fs::create_dir_all(role_path.parent().unwrap()).unwrap();
 
@@ -6131,8 +6101,7 @@ fn subsystem_index_is_case_insensitive() {
         )
     }
 
-    let root =
-        std::env::temp_dir().join(format!("bsl_subsystem_case_{}_{}", std::process::id(), line!()));
+    let root = stdx::test_temp::unique_dir("bsl_subsystem_case");
     let sub_path = root.join("Subsystems/МояПодсистема.xml");
     std::fs::create_dir_all(sub_path.parent().unwrap()).unwrap();
 
@@ -8221,8 +8190,7 @@ fn warming_loads_the_attributed_root_of_a_service_module() {
         )
     }
 
-    let ws =
-        std::env::temp_dir().join(format!("bsl_warm_roots_{}_{}", std::process::id(), line!()));
+    let ws = stdx::test_temp::unique_dir("bsl_warm_roots");
     let deep = ws.join("deep");
 
     // The SAME service name in both configurations: the declared root's copy is
@@ -8474,11 +8442,7 @@ fn resolve_defined_type_across_roots_lets_an_extension_replace_the_base() {
 /// must leave the external out while the file's own chain sees every extension.
 #[test]
 fn an_external_root_binds_its_files_through_the_snapshot_not_the_disk() {
-    let base = std::env::temp_dir().join(format!(
-        "bsl_external_root_binding_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let base = stdx::test_temp::unique_dir("bsl_external_root_binding");
     let cf = base.join("cf");
     let ext = base.join("ext");
     let epf = base.join("epf");
@@ -8562,11 +8526,7 @@ fn an_external_root_binds_its_files_through_the_snapshot_not_the_disk() {
 #[cfg(unix)]
 #[test]
 fn an_external_root_matches_its_canonical_spelling_and_keys_by_the_configured_one() {
-    let base = std::env::temp_dir().join(format!(
-        "bsl_external_root_spelling_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let base = stdx::test_temp::unique_dir("bsl_external_root_spelling");
     let epf_real = base.join("epf-real");
     let epf_link = base.join("epf-link");
     std::fs::create_dir_all(epf_real.join("АРМ/Forms/Форма/Ext/Form")).unwrap();
@@ -9198,11 +9158,7 @@ fn borrowed_form_picks_up_a_base_dialog_that_appears_on_disk() {
 /// extension's module is the developer's own whatever uuids its objects carry.
 #[test]
 fn vendor_support_answers_for_main_configuration_files_only() {
-    let root = std::env::temp_dir().join(format!(
-        "bsl_vendor_support_main_only_{}_{}",
-        std::process::id(),
-        line!()
-    ));
+    let root = stdx::test_temp::unique_dir("bsl_vendor_support_main_only");
     let main_root = root.join("cf");
     let ext_root = root.join("cfe/X");
     std::fs::create_dir_all(&main_root).unwrap();

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+stdx.workspace = true
 ide-db.workspace = true
 base-db.workspace = true
 syntax.workspace = true

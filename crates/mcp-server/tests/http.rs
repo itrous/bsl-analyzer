@@ -49,7 +49,7 @@ static ISOLATE_CACHE: Once = Once::new();
 /// suite reproduces the same content a real run would write.
 fn isolate_reference_cache() {
     ISOLATE_CACHE.call_once(|| {
-        let scratch = std::env::temp_dir().join(format!("bsl-http-tests-{}", std::process::id()));
+        let scratch = stdx::test_temp::unique_dir("bsl-http-tests");
         std::fs::create_dir_all(&scratch).expect("scratch cache directory should be creatable");
         std::env::set_var("XDG_CACHE_HOME", &scratch);
         if cfg!(target_os = "macos") {

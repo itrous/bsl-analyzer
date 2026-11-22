@@ -401,11 +401,7 @@ mod tests {
     /// негодном обработчике (github#172).
     #[test]
     fn a_broken_handler_of_an_extension_only_project_is_reported() {
-        let root = std::env::temp_dir().join(format!(
-            "bsl_missing_handler_extension_only_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_missing_handler_extension_only");
         std::fs::create_dir_all(root.join("Ext")).unwrap();
         std::fs::create_dir_all(root.join("EventSubscriptions")).unwrap();
         std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();

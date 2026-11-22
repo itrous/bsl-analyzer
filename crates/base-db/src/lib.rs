@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn read_disk_text_preserves_bom_verbatim() {
-        let dir = std::env::temp_dir().join(format!("bsl_rdt_bom_{}", std::process::id()));
+        let dir = stdx::test_temp::unique_dir("bsl_rdt_bom");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bom.bsl");
         // A leading BOM plus body; read_disk_text must not strip it, so the
@@ -1024,7 +1024,7 @@ mod tests {
 
     #[test]
     fn file_text_query_reads_disk_without_overlay() {
-        let dir = std::env::temp_dir().join(format!("bsl_ft_disk_{}", std::process::id()));
+        let dir = stdx::test_temp::unique_dir("bsl_ft_disk");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("disk.bsl");
         let content = "Функция Ф() Возврат 1; КонецФункции";
@@ -1052,7 +1052,7 @@ mod tests {
     fn metadata_root_cone_shallow_verifies_after_low_write() {
         use salsa::Database;
 
-        let dir = std::env::temp_dir().join(format!("bsl_durability_{}", std::process::id()));
+        let dir = stdx::test_temp::unique_dir("bsl_durability");
         std::fs::create_dir_all(&dir).unwrap();
         let xml_path = dir.join("Товары.xml");
         let bsl_path = dir.join("Модуль.bsl");
@@ -1109,7 +1109,7 @@ mod tests {
 
     #[test]
     fn file_text_query_supersedes_a_read_on_disk_drift() {
-        let dir = std::env::temp_dir().join(format!("bsl_ft_drift_{}", std::process::id()));
+        let dir = stdx::test_temp::unique_dir("bsl_ft_drift");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("drift.bsl");
         std::fs::write(&path, "actual on-disk bytes").unwrap();
@@ -1149,7 +1149,7 @@ mod tests {
     /// names the file, so a sweep can skip it, and nothing is returned in its place.
     #[test]
     fn file_text_query_still_panics_on_an_unreadable_disk_file() {
-        let dir = std::env::temp_dir().join(format!("bsl_ft_gone_{}", std::process::id()));
+        let dir = stdx::test_temp::unique_dir("bsl_ft_gone");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gone.bsl");
 

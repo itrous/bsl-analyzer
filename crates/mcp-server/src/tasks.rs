@@ -495,7 +495,8 @@ mod tests {
     /// sits until its deadline over a build that will never publish anything.
     #[tokio::test]
     async fn a_failed_index_stops_the_wait_instead_of_burning_the_deadline() {
-        let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
+        let diag =
+            DiagnosticsState::for_workspace(stdx::test_temp::unique_dir("diagnostics_state"));
         diag.fail_for_test("boom");
 
         let manager = TaskManager::new();
@@ -526,7 +527,8 @@ mod tests {
     #[tokio::test]
     async fn a_deadline_before_the_index_names_the_index() {
         // Never kicked: the state stays `Idle`, which is what a wait sleeps on.
-        let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
+        let diag =
+            DiagnosticsState::for_workspace(stdx::test_temp::unique_dir("diagnostics_state"));
 
         let manager = TaskManager::new();
         let expires = tokio::time::Instant::now() + Duration::from_millis(100);
@@ -585,7 +587,8 @@ mod tests {
         manager: &TaskManager,
     ) -> (rmcp::model::Task, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         // `Failed` is not a state the wait sleeps on, so the body runs at once.
-        let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
+        let diag =
+            DiagnosticsState::for_workspace(stdx::test_temp::unique_dir("diagnostics_state"));
         diag.fail_for_test("not the subject");
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         let (answer_tx, answer_rx) = std::sync::mpsc::channel::<()>();
@@ -627,7 +630,8 @@ mod tests {
 
         // `Failed` is not a state the wait sleeps on, so the body runs at once and this gate
         // is about the stop alone.
-        let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
+        let diag =
+            DiagnosticsState::for_workspace(stdx::test_temp::unique_dir("diagnostics_state"));
         diag.fail_for_test("not the subject");
 
         let entered = Arc::new(AtomicBool::new(false));
@@ -876,7 +880,8 @@ mod tests {
     /// the failure lands before the deadline however slowly the machine runs.
     #[tokio::test(start_paused = true)]
     async fn a_deadline_does_not_speak_over_an_answered_lifecycle() {
-        let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
+        let diag =
+            DiagnosticsState::for_workspace(stdx::test_temp::unique_dir("diagnostics_state"));
         let manager = TaskManager::new();
         let watched = diag.clone();
         let task = manager.spawn(TaskOptions::new(), move |task_ctx| {
@@ -918,7 +923,8 @@ mod tests {
     /// can make it so.
     #[tokio::test]
     async fn a_waiting_task_counts_as_use_of_the_resident() {
-        let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
+        let diag =
+            DiagnosticsState::for_workspace(stdx::test_temp::unique_dir("diagnostics_state"));
         let dwell = READINESS_POLL * 3;
 
         // The resident's last use is its creation, before the spawn below, so the comparison

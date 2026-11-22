@@ -16,6 +16,10 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// its files survive, and the 24-hour sweep of sibling roots bounds the disk use.
 pub fn root() -> &'static Path {
     ROOT.get_or_init(|| {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the run root is created in the system temp dir, which is the one place this helper is meant to read it"
+        )]
         let temp = std::env::temp_dir();
         let root = create_root(&temp, std::process::id());
         sweep_stale(&temp, &root, SystemTime::now(), STALE_AFTER);

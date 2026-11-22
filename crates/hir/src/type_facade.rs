@@ -587,8 +587,6 @@ mod tests {
     use ide_db::RootDatabaseImpl;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     fn empty_db() -> (RootDatabaseImpl, FileId) {
         let mut db = RootDatabaseImpl::new();
         let file_id = FileId(0);
@@ -768,12 +766,7 @@ mod tests {
 
     impl TempFixture {
         fn duplicated_field() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock before epoch")
-                .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("bsl-analyzer-type-facade-{}-{unique}", std::process::id()));
+            let path = stdx::test_temp::unique_dir("bsl-analyzer-type-facade");
             copy_dir_all(&designer_fixture_path(), &path);
 
             let catalog_path = path.join("Catalogs/Справочник1.xml");
@@ -785,12 +778,7 @@ mod tests {
         }
 
         fn information_register_with_resource() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock before epoch")
-                .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("bsl-analyzer-type-facade-{}-{unique}", std::process::id()));
+            let path = stdx::test_temp::unique_dir("bsl-analyzer-type-facade");
             copy_dir_all(&designer_fixture_path(), &path);
 
             let register_path = path.join("InformationRegisters/РегистрСведений1.xml");

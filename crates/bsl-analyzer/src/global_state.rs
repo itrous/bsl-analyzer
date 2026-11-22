@@ -2743,11 +2743,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_bootstrap_meta_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_bootstrap_meta");
         let catalogs = root.join("Catalogs");
         std::fs::create_dir_all(&catalogs).unwrap();
         std::fs::write(
@@ -2846,11 +2842,7 @@ mod vfs_race_tests {
         }
 
         let cat = bsl_metadata::MdoType::Catalog;
-        let root = std::env::temp_dir().join(format!(
-            "bsl_refresh_meta_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_refresh_meta");
         let catalogs = root.join("Catalogs");
         std::fs::create_dir_all(&catalogs).unwrap();
         let write = |name: &str, uuid: &str| {
@@ -2918,11 +2910,7 @@ mod vfs_race_tests {
         use hir::ConfigsDatabase;
 
         let cat = bsl_metadata::MdoType::Catalog;
-        let root = std::env::temp_dir().join(format!(
-            "bsl_resolve_parity_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_resolve_parity");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(main_root.join("Catalogs")).unwrap();
@@ -3011,11 +2999,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_event_subscription_parity_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_event_subscription_parity");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(main_root.join("EventSubscriptions")).unwrap();
@@ -3122,11 +3106,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_scheduled_job_parity_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_scheduled_job_parity");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(main_root.join("ScheduledJobs")).unwrap();
@@ -3241,11 +3221,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_role_parity_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_role_parity");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(main_root.join("Roles/ТестоваяРоль/Ext")).unwrap();
@@ -3362,11 +3338,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_role_rights_refresh_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_role_rights_refresh");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(main_root.join("Roles/ТестоваяРоль/Ext")).unwrap();
@@ -3448,11 +3420,7 @@ mod vfs_race_tests {
         use base_db::{SourceDatabase, SourceRoot, BSL_SOURCE_ROOT};
         use bsl_metadata::traits::MdObject;
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_common_module_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_common_module");
         let cf = root.join("src/cf");
         let cm_dir = cf.join("CommonModules");
         std::fs::create_dir_all(cm_dir.join("МойМодуль/Ext")).unwrap();
@@ -3520,8 +3488,7 @@ mod vfs_race_tests {
         // Common-module visibility (same scoping as metadata objects): a main-config
         // common module is visible everywhere, but an extension's common module is
         // visible only within that extension — a sibling extension's modules are not.
-        let root =
-            std::env::temp_dir().join(format!("bsl_cm_xext_{}_{}", std::process::id(), line!()));
+        let root = stdx::test_temp::unique_dir("bsl_cm_xext");
         let base = root.join("src/cf");
         let ext_a = root.join("src/cfe/A");
         let ext_b = root.join("src/cfe/B");
@@ -3597,11 +3564,7 @@ mod vfs_race_tests {
         //  - a file in extension A sees base + A merged (A priority), never B;
         //  - extensions do not bleed into each other.
         let cat = bsl_metadata::MdoType::Catalog;
-        let root = std::env::temp_dir().join(format!(
-            "bsl_resolve_scope_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_resolve_scope");
         let base = root.join("src/cf");
         let ext_a = root.join("src/cfe/A");
         let ext_b = root.join("src/cfe/B");
@@ -4080,11 +4043,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_http_service_parity_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_http_service_parity");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(main_root.join("HTTPServices/МойСервис")).unwrap();
@@ -4178,11 +4137,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_web_service_parity_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_web_service_parity");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(main_root.join("WebServices/МойСервис")).unwrap();
@@ -4276,11 +4231,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_integration_service_parity_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_integration_service_parity");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(main_root.join("IntegrationServices/ОбменСообщениями")).unwrap();
@@ -4353,11 +4304,7 @@ mod vfs_race_tests {
     fn service_module_file_lookup_matches_path_side_path_for_http_web_integration() {
         use base_db::{SourceDatabase, SourceRoot, BSL_SOURCE_ROOT};
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_service_module_file_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_service_module_file");
         let cf = root.join("src/cf");
         std::fs::create_dir_all(cf.join("Configuration.xml").parent().unwrap()).unwrap();
         std::fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
@@ -4475,11 +4422,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_http_service_refresh_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_http_service_refresh");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(&main_root).unwrap();
@@ -4779,11 +4722,7 @@ mod vfs_race_tests {
             )
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "bsl_subsystem_parity_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let root = stdx::test_temp::unique_dir("bsl_subsystem_parity");
         let main_root = root.join("src/cf");
         let ext_root = root.join("src/cfe/X");
         std::fs::create_dir_all(main_root.join("Subsystems")).unwrap();

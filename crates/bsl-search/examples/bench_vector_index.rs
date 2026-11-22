@@ -48,7 +48,7 @@ fn main() {
     println!("VectorIndex::build  : {:>8.2?}   (serial add, size {})", t_build, index.size());
 
     // Phase 3: persist the built index (the proposed one-time cost on change).
-    let path = std::env::temp_dir().join("bsl_bench_index.usearch");
+    let path = stdx::test_temp::root().join("bsl_bench_index.usearch");
     let path_s = path.to_str().unwrap();
     let t = Instant::now();
     index.save(path_s).expect("save");

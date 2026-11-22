@@ -109,6 +109,10 @@ impl WorkspaceCacheLayout {
             std::env::var_os(WORKSPACE_CACHE_BASE_ENV),
             inherited_origin,
         )?;
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the system temp dir is the base of the default workspace cache for workspaces that live under it"
+        )]
         let base_declared = match selected {
             Some(path) if path.is_absolute() => path,
             Some(path) => current_dir()?.join(path),
@@ -1448,7 +1452,7 @@ mod tests {
         let project = project(workspace.path());
         let layout =
             WorkspaceCacheLayout::for_project(&project, None, workspace.path(), None).unwrap();
-        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let temp = stdx::test_temp::root().parent().unwrap().canonicalize().unwrap();
         assert!(layout.base().starts_with(&temp), "{:?} not under {:?}", layout.base(), temp);
         if let Some(os_cache) = dirs::cache_dir() {
             assert!(!layout.base().starts_with(os_cache));

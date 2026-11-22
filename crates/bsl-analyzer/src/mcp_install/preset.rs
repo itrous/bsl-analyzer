@@ -226,7 +226,7 @@ mod tests {
     /// auto-updating launcher.
     #[test]
     fn resolve_binary_prefers_launcher_over_app() {
-        let launcher = std::env::temp_dir().join("bsl-analyzer").to_string_lossy().into_owned();
+        let launcher = stdx::test_temp::root().join("bsl-analyzer").to_string_lossy().into_owned();
         let bin = super::resolve_binary(
             Some(launcher.clone()),
             Some("/home/u/.bsl-analyzer/bin/bsl-analyzer-app".to_owned()),

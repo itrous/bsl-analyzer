@@ -114,13 +114,7 @@ mod tests {
 
     impl FixtureConfig {
         fn materialize() -> Self {
-            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "bsl_unlimited_string_fixture_{}_{}",
-                std::process::id(),
-                id
-            ));
+            let root = stdx::test_temp::unique_dir("bsl_unlimited_string_fixture");
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("Catalogs")).expect("create fixture dirs");
             std::fs::write(root.join("Configuration.xml"), CONFIGURATION_XML)
