@@ -109,14 +109,14 @@ pub trait AnalysisProvider {
         merged.map(Arc::new)
     }
 
-    /// Export status of the method selected by the same qualified lookup as the call graph.
-    /// Providers without semantic resolution return `None` rather than guessing.
-    fn qualified_method_export(
+    /// Conditional declarations of a qualified common-module method, grouped by
+    /// expected body priority. Unread or unmapped bodies are represented as uncertainty.
+    fn qualified_method_declarations(
         &self,
         _file_id: FileId,
         _module_name: &Name,
         _method_name: &Name,
-    ) -> Option<Result<bool, hir::QualifiedMethodError>> {
+    ) -> Option<Result<hir::QualifiedMethodDeclarations, hir::QualifiedMethodError>> {
         None
     }
 
@@ -128,6 +128,17 @@ pub trait AnalysisProvider {
         _owner: DefWithBodyId,
         _registration_range: syntax::TextRange,
         _methods: &[MethodId],
+    ) -> hir::NotifyHandlerAvailability {
+        hir::NotifyHandlerAvailability::Unknown
+    }
+
+    fn notify_handler_availability_for_method_bodies_in_registration(
+        &self,
+        _file_id: FileId,
+        _owner: DefWithBodyId,
+        _registration_range: syntax::TextRange,
+        _method_bodies: &[Vec<MethodId>],
+        _incomplete_tail: bool,
     ) -> hir::NotifyHandlerAvailability {
         hir::NotifyHandlerAvailability::Unknown
     }

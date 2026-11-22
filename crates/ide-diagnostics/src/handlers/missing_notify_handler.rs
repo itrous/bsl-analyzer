@@ -60,10 +60,14 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                     .map(|v| (v, reg.callback_name.to_string()))
             }
             NotifyTarget::Module(module_name) => {
-                let key = (module_name.clone(), reg.callback_name.clone());
-                let verdict = *module_verdicts
-                    .entry(key)
-                    .or_insert_with(|| module_verdict(ctx, module_name, &reg.callback_name));
+                let owner = match reg.caller {
+                    CallerId::Method(key) => DefWithBodyId::Method(key),
+                    CallerId::ModuleCode => DefWithBodyId::ModuleCode,
+                };
+                let key = (module_name.clone(), reg.callback_name.clone(), reg.caller, reg.range);
+                let verdict = *module_verdicts.entry(key).or_insert_with(|| {
+                    module_verdict(ctx, module_name, &reg.callback_name, owner, reg.range)
+                });
                 verdict.map(|v| {
                     (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
                 })
@@ -129,21 +133,33 @@ fn local_verdict(
 
 /// Handler named on a bare identifier. Only a receiver that is a known common module is
 /// judged: any other identifier (a local variable, a module the analysis cannot see) says
-/// nothing about where the handler lives, and neither does a body that could not be read.
-fn module_verdict(ctx: &DiagnosticsContext, module_name: &Name, name: &Name) -> Option<Verdict> {
+/// nothing about where the handler lives. Registration and declaration environments are
+/// compared by the semantic provider; incomplete expected bodies remain unknown.
+fn module_verdict(
+    ctx: &DiagnosticsContext,
+    module_name: &Name,
+    name: &Name,
+    owner: DefWithBodyId,
+    registration_range: syntax::TextRange,
+) -> Option<Verdict> {
     ctx.resolve_common_module(module_name.as_str())?;
-    let bodies = ctx.common_module_bodies(module_name.as_str());
-    if bodies.is_empty() || bodies.has_missing_expected_body() {
-        return None;
-    }
-
-    match ctx.qualified_method_export(module_name, name)? {
-        Ok(true) => None,
-        Ok(false) => Some(Verdict::NotExported),
-        Err(hir::QualifiedMethodError::NotFound) => Some(Verdict::NotFound),
+    let declarations = match ctx.qualified_method_declarations(module_name, name)? {
+        Ok(declarations) => declarations,
+        Err(hir::QualifiedMethodError::NotFound) => return Some(Verdict::NotFound),
         Err(
             hir::QualifiedMethodError::BodyUnread | hir::QualifiedMethodError::NotVisibleInConfigs,
-        ) => None,
+        ) => return None,
+    };
+    let availability = ctx.notify_handler_availability_for_method_bodies_in_registration(
+        owner,
+        registration_range,
+        &declarations.bodies,
+        declarations.incomplete_tail,
+    );
+    match availability {
+        hir::NotifyHandlerAvailability::Exported | hir::NotifyHandlerAvailability::Unknown => None,
+        hir::NotifyHandlerAvailability::NotExported => Some(Verdict::NotExported),
+        hir::NotifyHandlerAvailability::NotFound => Some(Verdict::NotFound),
     }
 }
 
@@ -397,6 +413,114 @@ mod tests {
             diagnostics[0].message,
             "Создайте экспортную процедуру \"МойМодульКлиент.Готово\" или исправьте имя обработчика оповещения"
         );
+    }
+
+    #[test]
+    fn common_module_handler_is_checked_in_the_registration_environment() {
+        let diagnostics = with_module(
+            module_source(),
+            "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n",
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "client handler should satisfy a client registration: {diagnostics:#?}"
+        );
+
+        let server_source = "&НаСервере\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\nКонецПроцедуры\n";
+        let diagnostics = with_module(
+            server_source,
+            "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n",
+        );
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "a client-only declaration cannot satisfy server registration: {diagnostics:#?}"
+        );
+        assert!(diagnostics[0].message.starts_with("Создайте экспортную процедуру"));
+    }
+
+    #[test]
+    fn common_module_conditional_declarations_can_jointly_cover_client_and_server() {
+        let source = "&НаКлиентеНаСервере\nПроцедура ПередЗакрытием()\n#Если Клиент Тогда\n    А = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n#КонецЕсли\n#Если Сервер Тогда\n    Б = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n#КонецЕсли\nКонецПроцедуры\n";
+        let module = "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n#Если Сервер Тогда\n&НаСервере\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
+        let diagnostics = with_module(source, module);
+        assert!(
+            diagnostics.is_empty(),
+            "complementary declarations should cover both registrations: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn uncertain_common_module_declaration_keeps_the_verdict_unknown() {
+        let module = "#Если НеизвестныйСимвол Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
+        let diagnostics = with_module(module_source(), module);
+        assert!(
+            diagnostics.is_empty(),
+            "an undecidable declaration cannot prove absence or failure: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn expected_common_module_bodies_are_combined_by_environment_and_priority() {
+        fn run_with_extension_body(source: &str, base_body: &str, extension_body: &str) -> Vec<Diagnostic> {
+            use crate::test_utils::check_cfe_at_with_db;
+
+            let mut builder = CfeFixtureBuilder::new("");
+            builder.add_base_module("МойМодульКлиент", base_body).add_extension("Расш", "");
+            let source = client_context_source(source);
+            check_cfe_at_with_db(
+                CALLER,
+                &source,
+                builder.build(),
+                &[],
+                crate::DiagnosticsConfig::all_enabled(),
+                |fixture| {
+                    let base_module = fixture.root().join("CommonModules/МойМодульКлиент.xml");
+                    let extension = fixture.extensions()[0].root();
+                    let ext_modules = extension.join("CommonModules");
+                    std::fs::create_dir_all(&ext_modules).unwrap();
+                    std::fs::copy(&base_module, ext_modules.join("МойМодульКлиент.xml")).unwrap();
+                    let ext_body = ext_modules.join("МойМодульКлиент/Ext/Module.bsl");
+                    std::fs::create_dir_all(ext_body.parent().unwrap()).unwrap();
+                    std::fs::write(ext_body, extension_body).unwrap();
+                    let form = extension.join("CommonForms/Форма1/Ext/Form.xml");
+                    std::fs::create_dir_all(form.parent().unwrap()).unwrap();
+                    std::fs::write(form, PLAIN_FORM_XML).unwrap();
+                },
+                |_, ctx| check(ctx),
+            )
+        }
+
+        let source = module_source();
+        let client_only_base = "#Если Сервер Тогда\n&НаСервере\nПроцедура Готово()\nКонецПроцедуры\n#КонецЕсли\n";
+        let client_export = "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
+        assert!(
+            run_with_extension_body(source, client_only_base, client_export).is_empty(),
+            "the extension body supplies the client-only handler"
+        );
+
+        let client_non_export = "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово()\nКонецПроцедуры\n#КонецЕсли\n";
+        let diagnostics = run_with_extension_body(source, client_non_export, client_export);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "base declaration takes priority where both exist: {diagnostics:#?}"
+        );
+        assert!(diagnostics[0].message.starts_with("Добавьте"));
+    }
+
+    #[test]
+    fn registration_preprocessor_position_is_used_for_common_module_verdicts() {
+        let source = "&НаКлиентеНаСервере\nПроцедура ПередЗакрытием()\n#Если Клиент Тогда\n    А = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n#КонецЕсли\n#Если Сервер Тогда\n    Б = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n#КонецЕсли\nКонецПроцедуры\n";
+        let module = "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
+        let diagnostics = with_module(source, module);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "only the server-position registration lacks a handler: {diagnostics:#?}"
+        );
+        let server_registration = source.find("Б = Новый").unwrap();
+        assert!(usize::from(diagnostics[0].range.start()) >= server_registration);
     }
 
     fn async_local_source(export: &str) -> String {

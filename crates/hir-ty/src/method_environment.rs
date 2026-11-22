@@ -41,8 +41,8 @@ pub(crate) fn possible_method_env(
     Some(environment & (decl.preproc_env | decl.preproc_undecided))
 }
 
-/// Outcome of checking whether same-named local declarations provide an exported handler
-/// in every proven environment of a particular registration.
+/// Outcome of checking declarations provide an exported handler in every proven
+/// environment of a particular registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifyHandlerAvailability {
     Exported,
@@ -51,11 +51,7 @@ pub enum NotifyHandlerAvailability {
     Unknown,
 }
 
-/// Checks local callback declarations against the execution environments of one registration.
-///
-/// A possible but undecidable environment is never treated as proof that a callback is
-/// available or absent. Multiple declarations contribute to one union of environments, so
-/// complementary exported declarations can jointly cover a registration.
+/// Checks same-module callback declarations against one registration.
 pub fn notify_handler_availability_in_registration(
     db: &dyn HirDatabase,
     file_id: vfs::FileId,
@@ -63,9 +59,36 @@ pub fn notify_handler_availability_in_registration(
     registration_range: syntax::TextRange,
     methods: &[MethodId],
 ) -> NotifyHandlerAvailability {
+    if methods.is_empty() {
+        return NotifyHandlerAvailability::NotFound;
+    }
+    notify_handler_availability_for_method_bodies_in_registration(
+        db,
+        file_id,
+        owner,
+        registration_range,
+        &[methods.to_vec()],
+        false,
+    )
+}
+
+/// Checks conditional declarations in common-module bodies against the registration's
+/// environments. Each inner slice is one body, in resolver priority order. Within a body,
+/// declarations are combined because conditional declarations may provide complementary
+/// runtime surfaces. A later body is considered only in environments where earlier bodies
+/// have no possible declaration. `incomplete_tail` keeps unread or unmapped expected bodies
+/// from being mistaken for a definitive absence.
+pub fn notify_handler_availability_for_method_bodies_in_registration(
+    db: &dyn HirDatabase,
+    file_id: vfs::FileId,
+    owner: DefWithBodyId,
+    registration_range: syntax::TextRange,
+    method_bodies: &[Vec<MethodId>],
+    incomplete_tail: bool,
+) -> NotifyHandlerAvailability {
     use NotifyHandlerAvailability as Availability;
 
-    if methods.is_empty() {
+    if method_bodies.iter().all(Vec::is_empty) && !incomplete_tail {
         return Availability::NotFound;
     }
 
@@ -81,48 +104,70 @@ pub fn notify_handler_availability_in_registration(
     if registration_definite.is_empty() {
         return Availability::Unknown;
     }
-
     let registration_possible = owner_possible & (site_definite | site_undecided);
-    let mut exported_definite = EnvFlags::EMPTY;
-    let mut exported_possible = EnvFlags::EMPTY;
-    let mut other_definite = EnvFlags::EMPTY;
-    let mut other_possible = EnvFlags::EMPTY;
 
-    for &method in methods {
-        if method.module != module {
-            return Availability::Unknown;
+    let mut body_environments = Vec::with_capacity(method_bodies.len());
+    for methods in method_bodies {
+        let mut exported_definite = EnvFlags::EMPTY;
+        let mut exported_possible = EnvFlags::EMPTY;
+        let mut other_definite = EnvFlags::EMPTY;
+        let mut other_possible = EnvFlags::EMPTY;
+        for &method in methods {
+            let Some(declaration) = db.interface_method(method) else {
+                return Availability::Unknown;
+            };
+            let definite = effective_method_env(db, method, &options);
+            let Some(possible) = possible_method_env(db, method, &options) else {
+                return Availability::Unknown;
+            };
+            let (definite_env, possible_env) = if declaration.is_export {
+                (&mut exported_definite, &mut exported_possible)
+            } else {
+                (&mut other_definite, &mut other_possible)
+            };
+            *definite_env = *definite_env | definite;
+            *possible_env = *possible_env | possible;
         }
-        let Some(declaration) = db.interface_method(method) else {
-            return Availability::Unknown;
-        };
-        let definite = effective_method_env(db, method, &options);
-        let Some(possible) = possible_method_env(db, method, &options) else {
-            return Availability::Unknown;
-        };
-        let (definite_env, possible_env) = if declaration.is_export {
-            (&mut exported_definite, &mut exported_possible)
-        } else {
-            (&mut other_definite, &mut other_possible)
-        };
-        *definite_env = *definite_env | definite;
-        *possible_env = *possible_env | possible;
+        body_environments.push((
+            exported_definite,
+            exported_possible,
+            other_definite,
+            other_possible,
+        ));
     }
 
     let mut has_unexported_registration_env = false;
     let mut has_missing_registration_env = false;
     let mut has_undecided_registration_env = false;
+
     for environment in registration_definite.iter() {
-        if exported_definite.contains(environment) {
-            continue;
+        let mut environment_verdict = None;
+        for &(exported_definite, exported_possible, other_definite, other_possible) in
+            &body_environments
+        {
+            environment_verdict = if exported_definite.contains(environment) {
+                Some(Availability::Exported)
+            } else if exported_possible.contains(environment) {
+                Some(Availability::Unknown)
+            } else if other_definite.contains(environment) {
+                Some(Availability::NotExported)
+            } else if other_possible.contains(environment) {
+                Some(Availability::Unknown)
+            } else {
+                None
+            };
+            if environment_verdict.is_some() {
+                break;
+            }
         }
-        if exported_possible.contains(environment) {
-            has_undecided_registration_env = true;
-        } else if other_definite.contains(environment) {
-            has_unexported_registration_env = true;
-        } else if other_possible.contains(environment) {
-            has_undecided_registration_env = true;
-        } else {
-            has_missing_registration_env = true;
+
+        match environment_verdict {
+            Some(Availability::Exported) => {}
+            Some(Availability::NotExported) => has_unexported_registration_env = true,
+            Some(Availability::NotFound) => has_missing_registration_env = true,
+            Some(Availability::Unknown) => has_undecided_registration_env = true,
+            None if incomplete_tail => has_undecided_registration_env = true,
+            None => has_missing_registration_env = true,
         }
     }
 

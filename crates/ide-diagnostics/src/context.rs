@@ -354,12 +354,12 @@ impl<'a> AnalysisContext<'a> {
         self.query(|p| p.module_metadata(module_id))
     }
 
-    pub(crate) fn qualified_method_export(
+    pub(crate) fn qualified_method_declarations(
         &self,
         module_name: &hir::Name,
         method_name: &hir::Name,
-    ) -> Option<Result<bool, hir::QualifiedMethodError>> {
-        self.query(|p| p.qualified_method_export(self.file_id, module_name, method_name))
+    ) -> Option<Result<hir::QualifiedMethodDeclarations, hir::QualifiedMethodError>> {
+        self.query(|p| p.qualified_method_declarations(self.file_id, module_name, method_name))
     }
 
     pub(crate) fn notify_handler_availability_in_registration(
@@ -374,6 +374,24 @@ impl<'a> AnalysisContext<'a> {
                 owner,
                 registration_range,
                 methods,
+            )
+        })
+    }
+
+    pub(crate) fn notify_handler_availability_for_method_bodies_in_registration(
+        &self,
+        owner: hir::DefWithBodyId,
+        registration_range: syntax::TextRange,
+        method_bodies: &[Vec<hir::MethodId>],
+        incomplete_tail: bool,
+    ) -> hir::NotifyHandlerAvailability {
+        self.query(|p| {
+            p.notify_handler_availability_for_method_bodies_in_registration(
+                self.file_id,
+                owner,
+                registration_range,
+                method_bodies,
+                incomplete_tail,
             )
         })
     }

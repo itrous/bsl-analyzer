@@ -23,8 +23,8 @@ pub use hir_ty::{
 };
 pub use hir_ty::{is_form_items_collection_ty, FORM_ITEMS_TYPE_EN, FORM_ITEMS_TYPE_RU};
 pub use hir_ty::{
-    method_has_form_context, notify_handler_availability_in_registration, owner_has_form_context,
-    NotifyHandlerAvailability,
+    method_has_form_context, notify_handler_availability_for_method_bodies_in_registration,
+    notify_handler_availability_in_registration, owner_has_form_context, NotifyHandlerAvailability,
 };
 pub use hir_ty::{PlatformMethodHandle, PlatformMethodOrigin};
 pub use name_classify::{classify_token, NameClass};
@@ -81,7 +81,8 @@ pub use hir_def::{
 
 pub use hir_def::resolver::{
     AssignmentResolution, GlobalExportCapabilities, GlobalExportDefinition, GlobalExportEntry,
-    GlobalExportHost, GlobalExports, GlobalSurfaceGap, QualifiedMethodError, Resolver,
+    GlobalExportHost, GlobalExports, GlobalSurfaceGap, QualifiedMethodDeclarations,
+    QualifiedMethodError, Resolver,
 };
 pub use hir_def::scope::{ExprScopes, ScopeDef};
 pub use hir_def::DefDatabase;

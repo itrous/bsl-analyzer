@@ -158,16 +158,15 @@ impl AnalysisProvider for SalsaProvider<'_> {
         self.db.resolve_common_module(file_id, name)
     }
 
-    fn qualified_method_export(
+    fn qualified_method_declarations(
         &self,
         file_id: FileId,
         module_name: &Name,
         method_name: &Name,
-    ) -> Option<Result<bool, hir::QualifiedMethodError>> {
+    ) -> Option<Result<hir::QualifiedMethodDeclarations, hir::QualifiedMethodError>> {
         Some(
             Resolver::with_workspace_scope(ModuleId::new(file_id))
-                .resolve_qualified_method(self.db, module_name, method_name)
-                .map(|method| method.is_export),
+                .resolve_qualified_method_declarations(self.db, module_name, method_name),
         )
     }
 
@@ -184,6 +183,24 @@ impl AnalysisProvider for SalsaProvider<'_> {
             owner,
             registration_range,
             methods,
+        )
+    }
+
+    fn notify_handler_availability_for_method_bodies_in_registration(
+        &self,
+        file_id: FileId,
+        owner: DefWithBodyId,
+        registration_range: syntax::TextRange,
+        method_bodies: &[Vec<MethodId>],
+        incomplete_tail: bool,
+    ) -> hir::NotifyHandlerAvailability {
+        hir::notify_handler_availability_for_method_bodies_in_registration(
+            self.db,
+            file_id,
+            owner,
+            registration_range,
+            method_bodies,
+            incomplete_tail,
         )
     }
 

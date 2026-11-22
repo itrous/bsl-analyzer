@@ -638,6 +638,49 @@ impl Resolver {
         ))
     }
 
+    /// Every declaration of `method_name` across the readable bodies of a common module,
+    /// kept in body priority order. Unlike [`Self::resolve_qualified_method`], this does not
+    /// select the first declaration: conditional declarations may cover different runtime
+    /// environments, and a later body may supply the method where an earlier one does not.
+    pub fn resolve_qualified_method_declarations(
+        &self,
+        db: &dyn ConfigsDatabase,
+        module_name: &Name,
+        method_name: &Name,
+    ) -> Result<QualifiedMethodDeclarations, QualifiedMethodError> {
+        let candidates = self.locate_common_module_candidates(db, module_name)?;
+        let mut bodies = Vec::new();
+        let incomplete_prefix = candidates.missing_body();
+        let mut incomplete_tail = false;
+
+        for &(module_id, unread) in &candidates.bodies {
+            if unread {
+                incomplete_tail = true;
+                break;
+            }
+            let declarations = db
+                .module_interface_ref(module_id)
+                .find_methods(method_name)
+                .into_iter()
+                .map(|method| method.id)
+                .collect::<Vec<_>>();
+            if !declarations.is_empty() {
+                bodies.push(declarations);
+            }
+        }
+
+        if bodies.is_empty() && !incomplete_prefix && !incomplete_tail {
+            return Err(QualifiedMethodError::NotFound);
+        }
+        // An unmapped expected body has no recoverable position in the priority list, so it
+        // could shadow any readable declaration. Do not use those declarations to guess.
+        if incomplete_prefix {
+            bodies.clear();
+            incomplete_tail = true;
+        }
+        Ok(QualifiedMethodDeclarations { bodies, incomplete_tail })
+    }
+
     pub fn resolve_qualified_method(
         &self,
         db: &dyn ConfigsDatabase,
@@ -951,6 +994,15 @@ fn application_module_name(kind: crate::ApplicationModuleKind) -> Name {
         crate::ApplicationModuleKind::Generic => "МодульПриложения",
         crate::ApplicationModuleKind::ExternalConnection => "МодульВнешнегоСоединения",
     })
+}
+
+/// Conditional declarations of one qualified common-module method, grouped by
+/// body priority. `incomplete_tail` means an unread or unmapped expected body
+/// prevented examining the rest of the surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedMethodDeclarations {
+    pub bodies: Vec<Vec<MethodId>>,
+    pub incomplete_tail: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
