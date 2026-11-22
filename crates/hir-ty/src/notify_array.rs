@@ -87,6 +87,18 @@ pub(crate) fn collect_notify_array_registrations(
             continue;
         }
 
+        // Dynamic code can write any local without naming it in this statement's syntax tree.
+        // Reaching definitions models `Выполнить` as a possible write to every local for this
+        // reason; do not trust a tracked array after it.
+        if matches!(stmt, Stmt::Execute { .. }) {
+            for state in states.values_mut() {
+                if matches!(state, ArrayState::Known(_)) {
+                    *state = ArrayState::Unknown;
+                }
+            }
+            continue;
+        }
+
         if let Stmt::Assign { target, value } = stmt {
             if let Some(target_name) = path_name(body, *target) {
                 let key = target_name.as_str().fold_lower();
@@ -682,11 +694,57 @@ EndProcedure
 О = Новый("CallbackDescription", Параметры);
 КонецПроцедуры"#,
             ),
+            (
+                "a possible write through a nested call invalidates the array",
+                r#"Процедура Test()
+Перем Параметры;
+Параметры = Новый Массив;
+Параметры.Добавить("Готово");
+Параметры.Добавить(ЭтотОбъект);
+Результат = Изменить(Параметры);
+О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры"#,
+            ),
         ];
 
         for (reason, source) in cases {
             assert!(registrations(source).is_empty(), "{reason}");
         }
+    }
+
+    #[test]
+    fn execute_may_write_a_tracked_array_without_naming_it_syntactically() {
+        let source = r#"
+Процедура Test()
+    Перем Параметры;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Готово");
+    Параметры.Добавить(ЭтотОбъект);
+    Выполнить("Параметры = Новый Массив");
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+
+        assert!(registrations(source).is_empty());
+    }
+
+    #[test]
+    fn an_earlier_registration_is_not_changed_by_later_execute() {
+        let found = registrations(
+            r#"
+Процедура Test()
+    Перем Параметры;
+    Перем Оповещение;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Готово");
+    Параметры.Добавить(ЭтотОбъект);
+    Оповещение = Новый("CallbackDescription", Параметры);
+    Выполнить("Параметры.Добавить(1)");
+КонецПроцедуры
+"#,
+        );
+
+        assert_eq!(found.len(), 1, "{found:#?}");
     }
 
     #[test]
