@@ -2110,11 +2110,11 @@ EndProcedure
         assert_eq!(
             summary.notify_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>(),
             [
-                "ОбработатьОповещение",
                 "HandleResult",
                 "PositionalHandler",
                 "PrimaryHandler",
                 "ErrorHandler",
+                "ОбработатьОповещение",
             ]
         );
         assert_eq!(summary.notify_candidates.len(), 4, "{:#?}", summary.notify_candidates);
