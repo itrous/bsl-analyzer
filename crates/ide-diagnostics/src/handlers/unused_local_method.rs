@@ -153,9 +153,8 @@ pub(crate) fn collect_called_methods(
             // callback by name through a common-module wrapper —
             // `УправлениеСвойствамиКлиент.ОбновитьЗависимостиДополнительныхРеквизитов(Форма)`
             // ultimately runs `Форма.ПодключитьОбработчикОжидания("ОбновитьЗависимости…")`
-            // — so the local procedure sharing that name is reachable even
-            // though the module contains no bare call to it. Matching by name is
-            // the only signal available without cross-module flow.
+            // — so the local procedure sharing its name remains reachable despite there
+            // being no bare call to it.
             hir::call_graph::CallTarget::QualifiedModule { method_name, .. } => {
                 if member_calls_count {
                     called_methods.insert(method_name.as_str().fold_lower());
@@ -180,7 +179,7 @@ pub(crate) fn collect_called_methods(
     // The platform invokes these by the registered string name:
     // ПодключитьОбработчикОжидания and Новый ОписаниеОповещения (both handler slots).
     for reg in &summary.notify_regs {
-        if matches!(&reg.target, hir::call_graph::NotifyTarget::NotCompiled { .. }) {
+        if !matches!(&reg.target, hir::call_graph::NotifyTarget::ThisObject) {
             continue;
         }
         called_methods.insert(reg.callback_name.as_str().fold_lower());
@@ -874,10 +873,8 @@ mod tests {
 
     #[test]
     fn test_callback_used_via_qualified_call_not_flagged() {
-        // BSP "Свойства" pattern: the form's local no-arg callback is re-armed by
-        // name from a common-module wrapper that shares its name. No bare call to
-        // the local procedure exists, only the qualified `Модуль.Имя(...)` call, so
-        // the method segment of a member call must count as a use.
+        // The method segment of an external member call is still an established use
+        // for this rule's historical same-name reachability behaviour.
         let code = r#"
 &НаКлиенте
 Процедура ОбновитьЗависимостиДополнительныхРеквизитов()
@@ -897,6 +894,71 @@ mod tests {
                   message: Неиспользуемый локальный метод "НеИспользуемая"
                   severity: Warning"#]],
         );
+    }
+
+    #[test]
+    fn notify_reg_requires_normalized_this_object_target_to_reach_local_method() {
+        let code = r#"
+&НаКлиенте
+Процедура Зарегистрировать()
+    Описание = Новый ОписаниеОповещения("ОбработчикОбъекта", ЭтотОбъект);
+    Описание = Новый ОписаниеОповещения("ОбработчикМодуля", ВнешнийМодуль);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ОбработчикОбъекта()
+    Сообщить("self");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ОбработчикМодуля()
+    Сообщить("module");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура НеИспользуется()
+    Сообщить("unused");
+КонецПроцедуры
+"#;
+        let unused = check_hir_diagnostic(code)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+
+        assert!(
+            unused
+                .iter()
+                .any(|message| message.as_str()
+                    == "Неиспользуемый локальный метод \"ОбработчикМодуля\""),
+            "external-receiver handler must remain unused: {unused:?}"
+        );
+        assert!(
+            unused
+                .iter()
+                .any(|message| message.as_str()
+                    == "Неиспользуемый локальный метод \"НеИспользуется\""),
+            "unrelated method must remain unused: {unused:?}"
+        );
+        assert!(
+            unused.iter().any(|message| message.as_str()
+                == "Неиспользуемый локальный метод \"ОбработчикОбъекта\""),
+            "syntactic receiver spelling without a normalized ThisObject target is not a proven use: {unused:?}"
+        );
+    }
+
+    #[test]
+    fn test_this_object_call_uses_local_method() {
+        let code = r#"
+Процедура Используется()
+КонецПроцедуры
+
+Процедура Вызов()
+    ЭтотОбъект.Используется();
+КонецПроцедуры
+"#;
+
+        check_diagnostics_snapshot_for(code, DiagnosticCode::UnusedLocalMethod, expect![[r#""#]]);
     }
 
     #[test]
@@ -1016,6 +1078,62 @@ mod tests {
             .collect();
 
         assert_eq!(unused, vec!["Неиспользуемый локальный метод \"МёртвыйТолькоИзРегистрации\""]);
+    }
+
+    #[test]
+    fn external_notify_receiver_does_not_hide_form_local_method() {
+        let code = r#"
+&НаКлиенте
+Процедура Зарегистрировать()
+    О = Новый ОписаниеОповещения("ВнешнийОбработчик", ВнешнийМодуль);
+    О = Новый ОписаниеОповещения("ЛокальныйОбработчик", ЭтотОбъект);
+    П = Новый Структура("Имя", "СвязанныйСтрокой");
+    Сообщить("register");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ВнешнийОбработчик()
+    Сообщить("external");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ЛокальныйОбработчик()
+    Сообщить("self");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура СвязанныйСтрокой()
+    Сообщить("bound");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура НеИспользуемый()
+    Сообщить("unused");
+КонецПроцедуры
+"#;
+        let diagnostics = crate::test_utils::check_form_with_common_modules(code, &[]);
+        let unused: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert!(
+            unused.iter().any(|message| message.contains("ВнешнийОбработчик")),
+            "external receiver must not keep a same-named form method alive: {unused:?}"
+        );
+        assert!(
+            unused.iter().any(|message| message.contains("НеИспользуемый")),
+            "unrelated unused form method must remain flagged: {unused:?}"
+        );
+        assert!(
+            !unused.iter().any(|message| message.contains("ЛокальныйОбработчик")),
+            "ThisObject callback remains a valid form-local use: {unused:?}"
+        );
+        assert!(
+            !unused.iter().any(|message| message.contains("СвязанныйСтрокой")),
+            "other form string-name bindings remain protected: {unused:?}"
+        );
     }
 
     #[test]

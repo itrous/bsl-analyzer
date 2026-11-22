@@ -19,6 +19,9 @@ pub struct ModuleCallSummary {
     /// Generic syntax-only constructor candidates. Platform validation and callback-slot
     /// interpretation happen in `hir-ty`; these are not notify registrations.
     pub notify_candidates: Vec<NotifyConstructorCandidate>,
+    /// Callback names whose fixed signature follows from the source-level constructor and
+    /// receiver shape. Kept when platform metadata cannot normalize a registration.
+    pub notify_signature_handlers: Vec<Name>,
     /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
     pub idle_handler_regs: Vec<IdleReg>,
@@ -33,8 +36,8 @@ pub struct ModuleCallSummary {
     /// Sorted and deduplicated.
     pub name_literal_refs: Vec<MethodKey>,
     /// Source sites for local method-name string literals. The semantic summary narrows this
-    /// to literals naming a notify callback, then uses exact expression ids to exclude an
-    /// unavailable registration without suppressing a separate string reference.
+    /// to local-object notify callback literals and keeps exact sites separate from other
+    /// string references so an external callback name cannot mask a local method.
     pub name_literal_ref_sites: Vec<NameLiteralRefSite>,
     pub form_entries: Vec<FormEventEntry>,
 }
@@ -151,6 +154,7 @@ impl ModuleCallSummary {
             methods: Vec::new(),
             call_edges,
             notify_candidates: Vec::new(),
+            notify_signature_handlers: Vec::new(),
             notify_regs,
             idle_handler_regs,
             set_action_regs: Vec::new(),
@@ -437,6 +441,8 @@ pub struct NotifyConstructorCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyReg {
     pub caller: CallerId,
+    /// Expression containing the callback string literal, for source-exact reference filtering.
+    pub callback_expr: ExprId,
     pub callback_name: Name,
     /// Source syntax retained independently of semantic receiver resolution.
     pub receiver_syntax: NotifyReceiverSyntax,
@@ -813,6 +819,7 @@ pub fn extract_call_summary(
 
     let mut call_edges = Vec::new();
     let mut notify_candidates = Vec::new();
+    let mut notify_signature_handlers = Vec::new();
     let mut idle_handler_regs = Vec::new();
     let mut set_action_regs = Vec::new();
     let mut name_literals: FxHashSet<MethodKey> = FxHashSet::default();
@@ -827,6 +834,7 @@ pub fn extract_call_summary(
             &local_method_ids,
             &mut call_edges,
             &mut notify_candidates,
+            &mut notify_signature_handlers,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
@@ -842,6 +850,7 @@ pub fn extract_call_summary(
             &local_method_ids,
             &mut call_edges,
             &mut notify_candidates,
+            &mut notify_signature_handlers,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
@@ -864,6 +873,7 @@ pub fn extract_call_summary(
         methods,
         call_edges,
         notify_candidates,
+        notify_signature_handlers,
         notify_regs: Vec::new(),
         idle_handler_regs,
         set_action_regs,
@@ -1000,6 +1010,7 @@ fn extract_from_body(
     local_method_ids: &FxHashMap<NormName, MethodKey>,
     call_edges: &mut Vec<CallEdge>,
     notify_candidates: &mut Vec<NotifyConstructorCandidate>,
+    notify_signature_handlers: &mut Vec<Name>,
     idle_handler_regs: &mut Vec<IdleReg>,
     set_action_regs: &mut Vec<SetActionReg>,
     name_literals: &mut FxHashSet<MethodKey>,
@@ -1064,16 +1075,59 @@ fn extract_from_body(
                     _ => {}
                 }
             }
-            Expr::New { type_name, args }
-                if is_notify_constructor_candidate(body, type_name.is_some(), args) =>
-            {
-                notify_candidates.push(NotifyConstructorCandidate {
-                    caller,
-                    constructor: expr_id,
-                    range: source_map.expr_range(expr_id).unwrap_or(TextRange::empty(0.into())),
-                });
+            Expr::New { type_name, args } => {
+                if is_notify_constructor_candidate(body, type_name.is_some(), args) {
+                    notify_candidates.push(NotifyConstructorCandidate {
+                        caller,
+                        constructor: expr_id,
+                        range: source_map.expr_range(expr_id).unwrap_or(TextRange::empty(0.into())),
+                    });
+                }
+                extract_notify_signature_handlers(
+                    body,
+                    type_name.as_ref(),
+                    args,
+                    notify_signature_handlers,
+                );
             }
             _ => {}
+        }
+    }
+}
+
+fn extract_notify_signature_handlers(
+    body: &Body,
+    type_name: Option<&Name>,
+    args: &[ExprIdx],
+    handlers: &mut Vec<Name>,
+) {
+    let (type_name, slot_offset) = match type_name {
+        Some(type_name) => (type_name.as_str().to_owned(), 0),
+        None => {
+            let Some(type_name) = args.first().and_then(|&idx| extract_string_literal(body, idx))
+            else {
+                return;
+            };
+            (type_name, 1)
+        }
+    };
+    let type_name = type_name.fold_lower();
+    if !matches!(type_name.as_str(), "описаниеоповещения" | "notifydescription") {
+        return;
+    }
+
+    for (handler_slot, receiver_slot) in [(0, 1), (3, 4)] {
+        let Some(&handler_idx) = args.get(handler_slot + slot_offset) else { continue };
+        let Some(handler) = extract_string_literal(body, handler_idx) else { continue };
+        let receiver_syntax =
+            args.get(receiver_slot + slot_offset).map_or(NotifyReceiverSyntax::Other, |&idx| {
+                match body.expr_idx(idx) {
+                    Expr::Path(name) => NotifyReceiverSyntax::for_bare_name(name),
+                    _ => NotifyReceiverSyntax::Other,
+                }
+            });
+        if matches!(receiver_syntax, NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other) {
+            handlers.push(Name::new(&handler));
         }
     }
 }
@@ -1418,9 +1472,11 @@ mod tests {
                 ),
             ],
             notify_candidates: Vec::new(),
+            notify_signature_handlers: Vec::new(),
             notify_regs: vec![
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
                     callback_name: Name::new("Обработчик"),
                     receiver_syntax: NotifyReceiverSyntax::SelfName,
                     target: NotifyTarget::ThisObject,
@@ -1428,6 +1484,7 @@ mod tests {
                 },
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
                     callback_name: Name::new("Обработчик"),
                     receiver_syntax: NotifyReceiverSyntax::BareName,
                     target: NotifyTarget::Unsupported,
@@ -1435,6 +1492,7 @@ mod tests {
                 },
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
                     callback_name: Name::new("ВнешнийОбработчик"),
                     receiver_syntax: NotifyReceiverSyntax::BareName,
                     target: NotifyTarget::Module(Name::new("Handlers")),
@@ -1507,6 +1565,7 @@ mod tests {
             vec![
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
                     callback_name: Name::new("Обработчик"),
                     receiver_syntax: NotifyReceiverSyntax::SelfName,
                     target: NotifyTarget::ThisObject,
@@ -1514,6 +1573,7 @@ mod tests {
                 },
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
+                    callback_expr: ExprId::from_raw(0.into()),
                     callback_name: Name::new("ВнешнийОбработчик"),
                     receiver_syntax: NotifyReceiverSyntax::BareName,
                     target: NotifyTarget::Module(Name::new("Handlers")),
@@ -2039,12 +2099,24 @@ Procedure Test()
     Other = New UnknownType("AnotherHandler", CommonModule);
     Params = New Array;
     Dynamic = New("CallbackDescription", Params);
-    Invalid = New("CallbackDescription", "PositionalHandler", ThisObject);
+    Positional = New("NotifyDescription", "PositionalHandler", ThisObject);
+    PositionalWithError = New("NotifyDescription", "PrimaryHandler", ThisObject, Undefined, "ErrorHandler", ThisObject);
+    CallbackDescriptionPositional = New("CallbackDescription", "NotProtectedBySource", ThisObject);
 EndProcedure
 "#;
         let summary = parse_and_extract(code);
 
         assert!(summary.notify_regs.is_empty(), "raw syntax candidates are not registrations");
+        assert_eq!(
+            summary.notify_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>(),
+            [
+                "ОбработатьОповещение",
+                "HandleResult",
+                "PositionalHandler",
+                "PrimaryHandler",
+                "ErrorHandler",
+            ]
+        );
         assert_eq!(summary.notify_candidates.len(), 4, "{:#?}", summary.notify_candidates);
         assert_eq!(summary.notify_candidates[0].caller, CallerId::Method(MethodKey::first("Test")));
         assert_eq!(summary.notify_candidates[1].caller, CallerId::Method(MethodKey::first("Test")));

@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use vfs::FileId;
 
 use crate::db::HirDatabase;
-use crate::infer::{infer_owner, BareNameOrigin, InferOwnerResult};
+use crate::infer::{BareNameOrigin, InferOwnerResult, infer_owner};
 use crate::notify_array::{
     accepts_argument_count, callback_slots, collect_notify_array_registrations,
 };
@@ -94,14 +94,34 @@ fn retain_notify_name_literal_sites(summary: &mut ModuleCallSummary) {
     for method in &summary.methods {
         local_methods.entry(NormName::intern(method.name.as_str())).or_insert(method.local_id);
     }
-    let notify_handlers: FxHashSet<_> = summary
-        .notify_regs
+
+    let mut notify_handler_methods = FxHashSet::default();
+    let mut notify_callback_sites = FxHashSet::default();
+    let mut local_callback_sites = FxHashSet::default();
+    for registration in &summary.notify_regs {
+        let site = (registration.caller, registration.callback_expr);
+        notify_callback_sites.insert(site);
+        if let Some(&local_id) =
+            local_methods.get(&NormName::intern(registration.callback_name.as_str()))
+        {
+            notify_handler_methods.insert(local_id);
+        }
+        if matches!(&registration.target, NotifyTarget::ThisObject) {
+            local_callback_sites.insert(site);
+        }
+    }
+
+    let retained_local_methods: FxHashSet<_> = summary
+        .name_literal_ref_sites
         .iter()
-        .filter_map(|registration| {
-            local_methods.get(&NormName::intern(registration.callback_name.as_str())).copied()
+        .filter(|site| {
+            let key = (site.caller, site.expr);
+            !notify_callback_sites.contains(&key) || local_callback_sites.contains(&key)
         })
+        .map(|site| site.local_id)
         .collect();
-    summary.name_literal_ref_sites.retain(|site| notify_handlers.contains(&site.local_id));
+    summary.name_literal_refs.retain(|method| retained_local_methods.contains(method));
+    summary.name_literal_ref_sites.retain(|site| notify_handler_methods.contains(&site.local_id));
 }
 
 fn filter_uncompiled_notify_name_literals(summary: &mut ModuleCallSummary) {
@@ -244,6 +264,7 @@ fn append_notify_registration(
     let callback_name = Name::new(callback_name);
     registrations.push(NotifyReg {
         caller: candidate.caller,
+        callback_expr,
         callback_name,
         receiver_syntax,
         target,

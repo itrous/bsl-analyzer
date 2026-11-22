@@ -93,6 +93,10 @@ mod heap_estimate {
             bytes += call_target_name_heap(&e.target);
         }
         bytes += vec_bytes::<NotifyConstructorCandidate>(s.notify_candidates.len());
+        bytes += vec_bytes::<crate::name::Name>(s.notify_signature_handlers.len());
+        for handler in &s.notify_signature_handlers {
+            bytes += name_bytes(handler);
+        }
         bytes += vec_bytes::<NotifyReg>(s.notify_regs.len());
         for r in &s.notify_regs {
             bytes += name_bytes(&r.callback_name);

@@ -104,10 +104,14 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
+    // The source layer records syntactic callback protections independently of whether
+    // platform metadata can normalize these constructors into registrations.
+    fixed_signature_handlers.extend(
+        summary.notify_signature_handlers.iter().map(|handler| handler.as_str().fold_lower()),
+    );
+    // The semantic registrations also cover platform-described dynamic constructors whose
+    // callback slots are not visible from the local syntax shape alone.
     for reg in &summary.notify_regs {
-        // Keep the B0 exemption based on source syntax, not semantic receiver resolution:
-        // an unresolved bare name may be external, while self and non-bare receivers fix
-        // the callback signature.
         if matches!(
             reg.receiver_syntax,
             NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other
@@ -1087,6 +1091,37 @@ EndProcedure
 "#;
 
         check_diagnostics_snapshot_for(code, DiagnosticCode::UnusedParameters, expect![[r#""#]]);
+    }
+
+    #[test]
+    fn uncompiled_notify_protects_only_a_syntactic_self_receiver() {
+        let code = r#"&НаКлиенте
+Процедура СоздатьОповещения()
+#Если МобильныйКлиент Тогда
+    Описание = Новый ОписаниеОповещения("SelfHandler", ЭтотОбъект);
+    Описание = Новый ОписаниеОповещения("ForeignHandler", ДругойМодуль);
+#КонецЕсли
+КонецПроцедуры
+
+&НаКлиенте
+Процедура SelfHandler(Параметр)
+    Сообщить("self");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ForeignHandler(ЧужойПараметр)
+    Сообщить("foreign");
+КонецПроцедуры
+"#;
+
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::UnusedParameters,
+            expect![[r#"
+                UnusedParameters @ 15:25..15:38
+                  message: Уберите неиспользуемый параметр "ЧужойПараметр"
+                  severity: Warning"#]],
+        );
     }
 
     #[test]
