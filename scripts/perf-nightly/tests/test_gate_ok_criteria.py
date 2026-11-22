@@ -245,10 +245,10 @@ class RulesThatStayInForce(CriteriaCase):
         self.assertEqual((code, summary["verdict"]), (1, "block"))
 
     def test_a_profile_that_does_not_compare_leaves_the_gate_incomplete(self):
-        self.machine.print["kernel"] = "7.0"
+        self.machine.print["mem_total"] = "63 GiB"
         code, summary, _ = self.judged("profile")
         self.assertEqual((code, summary["verdict"]), (2, "incomplete"))
-        self.assertIn("record_profile_mismatch:kernel", summary["reasons"])
+        self.assertIn("record_profile_mismatch:mem_total", summary["reasons"])
 
     def test_a_foreign_load_leaves_the_gate_incomplete(self):
         self.script.values["foreign"] = 8.0
