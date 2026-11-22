@@ -5,6 +5,7 @@ use syntax::{TextRange, TextSize};
 
 use crate::{
     body::{Body, ManagerType},
+    execution_env::EnvFlags,
     hir::{Expr, ExprIdx, Literal, Stmt},
     item_tree::{AnnotationKind, ItemTree},
     name::Name,
@@ -438,6 +439,16 @@ pub struct NotifyConstructorCandidate {
     pub range: TextRange,
 }
 
+/// Execution environments in which a notification registration may exist.
+/// `definite` is proven to register; `possible` also includes undecided
+/// preprocessor conditions. Consumers must not turn a possible-only
+/// environment into a definitive verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct NotifyRegistrationEnvironments {
+    pub definite: EnvFlags,
+    pub possible: EnvFlags,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyReg {
     pub caller: CallerId,
@@ -447,6 +458,8 @@ pub struct NotifyReg {
     /// Source syntax retained independently of semantic receiver resolution.
     pub receiver_syntax: NotifyReceiverSyntax,
     pub target: NotifyTarget,
+    /// Environment mask for this constructor, not merely its enclosing method.
+    pub environments: NotifyRegistrationEnvironments,
     pub range: TextRange,
 }
 
@@ -1111,12 +1124,14 @@ fn extract_notify_signature_handlers(
             (type_name, 1)
         }
     };
-    let type_name = type_name.fold_lower();
-    if !matches!(type_name.as_str(), "описаниеоповещения" | "notifydescription") {
+    if !bsl_platform::is_callback_description_compatibility_type_name(&type_name) {
         return;
     }
+    let slots = bsl_platform::bundled_callback_description_slots();
 
-    for (handler_slot, receiver_slot) in [(0, 1), (3, 4)] {
+    for (handler_slot, receiver_slot) in
+        [(slots.handler, slots.receiver), (slots.error_handler, slots.error_receiver)]
+    {
         let Some(&handler_idx) = args.get(handler_slot + slot_offset) else { continue };
         let Some(handler) = extract_string_literal(body, handler_idx) else { continue };
         let receiver_syntax =
@@ -1480,6 +1495,7 @@ mod tests {
                     callback_name: Name::new("Обработчик"),
                     receiver_syntax: NotifyReceiverSyntax::SelfName,
                     target: NotifyTarget::ThisObject,
+                    environments: NotifyRegistrationEnvironments::default(),
                     range: range(70),
                 },
                 NotifyReg {
@@ -1488,6 +1504,7 @@ mod tests {
                     callback_name: Name::new("Обработчик"),
                     receiver_syntax: NotifyReceiverSyntax::BareName,
                     target: NotifyTarget::Unsupported,
+                    environments: NotifyRegistrationEnvironments::default(),
                     range: range(80),
                 },
                 NotifyReg {
@@ -1496,6 +1513,7 @@ mod tests {
                     callback_name: Name::new("ВнешнийОбработчик"),
                     receiver_syntax: NotifyReceiverSyntax::BareName,
                     target: NotifyTarget::Module(Name::new("Handlers")),
+                    environments: NotifyRegistrationEnvironments::default(),
                     range: range(85),
                 },
             ],
@@ -1569,6 +1587,7 @@ mod tests {
                     callback_name: Name::new("Обработчик"),
                     receiver_syntax: NotifyReceiverSyntax::SelfName,
                     target: NotifyTarget::ThisObject,
+                    environments: NotifyRegistrationEnvironments::default(),
                     range: zero,
                 },
                 NotifyReg {
@@ -1577,6 +1596,7 @@ mod tests {
                     callback_name: Name::new("ВнешнийОбработчик"),
                     receiver_syntax: NotifyReceiverSyntax::BareName,
                     target: NotifyTarget::Module(Name::new("Handlers")),
+                    environments: NotifyRegistrationEnvironments::default(),
                     range: zero,
                 },
             ],

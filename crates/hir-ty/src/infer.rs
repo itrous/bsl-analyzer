@@ -1094,11 +1094,25 @@ pub(crate) struct NotifyConstructorEnvironment {
 }
 
 impl NotifyConstructorEnvironment {
+    pub(crate) fn registration_envs(
+        self,
+    ) -> (hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags) {
+        let definite = self.definite & self.available;
+        let possible = if self.definite.is_empty() && self.possible.is_empty() {
+            self.available
+        } else {
+            self.possible & self.available
+        };
+        (definite, possible)
+    }
+
     pub(crate) fn may_be_available(self) -> bool {
         self.definite.intersects(self.available)
             || self.possible.intersects(self.available)
-            // Empty means unknown unless inference separately marks the statement dead.
-            || self.definite.is_empty() && self.possible.is_empty()
+            // Empty body masks mean unknown, unless the constructor itself is unavailable.
+            || self.definite.is_empty()
+                && self.possible.is_empty()
+                && !self.available.is_empty()
     }
 }
 
@@ -1251,6 +1265,14 @@ impl InferOwnerResult {
                 r.notify_constructor_environments.get(&expr).copied()
             }
         }
+    }
+
+    pub(crate) fn notify_constructor_registration_envs(
+        &self,
+        expr: ExprId,
+    ) -> Option<(hir_def::execution_env::EnvFlags, hir_def::execution_env::EnvFlags)> {
+        self.notify_constructor_environment(expr)
+            .map(NotifyConstructorEnvironment::registration_envs)
     }
 
     pub fn expr_types(&self) -> &FxHashMap<ExprId, TypeId> {

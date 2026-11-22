@@ -364,32 +364,24 @@ impl<'a> AnalysisContext<'a> {
 
     pub(crate) fn notify_handler_availability_in_registration(
         &self,
-        owner: hir::DefWithBodyId,
-        registration_range: syntax::TextRange,
+        registration: &hir::call_graph::NotifyReg,
         methods: &[hir::MethodId],
     ) -> hir::NotifyHandlerAvailability {
         self.query(|p| {
-            p.notify_handler_availability_in_registration(
-                self.file_id,
-                owner,
-                registration_range,
-                methods,
-            )
+            p.notify_handler_availability_in_registration(self.file_id, registration, methods)
         })
     }
 
     pub(crate) fn notify_handler_availability_for_method_bodies_in_registration(
         &self,
-        owner: hir::DefWithBodyId,
-        registration_range: syntax::TextRange,
+        registration: &hir::call_graph::NotifyReg,
         method_bodies: &[Vec<hir::MethodId>],
         incomplete_tail: bool,
     ) -> hir::NotifyHandlerAvailability {
         self.query(|p| {
             p.notify_handler_availability_for_method_bodies_in_registration(
                 self.file_id,
-                owner,
-                registration_range,
+                registration,
                 method_bodies,
                 incomplete_tail,
             )

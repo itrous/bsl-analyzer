@@ -142,7 +142,10 @@ fn command_module_this_object_shadowed_by_parameter_or_local_is_not_a_receiver()
         "unknown receivers are not judged as command-local handlers: {diagnostics:#?}"
     );
     assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedLocalMethod && diagnostic.message.contains("ПараметрОбработчик")),
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedLocalMethod
+                && diagnostic.message.contains("ПараметрОбработчик")),
         "the parameter-shadowed registration must not protect the same-named method: {diagnostics:#?}"
     );
     assert!(
@@ -193,6 +196,56 @@ fn unavailable_command_module_registration_does_not_judge_or_protect_handler() {
         }),
         "an unavailable registration must not protect its method: {diagnostics:#?}"
     );
+}
+
+#[test]
+fn constructor_after_return_is_not_compiled() {
+    const SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+    Возврат;
+    О = Новый ОписаниеОповещения("Недостижимый", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Недостижимый()
+КонецПроцедуры
+"#;
+
+    run_in_command_module(SOURCE, |db, ctx| {
+        let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+        assert_eq!(summary.notify_regs.len(), 1, "{:#?}", summary.notify_regs);
+        assert!(
+            matches!(summary.notify_regs[0].target, NotifyTarget::NotCompiled { .. }),
+            "a constructor after Возврат cannot be compiled: {:#?}",
+            summary.notify_regs
+        );
+        Vec::new()
+    });
+}
+
+#[test]
+fn constructor_in_if_condition_is_reachable() {
+    const SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+    Если Новый ОписаниеОповещения("Готово", ЭтотОбъект) Тогда
+    КонецЕсли;
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Готово() Экспорт
+КонецПроцедуры
+"#;
+
+    run_in_command_module(SOURCE, |db, ctx| {
+        let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+        assert_eq!(summary.notify_regs.len(), 1, "{:#?}", summary.notify_regs);
+        assert!(
+            matches!(summary.notify_regs[0].target, NotifyTarget::ThisObject),
+            "the CFG conditional vertex represents a reachable statement: {:#?}",
+            summary.notify_regs
+        );
+        Vec::new()
+    });
 }
 
 #[test]
@@ -610,6 +663,135 @@ fn notify_receiver_assignments_shadow_only_overlapping_environments() {
             .collect();
         assert_eq!(missing.len(), expected_module_targets, "{case}: {diagnostics:#?}");
     }
+}
+
+#[test]
+fn client_server_method_in_client_only_module_checks_notify_handler_in_client_environment() {
+    const CALLER: &str = "CommonModules/Caller/Ext/Module.bsl";
+    let cases = [
+        (
+            "client export is available",
+            "&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n",
+            0,
+        ),
+        (
+            "client non-export remains invalid",
+            "&НаКлиенте\nПроцедура Готово()\nКонецПроцедуры\n",
+            1,
+        ),
+    ];
+
+    for (case, handler, expected) in cases {
+        let source = format!(
+            "&НаКлиентеНаСервере\nПроцедура Тест()\n    О = Новый ОписаниеОповещения(\"Готово\", Caller);\nКонецПроцедуры\n{handler}"
+        );
+        let fixture = CfeFixtureBuilder::new("").build();
+        let diagnostics = crate::test_utils::check_cfe_at_with_db(
+            CALLER,
+            &source,
+            fixture,
+            &[],
+            DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                write_client_common_module_metadata(fixture.root(), "Caller");
+                let path = fixture.root().join("CommonModules/Caller.xml");
+                let xml = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(
+                    path,
+                    xml.replace("<Server>true</Server>", "<Server>false</Server>"),
+                )
+                .unwrap();
+            },
+            |db, ctx| {
+                let module = ModuleId::new(ctx.file_id);
+                let registration = &db.module_call_summary(module).notify_regs[0];
+                assert!(
+                    matches!(&registration.target, NotifyTarget::Module(module) if module.as_str() == "Caller"),
+                    "{case}: expected self common-module receiver, got {registration:#?}"
+                );
+                assert!(
+                    !registration.environments.definite.is_empty(),
+                    "{case}: expected a non-empty definite environment"
+                );
+                assert!(registration
+                    .environments
+                    .definite
+                    .intersects(hir::execution_env::EnvFlags::MANAGED_CLIENTS));
+                assert!(!registration
+                    .environments
+                    .definite
+                    .intersects(hir::execution_env::EnvFlags::SERVER));
+                let symbol_tree = ctx.symbol_tree();
+                let methods = symbol_tree.find_methods(&hir::Name::new("Готово"));
+                let availability = ctx.notify_handler_availability_in_registration(
+                    registration,
+                    &methods.iter().map(|method| method.id).collect::<Vec<_>>(),
+                );
+                assert_eq!(
+                    availability,
+                    if expected == 0 {
+                        hir::NotifyHandlerAvailability::Exported
+                    } else {
+                        hir::NotifyHandlerAvailability::NotExported
+                    },
+                    "{case}: registration={registration:#?}, methods={methods:#?}"
+                );
+                missing_notify_handler::check(ctx)
+            },
+        );
+        let missing: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+            .collect();
+        assert_eq!(missing.len(), expected, "{case}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn an_undecidable_registration_environment_remains_unknown() {
+    const CALLER: &str = "CommonForms/Форма1/Ext/Form/Module.bsl";
+    const SOURCE: &str = r#"
+&НаКлиентеНаСервере
+Процедура Тест()
+#Если НеизвестныйСимвол Тогда
+    О = Новый ОписаниеОповещения("Готово", ЭтотОбъект);
+#КонецЕсли
+КонецПроцедуры
+"#;
+    let fixture = CfeFixtureBuilder::new("").build();
+    let diagnostics = crate::test_utils::check_cfe_at_with_db(
+        CALLER,
+        SOURCE,
+        fixture,
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        |fixture| {
+            let form = fixture.root().join("CommonForms/Форма1/Ext/Form.xml");
+            std::fs::create_dir_all(form.parent().unwrap()).unwrap();
+            std::fs::write(
+                form,
+                r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" version="2.20"><Events/></Form>"#,
+            )
+            .unwrap();
+        },
+        |db, ctx| {
+            let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+            assert_eq!(summary.notify_regs.len(), 1, "{:#?}", summary.notify_regs);
+            let environments = summary.notify_regs[0].environments;
+            assert!(environments.definite.is_empty(), "{environments:#?}");
+            assert!(
+                !environments.possible.is_empty(),
+                "an undecidable registration must retain possible environments: {environments:#?}"
+            );
+            missing_notify_handler::check(ctx)
+        },
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != crate::DiagnosticCode::MissingNotifyHandler),
+        "possible-only registration must not produce a definitive verdict: {diagnostics:#?}"
+    );
 }
 
 #[test]

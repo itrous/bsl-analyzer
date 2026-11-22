@@ -7,8 +7,9 @@
 //! state. Type and constructor facts come from the platform snapshot, not syntax lowering.
 
 use bsl_platform::PlatformDataInner;
+use cfg::{CfgEdgeType, CfgVertex, ControlFlowGraph};
 use cfg_types::{ExprId, IdConversion};
-use hir_def::body::events::{for_each_expr_child, for_each_stmt_expr_root};
+use hir_def::body::events::{for_each_expr_child, for_each_stmt_expr_root, EvalPoint};
 use hir_def::body::Body;
 use hir_def::call_graph::NotifyReceiverSyntax;
 use hir_def::hir::{Expr, ExprIdx, Literal, Stmt, StmtIdx};
@@ -38,14 +39,20 @@ enum ArrayState {
     Unknown,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct CallbackSlots {
-    pub(crate) handler: usize,
-    pub(crate) receiver: usize,
-    pub(crate) error_handler: usize,
-    pub(crate) error_receiver: usize,
-    arity: usize,
-    min_arity: usize,
+pub(crate) type CallbackSlots = bsl_platform::CallbackDescriptionSlots;
+
+pub(crate) fn reachable_statements(cfg: &ControlFlowGraph) -> FxHashSet<cfg_types::StmtId> {
+    let Some(start) = cfg.start() else { return FxHashSet::default() };
+    cfg.reachable_vertices(start, CfgEdgeType::is_executable)
+        .into_iter()
+        .flat_map(|vertex| {
+            let mut statements = cfg.source_stmt_id(vertex).into_iter().collect::<Vec<_>>();
+            if let Some(CfgVertex::BasicBlock(block)) = cfg.vertex(vertex) {
+                statements.extend_from_slice(block.statements());
+            }
+            statements
+        })
+        .collect()
 }
 
 /// Collect dynamic notification constructors whose argument array is exact at the read point.
@@ -58,12 +65,18 @@ pub(crate) struct CallbackSlots {
 /// defensible receiver expression and parameter order.
 pub(crate) fn collect_notify_array_registrations(
     body: &Body,
+    cfg: &ControlFlowGraph,
+    reaching_defs: Option<&dataflow::reaching_defs::ReachingDefsResult>,
     platform: &PlatformDataInner,
 ) -> Vec<NotifyArrayRegistration> {
     if body.is_lowering_incomplete() {
         return Vec::new();
     }
+    let Some(reaching_defs) = reaching_defs else {
+        return Vec::new();
+    };
 
+    let reachable_stmts = reachable_statements(cfg);
     let local_declarations = unique_local_declarations(body);
     let mut states: FxHashMap<String, ArrayState> =
         local_declarations.keys().map(|name| (name.clone(), ArrayState::Uninitialized)).collect();
@@ -71,6 +84,10 @@ pub(crate) fn collect_notify_array_registrations(
     let mut registrations = Vec::new();
 
     for (position, &stmt_idx) in body.body_stmts_typed().iter().enumerate() {
+        let stmt_id = cfg_types::StmtId::from_idx(stmt_idx);
+        if !reachable_stmts.contains(&stmt_id) {
+            continue;
+        }
         let stmt = body.stmt_idx(stmt_idx);
         if is_control_flow(stmt) {
             let mentioned = stmt_path_names(body, stmt_idx);
@@ -79,18 +96,6 @@ pub(crate) fn collect_notify_array_registrations(
                     used_before_initialization.insert(name);
                 }
             }
-            for state in states.values_mut() {
-                if matches!(state, ArrayState::Known(_)) {
-                    *state = ArrayState::Unknown;
-                }
-            }
-            continue;
-        }
-
-        // Dynamic code can write any local without naming it in this statement's syntax tree.
-        // Reaching definitions models `Выполнить` as a possible write to every local for this
-        // reason; do not trust a tracked array after it.
-        if matches!(stmt, Stmt::Execute { .. }) {
             for state in states.values_mut() {
                 if matches!(state, ArrayState::Known(_)) {
                     *state = ArrayState::Unknown;
@@ -113,6 +118,7 @@ pub(crate) fn collect_notify_array_registrations(
                             ArrayState::Unknown
                         };
                         states.insert(key, state);
+                        invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
                         continue;
                     }
                 }
@@ -144,6 +150,7 @@ pub(crate) fn collect_notify_array_registrations(
                     mentioned.remove(&array_name.as_str().fold_lower());
                 }
                 invalidate_or_record_uses(&mut states, &mut used_before_initialization, mentioned);
+                invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
                 continue;
             }
 
@@ -163,6 +170,7 @@ pub(crate) fn collect_notify_array_registrations(
                 let mut mentioned = stmt_path_names(body, stmt_idx);
                 mentioned.remove(&array_key);
                 invalidate_or_record_uses(&mut states, &mut used_before_initialization, mentioned);
+                invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
                 continue;
             }
         }
@@ -197,6 +205,7 @@ pub(crate) fn collect_notify_array_registrations(
                     &mut used_before_initialization,
                     other_names,
                 );
+                invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
                 continue;
             }
         }
@@ -206,9 +215,24 @@ pub(crate) fn collect_notify_array_registrations(
             &mut used_before_initialization,
             stmt_path_names(body, stmt_idx),
         );
+        invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
     }
 
     registrations
+}
+
+fn invalidate_possible_writes(
+    states: &mut FxHashMap<String, ArrayState>,
+    reaching_defs: &dataflow::reaching_defs::ReachingDefsResult,
+    stmt: cfg_types::StmtId,
+) {
+    for (name, state) in states {
+        if matches!(state, ArrayState::Known(_))
+            && !reaching_defs.possible_writes_at(EvalPoint::Stmt(stmt), name).is_empty()
+        {
+            *state = ArrayState::Unknown;
+        }
+    }
 }
 
 fn unique_local_declarations(body: &Body) -> FxHashMap<String, usize> {
@@ -277,51 +301,7 @@ pub(crate) fn callback_slots(
 ) -> Option<CallbackSlots> {
     let constructors = platform.get_constructors(type_name);
     let [constructor] = constructors.as_slice() else { return None };
-    let parameters = &constructor.parameters;
-    if parameters.len() != 5 {
-        return None;
-    }
-
-    let handler = unique_parameter_index(parameters, "ИмяПроцедуры")?;
-    let receiver = unique_parameter_index(parameters, "Модуль")?;
-    let error_handler = unique_parameter_index(parameters, "ИмяПроцедурыОбработкиОшибки")?;
-    let error_receiver = unique_parameter_index(parameters, "МодульОбработкиОшибки")?;
-    let extra_parameters = unique_parameter_index(parameters, "ДополнительныеПараметры")?;
-    if extra_parameters != 2
-        || handler != 0
-        || receiver != 1
-        || error_handler != 3
-        || error_receiver != 4
-    {
-        return None;
-    }
-
-    Some(CallbackSlots {
-        handler,
-        receiver,
-        error_handler,
-        error_receiver,
-        arity: parameters.len(),
-        min_arity: parameters
-            .iter()
-            .enumerate()
-            .filter(|(_, parameter)| !parameter.is_optional && !parameter.is_variadic)
-            .map(|(index, _)| index + 1)
-            .max()
-            .unwrap_or(0),
-    })
-}
-
-fn unique_parameter_index(
-    parameters: &[bsl_platform::MethodParam],
-    expected: &str,
-) -> Option<usize> {
-    let mut matches = parameters
-        .iter()
-        .enumerate()
-        .filter(|(_, parameter)| eq_ignore_case(parameter.name.as_str(), expected));
-    let index = matches.next()?.0;
-    matches.next().is_none().then_some(index)
+    bsl_platform::callback_description_slots_for_parameters(&constructor.parameters)
 }
 
 pub(crate) fn accepts_argument_count(slots: CallbackSlots, count: usize) -> bool {
@@ -439,6 +419,12 @@ fn is_control_flow(stmt: &Stmt) -> bool {
             | Stmt::For { .. }
             | Stmt::ForEach { .. }
             | Stmt::Try { .. }
+            | Stmt::Goto(_)
+            | Stmt::Label(_)
+            | Stmt::Return { .. }
+            | Stmt::Raise { .. }
+            | Stmt::Break
+            | Stmt::Continue
     )
 }
 
@@ -532,7 +518,22 @@ mod tests {
         let parse = parser::parse(source);
         let bodies = hir_def::ModuleBodies::from_parse(&parse);
         let body = bodies.iter_bodies().next().expect("the fixture declares a method").1;
-        let registrations = collect_notify_array_registrations(body, PlatformDataInner::instance());
+        let cfg = cfg::CfgBuilder::new().build_graph_from_hir(body.body_stmts_typed(), body);
+        let body_arc = std::sync::Arc::new(body.clone());
+        let events = std::sync::Arc::new(hir_def::body::events::BodyEvents::collect(body));
+        let reaching_defs = dataflow::reaching_defs::solve_executable_reaching_definitions(
+            std::sync::Arc::new(cfg.clone()),
+            &body_arc,
+            events,
+            true,
+            dataflow::reaching_defs::RecoveredBody::Solve,
+        );
+        let registrations = collect_notify_array_registrations(
+            body,
+            &cfg,
+            reaching_defs.as_deref(),
+            PlatformDataInner::instance(),
+        );
         (bodies, registrations)
     }
 
@@ -779,6 +780,53 @@ EndProcedure
         for source in cases {
             assert!(registrations(source).is_empty(), "{source}");
         }
+    }
+
+    #[test]
+    fn goto_and_labels_conservatively_break_array_proofs() {
+        let cases = [
+            r#"Процедура Test()
+Перем Параметры;
+Параметры = Новый Массив;
+Параметры.Добавить("Готово");
+Параметры.Добавить(ЭтотОбъект);
+Перейти ~Готово;
+Параметры.Добавить("Недостижимо");
+~Готово:
+О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры"#,
+            r#"Процедура Test()
+Перем Параметры;
+Перейти ~Продолжение;
+Параметры = Новый Массив;
+~Продолжение:
+Параметры.Добавить("Готово");
+Параметры.Добавить(ЭтотОбъект);
+О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры"#,
+        ];
+        for source in cases {
+            assert!(registrations(source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn statements_after_return_do_not_change_reachable_array_contents() {
+        let found = registrations(
+            r#"
+Процедура Test()
+    Перем Параметры;
+    Перем Оповещение;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Готово");
+    Параметры.Добавить(ЭтотОбъект);
+    Оповещение = Новый("CallbackDescription", Параметры);
+    Возврат;
+    Параметры.Изменить();
+КонецПроцедуры
+"#,
+        );
+        assert_eq!(found.len(), 1, "{found:#?}");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
-use hir::{call_graph::CallerId, DefWithBodyId, ModuleId, Name, NotifyTarget};
+use hir::{ModuleId, Name, NotifyTarget};
 use rustc_hash::FxHashMap;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
@@ -51,23 +51,13 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     for reg in &summary.notify_regs {
         let verdict = match &reg.target {
             NotifyTarget::ThisObject if local_unprovable => None,
-            NotifyTarget::ThisObject => {
-                let owner = match reg.caller {
-                    CallerId::Method(key) => DefWithBodyId::Method(key),
-                    CallerId::ModuleCode => DefWithBodyId::ModuleCode,
-                };
-                local_verdict(ctx, &reg.callback_name, owner, reg.range)
-                    .map(|v| (v, reg.callback_name.to_string()))
-            }
+            NotifyTarget::ThisObject => local_verdict(ctx, &reg.callback_name, reg)
+                .map(|v| (v, reg.callback_name.to_string())),
             NotifyTarget::Module(module_name) => {
-                let owner = match reg.caller {
-                    CallerId::Method(key) => DefWithBodyId::Method(key),
-                    CallerId::ModuleCode => DefWithBodyId::ModuleCode,
-                };
-                let key = (module_name.clone(), reg.callback_name.clone(), reg.caller, reg.range);
-                let verdict = *module_verdicts.entry(key).or_insert_with(|| {
-                    module_verdict(ctx, module_name, &reg.callback_name, owner, reg.range)
-                });
+                let key = (module_name.clone(), reg.callback_name.clone(), reg.environments);
+                let verdict = *module_verdicts
+                    .entry(key)
+                    .or_insert_with(|| module_verdict(ctx, module_name, &reg.callback_name, reg));
                 verdict.map(|v| {
                     (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
                 })
@@ -114,8 +104,7 @@ fn message(verdict: Verdict, detail: &str) -> String {
 fn local_verdict(
     ctx: &DiagnosticsContext,
     name: &Name,
-    owner: DefWithBodyId,
-    registration_range: syntax::TextRange,
+    registration: &hir::call_graph::NotifyReg,
 ) -> Option<Verdict> {
     let methods = ctx
         .symbol_tree()
@@ -124,7 +113,7 @@ fn local_verdict(
         .map(|method| method.id)
         .collect::<Vec<_>>();
 
-    match ctx.notify_handler_availability_in_registration(owner, registration_range, &methods) {
+    match ctx.notify_handler_availability_in_registration(registration, &methods) {
         hir::NotifyHandlerAvailability::Exported | hir::NotifyHandlerAvailability::Unknown => None,
         hir::NotifyHandlerAvailability::NotExported => Some(Verdict::NotExported),
         hir::NotifyHandlerAvailability::NotFound => Some(Verdict::NotFound),
@@ -139,22 +128,22 @@ fn module_verdict(
     ctx: &DiagnosticsContext,
     module_name: &Name,
     name: &Name,
-    owner: DefWithBodyId,
-    registration_range: syntax::TextRange,
+    registration: &hir::call_graph::NotifyReg,
 ) -> Option<Verdict> {
     ctx.resolve_common_module(module_name.as_str())?;
-    let declarations = match ctx.qualified_method_declarations(module_name, name)? {
-        Ok(declarations) => declarations,
-        Err(hir::QualifiedMethodError::NotFound) => return Some(Verdict::NotFound),
+    let (method_bodies, incomplete_tail) = match ctx
+        .qualified_method_declarations(module_name, name)?
+    {
+        Ok(declarations) => (declarations.bodies, declarations.incomplete_tail),
+        Err(hir::QualifiedMethodError::NotFound) => (Vec::new(), false),
         Err(
             hir::QualifiedMethodError::BodyUnread | hir::QualifiedMethodError::NotVisibleInConfigs,
         ) => return None,
     };
     let availability = ctx.notify_handler_availability_for_method_bodies_in_registration(
-        owner,
-        registration_range,
-        &declarations.bodies,
-        declarations.incomplete_tail,
+        registration,
+        &method_bodies,
+        incomplete_tail,
     );
     match availability {
         hir::NotifyHandlerAvailability::Exported | hir::NotifyHandlerAvailability::Unknown => None,
@@ -225,10 +214,13 @@ mod tests {
                 let edges: Vec<_> =
                     graph.edges.iter().filter(|edge| edge.kind == EdgeKind::NotifyRef).collect();
                 assert_eq!(edges.len(), expected_edges, "{edges:#?}");
-                assert!(edges.iter().all(|edge| {
-                    edge.provenance == EdgeProvenance::StringResolved
-                        && matches!(edge.target, ResolvedTarget::Method(_))
-                }), "the graph still resolves string callbacks independent of declaration availability: {edges:#?}");
+                assert!(
+                    edges.iter().all(|edge| {
+                        edge.provenance == EdgeProvenance::StringResolved
+                            && matches!(edge.target, ResolvedTarget::Method(_))
+                    }),
+                    "the graph still resolves string callbacks independent of declaration availability: {edges:#?}"
+                );
                 check(ctx)
             },
         )
@@ -307,11 +299,10 @@ mod tests {
     }
 
     #[test]
-    fn an_export_in_only_some_registration_environments_is_not_enough() {
+    fn a_client_export_covers_all_constructor_available_environments() {
         let source = "&НаКлиентеНаСервере\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\nКонецПроцедуры\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n";
         let diagnostics = run_local_with_string_resolved_notify_edges(source, 1);
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert!(diagnostics[0].message.starts_with("Создайте экспортную процедуру"));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     #[test]
@@ -322,16 +313,10 @@ mod tests {
     }
 
     #[test]
-    fn registrations_in_one_method_use_their_own_preprocessor_environments() {
+    fn server_only_registration_position_has_no_constructor_environment() {
         let source = "&НаКлиентеНаСервере\nПроцедура ПередЗакрытием()\n#Если Клиент Тогда\n    А = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\n#КонецЕсли\n#Если Сервер Тогда\n    Б = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\n#КонецЕсли\nКонецПроцедуры\n#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
         let diagnostics = run_local_with_string_resolved_notify_edges(source, 2);
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert!(diagnostics[0].message.starts_with("Создайте экспортную процедуру"));
-        let server_registration = source.find("Б = Новый").unwrap();
-        assert!(
-            usize::from(diagnostics[0].range.start()) >= server_registration,
-            "the client registration is valid; the server registration is not: {diagnostics:#?}"
-        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     #[test]
@@ -441,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn common_module_handler_is_checked_in_the_registration_environment() {
+    fn common_module_handler_is_checked_in_constructor_available_environments() {
         let diagnostics = with_module(
             module_source(),
             "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n",
@@ -456,12 +441,10 @@ mod tests {
             server_source,
             "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n",
         );
-        assert_eq!(
-            diagnostics.len(),
-            1,
-            "a client-only declaration cannot satisfy server registration: {diagnostics:#?}"
+        assert!(
+            diagnostics.is_empty(),
+            "the server-incompatible constructor has no server registration: {diagnostics:#?}"
         );
-        assert!(diagnostics[0].message.starts_with("Создайте экспортную процедуру"));
     }
 
     #[test]
@@ -545,17 +528,11 @@ mod tests {
     }
 
     #[test]
-    fn registration_preprocessor_position_is_used_for_common_module_verdicts() {
+    fn server_preprocessor_position_is_excluded_when_constructor_is_unavailable() {
         let source = "&НаКлиентеНаСервере\nПроцедура ПередЗакрытием()\n#Если Клиент Тогда\n    А = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n#КонецЕсли\n#Если Сервер Тогда\n    Б = Новый ОписаниеОповещения(\"Готово\", МойМодульКлиент);\n#КонецЕсли\nКонецПроцедуры\n";
         let module = "#Если Клиент Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
         let diagnostics = with_module(source, module);
-        assert_eq!(
-            diagnostics.len(),
-            1,
-            "only the server-position registration lacks a handler: {diagnostics:#?}"
-        );
-        let server_registration = source.find("Б = Новый").unwrap();
-        assert!(usize::from(diagnostics[0].range.start()) >= server_registration);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     fn async_local_source(export: &str) -> String {

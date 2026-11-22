@@ -1,5 +1,5 @@
-pub mod capability;
 pub mod callback_description;
+pub mod capability;
 mod db;
 pub mod deprecation;
 mod global_catalog;

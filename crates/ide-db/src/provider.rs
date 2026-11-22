@@ -5,9 +5,10 @@ use stdx::case::CaseExt;
 use base_db::SourceRootId;
 use bsl_metadata::Configuration;
 use hir::{
-    dataflow::effect_summary::EffectSummary, AssignmentResolution, DefWithBodyId,
-    InferenceDiagnostic, InferenceResult, ItemTree, MethodDocs, MethodId, ModuleBodies, ModuleId,
-    ModuleIndex, ModuleMetadata, Name, SymbolTree, VariableDocs, VariableId,
+    call_graph::NotifyReg, dataflow::effect_summary::EffectSummary, AssignmentResolution,
+    DefWithBodyId, InferenceDiagnostic, InferenceResult, ItemTree, MethodDocs, MethodId,
+    ModuleBodies, ModuleId, ModuleIndex, ModuleMetadata, Name, SymbolTree, VariableDocs,
+    VariableId,
 };
 use syntax::{Parse, SyntaxNode};
 use vfs::{FileId, VfsPath};
@@ -125,8 +126,7 @@ pub trait AnalysisProvider {
     fn notify_handler_availability_in_registration(
         &self,
         _file_id: FileId,
-        _owner: DefWithBodyId,
-        _registration_range: syntax::TextRange,
+        _registration: &NotifyReg,
         _methods: &[MethodId],
     ) -> hir::NotifyHandlerAvailability {
         hir::NotifyHandlerAvailability::Unknown
@@ -135,8 +135,7 @@ pub trait AnalysisProvider {
     fn notify_handler_availability_for_method_bodies_in_registration(
         &self,
         _file_id: FileId,
-        _owner: DefWithBodyId,
-        _registration_range: syntax::TextRange,
+        _registration: &NotifyReg,
         _method_bodies: &[Vec<MethodId>],
         _incomplete_tail: bool,
     ) -> hir::NotifyHandlerAvailability {

@@ -10,15 +10,20 @@ use hir_def::call_graph::{
     NotifyTarget,
 };
 use hir_def::hir::{Expr, ExprIdx, Literal};
-use hir_def::{DefWithBodyId, ExprId, MethodKey, ModuleId, Name, StmtId};
+use hir_def::{
+    call_graph::NotifyRegistrationEnvironments, execution_env::EnvFlags, DefWithBodyId, ExprId,
+    MethodKey, ModuleId, Name, StmtId,
+};
 use intern::NormName;
 use rustc_hash::{FxHashMap, FxHashSet};
 use vfs::FileId;
 
+use crate::body_flow::BodyFlow;
 use crate::db::HirDatabase;
 use crate::infer::{infer_owner, BareNameOrigin, InferOwnerResult};
 use crate::notify_array::{
     accepts_argument_count, callback_slots, collect_notify_array_registrations,
+    reachable_statements,
 };
 
 #[salsa::tracked(
@@ -172,7 +177,25 @@ fn normalize_owner_candidates(
 ) {
     let inference = infer_owner(db, file_id, owner);
     let dead_stmts: FxHashSet<StmtId> = inference.dead_stmts().iter().copied().collect();
-    let array_registrations = collect_notify_array_registrations(body, platform);
+    let flow = match owner {
+        DefWithBodyId::Method(local_id) => {
+            let method = hir_def::MethodId { module: ModuleId::new(file_id), local_id };
+            let input = hir_def::MethodIdInput::new(db, method);
+            BodyFlow::for_method(db, input, db.method_body_ref(input))
+        }
+        DefWithBodyId::ModuleCode => {
+            let bodies = db.module_bodies_ref(ModuleId::new(file_id));
+            bodies.module_code_arc().map_or_else(
+                || BodyFlow::detached(std::sync::Arc::new(body.clone()), false),
+                |body| BodyFlow::for_module_code(db, file_id, body),
+            )
+        }
+    };
+    let cfg = flow.cfg(db);
+    let reachable_stmts = reachable_statements(&cfg);
+    let reaching_defs = flow.executable_reaching_defs(db);
+    let array_registrations =
+        collect_notify_array_registrations(body, &cfg, reaching_defs.as_deref(), platform);
 
     for &index in candidate_indices {
         let candidate = candidates[index];
@@ -187,8 +210,15 @@ fn normalize_owner_candidates(
             continue;
         }
         let Some(slots) = callback_slots(platform, platform_type_name) else { continue };
-        let not_compiled =
-            constructor_is_not_compiled(body, &dead_stmts, &inference, candidate.constructor);
+        let not_compiled = constructor_is_not_compiled(
+            body,
+            &dead_stmts,
+            &reachable_stmts,
+            &inference,
+            candidate.constructor,
+        );
+        let environments =
+            notify_registration_environments(db, file_id, &inference, candidate, not_compiled);
 
         if dynamic {
             let Some(array) = array_registrations
@@ -206,6 +236,7 @@ fn normalize_owner_candidates(
                     handler.receiver,
                     handler.receiver_syntax,
                     not_compiled,
+                    environments,
                     &inference,
                     registrations,
                 );
@@ -232,6 +263,7 @@ fn normalize_owner_candidates(
                 receiver,
                 receiver_syntax,
                 not_compiled,
+                environments,
                 &inference,
                 registrations,
             );
@@ -251,6 +283,7 @@ fn append_notify_registration(
     receiver: Option<ExprId>,
     receiver_syntax: NotifyReceiverSyntax,
     not_compiled: bool,
+    environments: NotifyRegistrationEnvironments,
     inference: &InferOwnerResult,
     registrations: &mut Vec<NotifyReg>,
 ) {
@@ -268,6 +301,7 @@ fn append_notify_registration(
         callback_name,
         receiver_syntax,
         target,
+        environments,
         range: candidate.range,
     });
 }
@@ -289,13 +323,38 @@ fn receiver_syntax(body: &Body, receiver: Option<ExprId>) -> NotifyReceiverSynta
 fn constructor_is_not_compiled(
     body: &Body,
     dead_stmts: &FxHashSet<StmtId>,
+    reachable_stmts: &FxHashSet<StmtId>,
     inference: &InferOwnerResult,
     constructor: ExprId,
 ) -> bool {
-    body.enclosing_stmt(constructor).is_some_and(|stmt| dead_stmts.contains(&stmt))
+    body.enclosing_stmt(constructor)
+        .is_some_and(|stmt| dead_stmts.contains(&stmt) || !reachable_stmts.contains(&stmt))
         || inference
             .notify_constructor_environment(constructor)
             .is_some_and(|environment| !environment.may_be_available())
+}
+
+fn notify_registration_environments(
+    db: &dyn HirDatabase,
+    file_id: FileId,
+    inference: &InferOwnerResult,
+    candidate: NotifyConstructorCandidate,
+    not_compiled: bool,
+) -> NotifyRegistrationEnvironments {
+    if not_compiled {
+        return NotifyRegistrationEnvironments::default();
+    }
+    let (constructor_definite, constructor_possible) = inference
+        .notify_constructor_registration_envs(candidate.constructor)
+        .unwrap_or((EnvFlags::EMPTY, EnvFlags::ALL));
+    let (site_definite, site_undecided) = hir_def::execution_env::conditional_env_tracking(
+        &db.conditional_tree(file_id),
+        candidate.range,
+    );
+    NotifyRegistrationEnvironments {
+        definite: constructor_definite & site_definite,
+        possible: constructor_possible & (site_definite | site_undecided),
+    }
 }
 
 fn normalize_receiver(

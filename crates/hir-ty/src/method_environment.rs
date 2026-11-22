@@ -1,5 +1,6 @@
+use hir_def::call_graph::NotifyReg;
 use hir_def::execution_env::{self, EnvFlags, EnvOptions};
-use hir_def::{DefWithBodyId, MethodId, ModuleId};
+use hir_def::MethodId;
 
 use crate::db::HirDatabase;
 
@@ -54,19 +55,12 @@ pub enum NotifyHandlerAvailability {
 /// Checks same-module callback declarations against one registration.
 pub fn notify_handler_availability_in_registration(
     db: &dyn HirDatabase,
-    file_id: vfs::FileId,
-    owner: DefWithBodyId,
-    registration_range: syntax::TextRange,
+    registration: &NotifyReg,
     methods: &[MethodId],
 ) -> NotifyHandlerAvailability {
-    if methods.is_empty() {
-        return NotifyHandlerAvailability::NotFound;
-    }
     notify_handler_availability_for_method_bodies_in_registration(
         db,
-        file_id,
-        owner,
-        registration_range,
+        registration,
         &[methods.to_vec()],
         false,
     )
@@ -80,31 +74,22 @@ pub fn notify_handler_availability_in_registration(
 /// from being mistaken for a definitive absence.
 pub fn notify_handler_availability_for_method_bodies_in_registration(
     db: &dyn HirDatabase,
-    file_id: vfs::FileId,
-    owner: DefWithBodyId,
-    registration_range: syntax::TextRange,
+    registration: &NotifyReg,
     method_bodies: &[Vec<MethodId>],
     incomplete_tail: bool,
 ) -> NotifyHandlerAvailability {
     use NotifyHandlerAvailability as Availability;
 
+    let registration_definite = registration.environments.definite;
+    let registration_possible = registration.environments.possible;
+    if registration_definite.is_empty() {
+        return Availability::Unknown;
+    }
     if method_bodies.iter().all(Vec::is_empty) && !incomplete_tail {
         return Availability::NotFound;
     }
 
-    let module = ModuleId::new(file_id);
     let options = db.env_options();
-    let Some((owner_definite, owner_possible)) = owner_environments(db, module, owner, &options)
-    else {
-        return Availability::Unknown;
-    };
-    let (site_definite, site_undecided) =
-        execution_env::conditional_env_tracking(&db.conditional_tree(file_id), registration_range);
-    let registration_definite = owner_definite & site_definite;
-    if registration_definite.is_empty() {
-        return Availability::Unknown;
-    }
-    let registration_possible = owner_possible & (site_definite | site_undecided);
 
     let mut body_environments = Vec::with_capacity(method_bodies.len());
     for methods in method_bodies {
@@ -181,26 +166,6 @@ pub fn notify_handler_availability_for_method_bodies_in_registration(
         Availability::Unknown
     } else {
         Availability::Exported
-    }
-}
-
-fn owner_environments(
-    db: &dyn HirDatabase,
-    module: ModuleId,
-    owner: DefWithBodyId,
-    options: &EnvOptions,
-) -> Option<(EnvFlags, EnvFlags)> {
-    match owner {
-        DefWithBodyId::Method(local_id) => {
-            let method = MethodId { module, local_id };
-            let possible = possible_method_env(db, method, options)?;
-            Some((effective_method_env(db, method, options), possible))
-        }
-        DefWithBodyId::ModuleCode => {
-            let metadata = db.module_metadata(module);
-            let environment = execution_env::module_code_env(&metadata, options);
-            (!environment.is_empty()).then_some((environment, environment))
-        }
     }
 }
 

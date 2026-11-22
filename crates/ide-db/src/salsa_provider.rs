@@ -3,9 +3,9 @@ use std::sync::Arc;
 use base_db::{FileIdInput, SourceRootId};
 use bsl_metadata::Configuration;
 use hir::{
-    AssignmentResolution, DefWithBodyId, HirDatabase, InferenceDiagnostic, InferenceResult,
-    ItemTree, MethodId, ModuleBodies, ModuleId, ModuleIndex, ModuleMetadata, Name, Resolver,
-    SymbolTree,
+    call_graph::NotifyReg, AssignmentResolution, DefWithBodyId, HirDatabase, InferenceDiagnostic,
+    InferenceResult, ItemTree, MethodId, ModuleBodies, ModuleId, ModuleIndex, ModuleMetadata, Name,
+    Resolver, SymbolTree,
 };
 use syntax::{Parse, SyntaxNode};
 use vfs::FileId;
@@ -172,33 +172,23 @@ impl AnalysisProvider for SalsaProvider<'_> {
 
     fn notify_handler_availability_in_registration(
         &self,
-        file_id: FileId,
-        owner: DefWithBodyId,
-        registration_range: syntax::TextRange,
+        _file_id: FileId,
+        registration: &NotifyReg,
         methods: &[MethodId],
     ) -> hir::NotifyHandlerAvailability {
-        hir::notify_handler_availability_in_registration(
-            self.db,
-            file_id,
-            owner,
-            registration_range,
-            methods,
-        )
+        hir::notify_handler_availability_in_registration(self.db, registration, methods)
     }
 
     fn notify_handler_availability_for_method_bodies_in_registration(
         &self,
-        file_id: FileId,
-        owner: DefWithBodyId,
-        registration_range: syntax::TextRange,
+        _file_id: FileId,
+        registration: &NotifyReg,
         method_bodies: &[Vec<MethodId>],
         incomplete_tail: bool,
     ) -> hir::NotifyHandlerAvailability {
         hir::notify_handler_availability_for_method_bodies_in_registration(
             self.db,
-            file_id,
-            owner,
-            registration_range,
+            registration,
             method_bodies,
             incomplete_tail,
         )
