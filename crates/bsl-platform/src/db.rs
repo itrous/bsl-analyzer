@@ -708,7 +708,8 @@ pub const LEGACY_GLOBAL_FUNCTION_EN_ALIASES: &[(&str, &str)] = &[
 
 /// Historical English platform type names accepted by the runtime in addition
 /// to the current spelling in the help corpus.
-const LEGACY_ENGLISH_TYPE_ALIASES: &[(&str, &str)] = &[("ОписаниеОповещения", "NotifyDescription")];
+pub(crate) const LEGACY_ENGLISH_TYPE_ALIASES: &[(&str, &str)] =
+    &[("ОписаниеОповещения", "NotifyDescription")];
 
 /// Since the 8.3.27 help archives, the `СписокЭлементовDOM` page lists only
 /// HTML element classes as collection elements, while the same collection is

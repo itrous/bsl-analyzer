@@ -1,4 +1,5 @@
 pub mod capability;
+pub mod callback_description;
 mod db;
 pub mod deprecation;
 mod global_catalog;
@@ -23,6 +24,10 @@ pub use standard_mdo_attributes::{
     StandardAttrSpec, StandardKind,
 };
 
+pub use callback_description::{
+    bundled_callback_description_slots, callback_description_slots_for_parameters,
+    is_callback_description_compatibility_type_name, CallbackDescriptionSlots,
+};
 pub use db::{
     docs_gap_synthesized_member_types, find_prefixed_method, find_prefixed_methods,
     global_function_query, global_member_method_query, global_property_query,
