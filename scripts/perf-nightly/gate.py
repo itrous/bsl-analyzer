@@ -1044,6 +1044,11 @@ def _differing(expected: dict, measured: dict) -> list[str]:
     return sorted(k for k in expected.keys() | measured.keys() if expected.get(k) != measured.get(k))
 
 
+def _record_profile_differing(expected: dict, measured: dict) -> list[str]:
+    return _differing({k: v for k, v in expected.items() if k != "kernel"},
+                      {k: v for k, v in measured.items() if k != "kernel"})
+
+
 def _text(value) -> bool:
     return isinstance(value, str) and bool(value)
 
@@ -1125,7 +1130,7 @@ class Baseline:
         """The reasons no number of this measurement compares with any record."""
         reasons = list(self.reasons)
         if self.profile and print_ is not None:
-            diff = _differing(self.profile, print_)
+            diff = _record_profile_differing(self.profile, print_)
             reasons += [f"record_profile_mismatch:{','.join(diff)}"] if diff else []
         if self.protocol:
             diff = _differing(self.protocol, measured_protocol())
