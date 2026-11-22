@@ -247,7 +247,7 @@ pub use baseline::{
 };
 pub use cache::{
     expected_scope_from_env, rotated_log_path, CacheOrigin, WorkspaceCacheLayout,
-    ROTATED_LOG_RETENTION, WORKSPACE_CACHE_BASE_ENV, WORKSPACE_CACHE_SCOPE_ENV,
+    LOG_ROTATE_BYTES, ROTATED_LOG_RETENTION, WORKSPACE_CACHE_BASE_ENV, WORKSPACE_CACHE_SCOPE_ENV,
 };
 pub use graph_db::{
     read_source_root_scoped_sqlite_method_call_digest, read_sqlite_method_call_digest,

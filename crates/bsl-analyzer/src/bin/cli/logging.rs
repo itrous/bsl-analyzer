@@ -51,6 +51,12 @@ pub fn start_logging(
 ) -> anyhow::Result<JournalGuard> {
     use std::io::Write;
 
+    if !default_log {
+        if let Some(path) = &log_file {
+            rotate_explicit_log(path);
+        }
+    }
+
     match setup_logging(log_file.clone(), profile_filter.clone(), json_profile_filter.clone()) {
         Ok(guard) => Ok(guard),
         Err(error) => {
@@ -66,6 +72,23 @@ pub fn start_logging(
             }
             Err(error)
         }
+    }
+}
+
+/// Moves an explicit log above [`mcp_server::LOG_ROTATE_BYTES`] to its `.prev` trail, replacing
+/// the previous one, so the file opened next starts empty: an appended log otherwise grows
+/// without bound (one measured file reached 5.9 GB).
+///
+/// The trail is never deleted here, unlike the daemon's cache log: the directory belongs to
+/// whoever named the path, so a file there is theirs however old, and the bound is two files of
+/// at most the threshold each. Every filesystem failure is ignored: a log that stays
+/// unrotated keeps being appended to, and must not fail the start.
+fn rotate_explicit_log(path: &std::path::Path) {
+    if !fs::metadata(path).is_ok_and(|meta| meta.len() > mcp_server::LOG_ROTATE_BYTES) {
+        return;
+    }
+    if let Some(trail) = mcp_server::rotated_log_path(path) {
+        let _ = fs::rename(path, trail);
     }
 }
 
@@ -285,5 +308,113 @@ mod tests {
         assert!(stderr.contains("Failed to setup logging"), "{stderr}");
         assert!(stderr.contains("served-from-stderr"), "no stderr fallback:\n{stderr}");
         assert!(unwritable.is_dir(), "the destination was replaced");
+    }
+
+    /// Writes `len` real bytes (not a sparse `set_len` file): the rotation reads only the
+    /// length, but real bytes keep "the old bytes moved" checkable by content.
+    fn write_log(path: &std::path::Path, head: &str, len: u64) {
+        let mut bytes = head.as_bytes().to_vec();
+        bytes.resize(usize::try_from(len).unwrap(), b'.');
+        fs::write(path, bytes).unwrap();
+    }
+
+    const OVER: u64 = mcp_server::LOG_ROTATE_BYTES + 1;
+
+    #[test]
+    fn a_log_over_the_threshold_is_rotated_to_its_trail() {
+        if act_as_child() {
+            return;
+        }
+        const TEST: &str = "a_log_over_the_threshold_is_rotated_to_its_trail";
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        let trail = dir.path().join("run.log.prev");
+        write_log(&log, SENTINEL, OVER);
+
+        run_child(TEST, "start:fresh-after-rotation", &log, "warn");
+
+        let old = fs::read(&trail).unwrap();
+        assert_eq!(u64::try_from(old.len()).unwrap(), OVER);
+        assert!(old.starts_with(SENTINEL.as_bytes()));
+        let live = fs::read_to_string(&log).unwrap();
+        assert!(!live.contains(SENTINEL), "the old bytes stayed in the live log");
+        assert!(live.contains("fresh-after-rotation"), "{live}");
+    }
+
+    /// The control of the test above: a log not over the threshold is a normal log.
+    #[test]
+    fn a_log_at_the_threshold_is_appended_and_leaves_no_trail() {
+        if act_as_child() {
+            return;
+        }
+        const TEST: &str = "a_log_at_the_threshold_is_appended_and_leaves_no_trail";
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        write_log(&log, SENTINEL, mcp_server::LOG_ROTATE_BYTES);
+
+        run_child(TEST, "start:appended-not-rotated", &log, "warn");
+
+        assert!(!dir.path().join("run.log.prev").exists(), "a log at the threshold was rotated");
+        let bytes = fs::read(&log).unwrap();
+        assert!(bytes.starts_with(SENTINEL.as_bytes()));
+        assert!(String::from_utf8_lossy(&bytes).contains("appended-not-rotated"));
+    }
+
+    #[test]
+    fn a_rotation_replaces_an_existing_trail() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        let trail = dir.path().join("run.log.prev");
+        fs::write(&trail, "an older trail").unwrap();
+        write_log(&log, SENTINEL, OVER);
+
+        rotate_explicit_log(&log);
+
+        let moved = fs::read(&trail).unwrap();
+        assert_eq!(u64::try_from(moved.len()).unwrap(), OVER);
+        assert!(moved.starts_with(SENTINEL.as_bytes()), "the older trail was kept");
+        assert!(!log.exists(), "the rotated log was not moved away");
+    }
+
+    /// The daemon's cache log is rotated by the MCP command before logging starts; rotating it
+    /// here too would apply its bound twice.
+    #[test]
+    fn the_daemon_default_log_is_not_rotated_by_the_logging_start() {
+        if act_as_child() {
+            return;
+        }
+        const TEST: &str = "the_daemon_default_log_is_not_rotated_by_the_logging_start";
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        write_log(&log, SENTINEL, OVER);
+
+        run_child(TEST, "default:default-log-line", &log, "warn");
+
+        assert!(!dir.path().join("run.log.prev").exists(), "the default log was rotated");
+        let bytes = fs::read(&log).unwrap();
+        assert!(u64::try_from(bytes.len()).unwrap() > OVER, "the default log was not appended to");
+        assert!(bytes.starts_with(SENTINEL.as_bytes()));
+    }
+
+    /// The trail path is a directory, so the rename cannot happen: the start still succeeds,
+    /// and the old file keeps its bytes and keeps being appended to.
+    #[test]
+    fn a_rotation_that_cannot_happen_keeps_the_old_log_and_starts() {
+        if act_as_child() {
+            return;
+        }
+        const TEST: &str = "a_rotation_that_cannot_happen_keeps_the_old_log_and_starts";
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        let trail = dir.path().join("run.log.prev");
+        fs::create_dir(&trail).unwrap();
+        write_log(&log, SENTINEL, OVER);
+
+        run_child(TEST, "start:appended-despite-failed-rotation", &log, "warn");
+
+        assert!(trail.is_dir(), "the trail directory was replaced");
+        let bytes = fs::read(&log).unwrap();
+        assert!(bytes.starts_with(SENTINEL.as_bytes()), "the old bytes were lost");
+        assert!(String::from_utf8_lossy(&bytes).contains("appended-despite-failed-rotation"));
     }
 }

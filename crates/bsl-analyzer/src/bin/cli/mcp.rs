@@ -256,8 +256,6 @@ impl McpCommand {
         opt_in: Option<&str>,
         expected_scope: Option<&str>,
     ) -> Option<PathBuf> {
-        const ROTATE_BYTES: u64 = 50 * 1024 * 1024;
-
         let McpCommand::Serve(args) = self else { return None };
         if !matches!(args.mode, Some(McpServeMode::Daemon)) {
             return None;
@@ -309,7 +307,7 @@ impl McpCommand {
             remove_stale_prev_log(&log_path, std::time::SystemTime::now());
         }
         let rotated = mcp_server::rotated_log_path(&log_path)
-            .filter(|_| std::fs::metadata(&log_path).is_ok_and(|m| m.len() > ROTATE_BYTES));
+            .filter(|_| std::fs::metadata(&log_path).is_ok_and(|m| m.len() > mcp_server::LOG_ROTATE_BYTES));
         if let Some(rotated) = rotated {
             if std::fs::rename(&log_path, &rotated).is_ok() && is_cache_log {
                 // A rename keeps the last write's mtime, and the stale-trail sweep reads the age
