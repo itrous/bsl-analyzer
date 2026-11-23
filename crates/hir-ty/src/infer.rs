@@ -1543,6 +1543,22 @@ impl<'db> InferenceContext<'db> {
         {
             return;
         }
+        // The platform drops a `#Если` branch nothing compiles, so a name read there is
+        // never looked up. The name still resolves for completion and navigation (the
+        // verdict is recorded before this point); only the report is withheld.
+        if self.in_dead_branch
+            && matches!(
+                diag,
+                InferenceDiagnostic::UnresolvedName { .. }
+                    | InferenceDiagnostic::UnresolvedBareCall { .. }
+                    | InferenceDiagnostic::UnresolvedMethodCall {
+                        kind: UnresolvedMethodKind::ReceiverNameAbsent,
+                        ..
+                    }
+            )
+        {
+            return;
+        }
         // A call whose target body could not be read gets no "unresolved" verdict from
         // ANY later attempt: resolution continues past the unread module (the platform
         // surface of a manager or object does not live in the user module, and losing
@@ -3826,36 +3842,44 @@ impl<'db> InferenceContext<'db> {
                 let parent_dead = self.in_dead_branch;
                 let mut remaining = parent;
                 let mut possible_remaining = parent_possible;
-                let enter = |this: &mut Self, mask: EnvFlags, possible: EnvFlags| {
-                    this.body_env = mask;
-                    this.possible_env = possible;
-                    this.in_uncompiled_branch = parent_uncompiled || mask.is_empty();
-                    this.in_dead_branch =
-                        parent_dead || (!parent_possible.is_empty() && possible.is_empty());
-                };
+                // `contradiction` covers a body whose environment is unknown: a
+                // condition false under every valuation of its symbols
+                // (`Сервер И Не Сервер`) is dropped whatever the environment.
+                let enter =
+                    |this: &mut Self, mask: EnvFlags, possible: EnvFlags, contradiction: bool| {
+                        this.body_env = mask;
+                        this.possible_env = possible;
+                        this.in_uncompiled_branch = parent_uncompiled || mask.is_empty();
+                        this.in_dead_branch = parent_dead
+                            || contradiction
+                            || (!parent_possible.is_empty() && possible.is_empty());
+                    };
                 let mask = preproc.condition.narrow_branch(&mut remaining);
                 let taken = preproc.condition.possible_branch(&mut possible_remaining);
-                enter(self, mask, taken);
+                enter(self, mask, taken, preproc.condition.is_contradiction());
                 self.infer_stmts(&preproc.then_branch);
                 for (idx, (_, _, branch)) in preproc.elsif_branches.iter().enumerate() {
-                    let (mask, taken) = match preproc.elsif_conditions.get(idx) {
+                    let (mask, taken, contradiction) = match preproc.elsif_conditions.get(idx) {
                         Some(cond) => (
                             cond.narrow_branch(&mut remaining),
                             cond.possible_branch(&mut possible_remaining),
+                            cond.is_contradiction(),
                         ),
                         // A branch without a lowered condition (broken
                         // alignment) poisons the rest of the chain,
                         // including #Иначе.
                         None => {
                             remaining = EnvFlags::EMPTY;
-                            (EnvFlags::EMPTY, possible_remaining)
+                            (EnvFlags::EMPTY, possible_remaining, false)
                         }
                     };
-                    enter(self, mask, taken);
+                    enter(self, mask, taken, contradiction);
                     self.infer_stmts(branch);
                 }
                 if let Some(else_branch) = &preproc.else_branch {
-                    enter(self, remaining, possible_remaining);
+                    // `#Иначе` of a dropped branch is live: nothing it follows
+                    // was compiled, so it takes whatever is left.
+                    enter(self, remaining, possible_remaining, false);
                     self.infer_stmts(else_branch);
                 }
                 self.body_env = parent;

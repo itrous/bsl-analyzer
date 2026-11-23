@@ -340,6 +340,104 @@ mod tests {
         );
     }
 
+    /// Messages of `UnresolvedName` for `body` as a procedure body, in a module of
+    /// unknown environment (`Caller`) or in a server common module (`Проба`).
+    fn unresolved_in(server_module: bool, body: &str) -> Vec<String> {
+        use crate::test_utils::{check_cfe_at_with_unreadable, check_with_cfe};
+
+        let source = format!("Процедура Тест()\n{body}КонецПроцедуры\n");
+        let diagnostics = if server_module {
+            let mut builder = test_fixture::CfeFixtureBuilder::new("");
+            builder.add_base_module("Проба", &source);
+            check_cfe_at_with_unreadable(
+                "CommonModules/Проба/Ext/Module.bsl",
+                &source,
+                builder.build(),
+                &[],
+                crate::diagnostics,
+            )
+        } else {
+            check_with_cfe(&source, test_fixture::CfeFixtureBuilder::new("").build())
+        };
+        diagnostics
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnresolvedName)
+            .map(|diag| diag.message)
+            .collect()
+    }
+
+    /// The platform never compiles `#Если Сервер И Не Сервер` (the idiom that gives the
+    /// editor a type hint), so a name read there is never looked up. The pair differs in
+    /// the directive lines alone; a branch some environment compiles and the plain body
+    /// keep the verdict.
+    #[test]
+    fn a_name_in_a_branch_no_valuation_compiles_is_not_reported() {
+        for server_module in [false, true] {
+            let plain = unresolved_in(server_module, "    Х = НетТакогоИмени;\n");
+            assert_eq!(plain.len(), 1, "control (server={server_module}): {plain:?}");
+
+            let dead = unresolved_in(
+                server_module,
+                "#Если Сервер И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+            );
+            assert!(dead.is_empty(), "dead branch (server={server_module}): {dead:?}");
+
+            let satisfiable = unresolved_in(
+                server_module,
+                "#Если Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+            );
+            assert_eq!(
+                satisfiable.len(),
+                1,
+                "satisfiable (server={server_module}): {satisfiable:?}"
+            );
+
+            // Only the branch is silent.
+            let after = unresolved_in(
+                server_module,
+                "#Если Сервер И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n    Х = ДругоеНет;\n",
+            );
+            assert_eq!(after.len(), 1, "after the branch (server={server_module}): {after:?}");
+            assert!(after[0].contains("ДругоеНет"), "{after:?}");
+        }
+    }
+
+    /// `#Иначе` of a dropped branch is compiled: it takes everything the branch did not.
+    /// A dropped `#ИначеЕсли` is silent like the dropped `#Если`.
+    #[test]
+    fn the_else_of_a_dropped_branch_is_live() {
+        for server_module in [false, true] {
+            let in_else = unresolved_in(
+                server_module,
+                "#Если Сервер И Не Сервер Тогда\n    А = Скрыто;\n#Иначе\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+            );
+            assert_eq!(in_else.len(), 1, "#Иначе (server={server_module}): {in_else:?}");
+            assert!(in_else[0].contains("НетТакогоИмени"), "{in_else:?}");
+
+            let in_elsif = unresolved_in(
+                server_module,
+                "#Если Сервер Тогда\n    Х = 1;\n#ИначеЕсли Клиент И Не Клиент Тогда\n    А = Скрыто;\n#КонецЕсли\n",
+            );
+            assert!(in_elsif.is_empty(), "#ИначеЕсли (server={server_module}): {in_elsif:?}");
+        }
+    }
+
+    /// A condition with a symbol nothing is known about is not a contradiction unless a
+    /// recognised operand already forces it.
+    #[test]
+    fn an_undecided_condition_keeps_the_verdict() {
+        let unknown = unresolved_in(
+            false,
+            "#Если Линукс И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+        );
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        let forced = unresolved_in(
+            false,
+            "#Если Линукс И Сервер И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\n",
+        );
+        assert!(forced.is_empty(), "{forced:?}");
+    }
+
     #[test]
     fn unread_application_module_keeps_unknown_name_indeterminate() {
         use crate::test_utils::check_with_cfe_unreadable;
