@@ -1296,21 +1296,21 @@ fn extract_dynamic_notify_handlers(
     for (handler_slot, receiver_slot) in
         [(slots.handler, slots.receiver), (slots.error_handler, slots.error_receiver)]
     {
-        let Some(handler) = values
-            .get(handler_slot)
-            .and_then(|&idx| extract_string_literal(body, idx))
+        let Some(handler) =
+            values.get(handler_slot).and_then(|&idx| extract_string_literal(body, idx))
         else {
             continue;
         };
         if !is_identifier_like(&handler) {
             continue;
         }
-        let receiver_syntax = values.get(receiver_slot).map_or(NotifyReceiverSyntax::Other, |&idx| {
-            match body.expr_idx(idx) {
-                Expr::Path(name) => NotifyReceiverSyntax::for_bare_name(name),
-                _ => NotifyReceiverSyntax::Other,
-            }
-        });
+        let receiver_syntax =
+            values.get(receiver_slot).map_or(NotifyReceiverSyntax::Other, |&idx| {
+                match body.expr_idx(idx) {
+                    Expr::Path(name) => NotifyReceiverSyntax::for_bare_name(name),
+                    _ => NotifyReceiverSyntax::Other,
+                }
+            });
         if matches!(receiver_syntax, NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other) {
             handlers.push(Name::new(&handler));
         }
@@ -1339,8 +1339,12 @@ fn dynamic_array_has_branch(
     body.stmts_iter().any(|(stmt_id, stmt)| {
         if !matches!(
             stmt,
-            Stmt::If(_) | Stmt::PreprocIf(_) | Stmt::While { .. } | Stmt::For { .. }
-                | Stmt::ForEach { .. } | Stmt::Try { .. }
+            Stmt::If(_)
+                | Stmt::PreprocIf(_)
+                | Stmt::While { .. }
+                | Stmt::For { .. }
+                | Stmt::ForEach { .. }
+                | Stmt::Try { .. }
         ) {
             return false;
         }
@@ -2410,11 +2414,7 @@ EndProcedure
             ["NotProtectedBySource"]
         );
         assert_eq!(
-            summary
-                .notify_dynamic_signature_handlers
-                .iter()
-                .map(Name::as_str)
-                .collect::<Vec<_>>(),
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>(),
             ["DynamicHandler", "DynamicErrorHandler"]
         );
         assert_eq!(summary.notify_candidates.len(), 4, "{:#?}", summary.notify_candidates);

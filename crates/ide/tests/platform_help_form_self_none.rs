@@ -1,7 +1,7 @@
 #[path = "platform_help_self/support.rs"]
 mod support;
 
-use bsl_platform::{PlatformData, PlatformHelp, PlatformHelpRequest, install_platform_help};
+use bsl_platform::{install_platform_help, PlatformData, PlatformHelp, PlatformHelpRequest};
 use ide_db::base_db::SourceDatabase;
 use support::*;
 

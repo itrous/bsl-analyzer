@@ -1,7 +1,7 @@
 use base_db::FileIdInput;
-use bsl_platform::MemberSurface;
 use bsl_platform::deprecation::{self, ElementKind, Lookup};
 use bsl_platform::security::Category as SecurityCategory;
+use bsl_platform::MemberSurface;
 use bsl_types::builders::Builders;
 use bsl_types::facet::{DateComponent, FormDataFacet, MdoRefFacet, ProjectionSource};
 use bsl_types::intern::TypeKernelDb;
@@ -5326,14 +5326,8 @@ impl<'db> InferenceContext<'db> {
                 // their member lists are complete before a missing bare member is absent.
                 type_names.iter().any(|name| {
                     data.get_type(name).is_none()
-                        || !data.platform_type_member_surface_verified(
-                            name,
-                            MemberSurface::Methods,
-                        )
-                        || !data.platform_type_member_surface_verified(
-                            name,
-                            MemberSurface::Fields,
-                        )
+                        || !data.platform_type_member_surface_verified(name, MemberSurface::Methods)
+                        || !data.platform_type_member_surface_verified(name, MemberSurface::Fields)
                 })
             }
             // Metadata receivers still inherit methods from platform types, while

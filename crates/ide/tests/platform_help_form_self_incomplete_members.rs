@@ -1,7 +1,7 @@
 #[path = "platform_help_self/support.rs"]
 mod support;
 
-use bsl_platform::{PlatformData, PlatformHelp, PlatformHelpRequest, install_platform_help};
+use bsl_platform::{install_platform_help, PlatformData, PlatformHelp, PlatformHelpRequest};
 use ide_db::base_db::SourceDatabase;
 use support::*;
 
@@ -16,18 +16,16 @@ fn present_form_type_without_member_does_not_prove_bare_member_absent() {
         .expect("bundled platform has the managed form type")
         .english_name
         .clone();
-    assert!(
-        help.snapshot
-            .methods
-            .iter()
-            .any(|method| { method.type_name == form_type && method.name == "Открыть" })
-    );
-    assert!(
-        help.snapshot
-            .methods
-            .iter()
-            .any(|method| { method.type_name == form_type && method.name == "Закрыть" })
-    );
+    assert!(help
+        .snapshot
+        .methods
+        .iter()
+        .any(|method| { method.type_name == form_type && method.name == "Открыть" }));
+    assert!(help
+        .snapshot
+        .methods
+        .iter()
+        .any(|method| { method.type_name == form_type && method.name == "Закрыть" }));
     help.snapshot
         .methods
         .retain(|method| !(method.type_name == form_type && method.name == "Закрыть"));
