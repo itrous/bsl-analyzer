@@ -81,8 +81,8 @@ pub use lower::TyLoweringContext;
 pub use manager_lookup::{lookup_manager_field, ManagerMemberInfo};
 pub use method_environment::{
     method_has_form_context, notify_handler_availability_for_method_bodies_in_registration,
-    notify_handler_availability_in_registration, owner_body_env, owner_has_form_context,
-    NotifyHandlerAvailability,
+    notify_handler_availability_in_registration, notify_method_is_exported_in_registration,
+    owner_body_env, owner_has_form_context, NotifyHandlerAvailability,
 };
 pub use method_lookup::{lookup_method, MethodInfo};
 pub use method_resolution::{resolve_qualified_call, MethodResolution};

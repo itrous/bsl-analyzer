@@ -121,6 +121,17 @@ pub trait AnalysisProvider {
         None
     }
 
+    /// Whether a declaration participates in a fully exported local callback surface.
+    fn notify_method_is_exported_in_registration(
+        &self,
+        _file_id: FileId,
+        _registration: &NotifyReg,
+        _method: MethodId,
+        _methods: &[MethodId],
+    ) -> bool {
+        false
+    }
+
     /// Whether same-named local methods provide an exported callback in each
     /// proven execution environment of a registration.
     fn notify_handler_availability_in_registration(

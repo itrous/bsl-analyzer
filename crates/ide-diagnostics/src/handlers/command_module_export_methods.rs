@@ -33,21 +33,32 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let item_tree = ctx.item_tree();
     let module = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module);
+    let symbol_tree = ctx.symbol_tree();
     let mut diagnostics = Vec::new();
 
     for (_, proc) in item_tree.procedures() {
-        let method = hir::MethodId { module, local_id: proc.key };
         if proc.is_export
-            && !registered_on_this_object(ctx, &summary.notify_regs, &proc.name, method)
+            && !registered_on_this_object(
+                ctx,
+                &summary.notify_regs,
+                &proc.name,
+                hir::MethodId { module, local_id: proc.key },
+                &symbol_tree,
+            )
         {
             diagnostics.push(make_diagnostic(proc.name_range, code, ctx));
         }
     }
 
     for (_, func) in item_tree.functions() {
-        let method = hir::MethodId { module, local_id: func.key };
         if func.is_export
-            && !registered_on_this_object(ctx, &summary.notify_regs, &func.name, method)
+            && !registered_on_this_object(
+                ctx,
+                &summary.notify_regs,
+                &func.name,
+                hir::MethodId { module, local_id: func.key },
+                &symbol_tree,
+            )
         {
             diagnostics.push(make_diagnostic(func.name_range, code, ctx));
         }
@@ -63,12 +74,18 @@ fn registered_on_this_object(
     registrations: &[hir::call_graph::NotifyReg],
     name: &hir::Name,
     method: hir::MethodId,
+    symbol_tree: &hir::SymbolTree,
 ) -> bool {
+    let methods =
+        symbol_tree.find_methods(name).into_iter().map(|method| method.id).collect::<Vec<_>>();
+    if methods.is_empty() {
+        return false;
+    }
+
     registrations.iter().any(|registration| {
         matches!(&registration.target, hir::call_graph::NotifyTarget::ThisObject)
             && registration.callback_name.eq_ignore_case(name)
-            && ctx.notify_handler_availability_in_registration(registration, &[method])
-                == hir::NotifyHandlerAvailability::Exported
+            && ctx.notify_method_is_exported_in_registration(registration, method, &methods)
     })
 }
 
@@ -220,6 +237,68 @@ mod tests {
               message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint
             CommandModuleExportMethods @ 7:11..7:23
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn complementary_conditional_declarations_cover_the_registration_environment() {
+        let code = r#"&НаКлиенте
+Процедура ОбработкаКоманды(Команда, Параметры) Экспорт
+    Оповещение = Новый ОписаниеОповещения("ПослеКоманды", ЭтотОбъект);
+КонецПроцедуры
+
+#Если ТонкийКлиент Тогда
+&НаКлиенте
+Процедура ПослеКоманды() Экспорт
+КонецПроцедуры
+#Иначе
+&НаКлиенте
+Процедура ПослеКоманды() Экспорт
+КонецПроцедуры
+#КонецЕсли
+
+#Если Сервер Тогда
+&НаСервере
+Процедура ПослеКоманды() Экспорт
+КонецПроцедуры
+#КонецЕсли
+"#;
+        let diagnostics = check_command_at(code);
+        expect![[r#"
+            CommandModuleExportMethods @ 2:11..2:27
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint
+            CommandModuleExportMethods @ 18:11..18:23
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn incomplete_conditional_export_does_not_exempt_the_handler() {
+        let code = r#"&НаКлиенте
+Процедура ОбработкаКоманды(Команда, Параметры) Экспорт
+    Оповещение = Новый ОписаниеОповещения("ПослеКоманды", ЭтотОбъект);
+КонецПроцедуры
+
+#Если ТонкийКлиент Тогда
+&НаКлиенте
+Процедура ПослеКоманды() Экспорт
+КонецПроцедуры
+#Иначе
+&НаКлиенте
+Процедура ПослеКоманды()
+КонецПроцедуры
+#КонецЕсли
+"#;
+        let diagnostics = check_command_at(code);
+        expect![[r#"
+            CommandModuleExportMethods @ 2:11..2:27
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint
+            CommandModuleExportMethods @ 8:11..8:23
               message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint"#]]
         .assert_eq(&format_diags(code, &diagnostics));

@@ -362,6 +362,17 @@ impl<'a> AnalysisContext<'a> {
         self.query(|p| p.qualified_method_declarations(self.file_id, module_name, method_name))
     }
 
+    pub(crate) fn notify_method_is_exported_in_registration(
+        &self,
+        registration: &hir::call_graph::NotifyReg,
+        method: hir::MethodId,
+        methods: &[hir::MethodId],
+    ) -> bool {
+        self.query(|p| {
+            p.notify_method_is_exported_in_registration(self.file_id, registration, method, methods)
+        })
+    }
+
     pub(crate) fn notify_handler_availability_in_registration(
         &self,
         registration: &hir::call_graph::NotifyReg,

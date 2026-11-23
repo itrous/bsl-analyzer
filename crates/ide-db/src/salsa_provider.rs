@@ -92,6 +92,16 @@ impl<'db> SalsaProvider<'db> {
 }
 
 impl AnalysisProvider for SalsaProvider<'_> {
+    fn notify_method_is_exported_in_registration(
+        &self,
+        _file_id: FileId,
+        registration: &hir::call_graph::NotifyReg,
+        method: hir::MethodId,
+        methods: &[hir::MethodId],
+    ) -> bool {
+        hir::notify_method_is_exported_in_registration(self.db, registration, method, methods)
+    }
+
     fn configuration(&self) -> Option<Arc<Configuration>> {
         let path_input = self.configuration_path_input?;
         Some(self.db.load_configuration(path_input))
