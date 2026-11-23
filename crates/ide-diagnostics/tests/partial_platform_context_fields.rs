@@ -9,7 +9,8 @@ use ide_diagnostics::{DiagnosticCode, DiagnosticsConfig, DiagnosticsContext};
 use std::fs;
 use vfs::{FileId, FileSet, VfsPath};
 
-const SOURCE: &str = "Процедура Проверить()\n    НеизвестноеПоле = 1;\nКонецПроцедуры\n";
+const SOURCE: &str =
+    "Процедура Проверить()\n    Перем НастоящаяЛокаль;\n    НеизвестноеПоле = 1;\nКонецПроцедуры\n";
 
 #[test]
 fn partial_callback_facts_conservatively_suppress_implicit_context_assignments() {
@@ -63,8 +64,17 @@ fn partial_callback_facts_conservatively_suppress_implicit_context_assignments()
     assert_eq!(ctx.module_metadata().module_type, bsl_metadata::ModuleType::ObjectModule);
 
     let diagnostics = ide_diagnostics::handlers::unused_local_variable::check(&ctx);
+    let unused_locals: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalVariable)
+        .collect();
+    assert_eq!(
+        unused_locals.len(),
+        1,
+        "the incomplete context cannot prove the implicit assignment is local, while explicit locals remain visible: {diagnostics:#?}"
+    );
     assert!(
-        diagnostics.iter().all(|diagnostic| diagnostic.code != DiagnosticCode::UnusedLocalVariable),
-        "partial callback facts conservatively silence implicit assignments: {diagnostics:#?}"
+        unused_locals[0].message.contains("НастоящаяЛокаль"),
+        "the real declared local remains diagnosable: {diagnostics:#?}"
     );
 }

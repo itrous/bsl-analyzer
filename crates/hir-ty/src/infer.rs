@@ -5127,22 +5127,37 @@ impl<'db> InferenceContext<'db> {
             }
         }
 
-        if bodywide_local && !body_binding_shadows && !self.assigned_var_names.contains(&flow_key) {
-            return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
-        }
-        if scope_sensitive {
-            if assigned_in_body {
-                let ty = self.flow_local_type_at(name, expr_id);
-                let ty = self.refine_flow_local_type(name, expr_id, ty);
-                return found(ty, BareNameOrigin::FlowLocal, all_env);
-            }
-        } else {
-            if self.reset_vars.contains(&flow_key) {
+        let flow_local_candidate = bodywide_local
+            && !body_binding_shadows
+            && !self.assigned_var_names.contains(&flow_key)
+            || (scope_sensitive && assigned_in_body)
+            || (!scope_sensitive
+                && (self.reset_vars.contains(&flow_key) || self.var_types.contains_key(&flow_key)));
+        let assignment_receiver_surface_missing = usage == BareNameUse::AssignmentTarget
+            && flow_local_candidate
+            && self.implicit_self_surface_has_bare_fields()
+            && self.implicit_self_surface_is_missing();
+        if !assignment_receiver_surface_missing {
+            if bodywide_local
+                && !body_binding_shadows
+                && !self.assigned_var_names.contains(&flow_key)
+            {
                 return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
             }
-            if let Some(ty) = self.var_types.get(&flow_key).copied() {
-                let ty = self.refine_flow_local_type(name, expr_id, ty);
-                return found(ty, BareNameOrigin::FlowLocal, all_env);
+            if scope_sensitive {
+                if assigned_in_body {
+                    let ty = self.flow_local_type_at(name, expr_id);
+                    let ty = self.refine_flow_local_type(name, expr_id, ty);
+                    return found(ty, BareNameOrigin::FlowLocal, all_env);
+                }
+            } else {
+                if self.reset_vars.contains(&flow_key) {
+                    return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
+                }
+                if let Some(ty) = self.var_types.get(&flow_key).copied() {
+                    let ty = self.refine_flow_local_type(name, expr_id, ty);
+                    return found(ty, BareNameOrigin::FlowLocal, all_env);
+                }
             }
         }
 
@@ -5400,9 +5415,20 @@ impl<'db> InferenceContext<'db> {
         {
             gaps.push(BareNameGap::MissingConfigurationRoot);
         }
+        if self.implicit_self_surface_is_missing() {
+            gaps.push(BareNameGap::MissingImplicitReceiverSurface);
+        }
+
+        let target = self.db.target_platform_version();
+        let platform_status =
+            bsl_platform::PlatformGlobalCatalog::instance().status_for_target(target.as_deref());
+        classify_bare_name_miss(gaps, platform_status)
+    }
+
+    fn implicit_self_surface_is_missing(&self) -> bool {
         let receiver_surface = self.implicit_self_surface();
         let data = bsl_platform::PlatformData::instance();
-        let receiver_surface_missing = match receiver_surface {
+        match receiver_surface {
             ImplicitSelfSurface::PlatformTypes(type_names) => {
                 // A missing candidate may still own the name even if another type is known.
                 // Present type records are not enough: the corpus must also attest that
@@ -5424,15 +5450,7 @@ impl<'db> InferenceContext<'db> {
             }
             ImplicitSelfSurface::Unreadable => true,
             ImplicitSelfSurface::None => false,
-        };
-        if receiver_surface_missing {
-            gaps.push(BareNameGap::MissingImplicitReceiverSurface);
         }
-
-        let target = self.db.target_platform_version();
-        let platform_status =
-            bsl_platform::PlatformGlobalCatalog::instance().status_for_target(target.as_deref());
-        classify_bare_name_miss(gaps, platform_status)
     }
 
     fn infer_literal(&self, lit: &Literal) -> TypeId {

@@ -191,6 +191,19 @@ fn test_mode(mode: &str) {
         "the value-manager surface is not attested complete, so a miss cannot prove local ownership ({mode}): {messages:?}"
     );
 
+    if mode == "bundled" {
+        let (db, file) = db_for(
+            "Catalogs/Справочник1/Forms/ФормаЭлемента/Ext/Form/Module.bsl",
+            "Процедура Тест()\n    Заголовок = Новый Массив;\n    Заголовок.Добавить(1);\nКонецПроцедуры\n",
+        );
+        let diagnostics =
+            ide_diagnostics::file_diagnostics(&db, file, &DiagnosticsConfig::all_enabled());
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code != DiagnosticCode::UnresolvedMethodCall),
+            "a previously assigned flow-local still shadows the form member on read ({mode}): {diagnostics:#?}"
+        );
+    }
+
     let (db, file) = db_for(
         "CommonModules/ПервыйОбщийМодуль/Ext/Module.bsl",
         "Перем Заголовок;\nПроцедура Тест()\n    Локальная = 1;\nКонецПроцедуры\n",
