@@ -1,6 +1,7 @@
 //! Syntax-only callback protection for dynamic callback-description constructors.
 
 #[path = "platform_help/common.rs"]
+#[allow(dead_code, reason = "The shared fixture also provides helpers used by other test targets.")]
 mod common;
 
 use bsl_platform::{install_platform_help, PlatformData, PlatformHelp, PlatformHelpRequest};
