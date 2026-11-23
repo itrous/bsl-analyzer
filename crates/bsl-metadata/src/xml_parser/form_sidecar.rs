@@ -190,7 +190,7 @@ fn parse_sidecar(json: &str, form_name: &str) -> std::result::Result<Form, Sidec
             let attr_type = attr
                 .type_name
                 .as_deref()
-                .and_then(object_type_of)
+                .and_then(sidecar_type_of)
                 .unwrap_or(AttributeType::Unknown);
             let mut attribute = FormAttribute::new(attr.name, attr_type);
             attribute.is_main = attr.main;
@@ -266,6 +266,77 @@ fn object_type_of(type_name: &str) -> Option<AttributeType> {
     let (_, mdo_type) =
         OBJECT_TYPE_PREFIXES.iter().find(|(known, _)| stdx::case::eq_ignore_case(known, prefix))?;
     Some(AttributeType::Ref { mdo_type: *mdo_type, name: name.to_string() })
+}
+
+/// A sidecar `type` as the attribute type this reader can name: an object type, a
+/// register's record manager or record set, or a platform LIST type. Anything else is
+/// `None`, so the attribute keeps `Unknown` rather than a guess.
+fn sidecar_type_of(type_name: &str) -> Option<AttributeType> {
+    object_type_of(type_name)
+        .or_else(|| register_type_of(type_name))
+        .or_else(|| list_type_of(type_name))
+}
+
+/// `<Регистр>МенеджерЗаписи.<Имя>` and `<Регистр>НаборЗаписей.<Имя>` in either notation.
+/// The heads are built from the metadata kind's own names, so no spelling is listed here;
+/// a register has one `Ref` shape (no object/reference split), which is its record set.
+fn register_type_of(type_name: &str) -> Option<AttributeType> {
+    let (prefix, name) = split_type_name(type_name)?;
+    MdoType::all().iter().filter(|mdo| mdo.is_register()).find_map(|mdo| {
+        let is = |ru: &str, en: &str| {
+            stdx::case::eq_ignore_case(&format!("{}{ru}", mdo.russian_name()), prefix)
+                || stdx::case::eq_ignore_case(&format!("{}{en}", mdo.english_name()), prefix)
+        };
+        if is("НаборЗаписей", "RecordSet") {
+            Some(AttributeType::Ref { mdo_type: *mdo, name: name.to_string() })
+        } else if *mdo == MdoType::InformationRegister && is("МенеджерЗаписи", "RecordManager")
+        {
+            Some(AttributeType::InformationRegisterRecordManager { name: name.to_string() })
+        } else {
+            None
+        }
+    })
+}
+
+/// `<Вид>Список.<Имя>` in either notation, as `PlatformNamed("<русское имя>.<Имя>")`.
+fn list_type_of(type_name: &str) -> Option<AttributeType> {
+    let (prefix, name) = split_type_name(type_name)?;
+    let (ru, _) = platform_list_heads(prefix)?;
+    Some(AttributeType::PlatformNamed(format!("{ru}.{name}")))
+}
+
+fn split_type_name(type_name: &str) -> Option<(&str, &str)> {
+    let (prefix, name) = type_name.trim().split_once('.')?;
+    (!name.is_empty() && !name.contains('.')).then_some((prefix, name))
+}
+
+/// The Russian and English heads (`СправочникСписок`, `CatalogList`) of the platform
+/// LIST type `spelling` names in either notation. The catalog is the only source: its
+/// templated types (`СправочникСписок.<Имя справочника>`) whose Russian head ends in
+/// `Список` and English head in `List`. `None` for any other head.
+pub fn platform_list_heads(spelling: &str) -> Option<(&'static str, &'static str)> {
+    static HEADS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let heads = HEADS.get_or_init(|| {
+        let mut found: Vec<(String, String)> = Vec::new();
+        for ty in bsl_platform::PlatformDataInner::instance().all_types() {
+            let (Some((ru, _)), Some((en, _))) =
+                (ty.name.split_once('.'), ty.english_name.split_once('.'))
+            else {
+                continue;
+            };
+            if ru.ends_with("Список") && en.ends_with("List") && !found.iter().any(|(r, _)| r == ru)
+            {
+                found.push((ru.to_string(), en.to_string()));
+            }
+        }
+        found
+    });
+    heads
+        .iter()
+        .find(|(ru, en)| {
+            stdx::case::eq_ignore_case(ru, spelling) || stdx::case::eq_ignore_case(en, spelling)
+        })
+        .map(|(ru, en)| (ru.as_str(), en.as_str()))
 }
 
 fn handlers_of(handlers: BTreeMap<String, String>) -> Vec<FormEventHandler> {
@@ -503,6 +574,89 @@ mod tests {
         let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
         assert!(form.main_attribute().is_none());
         assert_eq!(form.find_attribute("ОбщийОтчет").unwrap().attr_type, AttributeType::Unknown);
+    }
+
+    fn main_type_of(type_name: &str) -> AttributeType {
+        let json = format!(
+            r#"{{"schema": 14, "attributes": [{{"id": 0, "name": "А", "type": "{type_name}", "main": true}}]}}"#
+        );
+        parse_ordinary_form_sidecar(&json, "Ф").unwrap().main_attribute().unwrap().attr_type.clone()
+    }
+
+    /// Every list spelling the 3097-form corpus carries, in both notations, names the
+    /// platform list type; the stored name is the Russian one whichever was written.
+    #[test]
+    fn a_list_type_is_read_in_both_notations() {
+        let pairs = [
+            ("СправочникСписок", "CatalogList"),
+            ("ДокументСписок", "DocumentList"),
+            ("РегистрСведенийСписок", "InformationRegisterList"),
+            ("РегистрНакопленияСписок", "AccumulationRegisterList"),
+            ("РегистрБухгалтерииСписок", "AccountingRegisterList"),
+            ("РегистрРасчетаСписок", "CalculationRegisterList"),
+            ("ПланВидовХарактеристикСписок", "ChartOfCharacteristicTypesList"),
+            ("ПланСчетовСписок", "ChartOfAccountsList"),
+            ("ПланВидовРасчетаСписок", "ChartOfCalculationTypesList"),
+            ("ПланОбменаСписок", "ExchangePlanList"),
+            ("БизнесПроцессСписок", "BusinessProcessList"),
+            ("ЗадачаСписок", "TaskList"),
+            ("ЖурналДокументовСписок", "DocumentJournalList"),
+            ("КритерийОтбораСписок", "FilterCriterionList"),
+            ("ПеречислениеСписок", "EnumList"),
+        ];
+        for (ru, en) in pairs {
+            let expected = AttributeType::PlatformNamed(format!("{ru}.Имя"));
+            assert_eq!(main_type_of(&format!("{ru}.Имя")), expected, "{ru}");
+            assert_eq!(main_type_of(&format!("{en}.Имя")), expected, "{en}");
+            assert_eq!(platform_list_heads(en).map(|(ru, _)| ru), Some(ru));
+            assert_eq!(platform_list_heads(ru).map(|(_, en)| en), Some(en));
+        }
+    }
+
+    /// The control of the list reading: spellings that look alike but are not a list
+    /// type keep `Unknown`.
+    #[test]
+    fn a_type_that_is_not_a_list_keeps_unknown() {
+        for spelling in [
+            "СправочникМенеджер.Имя",
+            "СправочникСсылка.Имя",
+            "СписокЗначений.Имя",
+            "СправочникСписок",
+            "СправочникСписок.",
+            "СправочникСписок.А.Б",
+            "НесуществующийСписок.Имя",
+            "Список.Имя",
+        ] {
+            assert_eq!(main_type_of(spelling), AttributeType::Unknown, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_register_record_set_and_record_manager_are_read_in_both_notations() {
+        let set = |mdo_type| AttributeType::Ref { mdo_type, name: "Имя".to_string() };
+        assert_eq!(
+            main_type_of("РегистрСведенийНаборЗаписей.Имя"),
+            set(MdoType::InformationRegister)
+        );
+        assert_eq!(
+            main_type_of("InformationRegisterRecordSet.Имя"),
+            set(MdoType::InformationRegister)
+        );
+        assert_eq!(
+            main_type_of("РегистрНакопленияНаборЗаписей.Имя"),
+            set(MdoType::AccumulationRegister)
+        );
+        assert_eq!(
+            main_type_of("CalculationRegisterRecordSet.Имя"),
+            set(MdoType::CalculationRegister)
+        );
+        let manager =
+            AttributeType::InformationRegisterRecordManager { name: "Имя".to_string() };
+        assert_eq!(main_type_of("РегистрСведенийМенеджерЗаписи.Имя"), manager);
+        assert_eq!(main_type_of("InformationRegisterRecordManager.Имя"), manager);
+        // Only an information register has a record manager.
+        assert_eq!(main_type_of("РегистрНакопленияМенеджерЗаписи.Имя"), AttributeType::Unknown);
+        assert_eq!(main_type_of("РегистрСведенийМенеджер.Имя"), AttributeType::Unknown);
     }
 
     #[test]

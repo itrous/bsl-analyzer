@@ -316,9 +316,36 @@ enum ImplicitSelfSurface {
         types: Vec<&'static str>,
         owner: (bsl_metadata::MdoType, Name),
     },
+    /// The module of an ordinary form whose main attribute is a LIST or a register's
+    /// record set / record manager rather than an object. Only bare READS are judged
+    /// against it: a bare call keeps its earlier verdict (silent), exactly as for
+    /// `Unreadable`, and no object module is consulted.
+    OrdinaryFormRead {
+        types: Vec<&'static str>,
+        main: OrdinaryFormMain,
+    },
     /// An implicit receiver exists but its surface cannot be produced — a gap, not
     /// an absence.
     Unreadable,
+}
+
+fn ordinary_read_surface(main: OrdinaryFormMain) -> ImplicitSelfSurface {
+    ImplicitSelfSurface::OrdinaryFormRead {
+        types: crate::form_self::ordinary_form_self_types(),
+        main,
+    }
+}
+
+/// What an ordinary form's main attribute holds when it is not an object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrdinaryFormMain {
+    /// A platform list (`СправочникСписок.<Имя>`): the properties the catalog files
+    /// under the list type's English head (`CatalogList`). The attributes of the
+    /// listed object are NOT in the surface: a list is not an object.
+    List { english_head: &'static str },
+    /// A register's record set or record manager: its fields come from the same
+    /// field lookup an object module uses.
+    Register { kind: hir_def::ty::MetadataKind, name: Name },
 }
 
 /// The catalog prefix of a constant's value manager — the receiver of its
@@ -5808,8 +5835,10 @@ impl<'db> InferenceContext<'db> {
     /// but its surface cannot be produced. `Unreadable` is not recognition;
     /// it is still silence, because absence is not proven.
     fn implicit_receiver_call_is_silent(&self, name: &hir_def::Name) -> bool {
-        matches!(self.implicit_self_surface(), ImplicitSelfSurface::Unreadable)
-            || self.implicit_receiver_owns_method(name)
+        matches!(
+            self.implicit_self_surface(),
+            ImplicitSelfSurface::Unreadable | ImplicitSelfSurface::OrdinaryFormRead { .. }
+        ) || self.implicit_receiver_owns_method(name)
     }
 
     /// Whether the call channel already recognises `name` as a method of this
@@ -5838,7 +5867,9 @@ impl<'db> InferenceContext<'db> {
                 types.iter().any(|ty| data.get_method(ty, name.as_str()).is_some())
                     || self.form_owner_owns_method(owner.0, &owner.1, name)
             }
-            ImplicitSelfSurface::None | ImplicitSelfSurface::Unreadable => false,
+            ImplicitSelfSurface::None
+            | ImplicitSelfSurface::Unreadable
+            | ImplicitSelfSurface::OrdinaryFormRead { .. } => false,
         }
     }
 
@@ -5858,14 +5889,55 @@ impl<'db> InferenceContext<'db> {
         {
             return false;
         }
-        let ImplicitSelfSurface::OrdinaryForm { types, owner } = self.implicit_self_surface()
-        else {
+        let surface = self.implicit_self_surface();
+        if !matches!(
+            surface,
+            ImplicitSelfSurface::OrdinaryForm { .. } | ImplicitSelfSurface::OrdinaryFormRead { .. }
+        ) {
             return false;
-        };
+        }
         if metadata.form.as_deref().is_some_and(|form| form.find_attribute(name.as_str()).is_some())
         {
             return true;
         }
+        let (types, owner) = match surface {
+            ImplicitSelfSurface::OrdinaryForm { types, owner } => (types, owner),
+            ImplicitSelfSurface::OrdinaryFormRead { types, main } => {
+                let data = bsl_platform::PlatformData::instance();
+                if types.iter().any(|ty| data.get_property(ty, name.as_str()).is_some()) {
+                    return true;
+                }
+                return match main {
+                    OrdinaryFormMain::List { english_head } => {
+                        let wanted = name.as_str().fold_lower();
+                        data.get_manager_properties(english_head).into_iter().any(|prop| {
+                            let english = prop
+                                .english_name
+                                .as_str()
+                                .rsplit('.')
+                                .next()
+                                .unwrap_or(prop.english_name.as_str());
+                            prop.name.as_str().fold_lower() == wanted
+                                || english.fold_lower() == wanted
+                        })
+                    }
+                    OrdinaryFormMain::Register { kind, name: register } => {
+                        let obj_resolver = crate::object_resolver::DbObjectResolver::new(
+                            self.db,
+                            module_id.file_id,
+                        );
+                        let receiver = self.db.metadata_ref(
+                            kind,
+                            register.as_str().to_string(),
+                            &RootConfigCtx,
+                        );
+                        crate::field_lookup::lookup_field(self.db, &obj_resolver, receiver, name)
+                            .is_some()
+                    }
+                };
+            }
+            _ => return false,
+        };
         let (mdo_type, owner_name) = (owner.0, &owner.1);
         if let Some(kind) = hir_def::ty::MetadataKind::object_kind_for(mdo_type) {
             let obj_resolver =
@@ -6016,6 +6088,36 @@ impl<'db> InferenceContext<'db> {
                             owner: (*mdo_type, Name::new(name)),
                         }
                     }
+                    Some(bsl_metadata::FormAttribute {
+                        attr_type: bsl_metadata::AttributeType::Ref { mdo_type, name },
+                        ..
+                    }) => match hir_def::ty::MetadataKind::record_set_kind_for(*mdo_type) {
+                        Some(kind) => ordinary_read_surface(OrdinaryFormMain::Register {
+                            kind,
+                            name: Name::new(name),
+                        }),
+                        None => ImplicitSelfSurface::Unreadable,
+                    },
+                    Some(bsl_metadata::FormAttribute {
+                        attr_type:
+                            bsl_metadata::AttributeType::InformationRegisterRecordManager { name },
+                        ..
+                    }) => ordinary_read_surface(OrdinaryFormMain::Register {
+                        kind: hir_def::ty::MetadataKind::InformationRegisterRecordManager,
+                        name: Name::new(name),
+                    }),
+                    Some(bsl_metadata::FormAttribute {
+                        attr_type: bsl_metadata::AttributeType::PlatformNamed(named),
+                        ..
+                    }) => match named
+                        .split_once('.')
+                        .and_then(|(head, _)| bsl_metadata::xml_parser::platform_list_heads(head))
+                    {
+                        Some((_, english_head)) => {
+                            ordinary_read_surface(OrdinaryFormMain::List { english_head })
+                        }
+                        None => ImplicitSelfSurface::Unreadable,
+                    },
                     _ => ImplicitSelfSurface::Unreadable,
                 },
                 _ => ImplicitSelfSurface::Unreadable,

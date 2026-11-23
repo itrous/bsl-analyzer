@@ -596,3 +596,180 @@ fn a_constant_value_manager_module_resolves_its_receiver() {
     let (db, file_id) = setup_at(CONSTANT_VALUE_MANAGER_MODULE, text);
     assert_eq!(absent_bare_calls(&db, file_id), vec!["СовсемНеизвестныйВызов".to_string()]);
 }
+
+const FORMS: &str = "Catalogs/Справочник1/Forms";
+
+fn form_module(form: &str) -> String {
+    format!("{FORMS}/{form}/Ext/Form/Module.bsl")
+}
+
+/// One read per surface of a LIST form. Owned by the list type the catalog files
+/// under the main attribute's type (`Отбор`, `Порядок`, `Колонки`), by the form type
+/// (`Модифицированность`, `ЭтаФорма`, `ВладелецФормы`), by a form extension
+/// (`ПараметрОтборПоРегистратору`) and by the form's own attributes. Not owned: an
+/// unknown name, a name the platform lists for no form or list type
+/// (`ТекущаяСтрока`), and `Наименование` - an attribute of the listed catalog,
+/// which a list is not.
+const LIST_FORM_READS: &str = "Процедура Тест()
+    А = СовсемНеизвестноеИмя;
+    Б = РеквизитФормы;
+    В = Отбор;
+    Г = Порядок;
+    Д = Колонки;
+    Е = Модифицированность;
+    Ж = ЭтаФорма;
+    З = ВладелецФормы;
+    И = ПараметрОтборПоРегистратору;
+    К = Наименование;
+    Л = ТекущаяСтрока;
+КонецПроцедуры
+";
+
+fn reported(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+const ALL_LIST_READS: [&str; 11] = [
+    "СовсемНеизвестноеИмя",
+    "РеквизитФормы",
+    "Отбор",
+    "Порядок",
+    "Колонки",
+    "Модифицированность",
+    "ЭтаФорма",
+    "ВладелецФормы",
+    "ПараметрОтборПоРегистратору",
+    "Наименование",
+    "ТекущаяСтрока",
+];
+
+#[test]
+fn a_list_form_read_resolves_the_list_and_form_surface_and_not_the_listed_object() {
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаСТипом"), LIST_FORM_READS);
+    assert_eq!(
+        absent_names(&db, file_id),
+        reported(&["СовсемНеизвестноеИмя", "Наименование", "ТекущаяСтрока"])
+    );
+}
+
+/// The English spelling of a list type, in a notation the object spellings of the
+/// same sidecar reader never use.
+#[test]
+fn a_list_form_with_an_english_list_type_resolves_the_same_surface() {
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаАнглийская"), LIST_FORM_READS);
+    assert_eq!(
+        absent_names(&db, file_id),
+        reported(&["СовсемНеизвестноеИмя", "Наименование", "ТекущаяСтрока"])
+    );
+}
+
+/// The control of the list tests: the same module over the sidecar that differs only
+/// in the missing `type` and `main` keys. Every name is reported as before.
+#[test]
+fn a_list_form_without_a_main_attribute_is_judged_as_before() {
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаБезТипа"), LIST_FORM_READS);
+    assert_eq!(absent_names(&db, file_id), reported(&ALL_LIST_READS));
+}
+
+/// A plain value as the main attribute names no list: the surface stays unreadable.
+#[test]
+fn a_list_form_whose_main_attribute_is_a_plain_string_is_judged_as_before() {
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаСтрока"), LIST_FORM_READS);
+    assert_eq!(absent_names(&db, file_id), reported(&ALL_LIST_READS));
+}
+
+/// A bare CALL keeps its earlier verdict on a list form: silent, as for an unreadable
+/// surface. The surface built for reads must not start judging calls.
+#[test]
+fn a_bare_call_in_a_list_form_stays_silent() {
+    let text = "Процедура Тест()
+    СовсемНеизвестныйВызов();
+КонецПроцедуры
+";
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаСТипом"), text);
+    assert!(absent_bare_calls(&db, file_id).is_empty());
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаБезТипа"), text);
+    assert!(absent_bare_calls(&db, file_id).is_empty());
+}
+
+/// A list form's own attribute named like a global metadata collection is that
+/// attribute: a member called on it is not judged against the collection manager
+/// (which has no `НайтиСтроки`).
+const LIST_COLLISION_CALLS: &str = "Процедура Тест()
+    А = Справочники.НайтиСтроки(Новый Структура(\"Значение\", 1));
+    Б = Отчеты.Количество();
+    В = Справочники;
+    Г = СовсемНеизвестноеИмя;
+КонецПроцедуры
+";
+
+#[test]
+fn a_list_form_attribute_named_like_a_global_collection_wins_as_a_call_receiver() {
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаКоллизия"), LIST_COLLISION_CALLS);
+    assert_eq!(unresolved_method_calls(&db, file_id), Vec::<String>::new());
+    assert_eq!(absent_names(&db, file_id), reported(&["СовсемНеизвестноеИмя"]));
+}
+
+/// The control of the collision test: the same module and the same typed main
+/// attribute over a sidecar WITHOUT the two attributes named like collections. The
+/// surface owns neither name, so both resolve to the global collections as before and
+/// the unknown name is still reported. (With the surface not consulted by the
+/// receiver dispatch, the test above reports `Справочники.НайтиСтроки` and
+/// `Отчеты.Количество` - checked by disabling that one consultation.)
+#[test]
+fn a_collection_name_the_list_surface_does_not_own_is_still_the_collection() {
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаСТипом"), LIST_COLLISION_CALLS);
+    assert_eq!(unresolved_method_calls(&db, file_id), Vec::<String>::new());
+    assert_eq!(absent_names(&db, file_id), reported(&["СовсемНеизвестноеИмя"]));
+}
+
+/// Reads of a register form. The register of the fixture is not periodic, so `Период`
+/// is owned by nothing; its dimension `Справочник1` is a field of the register, and
+/// `Отбор` is a property the platform lists for a record SET but not for a record
+/// manager.
+const REGISTER_FORM_READS: &str = "Процедура Тест()
+    А = СовсемНеизвестноеИмя;
+    Б = РеквизитФормы;
+    В = Справочник1;
+    Г = Период;
+    Д = Отбор;
+    Е = Модифицированность;
+КонецПроцедуры
+";
+
+#[test]
+fn a_record_manager_form_read_resolves_the_registers_fields() {
+    let (db, file_id) = setup_at(&form_module("ФормаЗаписиРегистра"), REGISTER_FORM_READS);
+    assert_eq!(absent_names(&db, file_id), reported(&["СовсемНеизвестноеИмя", "Период", "Отбор"]));
+}
+
+#[test]
+fn a_record_set_form_read_resolves_the_registers_fields_in_both_notations() {
+    for form in ["ФормаНабораРегистра", "ФормаНабораАнглийская"]
+    {
+        let (db, file_id) = setup_at(&form_module(form), REGISTER_FORM_READS);
+        assert_eq!(
+            absent_names(&db, file_id),
+            reported(&["СовсемНеизвестноеИмя", "Период"]),
+            "{form}"
+        );
+    }
+}
+
+/// The control of the register tests: the same module over the sidecar without `type`
+/// and `main`. Every name is reported as before.
+#[test]
+fn a_register_form_without_a_main_attribute_is_judged_as_before() {
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаБезТипа"), REGISTER_FORM_READS);
+    assert_eq!(
+        absent_names(&db, file_id),
+        reported(&[
+            "СовсемНеизвестноеИмя",
+            "РеквизитФормы",
+            "Справочник1",
+            "Период",
+            "Отбор",
+            "Модифицированность"
+        ])
+    );
+}
