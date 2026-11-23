@@ -336,6 +336,17 @@ fn ordinary_read_surface(main: OrdinaryFormMain) -> ImplicitSelfSurface {
     }
 }
 
+/// The surface of an ordinary form whose main attribute gives no more than the
+/// sidecar's own names. A sidecar that was not read (absent, stale, rejected) knows
+/// nothing, so there the surface stays unreadable, exactly as before.
+fn own_surface_only(form: &bsl_metadata::Form) -> ImplicitSelfSurface {
+    if form.ordinary_dialog_known() {
+        ordinary_read_surface(OrdinaryFormMain::OwnOnly)
+    } else {
+        ImplicitSelfSurface::Unreadable
+    }
+}
+
 /// What an ordinary form's main attribute holds when it is not an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OrdinaryFormMain {
@@ -346,6 +357,11 @@ enum OrdinaryFormMain {
     /// A register's record set or record manager: its fields come from the same
     /// field lookup an object module uses.
     Register { kind: hir_def::ty::MetadataKind, name: Name },
+    /// The sidecar was read but its main attribute names nothing this surface can
+    /// enumerate (no main attribute, a plain value, a type of no known kind). Only
+    /// what does not depend on the main attribute is known: the form's own
+    /// attributes and the properties of the ordinary form types.
+    OwnOnly,
 }
 
 /// The catalog prefix of a constant's value manager — the receiver of its
@@ -5908,6 +5924,7 @@ impl<'db> InferenceContext<'db> {
                     return true;
                 }
                 return match main {
+                    OrdinaryFormMain::OwnOnly => false,
                     OrdinaryFormMain::List { english_head } => {
                         let wanted = name.as_str().fold_lower();
                         data.get_manager_properties(english_head).into_iter().any(|prop| {
@@ -6096,7 +6113,7 @@ impl<'db> InferenceContext<'db> {
                             kind,
                             name: Name::new(name),
                         }),
-                        None => ImplicitSelfSurface::Unreadable,
+                        None => own_surface_only(form),
                     },
                     Some(bsl_metadata::FormAttribute {
                         attr_type:
@@ -6116,9 +6133,9 @@ impl<'db> InferenceContext<'db> {
                         Some((_, english_head)) => {
                             ordinary_read_surface(OrdinaryFormMain::List { english_head })
                         }
-                        None => ImplicitSelfSurface::Unreadable,
+                        None => own_surface_only(form),
                     },
-                    _ => ImplicitSelfSurface::Unreadable,
+                    _ => own_surface_only(form),
                 },
                 _ => ImplicitSelfSurface::Unreadable,
             },

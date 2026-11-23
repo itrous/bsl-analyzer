@@ -477,14 +477,34 @@ fn an_ordinary_form_read_resolves_the_names_its_surface_owns() {
     );
 }
 
-/// The control of the test above: the same module and workspace, the sidecar without
-/// `type` and `main`. The owner is unknown, so every name is judged exactly as it was
-/// before the surface existed - reported - and none of the resolved names above is
-/// resolved by a guess.
+/// The sidecar without `type` and `main`: the form's own attributes and the
+/// properties of the form types are known whatever the main attribute is, so they
+/// resolve. What hangs off the main attribute's object (an attribute, a tabular
+/// section, the exports of its object and manager modules) is not known and is
+/// reported as before, with the two names nothing owns.
 #[test]
-fn an_ordinary_form_read_without_a_typed_main_attribute_is_judged_as_before() {
+fn an_ordinary_form_read_without_a_typed_main_attribute_resolves_only_what_needs_no_owner() {
     let (db, file_id) =
         setup_at_with(UNTYPED_READ_FORM_MODULE, ORDINARY_FORM_READS, &ordinary_read_siblings());
+    assert_eq!(
+        absent_names(&db, file_id),
+        [
+            "СовсемНеизвестноеИмя",
+            "АдресСайта",
+            "НастройкиЭксель",
+            "ЭкспортнаяПроцедураОбъекта",
+            "ЭкспортМенеджера",
+            "ЕщёОдноНеизвестноеИмя",
+        ]
+    );
+}
+
+/// The control of the test above: the same text and workspace in a form with NO
+/// sidecar. Nothing is known, so every name is reported exactly as before.
+#[test]
+fn an_ordinary_form_read_without_a_sidecar_is_judged_as_before() {
+    let (db, file_id) =
+        setup_at_with(ORDINARY_FORM_MODULE, ORDINARY_FORM_READS, &ordinary_read_siblings());
     assert_eq!(
         absent_names(&db, file_id),
         [
@@ -499,17 +519,7 @@ fn an_ordinary_form_read_without_a_typed_main_attribute_is_judged_as_before() {
             "ПараметрОснование",
             "ЕщёОдноНеизвестноеИмя",
         ]
-        .map(String::from)
-        .to_vec()
     );
-}
-
-#[test]
-fn an_ordinary_form_read_without_a_sidecar_is_judged_as_before() {
-    let (db, file_id) =
-        setup_at_with(ORDINARY_FORM_MODULE, ORDINARY_FORM_READS, &ordinary_read_siblings());
-    let names = absent_names(&db, file_id);
-    assert_eq!(names.len(), 10, "{names:?}");
 }
 
 /// The read surface must not move a call verdict: a bare CALL of a manager export is
@@ -663,18 +673,30 @@ fn a_list_form_with_an_english_list_type_resolves_the_same_surface() {
     );
 }
 
-/// The control of the list tests: the same module over the sidecar that differs only
-/// in the missing `type` and `main` keys. Every name is reported as before.
+/// The sidecar that differs from the list one only in the missing `type` and `main`
+/// keys: the list's own properties (`Отбор`, `Порядок`, `Колонки`) are not known, but
+/// the form's own attribute and the properties of the form types are.
+const OWN_SURFACE_LIST_REPORTED: [&str; 6] =
+    ["СовсемНеизвестноеИмя", "Отбор", "Порядок", "Колонки", "Наименование", "ТекущаяСтрока"];
+
 #[test]
-fn a_list_form_without_a_main_attribute_is_judged_as_before() {
+fn a_list_form_without_a_main_attribute_resolves_only_its_own_surface() {
     let (db, file_id) = setup_at(&form_module("ФормаСпискаБезТипа"), LIST_FORM_READS);
-    assert_eq!(absent_names(&db, file_id), reported(&ALL_LIST_READS));
+    assert_eq!(absent_names(&db, file_id), reported(&OWN_SURFACE_LIST_REPORTED));
 }
 
-/// A plain value as the main attribute names no list: the surface stays unreadable.
+/// A plain value as the main attribute names no list: the same own surface.
 #[test]
-fn a_list_form_whose_main_attribute_is_a_plain_string_is_judged_as_before() {
+fn a_list_form_whose_main_attribute_is_a_plain_string_resolves_only_its_own_surface() {
     let (db, file_id) = setup_at(&form_module("ФормаСпискаСтрока"), LIST_FORM_READS);
+    assert_eq!(absent_names(&db, file_id), reported(&OWN_SURFACE_LIST_REPORTED));
+}
+
+/// The control of the two tests above: the same text in a form with NO sidecar. Every
+/// name is reported as before.
+#[test]
+fn a_list_module_text_without_a_sidecar_is_judged_as_before() {
+    let (db, file_id) = setup_at(ORDINARY_FORM_MODULE, LIST_FORM_READS);
     assert_eq!(absent_names(&db, file_id), reported(&ALL_LIST_READS));
 }
 
@@ -689,6 +711,8 @@ fn a_bare_call_in_a_list_form_stays_silent() {
     let (db, file_id) = setup_at(&form_module("ФормаСпискаСТипом"), text);
     assert!(absent_bare_calls(&db, file_id).is_empty());
     let (db, file_id) = setup_at(&form_module("ФормаСпискаБезТипа"), text);
+    assert!(absent_bare_calls(&db, file_id).is_empty());
+    let (db, file_id) = setup_at(&form_module("ФормаСпискаСтрока"), text);
     assert!(absent_bare_calls(&db, file_id).is_empty());
 }
 
@@ -756,11 +780,22 @@ fn a_record_set_form_read_resolves_the_registers_fields_in_both_notations() {
     }
 }
 
-/// The control of the register tests: the same module over the sidecar without `type`
-/// and `main`. Every name is reported as before.
+/// The same module over the sidecar without `type` and `main`: the register's fields
+/// and its set's `Отбор` hang off the main attribute and are not known; the form's own
+/// attribute and the form types' properties are.
 #[test]
-fn a_register_form_without_a_main_attribute_is_judged_as_before() {
+fn a_register_module_text_without_a_main_attribute_resolves_only_its_own_surface() {
     let (db, file_id) = setup_at(&form_module("ФормаСпискаБезТипа"), REGISTER_FORM_READS);
+    assert_eq!(
+        absent_names(&db, file_id),
+        reported(&["СовсемНеизвестноеИмя", "Справочник1", "Период", "Отбор"])
+    );
+}
+
+/// The control: the same text in a form with NO sidecar reports every name.
+#[test]
+fn a_register_module_text_without_a_sidecar_is_judged_as_before() {
+    let (db, file_id) = setup_at(ORDINARY_FORM_MODULE, REGISTER_FORM_READS);
     assert_eq!(
         absent_names(&db, file_id),
         reported(&[
@@ -772,4 +807,44 @@ fn a_register_form_without_a_main_attribute_is_judged_as_before() {
             "Модифицированность"
         ])
     );
+}
+
+const OWN_ONLY_COLLISION_FORM: &str =
+    "Catalogs/Справочник1/Forms/ФормаОбычнаяБезГлавногоКоллизия/Ext/Form/Module.bsl";
+
+/// A sidecar-only form (no main attribute at all) whose own attributes are named like
+/// global metadata collections: a member called on such an attribute is not judged
+/// against the collection manager. The unknown name is still reported.
+const OWN_ONLY_COLLISION_CALLS: &str = "Процедура Тест()
+    А = Справочники.НайтиСтроки(Новый Структура(\"Значение\", 1));
+    Б = Отчеты.Количество();
+    В = Справочники;
+    Г = РеквизитФормы;
+    Д = СовсемНеизвестноеИмя;
+КонецПроцедуры
+";
+
+#[test]
+fn an_own_attribute_of_a_sidecar_only_form_named_like_a_collection_wins_as_a_call_receiver() {
+    let (db, file_id) = setup_at(OWN_ONLY_COLLISION_FORM, OWN_ONLY_COLLISION_CALLS);
+    assert_eq!(unresolved_method_calls(&db, file_id), Vec::<String>::new());
+    assert_eq!(absent_names(&db, file_id), reported(&["СовсемНеизвестноеИмя"]));
+}
+
+/// A bare CALL to a name nothing owns stays silent in a sidecar-only form, and a name
+/// the form owns is not a call finding either.
+#[test]
+fn a_bare_call_in_a_sidecar_only_form_stays_silent() {
+    let text = "Процедура Тест()
+    СовсемНеизвестныйВызов();
+    РеквизитФормы();
+КонецПроцедуры
+";
+    for form in [
+        "Catalogs/Справочник1/Forms/ФормаОбычнаяБезТипа/Ext/Form/Module.bsl",
+        OWN_ONLY_COLLISION_FORM,
+    ] {
+        let (db, file_id) = setup_at(form, text);
+        assert!(absent_bare_calls(&db, file_id).is_empty(), "{form}");
+    }
 }
