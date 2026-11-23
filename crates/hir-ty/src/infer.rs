@@ -4553,6 +4553,10 @@ impl<'db> InferenceContext<'db> {
                 trace!("resolved {} as the ordinary form's controls", name);
                 return found(ty, BareNameOrigin::FormMember, all_env);
             }
+            if self.ordinary_form_surface_owns_name(&resolver, name) {
+                trace!("resolved {} on the ordinary form's surface", name);
+                return found(self.db.unknown(), BareNameOrigin::FormMember, all_env);
+            }
         }
 
         let workspace_owns_common_module = resolver.user_common_module_exists(self.db, name);
@@ -5836,6 +5840,59 @@ impl<'db> InferenceContext<'db> {
             }
             ImplicitSelfSurface::None | ImplicitSelfSurface::Unreadable => false,
         }
+    }
+
+    /// Whether a bare READ of `name` in an ordinary form module lands on the surface
+    /// the call channel already judges calls by: an attribute of the form (the
+    /// sidecar's names, type unread), an attribute, tabular section or standard
+    /// attribute of the object the main attribute holds, an export of that object's
+    /// object module (and, off a call, of its manager module), then a property the
+    /// platform lists for the form types. Only a typed main attribute makes this
+    /// surface readable; without one nothing here is known and the answer is `false`,
+    /// so the miss is judged exactly as before.
+    fn ordinary_form_surface_owns_name(&self, resolver: &Resolver, name: &Name) -> bool {
+        let Some(module_id) = resolver.module_id() else { return false };
+        let metadata = self.db.module_metadata(module_id);
+        if metadata.module_type != bsl_metadata::ModuleType::FormModule
+            || !metadata.form.as_deref().is_some_and(|form| form.is_ordinary())
+        {
+            return false;
+        }
+        let ImplicitSelfSurface::OrdinaryForm { types, owner } = self.implicit_self_surface()
+        else {
+            return false;
+        };
+        if metadata.form.as_deref().is_some_and(|form| form.find_attribute(name.as_str()).is_some())
+        {
+            return true;
+        }
+        let (mdo_type, owner_name) = (owner.0, &owner.1);
+        if let Some(kind) = hir_def::ty::MetadataKind::object_kind_for(mdo_type) {
+            let obj_resolver =
+                crate::object_resolver::DbObjectResolver::new(self.db, module_id.file_id);
+            let receiver =
+                self.db.metadata_ref(kind, owner_name.as_str().to_string(), &RootConfigCtx);
+            if crate::field_lookup::lookup_field(self.db, &obj_resolver, receiver, name).is_some() {
+                return true;
+            }
+        }
+        let exports = |found: Result<hir_def::resolver::QualifiedMethodResolution, _>| match found {
+            Ok(method) => method.is_export,
+            Err(hir_def::resolver::QualifiedMethodError::BodyUnread) => true,
+            Err(_) => false,
+        };
+        if exports(resolver.resolve_object_module_method(self.db, mdo_type, owner_name, name)) {
+            return true;
+        }
+        // A call to a manager export is judged by the call channel, which does not
+        // count the manager module in; resolving the callee here would flip that verdict.
+        if !self.reading_bare_call_callee
+            && exports(resolver.resolve_aliased_manager_method(self.db, mdo_type, owner_name, name))
+        {
+            return true;
+        }
+        let data = bsl_platform::PlatformData::instance();
+        types.iter().any(|ty| data.get_property(ty, name.as_str()).is_some())
     }
 
     /// Whether the object an ordinary form belongs to provides `name` to the form's

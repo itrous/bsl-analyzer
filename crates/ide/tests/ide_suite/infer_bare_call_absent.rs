@@ -420,6 +420,129 @@ fn an_ordinary_form_without_a_sidecar_stays_silent() {
     assert!(absent_bare_calls(&db, file_id).is_empty());
 }
 
+fn absent_names(db: &RootDatabaseImpl, file_id: FileId) -> Vec<String> {
+    db.infer(file_id)
+        .diagnostics
+        .iter()
+        .filter_map(|(_, diag)| match diag {
+            InferenceDiagnostic::UnresolvedName { name, .. } => Some(name.as_str().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+const DATA_PROCESSOR_MANAGER_MODULE: &str =
+    "DataProcessors/ТестоваяОбработка/Ext/ManagerModule.bsl";
+const TYPED_READ_FORM_MODULE: &str =
+    "Catalogs/Справочник1/Forms/ФормаОбычнаяЧтениеСТипом/Ext/Form/Module.bsl";
+const UNTYPED_READ_FORM_MODULE: &str =
+    "Catalogs/Справочник1/Forms/ФормаОбычнаяЧтениеБезТипа/Ext/Form/Module.bsl";
+
+/// One read per surface, each owned by exactly one of them, plus two names nothing
+/// owns: a form attribute, an attribute and a tabular section of the main
+/// attribute's object, an export of its object module and of its manager module,
+/// and platform properties of the form type and of a form extension.
+const ORDINARY_FORM_READS: &str = "Процедура Тест()
+    А = СовсемНеизвестноеИмя;
+    Б = РеквизитФормы;
+    В = АдресСайта;
+    Г = НастройкиЭксель;
+    Д = ЭкспортнаяПроцедураОбъекта;
+    Е = ЭкспортМенеджера;
+    Ж = Модифицированность;
+    З = ЭтаФорма;
+    И = ПараметрОснование;
+    К = ЕщёОдноНеизвестноеИмя;
+КонецПроцедуры
+";
+
+const DATA_PROCESSOR_MANAGER_EXPORT: &str = "Процедура ЭкспортМенеджера() Экспорт
+КонецПроцедуры
+";
+
+fn ordinary_read_siblings() -> [(&'static str, &'static str); 2] {
+    [
+        (DATA_PROCESSOR_OBJECT_MODULE, DATA_PROCESSOR_EXPORT),
+        (DATA_PROCESSOR_MANAGER_MODULE, DATA_PROCESSOR_MANAGER_EXPORT),
+    ]
+}
+
+#[test]
+fn an_ordinary_form_read_resolves_the_names_its_surface_owns() {
+    let (db, file_id) =
+        setup_at_with(TYPED_READ_FORM_MODULE, ORDINARY_FORM_READS, &ordinary_read_siblings());
+    assert_eq!(
+        absent_names(&db, file_id),
+        vec!["СовсемНеизвестноеИмя".to_string(), "ЕщёОдноНеизвестноеИмя".to_string()]
+    );
+}
+
+/// The control of the test above: the same module and workspace, the sidecar without
+/// `type` and `main`. The owner is unknown, so every name is judged exactly as it was
+/// before the surface existed - reported - and none of the resolved names above is
+/// resolved by a guess.
+#[test]
+fn an_ordinary_form_read_without_a_typed_main_attribute_is_judged_as_before() {
+    let (db, file_id) =
+        setup_at_with(UNTYPED_READ_FORM_MODULE, ORDINARY_FORM_READS, &ordinary_read_siblings());
+    assert_eq!(
+        absent_names(&db, file_id),
+        [
+            "СовсемНеизвестноеИмя",
+            "РеквизитФормы",
+            "АдресСайта",
+            "НастройкиЭксель",
+            "ЭкспортнаяПроцедураОбъекта",
+            "ЭкспортМенеджера",
+            "Модифицированность",
+            "ЭтаФорма",
+            "ПараметрОснование",
+            "ЕщёОдноНеизвестноеИмя",
+        ]
+        .map(String::from)
+        .to_vec()
+    );
+}
+
+#[test]
+fn an_ordinary_form_read_without_a_sidecar_is_judged_as_before() {
+    let (db, file_id) =
+        setup_at_with(ORDINARY_FORM_MODULE, ORDINARY_FORM_READS, &ordinary_read_siblings());
+    let names = absent_names(&db, file_id);
+    assert_eq!(names.len(), 10, "{names:?}");
+}
+
+/// The read surface must not move a call verdict: a bare CALL of a manager export is
+/// still judged by the call channel, which does not count the manager module in.
+#[test]
+fn a_bare_call_of_a_manager_export_is_still_reported() {
+    let text = "Процедура Тест()
+    ЭкспортМенеджера();
+КонецПроцедуры
+";
+    let (db, file_id) = setup_at_with(TYPED_READ_FORM_MODULE, text, &ordinary_read_siblings());
+    assert_eq!(absent_bare_calls(&db, file_id), vec!["ЭкспортМенеджера".to_string()]);
+}
+
+/// The standard attributes of the main attribute's object are read bare too; the
+/// neighbouring name nothing owns is still reported.
+#[test]
+fn an_ordinary_form_read_resolves_the_standard_attributes_of_its_object() {
+    let text = "Процедура Тест()
+    А = Ссылка;
+    Б = Код;
+    В = Наименование;
+    Г = ПометкаУдаления;
+    Д = СовсемНеизвестноеИмя;
+КонецПроцедуры
+";
+    let (db, file_id) = setup_at(
+        "Catalogs/Справочник1/Forms/ФормаОбычнаяЧтениеСправочника/Ext/Form/Module.bsl",
+        text,
+    );
+    assert_eq!(absent_names(&db, file_id), vec!["СовсемНеизвестноеИмя".to_string()]);
+}
+
 /// A constant's value-manager module hangs off `КонстантаМенеджерЗначения`:
 /// `Записать()` / `Прочитать()` are its methods written without the receiver.
 #[test]

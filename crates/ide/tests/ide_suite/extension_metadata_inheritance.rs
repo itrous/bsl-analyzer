@@ -718,10 +718,13 @@ fn borrowed_form_module_resolves_base_form_attributes() {
         files.borrowed_ordinary_form,
         &[("БазовыйРеквизитФормы", true)],
     );
+    // This base form's data names a typed main attribute (`Объект`, `DocumentObject.Заказ`)
+    // and its own attribute, so an ordinary-form read finds both; the borrowed twin above has
+    // no attributes of its own and keeps its report.
     assert_unresolved_names(
         &fixture,
         files.base_ordinary_form,
-        &[("Объект", true), ("БазовыйРеквизитФормы", true)],
+        &[("Объект", false), ("БазовыйРеквизитФормы", false)],
     );
     assert!(
         fixture
