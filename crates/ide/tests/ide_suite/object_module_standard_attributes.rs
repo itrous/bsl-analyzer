@@ -222,13 +222,12 @@ fn reported(rel: &str, code: &str, name: &str) -> Vec<String> {
 
 #[test]
 fn flat_catalog_without_owners_sees_the_attributes_of_the_implicit_receiver() {
-    for name in ["ЭтоГруппа", "Родитель", "Владелец"] {
-        assert_eq!(
-            reported(OBJECT_MODULE_OF_PLAIN, &read_of(name), name),
-            Vec::<String>::new(),
-            "{name}"
-        );
-    }
+    // Collected over all names so a failure lists every name that is reported, not the first.
+    let found: Vec<String> = ["ЭтоГруппа", "Родитель", "Владелец"]
+        .iter()
+        .flat_map(|name| reported(OBJECT_MODULE_OF_PLAIN, &read_of(name), name))
+        .collect();
+    assert_eq!(found, Vec::<String>::new());
 }
 
 #[test]
