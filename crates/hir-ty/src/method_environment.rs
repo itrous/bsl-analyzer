@@ -76,9 +76,8 @@ pub fn notify_method_is_exported_in_registration(
     methods.contains(&method)
         && notify_handler_availability_in_registration(db, registration, methods)
             == NotifyHandlerAvailability::Exported
-        && possible_method_env(db, method, &db.env_options()).is_some_and(|environment| {
-            environment.intersects(registration.environments.possible)
-        })
+        && possible_method_env(db, method, &db.env_options())
+            .is_some_and(|environment| environment.intersects(registration.environments.possible))
 }
 
 /// Checks conditional declarations in common-module bodies against the registration's
