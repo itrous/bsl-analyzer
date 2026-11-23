@@ -494,6 +494,21 @@ mod tests {
         assert_eq!(form.elements().len(), 4);
     }
 
+    /// Only an entry of `controls` that carries a name is a control: a table column and
+    /// a command-bar button are named in the file but are not members of the form.
+    #[test]
+    fn columns_and_command_bar_buttons_are_not_controls() {
+        let json = r#"{"controls": [
+            {"kind": "list", "id": 1, "name": "Таблица", "columns": [{"name": "Колонка"}]},
+            {"kind": "commandPanel", "id": 2, "name": "Панель",
+             "buttons": [{"name": "Кнопка", "kind": "button"}]},
+            {"kind": "input", "id": 3}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        let names: Vec<&str> = form.elements().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Таблица", "Панель"]);
+    }
+
     #[test]
     fn version_2_without_form_handlers_binds_no_form_event() {
         let json = r#"{"schema": 2, "form": {"name": "Ф"}, "controls": []}"#;

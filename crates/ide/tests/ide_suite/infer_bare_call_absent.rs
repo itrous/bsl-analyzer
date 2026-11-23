@@ -848,3 +848,73 @@ fn a_bare_call_in_a_sidecar_only_form_stays_silent() {
         assert!(absent_bare_calls(&db, file_id).is_empty(), "{form}");
     }
 }
+
+const CONTROLS_FORM_MODULE: &str =
+    "Catalogs/Справочник1/Forms/ФормаОбычнаяЭлементы/Ext/Form/Module.bsl";
+const CONTROLS_WITHOUT_CHECKBOX_FORM_MODULE: &str =
+    "Catalogs/Справочник1/Forms/ФормаОбычнаяЭлементыБезФлажка/Ext/Form/Module.bsl";
+const MANAGED_ITEM_FORM_MODULE: &str =
+    "Catalogs/Справочник1/Forms/ФормаЭлемента/Ext/Form/Module.bsl";
+
+/// Controls of every kind the dialog names, then what the sidecar names without
+/// making a control (a table column, a command-bar button), then a name nothing owns.
+const ORDINARY_CONTROL_READS: &str = "Процедура Тест()
+    А = ФлажокПараметра;
+    Б = ПолеПараметра;
+    В = НадписьПояснения;
+    Г = ТаблицаСписка;
+    Д = КоманднаяПанельФормы;
+    Е = РеквизитФормы;
+    Ж = КолонкаСписка;
+    З = КнопкаПанели;
+    И = СовсемНеизвестноеИмя;
+КонецПроцедуры
+";
+
+/// A bare read of a name the form's own sidecar gives to a control is the form's
+/// member. A column and a command-bar button are named in the sidecar too but are
+/// not controls of the form, and a name in neither stays reported.
+#[test]
+fn a_bare_read_of_a_control_the_sidecar_names_is_the_forms_member() {
+    let (db, file_id) = setup_at(CONTROLS_FORM_MODULE, ORDINARY_CONTROL_READS);
+    assert_eq!(
+        absent_names(&db, file_id),
+        reported(&["КолонкаСписка", "КнопкаПанели", "СовсемНеизвестноеИмя"])
+    );
+}
+
+/// The pair of the test above: the same module over a sidecar without the checkbox
+/// entry. Only that one name flips to reported.
+#[test]
+fn the_same_read_is_reported_once_the_sidecar_entry_is_gone() {
+    let (db, file_id) = setup_at(CONTROLS_WITHOUT_CHECKBOX_FORM_MODULE, ORDINARY_CONTROL_READS);
+    assert_eq!(
+        absent_names(&db, file_id),
+        reported(&["ФлажокПараметра", "КолонкаСписка", "КнопкаПанели", "СовсемНеизвестноеИмя"])
+    );
+}
+
+/// A control is read, not called: a bare call of its name does not become a
+/// resolved call through the sidecar.
+#[test]
+fn a_control_name_does_not_change_the_verdict_of_a_bare_call() {
+    let text = "Процедура Тест()
+    ФлажокПараметра();
+КонецПроцедуры
+";
+    let (db, with_entry) = setup_at(CONTROLS_FORM_MODULE, text);
+    let (db_without, without_entry) = setup_at(CONTROLS_WITHOUT_CHECKBOX_FORM_MODULE, text);
+    assert_eq!(absent_bare_calls(&db, with_entry), absent_bare_calls(&db_without, without_entry));
+}
+
+/// A managed form is untouched: its `Form.xml` names an item `НесуществующийРеквизит`,
+/// and a bare read of that name is still reported (items are reached through `Элементы`).
+#[test]
+fn a_managed_form_item_is_not_a_bare_name() {
+    let text = "Процедура Тест()
+    А = НесуществующийРеквизит;
+КонецПроцедуры
+";
+    let (db, file_id) = setup_at(MANAGED_ITEM_FORM_MODULE, text);
+    assert_eq!(absent_names(&db, file_id), reported(&["НесуществующийРеквизит"]));
+}

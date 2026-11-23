@@ -1,0 +1,12 @@
+{
+  "schema": 14,
+  "form": {"handlers": {"ПередОткрытием": "ПередОткрытием"}},
+  "attributes": [{"id": 0, "name": "РеквизитФормы"}],
+  "controls": [
+    {"kind": "input", "id": 2, "name": "ПолеПараметра"},
+    {"kind": "label", "id": 3, "name": "НадписьПояснения"},
+    {"kind": "list", "id": 4, "name": "ТаблицаСписка", "columns": [{"name": "КолонкаСписка"}]},
+    {"kind": "commandPanel", "id": 5, "name": "КоманднаяПанельФормы", "buttons": [{"name": "КнопкаПанели", "kind": "button"}]},
+    {"kind": "generic", "id": 0}
+  ]
+}

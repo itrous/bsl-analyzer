@@ -5901,7 +5901,7 @@ impl<'db> InferenceContext<'db> {
 
     /// Whether a bare READ of `name` in an ordinary form module lands on the surface
     /// the call channel already judges calls by: an attribute of the form (the
-    /// sidecar's names, type unread), an attribute, tabular section or standard
+    /// sidecar's names, type unread), a control the dialog names, an attribute, tabular section or standard
     /// attribute of the object the main attribute holds, an export of that object's
     /// object module (and, off a call, of its manager module), then a property the
     /// platform lists for the form types. Only a typed main attribute makes this
@@ -5923,6 +5923,18 @@ impl<'db> InferenceContext<'db> {
             return false;
         }
         if metadata.form.as_deref().is_some_and(|form| form.find_attribute(name.as_str()).is_some())
+        {
+            return true;
+        }
+        // Every control the dialog names is a member of the form object, whatever its
+        // kind. What the sidecar names without making it a control (a table column,
+        // a command-bar button) is not in `elements`, so it stays out. A control is
+        // read, never called: a bare call keeps the verdict it had.
+        if !self.reading_bare_call_callee
+            && metadata
+                .form
+                .as_deref()
+                .is_some_and(|form| form.find_element(name.as_str()).is_some())
         {
             return true;
         }
