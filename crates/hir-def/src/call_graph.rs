@@ -27,6 +27,10 @@ pub struct ModuleCallSummary {
     /// separate so consumers can use it only when configured platform facts are absent, without
     /// changing compatibility behavior elsewhere.
     pub notify_additional_signature_handlers: Vec<Name>,
+    /// Callback-name strings added to arrays passed to dynamic callback-description constructors.
+    /// Kept separate so consumers can restrict this conservative syntax fallback to configurations
+    /// without callback constructor facts.
+    pub notify_dynamic_signature_handlers: Vec<Name>,
     /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
     pub idle_handler_regs: Vec<IdleReg>,
@@ -158,6 +162,7 @@ impl ModuleCallSummary {
             notify_candidates: Vec::new(),
             notify_signature_handlers: Vec::new(),
             notify_additional_signature_handlers: Vec::new(),
+            notify_dynamic_signature_handlers: Vec::new(),
             notify_regs,
             idle_handler_regs,
             set_action_regs: Vec::new(),
@@ -833,6 +838,7 @@ pub fn extract_call_summary(
     let mut notify_candidates = Vec::new();
     let mut notify_signature_handlers = Vec::new();
     let mut notify_additional_signature_handlers = Vec::new();
+    let mut notify_dynamic_signature_handlers = Vec::new();
     let mut idle_handler_regs = Vec::new();
     let mut set_action_regs = Vec::new();
     let mut name_literals: FxHashSet<MethodKey> = FxHashSet::default();
@@ -849,6 +855,7 @@ pub fn extract_call_summary(
             &mut notify_candidates,
             &mut notify_signature_handlers,
             &mut notify_additional_signature_handlers,
+            &mut notify_dynamic_signature_handlers,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
@@ -866,6 +873,7 @@ pub fn extract_call_summary(
             &mut notify_candidates,
             &mut notify_signature_handlers,
             &mut notify_additional_signature_handlers,
+            &mut notify_dynamic_signature_handlers,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
@@ -890,6 +898,7 @@ pub fn extract_call_summary(
         notify_candidates,
         notify_signature_handlers,
         notify_additional_signature_handlers,
+        notify_dynamic_signature_handlers,
         notify_regs: Vec::new(),
         idle_handler_regs,
         set_action_regs,
@@ -1015,9 +1024,9 @@ fn is_attach_data_change_handler(name_lower: &str) -> bool {
     name_lower == "подключитьобработчикизмененияданных" || name_lower == "attachdatachangehandler"
 }
 
-// One &mut accumulator per output list (call edges, constructor candidates, and the three
-// string-named dispatch registries) plus the read-only inputs; bundling them into a struct
-// would only move the same fields behind one more indirection.
+// One &mut accumulator per output list (call edges, constructor candidates, and the string-named
+// dispatch registries) plus the read-only inputs; bundling them into a struct would only move the
+// same fields behind one more indirection.
 #[allow(clippy::too_many_arguments)]
 fn extract_from_body(
     body: &Body,
@@ -1028,12 +1037,58 @@ fn extract_from_body(
     notify_candidates: &mut Vec<NotifyConstructorCandidate>,
     notify_signature_handlers: &mut Vec<Name>,
     notify_additional_signature_handlers: &mut Vec<Name>,
+    notify_dynamic_signature_handlers: &mut Vec<Name>,
     idle_handler_regs: &mut Vec<IdleReg>,
     set_action_regs: &mut Vec<SetActionReg>,
     name_literals: &mut FxHashSet<MethodKey>,
     name_literal_ref_sites: &mut Vec<NameLiteralRefSite>,
 ) {
     let common_bindings = crate::common_module_ref::common_module_var_bindings(body);
+    let dynamic_candidates = body
+        .exprs_iter()
+        .filter_map(|(expr_id, expr)| {
+            let Expr::New { type_name: None, args } = expr else { return None };
+            let array_name = dynamic_notify_array_name(body, args)?;
+            Some(DynamicNotifyArrayCandidate {
+                array_name,
+                constructor_start: source_map.expr_range(expr_id)?.start(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if !dynamic_candidates.is_empty() {
+        let candidate_arrays: FxHashSet<_> =
+            dynamic_candidates.iter().map(|candidate| candidate.array_name).collect();
+        let mut array_additions = body
+            .exprs_iter()
+            .filter_map(|(expr_id, expr)| {
+                let Expr::Call { callee, args } = expr else { return None };
+                let [value, ..] = args.as_ref() else { return None };
+                let Expr::Field { base, field } = body.expr_idx(*callee) else { return None };
+                let Expr::Path(array_name) = body.expr_idx(*base) else { return None };
+                let key = NormName::intern(array_name.as_str());
+                if !candidate_arrays.contains(&key) {
+                    return None;
+                }
+                let method = field.as_str().fold_lower();
+                if method != "добавить" && method != "add" {
+                    return None;
+                }
+                let range = source_map.expr_range(expr_id)?;
+                Some((key, range.start(), *value))
+            })
+            .collect::<Vec<_>>();
+        array_additions.sort_unstable_by_key(|(_, start, _)| *start);
+        for candidate in &dynamic_candidates {
+            extract_dynamic_notify_handlers(
+                body,
+                source_map,
+                candidate,
+                &array_additions,
+                notify_dynamic_signature_handlers,
+            );
+        }
+    }
+
     for (expr_id, expr) in body.exprs_iter() {
         match expr {
             Expr::Literal(Literal::String(s)) if is_identifier_like(s) => {
@@ -1166,6 +1221,187 @@ fn extract_notify_handlers(
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DynamicNotifyArrayCandidate {
+    array_name: NormName,
+    constructor_start: TextSize,
+}
+
+fn dynamic_notify_array_name(body: &Body, args: &[ExprIdx]) -> Option<NormName> {
+    let type_name = args.first().and_then(|&idx| extract_string_literal(body, idx))?;
+    if !bsl_platform::is_callback_description_type_name(&type_name) {
+        return None;
+    }
+    match body.expr_idx(*args.get(1)?) {
+        Expr::Path(name) => Some(NormName::intern(name.as_str())),
+        _ => None,
+    }
+}
+
+fn extract_dynamic_notify_handlers(
+    body: &Body,
+    source_map: crate::body::SourceMapAt<'_>,
+    candidate: &DynamicNotifyArrayCandidate,
+    array_additions: &[(NormName, TextSize, ExprIdx)],
+    handlers: &mut Vec<Name>,
+) {
+    let reset_start = body
+        .body_stmts()
+        .filter_map(|stmt_id| {
+            let Stmt::Assign { target, value } = body.stmt(stmt_id) else { return None };
+            let Expr::Path(name) = body.expr_idx(*target) else { return None };
+            if NormName::intern(name.as_str()) != candidate.array_name
+                || !is_array_constructor(body, body.expr_idx(*value))
+            {
+                return None;
+            }
+            let start = source_map.stmt_range(stmt_id)?.start();
+            (start < candidate.constructor_start).then_some(start)
+        })
+        .max();
+    let branch_after_reset = dynamic_array_has_branch(
+        body,
+        source_map,
+        candidate,
+        reset_start.unwrap_or(TextSize::from(0)),
+    );
+    let reset_start = (!branch_after_reset).then_some(reset_start).flatten();
+
+    let values = array_additions
+        .iter()
+        .filter(|(name, start, _)| {
+            *name == candidate.array_name
+                && *start < candidate.constructor_start
+                && reset_start.is_none_or(|reset| *start > reset)
+        })
+        .map(|(_, _, value)| *value)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+
+    if reset_start.is_none()
+        || dynamic_array_sequence_is_uncertain(body, source_map, candidate, reset_start)
+    {
+        handlers.extend(values.into_iter().filter_map(|value| {
+            let name = extract_string_literal(body, value)?;
+            is_identifier_like(&name).then(|| Name::new(&name))
+        }));
+        return;
+    }
+
+    let slots = bsl_platform::bundled_callback_description_slots();
+    for (handler_slot, receiver_slot) in
+        [(slots.handler, slots.receiver), (slots.error_handler, slots.error_receiver)]
+    {
+        let Some(handler) = values
+            .get(handler_slot)
+            .and_then(|&idx| extract_string_literal(body, idx))
+        else {
+            continue;
+        };
+        if !is_identifier_like(&handler) {
+            continue;
+        }
+        let receiver_syntax = values.get(receiver_slot).map_or(NotifyReceiverSyntax::Other, |&idx| {
+            match body.expr_idx(idx) {
+                Expr::Path(name) => NotifyReceiverSyntax::for_bare_name(name),
+                _ => NotifyReceiverSyntax::Other,
+            }
+        });
+        if matches!(receiver_syntax, NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other) {
+            handlers.push(Name::new(&handler));
+        }
+    }
+}
+
+fn is_array_constructor(body: &Body, expr: &Expr) -> bool {
+    match expr {
+        Expr::New { type_name: Some(name), .. } => {
+            matches!(name.as_str().fold_lower().as_str(), "массив" | "array")
+        }
+        Expr::New { type_name: None, args } => args
+            .first()
+            .and_then(|&idx| extract_string_literal(body, idx))
+            .is_some_and(|name| matches!(name.fold_lower().as_str(), "массив" | "array")),
+        _ => false,
+    }
+}
+
+fn dynamic_array_has_branch(
+    body: &Body,
+    source_map: crate::body::SourceMapAt<'_>,
+    candidate: &DynamicNotifyArrayCandidate,
+    start: TextSize,
+) -> bool {
+    body.stmts_iter().any(|(stmt_id, stmt)| {
+        if !matches!(
+            stmt,
+            Stmt::If(_) | Stmt::PreprocIf(_) | Stmt::While { .. } | Stmt::For { .. }
+                | Stmt::ForEach { .. } | Stmt::Try { .. }
+        ) {
+            return false;
+        }
+        source_map.stmt_range(stmt_id).is_some_and(|range| {
+            range.start() >= start && range.start() < candidate.constructor_start
+        })
+    })
+}
+
+fn dynamic_array_sequence_is_uncertain(
+    body: &Body,
+    source_map: crate::body::SourceMapAt<'_>,
+    candidate: &DynamicNotifyArrayCandidate,
+    reset_start: Option<TextSize>,
+) -> bool {
+    let start = reset_start.unwrap_or(TextSize::from(0));
+    if dynamic_array_has_branch(body, source_map, candidate, start) {
+        return true;
+    }
+
+    let has_reassignment = body.stmts_iter().any(|(stmt_id, stmt)| {
+        let Stmt::Assign { target, value } = stmt else { return false };
+        let Expr::Path(name) = body.expr_idx(*target) else { return false };
+        if NormName::intern(name.as_str()) != candidate.array_name {
+            return false;
+        }
+        let Some(range) = source_map.stmt_range(stmt_id) else { return true };
+        range.start() >= start
+            && range.start() < candidate.constructor_start
+            && (Some(range.start()) != reset_start
+                || !is_array_constructor(body, body.expr_idx(*value)))
+    });
+    if has_reassignment {
+        return true;
+    }
+
+    // A call through the array variable other than a recognized append can change its
+    // contents or expose it to code whose effects are not represented in this syntax pass.
+    body.exprs_iter().any(|(expr_id, expr)| {
+        let Some(range) = source_map.expr_range(expr_id) else { return false };
+        if range.start() < start || range.start() >= candidate.constructor_start {
+            return false;
+        }
+        match expr {
+            Expr::Call { callee, args } => {
+                if let Expr::Field { base, field } = body.expr_idx(*callee) {
+                    if let Expr::Path(name) = body.expr_idx(*base) {
+                        if NormName::intern(name.as_str()) == candidate.array_name {
+                            let method = field.as_str().fold_lower();
+                            return method != "добавить" && method != "add";
+                        }
+                    }
+                }
+                args.iter().any(|&arg| {
+                    matches!(body.expr_idx(arg), Expr::Path(name)
+                        if NormName::intern(name.as_str()) == candidate.array_name)
+                })
+            }
+            _ => false,
+        }
+    })
 }
 
 fn is_notify_constructor_candidate(body: &Body, typed: bool, args: &[ExprIdx]) -> bool {
@@ -1510,6 +1746,7 @@ mod tests {
             notify_candidates: Vec::new(),
             notify_signature_handlers: Vec::new(),
             notify_additional_signature_handlers: Vec::new(),
+            notify_dynamic_signature_handlers: Vec::new(),
             notify_regs: vec![
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
@@ -2140,6 +2377,11 @@ Procedure Test()
     Notification = New NotifyDescription("HandleResult", ThisObject);
     Other = New UnknownType("AnotherHandler", CommonModule);
     Params = New Array;
+    Params.Add("DynamicHandler");
+    Params.Add(ThisObject);
+    Params.Add(Undefined);
+    Params.Add("DynamicErrorHandler");
+    Params.Add(ThisObject);
     Dynamic = New("CallbackDescription", Params);
     Positional = New("NotifyDescription", "PositionalHandler", ThisObject);
     PositionalWithError = New("NotifyDescription", "PrimaryHandler", ThisObject, Undefined, "ErrorHandler", ThisObject);
@@ -2166,6 +2408,14 @@ EndProcedure
                 .map(Name::as_str)
                 .collect::<Vec<_>>(),
             ["NotProtectedBySource"]
+        );
+        assert_eq!(
+            summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .map(Name::as_str)
+                .collect::<Vec<_>>(),
+            ["DynamicHandler", "DynamicErrorHandler"]
         );
         assert_eq!(summary.notify_candidates.len(), 4, "{:#?}", summary.notify_candidates);
         assert_eq!(summary.notify_candidates[0].caller, CallerId::Method(MethodKey::first("Test")));

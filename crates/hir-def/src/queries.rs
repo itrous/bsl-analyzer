@@ -101,6 +101,10 @@ mod heap_estimate {
         for handler in &s.notify_additional_signature_handlers {
             bytes += name_bytes(handler);
         }
+        bytes += vec_bytes::<crate::name::Name>(s.notify_dynamic_signature_handlers.len());
+        for handler in &s.notify_dynamic_signature_handlers {
+            bytes += name_bytes(handler);
+        }
         bytes += vec_bytes::<NotifyReg>(s.notify_regs.len());
         for r in &s.notify_regs {
             bytes += name_bytes(&r.callback_name);
