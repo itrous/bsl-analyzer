@@ -990,4 +990,99 @@ mod tests {
             !crate::DiagnosticsConfig::all_enabled().is_disabled(DiagnosticCode::UnresolvedName)
         );
     }
+
+    /// Messages of `UnresolvedName` for `source` as the body of the common module
+    /// `Caller` whose metadata carries the given flags.
+    fn unresolved_in_flagged_module(
+        server_call: bool,
+        ordinary: bool,
+        ordinary_app_support: bool,
+        source: &str,
+    ) -> Vec<String> {
+        use crate::test_utils::check_with_cfe_config;
+
+        let fixture = test_fixture::CfeFixtureBuilder::new("").build();
+        let modules = fixture.root().join("CommonModules");
+        let ext = modules.join("Caller/Ext");
+        std::fs::create_dir_all(&ext).expect("create CommonModule directory");
+        std::fs::write(ext.join("Module.bsl"), source).expect("write CommonModule body");
+        std::fs::write(
+            modules.join("Caller.xml"),
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+<CommonModule uuid="52000000-0000-0000-0000-000000000002"><Properties>
+<Name>Caller</Name>
+<ClientManagedApplication>false</ClientManagedApplication>
+<Server>true</Server>
+<ExternalConnection>true</ExternalConnection>
+<ClientOrdinaryApplication>{ordinary}</ClientOrdinaryApplication>
+<ServerCall>{server_call}</ServerCall>
+</Properties></CommonModule>
+</MetaDataObject>"#
+            ),
+        )
+        .expect("write CommonModule metadata");
+        let config = crate::DiagnosticsConfig {
+            ordinary_app_support,
+            ..crate::DiagnosticsConfig::all_enabled()
+        };
+        check_with_cfe_config(source, fixture, config)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnresolvedName)
+            .map(|diag| diag.message)
+            .collect()
+    }
+
+    /// A `ServerCall` module flagged «Клиент (обычное приложение)» is compiled in the
+    /// thick client of the ordinary application, so its `#Если Клиент` block is live
+    /// and a name nothing declares there is reported. The pairs differ in one flag.
+    #[test]
+    fn a_client_block_of_a_server_call_module_with_the_ordinary_client_is_live() {
+        let client_block = "#Если Клиент Тогда\nПроцедура Тест()\n    Х = НетТакогоИмени;\nКонецПроцедуры\n#КонецЕсли\n";
+        let in_body = "Процедура Тест()\n#Если Клиент Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\nКонецПроцедуры\n";
+        for ordinary_app_support in [false, true] {
+            for source in [client_block, in_body] {
+                // Control: without `ServerCall` the module has the ordinary client.
+                let control =
+                    unresolved_in_flagged_module(false, true, ordinary_app_support, source);
+                assert_eq!(
+                    control.len(),
+                    1,
+                    "control (support={ordinary_app_support}): {control:?}"
+                );
+
+                let live = unresolved_in_flagged_module(true, true, ordinary_app_support, source);
+                assert_eq!(
+                    live.len(),
+                    1,
+                    "ServerCall + ordinary (support={ordinary_app_support}): {live:?}"
+                );
+                assert!(live[0].contains("НетТакогоИмени"), "{live:?}");
+            }
+        }
+    }
+
+    /// The suppression keeps its two intended cases next to the live one above: a
+    /// client block of a module no client compiles, and a contradictory condition in a
+    /// module that does have the ordinary client.
+    #[test]
+    fn a_client_block_no_client_compiles_stays_silent() {
+        let client_block = "#Если Клиент Тогда\nПроцедура Тест()\n    Х = НетТакогоИмени;\nКонецПроцедуры\n#КонецЕсли\n";
+        let in_body = "Процедура Тест()\n#Если Клиент Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\nКонецПроцедуры\n";
+        let contradiction = "Процедура Тест()\n#Если Сервер И Не Сервер Тогда\n    Х = НетТакогоИмени;\n#КонецЕсли\nКонецПроцедуры\n";
+        for ordinary_app_support in [false, true] {
+            for source in [client_block, in_body] {
+                // Server only: no environment of the module is a client.
+                let silent =
+                    unresolved_in_flagged_module(true, false, ordinary_app_support, source);
+                assert!(
+                    silent.is_empty(),
+                    "server only (support={ordinary_app_support}): {silent:?}"
+                );
+            }
+            let dead =
+                unresolved_in_flagged_module(true, true, ordinary_app_support, contradiction);
+            assert!(dead.is_empty(), "contradiction (support={ordinary_app_support}): {dead:?}");
+        }
+    }
 }

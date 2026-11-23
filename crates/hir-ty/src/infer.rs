@@ -1109,7 +1109,7 @@ impl<'db> InferenceContext<'db> {
                 ),
                 DefWithBodyId::ModuleCode => {
                     let metadata = db.module_metadata(hir_def::ModuleId { file_id });
-                    Some(hir_def::execution_env::module_code_env(&metadata, &opts))
+                    Some(hir_def::execution_env::possible_module_code_env(&metadata, &opts))
                         .filter(|env| !env.is_empty())
                 }
             }

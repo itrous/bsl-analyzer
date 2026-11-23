@@ -473,7 +473,26 @@ pub fn body_env(
     annotations: &[AnnotationKind],
     opts: &EnvOptions,
 ) -> EnvFlags {
-    let base = module_base_env(metadata, opts);
+    body_env_over(module_base_env(metadata, opts), metadata, annotations, opts)
+}
+
+/// [`body_env`] widened to every environment that may compile the body. Availability
+/// checks need the narrow answer; the verdict "the platform compiles this nowhere"
+/// needs this one, because a narrow model there silences a real finding.
+pub fn possible_body_env(
+    metadata: &ModuleMetadata,
+    annotations: &[AnnotationKind],
+    opts: &EnvOptions,
+) -> EnvFlags {
+    body_env_over(possible_module_base_env(metadata, opts), metadata, annotations, opts)
+}
+
+fn body_env_over(
+    base: EnvFlags,
+    metadata: &ModuleMetadata,
+    annotations: &[AnnotationKind],
+    opts: &EnvOptions,
+) -> EnvFlags {
     if base.is_empty() {
         return EnvFlags::EMPTY;
     }
@@ -497,6 +516,29 @@ pub fn body_env(
 /// initializers), which never carries a directive.
 pub fn module_code_env(metadata: &ModuleMetadata, opts: &EnvOptions) -> EnvFlags {
     module_base_env(metadata, opts)
+}
+
+/// [`module_code_env`] widened the way [`possible_body_env`] describes.
+pub fn possible_module_code_env(metadata: &ModuleMetadata, opts: &EnvOptions) -> EnvFlags {
+    possible_module_base_env(metadata, opts)
+}
+
+/// [`module_base_env`] plus what its model leaves out on purpose. A `ServerCall`
+/// module is judged as running on the server only, which is right for the managed
+/// clients but not for «Клиент (обычное приложение)»: vendor modules carrying both
+/// flags hold client blocks written against the ordinary thick client's own API
+/// (`ЭлементыФормы`), so that client does compile them.
+fn possible_module_base_env(metadata: &ModuleMetadata, opts: &EnvOptions) -> EnvFlags {
+    let base = module_base_env(metadata, opts);
+    if base.is_empty() || metadata.module_type != ModuleType::CommonModule {
+        return base;
+    }
+    match &metadata.common_module {
+        Some(cm) if cm.is_server_call() && cm.is_client_ordinary_application() => {
+            base | EnvFlags::THICK_CLIENT_ORDINARY
+        }
+        _ => base,
+    }
 }
 
 /// [`body_env`] for a method of the item tree.
@@ -726,6 +768,31 @@ mod tests {
             .build();
         let md = common_metadata(cm);
         assert_eq!(body_env(&md, &[], &opts), EnvFlags::SERVER);
+    }
+
+    /// The checks keep judging a `ServerCall` module as server-only; only the verdict
+    /// "compiled nowhere" counts the ordinary client the module is flagged for, and
+    /// only that one (the managed clients stay out, as above).
+    #[test]
+    fn possible_env_of_a_server_call_module_adds_only_the_ordinary_client() {
+        let opts = EnvOptions::default();
+        let build = |ordinary: bool| {
+            bsl_metadata::CommonModuleBuilder::default()
+                .server(true)
+                .server_call(true)
+                .client_managed_application(true)
+                .client_ordinary_application(ordinary)
+                .build()
+        };
+        let with = common_metadata(build(true));
+        assert_eq!(body_env(&with, &[], &opts), EnvFlags::SERVER);
+        assert_eq!(
+            possible_body_env(&with, &[], &opts),
+            EnvFlags::SERVER | EnvFlags::THICK_CLIENT_ORDINARY
+        );
+        let without = common_metadata(build(false));
+        assert_eq!(body_env(&without, &[], &opts), EnvFlags::SERVER);
+        assert_eq!(possible_body_env(&without, &[], &opts), EnvFlags::SERVER);
     }
 
     #[test]

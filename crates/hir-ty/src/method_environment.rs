@@ -34,10 +34,10 @@ pub(crate) fn possible_method_env(
 ) -> Option<EnvFlags> {
     let decl = db.interface_method(method)?;
     let metadata = db.module_metadata(method.module);
-    let environment = execution_env::body_env(&metadata, &decl.directives, options);
-    if environment.is_empty() {
+    if execution_env::body_env(&metadata, &decl.directives, options).is_empty() {
         return None;
     }
+    let environment = execution_env::possible_body_env(&metadata, &decl.directives, options);
     Some(environment & (decl.preproc_env | decl.preproc_undecided))
 }
 
