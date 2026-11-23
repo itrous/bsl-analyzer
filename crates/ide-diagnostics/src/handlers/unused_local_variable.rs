@@ -149,19 +149,18 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     // (БлокироватьДляИзменения, ОбменДанными, ДополнительныеСвойства, …):
     // assigning one is a side effect on the module context, not a local.
     skip_attr_names.extend(ctx.module_implicit_field_names());
-    // Without platform types, implicit assignments in modules with platform-owned
-    // context fields cannot be proven to introduce locals. Keep syntactic bindings
-    // and module `Перем` diagnostics below, but conservatively skip those writes.
+    // Without usable callback-constructor facts, conservatively assume implicit writes may
+    // target platform fields. This fallback is not evidence that the field surface is complete.
     let metadata = ctx.module_metadata();
-    let suppress_implicit_assignments =
-        bsl_platform::PlatformData::instance().all_types().is_empty()
-            && matches!(
-                metadata.module_type,
-                bsl_metadata::ModuleType::FormModule
-                    | bsl_metadata::ModuleType::ObjectModule
-                    | bsl_metadata::ModuleType::RecordSetModule
-                    | bsl_metadata::ModuleType::ValueManagerModule
-            );
+    let suppress_implicit_assignments = !bsl_platform::has_callback_description_constructor_facts(
+        bsl_platform::PlatformData::instance(),
+    ) && matches!(
+        metadata.module_type,
+        bsl_metadata::ModuleType::FormModule
+            | bsl_metadata::ModuleType::ObjectModule
+            | bsl_metadata::ModuleType::RecordSetModule
+            | bsl_metadata::ModuleType::ValueManagerModule
+    );
 
     let module_bodies = ctx.module_bodies();
 

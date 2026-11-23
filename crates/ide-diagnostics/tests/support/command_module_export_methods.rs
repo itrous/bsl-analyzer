@@ -6,18 +6,77 @@ use vfs::{FileId, FileSet, VfsPath};
 
 const SOURCE: &str = r#"&НаКлиенте
 Процедура Зарегистрировать()
-    Оповещение = Новый ОписаниеОповещения("ПослеКоманды", ЭтотОбъект);
+    Оповещение = Новый CallbackDescription("ПослеКоманды", ЭтотОбъект);
 КонецПроцедуры
 
 &НаКлиенте
-Процедура ПослеКоманды() Экспорт
+Процедура ПослеКоманды(ФиксированныйПараметр) Экспорт
 КонецПроцедуры
 
 Процедура ОбычныйЭкспорт() Экспорт
 КонецПроцедуры
 "#;
 
+const DYNAMIC_SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+    Параметры = Новый Массив;
+    Параметры.Добавить("ПослеКоманды");
+    Параметры.Добавить(ЭтотОбъект);
+    Параметры.Добавить(Неопределено);
+    Параметры.Добавить("ПослеОшибки");
+    Параметры.Добавить(ЭтотОбъект);
+    Оповещение = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ПослеКоманды(ФиксированныйПараметр) Экспорт
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ПослеОшибки(ФиксированныйПараметр) Экспорт
+КонецПроцедуры
+
+Процедура ОбычныйЭкспорт() Экспорт
+КонецПроцедуры
+"#;
+
+#[allow(
+    dead_code,
+    reason = "The shared test module is imported by suites that exercise different entry points."
+)]
 pub fn command_module_export_diagnostics() -> (Vec<Diagnostic>, String) {
+    command_module_diagnostics(SOURCE, |ctx| {
+        ide_diagnostics::handlers::command_module_export_methods::check(ctx)
+    })
+}
+
+#[allow(
+    dead_code,
+    reason = "The shared test module is imported by suites that exercise different entry points."
+)]
+pub fn command_module_callback_guard_diagnostics() -> (Vec<Diagnostic>, String) {
+    command_module_diagnostics(SOURCE, callback_guard_diagnostics)
+}
+
+#[allow(
+    dead_code,
+    reason = "The shared test module is imported by suites that exercise different entry points."
+)]
+pub fn command_module_dynamic_callback_guard_diagnostics() -> (Vec<Diagnostic>, String) {
+    command_module_diagnostics(DYNAMIC_SOURCE, callback_guard_diagnostics)
+}
+
+fn callback_guard_diagnostics(ctx: &DiagnosticsContext<'_>) -> Vec<Diagnostic> {
+    let mut diagnostics = ide_diagnostics::handlers::unused_parameters::check(ctx);
+    diagnostics.extend(ide_diagnostics::handlers::unused_local_method::check(ctx));
+    diagnostics.extend(ide_diagnostics::handlers::command_module_export_methods::check(ctx));
+    diagnostics
+}
+
+fn command_module_diagnostics(
+    source: &str,
+    run: impl FnOnce(&DiagnosticsContext<'_>) -> Vec<Diagnostic>,
+) -> (Vec<Diagnostic>, String) {
     let dir = tempfile::tempdir().expect("temporary command configuration");
     let root = dir.path();
     let command_dir = root.join("CommonCommands/ПроверкаЭкспортов");
@@ -41,7 +100,7 @@ pub fn command_module_export_diagnostics() -> (Vec<Diagnostic>, String) {
     )
     .unwrap();
     let module_path = command_dir.join("Ext/CommandModule.bsl");
-    fs::write(&module_path, SOURCE).unwrap();
+    fs::write(&module_path, source).unwrap();
 
     let mut db = RootDatabaseImpl::new();
     db.set_all_config_paths(
@@ -54,7 +113,7 @@ pub fn command_module_export_diagnostics() -> (Vec<Diagnostic>, String) {
     let source_root = SourceRoot::new_local(file_set);
     db.set_source_root(SourceRootId(0), source_root);
     db.set_file_source_root(file_id, SourceRootId(0));
-    db.set_file_text(file_id, SOURCE);
+    db.set_file_text(file_id, source);
 
     let root_string = root.to_string_lossy();
     let config_path = intern_configuration_path(&db, &root_string, 0);
@@ -66,6 +125,6 @@ pub fn command_module_export_diagnostics() -> (Vec<Diagnostic>, String) {
         bsl_metadata::ModuleType::CommandModule,
         "the test must exercise a real CommandModule"
     );
-    let diagnostics = ide_diagnostics::handlers::command_module_export_methods::check(&ctx);
-    (diagnostics, SOURCE.to_string())
+    let diagnostics = run(&ctx);
+    (diagnostics, source.to_string())
 }

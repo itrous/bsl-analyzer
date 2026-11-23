@@ -111,12 +111,15 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         summary.notify_signature_handlers.iter().map(|handler| NormName::intern(handler.as_str())),
     );
     // The current English type spelling was not part of the compatibility-only projection.
-    // Protect it, and the other fact-derived spellings, only when no platform type facts exist.
-    if bsl_platform::PlatformData::instance().all_types().is_empty() {
+    // Use syntax protection while platform facts cannot normalize callback constructors.
+    if !bsl_platform::has_callback_description_constructor_facts(
+        bsl_platform::PlatformData::instance(),
+    ) {
         fixed_signature_handlers.extend(
             summary
                 .notify_additional_signature_handlers
                 .iter()
+                .chain(&summary.notify_dynamic_signature_handlers)
                 .map(|handler| NormName::intern(handler.as_str())),
         );
     }

@@ -139,15 +139,18 @@ pub(crate) fn collect_called_methods(
     let summary = ctx.call_summary(module_id);
 
     let mut called_methods: FxHashSet<NormName> = FxHashSet::default();
-    // Without a platform type surface, the callback constructor's source syntax is the only
-    // available evidence that the platform may invoke the local handler. With facts available,
-    // use only normalized semantic registrations below.
-    if bsl_platform::PlatformData::instance().all_types().is_empty() {
+    // Without enough platform facts to normalize the callback constructor, its source syntax
+    // is the only available evidence that the platform may invoke the local handler. With
+    // constructor facts available, use only normalized semantic registrations below.
+    if !bsl_platform::has_callback_description_constructor_facts(
+        bsl_platform::PlatformData::instance(),
+    ) {
         called_methods.extend(
             summary
                 .notify_signature_handlers
                 .iter()
                 .chain(&summary.notify_additional_signature_handlers)
+                .chain(&summary.notify_dynamic_signature_handlers)
                 .map(|handler| NormName::intern(handler.as_str())),
         );
     }
