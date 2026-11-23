@@ -98,7 +98,7 @@ Observed = Handlers;
             fixture,
             &[],
             DiagnosticsConfig::all_enabled(),
-            |fixture| configure_common_modules(fixture),
+            configure_common_modules,
             |db, ctx| {
                 let module_id = ModuleId::new(ctx.file_id);
                 let summary = db.module_call_summary(module_id);
@@ -226,7 +226,7 @@ fn bare_read_and_method_call_share_ownership_before_a_disjoint_late_assignment()
         fixture,
         &[],
         DiagnosticsConfig::all_enabled(),
-        |fixture| configure_common_modules(fixture),
+        configure_common_modules,
         |db, ctx| {
             let module_id = ModuleId::new(ctx.file_id);
             let summary = db.module_call_summary(module_id);

@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn an_undecidable_export_environment_does_not_produce_a_verdict() {
         let source = "&НаКлиенте\nПроцедура ПередЗакрытием()\n    О = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\nКонецПроцедуры\n#Если НеизвестныйСимвол Тогда\n&НаКлиенте\nПроцедура Готово() Экспорт\nКонецПроцедуры\n#КонецЕсли\n";
-        let diagnostics = run_local(&source);
+        let diagnostics = run_local(source);
         assert!(
             diagnostics.is_empty(),
             "unknown preprocessor availability is not proof of absence: {diagnostics:#?}"

@@ -545,8 +545,7 @@ mod tests {
     Сообщить("οσ");
 КонецПроцедуры
 "#;
-        let mut config = DiagnosticsConfig::default();
-        config.quick_fixes = true;
+        let config = DiagnosticsConfig { quick_fixes: true, ..DiagnosticsConfig::default() };
         let diagnostics = check_hir_diagnostic_with_config(code, config, crate::diagnostics);
         let diagnostic = diagnostics
             .iter()
