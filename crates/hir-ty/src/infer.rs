@@ -5321,7 +5321,8 @@ impl<'db> InferenceContext<'db> {
         let data = bsl_platform::PlatformData::instance();
         let receiver_surface_missing = match receiver_surface {
             ImplicitSelfSurface::PlatformTypes(type_names) => {
-                !type_names.iter().any(|name| data.get_type(name).is_some())
+                // A missing candidate may still own the name even if another type is known.
+                type_names.iter().any(|name| data.get_type(name).is_none())
             }
             // Metadata receivers still inherit methods from platform types, while
             // prefix receivers query the platform manager catalog directly.
