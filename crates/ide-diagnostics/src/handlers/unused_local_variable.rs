@@ -741,9 +741,14 @@ mod tests {
                 let resolution =
                     inference.assignment_target_resolution(target).map(
                         |resolution| match resolution {
-                            hir::BareNameResolution::Resolved { origin, .. } => Some(*origin),
-                            hir::BareNameResolution::Absent
-                            | hir::BareNameResolution::Indeterminate { .. } => None,
+                            hir::BareNameResolution::Resolved { origin, .. } => {
+                                (Some(*origin), false)
+                            }
+                            hir::BareNameResolution::Absent => (None, false),
+                            hir::BareNameResolution::Indeterminate { gaps } => (
+                                None,
+                                gaps.contains(&hir::BareNameGap::MissingImplicitReceiverSurface),
+                            ),
                         },
                     );
                 Some((name.as_str().to_owned(), resolution))
@@ -752,18 +757,17 @@ mod tests {
         let diagnostics = crate::diagnostics(&ctx);
         assert_eq!(
             target_resolutions,
-            vec![
-                ("Метаданные".to_owned(), None),
-                ("Мертвая".to_owned(), Some(Some(hir::BareNameOrigin::FlowLocal)),),
-            ],
-            "the read-only global bypasses target inference, but a local gets an explicit verdict"
+            vec![("Метаданные".to_owned(), None), ("Мертвая".to_owned(), Some((None, true))),],
+            "the read-only global bypasses target inference; an implicit form target stays indeterminate"
         );
         let unused: Vec<_> = diagnostics
             .iter()
             .filter(|diag| diag.code == DiagnosticCode::UnusedLocalVariable)
             .collect();
-        assert_eq!(unused.len(), 1, "only the positively resolved local is reported: {unused:#?}");
-        assert!(unused[0].message.contains("Мертвая"));
+        assert!(
+            unused.is_empty(),
+            "an indeterminate assignment is not a proven local: {unused:#?}"
+        );
         assert!(
             diagnostics.iter().any(|diag| diag.code == DiagnosticCode::GlobalPropertyNotWritable),
             "the missing target verdict is the actual read-only global case"

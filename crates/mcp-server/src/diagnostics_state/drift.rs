@@ -3167,9 +3167,28 @@ mod tests {
     }
 
     /// A form attribute added to `Ext/Form.xml` on disk while the resident runs must
-    /// silence `UnusedLocalVariable` for the same-named assignment in the form module.
+    /// reach its metadata view without turning an indeterminate assignment into a local.
     #[test]
     fn form_xml_attribute_added_on_disk_reaches_the_running_resident() {
+        fn form_has_attribute(state: &DiagnosticsState, module: &Path, name: &str) -> bool {
+            use hir::{DefDatabase, ModuleId};
+
+            match state.read(|resident, _| {
+                let file_id = resident.file_id_for(module)?;
+                Some(
+                    resident
+                        .db()
+                        .module_metadata(ModuleId::new(file_id))
+                        .form
+                        .as_ref()
+                        .is_some_and(|form| form.find_attribute(name).is_some()),
+                )
+            }) {
+                ResidentOutcome::Ready(Some(found), _) => found,
+                _ => panic!("expected a ready form module"),
+            }
+        }
+
         const FORM_XML_REL: &str = "Catalogs/Товары/Forms/Форма/Ext/Form.xml";
         const MODULE_REL: &str = "Catalogs/Товары/Forms/Форма/Ext/Form/Module.bsl";
         let form_xml = |attrs: &str| {
@@ -3196,9 +3215,11 @@ mod tests {
 
         let module = root.join(MODULE_REL);
         let baseline = module_diag_fingerprint(&state, &module);
-        if !baseline.iter().any(|l| l.contains("UnusedLocalVariable")) {
-            panic!("stand is wrong, baseline lacks UnusedLocalVariable: {baseline:#?}");
-        }
+        assert!(!form_has_attribute(&state, &module, "СостояниеПриемки"));
+        assert!(
+            !baseline.iter().any(|l| l.contains("UnusedLocalVariable")),
+            "an unresolved form assignment is not proven local: {baseline:#?}"
+        );
 
         std::thread::sleep(Duration::from_millis(10));
         write(
@@ -3209,8 +3230,12 @@ mod tests {
 
         let after = module_diag_fingerprint(&state, &module);
         assert!(
+            form_has_attribute(&state, &module, "СостояниеПриемки"),
+            "form attribute added on disk did not reach the resident"
+        );
+        assert!(
             !after.iter().any(|l| l.contains("UnusedLocalVariable")),
-            "form attribute added on disk did not reach the resident; baseline: {baseline:#?}; after: {after:#?}"
+            "an indeterminate form assignment was reported as a local: {baseline:#?}; after: {after:#?}"
         );
     }
 
