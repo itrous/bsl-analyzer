@@ -66,7 +66,10 @@ pub fn notify_handler_availability_in_registration(
     )
 }
 
-/// Whether one declaration participates in a registration whose complete local surface is exported.
+/// Whether this exported declaration participates in a registration.
+///
+/// This is deliberately separate from checking whether the registration's complete local
+/// surface is exported: another conditional declaration may provide a non-exported alternative.
 pub fn notify_method_is_exported_in_registration(
     db: &dyn HirDatabase,
     registration: &NotifyReg,
@@ -74,8 +77,7 @@ pub fn notify_method_is_exported_in_registration(
     methods: &[MethodId],
 ) -> bool {
     methods.contains(&method)
-        && notify_handler_availability_in_registration(db, registration, methods)
-            == NotifyHandlerAvailability::Exported
+        && db.interface_method(method).is_some_and(|declaration| declaration.is_export)
         && possible_method_env(db, method, &db.env_options())
             .is_some_and(|environment| environment.intersects(registration.environments.possible))
 }

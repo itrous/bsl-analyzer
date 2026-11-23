@@ -117,6 +117,13 @@ mod tests {
     const REGULAR_MODULE: &str = "/СкладскойУчет.bsl";
 
     fn check_command_at(code: &str) -> Vec<Diagnostic> {
+        check_command_at_with(code, check)
+    }
+
+    fn check_command_at_with(
+        code: &str,
+        run: impl FnOnce(&DiagnosticsContext<'_>) -> Vec<Diagnostic>,
+    ) -> Vec<Diagnostic> {
         let fixture = test_fixture::CfeFixtureBuilder::new("").build();
         crate::test_utils::check_cfe_at_with_db(
             COMMON_COMMAND,
@@ -143,7 +150,7 @@ mod tests {
                     ctx.module_metadata().module_type,
                     bsl_metadata::ModuleType::CommandModule
                 );
-                check(ctx)
+                run(ctx)
             },
         )
     }
@@ -277,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_conditional_export_does_not_exempt_the_handler() {
+    fn partially_non_exported_registration_does_not_recommend_removing_required_export() {
         let code = r#"&НаКлиенте
 Процедура ОбработкаКоманды(Команда, Параметры) Экспорт
     Оповещение = Новый ОписаниеОповещения("ПослеКоманды", ЭтотОбъект);
@@ -293,15 +300,25 @@ mod tests {
 КонецПроцедуры
 #КонецЕсли
 "#;
-        let diagnostics = check_command_at(code);
+        let diagnostics = check_command_at_with(code, |ctx| {
+            let mut diagnostics = check(ctx);
+            diagnostics.extend(crate::handlers::missing_notify_handler::check(ctx));
+            diagnostics
+        });
+        let export_method_diagnostics = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::CommandModuleExportMethods)
+            .cloned()
+            .collect::<Vec<_>>();
         expect![[r#"
             CommandModuleExportMethods @ 2:11..2:27
               message: Экспортные методы в модулях команд не имеют смысла
-              severity: Hint
-            CommandModuleExportMethods @ 8:11..8:23
-              message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint"#]]
-        .assert_eq(&format_diags(code, &diagnostics));
+        .assert_eq(&format_diags(code, &export_method_diagnostics));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == DiagnosticCode::MissingNotifyHandler
+                && diagnostic.message.contains("ПослеКоманды")
+        }));
     }
 
     #[test]
