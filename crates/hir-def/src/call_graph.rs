@@ -300,7 +300,9 @@ pub enum EdgeKind {
     /// as. Derived from form metadata, not from code.
     DataBinding,
     /// A `Новый ОписаниеОповещения("Метод", …)` callback: the registering method (or
-    /// module body) links to the handler named by the string literal. Not a direct
+    /// module body) links to the handler named by the string literal. This is a
+    /// reference to a found name, not a guarantee that the handler can be invoked:
+    /// for example, a local declaration need not be exported. It is not a direct
     /// call — the platform invokes it later — so it is kept separate from `call`.
     NotifyRef,
     /// A `ПодключитьОбработчикОжидания("Метод", …)` idle handler: the registering
