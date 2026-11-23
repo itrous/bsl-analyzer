@@ -169,15 +169,20 @@ fn dispatch_inference_diagnostic(
             }
             handlers::unresolved_bare_call::from_hir(name, range, ctx)
         }
-        InferenceDiagnostic::MismatchedArgCount { required_count, total_count, found, .. } => {
-            handlers::mismatched_arg_count::from_hir(
-                *required_count,
-                *total_count,
-                *found,
-                range,
-                ctx,
-            )
-        }
+        InferenceDiagnostic::MismatchedArgCount {
+            required_count,
+            total_count,
+            found,
+            version_limit,
+            ..
+        } => handlers::mismatched_arg_count::from_hir(
+            *required_count,
+            *total_count,
+            *found,
+            version_limit.as_ref(),
+            range,
+            ctx,
+        ),
         InferenceDiagnostic::TypeMismatch { expected, actual, from_doc_comment, .. } => {
             if *from_doc_comment {
                 handlers::type_mismatch_by_doc_comment::from_hir(*expected, *actual, range, ctx)

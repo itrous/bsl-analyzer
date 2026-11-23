@@ -23,7 +23,7 @@ use crate::call_resolution::{
     CandidateProvenance, CandidateRejection,
 };
 use crate::db::HirDatabase;
-use crate::infer::{CallArgBinding, InferenceDiagnostic};
+use crate::infer::{ArgCountVersionLimit, CallArgBinding, InferenceDiagnostic};
 use crate::narrow::{narrowed_type_at, refine_by_ternary_guard, NarrowState};
 
 #[cfg(test)]
@@ -398,11 +398,28 @@ fn diagnostic_for_binding(
                 .as_slice()
                 .iter()
                 .find(|candidate| candidate.id == fallback.candidate)?;
+            let found = post_types.len();
+            let (total_count, version_limit) = match binding
+                .min_platform
+                .and_then(|minimum| signature.version_cap(minimum).map(|cap| (minimum, cap)))
+            {
+                // A call short of the required count is no business of the release.
+                Some((minimum, cap)) if found > cap.allowed => (
+                    cap.allowed,
+                    Some(ArgCountVersionLimit {
+                        parameter: cap.parameter,
+                        introduced: cap.introduced,
+                        minimum,
+                    }),
+                ),
+                _ => (signature.params.len(), None),
+            };
             Some(InferenceDiagnostic::MismatchedArgCount {
                 call_expr: binding.call_expr,
                 required_count: signature.required_args,
-                total_count: signature.params.len(),
-                found: post_types.len(),
+                total_count,
+                found,
+                version_limit,
             })
         }
         CallSelection::Rejected(CallRejection::Type) => {

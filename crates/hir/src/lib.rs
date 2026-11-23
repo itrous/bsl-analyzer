@@ -236,11 +236,11 @@ pub use hir_ty::query_text_dataflow::{executed_query_texts, ExecutedQueryText};
 pub use hir_ty::value_origin::{value_origin_of, Unproven, ValueOrigin};
 pub use hir_ty::{
     form_control_platform_type_chain, form_control_platform_type_name, form_element_kind_label,
-    form_element_kind_sort_band, BareNameGap, BareNameOrigin, BareNameResolution, BareNameUse,
-    BodyInferenceResult, CallArgBinding, EnvCalleeKind, EnvMemberKind, FormElementKind,
-    ImplicitDatabaseReadKind, InferOwnerResult, InferenceContext, InferenceDiagnostic,
-    InferenceResult, MetadataKind, ModuleCodeInferenceResult, RefPresentationCause,
-    UninitializedPath, UnresolvedMethodKind,
+    form_element_kind_sort_band, ArgCountVersionLimit, BareNameGap, BareNameOrigin,
+    BareNameResolution, BareNameUse, BodyInferenceResult, CallArgBinding, EnvCalleeKind,
+    EnvMemberKind, FormElementKind, ImplicitDatabaseReadKind, InferOwnerResult, InferenceContext,
+    InferenceDiagnostic, InferenceResult, MetadataKind, ModuleCodeInferenceResult,
+    RefPresentationCause, UninitializedPath, UnresolvedMethodKind,
 };
 
 pub use bsl_types::builders::Builders;

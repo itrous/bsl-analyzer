@@ -31,6 +31,9 @@ pub(crate) struct MethodParameterOverride {
     /// `Some` states that the call's result is the text of this argument, or text derived from it
     /// by a transformation that preserves what the text says; `None` states nothing.
     pub(crate) result_follows_argument_text: Option<bool>,
+    /// `Some` states the platform release in which the parameter first appeared. Not the corpus
+    /// scope of the record: that is `min_version` / `max_version`.
+    pub(crate) parameter_min_version: Option<String>,
 }
 
 impl MethodParameterOverride {
@@ -769,6 +772,7 @@ fn parse_override(
         "replacement_type_list",
         "passing",
         "result_follows_argument_text",
+        "parameter_min_version",
         "evidence_source",
         "rationale",
     ];
@@ -853,13 +857,30 @@ fn parse_override(
             )))
         }
     };
+    let parameter_min_version = match object.get("parameter_min_version") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            if parse_version(value).is_none() {
+                return Err(OverlayError(format!(
+                    "overlay entry {index} parameter_min_version must be a dotted numeric version"
+                )));
+            }
+            Some(value.clone())
+        }
+        Some(value) => {
+            return Err(OverlayError(format!(
+                "overlay entry {index} parameter_min_version must be a dotted numeric version, got {value}"
+            )))
+        }
+    };
     // `false` is what a parameter nobody recorded reads as, so alone it states nothing.
     if replacement_type_list.is_none()
+        && parameter_min_version.is_none()
         && passing.is_none()
         && result_follows_argument_text != Some(true)
     {
         return Err(OverlayError(format!(
-            "overlay entry {index} changes nothing: it needs replacement_type_list, passing or result_follows_argument_text"
+            "overlay entry {index} changes nothing: it needs replacement_type_list, parameter_min_version, passing or result_follows_argument_text"
         )));
     }
     required_string(object, "evidence_source", index)?;
@@ -875,6 +896,7 @@ fn parse_override(
         replacement_type_list,
         passing,
         result_follows_argument_text,
+        parameter_min_version,
     })
 }
 

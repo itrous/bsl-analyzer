@@ -35,6 +35,7 @@ fn candidates(db: &InMemoryDb, parameter_sets: &[&[TypeId]]) -> CallCandidateSet
                             mode: CallParamMode::Positional,
                             passing: None,
                             result_follows_argument_text: false,
+                            min_version: None,
                         })
                         .collect(),
                     required_args: parameter_types.len(),
@@ -60,6 +61,7 @@ fn binding(db: &InMemoryDb, parameter_sets: &[&[TypeId]], pre_types: &[TypeId]) 
         args: (0..pre_types.len()).map(|index| expr(index as u32 + 1)).collect(),
         candidate: CandidateCallBinding { candidates, resolution },
         in_dead_branch: false,
+        min_platform: None,
     }
 }
 
@@ -120,6 +122,7 @@ fn t12_arity_rejection_uses_resolver_fallback_once() {
             required_count: 2,
             total_count: 2,
             found: 1,
+            version_limit: None,
         })
     );
 }

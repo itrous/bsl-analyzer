@@ -1590,7 +1590,7 @@ fn a_record_that_states_none_of_the_three_facts_is_refused() {
 
     assert_eq!(
         error.to_string(),
-        "overlay entry 0 changes nothing: it needs replacement_type_list, passing or result_follows_argument_text"
+        "overlay entry 0 changes nothing: it needs replacement_type_list, parameter_min_version, passing or result_follows_argument_text"
     );
 }
 
@@ -2071,7 +2071,7 @@ fn a_record_whose_only_fact_is_result_follows_argument_text_false_is_refused() {
             .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "overlay entry 0 changes nothing: it needs replacement_type_list, passing or result_follows_argument_text"
+        "overlay entry 0 changes nothing: it needs replacement_type_list, parameter_min_version, passing or result_follows_argument_text"
     );
 }
 
@@ -2084,7 +2084,7 @@ fn a_record_stating_none_of_the_three_facts_is_refused_and_each_one_alone_is_acc
         .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "overlay entry 0 changes nothing: it needs replacement_type_list, passing or result_follows_argument_text"
+        "overlay entry 0 changes nothing: it needs replacement_type_list, parameter_min_version, passing or result_follows_argument_text"
     );
 
     let mut with_list = follows_text_record();
@@ -2197,4 +2197,60 @@ fn the_shipped_overlay_marks_exactly_the_seven_text_functions() {
             .collect();
     expected.sort();
     assert_eq!(marked, expected);
+}
+
+fn parameter_version_record(value: Value) -> Value {
+    json!({
+        "russian_name": "ВвестиСтроку",
+        "english_name": "InputString",
+        "min_version": "8.0",
+        "parameter_index": 1,
+        "parameter_min_version": value,
+        "evidence_source": "the parameter is absent from the older signature",
+        "rationale": "the call is judged against the project's minimum release"
+    })
+}
+
+#[test]
+fn a_parameter_min_version_alone_is_a_record_and_reaches_the_parameter_and_its_variants() {
+    let mut data = passing_data();
+    data["global_functions"][0]["variants"] = json!([
+        {"parameters": [{"name": "Строка", "param_type": "Строка"}]},
+        {"parameters": [
+            {"name": "Строка", "param_type": "Строка"},
+            {"name": "Подсказка", "param_type": "Строка"}
+        ]}
+    ]);
+
+    apply_global_function_parameter_overlays(
+        &mut data,
+        &global_function_overlay(parameter_version_record(json!("8.3.21"))),
+    )
+    .unwrap();
+
+    let function = &data["global_functions"][0];
+    assert_eq!(function["parameters"][1]["min_version"], "8.3.21");
+    assert!(function["parameters"][0].get("min_version").is_none(), "the neighbour is undated");
+    assert_eq!(function["variants"][1]["parameters"][1]["min_version"], "8.3.21");
+    assert!(
+        function["variants"][0]["parameters"][0].get("min_version").is_none(),
+        "a variant without the parameter gains nothing"
+    );
+    assert_eq!(function["parameters"][1]["param_type"], "Строка", "no type list rewrites none");
+}
+
+#[test]
+fn a_parameter_min_version_that_is_not_a_dotted_version_is_refused() {
+    for given in [json!("новая"), json!(8), json!("8..21")] {
+        let mut data = passing_data();
+        let error = apply_global_function_parameter_overlays(
+            &mut data,
+            &global_function_overlay(parameter_version_record(given.clone())),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("parameter_min_version must be a dotted numeric version"),
+            "{given}: {error}"
+        );
+    }
 }

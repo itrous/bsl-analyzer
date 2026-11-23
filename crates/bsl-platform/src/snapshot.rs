@@ -655,6 +655,7 @@ fn param_list(params: &[Value]) -> Result<Vec<MethodParam>, SnapshotDecodeError>
                 is_variadic: param.get("is_variadic").and_then(Value::as_bool).unwrap_or(false),
                 passing: passing(param)?,
                 result_follows_argument_text: result_follows_argument_text(param)?,
+                min_version: opt_string(param, "min_version"),
             })
         })
         .collect()

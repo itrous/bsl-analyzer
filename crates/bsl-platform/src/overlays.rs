@@ -158,6 +158,31 @@ fn apply_parameter_overrides(
             parameter_object
                 .insert("result_follows_argument_text".to_owned(), Value::Bool(follows));
         }
+        if let Some(introduced) = &overlay.parameter_min_version {
+            let parameter_name =
+                parameter_object.get("name").and_then(Value::as_str).map(str::to_owned);
+            parameter_object.insert("min_version".to_owned(), Value::String(introduced.clone()));
+            // A call is judged against the variant that matches its arguments, so the variants
+            // carry their own copies of the parameter; the stamp follows it by name.
+            if let Some(name) = parameter_name {
+                let variants =
+                    methods[method_index].get_mut("variants").and_then(Value::as_array_mut);
+                for variant in variants.into_iter().flatten() {
+                    let variant_parameters =
+                        variant.get_mut("parameters").and_then(Value::as_array_mut);
+                    for candidate in variant_parameters.into_iter().flatten() {
+                        if candidate.get("name").and_then(Value::as_str) == Some(name.as_str()) {
+                            if let Some(object) = candidate.as_object_mut() {
+                                object.insert(
+                                    "min_version".to_owned(),
+                                    Value::String(introduced.clone()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

@@ -46,6 +46,7 @@ impl CallCandidateSet {
                 // declaration's `Знач` instead, so there is one source per kind of callee.
                 passing: None,
                 result_follows_argument_text: false,
+                min_version: None,
             })
             .collect();
         let max_args = match facet.max_args {
@@ -109,6 +110,7 @@ impl CallSignature {
                 mode: CallParamMode::Positional,
                 passing: None,
                 result_follows_argument_text: false,
+                min_version: None,
             })
             .collect();
         let method_id = UserMethodId::from(method.id);
@@ -222,6 +224,7 @@ impl PlatformCandidateContext<'_> {
                 },
                 passing: param.passing,
                 result_follows_argument_text: param.result_follows_argument_text,
+                min_version: param.min_version.clone(),
             })
             .collect();
         let required_args = params

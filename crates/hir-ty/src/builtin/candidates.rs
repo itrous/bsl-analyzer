@@ -66,6 +66,7 @@ impl BuiltinSignature {
                     .get(index)
                     .copied()
                     .unwrap_or(false),
+                min_version: self.min_versions.get(index).cloned().flatten(),
             })
             .collect();
         CallSignature {
