@@ -4,12 +4,13 @@
 index. It is intentionally narrower than the workspace graph: it contains only
 resolved method-to-method caller pairs for one source root. Direct, qualified,
 manager user-method, `NotifyRef`, and idle-handler edges are included when
-resolved. With `platform_help = none`, callback constructors cannot be resolved
-and `NotifyRef` edges are absent. Separately, the syntax-only compatibility
-protection for unused parameters remains available without platform help: it
-recognizes `ОписаниеОповещения` and the legacy English `NotifyDescription`, but
-not the newer English `CallbackDescription`. This protection does not create
-call hierarchy edges.
+resolved. With `platform_help = none`, platform facts for callback constructors
+are unavailable, so they are not semantically resolved and no `NotifyRef` edges
+are created. The index does not substitute syntax guesses for those semantic
+facts. Separately, syntax-only protection for potentially used local methods and
+their fixed signatures remains available without platform help: it recognizes
+`ОписаниеОповещения`, `NotifyDescription`, and `CallbackDescription`. That
+protection does not create callback registrations or call-hierarchy edges.
 
 `SetAction`, module code, unresolved targets, metadata/query/form domains, and
 other non-method edges are excluded.
