@@ -93,6 +93,24 @@ fn names_of(body: &hir::Body, proof: rustc_hash::FxHashSet<hir::ExprId>) -> Vec<
     names
 }
 
+fn effect_callees(
+    body: &hir::Body,
+    effects: rustc_hash::FxHashMap<hir::ExprId, hir::dataflow::catch_outcome::CallEffect>,
+) -> Vec<String> {
+    names_of(
+        body,
+        effects
+            .into_keys()
+            .map(|call| {
+                let Expr::Call { callee, .. } = body.expr(call) else {
+                    panic!("effect on a non-call expression: {:?}", body.expr(call));
+                };
+                hir::ExprId::from_idx(*callee)
+            })
+            .collect(),
+    )
+}
+
 #[test]
 fn platform_call_proof_keeps_the_separate_variable_namespace() {
     let fixture = Fixture::new("Перем XMLString;\nПроцедура Test(Строка)\nСтрСоединить = 1;\nСтрока(1);\nString(1);\nXMLString(1);\nСтрСоединить(Новый Массив);\nStrConcat(Новый Массив);\nТранзакцияАктивна();\nTransactionActive();\nКонецПроцедуры");
@@ -211,6 +229,11 @@ fn platform_call_proof_uses_effective_body_ids_and_keeps_copied_base_context() {
     let bodies = hir::module_bodies_effective(&fixture.db, route);
     let DefWithBodyId::Method(key) = copied else { unreachable!() };
     assert_eq!(names_of(bodies.body(key).unwrap(), proof), ["XMLString"]);
+    let effects = |owner| {
+        hir_ty::infer::platform_call_effects(&fixture.db, fixture.caller, owner, Some(route), None)
+    };
+    assert!(effects(changed).is_empty());
+    assert_eq!(effect_callees(bodies.body(key).unwrap(), effects(copied)), ["XMLString"]);
 }
 
 #[test]
@@ -241,4 +264,23 @@ fn platform_call_proof_honors_weaving_base_siblings() {
     let bodies = fixture.db.module_bodies(ModuleId::new(fixture.caller));
     let DefWithBodyId::Method(key) = owner else { unreachable!() };
     assert_eq!(names_of(bodies.body(key).unwrap(), proof), ["XMLString"]);
+    let effects = |route| {
+        hir_ty::infer::platform_call_effects(&fixture.db, fixture.caller, owner, None, Some(route))
+    };
+    assert!(effects(foreign_route).is_empty());
+    assert_eq!(effect_callees(bodies.body(key).unwrap(), effects(route)), ["XMLString"]);
+}
+
+#[test]
+fn platform_call_effects_use_module_code_ids() {
+    let fixture = Fixture::new("Failure = XMLString(\"failure\");\n");
+    let effects = hir_ty::infer::platform_call_effects(
+        &fixture.db,
+        fixture.caller,
+        DefWithBodyId::ModuleCode,
+        None,
+        None,
+    );
+    let bodies = fixture.db.module_bodies(ModuleId::new(fixture.caller));
+    assert_eq!(effect_callees(bodies.module_code().unwrap(), effects), ["XMLString"]);
 }

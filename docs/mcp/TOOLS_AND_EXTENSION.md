@@ -1189,11 +1189,12 @@ bsl-analyzer mcp serve --profile reference
 `snippet`), а для module — `module_type` и `context`. В профиле подключений
 `check_executor` задаёт локальную команду native-проверки и явный
 `handles_snippet`: `true` направляет snippet исполнителю, `false` — HTTP при
-наличии URL. Module всегда направляется исполнителю. Автоматического перехода
-на другой backend при ошибке нет. Если URL отсутствует, HTTP-пути и
-`run`/`eval`/`event_log` недоступны; отсутствие HTTP-переменных окружения не
-блокирует executor-only профиль. Профиль и значения лимитов приведены в
-`docs/mcp/check-contract/README.md`.
+наличии URL. Для `module` MCP использует `check_executor`, если он настроен.
+Без исполнителя MCP вызывает HTTP `/check-module`, если в профиле включён
+`epf_module_check` и задан URL. Иначе возвращает `unsupported`.
+Автоматического перехода на другой backend при ошибке нет. Без URL HTTP-пути и
+`run`/`eval`/`event_log` недоступны. Отсутствие HTTP-переменных окружения не
+блокирует executor-only профиль. [Профиль исполнителя и значения лимитов](check-contract/README.md).
 
 Snippet с AST-объявлением процедуры/функции, аннотацией или директивой получает
 `context_required` с подсказкой повторить вызов как module. Слова в строках и

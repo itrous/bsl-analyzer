@@ -203,6 +203,13 @@ impl<'a> BodyContext<'a> {
         })
     }
 
+    /// Proven value transfers keyed by the whole call expression in this body.
+    pub fn platform_call_effects(
+        &self,
+    ) -> rustc_hash::FxHashMap<hir::ExprId, hir::dataflow::catch_outcome::CallEffect> {
+        self.analysis.provider().platform_call_effects(self.file_id, self.owner)
+    }
+
     /// One semantic verdict feeds a replacement's message and fix.
     pub fn replacement_applicability(&self, target: &str) -> hir::ReplacementApplicability {
         if let Some(result) = self.replacement_applicabilities.borrow().get(target).copied() {

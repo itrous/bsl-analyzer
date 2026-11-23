@@ -1,13 +1,14 @@
 use base_db::FileIdInput;
 use bsl_platform::deprecation::{self, ElementKind, Lookup};
 use bsl_platform::security::Category as SecurityCategory;
-use bsl_platform::MemberSurface;
+use bsl_platform::{CallValueEffect, CallValueEffectTarget, MemberSurface, ParamPassing};
 use bsl_types::builders::Builders;
 use bsl_types::facet::{DateComponent, FormDataFacet, MdoRefFacet, ProjectionSource};
 use bsl_types::intern::TypeKernelDb;
 use bsl_types::kind::{ConfigId, Projection, TypeId, TypeKind};
 use bsl_types::testing::RootConfigCtx;
 use cfg_types::{BindingId, IdConversion};
+use dataflow::catch_outcome::CallEffect;
 use hir_def::body::Body;
 use hir_def::effective_module::EffectiveModuleId;
 use hir_def::hir::{BinaryOp, Expr, ExprIdx, Literal, Stmt, StmtIdx, UnaryOp};
@@ -24,6 +25,9 @@ use vfs::FileId;
 
 use crate::body_flow::BodyFlow;
 use crate::builtin;
+use crate::call_resolution::{
+    BuiltinCallableId, CallParamMode, CallSignature, CandidateId, PlatformSignatureSlot,
+};
 use crate::db::HirDatabase;
 use crate::definite_init;
 use crate::lower::TyLoweringContext;
@@ -227,6 +231,10 @@ struct PathWalk {
     /// Whether a call or `Выполнить` that may rebind a local read through
     /// [`Self::own_defs`] vouches for nothing, or is passed over.
     weigh_possible_writes: bool,
+    /// An initial path with no value defeats a proof about the receiver of a platform call.
+    require_known_on_every_path: bool,
+    /// Call bindings by callee expression, also used while proving earlier calls harmless.
+    call_bindings: FxHashMap<ExprId, usize>,
 }
 
 /// What a definition reaching a read takes its value from.
@@ -1090,6 +1098,65 @@ pub fn unshadowed_platform_global_calls<'db>(
         .unwrap_or_default()
 }
 
+/// Value flow through calls whose platform signature and receiver type are proved for this body.
+pub fn platform_call_effects<'db>(
+    db: &'db dyn HirDatabase,
+    file_id: FileId,
+    owner: DefWithBodyId,
+    effective: Option<EffectiveModuleId<'db>>,
+    weaving: Option<hir_def::weaving::WeavingModuleId<'db>>,
+) -> FxHashMap<ExprId, CallEffect> {
+    let _span = tracing::debug_span!("platform_call_effects").entered();
+    let Some(mut context) = routed_inference_context(db, file_id, owner, effective, weaving) else {
+        return FxHashMap::default();
+    };
+    let platform = bsl_platform::PlatformData::instance();
+    let may_have_effect = |target| !platform.call_value_effects(target).is_empty();
+    if context.body.is_lowering_incomplete()
+        || !context.body.exprs_iter().any(|(_, expr)| match expr {
+            Expr::Call { callee, .. } => match context.body.expr_idx(*callee) {
+                Expr::Path(name) => {
+                    platform.get_global_function(name.as_str()).is_some_and(|function| {
+                        may_have_effect(CallValueEffectTarget::GlobalFunction(function.id))
+                    })
+                }
+                Expr::Field { .. } => true,
+                _ => false,
+            },
+            Expr::MethodCall { .. } => true,
+            Expr::New { type_name: Some(name), .. } => {
+                platform.get_constructors(name.as_str()).iter().any(|constructor| {
+                    may_have_effect(CallValueEffectTarget::Constructor(constructor.id))
+                })
+            }
+            _ => false,
+        })
+    {
+        return FxHashMap::default();
+    }
+    let routed = effective
+        .map(|route| infer_effective(db, route))
+        .or_else(|| weaving.map(|route| infer_weaving(db, route)));
+    if let Some(result) =
+        routed.as_ref().filter(|result| result.expr_types_by_body.contains_key(&owner))
+    {
+        context.expr_types = result.expr_types_by_body[&owner].clone();
+        context.call_arg_bindings = result
+            .call_arg_bindings
+            .iter()
+            .filter(|binding| binding.owner == owner)
+            .cloned()
+            .collect();
+    } else {
+        // Effective inference elides copied bodies, which are inferred in the base context.
+        let physical_file = effective.map_or(file_id, |route| route.base_file(db));
+        let inferred = infer_owner(db, physical_file, owner);
+        context.expr_types = inferred.expr_types().clone();
+        context.call_arg_bindings = inferred.call_arg_bindings().to_vec();
+    }
+    context.proven_call_effects()
+}
+
 fn routed_inference_context<'db>(
     db: &'db dyn HirDatabase,
     file_id: FileId,
@@ -1152,6 +1219,58 @@ fn platform_global_is_callable(name: &Name) -> bool {
                     && symbol.capabilities.callable == Some(true)
             },
         )
+}
+
+fn selected_signature(binding: &CandidateCallBinding) -> Option<&CallSignature> {
+    let candidate = binding.resolution.selection.sole_candidate()?;
+    binding.candidates.as_slice().iter().find(|signature| signature.id == candidate)
+}
+
+fn proven_signature_effect(
+    target: CallValueEffectTarget,
+    signature: &CallSignature,
+    argument_count: usize,
+) -> Option<CallEffect> {
+    let expected = match target {
+        CallValueEffectTarget::GlobalFunction(id) => CandidateId::Builtin {
+            callable: BuiltinCallableId::PlatformGlobal(id),
+            signature_ordinal: 0,
+        },
+        CallValueEffectTarget::Method(id) | CallValueEffectTarget::Constructor(id) => {
+            CandidateId::Platform { method_id: id, signature: PlatformSignatureSlot::Base }
+        }
+    };
+    let transfers = bsl_platform::PlatformData::instance().call_value_effects(target);
+    if signature.id != expected || transfers.is_empty() {
+        return None;
+    }
+    let is_constructor = matches!(target, CallValueEffectTarget::Constructor(_));
+    let no_writeback = transfers.contains(&CallValueEffect::NoArgumentWriteback {
+        parameter_count: signature.params.len(),
+    });
+    let mut effect = CallEffect::default();
+    for (position, param) in signature.params.iter().enumerate() {
+        let positions = if param.mode == CallParamMode::Variadic {
+            position..argument_count
+        } else {
+            position..(position + 1).min(argument_count)
+        };
+        if is_constructor
+            || param.passing == Some(ParamPassing::ByVal)
+            || (param.passing.is_none() && no_writeback)
+        {
+            effect.preserved_arguments.extend(positions.clone());
+        }
+        if transfers.contains(&CallValueEffect::ArgumentToResult(position)) {
+            effect.arguments_to_result.extend(positions.clone());
+        }
+        if transfers.contains(&CallValueEffect::ArgumentToReceiver(position)) {
+            effect.arguments_to_receiver.get_or_insert_with(Vec::new).extend(positions);
+        }
+    }
+    effect.receiver_to_result = transfers.contains(&CallValueEffect::ReceiverToResult);
+    effect.clear_receiver = transfers.contains(&CallValueEffect::ClearReceiver);
+    Some(effect)
 }
 
 impl<'db> InferenceContext<'db> {
@@ -2162,6 +2281,167 @@ impl<'db> InferenceContext<'db> {
                 .then_some(callee)
             })
             .collect()
+    }
+
+    fn proven_call_effects(&mut self) -> FxHashMap<ExprId, CallEffect> {
+        let globals = self.proven_platform_global_calls();
+        let mut walk = PathWalk {
+            inferred_leaves: true,
+            weigh_possible_writes: true,
+            require_known_on_every_path: true,
+            call_bindings: self
+                .call_arg_bindings
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| (binding.call_expr, index))
+                .collect(),
+            ..PathWalk::default()
+        };
+        let platform = bsl_platform::PlatformData::instance();
+        self.body
+            .exprs_iter()
+            .filter_map(|(call, expression)| {
+                if self.body.is_recovered(call) {
+                    return None;
+                }
+                let effect = match expression {
+                    Expr::Call { callee, args } => {
+                        let callee = ExprId::from_idx(*callee);
+                        if self.body.is_recovered(callee) {
+                            return None;
+                        }
+                        match self.body.expr(callee) {
+                            Expr::Field { .. } => self.proven_method_effect(call, &mut walk),
+                            Expr::Path(_) if globals.contains(&callee) => {
+                                let signature = self.bound_call_signature(callee, &walk)?;
+                                let CandidateId::Builtin {
+                                    callable: BuiltinCallableId::PlatformGlobal(id),
+                                    ..
+                                } = signature.id
+                                else {
+                                    return None;
+                                };
+                                proven_signature_effect(
+                                    CallValueEffectTarget::GlobalFunction(id),
+                                    signature,
+                                    args.len(),
+                                )
+                            }
+                            _ => return None,
+                        }
+                    }
+                    Expr::MethodCall { .. } => self.proven_method_effect(call, &mut walk),
+                    Expr::New { type_name: Some(name), args } => {
+                        let ty = self.expr_types.get(&call).copied()?;
+                        let owner = crate::method_lookup::platform_type_key_id(self.db, ty)?;
+                        let named = platform.get_type(name.as_str())?;
+                        if platform.is_ambiguous_type_name(name.as_str())
+                            || platform.get_type(&owner)? != named
+                        {
+                            return None;
+                        }
+                        let signature = self.bound_call_signature(call, &walk)?;
+                        let CandidateId::Platform { method_id, .. } = signature.id else {
+                            return None;
+                        };
+                        proven_signature_effect(
+                            CallValueEffectTarget::Constructor(method_id),
+                            signature,
+                            args.len(),
+                        )
+                    }
+                    _ => None,
+                }?;
+                Some((call, effect))
+            })
+            .collect()
+    }
+
+    fn bound_call_signature(&self, callee: ExprId, walk: &PathWalk) -> Option<&CallSignature> {
+        let index = *walk.call_bindings.get(&callee)?;
+        selected_signature(&self.call_arg_bindings[index].candidate)
+    }
+
+    fn proven_method_effect(&self, call: ExprId, walk: &mut PathWalk) -> Option<CallEffect> {
+        if self.body.is_recovered(call) {
+            return None;
+        }
+        match self.body.expr(call) {
+            Expr::Call { callee, args } => {
+                let callee = ExprId::from_idx(*callee);
+                let Expr::Field { base, field } = self.body.expr(callee) else { return None };
+                if self.body.is_recovered(callee) {
+                    return None;
+                }
+                let signature = self.bound_call_signature(callee, walk)?;
+                let target = self.method_effect_target(*base, field, walk)?;
+                proven_signature_effect(target, signature, args.len())
+            }
+            Expr::MethodCall { receiver, method, args } => {
+                let target = self.method_effect_target(*receiver, method, walk)?;
+                let ty = self.expr_types.get(&ExprId::from_idx(*receiver)).copied()?;
+                let info = crate::method_lookup::lookup_method(self.db, ty, method)?;
+                let arg_types = args
+                    .iter()
+                    .map(|arg| {
+                        self.expr_types
+                            .get(&ExprId::from_idx(*arg))
+                            .copied()
+                            .unwrap_or_else(|| self.db.unknown())
+                    })
+                    .collect::<Vec<_>>();
+                let binding =
+                    crate::call_binding::resolve_binding(self.db, info.candidates, &arg_types);
+                let signature = selected_signature(&binding.semantic)?;
+                proven_signature_effect(target, signature, args.len())
+            }
+            _ => None,
+        }
+    }
+
+    fn method_preserves_argument(
+        &self,
+        def: &dataflow::reaching_defs::Definition,
+        defs: &dataflow::reaching_defs::ReachingDefsResult,
+        walk: &mut PathWalk,
+    ) -> bool {
+        use dataflow::reaching_defs::{DefSite, WriteEventKind};
+
+        let DefSite::MayWrite(id) = def.def_site else { return false };
+        let Some(WriteEventKind::Argument { call, position, .. }) =
+            defs.write(id).map(|write| write.kind)
+        else {
+            return false;
+        };
+        self.proven_method_effect(call, walk)
+            .is_some_and(|effect| effect.preserved_arguments.contains(&(position as usize)))
+    }
+
+    fn method_effect_target(
+        &self,
+        receiver: ExprIdx,
+        method: &Name,
+        walk: &mut PathWalk,
+    ) -> Option<CallValueEffectTarget> {
+        let receiver = ExprId::from_idx(receiver);
+        let ty = self.expr_types.get(&receiver).copied()?;
+        let owner = crate::method_lookup::platform_type_key_id(self.db, ty)?;
+        let platform = bsl_platform::PlatformData::instance();
+        let target =
+            CallValueEffectTarget::Method(platform.get_method(&owner, method.as_str())?.id);
+        if platform.call_value_effects(target).is_empty()
+            || platform.is_ambiguous_type_name(&owner)
+            || hir_def::body::events::has_unresolved_jump(&self.body)
+        {
+            return None;
+        }
+        if walk.own_defs.is_none() {
+            walk.own_defs = Some(self.flow.executable_reaching_defs(self.db)?);
+        }
+        match self.types_on_every_path(receiver, walk)?.as_slice() {
+            [proved] if *proved == ty => Some(target),
+            _ => None,
+        }
     }
 
     fn is_call_name_shadowed(&mut self, name: &Name) -> bool {
@@ -3243,7 +3523,7 @@ impl<'db> InferenceContext<'db> {
                     _ => Some(vec![self.expr_types.get(&expr).copied()?]),
                 }
             }
-            Expr::Literal(_) | Expr::New { .. } if walk.inferred_leaves => {
+            Expr::Literal(_) | Expr::New { .. } | Expr::Array(_) if walk.inferred_leaves => {
                 Some(vec![self.expr_types.get(&expr).copied()?])
             }
             Expr::Path(name) => {
@@ -3265,7 +3545,7 @@ impl<'db> InferenceContext<'db> {
                     .then(|| vec![ty]);
                 }
                 let use_stmt = self.body.enclosing_stmt(expr)?;
-                let reaching = match &walk.own_defs {
+                let reaching = match walk.own_defs.clone() {
                     Some(defs) => {
                         use hir_def::body::events::EvalPoint;
                         let point =
@@ -3278,26 +3558,40 @@ impl<'db> InferenceContext<'db> {
                         };
                         // A path that never assigns the local gives no value of its own: what
                         // the walk vouches for is the values the body gives it.
-                        found.retain(|def| {
-                            !matches!(def.def_site, dataflow::reaching_defs::DefSite::Unknown)
-                        });
+                        if !walk.require_known_on_every_path {
+                            found.retain(|def| {
+                                !matches!(def.def_site, dataflow::reaching_defs::DefSite::Unknown)
+                            });
+                        }
                         if walk.weigh_possible_writes {
                             found.extend(defs.possible_writes_at(point, &key).into_iter().filter(
                                 |def| {
                                     crate::possible_writes::may_write_before(
-                                        &self.body, defs, def, expr,
+                                        &self.body, &defs, def, expr,
                                     )
                                 },
                             ));
+                            // A possible write can lead back to this read through the callee's
+                            // receiver. A cycle supplies no proof that the write is harmless.
+                            walk.active.push(expr);
                             found.retain(|def| {
-                                crate::possible_writes::rebinding(
+                                match crate::possible_writes::rebinding(
                                     self.db,
                                     &self.body,
                                     &self.call_arg_bindings,
-                                    defs,
+                                    &defs,
                                     def,
-                                ) != Some(crate::possible_writes::Rebinding::Cannot)
+                                ) {
+                                    Some(crate::possible_writes::Rebinding::Cannot) => false,
+                                    Some(crate::possible_writes::Rebinding::Unattested)
+                                        if walk.require_known_on_every_path =>
+                                    {
+                                        !self.method_preserves_argument(def, &defs, walk)
+                                    }
+                                    _ => true,
+                                }
                             });
+                            walk.active.pop();
                         } else {
                             found.retain(|def| {
                                 !matches!(
@@ -7376,6 +7670,26 @@ pub fn type_of_expr_query(
 mod tests {
     use super::*;
     use bsl_types::testing::InMemoryDb;
+
+    #[test]
+    fn array_add_writeback_proof_yields_to_explicit_byref() {
+        let platform = bsl_platform::PlatformData::instance();
+        let method = platform.get_method("Array", "Add").unwrap();
+        let target = CallValueEffectTarget::Method(method.id);
+        let info = crate::method_lookup::to_method_info(&InMemoryDb::new(), method);
+        let mut signature = info.candidates.as_slice()[0].clone();
+
+        assert_eq!(signature.params[0].passing, None);
+        assert_eq!(
+            proven_signature_effect(target, &signature, 1).unwrap().preserved_arguments,
+            [0]
+        );
+        signature.params[0].passing = Some(ParamPassing::ByRef);
+        assert!(proven_signature_effect(target, &signature, 1)
+            .unwrap()
+            .preserved_arguments
+            .is_empty());
+    }
 
     #[test]
     fn served_help_covers_only_a_target_it_is_known_not_to_predate() {

@@ -34,7 +34,17 @@ pub struct InspectionIdentity {
 }
 
 impl InspectionIdentity {
+    /// Read a descriptor using the standard default for absent ownership.
     pub fn from_xml(xml: &str, kind: &str) -> crate::Result<Self> {
+        Self::read_xml(xml, kind, false)
+    }
+
+    /// A native extension form can omit ownership when it declares no adoption.
+    pub fn from_extension_form_xml(xml: &str, kind: &str) -> crate::Result<Self> {
+        Self::read_xml(xml, kind, true)
+    }
+
+    fn read_xml(xml: &str, kind: &str, extension_form: bool) -> crate::Result<Self> {
         use crate::xml_parser::helpers::{child_text, find_child, parse_extension_ownership};
         let document = roxmltree::Document::parse(xml.trim_start_matches('\u{feff}'))
             .map_err(|e| crate::MetadataError::InvalidFormat(e.to_string()))?;
@@ -50,7 +60,13 @@ impl InspectionIdentity {
         let props = find_child(node, "Properties").ok_or_else(|| {
             crate::MetadataError::InvalidFormat("Descriptor properties unavailable".into())
         })?;
-        let (object_belonging, extends) = parse_extension_ownership(props);
+        let (mut object_belonging, extends) = parse_extension_ownership(props);
+        if extension_form
+            && object_belonging == crate::ObjectBelonging::Own
+            && find_child(props, "ExtendedConfigurationObject").is_some()
+        {
+            object_belonging = crate::ObjectBelonging::Unknown;
+        }
         Ok(Self {
             uuid: node.attribute("uuid").and_then(|s| s.parse().ok()).unwrap_or_default(),
             name: child_text(props, "Name").unwrap_or_default().into(),

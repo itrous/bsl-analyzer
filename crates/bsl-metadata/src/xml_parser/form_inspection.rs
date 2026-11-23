@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AttributeType, MetadataError};
+use crate::{inspection_sources::BinaryFingerprint, AttributeType, Form, MetadataError};
 
 use super::form_sidecar::BOUND_HANDLER_EVENT;
 use super::helpers::{child_text, find_child};
@@ -369,7 +369,36 @@ pub fn parse_ordinary_form_inspection(
     let form = super::form_sidecar::parse_ordinary_form_sidecar(json, name)?;
     let source: serde_json::Value = serde_json::from_str(json.trim_start_matches('\u{feff}'))
         .map_err(|e| MetadataError::InvalidFormat(e.to_string()))?;
-    validate_sidecar_fingerprint(&source, fingerprint)?;
+    inspect_ordinary_form(form, &source, fingerprint, origin)
+}
+
+/// Read a sidecar against the fingerprint and legacy freshness recorded by the source owner.
+pub fn parse_prepared_ordinary_form_inspection(
+    json: &str,
+    name: &str,
+    fingerprint: Option<&BinaryFingerprint>,
+    origin: &str,
+) -> Result<FormInspection, String> {
+    let source: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    if source.pointer("/source/sha256").is_none()
+        && fingerprint.and_then(|value| value.legacy_sidecar_stale) == Some(true)
+    {
+        return Err("ordinary_sidecar_stale".into());
+    }
+    let form = super::form_sidecar::parse_ordinary_form_sidecar(json, name)
+        .map_err(|error| error.to_string())?;
+    inspect_ordinary_form(form, &source, fingerprint.map(|value| value.sha256.as_str()), origin)
+        .map_err(|error| error.to_string())
+}
+
+fn inspect_ordinary_form(
+    form: Form,
+    source: &serde_json::Value,
+    fingerprint: Option<&str>,
+    origin: &str,
+) -> crate::Result<FormInspection> {
+    validate_sidecar_fingerprint(source, fingerprint)?;
     let mut controls = BTreeMap::new();
     fn index<'a>(
         values: &'a [serde_json::Value],

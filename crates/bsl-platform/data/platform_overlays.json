@@ -388,6 +388,145 @@
       "rationale": "The extract keeps only the first five entries of a parameter's type list, so Дата — the first type the help documents after the scalars, and the one most often written here — is reported as a type mismatch at Error severity. Enumerating the admissible set in its place is not possible: it includes every configuration reference type and every system enumeration value, which the extract has no name for. «Произвольный» states what the platform states — this parameter carries no static constraint — and leaves the arguments that really are wrong (Массив, Структура, Тип) to the run-time conversion error, where the platform itself leaves them."
     }
   ],
+  "call_value_effects": [
+    {
+      "target": {
+        "kind": "function",
+        "name": "String"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, String.",
+      "rationale": "The result is the string representation of the argument."
+    },
+    {
+      "target": {
+        "kind": "function",
+        "name": "XMLString"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, XMLString.",
+      "rationale": "The result is the XML representation of the argument."
+    },
+    {
+      "target": {
+        "kind": "function",
+        "name": "StrConcat"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, StrConcat.",
+      "rationale": "The result joins the input collection's strings."
+    },
+    {
+      "target": {
+        "kind": "function",
+        "name": "StrConcat"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 1,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, StrConcat.",
+      "rationale": "The separator can appear between elements in the result."
+    },
+    {
+      "target": {
+        "kind": "constructor",
+        "type": "Array",
+        "variant": "На основании фиксированного массива"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array, based on a fixed array.",
+      "rationale": "The new array copies values from the fixed array."
+    },
+    {
+      "target": {
+        "kind": "constructor",
+        "type": "Structure",
+        "variant": "По ключам и значениям"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 1,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Structure, by keys and values.",
+      "rationale": "The second parameter and its variadic tail supply stored values."
+    },
+    {
+      "target": {
+        "kind": "constructor",
+        "type": "Structure",
+        "variant": "На основании фиксированной структуры"
+      },
+      "effect": "argument_to_result",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Structure, based on a fixed structure.",
+      "rationale": "The new structure copies values from the fixed structure."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Add"
+      },
+      "effect": "argument_to_receiver",
+      "parameter_index": 0,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array.Add.",
+      "rationale": "The parameter supplies the value appended to the array."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Insert"
+      },
+      "effect": "argument_to_receiver",
+      "parameter_index": 1,
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array.Insert.",
+      "rationale": "The second parameter supplies the stored value. The first parameter selects its index."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Add"
+      },
+      "effect": "no_argument_writeback",
+      "parameter_count": 1,
+      "evidence_source": "Linux 1C:Enterprise 8.3.27.2130 runtime probe EPF SHA-256 0761b89466aefdce2cb1ecc797266fb5f9875406bf24040d781659caeb2b922d: V = \"add\"; A = New Array; A.Add(V) leaves V = \"add\" and adds that value at A[0].",
+      "rationale": "Adding an element leaves the caller's value variable unchanged. The analysis retains its existing value after this signature when passing is unstated."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Insert"
+      },
+      "effect": "no_argument_writeback",
+      "parameter_count": 2,
+      "evidence_source": "Linux 1C:Enterprise 8.3.27.2130 runtime probe EPF SHA-256 0761b89466aefdce2cb1ecc797266fb5f9875406bf24040d781659caeb2b922d: I = 0; V = \"insert\"; A.Insert(I, V) leaves I = 0 and V = \"insert\" and inserts that value at A[0].",
+      "rationale": "Inserting the element leaves both caller variables unchanged. The analysis retains their existing values after this signature when passing is unstated."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Count"
+      },
+      "effect": "receiver_to_result",
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array.Count.",
+      "rationale": "The returned count reflects which elements the receiver contains."
+    },
+    {
+      "target": {
+        "kind": "method",
+        "type": "Array",
+        "name": "Clear"
+      },
+      "effect": "clear_receiver",
+      "evidence_source": "1C:Enterprise 8.3.27 Syntax Assistant, Array.Clear.",
+      "rationale": "The array is emptied in place."
+    }
+  ],
   "type_property_additions": [
     {
       "canonical_type": "ClientApplicationForm",

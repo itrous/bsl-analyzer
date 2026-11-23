@@ -16,6 +16,12 @@ the name boundary. Unknown free names, unknown constructors, configuration
 callables and `ThisObject`/`ЭтотОбъект` require context the carrier does not own.
 Properties of an admitted local or parameter retain their normal dynamic meaning.
 
+`admission.rs` classifies names directly from the syntax tree and the server
+platform catalog. The carrier has no project database or configuration to resolve
+against. Its name check answers only whether the module can be packaged in the
+synthetic context. If a free name cannot be proved available there, admission
+rejects the module before packaging.
+
 Admission refuses with existing `context_required` or `unsupported` status and
 never emits native `valid`/`invalid`. A syntactically complete semantic error,
 such as returning a value from a procedure, remains admissible so that the

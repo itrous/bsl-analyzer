@@ -2,12 +2,15 @@ use std::sync::Arc;
 
 use bsl_conventions::{ConventionalName, XML_EXTENSION};
 
-use bsl_metadata::inspection_sources::InspectionIdentity;
-use bsl_metadata::{Form, FormAttribute, ObjectBelonging};
+use bsl_metadata::FormAttribute;
 use hir::metadata_symbol::{MetadataIdentityError, MetadataIdentityResolver, MetadataSymbolPath};
 use vfs::FileId;
 
 use crate::{metadata::RootKind, RootDatabaseImpl};
+
+use super::form_composition::{
+    compose_form, FormDescriptorKind, FormParent, FormPurpose, FormRequest,
+};
 
 impl RootDatabaseImpl {
     /// Compose only UUID-attested form sources from the prepared visible root chain.
@@ -70,80 +73,215 @@ impl RootDatabaseImpl {
             .and_then(|ext| ext.parent())
             .ok_or(MetadataIdentityError::MissingDeclaration)?;
         let descriptor = form_directory.with_extension(XML_EXTENSION);
-        let descriptor_kind =
-            if external_kind.is_some() || owner.is_some() { "Form" } else { "CommonForm" };
-        let parent_path = owner.map(|(kind, name)| MetadataSymbolPath {
-            owner_kind: *kind,
-            owner_name: hir::Name::new(name),
-            members: Vec::new(),
-        });
-        let parent_identity = parent_path
-            .as_ref()
-            .map(|owner| self.metadata_identity(form_xml_file, owner))
-            .transpose()?;
-        let relative_descriptor = descriptor
-            .to_str()
-            .ok_or(MetadataIdentityError::MissingDeclaration)?
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        let relative_content = relative
-            .to_str()
-            .ok_or(MetadataIdentityError::MissingDeclaration)?
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        let mut effective: Option<(InspectionIdentity, Form)> = None;
-        for root in &roots {
-            let Some(descriptor_file) = self.inspection_file_id(root, &relative_descriptor) else {
-                if root == selected {
-                    return Err(MetadataIdentityError::MissingDeclaration);
-                }
-                continue;
-            };
-            if let (Some(parent), Some(expected)) = (&parent_path, &parent_identity) {
-                if self.metadata_identity(descriptor_file, parent)? != *expected {
-                    continue;
-                }
-            }
-            let descriptor_text = self
-                .inspection_file(root, &relative_descriptor)
-                .ok_or(MetadataIdentityError::UnreadSource)?;
-            let identity = InspectionIdentity::from_xml(&descriptor_text, descriptor_kind)
-                .map_err(|_| MetadataIdentityError::MissingDeclaration)?;
-            if identity.uuid.is_nil()
-                || !matches!(identity.form_type.as_deref(), None | Some("Managed"))
-            {
-                return Err(MetadataIdentityError::UnreadSource);
-            }
-            let is_extension = snapshot
-                .paths
-                .iter()
-                .position(|(_, path)| path == root)
-                .is_some_and(|index| snapshot.kinds.get(index) == Some(&RootKind::Extension));
-            if is_extension && identity.object_belonging == ObjectBelonging::Unknown {
-                return Err(MetadataIdentityError::UnprovedAdoption);
-            }
-            let content = self
-                .inspection_file(root, &relative_content)
-                .ok_or(MetadataIdentityError::UnreadSource)?;
-            let form = bsl_metadata::xml_parser::parse_form_xml(&content)
-                .map_err(|_| MetadataIdentityError::UnreadSource)?;
-            if !form.is_managed() {
-                return Err(MetadataIdentityError::UnreadSource);
-            }
-            if identity.object_belonging == ObjectBelonging::Adopted {
-                let Some((base_identity, base)) =
-                    effective.as_mut().filter(|(base, _)| identity.adopts(base))
-                else {
-                    return Err(MetadataIdentityError::UnprovedAdoption);
+        let kind = if external_kind.is_some() || owner.is_some() {
+            FormDescriptorKind::Form
+        } else {
+            FormDescriptorKind::CommonForm
+        };
+        let parent = owner
+            .map(|(kind, name)| {
+                let name = hir::Name::new(name);
+                let path = MetadataSymbolPath {
+                    owner_kind: *kind,
+                    owner_name: name.clone(),
+                    members: Vec::new(),
                 };
-                base.apply_extension_overlay(&form);
-                *base_identity = identity;
-            } else {
-                if form.has_base_form {
-                    return Err(MetadataIdentityError::UnprovedAdoption);
-                }
-                effective = Some((identity, form));
+                let identity = self.metadata_identity(form_xml_file, &path)?;
+                Ok(FormParent { kind: *kind, name, identity })
+            })
+            .transpose()?;
+        let relative_path = |path: &std::path::Path| {
+            path.to_str()
+                .ok_or(MetadataIdentityError::MissingDeclaration)
+                .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
+        };
+        let result = compose_form(
+            self,
+            FormRequest {
+                selected: selected.clone(),
+                roots: roots
+                    .into_iter()
+                    .map(|root| {
+                        let label = snapshot
+                            .paths
+                            .iter()
+                            .find(|(_, path)| path == &root)
+                            .and_then(|(label, _)| label.clone())
+                            .unwrap_or_default();
+                        (label, root)
+                    })
+                    .collect(),
+                directory: relative_path(form_directory)?,
+                descriptor: relative_path(&descriptor)?,
+                managed: relative_path(relative)?,
+                kind,
+                purpose: FormPurpose::Rename(parent),
+            },
+        );
+        let form = result.rename_form()?;
+        Ok(Arc::new(form.attributes().to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::{MdoEntry, MetadataListingData};
+    use base_db::{SourceDatabase, SourceRoot, METADATA_SOURCE_ROOT};
+    use bsl_metadata::MdoType;
+    use vfs::{file_set::FileSet, VfsPath};
+
+    #[test]
+    fn rename_form_checks_the_parent_declaration_in_every_visible_root() {
+        let main = std::path::absolute("/form-bindings/base").unwrap();
+        let extension = std::path::absolute("/form-bindings/extension").unwrap();
+        let mut db = RootDatabaseImpl::new();
+        db.set_all_config_paths(
+            vec![(None, main.clone()), (Some("Extension".into()), extension.clone())],
+            None,
+        );
+        db.use_prepared_metadata_inputs();
+        let descriptor = |kind, name, id, property, target: Option<&str>| {
+            let extends = target
+                .map(|uuid| {
+                    format!("<ExtendedConfigurationObject>{uuid}</ExtendedConfigurationObject>")
+                })
+                .unwrap_or_default();
+            format!(
+                "<MetaDataObject xmlns='http://v8.1c.ru/8.3/MDClasses'>
+                    <{kind} uuid='{id}'><Properties><Name>{name}</Name>
+                    {property}{extends}</Properties></{kind}>
+                </MetaDataObject>"
+            )
+        };
+        let own = "<ObjectBelonging>Own</ObjectBelonging>";
+        let adopted = "<ObjectBelonging>Adopted</ObjectBelonging>";
+        let parent_id = "10000000-0000-0000-0000-000000000001";
+        let other_parent_id = "10000000-0000-0000-0000-000000000002";
+        let base_form_id = "10000000-0000-0000-0000-000000000003";
+        let extension_form_id = "10000000-0000-0000-0000-000000000004";
+        let base_form = "<Form xmlns='http://v8.1c.ru/8.3/xcf/logform'
+            xmlns:v='http://v8.1c.ru/8.1/data/core' xmlns:xs='http://www.w3.org/2001/XMLSchema'>
+            <Attributes><Attribute name='Base' id='1'><Type><v:Type>xs:string</v:Type></Type>
+            </Attribute></Attributes></Form>";
+        let extension_form = base_form.replace("'Base' id='1'", "'Extension' id='2'");
+        let mut files = FileSet::new();
+        for (index, (root, parent, form, content)) in [
+            (
+                &main,
+                descriptor("Catalog", "Orders", parent_id, own, None),
+                descriptor("Form", "Dialog", base_form_id, own, None),
+                base_form,
+            ),
+            (
+                &extension,
+                descriptor("Catalog", "Orders", other_parent_id, adopted, Some(parent_id)),
+                descriptor("Form", "Dialog", extension_form_id, adopted, Some(base_form_id)),
+                extension_form.as_str(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parent_id = FileId::from_raw(100 + index as u32 * 3);
+            db.set_metadata_listing(
+                &root.to_string_lossy(),
+                MetadataListingData {
+                    entries: vec![MdoEntry {
+                        kind: MdoType::Catalog,
+                        name: "Orders".into(),
+                        main: parent_id,
+                        predefined: None,
+                    }],
+                    ..MetadataListingData::default()
+                },
+            );
+            for (offset, (path, text)) in [
+                ("Catalogs/Orders.xml", parent.as_str()),
+                ("Catalogs/Orders/Forms/Dialog.xml", form.as_str()),
+                ("Catalogs/Orders/Forms/Dialog/Ext/Form.xml", content),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let id = FileId::from_raw(parent_id.index() + offset as u32);
+                files.insert(id, VfsPath::new(root.join(path)));
+                db.set_file_source_root(id, METADATA_SOURCE_ROOT);
+                db.set_file_text(id, text);
             }
         }
-        let (_, form) = effective.ok_or(MetadataIdentityError::MissingDeclaration)?;
-        Ok(Arc::new(form.attributes().to_vec()))
+        db.set_source_root(METADATA_SOURCE_ROOT, SourceRoot::new_metadata(files.clone()));
+        let form = FileId::from_raw(105);
+        let attributes = db.metadata_rename_form_attributes(form).unwrap();
+        assert_eq!(
+            attributes.iter().map(|attribute| attribute.name.as_str()).collect::<Vec<_>>(),
+            ["Base", "Extension"]
+        );
+
+        db.set_file_text(
+            FileId::from_raw(103),
+            &descriptor("Catalog", "Orders", other_parent_id, own, None),
+        );
+        assert_eq!(
+            db.metadata_rename_form_attributes(form),
+            Err(MetadataIdentityError::UnprovedAdoption)
+        );
+        let selected_descriptor = FileId::from_raw(104);
+        for ownership in [
+            "<ObjectBelonging>Unknown</ObjectBelonging>",
+            "<ExtendedConfigurationObject>invalid</ExtendedConfigurationObject>",
+        ] {
+            db.set_file_text(
+                selected_descriptor,
+                &descriptor("Form", "Dialog", extension_form_id, ownership, None),
+            );
+            assert_eq!(
+                db.metadata_rename_form_attributes(form),
+                Err(MetadataIdentityError::UnprovedAdoption)
+            );
+        }
+        db.set_file_text(
+            selected_descriptor,
+            &descriptor("Form", "Dialog", extension_form_id, "", None),
+        );
+        let attributes = db.metadata_rename_form_attributes(form).unwrap();
+        assert_eq!(attributes.len(), 1);
+        assert_eq!(attributes[0].name, "Extension");
+
+        db.set_file_text(form, &extension_form.replace("</Form>", "<BaseForm/></Form>"));
+        assert_eq!(
+            db.metadata_rename_form_attributes(form),
+            Err(MetadataIdentityError::UnprovedAdoption)
+        );
+        db.set_file_text(form, &extension_form);
+        db.set_file_text(
+            selected_descriptor,
+            &descriptor("Form", "Dialog", extension_form_id, own, None),
+        );
+        let attributes = db.metadata_rename_form_attributes(form).unwrap();
+        assert_eq!(attributes.len(), 1);
+        assert_eq!(attributes[0].name, "Extension");
+
+        db.set_file_unreadable(form);
+        assert_eq!(
+            db.metadata_rename_form_attributes(form),
+            Err(MetadataIdentityError::UnreadSource)
+        );
+        db.set_file_text(form, &extension_form);
+        db.set_file_text(
+            selected_descriptor,
+            &descriptor("Form", "Dialog", "00000000-0000-0000-0000-000000000000", own, None),
+        );
+        assert_eq!(
+            db.metadata_rename_form_attributes(form),
+            Err(MetadataIdentityError::UnreadSource)
+        );
+
+        files.remove(selected_descriptor);
+        db.set_source_root(METADATA_SOURCE_ROOT, SourceRoot::new_metadata(files));
+        assert_eq!(
+            db.metadata_rename_form_attributes(form),
+            Err(MetadataIdentityError::MissingDeclaration)
+        );
     }
 }

@@ -439,6 +439,20 @@ impl AnalysisProvider for SalsaProvider<'_> {
         )
     }
 
+    fn platform_call_effects(
+        &self,
+        file_id: FileId,
+        owner: DefWithBodyId,
+    ) -> rustc_hash::FxHashMap<hir::ExprId, hir::dataflow::catch_outcome::CallEffect> {
+        hir::platform_call_effects(
+            self.db,
+            file_id,
+            owner,
+            self.effective_for(file_id),
+            self.weaving_for(file_id),
+        )
+    }
+
     fn replacement_applicability(
         &self,
         file_id: FileId,

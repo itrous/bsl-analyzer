@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Map, Value};
 use smol_str::SmolStr;
 
@@ -19,6 +19,7 @@ use crate::types::{
     PlatformMethod, PlatformProperty, PlatformType, PropertyDocs,
 };
 use crate::GLOBAL_CONTEXT_OWNER;
+use crate::{CallValueEffect, CallValueEffectTarget};
 
 /// The curated overlay the analyzer applies to every corpus it loads.
 const CURATED_OVERLAYS: &str = include_str!("../data/platform_overlays.json");
@@ -43,6 +44,8 @@ pub struct PlatformSnapshot {
     /// carried by the curated overlays (`parameter_passing_attestations`). Empty when no
     /// overlay attests anything.
     pub parameter_passing_attestations: Vec<ParameterPassingAttestationRecord>,
+    /// Call effects attached by the overlay to uniquely identified platform signatures.
+    pub call_value_effects: FxHashMap<CallValueEffectTarget, Vec<CallValueEffect>>,
 }
 
 /// One of the two member surfaces of a platform type an attestation can cover.
@@ -203,6 +206,8 @@ impl PlatformSnapshot {
             .collect();
         snapshot.parameter_passing_attestations = parameter_passing_attestations;
         snapshot.validate()?;
+        snapshot.call_value_effects =
+            crate::call_effects::resolve(&snapshot, overlays).map_err(overlay_error)?;
         Ok(snapshot)
     }
 

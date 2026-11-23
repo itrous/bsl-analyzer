@@ -12,15 +12,19 @@ use std::ptr::{null, null_mut};
 
 use anyhow::Context;
 use windows_sys::Win32::{
-    Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Globalization::CompareStringOrdinal,
     System::{
         Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW},
-        JobObjects::IsProcessInJob,
+        JobObjects::{
+            IsProcessInJob, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+            JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        },
         Threading::{
-            CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB,
-            CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
-            PROCESS_INFORMATION, STARTUPINFOW,
+            CreateProcessW, GetCurrentProcess, GetExitCodeProcess, WaitForSingleObject,
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
+            DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
         },
     },
 };
@@ -119,31 +123,35 @@ impl BrokerChild {
 /// broker inside: it then ends with that job like any other child of it, the job itself
 /// is left as it is, and the editor still gets its shared backend.
 pub(super) fn spawn(cmd: &BrokerCommand) -> anyhow::Result<BrokerChild> {
-    let child = match create(cmd, CREATE_BREAKAWAY_FROM_JOB) {
-        Ok(child) => child,
-        Err(breakaway) => create(cmd, 0).with_context(|| {
-            format!("cannot launch detached broker (outside its job: {breakaway})")
-        })?,
-    };
-    if remains_in_job(&child) {
-        tracing::warn!(
+    let child = create(cmd)?;
+    match job_membership(child.handle(), null_mut()) {
+        Ok(true) => tracing::warn!(
             "a containing Windows job forbids breakaway: the broker ends together with that job"
-        );
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            os_error = error.raw_os_error(),
+            "cannot determine Windows broker job membership"
+        ),
     }
     Ok(child)
 }
 
-fn create(cmd: &BrokerCommand, job_flags: u32) -> io::Result<BrokerChild> {
+fn create(cmd: &BrokerCommand) -> anyhow::Result<BrokerChild> {
     let program = cmd.0.get_program();
     if !Path::new(program).is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "broker executable must be absolute",
-        ));
+        )
+        .into());
     }
     let mut executable = wide(program)?;
     if executable.contains(&u16::from(b'"')) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid broker executable path"));
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid broker executable path").into()
+        );
     }
     let mut command_line = Vec::new();
     append_argument(&mut command_line, &executable);
@@ -163,26 +171,46 @@ fn create(cmd: &BrokerCommand, job_flags: u32) -> io::Result<BrokerChild> {
     // the broker independent of the proxy's standard streams and other handles.
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: All input buffers are valid and terminated for the duration of the
-    // call. CreateProcessW writes only into the mutable command line and output.
-    let created = unsafe {
-        CreateProcessW(
-            executable.as_ptr(),
-            command_line.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT | job_flags,
-            environment.as_ptr().cast(),
-            cwd.as_ref().map_or(null(), |dir| dir.as_ptr()),
-            &startup,
-            &mut process,
-        )
+    let launch = |job_flags, command_line: &mut [u16]| -> io::Result<PROCESS_INFORMATION> {
+        let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: All input buffers are valid and terminated for the duration of the
+        // call. CreateProcessW writes only into the mutable command line and output.
+        let created = unsafe {
+            CreateProcessW(
+                executable.as_ptr(),
+                command_line.as_mut_ptr(),
+                null(),
+                null(),
+                0,
+                DETACHED_PROCESS
+                    | CREATE_NEW_PROCESS_GROUP
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | job_flags,
+                environment.as_ptr().cast(),
+                cwd.as_ref().map_or(null(), |dir| dir.as_ptr()),
+                &startup,
+                &mut process,
+            )
+        };
+        if created == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(process)
     };
-    if created == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // CreateProcessW can modify the command line; keep a pristine buffer for a retry.
+    let process = match launch(CREATE_BREAKAWAY_FROM_JOB, &mut command_line.clone()) {
+        Err(error)
+            if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+                && current_job_forbids_breakaway() =>
+        {
+            launch(0, &mut command_line).with_context(|| {
+                format!(
+                    "cannot launch detached broker inside its job after breakaway failed: {error}"
+                )
+            })?
+        }
+        first => first?,
+    };
     // SAFETY: A successful call returned two handles owned by the caller.
     let _thread = unsafe { OwnedHandle::from_raw_handle(process.hThread) };
     Ok(BrokerChild {
@@ -192,11 +220,37 @@ fn create(cmd: &BrokerCommand, job_flags: u32) -> io::Result<BrokerChild> {
     })
 }
 
-fn remains_in_job(child: &BrokerChild) -> bool {
+fn current_job_forbids_breakaway() -> bool {
+    // SAFETY: GetCurrentProcess returns a pseudo-handle valid for the current process.
+    let process = unsafe { GetCurrentProcess() };
+    if !matches!(job_membership(process, null_mut()), Ok(true)) {
+        return false;
+    }
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: A null handle queries the current process's immediate job and the
+    // output buffer matches the requested information class.
+    let queried = unsafe {
+        QueryInformationJobObject(
+            null_mut(),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_mut(&mut limits).cast(),
+            std::mem::size_of_val(&limits) as u32,
+            null_mut(),
+        )
+    };
+    queried != 0
+        && limits.BasicLimitInformation.LimitFlags
+            & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+            == 0
+}
+
+pub(super) fn job_membership(process: HANDLE, job: HANDLE) -> io::Result<bool> {
     let mut in_job = 0;
-    // SAFETY: The owned process handle stays valid for the query.
-    let queried = unsafe { IsProcessInJob(child.handle(), null_mut(), &mut in_job) };
-    queried != 0 && in_job != 0
+    // SAFETY: The API validates the handles and writes into the local output buffer.
+    if unsafe { IsProcessInJob(process, job, &mut in_job) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(in_job != 0)
 }
 
 fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
@@ -305,6 +359,33 @@ fn environment_block(cmd: &BrokerCommand) -> io::Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broker::proxy::windows_lifetime_tests::broker_temp_dir;
+
+    #[test]
+    fn broker_launch_preserves_validation_and_non_job_os_errors() {
+        use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+
+        let root = broker_temp_dir().unwrap();
+        let relative = BrokerCommand::new("relative.exe");
+        let missing = BrokerCommand::new(root.path().join("missing.exe"));
+        let invalid = spawn(&relative).err().expect("relative executable must fail validation");
+        let invalid_source = invalid.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(invalid_source.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(invalid.to_string(), "broker executable must be absolute");
+
+        let nonexistent = spawn(&missing).err().expect("missing executable must fail launch");
+        let missing_source = nonexistent.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(missing_source.raw_os_error(), Some(ERROR_FILE_NOT_FOUND as i32));
+        assert_eq!(nonexistent.to_string(), missing_source.to_string());
+    }
+
+    #[test]
+    fn job_membership_preserves_query_error() {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+
+        let error = job_membership(null_mut(), null_mut()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
+    }
 
     #[test]
     fn quotes_empty_unicode_and_backslash_arguments() {

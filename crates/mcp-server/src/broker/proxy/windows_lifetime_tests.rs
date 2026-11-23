@@ -11,9 +11,8 @@ use windows_sys::Win32::{
     Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::{
         JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
-            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-            QueryInformationJobObject, SetInformationJobObject,
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
@@ -24,7 +23,9 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{connect_existing, spawn_detached, BackendKey, BrokerCommand};
+use super::{
+    connect_existing, spawn_detached, windows_spawn::job_membership, BackendKey, BrokerCommand,
+};
 use crate::{broker, McpProfile, McpServer, SharedState};
 
 mod launcher_lifetime {
@@ -34,6 +35,13 @@ mod launcher_lifetime {
 const WORKER: &str = "broker::proxy::windows_lifetime_tests::worker";
 const ROLE: &str = "BSL_TEST_WINDOWS_LIFETIME_ROLE";
 const ROOT: &str = "BSL_TEST_WINDOWS_LIFETIME_ROOT";
+
+pub(super) fn broker_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    match std::env::var_os("BSL_TEST_BROKER_TEMP_DIR") {
+        Some(path) => tempfile::tempdir_in(path),
+        None => tempfile::tempdir(),
+    }
+}
 
 struct OwnedProcess(OwnedHandle);
 
@@ -178,7 +186,7 @@ async fn handshake(root: &Path, pid: u32) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_survives_launcher_job_and_serves_second_client_until_idle_ttl() {
-    let root = tempfile::tempdir().unwrap();
+    let root = broker_temp_dir().unwrap();
     let mut proxy = worker_command("proxy", root.path()).spawn().unwrap();
     let proxy_process = OwnedProcess::open(proxy.id());
     let launcher_job = launcher_lifetime::adopt_child(&proxy).unwrap();
@@ -203,7 +211,7 @@ async fn broker_survives_launcher_job_and_serves_second_client_until_idle_ttl() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directly_spawned_broker_serves_and_idles_out_without_a_launcher_job() {
-    let root = tempfile::tempdir().unwrap();
+    let root = broker_temp_dir().unwrap();
     let mut command = broker_command("broker", root.path());
     let mut child = spawn_detached(&key(root.path()), &mut command).unwrap();
     let process = OwnedProcess::open(child.id());
@@ -214,7 +222,7 @@ async fn directly_spawned_broker_serves_and_idles_out_without_a_launcher_job() {
 
 #[test]
 fn detached_broker_preserves_unicode_environment_and_working_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = broker_temp_dir().unwrap();
     let cwd = root.path().join("Рабочий каталог");
     std::fs::create_dir(&cwd).unwrap();
     let mut command = broker_command("launch-contract", root.path());
@@ -231,7 +239,7 @@ fn detached_broker_preserves_unicode_environment_and_working_directory() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_proxy_stdout_reaches_eof_while_another_session_keeps_broker_alive() {
-    let root = tempfile::tempdir().unwrap();
+    let root = broker_temp_dir().unwrap();
     let mut proxy =
         worker_command("stdout-proxy", root.path()).stdout(Stdio::piped()).spawn().unwrap();
     let proxy_process = OwnedProcess::open(proxy.id());
@@ -275,12 +283,13 @@ async fn cold_proxy_stdout_reaches_eof_while_another_session_keeps_broker_alive(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreign_job_that_forbids_breakaway_keeps_a_serving_broker_and_its_own_limits() {
     for role in ["blocked-proxy", "nested-proxy"] {
-        let root = tempfile::tempdir().unwrap();
+        let root = broker_temp_dir().unwrap();
         let mut proxy = worker_command(role, root.path()).spawn().unwrap();
         let process = OwnedProcess::open(proxy.id());
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         assert!(!job.is_null());
         let job = unsafe { OwnedHandle::from_raw_handle(job) };
+        assert!(!job_membership(process.handle(), job.as_raw_handle()).unwrap());
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         assert_ne!(
@@ -312,14 +321,10 @@ async fn foreign_job_that_forbids_breakaway_keeps_a_serving_broker_and_its_own_l
         process.wait();
         assert!(proxy.wait().unwrap().success());
         assert!(!root.path().join("spawn-error").exists());
-        let mut in_job = 0;
-        assert_ne!(
-            unsafe {
-                IsProcessInJob(broker_process.handle(), job.as_raw_handle() as HANDLE, &mut in_job)
-            },
-            0
+        assert!(
+            job_membership(broker_process.handle(), job.as_raw_handle()).unwrap(),
+            "a job that forbids breakaway keeps the broker inside"
         );
-        assert_ne!(in_job, 0, "a job that forbids breakaway keeps the broker inside");
         let mut after: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         assert_ne!(
             unsafe {

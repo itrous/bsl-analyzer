@@ -96,7 +96,7 @@ crates/bsl-metadata/src/rename_xml.rs	Form	1	вне-класса: XML QName ко
 crates/bsl-metadata/src/rename_xml/properties.rs	CommonModule	2	вне-класса: вид XML декларации метаданных в контракте свойств, не имя файла
 crates/bsl-metadata/src/rename_xml/properties.rs	Form	10	вне-класса: вид декларации метаданных и цель XML reference contract
 crates/epf-carrier/src/lib.rs	AdmittedModule	1	вне-класса: имя Rust-типа в debug_struct, не имя файла
-crates/ide-db/src/metadata_symbol/form_bindings.rs	Form	1	вне-класса: вид XML descriptor, не путь контейнера формы
+crates/ide-db/src/metadata_symbol/form_composition.rs	Form	1	вне-класса: вид XML descriptor, не путь контейнера формы
 crates/ide/src/metadata_rename_plan/build/xml_paths.rs	ExternalConnectionModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
 crates/ide/src/metadata_rename_plan/build/xml_paths.rs	Form	3	вне-класса: вид XML декларации и имя внутренней записи ConfigDumpInfo
 crates/ide/src/metadata_rename_plan/build/xml_paths.rs	ManagedApplicationModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
@@ -105,7 +105,6 @@ crates/ide/src/metadata_rename_plan/build/xml_paths.rs	Module	1	вне-клас�
 crates/ide/src/metadata_rename_plan/build/xml_paths.rs	ObjectModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
 crates/ide/src/metadata_rename_plan/build/xml_paths.rs	OrdinaryApplicationModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
 crates/ide/src/metadata_rename_plan/build/xml_paths.rs	SessionModule	1	вне-класса: имя внутренней записи ConfigDumpInfo, не имя файла
-crates/mcp-server/src/tools/metadata/inspection_cards.rs	Form	1	вне-класса: вид XML descriptor, не путь контейнера формы
 crates/mcp-server/src/tools/metadata/inspection_cards.rs	form	2	вне-класса: поле JSON результата source-карточки
 crates/mcp-server/src/tools/metadata/inspection_cards.rs	forms	1	вне-класса: поле JSON результата списка source-форм
 crates/onec-client/src/epf_module.rs	ObjectModule	1	вне-класса: английский сегмент штатного кадра ошибки 1С, не имя файла
