@@ -103,7 +103,8 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
                 Some(form) if !form.is_managed() => ORDINARY_FORM_TYPE_NAME,
                 _ => MANAGED_FORM_TYPE_NAME,
             };
-            let mut names: FxHashSet<String> = bsl_platform::PlatformDataInner::instance()
+            let platform = bsl_platform::PlatformDataInner::instance();
+            let mut names: FxHashSet<String> = platform
                 .get_type_properties(form_type_name)
                 .into_iter()
                 .flat_map(|prop| {
@@ -119,10 +120,7 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
             // threaded here, so union every extension name; these are specific
             // reserved identifiers, unlike a bare local.
             names.extend(
-                bsl_platform::PlatformDataInner::instance()
-                    .form_extension_property_names()
-                    .iter()
-                    .map(|name| name.to_string()),
+                platform.form_extension_property_names().iter().map(|name| name.to_string()),
             );
 
             if let Some(form) = &metadata.form {
@@ -151,6 +149,19 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     // (БлокироватьДляИзменения, ОбменДанными, ДополнительныеСвойства, …):
     // assigning one is a side effect on the module context, not a local.
     skip_attr_names.extend(ctx.module_implicit_field_names());
+    // Without platform types, implicit assignments in modules with platform-owned
+    // context fields cannot be proven to introduce locals. Keep syntactic bindings
+    // and module `Перем` diagnostics below, but conservatively skip those writes.
+    let metadata = ctx.module_metadata();
+    let suppress_implicit_assignments =
+        bsl_platform::PlatformData::instance().all_types().is_empty()
+            && matches!(
+                metadata.module_type,
+                bsl_metadata::ModuleType::FormModule
+                    | bsl_metadata::ModuleType::ObjectModule
+                    | bsl_metadata::ModuleType::RecordSetModule
+                    | bsl_metadata::ModuleType::ValueManagerModule
+            );
 
     let module_bodies = ctx.module_bodies();
 
@@ -170,10 +181,16 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             code,
             ctx,
             &skip_attr_names,
+            suppress_implicit_assignments,
         ));
     }
 
-    diagnostics.extend(check_module_level_code(code, ctx, &skip_attr_names));
+    diagnostics.extend(check_module_level_code(
+        code,
+        ctx,
+        &skip_attr_names,
+        suppress_implicit_assignments,
+    ));
 
     diagnostics.extend(check_module_var_declarations(&module_bodies, code, ctx));
 
@@ -266,6 +283,7 @@ fn check_method(
     code: DiagnosticCode,
     ctx: &DiagnosticsContext,
     skip_attr_names: &FxHashSet<String>,
+    suppress_implicit_assignments: bool,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -343,6 +361,10 @@ fn check_method(
         }
     }
 
+    if suppress_implicit_assignments {
+        return diagnostics;
+    }
+
     let mut implicit_vars: rustc_hash::FxHashMap<String, (String, ide_db::TextRange)> =
         rustc_hash::FxHashMap::default();
 
@@ -384,6 +406,7 @@ fn check_module_level_code(
     code: DiagnosticCode,
     ctx: &DiagnosticsContext,
     skip_attr_names: &FxHashSet<String>,
+    suppress_implicit_assignments: bool,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -393,6 +416,9 @@ fn check_module_level_code(
         Some(result) => result,
         None => return diagnostics,
     };
+    if suppress_implicit_assignments {
+        return diagnostics;
+    }
 
     let body = lower_result.body();
     let source_map = lower_result.source_map();
