@@ -1129,6 +1129,8 @@ fn extract_notify_signature_handlers(
     }
     let slots = bsl_platform::bundled_callback_description_slots();
 
+    // Preserve the syntax-only signature protection even for invalid arity. Semantic
+    // registration, unlike this compatibility path, requires constructor binding.
     for (handler_slot, receiver_slot) in
         [(slots.handler, slots.receiver), (slots.error_handler, slots.error_receiver)]
     {

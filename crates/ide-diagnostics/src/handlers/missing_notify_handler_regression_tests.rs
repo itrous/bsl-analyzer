@@ -99,6 +99,47 @@ fn command_module_this_object_is_a_callback_receiver_for_both_rules() {
 }
 
 #[test]
+fn invalid_constructor_arity_keeps_only_the_syntax_signature_protection() {
+    const SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+    А = Новый ОписаниеОповещения("Защищённый", ЭтотОбъект, Неопределено, Неопределено, Неопределено, Неопределено);
+    Б = Новый ОписаниеОповещения("Живой", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Защищённый(ПараметрЗащищённого) Экспорт
+    Сообщить("защищённый");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Живой(ПараметрЖивого) Экспорт
+    Сообщить("живой");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Обычный(ОбычныйПараметр)
+    Сообщить("обычный");
+КонецПроцедуры
+"#;
+    let diagnostics = run_in_command_module(SOURCE, |db, ctx| {
+        let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+        assert_eq!(summary.notify_regs.len(), 1, "{:#?}", summary.notify_regs);
+        assert_eq!(summary.notify_regs[0].callback_name.as_str(), "Живой");
+        assert!(summary
+            .notify_signature_handlers
+            .iter()
+            .any(|name| name.as_str() == "Защищённый"));
+        super::unused_parameters::check(ctx)
+    });
+    let unused: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::UnusedParameters)
+        .collect();
+    assert_eq!(unused.len(), 1, "{diagnostics:#?}");
+    assert!(unused[0].message.contains("ОбычныйПараметр"), "{diagnostics:#?}");
+}
+
+#[test]
 fn command_module_this_object_shadowed_by_parameter_or_local_is_not_a_receiver() {
     const SOURCE: &str = r#"&НаКлиенте
 Процедура Параметр(ЭтотОбъект)
