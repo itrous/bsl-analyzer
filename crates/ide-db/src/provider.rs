@@ -429,6 +429,15 @@ pub trait AnalysisProvider {
         Default::default()
     }
 
+    /// Call effects proved for expression IDs in the active body.
+    fn platform_call_effects(
+        &self,
+        _file_id: FileId,
+        _owner: DefWithBodyId,
+    ) -> rustc_hash::FxHashMap<hir::ExprId, hir::dataflow::catch_outcome::CallEffect> {
+        Default::default()
+    }
+
     /// Availability of an intended replacement in the active body.
     fn replacement_applicability(
         &self,

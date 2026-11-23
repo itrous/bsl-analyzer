@@ -1,6 +1,9 @@
 //! Bind semantic metadata paths to declarations in prepared, file-visible source sets.
 
 mod form_bindings;
+mod form_composition;
+
+pub use form_composition::EffectiveFormComposition;
 
 use base_db::SourceDatabase;
 use bsl_metadata::declaration_identity::{

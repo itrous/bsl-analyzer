@@ -2316,3 +2316,139 @@ fn the_shipped_overlay_marks_exactly_the_seven_text_functions() {
     expected.sort();
     assert_eq!(marked, expected);
 }
+
+#[test]
+fn call_value_effects_attach_to_bundled_signatures() {
+    assert_call_value_effects(include_bytes!("../data/platform_facts.json"));
+}
+
+#[test]
+#[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+fn call_value_effects_attach_to_help_signatures() {
+    let path = std::env::var_os(crate::CORPUS_ENV).expect("platform help corpus path");
+    assert_call_value_effects(&std::fs::read(path).unwrap());
+}
+
+fn assert_call_value_effects(corpus: &[u8]) {
+    use crate::CallValueEffect::{
+        ArgumentToReceiver, ArgumentToResult, ClearReceiver, NoArgumentWriteback, ReceiverToResult,
+    };
+    use crate::CallValueEffectTarget::{Constructor, GlobalFunction, Method};
+    use crate::PlatformSnapshot;
+
+    let snapshot = PlatformSnapshot::from_corpus_json(corpus).unwrap();
+    for (name, expected) in [
+        ("СтрСоединить", vec![ArgumentToResult(0), ArgumentToResult(1)]),
+        ("Строка", vec![ArgumentToResult(0)]),
+        ("XMLСтрока", vec![ArgumentToResult(0)]),
+    ] {
+        let function = global_function(&snapshot, name);
+        assert_eq!(snapshot.call_value_effects[&GlobalFunction(function.id)], expected, "{name}");
+        assert_eq!(function.parameters[0].result_follows_argument_text, name == "Строка");
+    }
+    for (name, expected) in [
+        ("Add", vec![ArgumentToReceiver(0), NoArgumentWriteback { parameter_count: 1 }]),
+        ("Insert", vec![ArgumentToReceiver(1), NoArgumentWriteback { parameter_count: 2 }]),
+        ("Count", vec![ReceiverToResult]),
+        ("Clear", vec![ClearReceiver]),
+    ] {
+        let method = snapshot
+            .methods
+            .iter()
+            .find(|method| method.type_name == "Array" && method.english_name == name)
+            .unwrap();
+        assert_eq!(snapshot.call_value_effects[&Method(method.id)], expected, "{name}");
+    }
+    for (owner, variant, position) in [
+        ("Array", "На основании фиксированного массива", 0),
+        ("Structure", "По ключам и значениям", 1),
+        ("Structure", "На основании фиксированной структуры", 0),
+    ] {
+        let constructor = snapshot
+            .constructors
+            .iter()
+            .find(|ctor| ctor.type_name == owner && ctor.variant_name.as_deref() == Some(variant))
+            .unwrap();
+        assert_eq!(
+            snapshot.call_value_effects[&Constructor(constructor.id)],
+            [ArgumentToResult(position)]
+        );
+    }
+    assert_eq!(snapshot.call_value_effects.len(), 10);
+}
+
+#[test]
+fn call_value_effects_require_the_proven_writeback_signature() {
+    use crate::{CallValueEffect, CallValueEffectTarget, PlatformSnapshot};
+
+    let overlay = json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "call_value_effects": [{
+            "target": {"kind": "method", "type": "Array", "name": "Add"},
+            "effect": "no_argument_writeback",
+            "parameter_count": 1,
+            "evidence_source": "Sample",
+            "rationale": "Sample"
+        }]
+    })
+    .to_string();
+    let mut corpus = json!({
+        "types": [{"name": "Массив", "english_name": "Array"}],
+        "methods": [{
+            "id": 1,
+            "type_name": "Array",
+            "name": "Добавить",
+            "english_name": "Add",
+            "parameters": [{"name": "Значение", "param_type": "Произвольный"}]
+        }]
+    });
+    let load = |corpus: &Value| {
+        PlatformSnapshot::from_corpus_json_with_overlays(corpus.to_string().as_bytes(), &overlay)
+            .unwrap()
+    };
+    let snapshot = load(&corpus);
+    assert_eq!(
+        snapshot.call_value_effects[&CallValueEffectTarget::Method(1)],
+        [CallValueEffect::NoArgumentWriteback { parameter_count: 1 }]
+    );
+    assert_eq!(snapshot.methods[0].parameters[0].passing, None);
+    corpus["methods"][0]["parameters"][0]["is_variadic"] = json!(true);
+    assert!(load(&corpus).call_value_effects.is_empty());
+    corpus["methods"][0]["parameters"][0]["is_variadic"] = json!(false);
+    corpus["methods"][0]["parameters"].as_array_mut().unwrap().push(json!({"name": "Параметр"}));
+    assert!(load(&corpus).call_value_effects.is_empty());
+    assert!(load(&json!({})).call_value_effects.is_empty());
+}
+
+#[test]
+fn call_value_effects_validate_entries_and_skip_absent_corpus_signatures() {
+    use crate::PlatformSnapshot;
+
+    let valid = curated_overlay()["call_value_effects"][0].clone();
+    let load = |entry| {
+        PlatformSnapshot::from_corpus_json_with_overlays(
+            b"{}",
+            &json!({
+                "schema_version": 1,
+                "method_parameter_overrides": [],
+                "call_value_effects": [entry]
+            })
+            .to_string(),
+        )
+    };
+    assert!(load(valid.clone()).unwrap().call_value_effects.is_empty());
+    for (field, value) in [
+        ("target", json!(null)),
+        ("target", json!({"kind": "method", "name": "Add"})),
+        ("effect", json!("made_up")),
+        ("parameter_index", json!(-1)),
+        ("rationale", json!("")),
+        ("evidence_source", json!(null)),
+    ] {
+        let mut entry = valid.clone();
+        entry[field] = value;
+        let error = load(entry).unwrap_err();
+        assert!(error.to_string().contains("overlay entry 0"), "{field}: {error}");
+    }
+}

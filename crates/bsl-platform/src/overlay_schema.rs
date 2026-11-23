@@ -144,7 +144,21 @@ const OVERLAY_ROOT_FIELDS: &[&str] = &[
     "method_return_type_corrections",
     "type_member_surface_attestations",
     "parameter_passing_attestations",
+    "call_value_effects",
 ];
+
+pub(crate) fn call_value_effect_entries(overlay_source: &str) -> Result<Vec<Value>, OverlayError> {
+    let mut root: Value = serde_json::from_str(overlay_source)
+        .map_err(|error| OverlayError(format!("malformed overlay JSON: {error}")))?;
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| OverlayError("overlay root must be an object".to_owned()))?;
+    match object.remove("call_value_effects") {
+        None => Ok(Vec::new()),
+        Some(Value::Array(entries)) => Ok(entries),
+        _ => Err(OverlayError("overlay call_value_effects must be an array".to_owned())),
+    }
+}
 
 pub(crate) fn parse_overrides(
     overlay_source: &str,
@@ -925,7 +939,7 @@ fn parse_override(
     })
 }
 
-fn require_only_fields(
+pub(crate) fn require_only_fields(
     object: &Map<String, Value>,
     allowed_fields: &[&str],
     context: &str,
@@ -936,7 +950,7 @@ fn require_only_fields(
     Ok(())
 }
 
-fn required_string(
+pub(crate) fn required_string(
     object: &Map<String, Value>,
     field: &str,
     entry_index: usize,

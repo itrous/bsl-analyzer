@@ -45,7 +45,25 @@ pub(super) fn append_read_properties(
         if let Some(value) = &member.fill_value {
             let _ = writeln!(out, "- FillValue {path}: {}", json!(value));
         }
-        let _=writeln!(out,"- ChoiceParameters {path}: {}\n- ChoiceParameterLinks {path}: {}\n- FillChecking {path}: {}",member.choice.choice_parameters.as_ref().map(|value|json!(value).to_string()).as_deref().unwrap_or("unknown"),member.choice.choice_parameter_links.as_ref().map(|value|json!(value).to_string()).as_deref().unwrap_or("unknown"),member.choice.fill_checking.as_deref().unwrap_or("unknown"));
+        let _ = writeln!(
+            out,
+            "- ChoiceParameters {path}: {}\n- ChoiceParameterLinks {path}: {}\n- FillChecking {path}: {}",
+            member
+                .choice
+                .choice_parameters
+                .as_ref()
+                .map(|value| json!(value).to_string())
+                .as_deref()
+                .unwrap_or("unknown"),
+            member
+                .choice
+                .choice_parameter_links
+                .as_ref()
+                .map(|value| json!(value).to_string())
+                .as_deref()
+                .unwrap_or("unknown"),
+            member.choice.fill_checking.as_deref().unwrap_or("unknown")
+        );
     }
     if kind == MdoType::Catalog {
         let _ = writeln!(
@@ -108,7 +126,19 @@ pub(super) fn append_read_properties(
         match &properties.predefined_accounts {
             Some(accounts) => {
                 for account in accounts {
-                    let _ = writeln!(out,"Предопределённый счёт {}: Code={}, Parent={}, AccountType={}, OffBalance={}",escape_markdown(&account.name),account.code.as_deref().unwrap_or("unknown"),account.parent.as_deref().unwrap_or("корневой"),account.account_type.as_deref().unwrap_or("unknown"),account.off_balance.map(|value|value.to_string()).as_deref().unwrap_or("unknown"));
+                    let _ = writeln!(
+                        out,
+                        "Предопределённый счёт {}: Code={}, Parent={}, AccountType={}, OffBalance={}",
+                        escape_markdown(&account.name),
+                        account.code.as_deref().unwrap_or("unknown"),
+                        account.parent.as_deref().unwrap_or("корневой"),
+                        account.account_type.as_deref().unwrap_or("unknown"),
+                        account
+                            .off_balance
+                            .map(|value| value.to_string())
+                            .as_deref()
+                            .unwrap_or("unknown")
+                    );
                     let _ = writeln!(
                         out,
                         "AccountingFlags: {}\nExtDimensionTypes: {}",
@@ -518,7 +548,17 @@ pub(super) fn read_object_response(
     if object.kind == ReadObjectKind::CommonPicture && object.picture.is_none() {
         reasons.push(json!({"code":"picture_content_unavailable","path":"/object/picture"}));
     }
-    let mut text = format!("# {}.{}\n\nСиноним: {}\nХранение: {}\nПривилегированное получение: {}\nСостав: {}\nГруппа команды: {}\nКартинка: {}\n",object.kind.russian_name(),escape_markdown(&object.name),json!(object.synonym),object.location.as_deref().unwrap_or("unknown"),object.privileged_get_mode.map(|v|v.to_string()).as_deref().unwrap_or("unknown"),json!(object.content),object.group.as_deref().unwrap_or("unknown"),object.picture.as_deref().unwrap_or("unknown"));
+    let mut text = format!(
+        "# {}.{}\n\nСиноним: {}\nХранение: {}\nПривилегированное получение: {}\nСостав: {}\nГруппа команды: {}\nКартинка: {}\n",
+        object.kind.russian_name(),
+        escape_markdown(&object.name),
+        json!(object.synonym),
+        object.location.as_deref().unwrap_or("unknown"),
+        object.privileged_get_mode.map(|v| v.to_string()).as_deref().unwrap_or("unknown"),
+        json!(object.content),
+        object.group.as_deref().unwrap_or("unknown"),
+        object.picture.as_deref().unwrap_or("unknown")
+    );
     if object.resolution_incomplete
         || object.object_belonging == bsl_metadata::ObjectBelonging::Adopted
     {

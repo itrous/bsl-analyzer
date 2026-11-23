@@ -3,9 +3,6 @@ use super::*;
 use bsl_conventions::{ConventionalName, XML_EXTENSION};
 
 use bsl_metadata::inspection_sources::InspectionIdentity;
-use bsl_metadata::xml_parser::form_inspection::{
-    parse_managed_form_inspection, parse_ordinary_form_inspection, FormInspection,
-};
 use serde_json::{json, Value};
 
 fn segment(value: &str) -> Result<&str, McpError> {
@@ -55,124 +52,17 @@ pub fn form_from_db(
         return Ok(listing(db, &roots, &container, "forms"));
     };
     let name = segment(name)?;
-    let mut effective: Option<(InspectionIdentity, FormInspection)> = None;
-    let mut reasons = Vec::new();
-    for (label, root) in &roots {
-        let origin = format!("{label}:{container}/{name}");
-        let descriptor = db.inspection_file(root, &format!("{container}/{name}.{XML_EXTENSION}"));
-        let managed = db.inspection_file(
-            root,
-            &format!(
-                "{container}/{name}/{}/{}",
-                ConventionalName::Ext.canonical(),
-                ConventionalName::FormXml.canonical()
-            ),
-        );
-        let sidecar = db.inspection_file(
-            root,
-            &format!(
-                "{container}/{name}/{}/{}/{}",
-                ConventionalName::Ext.canonical(),
-                ConventionalName::Form.canonical(),
-                ConventionalName::FormJson.canonical()
-            ),
-        );
-        if descriptor.is_none() && managed.is_none() && sidecar.is_none() {
-            continue;
-        }
-        let identity = descriptor
-            .as_deref()
-            .map(|text| {
-                InspectionIdentity::from_xml(
-                    text,
-                    if container == "CommonForms" { "CommonForm" } else { "Form" },
-                )
-            })
-            .transpose()
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let form_type = identity.as_ref().and_then(|i| i.form_type.as_deref());
-        let ordinary = form_type == Some("Ordinary");
-        let parsed = if form_type == Some("Managed") && managed.is_none() {
-            Err("managed_representation_unavailable".to_string())
-        } else if ordinary || managed.is_none() {
-            sidecar
-                .as_deref()
-                .ok_or_else(|| "ordinary_representation_unavailable".to_string())
-                .and_then(|text| {
-                    let fingerprint = db.ordinary_form_fingerprint(
-                        root,
-                        &format!(
-                            "{container}/{name}/{}/{}",
-                            ConventionalName::Ext.canonical(),
-                            ConventionalName::FormBin.canonical()
-                        ),
-                    );
-                    let source: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-                    if source.pointer("/source/sha256").is_none()
-                        && fingerprint.as_ref().and_then(|v| v.legacy_sidecar_stale) == Some(true)
-                    {
-                        return Err("ordinary_sidecar_stale".into());
-                    }
-                    parse_ordinary_form_inspection(
-                        text,
-                        name,
-                        fingerprint.as_ref().map(|v| v.sha256.as_str()),
-                        &origin,
-                    )
-                    .map_err(|e| e.to_string())
-                })
-        } else {
-            parse_managed_form_inspection(
-                managed.as_deref().expect("managed content was checked"),
-                &origin,
-            )
-            .map_err(|e| e.to_string())
-        };
-        let mut view = match parsed {
-            Ok(view) => view,
-            Err(error) => {
-                if ordinary
-                    || identity.as_ref().is_some_and(|identity| {
-                        identity.object_belonging == bsl_metadata::ObjectBelonging::Own
-                    })
-                {
-                    effective = None;
-                }
-                reasons.push(
-                    json!({"code":"form_content_unavailable","origin":origin,"detail":error}),
-                );
-                continue;
-            }
-        };
-        match identity {
-            Some(identity) => {
-                if identity.object_belonging == bsl_metadata::ObjectBelonging::Adopted {
-                    if let Some((base_identity, base_view)) =
-                        effective.as_mut().filter(|(base, _)| identity.adopts(base))
-                    {
-                        base_view.apply_overlay(&view);
-                        *base_identity = identity;
-                        continue;
-                    }
-                    view.incomplete_reasons.push("adopted_base_identity_unavailable".into());
-                }
-                effective = Some((identity, view));
-            }
-            None => {
-                view.incomplete_reasons.push("form_descriptor_unavailable".into());
-                let identity = InspectionIdentity {
-                    uuid: bsl_metadata::Uuid::nil(),
-                    name: name.into(),
-                    object_belonging: bsl_metadata::ObjectBelonging::Unknown,
-                    extends: None,
-                    form_type: Some(view.form_type.clone()),
-                    template_type: None,
-                };
-                effective = Some((identity, view));
-            }
-        }
-    }
-    let Some((identity, view)) = effective else {
+    let composition = db
+        .metadata_inspect_form(roots, &container, name)
+        .map_err(|error| McpError::internal_error(error, None))?;
+    let mut reasons = composition
+        .inspection_reasons()
+        .map(|(code, origin, detail)| match detail {
+            Some(detail) => json!({"code":code,"origin":origin,"detail":detail}),
+            None => json!({"code":code,"origin":origin}),
+        })
+        .collect::<Vec<_>>();
+    let Some((identity, view)) = composition.inspection() else {
         if reasons.is_empty() {
             return Err(McpError::invalid_params(
                 format!("Form {name} not found in selected source scope"),
@@ -185,7 +75,6 @@ pub fn form_from_db(
             reasons,
         ));
     };
-    reasons.extend(view.incomplete_reasons.iter().map(|code| json!({"code":code})));
     if view.parameters.is_none() {
         reasons.push(json!({"code":"form_parameters_unread","path":"/object/form/parameters"}));
     }
@@ -354,11 +243,36 @@ pub fn template_from_db(
             ),
         );
         let mut reasons = Vec::new();
-        let value=match (identity.template_type.as_deref(),content) {
-            (Some("DataCompositionSchema"),Some(text))=>bsl_metadata::xml_parser::content_inspection::parse_composition_inspection(&text,&origin).map(|v|json!({"composition":v})),
-            (Some("SpreadsheetDocument"),Some(text))=>bsl_metadata::xml_parser::content_inspection::parse_spreadsheet_inspection(&text,&origin).map(|v|json!({"spreadsheet":v})),
-            (kind,_)=>{reasons.push(json!({"code":"template_representation_unavailable","template_type":kind,"origin":origin}));Ok(Value::Null)},
-        }.unwrap_or_else(|error|{reasons.push(json!({"code":"template_content_unread","detail":error.to_string(),"origin":origin}));Value::Null});
+        let value = match (identity.template_type.as_deref(), content) {
+            (Some("DataCompositionSchema"), Some(text)) => {
+                bsl_metadata::xml_parser::content_inspection::parse_composition_inspection(
+                    &text, &origin,
+                )
+                .map(|value| json!({"composition":value}))
+            }
+            (Some("SpreadsheetDocument"), Some(text)) => {
+                bsl_metadata::xml_parser::content_inspection::parse_spreadsheet_inspection(
+                    &text, &origin,
+                )
+                .map(|value| json!({"spreadsheet":value}))
+            }
+            (kind, _) => {
+                reasons.push(json!({
+                    "code":"template_representation_unavailable",
+                    "template_type":kind,
+                    "origin":origin,
+                }));
+                Ok(Value::Null)
+            }
+        }
+        .unwrap_or_else(|error| {
+            reasons.push(json!({
+                "code":"template_content_unread",
+                "detail":error.to_string(),
+                "origin":origin,
+            }));
+            Value::Null
+        });
         if let Some(paths) =
             value.pointer("/composition/unsupported_paths").and_then(Value::as_array)
         {
@@ -445,9 +359,16 @@ pub fn role_from_db(
 }
 
 fn card(text: String, object: Value, reasons: Vec<Value>) -> CallToolResult {
+    let status = if reasons.is_empty() { "complete" } else { "partial" };
     crate::tools::response::structured_with_text(
         text,
-        json!({"schema_version":"2","source":"source","object":object,"completeness":{"status":if reasons.is_empty(){"complete"}else{"partial"},"reasons":reasons},"truncated":false}),
+        json!({
+            "schema_version": "2",
+            "source": "source",
+            "object": object,
+            "completeness": {"status": status, "reasons": reasons},
+            "truncated": false,
+        }),
     )
 }
 
@@ -455,6 +376,7 @@ fn card(text: String, object: Value, reasons: Vec<Value>) -> CallToolResult {
 mod tests {
     use super::*;
     use base_db::{SourceDatabase, SourceRoot, METADATA_SOURCE_ROOT};
+    use bsl_metadata::inspection_sources::BinaryFingerprint;
     use vfs::{file_set::FileSet, FileId, VfsPath};
 
     fn database(files: &[(&str, &str)]) -> ide::RootDatabaseImpl {
@@ -485,12 +407,316 @@ mod tests {
             db.set_file_text(id, text);
         }
         db.set_source_root(METADATA_SOURCE_ROOT, SourceRoot::new_metadata(set));
-        db.set_ordinary_form_fingerprints(std::sync::Arc::new(fingerprints));
+        if !fingerprints.is_empty() {
+            db.set_ordinary_form_fingerprints(std::sync::Arc::new(fingerprints));
+        }
         db
     }
 
     fn descriptor(kind: &str, name: &str, uuid: &str, properties: &str) -> String {
         format!("<MetaDataObject xmlns='http://v8.1c.ru/8.3/MDClasses'><{kind} uuid='{uuid}'><Properties><Name>{name}</Name>{properties}</Properties></{kind}></MetaDataObject>")
+    }
+
+    #[test]
+    fn unknown_extension_form_keeps_only_proven_content() {
+        let base = descriptor(
+            "CommonForm",
+            "Dialog",
+            "10000000-0000-0000-0000-000000000001",
+            "<FormType>Managed</FormType>",
+        );
+        let form = "<Form xmlns='http://v8.1c.ru/8.3/xcf/logform'>
+            <ChildItems><InputField name='BaseField' id='1'/></ChildItems>
+            <Parameters/><Attributes/>
+        </Form>";
+        let fragment = form.replace("BaseField", "ExtensionField");
+        for (has_base, ownership, has_base_snapshot) in [
+            (true, Some("<ObjectBelonging>Unknown</ObjectBelonging>"), false),
+            (false, Some("<ObjectBelonging/>"), false),
+            (
+                true,
+                Some("<ExtendedConfigurationObject>invalid</ExtendedConfigurationObject>"),
+                false,
+            ),
+            (true, Some(""), true),
+            (true, None, false),
+        ] {
+            let extension = ownership.map(|ownership| {
+                descriptor(
+                    "CommonForm",
+                    "Dialog",
+                    "10000000-0000-0000-0000-000000000002",
+                    &format!("<FormType>Managed</FormType>{ownership}"),
+                )
+            });
+            let fragment = if has_base_snapshot {
+                fragment.replace("</Form>", "<BaseForm/></Form>")
+            } else {
+                fragment.clone()
+            };
+            let mut files = vec![("ext/CommonForms/Dialog/Ext/Form.xml", fragment.as_str())];
+            if has_base {
+                files.extend([
+                    ("base/CommonForms/Dialog.xml", base.as_str()),
+                    ("base/CommonForms/Dialog/Ext/Form.xml", form),
+                ]);
+            }
+            if let Some(extension) = &extension {
+                files.push(("ext/CommonForms/Dialog.xml", extension));
+            }
+            let db = database(&files);
+            let body = form_from_db(&db, Some("Extension"), "CommonForm", None, Some("Dialog"))
+                .unwrap()
+                .structured_content
+                .unwrap();
+            if has_base {
+                assert_eq!(body["object"]["form"]["elements"][0]["name"], "BaseField");
+                assert_eq!(body["object"]["form"]["elements"].as_array().unwrap().len(), 1);
+            } else {
+                assert!(body["object"]["form"].is_null());
+            }
+            let mut reasons = vec![json!({
+                "code":"adopted_base_identity_unavailable",
+                "origin":"Extension:CommonForms/Dialog"
+            })];
+            if extension.is_none() {
+                reasons.push(json!({
+                    "code":"form_descriptor_unavailable",
+                    "origin":"Extension:CommonForms/Dialog"
+                }));
+            }
+            assert_eq!(body["completeness"]["reasons"], json!(reasons));
+            assert_eq!(body["completeness"]["status"], "partial");
+        }
+    }
+
+    #[test]
+    fn unread_extension_descriptor_without_content_is_partial() {
+        let base = descriptor(
+            "CommonForm",
+            "Dialog",
+            "10000000-0000-0000-0000-000000000001",
+            "<FormType>Managed</FormType>",
+        );
+        let extension = base.replace("000000000001", "000000000002");
+        let form = "<Form xmlns='http://v8.1c.ru/8.3/xcf/logform'>
+            <ChildItems><InputField name='BaseField' id='1'/></ChildItems>
+            <Parameters/><Attributes/>
+        </Form>";
+        let read = |has_base| {
+            let mut files = vec![("ext/CommonForms/Dialog.xml", extension.as_str())];
+            if has_base {
+                files.extend([
+                    ("base/CommonForms/Dialog.xml", base.as_str()),
+                    ("base/CommonForms/Dialog/Ext/Form.xml", form),
+                ]);
+            }
+            let mut db = database(&files);
+            db.set_file_unreadable(FileId::from_raw(100));
+            form_from_db(&db, Some("Extension"), "CommonForm", None, Some("Dialog"))
+                .map(|result| result.structured_content.unwrap())
+        };
+        let with_base = read(true);
+        let without_base = read(false);
+        assert_eq!(
+            [with_base.as_ref().ok(), without_base.as_ref().ok()]
+                .map(|body| body.map(|body| &body["completeness"]["status"])),
+            [Some(&json!("partial")), Some(&json!("partial"))]
+        );
+        let with_base = with_base.unwrap();
+        let without_base = without_base.unwrap();
+        assert_form_elements(&with_base, &["BaseField"]);
+        assert!(without_base["object"]["form"].is_null());
+        for body in [with_base, without_base] {
+            let reasons = body["completeness"]["reasons"].as_array().unwrap();
+            for code in ["adopted_base_identity_unavailable", "form_descriptor_unavailable"] {
+                assert!(reasons.contains(&json!({
+                    "code": code,
+                    "origin": "Extension:CommonForms/Dialog"
+                })));
+            }
+        }
+    }
+
+    #[test]
+    fn orphan_form_fragment_cannot_supply_the_base_for_a_later_extension() {
+        let extension = descriptor(
+            "CommonForm",
+            "Dialog",
+            "10000000-0000-0000-0000-000000000002",
+            concat!(
+                "<FormType>Managed</FormType><ObjectBelonging>Adopted</ObjectBelonging>",
+                "<ExtendedConfigurationObject>10000000-0000-0000-0000-000000000001",
+                "</ExtendedConfigurationObject>"
+            ),
+        );
+        let other = extension.replace("000000000002", "000000000003");
+        let fragment = "<Form xmlns='http://v8.1c.ru/8.3/xcf/logform'>
+            <BaseForm/><ChildItems><InputField name='First' id='1'/></ChildItems>
+            <Parameters/><Attributes/>
+        </Form>";
+        let later = fragment.replace("'First' id='1'", "'Second' id='2'");
+        let mut db = database(&[
+            ("ext/CommonForms/Dialog.xml", &extension),
+            ("ext/CommonForms/Dialog/Ext/Form.xml", fragment),
+            ("other/CommonForms/Dialog.xml", &other),
+            ("other/CommonForms/Dialog/Ext/Form.xml", &later),
+        ]);
+        let mut scope = db.workspace_configs_snapshot().as_ref().clone();
+        scope.closures[2] = vec![1];
+        db.set_workspace_configs_snapshot(scope);
+        let read = |db: &ide::RootDatabaseImpl, root: &str| {
+            form_from_db(db, Some(root), "CommonForm", None, Some("Dialog"))
+                .unwrap()
+                .structured_content
+                .unwrap()
+        };
+        assert_form_elements(&read(&db, "Extension"), &["First"]);
+        let body = read(&db, "Other");
+        assert_form_elements(&body, &["Second"]);
+        assert_eq!(
+            body["completeness"]["reasons"][0],
+            json!({"code":"adopted_base_identity_unavailable","origin":"Other:CommonForms/Dialog"})
+        );
+
+        db.set_file_text(
+            FileId::from_raw(102),
+            &descriptor(
+                "CommonForm",
+                "Dialog",
+                "10000000-0000-0000-0000-000000000003",
+                "<FormType>Managed</FormType><ObjectBelonging>Own</ObjectBelonging>",
+            ),
+        );
+        let body = read(&db, "Other");
+        assert!(body["object"]["form"].is_null());
+        assert_eq!(body["completeness"]["reasons"][0]["code"], "adopted_base_identity_unavailable");
+    }
+
+    #[test]
+    fn form_composition_tracks_vfs_contents_and_visible_root_chain() {
+        let base = descriptor(
+            "CommonForm",
+            "Dialog",
+            "10000000-0000-0000-0000-000000000001",
+            "<FormType>Managed</FormType>",
+        );
+        let extension = descriptor(
+            "CommonForm",
+            "Dialog",
+            "10000000-0000-0000-0000-000000000002",
+            concat!(
+                "<FormType>Managed</FormType><ObjectBelonging>Adopted</ObjectBelonging>",
+                "<ExtendedConfigurationObject>10000000-0000-0000-0000-000000000001",
+                "</ExtendedConfigurationObject>"
+            ),
+        );
+        let form = "<Form xmlns='http://v8.1c.ru/8.3/xcf/logform'>
+            <ChildItems><InputField name='Base' id='1'/></ChildItems>
+            <Parameters/><Attributes/>
+        </Form>";
+        let overlay = form.replace("'Base' id='1'", "'Extension' id='2'");
+        let mut db = database(&[
+            ("base/CommonForms/Dialog.xml", &base),
+            ("base/CommonForms/Dialog/Ext/Form.xml", form),
+            ("ext/CommonForms/Dialog.xml", &extension),
+            ("ext/CommonForms/Dialog/Ext/Form.xml", &overlay),
+        ]);
+        let read = |db: &ide::RootDatabaseImpl| {
+            form_from_db(db, Some("Other"), "CommonForm", None, Some("Dialog"))
+                .unwrap()
+                .structured_content
+                .unwrap()
+        };
+        assert_form_elements(&read(&db), &["Base"]);
+
+        let mut scope = db.workspace_configs_snapshot().as_ref().clone();
+        scope.closures[2] = vec![1];
+        db.set_workspace_configs_snapshot(scope.clone());
+        assert_form_elements(&read(&db), &["Base", "Extension"]);
+
+        db.set_file_text(FileId::from_raw(103), &overlay.replace("Extension", "Revised"));
+        assert_form_elements(&read(&db), &["Base", "Revised"]);
+
+        db.set_file_text(
+            FileId::from_raw(102),
+            &descriptor(
+                "CommonForm",
+                "Dialog",
+                "10000000-0000-0000-0000-000000000002",
+                "<FormType>Managed</FormType>",
+            ),
+        );
+        let body = read(&db);
+        assert_form_elements(&body, &["Revised"]);
+        assert_eq!(body["completeness"]["status"], "complete");
+
+        let source = db.try_source_root_input(METADATA_SOURCE_ROOT).unwrap();
+        let mut files = source.root(&db).file_set().clone();
+        files.remove(FileId::from_raw(103));
+        db.set_source_root(METADATA_SOURCE_ROOT, SourceRoot::new_metadata(files));
+        let body = read(&db);
+        assert!(body["object"]["form"].is_null());
+        assert_eq!(body["completeness"]["reasons"][0]["code"], "form_content_unavailable");
+
+        scope.closures[2].clear();
+        db.set_workspace_configs_snapshot(scope);
+        assert_form_elements(&read(&db), &["Base"]);
+    }
+
+    fn assert_form_elements(body: &Value, expected: &[&str]) {
+        let elements = body["object"]["form"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements.iter().map(|element| element["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn form_composition_tracks_initial_and_changed_ordinary_fingerprints() {
+        let descriptor = descriptor(
+            "CommonForm",
+            "Dialog",
+            "10000000-0000-0000-0000-000000000001",
+            "<FormType>Ordinary</FormType>",
+        );
+        let sidecar = include_str!("../../../../bsl-metadata/fixtures/inspection/ordinary.json");
+        let mut db = database(&[
+            ("base/CommonForms/Dialog.xml", &descriptor),
+            ("base/CommonForms/Dialog/Ext/Form/Form.json", sidecar),
+        ]);
+        let read = |db: &ide::RootDatabaseImpl| {
+            form_from_db(db, None, "CommonForm", None, Some("Dialog"))
+                .unwrap()
+                .structured_content
+                .unwrap()
+        };
+        let fingerprint = |db: &mut ide::RootDatabaseImpl, hash: &str, stale| {
+            db.set_ordinary_form_fingerprints(std::sync::Arc::new(vec![(
+                "/inspection/base/CommonForms/Dialog/Ext/Form.bin".into(),
+                Some(BinaryFingerprint { sha256: hash.repeat(64), legacy_sidecar_stale: stale }),
+            )]));
+        };
+
+        assert!(read(&db)["object"]["form"].is_null());
+        fingerprint(&mut db, "a", Some(true));
+        assert_eq!(read(&db)["object"]["form"]["freshness"], "sha256");
+        fingerprint(&mut db, "b", Some(true));
+        assert!(read(&db)["object"]["form"].is_null());
+
+        let mut legacy: Value = serde_json::from_str(sidecar).unwrap();
+        legacy.as_object_mut().unwrap().remove("source");
+        db.set_file_text(FileId::from_raw(101), &legacy.to_string());
+        assert_eq!(
+            read(&db)["completeness"]["reasons"][0],
+            json!({
+                "code":"form_content_unavailable",
+                "origin":":CommonForms/Dialog",
+                "detail":"ordinary_sidecar_stale"
+            })
+        );
+        fingerprint(&mut db, "b", Some(false));
+        assert_eq!(read(&db)["object"]["form"]["freshness"], "mtime_only");
     }
 
     #[test]
@@ -501,13 +727,33 @@ mod tests {
             "10000000-0000-0000-0000-000000000001",
             "<FormType>Managed</FormType>",
         );
-        let ext=descriptor("Form","Dialog","10000000-0000-0000-0000-000000000002","<FormType>Managed</FormType><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>10000000-0000-0000-0000-000000000001</ExtendedConfigurationObject>");
-        let db=database(&[
-            ("base/Documents/Order/Forms/Dialog.xml",&base),
-            ("base/Documents/Order/Forms/Dialog/Ext/Form.xml",include_str!(concat!(env!("CARGO_MANIFEST_DIR"),"/../bsl-metadata/fixtures/inspection/managed-base.xml"))),
-            ("ext/Documents/Order/Forms/Dialog.xml",&ext),
-            ("ext/Documents/Order/Forms/Dialog/Ext/Form.xml",include_str!(concat!(env!("CARGO_MANIFEST_DIR"),"/../bsl-metadata/fixtures/inspection/managed.xml"))),
-            ("other/Documents/Order/Forms/Dialog/Ext/Form.xml","<Form xmlns='http://v8.1c.ru/8.3/xcf/logform'><ChildItems><InputField name='Unrelated' id='55'/></ChildItems></Form>"),
+        let ext = descriptor(
+            "Form",
+            "Dialog",
+            "10000000-0000-0000-0000-000000000002",
+            concat!(
+                "<FormType>Managed</FormType><ObjectBelonging>Adopted</ObjectBelonging>",
+                "<ExtendedConfigurationObject>10000000-0000-0000-0000-000000000001",
+                "</ExtendedConfigurationObject>"
+            ),
+        );
+        let db = database(&[
+            ("base/Documents/Order/Forms/Dialog.xml", &base),
+            (
+                "base/Documents/Order/Forms/Dialog/Ext/Form.xml",
+                include_str!("../../../../bsl-metadata/fixtures/inspection/managed-base.xml"),
+            ),
+            ("ext/Documents/Order/Forms/Dialog.xml", &ext),
+            (
+                "ext/Documents/Order/Forms/Dialog/Ext/Form.xml",
+                include_str!("../../../../bsl-metadata/fixtures/inspection/managed.xml"),
+            ),
+            (
+                "other/Documents/Order/Forms/Dialog/Ext/Form.xml",
+                "<Form xmlns='http://v8.1c.ru/8.3/xcf/logform'>
+                    <ChildItems><InputField name='Unrelated' id='55'/></ChildItems>
+                </Form>",
+            ),
         ]);
         let result =
             form_from_db(&db, Some("Extension"), "Document", Some("Order"), Some("Dialog"))
@@ -627,7 +873,15 @@ mod tests {
             original,
             "<FormType>Managed</FormType><ObjectBelonging>Own</ObjectBelonging>",
         );
-        let first = descriptor("Form", "Dialog", "10000000-0000-0000-0000-000000000002", &format!("<FormType>Managed</FormType><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>{original}</ExtendedConfigurationObject>"));
+        let first = descriptor(
+            "Form",
+            "Dialog",
+            "10000000-0000-0000-0000-000000000002",
+            &format!(
+                "<FormType>Managed</FormType><ObjectBelonging>Adopted</ObjectBelonging>
+                 <ExtendedConfigurationObject>{original}</ExtendedConfigurationObject>"
+            ),
+        );
         let content = |element: &str, id: u32, event: &str, procedure: &str, attribute: &str| {
             format!("<Form xmlns='http://v8.1c.ru/8.3/xcf/logform' xmlns:v8='http://v8.1c.ru/8.1/data/core' xmlns:xs='http://www.w3.org/2001/XMLSchema'><Events><Event name='{event}'>{procedure}</Event></Events><ChildItems><InputField name='{element}' id='{id}'/></ChildItems><Parameters/><Attributes><Attribute name='{attribute}' id='1'><Type><v8:Type>xs:string</v8:Type></Type></Attribute></Attributes></Form>")
         };
@@ -645,7 +899,15 @@ mod tests {
                     format!("<ExtendedConfigurationObject>{target}</ExtendedConfigurationObject>")
                 })
                 .unwrap_or_default();
-            let second=descriptor("Form","Dialog","10000000-0000-0000-0000-000000000003",&format!("<FormType>Managed</FormType><ObjectBelonging>{belonging}</ObjectBelonging>{target}"));
+            let second = descriptor(
+                "Form",
+                "Dialog",
+                "10000000-0000-0000-0000-000000000003",
+                &format!(
+                    "<FormType>Managed</FormType><ObjectBelonging>{belonging}</ObjectBelonging>
+                     {target}"
+                ),
+            );
             let mut db = database(&[
                 ("base/Documents/Order/Forms/Dialog.xml", &base),
                 ("base/Documents/Order/Forms/Dialog/Ext/Form.xml", &base_content),
@@ -921,7 +1183,16 @@ mod tests {
 
     #[test]
     fn source_form_mismatched_base_and_missing_representation_are_explicit() {
-        let ext=descriptor("Form","Dialog","10000000-0000-0000-0000-000000000002","<FormType>Managed</FormType><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>10000000-0000-0000-0000-000000000099</ExtendedConfigurationObject>");
+        let ext = descriptor(
+            "Form",
+            "Dialog",
+            "10000000-0000-0000-0000-000000000002",
+            concat!(
+                "<FormType>Managed</FormType><ObjectBelonging>Adopted</ObjectBelonging>",
+                "<ExtendedConfigurationObject>10000000-0000-0000-0000-000000000099",
+                "</ExtendedConfigurationObject>"
+            ),
+        );
         let ordinary = descriptor(
             "Form",
             "Legacy",

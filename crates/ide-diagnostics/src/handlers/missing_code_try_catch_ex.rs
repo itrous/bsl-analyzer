@@ -51,7 +51,7 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
         hir::dataflow::catch_outcome::observable_catch_results(
             body,
             ctx.cfg(),
-            ctx.unshadowed_platform_global_calls().clone(),
+            ctx.platform_call_effects(),
         )
     } else {
         Default::default()
@@ -198,6 +198,130 @@ mod tests {
         let code = include_str!("fixtures/shadowed_catch_formatters.bsl");
         let diagnostics = configured_diagnostics(code);
         assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn platform_calls_propagate_only_the_value_positions() {
+        for (setup, caught, after, expected) in [
+            ("", "Failure = ErrorDescription();", "Return XMLString(String(Failure));", 0),
+            ("", "Ошибка = ОписаниеОшибки();", "Возврат XMLСтрока(Строка(Ошибка));", 0),
+            (
+                "",
+                "Failure = ErrorDescription();",
+                "Return New Structure(\"One,Two\", \"constant\", Failure);",
+                0,
+            ),
+            ("", "Failure = New FixedArray(New Array);", "Return New Array(Failure);", 0),
+            ("", "Size = 1;", "Return New Array(Size);", 1),
+            ("", "Failure = \"Key\";", "Return New Structure(Failure, \"constant\");", 1),
+            (
+                "Values = New Array;",
+                "Failure = ErrorDescription();",
+                "Values.Insert(0, Failure);\nReturn StrConcat(Values, \",\");",
+                0,
+            ),
+            (
+                "Values = New Array;",
+                "Position = 0;",
+                "Values.Insert(Position, \"constant\");\nReturn Values.Count();",
+                1,
+            ),
+            ("Values = New Array;", "Values.Add();", "Return Values.Count();", 0),
+            (
+                "Values = New Array;",
+                "Values.Add(ErrorDescription());",
+                "Values.Clear();\nReturn Values.Count();",
+                1,
+            ),
+            ("", "Failure = ErrorDescription();", "Values.Add(Failure);\nReturn Values;", 1),
+            (
+                "If Flag Then\nValues = New Structure;\nElse\nValues = New Array;\nEndIf;",
+                "Failure = ErrorDescription();",
+                "Values.Add(Failure);\nReturn Values;",
+                1,
+            ),
+        ] {
+            let code = format!(
+                "Function Test(Values, Flag)\n{setup}\nTry\n Work();\nExcept\n{caught}\nEndTry;\n{after}\nEndFunction"
+            );
+            let diagnostics = configured_diagnostics(&code);
+            assert_eq!(diagnostics.len(), expected, "{code}\n{diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn array_calls_preserve_the_failure_variable() {
+        for (call, result, expected) in [
+            ("Values.Add(Failure)", "Failure", 0),
+            ("Values.Insert(Index, Failure)", "Failure", 0),
+            ("Values.Insert(Index, Failure)", "Index", 0),
+            ("UnknownValues.Add(Failure)", "Failure", 1),
+            ("Add(Failure)", "Failure", 1),
+        ] {
+            let code = format!(
+                r#"Procedure Add(Failure)
+    Failure = "";
+EndProcedure
+
+Function Test(UnknownValues)
+    Values = New Array;
+    Try
+        Work();
+    Except
+        Failure = ErrorDescription();
+        Index = 0;
+    EndTry;
+    {call};
+    Return {result};
+EndFunction"#
+            );
+            let diagnostics = configured_diagnostics(&code);
+            assert_eq!(diagnostics.len(), expected, "{call}\n{diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn known_array_calls_preserve_the_type_of_collection_arguments() {
+        for (setup, earlier_call, expected) in [
+            ("Holder = New Array;", "Holder.Add(Values);", 0),
+            (
+                "Holder = New Array;\nOuter = New Array;",
+                "Outer.Add(Holder);\nHolder.Insert(0, Values);",
+                0,
+            ),
+            ("", "Holder.Add(Values);", 1),
+            (
+                "If Flag Then\nHolder = Unknown;\nElse\nHolder = New Array;\nEndIf;",
+                "Holder.Add(Values);",
+                1,
+            ),
+            (
+                "Holder = New Array;",
+                "While Flag Do\nHolder.Add(Values);\nValues.Add(Holder);\nHolder = Unknown;\nEndDo;",
+                1,
+            ),
+            ("", "Change(Values);", 1),
+        ] {
+            let code = format!(
+                r#"Procedure Change(Values)
+    Values = Undefined;
+EndProcedure
+
+Function Test(Holder, Unknown, Flag)
+    Values = New Array;
+    {setup}
+    {earlier_call}
+    Try
+        Work();
+    Except
+        Values.Add(ErrorDescription());
+    EndTry;
+    Return Values.Count();
+EndFunction"#
+            );
+            let diagnostics = configured_diagnostics(&code);
+            assert_eq!(diagnostics.len(), expected, "{setup}\n{earlier_call}\n{diagnostics:#?}");
+        }
     }
 
     #[test]

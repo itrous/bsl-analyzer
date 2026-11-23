@@ -4,6 +4,7 @@ mod overlay_schema;
 use crate::snapshot::ParameterPassingAttestationRecord;
 use crate::types::ParamPassing;
 pub(crate) use overlay_schema::OverlayError;
+pub(crate) use overlay_schema::{call_value_effect_entries, require_only_fields, required_string};
 use overlay_schema::{
     parse_global_function_overrides, parse_member_surface_attestations,
     parse_method_return_type_corrections, parse_overrides, parse_parameter_passing_attestations,

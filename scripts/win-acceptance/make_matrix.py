@@ -18,10 +18,12 @@ def main():
     parser.add_argument("--manifest", required=True, help="proposed-requests.json")
     parser.add_argument("--repo-root", required=True, help="root the manifest paths are relative to")
     parser.add_argument("--out", required=True)
-    parser.add_argument("--sentinel-dir", default=r"C:\CodexWork\ba310-current-qualification-20261109\sentinels\windows",
+    parser.add_argument("--sentinel-dir", required=True,
                         help="guest sentinel directory used in the manifest; stored as {SENTINELS}")
     parser.add_argument("--corrections", default=str(pathlib.Path(__file__).with_name("oracle-corrections.json")))
     args = parser.parse_args()
+    if not args.sentinel_dir:
+        parser.error("--sentinel-dir must not be empty")
 
     root = pathlib.Path(args.repo_root)
     manifest = json.loads(pathlib.Path(args.manifest).read_text(encoding="utf-8"))
@@ -54,7 +56,7 @@ def main():
         raise SystemExit(f"corrections for unknown rows: {sorted(corrections)}")
     out = {"rows": rows, "lifecycle": lifecycle}
     text = json.dumps(out, ensure_ascii=False, indent=1)
-    text = text.replace(json.dumps(args.sentinel_dir)[1:-1], SENTINELS)
+    text = text.replace(json.dumps(args.sentinel_dir, ensure_ascii=False)[1:-1], SENTINELS)
     pathlib.Path(args.out).write_text(text + "\n", encoding="utf-8")
     print(f"{len(rows)} rows, {len(lifecycle)} lifecycle rows listed separately")
 

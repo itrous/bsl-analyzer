@@ -10,6 +10,7 @@ pub use bsl_types::kind::{MetadataReferenceKind, TypeId, TypeKind};
 pub use definition::{Definition, ReferenceScope};
 pub use hir_ty::builtin::builtin_functions;
 pub use hir_ty::compat_mode;
+pub use hir_ty::infer::platform_call_effects;
 pub use hir_ty::infer::{
     replacement_applicability, CandidateCallBinding, ReplacementApplicability,
 };
@@ -124,7 +125,7 @@ pub mod dataflow {
     pub use ::dataflow::{DataflowResult, DataflowSolver, Direction, DEFAULT_MAX_ITERATIONS};
 
     pub mod catch_outcome {
-        pub use ::dataflow::catch_outcome::observable_catch_results;
+        pub use ::dataflow::catch_outcome::{observable_catch_results, CallEffect};
     }
 
     pub mod path_terminates {

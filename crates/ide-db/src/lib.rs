@@ -31,6 +31,7 @@ pub use database::{
     EffectiveMetadataMember, EffectiveMetadataMemberValue, GraphConfigCache, RootDatabaseImpl,
     VisibleRoots,
 };
+pub use metadata_symbol::EffectiveFormComposition;
 pub use root_db::RootDatabase;
 
 pub use provider::AnalysisProvider;
