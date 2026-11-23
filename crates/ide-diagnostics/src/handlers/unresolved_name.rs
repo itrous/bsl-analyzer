@@ -830,10 +830,10 @@ mod tests {
         assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedName));
     }
 
-    /// An ordinary form has an implicit receiver whose surface cannot be built.
-    /// The call channel stays silent there; the callee read must not fill that
-    /// silence with `UnresolvedName`. A value read of the same spelling is still
-    /// not a value.
+    /// An ordinary form has an unreadable implicit receiver. Neither a bare call nor
+    /// a value read can be classified as absent from that unknown surface. A common-
+    /// module control proves the same value spelling is still diagnosed when its
+    /// receiver surface is complete.
     #[test]
     fn unreadable_form_bare_call_is_not_an_unresolved_name() {
         let source = "\
@@ -858,8 +858,18 @@ mod tests {
             "a bare call on an unreadable form must not be accused as an undefined name: {diagnostics:?}"
         );
         assert!(
-            value_read_is_unresolved(source, &diagnostics, "Закрыть"),
-            "a value read is still not a value: {diagnostics:?}"
+            !value_read_is_unresolved(source, &diagnostics, "Закрыть"),
+            "an unreadable form surface cannot prove this value absent: {diagnostics:?}"
+        );
+
+        let control_source = "Процедура Тест()\n    Значение = Закрыть;\nКонецПроцедуры\n";
+        let control = crate::test_utils::check_with_cfe(
+            control_source,
+            test_fixture::CfeFixtureBuilder::new("").build(),
+        );
+        assert!(
+            value_read_is_unresolved(control_source, &control, "Закрыть"),
+            "the complete common-module control still diagnoses the same value read: {control:?}"
         );
     }
 

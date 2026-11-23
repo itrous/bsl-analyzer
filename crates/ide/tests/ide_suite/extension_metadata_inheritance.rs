@@ -662,6 +662,8 @@ fn assert_unresolved_names(fixture: &Fixture, file: FileId, expected: &[(&str, b
     }
 }
 
+/// The inherited positive names remain checked, but missing form names are not
+/// classified while the candidate form-member surface lacks completeness evidence.
 #[test]
 fn borrowed_form_module_resolves_base_form_attributes() {
     use hir::DefDatabase;
@@ -676,7 +678,7 @@ fn borrowed_form_module_resolves_base_form_attributes() {
             &[
                 ("Объект", false),
                 ("БазовыйРеквизитФормы", false),
-                ("НетТакогоРеквизитаФормы", true),
+                ("НетТакогоРеквизитаФормы", false),
             ],
         );
     }
@@ -688,18 +690,18 @@ fn borrowed_form_module_resolves_base_form_attributes() {
             ("БазовыйРеквизитФормы", false),
             ("СЧЁТЧИК", false),
             ("РасшРеквизитФормы", false),
-            ("НетТакогоРеквизитаФормы", true),
+            ("НетТакогоРеквизитаФормы", false),
         ],
     );
     assert_unresolved_names(
         &fixture,
         files.own_owner_form,
-        &[("ЛокальныйРеквизитФормы", false), ("БазовыйРеквизитФормы", true)],
+        &[("ЛокальныйРеквизитФормы", false), ("БазовыйРеквизитФормы", false)],
     );
     assert_unresolved_names(
         &fixture,
         files.unpaired_form,
-        &[("СвойРеквизитФормы", false), ("БазовыйРеквизитФормы", true)],
+        &[("СвойРеквизитФормы", false), ("БазовыйРеквизитФормы", false)],
     );
     for file in [
         files.base_form,
@@ -716,12 +718,22 @@ fn borrowed_form_module_resolves_base_form_attributes() {
     assert_unresolved_names(
         &fixture,
         files.borrowed_ordinary_form,
-        &[("БазовыйРеквизитФормы", true)],
+        &[("БазовыйРеквизитФормы", false)],
     );
     assert_unresolved_names(
         &fixture,
         files.base_ordinary_form,
-        &[("Объект", true), ("БазовыйРеквизитФормы", true)],
+        &[("Объект", false), ("БазовыйРеквизитФормы", false)],
+    );
+    assert!(
+        fixture
+            .analysis
+            .database()
+            .module_metadata(hir::ModuleId::new(files.borrowed_form))
+            .form
+            .as_ref()
+            .is_some_and(|form| form.find_attribute("БазовыйРеквизитФормы").is_some()),
+        "the borrowed managed-form control retains its inherited attribute in effective metadata"
     );
     assert!(
         fixture
