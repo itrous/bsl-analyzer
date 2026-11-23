@@ -31,6 +31,10 @@ pub struct ModuleCallSummary {
     /// Kept separate so consumers can restrict this conservative syntax fallback to configurations
     /// without callback constructor facts.
     pub notify_dynamic_signature_handlers: Vec<Name>,
+    /// Source call sites for the dynamic callback names above. The constructor range lets semantic
+    /// consumers distinguish an unnormalized callback array from another registration with the
+    /// same handler name.
+    pub notify_dynamic_signature_handler_sites: Vec<DynamicNotifySignatureHandler>,
     /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
     pub idle_handler_regs: Vec<IdleReg>,
@@ -163,6 +167,7 @@ impl ModuleCallSummary {
             notify_signature_handlers: Vec::new(),
             notify_additional_signature_handlers: Vec::new(),
             notify_dynamic_signature_handlers: Vec::new(),
+            notify_dynamic_signature_handler_sites: Vec::new(),
             notify_regs,
             idle_handler_regs,
             set_action_regs: Vec::new(),
@@ -171,6 +176,12 @@ impl ModuleCallSummary {
             form_entries: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicNotifySignatureHandler {
+    pub handler_name: Name,
+    pub constructor_range: TextRange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -839,6 +850,7 @@ pub fn extract_call_summary(
     let mut notify_signature_handlers = Vec::new();
     let mut notify_additional_signature_handlers = Vec::new();
     let mut notify_dynamic_signature_handlers = Vec::new();
+    let mut notify_dynamic_signature_handler_sites = Vec::new();
     let mut idle_handler_regs = Vec::new();
     let mut set_action_regs = Vec::new();
     let mut name_literals: FxHashSet<MethodKey> = FxHashSet::default();
@@ -856,6 +868,7 @@ pub fn extract_call_summary(
             &mut notify_signature_handlers,
             &mut notify_additional_signature_handlers,
             &mut notify_dynamic_signature_handlers,
+            &mut notify_dynamic_signature_handler_sites,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
@@ -874,12 +887,18 @@ pub fn extract_call_summary(
             &mut notify_signature_handlers,
             &mut notify_additional_signature_handlers,
             &mut notify_dynamic_signature_handlers,
+            &mut notify_dynamic_signature_handler_sites,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
             &mut name_literal_ref_sites,
         );
     }
+
+    let mut seen_dynamic_sites = FxHashSet::default();
+    notify_dynamic_signature_handler_sites.retain(|site| {
+        seen_dynamic_sites.insert((site.handler_name.clone(), site.constructor_range))
+    });
 
     let mut name_literal_refs: Vec<MethodKey> = name_literals.into_iter().collect();
     name_literal_refs.sort_unstable();
@@ -899,6 +918,7 @@ pub fn extract_call_summary(
         notify_signature_handlers,
         notify_additional_signature_handlers,
         notify_dynamic_signature_handlers,
+        notify_dynamic_signature_handler_sites,
         notify_regs: Vec::new(),
         idle_handler_regs,
         set_action_regs,
@@ -1038,6 +1058,7 @@ fn extract_from_body(
     notify_signature_handlers: &mut Vec<Name>,
     notify_additional_signature_handlers: &mut Vec<Name>,
     notify_dynamic_signature_handlers: &mut Vec<Name>,
+    notify_dynamic_signature_handler_sites: &mut Vec<DynamicNotifySignatureHandler>,
     idle_handler_regs: &mut Vec<IdleReg>,
     set_action_regs: &mut Vec<SetActionReg>,
     name_literals: &mut FxHashSet<MethodKey>,
@@ -1046,14 +1067,23 @@ fn extract_from_body(
     let common_bindings = crate::common_module_ref::common_module_var_bindings(body);
     let dynamic_candidates = body
         .exprs_iter()
-        .filter_map(|(expr_id, expr)| {
+        .flat_map(|(expr_id, expr)| {
             let Expr::New { type_name: None, args } = expr else { return None };
-            let array_name = dynamic_notify_array_name(body, args)?;
-            Some(DynamicNotifyArrayCandidate {
-                array_name,
-                constructor_start: source_map.expr_range(expr_id)?.start(),
+            let constructor_range = source_map.expr_range(expr_id)?;
+            dynamic_notify_array_aliases(body, source_map, args, constructor_range).map(|aliases| {
+                aliases
+                    .into_iter()
+                    .map(|alias| DynamicNotifyArrayCandidate {
+                        array_name: alias.array_name,
+                        array_start: alias.array_start,
+                        array_end: alias.array_end,
+                        constructor_start: constructor_range.start(),
+                        constructor_range,
+                    })
+                    .collect::<Vec<_>>()
             })
         })
+        .flatten()
         .collect::<Vec<_>>();
     if !dynamic_candidates.is_empty() {
         let candidate_arrays: FxHashSet<_> =
@@ -1085,6 +1115,7 @@ fn extract_from_body(
                 candidate,
                 &array_additions,
                 notify_dynamic_signature_handlers,
+                notify_dynamic_signature_handler_sites,
             );
         }
     }
@@ -1226,18 +1257,188 @@ fn extract_notify_handlers(
 #[derive(Debug, Clone, Copy)]
 struct DynamicNotifyArrayCandidate {
     array_name: NormName,
+    array_start: Option<TextSize>,
+    array_end: TextSize,
     constructor_start: TextSize,
+    constructor_range: TextRange,
 }
 
-fn dynamic_notify_array_name(body: &Body, args: &[ExprIdx]) -> Option<NormName> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DynamicNotifyArrayAlias {
+    array_name: NormName,
+    array_start: Option<TextSize>,
+    array_end: TextSize,
+}
+
+fn dynamic_notify_array_aliases(
+    body: &Body,
+    source_map: crate::body::SourceMapAt<'_>,
+    args: &[ExprIdx],
+    constructor_range: TextRange,
+) -> Option<Vec<DynamicNotifyArrayAlias>> {
     let type_name = args.first().and_then(|&idx| extract_string_literal(body, idx))?;
     if !bsl_platform::is_callback_description_type_name(&type_name) {
         return None;
     }
-    match body.expr_idx(*args.get(1)?) {
-        Expr::Path(name) => Some(NormName::intern(name.as_str())),
-        _ => None,
+    let Expr::Path(name) = body.expr_idx(*args.get(1)?) else { return None };
+    let name = NormName::intern(name.as_str());
+    let mut aliases = resolve_dynamic_array_aliases(
+        body,
+        source_map,
+        name,
+        constructor_range.start(),
+        constructor_range.start(),
+    );
+    if aliases.is_empty() {
+        aliases.push(DynamicNotifyArrayAlias {
+            array_name: name,
+            array_start: None,
+            array_end: constructor_range.start(),
+        });
     }
+    let mut seen = FxHashSet::default();
+    aliases.retain(|alias| seen.insert(*alias));
+    Some(aliases)
+}
+
+/// Trace known array references at the binding site. A later reassignment changes the variable,
+/// not the object already copied into another local; conditional bindings retain both the
+/// preceding value and each possible branch value.
+fn resolve_dynamic_array_aliases(
+    body: &Body,
+    source_map: crate::body::SourceMapAt<'_>,
+    name: NormName,
+    before: TextSize,
+    candidate_end: TextSize,
+) -> Vec<DynamicNotifyArrayAlias> {
+    let assignments = dynamic_array_assignments(body, source_map, name, before);
+    if assignments.is_empty() {
+        return Vec::new();
+    }
+
+    let latest = *assignments.iter().max_by_key(|(range, _)| range.start()).unwrap();
+    let branch = dynamic_array_branch_containing(body, source_map, latest.0);
+    let selected = if let Some(branch) = branch {
+        let mut possible = assignments
+            .iter()
+            .filter(|(range, _)| branch.contains_range(*range))
+            .copied()
+            .collect::<Vec<_>>();
+        if let Some(previous) = assignments
+            .iter()
+            .filter(|(range, _)| range.end() <= branch.start())
+            .max_by_key(|(range, _)| range.start())
+        {
+            possible.push(*previous);
+        }
+        possible
+    } else {
+        vec![latest]
+    };
+
+    let mut results = Vec::new();
+    for (range, value) in selected {
+        let binding_start = range.start();
+        match value {
+            Expr::New { .. } if is_array_constructor(body, value) => {
+                results.push(DynamicNotifyArrayAlias {
+                    array_name: name,
+                    array_start: Some(binding_start),
+                    array_end: next_unconditional_array_assignment(
+                        body,
+                        source_map,
+                        name,
+                        binding_start,
+                        candidate_end,
+                    ),
+                });
+            }
+            Expr::Path(source_name) => {
+                let source = NormName::intern(source_name.as_str());
+                if source == name {
+                    continue;
+                }
+                for mut alias in resolve_dynamic_array_aliases(
+                    body,
+                    source_map,
+                    source,
+                    binding_start,
+                    candidate_end,
+                ) {
+                    alias.array_end = alias.array_end.min(next_unconditional_array_assignment(
+                        body,
+                        source_map,
+                        source,
+                        binding_start,
+                        candidate_end,
+                    ));
+                    results.push(alias);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut seen = FxHashSet::default();
+    results.retain(|alias| seen.insert(*alias));
+    results
+}
+
+fn dynamic_array_assignments<'a>(
+    body: &'a Body,
+    source_map: crate::body::SourceMapAt<'_>,
+    name: NormName,
+    before: TextSize,
+) -> Vec<(TextRange, &'a Expr)> {
+    body.stmts_iter()
+        .filter_map(|(stmt_id, stmt)| {
+            let Stmt::Assign { target, value } = stmt else { return None };
+            let Expr::Path(target_name) = body.expr_idx(*target) else { return None };
+            let range = source_map.stmt_range(stmt_id)?;
+            (NormName::intern(target_name.as_str()) == name && range.start() < before)
+                .then_some((range, body.expr_idx(*value)))
+        })
+        .collect()
+}
+
+fn dynamic_array_branch_containing(
+    body: &Body,
+    source_map: crate::body::SourceMapAt<'_>,
+    site: TextRange,
+) -> Option<TextRange> {
+    body.stmts_iter()
+        .filter_map(|(stmt_id, stmt)| {
+            matches!(
+                stmt,
+                Stmt::If(_)
+                    | Stmt::PreprocIf(_)
+                    | Stmt::While { .. }
+                    | Stmt::For { .. }
+                    | Stmt::ForEach { .. }
+                    | Stmt::Try { .. }
+            )
+            .then(|| source_map.stmt_range(stmt_id))
+            .flatten()
+        })
+        .filter(|range| range.contains_range(site))
+        .min_by_key(|range| range.len())
+}
+
+fn next_unconditional_array_assignment(
+    body: &Body,
+    source_map: crate::body::SourceMapAt<'_>,
+    name: NormName,
+    after: TextSize,
+    before: TextSize,
+) -> TextSize {
+    dynamic_array_assignments(body, source_map, name, before)
+        .into_iter()
+        .filter(|(range, _)| {
+            range.start() > after
+                && dynamic_array_branch_containing(body, source_map, *range).is_none()
+        })
+        .map(|(range, _)| range.start())
+        .min()
+        .unwrap_or(before)
 }
 
 fn extract_dynamic_notify_handlers(
@@ -1246,23 +1447,26 @@ fn extract_dynamic_notify_handlers(
     candidate: &DynamicNotifyArrayCandidate,
     array_additions: &[(NormName, TextRange, ExprIdx)],
     handlers: &mut Vec<Name>,
+    handler_sites: &mut Vec<DynamicNotifySignatureHandler>,
 ) {
     // Only a top-level reassignment to a fresh array is an unconditional reset; a nested
     // reset cannot be pinpointed this way, and the branch scan below accounts for it.
-    let reset_start = body
-        .body_stmts()
-        .filter_map(|stmt_id| {
-            let Stmt::Assign { target, value } = body.stmt(stmt_id) else { return None };
-            let Expr::Path(name) = body.expr_idx(*target) else { return None };
-            if NormName::intern(name.as_str()) != candidate.array_name
-                || !is_array_constructor(body, body.expr_idx(*value))
-            {
-                return None;
-            }
-            let start = source_map.stmt_range(stmt_id)?.start();
-            (start < candidate.constructor_start).then_some(start)
-        })
-        .max();
+    let reset_start = candidate.array_start.or_else(|| {
+        body.body_stmts()
+            .filter_map(|stmt_id| {
+                let Stmt::Assign { target, value } = body.stmt(stmt_id) else { return None };
+                let Expr::Path(name) = body.expr_idx(*target) else { return None };
+                if NormName::intern(name.as_str()) != candidate.array_name
+                    || !is_array_constructor(body, body.expr_idx(*value))
+                {
+                    return None;
+                }
+                let start = source_map.stmt_range(stmt_id)?.start();
+                (start < candidate.constructor_start && start < candidate.array_end)
+                    .then_some(start)
+            })
+            .max()
+    });
     let sequence_start = reset_start.unwrap_or(TextSize::from(0));
     let branched_activity = dynamic_array_activity_in_branch(
         body,
@@ -1270,8 +1474,15 @@ fn extract_dynamic_notify_handlers(
         candidate,
         array_additions,
         sequence_start,
+        candidate.array_end,
     );
-    let uncertainty = dynamic_array_uncertain_writes(body, source_map, candidate, sequence_start);
+    let uncertainty = dynamic_array_uncertain_writes(
+        body,
+        source_map,
+        candidate,
+        sequence_start,
+        candidate.array_end,
+    );
 
     let mut values = array_additions
         .iter()
@@ -1279,6 +1490,7 @@ fn extract_dynamic_notify_handlers(
             *name == candidate.array_name
                 && range.start() > sequence_start
                 && range.start() < candidate.constructor_start
+                && range.start() < candidate.array_end
         })
         .map(|(_, _, value)| *value)
         .collect::<Vec<_>>();
@@ -1288,10 +1500,12 @@ fn extract_dynamic_notify_handlers(
     // slot sequence is never trusted; the same holds when an append or a reset may run
     // conditionally, or an opaque write shifts the array contents.
     if reset_start.is_none() || branched_activity || uncertainty.uncertain {
-        handlers.extend(values.into_iter().filter_map(|value| {
-            let name = extract_string_literal(body, value)?;
-            is_identifier_like(&name).then(|| Name::new(&name))
-        }));
+        for value in values {
+            let Some(name) = extract_string_literal(body, value) else { continue };
+            if is_identifier_like(&name) {
+                push_dynamic_notify_handler(&name, candidate, handlers, handler_sites);
+            }
+        }
         return;
     }
 
@@ -1315,9 +1529,23 @@ fn extract_dynamic_notify_handlers(
                 }
             });
         if matches!(receiver_syntax, NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other) {
-            handlers.push(Name::new(&handler));
+            push_dynamic_notify_handler(&handler, candidate, handlers, handler_sites);
         }
     }
+}
+
+fn push_dynamic_notify_handler(
+    name: &str,
+    candidate: &DynamicNotifyArrayCandidate,
+    handlers: &mut Vec<Name>,
+    handler_sites: &mut Vec<DynamicNotifySignatureHandler>,
+) {
+    let handler_name = Name::new(name);
+    handlers.push(handler_name.clone());
+    handler_sites.push(DynamicNotifySignatureHandler {
+        handler_name,
+        constructor_range: candidate.constructor_range,
+    });
 }
 
 fn is_array_constructor(body: &Body, expr: &Expr) -> bool {
@@ -1343,6 +1571,7 @@ fn dynamic_array_activity_in_branch(
     candidate: &DynamicNotifyArrayCandidate,
     array_additions: &[(NormName, TextRange, ExprIdx)],
     start: TextSize,
+    end: TextSize,
 ) -> bool {
     let mut sequence_sites: Vec<TextRange> = array_additions
         .iter()
@@ -1350,6 +1579,7 @@ fn dynamic_array_activity_in_branch(
             *name == candidate.array_name
                 && range.start() >= start
                 && range.start() < candidate.constructor_start
+                && range.start() < end
         })
         .map(|(_, range, _)| *range)
         .collect();
@@ -1363,7 +1593,9 @@ fn dynamic_array_activity_in_branch(
         }
         match source_map.stmt_range(stmt_id) {
             Some(range)
-                if range.start() >= start && range.start() < candidate.constructor_start =>
+                if range.start() >= start
+                    && range.start() < candidate.constructor_start
+                    && range.start() < end =>
             {
                 sequence_sites.push(range);
             }
@@ -1388,6 +1620,7 @@ fn dynamic_array_activity_in_branch(
         let Some(branch_range) = source_map.stmt_range(stmt_id) else { return false };
         branch_range.start() >= start
             && branch_range.start() < candidate.constructor_start
+            && branch_range.start() < end
             && sequence_sites.iter().any(|site| branch_range.contains_range(*site))
     })
 }
@@ -1430,6 +1663,7 @@ fn dynamic_array_uncertain_writes(
     source_map: crate::body::SourceMapAt<'_>,
     candidate: &DynamicNotifyArrayCandidate,
     start: TextSize,
+    end: TextSize,
 ) -> DynamicArrayUncertainty {
     let mut result = DynamicArrayUncertainty::default();
 
@@ -1445,7 +1679,10 @@ fn dynamic_array_uncertain_writes(
             let Expr::Path(target_name) = body.expr_idx(*target) else { return None };
             let Expr::Path(value_name) = body.expr_idx(*value) else { return None };
             let range = source_map.stmt_range(stmt_id)?;
-            if range.start() < start || range.start() >= candidate.constructor_start {
+            if range.start() < start
+                || range.start() >= candidate.constructor_start
+                || range.start() >= end
+            {
                 return None;
             }
             Some((NormName::intern(target_name.as_str()), NormName::intern(value_name.as_str())))
@@ -1482,7 +1719,10 @@ fn dynamic_array_uncertain_writes(
             }
             continue;
         };
-        if range.start() < start || range.start() >= candidate.constructor_start {
+        if range.start() < start
+            || range.start() >= candidate.constructor_start
+            || range.start() >= end
+        {
             continue;
         }
         match body.expr_idx(*target) {
@@ -1509,7 +1749,9 @@ fn dynamic_array_uncertain_writes(
     for (expr_id, expr) in body.exprs_iter() {
         let Expr::Call { callee, args } = expr else { continue };
         let in_window = source_map.expr_range(expr_id).is_some_and(|range| {
-            range.start() >= start && range.start() < candidate.constructor_start
+            range.start() >= start
+                && range.start() < candidate.constructor_start
+                && range.start() < end
         });
         if !in_window {
             continue;
@@ -1895,6 +2137,7 @@ mod tests {
             notify_signature_handlers: Vec::new(),
             notify_additional_signature_handlers: Vec::new(),
             notify_dynamic_signature_handlers: Vec::new(),
+            notify_dynamic_signature_handler_sites: Vec::new(),
             notify_regs: vec![
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
@@ -2570,6 +2813,59 @@ EndProcedure
             .notify_candidates
             .iter()
             .all(|candidate| candidate.range.start() < candidate.range.end()));
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_reads_the_original_array_under_none() {
+        let code = r#"
+Процедура Тест()
+    Перем Параметры;
+    Перем Алиас;
+    Параметры = Новый Массив;
+    Алиас = Параметры;
+    Параметры.Добавить("ИзИсходногоМассива");
+    Параметры.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", Алиас);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>(),
+            ["ИзИсходногоМассива"]
+        );
+
+        let negative_control =
+            code.replace("Алиас = Параметры;", "Алиас = Параметры;\n    Параметры = Новый Массив;");
+        let summary = parse_and_extract(&negative_control);
+        assert!(summary.notify_dynamic_signature_handlers.is_empty(), "{summary:#?}");
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_survives_source_rebinding_and_branching() {
+        let code = r#"
+Процедура Тест(Условие)
+    Перем Параметры;
+    Перем Копия;
+    Перем Альтернативный;
+    Параметры = Новый Массив;
+    Параметры.Добавить("ДоКопирования");
+    Параметры.Добавить(ЭтотОбъект);
+    Альтернативный = Новый Массив;
+    Альтернативный.Добавить("ИзВетви");
+    Альтернативный.Добавить(ЭтотОбъект);
+    Копия = Параметры;
+    Параметры = Новый Массив;
+    Если Условие Тогда
+        Копия = Альтернативный;
+    КонецЕсли;
+    О = Новый("CallbackDescription", Копия);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let mut handlers =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
+        handlers.sort_unstable();
+        assert_eq!(handlers, ["ДоКопирования", "ИзВетви"]);
     }
 
     #[test]

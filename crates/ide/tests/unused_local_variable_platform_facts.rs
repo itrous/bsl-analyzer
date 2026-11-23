@@ -3,7 +3,8 @@
 //! platform snapshot is process-wide.
 
 use bsl_platform::{
-    install_platform_help, PlatformData, PlatformDataInner, PlatformHelp, PlatformHelpRequest,
+    has_callback_description_constructor_facts, install_platform_help, MemberSurface, PlatformData,
+    PlatformDataInner, PlatformHelp, PlatformHelpRequest,
 };
 use hir::{DefDatabase, ModuleId};
 use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
@@ -40,13 +41,29 @@ fn unused_messages(db: &RootDatabaseImpl, file: FileId) -> Vec<String> {
 }
 
 fn test_mode(mode: &str) {
-    let request = match mode {
-        "none" => PlatformHelpRequest::None,
-        "bundled" => PlatformHelpRequest::Bundled,
+    let help = match mode {
+        "none" => {
+            PlatformHelp::without_io(&PlatformHelpRequest::None).expect("selection requires no I/O")
+        }
+        "bundled" => PlatformHelp::without_io(&PlatformHelpRequest::Bundled)
+            .expect("selection requires no I/O"),
+        "partial" => {
+            let mut help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled)
+                .expect("selection requires no I/O");
+            help.snapshot.properties.retain(|property| {
+                !(property.type_name == "ClientApplicationForm" && property.english_name == "Title")
+            });
+            help.snapshot.member_surface_attestations.retain(|attestation| {
+                !attestation.type_name.eq_ignore_ascii_case("ClientApplicationForm")
+            });
+            help
+        }
         _ => panic!("unknown platform mode: {mode}"),
     };
-    let help = PlatformHelp::without_io(&request).expect("selection requires no I/O");
     install_platform_help(help).expect("fresh child process owns the platform snapshot");
+    let has_callback_constructor =
+        has_callback_description_constructor_facts(PlatformDataInner::instance());
+    assert_eq!(has_callback_constructor, mode != "none");
 
     let data = PlatformData::instance();
     let is_empty = mode == "none";
@@ -55,11 +72,32 @@ fn test_mode(mode: &str) {
         is_empty,
         "all_types().is_empty() is the conservative-mode condition"
     );
-    assert_eq!(
-        data.get_type_properties("ФормаКлиентскогоПриложения").is_empty(),
-        is_empty,
-        "the selected managed-form facts"
-    );
+    if mode == "none" {
+        assert!(
+            data.get_type_properties("ФормаКлиентскогоПриложения").is_empty(),
+            "none removes managed-form facts"
+        );
+    } else if mode == "partial" {
+        assert!(
+            data.get_type_properties("ClientApplicationForm")
+                .iter()
+                .all(|property| { property.english_name != "Title" }),
+            "the partial snapshot removes the form title property"
+        );
+    }
+    if mode == "partial" {
+        assert!(
+            has_callback_constructor,
+            "the partial snapshot retains callback constructor facts"
+        );
+        assert!(
+            !data.platform_type_member_surface_verified(
+                "ClientApplicationForm",
+                MemberSurface::Fields
+            ),
+            "removing one form field invalidates the completeness attestation for that surface"
+        );
+    }
     assert_eq!(
         PlatformDataInner::instance().form_extension_property_names().is_empty(),
         is_empty,
@@ -89,15 +127,13 @@ fn test_mode(mode: &str) {
             }),
             "form context assignments are not unused locals ({mode}, {relative_path}): {messages:?}"
         );
-        assert_eq!(
-            messages.iter().any(|message| message.contains("КлючНазначенияИспользования")),
-            mode == "bundled" && !managed,
-            "managed-only property membership is preserved with facts ({mode}, {relative_path}): {messages:?}"
+        assert!(
+            !messages.iter().any(|message| message.contains("КлючНазначенияИспользования")),
+            "the unreadable form context cannot prove this assignment is a local ({mode}, {relative_path}): {messages:?}"
         );
-        assert_eq!(
-            messages.iter().any(|message| message.contains("МертваяЛокаль")),
-            mode == "bundled",
-            "an implicit assignment is inconclusive without platform facts ({mode}, {relative_path}): {messages:?}"
+        assert!(
+            !messages.iter().any(|message| message.contains("МертваяЛокаль")),
+            "this managed form has no attested complete implicit member surface, even in bundled mode ({mode}, {relative_path}): {messages:?}"
         );
 
         let explicit_local =
@@ -120,10 +156,9 @@ fn test_mode(mode: &str) {
         !messages.iter().any(|message| message.contains("ВариантМодифицирован")),
         "report-form extension assignment is not an unused local ({mode}): {messages:?}"
     );
-    assert_eq!(
-        messages.iter().any(|message| message.contains("МертваяЛокаль")),
-        mode == "bundled",
-        "an implicit assignment is inconclusive without platform facts ({mode}): {messages:?}"
+    assert!(
+        !messages.iter().any(|message| message.contains("МертваяЛокаль")),
+        "this report form's implicit member surface is not attested complete ({mode}): {messages:?}"
     );
 
     let (db, file) = db_for(
@@ -135,10 +170,10 @@ fn test_mode(mode: &str) {
         bsl_metadata::ModuleType::ValueManagerModule
     );
     let value_manager_fields = hir::module_implicit_field_names(&db, file);
-    if mode == "bundled" {
+    if mode != "none" {
         assert!(
             value_manager_fields.iter().any(|name| name == "дополнительныесвойства"),
-            "bundled facts expose value-manager implicit fields: {value_manager_fields:?}"
+            "selected facts expose value-manager implicit fields: {value_manager_fields:?}"
         );
     } else {
         assert!(
@@ -151,10 +186,9 @@ fn test_mode(mode: &str) {
         !messages.iter().any(|message| message.contains("ДополнительныеСвойства")),
         "a value-manager context write is not an unused local ({mode}): {messages:?}"
     );
-    assert_eq!(
-        messages.iter().any(|message| message.contains("МертваяЛокаль")),
-        mode == "bundled",
-        "an implicit assignment is inconclusive without platform facts ({mode}): {messages:?}"
+    assert!(
+        !messages.iter().any(|message| message.contains("МертваяЛокаль")),
+        "the value-manager surface is not attested complete, so a miss cannot prove local ownership ({mode}): {messages:?}"
     );
 
     let (db, file) = db_for(
@@ -203,10 +237,10 @@ fn test_mode(mode: &str) {
         let (db, file) = db_for(relative_path, source);
         assert_eq!(db.module_metadata(ModuleId::new(file)).module_type, module_type);
         let fields = hir::module_implicit_field_names(&db, file);
-        if mode == "bundled" {
+        if mode != "none" {
             assert!(
                 fields.iter().any(|name| name == "дополнительныесвойства"),
-                "bundled facts expose platform context fields for {module_type:?}: {fields:?}"
+                "selected facts expose platform context fields for {module_type:?}: {fields:?}"
             );
         } else {
             assert!(
@@ -229,7 +263,7 @@ fn platform_modes_keep_form_context_assignments_out_of_unused_locals() {
     }
 
     let executable = std::env::current_exe().expect("integration test executable");
-    for mode in ["none", "bundled"] {
+    for mode in ["none", "bundled", "partial"] {
         let status = Command::new(&executable)
             .args([
                 "--exact",

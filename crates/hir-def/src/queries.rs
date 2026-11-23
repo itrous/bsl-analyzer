@@ -77,8 +77,8 @@ mod heap_estimate {
 
     pub(super) fn module_call_summary_heap(v: &Arc<ModuleCallSummary>) -> usize {
         use crate::call_graph::{
-            CallEdge, FormEventEntry, IdleReg, MethodSummary, NameLiteralRefSite,
-            NotifyConstructorCandidate, NotifyReg, NotifyTarget, SetActionReg,
+            CallEdge, DynamicNotifySignatureHandler, FormEventEntry, IdleReg, MethodSummary,
+            NameLiteralRefSite, NotifyConstructorCandidate, NotifyReg, NotifyTarget, SetActionReg,
         };
 
         let s = &**v;
@@ -104,6 +104,12 @@ mod heap_estimate {
         bytes += vec_bytes::<crate::name::Name>(s.notify_dynamic_signature_handlers.len());
         for handler in &s.notify_dynamic_signature_handlers {
             bytes += name_bytes(handler);
+        }
+        bytes += vec_bytes::<DynamicNotifySignatureHandler>(
+            s.notify_dynamic_signature_handler_sites.len(),
+        );
+        for site in &s.notify_dynamic_signature_handler_sites {
+            bytes += name_bytes(&site.handler_name);
         }
         bytes += vec_bytes::<NotifyReg>(s.notify_regs.len());
         for r in &s.notify_regs {

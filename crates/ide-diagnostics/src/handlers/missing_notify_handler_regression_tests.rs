@@ -393,6 +393,232 @@ fn common_module_handler_selection_matches_the_graph() {
     }
 }
 
+/// The main and the error-handler slot naming the same procedure on the same receiver
+/// describe one platform invocation: one registration, one verdict. Different names or
+/// different receivers stay separate registrations — those are the dedup controls.
+#[test]
+fn identical_main_and_error_handler_slots_register_once() {
+    const CALLER: &str = "CommonCommands/ПроверкаОповещений/Ext/CommandModule.bsl";
+    let registration_line = |slots: &str| {
+        format!(
+            r#"&НаКлиенте
+Процедура Зарегистрировать()
+    О = Новый ОписаниеОповещения({slots});
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Готово(ЛишнийПараметр) Экспорт
+    Сообщить("обработчик");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Обычный(ОбычныйПараметр)
+    Сообщить("обычный");
+КонецПроцедуры
+"#
+        )
+    };
+    let cases = [
+        // Identical slots, missing handler: one registration, one diagnostic.
+        ("Провал", "ЭтотОбъект", "Провал", "ЭтотОбъект", (1, 1, &["Провал"][..])),
+        // Case-insensitive spelling of the same handler stays one invocation target.
+        ("Провал", "ЭтотОбъект", "провал", "ЭтотОбъект", (1, 1, &["Провал"][..])),
+        // Control: distinct handler names are two registrations and two verdicts.
+        ("Провал", "ЭтотОбъект", "ИнойПровал", "ЭтотОбъект", (2, 2, &["Провал", "ИнойПровал"][..])),
+        // Control: same name on a different receiver is not deduplicated; the unknown
+        // receiver is not judged, so only the ThisObject slot gets a verdict.
+        ("Провал", "ЭтотОбъект", "Провал", "ДругойМодуль", (2, 1, &["Провал"][..])),
+        // Control: two unresolvable receivers are both Unsupported — equally unknown, not
+        // proven identical, so both registrations stay and neither slot is judged.
+        ("Провал", "Форма1", "Провал", "Форма2", (2, 0, &[][..])),
+    ];
+    for (main, main_receiver, error, error_receiver, (regs, verdicts, names)) in cases {
+        let slots = format!("\"{main}\", {main_receiver}, , \"{error}\", {error_receiver}");
+        let source = registration_line(&slots);
+        let fixture = CfeFixtureBuilder::new("").build();
+        let diagnostics = crate::test_utils::check_cfe_at_with_db(
+            CALLER,
+            &source,
+            fixture,
+            &[],
+            DiagnosticsConfig::all_enabled(),
+            |_| {},
+            |db, ctx| {
+                let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+                assert_eq!(summary.notify_regs.len(), regs, "{slots}: {:#?}", summary.notify_regs);
+                missing_notify_handler::check(ctx)
+            },
+        );
+        let missing: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+            .collect();
+        assert_eq!(missing.len(), verdicts, "{slots}: {diagnostics:#?}");
+        for name in names {
+            assert!(
+                missing.iter().any(|diagnostic| diagnostic.message.contains(name)),
+                "{slots}: {diagnostics:#?}"
+            );
+        }
+    }
+}
+
+/// Identical slots inside an unreachable branch produce two NotCompiled registrations.
+/// They cannot be told apart by callback_expr (each slot carries its own literal), and the
+/// unavailability proves nothing about the receiver — so neither registration is dropped.
+#[test]
+fn not_compiled_identical_slots_keep_both_registrations() {
+    const CALLER: &str = "CommonCommands/ПроверкаОповещений/Ext/CommandModule.bsl";
+    const SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+#Если Сервер И Не Сервер Тогда
+    О = Новый ОписаниеОповещения("Провал", ЭтотОбъект, , "Провал", ЭтотОбъект);
+#КонецЕсли
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Обычный(ОбычныйПараметр)
+    Сообщить("обычный");
+КонецПроцедуры
+"#;
+    let fixture = CfeFixtureBuilder::new("").build();
+    let diagnostics = crate::test_utils::check_cfe_at_with_db(
+        CALLER,
+        SOURCE,
+        fixture,
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        |_| {},
+        |db, ctx| {
+            let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+            assert_eq!(summary.notify_regs.len(), 2, "{:#?}", summary.notify_regs);
+            assert!(
+                summary.notify_regs.iter().all(|registration| matches!(
+                    &registration.target,
+                    hir::call_graph::NotifyTarget::NotCompiled {
+                        receiver_syntax: NotifyReceiverSyntax::SelfName,
+                        ..
+                    }
+                )),
+                "{:#?}",
+                summary.notify_regs
+            );
+            missing_notify_handler::check(ctx)
+        },
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != crate::DiagnosticCode::MissingNotifyHandler),
+        "an unavailable registration is not judged: {diagnostics:#?}"
+    );
+}
+
+/// The dynamic-array path dedups the same way: identical slots on a proven receiver
+/// collapse to one registration, unproven receivers keep both.
+#[test]
+fn identical_dynamic_array_slots_follow_the_same_dedup_rule() {
+    const CALLER: &str = "CommonCommands/ПроверкаОповещений/Ext/CommandModule.bsl";
+    let source = |second_receiver: &str| {
+        format!(
+            r#"&НаКлиенте
+Процедура Зарегистрировать()
+    Перем Параметры;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Провал");
+    Параметры.Добавить(ЭтотОбъект);
+    Параметры.Добавить(Неопределено);
+    Параметры.Добавить("Провал");
+    Параметры.Добавить({second_receiver});
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Обычный(ОбычныйПараметр)
+    Сообщить("обычный");
+КонецПроцедуры
+"#
+        )
+    };
+    // The second case keeps the unsupported error slot as its own registration while the
+    // proven ThisObject main slot still gets its verdict.
+    for (second_receiver, regs, verdicts) in [("ЭтотОбъект", 1, 1), ("Форма2", 2, 1)]
+    {
+        let source = source(second_receiver);
+        let fixture = CfeFixtureBuilder::new("").build();
+        let diagnostics = crate::test_utils::check_cfe_at_with_db(
+            CALLER,
+            &source,
+            fixture,
+            &[],
+            DiagnosticsConfig::all_enabled(),
+            |_| {},
+            |db, ctx| {
+                let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+                assert_eq!(
+                    summary.notify_regs.len(),
+                    regs,
+                    "receiver {second_receiver}: {:#?}",
+                    summary.notify_regs
+                );
+                eprintln!("DEBUG targets: {:#?}", summary.notify_regs); // TEMP
+                missing_notify_handler::check(ctx)
+            },
+        );
+        let missing: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == crate::DiagnosticCode::MissingNotifyHandler)
+            .collect();
+        assert_eq!(missing.len(), verdicts, "receiver {second_receiver}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn identical_main_and_error_handler_slots_still_protect_the_handler() {
+    const CALLER: &str = "CommonCommands/ПроверкаОповещений/Ext/CommandModule.bsl";
+    const SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+    О = Новый ОписаниеОповещения("Готово", ЭтотОбъект, , "Готово", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Готово(ЛишнийПараметр) Экспорт
+    Сообщить("обработчик");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Обычный(ОбычныйПараметр)
+    Сообщить("обычный");
+КонецПроцедуры
+"#;
+    let fixture = CfeFixtureBuilder::new("").build();
+    let diagnostics = crate::test_utils::check_cfe_at_with_db(
+        CALLER,
+        SOURCE,
+        fixture,
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        |_| {},
+        |db, ctx| {
+            let module = ModuleId::new(ctx.file_id);
+            let summary = db.module_call_summary(module);
+            assert_eq!(summary.notify_regs.len(), 1, "{:#?}", summary.notify_regs);
+            assert!(missing_notify_handler::check(ctx).is_empty());
+            let mut diagnostics = super::unused_parameters::check(ctx);
+            diagnostics.extend(super::unused_local_method::check(ctx));
+            diagnostics
+        },
+    );
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic.message.contains("ЛишнийПараметр")),
+        "the deduplicated registration still protects the handler signature: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic.message.contains("ОбычныйПараметр")),
+        "an unregistered method stays unprotected: {diagnostics:#?}"
+    );
+}
+
 fn write_client_common_module_metadata(root: &std::path::Path, name: &str) {
     let path = root.join(format!("CommonModules/{name}.xml"));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

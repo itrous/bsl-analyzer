@@ -552,6 +552,31 @@ fn is_undocumented_platform_global(name: &str) -> bool {
     UNDOCUMENTED_PLATFORM_GLOBALS.iter().any(|global| global.to_lowercase() == name.to_lowercase())
 }
 
+fn implicit_receiver_platform_type_name(db: &dyn TypeKernelDb, ty: TypeId) -> Option<String> {
+    let name = match db.lookup_type(ty) {
+        TypeKind::ThisObject { owner, .. } => {
+            hir_def::ty::MetadataKind::object_kind_for(owner.mdo_type)
+                .and_then(|kind| kind.platform_prefix().or_else(|| kind.bare_platform_type()))?
+        }
+        TypeKind::ThisManager { owner, .. } => owner.mdo_type.manager_type_prefix()?,
+        TypeKind::MetadataRef(facet) => {
+            facet.kind.platform_prefix().or_else(|| facet.kind.bare_platform_type())?
+        }
+        TypeKind::MetadataObject(facet) => {
+            facet.kind.platform_prefix().or_else(|| facet.kind.bare_platform_type())?
+        }
+        TypeKind::ObjectManager(facet) => facet.mdo.manager_type_prefix()?,
+        TypeKind::PlatformObject(facet) => return Some(facet.name.clone()),
+        _ => return None,
+    };
+    Some(name.to_owned())
+}
+
+fn platform_member_surfaces_are_complete(data: &bsl_platform::PlatformData, name: &str) -> bool {
+    data.platform_type_member_surface_verified(name, MemberSurface::Methods)
+        && data.platform_type_member_surface_verified(name, MemberSurface::Fields)
+}
+
 fn classify_bare_name_miss(
     mut gaps: Vec<BareNameGap>,
     platform_status: bsl_platform::PlatformCatalogStatus,
@@ -989,6 +1014,8 @@ pub struct InferenceContext<'db> {
 
     /// Bare path answers are recorded once for all consumers that receive an ExprId.
     bare_name_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
+    /// Semantic ownership verdicts for assignment targets, including surface gaps.
+    assignment_target_resolutions: FxHashMap<ExprId, BareNameResolution>,
 
     /// Bare reads the cascade resolved as a local of this body; only these are
     /// judged by the definite-initialization check.
@@ -1128,6 +1155,7 @@ pub struct BodyInferenceResult {
     /// Bare-path read answers keyed by `ExprId`, so later consumers can project the same
     /// inference result onto any selected notification receiver.
     pub(crate) notify_receiver_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
+    pub assignment_target_resolutions: FxHashMap<ExprId, BareNameResolution>,
     pub diagnostics: Vec<InferenceDiagnostic>,
     pub call_arg_bindings: Vec<CallArgBinding>,
     /// Statements walked inside a `#Если` branch nothing proves compiled (see
@@ -1154,6 +1182,7 @@ impl BodyInferenceResult {
             expr_types: FxHashMap::default(),
             notify_constructor_environments: FxHashMap::default(),
             notify_receiver_resolutions: FxHashMap::default(),
+            assignment_target_resolutions: FxHashMap::default(),
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
@@ -1174,6 +1203,7 @@ pub struct ModuleCodeInferenceResult {
     pub(crate) notify_constructor_environments: FxHashMap<ExprId, NotifyConstructorEnvironment>,
     /// Bare-path read answers keyed by `ExprId`, shared with the method-body projection.
     pub(crate) notify_receiver_resolutions: FxHashMap<ExprId, (BareNameOrigin, TypeId)>,
+    pub assignment_target_resolutions: FxHashMap<ExprId, BareNameResolution>,
     pub diagnostics: Vec<InferenceDiagnostic>,
     pub call_arg_bindings: Vec<CallArgBinding>,
     /// See [`BodyInferenceResult::uncompiled_stmts`].
@@ -1193,6 +1223,7 @@ impl Default for ModuleCodeInferenceResult {
             expr_types: FxHashMap::default(),
             notify_constructor_environments: FxHashMap::default(),
             notify_receiver_resolutions: FxHashMap::default(),
+            assignment_target_resolutions: FxHashMap::default(),
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
@@ -1216,6 +1247,7 @@ impl ModuleCodeInferenceResult {
             expr_types: body.expr_types,
             notify_constructor_environments: body.notify_constructor_environments,
             notify_receiver_resolutions: body.notify_receiver_resolutions,
+            assignment_target_resolutions: body.assignment_target_resolutions,
             diagnostics: body.diagnostics,
             call_arg_bindings: body.call_arg_bindings,
             uncompiled_stmts: body.uncompiled_stmts,
@@ -1243,6 +1275,13 @@ impl InferOwnerResult {
         match self {
             InferOwnerResult::Method(r) => r.expr_types.get(&expr).copied(),
             InferOwnerResult::ModuleCode(r) => r.expr_types.get(&expr).copied(),
+        }
+    }
+
+    pub fn assignment_target_resolution(&self, expr: ExprId) -> Option<&BareNameResolution> {
+        match self {
+            InferOwnerResult::Method(r) => r.assignment_target_resolutions.get(&expr),
+            InferOwnerResult::ModuleCode(r) => r.assignment_target_resolutions.get(&expr),
         }
     }
 
@@ -1484,6 +1523,7 @@ impl<'db> InferenceContext<'db> {
             body_binding_scope_stmts,
             body_stmt_scopes,
             bare_name_resolutions: FxHashMap::default(),
+            assignment_target_resolutions: FxHashMap::default(),
             local_reads: FxHashSet::default(),
             calls_with_unread_target: rustc_hash::FxHashSet::default(),
             call_arg_bindings: Vec::new(),
@@ -2611,6 +2651,7 @@ impl<'db> InferenceContext<'db> {
             expr_types: self.expr_types,
             notify_constructor_environments: self.notify_constructor_environments,
             notify_receiver_resolutions,
+            assignment_target_resolutions: self.assignment_target_resolutions,
             diagnostics: self.diagnostics,
             call_arg_bindings: self.call_arg_bindings,
             uncompiled_stmts: self.uncompiled_stmts,
@@ -4899,6 +4940,22 @@ impl<'db> InferenceContext<'db> {
             BareNameUse::ReadValue
         };
         let resolution = self.resolve_bare_name(name, expr_id, usage);
+        if usage == BareNameUse::AssignmentTarget {
+            let ownership = match &resolution {
+                BareNameResolution::Indeterminate { gaps }
+                    if !self.implicit_self_surface_has_bare_fields()
+                        || !gaps.contains(&BareNameGap::MissingImplicitReceiverSurface) =>
+                {
+                    BareNameResolution::Resolved {
+                        ty: self.db.unknown(),
+                        origin: BareNameOrigin::FlowLocal,
+                        availability: hir_def::execution_env::EnvFlags::ALL,
+                    }
+                }
+                _ => resolution.clone(),
+            };
+            self.assignment_target_resolutions.insert(expr_id, ownership);
+        }
         if usage == BareNameUse::ReadValue {
             if let BareNameResolution::Resolved { ty, origin, .. } = &resolution {
                 self.bare_name_resolutions.insert(expr_id, (*origin, *ty));
@@ -4981,6 +5038,9 @@ impl<'db> InferenceContext<'db> {
         let scope_sensitive = ownership.scope_sensitive;
         let assigned_in_body = ownership.assigned_in_body;
         let bodywide_local = ownership.bodywide_local;
+        let user_shadows =
+            matches!(resolved, Some(Resolution::Method(_)) | Some(Resolution::Variable(_)))
+                || resolver.resolve_module_variable(self.db, name).is_some();
 
         let self_name_wins = is_self_name(&name_lower)
             && !self.self_name_is_shadowed(name, &resolver, assigned_in_body);
@@ -5054,6 +5114,19 @@ impl<'db> InferenceContext<'db> {
             return found(self.db.unknown(), BareNameOrigin::SelfName, all_env);
         }
 
+        if usage == BareNameUse::AssignmentTarget && !user_shadows && !body_binding_shadows {
+            if let Some(ty) =
+                crate::this_object_attr::resolve_this_object_member(self.db, &resolver, name)
+            {
+                return found(ty, BareNameOrigin::ObjectMember, all_env);
+            }
+            if let Some(ty) =
+                crate::this_object_attr::resolve_this_record_set_member(self.db, &resolver, name)
+            {
+                return found(ty, BareNameOrigin::ObjectMember, all_env);
+            }
+        }
+
         if bodywide_local && !body_binding_shadows && !self.assigned_var_names.contains(&flow_key) {
             return found(self.db.unknown(), BareNameOrigin::FlowLocal, all_env);
         }
@@ -5072,10 +5145,6 @@ impl<'db> InferenceContext<'db> {
                 return found(ty, BareNameOrigin::FlowLocal, all_env);
             }
         }
-
-        let user_shadows =
-            matches!(resolved, Some(Resolution::Method(_)) | Some(Resolution::Variable(_)))
-                || resolver.resolve_module_variable(self.db, name).is_some();
 
         if user_shadows || body_binding_shadows {
             return found(self.db.unknown(), BareNameOrigin::UserBinding, all_env);
@@ -5106,6 +5175,20 @@ impl<'db> InferenceContext<'db> {
             {
                 trace!("resolved {} as the ordinary form's controls", name);
                 return found(ty, BareNameOrigin::FormMember, all_env);
+            }
+        }
+
+        // Resolve every known implicit member before treating an incomplete surface
+        // as a gap. A known form property still owns the target when sibling facts
+        // are missing from the platform snapshot.
+        if usage == BareNameUse::AssignmentTarget && self.implicit_self_surface_has_bare_fields() {
+            let miss = self.bare_name_miss();
+            if matches!(
+                &miss,
+                BareNameResolution::Indeterminate { gaps }
+                    if gaps.contains(&BareNameGap::MissingImplicitReceiverSurface)
+            ) {
+                return miss;
             }
         }
 
@@ -5330,11 +5413,14 @@ impl<'db> InferenceContext<'db> {
                         || !data.platform_type_member_surface_verified(name, MemberSurface::Fields)
                 })
             }
-            // Metadata receivers still inherit methods from platform types, while
-            // prefix receivers query the platform manager catalog directly.
-            // Neither surface can prove absence when the platform facts are empty.
-            ImplicitSelfSurface::Receiver(_) | ImplicitSelfSurface::PlatformPrefix(_) => {
-                data.all_types().is_empty()
+            ImplicitSelfSurface::Receiver(receiver_ty) => {
+                match implicit_receiver_platform_type_name(self.db, receiver_ty) {
+                    Some(type_name) => !platform_member_surfaces_are_complete(data, &type_name),
+                    None => true,
+                }
+            }
+            ImplicitSelfSurface::PlatformPrefix(prefix) => {
+                !platform_member_surfaces_are_complete(data, prefix)
             }
             ImplicitSelfSurface::Unreadable => true,
             ImplicitSelfSurface::None => false,
@@ -6419,6 +6505,25 @@ impl<'db> InferenceContext<'db> {
             return false;
         };
         self.db.module_metadata(module_id).compiles_nowhere()
+    }
+
+    fn implicit_self_surface_has_bare_fields(&self) -> bool {
+        use bsl_metadata::ModuleType;
+
+        let module_type = self
+            .get_resolver()
+            .module_id()
+            .map(|module_id| self.db.module_metadata(module_id).module_type);
+        match (self.implicit_self_surface(), module_type) {
+            (ImplicitSelfSurface::None, _) | (_, Some(ModuleType::Unknown)) | (_, None) => false,
+            (ImplicitSelfSurface::Receiver(_), Some(ModuleType::ManagerModule)) => false,
+            (ImplicitSelfSurface::Unreadable, Some(ModuleType::ManagerModule)) => false,
+            (ImplicitSelfSurface::Receiver(_) | ImplicitSelfSurface::Unreadable, Some(_))
+            | (
+                ImplicitSelfSurface::PlatformTypes(_) | ImplicitSelfSurface::PlatformPrefix(_),
+                Some(_),
+            ) => true,
+        }
     }
 
     /// What a bare name in this module implicitly hangs off — the value `ЭтотОбъект`

@@ -112,9 +112,10 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     );
     // The current English type spelling was not part of the compatibility-only projection.
     // Use syntax protection while platform facts cannot normalize callback constructors.
-    if !bsl_platform::has_callback_description_constructor_facts(
+    let has_callback_facts = bsl_platform::has_callback_description_constructor_facts(
         bsl_platform::PlatformData::instance(),
-    ) {
+    );
+    if !has_callback_facts {
         fixed_signature_handlers.extend(
             summary
                 .notify_additional_signature_handlers
@@ -122,6 +123,20 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 .chain(&summary.notify_dynamic_signature_handlers)
                 .map(|handler| NormName::intern(handler.as_str())),
         );
+    } else if metadata.module_type == bsl_metadata::ModuleType::CommandModule {
+        // The syntax fallback remains useful when the bundled schema cannot normalize an
+        // alias or conditional array. Only a proven foreign target for that same constructor
+        // prevents treating its syntactic handler as locally invoked.
+        for site in &summary.notify_dynamic_signature_handler_sites {
+            let has_proven_foreign_registration = summary.notify_regs.iter().any(|registration| {
+                registration.range == site.constructor_range
+                    && registration.callback_name.eq_ignore_case(&site.handler_name)
+                    && matches!(&registration.target, hir::call_graph::NotifyTarget::Module(_))
+            });
+            if !has_proven_foreign_registration {
+                fixed_signature_handlers.insert(NormName::intern(site.handler_name.as_str()));
+            }
+        }
     }
     // The semantic registrations also cover platform-described dynamic constructors whose
     // callback slots are not visible from the local syntax shape alone.

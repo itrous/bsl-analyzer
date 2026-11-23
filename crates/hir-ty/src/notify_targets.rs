@@ -230,8 +230,9 @@ fn normalize_owner_candidates(
             else {
                 continue;
             };
+            let mut candidate_regs = Vec::with_capacity(array.handlers.len());
             for handler in &array.handlers {
-                append_notify_registration(
+                candidate_regs.push(build_notify_registration(
                     db,
                     candidate,
                     handler.callback_name.as_str(),
@@ -241,9 +242,10 @@ fn normalize_owner_candidates(
                     not_compiled,
                     environments,
                     &inference,
-                    registrations,
-                );
+                ));
             }
+            dedup_identical_callback_slots(&mut candidate_regs);
+            registrations.extend(candidate_regs);
             continue;
         }
 
@@ -255,6 +257,7 @@ fn normalize_owner_candidates(
             continue;
         };
         let Some(arguments) = callback_arguments_for_binding(binding) else { continue };
+        let mut candidate_regs = Vec::with_capacity(2);
         for (handler_argument, receiver_argument) in [
             (arguments.handler, arguments.receiver),
             (arguments.error_handler, arguments.error_receiver),
@@ -266,7 +269,7 @@ fn normalize_owner_candidates(
             let Some(callback_name) = string_literal_id(body, callback_expr) else { continue };
             let receiver = receiver_argument.and_then(|index| binding.args.get(index)).copied();
             let receiver_syntax = receiver_syntax(body, receiver);
-            append_notify_registration(
+            candidate_regs.push(build_notify_registration(
                 db,
                 candidate,
                 callback_name,
@@ -276,9 +279,36 @@ fn normalize_owner_candidates(
                 not_compiled,
                 environments,
                 &inference,
-                registrations,
-            );
+            ));
         }
+        dedup_identical_callback_slots(&mut candidate_regs);
+        registrations.extend(candidate_regs);
+    }
+}
+
+/// The error-handler slot repeating the main handler on the same receiver names one platform
+/// invocation target; keeping both registrations would double the same diagnostic and graph
+/// edge. Distinct names or receivers stay separate registrations.
+fn dedup_identical_callback_slots(regs: &mut Vec<NotifyReg>) {
+    regs.dedup_by(|later, earlier| {
+        NormName::intern(later.callback_name.as_str())
+            == NormName::intern(earlier.callback_name.as_str())
+            && later.receiver_syntax == earlier.receiver_syntax
+            && same_normalized_target(&later.target, &earlier.target)
+    });
+}
+
+/// Dedup merges only proven-identical invocation targets: `ThisObject` is the current
+/// module itself, and equal folded module names are the same common module. `Unsupported`
+/// and `NotCompiled` mean "unknown receiver", not "the same receiver" — different
+/// unsupported expressions share the classification, so their registrations stay.
+fn same_normalized_target(left: &NotifyTarget, right: &NotifyTarget) -> bool {
+    match (left, right) {
+        (NotifyTarget::ThisObject, NotifyTarget::ThisObject) => true,
+        (NotifyTarget::Module(left), NotifyTarget::Module(right)) => {
+            NormName::intern(left.as_str()) == NormName::intern(right.as_str())
+        }
+        _ => false,
     }
 }
 
@@ -286,7 +316,7 @@ fn normalize_owner_candidates(
     clippy::too_many_arguments,
     reason = "Source provenance and inferred receiver state are both needed to create each registration."
 )]
-fn append_notify_registration(
+fn build_notify_registration(
     db: &dyn HirDatabase,
     candidate: NotifyConstructorCandidate,
     callback_name: &str,
@@ -296,8 +326,7 @@ fn append_notify_registration(
     not_compiled: bool,
     environments: NotifyRegistrationEnvironments,
     inference: &InferOwnerResult,
-    registrations: &mut Vec<NotifyReg>,
-) {
+) -> NotifyReg {
     let target = if not_compiled {
         NotifyTarget::NotCompiled { callback_expr, receiver_syntax }
     } else {
@@ -306,7 +335,7 @@ fn append_notify_registration(
         })
     };
     let callback_name = Name::new(callback_name);
-    registrations.push(NotifyReg {
+    NotifyReg {
         caller: candidate.caller,
         callback_expr,
         callback_name,
@@ -314,7 +343,7 @@ fn append_notify_registration(
         target,
         environments,
         range: candidate.range,
-    });
+    }
 }
 
 fn string_literal(body: &Body, expr: ExprIdx) -> Option<&str> {

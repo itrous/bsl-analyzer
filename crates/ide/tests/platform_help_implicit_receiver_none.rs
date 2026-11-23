@@ -109,7 +109,7 @@ fn unresolved_names(db: &RootDatabaseImpl, file_id: FileId) -> (Vec<String>, Vec
 
 #[test]
 fn metadata_receivers_are_indeterminate_without_facts_but_common_module_misses_remain() {
-    for mode in ["bundled", "none"] {
+    for mode in ["bundled", "none", "partial"] {
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "isolated_platform_help_probe", "--nocapture"])
             .env("PIO_PLATFORM_HELP_PROBE", mode)
@@ -129,21 +129,37 @@ fn isolated_platform_help_probe() {
     let Ok(mode) = std::env::var("PIO_PLATFORM_HELP_PROBE") else {
         return;
     };
-    let request = match mode.as_str() {
-        "bundled" => PlatformHelpRequest::Bundled,
-        "none" => PlatformHelpRequest::None,
+    let help = match mode.as_str() {
+        "bundled" => PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap(),
+        "none" => PlatformHelp::without_io(&PlatformHelpRequest::None).unwrap(),
+        "partial" => {
+            let mut help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+            help.snapshot.types.retain(|ty| ty.english_name == "Array");
+            help.snapshot.methods.clear();
+            help.snapshot.properties.clear();
+            help.snapshot.member_surface_attestations.clear();
+            help
+        }
         other => panic!("unexpected probe mode {other}"),
     };
-    let help = PlatformHelp::without_io(&request).unwrap();
+    let request = help.request.clone();
     let _ = install_platform_help(help);
     assert_eq!(PlatformData::instance().help_request(), &request);
     let root = configuration();
 
-    if mode == "bundled" {
-        assert!(!PlatformData::instance().all_types().is_empty());
-    } else {
-        assert!(PlatformData::instance().all_types().is_empty());
-        assert!(PlatformData::instance().all_methods().is_empty());
+    match mode.as_str() {
+        "bundled" => assert!(!PlatformData::instance().all_types().is_empty()),
+        "none" => {
+            assert!(PlatformData::instance().all_types().is_empty());
+            assert!(PlatformData::instance().all_methods().is_empty());
+        }
+        "partial" => {
+            assert_eq!(PlatformData::instance().all_types().len(), 1);
+            assert_eq!(PlatformData::instance().all_types()[0].english_name, "Array");
+        }
+        _ => unreachable!(),
+    }
+    if mode != "bundled" {
         assert_eq!(
             PlatformGlobalCatalog::instance().status_for_target(Some("8.3.27")),
             PlatformCatalogStatus::Complete

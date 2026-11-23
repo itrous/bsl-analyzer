@@ -145,10 +145,13 @@ fn implicit_object_methods_are_not_absent() {
 }
 
 #[test]
-fn an_object_module_still_reports_a_name_owned_by_nothing() {
+fn an_object_module_does_not_claim_absence_without_a_complete_receiver_surface() {
     let text = "Процедура Тест()\n    СовсемНеизвестныйВызов();\nКонецПроцедуры\n";
     let (db, file_id) = setup_at(CATALOG_OBJECT_MODULE, text);
-    assert_eq!(absent_bare_calls(&db, file_id), vec!["СовсемНеизвестныйВызов".to_string()]);
+    assert!(
+        absent_bare_calls(&db, file_id).is_empty(),
+        "a metadata-backed receiver without attested member completeness cannot prove absence"
+    );
 }
 
 #[test]

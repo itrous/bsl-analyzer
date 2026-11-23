@@ -46,6 +46,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             && !registered_on_this_object(
                 ctx,
                 &summary.notify_regs,
+                &summary.notify_dynamic_signature_handler_sites,
                 &proc.name,
                 hir::MethodId { module, local_id: proc.key },
                 &symbol_tree,
@@ -60,6 +61,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             && !registered_on_this_object(
                 ctx,
                 &summary.notify_regs,
+                &summary.notify_dynamic_signature_handler_sites,
                 &func.name,
                 hir::MethodId { module, local_id: func.key },
                 &symbol_tree,
@@ -72,11 +74,12 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     diagnostics
 }
 
-// Only a normalized ThisObject registration proves a local callback reference. Unsupported
-// and not-compiled receivers must not hide an export diagnostic by name alone.
+// A normalized ThisObject registration can prove a reference. An unresolved dynamic
+// constructor also prevents a negative verdict when its syntax names this handler.
 fn registered_on_this_object(
     ctx: &DiagnosticsContext,
     registrations: &[hir::call_graph::NotifyReg],
+    dynamic_signature_handler_sites: &[hir::call_graph::DynamicNotifySignatureHandler],
     name: &hir::Name,
     method: hir::MethodId,
     symbol_tree: &hir::SymbolTree,
@@ -87,11 +90,32 @@ fn registered_on_this_object(
         return false;
     }
 
-    registrations.iter().any(|registration| {
+    let matching_registrations = registrations
+        .iter()
+        .filter(|registration| registration.callback_name.eq_ignore_case(name))
+        .collect::<Vec<_>>();
+    if matching_registrations.iter().any(|registration| {
         matches!(&registration.target, hir::call_graph::NotifyTarget::ThisObject)
-            && registration.callback_name.eq_ignore_case(name)
             && ctx.notify_method_is_exported_in_registration(registration, method, &methods)
-    })
+    }) {
+        return true;
+    }
+    // An unrelated registration cannot disprove an unresolved dynamic constructor, even
+    // when it names the same handler. Only a resolved target at that constructor's own
+    // site can rule out its syntactic candidate.
+    dynamic_signature_handler_sites
+        .iter()
+        .filter(|site| site.handler_name.eq_ignore_case(name))
+        .any(|site| {
+            !matching_registrations.iter().any(|registration| {
+                registration.range == site.constructor_range
+                    && matches!(
+                        &registration.target,
+                        hir::call_graph::NotifyTarget::Module(_)
+                            | hir::call_graph::NotifyTarget::ThisObject
+                    )
+            })
+        })
 }
 
 fn make_diagnostic(range: TextRange, code: DiagnosticCode, ctx: &DiagnosticsContext) -> Diagnostic {
@@ -230,6 +254,163 @@ mod tests {
               message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint"#]]
         .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn dynamic_array_alias_protects_only_unproven_local_callback_registrations() {
+        let code = r#"&НаКлиенте
+Процедура RegisterCallbacks()
+    Параметры = Новый Массив;
+    Параметры.Добавить("AliasCallback");
+    Параметры.Добавить(ЭтотОбъект);
+    Алиас = Параметры;
+    Оповещение = Новый("CallbackDescription", Алиас);
+    Оповещение = Новый CallbackDescription("AliasCallback", ДругойМодуль);
+
+    ПараметрыЛокальногоАлиаса = Новый Массив;
+    ПараметрыЛокальногоАлиаса.Добавить("LocalAliasCallback");
+    ПараметрыЛокальногоАлиаса.Добавить(ЭтотОбъект);
+    КопияЛокальногоАлиаса = ПараметрыЛокальногоАлиаса;
+    Оповещение = Новый("CallbackDescription", КопияЛокальногоАлиаса);
+
+    ВетвевыеПараметры = Новый Массив;
+    Если Истина Тогда
+        ВетвевыеПараметры.Добавить("BranchCallback");
+        ВетвевыеПараметры.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    Оповещение = Новый("CallbackDescription", ВетвевыеПараметры);
+
+    ЧужиеПараметры = Новый Массив;
+    ЧужиеПараметры.Добавить("ForeignCallback");
+    ЧужиеПараметры.Добавить(ДругойМодуль);
+    Оповещение = Новый("CallbackDescription", ЧужиеПараметры);
+    Оповещение = Новый CallbackDescription("ForeignLocalCallback", ДругойМодуль);
+
+    КлиентскиеПараметры = Новый Массив;
+    КлиентскиеПараметры.Добавить("ServerCallback");
+    КлиентскиеПараметры.Добавить(ЭтотОбъект);
+    Оповещение = Новый("CallbackDescription", КлиентскиеПараметры);
+    Оповещение = Новый CallbackDescription("ServerCallback", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура AliasCallback(AliasParameter) Экспорт
+    Сообщить(1);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура BranchCallback(BranchParameter) Экспорт
+    Сообщить(1);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ForeignCallback(ForeignParameter) Экспорт
+    Сообщить(1);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура ForeignLocalCallback(ForeignLocalParameter)
+    Сообщить(1);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура LocalAliasCallback(LocalAliasParameter)
+    Сообщить(1);
+КонецПроцедуры
+
+&НаСервере
+Процедура ServerCallback() Экспорт
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at_with(code, |ctx| {
+            assert!(bsl_platform::has_callback_description_constructor_facts(
+                bsl_platform::PlatformData::instance()
+            ));
+            let module = hir::ModuleId::new(ctx.file_id);
+            let summary = ctx.call_summary(module);
+            for name in ["AliasCallback", "BranchCallback"] {
+                assert!(
+                    summary
+                        .notify_dynamic_signature_handlers
+                        .iter()
+                        .any(|handler| { handler.eq_ignore_case(&hir::Name::new(name)) }),
+                    "{:#?}",
+                    summary.notify_dynamic_signature_handlers
+                );
+                let site = summary
+                    .notify_dynamic_signature_handler_sites
+                    .iter()
+                    .find(|site| site.handler_name.eq_ignore_case(&hir::Name::new(name)))
+                    .expect("dynamic callback site");
+                assert!(
+                    !summary.notify_regs.iter().any(|registration| {
+                        registration.range == site.constructor_range
+                            && registration.callback_name.eq_ignore_case(&hir::Name::new(name))
+                    }),
+                    "{:#?}",
+                    summary.notify_regs
+                );
+            }
+            let unused_methods = crate::handlers::unused_local_method::check(ctx);
+            let unused_parameters = crate::handlers::unused_parameters::check(ctx);
+            let reports_name = |items: &[crate::Diagnostic], diagnostic_code, name: &str| {
+                items.iter().any(|diagnostic| {
+                    if diagnostic.code != diagnostic_code {
+                        return false;
+                    }
+                    let start: usize = diagnostic.range.start().into();
+                    let end: usize = diagnostic.range.end().into();
+                    &code[start..end] == name
+                })
+            };
+            assert!(reports_name(
+                &unused_methods,
+                crate::DiagnosticCode::UnusedLocalMethod,
+                "ForeignLocalCallback"
+            ));
+            assert!(!reports_name(
+                &unused_methods,
+                crate::DiagnosticCode::UnusedLocalMethod,
+                "LocalAliasCallback"
+            ));
+            for name in ["AliasParameter", "BranchParameter"] {
+                assert!(
+                    !reports_name(
+                        &unused_parameters,
+                        crate::DiagnosticCode::UnusedParameters,
+                        name
+                    ),
+                    "{unused_parameters:#?}"
+                );
+            }
+            assert!(
+                reports_name(
+                    &unused_parameters,
+                    crate::DiagnosticCode::UnusedParameters,
+                    "ForeignLocalParameter"
+                ),
+                "dynamic sites={:#?} names={:#?} regs={:#?} diagnostics={:#?}",
+                summary.notify_dynamic_signature_handler_sites,
+                summary.notify_dynamic_signature_handlers,
+                summary.notify_regs,
+                unused_parameters,
+            );
+            assert!(!reports_name(
+                &unused_parameters,
+                crate::DiagnosticCode::UnusedParameters,
+                "LocalAliasParameter"
+            ));
+            check(ctx)
+        });
+        let reported = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let start: usize = diagnostic.range.start().into();
+                let end: usize = diagnostic.range.end().into();
+                &code[start..end]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reported, ["ForeignCallback"], "{diagnostics:#?}");
     }
 
     #[test]

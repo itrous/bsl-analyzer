@@ -149,19 +149,6 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     // (БлокироватьДляИзменения, ОбменДанными, ДополнительныеСвойства, …):
     // assigning one is a side effect on the module context, not a local.
     skip_attr_names.extend(ctx.module_implicit_field_names());
-    // Without usable callback-constructor facts, conservatively assume implicit writes may
-    // target platform fields. This fallback is not evidence that the field surface is complete.
-    let metadata = ctx.module_metadata();
-    let suppress_implicit_assignments = !bsl_platform::has_callback_description_constructor_facts(
-        bsl_platform::PlatformData::instance(),
-    ) && matches!(
-        metadata.module_type,
-        bsl_metadata::ModuleType::FormModule
-            | bsl_metadata::ModuleType::ObjectModule
-            | bsl_metadata::ModuleType::RecordSetModule
-            | bsl_metadata::ModuleType::ValueManagerModule
-    );
-
     let module_bodies = ctx.module_bodies();
 
     // Module `Перем` variables are not method locals. Assigning one inside a
@@ -180,16 +167,10 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             code,
             ctx,
             &skip_attr_names,
-            suppress_implicit_assignments,
         ));
     }
 
-    diagnostics.extend(check_module_level_code(
-        code,
-        ctx,
-        &skip_attr_names,
-        suppress_implicit_assignments,
-    ));
+    diagnostics.extend(check_module_level_code(code, ctx, &skip_attr_names));
 
     diagnostics.extend(check_module_var_declarations(&module_bodies, code, ctx));
 
@@ -230,49 +211,50 @@ fn collect_read_var_names(body: &hir::Body) -> FxHashSet<String> {
     read_vars
 }
 
-/// Whether the bare name `name_lower` denotes a metadata manager collection —
-/// cheap and purely textual, used only to decide whether the question below is
-/// worth asking at all.
-fn names_a_manager_collection(name_lower: &str) -> bool {
-    bsl_metadata::MdoType::from_plural(name_lower)
-        .is_some_and(|mdo| mdo.manager_type_prefix().is_some())
-}
-
-/// Whether an unread bare assignment declares a local at all.
-///
-/// For an ordinary name it always does, unless a declaration or an implicit
-/// member already owns it. For a metadata-collection name the answer belongs to
-/// INFERENCE and nowhere else: assigning to a Global-context property declares
-/// nothing (the platform refuses the write, and `GlobalPropertyNotWritable`
-/// reports it), but a non-writable owner — a same-named method, a common module
-/// known from the configuration OR merely from the source root — takes the name
-/// first, and then the assignment does declare a real local.
-///
-/// Answering that here a second time is what produced three separate defects:
-/// the local copy disagreed with inference on config-less common modules, on
-/// methods, and on the method-versus-attribute resolution order. Inference is
-/// consulted only for collection names, so ordinary bodies pay nothing.
+/// Whether a bare assignment introduces an implicit local, using inference's
+/// ownership verdict rather than rebuilding the name-resolution cascade here.
+/// Explicit declarations are collected syntactically because their diagnostics
+/// are handled separately; implicit members are supplied by the module context.
 fn declares_a_local(
     name_lower: &str,
     body: hir::DefWithBodyId,
     declared_vars: &FxHashSet<String>,
     skip_attr_names: &FxHashSet<String>,
+    assignment_target_resolution: Option<&hir::BareNameResolution>,
     ctx: &DiagnosticsContext,
 ) -> bool {
-    if names_a_manager_collection(name_lower) {
-        // A syntactic binding — parameter, `Перем`, loop variable — owns the name
-        // outright, and its own dead-store check already covers it. Inference
-        // keeps writes to such bindings in the same table as implicit locals, so
-        // that table answers "does a local by this name exist", not "did THIS
-        // write declare one"; the declaration is what tells the two apart.
-        return !declared_vars.contains(name_lower)
-            && ctx
-                .infer()
-                .implicit_locals_by_body
-                .get(&body)
-                .is_some_and(|locals| locals.contains_key(name_lower));
+    if declared_vars.contains(name_lower) || skip_attr_names.contains(name_lower) {
+        return false;
     }
-    !declared_vars.contains(name_lower) && !skip_attr_names.contains(name_lower)
+    if bsl_metadata::MdoType::from_plural(name_lower)
+        .is_some_and(|mdo| mdo.manager_type_prefix().is_some())
+    {
+        return ctx
+            .infer()
+            .implicit_locals_by_body
+            .get(&body)
+            .is_some_and(|locals| locals.contains_key(name_lower));
+    }
+    match assignment_target_resolution {
+        Some(hir::BareNameResolution::Resolved {
+            origin: hir::BareNameOrigin::FlowLocal, ..
+        })
+        | Some(hir::BareNameResolution::Absent) => true,
+        // A missing inference entry is not evidence of a new local. In contextual
+        // modules inference can intentionally skip a target (for example, a
+        // read-only global property); do not guess local ownership there.
+        None => !matches!(
+            ctx.module_metadata().module_type,
+            bsl_metadata::ModuleType::FormModule
+                | bsl_metadata::ModuleType::ObjectModule
+                | bsl_metadata::ModuleType::RecordSetModule
+                | bsl_metadata::ModuleType::ManagerModule
+                | bsl_metadata::ModuleType::ValueManagerModule
+                | bsl_metadata::ModuleType::Unknown
+        ),
+        Some(hir::BareNameResolution::Resolved { .. })
+        | Some(hir::BareNameResolution::Indeterminate { .. }) => false,
+    }
 }
 
 fn check_method(
@@ -282,7 +264,6 @@ fn check_method(
     code: DiagnosticCode,
     ctx: &DiagnosticsContext,
     skip_attr_names: &FxHashSet<String>,
-    suppress_implicit_assignments: bool,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -292,6 +273,7 @@ fn check_method(
     };
 
     let read_vars = collect_read_var_names(body);
+    let inference = ctx.infer_owner(hir::DefWithBodyId::Method(local_id));
 
     // A `Для Сч = … По …` counter is syntactically mandatory and cannot simply
     // be "removed", so a project may opt out of reporting unused numeric loop
@@ -360,10 +342,6 @@ fn check_method(
         }
     }
 
-    if suppress_implicit_assignments {
-        return diagnostics;
-    }
-
     let mut implicit_vars: rustc_hash::FxHashMap<String, (String, ide_db::TextRange)> =
         rustc_hash::FxHashMap::default();
 
@@ -378,6 +356,7 @@ fn check_method(
                     hir::DefWithBodyId::Method(local_id),
                     &declared_vars,
                     skip_attr_names,
+                    inference.assignment_target_resolution(target_opaque),
                     ctx,
                 ) {
                     if let std::collections::hash_map::Entry::Vacant(e) =
@@ -405,7 +384,6 @@ fn check_module_level_code(
     code: DiagnosticCode,
     ctx: &DiagnosticsContext,
     skip_attr_names: &FxHashSet<String>,
-    suppress_implicit_assignments: bool,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -415,14 +393,11 @@ fn check_module_level_code(
         Some(result) => result,
         None => return diagnostics,
     };
-    if suppress_implicit_assignments {
-        return diagnostics;
-    }
-
     let body = lower_result.body();
     let source_map = lower_result.source_map();
 
     let read_vars = collect_read_var_names(body);
+    let inference = ctx.infer_owner(hir::DefWithBodyId::ModuleCode);
 
     let mut implicit_vars: rustc_hash::FxHashMap<String, (String, ide_db::TextRange)> =
         rustc_hash::FxHashMap::default();
@@ -438,6 +413,7 @@ fn check_module_level_code(
                     hir::DefWithBodyId::ModuleCode,
                     &FxHashSet::default(),
                     skip_attr_names,
+                    inference.assignment_target_resolution(target_opaque),
                     ctx,
                 ) {
                     continue;
@@ -727,6 +703,70 @@ mod tests {
             diags.iter().filter(|d| d.code == DiagnosticCode::SelfAssign).count(),
             1,
             "nothing supersedes the self-assignment any more:\n{diags:#?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_assignment_verdict_in_a_form_context_is_not_proof_of_a_local() {
+        use hir::{DefWithBodyId, Expr, ExprId, IdConversion, Stmt};
+        use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
+        use ide_db::RootDatabaseImpl;
+        use vfs::FileSet;
+
+        let fixture_text = "//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl\n&НаСервере\nПроцедура Тест()\n    Метаданные = Новый Структура;\n    Мертвая = 1;\nКонецПроцедуры\n";
+        let fixture = test_fixture::Fixture::parse(fixture_text);
+        let mut db = RootDatabaseImpl::new();
+        let mut file_set = FileSet::default();
+        for (file_id, file) in &fixture.files {
+            file_set.insert(*file_id, file.path.clone());
+            db.set_file_text(*file_id, &file.content);
+            db.set_file_source_root(*file_id, SourceRootId(0));
+        }
+        db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+        let file_id = *fixture.files.keys().last().expect("form module fixture");
+        let config = crate::DiagnosticsConfig::all_enabled();
+        let provider = ide_db::SalsaProvider::new(&db, None);
+        let ctx = crate::DiagnosticsContext::new(&config, file_id, &provider);
+        assert_eq!(ctx.module_metadata().module_type, bsl_metadata::ModuleType::FormModule);
+
+        let module_bodies = ctx.module_bodies();
+        let (method_id, body) = module_bodies.iter_bodies().next().expect("method body");
+        let inference = ctx.infer_owner(DefWithBodyId::Method(method_id));
+        let target_resolutions: Vec<_> = body
+            .stmts_iter()
+            .filter_map(|(_, stmt)| {
+                let Stmt::Assign { target, .. } = stmt else { return None };
+                let target = ExprId::from_idx(*target);
+                let Expr::Path(name) = body.expr(target) else { return None };
+                let resolution =
+                    inference.assignment_target_resolution(target).map(
+                        |resolution| match resolution {
+                            hir::BareNameResolution::Resolved { origin, .. } => Some(*origin),
+                            hir::BareNameResolution::Absent
+                            | hir::BareNameResolution::Indeterminate { .. } => None,
+                        },
+                    );
+                Some((name.as_str().to_owned(), resolution))
+            })
+            .collect();
+        let diagnostics = crate::diagnostics(&ctx);
+        assert_eq!(
+            target_resolutions,
+            vec![
+                ("Метаданные".to_owned(), None),
+                ("Мертвая".to_owned(), Some(Some(hir::BareNameOrigin::FlowLocal)),),
+            ],
+            "the read-only global bypasses target inference, but a local gets an explicit verdict"
+        );
+        let unused: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == DiagnosticCode::UnusedLocalVariable)
+            .collect();
+        assert_eq!(unused.len(), 1, "only the positively resolved local is reported: {unused:#?}");
+        assert!(unused[0].message.contains("Мертвая"));
+        assert!(
+            diagnostics.iter().any(|diag| diag.code == DiagnosticCode::GlobalPropertyNotWritable),
+            "the missing target verdict is the actual read-only global case"
         );
     }
 

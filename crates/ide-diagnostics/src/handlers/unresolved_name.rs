@@ -362,9 +362,10 @@ mod tests {
     }
 
     /// A method of the implicit object, as the call channel already recognises
-    /// it, must not be `UnresolvedName` when read as a bare callee. A value
-    /// read of the same spelling, a name that kind does not own, and the same
-    /// call in a module with no such receiver stay diagnosed.
+    /// it, must not be `UnresolvedName` when read as a bare callee. The CFE test
+    /// fixture does not attest a complete member surface, so its unlisted calls
+    /// are deliberately not treated as absent. A separate common-module control
+    /// below has no implicit receiver and still diagnoses a truly absent call.
     struct ObjectKind {
         collection: &'static str,
         element: &'static str,
@@ -608,14 +609,14 @@ mod tests {
             }
             for call in kind.absent_calls {
                 assert!(
-                    is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
-                    "{}: {call}() is not a method of this object: {unresolved:?}",
+                    !is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
+                    "{}: an unattested implicit receiver surface cannot prove {call}() absent: {unresolved:?}",
                     kind.collection
                 );
             }
             assert!(
-                value_read_is_unresolved(&source, &diagnostics, "ЭтоНовый"),
-                "{}: a value read of a method is still not a value: {unresolved:?}",
+                !value_read_is_unresolved(&source, &diagnostics, "ЭтоНовый"),
+                "{}: incomplete field facts cannot prove the method spelling absent as a value: {unresolved:?}",
                 kind.collection
             );
             if kind.methods.contains(&"ЭтоНовый") {
@@ -662,17 +663,26 @@ mod tests {
             crate::diagnostics,
         );
         let unresolved = tokens(source, &diagnostics, DiagnosticCode::UnresolvedName);
-        assert_eq!(
-            unresolved,
-            vec!["СовсемНеизвестныйВызов".to_string()],
-            "the parameter owns the value read, the call is the object method: {diagnostics:?}"
+        assert!(
+            !unresolved.iter().any(|name| name == "ЭтоНовый"),
+            "the parameter owns the value read: {diagnostics:?}"
+        );
+        assert!(
+            !is_call_callee(
+                source,
+                &diagnostics,
+                DiagnosticCode::UnresolvedName,
+                "СовсемНеизвестныйВызов"
+            ),
+            "an incomplete implicit receiver cannot prove the call absent: {diagnostics:?}"
         );
         assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedBareCall));
     }
 
     /// An export root has no collection directory. The call channel still
-    /// looks up methods of `ExternalDataProcessor` / `ExternalReport` once the
-    /// owner is attached; the callee read must use that same recognition.
+    /// looks up known methods of `ExternalDataProcessor` / `ExternalReport` once
+    /// the owner is attached; absent-call claims wait for a complete member
+    /// surface, which this fixture does not attest.
     #[test]
     fn external_object_module_bare_method_is_not_an_unresolved_name() {
         for (element, kind) in [
@@ -698,8 +708,8 @@ mod tests {
             );
             for call in ["ЭтоНовый", "СовсемНеизвестныйВызов"] {
                 assert!(
-                    is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
-                    "{element}: {call}() is not a method of this export: {unresolved:?}"
+                    !is_call_callee(&source, &diagnostics, DiagnosticCode::UnresolvedName, call),
+                    "{element}: incomplete implicit receiver data cannot prove {call}() absent: {unresolved:?}"
                 );
             }
         }
@@ -782,9 +792,9 @@ mod tests {
         diagnostics
     }
 
-    /// With `UnresolvedName` off, the call channel still owns the token: a
-    /// method of the implicit object stays silent, a name it does not own is
-    /// `UnresolvedBareCall`.
+    /// With `UnresolvedName` off, the call channel still owns the token. A
+    /// known method stays silent; an arbitrary call stays indeterminate while
+    /// the implicit receiver surface is incomplete.
     #[test]
     fn default_profile_keeps_the_call_channel_for_an_object_module() {
         let source = "\
@@ -819,13 +829,13 @@ mod tests {
             "the call channel already recognises ЭтоНовый(): {diagnostics:?}"
         );
         assert!(
-            is_call_callee(
+            !is_call_callee(
                 source,
                 &diagnostics,
                 DiagnosticCode::UnresolvedBareCall,
                 "СовсемНеизвестныйВызов",
             ),
-            "an unknown bare call stays on the call channel: {diagnostics:?}"
+            "the call channel also defers when the implicit receiver surface is incomplete: {diagnostics:?}"
         );
         assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedName));
     }

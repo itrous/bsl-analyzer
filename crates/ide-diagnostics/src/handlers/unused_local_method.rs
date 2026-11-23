@@ -142,9 +142,10 @@ pub(crate) fn collect_called_methods(
     // Without enough platform facts to normalize the callback constructor, its source syntax
     // is the only available evidence that the platform may invoke the local handler. With
     // constructor facts available, use only normalized semantic registrations below.
-    if !bsl_platform::has_callback_description_constructor_facts(
+    let has_callback_facts = bsl_platform::has_callback_description_constructor_facts(
         bsl_platform::PlatformData::instance(),
-    ) {
+    );
+    if !has_callback_facts {
         called_methods.extend(
             summary
                 .notify_signature_handlers
@@ -153,6 +154,20 @@ pub(crate) fn collect_called_methods(
                 .chain(&summary.notify_dynamic_signature_handlers)
                 .map(|handler| NormName::intern(handler.as_str())),
         );
+    } else if metadata.module_type == bsl_metadata::ModuleType::CommandModule {
+        // Bundled constructor facts do not make an alias or a conditionally-built array
+        // semantically knowable. Keep the syntax proof for those unresolved callbacks unless
+        // the same constructor proves that the named handler belongs to a foreign module.
+        for site in &summary.notify_dynamic_signature_handler_sites {
+            let has_proven_foreign_registration = summary.notify_regs.iter().any(|registration| {
+                registration.range == site.constructor_range
+                    && registration.callback_name.eq_ignore_case(&site.handler_name)
+                    && matches!(&registration.target, hir::call_graph::NotifyTarget::Module(_))
+            });
+            if !has_proven_foreign_registration {
+                called_methods.insert(NormName::intern(site.handler_name.as_str()));
+            }
+        }
     }
 
     for edge in &summary.call_edges {

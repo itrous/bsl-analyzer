@@ -664,6 +664,25 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         std::sync::Arc::clone(&self.metadata)
     }
 
+    fn module_implicit_field_names(&self, _file_id: vfs::FileId) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(mdo) = &self.metadata.mdo {
+            names.extend(mdo.attributes.iter().map(|attribute| attribute.name.as_str()));
+            names.extend(mdo.tabular_sections.iter().map(|section| section.name()));
+            names.extend(mdo.common_attributes.iter().map(|field| field.name.as_str()));
+        }
+        if let Some(register) = &self.metadata.register {
+            names.extend(register.dimensions().iter().map(|dimension| dimension.name()));
+            names.extend(register.resources().iter().map(|resource| resource.name()));
+            names.extend(register.attributes().iter().map(|attribute| attribute.name()));
+            names.extend(register.common_attributes().iter().map(|field| field.name.as_str()));
+        }
+        if let Some(form) = &self.metadata.form {
+            names.extend(form.attributes().iter().map(|attribute| attribute.name.as_str()));
+        }
+        names.into_iter().map(stdx::case::fold_lower_per_char).collect()
+    }
+
     /// The test file stands for a module of the main configuration.
     fn vendor_support_for_file(
         &self,
