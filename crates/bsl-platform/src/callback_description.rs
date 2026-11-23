@@ -75,7 +75,17 @@ pub fn is_callback_description_type_name(name: &str) -> bool {
 /// slots that `notify_targets` extracts from its call-argument binding. Every overload must
 /// expose the same positions; `callback_arguments_for_binding` declines conflicting projections.
 pub fn has_callback_description_constructor_facts(platform: &PlatformDataInner) -> bool {
-    if !platform.is_notify_description_type_name("CallbackDescription") {
+    let names = &facts().type_names;
+    let legacy_names = crate::db::LEGACY_ENGLISH_TYPE_ALIASES
+        .iter()
+        .filter(|(russian, _)| russian.fold_lower() == names[0].fold_lower())
+        .map(|(_, legacy)| *legacy);
+    if names
+        .iter()
+        .map(SmolStr::as_str)
+        .chain(legacy_names)
+        .any(|name| !platform.is_notify_description_type_name(name))
+    {
         return false;
     }
 
@@ -261,6 +271,32 @@ mod tests {
 
         assert!(platform.is_notify_description_type_name("CallbackDescription"));
         assert!(platform.get_constructors("CallbackDescription").len() > 1);
+        assert!(!has_callback_description_constructor_facts(&platform));
+    }
+
+    #[test]
+    fn ambiguous_callback_spelling_is_not_sufficient_knowledge() {
+        use crate::{
+            PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
+        };
+
+        let mut snapshot =
+            PlatformSnapshot::from_corpus_json(include_bytes!("../data/platform_facts.json"))
+                .unwrap();
+        let array = snapshot.types.iter_mut().find(|ty| ty.name == "Массив").unwrap();
+        array.name = "ОписаниеОповещения".into();
+        let platform = PlatformDataInner::from_help(PlatformHelp::loaded(
+            PlatformHelpRequest::ExternalPath("ambiguous-callback-name".into()),
+            snapshot,
+            PlatformHelpOrigin {
+                source: PlatformHelpSourceKind::External,
+                location: None,
+                platform_version: None,
+                digest: None,
+            },
+        ));
+        assert!(platform.is_notify_description_type_name("CallbackDescription"));
+        assert!(!platform.is_notify_description_type_name("ОписаниеОповещения"));
         assert!(!has_callback_description_constructor_facts(&platform));
     }
 
