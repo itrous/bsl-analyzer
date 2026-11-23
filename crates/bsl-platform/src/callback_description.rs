@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use smol_str::SmolStr;
 use stdx::case::CaseExt;
 
-use crate::{MethodParam, PlatformSnapshot};
+use crate::{MethodParam, PlatformDataInner, PlatformSnapshot};
 
 /// The positional parameters that carry callback names and their receiver modules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +68,30 @@ pub fn is_callback_description_compatibility_type_name(name: &str) -> bool {
 pub fn is_callback_description_type_name(name: &str) -> bool {
     is_callback_description_compatibility_type_name(name)
         || facts().type_names[1].fold_lower() == name.fold_lower()
+}
+
+/// Whether the served platform facts can drive the same callback normalization as `hir-ty`.
+/// A type record alone is insufficient: constructor inference must expose the named callback
+/// slots that `notify_targets` extracts from its call-argument binding. Every overload must
+/// expose the same positions; `callback_arguments_for_binding` declines conflicting projections.
+pub fn has_callback_description_constructor_facts(platform: &PlatformDataInner) -> bool {
+    if !platform.is_notify_description_type_name("CallbackDescription") {
+        return false;
+    }
+
+    let mut known_slots = None;
+    for constructor in platform.get_constructors("CallbackDescription") {
+        let Some(slots) = callback_description_slots_for_parameters(&constructor.parameters) else {
+            return false;
+        };
+        let callback_positions =
+            (slots.handler, slots.receiver, slots.error_handler, slots.error_receiver);
+        if known_slots.is_some_and(|known| known != callback_positions) {
+            return false;
+        }
+        known_slots = Some(callback_positions);
+    }
+    known_slots.is_some()
 }
 
 /// The callback slots attested by the bundled constructor facts. Used by syntax-only consumers
@@ -142,6 +166,117 @@ mod tests {
             assert!(is_callback_description_type_name(&name.to_uppercase()));
         }
         assert!(!is_callback_description_type_name("Structure"));
+    }
+
+    #[test]
+    fn constructor_knowledge_requires_the_type_and_usable_callback_slots() {
+        use crate::{
+            PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
+        };
+
+        let mut snapshot =
+            PlatformSnapshot::from_corpus_json(include_bytes!("../data/platform_facts.json"))
+                .unwrap();
+        snapshot.types.retain(|ty| ty.name == "Массив");
+        snapshot.constructors.retain(|constructor| constructor.type_name == "Массив");
+        let platform = PlatformDataInner::from_help(PlatformHelp::loaded(
+            PlatformHelpRequest::ExternalPath("partial".into()),
+            snapshot,
+            PlatformHelpOrigin {
+                source: PlatformHelpSourceKind::External,
+                location: None,
+                platform_version: None,
+                digest: None,
+            },
+        ));
+
+        assert!(platform.get_type("Массив").is_some());
+        assert!(platform.get_type("CallbackDescription").is_none());
+        assert!(!has_callback_description_constructor_facts(&platform));
+    }
+
+    #[test]
+    fn callback_type_without_constructor_slots_is_not_sufficient_knowledge() {
+        use crate::{
+            PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
+        };
+
+        let mut snapshot =
+            PlatformSnapshot::from_corpus_json(include_bytes!("../data/platform_facts.json"))
+                .unwrap();
+        snapshot.constructors.retain(|constructor| {
+            !constructor.type_name.eq_ignore_ascii_case("CallbackDescription")
+        });
+        let platform = PlatformDataInner::from_help(PlatformHelp::loaded(
+            PlatformHelpRequest::ExternalPath("without-callback-constructor".into()),
+            snapshot,
+            PlatformHelpOrigin {
+                source: PlatformHelpSourceKind::External,
+                location: None,
+                platform_version: None,
+                digest: None,
+            },
+        ));
+
+        assert!(platform.is_notify_description_type_name("CallbackDescription"));
+        assert!(!has_callback_description_constructor_facts(&platform));
+    }
+
+    #[test]
+    fn conflicting_callback_constructor_overloads_are_not_sufficient_knowledge() {
+        use crate::{
+            PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
+        };
+
+        let mut snapshot =
+            PlatformSnapshot::from_corpus_json(include_bytes!("../data/platform_facts.json"))
+                .unwrap();
+        let constructor = snapshot
+            .constructors
+            .iter()
+            .find(|constructor| constructor.type_name.eq_ignore_ascii_case("CallbackDescription"))
+            .expect("bundled constructor exists")
+            .clone();
+
+        let mut unreadable = constructor.clone();
+        unreadable.id = snapshot.constructors.iter().map(|entry| entry.id).max().unwrap() + 1;
+        unreadable.parameters[0].name = "НеизвестныйПараметр".into();
+        snapshot.constructors.push(unreadable);
+
+        let mut conflicting = constructor;
+        conflicting.id = snapshot.constructors.iter().map(|entry| entry.id).max().unwrap() + 1;
+        conflicting.parameters.swap(0, 1);
+        snapshot.constructors.push(conflicting);
+
+        let platform = PlatformDataInner::from_help(PlatformHelp::loaded(
+            PlatformHelpRequest::ExternalPath("conflicting-callback-overloads".into()),
+            snapshot,
+            PlatformHelpOrigin {
+                source: PlatformHelpSourceKind::External,
+                location: None,
+                platform_version: None,
+                digest: None,
+            },
+        ));
+
+        assert!(platform.is_notify_description_type_name("CallbackDescription"));
+        assert!(platform.get_constructors("CallbackDescription").len() > 1);
+        assert!(!has_callback_description_constructor_facts(&platform));
+    }
+
+    #[test]
+    fn none_and_bundled_snapshots_report_callback_constructor_knowledge() {
+        use crate::{PlatformHelp, PlatformHelpRequest};
+
+        let bundled =
+            PlatformDataInner::from_help(PlatformHelp::bundled(PlatformHelpRequest::Bundled, None));
+        let none = PlatformDataInner::from_help(PlatformHelp::missing(
+            PlatformHelpRequest::None,
+            "disabled",
+        ));
+
+        assert!(has_callback_description_constructor_facts(&bundled));
+        assert!(!has_callback_description_constructor_facts(&none));
     }
 
     #[test]
