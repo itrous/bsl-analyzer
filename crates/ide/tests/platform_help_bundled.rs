@@ -10,7 +10,9 @@ use bsl_platform::{
     PlatformHelpStatus,
 };
 use common::*;
+use hir::DefDatabase;
 use ide::Analysis;
+use ide_db::base_db::SourceDatabase;
 
 fn install_bundled() {
     let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
@@ -49,6 +51,60 @@ fn hover_and_completion_work_on_facts_without_texts() {
     assert!(function.contains("СтрДлина") && function.contains("Строка"), "{function}");
     let keyword = hover(&analysis, file_id, "Если").expect("keyword hover");
     assert!(keyword.contains("Условный оператор"), "{keyword}");
+}
+
+#[test]
+fn unused_local_method_uses_no_syntax_fallback_when_facts_are_present() {
+    const SOURCE: &str = r#"&AtClient
+Procedure Register()
+    Notification = New CallbackDescription(
+        "Callback", ThisObject, Undefined, "ErrorCallback", ThisObject
+    );
+EndProcedure
+
+&AtClient
+Procedure Callback()
+EndProcedure
+
+&AtClient
+Procedure ErrorCallback()
+EndProcedure
+
+&AtClient
+Procedure DeadMethod()
+EndProcedure
+
+Register();
+"#;
+
+    install_bundled();
+    let (mut db, file_id, _fixture) = database(None);
+    db.set_file_text(file_id, SOURCE);
+    let summary = db.module_call_summary(hir::ModuleId::new(file_id));
+    assert!(
+        !bsl_platform::PlatformData::instance().all_types().is_empty()
+            && summary.notify_regs.iter().any(|registration| {
+                registration.callback_name.as_str() == "Callback"
+                    && matches!(registration.target, hir::call_graph::NotifyTarget::Unsupported)
+            })
+            && summary.notify_regs.iter().any(|registration| {
+                registration.callback_name.as_str() == "ErrorCallback"
+                    && matches!(registration.target, hir::call_graph::NotifyTarget::Unsupported)
+            }),
+        "the test requires present facts and unsupported semantic targets: {:?}",
+        summary.notify_regs
+    );
+
+    let analysis = Analysis::from_database(db);
+    let unused = analysis
+        .diagnostics(file_id, &ide::DiagnosticsConfig::all_enabled())
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == ide::DiagnosticCode::UnusedLocalMethod)
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>();
+    assert!(unused.iter().any(|message| message.contains("\"Callback\"")), "{unused:?}");
+    assert!(unused.iter().any(|message| message.contains("\"ErrorCallback\"")), "{unused:?}");
+    assert!(unused.iter().any(|message| message.contains("DeadMethod")), "{unused:?}");
 }
 
 #[test]

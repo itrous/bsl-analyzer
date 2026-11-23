@@ -110,6 +110,16 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     fixed_signature_handlers.extend(
         summary.notify_signature_handlers.iter().map(|handler| NormName::intern(handler.as_str())),
     );
+    // The current English type spelling was not part of the compatibility-only projection.
+    // Protect it, and the other fact-derived spellings, only when no platform type facts exist.
+    if bsl_platform::PlatformData::instance().all_types().is_empty() {
+        fixed_signature_handlers.extend(
+            summary
+                .notify_additional_signature_handlers
+                .iter()
+                .map(|handler| NormName::intern(handler.as_str())),
+        );
+    }
     // The semantic registrations also cover platform-described dynamic constructors whose
     // callback slots are not visible from the local syntax shape alone.
     for reg in &summary.notify_regs {

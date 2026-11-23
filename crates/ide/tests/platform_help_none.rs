@@ -60,8 +60,14 @@ Procedure Register()
 #If MobileClient Then
     Notification = New NotifyDescription("SelfCallback", ThisObject);
     Notification = New("NotifyDescription", "DynamicCallback", ThisObject, Undefined, "DynamicErrorCallback", ThisObject);
+    Notification = New ОписаниеОповещения(
+        "RussianCallback", ЭтотОбъект, Неопределено, "RussianErrorCallback", ЭтотОбъект
+    );
     Notification = New NotifyDescription("ForeignCallback", OtherModule);
-    Notification = New("CallbackDescription", "NotProtectedCallback", ThisObject);
+    Notification = New CallbackDescription(
+        "NotProtectedCallback", ThisObject, Undefined, "CallbackError", ThisObject
+    );
+    Notification = New("CallbackDescription", "DynamicAliasCallback", ThisObject);
 #EndIf
 EndProcedure
 
@@ -81,6 +87,16 @@ Procedure DynamicErrorCallback(UnusedDynamicErrorParameter)
 EndProcedure
 
 &AtClient
+Procedure RussianCallback(UnusedRussianParameter)
+    Message("russian");
+EndProcedure
+
+&AtClient
+Procedure RussianErrorCallback(UnusedRussianErrorParameter)
+    Message("russian-error");
+EndProcedure
+
+&AtClient
 Procedure ForeignCallback(UnusedForeignParameter)
     Message("foreign");
 EndProcedure
@@ -89,6 +105,22 @@ EndProcedure
 Procedure NotProtectedCallback(UnusedAliasParameter)
     Message("alias");
 EndProcedure
+
+&AtClient
+Procedure CallbackError(UnusedErrorParameter)
+    Message("error");
+EndProcedure
+
+&AtClient
+Procedure DynamicAliasCallback(UnusedDynamicAliasParameter)
+    Message("dynamic-alias");
+EndProcedure
+
+&AtClient
+Procedure DeadMethod()
+EndProcedure
+
+Register();
 "#;
 
     install_none();
@@ -98,11 +130,25 @@ EndProcedure
     assert!(summary.notify_regs.is_empty(), "none help should leave registrations unnormalized");
     assert_eq!(
         summary
+            .notify_additional_signature_handlers
+            .iter()
+            .map(|handler| handler.as_str())
+            .collect::<Vec<_>>(),
+        ["NotProtectedCallback", "CallbackError", "DynamicAliasCallback"]
+    );
+    assert_eq!(
+        summary
             .notify_signature_handlers
             .iter()
             .map(|handler| handler.as_str())
             .collect::<Vec<_>>(),
-        ["SelfCallback", "DynamicCallback", "DynamicErrorCallback"]
+        [
+            "SelfCallback",
+            "DynamicCallback",
+            "DynamicErrorCallback",
+            "RussianCallback",
+            "RussianErrorCallback",
+        ]
     );
 
     let analysis = Analysis::from_database(db);
@@ -112,13 +158,31 @@ EndProcedure
         .filter(|diagnostic| diagnostic.code == ide::DiagnosticCode::UnusedParameters)
         .map(|diagnostic| diagnostic.message)
         .collect::<Vec<_>>();
-    assert_eq!(
-        unused,
-        [
-            "Уберите неиспользуемый параметр \"UnusedForeignParameter\"",
-            "Уберите неиспользуемый параметр \"UnusedAliasParameter\"",
-        ]
-    );
+    assert_eq!(unused, ["Уберите неиспользуемый параметр \"UnusedForeignParameter\""]);
+
+    let unused_methods = analysis
+        .diagnostics(file_id, &DiagnosticsConfig::all_enabled())
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == ide::DiagnosticCode::UnusedLocalMethod)
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>();
+    for protected in [
+        "SelfCallback",
+        "DynamicCallback",
+        "DynamicErrorCallback",
+        "RussianCallback",
+        "RussianErrorCallback",
+        "NotProtectedCallback",
+        "CallbackError",
+        "DynamicAliasCallback",
+    ] {
+        assert!(
+            !unused_methods.iter().any(|message| message.contains(protected)),
+            "{protected} should remain protected without platform facts: {unused_methods:?}"
+        );
+    }
+    assert!(unused_methods.iter().any(|message| message.contains("ForeignCallback")));
+    assert!(unused_methods.iter().any(|message| message.contains("DeadMethod")));
 }
 
 #[test]

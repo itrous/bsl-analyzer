@@ -20,9 +20,13 @@ pub struct ModuleCallSummary {
     /// Generic syntax-only constructor candidates. Platform validation and callback-slot
     /// interpretation happen in `hir-ty`; these are not notify registrations.
     pub notify_candidates: Vec<NotifyConstructorCandidate>,
-    /// Callback names whose fixed signature follows from the source-level constructor and
+    /// Callback names whose fixed signature follows from compatibility constructor names and
     /// receiver shape. Kept when platform metadata cannot normalize a registration.
     pub notify_signature_handlers: Vec<Name>,
+    /// Callback names introduced by the current English `CallbackDescription` spelling. Kept
+    /// separate so consumers can use it only when configured platform facts are absent, without
+    /// changing compatibility behavior elsewhere.
+    pub notify_additional_signature_handlers: Vec<Name>,
     /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
     pub idle_handler_regs: Vec<IdleReg>,
@@ -153,6 +157,7 @@ impl ModuleCallSummary {
             call_edges,
             notify_candidates: Vec::new(),
             notify_signature_handlers: Vec::new(),
+            notify_additional_signature_handlers: Vec::new(),
             notify_regs,
             idle_handler_regs,
             set_action_regs: Vec::new(),
@@ -825,6 +830,7 @@ pub fn extract_call_summary(
     let mut call_edges = Vec::new();
     let mut notify_candidates = Vec::new();
     let mut notify_signature_handlers = Vec::new();
+    let mut notify_additional_signature_handlers = Vec::new();
     let mut idle_handler_regs = Vec::new();
     let mut set_action_regs = Vec::new();
     let mut name_literals: FxHashSet<MethodKey> = FxHashSet::default();
@@ -840,6 +846,7 @@ pub fn extract_call_summary(
             &mut call_edges,
             &mut notify_candidates,
             &mut notify_signature_handlers,
+            &mut notify_additional_signature_handlers,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
@@ -856,6 +863,7 @@ pub fn extract_call_summary(
             &mut call_edges,
             &mut notify_candidates,
             &mut notify_signature_handlers,
+            &mut notify_additional_signature_handlers,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
@@ -879,6 +887,7 @@ pub fn extract_call_summary(
         call_edges,
         notify_candidates,
         notify_signature_handlers,
+        notify_additional_signature_handlers,
         notify_regs: Vec::new(),
         idle_handler_regs,
         set_action_regs,
@@ -1016,6 +1025,7 @@ fn extract_from_body(
     call_edges: &mut Vec<CallEdge>,
     notify_candidates: &mut Vec<NotifyConstructorCandidate>,
     notify_signature_handlers: &mut Vec<Name>,
+    notify_additional_signature_handlers: &mut Vec<Name>,
     idle_handler_regs: &mut Vec<IdleReg>,
     set_action_regs: &mut Vec<SetActionReg>,
     name_literals: &mut FxHashSet<MethodKey>,
@@ -1088,11 +1098,12 @@ fn extract_from_body(
                         range: source_map.expr_range(expr_id).unwrap_or(TextRange::empty(0.into())),
                     });
                 }
-                extract_notify_signature_handlers(
+                extract_notify_handlers(
                     body,
                     type_name.as_ref(),
                     args,
                     notify_signature_handlers,
+                    notify_additional_signature_handlers,
                 );
             }
             _ => {}
@@ -1100,11 +1111,17 @@ fn extract_from_body(
     }
 }
 
-fn extract_notify_signature_handlers(
+fn is_additional_callback_description_type_name(name: &str) -> bool {
+    bsl_platform::is_callback_description_type_name(name)
+        && !bsl_platform::is_callback_description_compatibility_type_name(name)
+}
+
+fn extract_notify_handlers(
     body: &Body,
     type_name: Option<&Name>,
     args: &[ExprIdx],
-    handlers: &mut Vec<Name>,
+    compatibility_handlers: &mut Vec<Name>,
+    additional_handlers: &mut Vec<Name>,
 ) {
     let (type_name, slot_offset) = match type_name {
         Some(type_name) => (type_name.as_str().to_owned(), 0),
@@ -1116,7 +1133,10 @@ fn extract_notify_signature_handlers(
             (type_name, 1)
         }
     };
-    if !bsl_platform::is_callback_description_compatibility_type_name(&type_name) {
+    let is_compatibility_name =
+        bsl_platform::is_callback_description_compatibility_type_name(&type_name);
+    let is_additional_name = is_additional_callback_description_type_name(&type_name);
+    if !is_compatibility_name && !is_additional_name {
         return;
     }
     let slots = bsl_platform::bundled_callback_description_slots();
@@ -1136,7 +1156,12 @@ fn extract_notify_signature_handlers(
                 }
             });
         if matches!(receiver_syntax, NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other) {
-            handlers.push(Name::new(&handler));
+            if is_compatibility_name {
+                compatibility_handlers.push(Name::new(&handler));
+            }
+            if is_additional_name {
+                additional_handlers.push(Name::new(&handler));
+            }
         }
     }
 }
@@ -1482,6 +1507,7 @@ mod tests {
             ],
             notify_candidates: Vec::new(),
             notify_signature_handlers: Vec::new(),
+            notify_additional_signature_handlers: Vec::new(),
             notify_regs: vec![
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
@@ -2130,6 +2156,14 @@ EndProcedure
                 "ErrorHandler",
                 "ОбработатьОповещение",
             ]
+        );
+        assert_eq!(
+            summary
+                .notify_additional_signature_handlers
+                .iter()
+                .map(Name::as_str)
+                .collect::<Vec<_>>(),
+            ["NotProtectedBySource"]
         );
         assert_eq!(summary.notify_candidates.len(), 4, "{:#?}", summary.notify_candidates);
         assert_eq!(summary.notify_candidates[0].caller, CallerId::Method(MethodKey::first("Test")));
