@@ -4618,7 +4618,8 @@ impl<'db> InferenceContext<'db> {
             }
         }
 
-        if !user_shadows && !body_binding_shadows {
+        // A bare call `ЭтоГруппа()` is a method call, and the object has no such method.
+        if !user_shadows && !body_binding_shadows && !self.reading_bare_call_callee {
             if let Some(ty) = crate::this_object_attr::resolve_this_catalog_conditional_member(
                 self.db, &resolver, name,
             ) {

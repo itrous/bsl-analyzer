@@ -247,3 +247,22 @@ fn the_same_names_read_through_a_reference_are_still_reported() {
         );
     }
 }
+
+#[test]
+fn bare_read_resolves_but_bare_call_of_the_same_name_is_still_reported() {
+    // The control pair differs in the parentheses only, in the same flat catalog object module:
+    // the attribute is a value, never a method of the object.
+    let read = "Процедура Тест()
+    Значение = ЭтоГруппа;
+КонецПроцедуры
+";
+    let call = "Процедура Тест()
+    Значение = ЭтоГруппа();
+КонецПроцедуры
+";
+    assert_eq!(reported(OBJECT_MODULE_OF_PLAIN, read, "ЭтоГруппа"), Vec::<String>::new());
+    assert!(
+        !reported(OBJECT_MODULE_OF_PLAIN, call, "ЭтоГруппа").is_empty(),
+        "bare ЭтоГруппа() must stay reported"
+    );
+}
