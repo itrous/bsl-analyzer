@@ -2641,6 +2641,18 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
+    /// Whether some assignment of `key` reaches this read only through the handler of a
+    /// `Попытка`.
+    fn handler_receives_write(&self, use_expr: ExprId, key: &str) -> bool {
+        let Some(point) = self.body.enclosing_stmt(use_expr).and_then(|stmt| self.read_point(stmt))
+        else {
+            return false;
+        };
+        self.reaching_definitions_at(point, key)
+            .and_then(|defs| self.writes_reaching_through_a_handler(point, key, &defs))
+            .is_some_and(|writes| !writes.is_empty())
+    }
+
     /// Whether an implicit assignment actually reaches this read. The assignment
     /// may carry `Unknown` and therefore be absent from `var_types`, but still
     /// declares the local on every path represented by reaching definitions.
@@ -2650,7 +2662,10 @@ impl<'db> InferenceContext<'db> {
         }
         let key = name.as_str().fold_lower();
         if let Some(definitions) = self.reaching_assignment_types(use_expr, &key) {
-            return !definitions.is_empty();
+            // A handler reads what the protected statements wrote before the exception:
+            // reaching definitions hand it only the state before them, so a write that an
+            // exception interrupts part way is added here, as the type walk adds it.
+            return !definitions.is_empty() || self.handler_receives_write(use_expr, &key);
         }
 
         // Recovery/effective bodies may lack dataflow. Keep the sequential
