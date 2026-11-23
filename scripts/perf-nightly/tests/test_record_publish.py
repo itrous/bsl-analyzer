@@ -377,7 +377,7 @@ class WhenGhFails(RecordPublish):
 
 class IncomparableProfile(RecordPublish):
     def mismatch(self, date=DATE) -> dict:
-        self.machine.print["kernel"] = "7.0"
+        self.machine.print["mem_total"] = "63 GiB"
         return self.summary(date)
 
     def test_a_profile_that_does_not_compare_is_one_issue_of_its_own_and_no_claim_of_a_regression(self):
@@ -386,18 +386,18 @@ class IncomparableProfile(RecordPublish):
         entries = self.publish(saved)
         self.assertEqual(self.actions(entries), [("create", 1, PROFILE)])
         [created] = self.issues()
-        self.assertEqual(created["title"], "perf: рекорд несопоставим — record_profile_mismatch:kernel")
+        self.assertEqual(created["title"], "perf: рекорд несопоставим — record_profile_mismatch:mem_total")
         self.assertEqual(created["labels"], ["perf"])
         self.assertIn(f"{publish.KEY_PREFIX}{PROFILE}", self.lines(created["body"]))
         self.assertIn("Это несопоставимость замера, а не регрессия продукта.", created["body"])
         self.assertIn("Значения рекорда не повышать", created["body"])
-        self.assertIn("Отличия от профиля рекорда: kernel.", created["body"])
+        self.assertIn("Отличия от профиля рекорда: mem_total.", created["body"])
         self.assertNotIn("Δ =", created["body"])
         self.assertNotIn(RECORD_SHA, created["body"], "no range of commits is named for a profile")
         self.assertNotIn("/compare/", created["body"])
         self.assertNotIn(WORK, created["body"], "with another kernel no metric issue claims an excess")
 
-    def test_a_changed_kernel_under_the_very_sha_of_the_record_is_a_profile_and_not_an_empty_range(self):
+    def test_a_changed_memory_profile_under_the_very_sha_of_the_record_is_not_an_empty_range(self):
         self.set_record("graph_resolve_s", sha=CAND_SHA)
         before = self.baseline_bytes()
         entries = self.publish(self.mismatch())
@@ -405,7 +405,7 @@ class IncomparableProfile(RecordPublish):
         [created] = self.issues()
         self.assertEqual(created["labels"], ["perf"], "no claim of a regression")
         self.assertNotIn("Диапазон пуст", created["body"])
-        self.assertEqual(self.baseline_bytes(), before, "and the record is not raised to fit the new kernel")
+        self.assertEqual(self.baseline_bytes(), before, "and the record is not raised to fit the new memory profile")
 
     def test_the_same_profile_issue_gets_a_comment_the_next_night_and_not_a_second_issue(self):
         self.publish(self.mismatch())

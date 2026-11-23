@@ -52,6 +52,8 @@ mod workspace_lease;
 pub(crate) mod measured_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     thread_local! {
         /// Whether THIS thread is measuring. Per-thread rather than global for two reasons:
@@ -67,6 +69,55 @@ pub(crate) mod measured_alloc {
 
     fn armed() -> bool {
         ARMED.try_with(Cell::get).unwrap_or(false)
+    }
+
+    /// The one block shape the process-wide watch counts, and how many blocks of it came
+    /// by. `0` bytes is "nothing watched": no allocation has that size.
+    static WATCHED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static WATCHED_ALIGN: AtomicUsize = AtomicUsize::new(0);
+    static WATCHED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    /// One watch at a time: the shape is process-wide, so two tests watching beside each
+    /// other would count each other's blocks.
+    static WATCH_TURN: Mutex<()> = Mutex::new(());
+
+    fn count_watched(bytes: usize, align: usize) {
+        if bytes == WATCHED_BYTES.load(Ordering::Relaxed)
+            && align == WATCHED_ALIGN.load(Ordering::Relaxed)
+        {
+            WATCHED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts, on EVERY thread, the blocks that come by with exactly this size and
+    /// alignment - from an allocation or a reallocation to that size.
+    ///
+    /// For work that fans out over a pool: the per-thread counters above cannot see what
+    /// a worker allocates. The shape has to be one nothing else in the process allocates
+    /// by accident, which the caller buys with an input of an unusual length.
+    pub(crate) struct BlockWatch {
+        _turn: MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn watch_blocks(bytes: usize, align: usize) -> BlockWatch {
+        assert!(bytes > 0, "no allocation has zero bytes: that would watch nothing");
+        let turn = WATCH_TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        WATCHED_BLOCKS.store(0, Ordering::Relaxed);
+        WATCHED_ALIGN.store(align, Ordering::Relaxed);
+        WATCHED_BYTES.store(bytes, Ordering::Relaxed);
+        BlockWatch { _turn: turn }
+    }
+
+    impl BlockWatch {
+        /// Blocks of the watched shape that have come by since the watch began.
+        pub(crate) fn blocks(&self) -> usize {
+            WATCHED_BLOCKS.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for BlockWatch {
+        fn drop(&mut self) {
+            WATCHED_BYTES.store(0, Ordering::Relaxed);
+        }
     }
 
     /// What one thread's allocator calls added up to since `arm`: how many blocks were
@@ -117,6 +168,7 @@ pub(crate) mod measured_alloc {
     unsafe impl GlobalAlloc for Measuring {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             let pointer = unsafe { System.alloc(layout) };
+            count_watched(layout.size(), layout.align());
             if !pointer.is_null() && armed() {
                 note(layout.size() as isize);
             }
@@ -125,6 +177,7 @@ pub(crate) mod measured_alloc {
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             let pointer = unsafe { System.alloc_zeroed(layout) };
+            count_watched(layout.size(), layout.align());
             if !pointer.is_null() && armed() {
                 note(layout.size() as isize);
             }
@@ -140,6 +193,7 @@ pub(crate) mod measured_alloc {
 
         unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             let moved = unsafe { System.realloc(pointer, layout, new_size) };
+            count_watched(new_size, layout.align());
             if !moved.is_null() && armed() {
                 note(new_size as isize - layout.size() as isize);
             }

@@ -1,6 +1,6 @@
 """Scripted stand-in for `bsl-analyzer-app`: `analyze`, `lsp`, `mcp serve`.
 
-Behaviour is chosen by environment variables (the harness strips only `BSL_*`):
+Behaviour is chosen by environment variables (the harness strips only `BSL_*` and `EMBEDDING_*`):
   FAKE_LOG     directory for logs (argv, cwd, environment, launch counter)
   FAKE_MODE    comma-separated switches, see below; `<label>=<switch>` only for that binary
 Every launch appends `{"argv", "cwd", "env", "cache"}` to FAKE_LOG/launches.jsonl.

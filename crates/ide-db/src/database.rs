@@ -594,15 +594,33 @@ impl RootDatabaseImpl {
     /// another; asked first from inside a batch, it holds the asking worker - and every
     /// form module that asks next - for the whole scan.
     pub fn prime_foreign_handler_bindings(&self, source_root_id: base_db::SourceRootId) {
+        self.prime_foreign_handler_bindings_while(source_root_id, || true);
+    }
+
+    /// [`Self::prime_foreign_handler_bindings`] for a caller that may be told to stop:
+    /// `keep_going` is asked before each file and before the fold itself, and after a
+    /// "no" the rest is left to whoever asks for the fold next. The per-file work runs
+    /// on handles of its own, which a cancellation of this handle does not reach - the
+    /// question is what stops them.
+    pub fn prime_foreign_handler_bindings_while(
+        &self,
+        source_root_id: base_db::SourceRootId,
+        keep_going: impl Fn() -> bool + Sync,
+    ) {
         use rayon::prelude::*;
 
         let source_root_input = self.source_root_input(source_root_id);
-        hir::foreign_handler_binding_scan_files(self, source_root_input)
-            .par_iter()
-            .for_each_with(self.clone(), |db, &file_id| {
-                hir::prime_file_foreign_handler_bindings(&*db, file_id)
-            });
-        let _ = hir::DefDatabase::workspace_foreign_handler_bindings(self, source_root_id);
+        hir::foreign_handler_binding_scan_files(self, source_root_input).par_iter().for_each_with(
+            self.clone(),
+            |db, &file_id| {
+                if keep_going() {
+                    hir::prime_file_foreign_handler_bindings(&*db, file_id)
+                }
+            },
+        );
+        if keep_going() {
+            let _ = hir::DefDatabase::workspace_foreign_handler_bindings(self, source_root_id);
+        }
     }
 
     fn workspace_configs(&self) -> metadata::WorkspaceConfigsInput {

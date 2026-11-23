@@ -130,7 +130,7 @@ class RecordNight(RecordCase):
         self.assertEqual(gate.record_estimates(self.data, "2026-10-22", print_), {"A": 230.0, "B": 185.0})
         self.assertEqual(gate.record_estimates(self.data, "2026-10-21", print_), gate.RECORD_RUN_ESTIMATE_S,
                          "the night itself and the later ones are no history")
-        self.assertEqual(gate.record_estimates(self.data, "2026-10-22", {**print_, "kernel": "7.0"}),
+        self.assertEqual(gate.record_estimates(self.data, "2026-10-22", {**print_, "mem_total": "63 GiB"}),
                          gate.RECORD_RUN_ESTIMATE_S, "another profile has no history either")
         # A window of 990 s, the runs of this night taking 210 and 180 s: by the longest runs of the night before
         # (230 and 185 s) the first B ends by 810 s and the second would end at 995 s; by the shortest (210 and
@@ -144,7 +144,7 @@ class RecordNight(RecordCase):
                          "the defaults of the first night on this profile: B would end after the window")
 
     def other_profile(self):
-        machine = ScriptedMachine(self.script, self.clock, print_={**self.machine.print, "kernel": "7.0"})
+        machine = ScriptedMachine(self.script, self.clock, print_={**self.machine.print, "mem_total": "63 GiB"})
         return machine
 
     def test_a_series_is_not_started_when_its_estimate_does_not_fit_and_a_wait_for_quiet_is_not_unbounded(self):
@@ -202,10 +202,10 @@ class RecordNight(RecordCase):
         before = self.baseline_bytes()
         result = self.measure(machine=self.other_profile())
         self.assertEqual((result["verdict"], result["record_verdict"]), ("incomplete", "incomplete"))
-        self.assertIn("record_profile_mismatch:kernel", result["reasons"])
+        self.assertIn("record_profile_mismatch:mem_total", result["reasons"])
         saved = self.saved(result)
         self.assertTrue(all(r["delta"] is None for r in saved["record"]["rows"]), "no number is set against the record")
-        self.assertEqual(saved["record"]["profile"]["kernel"], "7.0")
+        self.assertEqual(saved["record"]["profile"]["mem_total"], "63 GiB")
         self.assertEqual(self.baseline_bytes(), before)
 
     def test_the_baseline_is_named_without_a_path_of_this_machine(self):
@@ -318,11 +318,11 @@ class NightRecord(NightCase):
     def test_a_night_whose_record_did_not_compare_is_not_ok_whatever_the_warm_set_says(self):
         self.fresh_noise()
         self.assertEqual(self.run_night(date="2026-10-22")["record"]["record_verdict"], "pass")
-        edit_json(self.baseline_path, lambda doc: doc["profile"].update(kernel="other"))
+        edit_json(self.baseline_path, lambda doc: doc["profile"].update(mem_total="63 GiB"))
         missing = self.run_night(date="2026-10-23")
         self.assertEqual(missing["record"]["record_verdict"], "incomplete")
         self.assertNotEqual(missing["verdict"], "ok")
-        self.assertIn("record incomplete: record_profile_mismatch:kernel", missing["reasons"])
+        self.assertIn("record incomplete: record_profile_mismatch:mem_total", missing["reasons"])
 
     def test_the_record_shares_the_window_with_the_warm_set_and_is_incomplete_when_it_runs_out(self):
         self.fresh_noise()

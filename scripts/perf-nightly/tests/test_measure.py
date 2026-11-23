@@ -11,7 +11,7 @@ import subprocess
 import sys
 import unittest
 
-from helpers import FOREIGN_PREFIX, FakeClock, Workspace, run_git, set_mode
+from helpers import FOREIGN_PREFIX, FakeClock, Workspace, mock_env, run_git, set_mode
 
 import common
 import corpus
@@ -306,6 +306,32 @@ class Refusals(Workspace):
                 common.Data(self.data_dir)
         self.assertEqual(code, 2)
         self.assertFalse(os.path.exists(inside))
+
+
+class EmbeddingSettingsOfTheCaller(Workspace):
+    """A process the harness starts - the measured run, the help check and the discovery of
+    points - is started without the embedding settings the caller has in its environment:
+    they switch on the background embedding pass, which a measurement must not include."""
+
+    def test_no_process_the_harness_starts_sees_them(self):
+        mock_env(self, {"EMBEDDING_URL": "http://127.0.0.1:9", "EMBEDDING_MODEL": "m",
+                        "EMBEDDING_DIM": "8", "EMBEDDING_API_KEY": "k"})
+        self.helpcheck()
+        # The fake binary knows no `bench`: it logs its launch and exits non-zero, which is
+        # all the discovery has to do for its environment to be on record.
+        with self.assertRaises(HarnessError) as refused:
+            perf_nightly.cmd_points(self.args(), FakeClock())
+        self.assertEqual(refused.exception.reason, "discover_failed")
+        self.measure(scenario="analyze", temp="warm")
+
+        launches = self.launches()
+        self.assertTrue([l for l in launches if l["env"].get("BSL_LOG") == "info"], "the control: a help check ran")
+        self.assertTrue([l for l in launches if l["argv"][:2] == ["bench", "discover"]],
+                        "the control: a discovery ran")
+        self.assertTrue([l for l in launches if l["argv"][:1] == ["analyze"] and "BSL_LOG" not in l["env"]],
+                        "the control: a measured run ran")
+        for launch in launches:
+            self.assertEqual([k for k in launch["env"] if k.startswith("EMBEDDING_")], [], launch["argv"])
 
 
 class TrackedSetIsEmptyAfterEachRun(Workspace):
