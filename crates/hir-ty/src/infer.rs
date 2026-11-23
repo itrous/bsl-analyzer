@@ -292,6 +292,7 @@ pub enum BareNameGap {
     MissingPlatformCatalog,
     UnverifiedPlatformCatalog,
     UnsupportedTargetPlatform,
+    MissingImplicitReceiverSurface,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5302,7 +5303,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     /// What a miss of every owner amounts to: `Absent` only when the user global
-    /// surface, the configuration root and the platform catalog are all complete.
+    /// surface, configuration root, platform catalog and implicit-receiver surface are complete.
     fn bare_name_miss(&mut self) -> BareNameResolution {
         // Building the cached maps also records whether every user-global body
         // (global common + application modules) was readable and enumerable.
@@ -5315,6 +5316,23 @@ impl<'db> InferenceContext<'db> {
             || self.db.configurations(self.context_file_id).is_empty()
         {
             gaps.push(BareNameGap::MissingConfigurationRoot);
+        }
+        let receiver_surface = self.implicit_self_surface();
+        let data = bsl_platform::PlatformData::instance();
+        let receiver_surface_missing = match receiver_surface {
+            ImplicitSelfSurface::PlatformTypes(type_names) => {
+                !type_names.iter().any(|name| data.get_type(name).is_some())
+            }
+            // Metadata receivers still inherit methods from platform types, while
+            // prefix receivers query the platform manager catalog directly.
+            // Neither surface can prove absence when the platform facts are empty.
+            ImplicitSelfSurface::Receiver(_) | ImplicitSelfSurface::PlatformPrefix(_) => {
+                data.all_types().is_empty()
+            }
+            ImplicitSelfSurface::None | ImplicitSelfSurface::Unreadable => false,
+        };
+        if receiver_surface_missing {
+            gaps.push(BareNameGap::MissingImplicitReceiverSurface);
         }
 
         let target = self.db.target_platform_version();
