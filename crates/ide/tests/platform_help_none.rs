@@ -152,8 +152,14 @@ Register();
     );
 
     let analysis = Analysis::from_database(db);
-    let unused = analysis
-        .diagnostics(file_id, &DiagnosticsConfig::all_enabled())
+    let diagnostics = analysis.diagnostics(file_id, &DiagnosticsConfig::all_enabled());
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == ide::DiagnosticCode::MissingNotifyHandler),
+        "no registration means no MissingNotifyHandler finding: {diagnostics:?}"
+    );
+    let unused = diagnostics
         .into_iter()
         .filter(|diagnostic| diagnostic.code == ide::DiagnosticCode::UnusedParameters)
         .map(|diagnostic| diagnostic.message)
