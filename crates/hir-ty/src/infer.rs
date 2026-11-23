@@ -4619,6 +4619,15 @@ impl<'db> InferenceContext<'db> {
         }
 
         if !user_shadows && !body_binding_shadows {
+            if let Some(ty) = crate::this_object_attr::resolve_this_catalog_conditional_member(
+                self.db, &resolver, name,
+            ) {
+                trace!("resolved {} as a conditional standard attribute of the catalog", name);
+                return found(ty, BareNameOrigin::ObjectMember, all_env);
+            }
+        }
+
+        if !user_shadows && !body_binding_shadows {
             if let Some(ty) =
                 crate::this_object_attr::resolve_this_record_set_member(self.db, &resolver, name)
             {

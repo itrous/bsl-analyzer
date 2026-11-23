@@ -195,3 +195,56 @@ fn standard_attributes_that_always_resolve_stay_resolved() {
         );
     }
 }
+
+/// Every diagnostic message (any code) that mentions `name`, for `code` placed at `rel`.
+fn reported(rel: &str, code: &str, name: &str) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    configuration(root);
+    write(root, rel, code);
+
+    let file_id = FileId(0);
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(vec![(None, root.to_path_buf())], None);
+    let mut file_set = FileSet::default();
+    file_set.insert(file_id, VfsPath::new(root.join(rel).to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    db.set_file_text(file_id, code);
+
+    Analysis::from_database(db)
+        .diagnostics(file_id, &DiagnosticsConfig::all_enabled())
+        .into_iter()
+        .map(|d| format!("{:?}: {}", d.code, d.message))
+        .filter(|m| m.contains(name))
+        .collect()
+}
+
+#[test]
+fn flat_catalog_without_owners_sees_the_attributes_of_the_implicit_receiver() {
+    for name in ["ЭтоГруппа", "Родитель", "Владелец"] {
+        assert_eq!(
+            reported(OBJECT_MODULE_OF_PLAIN, &read_of(name), name),
+            Vec::<String>::new(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn the_same_names_read_through_a_reference_are_still_reported() {
+    // The control for the test above: the same flat catalog and names, but the read goes through
+    // the object's own reference, so the leniency of the implicit receiver does not apply.
+    for name in ["ЭтоГруппа", "Родитель", "Владелец"] {
+        let code = format!(
+            "Процедура Тест()
+    Значение = Ссылка.{name};
+КонецПроцедуры
+"
+        );
+        assert!(
+            !reported(OBJECT_MODULE_OF_PLAIN, &code, name).is_empty(),
+            "{name} through a reference must stay reported"
+        );
+    }
+}
