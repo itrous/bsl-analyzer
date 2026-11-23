@@ -1,7 +1,7 @@
 use base_db::FileIdInput;
+use bsl_platform::MemberSurface;
 use bsl_platform::deprecation::{self, ElementKind, Lookup};
 use bsl_platform::security::Category as SecurityCategory;
-use bsl_platform::MemberSurface;
 use bsl_types::builders::Builders;
 use bsl_types::facet::{DateComponent, FormDataFacet, MdoRefFacet, ProjectionSource};
 use bsl_types::intern::TypeKernelDb;
@@ -5322,7 +5322,19 @@ impl<'db> InferenceContext<'db> {
         let receiver_surface_missing = match receiver_surface {
             ImplicitSelfSurface::PlatformTypes(type_names) => {
                 // A missing candidate may still own the name even if another type is known.
-                type_names.iter().any(|name| data.get_type(name).is_none())
+                // Present type records are not enough: the corpus must also attest that
+                // their member lists are complete before a missing bare member is absent.
+                type_names.iter().any(|name| {
+                    data.get_type(name).is_none()
+                        || !data.platform_type_member_surface_verified(
+                            name,
+                            MemberSurface::Methods,
+                        )
+                        || !data.platform_type_member_surface_verified(
+                            name,
+                            MemberSurface::Fields,
+                        )
+                })
             }
             // Metadata receivers still inherit methods from platform types, while
             // prefix receivers query the platform manager catalog directly.
@@ -5330,7 +5342,8 @@ impl<'db> InferenceContext<'db> {
             ImplicitSelfSurface::Receiver(_) | ImplicitSelfSurface::PlatformPrefix(_) => {
                 data.all_types().is_empty()
             }
-            ImplicitSelfSurface::None | ImplicitSelfSurface::Unreadable => false,
+            ImplicitSelfSurface::Unreadable => true,
+            ImplicitSelfSurface::None => false,
         };
         if receiver_surface_missing {
             gaps.push(BareNameGap::MissingImplicitReceiverSurface);
