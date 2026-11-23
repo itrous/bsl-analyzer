@@ -1074,10 +1074,10 @@ fn extract_from_body(
                     return None;
                 }
                 let range = source_map.expr_range(expr_id)?;
-                Some((key, range.start(), *value))
+                Some((key, range, *value))
             })
             .collect::<Vec<_>>();
-        array_additions.sort_unstable_by_key(|(_, start, _)| *start);
+        array_additions.sort_unstable_by_key(|(_, range, _)| range.start());
         for candidate in &dynamic_candidates {
             extract_dynamic_notify_handlers(
                 body,
@@ -1244,9 +1244,11 @@ fn extract_dynamic_notify_handlers(
     body: &Body,
     source_map: crate::body::SourceMapAt<'_>,
     candidate: &DynamicNotifyArrayCandidate,
-    array_additions: &[(NormName, TextSize, ExprIdx)],
+    array_additions: &[(NormName, TextRange, ExprIdx)],
     handlers: &mut Vec<Name>,
 ) {
+    // Only a top-level reassignment to a fresh array is an unconditional reset; a nested
+    // reset cannot be pinpointed this way, and the branch scan below accounts for it.
     let reset_start = body
         .body_stmts()
         .filter_map(|stmt_id| {
@@ -1261,30 +1263,31 @@ fn extract_dynamic_notify_handlers(
             (start < candidate.constructor_start).then_some(start)
         })
         .max();
-    let branch_after_reset = dynamic_array_has_branch(
+    let sequence_start = reset_start.unwrap_or(TextSize::from(0));
+    let branched_activity = dynamic_array_activity_in_branch(
         body,
         source_map,
         candidate,
-        reset_start.unwrap_or(TextSize::from(0)),
+        array_additions,
+        sequence_start,
     );
-    let reset_start = (!branch_after_reset).then_some(reset_start).flatten();
+    let uncertainty = dynamic_array_uncertain_writes(body, source_map, candidate, sequence_start);
 
-    let values = array_additions
+    let mut values = array_additions
         .iter()
-        .filter(|(name, start, _)| {
+        .filter(|(name, range, _)| {
             *name == candidate.array_name
-                && *start < candidate.constructor_start
-                && reset_start.is_none_or(|reset| *start > reset)
+                && range.start() > sequence_start
+                && range.start() < candidate.constructor_start
         })
         .map(|(_, _, value)| *value)
         .collect::<Vec<_>>();
-    if values.is_empty() {
-        return;
-    }
+    values.extend(uncertainty.possible_values);
 
-    if reset_start.is_none()
-        || dynamic_array_sequence_is_uncertain(body, source_map, candidate, reset_start)
-    {
+    // Without an unconditional reset the observed appends may be partial, so the exact
+    // slot sequence is never trusted; the same holds when an append or a reset may run
+    // conditionally, or an opaque write shifts the array contents.
+    if reset_start.is_none() || branched_activity || uncertainty.uncertain {
         handlers.extend(values.into_iter().filter_map(|value| {
             let name = extract_string_literal(body, value)?;
             is_identifier_like(&name).then(|| Name::new(&name))
@@ -1330,12 +1333,46 @@ fn is_array_constructor(body: &Body, expr: &Expr) -> bool {
     }
 }
 
-fn dynamic_array_has_branch(
+/// Whether a branch between `start` and the constructor conditionally executes an append
+/// to, or a reset of, the candidate array. A branch that never touches the array leaves
+/// the append sequence intact, so exact handler slots survive unrelated control flow;
+/// a conditional append or reset makes the slot positions unknowable.
+fn dynamic_array_activity_in_branch(
     body: &Body,
     source_map: crate::body::SourceMapAt<'_>,
     candidate: &DynamicNotifyArrayCandidate,
+    array_additions: &[(NormName, TextRange, ExprIdx)],
     start: TextSize,
 ) -> bool {
+    let mut sequence_sites: Vec<TextRange> = array_additions
+        .iter()
+        .filter(|(name, range, _)| {
+            *name == candidate.array_name
+                && range.start() >= start
+                && range.start() < candidate.constructor_start
+        })
+        .map(|(_, range, _)| *range)
+        .collect();
+    for (stmt_id, stmt) in body.stmts_iter() {
+        let Stmt::Assign { target, value } = stmt else { continue };
+        let Expr::Path(name) = body.expr_idx(*target) else { continue };
+        if NormName::intern(name.as_str()) != candidate.array_name
+            || !is_array_constructor(body, body.expr_idx(*value))
+        {
+            continue;
+        }
+        match source_map.stmt_range(stmt_id) {
+            Some(range)
+                if range.start() >= start && range.start() < candidate.constructor_start =>
+            {
+                sequence_sites.push(range);
+            }
+            _ => {}
+        }
+    }
+    if sequence_sites.is_empty() {
+        return false;
+    }
     body.stmts_iter().any(|(stmt_id, stmt)| {
         if !matches!(
             stmt,
@@ -1348,64 +1385,171 @@ fn dynamic_array_has_branch(
         ) {
             return false;
         }
-        source_map.stmt_range(stmt_id).is_some_and(|range| {
-            range.start() >= start && range.start() < candidate.constructor_start
-        })
+        let Some(branch_range) = source_map.stmt_range(stmt_id) else { return false };
+        branch_range.start() >= start
+            && branch_range.start() < candidate.constructor_start
+            && sequence_sites.iter().any(|site| branch_range.contains_range(*site))
     })
 }
 
-fn dynamic_array_sequence_is_uncertain(
+/// Writes to the candidate array that the append sequence cannot account for: an indexed
+/// write, a write through a local alias of the array, or a same-named member reached off
+/// `ЭтотОбъект`. Any such write makes the exact slot sequence untrustworthy, and its
+/// string value is a possible handler name.
+#[derive(Debug, Default)]
+struct DynamicArrayUncertainty {
+    uncertain: bool,
+    possible_values: Vec<ExprIdx>,
+}
+
+/// Whether `expr` may designate the candidate array itself: the variable, a local alias
+/// bound to it, or a same-named member of `ЭтотОбъект`. A same-named member of any other
+/// receiver is an unrelated object.
+fn expr_may_designate_candidate_array(
+    body: &Body,
+    expr: &Expr,
+    candidate: &DynamicNotifyArrayCandidate,
+    aliases: &FxHashSet<NormName>,
+) -> bool {
+    match expr {
+        Expr::Path(name) => {
+            let key = NormName::intern(name.as_str());
+            key == candidate.array_name || aliases.contains(&key)
+        }
+        Expr::Field { base, field } => {
+            NormName::intern(field.as_str()) == candidate.array_name
+                && matches!(body.expr_idx(*base), Expr::Path(name)
+                    if is_this_object(&name.as_str().fold_lower()))
+        }
+        _ => false,
+    }
+}
+
+fn dynamic_array_uncertain_writes(
     body: &Body,
     source_map: crate::body::SourceMapAt<'_>,
     candidate: &DynamicNotifyArrayCandidate,
-    reset_start: Option<TextSize>,
-) -> bool {
-    let start = reset_start.unwrap_or(TextSize::from(0));
-    if dynamic_array_has_branch(body, source_map, candidate, start) {
-        return true;
-    }
+    start: TextSize,
+) -> DynamicArrayUncertainty {
+    let mut result = DynamicArrayUncertainty::default();
 
-    let has_reassignment = body.stmts_iter().any(|(stmt_id, stmt)| {
-        let Stmt::Assign { target, value } = stmt else { return false };
-        let Expr::Path(name) = body.expr_idx(*target) else { return false };
-        if NormName::intern(name.as_str()) != candidate.array_name {
-            return false;
-        }
-        let Some(range) = source_map.stmt_range(stmt_id) else { return true };
-        range.start() >= start
-            && range.start() < candidate.constructor_start
-            && (Some(range.start()) != reset_start
-                || !is_array_constructor(body, body.expr_idx(*value)))
-    });
-    if has_reassignment {
-        return true;
-    }
-
-    // A call through the array variable other than a recognized append can change its
-    // contents or expose it to code whose effects are not represented in this syntax pass.
-    body.exprs_iter().any(|(expr_id, expr)| {
-        let Some(range) = source_map.expr_range(expr_id) else { return false };
-        if range.start() < start || range.start() >= candidate.constructor_start {
-            return false;
-        }
-        match expr {
-            Expr::Call { callee, args } => {
-                if let Expr::Field { base, field } = body.expr_idx(*callee) {
-                    if let Expr::Path(name) = body.expr_idx(*base) {
-                        if NormName::intern(name.as_str()) == candidate.array_name {
-                            let method = field.as_str().fold_lower();
-                            return method != "добавить" && method != "add";
-                        }
-                    }
-                }
-                args.iter().any(|&arg| {
-                    matches!(body.expr_idx(arg), Expr::Path(name)
-                        if NormName::intern(name.as_str()) == candidate.array_name)
-                })
+    // Names bound to the candidate array (`Копия = Параметры`) inside the window: arrays
+    // are reference objects, so writes through an alias reach the same contents. The
+    // binding chain is followed to a fixed point (`Копия = Псевдоним`, `Псевдоним =
+    // Параметры`), and sites are matched against the full alias set, keeping the scan
+    // independent of the order the lowering assigns statements.
+    let bindings: Vec<(NormName, NormName)> = body
+        .stmts_iter()
+        .filter_map(|(stmt_id, stmt)| {
+            let Stmt::Assign { target, value } = stmt else { return None };
+            let Expr::Path(target_name) = body.expr_idx(*target) else { return None };
+            let Expr::Path(value_name) = body.expr_idx(*value) else { return None };
+            let range = source_map.stmt_range(stmt_id)?;
+            if range.start() < start || range.start() >= candidate.constructor_start {
+                return None;
             }
-            _ => false,
+            Some((NormName::intern(target_name.as_str()), NormName::intern(value_name.as_str())))
+        })
+        .collect();
+    let mut aliases: FxHashSet<NormName> = FxHashSet::default();
+    loop {
+        let mut grew = false;
+        for &(target, value) in &bindings {
+            if target == candidate.array_name {
+                continue;
+            }
+            let bound_to_candidate = value == candidate.array_name || aliases.contains(&value);
+            if bound_to_candidate && aliases.insert(target) {
+                grew = true;
+            }
         }
-    })
+        if !grew {
+            break;
+        }
+    }
+
+    for (stmt_id, stmt) in body.stmts_iter() {
+        let Stmt::Assign { target, value } = stmt else { continue };
+        // An indexed write (`Параметры[0] = …`) targets its base receiver.
+        let target_receiver = match body.expr_idx(*target) {
+            Expr::Index { base, .. } => body.expr_idx(*base),
+            other => other,
+        };
+        let Some(range) = source_map.stmt_range(stmt_id) else {
+            // An assign to the candidate whose position cannot be resolved is opaque.
+            if expr_may_designate_candidate_array(body, target_receiver, candidate, &aliases) {
+                result.uncertain = true;
+            }
+            continue;
+        };
+        if range.start() < start || range.start() >= candidate.constructor_start {
+            continue;
+        }
+        match body.expr_idx(*target) {
+            Expr::Path(name) => {
+                let key = NormName::intern(name.as_str());
+                // A reassignment to something other than a fresh array is opaque; a
+                // fresh array is the reset the caller already accounts for.
+                if (key == candidate.array_name || aliases.contains(&key))
+                    && !is_array_constructor(body, body.expr_idx(*value))
+                {
+                    result.uncertain = true;
+                }
+            }
+            _ if expr_may_designate_candidate_array(body, target_receiver, candidate, &aliases) => {
+                // An indexed or same-named qualified write replaces a slot the pass
+                // cannot resolve, and its value is a possible handler name.
+                result.uncertain = true;
+                result.possible_values.push(*value);
+            }
+            _ => {}
+        }
+    }
+
+    for (expr_id, expr) in body.exprs_iter() {
+        let Expr::Call { callee, args } = expr else { continue };
+        let in_window = source_map.expr_range(expr_id).is_some_and(|range| {
+            range.start() >= start && range.start() < candidate.constructor_start
+        });
+        if !in_window {
+            continue;
+        }
+        // Handing the array to a call exposes it to effects this syntax pass cannot see.
+        if args.iter().any(|&arg| {
+            expr_may_designate_candidate_array(body, body.expr_idx(arg), candidate, &aliases)
+        }) {
+            result.uncertain = true;
+        }
+        let Expr::Field { base, field } = body.expr_idx(*callee) else { continue };
+        let method = field.as_str().fold_lower();
+        let is_append = method == "добавить" || method == "add";
+        match body.expr_idx(*base) {
+            Expr::Path(name) if NormName::intern(name.as_str()) == candidate.array_name => {
+                // A call through the array variable other than a recognized append can
+                // change its contents in a way this pass cannot place in a slot, and
+                // any string it passes may end up in the array; appends are already
+                // part of the sequence.
+                if !is_append {
+                    result.uncertain = true;
+                    result.possible_values.extend(args.iter().copied());
+                }
+            }
+            receiver
+                if matches!(receiver, Expr::Path(name)
+                    if aliases.contains(&NormName::intern(name.as_str())))
+                    || expr_may_designate_candidate_array(body, receiver, candidate, &aliases) =>
+            {
+                // A call through an alias or a same-named member of `ЭтотОбъект` may
+                // reach the same array: any string it passes is a possible handler
+                // name, and the call itself leaves the append sequence untrustworthy.
+                result.uncertain = true;
+                result.possible_values.extend(args.iter().copied());
+            }
+            _ => {}
+        }
+    }
+
+    result
 }
 
 fn is_notify_constructor_candidate(body: &Body, typed: bool, args: &[ExprIdx]) -> bool {
