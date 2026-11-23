@@ -561,7 +561,6 @@ fn identical_dynamic_array_slots_follow_the_same_dedup_rule() {
                     "receiver {second_receiver}: {:#?}",
                     summary.notify_regs
                 );
-                eprintln!("DEBUG targets: {:#?}", summary.notify_regs); // TEMP
                 missing_notify_handler::check(ctx)
             },
         );
