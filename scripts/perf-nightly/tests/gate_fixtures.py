@@ -84,6 +84,26 @@ class Script:
         value = self.values.get(name, self.DEFAULTS.get(name))
         return value(run, *args) if callable(value) else value
 
+    def call_wall(self, run: Run, call: str | None, override, arguments: dict):
+        """Virtual seconds a call occupies when a test scripts late load. Status
+        polls stay on the readiness clock; other calls take their metric time."""
+        if arguments.get("action") == "status":
+            return None
+        if "window_foreign" not in self.values and "call_wall" not in self.values:
+            return None
+        spec = self.values.get("call_wall")
+        if callable(spec):
+            found = spec(run, call)
+            if found is not None:
+                return found
+        elif isinstance(spec, dict) and call in spec:
+            return spec[call]
+        if override is not None:
+            return override
+        if call in self.ELAPSED:
+            return self.ELAPSED[call]
+        return 1.0
+
     def call_name(self, mcp_run, tool: str, arguments: dict) -> str | None:
         seen = mcp_run.__dict__.setdefault("_seen", collections.Counter())
         if tool == "graph" and arguments.get("action") == "resolve" and "top" not in arguments:
@@ -116,9 +136,13 @@ class Script:
 
         def cpu_s(sampler, exclude=None):
             # Only the readiness snapshot passes `exclude`: it is what the machine reads next.
+            # Before that the run has no scripted CPU, so a start probe's own delta is the
+            # whole readiness CPU and not zero against a constant.
             if exclude is not None:
                 script.stage = "ready"
-            return script.get("cpu", parse_run(sampler.run_id))
+            if script.stage in ("ready", "after"):
+                return script.get("cpu", parse_run(sampler.run_id))
+            return 0.0
 
         def stop(sampler):
             sampled = original["stop"](sampler)
@@ -134,9 +158,13 @@ class Script:
         def tool(mcp_run, name, arguments, timeout=scenarios.CALL_TIMEOUT_S):
             elapsed, result, error = original_tool(mcp_run, name, arguments, timeout)
             call = script.call_name(mcp_run, name, arguments)
-            override = script.get("elapsed", parse_run(mcp_run.ctx.run_id), call) if call else None
+            run = parse_run(mcp_run.ctx.run_id)
+            override = script.get("elapsed", run, call) if call else None
             if override is None and call:
                 override = script.ELAPSED[call] if call in script.ELAPSED else None
+            wall = script.call_wall(run, call, override, arguments)
+            if wall:
+                script.clock.advance(wall)
             return (elapsed if override is None else override), result, error
 
         for target, attribute, replacement in ((procs.Sampler, "__init__", init), (procs.Sampler, "cpu_s", cpu_s),
@@ -166,11 +194,34 @@ class ScriptedMachine:
 
     def busy_s(self) -> float:
         script = self.script
+        now = self.clock.now()
         if script.stage == "ready":
             script.stage = "after"
-            wall = self.clock.now() - script.started_at
+            wall = now - script.started_at
             self.total += script.get("cpu", script.current) + script.get("foreign", script.current) * wall
+            self._late_from = now
+            return self.total
+        if script.stage == "after":
+            start = getattr(self, "_late_from", None)
+            self._late_from = now
+            if start is not None and now > start:
+                self.total += self._window_rate() * (now - start)
         return self.total
+
+    def _window_rate(self) -> float:
+        spec = self.script.values.get("window_foreign")
+        if spec is None:
+            return 0.0
+        phase = getattr(self, "phase", None)
+        run = self.script.current
+        if callable(spec):
+            try:
+                return float(spec(run, phase))
+            except TypeError:
+                return float(spec(run))
+        if isinstance(spec, dict):
+            return float(spec.get(phase, 0.0))
+        return float(spec)
 
 
 class GateCase(unittest.TestCase):
