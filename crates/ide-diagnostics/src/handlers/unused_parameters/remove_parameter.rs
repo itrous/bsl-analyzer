@@ -325,11 +325,12 @@ fn notify_description_with_computed_name(new_expr: &SyntaxNode) -> bool {
     };
     let slots = list_slots(&args);
     let base = match syntax::ast_utils::new_expr_type_name_token(new_expr) {
-        Some(type_name) if is_notify_description(type_name.text()) => 0,
+        Some(type_name) if bsl_platform::is_callback_description_type_name(type_name.text()) => 0,
         Some(_) => return false,
         None => match slots.as_ref().and_then(|slots| slots.first()) {
             Some(first)
-                if string_literal(first).is_some_and(|name| is_notify_description(&name)) =>
+                if string_literal(first)
+                    .is_some_and(|name| bsl_platform::is_callback_description_type_name(&name)) =>
             {
                 1
             }
@@ -339,14 +340,11 @@ fn notify_description_with_computed_name(new_expr: &SyntaxNode) -> bool {
     let Some(slots) = slots else {
         return true;
     };
-    [base, base + 3]
+    let callback_slots = bsl_platform::bundled_callback_description_slots();
+    [callback_slots.handler, callback_slots.error_handler]
         .into_iter()
-        .filter_map(|index| slots.get(index))
+        .filter_map(|index| slots.get(base + index))
         .any(|slot| !slot.items.is_empty() && string_literal(slot).is_none())
-}
-
-fn is_notify_description(name: &str) -> bool {
-    matches!(name.fold_lower().as_str(), "описаниеоповещения" | "notifydescription")
 }
 
 /// The text of a position holding exactly one single-line string literal, unquoted.

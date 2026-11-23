@@ -26,7 +26,8 @@ pub use standard_mdo_attributes::{
 
 pub use callback_description::{
     bundled_callback_description_slots, callback_description_slots_for_parameters,
-    is_callback_description_compatibility_type_name, CallbackDescriptionSlots,
+    is_callback_description_compatibility_type_name, is_callback_description_type_name,
+    CallbackDescriptionSlots,
 };
 pub use db::{
     docs_gap_synthesized_member_types, find_prefixed_method, find_prefixed_methods,

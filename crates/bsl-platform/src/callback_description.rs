@@ -64,6 +64,12 @@ pub fn is_callback_description_compatibility_type_name(name: &str) -> bool {
         })
 }
 
+/// Whether `name` is a bundled callback-description type spelling, including the legacy alias.
+pub fn is_callback_description_type_name(name: &str) -> bool {
+    is_callback_description_compatibility_type_name(name)
+        || facts().type_names[1].fold_lower() == name.fold_lower()
+}
+
 /// The callback slots attested by the bundled constructor facts. Used by syntax-only consumers
 /// which must retain compatibility when the configured platform-help source is empty.
 pub fn bundled_callback_description_slots() -> CallbackDescriptionSlots {
@@ -130,6 +136,12 @@ mod tests {
         assert!(is_callback_description_compatibility_type_name("ОписаниеОповещения"));
         assert!(!is_callback_description_compatibility_type_name("CallbackDescription"));
         assert!(is_callback_description_compatibility_type_name("NotifyDescription"));
+        for name in ["ОписаниеОповещения", "NotifyDescription", "CallbackDescription"]
+        {
+            assert!(is_callback_description_type_name(name));
+            assert!(is_callback_description_type_name(&name.to_uppercase()));
+        }
+        assert!(!is_callback_description_type_name("Structure"));
     }
 
     #[test]
