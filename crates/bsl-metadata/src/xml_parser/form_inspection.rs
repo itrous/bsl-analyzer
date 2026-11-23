@@ -379,8 +379,8 @@ pub fn parse_prepared_ordinary_form_inspection(
     fingerprint: Option<&BinaryFingerprint>,
     origin: &str,
 ) -> Result<FormInspection, String> {
-    let source: serde_json::Value =
-        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let source: serde_json::Value = serde_json::from_str(json.trim_start_matches('\u{feff}'))
+        .map_err(|error| error.to_string())?;
     if source.pointer("/source/sha256").is_none()
         && fingerprint.and_then(|value| value.legacy_sidecar_stale) == Some(true)
     {
@@ -957,6 +957,19 @@ mod tests {
             .iter()
             .any(|b| b.procedure == "ОбновитьОтображение" && b.origin == "base"));
         assert_eq!(base.origins, ["base", "extension"]);
+    }
+
+    #[test]
+    fn prepared_ordinary_inspection_accepts_a_leading_bom() {
+        let json = format!("\u{feff}{}", include_str!("../../fixtures/inspection/ordinary.json"));
+        let form = parse_prepared_ordinary_form_inspection(
+            &json,
+            "Dialog",
+            Some(&BinaryFingerprint { sha256: "a".repeat(64), legacy_sidecar_stale: None }),
+            "ordinary",
+        )
+        .unwrap();
+        assert_eq!(form.form_type, "Ordinary");
     }
 
     #[test]
