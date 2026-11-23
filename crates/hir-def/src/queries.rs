@@ -100,14 +100,8 @@ mod heap_estimate {
         bytes += vec_bytes::<NotifyReg>(s.notify_regs.len());
         for r in &s.notify_regs {
             bytes += name_bytes(&r.callback_name);
-            match &r.target {
-                NotifyTarget::Module(name) | NotifyTarget::BareName { name, .. } => {
-                    bytes += name_bytes(name);
-                }
-                NotifyTarget::ThisObject
-                | NotifyTarget::Unresolved { .. }
-                | NotifyTarget::NotCompiled { .. }
-                | NotifyTarget::Unsupported => {}
+            if let NotifyTarget::Module(name) = &r.target {
+                bytes += name_bytes(name);
             }
         }
         bytes += vec_bytes::<IdleReg>(s.idle_handler_regs.len());
@@ -629,9 +623,9 @@ pub(crate) enum QualifiedLookup {
 /// is injected: `find_local` resolves a handler in the current module, `find_qualified`
 /// resolves a handler in a named common module. `global_module_names` lists the
 /// configuration's global common modules (shared by both callers), used to resolve a
-/// global-context idle handler that names no module. A handler that does not resolve
-/// yields no edge — `Unresolved` targets are dropped in projection anyway, and inventing
-/// edges for unknown receivers is worse than omitting them.
+/// global-context idle handler that names no module. An absent handler yields no edge;
+/// a visibility-blocked handler is retained as an unresolved edge. Inventing edges for
+/// unknown receivers is worse than omitting them.
 pub(crate) fn resolve_callback_edges(
     summary: &crate::call_graph::ModuleCallSummary,
     find_local: impl Fn(&crate::name::Name) -> Option<crate::MethodId>,
@@ -665,11 +659,7 @@ pub(crate) fn resolve_callback_edges(
                     QualifiedLookup::Absent => None,
                 }
             }
-            // A syntactic candidate must be normalized before a semantic edge can be emitted.
-            NotifyTarget::BareName { .. }
-            | NotifyTarget::Unresolved { .. }
-            | NotifyTarget::NotCompiled { .. }
-            | NotifyTarget::Unsupported => None,
+            NotifyTarget::NotCompiled { .. } | NotifyTarget::Unsupported => None,
         };
         if let Some((target, provenance)) = resolved {
             out.push(ResolvedCallEdge {

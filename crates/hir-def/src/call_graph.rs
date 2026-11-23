@@ -130,10 +130,7 @@ impl ModuleCallSummary {
                 matches!(reg.caller, CallerId::Method(_))
                     && !matches!(
                         reg.target,
-                        NotifyTarget::BareName { .. }
-                            | NotifyTarget::Unresolved { .. }
-                            | NotifyTarget::Unsupported
-                            | NotifyTarget::NotCompiled { .. }
+                        NotifyTarget::Unsupported | NotifyTarget::NotCompiled { .. }
                     )
             })
             .filter(|reg| {
@@ -410,16 +407,11 @@ impl NotifyReceiverSyntax {
     }
 }
 
-/// Where a `Новый ОписаниеОповещения` callback's handler lives. Bare names stay
-/// unresolved in the syntax query and are normalized by `hir-ty` using the same
-/// inference and name-resolution rules as other semantic consumers.
+/// Where a `Новый ОписаниеОповещения` callback's handler lives. `hir-ty` resolves
+/// bare receivers using the same inference and name-resolution rules as other semantic
+/// consumers; unresolved or unsupported receivers are represented by `Unsupported`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NotifyTarget {
-    /// A syntactic bare-name candidate, not a resolved module. The semantic summary
-    /// replaces it before exposing registrations through `DefDatabase`.
-    BareName { name: Name, receiver: ExprId, constructor: ExprId, callback_expr: ExprId },
-    /// The receiver is not a bare name, so inference cannot resolve its owner.
-    Unresolved { constructor: ExprId, callback_expr: ExprId },
     /// The registration lies only in an unavailable or unreachable compilation branch.
     NotCompiled { callback_expr: ExprId, receiver_syntax: NotifyReceiverSyntax },
     /// The receiver resolves to the current object/form module.

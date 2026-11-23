@@ -62,10 +62,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                     (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
                 })
             }
-            NotifyTarget::Unsupported
-            | NotifyTarget::BareName { .. }
-            | NotifyTarget::Unresolved { .. }
-            | NotifyTarget::NotCompiled { .. } => None,
+            NotifyTarget::Unsupported | NotifyTarget::NotCompiled { .. } => None,
         };
         let Some((verdict, detail)) = verdict else { continue };
         diagnostics.push(Diagnostic {
