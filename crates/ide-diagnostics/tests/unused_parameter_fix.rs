@@ -80,6 +80,36 @@ fn fixes(path: &str, source: &str) -> String {
 }
 
 #[test]
+fn greek_sigma_method_name_call_gets_parameter_quick_fix() {
+    let source = "Процедура ΟΣ(Лишний)\n    Сообщить(\"тело\");\nКонецПроцедуры\n\n\
+                  Процедура Обработать()\n    οσ(1);\nКонецПроцедуры\n";
+    assert_eq!(
+        fixes(COMMON_MODULE, source),
+        "UnusedParameters @ 1:14 Удалить неиспользуемый параметр \"Лишний\" и его аргумент в вызовах [fix_all=false]\n\
+         Процедура ΟΣ()\n    Сообщить(\"тело\");\nКонецПроцедуры\n\n\
+                  Процедура Обработать()\n    οσ();\nКонецПроцедуры\n"
+    );
+}
+
+#[test]
+fn greek_sigma_parameter_gets_removed_by_quick_fix() {
+    let source = "Процедура Метод(ΟΣ)\n    Сообщить(\"тело\");\nКонецПроцедуры\n\n\
+                  Процедура Обработать()\n    Метод(1);\nКонецПроцедуры\n";
+    assert_eq!(
+        fixes(COMMON_MODULE, source),
+        "UnusedParameters @ 1:17 Удалить неиспользуемый параметр \"ΟΣ\" и его аргумент в вызовах [fix_all=false]\n\
+         Процедура Метод()\n    Сообщить(\"тело\");\nКонецПроцедуры\n\n\
+                  Процедура Обработать()\n    Метод();\nКонецПроцедуры\n"
+    );
+}
+
+#[test]
+fn greek_sigma_method_name_string_prevents_parameter_quick_fix() {
+    let source = "Процедура ΟΣ(Лишний)\n    Сообщить(\"οσ\");\nКонецПроцедуры\n";
+    assert_eq!(fixes(COMMON_MODULE, source), "UnusedParameters @ 1:14 no fix");
+}
+
+#[test]
 fn last_parameter_goes_with_the_argument_of_each_call() {
     let source = "Процедура Записать(Данные, Лишний)\n    Сообщить(Данные);\nКонецПроцедуры\n\n\
                   Процедура Обработать()\n    Записать(1, 2);\n    Записать(3, \"а\");\nКонецПроцедуры\n";

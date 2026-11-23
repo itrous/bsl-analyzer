@@ -99,6 +99,52 @@ fn command_module_this_object_is_a_callback_receiver_for_both_rules() {
 }
 
 #[test]
+fn command_callback_greek_sigma_protects_parameter_and_local_method() {
+    for export in ["", " Экспорт"] {
+        let source = format!(
+            r#"&НаКлиенте
+Процедура Зарегистрировать()
+    О = Новый CallbackDescription("ΟΣ", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура οσ(ФиксированныйПараметр){export}
+    Сообщить("обработчик");
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Обычный(ОбычныйПараметр)
+    Сообщить("обычный");
+КонецПроцедуры
+"#
+        );
+        let diagnostics = run_in_command_module(&source, |db, ctx| {
+            let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
+            assert_eq!(summary.notify_regs.len(), 1, "{:#?}", summary.notify_regs);
+            assert_eq!(summary.notify_regs[0].callback_name.as_str(), "ΟΣ");
+            assert!(matches!(summary.notify_regs[0].target, NotifyTarget::ThisObject));
+            let mut diagnostics = super::unused_parameters::check(ctx);
+            diagnostics.extend(super::unused_local_method::check(ctx));
+            diagnostics
+        });
+        assert!(
+            diagnostics.iter().all(|d| !d.message.contains("ФиксированныйПараметр")),
+            "{diagnostics:#?}"
+        );
+        assert!(diagnostics.iter().all(|d| !d.message.contains("οσ")), "{diagnostics:#?}");
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("ОбычныйПараметр")),
+            "{diagnostics:#?}"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("Обычный")
+                && d.code == crate::DiagnosticCode::UnusedLocalMethod),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
 fn invalid_constructor_arity_keeps_only_the_syntax_signature_protection() {
     const SOURCE: &str = r#"&НаКлиенте
 Процедура Зарегистрировать()
@@ -125,10 +171,7 @@ fn invalid_constructor_arity_keeps_only_the_syntax_signature_protection() {
         let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
         assert_eq!(summary.notify_regs.len(), 1, "{:#?}", summary.notify_regs);
         assert_eq!(summary.notify_regs[0].callback_name.as_str(), "Живой");
-        assert!(summary
-            .notify_signature_handlers
-            .iter()
-            .any(|name| name.as_str() == "Защищённый"));
+        assert!(summary.notify_signature_handlers.iter().any(|name| name.as_str() == "Защищённый"));
         super::unused_parameters::check(ctx)
     });
     let unused: Vec<_> = diagnostics

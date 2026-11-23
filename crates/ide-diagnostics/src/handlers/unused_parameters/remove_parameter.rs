@@ -27,6 +27,7 @@
 use crate::handlers::unused_local_method::{mentions_identifier, string_literal_texts};
 use crate::{Diagnostic, DiagnosticsContext, Fix, TextEdit};
 use ide_db::TextRange;
+use intern::NormName;
 use rustc_hash::FxHashMap;
 use stdx::case::CaseExt;
 use syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
@@ -38,12 +39,12 @@ use syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
 /// made the fixes cost the size of the module times the number of reports.
 struct ModuleFacts {
     root: SyntaxNode,
-    /// Every identifier token of this body by its lower-cased text, in file order.
-    identifiers: FxHashMap<String, Vec<SyntaxToken>>,
-    /// Lower-cased string literals of this body and of the module's other bodies.
+    /// Every identifier token of this body by its normalized name, in file order.
+    identifiers: FxHashMap<NormName, Vec<SyntaxToken>>,
+    /// String literals of this body and of the module's other bodies.
     string_literals: Vec<String>,
-    /// Lower-cased texts of the tokens other than comments of the module's other
-    /// bodies (an extension's), which this fix cannot edit.
+    /// Texts of the tokens other than comments of the module's other bodies (an
+    /// extension's), which this fix cannot edit.
     sibling_texts: Vec<String>,
     /// Some body of the module runs code known only at run time.
     runs_dynamic_code: bool,
@@ -86,7 +87,7 @@ pub(super) fn attach_fixes(ctx: &DiagnosticsContext, diagnostics: &mut [Diagnost
     for sibling in &sibling_roots {
         string_literals.extend(string_literal_texts(sibling));
     }
-    let sibling_texts = sibling_roots.iter().flat_map(lower_cased_texts).collect();
+    let sibling_texts = sibling_roots.iter().flat_map(token_texts).collect();
     let facts = ModuleFacts {
         identifiers: identifiers_of(&root),
         root,
@@ -129,8 +130,8 @@ fn remove_parameter_fix(facts: &ModuleFacts, name_range: TextRange) -> Result<Fi
         return Err(ComputedCallback);
     }
 
-    let param_name = name_token.text().fold_lower();
-    if mentioned_elsewhere(&method, &name_token, &param_name) {
+    let param_name = name_token.text();
+    if mentioned_elsewhere(&method, &name_token, param_name) {
         return Err(ParameterNamed);
     }
     // A caller omitting the argument evaluates the default value; it goes with the
@@ -139,9 +140,9 @@ fn remove_parameter_fix(facts: &ModuleFacts, name_range: TextRange) -> Result<Fi
         return Err(ArgumentWithEffect);
     }
 
-    let method_lower = method_name.text().fold_lower();
-    if facts.string_literals.iter().any(|literal| mentions_identifier(literal, &method_lower))
-        || facts.sibling_texts.iter().any(|text| mentions_identifier(text, &method_lower))
+    let method_name_text = method_name.text();
+    if facts.string_literals.iter().any(|literal| mentions_identifier(literal, method_name_text))
+        || facts.sibling_texts.iter().any(|text| mentions_identifier(text, method_name_text))
     {
         return Err(MethodNamedOutsideCalls);
     }
@@ -158,7 +159,9 @@ fn remove_parameter_fix(facts: &ModuleFacts, name_range: TextRange) -> Result<Fi
         .collect();
 
     let mut call_edits = 0usize;
-    for call in calls_of(facts, &method_name, &method_lower).ok_or(NotACall)? {
+    for call in
+        calls_of(facts, &method_name, &NormName::intern(method_name_text)).ok_or(NotACall)?
+    {
         let arg_list =
             call.children().find(|node| node.kind() == SyntaxKind::ARG_LIST).ok_or(NotACall)?;
         let args = list_slots(&arg_list).ok_or(UnsupportedList)?;
@@ -203,24 +206,24 @@ fn mentioned_elsewhere(method: &SyntaxNode, declaration: &SyntaxToken, name: &st
         .filter_map(|element| element.into_token())
         .filter(|token| token != declaration && token.kind() != SyntaxKind::COMMENT)
         .filter(|token| token.parent().is_none_or(|parent| parent.kind() != SyntaxKind::FIELD_EXPR))
-        .any(|token| mentions_identifier(&token.text().fold_lower(), name))
+        .any(|token| mentions_identifier(token.text(), name))
 }
 
-fn lower_cased_texts(root: &SyntaxNode) -> Vec<String> {
+fn token_texts(root: &SyntaxNode) -> Vec<String> {
     root.descendants_with_tokens()
         .filter_map(|element| element.into_token())
         .filter(|token| token.kind() != SyntaxKind::COMMENT)
-        .map(|token| token.text().fold_lower())
+        .map(|token| token.text().to_string())
         .collect()
 }
 
-fn identifiers_of(root: &SyntaxNode) -> FxHashMap<String, Vec<SyntaxToken>> {
+fn identifiers_of(root: &SyntaxNode) -> FxHashMap<NormName, Vec<SyntaxToken>> {
     #[cfg(test)]
     tests::IDENTIFIER_INDEXES.with(|count| count.set(count.get() + 1));
-    let mut identifiers: FxHashMap<String, Vec<SyntaxToken>> = FxHashMap::default();
+    let mut identifiers: FxHashMap<NormName, Vec<SyntaxToken>> = FxHashMap::default();
     for token in root.descendants_with_tokens().filter_map(|element| element.into_token()) {
         if token.kind() == SyntaxKind::IDENT {
-            identifiers.entry(token.text().fold_lower()).or_default().push(token);
+            identifiers.entry(NormName::intern(token.text())).or_default().push(token);
         }
     }
     identifiers
@@ -228,7 +231,11 @@ fn identifiers_of(root: &SyntaxNode) -> FxHashMap<String, Vec<SyntaxToken>> {
 
 /// The calls of the method in the module, or `None` when the name is read in a way that
 /// is not a call of it this fix can rewrite.
-fn calls_of(facts: &ModuleFacts, declaration: &SyntaxToken, name: &str) -> Option<Vec<SyntaxNode>> {
+fn calls_of(
+    facts: &ModuleFacts,
+    declaration: &SyntaxToken,
+    name: &NormName,
+) -> Option<Vec<SyntaxNode>> {
     let mut calls = Vec::new();
     for token in facts.identifiers.get(name).into_iter().flatten() {
         if token == declaration {

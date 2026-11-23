@@ -8,6 +8,7 @@ use bsl_metadata::traits::MdObject;
 use hir::call_graph::NotifyReceiverSyntax;
 use hir::{Expr, ModItem};
 use ide_db::TextRange;
+use intern::NormName;
 use rustc_hash::FxHashSet;
 use stdx::case::CaseExt;
 
@@ -53,7 +54,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let item_tree = ctx.item_tree();
 
     let metadata = ctx.module_metadata();
-    let mut fixed_signature_handlers: FxHashSet<String> = FxHashSet::default();
+    let mut fixed_signature_handlers: FxHashSet<NormName> = FxHashSet::default();
     if let Some(ref form) = metadata.form {
         // An ordinary form keeps its dialog in the binary `Ext/Form.bin`; without a usable
         // `Ext/Form/Form.json` its bindings are unknown, so ANY local method may be a handler
@@ -65,39 +66,39 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             return Vec::new();
         }
         for handler in form.event_handlers() {
-            fixed_signature_handlers.insert(handler.handler_name.fold_lower());
+            fixed_signature_handlers.insert(NormName::intern(&handler.handler_name));
         }
         for handler in form.command_handlers() {
-            fixed_signature_handlers.insert(handler.fold_lower());
+            fixed_signature_handlers.insert(NormName::intern(handler));
         }
     }
     if let Some(ref http_service) = metadata.http_service {
         for (_, method) in http_service.all_methods() {
             if !method.is_handler_empty() {
-                fixed_signature_handlers.insert(method.handler().fold_lower());
+                fixed_signature_handlers.insert(NormName::intern(method.handler()));
             }
         }
     }
     if let Some(ref web_service) = metadata.web_service {
         for operation in web_service.operations() {
             if !operation.is_handler_empty() {
-                fixed_signature_handlers.insert(operation.procedure_name().fold_lower());
+                fixed_signature_handlers.insert(NormName::intern(operation.procedure_name()));
             }
         }
     }
     if let Some(ref integration_service) = metadata.integration_service {
         for handler in integration_service.receive_handlers() {
-            fixed_signature_handlers.insert(handler.fold_lower());
+            fixed_signature_handlers.insert(NormName::intern(handler));
         }
     }
 
     for subscription in ctx.visible_event_subscriptions() {
         if let Some(handler) = subscription.parse_handler() {
             if metadata.common_module.as_ref().is_some_and(|module| {
-                handler.module_name.fold_lower() == module.name().fold_lower()
+                NormName::intern(&handler.module_name) == NormName::intern(module.name())
             }) && !handler.method_name.is_empty()
             {
-                fixed_signature_handlers.insert(handler.method_name.fold_lower());
+                fixed_signature_handlers.insert(NormName::intern(&handler.method_name));
             }
         }
     }
@@ -107,7 +108,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     // The source layer records syntactic callback protections independently of whether
     // platform metadata can normalize these constructors into registrations.
     fixed_signature_handlers.extend(
-        summary.notify_signature_handlers.iter().map(|handler| handler.as_str().fold_lower()),
+        summary.notify_signature_handlers.iter().map(|handler| NormName::intern(handler.as_str())),
     );
     // The semantic registrations also cover platform-described dynamic constructors whose
     // callback slots are not visible from the local syntax shape alone.
@@ -116,7 +117,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             reg.receiver_syntax,
             NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other
         ) {
-            fixed_signature_handlers.insert(reg.callback_name.as_str().fold_lower());
+            fixed_signature_handlers.insert(NormName::intern(reg.callback_name.as_str()));
         }
     }
     // A form-module procedure bound at runtime — `УстановитьДействие` directly, or by
@@ -131,10 +132,10 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         // `Форма.Метод(...)` by name). The caller dictates the signature; a parameter the
         // body ignores is not the author's to drop.
         for method in summary.methods.iter().filter(|m| m.is_export) {
-            fixed_signature_handlers.insert(method.name.as_str().fold_lower());
+            fixed_signature_handlers.insert(NormName::intern(method.name.as_str()));
         }
         for reg in &summary.set_action_regs {
-            fixed_signature_handlers.insert(reg.handler_name.as_str().fold_lower());
+            fixed_signature_handlers.insert(NormName::intern(reg.handler_name.as_str()));
         }
         // A string excluded from the current environment can still name a form handler
         // in another build, even though it no longer contributes a live call-graph reference.
@@ -148,7 +149,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 continue;
             }
             if let Some(method) = summary.methods.iter().find(|m| m.local_id == *local_id) {
-                fixed_signature_handlers.insert(method.name.as_str().fold_lower());
+                fixed_signature_handlers.insert(NormName::intern(method.name.as_str()));
             }
         }
         // A handler bound by string from another module (a helper handed the form) is
@@ -157,7 +158,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         if !bindings.is_empty() {
             for method in &summary.methods {
                 if bindings.is_bound(method.name.as_str()) {
-                    fixed_signature_handlers.insert(method.name.as_str().fold_lower());
+                    fixed_signature_handlers.insert(NormName::intern(method.name.as_str()));
                 }
             }
         }
@@ -168,13 +169,13 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             method.annotations().iter().any(|annotation| annotation.kind.is_interception())
         }) {
             if let Some(name) = get_method_name(&item_tree, local_id) {
-                fixed_signature_handlers.insert(name.fold_lower());
+                fixed_signature_handlers.insert(NormName::intern(&name));
             }
         }
         if let Some(name) = get_method_name(&item_tree, local_id) {
             let lower = name.fold_lower();
             if attachable_prefixes.iter().any(|prefix| lower.starts_with(prefix)) {
-                fixed_signature_handlers.insert(lower);
+                fixed_signature_handlers.insert(NormName::intern(&name));
             }
         }
     }
@@ -211,7 +212,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 /// or declared in metadata, plus the module kind that decides which platform events
 /// this module can receive at all.
 struct SignatureExemptions<'a> {
-    fixed_handlers: &'a FxHashSet<String>,
+    fixed_handlers: &'a FxHashSet<NormName>,
     owner: ModuleOwner,
 }
 
@@ -252,7 +253,7 @@ fn check_method(
         return diagnostics;
     }
 
-    if method_name.is_some_and(|name| exemptions.fixed_handlers.contains(&name.fold_lower())) {
+    if method_name.is_some_and(|name| exemptions.fixed_handlers.contains(&NormName::intern(name))) {
         return diagnostics;
     }
 
@@ -1087,6 +1088,20 @@ EndProcedure
 &НаКлиенте
 Процедура Callback(Результат, ДопПараметры) Экспорт
     Вызов(Результат);
+КонецПроцедуры
+"#;
+
+        check_diagnostics_snapshot_for(code, DiagnosticCode::UnusedParameters, expect![[r#""#]]);
+    }
+
+    #[test]
+    fn greek_sigma_handler_name_uses_bsl_identifier_equivalence() {
+        let code = r#"Процедура СоздатьОповещение()
+    Описание = Новый ОписаниеОповещения("οσ", ЭтотОбъект);
+КонецПроцедуры
+
+Процедура ΟΣ(Параметр)
+    Сообщить("callback");
 КонецПроцедуры
 "#;
 
