@@ -6383,6 +6383,17 @@ impl<'db> InferenceContext<'db> {
             return BareReceiverDispatch::Resolved(self.db.unknown());
         }
 
+        // An ordinary form module reads its own surface before the global metadata
+        // collections: a tabular section named `Документы` of the main attribute's
+        // object is that section, not `ДокументыМенеджер`. The read of such a name is
+        // untyped, so the call lands here and must not be judged against the collection.
+        if self.ordinary_form_surface_owns_name(&resolver, module_name) {
+            for arg in args {
+                self.infer_expr(*arg);
+            }
+            return BareReceiverDispatch::Resolved(self.db.unknown());
+        }
+
         // The same holds for a member of the module's own object (`ЭтотОбъект.Реквизит`):
         // in an object or record-set module the bare name denotes that member and wins over
         // a same-named common module, exactly as on the bare-name read path. A member that

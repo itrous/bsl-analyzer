@@ -543,6 +543,49 @@ fn an_ordinary_form_read_resolves_the_standard_attributes_of_its_object() {
     assert_eq!(absent_names(&db, file_id), vec!["СовсемНеизвестноеИмя".to_string()]);
 }
 
+fn unresolved_method_calls(db: &RootDatabaseImpl, file_id: FileId) -> Vec<String> {
+    db.infer(file_id)
+        .diagnostics
+        .iter()
+        .filter_map(|(_, diag)| match diag {
+            InferenceDiagnostic::UnresolvedMethodCall { receiver_name, method_name, .. } => {
+                Some(format!("{}.{}", receiver_name.as_str(), method_name.as_str()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+const COLLISION_FORM_MODULE: &str =
+    "Catalogs/Справочник1/Forms/ФормаОбычнаяКоллизия/Ext/Form/Module.bsl";
+
+/// A tabular section named like a global metadata collection is that section inside an
+/// ordinary form module, so a member called on it is not judged against the collection
+/// manager (which has no `НайтиСтроки`).
+const COLLISION_CALLS: &str = "Процедура Тест()
+    А = Документы.НайтиСтроки(Новый Структура(\"Значение\", 1));
+    Б = Справочники.НайтиСтроки(Новый Структура(\"Значение\", 1));
+    В = Отчеты.Количество();
+    Г = Документы;
+КонецПроцедуры
+";
+
+#[test]
+fn a_tabular_section_named_like_a_collection_wins_over_the_collection() {
+    let (db, file_id) = setup_at(COLLISION_FORM_MODULE, COLLISION_CALLS);
+    assert_eq!(unresolved_method_calls(&db, file_id), Vec::<String>::new());
+    assert!(absent_names(&db, file_id).is_empty(), "{:?}", absent_names(&db, file_id));
+}
+
+/// Control: the same module over a form whose sidecar has no `type`/`main`. The owner is
+/// unknown, so the names keep resolving to the global collections and nothing changes.
+#[test]
+fn a_collection_named_member_without_a_typed_main_attribute_is_judged_as_before() {
+    let (db, file_id) = setup_at(UNTYPED_READ_FORM_MODULE, COLLISION_CALLS);
+    assert_eq!(unresolved_method_calls(&db, file_id), Vec::<String>::new());
+    assert!(absent_names(&db, file_id).is_empty());
+}
+
 /// A constant's value-manager module hangs off `КонстантаМенеджерЗначения`:
 /// `Записать()` / `Прочитать()` are its methods written without the receiver.
 #[test]
