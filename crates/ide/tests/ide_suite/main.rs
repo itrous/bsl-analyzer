@@ -101,6 +101,7 @@ mod narrow_arg_validation;
 mod narrow_ternary_guard;
 mod narrow_type_of_expr;
 mod narrow_undefined_branch_receiver;
+mod object_module_standard_attributes;
 mod ordinary_form_controls;
 mod ordinary_form_module;
 mod ordinary_form_sidecar;

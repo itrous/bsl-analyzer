@@ -1118,7 +1118,8 @@ mod tests {
         assert!(bp.find_attribute("Дата").is_some());
         assert!(bp.find_attribute("Стартован").is_some());
         assert!(bp.find_attribute("Завершен").is_some());
-        assert!(bp.find_attribute("ГлавнаяЗадача").is_some());
+        assert!(bp.find_attribute("ВедущаяЗадача").is_some());
+        assert!(bp.find_attribute("ГлавнаяЗадача").is_none());
 
         assert!(bp.find_attribute("Проведен").is_none());
         assert!(bp.find_attribute("Код").is_none());
