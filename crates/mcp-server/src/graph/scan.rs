@@ -259,6 +259,7 @@ pub(crate) fn portable_fingerprint_of(
             digest.as_bytes()[..8].try_into().expect("blake3 yields >= 8 bytes"),
         ),
         topology,
+        platform_help: bsl_platform::PlatformDataInner::instance().snapshot_fingerprint(),
     })
 }
 

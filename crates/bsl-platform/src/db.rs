@@ -112,6 +112,49 @@ pub struct PlatformDataInner {
     /// compares it on every member miss, and re-reading the origin string there
     /// would parse it again per miss.
     served_platform_version: Option<Vec<u32>>,
+    /// Stable content identity of the served, overlay-applied corpus. Graph
+    /// caches use it to invalidate when the process starts with another snapshot.
+    snapshot_fingerprint: u64,
+}
+
+struct HasherWriter<'a>(&'a mut blake3::Hasher);
+
+impl std::fmt::Write for HasherWriter<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0.update(text.as_bytes());
+        Ok(())
+    }
+}
+
+fn stable_snapshot_fingerprint(
+    snapshot: &PlatformSnapshot,
+    origin: Option<&PlatformHelpOrigin>,
+    has_missing_reason: bool,
+) -> u64 {
+    // PlatformSnapshot and its nested records are ordered vectors, not hash maps;
+    // their derived Debug form is deterministic across process starts. Stream it
+    // directly into BLAKE3 to avoid materializing the full corpus as a String.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bsl-platform-help-snapshot-v1\0");
+    {
+        let mut writer = HasherWriter(&mut hasher);
+        std::fmt::write(&mut writer, format_args!("{snapshot:?}"))
+            .expect("writing to the BLAKE3 hasher cannot fail");
+    }
+
+    // The served version gates semantic availability checks, while origin and
+    // degraded status gate whether the corpus can prove a complete type list.
+    hasher.update(&[u8::from(origin.is_some())]);
+    if let Some(version) = origin.and_then(|origin| origin.platform_version.as_deref()) {
+        hasher.update(&[1]);
+        hasher.update(&(version.len() as u64).to_le_bytes());
+        hasher.update(version.as_bytes());
+    } else {
+        hasher.update(&[0]);
+    }
+    hasher.update(&[u8::from(has_missing_reason)]);
+
+    u64::from_le_bytes(hasher.finalize().as_bytes()[..8].try_into().expect("BLAKE3 is 32 bytes"))
 }
 
 impl PlatformDataInner {
@@ -143,6 +186,11 @@ impl PlatformDataInner {
     /// A standalone instance over `help`, outside the process snapshot. Lets tests
     /// and tools compare sources side by side.
     pub fn from_help(help: PlatformHelp) -> Self {
+        let snapshot_fingerprint = stable_snapshot_fingerprint(
+            &help.snapshot,
+            help.origin.as_ref(),
+            help.missing_reason.is_some(),
+        );
         let PlatformHelp { request, snapshot, origin, missing_reason } = help;
         let PlatformSnapshot {
             mut types,
@@ -425,7 +473,14 @@ impl PlatformDataInner {
             form_extension_property_names,
             member_surface_versions,
             served_platform_version,
+            snapshot_fingerprint,
         }
+    }
+
+    /// Stable identity of the served platform-help snapshot, independent of its
+    /// source path and process lifetime.
+    pub fn snapshot_fingerprint(&self) -> u64 {
+        self.snapshot_fingerprint
     }
 
     /// The source this instance serves.
@@ -1609,6 +1664,42 @@ pub fn global_member_method_query<'db>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_fingerprint_tracks_contents_and_is_repeatable() {
+        let empty = PlatformSnapshot::default();
+        let mut changed = empty.clone();
+        changed.types.push(PlatformType {
+            name: "Тип".into(),
+            english_name: "Type".into(),
+            min_version: None,
+            context: None,
+            iter_element_types: Vec::new(),
+            xdto_name: None,
+        });
+
+        let first = stable_snapshot_fingerprint(&empty, None, true);
+        assert_eq!(first, stable_snapshot_fingerprint(&empty, None, true));
+        assert_ne!(first, stable_snapshot_fingerprint(&changed, None, true));
+
+        let help = PlatformHelp::bundled(PlatformHelpRequest::Auto, None);
+        let bundled = stable_snapshot_fingerprint(
+            &help.snapshot,
+            help.origin.as_ref(),
+            help.missing_reason.is_some(),
+        );
+        let mut changed_version = help.clone();
+        changed_version.origin.as_mut().unwrap().platform_version = Some("8.3.28".to_owned());
+        assert_ne!(
+            bundled,
+            stable_snapshot_fingerprint(
+                &changed_version.snapshot,
+                changed_version.origin.as_ref(),
+                changed_version.missing_reason.is_some(),
+            ),
+            "platform release is part of semantic graph identity",
+        );
+    }
 
     #[test]
     fn test_platform_data_singleton() {

@@ -695,8 +695,17 @@ impl GraphState {
         // A topology change re-shapes visibility for ANY module even when only
         // `.bsl` bodies drifted on disk — never body-patch across it.
         match self.store.read(Some(base), wait, |snapshot| snapshot.graph.freshness_token()) {
-            Ok(Ok((_, stored_token, _))) if stored_token.topology == project.portable_topology => {}
+            Ok(Ok((_, stored_token, _)))
+                if stored_token.topology == project.portable_topology
+                    && stored_token.platform_help
+                        == bsl_platform::PlatformDataInner::instance().snapshot_fingerprint() => {}
             Err(_) => return self.note_incremental("published_graph_moved"),
+            Ok(Ok((_, stored_token, _)))
+                if stored_token.platform_help
+                    != bsl_platform::PlatformDataInner::instance().snapshot_fingerprint() =>
+            {
+                return self.note_incremental("platform_help_changed");
+            }
             _ => return self.note_incremental("topology_moved"),
         }
         let pre = crate::graph::universe::ScannedUniverse::scan_project(&project);
@@ -1374,6 +1383,14 @@ impl GraphState {
                 stored = fingerprint.topology,
                 current = fp_now.topology,
                 "cached graph database was built for a different project composition; rebuilding"
+            );
+            return PublishAttemptOutcome::FallBack;
+        }
+        if fingerprint.platform_help != fp_now.platform_help {
+            tracing::warn!(
+                stored = fingerprint.platform_help,
+                current = fp_now.platform_help,
+                "cached graph database was built for a different platform-help snapshot; rebuilding"
             );
             return PublishAttemptOutcome::FallBack;
         }
@@ -2224,6 +2241,11 @@ fn build_candidate(
         )
         .map_err(LoadFailure::operation)?;
         conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('platform_help_fp', ?1)",
+            rusqlite::params![fp_publish.platform_help.to_string()],
+        )
+        .map_err(LoadFailure::operation)?;
+        conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('files', ?1)",
             rusqlite::params![summary.modules.to_string()],
         )
@@ -2397,6 +2419,7 @@ fn resume_pending_full_candidate(
                 ("revision", generation.to_string()),
                 ("fingerprint", fingerprint.files.to_string()),
                 ("topology_fp", fingerprint.topology.to_string()),
+                ("platform_help_fp", fingerprint.platform_help.to_string()),
                 ("force_stale", "0".to_owned()),
                 ("publication_id", graph.next_publication_id()),
             ] {
@@ -3246,6 +3269,7 @@ fn apply_patch_candidate_inner(
                             ("revision", meta.revision.to_string()),
                             ("fingerprint", caught_up_fingerprint.files.to_string()),
                             ("topology_fp", caught_up_fingerprint.topology.to_string()),
+                            ("platform_help_fp", caught_up_fingerprint.platform_help.to_string()),
                             ("force_stale", "0".to_owned()),
                             ("publication_id", graph.next_publication_id()),
                         ] {
@@ -9105,6 +9129,120 @@ mod tests {
             graph.hook_debt().topology,
             "and the whole-collection context re-render is still requested",
         );
+    }
+
+    /// Child-process half of the none → auto persistence test. The first process writes a
+    /// graph with the disabled help snapshot; the second process starts with auto's bundled
+    /// fallback and must reject that graph for a full projection.
+    #[test]
+    fn platform_help_cache_probe() {
+        let Ok(mode) = std::env::var("BSL_TEST_PLATFORM_HELP_CACHE_MODE") else { return };
+        let root = std::path::PathBuf::from(
+            std::env::var_os("BSL_TEST_PLATFORM_HELP_CACHE_ROOT").expect("test root is set"),
+        );
+        let help = match mode.as_str() {
+            "none" => bsl_platform::PlatformHelp::missing(
+                bsl_platform::PlatformHelpRequest::None,
+                "test disabled source",
+            ),
+            "auto" => {
+                bsl_platform::PlatformHelp::bundled(bsl_platform::PlatformHelpRequest::Auto, None)
+            }
+            _ => panic!("unknown test mode: {mode}"),
+        };
+        bsl_platform::install_platform_help(help).expect("first help snapshot installs");
+
+        match mode.as_str() {
+            "none" => {
+                fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+                write_common_module(
+                    &root,
+                    "Обработчики",
+                    false,
+                    r#"&НаКлиенте
+Процедура ПослеЗакрытия(Результат, Параметры) Экспорт
+КонецПроцедуры"#,
+                );
+                write_common_module(
+                    &root,
+                    "Регистрация",
+                    false,
+                    r#"&НаКлиенте
+Процедура Создать() Экспорт
+Описание = Новый ОписаниеОповещения("ПослеЗакрытия", Обработчики);
+КонецПроцедуры"#,
+                );
+                let fingerprint = workspace_fingerprint(&root);
+                seed_cache(&root, fingerprint);
+                let (_, edges, _, _) = dump_data(&graph_db_path(&root));
+                assert!(
+                    edges.iter().all(|edge| !edge.contains("Text(\"notify_ref\")")),
+                    "none should preserve the no-help NotifyRef behavior: {edges:?}"
+                );
+            }
+            "auto" => {
+                let active = bsl_platform::PlatformDataInner::instance().snapshot_fingerprint();
+                let none = bsl_platform::PlatformDataInner::from_help(
+                    bsl_platform::PlatformHelp::missing(
+                        bsl_platform::PlatformHelpRequest::None,
+                        "test disabled source",
+                    ),
+                )
+                .snapshot_fingerprint();
+                assert_ne!(none, active, "auto's served facts differ from none");
+                let graph = GraphState::for_workspace(root.clone());
+                assert!(
+                    matches!(graph.try_publish_cached(&root, 0), PublishAttemptOutcome::FallBack),
+                    "a none-built cache must not be reused by an auto snapshot"
+                );
+
+                // Exercise the real graph projector after cache rejection, using exactly the
+                // same source files. The newly published projection must now contain the edge.
+                let out = graph_db_path(&root);
+                fs::remove_file(&out).unwrap();
+                let fingerprint = workspace_fingerprint(&root);
+                let meta = crate::graph_db::GraphMeta {
+                    revision: 8,
+                    fingerprint,
+                    files: 2,
+                    built_at: "none-to-auto-rebuild".to_owned(),
+                    publication_id: "none-to-auto-rebuild".to_owned(),
+                };
+                build_whole_graph(&root, &out, 1, &meta).expect("the full rebuild succeeds");
+                let token = GraphDb::open(&out).unwrap().freshness_token().unwrap().1;
+                assert_eq!(token.platform_help, active);
+                let (_, edges, _, _) = dump_data(&out);
+                assert!(
+                    edges.iter().any(|edge| edge.contains("Text(\"notify_ref\")")),
+                    "auto's rebuilt graph contains the notification reference: {edges:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// A help-source switch across process restarts changes the persisted content fingerprint
+    /// even when project files and extension topology are identical, so the old graph is rebuilt.
+    #[test]
+    fn none_to_auto_invalidates_cached_graph_across_process_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let executable = std::env::current_exe().unwrap();
+        for mode in ["none", "auto"] {
+            let output = std::process::Command::new(&executable)
+                .arg("platform_help_cache_probe")
+                .arg("--nocapture")
+                .env("BSL_TEST_PLATFORM_HELP_CACHE_MODE", mode)
+                .env("BSL_TEST_PLATFORM_HELP_CACHE_ROOT", root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode} child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     /// A cached on-disk graph built under one dependency graph is dead the moment the

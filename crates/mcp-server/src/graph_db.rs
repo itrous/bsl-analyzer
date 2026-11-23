@@ -94,7 +94,9 @@ use crate::graph::input::{db_for_files, db_for_files_in_snapshot, GraphBatchSnap
 // receivers shadowed by body bindings, assignments, or module variables. Version-25 graphs can
 // therefore contain missing or spurious `notify_ref` edges even when the source fingerprint is
 // unchanged, so they must be rebuilt before serving.
-pub(crate) const SCHEMA_VERSION: u32 = 26;
+// 27: the freshness token includes the served platform-help snapshot contents. A version-26 graph
+// can reflect a different corpus from the current process even when all workspace files match.
+pub(crate) const SCHEMA_VERSION: u32 = 27;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
@@ -117,18 +119,18 @@ pub(crate) struct FileFingerprint {
     pub observation: Option<crate::graph::content_hash::Observation>,
 }
 
-/// The workspace identity a graph build reflects, as two independent components.
-/// `files` folds every graph-relevant file's `(root_id, path, content_hash)`; `topology`
-/// identifies the extension dependency graph (declared roots + `dependsOn`
-/// closures). Kept structured — not XOR-folded into one word — so a change in one
-/// component can never algebraically cancel a change in the other, and so a
-/// consumer can tell a topology-triggered rebuild from a plain file edit.
+/// The workspace identity a graph build reflects. `files` folds graph-relevant file
+/// contents; `topology` identifies extension dependencies; `platform_help` identifies
+/// the resolved platform-help snapshot used by semantic graph construction. Kept
+/// structured so changes in one component cannot cancel another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GraphFp {
     /// Stable BLAKE3 fold of the durable file keys and complete content hashes.
     pub files: u64,
     /// Stable hash of the extension-topology fingerprint.
     pub topology: u64,
+    /// Stable hash of the served platform-help snapshot contents.
+    pub platform_help: u64,
 }
 
 /// Build-level metadata recorded in the `meta` table, used on reopen to decide
@@ -137,7 +139,7 @@ pub struct GraphFp {
 pub struct GraphMeta {
     /// The [`GraphState`](crate::graph) generation this build reflects.
     pub revision: u64,
-    /// Workspace identity (portable file contents + extension topology) at build time.
+    /// Graph inputs (portable file contents, extension topology, and platform-help snapshot).
     pub fingerprint: GraphFp,
     /// Number of `.bsl` files indexed.
     pub files: usize,
@@ -540,12 +542,13 @@ impl GraphDbWriter {
         let nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
 
-        let rows: [(&str, String); 9] = [
+        let rows: [(&str, String); 10] = [
             ("schema_version", SCHEMA_VERSION.to_string()),
             ("publication_id", meta.publication_id.clone()),
             ("revision", meta.revision.to_string()),
             ("fingerprint", meta.fingerprint.files.to_string()),
             ("topology_fp", meta.fingerprint.topology.to_string()),
+            ("platform_help_fp", meta.fingerprint.platform_help.to_string()),
             ("files", meta.files.to_string()),
             ("built_at", meta.built_at.clone()),
             ("nodes", nodes.to_string()),
@@ -2621,11 +2624,12 @@ fn write_body_patch(
         // never force-stale.
         let node_count: i64 = tx.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         let edge_count: i64 = tx.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
-        let meta_rows: [(&str, String); 9] = [
+        let meta_rows: [(&str, String); 10] = [
             ("publication_id", meta.publication_id.clone()),
             ("revision", meta.revision.to_string()),
             ("fingerprint", meta.fingerprint.files.to_string()),
             ("topology_fp", meta.fingerprint.topology.to_string()),
+            ("platform_help_fp", meta.fingerprint.platform_help.to_string()),
             ("files", modules.to_string()),
             ("built_at", meta.built_at.clone()),
             ("nodes", node_count.to_string()),
@@ -3138,7 +3142,7 @@ mod tests {
         w.write_edges(&[edge("method/common/X/A", "method/common/X/B")]).unwrap();
         w.finalize(&GraphMeta {
             revision: 1,
-            fingerprint: GraphFp { files: 42, topology: 7 },
+            fingerprint: GraphFp { files: 42, topology: 7, platform_help: 0 },
             files: 1,
             built_at: "2026-06-01T00:00:00Z".to_string(),
             publication_id: "test-1".to_owned(),
@@ -3464,7 +3468,7 @@ mod tests {
         w.write_edges(&[sub_edge]).unwrap();
         w.finalize(&GraphMeta {
             revision: 1,
-            fingerprint: GraphFp { files: 1, topology: 0 },
+            fingerprint: GraphFp { files: 1, topology: 0, platform_help: 0 },
             files: 1,
             built_at: "t".to_string(),
             publication_id: "test-1".to_owned(),

@@ -470,8 +470,8 @@ impl GraphDb {
     /// from the file's own `meta`, so a served response's revision/staleness always
     /// describe the exact build being served (never a torn mix where a concurrent
     /// reload renamed a newer file in after the generation was captured elsewhere).
-    /// Both fingerprint components are required rows (`schema_version` gates out
-    /// builds that predate `topology_fp`); `force_stale` defaults to false when absent.
+    /// All fingerprint components are required rows (`schema_version` gates out
+    /// builds that predate `platform_help_fp`); `force_stale` defaults to false when absent.
     pub fn freshness_token(&self) -> anyhow::Result<(u64, crate::graph_db::GraphFp, bool)> {
         let revision = self
             .meta("revision")?
@@ -485,8 +485,12 @@ impl GraphDb {
             .meta("topology_fp")?
             .and_then(|v| v.parse().ok())
             .context("graph database meta.topology_fp missing or unparsable")?;
+        let platform_help = self
+            .meta("platform_help_fp")?
+            .and_then(|v| v.parse().ok())
+            .context("graph database meta.platform_help_fp missing or unparsable")?;
         let force_stale = self.meta("force_stale")?.map(|v| v == "1").unwrap_or(false);
-        Ok((revision, crate::graph_db::GraphFp { files, topology }, force_stale))
+        Ok((revision, crate::graph_db::GraphFp { files, topology, platform_help }, force_stale))
     }
 
     /// The identity of the publication this database holds.

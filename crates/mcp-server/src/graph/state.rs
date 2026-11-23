@@ -5856,7 +5856,7 @@ mod tests {
             inner.status = GraphStatus::Ready { files: 0 };
             inner.published = Some(Published {
                 generation: 1,
-                fingerprint: crate::graph_db::GraphFp { files: 1, topology: 1 },
+                fingerprint: crate::graph_db::GraphFp { files: 1, topology: 1, platform_help: 0 },
                 stale: false,
                 reload: ReloadState::Idle,
                 force_stale: false,
@@ -5896,7 +5896,7 @@ mod tests {
             let mut inner = lock_recover(&graph.inner);
             inner.published = Some(Published {
                 generation: 7,
-                fingerprint: crate::graph_db::GraphFp { files: 1, topology: 1 },
+                fingerprint: crate::graph_db::GraphFp { files: 1, topology: 1, platform_help: 0 },
                 stale: true,
                 reload: ReloadState::Failed("catch-up failed".to_owned()),
                 force_stale: false,
