@@ -1493,16 +1493,32 @@ impl GraphState {
         // One look at the file answers the token, the topology and the size together.
         let Ok(inspected) = self.inspect_unpublished(|graph| {
             graph.freshness_token().map(|token| {
-                (token, super::scan::graph_matches_live_project(graph, &project), graph.files())
+                (
+                    token,
+                    super::scan::graph_matches_live_project(graph, &project),
+                    super::scan::graph_matches_platform_help(graph),
+                    graph.files(),
+                )
             })
         }) else {
             return PublishAttemptOutcome::FallBack; // missing, truncated, or stale-schema → full rebuild
         };
-        let Ok(((revision, fingerprint, force_stale), matches_live_project, files)) = inspected
+        let Ok((
+            (revision, fingerprint, force_stale),
+            matches_live_project,
+            matches_platform_help,
+            files,
+        )) = inspected
         else {
             return PublishAttemptOutcome::FallBack;
         };
         if force_stale {
+            return PublishAttemptOutcome::FallBack;
+        }
+        if !matches_platform_help {
+            tracing::info!(
+                "cached graph database was built for another platform-help snapshot; rebuilding instead of serving it stale"
+            );
             return PublishAttemptOutcome::FallBack;
         }
         // Stale on FILES is what this path exists to serve — stale on TOPOLOGY is not. A build
@@ -9174,6 +9190,17 @@ mod tests {
                 );
                 let fingerprint = workspace_fingerprint(&root);
                 seed_cache(&root, fingerprint);
+                // Make the cache stale on source files without changing project topology.
+                write_common_module(
+                    &root,
+                    "Регистрация",
+                    false,
+                    r#"&НаКлиенте
+Процедура Создать() Экспорт
+Описание = Новый ОписаниеОповещения("ПослеЗакрытия", Обработчики);
+Переменная = 1;
+КонецПроцедуры"#,
+                );
                 let (_, edges, _, _) = dump_data(&graph_db_path(&root));
                 assert!(
                     edges.iter().all(|edge| !edge.contains("Text(\"notify_ref\")")),
@@ -9190,10 +9217,49 @@ mod tests {
                 )
                 .snapshot_fingerprint();
                 assert_ne!(none, active, "auto's served facts differ from none");
+                let stale_graph = GraphState::for_workspace(root.clone());
+                assert!(
+                    matches!(
+                        stale_graph.try_publish_stale_and_catch_up(&root),
+                        PublishAttemptOutcome::FallBack
+                    ),
+                    "the stale path must reject a none-built graph under auto"
+                );
+                assert!(
+                    stale_graph.snapshot().is_none(),
+                    "the incompatible stale graph was served"
+                );
+
                 let graph = GraphState::for_workspace(root.clone());
                 assert!(
                     matches!(graph.try_publish_cached(&root, 0), PublishAttemptOutcome::FallBack),
                     "a none-built cache must not be reused by an auto snapshot"
+                );
+
+                // A source-stale cache built with the current help snapshot remains eligible.
+                let compatible_root = root.join("compatible-stale");
+                fs::create_dir_all(&compatible_root).unwrap();
+                fs::write(compatible_root.join("Configuration.xml"), "<Configuration/>").unwrap();
+                write_common_module(
+                    &compatible_root,
+                    "Module",
+                    false,
+                    "Процедура A()\nКонецПроцедуры",
+                );
+                seed_cache(&compatible_root, workspace_fingerprint(&compatible_root));
+                write_common_module(
+                    &compatible_root,
+                    "Module",
+                    false,
+                    "Процедура A()\nПеременная = 1;\nКонецПроцедуры",
+                );
+                let compatible_graph = GraphState::for_workspace(compatible_root.clone());
+                assert!(
+                    matches!(
+                        compatible_graph.try_publish_stale_and_catch_up(&compatible_root),
+                        PublishAttemptOutcome::Published
+                    ),
+                    "a file-stale graph with a matching platform-help snapshot remains servable"
                 );
 
                 // Exercise the real graph projector after cache rejection, using exactly the
