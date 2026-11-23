@@ -3,7 +3,6 @@ use std::sync::Arc;
 use base_db::FileIdInput;
 use bsl_platform::PlatformDataInner;
 use bsl_types::kind::TypeKind;
-use cfg_types::IdConversion;
 use hir_def::body::Body;
 use hir_def::call_graph::{
     CallerId, ModuleCallSummary, NotifyConstructorCandidate, NotifyReceiverSyntax, NotifyReg,
@@ -22,8 +21,7 @@ use crate::body_flow::BodyFlow;
 use crate::db::HirDatabase;
 use crate::infer::{infer_owner, BareNameOrigin, InferOwnerResult};
 use crate::notify_array::{
-    accepts_argument_count, callback_slots, collect_notify_array_registrations,
-    reachable_statements,
+    callback_arguments_for_binding, collect_notify_array_registrations, reachable_statements,
 };
 
 #[salsa::tracked(
@@ -194,8 +192,14 @@ fn normalize_owner_candidates(
     let cfg = flow.cfg(db);
     let reachable_stmts = reachable_statements(&cfg);
     let reaching_defs = flow.executable_reaching_defs(db);
-    let array_registrations =
-        collect_notify_array_registrations(body, &cfg, reaching_defs.as_deref(), platform);
+    let array_registrations = collect_notify_array_registrations(
+        db,
+        body,
+        &cfg,
+        reaching_defs.as_deref(),
+        &inference,
+        platform,
+    );
 
     for &index in candidate_indices {
         let candidate = candidates[index];
@@ -209,7 +213,6 @@ fn normalize_owner_candidates(
         if !platform.is_notify_description_type_name(platform_type_name) {
             continue;
         }
-        let Some(slots) = callback_slots(platform, platform_type_name) else { continue };
         let not_compiled = constructor_is_not_compiled(
             body,
             &dead_stmts,
@@ -244,16 +247,24 @@ fn normalize_owner_candidates(
             continue;
         }
 
-        if !accepts_argument_count(slots, args.len()) {
+        let Some(binding) = inference
+            .call_arg_bindings()
+            .iter()
+            .find(|binding| binding.call_expr == candidate.constructor)
+        else {
             continue;
-        }
-        for (handler_slot, receiver_slot) in
-            [(slots.handler, slots.receiver), (slots.error_handler, slots.error_receiver)]
-        {
-            let Some(&callback_idx) = args.get(handler_slot) else { continue };
-            let Some(callback_name) = string_literal(body, callback_idx) else { continue };
-            let callback_expr = ExprId::from_idx(callback_idx);
-            let receiver = args.get(receiver_slot).copied().map(ExprId::from_idx);
+        };
+        let Some(arguments) = callback_arguments_for_binding(binding) else { continue };
+        for (handler_argument, receiver_argument) in [
+            (arguments.handler, arguments.receiver),
+            (arguments.error_handler, arguments.error_receiver),
+        ] {
+            let Some(&callback_expr) = handler_argument.and_then(|index| binding.args.get(index))
+            else {
+                continue;
+            };
+            let Some(callback_name) = string_literal_id(body, callback_expr) else { continue };
+            let receiver = receiver_argument.and_then(|index| binding.args.get(index)).copied();
             let receiver_syntax = receiver_syntax(body, receiver);
             append_notify_registration(
                 db,
@@ -308,6 +319,13 @@ fn append_notify_registration(
 
 fn string_literal(body: &Body, expr: ExprIdx) -> Option<&str> {
     match body.expr_idx(expr) {
+        Expr::Literal(Literal::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn string_literal_id(body: &Body, expr: ExprId) -> Option<&str> {
+    match body.expr(expr) {
         Expr::Literal(Literal::String(value)) => Some(value),
         _ => None,
     }

@@ -12,10 +12,20 @@ use cfg_types::{ExprId, IdConversion};
 use hir_def::body::events::{for_each_expr_child, for_each_stmt_expr_root, EvalPoint};
 use hir_def::body::Body;
 use hir_def::call_graph::NotifyReceiverSyntax;
+use hir_def::execution_env::EnvFlags;
 use hir_def::hir::{Expr, ExprIdx, Literal, Stmt, StmtIdx};
 use hir_def::Name;
+use intern::NormName;
 use rustc_hash::{FxHashMap, FxHashSet};
-use stdx::case::{eq_ignore_case, CaseExt};
+use stdx::case::eq_ignore_case;
+
+use crate::call_resolution::{
+    CallParamMode, CallRejection, CallSelection, CandidateApplicability, CandidateDisposition,
+    CandidateEvaluation, CandidateRejection,
+};
+use crate::infer::{CallArgBinding, InferOwnerResult};
+use bsl_types::builders::Builders;
+use bsl_types::intern::TypeKernelDb;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NotifyArrayHandler {
@@ -39,7 +49,13 @@ enum ArrayState {
     Unknown,
 }
 
-pub(crate) type CallbackSlots = bsl_platform::CallbackDescriptionSlots;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallbackArguments {
+    pub handler: Option<usize>,
+    pub receiver: Option<usize>,
+    pub error_handler: Option<usize>,
+    pub error_receiver: Option<usize>,
+}
 
 pub(crate) fn reachable_statements(cfg: &ControlFlowGraph) -> FxHashSet<cfg_types::StmtId> {
     let Some(start) = cfg.start() else { return FxHashSet::default() };
@@ -64,9 +80,11 @@ pub(crate) fn reachable_statements(cfg: &ControlFlowGraph) -> FxHashSet<cfg_type
 /// writes, and control-flow blocks invalidate the proof. These constraints trade recall for a
 /// defensible receiver expression and parameter order.
 pub(crate) fn collect_notify_array_registrations(
+    db: &dyn TypeKernelDb,
     body: &Body,
     cfg: &ControlFlowGraph,
     reaching_defs: Option<&dataflow::reaching_defs::ReachingDefsResult>,
+    inference: &InferOwnerResult,
     platform: &PlatformDataInner,
 ) -> Vec<NotifyArrayRegistration> {
     if body.is_lowering_incomplete() {
@@ -77,9 +95,10 @@ pub(crate) fn collect_notify_array_registrations(
     };
 
     let reachable_stmts = reachable_statements(cfg);
+    let name_spellings = local_name_spellings(body);
     let local_declarations = unique_local_declarations(body);
-    let mut states: FxHashMap<String, ArrayState> =
-        local_declarations.keys().map(|name| (name.clone(), ArrayState::Uninitialized)).collect();
+    let mut states: FxHashMap<NormName, ArrayState> =
+        local_declarations.keys().map(|&name| (name, ArrayState::Uninitialized)).collect();
     let mut used_before_initialization = FxHashSet::default();
     let mut registrations = Vec::new();
 
@@ -106,10 +125,10 @@ pub(crate) fn collect_notify_array_registrations(
 
         if let Stmt::Assign { target, value } = stmt {
             if let Some(target_name) = path_name(body, *target) {
-                let key = target_name.as_str().fold_lower();
-                if let Some(&declaration_position) = local_declarations.get(&key) {
+                let key = NormName::intern(target_name.as_str());
+                if let Some((declaration_position, _)) = local_declarations.get(&key) {
                     if is_empty_array_constructor(body, *value, platform) {
-                        let state = if declaration_position < position
+                        let state = if *declaration_position < position
                             && !used_before_initialization.contains(&key)
                             && matches!(states.get(&key), Some(ArrayState::Uninitialized))
                         {
@@ -118,19 +137,30 @@ pub(crate) fn collect_notify_array_registrations(
                             ArrayState::Unknown
                         };
                         states.insert(key, state);
-                        invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
+                        invalidate_possible_writes(
+                            &mut states,
+                            &name_spellings,
+                            reaching_defs,
+                            stmt_id,
+                        );
                         continue;
                     }
                 }
 
-                if let Some((constructor, array_name, slots)) =
+                if let Some((constructor, array_name)) =
                     dynamic_notify_array_call(body, *value, platform)
                 {
-                    let array_key = array_name.as_str().fold_lower();
+                    let array_key = NormName::intern(array_name.as_str());
                     if let Some(ArrayState::Known(elements)) = states.get(&array_key) {
-                        if accepts_argument_count(slots, elements.len()) {
-                            let handlers =
-                                handlers_from_elements(body, constructor, elements, slots);
+                        if let Some(binding) = dynamic_callback_binding(
+                            db,
+                            inference,
+                            body,
+                            constructor,
+                            elements,
+                            platform,
+                        ) {
+                            let handlers = handlers_from_binding(body, constructor, &binding);
                             if !handlers.is_empty() {
                                 registrations
                                     .push(NotifyArrayRegistration { constructor, handlers });
@@ -145,22 +175,28 @@ pub(crate) fn collect_notify_array_registrations(
 
                 let mut mentioned = stmt_path_names(body, stmt_idx);
                 mentioned.remove(&key);
-                if let Some((_, array_name, _)) = dynamic_notify_array_call(body, *value, platform)
-                {
-                    mentioned.remove(&array_name.as_str().fold_lower());
+                if let Some((_, array_name)) = dynamic_notify_array_call(body, *value, platform) {
+                    mentioned.remove(&NormName::intern(array_name.as_str()));
                 }
                 invalidate_or_record_uses(&mut states, &mut used_before_initialization, mentioned);
-                invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
+                invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id);
                 continue;
             }
 
-            if let Some((constructor, array_name, slots)) =
+            if let Some((constructor, array_name)) =
                 dynamic_notify_array_call(body, *value, platform)
             {
-                let array_key = array_name.as_str().fold_lower();
+                let array_key = NormName::intern(array_name.as_str());
                 if let Some(ArrayState::Known(elements)) = states.get(&array_key) {
-                    if accepts_argument_count(slots, elements.len()) {
-                        let handlers = handlers_from_elements(body, constructor, elements, slots);
+                    if let Some(binding) = dynamic_callback_binding(
+                        db,
+                        inference,
+                        body,
+                        constructor,
+                        elements,
+                        platform,
+                    ) {
+                        let handlers = handlers_from_binding(body, constructor, &binding);
                         if !handlers.is_empty() {
                             registrations.push(NotifyArrayRegistration { constructor, handlers });
                         }
@@ -170,21 +206,21 @@ pub(crate) fn collect_notify_array_registrations(
                 let mut mentioned = stmt_path_names(body, stmt_idx);
                 mentioned.remove(&array_key);
                 invalidate_or_record_uses(&mut states, &mut used_before_initialization, mentioned);
-                invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
+                invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id);
                 continue;
             }
         }
 
         if let Stmt::Expr(expr) = stmt {
             if let Some((receiver_name, argument)) = array_add_statement(body, *expr, platform) {
-                let key = receiver_name.as_str().fold_lower();
+                let key = NormName::intern(receiver_name.as_str());
                 let argument_names = expression_path_names(body, argument);
                 let argument_escapes = argument_names.iter().any(|name| states.contains_key(name));
                 if !argument_escapes {
                     if let Some(ArrayState::Known(elements)) = states.get_mut(&key) {
                         elements.push(ExprId::from_idx(argument));
                     } else if matches!(states.get(&key), Some(ArrayState::Uninitialized)) {
-                        used_before_initialization.insert(key.clone());
+                        used_before_initialization.insert(key);
                     }
                 } else if let Some(state) = states.get_mut(&key) {
                     *state = ArrayState::Unknown;
@@ -205,7 +241,7 @@ pub(crate) fn collect_notify_array_registrations(
                     &mut used_before_initialization,
                     other_names,
                 );
-                invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
+                invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id);
                 continue;
             }
         }
@@ -215,50 +251,77 @@ pub(crate) fn collect_notify_array_registrations(
             &mut used_before_initialization,
             stmt_path_names(body, stmt_idx),
         );
-        invalidate_possible_writes(&mut states, reaching_defs, stmt_id);
+        invalidate_possible_writes(&mut states, &name_spellings, reaching_defs, stmt_id);
     }
 
     registrations
 }
 
 fn invalidate_possible_writes(
-    states: &mut FxHashMap<String, ArrayState>,
+    states: &mut FxHashMap<NormName, ArrayState>,
+    name_spellings: &FxHashMap<NormName, Vec<Name>>,
     reaching_defs: &dataflow::reaching_defs::ReachingDefsResult,
     stmt: cfg_types::StmtId,
 ) {
     for (name, state) in states {
         if matches!(state, ArrayState::Known(_))
-            && !reaching_defs.possible_writes_at(EvalPoint::Stmt(stmt), name).is_empty()
+            && name_spellings.get(name).is_some_and(|spellings| {
+                spellings.iter().any(|spelling| {
+                    !reaching_defs
+                        .possible_writes_at(EvalPoint::Stmt(stmt), spelling.as_str())
+                        .is_empty()
+                })
+            })
         {
             *state = ArrayState::Unknown;
         }
     }
 }
 
-fn unique_local_declarations(body: &Body) -> FxHashMap<String, usize> {
-    let mut binding_counts: FxHashMap<String, usize> = FxHashMap::default();
+fn local_name_spellings(body: &Body) -> FxHashMap<NormName, Vec<Name>> {
+    let mut spellings: FxHashMap<NormName, Vec<Name>> = FxHashMap::default();
+    let mut add_spelling = |name: &Name| {
+        let names = spellings.entry(NormName::intern(name.as_str())).or_default();
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.clone());
+        }
+    };
     for (_, binding) in body.bindings_iter() {
-        *binding_counts.entry(binding.name.as_str().fold_lower()).or_default() += 1;
+        add_spelling(&binding.name);
+    }
+    for (_, expr) in body.exprs_iter() {
+        if let Expr::Path(name) = expr {
+            add_spelling(name);
+        }
+    }
+    spellings
+}
+
+fn unique_local_declarations(body: &Body) -> FxHashMap<NormName, (usize, Name)> {
+    let mut binding_counts: FxHashMap<NormName, usize> = FxHashMap::default();
+    for (_, binding) in body.bindings_iter() {
+        *binding_counts.entry(NormName::intern(binding.name.as_str())).or_default() += 1;
     }
 
-    let parameters: FxHashSet<String> =
-        body.params().map(|id| body.binding(id).name.as_str().fold_lower()).collect();
-    let mut declarations: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    let parameters: FxHashSet<NormName> =
+        body.params().map(|id| NormName::intern(body.binding(id).name.as_str())).collect();
+    let mut declarations: FxHashMap<NormName, Vec<(usize, Name)>> = FxHashMap::default();
     for (position, &stmt_idx) in body.body_stmts_typed().iter().enumerate() {
         let Stmt::VarDecl { bindings } = body.stmt_idx(stmt_idx) else { continue };
         for &binding in bindings.iter() {
-            let name = body.binding_idx(binding).name.as_str().fold_lower();
-            declarations.entry(name).or_default().push(position);
+            let binding = body.binding_idx(binding);
+            let name = NormName::intern(binding.name.as_str());
+            declarations.entry(name).or_default().push((position, binding.name.clone()));
         }
     }
 
     declarations
         .into_iter()
-        .filter_map(|(name, positions)| {
-            (positions.len() == 1
+        .filter_map(|(name, declarations)| {
+            (declarations.len() == 1
                 && binding_counts.get(&name) == Some(&1)
                 && !parameters.contains(&name))
-            .then_some((name, positions[0]))
+            .then(|| (name, declarations.into_iter().next().expect("one declaration")))
         })
         .collect()
 }
@@ -279,7 +342,7 @@ fn dynamic_notify_array_call(
     body: &Body,
     expr: ExprIdx,
     platform: &PlatformDataInner,
-) -> Option<(ExprId, Name, CallbackSlots)> {
+) -> Option<(ExprId, Name)> {
     let Expr::New { type_name: None, args } = body.expr_idx(expr) else { return None };
     if args.len() != 2 {
         return None;
@@ -291,59 +354,158 @@ fn dynamic_notify_array_call(
         return None;
     }
     let Expr::Path(array_name) = body.expr_idx(args[1]) else { return None };
-    let slots = callback_slots(platform, type_name)?;
-    Some((ExprId::from_idx(expr), array_name.clone(), slots))
+    Some((ExprId::from_idx(expr), array_name.clone()))
 }
 
-pub(crate) fn callback_slots(
-    platform: &PlatformDataInner,
-    type_name: &str,
-) -> Option<CallbackSlots> {
-    let constructors = platform.get_constructors(type_name);
-    let [constructor] = constructors.as_slice() else { return None };
-    bsl_platform::callback_description_slots_for_parameters(&constructor.parameters)
-}
-
-pub(crate) fn accepts_argument_count(slots: CallbackSlots, count: usize) -> bool {
-    (slots.min_arity..=slots.arity).contains(&count)
-}
-
-fn handlers_from_elements(
+fn dynamic_callback_binding(
+    db: &dyn TypeKernelDb,
+    inference: &InferOwnerResult,
     body: &Body,
     constructor: ExprId,
     elements: &[ExprId],
-    slots: CallbackSlots,
-) -> Vec<NotifyArrayHandler> {
-    let mut handlers = Vec::with_capacity(2);
-    if let Some(handler) =
-        handler_from_elements(body, constructor, elements, slots.handler, slots.receiver)
-    {
-        handlers.push(handler);
+    platform: &PlatformDataInner,
+) -> Option<CallArgBinding> {
+    let Expr::New { type_name: None, args } = body.expr(constructor) else { return None };
+    let Expr::Literal(Literal::String(type_name)) = body.expr_idx(*args.first()?) else {
+        return None;
+    };
+    let constructor_refs = platform.get_constructors(type_name).to_vec();
+    let (definite, possible) = inference
+        .notify_constructor_registration_envs(constructor)
+        .unwrap_or((EnvFlags::EMPTY, EnvFlags::ALL));
+    let environment = definite | possible;
+    let environment = if environment.is_empty() { EnvFlags::ALL } else { environment };
+    let candidates =
+        crate::builtin::candidates::constructor_candidates(db, &constructor_refs, environment)
+            .ok()?;
+    let argument_types = elements
+        .iter()
+        .map(|&expr| inference.type_id_of_expr(expr).unwrap_or_else(|| db.unknown()))
+        .collect::<Vec<_>>();
+    let candidate = crate::call_binding::resolve_binding(db, candidates, &argument_types).semantic;
+    Some(CallArgBinding {
+        owner: inference.owner(),
+        call_expr: constructor,
+        args: elements.to_vec(),
+        candidate,
+        in_dead_branch: false,
+    })
+}
+
+pub(crate) fn callback_arguments_for_binding(
+    binding: &CallArgBinding,
+) -> Option<CallbackArguments> {
+    let resolution = &binding.candidate.resolution;
+    let candidate_ids = match &resolution.selection {
+        CallSelection::Unique { candidate } => vec![*candidate],
+        CallSelection::Ambiguous { candidates } => candidates.to_vec(),
+        CallSelection::Rejected(CallRejection::Type) => resolution
+            .candidates
+            .iter()
+            .filter_map(|fact| {
+                matches!(
+                    &fact.disposition,
+                    CandidateDisposition::Rejected(CandidateRejection::TypeIncompatible { .. })
+                )
+                .then_some(fact.id)
+            })
+            .collect(),
+        CallSelection::Rejected(CallRejection::Arity { .. } | CallRejection::NoCandidates) => {
+            return None;
+        }
+    };
+
+    let candidates = binding.candidate.candidates.as_slice();
+    let mut projection = None;
+    for candidate_id in candidate_ids {
+        let fact = resolution.candidates.iter().find(|fact| fact.id == candidate_id)?;
+        let signature = candidates.iter().find(|signature| signature.id == candidate_id)?;
+        let current = callback_argument_projection(fact, signature)?;
+        if projection.is_some_and(|previous| previous != current) {
+            return None;
+        }
+        projection = Some(current);
     }
-    if let Some(handler) = handler_from_elements(
-        body,
-        constructor,
-        elements,
-        slots.error_handler,
-        slots.error_receiver,
-    ) {
-        handlers.push(handler);
+    projection
+}
+
+fn callback_argument_projection(
+    fact: &crate::call_resolution::CandidateFact,
+    signature: &crate::call_resolution::CallSignature,
+) -> Option<CallbackArguments> {
+    let CandidateEvaluation::ArityCompatible { applicability, .. } = &fact.evaluation else {
+        return None;
+    };
+    let evaluations = match applicability {
+        CandidateApplicability::Applicable { arguments }
+        | CandidateApplicability::Indeterminate { arguments }
+        | CandidateApplicability::Incompatible { arguments } => arguments.as_ref(),
+    };
+    let parameters = signature
+        .params
+        .iter()
+        .map(|parameter| bsl_platform::MethodParam {
+            name: parameter.name.clone(),
+            param_type: None,
+            is_optional: parameter.has_default,
+            is_variadic: parameter.mode == CallParamMode::Variadic,
+            passing: parameter.passing,
+            result_follows_argument_text: parameter.result_follows_argument_text,
+        })
+        .collect::<Vec<_>>();
+    let slots = bsl_platform::callback_description_slots_for_parameters(&parameters)?;
+    let argument_for_parameter = |parameter_index| {
+        let mut matches = evaluations.iter().filter_map(|argument| match argument.parameter {
+            crate::call_resolution::ArgumentParameter::Declared { index, .. }
+                if index == parameter_index =>
+            {
+                Some(argument.index)
+            }
+            _ => None,
+        });
+        let argument = matches.next();
+        argument.filter(|_| matches.next().is_none())
+    };
+    Some(CallbackArguments {
+        handler: argument_for_parameter(slots.handler),
+        receiver: argument_for_parameter(slots.receiver),
+        error_handler: argument_for_parameter(slots.error_handler),
+        error_receiver: argument_for_parameter(slots.error_receiver),
+    })
+}
+
+fn handlers_from_binding(
+    body: &Body,
+    constructor: ExprId,
+    binding: &CallArgBinding,
+) -> Vec<NotifyArrayHandler> {
+    let Some(arguments) = callback_arguments_for_binding(binding) else { return Vec::new() };
+    let mut handlers = Vec::with_capacity(2);
+    for (handler, receiver) in [
+        (arguments.handler, arguments.receiver),
+        (arguments.error_handler, arguments.error_receiver),
+    ] {
+        if let Some(handler) =
+            handler_from_bound_arguments(body, constructor, binding, handler, receiver)
+        {
+            handlers.push(handler);
+        }
     }
     handlers
 }
 
-fn handler_from_elements(
+fn handler_from_bound_arguments(
     body: &Body,
     constructor: ExprId,
-    elements: &[ExprId],
-    handler_index: usize,
-    receiver_index: usize,
+    binding: &CallArgBinding,
+    handler_argument: Option<usize>,
+    receiver_argument: Option<usize>,
 ) -> Option<NotifyArrayHandler> {
-    let callback_expr = *elements.get(handler_index)?;
+    let callback_expr = *binding.args.get(handler_argument?)?;
     let Expr::Literal(Literal::String(callback_name)) = body.expr(callback_expr) else {
         return None;
     };
-    let receiver = elements.get(receiver_index).copied();
+    let receiver = receiver_argument.and_then(|index| binding.args.get(index)).copied();
     let receiver_syntax = match receiver.map(|expr| body.expr(expr)) {
         Some(Expr::Path(name)) => NotifyReceiverSyntax::for_bare_name(name),
         _ => NotifyReceiverSyntax::Other,
@@ -429,9 +591,9 @@ fn is_control_flow(stmt: &Stmt) -> bool {
 }
 
 fn invalidate_or_record_uses(
-    states: &mut FxHashMap<String, ArrayState>,
-    used_before_initialization: &mut FxHashSet<String>,
-    mentioned: FxHashSet<String>,
+    states: &mut FxHashMap<NormName, ArrayState>,
+    used_before_initialization: &mut FxHashSet<NormName>,
+    mentioned: FxHashSet<NormName>,
 ) {
     for name in mentioned {
         match states.get_mut(&name) {
@@ -446,7 +608,7 @@ fn invalidate_or_record_uses(
     }
 }
 
-fn stmt_path_names(body: &Body, stmt: StmtIdx) -> FxHashSet<String> {
+fn stmt_path_names(body: &Body, stmt: StmtIdx) -> FxHashSet<NormName> {
     let mut names = FxHashSet::default();
     match body.stmt_idx(stmt) {
         Stmt::If(if_stmt) => {
@@ -490,21 +652,21 @@ fn stmt_path_names(body: &Body, stmt: StmtIdx) -> FxHashSet<String> {
     names
 }
 
-fn collect_statements_paths(body: &Body, statements: &[StmtIdx], names: &mut FxHashSet<String>) {
+fn collect_statements_paths(body: &Body, statements: &[StmtIdx], names: &mut FxHashSet<NormName>) {
     for &stmt in statements {
         names.extend(stmt_path_names(body, stmt));
     }
 }
 
-fn expression_path_names(body: &Body, expr: ExprIdx) -> FxHashSet<String> {
+fn expression_path_names(body: &Body, expr: ExprIdx) -> FxHashSet<NormName> {
     let mut names = FxHashSet::default();
     collect_expression_paths(body, expr, &mut names);
     names
 }
 
-fn collect_expression_paths(body: &Body, expr: ExprIdx, names: &mut FxHashSet<String>) {
+fn collect_expression_paths(body: &Body, expr: ExprIdx, names: &mut FxHashSet<NormName>) {
     if let Expr::Path(name) = body.expr_idx(expr) {
-        names.insert(name.as_str().fold_lower());
+        names.insert(NormName::intern(name.as_str()));
         return;
     }
     for_each_expr_child(body, expr, &mut |child| collect_expression_paths(body, child, names));
@@ -528,10 +690,16 @@ mod tests {
             true,
             dataflow::reaching_defs::RecoveredBody::Solve,
         );
+        let db = bsl_types::testing::InMemoryDb::new();
+        let inference = crate::infer::InferOwnerResult::ModuleCode(std::sync::Arc::new(
+            crate::infer::ModuleCodeInferenceResult::default(),
+        ));
         let registrations = collect_notify_array_registrations(
+            &db,
             body,
             &cfg,
             reaching_defs.as_deref(),
+            &inference,
             PlatformDataInner::instance(),
         );
         (bodies, registrations)
@@ -706,11 +874,40 @@ EndProcedure
 О = Новый("CallbackDescription", Параметры);
 КонецПроцедуры"#,
             ),
+            (
+                "a possible write through a differently cased Greek name invalidates the array",
+                r#"Процедура Test()
+Перем ΟΣ;
+ΟΣ = Новый Массив;
+ΟΣ.Добавить("Готово");
+ΟΣ.Добавить(ЭтотОбъект);
+Результат = Изменить(οσ);
+О = Новый("CallbackDescription", ΟΣ);
+КонецПроцедуры"#,
+            ),
         ];
 
         for (reason, source) in cases {
             assert!(registrations(source).is_empty(), "{reason}");
         }
+    }
+
+    #[test]
+    fn greek_sigma_case_variants_share_array_identity() {
+        let found = registrations(
+            r#"
+Процедура Test()
+    Перем ΟΣ;
+    ΟΣ = Новый Массив;
+    ΟΣ.Добавить("Нет");
+    ΟΣ.Добавить(ЭтотОбъект);
+    οσ = Новый Массив;
+    О = Новый("CallbackDescription", ΟΣ);
+КонецПроцедуры
+"#,
+        );
+
+        assert!(found.is_empty(), "a reassignment through οσ must invalidate ΟΣ contents");
     }
 
     #[test]
@@ -723,6 +920,22 @@ EndProcedure
     Параметры.Добавить(ЭтотОбъект);
     Выполнить("Параметры = Новый Массив");
     О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+
+        assert!(registrations(source).is_empty());
+    }
+
+    #[test]
+    fn execute_may_write_array_under_contextual_case_fold_spelling() {
+        let source = r#"
+Процедура Test()
+    Перем ΟΣ;
+    ΟΣ = Новый Массив;
+    ΟΣ.Добавить("Готово");
+    ΟΣ.Добавить(ЭтотОбъект);
+    Выполнить("ОС = Новый Массив");
+    О = Новый("CallbackDescription", ΟΣ);
 КонецПроцедуры
 "#;
 
@@ -845,6 +1058,17 @@ EndProcedure
 Параметры.Добавить("Готово");
 Параметры.Добавить(ЭтотОбъект);
 О = Новый("CallbackDescription", Параметры, Лишний);
+КонецПроцедуры"#,
+            r#"Процедура Test()
+Перем Параметры;
+Параметры = Новый Массив;
+Параметры.Добавить("Готово");
+Параметры.Добавить(ЭтотОбъект);
+Параметры.Добавить(Парам);
+Параметры.Добавить(Ошибка);
+Параметры.Добавить(ЭтотОбъект);
+Параметры.Добавить(Лишний);
+О = Новый("CallbackDescription", Параметры);
 КонецПроцедуры"#,
         ];
         for source in cases {
