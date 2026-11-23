@@ -109,6 +109,7 @@ fn registered_on_this_object(
         .any(|site| {
             !matching_registrations.iter().any(|registration| {
                 registration.range == site.constructor_range
+                    && registration.callback_expr == site.callback_expr
                     && matches!(
                         &registration.target,
                         hir::call_graph::NotifyTarget::Module(_)
@@ -229,6 +230,61 @@ mod tests {
               message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint"#]]
         .assert_eq(&format_diags(EXPORTED, &diagnostics));
+    }
+
+    #[test]
+    fn same_name_in_foreign_and_unknown_dynamic_slots_remains_uncertain() {
+        let code = "&НаКлиенте\nПроцедура Callback() Экспорт\nКонецПроцедуры\n";
+        check_command_at_with(code, |ctx| {
+            let name = hir::Name::new("Callback");
+            let symbol_tree = ctx.symbol_tree();
+            let methods = symbol_tree.find_methods(&name);
+            let method = methods.first().expect("exported callback method").id;
+            let constructor_range = TextRange::new(0.into(), 10.into());
+            let foreign_callback_expr = hir::ExprId::from_raw(0.into());
+            let unknown_callback_expr = hir::ExprId::from_raw(1.into());
+            let registration = hir::call_graph::NotifyReg {
+                caller: hir::call_graph::CallerId::ModuleCode,
+                callback_expr: foreign_callback_expr,
+                callback_name: name.clone(),
+                receiver_syntax: hir::call_graph::NotifyReceiverSyntax::BareName,
+                target: hir::call_graph::NotifyTarget::Module(hir::Name::new("Foreign")),
+                environments: hir::call_graph::NotifyRegistrationEnvironments::default(),
+                range: constructor_range,
+            };
+            let unknown_site = hir::call_graph::DynamicNotifySignatureHandler {
+                handler_name: name.clone(),
+                callback_expr: unknown_callback_expr,
+                constructor_range,
+            };
+            let site_is_not_disproved_by_other_slot = registered_on_this_object(
+                ctx,
+                std::slice::from_ref(&registration),
+                std::slice::from_ref(&unknown_site),
+                &name,
+                method,
+                &symbol_tree,
+            );
+            assert!(
+                site_is_not_disproved_by_other_slot,
+                "a foreign receiver in slot 1 must not prove an unknown slot 2"
+            );
+
+            // The exact same foreign receiver does disprove that particular slot.
+            let same_slot_site = hir::call_graph::DynamicNotifySignatureHandler {
+                callback_expr: foreign_callback_expr,
+                ..unknown_site
+            };
+            assert!(!registered_on_this_object(
+                ctx,
+                &[registration],
+                &[same_slot_site],
+                &name,
+                method,
+                &symbol_tree,
+            ));
+            Vec::new()
+        });
     }
 
     #[test]

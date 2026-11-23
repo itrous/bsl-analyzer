@@ -130,6 +130,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         for site in &summary.notify_dynamic_signature_handler_sites {
             let has_proven_foreign_registration = summary.notify_regs.iter().any(|registration| {
                 registration.range == site.constructor_range
+                    && registration.callback_expr == site.callback_expr
                     && registration.callback_name.eq_ignore_case(&site.handler_name)
                     && matches!(&registration.target, hir::call_graph::NotifyTarget::Module(_))
             });

@@ -1,4 +1,5 @@
 use bsl_metadata::MdoType;
+use cfg_types::IdConversion;
 use rustc_hash::{FxHashMap, FxHashSet};
 use stdx::case::CaseExt;
 use syntax::{TextRange, TextSize};
@@ -31,9 +32,9 @@ pub struct ModuleCallSummary {
     /// Kept separate so consumers can restrict this conservative syntax fallback to configurations
     /// without callback constructor facts.
     pub notify_dynamic_signature_handlers: Vec<Name>,
-    /// Source call sites for the dynamic callback names above. The constructor range lets semantic
-    /// consumers distinguish an unnormalized callback array from another registration with the
-    /// same handler name.
+    /// Source call sites for the dynamic callback names above. The callback expression and
+    /// constructor range identify a specific slot, so a resolved registration in a different slot
+    /// with the same handler name cannot disprove this candidate.
     pub notify_dynamic_signature_handler_sites: Vec<DynamicNotifySignatureHandler>,
     /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
@@ -181,6 +182,7 @@ impl ModuleCallSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicNotifySignatureHandler {
     pub handler_name: Name,
+    pub callback_expr: ExprId,
     pub constructor_range: TextRange,
 }
 
@@ -897,8 +899,15 @@ pub fn extract_call_summary(
 
     let mut seen_dynamic_sites = FxHashSet::default();
     notify_dynamic_signature_handler_sites.retain(|site| {
-        seen_dynamic_sites.insert((site.handler_name.clone(), site.constructor_range))
+        seen_dynamic_sites.insert((
+            site.handler_name.clone(),
+            site.callback_expr,
+            site.constructor_range,
+        ))
     });
+    let mut seen_dynamic_handlers = FxHashSet::default();
+    notify_dynamic_signature_handlers
+        .retain(|handler| seen_dynamic_handlers.insert(handler.clone()));
 
     let mut name_literal_refs: Vec<MethodKey> = name_literals.into_iter().collect();
     name_literal_refs.sort_unstable();
@@ -1317,24 +1326,29 @@ fn resolve_dynamic_array_aliases(
     }
 
     let latest = *assignments.iter().max_by_key(|(range, _)| range.start()).unwrap();
-    let branch = dynamic_array_branch_containing(body, source_map, latest.0);
-    let selected = if let Some(branch) = branch {
-        let mut possible = assignments
-            .iter()
-            .filter(|(range, _)| branch.contains_range(*range))
-            .copied()
-            .collect::<Vec<_>>();
+    let mut selected = vec![latest];
+    let mut pending = vec![latest];
+    while let Some((site, _)) = pending.pop() {
+        let Some(branch) = dynamic_array_branch_containing(body, source_map, site) else {
+            continue;
+        };
+        for assignment in assignments.iter().filter(|(range, _)| branch.contains_range(*range)) {
+            if !selected.iter().any(|(range, _)| range == &assignment.0) {
+                selected.push(*assignment);
+                pending.push(*assignment);
+            }
+        }
         if let Some(previous) = assignments
             .iter()
             .filter(|(range, _)| range.end() <= branch.start())
             .max_by_key(|(range, _)| range.start())
         {
-            possible.push(*previous);
+            if !selected.iter().any(|(range, _)| range == &previous.0) {
+                selected.push(*previous);
+                pending.push(*previous);
+            }
         }
-        possible
-    } else {
-        vec![latest]
-    };
+    }
 
     let mut results = Vec::new();
     for (range, value) in selected {
@@ -1503,7 +1517,13 @@ fn extract_dynamic_notify_handlers(
         for value in values {
             let Some(name) = extract_string_literal(body, value) else { continue };
             if is_identifier_like(&name) {
-                push_dynamic_notify_handler(&name, candidate, handlers, handler_sites);
+                push_dynamic_notify_handler(
+                    &name,
+                    ExprId::from_idx(value),
+                    candidate,
+                    handlers,
+                    handler_sites,
+                );
             }
         }
         return;
@@ -1529,13 +1549,20 @@ fn extract_dynamic_notify_handlers(
                 }
             });
         if matches!(receiver_syntax, NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other) {
-            push_dynamic_notify_handler(&handler, candidate, handlers, handler_sites);
+            push_dynamic_notify_handler(
+                &handler,
+                ExprId::from_idx(values[handler_slot]),
+                candidate,
+                handlers,
+                handler_sites,
+            );
         }
     }
 }
 
 fn push_dynamic_notify_handler(
     name: &str,
+    callback_expr: ExprId,
     candidate: &DynamicNotifyArrayCandidate,
     handlers: &mut Vec<Name>,
     handler_sites: &mut Vec<DynamicNotifySignatureHandler>,
@@ -1544,6 +1571,7 @@ fn push_dynamic_notify_handler(
     handlers.push(handler_name.clone());
     handler_sites.push(DynamicNotifySignatureHandler {
         handler_name,
+        callback_expr,
         constructor_range: candidate.constructor_range,
     });
 }
@@ -1719,9 +1747,14 @@ fn dynamic_array_uncertain_writes(
             }
             continue;
         };
+        let writes_through_alias = match body.expr_idx(*target) {
+            Expr::Path(name) => aliases.contains(&NormName::intern(name.as_str())),
+            _ => matches!(target_receiver, Expr::Path(name)
+                if aliases.contains(&NormName::intern(name.as_str()))),
+        };
         if range.start() < start
             || range.start() >= candidate.constructor_start
-            || range.start() >= end
+            || (range.start() >= end && !writes_through_alias)
         {
             continue;
         }
@@ -1748,10 +1781,20 @@ fn dynamic_array_uncertain_writes(
 
     for (expr_id, expr) in body.exprs_iter() {
         let Expr::Call { callee, args } = expr else { continue };
-        let in_window = source_map.expr_range(expr_id).is_some_and(|range| {
+        let range = source_map.expr_range(expr_id);
+        let calls_through_alias = match body.expr_idx(*callee) {
+            Expr::Field { base, .. } => matches!(body.expr_idx(*base), Expr::Path(name)
+                if aliases.contains(&NormName::intern(name.as_str()))),
+            _ => false,
+        };
+        let passes_alias = args.iter().any(|&arg| {
+            matches!(body.expr_idx(arg), Expr::Path(name)
+            if aliases.contains(&NormName::intern(name.as_str())))
+        });
+        let in_window = range.is_some_and(|range| {
             range.start() >= start
                 && range.start() < candidate.constructor_start
-                && range.start() < end
+                && (range.start() < end || calls_through_alias || passes_alias)
         });
         if !in_window {
             continue;
@@ -2866,6 +2909,121 @@ EndProcedure
             summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
         handlers.sort_unstable();
         assert_eq!(handlers, ["ДоКопирования", "ИзВетви"]);
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_writes_survive_source_rebinding() {
+        let code = r#"
+Процедура Тест()
+    Перем Параметры;
+    Перем Копия;
+    Параметры = Новый Массив;
+    Параметры.Добавить("ДоПерепривязки");
+    Параметры.Добавить(ЭтотОбъект);
+    Копия = Параметры;
+    Параметры = Новый Массив;
+    Копия.Добавить("ЧерезКопию");
+    Копия.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", Копия);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let mut handlers =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
+        handlers.sort_unstable();
+        assert_eq!(handlers, ["ДоПерепривязки", "ЧерезКопию"]);
+
+        // Rebinding and appending through the source changes a different object.
+        let source_write =
+            code.replace("Копия.Добавить(\"ЧерезКопию\");", "Параметры.Добавить(\"ЧужаяЗапись\");");
+        let summary = parse_and_extract(&source_write);
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("ЧужаяЗапись"))),
+            "{summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_keeps_values_before_sequential_conditional_rebindings() {
+        let code = r#"
+Процедура Тест(Условие1, Условие2)
+    Перем Параметры;
+    Перем Запасной;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Базовый");
+    Параметры.Добавить(ЭтотОбъект);
+    Если Условие1 Тогда
+        Параметры = Запасной;
+    КонецЕсли;
+    Если Условие2 Тогда
+        Параметры = Новый Массив;
+        Параметры.Добавить("ИзВторойВетви");
+        Параметры.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let mut handlers =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
+        handlers.sort_unstable();
+        assert_eq!(handlers, ["Базовый", "ИзВторойВетви"]);
+
+        let no_base = code.replace(
+            "Параметры.Добавить(ЭтотОбъект);\n    Если Условие1 Тогда",
+            "Параметры.Добавить(ЭтотОбъект);\n    Параметры = Новый Массив;\n    Если Условие1 Тогда",
+        );
+        let summary = parse_and_extract(&no_base);
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("Базовый"))),
+            "{summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_keeps_values_before_nested_conditional_rebindings() {
+        let code = r#"
+Процедура Тест(Первое, Второе)
+    Перем Параметры;
+    Перем Альт;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Главный");
+    Параметры.Добавить(ЭтотОбъект);
+    Альт = Новый Массив;
+    Альт.Добавить("ИзВетви");
+    Альт.Добавить(ЭтотОбъект);
+    Если Первое Тогда
+        Параметры = Альт;
+        Если Второе Тогда
+            Параметры = Новый Массив;
+        КонецЕсли;
+    КонецЕсли;
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let mut handlers =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
+        handlers.sort_unstable();
+        assert_eq!(handlers, ["Главный", "ИзВетви"]);
+
+        // If the only incoming array is definitely replaced, its handlers are not candidates.
+        let reset =
+            code.replace("Если Первое Тогда", "Параметры = Новый Массив;\n    Если Первое Тогда");
+        let summary = parse_and_extract(&reset);
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("Главный"))),
+            "{summary:#?}"
+        );
     }
 
     #[test]
