@@ -20,7 +20,10 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let code = DiagnosticCode::CommandModuleExportMethods;
 
-    if ctx.is_disabled_with_metadata(code) {
+    // An empty type surface cannot establish that an export is not a callback.
+    if ctx.is_disabled_with_metadata(code)
+        || bsl_platform::PlatformData::instance().all_types().is_empty()
+    {
         return Vec::new();
     }
 
