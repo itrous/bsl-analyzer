@@ -675,6 +675,13 @@ fn collect_expression_paths(body: &Body, expr: ExprIdx, names: &mut FxHashSet<No
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::call_resolution::{
+        ArgumentApplicability, ArgumentEvaluation, ArgumentParameter, ArityFallback, ArityMismatch,
+        ArityUsage, CallCandidateSet, CallParam, CallRejection, CallResolution, CallSelection,
+        CallSignature, CandidateApplicability, CandidateDisposition, CandidateEvaluation,
+        CandidateFact, CandidateId, CandidateOrigin, CandidateProvenance, PlatformSignatureSlot,
+    };
+    use bsl_types::testing::InMemoryDb;
 
     fn parsed(source: &str) -> (hir_def::ModuleBodies, Vec<NotifyArrayRegistration>) {
         let parse = parser::parse(source);
@@ -1073,6 +1080,233 @@ EndProcedure
         ];
         for source in cases {
             assert!(registrations(source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn callback_arguments_follow_evaluation_mapping_for_unique_and_rejected_type_calls() {
+        let schema = [
+            "ДополнительныеПараметры",
+            "Модуль",
+            "ИмяПроцедуры",
+            "МодульОбработкиОшибки",
+            "ИмяПроцедурыОбработкиОшибки",
+        ];
+        let unique = binding_for_schemas(&[schema], TestResolution::Unique);
+        let expected = CallbackArguments {
+            handler: Some(2),
+            receiver: Some(1),
+            error_handler: Some(4),
+            error_receiver: Some(3),
+        };
+        assert_eq!(callback_arguments_for_binding(&unique), Some(expected));
+
+        let rejected = binding_for_schemas(&[schema], TestResolution::TypeRejected);
+        assert_eq!(callback_arguments_for_binding(&rejected), Some(expected));
+    }
+
+    #[test]
+    fn ambiguous_constructor_schemas_require_the_same_argument_projection() {
+        let schema = [
+            "ДополнительныеПараметры",
+            "Модуль",
+            "ИмяПроцедуры",
+            "МодульОбработкиОшибки",
+            "ИмяПроцедурыОбработкиОшибки",
+        ];
+        let same_schema = binding_for_schemas(&[schema, schema], TestResolution::Ambiguous);
+        assert_eq!(
+            callback_arguments_for_binding(&same_schema),
+            Some(CallbackArguments {
+                handler: Some(2),
+                receiver: Some(1),
+                error_handler: Some(4),
+                error_receiver: Some(3),
+            })
+        );
+
+        let different_schema = binding_for_schemas(
+            &[
+                schema,
+                [
+                    "ИмяПроцедуры",
+                    "Модуль",
+                    "ДополнительныеПараметры",
+                    "ИмяПроцедурыОбработкиОшибки",
+                    "МодульОбработкиОшибки",
+                ],
+            ],
+            TestResolution::Ambiguous,
+        );
+        assert_eq!(callback_arguments_for_binding(&different_schema), None);
+    }
+
+    #[test]
+    fn arity_rejected_constructor_has_no_callback_argument_projection() {
+        let schema = [
+            "ИмяПроцедуры",
+            "Модуль",
+            "ДополнительныеПараметры",
+            "ИмяПроцедурыОбработкиОшибки",
+            "МодульОбработкиОшибки",
+        ];
+        let rejected = binding_for_schemas(&[schema], TestResolution::ArityRejected);
+        assert_eq!(callback_arguments_for_binding(&rejected), None);
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestResolution {
+        Unique,
+        Ambiguous,
+        TypeRejected,
+        ArityRejected,
+    }
+
+    fn binding_for_schemas(
+        schemas: &[[&str; 5]],
+        resolution_kind: TestResolution,
+    ) -> CallArgBinding {
+        let db = InMemoryDb::new();
+        let unknown = db.unknown();
+        let ids = schemas
+            .iter()
+            .enumerate()
+            .map(|(index, _)| CandidateId::Platform {
+                method_id: index as u32 + 1,
+                signature: PlatformSignatureSlot::Base,
+            })
+            .collect::<Vec<_>>();
+        let signatures = schemas
+            .iter()
+            .enumerate()
+            .map(|(index, schema)| CallSignature {
+                id: ids[index],
+                params: schema
+                    .iter()
+                    .map(|name| CallParam {
+                        name: (*name).into(),
+                        ty: unknown,
+                        has_default: true,
+                        mode: CallParamMode::Positional,
+                        passing: None,
+                        result_follows_argument_text: false,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                required_args: 0,
+                max_args: Some(5),
+                return_ty: unknown,
+                origin: CandidateOrigin::Platform,
+                environment: EnvFlags::ALL,
+                provenance: CandidateProvenance::PlatformMethod {
+                    method_id: index as u32 + 1,
+                    signature: PlatformSignatureSlot::Base,
+                },
+                from_doc_comment: false,
+            })
+            .collect::<Vec<_>>();
+        let candidates = CallCandidateSet::try_from(signatures).expect("unique candidate ids");
+        let facts = ids
+            .iter()
+            .map(|&id| {
+                let (evaluation, disposition) = match resolution_kind {
+                    TestResolution::ArityRejected => {
+                        let mismatch = ArityMismatch::TooMany { actual: 6, maximum: 5 };
+                        (
+                            CandidateEvaluation::ArityIncompatible(mismatch),
+                            CandidateDisposition::Rejected(
+                                crate::call_resolution::CandidateRejection::Arity(mismatch),
+                            ),
+                        )
+                    }
+                    TestResolution::TypeRejected => (
+                        CandidateEvaluation::ArityCompatible {
+                            usage: ArityUsage {
+                                actual: 5,
+                                defaults_used: 0,
+                                variadic_arguments: 0,
+                            },
+                            applicability: CandidateApplicability::Incompatible {
+                                arguments: (0..5)
+                                    .map(|index| ArgumentEvaluation {
+                                        index,
+                                        argument_ty: unknown,
+                                        parameter: ArgumentParameter::Declared {
+                                            index,
+                                            mode: CallParamMode::Positional,
+                                            ty: unknown,
+                                        },
+                                        applicability: ArgumentApplicability::Incompatible,
+                                    })
+                                    .collect(),
+                            },
+                        },
+                        CandidateDisposition::Rejected(
+                            crate::call_resolution::CandidateRejection::TypeIncompatible {
+                                arguments: (0..5)
+                                    .map(|index| ArgumentEvaluation {
+                                        index,
+                                        argument_ty: unknown,
+                                        parameter: ArgumentParameter::Declared {
+                                            index,
+                                            mode: CallParamMode::Positional,
+                                            ty: unknown,
+                                        },
+                                        applicability: ArgumentApplicability::Incompatible,
+                                    })
+                                    .collect(),
+                            },
+                        ),
+                    ),
+                    TestResolution::Unique | TestResolution::Ambiguous => (
+                        CandidateEvaluation::ArityCompatible {
+                            usage: ArityUsage {
+                                actual: 5,
+                                defaults_used: 0,
+                                variadic_arguments: 0,
+                            },
+                            applicability: CandidateApplicability::Applicable {
+                                arguments: (0..5)
+                                    .map(|index| ArgumentEvaluation {
+                                        index,
+                                        argument_ty: unknown,
+                                        parameter: ArgumentParameter::Declared {
+                                            index,
+                                            mode: CallParamMode::Positional,
+                                            ty: unknown,
+                                        },
+                                        applicability: ArgumentApplicability::Exact,
+                                    })
+                                    .collect(),
+                            },
+                        },
+                        CandidateDisposition::Survivor,
+                    ),
+                };
+                CandidateFact { id, return_ty: unknown, evaluation, score: None, disposition }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let selection = match resolution_kind {
+            TestResolution::Unique => CallSelection::Unique { candidate: ids[0] },
+            TestResolution::Ambiguous => {
+                CallSelection::Ambiguous { candidates: ids.clone().into_boxed_slice() }
+            }
+            TestResolution::TypeRejected => CallSelection::Rejected(CallRejection::Type),
+            TestResolution::ArityRejected => {
+                let mismatch = ArityMismatch::TooMany { actual: 6, maximum: 5 };
+                CallSelection::Rejected(CallRejection::Arity {
+                    fallback: ArityFallback { candidate: ids[0], mismatch, distance: 1 },
+                })
+            }
+        };
+        let resolution = CallResolution { candidates: facts, selection, return_ty: unknown };
+        CallArgBinding {
+            owner: hir_def::DefWithBodyId::ModuleCode,
+            call_expr: ExprId::from_raw(0u32.into()),
+            args: (0..5).map(|index| ExprId::from_raw((index as u32).into())).collect(),
+            candidate: crate::infer::CandidateCallBinding { candidates, resolution },
+            in_dead_branch: false,
         }
     }
 }
