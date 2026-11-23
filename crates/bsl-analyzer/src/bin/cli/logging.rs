@@ -1,4 +1,9 @@
-use std::{env, fs, io, path::PathBuf, sync::Arc};
+use std::{
+    env, fs, io,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 mod journal;
 pub use journal::JournalGuard;
@@ -54,6 +59,14 @@ pub fn start_logging(
     if !default_log {
         if let Some(path) = &log_file {
             rotate_explicit_log(path);
+            // The path arrives already expanded, so the configured value is the only
+            // place that still says whether the user opted into per-pid names.
+            if let Some(pattern) = non_empty_env("BSL_LOG_FILE")
+                .filter(|value| value.contains(PID_PLACEHOLDER))
+                .map(PathBuf::from)
+            {
+                prune_stale_pid_logs(&pattern, path, mcp_server::ROTATED_LOG_RETENTION);
+            }
         }
     }
 
@@ -92,6 +105,134 @@ fn rotate_explicit_log(path: &std::path::Path) {
     }
 }
 
+/// Deletes sibling logs of a `{pid}` pattern left by processes that are long gone: every process
+/// creates its own file and nothing else ever removes them.
+///
+/// A live process's open file cannot be deleted on Windows, which is the natural guard against
+/// removing a log that is still being written; the current process's own file is skipped
+/// explicitly for the platforms where deletion would succeed. Every error is ignored and the scan
+/// is bounded, so this can neither fail nor stall the start.
+fn prune_stale_pid_logs(pattern: &std::path::Path, own: &std::path::Path, retention: Duration) {
+    const MAX_ENTRIES: usize = 10_000;
+
+    let Some((prefix, suffix)) = pattern
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once(PID_PLACEHOLDER))
+    else {
+        return;
+    };
+    // The pattern is the unexpanded setting and may be relative to a directory this process is
+    // not in; the own path is already expanded, so the directory comes from it.
+    let dir = match own.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let own_name = own.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let own_trail = format!("{own_name}.prev");
+    let Ok(entries) = fs::read_dir(dir) else { return };
+
+    for entry in entries.take(MAX_ENTRIES).flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else { continue };
+        if name == own_name || name == own_trail {
+            continue;
+        }
+        let stem = name.strip_suffix(".prev").unwrap_or(name);
+        let Some(pid) = stem.strip_prefix(prefix).and_then(|rest| rest.strip_suffix(suffix)) else {
+            continue;
+        };
+        if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let is_stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > retention);
+        if is_stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// An explicit log file that rotates while the process runs, not only at start: a daemon lives
+/// for hours and an appended log otherwise grows without bound.
+///
+/// Logging must never be the reason the process dies, so a failure while rotating is swallowed:
+/// the write that triggered it has already succeeded.
+struct RotatingLogFile {
+    path: PathBuf,
+    limit: u64,
+    state: Mutex<LogState>,
+}
+
+struct LogState {
+    file: Option<fs::File>,
+    written: u64,
+}
+
+impl RotatingLogFile {
+    fn new(path: PathBuf) -> io::Result<Self> {
+        Self::with_limit(path, mcp_server::LOG_ROTATE_BYTES)
+    }
+
+    fn with_limit(path: PathBuf, limit: u64) -> io::Result<Self> {
+        let file = Self::open(&path)?;
+        // Seeded from the existing length so a file already near the threshold rotates soon
+        // after start instead of only at the next restart.
+        let written = file.metadata().map_or(0, |meta| meta.len());
+        Ok(Self { path, limit, state: Mutex::new(LogState { file: Some(file), written }) })
+    }
+
+    fn open(path: &std::path::Path) -> io::Result<fs::File> {
+        fs::OpenOptions::new().create(true).append(true).open(path)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LogState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn rotate(&self, state: &mut LogState) {
+        // The handle goes first: on Windows a rename fails on a file that is still open
+        // without FILE_SHARE_DELETE.
+        state.file = None;
+        if let Some(trail) = mcp_server::rotated_log_path(&self.path) {
+            let _ = fs::rename(&self.path, trail);
+        }
+        // A failed rename leaves the old file in place; counting from zero retries after
+        // another threshold's worth of bytes rather than on every write.
+        state.file = Self::open(&self.path).ok();
+        state.written = 0;
+    }
+}
+
+impl io::Write for &RotatingLogFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut state = self.lock();
+        if state.file.is_none() {
+            let file = RotatingLogFile::open(&self.path)?;
+            state.written = file.metadata().map_or(0, |meta| meta.len());
+            state.file = Some(file);
+        }
+        let Some(file) = state.file.as_mut() else { return Ok(0) };
+        let count = io::Write::write(file, buf)?;
+        state.written += count as u64;
+        if state.written > self.limit {
+            self.rotate(&mut state);
+        }
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.lock().file.as_mut() {
+            Some(file) => io::Write::flush(file),
+            None => Ok(()),
+        }
+    }
+}
+
 fn setup_logging(
     log_file: Option<PathBuf>,
     profile_filter: Option<String>,
@@ -103,9 +244,7 @@ fn setup_logging(
     // concurrent short-lived daemon candidates (the broker's spawn race) do not
     // truncate the winner's live file.
     let writer: BoxMakeWriter = match log_file {
-        Some(file) => BoxMakeWriter::new(Arc::new(
-            fs::OpenOptions::new().create(true).append(true).open(&file)?,
-        )),
+        Some(file) => BoxMakeWriter::new(Arc::new(RotatingLogFile::new(file)?)),
         None => BoxMakeWriter::new(io::stderr),
     };
 
@@ -350,7 +489,8 @@ mod tests {
         const TEST: &str = "a_log_at_the_threshold_is_appended_and_leaves_no_trail";
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("run.log");
-        write_log(&log, SENTINEL, mcp_server::LOG_ROTATE_BYTES);
+        // Short of the threshold by more than the one line the child writes.
+        write_log(&log, SENTINEL, mcp_server::LOG_ROTATE_BYTES - 4096);
 
         run_child(TEST, "start:appended-not-rotated", &log, "warn");
 
@@ -376,24 +516,129 @@ mod tests {
         assert!(!log.exists(), "the rotated log was not moved away");
     }
 
-    /// The daemon's cache log is rotated by the MCP command before logging starts; rotating it
-    /// here too would apply its bound twice.
+    /// The start itself leaves the daemon's cache log alone (the MCP command rotates it before
+    /// logging starts); once the process writes, the running writer applies the same bound, so
+    /// the first line pushes an over-threshold file to its trail.
     #[test]
-    fn the_daemon_default_log_is_not_rotated_by_the_logging_start() {
+    fn the_daemon_default_log_is_rotated_by_the_writer_not_the_logging_start() {
         if act_as_child() {
             return;
         }
-        const TEST: &str = "the_daemon_default_log_is_not_rotated_by_the_logging_start";
+        const TEST: &str = "the_daemon_default_log_is_rotated_by_the_writer_not_the_logging_start";
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("run.log");
         write_log(&log, SENTINEL, OVER);
 
         run_child(TEST, "default:default-log-line", &log, "warn");
 
-        assert!(!dir.path().join("run.log.prev").exists(), "the default log was rotated");
-        let bytes = fs::read(&log).unwrap();
-        assert!(u64::try_from(bytes.len()).unwrap() > OVER, "the default log was not appended to");
-        assert!(bytes.starts_with(SENTINEL.as_bytes()));
+        let trail = fs::read(dir.path().join("run.log.prev")).unwrap();
+        assert!(u64::try_from(trail.len()).unwrap() > OVER, "the line was not written first");
+        assert!(trail.starts_with(SENTINEL.as_bytes()));
+        assert!(fs::metadata(&log).map_or(0, |meta| meta.len()) < OVER);
+    }
+
+    fn write_through(log: &RotatingLogFile, bytes: &[u8]) {
+        use std::io::Write;
+        let mut writer = log;
+        writer.write_all(bytes).unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn writing_past_the_threshold_rotates_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.log");
+        let log = RotatingLogFile::with_limit(path.clone(), 100).unwrap();
+
+        write_through(&log, &[b'a'; 60]);
+        write_through(&log, &[b'b'; 60]);
+
+        let trail = fs::read(dir.path().join("run.log.prev")).unwrap();
+        assert_eq!(trail.len(), 120);
+        assert!(fs::metadata(&path).unwrap().len() < 100);
+        write_through(&log, b"after");
+        assert_eq!(fs::read(&path).unwrap(), b"after");
+    }
+
+    /// The control of the test above: the same writes under the threshold leave no trail.
+    #[test]
+    fn writing_below_the_threshold_leaves_no_trail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.log");
+        let log = RotatingLogFile::with_limit(path.clone(), 100).unwrap();
+
+        write_through(&log, &[b'a'; 40]);
+        write_through(&log, &[b'b'; 40]);
+
+        assert!(!dir.path().join("run.log.prev").exists());
+        assert_eq!(fs::metadata(&path).unwrap().len(), 80);
+    }
+
+    #[test]
+    fn a_file_already_near_the_threshold_rotates_after_a_small_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.log");
+        write_log(&path, SENTINEL, 95);
+        let log = RotatingLogFile::with_limit(path.clone(), 100).unwrap();
+
+        write_through(&log, b"0123456789");
+
+        let trail = fs::read(dir.path().join("run.log.prev")).unwrap();
+        assert!(trail.starts_with(SENTINEL.as_bytes()));
+        assert_eq!(trail.len(), 105);
+        assert!(fs::metadata(&path).unwrap().len() < 100);
+    }
+
+    fn set_age(path: &std::path::Path, age: Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age).unwrap();
+    }
+
+    #[test]
+    fn pruning_removes_only_old_siblings_of_the_pid_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = Duration::from_secs(24 * 60 * 60);
+        let pattern = dir.path().join("run-{pid}.log");
+        let own = dir.path().join("run-100.log");
+        let old_match = dir.path().join("run-200.log");
+        let old_trail = dir.path().join("run-201.log.prev");
+        let fresh_match = dir.path().join("run-300.log");
+        let unrelated = dir.path().join("run-abc.log");
+        let other = dir.path().join("notes.txt");
+        for file in [&own, &old_match, &old_trail, &fresh_match, &unrelated, &other] {
+            fs::write(file, "x").unwrap();
+        }
+        for file in [&own, &old_match, &old_trail, &unrelated, &other] {
+            set_age(file, day * 3);
+        }
+
+        prune_stale_pid_logs(&pattern, &own, day);
+
+        assert!(!old_match.exists(), "an old sibling was kept");
+        assert!(!old_trail.exists(), "an old sibling trail was kept");
+        assert!(own.exists(), "the current file was deleted");
+        assert!(fresh_match.exists(), "a fresh sibling was deleted");
+        assert!(unrelated.exists(), "a non-digit name matched the pattern");
+        assert!(other.exists(), "a file outside the pattern was deleted");
+    }
+
+    /// The configured pattern is often relative and unexpanded; the directory to scan comes from
+    /// the process's own expanded log path, never from the process's working directory.
+    #[test]
+    fn pruning_scans_the_directory_of_the_own_log_not_of_the_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = Duration::from_secs(24 * 60 * 60);
+        let own = dir.path().join("bsl-analyzer-100.log");
+        let old_match = dir.path().join("bsl-analyzer-200.log");
+        for file in [&own, &old_match] {
+            fs::write(file, "x").unwrap();
+        }
+        set_age(&old_match, day * 3);
+
+        prune_stale_pid_logs(std::path::Path::new("bsl-analyzer-{pid}.log"), &own, day);
+
+        assert!(!old_match.exists(), "the sibling next to the own log was not pruned");
+        assert!(own.exists(), "the current file was deleted");
     }
 
     /// The trail path is a directory, so the rename cannot happen: the start still succeeds,
