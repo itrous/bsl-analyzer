@@ -2131,9 +2131,14 @@ fn is_notify_constructor_candidate(body: &Body, typed: bool, args: &[ExprIdx]) -
     if typed {
         args.iter().any(|&arg| matches!(body.expr_idx(arg), Expr::Literal(Literal::String(_))))
     } else {
-        // Dynamic `New(type, parameters)` is only a candidate by shape. The type and
-        // parameter-array semantics are established later by `hir-ty`.
+        // Dynamic array arguments need semantic resolution; the legacy direct-argument
+        // spelling also needs its source sites retained when platform facts are absent.
         args.len() == 2
+            || (args.len() > 2
+                && args
+                    .first()
+                    .and_then(|&arg| extract_string_literal(body, arg))
+                    .is_some_and(|name| bsl_platform::is_callback_description_type_name(&name)))
     }
 }
 
@@ -3212,6 +3217,18 @@ EndProcedure
             summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
         handlers.sort_unstable();
         assert_eq!(handlers, ["ДоКопирования", "ИзВетви"]);
+    }
+
+    #[test]
+    fn direct_dynamic_callback_arguments_are_retained_as_candidates() {
+        let code = r#"
+Процедура Тест()
+    О = Новый("NotifyDescription", "Готово", ЭтотОбъект, Неопределено, "Ошибка", ЭтотОбъект);
+    Другое = Новый("Unrelated", "Готово", ЭтотОбъект);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert_eq!(summary.notify_candidates.len(), 1, "{summary:#?}");
     }
 
     #[test]
