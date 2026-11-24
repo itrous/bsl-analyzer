@@ -58,6 +58,7 @@ mod infer_documented_union_argument;
 mod infer_field_lookup;
 mod infer_for_each_element;
 mod infer_form_attribute_to_value;
+mod infer_implicit_local_whole_body;
 mod infer_invalidation;
 mod infer_jsdoc_types;
 mod infer_local_reset_on_untyped_write;

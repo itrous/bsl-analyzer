@@ -39,7 +39,9 @@ pub use defined_type::parse_defined_type_xml;
 pub use enum_parser::parse_enum_xml;
 pub use event_subscription::parse_event_subscription_xml;
 pub use form::{parse_form_from_bsl_path, parse_form_xml};
-pub use form_sidecar::{parse_ordinary_form_sidecar, read_ordinary_form_sidecar, SidecarRejection};
+pub use form_sidecar::{
+    parse_ordinary_form_sidecar, platform_list_heads, read_ordinary_form_sidecar, SidecarRejection,
+};
 pub use http_service::parse_http_service_xml;
 pub use integration_service::parse_integration_service_xml;
 pub use predefined_parser::parse_predefined_xml;
