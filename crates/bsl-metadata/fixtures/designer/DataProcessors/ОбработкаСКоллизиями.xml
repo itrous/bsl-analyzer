@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<DataProcessor uuid="7e1c0039-3a5b-4c6d-8e7f-5a0000000051">
+		<Properties>
+			<Name>ОбработкаСКоллизиями</Name>
+		</Properties>
+		<ChildObjects>
+			<TabularSection uuid="7e1c0039-3a5b-4c6d-8e7f-5a0000000052">
+				<Properties>
+					<Name>Документы</Name>
+				</Properties>
+				<ChildObjects>
+					<Attribute uuid="7e1c0039-3a5b-4c6d-8e7f-5a0000000055">
+						<Properties>
+							<Name>Значение</Name>
+							<Type>
+								<v8:Type>xs:string</v8:Type>
+							</Type>
+						</Properties>
+					</Attribute>
+				</ChildObjects>
+			</TabularSection>
+			<TabularSection uuid="7e1c0039-3a5b-4c6d-8e7f-5a0000000053">
+				<Properties>
+					<Name>Справочники</Name>
+				</Properties>
+				<ChildObjects>
+					<Attribute uuid="7e1c0039-3a5b-4c6d-8e7f-5a0000000056">
+						<Properties>
+							<Name>Значение</Name>
+							<Type>
+								<v8:Type>xs:string</v8:Type>
+							</Type>
+						</Properties>
+					</Attribute>
+				</ChildObjects>
+			</TabularSection>
+			<TabularSection uuid="7e1c0039-3a5b-4c6d-8e7f-5a0000000054">
+				<Properties>
+					<Name>Отчеты</Name>
+				</Properties>
+				<ChildObjects>
+					<Attribute uuid="7e1c0039-3a5b-4c6d-8e7f-5a0000000057">
+						<Properties>
+							<Name>Значение</Name>
+							<Type>
+								<v8:Type>xs:string</v8:Type>
+							</Type>
+						</Properties>
+					</Attribute>
+				</ChildObjects>
+			</TabularSection>
+		</ChildObjects>
+	</DataProcessor>
+</MetaDataObject>

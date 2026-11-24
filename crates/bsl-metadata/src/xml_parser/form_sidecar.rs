@@ -25,7 +25,7 @@ use stdx::case::CaseExt;
 use crate::enums::FormType;
 use crate::error::{MetadataError, Result};
 use crate::form::{Form, FormAttribute, FormElement, FormElementKind, FormEventHandler};
-use crate::metadata_object::AttributeType;
+use crate::metadata_object::{AttributeType, MdoType};
 
 /// The `event_type` given to a `boundHandlers` entry no event map names: the
 /// sidecar says the procedure is bound, not to which event.
@@ -101,7 +101,16 @@ struct SidecarForm {
 #[serde(default)]
 struct SidecarAttribute {
     name: String,
+    /// The readable 1C type (`ОтчетОбъект.ОтчетДиаграмма`), schema 14+; absent before.
+    #[serde(rename = "type")]
+    type_name: Option<String>,
+    /// Set on the form's main attribute only, schema 14+.
+    main: bool,
+    /// The type already structured by the producer, where it emits one. Preferred
+    /// over `type_name`: it needs no mapping, so it cannot lose a case the mapping
+    /// does not know.
     attr_type: Option<AttributeType>,
+    /// The producer's own spelling of `main`. Either spelling marks the main attribute.
     is_main: bool,
 }
 
@@ -205,9 +214,12 @@ fn parse_sidecar(json: &str, form_name: &str) -> std::result::Result<Form, Sidec
         .into_iter()
         .filter(|attr| !attr.name.is_empty())
         .map(|attr| {
-            let mut attribute =
-                FormAttribute::new(attr.name, attr.attr_type.unwrap_or(AttributeType::Unknown));
-            attribute.is_main = attr.is_main;
+            let attr_type = attr
+                .attr_type
+                .or_else(|| attr.type_name.as_deref().and_then(object_type_of))
+                .unwrap_or(AttributeType::Unknown);
+            let mut attribute = FormAttribute::new(attr.name, attr_type);
+            attribute.is_main = attr.is_main || attr.main;
             attribute
         })
         .collect();
@@ -249,6 +261,37 @@ fn parse_sidecar(json: &str, form_name: &str) -> std::result::Result<Form, Sidec
     );
 
     Ok(form)
+}
+
+/// Russian spellings of the object types the sidecar's `type` may carry, with the
+/// metadata kind that owns each. Only OBJECT types are read: a reference type
+/// (`СправочникСсылка.X`) would map to the same `AttributeType::Ref` as an object
+/// type, so reading it would pass a reference off as the object itself.
+const OBJECT_TYPE_PREFIXES: &[(&str, MdoType)] = &[
+    ("СправочникОбъект", MdoType::Catalog),
+    ("ДокументОбъект", MdoType::Document),
+    ("ОтчетОбъект", MdoType::Report),
+    ("ОбработкаОбъект", MdoType::DataProcessor),
+    ("ЗадачаОбъект", MdoType::Task),
+    ("БизнесПроцессОбъект", MdoType::BusinessProcess),
+    ("ПланОбменаОбъект", MdoType::ExchangePlan),
+    ("ПланСчетовОбъект", MdoType::ChartOfAccounts),
+    ("ПланВидовХарактеристикОбъект", MdoType::ChartOfCharacteristicTypes),
+    ("ПланВидовРасчетаОбъект", MdoType::ChartOfCalculationTypes),
+    ("ВнешняяОбработкаОбъект", MdoType::ExternalDataProcessor),
+    ("ВнешнийОтчетОбъект", MdoType::ExternalReport),
+];
+
+/// `<Вид>Объект.<Имя>` as `AttributeType::Ref`; any other spelling is `None`, so the
+/// attribute keeps `Unknown` rather than a guess.
+fn object_type_of(type_name: &str) -> Option<AttributeType> {
+    let (prefix, name) = type_name.trim().split_once('.')?;
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    let (_, mdo_type) =
+        OBJECT_TYPE_PREFIXES.iter().find(|(known, _)| stdx::case::eq_ignore_case(known, prefix))?;
+    Some(AttributeType::Ref { mdo_type: *mdo_type, name: name.to_string() })
 }
 
 fn handlers_of(handlers: BTreeMap<String, String>) -> Vec<FormEventHandler> {
@@ -490,6 +533,87 @@ pub(crate) mod tests {
         let form = parse_ordinary_form_sidecar(json, "ИзПути").unwrap();
         assert_eq!(form.name(), "ИзПути");
         assert_eq!(form.find_element("Э").unwrap().kind, FormElementKind::Other);
+    }
+
+    #[test]
+    fn a_typed_main_attribute_is_read_and_everything_else_stays_unknown() {
+        let json = r#"{"schema": 14, "attributes": [
+            {"id": 0, "name": "ОбщийОтчет", "type": "ОтчетОбъект.ОтчетДиаграмма", "main": true},
+            {"id": 1, "name": "А", "type": "СправочникСсылка.Валюты"},
+            {"id": 2, "name": "Б", "type": "Строка(50)"},
+            {"id": 3, "name": "В", "type": "Произвольный"},
+            {"id": 4, "name": "Г", "type": "ОтчетОбъект.A.B"},
+            {"id": 5, "name": "Д"}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        let main = form.main_attribute().unwrap();
+        assert_eq!(main.name, "ОбщийОтчет");
+        assert_eq!(
+            main.attr_type,
+            AttributeType::Ref {
+                mdo_type: MdoType::Report, name: "ОтчетДиаграмма".to_string()
+            }
+        );
+        for name in ["А", "Б", "В", "Г", "Д"] {
+            let attr = form.find_attribute(name).unwrap();
+            assert_eq!(attr.attr_type, AttributeType::Unknown, "{name}");
+            assert!(!attr.is_main, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_sidecar_without_type_and_main_has_no_main_attribute() {
+        let json = r#"{"schema": 13, "attributes": [{"id": 0, "name": "ОбщийОтчет"}]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        assert!(form.main_attribute().is_none());
+        assert_eq!(form.find_attribute("ОбщийОтчет").unwrap().attr_type, AttributeType::Unknown);
+    }
+
+    #[test]
+    fn a_structured_attr_type_alone_gives_the_attribute_type() {
+        let json = r#"{"attributes": [
+            {"name": "Объект",
+             "attr_type": {"Ref": {"mdo_type": "Catalog", "name": "Валюты"}}}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        assert_eq!(
+            form.find_attribute("Объект").unwrap().attr_type,
+            AttributeType::Ref { mdo_type: MdoType::Catalog, name: "Валюты".to_string() }
+        );
+    }
+
+    #[test]
+    fn the_structured_attr_type_wins_over_the_type_name_when_both_are_present() {
+        // The name maps to a Report, the structured field says Catalog: Catalog must win.
+        let json = r#"{"schema": 14, "attributes": [
+            {"name": "А", "type": "ОтчетОбъект.ОтчетДиаграмма",
+             "attr_type": {"Ref": {"mdo_type": "Catalog", "name": "Валюты"}}}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        let attr_type = &form.find_attribute("А").unwrap().attr_type;
+        assert_eq!(
+            attr_type,
+            &AttributeType::Ref { mdo_type: MdoType::Catalog, name: "Валюты".to_string() }
+        );
+        assert_ne!(
+            attr_type,
+            &AttributeType::Ref {
+                mdo_type: MdoType::Report, name: "ОтчетДиаграмма".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn either_spelling_of_main_marks_the_main_attribute() {
+        let json = r#"{"attributes": [
+            {"name": "ПоИмени", "main": true},
+            {"name": "ПоСтруктуре", "is_main": true},
+            {"name": "Обычный"}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        assert!(form.find_attribute("ПоИмени").unwrap().is_main);
+        assert!(form.find_attribute("ПоСтруктуре").unwrap().is_main);
+        assert!(!form.find_attribute("Обычный").unwrap().is_main);
     }
 
     #[test]
