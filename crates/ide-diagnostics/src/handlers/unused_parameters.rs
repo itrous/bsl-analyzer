@@ -5,7 +5,6 @@ use crate::utils::platform_event_handlers::{
 };
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 use bsl_metadata::traits::MdObject;
-use hir::call_graph::NotifyReceiverSyntax;
 use hir::{Expr, ModItem};
 use ide_db::TextRange;
 use intern::NormName;
@@ -106,23 +105,17 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
     let notify_candidates = ctx.notify_candidates();
-    if notify_candidates.iter().any(|candidate| candidate.analysis_incomplete) {
+    if notify_candidates.iter().any(|candidate| {
+        candidate.signature_protection() == hir::NotifySignatureProtection::Indeterminate
+    }) {
         fixed_signature_handlers
             .extend(summary.methods.iter().map(|method| NormName::intern(method.name.as_str())));
     }
     for candidate in notify_candidates.iter() {
-        let syntax_may_be_local = matches!(
-            candidate.receiver_syntax,
-            NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other
-        );
-        let resolved_this_object = candidate.receiver == hir::NotifyCandidateReceiver::ThisObject;
-        let unresolved_dynamic_array = candidate.kind == hir::NotifyCandidateKind::DynamicArray
-            && matches!(candidate.receiver, hir::NotifyCandidateReceiver::Unknown);
-        if !candidate.analysis_incomplete
-            && (resolved_this_object || syntax_may_be_local || unresolved_dynamic_array)
-        {
-            fixed_signature_handlers.insert(NormName::intern(candidate.callback_name.as_str()));
+        if candidate.signature_protection() != hir::NotifySignatureProtection::Protected {
+            continue;
         }
+        fixed_signature_handlers.insert(NormName::intern(candidate.callback_name.as_str()));
     }
     // A form-module procedure bound at runtime — `УстановитьДействие` directly, or by
     // name through a code-created command / a helper in another module — has a
@@ -1577,5 +1570,205 @@ EndProcedure
             .map(|d| d.message)
             .collect();
         assert_eq!(messages.len(), 3, "{messages:?}");
+    }
+
+    #[test]
+    fn mixed_known_and_unknown_callback_branches_keep_the_handler_signature() {
+        let code = r#"Процедура Зарегистрировать(Вход)
+    А = Вход;
+    А.Добавить("H");
+    А.Добавить(ЭтотОбъект);
+    Если Флаг Тогда
+        А = Новый Массив;
+        А.Добавить("Другой");
+        А.Добавить(ЭтотОбъект);
+    КонецЕсли;
+    О = Новый("CallbackDescription", А);
+КонецПроцедуры
+
+Процедура H(Параметр)
+    Сообщить("H");
+КонецПроцедуры
+
+Процедура Другой(Параметр)
+    Сообщить("Другой");
+КонецПроцедуры
+"#;
+        let diagnostics = crate::test_utils::check_hir_diagnostic_with_config(
+            code,
+            crate::DiagnosticsConfig::all_enabled(),
+            |ctx| {
+                let candidates = ctx.notify_candidates();
+                assert!(
+                    candidates.iter().any(|candidate| {
+                        candidate.analysis_incomplete
+                            && candidate.signature_protection()
+                                == hir::NotifySignatureProtection::Indeterminate
+                    }),
+                    "a known branch beside an unknown one must stay uncertain: {candidates:#?}"
+                );
+                super::check(ctx)
+            },
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect::<Vec<_>>();
+        assert!(
+            unused.is_empty(),
+            "an uncertain callback array protects every local signature: {unused:#?}"
+        );
+    }
+
+    #[test]
+    fn dozens_of_methods_and_constructors_fit_the_work_budget() {
+        let mut code = String::new();
+        for index in 0..40 {
+            code.push_str(&format!(
+                concat!(
+                    "Процедура Регистрация{index}()\n",
+                    "    Описание{index} = Новый ОписаниеОповещения(\"H{index}\", ЭтотОбъект);\n",
+                    "    Параметры{index} = Новый Массив;\n",
+                    "    Параметры{index}.Добавить(\"D{index}\");\n",
+                    "    Параметры{index}.Добавить(ЭтотОбъект);\n",
+                    "    Динамическое{index} = Новый(\"CallbackDescription\", Параметры{index});\n",
+                    "КонецПроцедуры\n\n",
+                    "Процедура H{index}(Параметр)\n",
+                    "КонецПроцедуры\n\n",
+                    "Процедура D{index}(Параметр)\n",
+                    "КонецПроцедуры\n\n",
+                ),
+                index = index
+            ));
+        }
+
+        let (db, file_id) = crate::test_utils::create_test_db(&code);
+        let facts = hir::semantic_notify_facts_with_work_limit(
+            &db,
+            ide_db::base_db::FileIdInput::new(&db, file_id),
+            100_000,
+        );
+        assert!(
+            facts.notify_candidates.len() >= 80,
+            "every static and dynamic constructor must be classified: {}",
+            facts.notify_candidates.len()
+        );
+        assert!(
+            !facts.notify_candidates.iter().any(|candidate| candidate.signature_protection()
+                == hir::NotifySignatureProtection::Indeterminate),
+            "dozens of methods and constructors must fit the shared budget"
+        );
+
+        let diagnostics = crate::test_utils::check_hir_diagnostic(&code);
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect::<Vec<_>>();
+        assert!(unused.is_empty(), "every generated callback keeps its signature: {unused:#?}");
+    }
+
+    #[test]
+    fn every_early_work_budget_stop_is_conservative_and_covers_all_stages() {
+        let code = r#"Процедура РегистрацияРезерва()
+    Описание = Новый ОписаниеОповещения("Fallback", ЭтотОбъект, Неопределено, Неопределено, Неопределено, Неопределено);
+КонецПроцедуры
+
+Процедура РегистрацияСтатическая()
+#Если Сервер Тогда
+    Описание = Новый ОписаниеОповещения("H", ЭтотОбъект);
+#КонецЕсли
+КонецПроцедуры
+
+Процедура РегистрацияДинамическая()
+    Параметры = Новый Массив;
+    Параметры.Добавить("D");
+    Параметры.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+
+Процедура Fallback(Параметр)
+КонецПроцедуры
+
+Процедура H(Параметр)
+КонецПроцедуры
+
+Процедура D(Параметр)
+КонецПроцедуры
+"#;
+        let (db, file_id) = crate::test_utils::create_test_db(code);
+        let mut saw_marker_only = false;
+        let mut saw_normalized_partial = false;
+        let mut saw_syntax_fallback_partial = false;
+        let mut saw_partial_registrations = false;
+        let mut first_complete = None;
+        for work_limit in 0..2_000 {
+            let facts = hir::semantic_notify_facts_with_work_limit(
+                &db,
+                ide_db::base_db::FileIdInput::new(&db, file_id),
+                work_limit,
+            );
+            let incomplete = facts.notify_candidates.iter().any(|candidate| {
+                candidate.signature_protection() == hir::NotifySignatureProtection::Indeterminate
+            });
+            if !incomplete {
+                first_complete = Some((work_limit, facts));
+                break;
+            }
+            assert!(
+                !facts.notify_candidates.is_empty(),
+                "work_limit={work_limit}: exhaustion must keep a marker"
+            );
+            assert!(
+                facts.summary.notify_candidates.is_empty(),
+                "work_limit={work_limit}: raw constructor candidates are not a complete fact"
+            );
+            assert!(
+                !facts.summary.notify_dynamic_signature_analysis_incomplete.is_empty(),
+                "work_limit={work_limit}: the summary must carry module-level uncertainty"
+            );
+            saw_partial_registrations |= !facts.summary.notify_regs.is_empty();
+            let real: Vec<_> = facts
+                .notify_candidates
+                .iter()
+                .filter(|candidate| !candidate.analysis_incomplete)
+                .collect();
+            if real.is_empty() {
+                saw_marker_only = true;
+            }
+            if real.iter().any(|candidate| candidate.registration.is_some()) {
+                saw_normalized_partial = true;
+            }
+            if real.iter().any(|candidate| {
+                candidate.registration.is_none() && !candidate.callback_name.as_str().is_empty()
+            }) {
+                saw_syntax_fallback_partial = true;
+            }
+        }
+
+        let (work_limit, facts) = first_complete.expect("some budget must finish the projection");
+        assert!(work_limit > 0, "the first budget already finished; the test covers nothing");
+        assert!(
+            saw_marker_only,
+            "expected an early stop before any body/constructor is classified"
+        );
+        assert!(saw_normalized_partial, "expected an early stop inside the normalizer");
+        assert!(saw_partial_registrations, "proven registrations must survive a later stop");
+        assert!(
+            saw_syntax_fallback_partial,
+            "expected an early stop inside the syntax fallback pass"
+        );
+        let names: Vec<_> = facts
+            .notify_candidates
+            .iter()
+            .map(|candidate| candidate.callback_name.as_str())
+            .collect();
+        for expected in ["Fallback", "H", "D"] {
+            assert!(names.contains(&expected), "complete pass lost {expected}: {names:?}");
+        }
+        assert!(
+            !facts.notify_candidates.iter().any(|candidate| candidate.signature_protection()
+                == hir::NotifySignatureProtection::Indeterminate),
+            "a completed result must not report indeterminate signatures"
+        );
     }
 }

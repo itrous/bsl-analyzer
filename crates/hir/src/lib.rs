@@ -234,8 +234,9 @@ pub use hir_ty::narrow::{
     NarrowState,
 };
 pub use hir_ty::notify_targets::{
-    semantic_module_call_summary_query, semantic_notify_candidates_query, NotifyCallbackSlot,
-    NotifyCandidate, NotifyCandidateKind, NotifyCandidateReceiver,
+    semantic_module_call_summary_query, semantic_notify_candidates_query,
+    semantic_notify_facts_with_work_limit, NotifyCallbackSlot, NotifyCandidate,
+    NotifyCandidateKind, NotifyCandidateReceiver, NotifySignatureProtection,
 };
 pub use hir_ty::proc_signature;
 pub use hir_ty::query_in_loop::{

@@ -20,7 +20,9 @@
 //!
 //! [`call_graph::MethodDispatch`]: crate::call_graph::MethodDispatch
 
+use crate::conditional_tree::ConditionalKind;
 use crate::item_tree::{Annotation, AnnotationKind};
+use crate::preproc_condition::PreprocCondition;
 use crate::ModuleMetadata;
 use bsl_metadata::ModuleType;
 use syntax::preproc_symbols::PreprocSymbolId;
@@ -555,9 +557,6 @@ fn conditional_env_where(
     tree: &crate::conditional_tree::ConditionalTree,
     encloses: impl Fn(&text_size::TextRange) -> bool,
 ) -> (EnvFlags, EnvFlags) {
-    use crate::conditional_tree::ConditionalKind;
-    use crate::preproc_condition::PreprocCondition;
-
     // The innermost enclosing node is the smallest containing range: an `If`
     // node's range covers its ElsIf/Else clauses, so depth alone cannot
     // distinguish the then-branch from a sibling clause.
@@ -573,6 +572,15 @@ fn conditional_env_where(
         }
     }
 
+    conditional_env_for_node(tree, node)
+}
+
+/// Environment of an already located conditional node. Callers that index the tree
+/// once use this instead of rescanning every conditional per query.
+pub fn conditional_env_for_node(
+    tree: &crate::conditional_tree::ConditionalTree,
+    node: Option<crate::conditional_tree::ConditionalIdx>,
+) -> (EnvFlags, EnvFlags) {
     let mut env = EnvFlags::ALL;
     let mut possible = EnvFlags::ALL;
     let mut cur = node;

@@ -19,13 +19,12 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
 
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let code = DiagnosticCode::CommandModuleExportMethods;
+    let platform = bsl_platform::PlatformData::instance();
 
-    // Incomplete callback-constructor facts cannot establish that an export is not a callback.
-    if ctx.is_disabled_with_metadata(code)
-        || !bsl_platform::has_callback_description_constructor_facts(
-            bsl_platform::PlatformData::instance(),
-        )
-    {
+    // Without a served platform snapshot no constructor knowledge can distinguish an
+    // ordinary export from a handler the platform calls by name, so silence is the only
+    // safe verdict. A partial snapshot still identifies ordinary exports.
+    if ctx.is_disabled_with_metadata(code) || platform.help_origin().is_none() {
         return Vec::new();
     }
 

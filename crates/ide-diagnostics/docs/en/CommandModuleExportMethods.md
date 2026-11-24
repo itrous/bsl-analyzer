@@ -13,6 +13,13 @@ so the declaration matches the real execution model. It exempts a method registe
 as a notification handler on the current command module: the platform calls that
 handler by name and requires `Export`. The registration and receiver must be recognized.
 
+An incomplete set of platform constructor facts for `CallbackDescription` suppresses
+only handler-dependent conclusions: a method that may be a registered handler stays
+exempt, while ordinary exports are still reported. When platform help is unavailable
+entirely (`platform_help = none` or the help source cannot be found), the diagnostic
+stays silent: without constructor knowledge an ordinary export cannot be distinguished
+from a handler.
+
 ## Example
 
 ```bsl

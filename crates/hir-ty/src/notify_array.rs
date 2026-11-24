@@ -84,7 +84,7 @@ pub(crate) fn reachable_statements(cfg: &ControlFlowGraph) -> FxHashSet<cfg_type
 pub(crate) fn collect_notify_array_registrations(
     db: &dyn TypeKernelDb,
     body: &Body,
-    cfg: &ControlFlowGraph,
+    reachable_stmts: &FxHashSet<cfg_types::StmtId>,
     reaching_defs: Option<&dataflow::reaching_defs::ReachingDefsResult>,
     inference: &InferOwnerResult,
     platform: &PlatformDataInner,
@@ -96,7 +96,6 @@ pub(crate) fn collect_notify_array_registrations(
         return Vec::new();
     };
 
-    let reachable_stmts = reachable_statements(cfg);
     let name_spellings = local_name_spellings(body);
     let local_declarations = unique_local_declarations(body);
     let mut states: FxHashMap<NormName, ArrayState> =
@@ -708,7 +707,7 @@ mod tests {
         let registrations = collect_notify_array_registrations(
             &db,
             body,
-            &cfg,
+            &reachable_statements(&cfg),
             reaching_defs.as_deref(),
             &inference,
             PlatformDataInner::instance(),
