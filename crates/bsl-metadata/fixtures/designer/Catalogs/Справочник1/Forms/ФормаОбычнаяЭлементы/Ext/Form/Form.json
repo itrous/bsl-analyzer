@@ -1,0 +1,13 @@
+{
+  "schema": 14,
+  "form": {"handlers": {"ПередОткрытием": "ПередОткрытием"}},
+  "attributes": [{"id": 0, "name": "РеквизитФормы"}],
+  "controls": [
+    {"kind": "checkbox", "id": 1, "name": "ФлажокПараметра", "dataPath": "КонстантыНабор.adfa4b18-ae19-41ed-9e55-f268b7ab3b38"},
+    {"kind": "input", "id": 2, "name": "ПолеПараметра"},
+    {"kind": "label", "id": 3, "name": "НадписьПояснения"},
+    {"kind": "list", "id": 4, "name": "ТаблицаСписка", "columns": [{"name": "КолонкаСписка"}]},
+    {"kind": "commandPanel", "id": 5, "name": "КоманднаяПанельФормы", "buttons": [{"name": "КнопкаПанели", "kind": "button"}]},
+    {"kind": "generic", "id": 0}
+  ]
+}

@@ -25,7 +25,7 @@ use stdx::case::CaseExt;
 use crate::enums::FormType;
 use crate::error::{MetadataError, Result};
 use crate::form::{Form, FormAttribute, FormElement, FormElementKind, FormEventHandler};
-use crate::metadata_object::AttributeType;
+use crate::metadata_object::{AttributeType, MdoType};
 
 /// The `event_type` given to a `boundHandlers` entry no event map names: the
 /// sidecar says the procedure is bound, not to which event.
@@ -101,7 +101,16 @@ struct SidecarForm {
 #[serde(default)]
 struct SidecarAttribute {
     name: String,
+    /// The readable 1C type (`ОтчетОбъект.ОтчетДиаграмма`), schema 14+; absent before.
+    #[serde(rename = "type")]
+    type_name: Option<String>,
+    /// Set on the form's main attribute only, schema 14+.
+    main: bool,
+    /// The type already structured by the producer, where it emits one. Preferred
+    /// over `type_name`: it needs no mapping, so it cannot lose a case the mapping
+    /// does not know.
     attr_type: Option<AttributeType>,
+    /// The producer's own spelling of `main`. Either spelling marks the main attribute.
     is_main: bool,
 }
 
@@ -205,9 +214,12 @@ fn parse_sidecar(json: &str, form_name: &str) -> std::result::Result<Form, Sidec
         .into_iter()
         .filter(|attr| !attr.name.is_empty())
         .map(|attr| {
-            let mut attribute =
-                FormAttribute::new(attr.name, attr.attr_type.unwrap_or(AttributeType::Unknown));
-            attribute.is_main = attr.is_main;
+            let attr_type = attr
+                .attr_type
+                .or_else(|| attr.type_name.as_deref().and_then(sidecar_type_of))
+                .unwrap_or(AttributeType::Unknown);
+            let mut attribute = FormAttribute::new(attr.name, attr_type);
+            attribute.is_main = attr.is_main || attr.main;
             attribute
         })
         .collect();
@@ -249,6 +261,108 @@ fn parse_sidecar(json: &str, form_name: &str) -> std::result::Result<Form, Sidec
     );
 
     Ok(form)
+}
+
+/// Russian spellings of the object types the sidecar's `type` may carry, with the
+/// metadata kind that owns each. Only OBJECT types are read: a reference type
+/// (`СправочникСсылка.X`) would map to the same `AttributeType::Ref` as an object
+/// type, so reading it would pass a reference off as the object itself.
+const OBJECT_TYPE_PREFIXES: &[(&str, MdoType)] = &[
+    ("СправочникОбъект", MdoType::Catalog),
+    ("ДокументОбъект", MdoType::Document),
+    ("ОтчетОбъект", MdoType::Report),
+    ("ОбработкаОбъект", MdoType::DataProcessor),
+    ("ЗадачаОбъект", MdoType::Task),
+    ("БизнесПроцессОбъект", MdoType::BusinessProcess),
+    ("ПланОбменаОбъект", MdoType::ExchangePlan),
+    ("ПланСчетовОбъект", MdoType::ChartOfAccounts),
+    ("ПланВидовХарактеристикОбъект", MdoType::ChartOfCharacteristicTypes),
+    ("ПланВидовРасчетаОбъект", MdoType::ChartOfCalculationTypes),
+    ("ВнешняяОбработкаОбъект", MdoType::ExternalDataProcessor),
+    ("ВнешнийОтчетОбъект", MdoType::ExternalReport),
+];
+
+/// `<Вид>Объект.<Имя>` as `AttributeType::Ref`; any other spelling is `None`, so the
+/// attribute keeps `Unknown` rather than a guess.
+fn object_type_of(type_name: &str) -> Option<AttributeType> {
+    let (prefix, name) = type_name.trim().split_once('.')?;
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    let (_, mdo_type) =
+        OBJECT_TYPE_PREFIXES.iter().find(|(known, _)| stdx::case::eq_ignore_case(known, prefix))?;
+    Some(AttributeType::Ref { mdo_type: *mdo_type, name: name.to_string() })
+}
+
+/// A sidecar `type` as the attribute type this reader can name: an object type, a
+/// register's record manager or record set, or a platform LIST type. Anything else is
+/// `None`, so the attribute keeps `Unknown` rather than a guess.
+fn sidecar_type_of(type_name: &str) -> Option<AttributeType> {
+    object_type_of(type_name)
+        .or_else(|| register_type_of(type_name))
+        .or_else(|| list_type_of(type_name))
+}
+
+/// `<Регистр>МенеджерЗаписи.<Имя>` and `<Регистр>НаборЗаписей.<Имя>` in either notation.
+/// The heads are built from the metadata kind's own names, so no spelling is listed here;
+/// a register has one `Ref` shape (no object/reference split), which is its record set.
+fn register_type_of(type_name: &str) -> Option<AttributeType> {
+    let (prefix, name) = split_type_name(type_name)?;
+    MdoType::all().iter().filter(|mdo| mdo.is_register()).find_map(|mdo| {
+        let is = |ru: &str, en: &str| {
+            stdx::case::eq_ignore_case(&format!("{}{ru}", mdo.russian_name()), prefix)
+                || stdx::case::eq_ignore_case(&format!("{}{en}", mdo.english_name()), prefix)
+        };
+        if is("НаборЗаписей", "RecordSet") {
+            Some(AttributeType::Ref { mdo_type: *mdo, name: name.to_string() })
+        } else if *mdo == MdoType::InformationRegister && is("МенеджерЗаписи", "RecordManager")
+        {
+            Some(AttributeType::InformationRegisterRecordManager { name: name.to_string() })
+        } else {
+            None
+        }
+    })
+}
+
+/// `<Вид>Список.<Имя>` in either notation, as `PlatformNamed("<русское имя>.<Имя>")`.
+fn list_type_of(type_name: &str) -> Option<AttributeType> {
+    let (prefix, name) = split_type_name(type_name)?;
+    let (ru, _) = platform_list_heads(prefix)?;
+    Some(AttributeType::PlatformNamed(format!("{ru}.{name}")))
+}
+
+fn split_type_name(type_name: &str) -> Option<(&str, &str)> {
+    let (prefix, name) = type_name.trim().split_once('.')?;
+    (!name.is_empty() && !name.contains('.')).then_some((prefix, name))
+}
+
+/// The Russian and English heads (`СправочникСписок`, `CatalogList`) of the platform
+/// LIST type `spelling` names in either notation. The catalog is the only source: its
+/// templated types (`СправочникСписок.<Имя справочника>`) whose Russian head ends in
+/// `Список` and English head in `List`. `None` for any other head.
+pub fn platform_list_heads(spelling: &str) -> Option<(&'static str, &'static str)> {
+    static HEADS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let heads = HEADS.get_or_init(|| {
+        let mut found: Vec<(String, String)> = Vec::new();
+        for ty in bsl_platform::PlatformDataInner::instance().all_types() {
+            let (Some((ru, _)), Some((en, _))) =
+                (ty.name.split_once('.'), ty.english_name.split_once('.'))
+            else {
+                continue;
+            };
+            if ru.ends_with("Список") && en.ends_with("List") && !found.iter().any(|(r, _)| r == ru)
+            {
+                found.push((ru.to_string(), en.to_string()));
+            }
+        }
+        found
+    });
+    heads
+        .iter()
+        .find(|(ru, en)| {
+            stdx::case::eq_ignore_case(ru, spelling) || stdx::case::eq_ignore_case(en, spelling)
+        })
+        .map(|(ru, en)| (ru.as_str(), en.as_str()))
 }
 
 fn handlers_of(handlers: BTreeMap<String, String>) -> Vec<FormEventHandler> {
@@ -444,6 +558,21 @@ pub(crate) mod tests {
         assert_eq!(form.elements().len(), 4);
     }
 
+    /// Only an entry of `controls` that carries a name is a control: a table column and
+    /// a command-bar button are named in the file but are not members of the form.
+    #[test]
+    fn columns_and_command_bar_buttons_are_not_controls() {
+        let json = r#"{"controls": [
+            {"kind": "list", "id": 1, "name": "Таблица", "columns": [{"name": "Колонка"}]},
+            {"kind": "commandPanel", "id": 2, "name": "Панель",
+             "buttons": [{"name": "Кнопка", "kind": "button"}]},
+            {"kind": "input", "id": 3}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        let names: Vec<&str> = form.elements().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Таблица", "Панель"]);
+    }
+
     #[test]
     fn version_2_without_form_handlers_binds_no_form_event() {
         let json = r#"{"schema": 2, "form": {"name": "Ф"}, "controls": []}"#;
@@ -490,6 +619,123 @@ pub(crate) mod tests {
         let form = parse_ordinary_form_sidecar(json, "ИзПути").unwrap();
         assert_eq!(form.name(), "ИзПути");
         assert_eq!(form.find_element("Э").unwrap().kind, FormElementKind::Other);
+    }
+
+    #[test]
+    fn a_typed_main_attribute_is_read_and_everything_else_stays_unknown() {
+        let json = r#"{"schema": 14, "attributes": [
+            {"id": 0, "name": "ОбщийОтчет", "type": "ОтчетОбъект.ОтчетДиаграмма", "main": true},
+            {"id": 1, "name": "А", "type": "СправочникСсылка.Валюты"},
+            {"id": 2, "name": "Б", "type": "Строка(50)"},
+            {"id": 3, "name": "В", "type": "Произвольный"},
+            {"id": 4, "name": "Г", "type": "ОтчетОбъект.A.B"},
+            {"id": 5, "name": "Д"}
+        ]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        let main = form.main_attribute().unwrap();
+        assert_eq!(main.name, "ОбщийОтчет");
+        assert_eq!(
+            main.attr_type,
+            AttributeType::Ref {
+                mdo_type: MdoType::Report, name: "ОтчетДиаграмма".to_string()
+            }
+        );
+        for name in ["А", "Б", "В", "Г", "Д"] {
+            let attr = form.find_attribute(name).unwrap();
+            assert_eq!(attr.attr_type, AttributeType::Unknown, "{name}");
+            assert!(!attr.is_main, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_sidecar_without_type_and_main_has_no_main_attribute() {
+        let json = r#"{"schema": 13, "attributes": [{"id": 0, "name": "ОбщийОтчет"}]}"#;
+        let form = parse_ordinary_form_sidecar(json, "Ф").unwrap();
+        assert!(form.main_attribute().is_none());
+        assert_eq!(form.find_attribute("ОбщийОтчет").unwrap().attr_type, AttributeType::Unknown);
+    }
+
+    fn main_type_of(type_name: &str) -> AttributeType {
+        let json = format!(
+            r#"{{"schema": 14, "attributes": [{{"id": 0, "name": "А", "type": "{type_name}", "main": true}}]}}"#
+        );
+        parse_ordinary_form_sidecar(&json, "Ф").unwrap().main_attribute().unwrap().attr_type.clone()
+    }
+
+    /// Every list spelling the 3097-form corpus carries, in both notations, names the
+    /// platform list type; the stored name is the Russian one whichever was written.
+    #[test]
+    fn a_list_type_is_read_in_both_notations() {
+        let pairs = [
+            ("СправочникСписок", "CatalogList"),
+            ("ДокументСписок", "DocumentList"),
+            ("РегистрСведенийСписок", "InformationRegisterList"),
+            ("РегистрНакопленияСписок", "AccumulationRegisterList"),
+            ("РегистрБухгалтерииСписок", "AccountingRegisterList"),
+            ("РегистрРасчетаСписок", "CalculationRegisterList"),
+            ("ПланВидовХарактеристикСписок", "ChartOfCharacteristicTypesList"),
+            ("ПланСчетовСписок", "ChartOfAccountsList"),
+            ("ПланВидовРасчетаСписок", "ChartOfCalculationTypesList"),
+            ("ПланОбменаСписок", "ExchangePlanList"),
+            ("БизнесПроцессСписок", "BusinessProcessList"),
+            ("ЗадачаСписок", "TaskList"),
+            ("ЖурналДокументовСписок", "DocumentJournalList"),
+            ("КритерийОтбораСписок", "FilterCriterionList"),
+            ("ПеречислениеСписок", "EnumList"),
+        ];
+        for (ru, en) in pairs {
+            let expected = AttributeType::PlatformNamed(format!("{ru}.Имя"));
+            assert_eq!(main_type_of(&format!("{ru}.Имя")), expected, "{ru}");
+            assert_eq!(main_type_of(&format!("{en}.Имя")), expected, "{en}");
+            assert_eq!(platform_list_heads(en).map(|(ru, _)| ru), Some(ru));
+            assert_eq!(platform_list_heads(ru).map(|(_, en)| en), Some(en));
+        }
+    }
+
+    /// The control of the list reading: spellings that look alike but are not a list
+    /// type keep `Unknown`.
+    #[test]
+    fn a_type_that_is_not_a_list_keeps_unknown() {
+        for spelling in [
+            "СправочникМенеджер.Имя",
+            "СправочникСсылка.Имя",
+            "СписокЗначений.Имя",
+            "СправочникСписок",
+            "СправочникСписок.",
+            "СправочникСписок.А.Б",
+            "НесуществующийСписок.Имя",
+            "Список.Имя",
+        ] {
+            assert_eq!(main_type_of(spelling), AttributeType::Unknown, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_register_record_set_and_record_manager_are_read_in_both_notations() {
+        let set = |mdo_type| AttributeType::Ref { mdo_type, name: "Имя".to_string() };
+        assert_eq!(
+            main_type_of("РегистрСведенийНаборЗаписей.Имя"),
+            set(MdoType::InformationRegister)
+        );
+        assert_eq!(
+            main_type_of("InformationRegisterRecordSet.Имя"),
+            set(MdoType::InformationRegister)
+        );
+        assert_eq!(
+            main_type_of("РегистрНакопленияНаборЗаписей.Имя"),
+            set(MdoType::AccumulationRegister)
+        );
+        assert_eq!(
+            main_type_of("CalculationRegisterRecordSet.Имя"),
+            set(MdoType::CalculationRegister)
+        );
+        let manager =
+            AttributeType::InformationRegisterRecordManager { name: "Имя".to_string() };
+        assert_eq!(main_type_of("РегистрСведенийМенеджерЗаписи.Имя"), manager);
+        assert_eq!(main_type_of("InformationRegisterRecordManager.Имя"), manager);
+        // Only an information register has a record manager.
+        assert_eq!(main_type_of("РегистрНакопленияМенеджерЗаписи.Имя"), AttributeType::Unknown);
+        assert_eq!(main_type_of("РегистрСведенийМенеджер.Имя"), AttributeType::Unknown);
     }
 
     #[test]

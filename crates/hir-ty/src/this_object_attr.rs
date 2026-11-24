@@ -67,3 +67,33 @@ pub(crate) fn resolve_this_record_set_member(
     let receiver_id = db.metadata_ref(kind, mdo_name.as_str().to_string(), &RootConfigCtx);
     crate::field_lookup::lookup_field(db, &obj_resolver, receiver_id, name).map(|info| info.ty)
 }
+
+/// `ЭтоГруппа`, `Родитель` and `Владелец` as bare names of a catalog's own object module,
+/// whatever the catalog's hierarchy and owner flags say: the platform compiles them in a flat
+/// catalog without owners (measured on vendor code that runs on every write), while the same
+/// names read through a reference stay absent. So this is the implicit receiver's surface only,
+/// and it never feeds the typed field lookup of a reference.
+pub(crate) fn resolve_this_catalog_conditional_member(
+    db: &dyn HirDatabase,
+    resolver: &Resolver,
+    name: &Name,
+) -> Option<TypeId> {
+    use bsl_platform::{standard_attributes_for, MdoTemplateKind, ObjectView, PresenceCondition};
+    use stdx::case::CaseExt;
+
+    let (mdo_type, _) = crate::this_object::resolve_this_object_owner(db, resolver)?;
+    if mdo_type != bsl_metadata::MdoType::Catalog {
+        return None;
+    }
+    let wanted = name.as_str().fold_lower();
+    standard_attributes_for(MdoTemplateKind::Catalog, ObjectView::Object)
+        .iter()
+        .filter(|spec| {
+            matches!(spec.condition, PresenceCondition::Hierarchical | PresenceCondition::HasOwners)
+        })
+        .any(|spec| {
+            spec.kind.russian_name().fold_lower() == wanted
+                || spec.kind.english_name().fold_lower() == wanted
+        })
+        .then(|| db.unknown())
+}

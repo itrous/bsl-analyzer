@@ -722,6 +722,10 @@ fn borrowed_form_module_resolves_base_form_attributes() {
         files.borrowed_ordinary_form,
         &[("БазовыйРеквизитФормы", true)],
     );
+    // An ORDINARY form descriptor wins over the leftover managed `Ext/Form.xml` beside it, and
+    // this fixture has no `Ext/Form/Form.json`, so the form carries no own surface and both
+    // names stay reported. Do not flip this back by giving the fixture a sidecar: that fixture
+    // tree is not pinned in `.gitattributes`, so a CRLF checkout would break it.
     assert_unresolved_names(
         &fixture,
         files.base_ordinary_form,
