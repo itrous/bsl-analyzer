@@ -17,4 +17,11 @@ fn platform_help_none_silences_registered_and_ordinary_command_exports() {
         diagnostics.is_empty(),
         "without platform facts the command export diagnostic stays silent: {diagnostics:#?}"
     );
+
+    let (chain_diagnostics, _) =
+        command_module_export_methods::dynamic_alias_chain_export_diagnostics();
+    assert!(
+        chain_diagnostics.is_empty(),
+        "without callback facts the A→B→C candidate API and diagnostic stay silent: {chain_diagnostics:#?}"
+    );
 }

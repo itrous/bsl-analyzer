@@ -19,4 +19,11 @@ fn platform_facts_exempt_the_registered_handler_but_report_ordinary_exports() {
     let start: usize = range.start().into();
     let end: usize = range.end().into();
     assert_eq!(&source[start..end], "ОбычныйЭкспорт");
+
+    let (chain_diagnostics, chain_source) =
+        command_module_export_methods::dynamic_alias_chain_export_diagnostics();
+    assert!(
+        chain_diagnostics.is_empty(),
+        "the reachable A→B→C array callback is not an ordinary export: {chain_diagnostics:#?}\n{chain_source}"
+    );
 }

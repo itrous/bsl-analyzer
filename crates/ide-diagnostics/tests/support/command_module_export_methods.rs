@@ -25,6 +25,23 @@ const SOURCE: &str = r#"&НаКлиенте
 КонецПроцедуры
 "#;
 
+const DYNAMIC_ALIAS_CHAIN_SOURCE: &str = r#"&НаКлиенте
+Процедура Зарегистрировать()
+    A = Новый Массив;
+    A.Добавить("Старый");
+    A.Добавить(ЭтотОбъект);
+    B = A;
+    A = Новый Массив;
+    C = B;
+    C[0] = "Фактический";
+    Оповещение = Новый("CallbackDescription", C);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура Фактический() Экспорт
+КонецПроцедуры
+"#;
+
 const DYNAMIC_SOURCE: &str = r#"&НаКлиенте
 Процедура Зарегистрировать()
     Параметры = Новый Массив;
@@ -81,6 +98,37 @@ pub fn command_module_callback_guard_diagnostics() -> (Vec<Diagnostic>, String) 
 )]
 pub fn command_module_dynamic_callback_guard_diagnostics() -> (Vec<Diagnostic>, String) {
     command_module_diagnostics(DYNAMIC_SOURCE, callback_guard_diagnostics)
+}
+
+#[allow(
+    dead_code,
+    reason = "The shared test module is imported by platform-facts integration suites."
+)]
+pub fn dynamic_alias_chain_export_diagnostics() -> (Vec<Diagnostic>, String) {
+    command_module_diagnostics(DYNAMIC_ALIAS_CHAIN_SOURCE, |ctx| {
+        let candidates = ctx.notify_candidates();
+        if bsl_platform::has_callback_description_constructor_facts(
+            bsl_platform::PlatformData::instance(),
+        ) {
+            assert!(
+                candidates.iter().any(|candidate| {
+                    candidate.callback_name.eq_ignore_case(&hir::Name::new("Фактический"))
+                        && candidate.kind == hir::NotifyCandidateKind::DynamicArray
+                }),
+                "expected classified callback candidate for A→B→C array flow: {candidates:#?}"
+            );
+        } else {
+            assert!(
+                candidates.iter().all(|candidate| {
+                    candidate.analysis_incomplete
+                        || (candidate.receiver == hir::NotifyCandidateReceiver::Unknown
+                            && candidate.registration.is_none())
+                }),
+                "without platform facts candidates carry no resolved registration: {candidates:#?}"
+            );
+        }
+        ide_diagnostics::handlers::command_module_export_methods::check(ctx)
+    })
 }
 
 fn callback_guard_diagnostics(ctx: &DiagnosticsContext<'_>) -> Vec<Diagnostic> {

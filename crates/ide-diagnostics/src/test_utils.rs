@@ -691,6 +691,11 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         self.db.vendor_support()
     }
 
+    fn notify_candidates(&self, file_id: vfs::FileId) -> std::sync::Arc<Vec<hir::NotifyCandidate>> {
+        let input = ide_db::base_db::FileIdInput::new(&self.db, file_id);
+        hir::semantic_notify_candidates_query(&self.db, input)
+    }
+
     fn call_summary(&self, module_id: hir::ModuleId) -> std::sync::Arc<hir::ModuleCallSummary> {
         use hir::DefDatabase;
 

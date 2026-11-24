@@ -522,6 +522,8 @@ pub trait AnalysisProvider {
 
     fn call_summary(&self, module_id: ModuleId) -> Arc<hir::ModuleCallSummary>;
 
+    fn notify_candidates(&self, file_id: FileId) -> Arc<Vec<hir::NotifyCandidate>>;
+
     fn line_index(&self, file_id: FileId) -> Arc<line_index::LineIndex>;
 
     fn file_path(&self, file_id: FileId) -> Option<String>;

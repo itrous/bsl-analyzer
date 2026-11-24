@@ -240,18 +240,9 @@ fn declares_a_local(
             origin: hir::BareNameOrigin::FlowLocal, ..
         })
         | Some(hir::BareNameResolution::Absent) => true,
-        // A missing inference entry is not evidence of a new local. In contextual
-        // modules inference can intentionally skip a target (for example, a
-        // read-only global property); do not guess local ownership there.
-        None => !matches!(
-            ctx.module_metadata().module_type,
-            bsl_metadata::ModuleType::FormModule
-                | bsl_metadata::ModuleType::ObjectModule
-                | bsl_metadata::ModuleType::RecordSetModule
-                | bsl_metadata::ModuleType::ManagerModule
-                | bsl_metadata::ModuleType::ValueManagerModule
-                | bsl_metadata::ModuleType::Unknown
-        ),
+        // A missing inference entry is not evidence of a new local: inference can
+        // intentionally skip a target (for example, a read-only global property).
+        None => false,
         Some(hir::BareNameResolution::Resolved { .. })
         | Some(hir::BareNameResolution::Indeterminate { .. }) => false,
     }
@@ -573,6 +564,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_missing_assignment_verdict_in_a_common_module_is_not_a_local() {
+        let code = "Процедура Тест()\n    Метаданные = Новый Структура;\n    Локальная = 1;\nКонецПроцедуры\n";
+        let mut builder = test_fixture::CfeFixtureBuilder::new("");
+        builder.add_base_module("Общий", code);
+        let diags = crate::test_utils::check_cfe_at_with_unreadable_config_and_setup(
+            "CommonModules/Общий/Ext/Module.bsl",
+            code,
+            builder.build(),
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |_| {},
+            |ctx| {
+                assert_eq!(
+                    ctx.module_metadata().module_type,
+                    bsl_metadata::ModuleType::CommonModule
+                );
+                crate::diagnostics(ctx)
+            },
+        );
+        let unused: Vec<_> =
+            diags.iter().filter(|d| d.code == DiagnosticCode::UnusedLocalVariable).collect();
+        assert_eq!(unused.len(), 1, "only the proven local should be reported: {diags:#?}");
+        assert!(unused[0].message.contains("Локальная"), "{unused:#?}");
+        assert!(diags.iter().any(|d| d.code == DiagnosticCode::GlobalPropertyNotWritable));
+    }
+
     /// Уже объявленное имя коллекции локаль присваиванием не создаёт: параметр,
     /// `Перем` и счётчик цикла связывают имя раньше, и запись поверх них — просто
     /// запись в известную переменную. Инференс держит их в той же таблице, что и
@@ -669,19 +687,18 @@ mod tests {
         );
     }
 
-    /// Код `#Вставка` принадлежит effective-проходу, и мёртвая запись внутри него
-    /// обязана дожить до конца конвейера — обычная, ничего не знающая об именах
-    /// коллекций.
+    /// An assignment with no target-ownership verdict is not enough to prove a
+    /// local, even when it appears in inserted extension code.
     #[test]
-    fn a_dead_store_inside_a_change_and_validate_insert_survives() {
+    fn an_unresolved_target_inside_a_change_and_validate_insert_is_not_a_local() {
         let diags = extension_pair_diagnostics(
             "Процедура Цель() Экспорт\nКонецПроцедуры\n",
             "&ИзменениеИКонтроль(\"Цель\")\nПроцедура Цель()\n#Вставка\n\tМертвая = 1;\n#КонецВставки\nКонецПроцедуры\n",
         );
         assert_eq!(
             diags.iter().filter(|d| d.code == DiagnosticCode::UnusedLocalVariable).count(),
-            1,
-            "the insert's own dead store belongs to the extension author:\n{diags:#?}"
+            0,
+            "the missing target verdict does not establish local ownership:\n{diags:#?}"
         );
     }
 

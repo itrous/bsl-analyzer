@@ -36,6 +36,10 @@ pub struct ModuleCallSummary {
     /// constructor range identify a specific slot, so a resolved registration in a different slot
     /// with the same handler name cannot disprove this candidate.
     pub notify_dynamic_signature_handler_sites: Vec<DynamicNotifySignatureHandler>,
+    /// Dynamic callback-array constructors whose alias analysis was incomplete. A non-empty
+    /// list is module-level uncertainty: consumers must not infer that unlisted local methods
+    /// or exports are unused merely because a callback was not recovered from these sites.
+    pub notify_dynamic_signature_analysis_incomplete: Vec<DynamicNotifySignatureAnalysisGap>,
     /// Platform-validated registrations. Raw `hir-def` summaries leave this empty.
     pub notify_regs: Vec<NotifyReg>,
     pub idle_handler_regs: Vec<IdleReg>,
@@ -169,6 +173,7 @@ impl ModuleCallSummary {
             notify_additional_signature_handlers: Vec::new(),
             notify_dynamic_signature_handlers: Vec::new(),
             notify_dynamic_signature_handler_sites: Vec::new(),
+            notify_dynamic_signature_analysis_incomplete: Vec::new(),
             notify_regs,
             idle_handler_regs,
             set_action_regs: Vec::new(),
@@ -184,6 +189,17 @@ pub struct DynamicNotifySignatureHandler {
     pub handler_name: Name,
     pub callback_expr: ExprId,
     pub constructor_range: TextRange,
+}
+
+/// One constructor for which dynamic callback-array alias analysis could not finish.
+/// The containing module is semantically incomplete, so downstream negative conclusions
+/// must conservatively retain relevant local methods/exports beyond just `caller`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DynamicNotifySignatureAnalysisGap {
+    pub caller: CallerId,
+    pub constructor: ExprId,
+    pub constructor_range: TextRange,
+    pub array_name: Name,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -831,6 +847,20 @@ pub fn extract_call_summary(
     module_bodies: &ModuleBodies,
     form_event_handlers: &[bsl_metadata::FormEventHandler],
 ) -> ModuleCallSummary {
+    extract_call_summary_with_cancellation(
+        item_tree,
+        module_bodies,
+        form_event_handlers,
+        &mut || {},
+    )
+}
+
+pub(crate) fn extract_call_summary_with_cancellation(
+    item_tree: &ItemTree,
+    module_bodies: &ModuleBodies,
+    form_event_handlers: &[bsl_metadata::FormEventHandler],
+    cancel: &mut dyn FnMut(),
+) -> ModuleCallSummary {
     // Method enumeration is the cheap, body-free part — share it with the graph
     // build. The `local_method_ids` map (lowercased name → first local id) is what
     // body extraction uses to bind local calls.
@@ -853,6 +883,7 @@ pub fn extract_call_summary(
     let mut notify_additional_signature_handlers = Vec::new();
     let mut notify_dynamic_signature_handlers = Vec::new();
     let mut notify_dynamic_signature_handler_sites = Vec::new();
+    let mut notify_dynamic_signature_analysis_incomplete = Vec::new();
     let mut idle_handler_regs = Vec::new();
     let mut set_action_regs = Vec::new();
     let mut name_literals: FxHashSet<MethodKey> = FxHashSet::default();
@@ -871,10 +902,12 @@ pub fn extract_call_summary(
             &mut notify_additional_signature_handlers,
             &mut notify_dynamic_signature_handlers,
             &mut notify_dynamic_signature_handler_sites,
+            &mut notify_dynamic_signature_analysis_incomplete,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
             &mut name_literal_ref_sites,
+            cancel,
         );
     }
 
@@ -890,10 +923,12 @@ pub fn extract_call_summary(
             &mut notify_additional_signature_handlers,
             &mut notify_dynamic_signature_handlers,
             &mut notify_dynamic_signature_handler_sites,
+            &mut notify_dynamic_signature_analysis_incomplete,
             &mut idle_handler_regs,
             &mut set_action_regs,
             &mut name_literals,
             &mut name_literal_ref_sites,
+            cancel,
         );
     }
 
@@ -908,6 +943,10 @@ pub fn extract_call_summary(
     let mut seen_dynamic_handlers = FxHashSet::default();
     notify_dynamic_signature_handlers
         .retain(|handler| seen_dynamic_handlers.insert(handler.clone()));
+    let mut seen_dynamic_gaps = FxHashSet::default();
+    notify_dynamic_signature_analysis_incomplete.retain(|gap| {
+        seen_dynamic_gaps.insert((gap.caller, gap.constructor, gap.constructor_range))
+    });
 
     let mut name_literal_refs: Vec<MethodKey> = name_literals.into_iter().collect();
     name_literal_refs.sort_unstable();
@@ -928,6 +967,7 @@ pub fn extract_call_summary(
         notify_additional_signature_handlers,
         notify_dynamic_signature_handlers,
         notify_dynamic_signature_handler_sites,
+        notify_dynamic_signature_analysis_incomplete,
         notify_regs: Vec::new(),
         idle_handler_regs,
         set_action_regs,
@@ -1068,32 +1108,56 @@ fn extract_from_body(
     notify_additional_signature_handlers: &mut Vec<Name>,
     notify_dynamic_signature_handlers: &mut Vec<Name>,
     notify_dynamic_signature_handler_sites: &mut Vec<DynamicNotifySignatureHandler>,
+    notify_dynamic_signature_analysis_incomplete: &mut Vec<DynamicNotifySignatureAnalysisGap>,
     idle_handler_regs: &mut Vec<IdleReg>,
     set_action_regs: &mut Vec<SetActionReg>,
     name_literals: &mut FxHashSet<MethodKey>,
     name_literal_ref_sites: &mut Vec<NameLiteralRefSite>,
+    cancel: &mut dyn FnMut(),
 ) {
     let common_bindings = crate::common_module_ref::common_module_var_bindings(body);
-    let dynamic_candidates = body
-        .exprs_iter()
-        .flat_map(|(expr_id, expr)| {
-            let Expr::New { type_name: None, args } = expr else { return None };
-            let constructor_range = source_map.expr_range(expr_id)?;
-            dynamic_notify_array_aliases(body, source_map, args, constructor_range).map(|aliases| {
-                aliases
-                    .into_iter()
-                    .map(|alias| DynamicNotifyArrayCandidate {
-                        array_name: alias.array_name,
-                        array_start: alias.array_start,
-                        array_end: alias.array_end,
-                        constructor_start: constructor_range.start(),
-                        constructor_range,
-                    })
-                    .collect::<Vec<_>>()
-            })
-        })
-        .flatten()
-        .collect::<Vec<_>>();
+    let mut alias_resolver = None;
+    let mut resolver_initialized = false;
+    let mut dynamic_candidates = Vec::new();
+    for (expr_id, expr) in body.exprs_iter() {
+        cancel();
+        let Expr::New { type_name: None, args } = expr else { continue };
+        let Some(type_name) = args.first().and_then(|&idx| extract_string_literal(body, idx))
+        else {
+            continue;
+        };
+        if !bsl_platform::is_callback_description_type_name(&type_name)
+            || !matches!(args.get(1), Some(idx) if matches!(body.expr_idx(*idx), Expr::Path(_)))
+        {
+            continue;
+        }
+        if !resolver_initialized {
+            alias_resolver = DynamicArrayResolver::new(body, source_map, cancel);
+            resolver_initialized = true;
+        }
+        let Some(constructor_range) = source_map.expr_range(expr_id) else { continue };
+        let Some(aliases) = dynamic_notify_array_aliases(
+            body,
+            args,
+            alias_resolver.as_mut(),
+            DynamicNotifyAnalysisContext {
+                caller,
+                constructor: expr_id,
+                constructor_range,
+                incomplete: notify_dynamic_signature_analysis_incomplete,
+            },
+            cancel,
+        ) else {
+            continue;
+        };
+        dynamic_candidates.extend(aliases.into_iter().map(|alias| DynamicNotifyArrayCandidate {
+            array_name: alias.array_name,
+            array_start: alias.array_start,
+            array_end: alias.array_end,
+            constructor_start: constructor_range.start(),
+            constructor_range,
+        }));
+    }
     if !dynamic_candidates.is_empty() {
         let candidate_arrays: FxHashSet<_> =
             dynamic_candidates.iter().map(|candidate| candidate.array_name).collect();
@@ -1123,6 +1187,7 @@ fn extract_from_body(
                 source_map,
                 candidate,
                 &array_additions,
+                alias_resolver.as_ref(),
                 notify_dynamic_signature_handlers,
                 notify_dynamic_signature_handler_sites,
             );
@@ -1279,25 +1344,49 @@ struct DynamicNotifyArrayAlias {
     array_end: TextSize,
 }
 
+struct DynamicNotifyAnalysisContext<'a> {
+    caller: CallerId,
+    constructor: ExprId,
+    constructor_range: TextRange,
+    incomplete: &'a mut Vec<DynamicNotifySignatureAnalysisGap>,
+}
+
 fn dynamic_notify_array_aliases(
     body: &Body,
-    source_map: crate::body::SourceMapAt<'_>,
     args: &[ExprIdx],
-    constructor_range: TextRange,
+    resolver: Option<&mut DynamicArrayResolver<'_>>,
+    context: DynamicNotifyAnalysisContext<'_>,
+    cancel: &mut dyn FnMut(),
 ) -> Option<Vec<DynamicNotifyArrayAlias>> {
+    let DynamicNotifyAnalysisContext { caller, constructor, constructor_range, incomplete } =
+        context;
     let type_name = args.first().and_then(|&idx| extract_string_literal(body, idx))?;
     if !bsl_platform::is_callback_description_type_name(&type_name) {
         return None;
     }
     let Expr::Path(name) = body.expr_idx(*args.get(1)?) else { return None };
+    let array_name = Name::new(name.as_str());
     let name = NormName::intern(name.as_str());
-    let mut aliases = resolve_dynamic_array_aliases(
-        body,
-        source_map,
-        name,
-        constructor_range.start(),
-        constructor_range.start(),
-    );
+    let Some(resolver) = resolver else {
+        incomplete.push(DynamicNotifySignatureAnalysisGap {
+            caller,
+            constructor,
+            constructor_range,
+            array_name,
+        });
+        return Some(Vec::new());
+    };
+    let (mut aliases, complete) =
+        resolver.resolve(name, constructor_range.start(), constructor_range.start(), cancel);
+    if !complete {
+        incomplete.push(DynamicNotifySignatureAnalysisGap {
+            caller,
+            constructor,
+            constructor_range,
+            array_name,
+        });
+        return Some(Vec::new());
+    }
     if aliases.is_empty() {
         aliases.push(DynamicNotifyArrayAlias {
             array_name: name,
@@ -1305,123 +1394,53 @@ fn dynamic_notify_array_aliases(
             array_end: constructor_range.start(),
         });
     }
-    let mut seen = FxHashSet::default();
-    aliases.retain(|alias| seen.insert(*alias));
     Some(aliases)
 }
 
 /// Trace known array references at the binding site. A later reassignment changes the variable,
 /// not the object already copied into another local; conditional bindings retain both the
 /// preceding value and each possible branch value.
-fn resolve_dynamic_array_aliases(
-    body: &Body,
-    source_map: crate::body::SourceMapAt<'_>,
-    name: NormName,
-    before: TextSize,
-    candidate_end: TextSize,
-) -> Vec<DynamicNotifyArrayAlias> {
-    let assignments = dynamic_array_assignments(body, source_map, name, before);
-    if assignments.is_empty() {
-        return Vec::new();
-    }
+const DYNAMIC_ARRAY_ALIAS_WORK_BUDGET: usize = 8_192;
+const DYNAMIC_ARRAY_CANCEL_INTERVAL: usize = 128;
 
-    let latest = *assignments.iter().max_by_key(|(range, _)| range.start()).unwrap();
-    let mut selected = vec![latest];
-    let mut pending = vec![latest];
-    while let Some((site, _)) = pending.pop() {
-        let Some(branch) = dynamic_array_branch_containing(body, source_map, site) else {
-            continue;
-        };
-        for assignment in assignments.iter().filter(|(range, _)| branch.contains_range(*range)) {
-            if !selected.iter().any(|(range, _)| range == &assignment.0) {
-                selected.push(*assignment);
-                pending.push(*assignment);
-            }
-        }
-        if let Some(previous) = assignments
-            .iter()
-            .filter(|(range, _)| range.end() <= branch.start())
-            .max_by_key(|(range, _)| range.start())
-        {
-            if !selected.iter().any(|(range, _)| range == &previous.0) {
-                selected.push(*previous);
-                pending.push(*previous);
-            }
-        }
-    }
-
-    let mut results = Vec::new();
-    for (range, value) in selected {
-        let binding_start = range.start();
-        match value {
-            Expr::New { .. } if is_array_constructor(body, value) => {
-                results.push(DynamicNotifyArrayAlias {
-                    array_name: name,
-                    array_start: Some(binding_start),
-                    array_end: next_unconditional_array_assignment(
-                        body,
-                        source_map,
-                        name,
-                        binding_start,
-                        candidate_end,
-                    ),
-                });
-            }
-            Expr::Path(source_name) => {
-                let source = NormName::intern(source_name.as_str());
-                if source == name {
-                    continue;
-                }
-                for mut alias in resolve_dynamic_array_aliases(
-                    body,
-                    source_map,
-                    source,
-                    binding_start,
-                    candidate_end,
-                ) {
-                    alias.array_end = alias.array_end.min(next_unconditional_array_assignment(
-                        body,
-                        source_map,
-                        source,
-                        binding_start,
-                        candidate_end,
-                    ));
-                    results.push(alias);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut seen = FxHashSet::default();
-    results.retain(|alias| seen.insert(*alias));
-    results
+#[derive(Clone, Copy)]
+struct DynamicArrayAssignment<'a> {
+    range: TextRange,
+    value: &'a Expr,
+    branch: Option<TextRange>,
 }
 
-fn dynamic_array_assignments<'a>(
+/// Shared, bounded body index. Every statement/assignment/branch examined spends budget,
+/// so alias fan-out and large bodies have a fixed upper bound independent of path shape.
+struct DynamicArrayResolver<'a> {
     body: &'a Body,
-    source_map: crate::body::SourceMapAt<'_>,
-    name: NormName,
-    before: TextSize,
-) -> Vec<(TextRange, &'a Expr)> {
-    body.stmts_iter()
-        .filter_map(|(stmt_id, stmt)| {
-            let Stmt::Assign { target, value } = stmt else { return None };
-            let Expr::Path(target_name) = body.expr_idx(*target) else { return None };
-            let range = source_map.stmt_range(stmt_id)?;
-            (NormName::intern(target_name.as_str()) == name && range.start() < before)
-                .then_some((range, body.expr_idx(*value)))
-        })
-        .collect()
+    assignments: FxHashMap<NormName, Vec<DynamicArrayAssignment<'a>>>,
+    assignment_branches: FxHashMap<TextRange, Option<TextRange>>,
+    remaining: usize,
+    since_cancel: usize,
 }
 
-fn dynamic_array_branch_containing(
-    body: &Body,
-    source_map: crate::body::SourceMapAt<'_>,
-    site: TextRange,
-) -> Option<TextRange> {
-    body.stmts_iter()
-        .filter_map(|(stmt_id, stmt)| {
-            matches!(
+impl<'a> DynamicArrayResolver<'a> {
+    fn new(
+        body: &'a Body,
+        source_map: crate::body::SourceMapAt<'_>,
+        cancel: &mut dyn FnMut(),
+    ) -> Option<Self> {
+        let mut this = Self {
+            body,
+            assignments: FxHashMap::default(),
+            assignment_branches: FxHashMap::default(),
+            remaining: DYNAMIC_ARRAY_ALIAS_WORK_BUDGET,
+            since_cancel: 0,
+        };
+        let mut branches = Vec::new();
+        let mut unclassified = Vec::new();
+        for (stmt_id, stmt) in body.stmts_iter() {
+            if !this.spend(cancel) {
+                return None;
+            }
+            let Some(range) = source_map.stmt_range(stmt_id) else { continue };
+            if matches!(
                 stmt,
                 Stmt::If(_)
                     | Stmt::PreprocIf(_)
@@ -1429,30 +1448,222 @@ fn dynamic_array_branch_containing(
                     | Stmt::For { .. }
                     | Stmt::ForEach { .. }
                     | Stmt::Try { .. }
-            )
-            .then(|| source_map.stmt_range(stmt_id))
-            .flatten()
-        })
-        .filter(|range| range.contains_range(site))
-        .min_by_key(|range| range.len())
-}
+            ) {
+                branches.push(range);
+            }
+            if let Stmt::Assign { target, value } = stmt {
+                if let Expr::Path(name) = body.expr_idx(*target) {
+                    unclassified.push((
+                        NormName::intern(name.as_str()),
+                        range,
+                        body.expr_idx(*value),
+                    ));
+                }
+            }
+        }
+        for (name, range, value) in unclassified {
+            let mut branch = None;
+            for &candidate in &branches {
+                if !this.spend(cancel) {
+                    return None;
+                }
+                if candidate.contains_range(range)
+                    && branch.is_none_or(|previous: TextRange| candidate.len() < previous.len())
+                {
+                    branch = Some(candidate);
+                }
+            }
+            this.assignment_branches.insert(range, branch);
+            this.assignments.entry(name).or_default().push(DynamicArrayAssignment {
+                range,
+                value,
+                branch,
+            });
+        }
+        Some(this)
+    }
 
-fn next_unconditional_array_assignment(
-    body: &Body,
-    source_map: crate::body::SourceMapAt<'_>,
-    name: NormName,
-    after: TextSize,
-    before: TextSize,
-) -> TextSize {
-    dynamic_array_assignments(body, source_map, name, before)
-        .into_iter()
-        .filter(|(range, _)| {
-            range.start() > after
-                && dynamic_array_branch_containing(body, source_map, *range).is_none()
-        })
-        .map(|(range, _)| range.start())
-        .min()
-        .unwrap_or(before)
+    fn spend(&mut self, cancel: &mut dyn FnMut()) -> bool {
+        Self::spend_fields(&mut self.remaining, &mut self.since_cancel, cancel)
+    }
+
+    fn spend_fields(
+        remaining: &mut usize,
+        since_cancel: &mut usize,
+        cancel: &mut dyn FnMut(),
+    ) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        *since_cancel += 1;
+        if *since_cancel >= DYNAMIC_ARRAY_CANCEL_INTERVAL {
+            *since_cancel = 0;
+            cancel();
+        }
+        true
+    }
+
+    fn assignment_branch(&self, range: TextRange) -> Option<Option<TextRange>> {
+        self.assignment_branches.get(&range).copied()
+    }
+
+    fn next_unconditional(
+        &mut self,
+        name: NormName,
+        after: TextSize,
+        before: TextSize,
+        cancel: &mut dyn FnMut(),
+    ) -> Option<TextSize> {
+        let remaining = &mut self.remaining;
+        let since_cancel = &mut self.since_cancel;
+        let Some(assignments) = self.assignments.get(&name) else {
+            return Some(before);
+        };
+        let mut next = None;
+        for assignment in assignments {
+            if !Self::spend_fields(remaining, since_cancel, cancel) {
+                return None;
+            }
+            if assignment.range.start() > after
+                && assignment.range.start() < before
+                && assignment.branch.is_none()
+            {
+                next = Some(next.map_or(assignment.range.start(), |at: TextSize| {
+                    at.min(assignment.range.start())
+                }));
+            }
+        }
+        Some(next.unwrap_or(before))
+    }
+
+    fn resolve(
+        &mut self,
+        name: NormName,
+        before: TextSize,
+        candidate_end: TextSize,
+        cancel: &mut dyn FnMut(),
+    ) -> (Vec<DynamicNotifyArrayAlias>, bool) {
+        let mut pending = vec![(name, before, candidate_end)];
+        let mut visited = FxHashSet::default();
+        let mut results = Vec::new();
+        while let Some((current_name, current_before, end_cap)) = pending.pop() {
+            if !visited.insert((current_name, current_before, end_cap)) {
+                continue;
+            }
+            let assignment_index = &self.assignments;
+            let remaining = &mut self.remaining;
+            let since_cancel = &mut self.since_cancel;
+            let Some(all) = assignment_index.get(&current_name) else { continue };
+            let mut assignments = Vec::new();
+            for assignment in all {
+                if !Self::spend_fields(remaining, since_cancel, cancel) {
+                    return (Vec::new(), false);
+                }
+                if assignment.range.start() < current_before {
+                    assignments.push(*assignment);
+                }
+            }
+            let mut latest = None;
+            for assignment in &assignments {
+                if !self.spend(cancel) {
+                    return (Vec::new(), false);
+                }
+                if latest.is_none_or(|old: DynamicArrayAssignment<'_>| {
+                    assignment.range.start() > old.range.start()
+                }) {
+                    latest = Some(*assignment);
+                }
+            }
+            let Some(latest) = latest else { continue };
+            let mut selected = vec![latest];
+            let mut selected_ranges = FxHashSet::default();
+            selected_ranges.insert(latest.range);
+            let mut branch_pending = vec![latest];
+            while let Some(site) = branch_pending.pop() {
+                let Some(branch) = site.branch else { continue };
+                for assignment in &assignments {
+                    if !self.spend(cancel) {
+                        return (Vec::new(), false);
+                    }
+                    if branch.contains_range(assignment.range)
+                        && selected_ranges.insert(assignment.range)
+                    {
+                        selected.push(*assignment);
+                        branch_pending.push(*assignment);
+                    }
+                }
+                let mut previous = None;
+                for assignment in &assignments {
+                    if !self.spend(cancel) {
+                        return (Vec::new(), false);
+                    }
+                    if assignment.range.end() <= branch.start()
+                        && previous.is_none_or(|old: DynamicArrayAssignment<'_>| {
+                            assignment.range.start() > old.range.start()
+                        })
+                    {
+                        previous = Some(*assignment);
+                    }
+                }
+                if let Some(previous) = previous {
+                    if selected_ranges.insert(previous.range) {
+                        selected.push(previous);
+                        branch_pending.push(previous);
+                    }
+                }
+            }
+            for assignment in selected {
+                if !self.spend(cancel) {
+                    return (Vec::new(), false);
+                }
+                let binding_start = assignment.range.start();
+                match assignment.value {
+                    Expr::New { .. } if is_array_constructor(self.body, assignment.value) => {
+                        let Some(array_end) = self.next_unconditional(
+                            current_name,
+                            binding_start,
+                            candidate_end,
+                            cancel,
+                        ) else {
+                            return (Vec::new(), false);
+                        };
+                        results.push(DynamicNotifyArrayAlias {
+                            array_name: current_name,
+                            array_start: Some(binding_start),
+                            array_end: end_cap.min(array_end),
+                        });
+                    }
+                    Expr::Path(source_name) => {
+                        let source = NormName::intern(source_name.as_str());
+                        if source != current_name {
+                            let Some(source_end) = self.next_unconditional(
+                                source,
+                                binding_start,
+                                candidate_end,
+                                cancel,
+                            ) else {
+                                return (Vec::new(), false);
+                            };
+                            pending.push((source, binding_start, end_cap.min(source_end)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut seen = FxHashSet::default();
+        let mut unique = Vec::with_capacity(results.len());
+        for alias in results {
+            if !self.spend(cancel) {
+                return (Vec::new(), false);
+            }
+            if seen.insert(alias) {
+                unique.push(alias);
+            }
+        }
+        (unique, true)
+    }
 }
 
 fn extract_dynamic_notify_handlers(
@@ -1460,6 +1671,7 @@ fn extract_dynamic_notify_handlers(
     source_map: crate::body::SourceMapAt<'_>,
     candidate: &DynamicNotifyArrayCandidate,
     array_additions: &[(NormName, TextRange, ExprIdx)],
+    alias_resolver: Option<&DynamicArrayResolver<'_>>,
     handlers: &mut Vec<Name>,
     handler_sites: &mut Vec<DynamicNotifySignatureHandler>,
 ) {
@@ -1496,6 +1708,7 @@ fn extract_dynamic_notify_handlers(
         candidate,
         sequence_start,
         candidate.array_end,
+        alias_resolver,
     );
 
     let mut values = array_additions
@@ -1666,16 +1879,27 @@ struct DynamicArrayUncertainty {
 /// Whether `expr` may designate the candidate array itself: the variable, a local alias
 /// bound to it, or a same-named member of `ЭтотОбъект`. A same-named member of any other
 /// receiver is an unrelated object.
+fn dynamic_array_alias_is_active(
+    aliases: &FxHashMap<NormName, Vec<(TextSize, TextSize)>>,
+    name: NormName,
+    at: TextSize,
+) -> bool {
+    aliases
+        .get(&name)
+        .is_some_and(|intervals| intervals.iter().any(|(start, end)| *start <= at && at < *end))
+}
+
 fn expr_may_designate_candidate_array(
     body: &Body,
     expr: &Expr,
     candidate: &DynamicNotifyArrayCandidate,
-    aliases: &FxHashSet<NormName>,
+    aliases: &FxHashMap<NormName, Vec<(TextSize, TextSize)>>,
+    at: TextSize,
 ) -> bool {
     match expr {
         Expr::Path(name) => {
             let key = NormName::intern(name.as_str());
-            key == candidate.array_name || aliases.contains(&key)
+            key == candidate.array_name || dynamic_array_alias_is_active(aliases, key, at)
         }
         Expr::Field { base, field } => {
             NormName::intern(field.as_str()) == candidate.array_name
@@ -1692,44 +1916,58 @@ fn dynamic_array_uncertain_writes(
     candidate: &DynamicNotifyArrayCandidate,
     start: TextSize,
     end: TextSize,
+    alias_resolver: Option<&DynamicArrayResolver<'_>>,
 ) -> DynamicArrayUncertainty {
     let mut result = DynamicArrayUncertainty::default();
 
-    // Names bound to the candidate array (`Копия = Параметры`) inside the window: arrays
-    // are reference objects, so writes through an alias reach the same contents. The
-    // binding chain is followed to a fixed point (`Копия = Псевдоним`, `Псевдоним =
-    // Параметры`), and sites are matched against the full alias set, keeping the scan
-    // independent of the order the lowering assigns statements.
-    let bindings: Vec<(NormName, NormName)> = body
-        .stmts_iter()
-        .filter_map(|(stmt_id, stmt)| {
-            let Stmt::Assign { target, value } = stmt else { return None };
-            let Expr::Path(target_name) = body.expr_idx(*target) else { return None };
-            let Expr::Path(value_name) = body.expr_idx(*value) else { return None };
-            let range = source_map.stmt_range(stmt_id)?;
-            if range.start() < start
-                || range.start() >= candidate.constructor_start
-                || range.start() >= end
-            {
-                return None;
+    // Track aliases in source order so an unconditional rebinding releases the old array.
+    // Conditional rebinding keeps both possibilities because either arm may execute.
+    let mut bindings = Vec::new();
+    for (stmt_id, stmt) in body.stmts_iter() {
+        let Stmt::Assign { target, value } = stmt else { continue };
+        let Expr::Path(target_name) = body.expr_idx(*target) else { continue };
+        let Some(range) = source_map.stmt_range(stmt_id) else { continue };
+        if range.start() < start || range.start() >= candidate.constructor_start {
+            continue;
+        }
+        let value = match body.expr_idx(*value) {
+            Expr::Path(value_name) => Some(NormName::intern(value_name.as_str())),
+            _ => None,
+        };
+        bindings.push((range, NormName::intern(target_name.as_str()), value));
+    }
+    bindings.sort_unstable_by_key(|(range, _, _)| range.start());
+    let mut active_aliases: FxHashSet<NormName> = FxHashSet::default();
+    let mut open_aliases: FxHashMap<NormName, TextSize> = FxHashMap::default();
+    let mut alias_intervals: FxHashMap<NormName, Vec<(TextSize, TextSize)>> = FxHashMap::default();
+    for (range, target, value) in bindings {
+        if target == candidate.array_name {
+            continue;
+        }
+        let bound_to_candidate = value.is_some_and(|value| {
+            (value == candidate.array_name && range.start() < end)
+                || active_aliases.contains(&value)
+        });
+        let conditional = alias_resolver
+            .and_then(|resolver| resolver.assignment_branch(range))
+            .flatten()
+            .is_some();
+        if bound_to_candidate {
+            if active_aliases.insert(target) {
+                open_aliases.insert(target, range.start());
             }
-            Some((NormName::intern(target_name.as_str()), NormName::intern(value_name.as_str())))
-        })
-        .collect();
-    let mut aliases: FxHashSet<NormName> = FxHashSet::default();
-    loop {
-        let mut grew = false;
-        for &(target, value) in &bindings {
-            if target == candidate.array_name {
-                continue;
-            }
-            let bound_to_candidate = value == candidate.array_name || aliases.contains(&value);
-            if bound_to_candidate && aliases.insert(target) {
-                grew = true;
+        } else if !conditional && active_aliases.remove(&target) {
+            if let Some(opened_at) = open_aliases.remove(&target) {
+                alias_intervals.entry(target).or_default().push((opened_at, range.start()));
             }
         }
-        if !grew {
-            break;
+    }
+    for alias in active_aliases {
+        if let Some(opened_at) = open_aliases.remove(&alias) {
+            alias_intervals
+                .entry(alias)
+                .or_default()
+                .push((opened_at, candidate.constructor_start));
         }
     }
 
@@ -1741,16 +1979,36 @@ fn dynamic_array_uncertain_writes(
             other => other,
         };
         let Some(range) = source_map.stmt_range(stmt_id) else {
-            // An assign to the candidate whose position cannot be resolved is opaque.
-            if expr_may_designate_candidate_array(body, target_receiver, candidate, &aliases) {
+            // Without a position, any historical alias could have named the candidate.
+            let maybe_alias = match target_receiver {
+                Expr::Path(name) => alias_intervals.contains_key(&NormName::intern(name.as_str())),
+                _ => false,
+            };
+            if maybe_alias
+                || expr_may_designate_candidate_array(
+                    body,
+                    target_receiver,
+                    candidate,
+                    &alias_intervals,
+                    start,
+                )
+            {
                 result.uncertain = true;
             }
             continue;
         };
         let writes_through_alias = match body.expr_idx(*target) {
-            Expr::Path(name) => aliases.contains(&NormName::intern(name.as_str())),
+            Expr::Path(name) => dynamic_array_alias_is_active(
+                &alias_intervals,
+                NormName::intern(name.as_str()),
+                range.start(),
+            ),
             _ => matches!(target_receiver, Expr::Path(name)
-                if aliases.contains(&NormName::intern(name.as_str()))),
+            if dynamic_array_alias_is_active(
+                &alias_intervals,
+                NormName::intern(name.as_str()),
+                range.start()
+            )),
         };
         if range.start() < start
             || range.start() >= candidate.constructor_start
@@ -1763,13 +2021,21 @@ fn dynamic_array_uncertain_writes(
                 let key = NormName::intern(name.as_str());
                 // A reassignment to something other than a fresh array is opaque; a
                 // fresh array is the reset the caller already accounts for.
-                if (key == candidate.array_name || aliases.contains(&key))
+                if (key == candidate.array_name
+                    || dynamic_array_alias_is_active(&alias_intervals, key, range.start()))
                     && !is_array_constructor(body, body.expr_idx(*value))
                 {
                     result.uncertain = true;
                 }
             }
-            _ if expr_may_designate_candidate_array(body, target_receiver, candidate, &aliases) => {
+            _ if expr_may_designate_candidate_array(
+                body,
+                target_receiver,
+                candidate,
+                &alias_intervals,
+                range.start(),
+            ) =>
+            {
                 // An indexed or same-named qualified write replaces a slot the pass
                 // cannot resolve, and its value is a possible handler name.
                 result.uncertain = true;
@@ -1782,14 +2048,23 @@ fn dynamic_array_uncertain_writes(
     for (expr_id, expr) in body.exprs_iter() {
         let Expr::Call { callee, args } = expr else { continue };
         let range = source_map.expr_range(expr_id);
+        let at = range.map_or(start, |range| range.start());
         let calls_through_alias = match body.expr_idx(*callee) {
             Expr::Field { base, .. } => matches!(body.expr_idx(*base), Expr::Path(name)
-                if aliases.contains(&NormName::intern(name.as_str()))),
+            if dynamic_array_alias_is_active(
+                &alias_intervals,
+                NormName::intern(name.as_str()),
+                at
+            )),
             _ => false,
         };
         let passes_alias = args.iter().any(|&arg| {
             matches!(body.expr_idx(arg), Expr::Path(name)
-            if aliases.contains(&NormName::intern(name.as_str())))
+            if dynamic_array_alias_is_active(
+                &alias_intervals,
+                NormName::intern(name.as_str()),
+                at
+            ))
         });
         let in_window = range.is_some_and(|range| {
             range.start() >= start
@@ -1801,7 +2076,13 @@ fn dynamic_array_uncertain_writes(
         }
         // Handing the array to a call exposes it to effects this syntax pass cannot see.
         if args.iter().any(|&arg| {
-            expr_may_designate_candidate_array(body, body.expr_idx(arg), candidate, &aliases)
+            expr_may_designate_candidate_array(
+                body,
+                body.expr_idx(arg),
+                candidate,
+                &alias_intervals,
+                at,
+            )
         }) {
             result.uncertain = true;
         }
@@ -1821,8 +2102,17 @@ fn dynamic_array_uncertain_writes(
             }
             receiver
                 if matches!(receiver, Expr::Path(name)
-                    if aliases.contains(&NormName::intern(name.as_str())))
-                    || expr_may_designate_candidate_array(body, receiver, candidate, &aliases) =>
+                if dynamic_array_alias_is_active(
+                    &alias_intervals,
+                    NormName::intern(name.as_str()),
+                    at
+                )) || expr_may_designate_candidate_array(
+                    body,
+                    receiver,
+                    candidate,
+                    &alias_intervals,
+                    at,
+                ) =>
             {
                 // A call through an alias or a same-named member of `ЭтотОбъект` may
                 // reach the same array: any string it passes is a possible handler
@@ -2181,6 +2471,7 @@ mod tests {
             notify_additional_signature_handlers: Vec::new(),
             notify_dynamic_signature_handlers: Vec::new(),
             notify_dynamic_signature_handler_sites: Vec::new(),
+            notify_dynamic_signature_analysis_incomplete: Vec::new(),
             notify_regs: vec![
                 NotifyReg {
                     caller: CallerId::Method(MethodKey::first("Главная")),
@@ -2555,10 +2846,22 @@ mod tests {
         code: &str,
         handlers: &[bsl_metadata::FormEventHandler],
     ) -> ModuleCallSummary {
+        parse_and_extract_with_cancel_and_handlers(code, handlers, &mut || {})
+    }
+
+    fn parse_and_extract_with_cancel(code: &str, cancel: &mut dyn FnMut()) -> ModuleCallSummary {
+        parse_and_extract_with_cancel_and_handlers(code, &[], cancel)
+    }
+
+    fn parse_and_extract_with_cancel_and_handlers(
+        code: &str,
+        handlers: &[bsl_metadata::FormEventHandler],
+        cancel: &mut dyn FnMut(),
+    ) -> ModuleCallSummary {
         let parse = parser::parse(code);
         let item_tree = ItemTree::from_parse(&parse);
         let module_bodies = ModuleBodies::from_parse(&parse);
-        extract_call_summary(&item_tree, &module_bodies, handlers)
+        extract_call_summary_with_cancellation(&item_tree, &module_bodies, handlers, cancel)
     }
 
     #[test]
@@ -2909,6 +3212,179 @@ EndProcedure
             summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
         handlers.sort_unstable();
         assert_eq!(handlers, ["ДоКопирования", "ИзВетви"]);
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_chain_survives_source_rebinding() {
+        let code = r#"
+Процедура Тест()
+    Перем Источник;
+    Перем Алиас;
+    Перем Итог;
+    Источник = Новый Массив;
+    Источник.Добавить("ДоПерепривязки");
+    Источник.Добавить(ЭтотОбъект);
+    Алиас = Источник;
+    Источник = Новый Массив;
+    Итог = Алиас;
+    Итог.Добавить("ЧерезЦепочку");
+    Итог.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", Итог);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        let mut handlers =
+            summary.notify_dynamic_signature_handlers.iter().map(Name::as_str).collect::<Vec<_>>();
+        handlers.sort_unstable();
+        assert_eq!(handlers, ["ДоПерепривязки", "ЧерезЦепочку"]);
+
+        let rebound = r#"
+Процедура Тест()
+    Перем Источник;
+    Перем ДолгоживущийАлиас;
+    Перем КраткийАлиас;
+    Источник = Новый Массив;
+    Источник.Добавить("ПравильныйОбработчик");
+    Источник.Добавить(ЭтотОбъект);
+    ДолгоживущийАлиас = Источник;
+    Источник = Новый Массив;
+    КраткийАлиас = ДолгоживущийАлиас;
+    КраткийАлиас = Новый Массив;
+    КраткийАлиас.Добавить("НеИзСтарогоМассива");
+    КраткийАлиас.Добавить(ЭтотОбъект);
+    О = Новый("CallbackDescription", ДолгоживущийАлиас);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(rebound);
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("НеИзСтарогоМассива"))),
+            "a rebound alias must not contribute values to the old array: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_alias_chain_does_not_follow_source_after_reset() {
+        let code = r#"
+Процедура Тест()
+    Перем Источник;
+    Перем ДолгоживущийАлиас;
+    Перем КопияАлиаса;
+    Перем НовыйАлиас;
+    Источник = Новый Массив;
+    Источник.Добавить("СтарыйОбработчик");
+    Источник.Добавить(ЭтотОбъект);
+    ДолгоживущийАлиас = Источник;
+    КопияАлиаса = ДолгоживущийАлиас;
+    Источник = Новый Массив;
+    НовыйАлиас = Источник;
+    НовыйАлиас[0] = "НеИзСтарогоМассива";
+    О = Новый("CallbackDescription", КопияАлиаса);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(
+            summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("СтарыйОбработчик"))),
+            "aliases captured before source reset must remain linked: {summary:#?}"
+        );
+        assert!(
+            !summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("НеИзСтарогоМассива"))),
+            "aliases copied from the source after reset must not reach the old array: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_array_alias_write_before_rebinding_is_preserved() {
+        let code = r#"
+Процедура Тест()
+    Перем Параметры;
+    Перем Алиас;
+    Параметры = Новый Массив;
+    Параметры.Добавить("Old");
+    Параметры.Добавить(ЭтотОбъект);
+    Алиас = Параметры;
+    Алиас[0] = "Actual";
+    Алиас = Новый Массив;
+    О = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+"#;
+        let summary = parse_and_extract(code);
+        assert!(
+            summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("Actual"))),
+            "writes made through an alias before its rebinding must be retained: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_alias_branch_fanout_is_bounded_and_keeps_handler() {
+        const ALIAS_COUNT: usize = 32;
+        let mut code = String::from("Процедура Тест(Условие)\nПерем Root;\n");
+        for index in 0..=ALIAS_COUNT {
+            code.push_str(&format!("Перем Alias{index};\n"));
+        }
+        code.push_str(
+            "Root = Новый Массив;\nRoot.Добавить(\"ОжидаемыйОбработчик\");\nRoot.Добавить(ЭтотОбъект);\nAlias0 = Root;\n",
+        );
+        for index in 1..=ALIAS_COUNT {
+            code.push_str(&format!(
+                "Если Условие Тогда\nAlias{index} = Alias{};\nИначе\nAlias{index} = Alias{};\nКонецЕсли;\n",
+                index - 1,
+                index - 1,
+            ));
+        }
+        code.push_str(&format!(
+            "О = Новый(\"CallbackDescription\", Alias{ALIAS_COUNT});\nКонецПроцедуры\n"
+        ));
+
+        let summary = parse_and_extract(&code);
+        assert!(
+            summary.notify_dynamic_signature_analysis_incomplete.is_empty(),
+            "32 aliases with two branch bindings each must fit the bounded walk: {summary:#?}"
+        );
+        assert!(
+            summary
+                .notify_dynamic_signature_handlers
+                .iter()
+                .any(|handler| handler.eq_ignore_case(&Name::new("ОжидаемыйОбработчик"))),
+            "the handler reachable through either branch must be retained: {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_callback_alias_analysis_is_bounded_and_cancellable() {
+        let mut code = String::from("Процедура Тест()\nПерем А;\n");
+        for _ in 0..5_000 {
+            code.push_str("А = НеизвестноеЗначение;\n");
+        }
+        code.push_str("О = Новый(\"CallbackDescription\", А);\nКонецПроцедуры\n");
+
+        let mut cancellation_checks = 0;
+        let summary = parse_and_extract_with_cancel(&code, &mut || cancellation_checks += 1);
+        assert!(cancellation_checks > 1, "large scans must periodically check cancellation");
+        assert!(
+            summary.notify_dynamic_signature_handlers.is_empty(),
+            "an incomplete alias analysis must not recommend handlers: {summary:#?}"
+        );
+        assert_eq!(summary.notify_dynamic_signature_analysis_incomplete.len(), 1);
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete[0].caller,
+            CallerId::Method(MethodKey::first("Тест"))
+        );
+        assert_eq!(
+            summary.notify_dynamic_signature_analysis_incomplete[0].array_name,
+            Name::new("А")
+        );
     }
 
     #[test]

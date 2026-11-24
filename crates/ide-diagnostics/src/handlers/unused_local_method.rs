@@ -139,36 +139,10 @@ pub(crate) fn collect_called_methods(
     let summary = ctx.call_summary(module_id);
 
     let mut called_methods: FxHashSet<NormName> = FxHashSet::default();
-    // Without enough platform facts to normalize the callback constructor, its source syntax
-    // is the only available evidence that the platform may invoke the local handler. With
-    // constructor facts available, use only normalized semantic registrations below.
-    let has_callback_facts = bsl_platform::has_callback_description_constructor_facts(
-        bsl_platform::PlatformData::instance(),
-    );
-    if !has_callback_facts {
-        called_methods.extend(
-            summary
-                .notify_signature_handlers
-                .iter()
-                .chain(&summary.notify_additional_signature_handlers)
-                .chain(&summary.notify_dynamic_signature_handlers)
-                .map(|handler| NormName::intern(handler.as_str())),
-        );
-    } else if metadata.module_type == bsl_metadata::ModuleType::CommandModule {
-        // Bundled constructor facts do not make an alias or a conditionally-built array
-        // semantically knowable. Keep the syntax proof for those unresolved callbacks unless
-        // the same constructor proves that the named handler belongs to a foreign module.
-        for site in &summary.notify_dynamic_signature_handler_sites {
-            let has_proven_foreign_registration = summary.notify_regs.iter().any(|registration| {
-                registration.range == site.constructor_range
-                    && registration.callback_expr == site.callback_expr
-                    && registration.callback_name.eq_ignore_case(&site.handler_name)
-                    && matches!(&registration.target, hir::call_graph::NotifyTarget::Module(_))
-            });
-            if !has_proven_foreign_registration {
-                called_methods.insert(NormName::intern(site.handler_name.as_str()));
-            }
-        }
+    let notify_candidates = ctx.notify_candidates();
+    if notify_candidates.iter().any(|candidate| candidate.analysis_incomplete) {
+        called_methods
+            .extend(summary.methods.iter().map(|method| NormName::intern(method.name.as_str())));
     }
 
     for edge in &summary.call_edges {
@@ -210,11 +184,13 @@ pub(crate) fn collect_called_methods(
 
     // The platform invokes these by the registered string name:
     // ПодключитьОбработчикОжидания and Новый ОписаниеОповещения (both handler slots).
-    for reg in &summary.notify_regs {
-        if !matches!(&reg.target, hir::call_graph::NotifyTarget::ThisObject) {
-            continue;
+    for candidate in notify_candidates.iter() {
+        if !candidate.analysis_incomplete
+            && candidate.site_reachable
+            && candidate.protects_local_method
+        {
+            called_methods.insert(NormName::intern(candidate.callback_name.as_str()));
         }
-        called_methods.insert(NormName::intern(reg.callback_name.as_str()));
     }
     for reg in &summary.idle_handler_regs {
         called_methods.insert(NormName::intern(reg.handler_name.as_str()));
@@ -1162,6 +1138,70 @@ mod tests {
             .collect();
 
         assert_eq!(unused, vec!["Неиспользуемый локальный метод \"МёртвыйТолькоИзРегистрации\""]);
+    }
+
+    #[test]
+    fn duplicate_foreign_notify_slots_do_not_keep_a_form_local_method_alive() {
+        let handlers_xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+<CommonModule uuid="00000000-0000-0000-0000-000000000011"><Properties>
+<Name>Handlers</Name><Global>false</Global><ClientManagedApplication>true</ClientManagedApplication>
+<ClientOrdinaryApplication>false</ClientOrdinaryApplication><Server>true</Server>
+<ExternalConnection>false</ExternalConnection><ServerCall>false</ServerCall>
+<Privileged>false</Privileged><ReturnValuesReuse>DontUse</ReturnValuesReuse>
+</Properties></CommonModule></MetaDataObject>"#;
+        let handlers_source = r#"&НаКлиентеНаСервере
+Процедура H() Экспорт
+    Сообщить("external");
+КонецПроцедуры
+"#;
+        let source = |ordinary_string_reference: bool| {
+            format!(
+                r#"&НаКлиенте
+Процедура Зарегистрировать() Экспорт
+    О = Новый ОписаниеОповещения("H", Handlers, , "H", Handlers);
+    {ordinary_string_reference}
+КонецПроцедуры
+
+&НаКлиенте
+Процедура H()
+    Сообщить("local");
+КонецПроцедуры
+"#,
+                ordinary_string_reference = if ordinary_string_reference {
+                    "    Параметры = Новый Структура(\"Имя\", \"H\");"
+                } else {
+                    ""
+                }
+            )
+        };
+        let diagnostics = crate::test_utils::check_form_with_common_modules(
+            &source(false),
+            &[("Handlers", handlers_source, handlers_xml)],
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unused,
+            vec!["Неиспользуемый локальный метод \"H\""],
+            "duplicate foreign slots must not count as an ordinary local name reference: {diagnostics:#?}"
+        );
+
+        let diagnostics = crate::test_utils::check_form_with_common_modules(
+            &source(true),
+            &[("Handlers", handlers_source, handlers_xml)],
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedLocalMethod)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !unused.iter().any(|message| message.contains("\"H\"")),
+            "an ordinary independent string reference remains a local use: {diagnostics:#?}"
+        );
     }
 
     #[test]

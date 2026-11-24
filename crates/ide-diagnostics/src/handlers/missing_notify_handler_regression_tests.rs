@@ -446,6 +446,18 @@ fn identical_main_and_error_handler_slots_register_once() {
             |db, ctx| {
                 let summary = db.module_call_summary(ModuleId::new(ctx.file_id));
                 assert_eq!(summary.notify_regs.len(), regs, "{slots}: {:#?}", summary.notify_regs);
+                if main.eq_ignore_ascii_case(error) && main_receiver == error_receiver {
+                    let candidates = ctx.notify_candidates();
+                    let same_constructor = candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.callback_name.eq_ignore_case(&hir::Name::new(main))
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(same_constructor.len(), 2, "slot provenance: {same_constructor:#?}");
+                    assert_eq!(same_constructor[0].slot, hir::NotifyCallbackSlot::Handler);
+                    assert_eq!(same_constructor[1].slot, hir::NotifyCallbackSlot::ErrorHandler);
+                }
                 missing_notify_handler::check(ctx)
             },
         );

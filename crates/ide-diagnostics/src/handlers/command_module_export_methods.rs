@@ -37,7 +37,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let item_tree = ctx.item_tree();
     let module = hir::ModuleId::new(ctx.file_id);
-    let summary = ctx.call_summary(module);
+    let candidates = ctx.notify_candidates();
     let symbol_tree = ctx.symbol_tree();
     let mut diagnostics = Vec::new();
 
@@ -45,8 +45,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         if proc.is_export
             && !registered_on_this_object(
                 ctx,
-                &summary.notify_regs,
-                &summary.notify_dynamic_signature_handler_sites,
+                &candidates,
                 &proc.name,
                 hir::MethodId { module, local_id: proc.key },
                 &symbol_tree,
@@ -60,8 +59,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         if func.is_export
             && !registered_on_this_object(
                 ctx,
-                &summary.notify_regs,
-                &summary.notify_dynamic_signature_handler_sites,
+                &candidates,
                 &func.name,
                 hir::MethodId { module, local_id: func.key },
                 &symbol_tree,
@@ -78,45 +76,42 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 // constructor also prevents a negative verdict when its syntax names this handler.
 fn registered_on_this_object(
     ctx: &DiagnosticsContext,
-    registrations: &[hir::call_graph::NotifyReg],
-    dynamic_signature_handler_sites: &[hir::call_graph::DynamicNotifySignatureHandler],
+    candidates: &[hir::NotifyCandidate],
     name: &hir::Name,
     method: hir::MethodId,
     symbol_tree: &hir::SymbolTree,
 ) -> bool {
+    if candidates.iter().any(|candidate| candidate.site_reachable && candidate.analysis_incomplete)
+    {
+        return true;
+    }
     let methods =
         symbol_tree.find_methods(name).into_iter().map(|method| method.id).collect::<Vec<_>>();
     if methods.is_empty() {
         return false;
     }
 
-    let matching_registrations = registrations
+    let matching = candidates
         .iter()
-        .filter(|registration| registration.callback_name.eq_ignore_case(name))
+        .filter(|candidate| candidate.callback_name.eq_ignore_case(name))
         .collect::<Vec<_>>();
-    if matching_registrations.iter().any(|registration| {
-        matches!(&registration.target, hir::call_graph::NotifyTarget::ThisObject)
-            && ctx.notify_method_is_exported_in_registration(registration, method, &methods)
+    if matching.iter().any(|candidate| {
+        candidate.receiver == hir::NotifyCandidateReceiver::ThisObject
+            && candidate.registration.as_ref().is_some_and(|registration| {
+                ctx.notify_method_is_exported_in_registration(registration, method, &methods)
+            })
     }) {
         return true;
     }
-    // An unrelated registration cannot disprove an unresolved dynamic constructor, even
-    // when it names the same handler. Only a resolved target at that constructor's own
-    // site can rule out its syntactic candidate.
-    dynamic_signature_handler_sites
-        .iter()
-        .filter(|site| site.handler_name.eq_ignore_case(name))
-        .any(|site| {
-            !matching_registrations.iter().any(|registration| {
-                registration.range == site.constructor_range
-                    && registration.callback_expr == site.callback_expr
-                    && matches!(
-                        &registration.target,
-                        hir::call_graph::NotifyTarget::Module(_)
-                            | hir::call_graph::NotifyTarget::ThisObject
-                    )
-            })
-        })
+    // Syntax-only candidates and unresolved dynamic arrays are conservative; only a proven
+    // foreign receiver at this exact expression can rule them out. A resolved ThisObject
+    // registration must not fall back after its environment verdict was negative.
+    matching.iter().any(|candidate| {
+        candidate.site_reachable
+            && candidate.protects_local_method
+            && (candidate.registration.is_none()
+                || candidate.receiver == hir::NotifyCandidateReceiver::Unknown)
+    })
 }
 
 fn make_diagnostic(range: TextRange, code: DiagnosticCode, ctx: &DiagnosticsContext) -> Diagnostic {
@@ -252,15 +247,38 @@ mod tests {
                 environments: hir::call_graph::NotifyRegistrationEnvironments::default(),
                 range: constructor_range,
             };
-            let unknown_site = hir::call_graph::DynamicNotifySignatureHandler {
-                handler_name: name.clone(),
-                callback_expr: unknown_callback_expr,
-                constructor_range,
+            let constructor = hir::ExprId::from_raw(2.into());
+            let foreign_candidate = hir::NotifyCandidate {
+                caller: hir::call_graph::CallerId::ModuleCode,
+                constructor,
+                expression: foreign_callback_expr,
+                slot: hir::NotifyCallbackSlot::Handler,
+                kind: hir::NotifyCandidateKind::DynamicArray,
+                callback_name: name.clone(),
+                receiver_syntax: hir::call_graph::NotifyReceiverSyntax::BareName,
+                receiver: hir::NotifyCandidateReceiver::ForeignModule(hir::Name::new("Foreign")),
+                protects_local_method: false,
+                site_reachable: true,
+                analysis_incomplete: false,
+                registration: Some(registration.clone()),
+            };
+            let unknown_candidate = hir::NotifyCandidate {
+                caller: hir::call_graph::CallerId::ModuleCode,
+                constructor,
+                expression: unknown_callback_expr,
+                slot: hir::NotifyCallbackSlot::ErrorHandler,
+                kind: hir::NotifyCandidateKind::DynamicArray,
+                callback_name: name.clone(),
+                receiver_syntax: hir::call_graph::NotifyReceiverSyntax::Other,
+                receiver: hir::NotifyCandidateReceiver::Unknown,
+                protects_local_method: true,
+                site_reachable: true,
+                analysis_incomplete: false,
+                registration: None,
             };
             let site_is_not_disproved_by_other_slot = registered_on_this_object(
                 ctx,
-                std::slice::from_ref(&registration),
-                std::slice::from_ref(&unknown_site),
+                &[foreign_candidate.clone(), unknown_candidate],
                 &name,
                 method,
                 &symbol_tree,
@@ -271,14 +289,9 @@ mod tests {
             );
 
             // The exact same foreign receiver does disprove that particular slot.
-            let same_slot_site = hir::call_graph::DynamicNotifySignatureHandler {
-                callback_expr: foreign_callback_expr,
-                ..unknown_site
-            };
             assert!(!registered_on_this_object(
                 ctx,
-                &[registration],
-                &[same_slot_site],
+                &[foreign_candidate],
                 &name,
                 method,
                 &symbol_tree,
@@ -316,6 +329,15 @@ mod tests {
     fn dynamic_array_alias_protects_only_unproven_local_callback_registrations() {
         let code = r#"&НаКлиенте
 Процедура RegisterCallbacks()
+    Перем ПовторныеПараметры;
+    ПовторныеПараметры = Новый Массив;
+    ПовторныеПараметры.Добавить("SharedDynamicCallback");
+    ПовторныеПараметры.Добавить(ЭтотОбъект);
+    ПовторныеПараметры.Добавить(Неопределено);
+    ПовторныеПараметры.Добавить("SharedDynamicCallback");
+    ПовторныеПараметры.Добавить(ЭтотОбъект);
+    Оповещение = Новый("CallbackDescription", ПовторныеПараметры);
+
     Параметры = Новый Массив;
     Параметры.Добавить("AliasCallback");
     Параметры.Добавить(ЭтотОбъект);
@@ -347,6 +369,10 @@ mod tests {
     КлиентскиеПараметры.Добавить(ЭтотОбъект);
     Оповещение = Новый("CallbackDescription", КлиентскиеПараметры);
     Оповещение = Новый CallbackDescription("ServerCallback", ЭтотОбъект);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура SharedDynamicCallback() Экспорт
 КонецПроцедуры
 
 &НаКлиенте
@@ -384,6 +410,19 @@ mod tests {
             ));
             let module = hir::ModuleId::new(ctx.file_id);
             let summary = ctx.call_summary(module);
+            let candidates = ctx.notify_candidates();
+            let duplicate_dynamic_slots = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.callback_name.eq_ignore_case(&hir::Name::new("SharedDynamicCallback"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(duplicate_dynamic_slots.len(), 2, "{duplicate_dynamic_slots:#?}");
+            assert!(duplicate_dynamic_slots
+                .iter()
+                .all(|candidate| { candidate.kind == hir::NotifyCandidateKind::DynamicArray }));
+            assert_eq!(duplicate_dynamic_slots[0].slot, hir::NotifyCallbackSlot::Handler);
+            assert_eq!(duplicate_dynamic_slots[1].slot, hir::NotifyCallbackSlot::ErrorHandler);
             for name in ["AliasCallback", "BranchCallback"] {
                 assert!(
                     summary
@@ -492,6 +531,45 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_client_registration_does_not_exempt_server_only_handler() {
+        let code = r#"&НаКлиенте
+Процедура ОбработкаКоманды(Команда, Параметры) Экспорт
+    Перем МассивПараметров;
+    МассивПараметров = Новый Массив;
+    МассивПараметров.Добавить("ПослеКоманды");
+    МассивПараметров.Добавить(ЭтотОбъект);
+    Оповещение = Новый("CallbackDescription", МассивПараметров);
+КонецПроцедуры
+
+&НаСервере
+Процедура ПослеКоманды() Экспорт
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at_with(code, |ctx| {
+            let candidates = ctx.notify_candidates();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.callback_name.as_str() == "ПослеКоманды")
+                .expect("the dynamic callback candidate is exposed");
+            assert_eq!(
+                candidate.receiver,
+                hir::NotifyCandidateReceiver::ThisObject,
+                "the callback receiver must be semantically resolved: {candidates:#?}"
+            );
+            assert!(candidate.registration.is_some(), "{candidates:#?}");
+            check(ctx)
+        });
+        expect![[r#"
+            CommandModuleExportMethods @ 2:11..2:27
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint
+            CommandModuleExportMethods @ 11:11..11:23
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
     fn complementary_conditional_declarations_cover_the_registration_environment() {
         let code = r#"&НаКлиенте
 Процедура ОбработкаКоманды(Команда, Параметры) Экспорт
@@ -579,6 +657,29 @@ mod tests {
               message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint
             CommandModuleExportMethods @ 6:11..6:23
+              message: Экспортные методы в модулях команд не имеют смысла
+              severity: Hint"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn unreachable_dynamic_registration_does_not_hide_export_diagnostic() {
+        let code = r#"&НаКлиенте
+Процедура Зарегистрировать()
+#Если Сервер И Не Сервер Тогда
+    Параметры = Новый Массив;
+    Параметры.Добавить("ПослеКоманды");
+    Параметры.Добавить(ЭтотОбъект);
+    Оповещение = Новый("CallbackDescription", Параметры);
+#КонецЕсли
+КонецПроцедуры
+
+Процедура ПослеКоманды() Экспорт
+КонецПроцедуры
+"#;
+        let diagnostics = check_command_at(code);
+        expect![[r#"
+            CommandModuleExportMethods @ 11:11..11:23
               message: Экспортные методы в модулях команд не имеют смысла
               severity: Hint"#]]
         .assert_eq(&format_diags(code, &diagnostics));

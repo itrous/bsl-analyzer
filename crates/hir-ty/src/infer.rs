@@ -311,6 +311,10 @@ enum BareNameVerdict {
 
 #[derive(Clone, Copy)]
 struct CompileEnvScope {
+    // This compact projection records which environments compile a statement, not
+    // the identity of the preprocessor branch that selected them. Consequently,
+    // separate branches with the same environment mask may overlap here; retaining
+    // branch provenance would need a richer (and more expensive) scope key.
     definite: hir_def::execution_env::EnvFlags,
     possible: Option<hir_def::execution_env::EnvFlags>,
 }

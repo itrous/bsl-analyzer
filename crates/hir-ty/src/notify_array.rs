@@ -24,6 +24,7 @@ use crate::call_resolution::{
     CandidateEvaluation, CandidateRejection,
 };
 use crate::infer::{CallArgBinding, InferOwnerResult};
+use crate::notify_targets::NotifyCallbackSlot;
 use bsl_types::builders::Builders;
 use bsl_types::intern::TypeKernelDb;
 
@@ -34,6 +35,7 @@ pub(crate) struct NotifyArrayHandler {
     pub callback_expr: ExprId,
     pub receiver: Option<ExprId>,
     pub receiver_syntax: NotifyReceiverSyntax,
+    pub slot: NotifyCallbackSlot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,12 +483,12 @@ fn handlers_from_binding(
 ) -> Vec<NotifyArrayHandler> {
     let Some(arguments) = callback_arguments_for_binding(binding) else { return Vec::new() };
     let mut handlers = Vec::with_capacity(2);
-    for (handler, receiver) in [
-        (arguments.handler, arguments.receiver),
-        (arguments.error_handler, arguments.error_receiver),
+    for (handler, receiver, slot) in [
+        (arguments.handler, arguments.receiver, NotifyCallbackSlot::Handler),
+        (arguments.error_handler, arguments.error_receiver, NotifyCallbackSlot::ErrorHandler),
     ] {
         if let Some(handler) =
-            handler_from_bound_arguments(body, constructor, binding, handler, receiver)
+            handler_from_bound_arguments(body, constructor, binding, handler, receiver, slot)
         {
             handlers.push(handler);
         }
@@ -500,6 +502,7 @@ fn handler_from_bound_arguments(
     binding: &CallArgBinding,
     handler_argument: Option<usize>,
     receiver_argument: Option<usize>,
+    slot: NotifyCallbackSlot,
 ) -> Option<NotifyArrayHandler> {
     let callback_expr = *binding.args.get(handler_argument?)?;
     let Expr::Literal(Literal::String(callback_name)) = body.expr(callback_expr) else {
@@ -516,6 +519,7 @@ fn handler_from_bound_arguments(
         callback_expr,
         receiver,
         receiver_syntax,
+        slot,
     })
 }
 

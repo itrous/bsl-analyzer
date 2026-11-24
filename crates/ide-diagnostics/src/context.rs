@@ -68,6 +68,10 @@ impl<'a> DiagnosticsContext<'a> {
         self.query(|p| p.call_summary(module_id))
     }
 
+    pub fn notify_candidates(&self) -> Arc<Vec<hir::NotifyCandidate>> {
+        self.query(|p| p.notify_candidates(self.file_id))
+    }
+
     pub fn item_tree(&self) -> Arc<hir::ItemTree> {
         self.query(|p| p.item_tree(self.file_id))
     }

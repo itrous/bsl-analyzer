@@ -278,6 +278,60 @@ fn assigned_path_read(body: &hir::Body, target_name: &str, value_name: &str) -> 
         .unwrap_or_else(|| panic!("missing `{target_name} = {value_name}` in body"))
 }
 
+#[test]
+fn duplicate_foreign_notify_slots_do_not_leave_ordinary_local_name_references() {
+    const SOURCE: &str = r#"&НаКлиентеНаСервере
+Процедура Register()
+    О = Новый ОписаниеОповещения("SharedHandler", Handlers, , "SharedHandler", Handlers);
+КонецПроцедуры
+
+&НаКлиентеНаСервере
+Процедура SharedHandler() Экспорт
+КонецПроцедуры
+"#;
+    let mut builder = CfeFixtureBuilder::new("");
+    builder.add_base_module("Handlers", "Процедура SharedHandler() Экспорт\nКонецПроцедуры\n");
+    let fixture = builder.build();
+    let diagnostics = crate::test_utils::check_cfe_at_with_db(
+        CALLER,
+        SOURCE,
+        fixture,
+        &[],
+        DiagnosticsConfig::all_enabled(),
+        configure_common_modules,
+        |db, ctx| {
+            let module = ModuleId::new(ctx.file_id);
+            let summary = db.module_call_summary(module);
+            assert_eq!(summary.notify_regs.len(), 1, "the graph summary merges equal targets");
+            let candidates = ctx.notify_candidates();
+            assert_eq!(
+                candidates.len(),
+                2,
+                "both callback slots retain provenance: {candidates:#?}"
+            );
+            assert!(candidates.iter().all(|candidate| matches!(
+                &candidate.receiver,
+                hir::NotifyCandidateReceiver::ForeignModule(name) if name.as_str() == "Handlers"
+            )));
+            assert_eq!(candidates[0].slot, hir::NotifyCallbackSlot::Handler);
+            assert_eq!(candidates[1].slot, hir::NotifyCallbackSlot::ErrorHandler);
+            assert!(
+                summary.name_literal_refs.is_empty(),
+                "a foreign callback name must not count as an ordinary local reference: {summary:#?}"
+            );
+            assert!(
+                summary.name_literal_ref_sites.iter().all(|site| {
+                    candidates.iter().all(|candidate| candidate.expression != site.expr)
+                }),
+                "foreign slots must be removed from source-exact local references: {:#?}",
+                summary.name_literal_ref_sites
+            );
+            missing_notify_handler::check(ctx)
+        },
+    );
+    assert!(diagnostics.is_empty(), "external handler is not checked locally: {diagnostics:#?}");
+}
+
 fn notify_receivers(body: &hir::Body) -> Vec<ExprId> {
     let platform = PlatformDataInner::instance();
     body.exprs_iter()

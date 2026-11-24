@@ -1,7 +1,9 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
-use hir::{ModuleId, Name, NotifyTarget};
+#[cfg(test)]
+use hir::ModuleId;
+use hir::Name;
 use rustc_hash::FxHashMap;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
@@ -29,8 +31,8 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
-    let summary = ctx.call_summary(ModuleId::new(ctx.file_id));
-    if summary.notify_regs.is_empty() {
+    let notify_candidates = ctx.notify_candidates();
+    if notify_candidates.is_empty() {
         return Vec::new();
     }
 
@@ -47,13 +49,15 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let local_unprovable = metadata.form.as_deref().is_some_and(|form| form.has_base_form());
 
     let mut diagnostics = Vec::new();
+    let mut reported_slots: Vec<(syntax::TextRange, Option<Name>, Name)> = Vec::new();
     let mut module_verdicts = FxHashMap::default();
-    for reg in &summary.notify_regs {
-        let verdict = match &reg.target {
-            NotifyTarget::ThisObject if local_unprovable => None,
-            NotifyTarget::ThisObject => local_verdict(ctx, &reg.callback_name, reg)
+    for candidate in notify_candidates.iter() {
+        let Some(reg) = candidate.registration.as_ref() else { continue };
+        let verdict = match &candidate.receiver {
+            hir::NotifyCandidateReceiver::ThisObject if local_unprovable => None,
+            hir::NotifyCandidateReceiver::ThisObject => local_verdict(ctx, &reg.callback_name, reg)
                 .map(|v| (v, reg.callback_name.to_string())),
-            NotifyTarget::Module(module_name) => {
+            hir::NotifyCandidateReceiver::ForeignModule(module_name) => {
                 let key = (module_name.clone(), reg.callback_name.clone(), reg.environments);
                 let verdict = *module_verdicts
                     .entry(key)
@@ -62,12 +66,31 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                     (v, format!("{}.{}", module_name.as_str(), reg.callback_name.as_str()))
                 })
             }
-            NotifyTarget::Unsupported | NotifyTarget::NotCompiled { .. } => None,
+            hir::NotifyCandidateReceiver::Unknown | hir::NotifyCandidateReceiver::NotCompiled => {
+                None
+            }
         };
         let Some((verdict, detail)) = verdict else { continue };
+        let message = message(verdict, &detail);
+        let module = match &candidate.receiver {
+            hir::NotifyCandidateReceiver::ForeignModule(module) => Some(module.clone()),
+            _ => None,
+        };
+        if reported_slots.iter().any(|(range, previous_module, previous_name)| {
+            *range == reg.range
+                && previous_name.eq_ignore_case(&reg.callback_name)
+                && match (previous_module, &module) {
+                    (Some(left), Some(right)) => left.eq_ignore_case(right),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }) {
+            continue;
+        }
+        reported_slots.push((reg.range, module, reg.callback_name.clone()));
         diagnostics.push(Diagnostic {
             code,
-            message: message(verdict, &detail),
+            message,
             severity: ctx.severity(code),
             range: reg.range,
             tags: ctx.tags(code),

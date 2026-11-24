@@ -479,7 +479,12 @@ pub fn module_call_summary_query<'db>(
     let form_handlers: &[bsl_metadata::FormEventHandler] =
         module_metadata.form.as_ref().map(|f| f.event_handlers.as_slice()).unwrap_or(&[]);
 
-    Arc::new(crate::call_graph::extract_call_summary(item_tree, module_bodies, form_handlers))
+    Arc::new(crate::call_graph::extract_call_summary_with_cancellation(
+        item_tree,
+        module_bodies,
+        form_handlers,
+        &mut || db.unwind_if_revision_cancelled(),
+    ))
 }
 
 #[salsa::tracked(

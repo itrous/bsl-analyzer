@@ -530,6 +530,11 @@ impl AnalysisProvider for SalsaProvider<'_> {
         self.db.module_call_summary(module_id)
     }
 
+    fn notify_candidates(&self, file_id: FileId) -> Arc<Vec<hir::NotifyCandidate>> {
+        let input = FileIdInput::new(self.db, file_id);
+        hir::semantic_notify_candidates_query(self.db, input)
+    }
+
     fn line_index(&self, file_id: FileId) -> Arc<line_index::LineIndex> {
         if let Some(em) =
             self.effective_for(file_id).and_then(|eid| hir::effective_module_text(self.db, eid))

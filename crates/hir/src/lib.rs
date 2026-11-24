@@ -233,7 +233,10 @@ pub use hir_ty::narrow::{
     narrow_or_base, narrow_or_base_indexed, narrow_query, narrowed_type_at, NarrowExprIndex,
     NarrowState,
 };
-pub use hir_ty::notify_targets::semantic_module_call_summary_query;
+pub use hir_ty::notify_targets::{
+    semantic_module_call_summary_query, semantic_notify_candidates_query, NotifyCallbackSlot,
+    NotifyCandidate, NotifyCandidateKind, NotifyCandidateReceiver,
+};
 pub use hir_ty::proc_signature;
 pub use hir_ty::query_in_loop::{
     query_in_loop_candidates, BodyQueryFacts, LocalQueryCall, QueryCallKey, QueryExecutionKind,

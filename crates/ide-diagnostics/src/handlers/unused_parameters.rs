@@ -105,48 +105,23 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let module_id = hir::ModuleId::new(ctx.file_id);
     let summary = ctx.call_summary(module_id);
-    // The source layer records syntactic callback protections independently of whether
-    // platform metadata can normalize these constructors into registrations.
-    fixed_signature_handlers.extend(
-        summary.notify_signature_handlers.iter().map(|handler| NormName::intern(handler.as_str())),
-    );
-    // The current English type spelling was not part of the compatibility-only projection.
-    // Use syntax protection while platform facts cannot normalize callback constructors.
-    let has_callback_facts = bsl_platform::has_callback_description_constructor_facts(
-        bsl_platform::PlatformData::instance(),
-    );
-    if !has_callback_facts {
-        fixed_signature_handlers.extend(
-            summary
-                .notify_additional_signature_handlers
-                .iter()
-                .chain(&summary.notify_dynamic_signature_handlers)
-                .map(|handler| NormName::intern(handler.as_str())),
-        );
-    } else if metadata.module_type == bsl_metadata::ModuleType::CommandModule {
-        // The syntax fallback remains useful when the bundled schema cannot normalize an
-        // alias or conditional array. Only a proven foreign target for that same constructor
-        // prevents treating its syntactic handler as locally invoked.
-        for site in &summary.notify_dynamic_signature_handler_sites {
-            let has_proven_foreign_registration = summary.notify_regs.iter().any(|registration| {
-                registration.range == site.constructor_range
-                    && registration.callback_expr == site.callback_expr
-                    && registration.callback_name.eq_ignore_case(&site.handler_name)
-                    && matches!(&registration.target, hir::call_graph::NotifyTarget::Module(_))
-            });
-            if !has_proven_foreign_registration {
-                fixed_signature_handlers.insert(NormName::intern(site.handler_name.as_str()));
-            }
-        }
+    let notify_candidates = ctx.notify_candidates();
+    if notify_candidates.iter().any(|candidate| candidate.analysis_incomplete) {
+        fixed_signature_handlers
+            .extend(summary.methods.iter().map(|method| NormName::intern(method.name.as_str())));
     }
-    // The semantic registrations also cover platform-described dynamic constructors whose
-    // callback slots are not visible from the local syntax shape alone.
-    for reg in &summary.notify_regs {
-        if matches!(
-            reg.receiver_syntax,
+    for candidate in notify_candidates.iter() {
+        let syntax_may_be_local = matches!(
+            candidate.receiver_syntax,
             NotifyReceiverSyntax::SelfName | NotifyReceiverSyntax::Other
-        ) {
-            fixed_signature_handlers.insert(NormName::intern(reg.callback_name.as_str()));
+        );
+        let resolved_this_object = candidate.receiver == hir::NotifyCandidateReceiver::ThisObject;
+        let unresolved_dynamic_array = candidate.kind == hir::NotifyCandidateKind::DynamicArray
+            && matches!(candidate.receiver, hir::NotifyCandidateReceiver::Unknown);
+        if !candidate.analysis_incomplete
+            && (resolved_this_object || syntax_may_be_local || unresolved_dynamic_array)
+        {
+            fixed_signature_handlers.insert(NormName::intern(candidate.callback_name.as_str()));
         }
     }
     // A form-module procedure bound at runtime — `УстановитьДействие` directly, or by
@@ -1263,6 +1238,177 @@ EndProcedure
             .collect::<Vec<_>>();
         assert_eq!(unused.len(), 1, "{diagnostics:#?}");
         assert!(unused[0].message.contains("ДопПараметры"), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn current_common_module_notify_receiver_keeps_exported_handler_parameters() {
+        use crate::test_utils::check_cfe_at_with_db;
+        use hir::DefDatabase;
+        use test_fixture::CfeFixtureBuilder;
+
+        const MODULE: &str = "ЭтотОбщийМодуль";
+        const CALLER: &str = "CommonModules/ЭтотОбщийМодуль/Ext/Module.bsl";
+        const SOURCE: &str = r#"&НаКлиенте
+Процедура Вызов()
+    Описание = Новый ОписаниеОповещения("H", ЭтотОбщийМодуль);
+КонецПроцедуры
+
+&НаКлиенте
+Процедура H(Параметр) Экспорт
+    Сообщить("callback body");
+КонецПроцедуры
+"#;
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_base_module(MODULE, "");
+        let fixture = builder.build();
+        let diagnostics = check_cfe_at_with_db(
+            CALLER,
+            SOURCE,
+            fixture,
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                for (_, root) in fixture.config_paths() {
+                    let path = root.join(format!("CommonModules/{MODULE}.xml"));
+                    let xml = std::fs::read_to_string(&path).unwrap();
+                    let updated = xml.replace(
+                        "<ClientManagedApplication>false</ClientManagedApplication>",
+                        "<ClientManagedApplication>true</ClientManagedApplication>",
+                    );
+                    assert_ne!(updated, xml, "{MODULE} starts client-disabled");
+                    std::fs::write(path, updated).unwrap();
+                }
+            },
+            |db, ctx| {
+                let summary = db.module_call_summary(hir::ModuleId::new(ctx.file_id));
+                assert!(summary
+                    .methods
+                    .iter()
+                    .any(|method| { method.name.as_str() == "H" && method.is_export }));
+                assert!(matches!(
+                    &summary.notify_regs[0].target,
+                    hir::call_graph::NotifyTarget::Module(name)
+                        if name.eq_ignore_case(&hir::Name::new(MODULE))
+                ));
+                let candidates = ctx.notify_candidates();
+                let candidate = candidates
+                    .iter()
+                    .find(|candidate| candidate.callback_name.as_str() == "H")
+                    .expect("the callback candidate is exposed");
+                assert_eq!(candidate.receiver, hir::NotifyCandidateReceiver::ThisObject);
+                assert!(candidate.protects_local_method);
+                super::check(ctx)
+            },
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect::<Vec<_>>();
+        assert!(unused.is_empty(), "the current-module callback signature is fixed: {unused:?}");
+
+        const UNREGISTERED_SOURCE: &str = r#"&НаКлиенте
+Процедура H(Параметр) Экспорт
+    Сообщить("callback body");
+КонецПроцедуры
+"#;
+        let mut builder = CfeFixtureBuilder::new("");
+        builder.add_base_module(MODULE, "");
+        let fixture = builder.build();
+        let diagnostics = check_cfe_at_with_db(
+            CALLER,
+            UNREGISTERED_SOURCE,
+            fixture,
+            &[],
+            crate::DiagnosticsConfig::all_enabled(),
+            |fixture| {
+                for (_, root) in fixture.config_paths() {
+                    let path = root.join(format!("CommonModules/{MODULE}.xml"));
+                    let xml = std::fs::read_to_string(&path).unwrap();
+                    let updated = xml.replace(
+                        "<ClientManagedApplication>false</ClientManagedApplication>",
+                        "<ClientManagedApplication>true</ClientManagedApplication>",
+                    );
+                    assert_ne!(updated, xml, "{MODULE} starts client-disabled");
+                    std::fs::write(path, updated).unwrap();
+                }
+            },
+            |_, ctx| super::check(ctx),
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect::<Vec<_>>();
+        assert_eq!(unused.len(), 1, "the unregistered parameter remains unused: {diagnostics:#?}");
+        assert!(unused[0].message.contains("Параметр"), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn dynamic_notify_array_protects_exported_object_module_handler_parameters() {
+        use crate::test_utils::check_metadata_diagnostic;
+
+        const REGISTERED: &str = r#"Процедура Зарегистрировать()
+    Параметры = Новый Массив;
+    Параметры.Добавить("H");
+    Параметры.Добавить(ЭтотОбъект);
+    Описание = Новый("CallbackDescription", Параметры);
+КонецПроцедуры
+
+Процедура H(Параметр) Экспорт
+    Сообщить("callback body");
+КонецПроцедуры
+"#;
+        let diagnostics = check_metadata_diagnostic(
+            object_module_of(bsl_metadata::MdoType::Catalog, "Товары"),
+            REGISTERED,
+            |_metadata, ctx| {
+                assert_eq!(
+                    ctx.module_metadata().module_type,
+                    bsl_metadata::ModuleType::ObjectModule
+                );
+                let candidates = ctx.notify_candidates();
+                let candidate = candidates
+                    .iter()
+                    .find(|candidate| candidate.callback_name.as_str() == "H")
+                    .expect("the dynamic callback candidate is exposed");
+                assert_eq!(candidate.kind, hir::NotifyCandidateKind::DynamicArray);
+                super::check(ctx)
+            },
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect::<Vec<_>>();
+        assert!(
+            unused.is_empty(),
+            "the registered export has a fixed callback signature: {diagnostics:#?}"
+        );
+
+        const UNREGISTERED: &str = r#"Процедура H(Параметр) Экспорт
+    Сообщить("callback body");
+КонецПроцедуры
+"#;
+        let diagnostics = check_metadata_diagnostic(
+            object_module_of(bsl_metadata::MdoType::Catalog, "Товары"),
+            UNREGISTERED,
+            |_metadata, ctx| {
+                assert_eq!(
+                    ctx.module_metadata().module_type,
+                    bsl_metadata::ModuleType::ObjectModule
+                );
+                assert!(ctx.notify_candidates().is_empty());
+                super::check(ctx)
+            },
+        );
+        let unused = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::UnusedParameters)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unused.len(),
+            1,
+            "the unregistered export parameter is unused: {diagnostics:#?}"
+        );
+        assert!(unused[0].message.contains("Параметр"), "{diagnostics:#?}");
     }
 
     #[test]
