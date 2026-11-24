@@ -478,9 +478,9 @@ fn an_ordinary_form_read_resolves_the_names_its_surface_owns() {
 }
 
 /// The control of the test above: the same module and workspace, the sidecar without
-/// `type` and `main`. The owner is unknown, so every name is judged exactly as it was
-/// before the surface existed - reported - and none of the resolved names above is
-/// resolved by a guess.
+/// `type` and `main`. The form's own attribute is resolved from its sidecar whatever the
+/// main attribute is, so it is no longer reported; what this control pins is that no
+/// OWNER-dependent name is resolved by a guess.
 #[test]
 fn an_ordinary_form_read_without_a_typed_main_attribute_is_judged_as_before() {
     let (db, file_id) =
@@ -489,7 +489,6 @@ fn an_ordinary_form_read_without_a_typed_main_attribute_is_judged_as_before() {
         absent_names(&db, file_id),
         [
             "СовсемНеизвестноеИмя",
-            "РеквизитФормы",
             "АдресСайта",
             "НастройкиЭксель",
             "ЭкспортнаяПроцедураОбъекта",
