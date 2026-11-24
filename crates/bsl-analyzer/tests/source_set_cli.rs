@@ -11,6 +11,8 @@
 //! "diagnostic absent" result on its own is equally consistent with the file
 //! never having been analyzed at all.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 #[cfg(unix)]
@@ -392,13 +394,30 @@ impl Run {
 }
 
 fn analyze(source_dir: &Path, flags: &[&str]) -> Run {
-    let output = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+    let app = common::qualified_app();
+    let cache = tempfile::tempdir().expect("disposable CLI cache outside source root");
+    let mut command = Command::new(app);
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("PG")
+            || name.starts_with("EMBEDDING_")
+            || name.starts_with("BSL_SEARCH_")
+            || name.starts_with("BSL_MCP_EFFECTIVE_EMBEDDING_")
+            || name.starts_with("BSL_PLATFORM_HELP_")
+            || name.starts_with("BSL_ONEC_")
+            || matches!(name.as_str(), "DATABASE_URL" | "BSL_TEST_EMBEDDING")
+        {
+            command.env_remove(key);
+        }
+    }
+    let output = command
         .arg("analyze")
         .arg("-s")
         .arg(source_dir)
         .args(flags)
         .args(["--format", "jsonl"])
         .env_remove("ONEC_CONFIGURATIONS_ROOT")
+        .env("BSL_CACHE_DIR", cache.path())
         .output()
         .expect("failed to run the analyzer");
     // Checked for every run, including the ones inspected only through stderr:
@@ -4249,7 +4268,11 @@ fn cli_extension_override_drops_replaced_scope_and_loads_as_legacy() {
         "the override is legacy and warns: {}",
         run.stderr
     );
-    assert!(run.stderr.contains("EXT") && run.stderr.contains("a/b/ext"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("EXT") && run.stderr.replace('\\', "/").contains("a/b/ext"),
+        "{}",
+        run.stderr
+    );
     assert!(
         run.unresolved_modules(EXT_MODULE).contains(&MISSING_MODULE.to_string()),
         "the requested extension source was analyzed"
@@ -4262,7 +4285,11 @@ fn cli_extension_override_drops_replaced_scope_and_loads_as_legacy() {
         "named overrides without an explicit scope also retain the legacy mode: {}",
         named.stderr
     );
-    assert!(named.stderr.contains("EXT") && named.stderr.contains(EXT), "{}", named.stderr);
+    assert!(
+        named.stderr.contains("EXT") && named.stderr.replace('\\', "/").contains(EXT),
+        "{}",
+        named.stderr
+    );
     assert!(
         named.unresolved_modules(EXT_MODULE).contains(&MISSING_MODULE.to_string()),
         "the named extension path was analyzed"

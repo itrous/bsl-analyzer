@@ -309,7 +309,18 @@ fn current_process_identity() -> io::Result<PeerIdentity> {
     let exe = std::env::current_exe()
         .map_err(|e| io::Error::other(format!("current_exe failed: {e}")))?;
     let user = current_user_sid_string()?;
-    Ok(peer_identity_from_raw(Some(&exe), Some(&user)))
+    Ok(peer_identity_from_raw(Some(&comparable_executable_path(&exe)), Some(&user)))
+}
+
+/// The spelling executable identities are compared in: links and short names resolved,
+/// without the verbatim `\\?\` prefix. A process started as `\\?\C:\x.exe` reports that
+/// spelling as its own image while the system lists the same file as `C:\x.exe`, and its
+/// own backend must still be trusted. An image that no longer resolves keeps its spelling,
+/// minus the prefix.
+#[cfg(any(windows, test))]
+fn comparable_executable_path(path: &Path) -> std::path::PathBuf {
+    stdx::path_exclusion::resolve(path)
+        .unwrap_or_else(|_| stdx::path_exclusion::simplify_verbatim(path.to_path_buf()))
 }
 
 /// Introspect a running PID's image path and owner SID via `sysinfo`.
@@ -327,7 +338,7 @@ fn peer_identity_for_pid(pid: u32) -> Option<PeerIdentity> {
         ProcessRefreshKind::nothing().with_exe(UpdateKind::Always).with_user(UpdateKind::Always);
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true, kind);
     let process = sys.process(Pid::from_u32(pid))?;
-    let exe = process.exe().map(Path::to_path_buf);
+    let exe = process.exe().map(comparable_executable_path);
     let user = process.user_id().map(|uid| uid.to_string());
     Some(peer_identity_from_raw(exe.as_deref(), user.as_deref()))
 }
@@ -337,9 +348,29 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        peer_identity_from_raw, peer_identity_trusted, pipe_security_sddl_for_user_sid,
-        PeerIdentity,
+        comparable_executable_path, peer_identity_from_raw, peer_identity_trusted,
+        pipe_security_sddl_for_user_sid, PeerIdentity,
     };
+
+    #[test]
+    fn an_executable_reached_by_its_resolved_spelling_keeps_its_identity() {
+        let exe = std::env::current_exe().unwrap();
+        let resolved = exe.canonicalize().unwrap();
+
+        assert_eq!(comparable_executable_path(&resolved), comparable_executable_path(&exe));
+        assert!(!comparable_executable_path(&resolved).to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_reached_through_a_link_keeps_its_identity() {
+        let exe = std::env::current_exe().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let linked = link_dir.path().join("linked-executable");
+        std::os::unix::fs::symlink(&exe, &linked).unwrap();
+
+        assert_eq!(comparable_executable_path(&linked), comparable_executable_path(&exe));
+    }
 
     #[test]
     fn pipe_security_sddl_allows_only_exact_user_sid() {

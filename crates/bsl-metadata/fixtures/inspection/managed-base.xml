@@ -1,0 +1,9 @@
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <Events><Event name="OnCreateAtServer">BasePrepare</Event></Events>
+  <ChildItems><InputField name="BaseField" id="10"><DataPath>Object.Base</DataPath></InputField></ChildItems>
+  <Parameters>
+    <Parameter name="Kind"><Type><v8:Type>xs:string</v8:Type></Type></Parameter>
+    <Parameter name="Inherited"><Type><v8:Type>cfg:CatalogRef.Partners</v8:Type></Type><KeyParameter>false</KeyParameter></Parameter>
+  </Parameters>
+  <Attributes><Attribute name="Kind" id="1"><Type><v8:Type>xs:string</v8:Type></Type></Attribute></Attributes>
+</Form>

@@ -8,10 +8,7 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::CodeSmell,
     severity: DiagnosticSeverityLevel::Minor,
     scope: DiagnosticScope::Bsl,
-    modules: &[
-        bsl_metadata::ModuleType::CommonModule,
-        bsl_metadata::ModuleType::ManagerModule,
-    ],
+    modules: &[bsl_metadata::ModuleType::CommonModule],
     minutes_to_fix: 1,
     activated_by_default: true,
     compatibility_mode: DiagnosticCompatibilityMode::Undefined,
@@ -38,10 +35,7 @@ fn check_for_module_type(
 ) -> Vec<Diagnostic> {
     let code = DiagnosticCode::CommonModuleMissingAPI;
 
-    if !matches!(
-        module_type,
-        bsl_metadata::ModuleType::CommonModule | bsl_metadata::ModuleType::ManagerModule
-    ) {
+    if module_type != bsl_metadata::ModuleType::CommonModule {
         return Vec::new();
     }
 
@@ -203,7 +197,23 @@ mod tests {
 #КонецОбласти
 "#;
         let diagnostics = check_ast_diagnostic(code, check_as(ModuleType::ManagerModule));
-        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn manager_interception_and_helper_do_not_need_an_artificial_export() {
+        let code = include_str!("fixtures/common_module_missing_api/manager_interception.bsl");
+        for module_type in [
+            ModuleType::ManagerModule,
+            ModuleType::ObjectModule,
+            ModuleType::FormModule,
+            ModuleType::Unknown,
+        ] {
+            let diagnostics = check_ast_diagnostic(code, check_as(module_type));
+            assert!(diagnostics.is_empty(), "{module_type:?}: {diagnostics:?}");
+        }
+        let common = check_ast_diagnostic(code, check_as(ModuleType::CommonModule));
+        assert_eq!(common.len(), 1, "{common:?}");
     }
 
     #[test]

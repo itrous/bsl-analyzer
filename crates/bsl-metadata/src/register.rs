@@ -175,6 +175,8 @@ pub enum AccumulationRegisterType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Register {
+    #[serde(default)]
+    read_properties: crate::read_properties::ObjectReadProperties,
     #[serde(rename = "uuid")]
     uuid: Uuid,
 
@@ -236,6 +238,13 @@ pub struct Register {
 }
 
 impl Register {
+    pub fn read_properties(&self) -> &crate::read_properties::ObjectReadProperties {
+        &self.read_properties
+    }
+
+    pub fn set_read_properties(&mut self, value: crate::read_properties::ObjectReadProperties) {
+        self.read_properties = value;
+    }
     pub fn builder() -> RegisterBuilder {
         RegisterBuilder::default()
     }
@@ -282,6 +291,28 @@ impl Register {
         &self.attributes
     }
 
+    /// Narrow the standard recorder to the document movements visible to this caller.
+    pub fn resolve_recorder_type(&mut self, documents: impl FnOnce() -> Vec<String>) {
+        use crate::metadata_object::AttributeType;
+
+        let Some(recorder) =
+            self.attributes.iter_mut().find(|field| field.name_en() == Some("Recorder"))
+        else {
+            return;
+        };
+        let mut types: Vec<_> = documents()
+            .into_iter()
+            .map(|name| AttributeType::Ref { mdo_type: MdoType::Document, name })
+            .collect();
+        match types.len() {
+            0 => recorder.set_attr_type(AttributeType::UnknownNamed(
+                AttributeType::AnyObjectRef { mdo_type: MdoType::Document }.to_string(),
+            )),
+            1 => recorder.set_attr_type(types.pop().expect("one recorder type")),
+            _ => recorder.set_attr_type(AttributeType::Composite { types }),
+        }
+    }
+
     pub fn is_information_register(&self) -> bool {
         self.mdo_type == MdoType::InformationRegister
     }
@@ -304,6 +335,18 @@ impl Register {
 
     pub fn is_recorder_subordinate(&self) -> bool {
         self.recorder_subordinate
+    }
+
+    /// Known recorder subordination; an unread or unfamiliar write mode stays unknown.
+    pub fn recorder_subordination(&self) -> Option<bool> {
+        if self.mdo_type != MdoType::InformationRegister {
+            return Some(true);
+        }
+        match self.read_properties.write_mode.as_deref() {
+            Some("Independent") => Some(false),
+            Some("RecorderSubordinate") => Some(true),
+            _ => None,
+        }
     }
 
     pub fn register_type(&self) -> Option<AccumulationRegisterType> {
@@ -353,6 +396,7 @@ impl Register {
     /// them. Mirrors [`MetadataObject::apply_extension_overlay`](crate::MetadataObject::apply_extension_overlay)
     /// so the whole-config merge and the per-register resolver share one rule.
     pub fn apply_extension_overlay(&mut self, overlay: &Register) {
+        self.read_properties.apply_overlay(&overlay.read_properties);
         for dimension in &overlay.dimensions {
             let mut dimension = dimension.clone();
             // An omitted Balance is "the XML did not say", not "this member is no longer
@@ -447,6 +491,7 @@ impl Register {
     /// heap-owning fields must be added here too.
     pub fn estimated_heap_size(&self) -> usize {
         self.name.capacity()
+            + self.read_properties.estimated_heap_size()
             + self.chart_of_accounts.as_ref().map_or(0, String::capacity)
             + stdx::heap::vec_bytes::<Dimension>(self.dimensions.len())
             + self.dimensions.iter().map(Dimension::estimated_heap_size).sum::<usize>()
@@ -596,6 +641,7 @@ impl RegisterBuilder {
 
     pub fn build(self) -> Register {
         Register {
+            read_properties: Default::default(),
             uuid: self.uuid.unwrap_or_else(Uuid::new_v4),
             object_belonging: self.object_belonging,
             extended_configuration_object: self.extended_configuration_object,

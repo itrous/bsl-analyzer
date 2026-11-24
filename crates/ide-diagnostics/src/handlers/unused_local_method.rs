@@ -223,7 +223,7 @@ pub(crate) fn collect_called_methods(
         // button's handler. Reporting them unused turns one unread file into a pack of
         // false findings over every handler of the form, so stay silent here and let
         // `OrdinaryFormDialogUnread` say why the check was dropped.
-        if form.handler_bindings_unknown() {
+        if form.is_ordinary() && !form.ordinary_bindings_known() {
             return None;
         }
         for handler in form.event_handlers() {
@@ -1384,9 +1384,36 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_form_with_controls_and_unread_bindings_does_not_claim_unused_handlers() {
+        let form = bsl_metadata::xml_parser::parse_ordinary_form_sidecar(
+            r#"{
+          "schema":3,"form":{"name":"Dialog"},
+          "controls":[{"kind":"button","name":"Accept","id":1}],
+          "inspectionLimitations":["event_bindings_unread"]
+        }"#,
+            "Dialog",
+        )
+        .unwrap();
+        assert!(form.ordinary_dialog_known());
+        assert!(form.find_element("Accept").is_some());
+        let diagnostics = crate::test_utils::check_metadata_diagnostic(
+            form_module_metadata(form),
+            ORDINARY_FORM_MODULE,
+            |_metadata, ctx| super::check(ctx),
+        );
+        let unused: Vec<_> =
+            diagnostics.iter().filter(|d| d.code == DiagnosticCode::UnusedLocalMethod).collect();
+        assert!(
+            unused.is_empty(),
+            "bindings are unread even though controls are available: {unused:?}"
+        );
+    }
+
+    #[test]
     fn test_ordinary_form_with_known_dialog_still_reports_unused_methods() {
         let mut form = bsl_metadata::Form::ordinary_without_dialog("Форма");
         form.ordinary_dialog_known = true;
+        form.ordinary_bindings_known = true;
         form.event_handlers.push(bsl_metadata::FormEventHandler {
             event_type: "Нажатие".to_string(),
             handler_name: "КнопкаОКНажатие".to_string(),

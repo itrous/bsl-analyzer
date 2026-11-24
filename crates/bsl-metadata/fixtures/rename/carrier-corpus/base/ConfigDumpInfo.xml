@@ -1,0 +1,18 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" format="Hierarchical" version="2.20">
+	<ConfigVersions>
+		<Metadata name="Catalog.BA023Catalog" id="bde0946f-aa0a-44f2-8d35-5621c675bd43" configVersion="7a9222e0294f464bb3a8df3cd96d01bf00000000"/>
+		<Metadata name="Catalog.BA023Catalog.ManagerModule" id="bde0946f-aa0a-44f2-8d35-5621c675bd43.3" configVersion="2b8ba5b2c8223b43aca2dccb5104370800000000"/>
+		<Metadata name="Catalog.BA023Catalog.ObjectModule" id="bde0946f-aa0a-44f2-8d35-5621c675bd43.0" configVersion="71c8300a4d7d224ebdf0fe5295c68e1500000000"/>
+		<Metadata name="CommonForm.BA023Managed" id="dbe59a2a-30da-4e81-801f-500d8aedfde2" configVersion="e6a8535a7d61e148bc836829f999ffc900000000"/>
+		<Metadata name="CommonForm.BA023Managed.Form" id="dbe59a2a-30da-4e81-801f-500d8aedfde2.0" configVersion="c53486a3964794438acbf870204f406e00000000"/>
+		<Metadata name="CommonForm.BA023Ordinary" id="ad8a4ecd-b6e8-46bb-b7dd-5bb8a6a377c4" configVersion="fe42d429bf487e4ca3b0e73e1ee21b7a00000000"/>
+		<Metadata name="CommonModule.BA023Common" id="87631ad1-d94f-4b2f-a5b8-d6f66483a912" configVersion="39a3c3a40cf87543b9a383aa6527190400000000"/>
+		<Metadata name="CommonModule.BA023Common.Module" id="87631ad1-d94f-4b2f-a5b8-d6f66483a912.0" configVersion="95dc667e87d60f45aaeff72a2b1255e500000000"/>
+		<Metadata name="Configuration.BA023FixtureM" id="36ce9ddb-45a7-4017-9511-7a0f9f03092c" configVersion="bd5e9d223a231349864035950187868200000000"/>
+		<Metadata name="Document.BA095Document" id="7eff0bd8-3f15-42d3-a6eb-3ce1aa38c9ab" configVersion="0ff0f46bcc698548b4c5fab73e5d642400000000"/>
+		<Metadata name="Document.BA095Document.ManagerModule" id="7eff0bd8-3f15-42d3-a6eb-3ce1aa38c9ab.2" configVersion="5c1411bce83c85499c3ccdc8c994571e00000000"/>
+		<Metadata name="Document.BA095Document.ObjectModule" id="7eff0bd8-3f15-42d3-a6eb-3ce1aa38c9ab.0" configVersion="235387e5ecf2d449ab42bf97c3a190f200000000"/>
+		<Metadata name="Language.English" id="3334fa8d-3eff-404f-8977-12b1946bed88" configVersion="377ffbc60b12f542903e111f91c376ae00000000"/>
+	</ConfigVersions>
+</ConfigDumpInfo>

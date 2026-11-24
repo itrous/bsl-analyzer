@@ -74,6 +74,11 @@ impl WorkspaceHandle {
         self.diagnostics.catalog.clone()
     }
 
+    /// Admission shared by disk readers, editor requests, and metadata filesystem writes.
+    pub fn disk_gate(&self) -> ide_host_core::WorkspaceDiskGate {
+        self.diagnostics.disk_gate.clone()
+    }
+
     pub fn readiness(&self) -> WorkspaceReadiness {
         if let Some((generation, error)) = self.diagnostics.invalid_configuration() {
             return WorkspaceReadiness::Frozen { generation, error };
@@ -96,6 +101,21 @@ impl WorkspaceHandle {
     /// A storage-neutral, immutable view of the currently published disk owner.
     pub fn snapshot(&self) -> WorkspaceRead<WorkspaceSnapshot> {
         self.diagnostics.workspace_snapshot().map_or_else(read_error, WorkspaceRead::Ready)
+    }
+
+    /// Rescan terminal disk state while the caller retains exclusive filesystem ownership.
+    pub fn publish_disk_transaction(
+        &self,
+        writer: &ide_host_core::WorkspaceDiskWrite,
+    ) -> Result<WorkspaceSnapshot, String> {
+        self.diagnostics.publish_disk_transaction(writer)
+    }
+
+    /// Repeat the terminal wake after reopening read admission, for views that woke while frozen.
+    pub fn notify_disk_transaction_finished(&self) {
+        if let Ok(generation) = self.diagnostics.workspace_generation() {
+            notify_generation(&self.diagnostics, generation);
+        }
     }
 
     /// Refresh one already-admitted saved disk path through the resident's normal source
@@ -135,6 +155,14 @@ impl WorkspaceHandle {
     /// Clone the current disk `Analysis` under the resident lock. The lock is released
     /// before this method returns; the caller owns the clone only for that request.
     pub fn request_analysis(&self) -> WorkspaceRead<ide::Analysis> {
+        if self.diagnostics.disk_gate.is_frozen() {
+            if self.diagnostics.disk_gate.recovery_required() {
+                return WorkspaceRead::Failed(
+                    crate::diagnostics_state::DISK_RECOVERY_REQUIRED.to_owned(),
+                );
+            }
+            return WorkspaceRead::Busy;
+        }
         self.diagnostics.mark_in_use();
         self.diagnostics.workspace_analysis().map_or_else(read_error, WorkspaceRead::Ready)
     }
@@ -198,6 +226,77 @@ pub(crate) fn notify_generation(diagnostics: &DiagnosticsState, generation: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_transaction_rejects_a_writer_from_another_owner() {
+        use crate::diagnostics_state::test_support::{sample_workspace, wait_ready};
+
+        let workspace = tempfile::tempdir().unwrap();
+        sample_workspace(workspace.path());
+        let state = DiagnosticsState::for_workspace(workspace.path().to_path_buf());
+        let handle = WorkspaceHandle::new(state.clone());
+        wait_ready(&state);
+        let generation = state.generation();
+        let unrelated = ide_host_core::WorkspaceDiskGate::default();
+        let writer = unrelated.begin_write(std::time::Duration::from_secs(1), &|| false).unwrap();
+        assert!(handle.publish_disk_transaction(&writer).is_err());
+        assert_eq!(state.generation(), generation);
+    }
+
+    #[test]
+    fn disk_transaction_hides_intermediate_bytes_and_publishes_one_generation() {
+        use crate::diagnostics_state::test_support::{module_path, sample_workspace, wait_ready};
+
+        let workspace = tempfile::tempdir().unwrap();
+        sample_workspace(workspace.path());
+        let state = DiagnosticsState::for_workspace(workspace.path().to_path_buf());
+        let handle = WorkspaceHandle::new(state.clone());
+        wait_ready(&state);
+        let generation = state.generation();
+        let path = module_path(workspace.path(), "Сервер");
+        let gate = handle.disk_gate();
+        let mut writer = gate.begin_write(std::time::Duration::from_secs(1), &|| false).unwrap();
+        writer.mark_writing();
+        std::fs::write(&path, "intermediate").unwrap();
+        assert!(matches!(handle.refresh_saved_path(&path), WorkspaceRead::Busy));
+        assert!(matches!(handle.request_analysis(), WorkspaceRead::Busy));
+        state.poll_pending_drift();
+        assert_eq!(state.generation(), generation);
+
+        std::fs::write(&path, "Процедура Завершено() КонецПроцедуры").unwrap();
+        let snapshot = handle.publish_disk_transaction(&writer).unwrap();
+        assert_eq!(snapshot.generation, generation + 1);
+        assert!(matches!(handle.request_analysis(), WorkspaceRead::Busy));
+        writer.finish();
+        handle.notify_disk_transaction_finished();
+        let canonical_path = path.canonicalize().unwrap();
+        let file = snapshot.files.iter().find(|file| file.path == canonical_path).unwrap();
+        let WorkspaceRead::Ready(analysis) = handle.request_analysis() else {
+            panic!("terminal disk state must be readable after publication");
+        };
+        assert_eq!(
+            analysis.file_text(file.file_id).as_str(),
+            "Процедура Завершено() КонецПроцедуры"
+        );
+        assert_eq!(state.generation(), generation + 1);
+    }
+
+    #[test]
+    fn disk_transaction_recovery_is_reported_as_a_persistent_failure() {
+        let state = DiagnosticsState::disabled();
+        let handle = WorkspaceHandle::new(state.clone());
+        let gate = handle.disk_gate();
+        let mut writer = gate.begin_write(std::time::Duration::from_secs(1), &|| false).unwrap();
+        writer.mark_writing();
+        drop(writer);
+        assert!(matches!(handle.readiness(), WorkspaceReadiness::Failed(message)
+            if message == crate::diagnostics_state::DISK_RECOVERY_REQUIRED));
+        assert!(matches!(handle.request_analysis(), WorkspaceRead::Failed(_)));
+        let report = state.status_report();
+        assert_eq!(report.state, "failed");
+        assert_eq!(report.retry_after_ms, None);
+        assert_eq!(report.error.as_deref(), Some(crate::diagnostics_state::DISK_RECOVERY_REQUIRED));
+    }
 
     #[test]
     fn validated_project_and_exclusions_are_available_before_disk_seed() {

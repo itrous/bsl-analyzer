@@ -251,6 +251,21 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_constructor_in_a_negated_condition_is_reported() {
+        let code = include_str!("fixtures/parenthesized_new_postfix.bsl");
+        let diagnostics = check_diagnostics_for(code, DiagnosticCode::PostfixAccessOnExpression);
+        let spans: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                &code[usize::from(diagnostic.range.start())..usize::from(diagnostic.range.end())]
+            })
+            .collect();
+
+        assert_eq!(spans, [".Существует", ".ПолноеИмя"]);
+        assert_eq!(parse_errors(code), "");
+    }
+
+    #[test]
     fn a_dot_after_new_is_left_to_the_parser() {
         let code = r#"Процедура Тест(ИмяФайла)
     Р = Новый Файл(ИмяФайла).Размер();

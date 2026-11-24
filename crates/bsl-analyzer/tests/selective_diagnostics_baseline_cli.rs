@@ -1,3 +1,5 @@
+mod common;
+
 use std::{fs, path::Path, process::Command};
 
 use tempfile::TempDir;
@@ -5,7 +7,7 @@ use tempfile::TempDir;
 const BROKEN: &str = "Процедура Тест(\n";
 
 fn run(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
+    Command::new(common::qualified_app())
         .current_dir(root)
         .args(args)
         .output()

@@ -1,3 +1,5 @@
+mod metadata;
+
 use hir::{
     normalize_match_name, normalize_usage_name, Definition, Name, ReferenceScope, SemanticSymbol,
     SemanticSymbolKey, Semantics,
@@ -47,7 +49,7 @@ pub fn find_references<DB: RootDatabase>(
 
     let files_to_search: Vec<FileId> = match scope {
         ReferenceScope::FileLocal => vec![file_id],
-        ReferenceScope::Unknown => return Vec::new(),
+        ReferenceScope::Unknown | ReferenceScope::Metadata => return Vec::new(),
         ReferenceScope::ModuleSymbolWorkspace => {
             workspace_candidate_files(db, file_id, &symbol.name)
         }
@@ -254,6 +256,8 @@ pub enum ReferencesOutcome {
     /// The anchor is one symbol; the hit list IS the answer, and an empty list
     /// means exactly zero references.
     Resolved,
+    /// Known occurrences with explicit uncovered or unresolved metadata consumers.
+    Partial { reasons: Vec<crate::metadata_rename::MetadataPreviewIssue> },
     /// More than one symbol answers to this anchor; no references are counted.
     Ambiguous,
     /// Nothing matched exactly enough to anchor on.
@@ -491,6 +495,9 @@ fn resolve_by_name(
             if dictionary.anchorable {
                 return dictionary.result;
             }
+            if let Some(result) = metadata::by_name(db, name, req) {
+                return Anchored::Answered(result);
+            }
             match classify_unreferenceable(db, name) {
                 Some(category) => Anchored::Answered(ReferencesResult::outcome_only(
                     ReferencesOutcome::UnsupportedSymbol { category },
@@ -650,6 +657,9 @@ fn resolve_by_position(
     let Some(offset) = crate::name_lookup::offset_for_line_col(db, file_id, line, column) else {
         return not_found();
     };
+    if let Some(result) = metadata::at(db, file_id, offset, req) {
+        return Anchored::Answered(result);
+    }
     let Some(symbol) = symbol_at(db, file_id, offset) else {
         return not_found();
     };
@@ -917,7 +927,7 @@ fn begin_walk(
         ReferenceScope::FileLocal => vec![home_file],
         // The one case where an empty list is not an answer: nothing knows
         // where to look, so nothing was looked at.
-        ReferenceScope::Unknown => {
+        ReferenceScope::Unknown | ReferenceScope::Metadata => {
             return Anchored::Answered(ReferencesResult::outcome_only(
                 ReferencesOutcome::UnsupportedSymbol {
                     category: UnsupportedCategory::UnknownScope,
@@ -1047,6 +1057,40 @@ fn declaration_of(db: &RootDatabaseImpl, symbol: &hir::SemanticSymbol) -> Vec<De
         enclosing_range: definition.source_range(db),
         kind,
     }]
+}
+
+/// Rich positional references preserve the completeness of metadata results.
+pub fn find_references_at_rich(
+    db: &RootDatabaseImpl,
+    file_id: FileId,
+    offset: TextSize,
+    include_declaration: bool,
+    max_files: usize,
+) -> ReferencesResult {
+    let req = ReferencesRequest {
+        anchor: ReferenceAnchor::Position { file_id, line: 0, column: 0 },
+        anchor_files: None,
+        area: ReferenceArea::default(),
+        kinds: None,
+        include_declaration,
+        max_files,
+    };
+    if let Some(result) = metadata::at(db, file_id, offset, &req) {
+        return result;
+    }
+    let Some(symbol) = symbol_at(db, file_id, offset) else {
+        return ReferencesResult::outcome_only(ReferencesOutcome::NotFound, BodySource::Resident);
+    };
+    match begin_walk(db, file_id, symbol, &req) {
+        Anchored::Answered(result) => result,
+        Anchored::Walk(walk) => {
+            let mut hits = Vec::new();
+            for &file in walk.scanned() {
+                hits.extend(walk_reference_file(db, file, walk.symbol(), &req));
+            }
+            finish_references(db, walk, hits)
+        }
+    }
 }
 
 #[cfg(test)]

@@ -473,7 +473,7 @@ pub fn body_env(
     annotations: &[AnnotationKind],
     opts: &EnvOptions,
 ) -> EnvFlags {
-    body_env_over(module_base_env(metadata, opts), metadata, annotations, opts)
+    body_env_with_base(metadata, annotations, opts, module_base_env(metadata, opts))
 }
 
 /// [`body_env`] widened to every environment that may compile the body. Availability
@@ -484,14 +484,25 @@ pub fn possible_body_env(
     annotations: &[AnnotationKind],
     opts: &EnvOptions,
 ) -> EnvFlags {
-    body_env_over(possible_module_base_env(metadata, opts), metadata, annotations, opts)
+    possible_body_env_with_base(metadata, annotations, opts, module_base_env(metadata, opts))
 }
 
-fn body_env_over(
-    base: EnvFlags,
+/// [`possible_body_env`] over a module base the caller already chose, e.g. the one of a
+/// file's selected configuration context.
+pub(crate) fn possible_body_env_with_base(
     metadata: &ModuleMetadata,
     annotations: &[AnnotationKind],
     opts: &EnvOptions,
+    base: EnvFlags,
+) -> EnvFlags {
+    body_env_with_base(metadata, annotations, opts, widen_module_base_env(metadata, base))
+}
+
+pub(crate) fn body_env_with_base(
+    metadata: &ModuleMetadata,
+    annotations: &[AnnotationKind],
+    opts: &EnvOptions,
+    base: EnvFlags,
 ) -> EnvFlags {
     if base.is_empty() {
         return EnvFlags::EMPTY;
@@ -520,16 +531,16 @@ pub fn module_code_env(metadata: &ModuleMetadata, opts: &EnvOptions) -> EnvFlags
 
 /// [`module_code_env`] widened the way [`possible_body_env`] describes.
 pub fn possible_module_code_env(metadata: &ModuleMetadata, opts: &EnvOptions) -> EnvFlags {
-    possible_module_base_env(metadata, opts)
+    widen_module_base_env(metadata, module_base_env(metadata, opts))
 }
 
 /// [`module_base_env`] plus what its model leaves out on purpose. A `ServerCall`
 /// module is judged as running on the server only, which is right for the managed
 /// clients but not for «Клиент (обычное приложение)»: vendor modules carrying both
 /// flags hold client blocks written against the ordinary thick client's own API
-/// (`ЭлементыФормы`), so that client does compile them.
-fn possible_module_base_env(metadata: &ModuleMetadata, opts: &EnvOptions) -> EnvFlags {
-    let base = module_base_env(metadata, opts);
+/// (`ЭлементыФормы`), so that client does compile them. `base` is whatever module
+/// environment applies (an empty one stays empty: the context is unknown).
+pub(crate) fn widen_module_base_env(metadata: &ModuleMetadata, base: EnvFlags) -> EnvFlags {
     if base.is_empty() || metadata.module_type != ModuleType::CommonModule {
         return base;
     }
