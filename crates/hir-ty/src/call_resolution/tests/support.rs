@@ -53,6 +53,7 @@ pub(super) fn positional(name: &str, ty: TypeId, has_default: bool) -> CallParam
         mode: CallParamMode::Positional,
         passing: None,
         result_follows_argument_text: false,
+        min_version: None,
     }
 }
 
@@ -64,5 +65,6 @@ pub(super) fn variadic(name: &str, ty: TypeId) -> CallParam {
         mode: CallParamMode::Variadic,
         passing: None,
         result_follows_argument_text: false,
+        min_version: None,
     }
 }

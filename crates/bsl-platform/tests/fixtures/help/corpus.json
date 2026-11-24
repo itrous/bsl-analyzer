@@ -686,6 +686,37 @@
      "is_optional": false
     }
    ]
+  },
+  {
+   "id": 24,
+   "name": "ПодключитьВнешнююКомпоненту",
+   "english_name": "AttachAddIn",
+   "min_version": "8.0",
+   "return_type": "Булево",
+   "parameters": [
+    {"name": "ИдентификаторОбъекта", "param_type": "Строка", "is_optional": false},
+    {"name": "Местоположение", "param_type": "Строка", "is_optional": false},
+    {"name": "Имя", "param_type": "Строка", "is_optional": false},
+    {"name": "Тип", "param_type": "ТипВнешнейКомпоненты", "is_optional": true},
+    {"name": "ТипПодключения", "param_type": "ТипПодключенияВнешнейКомпоненты", "is_optional": true}
+   ],
+   "variants": [
+    {
+     "variant_name": "По идентификатору",
+     "parameters": [
+      {"name": "ИдентификаторОбъекта", "param_type": "Строка", "is_optional": false}
+     ]
+    },
+    {
+     "variant_name": "По имени и местоположению",
+     "parameters": [
+      {"name": "Местоположение", "param_type": "Строка", "is_optional": false},
+      {"name": "Имя", "param_type": "Строка", "is_optional": false},
+      {"name": "Тип", "param_type": "ТипВнешнейКомпоненты", "is_optional": true},
+      {"name": "ТипПодключения", "param_type": "ТипПодключенияВнешнейКомпоненты", "is_optional": true}
+     ]
+    }
+   ]
   }
  ],
  "constructors": [

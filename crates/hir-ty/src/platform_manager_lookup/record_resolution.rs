@@ -198,6 +198,7 @@ mod tests {
             is_variadic: false,
             passing: None,
             result_follows_argument_text: false,
+            min_version: None,
         };
         let method = PlatformMethod {
             id: 1,

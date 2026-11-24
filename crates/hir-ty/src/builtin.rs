@@ -35,6 +35,9 @@ pub struct BuiltinSignature {
     /// The platform corpus's "result follows this argument's text" fact per parameter, by
     /// position; a position past the end is `false`.
     result_follows_argument_text: Box<[bool]>,
+    /// The release in which each parameter first appeared, by position, where the corpus dates
+    /// it; a position past the end is undated.
+    min_versions: Box<[Option<SmolStr>]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +198,7 @@ pub(crate) fn descriptor_from_params(
     let mut defaults = Vec::with_capacity(params_in.len());
     let mut passing = Vec::with_capacity(params_in.len());
     let mut result_follows_argument_text = Vec::with_capacity(params_in.len());
+    let mut min_versions = Vec::with_capacity(params_in.len());
     for param in params_in {
         names.push(param.name.clone());
         params.push(
@@ -207,6 +211,7 @@ pub(crate) fn descriptor_from_params(
         defaults.push(param.is_optional);
         passing.push(param.passing);
         result_follows_argument_text.push(param.result_follows_argument_text);
+        min_versions.push(param.min_version.clone());
     }
 
     let last = params_in.last();
@@ -237,6 +242,7 @@ pub(crate) fn descriptor_from_params(
         env: EnvFlags::ALL,
         passing: passing.into_boxed_slice(),
         result_follows_argument_text: result_follows_argument_text.into_boxed_slice(),
+        min_versions: min_versions.into_boxed_slice(),
     }
 }
 
@@ -266,6 +272,7 @@ fn register_fallbacks(sigs: &mut FxHashMap<String, Vec<BuiltinSignature>>) {
             env: EnvFlags::ALL,
             passing: Box::default(),
             result_follows_argument_text: Box::default(),
+            min_versions: Box::default(),
         },
     );
 
@@ -282,6 +289,7 @@ fn register_fallbacks(sigs: &mut FxHashMap<String, Vec<BuiltinSignature>>) {
             env: EnvFlags::ALL,
             passing: Box::default(),
             result_follows_argument_text: Box::default(),
+            min_versions: Box::default(),
         },
     );
 }
@@ -469,6 +477,7 @@ mod tests {
             is_variadic: false,
             passing: None,
             result_follows_argument_text: false,
+            min_version: None,
         }];
         let sig = descriptor_from_params(&params, ReturnTypeSpec::Unknown);
         assert_eq!(sig.max_args(), Some(3), "Value3, Value4 and Value5 are three arguments");
@@ -496,6 +505,7 @@ mod tests {
             is_variadic: false,
             passing: None,
             result_follows_argument_text: false,
+            min_version: None,
         }];
         let sig = descriptor_from_params(&params, ReturnTypeSpec::Unknown);
         assert_eq!(
@@ -514,6 +524,7 @@ mod tests {
             is_variadic: true,
             passing: None,
             result_follows_argument_text: false,
+            min_version: None,
         }];
         let sig = descriptor_from_params(&params, ReturnTypeSpec::Unknown);
         assert_eq!(sig.max_args(), None, "is_variadic=true must lift the cap");
@@ -529,6 +540,7 @@ mod tests {
             is_variadic: true,
             passing: None,
             result_follows_argument_text: false,
+            min_version: None,
         }];
         let sig = descriptor_from_params(&params, ReturnTypeSpec::Unknown);
         assert_eq!(sig.max_args(), None, "explicit flag must override the cap idiom");
@@ -543,6 +555,7 @@ mod tests {
             is_variadic: false,
             passing,
             result_follows_argument_text: false,
+            min_version: None,
         };
         let params = vec![
             param("Первый", Some(bsl_platform::ParamPassing::ByRef)),
@@ -574,6 +587,7 @@ mod tests {
             is_variadic: false,
             passing: None,
             result_follows_argument_text: follows,
+            min_version: None,
         };
         let params = vec![param("Первый", true), param("Второй", false)];
         let sig = descriptor_from_params(&params, ReturnTypeSpec::Unknown);
@@ -596,6 +610,7 @@ mod tests {
                 is_variadic: false,
                 passing: None,
                 result_follows_argument_text: false,
+                min_version: None,
             },
             bsl_platform::MethodParam {
                 name: "КодЯзыка".into(),
@@ -604,6 +619,7 @@ mod tests {
                 is_variadic: false,
                 passing: None,
                 result_follows_argument_text: false,
+                min_version: None,
             },
         ];
         let sig = descriptor_from_params(&params, ReturnTypeSpec::Raw("Строка".to_string()));
@@ -658,6 +674,7 @@ mod tests {
             env: EnvFlags::ALL,
             passing: Box::default(),
             result_follows_argument_text: Box::default(),
+            min_versions: Box::default(),
         };
         sigs.insert("foo".into(), vec![json_like.clone()]);
         sigs.insert("bar".into(), vec![json_like.clone()]);
@@ -672,6 +689,7 @@ mod tests {
             env: EnvFlags::ALL,
             passing: Box::default(),
             result_follows_argument_text: Box::default(),
+            min_versions: Box::default(),
         };
         insert_pair(&mut sigs, ("foo", "bar"), fallback);
 

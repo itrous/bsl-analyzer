@@ -201,14 +201,19 @@ pub struct MethodParam {
     /// that preserves what the text says. Curated, additive: `false` means "not known to", never
     /// "known not to", so a missing record cannot produce a finding that is not there.
     pub result_follows_argument_text: bool,
+    /// The platform release in which this parameter first appeared, as the curated overlay
+    /// states it (`8.3.21`); `None` is unknown, which says nothing about its age. The extract
+    /// carries a version per function, never per parameter.
+    pub min_version: Option<SmolStr>,
 }
 
 impl MethodParam {
-    /// Heap bytes owned by this parameter: its name/type `SmolStr`s (spilled
+    /// Heap bytes owned by this parameter: its name/type/version `SmolStr`s (spilled
     /// ones only). `is_optional`/`is_variadic`/`passing` are `Copy` and own no heap.
     pub fn estimated_heap_size(&self) -> usize {
         stdx::heap::smol_str_bytes(self.name.len())
             + self.param_type.as_ref().map_or(0, |s| stdx::heap::smol_str_bytes(s.len()))
+            + self.min_version.as_ref().map_or(0, |s| stdx::heap::smol_str_bytes(s.len()))
     }
 }
 
@@ -348,6 +353,7 @@ mod tests {
                     is_variadic: false,
                     passing: None,
                     result_follows_argument_text: false,
+                    min_version: None,
                 },
                 MethodParam {
                     name: SmolStr::new("Второй"),
@@ -356,6 +362,7 @@ mod tests {
                     is_variadic: false,
                     passing: None,
                     result_follows_argument_text: false,
+                    min_version: None,
                 },
             ],
             variants: vec![],

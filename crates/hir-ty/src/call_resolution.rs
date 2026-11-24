@@ -126,6 +126,9 @@ pub struct CallParam {
     /// The platform corpus's fact that the call's result is the text of this argument or text
     /// derived from it preserving what it says; `false` is "not known to", not "known not to".
     pub result_follows_argument_text: bool,
+    /// The platform release in which the parameter first appeared, where the corpus dates it
+    /// (`8.3.21`); `None` is undated, which claims nothing about its age.
+    pub min_version: Option<SmolStr>,
 }
 
 /// Complete, Salsa-safe signature metadata for one call candidate.
@@ -147,6 +150,46 @@ impl CallSignature {
     pub fn variadic_param(&self) -> Option<&CallParam> {
         self.params.iter().find(|param| param.mode == CallParamMode::Variadic)
     }
+
+    /// The argument count a project whose oldest platform is `minimum` can pass: the trailing
+    /// parameters first dated after that release do not exist there. `None` when nothing is
+    /// cut, when no bound exists to cut (variadic), and when the cut would reach a required
+    /// parameter, which says the dating is wrong rather than that the call is.
+    pub fn version_cap(
+        &self,
+        minimum: bsl_platform::PlatformVersion,
+    ) -> Option<ParameterVersionCap> {
+        let maximum = self.max_args?;
+        let newer = |param: &CallParam| {
+            param
+                .min_version
+                .as_deref()
+                .and_then(bsl_platform::PlatformVersion::parse_release)
+                .is_some_and(|introduced| introduced.release_newer_than(minimum))
+        };
+        let mut allowed = self.params.len();
+        while allowed > 0 && newer(&self.params[allowed - 1]) {
+            allowed -= 1;
+        }
+        if allowed == self.params.len() || allowed < self.required_args {
+            return None;
+        }
+        let first_cut = &self.params[allowed];
+        Some(ParameterVersionCap {
+            allowed: allowed.min(maximum),
+            parameter: first_cut.name.clone(),
+            introduced: first_cut.min_version.clone()?,
+        })
+    }
+}
+
+/// How far a project's minimum platform release lowers a signature's accepted argument count,
+/// and which parameter is the first one it cuts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParameterVersionCap {
+    pub allowed: usize,
+    pub parameter: SmolStr,
+    pub introduced: SmolStr,
 }
 
 /// Deterministically ordered signatures with unique semantic identities.
@@ -161,6 +204,16 @@ impl CallCandidateSet {
 
     pub(crate) fn signatures_mut(&mut self) -> &mut [CallSignature] {
         &mut self.0
+    }
+
+    /// Lowers every signature's accepted argument count to what `minimum` can pass, so a call
+    /// that only a newer release accepts is an arity miss on this project.
+    pub(crate) fn lower_to_platform(&mut self, minimum: bsl_platform::PlatformVersion) {
+        for signature in &mut self.0 {
+            if let Some(cap) = signature.version_cap(minimum) {
+                signature.max_args = Some(cap.allowed);
+            }
+        }
     }
 }
 

@@ -22,16 +22,23 @@ pub fn from_hir(
     required_count: usize,
     total_count: usize,
     found: usize,
+    version_limit: Option<&hir::ArgCountVersionLimit>,
     range: LocalRange,
     ctx: &AnalysisContext,
 ) -> Option<Diagnostic<LocalRange>> {
-    let message = if required_count == total_count {
+    let mut message = if required_count == total_count {
         format!("Неверное количество аргументов: ожидалось {required_count}, передано {found}")
     } else {
         format!(
             "Неверное количество аргументов: ожидалось от {required_count} до {total_count}, передано {found}"
         )
     };
+    if let Some(limit) = version_limit {
+        message.push_str(&format!(
+            " (параметр «{}» доступен с {}, а минимальная платформа проекта {})",
+            limit.parameter, limit.introduced, limit.minimum
+        ));
+    }
     crate::simple_hir_diagnostic(DiagnosticCode::MismatchedArgCount, message, range, ctx)
 }
 
@@ -558,6 +565,88 @@ mod tests {
         assert!(
             !unread.iter().any(|d| d.code == DiagnosticCode::MismatchedArgCount),
             "an unread global body may declare this very name, got {unread:?}"
+        );
+    }
+}
+
+/// The fourth parameter of `ПодключитьВнешнююКомпоненту` (`ТипПодключения`) appeared in 8.3.21,
+/// so a project whose oldest platform is 8.3.17 cannot pass it.
+#[cfg(test)]
+mod platform_version_tests {
+    use crate::{Diagnostic, DiagnosticCode, DiagnosticsConfig};
+
+    const FOUR_ARGUMENTS: &str = r#"
+Процедура Тест()
+    Тип = ТипВнешнейКомпоненты.Native;
+    ПодключитьВнешнююКомпоненту("f.zip", "Ps", Тип, Тип);
+КонецПроцедуры
+"#;
+
+    const THREE_ARGUMENTS: &str = r#"
+Процедура Тест()
+    Тип = ТипВнешнейКомпоненты.Native;
+    ПодключитьВнешнююКомпоненту("f.zip", "Ps", Тип);
+КонецПроцедуры
+"#;
+
+    fn arity_findings(source: &str, minimum: Option<&str>) -> Vec<Diagnostic> {
+        let minimum = minimum.map(std::sync::Arc::<str>::from);
+        crate::test_utils::check_cfe_at_with_db_setup(
+            "CommonModules/Caller/Ext/Module.bsl",
+            source,
+            test_fixture::CfeFixtureBuilder::new("").build(),
+            &[],
+            DiagnosticsConfig::default(),
+            |_| {},
+            |db| db.set_min_platform_version(minimum),
+            |db, ctx| crate::file_diagnostics(db, ctx.file_id, ctx.config),
+        )
+        .into_iter()
+        .filter(|diag| diag.code == DiagnosticCode::MismatchedArgCount)
+        .collect()
+    }
+
+    #[test]
+    fn a_parameter_newer_than_the_minimum_platform_is_an_arity_miss() {
+        let found = arity_findings(FOUR_ARGUMENTS, Some("8.3.17"));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "Неверное количество аргументов: ожидалось от 2 до 3, передано 4 \
+             (параметр «ТипПодключения» доступен с 8.3.21, а минимальная платформа проекта 8.3.17)"
+        );
+    }
+
+    #[test]
+    fn the_same_call_is_silent_once_the_minimum_platform_has_the_parameter() {
+        let found = arity_findings(FOUR_ARGUMENTS, Some("8.3.21"));
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_project_without_a_minimum_platform_judges_nothing_by_release() {
+        let found = arity_findings(FOUR_ARGUMENTS, None);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_call_within_the_older_signature_is_silent_on_the_older_platform() {
+        let found = arity_findings(THREE_ARGUMENTS, Some("8.3.17"));
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_call_beyond_every_signature_still_fires_without_a_minimum_platform() {
+        let source = r#"
+Процедура Тест()
+    ПодключитьВнешнююКомпоненту("f.zip", "Ps", 1, 2, 3, 4);
+КонецПроцедуры
+"#;
+        let found = arity_findings(source, None);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message, "Неверное количество аргументов: ожидалось от 2 до 4, передано 6",
+            "nothing was lowered, so the message is the one it always was"
         );
     }
 }

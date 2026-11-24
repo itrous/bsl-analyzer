@@ -401,6 +401,15 @@ pub enum ImplicitDatabaseReadKind {
     ManagerFind { method: Name },
 }
 
+/// Why an argument count is refused more narrowly than the platform signature says: the project's
+/// minimum platform predates the parameter that would take the extra argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgCountVersionLimit {
+    pub parameter: smol_str::SmolStr,
+    pub introduced: smol_str::SmolStr,
+    pub minimum: bsl_platform::PlatformVersion,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InferenceDiagnostic {
     /// A static performance candidate, not a count of SQL queries at runtime.
@@ -439,6 +448,8 @@ pub enum InferenceDiagnostic {
         required_count: usize,
         total_count: usize,
         found: usize,
+        /// Set when `total_count` was lowered by the project's minimum platform.
+        version_limit: Option<ArgCountVersionLimit>,
     },
 
     TypeMismatch {
@@ -661,6 +672,8 @@ pub struct CallArgBinding {
     /// resolution readers; the argument judgement leaves it alone, because the
     /// platform drops such a branch before it could check a single argument.
     pub in_dead_branch: bool,
+    /// The project's minimum platform release the candidates were judged against, if any.
+    pub min_platform: Option<bsl_platform::PlatformVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2840,8 +2853,12 @@ impl<'db> InferenceContext<'db> {
         &mut self,
         call_expr: ExprId,
         args: &[ExprId],
-        candidates: crate::call_resolution::CallCandidateSet,
+        mut candidates: crate::call_resolution::CallCandidateSet,
     ) -> TypeId {
+        let min_platform = self.effective_min_platform();
+        if let Some(minimum) = min_platform {
+            candidates.lower_to_platform(minimum);
+        }
         let argument_types = args
             .iter()
             .map(|arg| self.expr_types.get(arg).copied().unwrap_or_else(|| self.db.unknown()))
@@ -2855,6 +2872,7 @@ impl<'db> InferenceContext<'db> {
                 args: args.to_vec(),
                 candidate: projection.semantic,
                 in_dead_branch: self.in_dead_branch,
+                min_platform,
             });
         }
         return_ty
@@ -4774,11 +4792,15 @@ impl<'db> InferenceContext<'db> {
                     self.check_unknown_constructed_type(expr_id, name);
                     let ctors = platform.get_constructors(name.as_str());
                     if !ctors.is_empty() {
-                        if let Ok(candidates) = builtin::candidates::constructor_candidates(
+                        if let Ok(mut candidates) = builtin::candidates::constructor_candidates(
                             self.db,
                             &ctors,
                             environment,
                         ) {
+                            let min_platform = self.effective_min_platform();
+                            if let Some(minimum) = min_platform {
+                                candidates.lower_to_platform(minimum);
+                            }
                             let arg_ids: Vec<ExprId> =
                                 args.iter().copied().map(ExprId::from_idx).collect();
                             let argument_types = arg_ids
@@ -4802,6 +4824,7 @@ impl<'db> InferenceContext<'db> {
                                     args: arg_ids,
                                     candidate: projection.semantic,
                                     in_dead_branch: self.in_dead_branch,
+                                    min_platform,
                                 });
                             }
                         }
@@ -6022,6 +6045,7 @@ impl<'db> InferenceContext<'db> {
                                     required_count: required,
                                     total_count: total,
                                     found: args.len(),
+                                    version_limit: None,
                                 },
                             );
                         }
@@ -7778,6 +7802,7 @@ mod tests {
             required_count: 2,
             total_count: 2,
             found: 1,
+            version_limit: None,
         };
 
         match diag {
@@ -7786,6 +7811,7 @@ mod tests {
                 required_count,
                 total_count,
                 found,
+                ..
             } => {
                 assert_eq!(call_expr, expr_id);
                 assert_eq!(required_count, 2);
@@ -7889,6 +7915,7 @@ mod tests {
                 required_count: 2,
                 total_count: 2,
                 found: 1,
+                version_limit: None,
             },
         ));
 
